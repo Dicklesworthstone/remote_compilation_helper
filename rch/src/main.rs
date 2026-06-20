@@ -694,6 +694,11 @@ CHECKS PERFORMED:
         /// check stability across passes (use with --smoke; a no-op on --dry-run)
         #[arg(long)]
         soak: bool,
+        /// Load mode: launch a bounded swarm of concurrent canary builds across
+        /// the fleet and gate it with the storm-control invariants (implies the
+        /// smoke profile; honors --worker/--all/--timeout; --dry-run plans only)
+        #[arg(long)]
+        load: bool,
         /// Plan only; do not execute scenarios (use with --smoke)
         #[arg(long)]
         dry_run: bool,
@@ -1982,11 +1987,12 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 scheduled,
                 smoke,
                 soak,
+                load,
                 dry_run,
             } => {
                 commands::self_test(
-                    action, worker, all, project, timeout, debug, scheduled, smoke, soak, dry_run,
-                    &ctx,
+                    action, worker, all, project, timeout, debug, scheduled, smoke, soak, load,
+                    dry_run, &ctx,
                 )
                 .await
             }
@@ -7281,6 +7287,7 @@ mod tests {
                 scheduled,
                 smoke,
                 soak,
+                load,
                 dry_run,
             }) => {
                 assert!(action.is_none());
@@ -7292,6 +7299,7 @@ mod tests {
                 assert!(!scheduled);
                 assert!(!smoke);
                 assert!(!soak);
+                assert!(!load);
                 assert!(!dry_run);
             }
             _ => fail_expected("Expected self-test command"),
@@ -7328,6 +7336,22 @@ mod tests {
                 assert!(dry_run);
             }
             _ => fail_expected("Expected self-test --smoke command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_self_test_smoke_load() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "self-test", "--smoke", "--load", "--all"]).unwrap();
+        match cli.command {
+            Some(Commands::SelfTest {
+                smoke, load, all, ..
+            }) => {
+                assert!(smoke);
+                assert!(load);
+                assert!(all);
+            }
+            _ => fail_expected("Expected self-test --smoke --load command"),
         }
     }
 

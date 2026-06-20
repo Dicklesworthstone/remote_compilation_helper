@@ -10,7 +10,7 @@ use crate::hook::{
 use crate::status_types::{
     DaemonFullStatusResponse, IssueFromApi, SelfTestHistoryResponseFromApi,
     SelfTestResultRecordFromApi, SelfTestRunResponseFromApi, SelfTestStatusResponseFromApi,
-    extract_json_body,
+    WorkerStatusFromApi, extract_json_body,
 };
 use crate::toolchain::detect_toolchain;
 use crate::ui::context::OutputContext;
@@ -20,6 +20,11 @@ use anyhow::{Context, Result};
 use rch_common::fleet_smoke_profile::{
     ProfileMode, ScenarioAction, SmokeProfileEvent, SmokeProfileInputs, SmokeProfilePlan,
     SmokeScenario, plan_smoke_profile,
+};
+use rch_common::job_identity::LOCAL_WRAPPER_ID_PREFIX;
+use rch_common::storm_control::{
+    InvariantReport, LiveJobOutcome, StormConfig, StormRun, StormWorker, WorkerEligibility,
+    all_passed, build_live_storm_run, check_all_invariants,
 };
 use rch_common::{
     ApiResponse, CommandPriority, PlacementPlan, RequestedWorkerFacts, RequestedWorkerOutcome,
@@ -1068,13 +1073,16 @@ pub async fn self_test(
     scheduled: bool,
     smoke: bool,
     soak: bool,
+    load: bool,
     dry_run: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     // The real-fleet smoke/soak profile is a distinct mode from the per-worker
-    // canary self-test (bd-session-history-remediation-ocv9i.16.6).
-    if smoke {
-        return self_test_smoke(worker, all, timeout, dry_run, soak, ctx).await;
+    // canary self-test (bd-session-history-remediation-ocv9i.16.6). `--load` is a
+    // bounded multi-agent storm-control pass over that same profile machinery
+    // (bd-…-10.4); it implies the smoke entry point.
+    if smoke || load {
+        return self_test_smoke(worker, all, timeout, dry_run, soak, load, ctx).await;
     }
     match action {
         Some(crate::SelfTestAction::Status) => self_test_status(ctx).await,
@@ -1805,12 +1813,388 @@ fn write_smoke_jsonl(run_id: &str, events: &[SmokeProfileEvent]) -> Option<Strin
     Some(path.display().to_string())
 }
 
+// ===========================================================================
+// Multi-agent LOAD / storm-control run
+// (bd-session-history-remediation-ocv9i.10.4 live wiring; bd-p4l0q).
+// ===========================================================================
+//
+// `rch self-test --smoke --load` launches a BOUNDED swarm of concurrent tiny
+// canary builds across the schedulable fleet, records how each one really
+// resolved (which worker built it, how long it took, or whether it fell back),
+// turns those real observations into the same `StormRun` shape the deterministic
+// simulator produces, and gates the run with the SAME five storm-control
+// invariants (`rch_common::storm_control::check_all_invariants`). The simulator
+// proves the scheduler LOGIC in CI; this proves a real deployed fleet upholds
+// the same guarantees under contention. Non-destructive: throwaway debug canary
+// builds only — never touches user source.
+
+/// Owning bead id for the load/storm JSONL trace.
+const LOAD_BEAD_ID: &str = "bd-session-history-remediation-ocv9i.10.4";
+
+/// Storm-control fairness tolerance for a live load run: the busiest schedulable
+/// worker may take up to this multiple of its fair share of placements. Matched
+/// to the simulator's varied/heterogeneous-fleet threshold (REQ-LOAD-001).
+const LOAD_FAIRNESS_TOLERANCE: f64 = 1.6;
+/// Maximum fraction of jobs that may fail open to local before the run is judged
+/// a fallback storm.
+const LOAD_MAX_FALLBACK_RATIO: f64 = 0.30;
+/// Default concurrent-canary cap when not overridden by `RCH_LOAD_CONCURRENCY`.
+const LOAD_DEFAULT_CONCURRENCY_CAP: usize = 8;
+/// Default number of waves (jobs per schedulable worker) when not overridden by
+/// `RCH_LOAD_WAVES`.
+const LOAD_DEFAULT_WAVES: usize = 3;
+
+/// Map a live daemon worker view to its storm-control eligibility. A worker is
+/// schedulable unless it is temporarily bypassed (active bypass record or open
+/// circuit) or its status marks it offline/disabled. Pure so it is unit-testable.
+fn worker_eligibility(w: &WorkerStatusFromApi) -> WorkerEligibility {
+    if w.bypass.is_some() || w.circuit_state.eq_ignore_ascii_case("open") {
+        return WorkerEligibility::TemporaryBypass;
+    }
+    match w.status.to_ascii_lowercase().as_str() {
+        "offline" | "unreachable" | "down" | "unknown" => WorkerEligibility::CapabilityInadmissible,
+        "disabled" | "drained" | "draining" | "quarantined" => WorkerEligibility::AdminDisabled,
+        "degraded" => WorkerEligibility::Degraded,
+        _ => WorkerEligibility::Healthy,
+    }
+}
+
+/// Build the storm-control fleet description from the daemon's live worker views.
+/// EVERY worker is included (with its real eligibility) so the
+/// no-ineligible-selection invariant is meaningful, not vacuous. Pure & testable.
+fn build_storm_fleet(workers: &[WorkerStatusFromApi]) -> Vec<StormWorker> {
+    workers
+        .iter()
+        .map(|w| StormWorker {
+            id: w.id.clone(),
+            total_slots: w.total_slots.max(1),
+            speed: if w.speed_score > 0.0 {
+                w.speed_score
+            } else {
+                1.0
+            },
+            eligibility: worker_eligibility(w),
+        })
+        .collect()
+}
+
+/// Resolve the bounded load parameters (waves, concurrency cap) from the
+/// environment, defaulting to sane values scaled to the schedulable fleet size.
+fn resolve_load_params(schedulable: usize, env: impl Fn(&str) -> Option<String>) -> (usize, usize) {
+    let waves = env("RCH_LOAD_WAVES")
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&w| w > 0)
+        .unwrap_or(LOAD_DEFAULT_WAVES);
+    let default_conc = schedulable
+        .saturating_mul(2)
+        .clamp(1, LOAD_DEFAULT_CONCURRENCY_CAP);
+    let concurrency = env("RCH_LOAD_CONCURRENCY")
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&c| c > 0)
+        .unwrap_or(default_conc);
+    (waves, concurrency)
+}
+
+/// One planned canary job in the swarm: a stable local wrapper id and the
+/// schedulable worker the operator targets for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadJobSpec {
+    local_job_id: String,
+    worker_id: String,
+}
+
+/// Plan the bounded swarm: `waves` jobs round-robined across the schedulable
+/// workers in `fleet`, restricted to `selected` when a single `--worker` was
+/// requested. Ineligible workers are never targeted (upholding the
+/// no-ineligible-selection invariant by construction). Pure & testable.
+fn plan_load_jobs(fleet: &[StormWorker], selected: Option<&str>, waves: usize) -> Vec<LoadJobSpec> {
+    let targets: Vec<&StormWorker> = fleet
+        .iter()
+        .filter(|w| w.eligibility.is_schedulable())
+        .filter(|w| selected.is_none_or(|sel| w.id == sel))
+        .collect();
+    let mut jobs = Vec::new();
+    let mut idx = 0usize;
+    for _ in 0..waves {
+        for w in &targets {
+            jobs.push(LoadJobSpec {
+                local_job_id: format!("{LOCAL_WRAPPER_ID_PREFIX}{idx:04}"),
+                worker_id: w.id.clone(),
+            });
+            idx += 1;
+        }
+    }
+    jobs
+}
+
+/// Classify one canary's real result into a live storm outcome. The remote build
+/// COMPLETING (a remote compile time was recorded) is the honest "ran remotely"
+/// signal — the same criterion the smoke `CargoCanary` scenario uses. Anything
+/// else means the fail-open canary did not run remotely, recorded as a local
+/// fallback. Pure & testable.
+fn classify_load_outcome(
+    spec: &LoadJobSpec,
+    remote_id: u64,
+    elapsed_ms: u64,
+    remote_time_ms: Option<u64>,
+) -> LiveJobOutcome {
+    match remote_time_ms {
+        Some(remote_ms) => LiveJobOutcome::remote(
+            spec.local_job_id.clone(),
+            spec.worker_id.clone(),
+            remote_id,
+            1,
+            remote_ms,
+        ),
+        None => LiveJobOutcome::local_fallback(spec.local_job_id.clone(), 1, elapsed_ms),
+    }
+}
+
+/// Fetch the daemon's live worker views (`GET /status`).
+async fn fetch_daemon_status_workers() -> Result<Vec<WorkerStatusFromApi>> {
+    let response = send_daemon_command("GET /status\n").await?;
+    let json = extract_json_body(&response)
+        .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
+    let status: DaemonFullStatusResponse =
+        serde_json::from_str(json).context("Failed to parse daemon status response")?;
+    Ok(status.workers)
+}
+
+/// Execute the planned swarm: launch each canary as a real `POST /self-test/run`
+/// against its target worker, bounded to `concurrency` in flight at once, and
+/// collect the real per-job outcomes. Each admitted job is minted a unique remote
+/// build id so the no-duplicate-remote-id invariant is exercised on real data.
+async fn execute_load_swarm(
+    specs: &[LoadJobSpec],
+    timeout: u64,
+    concurrency: usize,
+) -> Vec<LiveJobOutcome> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::Semaphore;
+
+    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
+    let next_remote_id = Arc::new(AtomicU64::new(1));
+    let mut handles = Vec::with_capacity(specs.len());
+
+    for spec in specs {
+        let spec = spec.clone();
+        let semaphore = semaphore.clone();
+        let next_remote_id = next_remote_id.clone();
+        handles.push(tokio::spawn(async move {
+            // Bound concurrency: the permit is held for the build's lifetime.
+            let _permit = semaphore.acquire_owned().await.ok()?;
+            let command = format!(
+                "POST /self-test/run?worker={}&timeout={}&debug=true&retries=0\n",
+                urlencoding_encode(&spec.worker_id),
+                timeout
+            );
+            let started = std::time::Instant::now();
+            let remote_time_ms = send_daemon_command(&command)
+                .await
+                .ok()
+                .and_then(|response| {
+                    let json = extract_json_body(&response)?;
+                    let run: SelfTestRunResponseFromApi = serde_json::from_str(json).ok()?;
+                    run.results
+                        .into_iter()
+                        .find(|r| r.worker_id == spec.worker_id)
+                })
+                .and_then(|r| r.remote_time_ms);
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let remote_id = next_remote_id.fetch_add(1, Ordering::Relaxed);
+            Some(classify_load_outcome(
+                &spec,
+                remote_id,
+                elapsed_ms,
+                remote_time_ms,
+            ))
+        }));
+    }
+
+    let mut outcomes = Vec::with_capacity(specs.len());
+    for handle in handles {
+        if let Ok(Some(outcome)) = handle.await {
+            outcomes.push(outcome);
+        }
+    }
+    // Stable order (by local wrapper id) for deterministic JSONL + reporting.
+    outcomes.sort_by(|a, b| a.local_job_id.cmp(&b.local_job_id));
+    outcomes
+}
+
+/// Drive the multi-agent LOAD / storm-control self-test: build the fleet from
+/// live daemon status, plan a bounded concurrent canary swarm, execute it,
+/// record the real outcomes as a `StormRun`, gate them with the five
+/// storm-control invariants, persist the JSONL trace, and report. Returns an
+/// error (non-zero exit) when any invariant is violated, so CI/operators notice.
+async fn run_load_storm(
+    run_id: &str,
+    selected_worker: Option<&str>,
+    timeout: u64,
+    dry_run: bool,
+    daemon_reachable: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    // 1. Build the fleet description from the daemon's live worker views.
+    let fleet = match fetch_daemon_status_workers().await {
+        Ok(ws) => build_storm_fleet(&ws),
+        Err(_) => Vec::new(),
+    };
+    let schedulable = fleet
+        .iter()
+        .filter(|w| w.eligibility.is_schedulable())
+        .count();
+    let (waves, concurrency) = resolve_load_params(schedulable, |k| std::env::var(k).ok());
+    let specs = plan_load_jobs(&fleet, selected_worker, waves);
+
+    // 2. Dry-run, or nothing schedulable: report the intent, execute nothing.
+    if dry_run || specs.is_empty() {
+        let reason = if dry_run {
+            "dry-run: planned the load swarm but executed nothing"
+        } else if !daemon_reachable {
+            "daemon unreachable; no live fleet to load"
+        } else {
+            "no schedulable workers to load"
+        };
+        let payload = serde_json::json!({
+            "run_id": run_id,
+            "bead_id": LOAD_BEAD_ID,
+            "mode": "load",
+            "dry_run": dry_run,
+            "daemon_reachable": daemon_reachable,
+            "schedulable_workers": schedulable,
+            "planned_jobs": specs.len(),
+            "waves": waves,
+            "concurrency": concurrency,
+            "executed": false,
+            "reason": reason,
+        });
+        let _ = ctx.json(&payload);
+        if !ctx.is_json() {
+            render_load_skip(reason, specs.len(), schedulable, ctx);
+        }
+        return Ok(());
+    }
+
+    // 3. Execute the bounded swarm and record real outcomes.
+    let outcomes = execute_load_swarm(&specs, timeout, concurrency).await;
+
+    // 4. Turn the observations into the same StormRun shape as the simulator and
+    //    gate it with the SAME five invariants.
+    let cfg = StormConfig::new(run_id, LOAD_BEAD_ID);
+    let run = build_live_storm_run(&cfg, &fleet, &outcomes);
+    let reports = check_all_invariants(
+        &run,
+        &fleet,
+        LOAD_FAIRNESS_TOLERANCE,
+        LOAD_MAX_FALLBACK_RATIO,
+    );
+    let passed = all_passed(&reports);
+
+    // 5. Persist the storm JSONL trace (best-effort) and report.
+    let log_path = write_smoke_jsonl(run_id, &run.events);
+    let payload = serde_json::json!({
+        "run_id": run_id,
+        "bead_id": LOAD_BEAD_ID,
+        "mode": "load",
+        "dry_run": false,
+        "daemon_reachable": daemon_reachable,
+        "schedulable_workers": schedulable,
+        "waves": waves,
+        "concurrency": concurrency,
+        "executed": true,
+        "passed": passed,
+        "summary": run.summary,
+        "invariants": reports,
+        "events": run.events,
+        "log_path": log_path,
+    });
+    let _ = ctx.json(&payload);
+    if !ctx.is_json() {
+        render_load_report(&run, &reports, log_path.as_deref(), ctx);
+    }
+    if passed {
+        Ok(())
+    } else {
+        let held = reports.iter().filter(|r| r.passed).count();
+        anyhow::bail!(
+            "storm-control invariants failed: {held}/{} held",
+            reports.len()
+        )
+    }
+}
+
+/// Render a skipped (dry-run or no-fleet) load run for humans.
+fn render_load_skip(reason: &str, planned_jobs: usize, schedulable: usize, ctx: &OutputContext) {
+    let style = ctx.style();
+    println!(
+        "{}",
+        style.format_header("Multi-Agent Load / Storm-Control (skipped)")
+    );
+    println!("  {reason}");
+    println!("  schedulable workers: {schedulable} · planned jobs: {planned_jobs}");
+}
+
+/// Render the storm summary + invariant verdicts for humans.
+fn render_load_report(
+    run: &StormRun,
+    reports: &[InvariantReport],
+    log_path: Option<&str>,
+    ctx: &OutputContext,
+) {
+    let style = ctx.style();
+    println!(
+        "{}",
+        style.format_header("Multi-Agent Load / Storm-Control")
+    );
+    let s = &run.summary;
+    println!(
+        "  jobs: {} total · {} remote · {} local-fallback · {} proof-refused · {} cancelled",
+        s.total_jobs, s.remote_successes, s.local_fallbacks, s.proof_refusals, s.cancellations
+    );
+    println!(
+        "  queue timeouts: {} · p95 queue wait: {}ms · p95 end-to-end: {}ms",
+        s.queue_timeouts, s.p95_queue_wait_ms, s.p95_end_to_end_ms
+    );
+    let util_rows: Vec<Vec<String>> = s
+        .per_worker_slot_utilization
+        .iter()
+        .map(|(id, u)| vec![id.clone(), format!("{:.1}%", u * 100.0)])
+        .collect();
+    if !util_rows.is_empty() {
+        ctx.table(&["Worker", "Slot Utilization"], &util_rows);
+    }
+    let inv_rows: Vec<Vec<String>> = reports
+        .iter()
+        .map(|r| {
+            vec![
+                r.name.clone(),
+                if r.passed { "PASS" } else { "FAIL" }.to_string(),
+                r.detail.clone(),
+            ]
+        })
+        .collect();
+    ctx.table(&["Invariant", "Verdict", "Detail"], &inv_rows);
+    let held = reports.iter().filter(|r| r.passed).count();
+    println!("  {held}/{} invariants held", reports.len());
+    for r in reports.iter().filter(|r| !r.passed) {
+        for v in &r.violations {
+            println!("    ✗ {}: {v}", r.name);
+        }
+    }
+    if let Some(path) = log_path {
+        println!("  trace: {path}");
+    }
+}
+
 async fn self_test_smoke(
     worker: Option<String>,
     all: bool,
     timeout: u64,
     dry_run: bool,
     soak: bool,
+    load: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let workers = load_workers_from_config().unwrap_or_default();
@@ -1824,16 +2208,36 @@ async fn self_test_smoke(
 
     // A single --worker selects that worker; --all (or neither) is fleet-wide.
     let selected_worker = if all { None } else { worker };
-    let inputs = build_smoke_inputs(
+    let mut inputs = build_smoke_inputs(
         workers_configured,
         daemon_reachable,
         dry_run,
         soak,
         selected_worker.clone(),
     );
+    // --load drives a bounded concurrent canary swarm (storm control) rather than
+    // the one-pass smoke scenarios; carry the Load mode into the plan/trace.
+    if load {
+        inputs.mode = ProfileMode::Load;
+    }
     let plan = plan_smoke_profile(&inputs);
 
     let run_id = uuid::Uuid::new_v4().to_string();
+
+    // Multi-agent LOAD / storm-control run (bd-…-10.4): instead of the eight
+    // one-pass smoke scenarios, launch a bounded swarm of concurrent canary
+    // builds and gate it with the five storm-control invariants.
+    if load {
+        return run_load_storm(
+            &run_id,
+            selected_worker.as_deref(),
+            timeout,
+            dry_run,
+            daemon_reachable,
+            ctx,
+        )
+        .await;
+    }
 
     // For a single `--worker` the planned per-worker events are scoped to that
     // worker; a fleet-wide run (`--all` or the default) leaves worker_id unset,
@@ -3353,5 +3757,214 @@ mod tests {
         let (p2, r2) = smoke_cancel_verdict(None);
         assert!(!p2);
         assert_eq!(r2.as_deref(), Some("cancel_response_malformed"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-agent load / storm-control (`--load`) wiring (bd-p4l0q)
+    // -----------------------------------------------------------------------
+
+    fn mk_worker_status(
+        id: &str,
+        status: &str,
+        circuit: &str,
+        slots: u32,
+        speed: f64,
+    ) -> WorkerStatusFromApi {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "host": "h",
+            "user": "u",
+            "status": status,
+            "circuit_state": circuit,
+            "used_slots": 0,
+            "total_slots": slots,
+            "speed_score": speed,
+            "last_error": null,
+        }))
+        .expect("worker status")
+    }
+
+    #[test]
+    fn worker_eligibility_maps_live_status() {
+        // Healthy/busy/ready map to schedulable; degraded stays schedulable.
+        assert_eq!(
+            worker_eligibility(&mk_worker_status("a", "ready", "closed", 4, 1.0)),
+            WorkerEligibility::Healthy
+        );
+        assert_eq!(
+            worker_eligibility(&mk_worker_status("a", "degraded", "closed", 4, 1.0)),
+            WorkerEligibility::Degraded
+        );
+        // Offline / disabled are not schedulable.
+        assert_eq!(
+            worker_eligibility(&mk_worker_status("a", "offline", "closed", 4, 1.0)),
+            WorkerEligibility::CapabilityInadmissible
+        );
+        assert_eq!(
+            worker_eligibility(&mk_worker_status("a", "disabled", "closed", 4, 1.0)),
+            WorkerEligibility::AdminDisabled
+        );
+        // An open circuit overrides an otherwise-ready status.
+        assert_eq!(
+            worker_eligibility(&mk_worker_status("a", "ready", "open", 4, 1.0)),
+            WorkerEligibility::TemporaryBypass
+        );
+    }
+
+    #[test]
+    fn build_storm_fleet_carries_slots_speed_and_eligibility() {
+        let workers = vec![
+            mk_worker_status("w1", "ready", "closed", 8, 90.0),
+            mk_worker_status("w2", "offline", "closed", 4, 0.0),
+        ];
+        let fleet = build_storm_fleet(&workers);
+        assert_eq!(fleet.len(), 2);
+        assert_eq!(fleet[0].id, "w1");
+        assert_eq!(fleet[0].total_slots, 8);
+        assert!((fleet[0].speed - 90.0).abs() < f64::EPSILON);
+        assert!(fleet[0].eligibility.is_schedulable());
+        // A zero speed score is floored to a positive weight so fairness math is
+        // well-defined; the offline worker is not schedulable.
+        assert!(fleet[1].speed > 0.0);
+        assert!(!fleet[1].eligibility.is_schedulable());
+    }
+
+    #[test]
+    fn resolve_load_params_defaults_and_overrides() {
+        // No env: waves default, concurrency scales to 2× schedulable, capped.
+        let (waves, conc) = resolve_load_params(3, |_| None);
+        assert_eq!(waves, LOAD_DEFAULT_WAVES);
+        assert_eq!(conc, 6);
+        // Large fleet caps concurrency.
+        let (_, conc_big) = resolve_load_params(50, |_| None);
+        assert_eq!(conc_big, LOAD_DEFAULT_CONCURRENCY_CAP);
+        // Env overrides are honored; invalid/zero values fall back to defaults.
+        let env = |k: &str| match k {
+            "RCH_LOAD_WAVES" => Some("5".to_string()),
+            "RCH_LOAD_CONCURRENCY" => Some("2".to_string()),
+            _ => None,
+        };
+        assert_eq!(resolve_load_params(3, env), (5, 2));
+        let bad = |k: &str| match k {
+            "RCH_LOAD_WAVES" => Some("0".to_string()),
+            "RCH_LOAD_CONCURRENCY" => Some("nope".to_string()),
+            _ => None,
+        };
+        assert_eq!(resolve_load_params(2, bad), (LOAD_DEFAULT_WAVES, 4));
+    }
+
+    #[test]
+    fn plan_load_jobs_round_robins_only_over_schedulable() {
+        let fleet = build_storm_fleet(&[
+            mk_worker_status("w1", "ready", "closed", 4, 100.0),
+            mk_worker_status("w2", "ready", "closed", 4, 100.0),
+            mk_worker_status("down", "offline", "closed", 4, 100.0),
+        ]);
+        // 2 schedulable workers × 3 waves = 6 jobs; the offline worker is never
+        // targeted, and ids are unique.
+        let jobs = plan_load_jobs(&fleet, None, 3);
+        assert_eq!(jobs.len(), 6);
+        assert!(jobs.iter().all(|j| j.worker_id != "down"));
+        let unique: std::collections::BTreeSet<_> =
+            jobs.iter().map(|j| j.local_job_id.clone()).collect();
+        assert_eq!(unique.len(), 6);
+        assert!(jobs.iter().all(|j| j.local_job_id.starts_with("rchw-")));
+        // Round-robin spread: each schedulable worker gets an equal share.
+        let w1 = jobs.iter().filter(|j| j.worker_id == "w1").count();
+        let w2 = jobs.iter().filter(|j| j.worker_id == "w2").count();
+        assert_eq!((w1, w2), (3, 3));
+    }
+
+    #[test]
+    fn plan_load_jobs_honors_single_worker_selection() {
+        let fleet = build_storm_fleet(&[
+            mk_worker_status("w1", "ready", "closed", 4, 100.0),
+            mk_worker_status("w2", "ready", "closed", 4, 100.0),
+        ]);
+        let jobs = plan_load_jobs(&fleet, Some("w2"), 2);
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|j| j.worker_id == "w2"));
+        // Selecting an ineligible/absent worker yields no jobs.
+        assert!(plan_load_jobs(&fleet, Some("ghost"), 2).is_empty());
+    }
+
+    #[test]
+    fn classify_load_outcome_splits_remote_vs_fallback() {
+        let spec = LoadJobSpec {
+            local_job_id: "rchw-0000".to_string(),
+            worker_id: "w1".to_string(),
+        };
+        // A recorded remote compile time => admitted/ran remotely.
+        let remote = classify_load_outcome(&spec, 42, 900, Some(700));
+        assert_eq!(
+            remote.disposition,
+            rch_common::storm_control::LiveDisposition::Remote
+        );
+        assert_eq!(remote.remote_job_id, Some(42));
+        assert_eq!(remote.selected_worker.as_deref(), Some("w1"));
+        assert_eq!(remote.runtime_ms, 700);
+        // No remote time => the fail-open canary fell back to local.
+        let fallback = classify_load_outcome(&spec, 43, 1200, None);
+        assert_eq!(
+            fallback.disposition,
+            rch_common::storm_control::LiveDisposition::LocalFallback
+        );
+        assert_eq!(fallback.remote_job_id, None);
+        assert!(fallback.selected_worker.is_none());
+        assert_eq!(fallback.runtime_ms, 1200);
+    }
+
+    #[test]
+    fn live_load_run_built_from_real_outcomes_upholds_invariants() {
+        // End-to-end of the pure path: plan a swarm over a 3-worker fleet, mark
+        // each job as a remote success, and confirm the assembled StormRun passes
+        // the same five storm-control invariants the live `--load` run gates on.
+        let fleet = build_storm_fleet(&[
+            mk_worker_status("w1", "ready", "closed", 4, 100.0),
+            mk_worker_status("w2", "ready", "closed", 4, 100.0),
+            mk_worker_status("w3", "ready", "closed", 4, 100.0),
+        ]);
+        let specs = plan_load_jobs(&fleet, None, 4);
+        let outcomes: Vec<LiveJobOutcome> = specs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| classify_load_outcome(s, (i + 1) as u64, 600, Some(500)))
+            .collect();
+        let cfg = StormConfig::new("load-test", LOAD_BEAD_ID);
+        let run = build_live_storm_run(&cfg, &fleet, &outcomes);
+        let reports = check_all_invariants(
+            &run,
+            &fleet,
+            LOAD_FAIRNESS_TOLERANCE,
+            LOAD_MAX_FALLBACK_RATIO,
+        );
+        assert!(all_passed(&reports), "live load invariants: {reports:?}");
+        assert_eq!(run.summary.remote_successes, specs.len() as u32);
+    }
+
+    #[test]
+    fn live_load_run_with_one_offline_worker_never_targets_it() {
+        // A fleet with an ineligible worker: it appears in the fleet description
+        // (so the invariant is non-vacuous) but never receives work.
+        let fleet = build_storm_fleet(&[
+            mk_worker_status("good", "ready", "closed", 4, 100.0),
+            mk_worker_status("bad", "offline", "closed", 4, 100.0),
+        ]);
+        let specs = plan_load_jobs(&fleet, None, 3);
+        let outcomes: Vec<LiveJobOutcome> = specs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| classify_load_outcome(s, (i + 1) as u64, 600, Some(500)))
+            .collect();
+        let cfg = StormConfig::new("load-test", LOAD_BEAD_ID);
+        let run = build_live_storm_run(&cfg, &fleet, &outcomes);
+        let report = check_all_invariants(
+            &run,
+            &fleet,
+            LOAD_FAIRNESS_TOLERANCE,
+            LOAD_MAX_FALLBACK_RATIO,
+        );
+        assert!(all_passed(&report));
+        assert_eq!(run.summary.per_worker_slot_utilization["bad"], 0.0);
     }
 }

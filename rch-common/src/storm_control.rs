@@ -563,10 +563,7 @@ impl<'a> Sim<'a> {
         let depth = self.queue_depth_u32();
         // The real queue contract: a busy fleet with no wait yields a definite,
         // reattachable not-started job carrying attach/cancel guidance.
-        let resp = QueueContractResponse::build(
-            &resolve_queue_contract(&AdmissionState::Queued, &QueueOptions::default(), None),
-            Some(self.state[job].local_id.clone()),
-        );
+        let guidance = queued_guidance(&self.state[job].local_id);
         self.emit(
             job,
             event::QUEUED,
@@ -576,7 +573,7 @@ impl<'a> Sim<'a> {
             None,
             Some(depth),
             0,
-            Some(resp.render()),
+            Some(guidance),
             None,
         );
         // Schedule timeout and (if applicable) cancellation.
@@ -720,18 +717,7 @@ impl<'a> Sim<'a> {
             });
         self.state[job].queue_wait_ms = wait;
         self.state[job].disposition = Some(Disposition::QueueTimeoutFallback);
-        let resp = QueueContractResponse::build(
-            &resolve_queue_contract(
-                &AdmissionState::Queued,
-                &QueueOptions {
-                    wait: true,
-                    wait_timeout_secs: Some(self.cfg.queue_timeout_ms / 1000),
-                    ..QueueOptions::default()
-                },
-                Some(WaitResult::TimedOut),
-            ),
-            Some(self.state[job].local_id.clone()),
-        );
+        let guidance = queue_timeout_guidance(&self.state[job].local_id, self.cfg.queue_timeout_ms);
         self.emit(
             job,
             event::FELL_BACK,
@@ -741,23 +727,14 @@ impl<'a> Sim<'a> {
             None,
             None,
             self.jobs[job].runtime_ms,
-            Some(resp.render()),
+            Some(guidance),
             None,
         );
     }
 
     fn dispose_local_fallback(&mut self, job: usize, decision_tok: &str) {
         self.state[job].disposition = Some(Disposition::LocalFallback);
-        let resp = QueueContractResponse::build(
-            &resolve_queue_contract(
-                &AdmissionState::RejectedBeforeAdmission(
-                    "fleet at capacity; ran locally (fail-open)".to_string(),
-                ),
-                &QueueOptions::default(),
-                None,
-            ),
-            None,
-        );
+        let guidance = local_fallback_guidance();
         self.emit(
             job,
             event::FELL_BACK,
@@ -767,7 +744,7 @@ impl<'a> Sim<'a> {
             None,
             None,
             self.jobs[job].runtime_ms,
-            Some(resp.detail),
+            Some(guidance),
             None,
         );
     }
@@ -801,17 +778,7 @@ impl<'a> Sim<'a> {
             .map_or(0, |e| self.clock.saturating_sub(e));
         self.state[job].queue_wait_ms = wait;
         self.state[job].disposition = Some(Disposition::Cancelled);
-        let resp = QueueContractResponse::build(
-            &resolve_queue_contract(
-                &AdmissionState::Queued,
-                &QueueOptions {
-                    wait: true,
-                    ..QueueOptions::default()
-                },
-                Some(WaitResult::CancelledBeforeStart),
-            ),
-            Some(self.state[job].local_id.clone()),
-        );
+        let guidance = cancel_guidance(&self.state[job].local_id);
         self.emit(
             job,
             event::CANCELLED,
@@ -821,7 +788,7 @@ impl<'a> Sim<'a> {
             None,
             None,
             0,
-            Some(resp.render()),
+            Some(guidance),
             None,
         );
     }
@@ -840,26 +807,21 @@ impl<'a> Sim<'a> {
         detail: Option<String>,
         remote_id: Option<RemoteBuildId>,
     ) {
-        let mut ev = SmokeProfileEvent::started(
-            self.cfg.run_id.clone(),
-            self.cfg.bead_id.clone(),
+        let ev = make_load_event(
+            &self.cfg.run_id,
+            &self.cfg.bead_id,
+            self.jobs[job].kind,
+            &self.state[job].local_id,
+            event_tok,
+            status_tok,
+            decision_tok,
             worker_id,
-            SmokeScenario::LoadStormControl,
+            selected_worker,
+            queue_depth,
+            duration_ms,
+            detail,
+            remote_id,
         );
-        ev.event = event_tok.to_string();
-        ev.status = status_tok.to_string();
-        ev.duration_ms = duration_ms;
-        ev.command_fingerprint = Some(self.jobs[job].kind.fingerprint().to_string());
-        ev = ev
-            .with_job_ids(Some(self.state[job].local_id.clone()), remote_id)
-            .with_selected_worker(selected_worker)
-            .with_fallback_decision(decision_tok);
-        if let Some(d) = queue_depth {
-            ev = ev.with_queue_depth(d);
-        }
-        if let Some(d) = detail {
-            ev = ev.with_detail(d);
-        }
         self.events.push(ev);
     }
 
@@ -946,6 +908,482 @@ fn percentile(values: &mut [u64], p: u64) -> u64 {
     let rank = (p * n).div_ceil(100).max(1);
     let idx = (rank - 1).min(n - 1) as usize;
     values[idx]
+}
+
+// ===========================================================================
+// Shared event / guidance construction (used by BOTH the discrete-event
+// simulator and the live recorder so the two emit byte-identical event shapes
+// for the same logical disposition — that is what lets the same invariant
+// checkers gate a SIMULATED storm in CI and a REAL `--load` self-test run).
+// ===========================================================================
+
+/// Build one [`SmokeProfileEvent`] for a load/storm job, carrying every load
+/// field. Shared by the simulator's `Sim::emit` and [`build_live_storm_run`].
+#[allow(clippy::too_many_arguments)] // one param per JSONL field the event carries
+fn make_load_event(
+    run_id: &str,
+    bead_id: &str,
+    kind: JobKind,
+    local_id: &str,
+    event_tok: &str,
+    status_tok: &str,
+    decision_tok: &str,
+    worker_id: Option<String>,
+    selected_worker: Option<String>,
+    queue_depth: Option<u32>,
+    duration_ms: u64,
+    detail: Option<String>,
+    remote_id: Option<RemoteBuildId>,
+) -> SmokeProfileEvent {
+    let mut ev = SmokeProfileEvent::started(
+        run_id.to_string(),
+        bead_id.to_string(),
+        worker_id,
+        SmokeScenario::LoadStormControl,
+    );
+    ev.event = event_tok.to_string();
+    ev.status = status_tok.to_string();
+    ev.duration_ms = duration_ms;
+    ev.command_fingerprint = Some(kind.fingerprint().to_string());
+    ev = ev
+        .with_job_ids(Some(local_id.to_string()), remote_id)
+        .with_selected_worker(selected_worker)
+        .with_fallback_decision(decision_tok);
+    if let Some(d) = queue_depth {
+        ev = ev.with_queue_depth(d);
+    }
+    if let Some(d) = detail {
+        ev = ev.with_detail(d);
+    }
+    ev
+}
+
+/// Attach/cancel guidance for a job that is queued and not yet started — the
+/// real busy-fleet queue contract (definite, reattachable not-started job).
+fn queued_guidance(local_id: &str) -> String {
+    QueueContractResponse::build(
+        &resolve_queue_contract(&AdmissionState::Queued, &QueueOptions::default(), None),
+        Some(local_id.to_string()),
+    )
+    .render()
+}
+
+/// Guidance for a fail-open job that never reached a worker (fleet at capacity)
+/// and ran locally instead.
+fn local_fallback_guidance() -> String {
+    QueueContractResponse::build(
+        &resolve_queue_contract(
+            &AdmissionState::RejectedBeforeAdmission(
+                "fleet at capacity; ran locally (fail-open)".to_string(),
+            ),
+            &QueueOptions::default(),
+            None,
+        ),
+        None,
+    )
+    .detail
+}
+
+/// Guidance for a job that waited past the queue wait-timeout and fell back.
+fn queue_timeout_guidance(local_id: &str, queue_timeout_ms: u64) -> String {
+    QueueContractResponse::build(
+        &resolve_queue_contract(
+            &AdmissionState::Queued,
+            &QueueOptions {
+                wait: true,
+                wait_timeout_secs: Some(queue_timeout_ms / 1000),
+                ..QueueOptions::default()
+            },
+            Some(WaitResult::TimedOut),
+        ),
+        Some(local_id.to_string()),
+    )
+    .render()
+}
+
+/// Guidance for a job cancelled before it started.
+fn cancel_guidance(local_id: &str) -> String {
+    QueueContractResponse::build(
+        &resolve_queue_contract(
+            &AdmissionState::Queued,
+            &QueueOptions {
+                wait: true,
+                ..QueueOptions::default()
+            },
+            Some(WaitResult::CancelledBeforeStart),
+        ),
+        Some(local_id.to_string()),
+    )
+    .render()
+}
+
+// ===========================================================================
+// Live recorder: real canary outcomes -> StormRun
+// ===========================================================================
+//
+// The deterministic simulator above proves the SCHEDULER LOGIC in CI. The
+// `rch self-test --smoke --load` consumer instead launches a bounded swarm of
+// REAL tiny canary builds on a deployed fleet, observes how each one actually
+// resolved, and feeds those observations here. [`build_live_storm_run`] turns
+// the observed outcomes into the exact same [`StormRun`] shape (JSONL event
+// stream + [`StormSummary`]) the simulator produces, so the *same five*
+// [`check_all_invariants`] gate a live run. The recorder owns the event
+// vocabulary and summary accounting; the consumer owns only the real execution.
+
+/// The terminal disposition of one observed live canary job. Mirrors the
+/// simulator's internal `Disposition` but is the public input the live consumer
+/// reports for each real build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveDisposition {
+    /// The job was admitted to a worker and ran remotely to completion.
+    Remote,
+    /// No remote capacity; a fail-open job ran locally instead.
+    LocalFallback,
+    /// The job waited past the queue wait-timeout and then ran locally.
+    QueueTimeoutFallback,
+    /// A proof (strict-remote) job refused local fallback (fail-closed).
+    ProofRefused,
+    /// The job was cancelled before it started.
+    Cancelled,
+}
+
+impl LiveDisposition {
+    /// Whether this disposition admitted the job to a worker.
+    #[must_use]
+    pub const fn is_remote(self) -> bool {
+        matches!(self, Self::Remote)
+    }
+
+    /// Whether this disposition counts as a local fallback in the summary.
+    #[must_use]
+    pub const fn is_local_fallback(self) -> bool {
+        matches!(self, Self::LocalFallback | Self::QueueTimeoutFallback)
+    }
+}
+
+/// One observed REAL canary outcome from a live `--load` self-test run.
+///
+/// The consumer populates one of these per concurrent canary build it launched,
+/// recording how the build actually resolved (which worker the daemon selected,
+/// the remote build id it was assigned, whether it queued/fell back/was
+/// refused/cancelled, and the measured timings).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveJobOutcome {
+    /// Local wrapper id (`rchw-…`) the hook minted for this job.
+    pub local_job_id: String,
+    /// Remote build id the daemon assigned once admitted; `None` if the job
+    /// never reached a worker.
+    pub remote_job_id: Option<RemoteBuildId>,
+    /// The worker the scheduler selected; `None` for fallback/refusal/cancel.
+    pub selected_worker: Option<String>,
+    /// Slots the job requested (for slot-utilization accounting).
+    pub slots: u32,
+    /// Command kind (only affects the redacted command fingerprint).
+    pub kind: JobKind,
+    /// How the job actually resolved.
+    pub disposition: LiveDisposition,
+    /// Whether the job spent time in the queue before resolving (drives an
+    /// intermediate `queued` event carrying attach/cancel guidance).
+    pub queued: bool,
+    /// Measured queue wait, milliseconds.
+    pub queue_wait_ms: u64,
+    /// Measured remote/local runtime, milliseconds.
+    pub runtime_ms: u64,
+    /// Queue depth observed when the job resolved, if known.
+    pub queue_depth: Option<u32>,
+}
+
+impl LiveJobOutcome {
+    /// A remote-success outcome: admitted to `worker` with `remote_id`, ran for
+    /// `runtime_ms`.
+    #[must_use]
+    pub fn remote(
+        local_job_id: impl Into<String>,
+        worker: impl Into<String>,
+        remote_id: RemoteBuildId,
+        slots: u32,
+        runtime_ms: u64,
+    ) -> Self {
+        Self {
+            local_job_id: local_job_id.into(),
+            remote_job_id: Some(remote_id),
+            selected_worker: Some(worker.into()),
+            slots,
+            kind: JobKind::Check,
+            disposition: LiveDisposition::Remote,
+            queued: false,
+            queue_wait_ms: 0,
+            runtime_ms,
+            queue_depth: None,
+        }
+    }
+
+    /// A local-fallback outcome: no remote capacity, ran locally for `runtime_ms`.
+    #[must_use]
+    pub fn local_fallback(local_job_id: impl Into<String>, slots: u32, runtime_ms: u64) -> Self {
+        Self {
+            local_job_id: local_job_id.into(),
+            remote_job_id: None,
+            selected_worker: None,
+            slots,
+            kind: JobKind::Check,
+            disposition: LiveDisposition::LocalFallback,
+            queued: false,
+            queue_wait_ms: 0,
+            runtime_ms,
+            queue_depth: None,
+        }
+    }
+
+    /// Override the command kind.
+    #[must_use]
+    pub fn with_kind(mut self, kind: JobKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Mark the job as having queued, with the measured wait and depth.
+    #[must_use]
+    pub fn queued_for(mut self, wait_ms: u64, depth: Option<u32>) -> Self {
+        self.queued = true;
+        self.queue_wait_ms = wait_ms;
+        self.queue_depth = depth;
+        self
+    }
+
+    /// Override the disposition (for fallback/refusal/cancel outcomes).
+    #[must_use]
+    pub fn with_disposition(mut self, disposition: LiveDisposition) -> Self {
+        self.disposition = disposition;
+        self
+    }
+}
+
+/// Build a [`StormRun`] (JSONL event stream + [`StormSummary`]) from a set of
+/// observed REAL canary outcomes, using the exact event vocabulary and summary
+/// accounting as the simulator. The resulting run can be fed straight into
+/// [`check_all_invariants`].
+///
+/// `workers` is the live fleet description (ids, slots, eligibility) so the
+/// fairness and ineligible-selection invariants — and per-worker slot
+/// utilization — can be computed against the real fleet shape.
+#[must_use]
+pub fn build_live_storm_run(
+    cfg: &StormConfig,
+    workers: &[StormWorker],
+    outcomes: &[LiveJobOutcome],
+) -> StormRun {
+    let mut events = Vec::new();
+    for o in outcomes {
+        // A job that waited emits an intermediate `queued` event carrying the
+        // real attach/cancel guidance, so the no-stuck-wrapper invariant has a
+        // definite, reattachable record even before the terminal event.
+        if o.queued {
+            events.push(make_load_event(
+                &cfg.run_id,
+                &cfg.bead_id,
+                o.kind,
+                &o.local_job_id,
+                event::QUEUED,
+                "queued",
+                decision::QUEUED,
+                None,
+                None,
+                o.queue_depth,
+                0,
+                Some(queued_guidance(&o.local_job_id)),
+                None,
+            ));
+        }
+        match o.disposition {
+            LiveDisposition::Remote => {
+                events.push(make_load_event(
+                    &cfg.run_id,
+                    &cfg.bead_id,
+                    o.kind,
+                    &o.local_job_id,
+                    event::STARTED,
+                    "run",
+                    decision::REMOTE,
+                    o.selected_worker.clone(),
+                    o.selected_worker.clone(),
+                    o.queue_depth,
+                    0,
+                    Some("admitted and running".to_string()),
+                    o.remote_job_id,
+                ));
+                events.push(make_load_event(
+                    &cfg.run_id,
+                    &cfg.bead_id,
+                    o.kind,
+                    &o.local_job_id,
+                    event::PASSED,
+                    "ok",
+                    decision::REMOTE,
+                    o.selected_worker.clone(),
+                    o.selected_worker.clone(),
+                    None,
+                    o.runtime_ms,
+                    Some("completed remotely".to_string()),
+                    o.remote_job_id,
+                ));
+            }
+            LiveDisposition::LocalFallback => {
+                events.push(make_load_event(
+                    &cfg.run_id,
+                    &cfg.bead_id,
+                    o.kind,
+                    &o.local_job_id,
+                    event::FELL_BACK,
+                    "local",
+                    decision::LOCAL_FALLBACK,
+                    None,
+                    None,
+                    None,
+                    o.runtime_ms,
+                    Some(local_fallback_guidance()),
+                    None,
+                ));
+            }
+            LiveDisposition::QueueTimeoutFallback => {
+                events.push(make_load_event(
+                    &cfg.run_id,
+                    &cfg.bead_id,
+                    o.kind,
+                    &o.local_job_id,
+                    event::FELL_BACK,
+                    "local",
+                    decision::QUEUE_TIMEOUT_FALLBACK,
+                    None,
+                    None,
+                    None,
+                    o.runtime_ms,
+                    Some(queue_timeout_guidance(
+                        &o.local_job_id,
+                        cfg.queue_timeout_ms,
+                    )),
+                    None,
+                ));
+            }
+            LiveDisposition::ProofRefused => {
+                let mut ev = make_load_event(
+                    &cfg.run_id,
+                    &cfg.bead_id,
+                    o.kind,
+                    &o.local_job_id,
+                    event::REFUSED,
+                    "refused",
+                    decision::PROOF_REFUSED,
+                    None,
+                    None,
+                    None,
+                    0,
+                    Some(
+                        "proof mode requires immediate remote admission; refused local fallback"
+                            .to_string(),
+                    ),
+                    None,
+                );
+                ev.reason_code = Some(PROOF_REFUSAL_REASON.to_string());
+                events.push(ev);
+            }
+            LiveDisposition::Cancelled => {
+                events.push(make_load_event(
+                    &cfg.run_id,
+                    &cfg.bead_id,
+                    o.kind,
+                    &o.local_job_id,
+                    event::CANCELLED,
+                    "cancelled",
+                    decision::CANCELLED,
+                    None,
+                    None,
+                    None,
+                    0,
+                    Some(cancel_guidance(&o.local_job_id)),
+                    None,
+                ));
+            }
+        }
+    }
+    let summary = summarize_live(workers, outcomes);
+    StormRun { events, summary }
+}
+
+/// Compute the [`StormSummary`] for a live run, mirroring the simulator's
+/// `Sim::finish` accounting.
+fn summarize_live(workers: &[StormWorker], outcomes: &[LiveJobOutcome]) -> StormSummary {
+    let mut remote_successes = 0u32;
+    let mut local_fallbacks = 0u32;
+    let mut proof_refusals = 0u32;
+    let mut queue_timeouts = 0u32;
+    let mut cancellations = 0u32;
+    let mut queue_waits = Vec::with_capacity(outcomes.len());
+    let mut end_to_ends = Vec::with_capacity(outcomes.len());
+    let mut busy_slot_ms: BTreeMap<&str, u128> = BTreeMap::new();
+    let mut makespan = 0u64;
+
+    for o in outcomes {
+        queue_waits.push(o.queue_wait_ms);
+        let end_to_end = o.queue_wait_ms.saturating_add(o.runtime_ms);
+        match o.disposition {
+            LiveDisposition::Remote => {
+                remote_successes += 1;
+                end_to_ends.push(end_to_end);
+                makespan = makespan.max(end_to_end);
+                if let Some(w) = o.selected_worker.as_deref() {
+                    *busy_slot_ms.entry(w).or_default() +=
+                        u128::from(o.slots) * u128::from(o.runtime_ms);
+                }
+            }
+            LiveDisposition::LocalFallback => {
+                local_fallbacks += 1;
+                end_to_ends.push(end_to_end);
+                makespan = makespan.max(end_to_end);
+            }
+            LiveDisposition::QueueTimeoutFallback => {
+                local_fallbacks += 1;
+                queue_timeouts += 1;
+                end_to_ends.push(end_to_end);
+                makespan = makespan.max(end_to_end);
+            }
+            LiveDisposition::ProofRefused => {
+                proof_refusals += 1;
+                end_to_ends.push(o.queue_wait_ms);
+            }
+            LiveDisposition::Cancelled => {
+                cancellations += 1;
+                end_to_ends.push(o.queue_wait_ms);
+            }
+        }
+    }
+
+    let makespan = makespan.max(1);
+    let mut per_worker_slot_utilization = BTreeMap::new();
+    for w in workers {
+        let capacity = u128::from(w.total_slots) * u128::from(makespan);
+        let busy = busy_slot_ms.get(w.id.as_str()).copied().unwrap_or(0);
+        #[allow(clippy::cast_precision_loss)]
+        let util = if capacity == 0 {
+            0.0
+        } else {
+            busy as f64 / capacity as f64
+        };
+        per_worker_slot_utilization.insert(w.id.clone(), util);
+    }
+
+    StormSummary {
+        total_jobs: u32::try_from(outcomes.len()).unwrap_or(u32::MAX),
+        remote_successes,
+        local_fallbacks,
+        proof_refusals,
+        queue_timeouts,
+        cancellations,
+        p95_queue_wait_ms: percentile(&mut queue_waits, 95),
+        p95_end_to_end_ms: percentile(&mut end_to_ends, 95),
+        per_worker_slot_utilization,
+    }
 }
 
 // ===========================================================================
@@ -1542,5 +1980,249 @@ mod tests {
         for r in &reports {
             assert!(r.passed, "invariant {} failed: {:?}", r.name, r.violations);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Live recorder (real-canary outcomes -> StormRun) tests
+    // -----------------------------------------------------------------------
+
+    /// A healthy live run: 30 remote successes spread evenly over a 3-worker
+    /// fleet, each with a unique remote id, upholds all five invariants — the
+    /// SAME checkers that gate the simulated storm.
+    #[test]
+    fn live_healthy_run_upholds_all_invariants() {
+        let workers = healthy_fleet();
+        let outcomes: Vec<LiveJobOutcome> = (0..30)
+            .map(|i| {
+                let w = &workers[i % workers.len()].id;
+                LiveJobOutcome::remote(format!("rchw-{i:04}"), w.clone(), (i + 1) as u64, 1, 500)
+            })
+            .collect();
+        let run = build_live_storm_run(&cfg(), &workers, &outcomes);
+        let reports = check_all_invariants(&run, &workers, 1.5, 0.25);
+        for r in &reports {
+            assert!(r.passed, "invariant {} failed: {:?}", r.name, r.violations);
+        }
+        assert_eq!(run.summary.total_jobs, 30);
+        assert_eq!(run.summary.remote_successes, 30);
+        assert_eq!(run.summary.local_fallbacks, 0);
+        // Every schedulable worker carried real work.
+        for w in &workers {
+            assert!(
+                run.summary.per_worker_slot_utilization[&w.id] > 0.0,
+                "worker {} starved",
+                w.id
+            );
+        }
+    }
+
+    /// A live run with a bounded mix of remote successes and fail-open local
+    /// fallbacks (under the cap) still passes — including the fallback-storm
+    /// invariant — and every fallback carries attach/cancel guidance.
+    #[test]
+    fn live_mixed_run_with_bounded_fallback_passes() {
+        let workers = healthy_fleet();
+        let mut outcomes = Vec::new();
+        for i in 0..24 {
+            let w = &workers[i % workers.len()].id;
+            outcomes.push(LiveJobOutcome::remote(
+                format!("rchw-{i:04}"),
+                w.clone(),
+                (i + 1) as u64,
+                1,
+                400,
+            ));
+        }
+        // 4 of 28 (~14%) fell back to local — within a 25% cap.
+        for i in 24..28 {
+            outcomes.push(LiveJobOutcome::local_fallback(
+                format!("rchw-{i:04}"),
+                1,
+                400,
+            ));
+        }
+        let run = build_live_storm_run(&cfg(), &workers, &outcomes);
+        let reports = check_all_invariants(&run, &workers, 1.5, 0.25);
+        for r in &reports {
+            assert!(r.passed, "invariant {} failed: {:?}", r.name, r.violations);
+        }
+        assert_eq!(run.summary.remote_successes, 24);
+        assert_eq!(run.summary.local_fallbacks, 4);
+        // A deliberately strict cap flags the same run (checker is not vacuous).
+        let strict = check_no_unbounded_local_fallback_storm(&run.events, &run.summary, 0.10);
+        assert!(!strict.passed, "10% cap must flag a 14% fallback rate");
+    }
+
+    /// The summary faithfully accounts every disposition kind a live run can
+    /// observe, matching the simulator's `finish()` accounting.
+    #[test]
+    fn live_summary_accounts_every_disposition() {
+        let workers = healthy_fleet();
+        let outcomes = vec![
+            LiveJobOutcome::remote("rchw-0000", "w1", 1, 1, 300),
+            LiveJobOutcome::remote("rchw-0001", "w2", 2, 1, 300),
+            LiveJobOutcome::local_fallback("rchw-0002", 1, 300),
+            LiveJobOutcome::local_fallback("rchw-0003", 1, 300)
+                .queued_for(40, Some(2))
+                .with_disposition(LiveDisposition::QueueTimeoutFallback),
+            LiveJobOutcome::local_fallback("rchw-0004", 1, 0)
+                .with_disposition(LiveDisposition::ProofRefused),
+            LiveJobOutcome::local_fallback("rchw-0005", 1, 0)
+                .queued_for(10, Some(1))
+                .with_disposition(LiveDisposition::Cancelled),
+        ];
+        let run = build_live_storm_run(&cfg(), &workers, &outcomes);
+        assert_eq!(run.summary.total_jobs, 6);
+        assert_eq!(run.summary.remote_successes, 2);
+        // LocalFallback + QueueTimeoutFallback both count as local fallbacks.
+        assert_eq!(run.summary.local_fallbacks, 2);
+        assert_eq!(run.summary.queue_timeouts, 1);
+        assert_eq!(run.summary.proof_refusals, 1);
+        assert_eq!(run.summary.cancellations, 1);
+        // Guidance + terminal invariants still hold for the mixed bag.
+        assert!(check_attach_cancel_guidance(&run.events).passed);
+    }
+
+    /// The live JSONL carries every load field on the started events and each
+    /// line is a valid `load_storm_control` record.
+    #[test]
+    fn live_jsonl_carries_load_fields() {
+        let workers = healthy_fleet();
+        let outcomes: Vec<LiveJobOutcome> = (0..6)
+            .map(|i| {
+                LiveJobOutcome::remote(
+                    format!("rchw-{i:04}"),
+                    workers[i % workers.len()].id.clone(),
+                    (i + 1) as u64,
+                    1,
+                    250,
+                )
+                .queued_for(5, Some(1))
+            })
+            .collect();
+        let run = build_live_storm_run(&cfg(), &workers, &outcomes);
+        let jsonl = run.to_jsonl().expect("serialize");
+        assert!(!jsonl.is_empty());
+        let started: Vec<&SmokeProfileEvent> = run
+            .events
+            .iter()
+            .filter(|e| e.event == event::STARTED)
+            .collect();
+        assert_eq!(started.len(), 6);
+        for ev in &started {
+            assert!(ev.local_job_id.is_some());
+            assert!(ev.remote_job_id.is_some());
+            assert!(ev.selected_worker.is_some());
+            assert!(ev.queue_depth.is_some());
+            assert_eq!(ev.fallback_decision.as_deref(), Some(decision::REMOTE));
+        }
+        for line in jsonl.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).expect("valid json line");
+            assert_eq!(v["scenario"], "load_storm_control");
+        }
+    }
+
+    /// A live run that (incorrectly) reports work on an ineligible worker is
+    /// caught — the live path is held to the same eligibility invariant.
+    #[test]
+    fn live_detector_catches_ineligible_selection() {
+        let workers = vec![
+            StormWorker::healthy("good", 4, 100.0),
+            StormWorker::healthy("disabled", 4, 100.0)
+                .with_eligibility(WorkerEligibility::AdminDisabled),
+        ];
+        // A forged outcome that landed on the admin-disabled worker.
+        let outcomes = vec![
+            LiveJobOutcome::remote("rchw-0000", "good", 1, 1, 300),
+            LiveJobOutcome::remote("rchw-0001", "disabled", 2, 1, 300),
+        ];
+        let run = build_live_storm_run(&cfg(), &workers, &outcomes);
+        let report = check_no_ineligible_worker_selected(&run.events, &workers);
+        assert!(!report.passed);
+        assert!(report.violations.iter().any(|v| v.contains("disabled")));
+    }
+
+    /// Two live outcomes that claim the same remote build id are caught.
+    #[test]
+    fn live_detector_catches_duplicate_remote_ids() {
+        let workers = healthy_fleet();
+        let outcomes = vec![
+            LiveJobOutcome::remote("rchw-0000", "w1", 7, 1, 300),
+            LiveJobOutcome::remote("rchw-0001", "w2", 7, 1, 300),
+        ];
+        let run = build_live_storm_run(&cfg(), &workers, &outcomes);
+        let report = check_no_duplicate_remote_job_ids(&run.events);
+        assert!(!report.passed);
+    }
+
+    /// A live proof-refusal outcome carries the proof reason code and refuses
+    /// rather than counting as a fallback.
+    #[test]
+    fn live_proof_refusal_carries_reason_code() {
+        let workers = healthy_fleet();
+        let outcomes = vec![
+            LiveJobOutcome::local_fallback("rchw-0000", 1, 0)
+                .with_disposition(LiveDisposition::ProofRefused),
+        ];
+        let run = build_live_storm_run(&cfg(), &workers, &outcomes);
+        assert_eq!(run.summary.proof_refusals, 1);
+        assert_eq!(run.summary.local_fallbacks, 0);
+        let refused: Vec<&SmokeProfileEvent> = run
+            .events
+            .iter()
+            .filter(|e| e.event == event::REFUSED)
+            .collect();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(
+            refused[0].reason_code.as_deref(),
+            Some(PROOF_REFUSAL_REASON)
+        );
+        // Fallback-storm invariant holds even at a zero cap (no fallbacks).
+        assert!(check_no_unbounded_local_fallback_storm(&run.events, &run.summary, 0.0).passed);
+    }
+
+    /// The live builder and the simulator emit the SAME event shape for a single
+    /// remote success (started + passed), proving the two paths are in lockstep.
+    #[test]
+    fn live_builder_matches_simulator_remote_event_shape() {
+        let workers = vec![StormWorker::healthy("w1", 4, 100.0)];
+        // Simulator: one job placed remotely.
+        let jobs = vec![StormJob::build(500, 1, "/p0").with_kind(JobKind::Check)];
+        let sim = simulate_storm(&workers, &jobs, &cfg());
+        let sim_started = sim
+            .events
+            .iter()
+            .find(|e| e.event == event::STARTED)
+            .expect("sim started");
+        // Live: the same logical outcome.
+        let outcomes = vec![LiveJobOutcome::remote(
+            sim.events
+                .iter()
+                .find_map(|e| e.local_job_id.clone())
+                .unwrap(),
+            "w1",
+            1,
+            1,
+            500,
+        )];
+        let live = build_live_storm_run(&cfg(), &workers, &outcomes);
+        let live_started = live
+            .events
+            .iter()
+            .find(|e| e.event == event::STARTED)
+            .expect("live started");
+        // Same scenario token, decision, status, fingerprint, selected worker.
+        assert_eq!(sim_started.scenario, live_started.scenario);
+        assert_eq!(sim_started.status, live_started.status);
+        assert_eq!(
+            sim_started.fallback_decision,
+            live_started.fallback_decision
+        );
+        assert_eq!(
+            sim_started.command_fingerprint,
+            live_started.command_fingerprint
+        );
+        assert_eq!(sim_started.selected_worker, live_started.selected_worker);
+        assert_eq!(sim_started.detail, live_started.detail);
     }
 }
