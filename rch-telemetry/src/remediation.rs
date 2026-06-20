@@ -80,7 +80,7 @@ pub const SELECTED_MODE_LABELS: &[&str] = &["local", "remote", "deferred"];
 pub const INCIDENT_REASON_CODE_LABELS: &[&str] = &[
     "RCH-I001", "RCH-I002", "RCH-I003", "RCH-I004", "RCH-I005", "RCH-I006", "RCH-I007", "RCH-I008",
     "RCH-I009", "RCH-I010", "RCH-I011", "RCH-I012", "RCH-I013", "RCH-I014", "RCH-I015", "RCH-I016",
-    "RCH-I017",
+    "RCH-I017", "RCH-I018",
 ];
 
 /// Admission decision / selected execution location ([`AdmissionDecision`]).
@@ -1237,7 +1237,7 @@ mod tests {
                 .max(1);
             // Every remediation series must stay well under any unbounded blow-up.
             // The widest is `rch_remediation_incident_total`
-            // (event_type 8 x reason_code 17 x source 5 = 680), which is still a
+            // (event_type 8 x reason_code 18 x source 5 = 720), which is still a
             // small, fixed ceiling — no path/command/secret ever widens it.
             assert!(
                 cardinality <= 1024,

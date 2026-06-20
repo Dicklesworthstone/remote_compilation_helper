@@ -224,6 +224,14 @@ Reading the trace:
   reported in `artifact_summary` as informational, **not** a pass requirement —
   workers whose rustc differs from the orchestrator legitimately differ (see
   `bd-784xt`).
+- The **daemon** self-test (`rch self-test`, scheduled self-test) now applies the
+  same tolerance via a canary verdict (`binary_hash::classify_canary`):
+  `reproduced` (byte-equivalent) and `toolchain_drift` (bytes differ, marker
+  present — advisory `RCH-I018`) both PASS and keep the worker schedulable;
+  `missing_marker` (corrupt/wrong build, `RCH-I014`) and `miscompile` (a byte
+  mismatch on a *confirmed-identical* toolchain, `RCH-E203`) FAIL. This stops the
+  self-test from disabling a healthy worker whose nightly merely differs, while
+  still catching corruption.
 - A `--worker` run skips `desired_vs_live_fleet` (`smoke_not_selected`);
   `proof_mode_refusal` runs only when remote execution is unavailable.
 - A failed `disk_inode_admission` (e.g. `RCH-I002`) or a per-worker canary

@@ -159,6 +159,7 @@ const fn incident_category(v: IncidentReasonCode) -> &'static str {
         I::LocalFallback => "fallback",
         I::ProofRefusal => "proof",
         I::RsyncVanishedFile | I::ArtifactMiss => "transfer",
+        I::ToolchainDrift => "self_test",
     }
 }
 
@@ -198,6 +199,9 @@ const fn incident_description(v: IncidentReasonCode) -> &'static str {
         I::DiskFull => "The target disk was full.",
         I::WrongUserPathWorkerBinary => {
             "A wrong-user or wrong-path/arch rch-wkr binary was detected on the worker."
+        }
+        I::ToolchainDrift => {
+            "A self-test canary built successfully but its bytes differ from the orchestrator's reference because the worker's toolchain differs — a healthy worker, not a failure."
         }
     }
 }
@@ -276,6 +280,10 @@ fn incident_remediation(v: IncidentReasonCode) -> Vec<String> {
         I::WrongUserPathWorkerBinary => &[
             "Re-deploy atomically: `rch fleet deploy --worker <id> --force --verify` — do not hand-patch the worker.",
             "Verify with `rch fleet verify --worker <id>`.",
+        ],
+        I::ToolchainDrift => &[
+            "Advisory only — the worker is healthy; its `rustc` nightly merely differs from the orchestrator's, so codegen differs. No action required.",
+            "To silence the advisory, align toolchains: `rch fleet deploy --worker <id>` after matching the worker's `rust-toolchain`, or compare with `rch workers capabilities --refresh`.",
         ],
     };
     steps.iter().map(|s| (*s).to_string()).collect()

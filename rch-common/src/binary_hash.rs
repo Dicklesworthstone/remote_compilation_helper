@@ -346,6 +346,119 @@ pub fn binaries_equivalent(local: &BinaryHashResult, remote: &BinaryHashResult) 
     true
 }
 
+/// The verdict of a self-test canary build, distinguishing a healthy worker whose
+/// toolchain merely differs from the orchestrator's (an advisory PASS) from a
+/// genuine miscompile or corruption (a FAIL).
+///
+/// Background (bd-784xt): the original canary criterion was pure bit-for-bit
+/// equivalence (`binaries_equivalent`) between a LOCAL reference build on the
+/// orchestrator and the REMOTE build on the worker. On a heterogeneous fleet a
+/// worker whose `rustc` nightly differs even slightly produces different codegen,
+/// so a perfectly healthy worker was marked FAILED and disabled. This classifier
+/// makes byte-identity advisory when toolchains differ (or parity is unknown),
+/// while still catching the two real failures: a build that does not contain the
+/// injected marker (corruption / wrong binary), and a byte mismatch on a
+/// *confirmed-identical* toolchain (a genuine miscompile).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanaryVerdict {
+    /// Marker present and binaries byte-equivalent — strong reproducibility. PASS.
+    Reproduced,
+    /// Marker present, binaries differ, but the worker's toolchain differs from
+    /// (or could not be confirmed equal to) the orchestrator's — legitimate
+    /// codegen drift. Advisory PASS.
+    ToolchainDrift,
+    /// Marker present, binaries differ, and the toolchains are *confirmed
+    /// identical* — the same compiler produced different code, a genuine
+    /// miscompile. FAIL.
+    Miscompile,
+    /// The remote binary does not contain the injected test marker — the build
+    /// is not the one we asked for, or it is corrupt. FAIL.
+    MissingMarker,
+}
+
+impl CanaryVerdict {
+    /// Whether this verdict counts as a passing self-test (the worker stays
+    /// schedulable). [`Self::ToolchainDrift`] passes with an advisory.
+    #[must_use]
+    pub const fn passed(self) -> bool {
+        matches!(self, Self::Reproduced | Self::ToolchainDrift)
+    }
+
+    /// Whether this verdict is an advisory (a pass that nonetheless warrants a
+    /// note in the trace), as opposed to a clean pass or a hard fail.
+    #[must_use]
+    pub const fn is_advisory(self) -> bool {
+        matches!(self, Self::ToolchainDrift)
+    }
+
+    /// Stable lowercase token for logs / JSONL (matches the serde representation).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reproduced => "reproduced",
+            Self::ToolchainDrift => "toolchain_drift",
+            Self::Miscompile => "miscompile",
+            Self::MissingMarker => "missing_marker",
+        }
+    }
+
+    /// A distinct incident reason-code token for the non-clean verdicts, so
+    /// toolchain drift is never conflated with a real mismatch:
+    /// - `RCH-I018` toolchain drift (advisory; [`crate::incident::IncidentReasonCode::ToolchainDrift`]),
+    /// - `RCH-I014` artifact miss (the marker-absent corruption case),
+    /// - `RCH-E203` worker self-test failed (a genuine same-toolchain miscompile).
+    ///
+    /// `None` for [`Self::Reproduced`] (a clean pass carries no reason).
+    #[must_use]
+    pub const fn reason_code(self) -> Option<&'static str> {
+        match self {
+            Self::Reproduced => None,
+            Self::ToolchainDrift => Some("RCH-I018"),
+            Self::Miscompile => Some("RCH-E203"),
+            Self::MissingMarker => Some("RCH-I014"),
+        }
+    }
+}
+
+/// Classify a self-test canary outcome (bd-784xt). Pure and total, so the verdict
+/// logic is unit-tested without a live daemon.
+///
+/// Inputs:
+/// - `local` / `remote`: the orchestrator and worker binary hashes,
+/// - `marker_present`: whether the remote binary contains the injected test
+///   marker (proving it is the build we asked for, not a stale/corrupt artifact),
+/// - `toolchains_match`: `Some(true)` if the worker's `rustc` is confirmed equal
+///   to the orchestrator's, `Some(false)` if confirmed different, `None` if parity
+///   could not be determined.
+///
+/// Verdict precedence:
+/// 1. marker absent -> [`CanaryVerdict::MissingMarker`] (corruption — FAIL),
+/// 2. byte-equivalent -> [`CanaryVerdict::Reproduced`] (PASS),
+/// 3. byte mismatch + toolchains confirmed identical -> [`CanaryVerdict::Miscompile`] (FAIL),
+/// 4. byte mismatch + toolchains differ/unknown -> [`CanaryVerdict::ToolchainDrift`] (advisory PASS).
+#[must_use]
+pub fn classify_canary(
+    local: &BinaryHashResult,
+    remote: &BinaryHashResult,
+    marker_present: bool,
+    toolchains_match: Option<bool>,
+) -> CanaryVerdict {
+    if !marker_present {
+        return CanaryVerdict::MissingMarker;
+    }
+    if binaries_equivalent(local, remote) {
+        return CanaryVerdict::Reproduced;
+    }
+    // Binaries differ but the marker is present. Only a *confirmed-identical*
+    // toolchain makes a mismatch a genuine miscompile; differing or unknown
+    // toolchains legitimately diverge (the bd-784xt false-fail).
+    match toolchains_match {
+        Some(true) => CanaryVerdict::Miscompile,
+        Some(false) | None => CanaryVerdict::ToolchainDrift,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,5 +1124,86 @@ mod tests {
             64,
             "BLAKE3 hash should be 64 hex chars"
         );
+    }
+
+    // --- canary verdict classification (bd-784xt) -------------------------
+
+    fn hash(code: &str, text: u64) -> BinaryHashResult {
+        BinaryHashResult {
+            full_hash: format!("full-{code}"),
+            code_hash: code.to_string(),
+            text_section_size: text,
+            is_debug: false,
+        }
+    }
+
+    #[test]
+    fn canary_equivalent_binaries_are_reproduced() {
+        let a = hash("aaaa", 100);
+        let b = hash("aaaa", 100);
+        // Marker present + byte-equivalent -> clean pass regardless of toolchain.
+        for tc in [Some(true), Some(false), None] {
+            let v = classify_canary(&a, &b, true, tc);
+            assert_eq!(v, CanaryVerdict::Reproduced);
+            assert!(v.passed());
+            assert!(!v.is_advisory());
+            assert_eq!(v.reason_code(), None);
+        }
+    }
+
+    #[test]
+    fn canary_missing_marker_is_corruption_fail() {
+        let a = hash("aaaa", 100);
+        let b = hash("aaaa", 100); // even identical hashes fail if the marker is absent
+        let v = classify_canary(&a, &b, false, Some(true));
+        assert_eq!(v, CanaryVerdict::MissingMarker);
+        assert!(!v.passed());
+        assert_eq!(v.reason_code(), Some("RCH-I014"));
+    }
+
+    #[test]
+    fn canary_mismatch_on_identical_toolchain_is_miscompile_fail() {
+        // The same compiler producing different code is a genuine miscompile.
+        let local = hash("aaaa", 100);
+        let remote = hash("bbbb", 99);
+        let v = classify_canary(&local, &remote, true, Some(true));
+        assert_eq!(v, CanaryVerdict::Miscompile);
+        assert!(!v.passed());
+        assert_eq!(v.reason_code(), Some("RCH-E203"));
+    }
+
+    #[test]
+    fn canary_mismatch_on_differing_toolchain_is_advisory_drift_pass() {
+        // The bd-784xt false-fail: a healthy worker whose rustc differs.
+        let local = hash("22472b9ad970e533", 251331);
+        let remote = hash("64c365ebc866d769", 251187);
+        let v = classify_canary(&local, &remote, true, Some(false));
+        assert_eq!(v, CanaryVerdict::ToolchainDrift);
+        assert!(v.passed(), "a healthy heterogeneous worker must not fail");
+        assert!(v.is_advisory());
+        assert_eq!(v.reason_code(), Some("RCH-I018"));
+    }
+
+    #[test]
+    fn canary_mismatch_with_unknown_toolchain_defaults_to_advisory_pass() {
+        // When parity cannot be determined, default to advisory PASS (do not
+        // disable a possibly-healthy worker on a hash difference alone).
+        let local = hash("aaaa", 100);
+        let remote = hash("bbbb", 99);
+        let v = classify_canary(&local, &remote, true, None);
+        assert_eq!(v, CanaryVerdict::ToolchainDrift);
+        assert!(v.passed());
+    }
+
+    #[test]
+    fn canary_verdict_tokens_and_serde_are_stable() {
+        assert_eq!(CanaryVerdict::Reproduced.as_str(), "reproduced");
+        assert_eq!(CanaryVerdict::ToolchainDrift.as_str(), "toolchain_drift");
+        assert_eq!(CanaryVerdict::Miscompile.as_str(), "miscompile");
+        assert_eq!(CanaryVerdict::MissingMarker.as_str(), "missing_marker");
+        let json = serde_json::to_string(&CanaryVerdict::ToolchainDrift).unwrap();
+        assert_eq!(json, "\"toolchain_drift\"");
+        let back: CanaryVerdict = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, CanaryVerdict::ToolchainDrift);
     }
 }

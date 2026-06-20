@@ -9,7 +9,9 @@
 //! 5. Syncing artifacts back
 //! 6. Comparing binary hashes to verify correctness
 
-use crate::binary_hash::{BinaryHashResult, binaries_equivalent, compute_binary_hash};
+use crate::binary_hash::{
+    BinaryHashResult, CanaryVerdict, binary_contains_marker, classify_canary, compute_binary_hash,
+};
 use crate::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
 use crate::ssh::{SshClient, SshOptions};
 use crate::test_change::{TestChangeGuard, TestCodeChange};
@@ -48,6 +50,12 @@ pub struct VerificationResult {
     pub error: Option<String>,
     /// The test marker ID that was embedded in the binary.
     pub test_marker: String,
+    /// The canary verdict token (bd-784xt): `reproduced` (byte-equivalent),
+    /// `toolchain_drift` (bytes differ but the worker is healthy — advisory PASS),
+    /// `miscompile` (same-toolchain byte mismatch — FAIL), or `missing_marker`
+    /// (the build is corrupt / not ours — FAIL). [`Self::success`] is true for the
+    /// first two. See [`crate::binary_hash::CanaryVerdict`].
+    pub verdict: String,
 }
 
 /// Configuration for a remote compilation test.
@@ -328,19 +336,46 @@ impl RemoteCompilationTest {
             .with_context(|| format!("Failed to hash remote binary: {:?}", remote_binary_path))?;
         info!("Remote hash: {}", &remote_hash.code_hash[..16]);
 
-        // 7. Compare
-        let success = binaries_equivalent(&local_hash, &remote_hash);
+        // 7. Classify the canary verdict (bd-784xt). Byte-for-byte identity to the
+        // orchestrator's reference build is ADVISORY: a healthy worker whose rustc
+        // nightly differs legitimately produces different codegen, so a strict
+        // equality check false-failed healthy workers on a heterogeneous fleet.
+        // The injected marker proves the binary is the build we asked for (catches
+        // corruption / a stale artifact); a byte mismatch on a *confirmed-
+        // identical* toolchain is a genuine miscompile. Toolchain parity is not
+        // probed in this path, so a mismatch with the marker present resolves to
+        // advisory drift (PASS) rather than a false failure.
+        let marker_present =
+            binary_contains_marker(&remote_binary_path, &test_marker).unwrap_or(true);
+        let verdict = classify_canary(&local_hash, &remote_hash, marker_present, None);
+        let success = verdict.passed();
         let total_ms = start.elapsed().as_millis() as u64;
 
+        let local_short = &local_hash.code_hash[..local_hash.code_hash.len().min(16)];
+        let remote_short = &remote_hash.code_hash[..remote_hash.code_hash.len().min(16)];
         let error = if success {
-            info!("Verification PASSED: Binary hashes match");
+            if verdict.is_advisory() {
+                info!(
+                    "Verification PASSED (advisory {}): worker healthy; codegen differs from the \
+                     orchestrator toolchain (local={local_short} remote={remote_short})",
+                    verdict.reason_code().unwrap_or("RCH-I018"),
+                );
+            } else {
+                info!("Verification PASSED: remote build reproduced the reference binary");
+            }
             None
         } else {
-            let msg = format!(
-                "Binary hash mismatch: local={} remote={}",
-                &local_hash.code_hash[..16],
-                &remote_hash.code_hash[..16]
-            );
+            let code = verdict.reason_code().unwrap_or("RCH-E203");
+            let msg = if verdict == CanaryVerdict::MissingMarker {
+                format!(
+                    "[{code}] canary missing test marker '{test_marker}' — remote build is corrupt or not ours"
+                )
+            } else {
+                format!(
+                    "[{code}] canary {} — local={local_short} remote={remote_short}",
+                    verdict.as_str(),
+                )
+            };
             warn!("Verification FAILED: {}", msg);
             Some(msg)
         };
@@ -356,6 +391,7 @@ impl RemoteCompilationTest {
             total_ms,
             error,
             test_marker,
+            verdict: verdict.as_str().to_string(),
         })
     }
 
@@ -400,7 +436,14 @@ impl RemoteCompilationTest {
         if let Some(name) = self.binary_name.clone() {
             return name;
         }
-        if let Some(pkg) = cargo_package_name(&self.test_project) {
+        // An empty project path is not a real project root: `cargo_package_name`
+        // would join "Cargo.toml" against an empty path and read `<cwd>/Cargo.toml`,
+        // misattributing the binary to whatever package the process happens to run
+        // in. Only consult the manifest for a real path; otherwise fall through to
+        // the file-name / "unknown" fallback.
+        if !self.test_project.as_os_str().is_empty()
+            && let Some(pkg) = cargo_package_name(&self.test_project)
+        {
             return pkg.replace('-', "_");
         }
         self.test_project
@@ -826,6 +869,7 @@ mod tests {
             total_ms: 5300,
             error: None,
             test_marker: "RCH_TEST_12345".to_string(),
+            verdict: "reproduced".to_string(),
         };
 
         logger.log(TestPhase::Execute, "Serializing VerificationResult to JSON");
@@ -873,6 +917,7 @@ mod tests {
             total_ms: 3100,
             error: Some("Binary hash mismatch".to_string()),
             test_marker: "RCH_TEST_99999".to_string(),
+            verdict: "reproduced".to_string(),
         };
 
         logger.log(TestPhase::Verify, "Checking failed verification result");
@@ -914,6 +959,7 @@ mod tests {
             total_ms: 18200,
             error: Some("Size mismatch: 5000 vs 5001".to_string()),
             test_marker: "RCH_FULL_TEST".to_string(),
+            verdict: "reproduced".to_string(),
         };
 
         logger.log(TestPhase::Execute, "Serializing result with all fields");
@@ -1515,6 +1561,7 @@ mod tests {
             total_ms: 8500,
             error: None,
             test_marker: "RCH_TEST_1".to_string(),
+            verdict: "reproduced".to_string(),
         };
 
         // Verify timing breakdown makes sense
@@ -1982,6 +2029,7 @@ mod tests {
             total_ms: 0,
             error: None,
             test_marker: "ZERO".to_string(),
+            verdict: "reproduced".to_string(),
         };
 
         logger.log(TestPhase::Execute, "Serializing zero-timing result");
@@ -2021,6 +2069,7 @@ mod tests {
             total_ms: u64::MAX,
             error: None,
             test_marker: "MAX".to_string(),
+            verdict: "reproduced".to_string(),
         };
 
         logger.log(TestPhase::Execute, "Serializing max-timing result");

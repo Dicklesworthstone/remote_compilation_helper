@@ -63,6 +63,11 @@ pub enum IncidentReasonCode {
     DiskFull,
     /// A wrong-user or wrong-path/arch `rch-wkr` binary was detected.
     WrongUserPathWorkerBinary,
+    /// A self-test canary built successfully but its bytes differ from the
+    /// orchestrator's reference because the worker's toolchain differs — a
+    /// healthy worker on a heterogeneous fleet, not a failure (bd-784xt).
+    /// Advisory only; distinct from a genuine same-toolchain miscompile.
+    ToolchainDrift,
 }
 
 impl IncidentReasonCode {
@@ -86,6 +91,7 @@ impl IncidentReasonCode {
         Self::QueueAmbiguity,
         Self::DiskFull,
         Self::WrongUserPathWorkerBinary,
+        Self::ToolchainDrift,
     ];
 
     /// Canonical `RCH-Innn` code string. Stable across releases — never
@@ -110,6 +116,7 @@ impl IncidentReasonCode {
             Self::QueueAmbiguity => "RCH-I015",
             Self::DiskFull => "RCH-I016",
             Self::WrongUserPathWorkerBinary => "RCH-I017",
+            Self::ToolchainDrift => "RCH-I018",
         }
     }
 
@@ -136,6 +143,7 @@ impl IncidentReasonCode {
             Self::QueueAmbiguity => "queue ambiguity",
             Self::DiskFull => "disk full",
             Self::WrongUserPathWorkerBinary => "wrong user/path worker binary",
+            Self::ToolchainDrift => "toolchain drift",
         }
     }
 
@@ -162,7 +170,9 @@ impl IncidentReasonCode {
             | Self::LocalFallback
             | Self::ProofRefusal
             | Self::QueueAmbiguity
-            | Self::WrongUserPathWorkerBinary => return None,
+            | Self::WrongUserPathWorkerBinary
+            // Advisory; a healthy-worker codegen difference has no error analogue.
+            | Self::ToolchainDrift => return None,
         })
     }
 
@@ -394,10 +404,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_covers_seventeen_session_history_failure_classes() {
-        // The session-history report enumerates exactly these classes; the
-        // registry must stay 1:1 so the validation matrix can map each one.
-        assert_eq!(IncidentReasonCode::ALL.len(), 17);
+    fn registry_covers_session_history_failure_classes_plus_appended() {
+        // The session-history report enumerates the first 17 classes (RCH-I001..
+        // RCH-I017); the registry maps each 1:1 for the validation matrix. Newer
+        // operational reasons are APPENDED with the next sequential code and never
+        // renumber an existing one — e.g. RCH-I018 (toolchain drift, bd-784xt).
+        assert_eq!(IncidentReasonCode::ALL.len(), 18);
+        assert_eq!(
+            IncidentReasonCode::WrongUserPathWorkerBinary.code(),
+            "RCH-I017"
+        );
+        assert_eq!(IncidentReasonCode::ToolchainDrift.code(), "RCH-I018");
+        assert!(
+            !IncidentReasonCode::ToolchainDrift
+                .failure_class()
+                .is_empty()
+        );
     }
 
     #[test]
