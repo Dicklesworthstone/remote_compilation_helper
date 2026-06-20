@@ -76,6 +76,7 @@ pub mod ssh;
 mod ssh_timeout_test;
 pub mod ssh_utils;
 pub mod stale_target_reap;
+pub mod storm_control;
 pub mod telemetry_explain;
 pub mod telemetry_freshness;
 pub mod test_change;

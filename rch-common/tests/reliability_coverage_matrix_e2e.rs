@@ -1368,6 +1368,121 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        // ---------------------------------------------------------------
+        // Domain: Load fairness / storm control
+        // ---------------------------------------------------------------
+        RequirementRow {
+            id: "REQ-LOAD-001".into(),
+            description: "Multi-agent load fairness and storm control: a deterministic mock-worker \
+                          E2E launches many concurrent build/test/check jobs with varied runtimes, \
+                          slot requests, project roots, and proof/fail-open policies, then proves the \
+                          scheduler/admission/queue/fallback/observability stay coherent under \
+                          contention — fairness/load-spreading, no duplicate remote job ids, no \
+                          unbounded local fallback storm, no stuck wrapper without attach/cancel \
+                          guidance, and no work to a temporarily-bypassed / admin-disabled / \
+                          capability-inadmissible worker. Emits SmokeProfileEvent JSONL (with \
+                          local_job_id, remote_job_id, queue_depth, selected_worker, \
+                          fallback_decision, detail) and a StormSummary of regression statistics. \
+                          Drives the real job_identity + queue_contract primitives."
+                .into(),
+            domain: "load_fairness".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.10.4".into(),
+            test_refs: vec![
+                // Mock-worker E2E: concurrent swarm upholds all five invariants,
+                // load spreads, ids unique, bounded queue, proof fail-closed,
+                // ineligible workers idle, cancellation clean, JSONL persisted.
+                TestRef {
+                    file: "storm_control_e2e.rs".into(),
+                    name_prefix: "e2e_storm_".into(),
+                    tier: "smoke".into(),
+                },
+                // Foundation unit tests: simulator + summary + invariant checkers
+                // (including non-vacuous detector tests).
+                TestRef {
+                    file: "../src/storm_control.rs".into(),
+                    name_prefix: "healthy_storm_upholds_all_invariants".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/storm_control.rs".into(),
+                    name_prefix: "fairness_spreads_load".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/storm_control.rs".into(),
+                    name_prefix: "unique_remote_job_ids".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/storm_control.rs".into(),
+                    name_prefix: "proof_jobs_refuse".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/storm_control.rs".into(),
+                    name_prefix: "ineligible_workers_never_receive_work".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/storm_control.rs".into(),
+                    name_prefix: "detector_catches_".into(),
+                    tier: "smoke".into(),
+                },
+                // The load-mode planning surface (ProfileMode::Load +
+                // LoadStormControl scenario token + JSONL field setters).
+                TestRef {
+                    file: "../src/fleet_smoke_profile.rs".into(),
+                    name_prefix: "load_mode_is_carried_into_the_plan".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/fleet_smoke_profile.rs".into(),
+                    name_prefix: "load_event_setters_populate_jsonl_fields".into(),
+                    tier: "smoke".into(),
+                },
+                // Shell E2E that runs the deterministic mock-worker storm suite.
+                TestRef {
+                    file: "../../scripts/e2e_storm_control.sh".into(),
+                    name_prefix: "e2e_storm_control".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "A 64-job concurrent swarm (varied runtime/slots/roots, mixed proof/force/fail-open) \
+                 upholds all five invariants; every wrapper resolves to a definite disposition \
+                 (storm_control_e2e::e2e_storm_concurrent_swarm_upholds_all_invariants)"
+                    .into(),
+                "Load spreads within tolerance across a heterogeneous fleet; no schedulable worker is \
+                 starved (storm_control_e2e::e2e_storm_load_spreads_across_the_fleet, check_load_fairness)"
+                    .into(),
+                "Every admitted job gets a unique remote_job_id; a forged collision is detected \
+                 (storm_control::{unique_remote_job_ids_under_storm, detector_catches_duplicate_remote_ids})"
+                    .into(),
+                "A bounded queue keeps local fallback bounded; an impossibly-tight cap flags the storm, \
+                 proving the checker is non-vacuous (storm_control_e2e::e2e_storm_bounded_queue_prevents_fallback_storm)"
+                    .into(),
+                "Proof (strict-remote) jobs fail closed — they refuse, never fall back to local — with \
+                 the proof reason code (storm_control_e2e::e2e_storm_proof_jobs_fail_closed_never_local)"
+                    .into(),
+                "Temporarily-bypassed / admin-disabled / capability-inadmissible workers are never \
+                 selected and stay at 0 utilization; a forged selection is detected \
+                 (storm_control_e2e::e2e_storm_ineligible_workers_never_selected, detector_catches_ineligible_selection)"
+                    .into(),
+                "Cancelled and not-started jobs carry attach/cancel guidance; a started job with no \
+                 terminal event is flagged as a stuck wrapper (storm_control::{detector_catches_stuck_wrapper}, \
+                 storm_control_e2e::e2e_storm_cancellation_leaves_no_stuck_wrapper)"
+                    .into(),
+                "StormSummary records total_jobs, remote_successes, local_fallbacks, proof_refusals, \
+                 queue_timeouts, cancellations, p95_queue_wait_ms, p95_end_to_end_ms, and per-worker \
+                 slot utilization; the SmokeProfileEvent JSONL trace is persisted to an isolated temp \
+                 dir with the full field set and no user files touched \
+                 (storm_control_e2e::{e2e_storm_records_summary_statistics, e2e_storm_jsonl_log_persisted_with_full_field_set})"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
     ];
 
     let total = requirements.len();
@@ -1426,6 +1541,7 @@ const KNOWN_TEST_FILES: &[&str] = &[
     "reliability_doctor_e2e.rs",
     "ux_regression_e2e.rs",
     "smoke.rs",
+    "storm_control_e2e.rs",
 ];
 
 // ===========================================================================

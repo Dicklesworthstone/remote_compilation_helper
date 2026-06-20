@@ -237,6 +237,59 @@ cp "$(jq -r .log_path /tmp/smoke.json)" docs/evidence/smoke_<bead>_<date>.jsonl
 # cite docs/evidence/smoke_*.jsonl in `br close --reason`
 ```
 
+## Multi-Agent Load Fairness and Storm Control (10.4)
+
+The core product promise is that many concurrent agents must not saturate the
+local machine or leave work in an ambiguous queued/running state. Unit tests for
+the individual queue/selection pieces are not enough, so a deterministic
+mock-worker E2E simulates a real swarm and proves the scheduler, admission,
+queue, fallback policy, and observability stay coherent under contention.
+
+The proof lives in `rch-common`: `storm_control` drives the **real** job-identity
+(`job_identity`) and queue-contract (`queue_contract`) primitives under a
+deterministic virtual-time model of the worker pool (slot accounting, the
+eligibility gate, `speed / (1 + recent)` fairness weighting, a bounded FIFO queue
+with a wait timeout, and the fail-open/proof fallback policy). No threads, no wall
+clock, no randomness — the same inputs always produce the same `StormRun`.
+
+```bash
+# Deterministic mock-worker storm suite (CI-safe; no daemon, no SSH):
+cargo test -p rch-common --test storm_control_e2e
+cargo test -p rch-common --lib storm_control::
+# Or the full E2E runner (validates the emitted JSONL + summary schema):
+./scripts/e2e_storm_control.sh
+```
+
+Each run emits a `SmokeProfileEvent` JSONL trace (`scenario = load_storm_control`)
+carrying, in addition to the smoke fields, `local_job_id`, `remote_job_id`,
+`queue_depth`, `selected_worker`, `fallback_decision`, and `detail`, plus a
+`StormSummary` of regression statistics: `total_jobs`, `remote_successes`,
+`local_fallbacks`, `proof_refusals`, `queue_timeouts`, `cancellations`,
+`p95_queue_wait_ms`, `p95_end_to_end_ms`, and per-worker slot utilization.
+
+Five invariants gate every run (`storm_control::check_all_invariants`), and each
+has a paired non-vacuous detector test that proves the checker catches a forged
+violation:
+
+1. **Fairness / load spreading** — no schedulable worker is starved or
+   overloaded beyond a tolerance of its fair share.
+2. **No duplicate remote job ids** — every admitted job gets a unique
+   `remote_job_id`.
+3. **No unbounded local fallback storm** — the local-fallback fraction stays
+   under a cap; a full bounded queue backpressures rather than growing.
+4. **No stuck wrapper without attach/cancel guidance** — every job reaches a
+   definite terminal disposition, and every not-started/cancelled job carries
+   attach/cancel guidance rendered from `QueueContractResponse`.
+5. **No work to an ineligible worker** — a temporarily-bypassed, admin-disabled,
+   or capability-inadmissible worker is never selected and stays at 0
+   utilization.
+
+These same checkers run against a **real daemon's** events from a bounded load
+pass (`rch self-test --smoke --load`, `ProfileMode::Load`): a swarm of concurrent
+tiny canary builds bounded by `--worker`/`--all`/`--timeout`, non-destructive in
+the same way the smoke profile is. The mock E2E is the always-green CI guard; the
+`--load` pass validates the live scheduler when an operator has a deployed fleet.
+
 ## Release Gate
 
 Before closing any non-doc remediation child bead:

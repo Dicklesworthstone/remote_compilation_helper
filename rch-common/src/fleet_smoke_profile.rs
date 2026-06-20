@@ -57,6 +57,13 @@ pub enum SmokeScenario {
     QueueAttachCancel,
     /// Proof-mode refuses (fail-closed) when remote execution is unavailable.
     ProofModeRefusal,
+    /// Multi-agent load / storm-control scenario
+    /// (bd-session-history-remediation-ocv9i.10.4). Deliberately **not** part of
+    /// [`SmokeScenario::ALL`] — it is exercised only under [`ProfileMode::Load`]
+    /// (a bounded swarm of concurrent canary builds), not in a normal one-pass
+    /// smoke run. It exists as a typed token so the load run's JSONL events carry
+    /// a stable `scenario` value.
+    LoadStormControl,
 }
 
 impl SmokeScenario {
@@ -84,6 +91,7 @@ impl SmokeScenario {
             Self::ArtifactRetrieval => "artifact_retrieval",
             Self::QueueAttachCancel => "queue_attach_cancel",
             Self::ProofModeRefusal => "proof_mode_refusal",
+            Self::LoadStormControl => "load_storm_control",
         }
     }
 
@@ -107,6 +115,12 @@ pub enum ProfileMode {
     /// Bounded, repeated passes (the repetition is the consumer's job; the
     /// plan is identical per pass).
     Soak,
+    /// Bounded multi-agent LOAD pass: the consumer launches a swarm of
+    /// concurrent tiny canary builds to validate load fairness and storm
+    /// control (bd-session-history-remediation-ocv9i.10.4). The per-pass plan is
+    /// identical to a smoke run; the mode signals the consumer to drive
+    /// concurrency and aggregate a [`crate::storm_control::StormSummary`].
+    Load,
 }
 
 /// Inputs that determine the plan. All booleans/values are observed by the
@@ -334,6 +348,33 @@ pub struct SmokeProfileEvent {
     /// Short artifact summary (e.g. file/byte counts), if applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_summary: Option<String>,
+    /// Local wrapper id ([`crate::job_identity::LocalWrapperId`]) of the job this
+    /// event pertains to, for load/storm runs. Always present even when a job
+    /// never reaches a worker, so an agent can correlate every wrapper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_job_id: Option<String>,
+    /// Remote build id ([`crate::job_identity::RemoteBuildId`]) assigned by the
+    /// daemon once the job was admitted; absent for jobs that fell back to local
+    /// or were refused before admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_job_id: Option<u64>,
+    /// Queue depth observed at the instant of this event, for load/storm runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_depth: Option<u32>,
+    /// The worker the scheduler SELECTED for this job. Distinct from
+    /// [`Self::worker_id`] (the worker the event pertains to): on a fallback
+    /// event there is no selected worker, so this is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_worker: Option<String>,
+    /// The placement/fallback decision token for the job
+    /// (see [`crate::storm_control::decision`]): `remote`, `local_fallback`,
+    /// `queue_timeout_fallback`, `proof_refused`, `cancelled`, or `queued`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_decision: Option<String>,
+    /// Free-form operator-/agent-facing detail (e.g. the attach/cancel guidance
+    /// rendered from [`crate::queue_contract::QueueContractResponse`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl SmokeProfileEvent {
@@ -359,6 +400,12 @@ impl SmokeProfileEvent {
             duration_ms: 0,
             remote_target_dir: None,
             artifact_summary: None,
+            local_job_id: None,
+            remote_job_id: None,
+            queue_depth: None,
+            selected_worker: None,
+            fallback_decision: None,
+            detail: None,
         }
     }
 
@@ -384,6 +431,12 @@ impl SmokeProfileEvent {
             duration_ms: 0,
             remote_target_dir: None,
             artifact_summary: None,
+            local_job_id: None,
+            remote_job_id: None,
+            queue_depth: None,
+            selected_worker: None,
+            fallback_decision: None,
+            detail: None,
         }
     }
 
@@ -416,6 +469,12 @@ impl SmokeProfileEvent {
             duration_ms,
             remote_target_dir: None,
             artifact_summary: None,
+            local_job_id: None,
+            remote_job_id: None,
+            queue_depth: None,
+            selected_worker: None,
+            fallback_decision: None,
+            detail: None,
         }
     }
 
@@ -446,7 +505,55 @@ impl SmokeProfileEvent {
             duration_ms,
             remote_target_dir: None,
             artifact_summary: None,
+            local_job_id: None,
+            remote_job_id: None,
+            queue_depth: None,
+            selected_worker: None,
+            fallback_decision: None,
+            detail: None,
         }
+    }
+
+    /// Attach the job identity (local wrapper id and, once admitted, the remote
+    /// build id) — used by load/storm runs to correlate every event of a job.
+    #[must_use]
+    pub fn with_job_ids(
+        mut self,
+        local_job_id: Option<String>,
+        remote_job_id: Option<u64>,
+    ) -> Self {
+        self.local_job_id = local_job_id;
+        self.remote_job_id = remote_job_id;
+        self
+    }
+
+    /// Attach the queue depth observed at this event.
+    #[must_use]
+    pub fn with_queue_depth(mut self, queue_depth: u32) -> Self {
+        self.queue_depth = Some(queue_depth);
+        self
+    }
+
+    /// Attach the worker the scheduler selected for this job (the placement
+    /// decision), distinct from the worker the event pertains to.
+    #[must_use]
+    pub fn with_selected_worker(mut self, selected_worker: Option<String>) -> Self {
+        self.selected_worker = selected_worker;
+        self
+    }
+
+    /// Attach the placement/fallback decision token.
+    #[must_use]
+    pub fn with_fallback_decision(mut self, decision: impl Into<String>) -> Self {
+        self.fallback_decision = Some(decision.into());
+        self
+    }
+
+    /// Attach free-form operator-facing detail (e.g. attach/cancel guidance).
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
     }
 }
 
@@ -668,10 +775,69 @@ mod tests {
             duration_ms: 1234,
             remote_target_dir: Some("/tmp/rch/proj_hash".into()),
             artifact_summary: Some("5 files, 4.8MB".into()),
+            local_job_id: Some("rchw-abc".into()),
+            remote_job_id: Some(7),
+            queue_depth: Some(3),
+            selected_worker: Some("hz1".into()),
+            fallback_decision: Some("remote".into()),
+            detail: Some("admitted and running".into()),
         };
         let json = serde_json::to_string(&ev).unwrap();
         let back: SmokeProfileEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn load_mode_is_carried_into_the_plan() {
+        // ProfileMode::Load (a bounded concurrent canary swarm) is carried into
+        // the plan unchanged; the per-pass plan is identical to a smoke run.
+        let inputs = SmokeProfileInputs {
+            mode: ProfileMode::Load,
+            ..full_fleet()
+        };
+        let plan = plan_smoke_profile(&inputs);
+        assert_eq!(plan.mode, ProfileMode::Load);
+        // The load scenario is not part of the one-pass smoke scenario set.
+        assert!(!SmokeScenario::ALL.contains(&SmokeScenario::LoadStormControl));
+        // ...but it still has a stable, worker-scoped JSONL token.
+        assert_eq!(
+            SmokeScenario::LoadStormControl.as_str(),
+            "load_storm_control"
+        );
+        assert!(SmokeScenario::LoadStormControl.requires_real_worker());
+    }
+
+    #[test]
+    fn load_event_setters_populate_jsonl_fields() {
+        let ev = SmokeProfileEvent::started(
+            "run-load",
+            "bd-...-10.4",
+            Some("hz2".into()),
+            SmokeScenario::LoadStormControl,
+        )
+        .with_job_ids(Some("rchw-1".into()), Some(42))
+        .with_queue_depth(5)
+        .with_selected_worker(Some("hz2".into()))
+        .with_fallback_decision("remote")
+        .with_detail("admitted and running");
+        assert_eq!(ev.local_job_id.as_deref(), Some("rchw-1"));
+        assert_eq!(ev.remote_job_id, Some(42));
+        assert_eq!(ev.queue_depth, Some(5));
+        assert_eq!(ev.selected_worker.as_deref(), Some("hz2"));
+        assert_eq!(ev.fallback_decision.as_deref(), Some("remote"));
+        assert_eq!(ev.detail.as_deref(), Some("admitted and running"));
+        // The new optional fields round-trip and are omitted when absent.
+        let bare = SmokeProfileEvent::started(
+            "r",
+            "b",
+            Some("w".into()),
+            SmokeScenario::WorkerCapabilitiesExactUserPath,
+        );
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(
+            !json.contains("local_job_id"),
+            "absent fields must be omitted"
+        );
     }
 
     #[test]
