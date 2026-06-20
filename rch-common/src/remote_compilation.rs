@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use shell_escape::escape;
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -102,6 +102,21 @@ fn resolve_cargo_binary_from(
         }
     }
     std::ffi::OsString::from("cargo")
+}
+
+/// Read the Cargo package name from `<project>/Cargo.toml` (the `[package] name`
+/// field). Cargo names the built binary after the package (not the directory),
+/// so the verification hash step must resolve the artifact by package name.
+/// Returns `None` if the manifest is absent/unparseable or has no package name.
+fn cargo_package_name(project: &Path) -> Option<String> {
+    let manifest = std::fs::read_to_string(project.join("Cargo.toml")).ok()?;
+    let table = toml::from_str::<toml::Table>(&manifest).ok()?;
+    table
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .and_then(|pkg| pkg.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn use_mock_transport(worker: &WorkerConfig) -> bool {
@@ -373,14 +388,26 @@ impl RemoteCompilationTest {
     }
 
     /// Get the binary name to verify.
+    ///
+    /// Prefers an explicit override, then the actual Cargo package name from the
+    /// project's `Cargo.toml` (cargo names the binary after the PACKAGE, with `-`
+    /// normalized to `_`), and only falls back to the directory name. The
+    /// directory-name heuristic is wrong whenever the dir and package names
+    /// differ — e.g. the self-test fixture lives in a `project/` dir but its
+    /// package is `rch_self_test`, so the produced binary is `rch_self_test`, not
+    /// `project`; reading Cargo.toml makes the hash step find the real artifact.
     fn get_binary_name(&self) -> String {
-        self.binary_name.clone().unwrap_or_else(|| {
-            self.test_project
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .replace('-', "_")
-        })
+        if let Some(name) = self.binary_name.clone() {
+            return name;
+        }
+        if let Some(pkg) = cargo_package_name(&self.test_project) {
+            return pkg.replace('-', "_");
+        }
+        self.test_project
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .replace('-', "_")
     }
 
     /// Get the remote project path on the worker.
@@ -431,6 +458,12 @@ impl RemoteCompilationTest {
 
         cmd.current_dir(&self.test_project)
             .env("CARGO_INCREMENTAL", "0") // Disable incremental for reproducibility
+            // Pin the output to the test project's own `target/` so the produced
+            // binary lands exactly where `local_binary_path()` reads it. The
+            // daemon inherits a process-wide `CARGO_TARGET_DIR` (it redirects its
+            // OWN builds to a shared cache); left unoverridden it sends the canary
+            // binary there instead, and the subsequent local-hash step fails.
+            .env("CARGO_TARGET_DIR", self.test_project.join("target"))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -733,6 +766,27 @@ mod tests {
             resolve_cargo_binary_from(None, Some(home.path().as_os_str().to_os_string())),
             cargo_path.into_os_string()
         );
+    }
+
+    #[test]
+    fn cargo_package_name_reads_package_not_directory() {
+        // The self-test fixture's real shape: a `project/` dir whose package is
+        // `rch_self_test` — cargo names the binary after the package, so reading
+        // the directory name (`project`) would look for a non-existent artifact.
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("Cargo.toml"),
+            "[package]\nname = \"rch_self_test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        assert_eq!(cargo_package_name(&proj).as_deref(), Some("rch_self_test"));
+
+        // No manifest -> None (caller falls back to the directory name).
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(cargo_package_name(&empty), None);
     }
 
     fn init_test_logging() {

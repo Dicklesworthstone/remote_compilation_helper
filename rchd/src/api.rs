@@ -423,6 +423,9 @@ pub struct SelfTestRunRequest {
     pub timeout_secs: Option<u64>,
     pub release_mode: bool,
     pub scheduled: bool,
+    /// Optional per-run retry-count override (`retries` query param). A bounded
+    /// smoke canary passes `Some(0)` for one fail-fast attempt.
+    pub retries: Option<u32>,
 }
 
 /// Status response for self-test scheduler.
@@ -944,6 +947,7 @@ pub async fn handle_connection(
                 options.timeout = Duration::from_secs(timeout);
             }
             options.release_mode = request.release_mode;
+            options.retry_count_override = request.retries;
 
             let report = if request.scheduled {
                 ctx.self_test.run_scheduled_now().await?
@@ -1300,6 +1304,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let mut timeout_secs = None;
         let mut release_mode = true;
         let mut scheduled = false;
+        let mut retries = None;
 
         for param in query.split('&') {
             if param.is_empty() {
@@ -1312,6 +1317,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 "worker" => worker_ids.push(percent_unescape_query_value(value)),
                 "project" => project = Some(percent_unescape_query_value(value)),
                 "timeout" => timeout_secs = value.parse().ok(),
+                "retries" => retries = value.parse().ok(),
                 "debug" if value == "1" || value.eq_ignore_ascii_case("true") => {
                     release_mode = false;
                 }
@@ -1331,6 +1337,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             timeout_secs,
             release_mode,
             scheduled,
+            retries,
         }));
     }
 

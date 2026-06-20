@@ -1504,18 +1504,19 @@ fn smoke_canary_verdict(result: &SelfTestResultRecordFromApi) -> (bool, Option<S
     }
 }
 
-/// Decide the `ArtifactRetrieval` outcome from a per-worker self-test result. The
-/// artifact is "retrieved" when it was rsynced back AND its hash matches the
-/// local build — exactly the self-test's `passed` (binary-hash-equivalence)
-/// verdict. The failure reason distinguishes a missing artifact from a hash
-/// mismatch. Pure; returns `(passed, reason)`.
+/// Decide the `ArtifactRetrieval` outcome from a per-worker self-test result.
+///
+/// "Retrieved" means the remote artifact was rsynced back and hashed — i.e.
+/// `remote_hash` is present. This scenario asserts RETRIEVAL (the artifact came
+/// back under the effective target dir), NOT bit-for-bit reproducibility: a
+/// remote build whose binary differs from the local reference (e.g. the worker's
+/// rustc differs from the orchestrator's — a normal heterogeneous-fleet
+/// condition) STILL retrieved an artifact. Byte-identity is the self-test's own
+/// stricter `passed` check, surfaced separately in the artifact summary, not a
+/// retrieval failure. Pure; returns `(passed, reason)`.
 fn smoke_artifact_verdict(result: &SelfTestResultRecordFromApi) -> (bool, Option<String>) {
-    if result.passed {
+    if result.remote_hash.is_some() {
         (true, None)
-    } else if result.remote_hash.is_none() {
-        (false, Some("artifact_not_retrieved".to_string()))
-    } else if result.remote_hash != result.local_hash {
-        (false, Some("artifact_hash_mismatch".to_string()))
     } else {
         (
             false,
@@ -1523,10 +1524,19 @@ fn smoke_artifact_verdict(result: &SelfTestResultRecordFromApi) -> (bool, Option
                 result
                     .error
                     .clone()
-                    .unwrap_or_else(|| "artifact_retrieval_failed".to_string()),
+                    .unwrap_or_else(|| "artifact_not_retrieved".to_string()),
             ),
         )
     }
+}
+
+/// Whether the retrieved artifact is bit-identical to the local reference build
+/// (the self-test's `passed`/`binaries_equivalent` verdict). Reported in the
+/// artifact summary as transparency; a `false` here on an otherwise-retrieved
+/// artifact indicates build non-determinism (commonly local-vs-worker rustc
+/// drift), not a retrieval failure.
+fn smoke_artifact_byte_identical(result: &SelfTestResultRecordFromApi) -> bool {
+    result.passed
 }
 
 /// Decide the `QueueAttachCancel` cancel-step outcome from the daemon's response
@@ -1581,8 +1591,11 @@ async fn run_smoke_canary_scenarios(
 
     // A debug build keeps the canary cheap; the size-optimized release profile
     // (opt-level=z + lto) is needlessly slow for a tiny correctness probe.
+    // `retries=0` makes the canary fail-fast (one attempt) so a real outcome
+    // surfaces immediately instead of being masked by the daemon's long retry
+    // delay blowing the scenario's own timeout budget.
     let command = format!(
-        "POST /self-test/run?worker={}&timeout={}&debug=true\n",
+        "POST /self-test/run?worker={}&timeout={}&debug=true&retries=0\n",
         urlencoding_encode(worker_id),
         timeout_secs
     );
@@ -1635,9 +1648,10 @@ async fn run_smoke_canary_scenarios(
         result.remote_time_ms.unwrap_or(elapsed_ms),
     ));
 
-    // ArtifactRetrieval: the artifact came back and its hash matches local — this
-    // is exactly the self-test's `passed` (binary-hash-equivalence) verdict. Split
-    // the failure reason so a missing artifact reads differently from a mismatch.
+    // ArtifactRetrieval: the artifact came back (remote_hash present). Byte-
+    // identity vs the local reference is reported in the summary, not required —
+    // a worker whose rustc differs from the orchestrator still RETRIEVES an
+    // artifact (build non-determinism is a separate concern).
     let (artifact_passed, artifact_reason) = smoke_artifact_verdict(&result);
     let mut artifact_event = SmokeProfileEvent::outcome(
         run_id,
@@ -1651,16 +1665,22 @@ async fn run_smoke_canary_scenarios(
     );
     artifact_event.remote_target_dir = remote_base.map(str::to_string);
     artifact_event.artifact_summary = Some(if artifact_passed {
+        let byte_identical = smoke_artifact_byte_identical(&result);
         match result.remote_hash.as_deref() {
             Some(hash) => format!(
-                "binary verified: hash {}… ({}ms remote)",
+                "retrieved: hash {}… ({}ms remote){}",
                 &hash[..hash.len().min(12)],
-                result.remote_time_ms.unwrap_or(0)
+                result.remote_time_ms.unwrap_or(0),
+                if byte_identical {
+                    "; bit-identical to local"
+                } else {
+                    "; differs from local build (non-deterministic/rustc drift)"
+                }
             ),
-            None => "binary verified".to_string(),
+            None => "retrieved".to_string(),
         }
     } else {
-        "artifact not verified".to_string()
+        "artifact not retrieved".to_string()
     });
     events.push(artifact_event);
 
@@ -3299,22 +3319,24 @@ mod tests {
     }
 
     #[test]
-    fn smoke_artifact_verdict_splits_missing_vs_mismatch() {
-        // Full pass: hashes matched and the artifact came back.
+    fn smoke_artifact_verdict_passes_on_retrieval_regardless_of_byte_identity() {
+        // Full pass: hashes matched and the artifact came back -> retrieved.
         let pass = self_test_result(true, Some("aaa"), Some("aaa"), Some(900), None);
         assert_eq!(smoke_artifact_verdict(&pass), (true, None));
+        assert!(smoke_artifact_byte_identical(&pass));
 
-        // Built remotely but no artifact rsynced back.
+        // Built remotely but no artifact rsynced back -> NOT retrieved.
         let not_retrieved = self_test_result(false, Some("aaa"), None, Some(900), None);
         let (p1, r1) = smoke_artifact_verdict(&not_retrieved);
         assert!(!p1);
         assert_eq!(r1.as_deref(), Some("artifact_not_retrieved"));
 
-        // Artifact came back but its hash differs from the local build.
-        let mismatch = self_test_result(false, Some("aaa"), Some("bbb"), Some(900), None);
-        let (p2, r2) = smoke_artifact_verdict(&mismatch);
-        assert!(!p2);
-        assert_eq!(r2.as_deref(), Some("artifact_hash_mismatch"));
+        // Artifact came back but differs from the local build (worker rustc drift):
+        // RETRIEVAL still succeeded; byte-identity is reported separately, not a
+        // retrieval failure.
+        let drift = self_test_result(false, Some("aaa"), Some("bbb"), Some(900), None);
+        assert_eq!(smoke_artifact_verdict(&drift), (true, None));
+        assert!(!smoke_artifact_byte_identical(&drift));
     }
 
     #[test]

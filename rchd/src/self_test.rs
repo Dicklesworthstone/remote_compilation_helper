@@ -253,6 +253,11 @@ pub struct SelfTestRunOptions {
     pub project_path: Option<PathBuf>,
     pub timeout: Duration,
     pub release_mode: bool,
+    /// Override the configured retry count for THIS run. `None` uses the service
+    /// config. A bounded smoke canary sets `Some(0)` (one attempt) so a failure
+    /// surfaces immediately instead of being masked by the long retry delay
+    /// blowing the run's own timeout budget.
+    pub retry_count_override: Option<u32>,
 }
 
 impl Default for SelfTestRunOptions {
@@ -263,6 +268,7 @@ impl Default for SelfTestRunOptions {
             project_path: None,
             timeout: Duration::from_secs(DEFAULT_SELF_TEST_TIMEOUT_SECS),
             release_mode: true,
+            retry_count_override: None,
         }
     }
 }
@@ -360,6 +366,7 @@ impl SelfTestService {
             project_path: None,
             timeout: Duration::from_secs(DEFAULT_SELF_TEST_TIMEOUT_SECS),
             release_mode: true,
+            retry_count_override: None,
         };
         self.run_internal(options).await
     }
@@ -619,13 +626,14 @@ async fn run_single_worker_test(
                 },
             };
 
-            if record.passed || attempt > config.retry_count {
+            let retry_count = options.retry_count_override.unwrap_or(config.retry_count);
+            if record.passed || attempt > retry_count {
                 return record;
             }
 
             warn!(
                 "Self-test failed for worker {} (attempt {}/{}), retrying in {:?}",
-                worker_id, attempt, config.retry_count, retry_delay
+                worker_id, attempt, retry_count, retry_delay
             );
             sleep(retry_delay).await;
         }
@@ -787,11 +795,13 @@ mod tests {
             project_path: Some(PathBuf::from("/tmp/project")),
             timeout: Duration::from_secs(60),
             release_mode: false,
+            retry_count_override: Some(0),
         };
         assert_eq!(options.run_type, SelfTestRunType::Scheduled);
         assert!(options.worker_ids.is_some());
         assert!(options.project_path.is_some());
         assert!(!options.release_mode);
+        assert_eq!(options.retry_count_override, Some(0));
     }
 
     // ==================== SelfTestHistory tests ====================
