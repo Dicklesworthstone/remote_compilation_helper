@@ -1074,7 +1074,7 @@ pub async fn self_test(
     // The real-fleet smoke/soak profile is a distinct mode from the per-worker
     // canary self-test (bd-session-history-remediation-ocv9i.16.6).
     if smoke {
-        return self_test_smoke(worker, all, dry_run, soak, ctx).await;
+        return self_test_smoke(worker, all, timeout, dry_run, soak, ctx).await;
     }
     match action {
         Some(crate::SelfTestAction::Status) => self_test_status(ctx).await,
@@ -1406,9 +1406,11 @@ async fn self_test_run(
 // consumer gathers inputs, runs the planner, performs the client-side daemon
 // reachability scenario for real, drives the live per-worker SSH probe scenarios
 // (capabilities + disk/inode admission, via the mock-SSH-tested executor
-// orchestrator), and renders/persists the trace. The remaining daemon/pipeline
-// scenarios (cargo canary, artifact retrieval, queue attach/cancel, desired-vs-
-// live fleet) and the client-side proof-mode refusal stay `planned` for now.
+// orchestrator), composes the daemon/pipeline scenarios from existing daemon
+// calls (desired-vs-live fleet via the status fleet view; cargo canary +
+// artifact retrieval via the daemon self-test pipeline; queue attach/cancel via
+// the status snapshot + a non-destructive cancel of a synthetic build id),
+// asserts the client-side proof-mode refusal, and renders/persists the trace.
 
 /// Owning bead id for the smoke-profile JSONL trace.
 const SMOKE_BEAD_ID: &str = "bd-session-history-remediation-ocv9i.16.6";
@@ -1480,6 +1482,247 @@ async fn fetch_fleet_status_report() -> Result<rch_common::fleet_status::FleetSt
     Ok(build_fleet_status_report(&status))
 }
 
+/// Decide the `CargoCanary` outcome from a per-worker self-test result. The
+/// canary passes when the remote build COMPLETED — the daemon records a remote
+/// compilation time only after the worker finished compiling, so its presence is
+/// the honest "the tiny canary built on the worker" signal. A pipeline error
+/// before the remote build (e.g. transfer/connect failure) leaves it unset.
+/// Pure so it is unit-testable without a daemon. Returns `(passed, reason)`.
+fn smoke_canary_verdict(result: &SelfTestResultRecordFromApi) -> (bool, Option<String>) {
+    if result.remote_time_ms.is_some() {
+        (true, None)
+    } else {
+        (
+            false,
+            Some(
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "remote_build_failed".to_string()),
+            ),
+        )
+    }
+}
+
+/// Decide the `ArtifactRetrieval` outcome from a per-worker self-test result. The
+/// artifact is "retrieved" when it was rsynced back AND its hash matches the
+/// local build — exactly the self-test's `passed` (binary-hash-equivalence)
+/// verdict. The failure reason distinguishes a missing artifact from a hash
+/// mismatch. Pure; returns `(passed, reason)`.
+fn smoke_artifact_verdict(result: &SelfTestResultRecordFromApi) -> (bool, Option<String>) {
+    if result.passed {
+        (true, None)
+    } else if result.remote_hash.is_none() {
+        (false, Some("artifact_not_retrieved".to_string()))
+    } else if result.remote_hash != result.local_hash {
+        (false, Some("artifact_hash_mismatch".to_string()))
+    } else {
+        (
+            false,
+            Some(
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "artifact_retrieval_failed".to_string()),
+            ),
+        )
+    }
+}
+
+/// Decide the `QueueAttachCancel` cancel-step outcome from the daemon's response
+/// status to cancelling a synthetic (cannot-exist) build id. The daemon's
+/// deterministic refusal for a build it cannot find is `status == "error"`; any
+/// other status, or a malformed/absent status, fails the scenario. Pure; returns
+/// `(passed, reason)`.
+fn smoke_cancel_verdict(status: Option<&str>) -> (bool, Option<String>) {
+    match status {
+        Some("error") => (true, None),
+        Some(other) => (false, Some(format!("unexpected_cancel_status:{other}"))),
+        None => (false, Some("cancel_response_malformed".to_string())),
+    }
+}
+
+/// Drive the build-pipeline smoke scenarios (`CargoCanary` + `ArtifactRetrieval`)
+/// for one worker via the daemon's existing per-worker self-test canary.
+///
+/// A single `POST /self-test/run` runs the full pipeline (local build → remote
+/// build → rsync artifacts back → hash verify), so one call decides both
+/// scenarios with a meaningful, non-tautological split:
+/// - **CargoCanary** passes when the remote build COMPLETED (`remote_time_ms`
+///   recorded) — the tiny canary compiled on the worker.
+/// - **ArtifactRetrieval** passes when the artifact was rsynced back AND its hash
+///   matches the local build (`passed`, which is exactly the hash-equivalence
+///   check). A canary that compiles but whose artifact fails to come back (or
+///   comes back mismatched) fails ArtifactRetrieval while CargoCanary still
+///   passes — the two are nested, not identical.
+///
+/// A daemon error, a missing per-worker result, or a build that never produced a
+/// remote time is a FAILED outcome (never a silent pass).
+async fn run_smoke_canary_scenarios(
+    run_id: &str,
+    worker_id: &str,
+    timeout_secs: u64,
+    remote_base: Option<&str>,
+) -> Vec<SmokeProfileEvent> {
+    let mut events = vec![
+        SmokeProfileEvent::started(
+            run_id,
+            SMOKE_BEAD_ID,
+            Some(worker_id.to_string()),
+            SmokeScenario::CargoCanary,
+        ),
+        SmokeProfileEvent::started(
+            run_id,
+            SMOKE_BEAD_ID,
+            Some(worker_id.to_string()),
+            SmokeScenario::ArtifactRetrieval,
+        ),
+    ];
+
+    // A debug build keeps the canary cheap; the size-optimized release profile
+    // (opt-level=z + lto) is needlessly slow for a tiny correctness probe.
+    let command = format!(
+        "POST /self-test/run?worker={}&timeout={}&debug=true\n",
+        urlencoding_encode(worker_id),
+        timeout_secs
+    );
+    let canary_fp = Some("self-test canary (cargo build, debug)".to_string());
+    let artifact_fp = Some("rsync artifacts from worker + hash verify".to_string());
+
+    let started = std::time::Instant::now();
+    let result = send_daemon_command(&command)
+        .await
+        .ok()
+        .and_then(|response| {
+            let json = extract_json_body(&response)?;
+            let run: SelfTestRunResponseFromApi = serde_json::from_str(json).ok()?;
+            run.results.into_iter().find(|r| r.worker_id == worker_id)
+        });
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    let Some(result) = result else {
+        // Could not get a per-worker self-test result: both scenarios fail.
+        for scenario in [SmokeScenario::CargoCanary, SmokeScenario::ArtifactRetrieval] {
+            events.push(SmokeProfileEvent::outcome(
+                run_id,
+                SMOKE_BEAD_ID,
+                Some(worker_id.to_string()),
+                scenario,
+                false,
+                Some("self_test_result_unavailable".to_string()),
+                if scenario == SmokeScenario::CargoCanary {
+                    canary_fp.clone()
+                } else {
+                    artifact_fp.clone()
+                },
+                elapsed_ms,
+            ));
+        }
+        return events;
+    };
+
+    // CargoCanary: the remote build completed when the daemon recorded a remote
+    // compilation time. A pipeline error before the remote build leaves it unset.
+    let (canary_passed, canary_reason) = smoke_canary_verdict(&result);
+    events.push(SmokeProfileEvent::outcome(
+        run_id,
+        SMOKE_BEAD_ID,
+        Some(worker_id.to_string()),
+        SmokeScenario::CargoCanary,
+        canary_passed,
+        canary_reason,
+        canary_fp,
+        result.remote_time_ms.unwrap_or(elapsed_ms),
+    ));
+
+    // ArtifactRetrieval: the artifact came back and its hash matches local — this
+    // is exactly the self-test's `passed` (binary-hash-equivalence) verdict. Split
+    // the failure reason so a missing artifact reads differently from a mismatch.
+    let (artifact_passed, artifact_reason) = smoke_artifact_verdict(&result);
+    let mut artifact_event = SmokeProfileEvent::outcome(
+        run_id,
+        SMOKE_BEAD_ID,
+        Some(worker_id.to_string()),
+        SmokeScenario::ArtifactRetrieval,
+        artifact_passed,
+        artifact_reason,
+        artifact_fp,
+        elapsed_ms,
+    );
+    artifact_event.remote_target_dir = remote_base.map(str::to_string);
+    artifact_event.artifact_summary = Some(if artifact_passed {
+        match result.remote_hash.as_deref() {
+            Some(hash) => format!(
+                "binary verified: hash {}… ({}ms remote)",
+                &hash[..hash.len().min(12)],
+                result.remote_time_ms.unwrap_or(0)
+            ),
+            None => "binary verified".to_string(),
+        }
+    } else {
+        "artifact not verified".to_string()
+    });
+    events.push(artifact_event);
+
+    events
+}
+
+/// Drive the `QueueAttachCancel` smoke scenario against the daemon control plane,
+/// non-destructively. It must prove the queue/cancel primitives are reachable and
+/// behave correctly WITHOUT touching any real in-flight build on the shared fleet:
+/// 1. Read the queue snapshot (`GET /status` → active + queued builds) — the
+///    "attach" view; a queue we cannot read is a failure.
+/// 2. Cancel a synthetic build id that cannot exist (`u64::MAX`) and assert the
+///    daemon returns its deterministic not-found refusal (`status == "error"`).
+///    This exercises the real cancel route without cancelling anyone's work.
+async fn run_smoke_queue_attach_cancel(run_id: &str) -> SmokeProfileEvent {
+    const SENTINEL_BUILD_ID: u64 = u64::MAX;
+    let started = std::time::Instant::now();
+
+    let (passed, reason) = smoke_queue_attach_cancel_probe(SENTINEL_BUILD_ID).await;
+    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    SmokeProfileEvent::outcome(
+        run_id,
+        SMOKE_BEAD_ID,
+        None,
+        SmokeScenario::QueueAttachCancel,
+        passed,
+        reason,
+        Some("GET /status; POST /builds/<sentinel>/cancel".to_string()),
+        ms,
+    )
+}
+
+/// The non-destructive queue+cancel control-plane probe. Returns `(passed,
+/// reason)`. Reads the queue snapshot, then cancels a build id that cannot exist
+/// and verifies the deterministic not-found refusal.
+async fn smoke_queue_attach_cancel_probe(sentinel_build_id: u64) -> (bool, Option<String>) {
+    // 1. Attach: the queue snapshot must be readable.
+    match send_daemon_command("GET /status\n").await {
+        Ok(response) => {
+            let parsed = extract_json_body(&response)
+                .and_then(|json| serde_json::from_str::<DaemonFullStatusResponse>(json).ok());
+            if parsed.is_none() {
+                return (false, Some("queue_snapshot_unreadable".to_string()));
+            }
+        }
+        Err(_) => return (false, Some("queue_snapshot_unavailable".to_string())),
+    }
+
+    // 2. Cancel a synthetic build id; the daemon must refuse it as not-found.
+    let cancel_cmd = format!("POST /builds/{sentinel_build_id}/cancel?force=false\n");
+    match send_daemon_command(&cancel_cmd).await {
+        Ok(response) => {
+            let status = extract_json_body(&response)
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string));
+            smoke_cancel_verdict(status.as_deref())
+        }
+        Err(_) => (false, Some("cancel_unavailable".to_string())),
+    }
+}
+
 /// Build the smoke-profile inputs from observed environment + flags. Pure so the
 /// input-derivation is unit-testable without a daemon or workers.
 fn build_smoke_inputs(
@@ -1545,6 +1788,7 @@ fn write_smoke_jsonl(run_id: &str, events: &[SmokeProfileEvent]) -> Option<Strin
 async fn self_test_smoke(
     worker: Option<String>,
     all: bool,
+    timeout: u64,
     dry_run: bool,
     soak: bool,
     ctx: &OutputContext,
@@ -1665,6 +1909,46 @@ async fn self_test_smoke(
                 events.extend(worker_events);
             }
         }
+    }
+
+    // CargoCanary + ArtifactRetrieval (daemon-pipeline): drive the daemon's
+    // existing per-worker self-test canary, which runs the full local-build →
+    // remote-build → rsync-back → hash-verify pipeline. One daemon call yields
+    // BOTH scenarios: the remote build completing satisfies CargoCanary; the
+    // artifact rsynced back and hash-matching satisfies ArtifactRetrieval. Bounded
+    // to a single representative worker (the `--worker` target, else the first
+    // configured worker) so a smoke run stays cheap and non-destructive.
+    if !dry_run
+        && plan
+            .scenarios
+            .iter()
+            .any(|p| p.scenario == SmokeScenario::CargoCanary && p.action.is_executed())
+    {
+        let canary_worker = match selected_worker.as_deref() {
+            Some(id) => workers.iter().find(|w| w.id.0 == id),
+            None => workers.first(),
+        };
+        if let Some(worker) = canary_worker {
+            let remote_base = smoke_disk_roots().into_iter().next();
+            let canary_events =
+                run_smoke_canary_scenarios(&run_id, &worker.id.0, timeout, remote_base.as_deref())
+                    .await;
+            events.extend(canary_events);
+        }
+    }
+
+    // QueueAttachCancel (daemon control-plane, non-destructive): confirm the
+    // queue/cancel control plane is reachable and behaves correctly WITHOUT
+    // disturbing any real in-flight build on the shared fleet — read the queue
+    // snapshot (the "attach" view), then cancel a synthetic build id that cannot
+    // exist and assert the daemon returns its deterministic not-found refusal.
+    if !dry_run
+        && plan
+            .scenarios
+            .iter()
+            .any(|p| p.scenario == SmokeScenario::QueueAttachCancel && p.action.is_executed())
+    {
+        events.push(run_smoke_queue_attach_cancel(&run_id).await);
     }
 
     // Proof-mode refusal (client-side, no SSH): when the plan expects a refusal
@@ -2961,5 +3245,91 @@ mod tests {
         let (ok2, reason2) = smoke_fleet_consistency(&drifted);
         assert!(!ok2);
         assert_eq!(reason2.as_deref(), Some("fleet_workers_absent"));
+    }
+
+    fn self_test_result(
+        passed: bool,
+        local_hash: Option<&str>,
+        remote_hash: Option<&str>,
+        remote_time_ms: Option<u64>,
+        error: Option<&str>,
+    ) -> SelfTestResultRecordFromApi {
+        SelfTestResultRecordFromApi {
+            run_id: 1,
+            worker_id: "hz1".to_string(),
+            passed,
+            local_hash: local_hash.map(str::to_string),
+            remote_hash: remote_hash.map(str::to_string),
+            local_time_ms: Some(10),
+            remote_time_ms,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn smoke_canary_verdict_passes_when_remote_build_completed() {
+        // A recorded remote compilation time means the worker finished building,
+        // even if a later step (artifact hash) ultimately failed the run.
+        let built_then_mismatch = self_test_result(
+            false,
+            Some("aaa"),
+            Some("bbb"),
+            Some(1500),
+            Some("mismatch"),
+        );
+        assert_eq!(smoke_canary_verdict(&built_then_mismatch), (true, None));
+
+        let full_pass = self_test_result(true, Some("aaa"), Some("aaa"), Some(900), None);
+        assert_eq!(smoke_canary_verdict(&full_pass), (true, None));
+    }
+
+    #[test]
+    fn smoke_canary_verdict_fails_when_remote_build_never_ran() {
+        // No remote time => the build never completed; carry the daemon error.
+        let connect_fail = self_test_result(false, None, None, None, Some("ssh connect refused"));
+        let (passed, reason) = smoke_canary_verdict(&connect_fail);
+        assert!(!passed);
+        assert_eq!(reason.as_deref(), Some("ssh connect refused"));
+
+        // Missing error still yields a stable fallback token (never a silent pass).
+        let no_error = self_test_result(false, None, None, None, None);
+        let (passed2, reason2) = smoke_canary_verdict(&no_error);
+        assert!(!passed2);
+        assert_eq!(reason2.as_deref(), Some("remote_build_failed"));
+    }
+
+    #[test]
+    fn smoke_artifact_verdict_splits_missing_vs_mismatch() {
+        // Full pass: hashes matched and the artifact came back.
+        let pass = self_test_result(true, Some("aaa"), Some("aaa"), Some(900), None);
+        assert_eq!(smoke_artifact_verdict(&pass), (true, None));
+
+        // Built remotely but no artifact rsynced back.
+        let not_retrieved = self_test_result(false, Some("aaa"), None, Some(900), None);
+        let (p1, r1) = smoke_artifact_verdict(&not_retrieved);
+        assert!(!p1);
+        assert_eq!(r1.as_deref(), Some("artifact_not_retrieved"));
+
+        // Artifact came back but its hash differs from the local build.
+        let mismatch = self_test_result(false, Some("aaa"), Some("bbb"), Some(900), None);
+        let (p2, r2) = smoke_artifact_verdict(&mismatch);
+        assert!(!p2);
+        assert_eq!(r2.as_deref(), Some("artifact_hash_mismatch"));
+    }
+
+    #[test]
+    fn smoke_cancel_verdict_accepts_only_deterministic_not_found() {
+        // The not-found refusal for a synthetic build id is the expected pass.
+        assert_eq!(smoke_cancel_verdict(Some("error")), (true, None));
+
+        // A "cancelled" status would mean we actually killed a real build — a
+        // safety regression for the non-destructive probe, so it must fail.
+        let (p, r) = smoke_cancel_verdict(Some("cancelled"));
+        assert!(!p);
+        assert_eq!(r.as_deref(), Some("unexpected_cancel_status:cancelled"));
+
+        let (p2, r2) = smoke_cancel_verdict(None);
+        assert!(!p2);
+        assert_eq!(r2.as_deref(), Some("cancel_response_malformed"));
     }
 }

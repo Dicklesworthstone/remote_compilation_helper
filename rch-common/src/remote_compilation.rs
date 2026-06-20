@@ -71,6 +71,39 @@ pub struct RemoteCompilationTest {
     pub remote_path_suffix: String,
 }
 
+/// Resolve the `cargo` executable for the LOCAL reference build.
+///
+/// The daemon runs with a minimal, systemd-style `PATH` (e.g.
+/// `/usr/local/bin:/usr/bin:...`) that does NOT include `~/.cargo/bin`, so a bare
+/// `Command::new("cargo")` fails with ENOENT and silently wedges the self-test
+/// canary. Resolve robustly: honor an explicit `CARGO` override, then the rustup
+/// default at `$HOME/.cargo/bin/cargo`, and only fall back to a bare `cargo`
+/// (PATH lookup) when neither is present.
+fn resolve_cargo_binary() -> std::ffi::OsString {
+    resolve_cargo_binary_from(std::env::var_os("CARGO"), std::env::var_os("HOME"))
+}
+
+/// Pure core of [`resolve_cargo_binary`]: pick the cargo executable from an
+/// explicit `CARGO` override and a `HOME` directory. Split out so the resolution
+/// order is unit-testable without mutating process-global env vars.
+fn resolve_cargo_binary_from(
+    cargo_override: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> std::ffi::OsString {
+    if let Some(explicit) = cargo_override
+        && !explicit.is_empty()
+    {
+        return explicit;
+    }
+    if let Some(home) = home {
+        let candidate = PathBuf::from(home).join(".cargo").join("bin").join("cargo");
+        if candidate.is_file() {
+            return candidate.into_os_string();
+        }
+    }
+    std::ffi::OsString::from("cargo")
+}
+
 fn use_mock_transport(worker: &WorkerConfig) -> bool {
     mock::is_mock_enabled() || mock::is_mock_worker(worker)
 }
@@ -389,7 +422,7 @@ impl RemoteCompilationTest {
 
     /// Build the project locally.
     async fn build_local(&self) -> Result<()> {
-        let mut cmd = Command::new("cargo");
+        let mut cmd = Command::new(resolve_cargo_binary());
         cmd.arg("build");
 
         if self.release_mode {
@@ -664,6 +697,43 @@ mod tests {
     use crate::test_guard;
     use crate::testing::{TestLogger, TestPhase};
     use crate::types::WorkerId;
+
+    #[test]
+    fn resolve_cargo_binary_prefers_override_then_rustup_then_path() {
+        use std::ffi::OsString;
+
+        // An explicit CARGO override always wins.
+        assert_eq!(
+            resolve_cargo_binary_from(Some(OsString::from("/opt/cargo")), None),
+            OsString::from("/opt/cargo")
+        );
+
+        // An empty override is ignored (falls through to HOME / PATH).
+        assert_eq!(
+            resolve_cargo_binary_from(Some(OsString::new()), None),
+            OsString::from("cargo")
+        );
+
+        // With no override and no rustup cargo present under HOME, fall back to a
+        // bare `cargo` (PATH lookup).
+        let empty_home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_cargo_binary_from(None, Some(empty_home.path().as_os_str().to_os_string())),
+            OsString::from("cargo")
+        );
+
+        // When `$HOME/.cargo/bin/cargo` exists (the rustup default the daemon's
+        // minimal PATH omits), resolve to it absolutely.
+        let home = tempfile::tempdir().unwrap();
+        let cargo_bin = home.path().join(".cargo").join("bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        let cargo_path = cargo_bin.join("cargo");
+        std::fs::write(&cargo_path, b"#!/bin/sh\n").unwrap();
+        assert_eq!(
+            resolve_cargo_binary_from(None, Some(home.path().as_os_str().to_os_string())),
+            cargo_path.into_os_string()
+        );
+    }
 
     fn init_test_logging() {
         let _ = tracing_subscriber::fmt()

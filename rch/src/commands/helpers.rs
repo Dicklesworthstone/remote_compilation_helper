@@ -17,6 +17,22 @@ const DAEMON_COMMAND_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_COMMAND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(unix)]
 const DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Extra wall-clock margin added on top of a self-test's per-worker `timeout`
+/// budget when waiting for the daemon response. The daemon caps each worker's
+/// whole canary (local build → remote build → rsync-back → hash verify) at the
+/// requested `timeout`, runs workers in parallel, and then serializes the
+/// report; this margin covers that scheduling/serialization overhead so the
+/// client does not give up a few seconds before a build that is about to land.
+#[cfg(unix)]
+const DAEMON_SELF_TEST_RESPONSE_MARGIN_SECS: u64 = 60;
+/// Hard ceiling on the self-test response timeout, so a pathological
+/// `timeout=<huge>` query cannot wedge the client forever.
+#[cfg(unix)]
+const DAEMON_SELF_TEST_RESPONSE_TIMEOUT_CAP: Duration = Duration::from_secs(3600);
+/// Fallback self-test budget when the `POST /self-test/run` request carries no
+/// `timeout` param. Mirrors the CLI `--timeout` default (300s).
+#[cfg(unix)]
+const DAEMON_SELF_TEST_DEFAULT_TIMEOUT_SECS: u64 = 300;
 
 // ============================================================================
 // Path helpers
@@ -743,9 +759,51 @@ async fn send_daemon_command_to_socket(socket_path: &Path, command: &str) -> Res
 fn daemon_command_response_timeout(command: &str) -> Duration {
     if daemon_command_is_capabilities_refresh(command) {
         DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT
+    } else if let Some(budget) = daemon_command_self_test_budget(command) {
+        // A self-test run blocks the daemon for the duration of a real canary
+        // build, which routinely exceeds the default 10s IO timeout. Wait for
+        // the worker budget plus a fixed margin (capped), never less than the
+        // default IO timeout. Without this the client times out (RCH-E504)
+        // while the daemon is still building.
+        let secs = budget
+            .saturating_add(DAEMON_SELF_TEST_RESPONSE_MARGIN_SECS)
+            .min(DAEMON_SELF_TEST_RESPONSE_TIMEOUT_CAP.as_secs());
+        Duration::from_secs(secs).max(DAEMON_COMMAND_IO_TIMEOUT)
     } else {
         DAEMON_COMMAND_IO_TIMEOUT
     }
+}
+
+/// If `command` is a `POST /self-test/run` request, return its per-worker
+/// `timeout` budget in seconds (the CLI default when the param is absent).
+/// Returns `None` for any other command.
+#[cfg(unix)]
+fn daemon_command_self_test_budget(command: &str) -> Option<u64> {
+    let request_target = command
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("");
+    let rest = request_target.strip_prefix("/self-test/run")?;
+    // Accept the bare path and the query form, but not a different route that
+    // merely shares the prefix (e.g. `/self-test/run-extra`).
+    let query = match rest {
+        "" => "",
+        q => q.strip_prefix('?')?,
+    };
+    let budget = query
+        .split('&')
+        .filter_map(|param| {
+            let mut kv = param.splitn(2, '=');
+            let key = kv.next().unwrap_or("");
+            let value = kv.next().unwrap_or("");
+            (key == "timeout")
+                .then(|| value.parse::<u64>().ok())
+                .flatten()
+        })
+        .next()
+        .unwrap_or(DAEMON_SELF_TEST_DEFAULT_TIMEOUT_SECS);
+    Some(budget)
 }
 
 #[cfg(unix)]
@@ -837,6 +895,62 @@ mod daemon_command_tests {
         );
         assert_eq!(
             daemon_command_response_timeout("GET /status\n"),
+            DAEMON_COMMAND_IO_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn self_test_run_command_waits_for_worker_budget_plus_margin() {
+        // A self-test canary blocks the daemon for the whole build; the client
+        // must wait the requested per-worker budget plus the fixed margin.
+        assert_eq!(
+            daemon_command_response_timeout("POST /self-test/run?worker=css&timeout=180\n"),
+            Duration::from_secs(180 + DAEMON_SELF_TEST_RESPONSE_MARGIN_SECS)
+        );
+        // Param order / extra params must not matter.
+        assert_eq!(
+            daemon_command_response_timeout(
+                "POST /self-test/run?debug=true&timeout=120&worker=hz1\n"
+            ),
+            Duration::from_secs(120 + DAEMON_SELF_TEST_RESPONSE_MARGIN_SECS)
+        );
+    }
+
+    #[test]
+    fn self_test_run_without_timeout_uses_default_budget() {
+        assert_eq!(
+            daemon_command_response_timeout("POST /self-test/run\n"),
+            Duration::from_secs(
+                DAEMON_SELF_TEST_DEFAULT_TIMEOUT_SECS + DAEMON_SELF_TEST_RESPONSE_MARGIN_SECS
+            )
+        );
+        assert_eq!(
+            daemon_command_response_timeout("POST /self-test/run?all=true\n"),
+            Duration::from_secs(
+                DAEMON_SELF_TEST_DEFAULT_TIMEOUT_SECS + DAEMON_SELF_TEST_RESPONSE_MARGIN_SECS
+            )
+        );
+    }
+
+    #[test]
+    fn self_test_run_response_timeout_is_capped() {
+        // A pathological huge timeout cannot wedge the client past the cap.
+        assert_eq!(
+            daemon_command_response_timeout("POST /self-test/run?timeout=999999999\n"),
+            DAEMON_SELF_TEST_RESPONSE_TIMEOUT_CAP
+        );
+    }
+
+    #[test]
+    fn self_test_status_and_lookalike_routes_keep_default_timeout() {
+        // The status/history reads are quick; only the run blocks. And a route
+        // that merely shares the prefix must not be mistaken for the run route.
+        assert_eq!(
+            daemon_command_response_timeout("GET /self-test/status\n"),
+            DAEMON_COMMAND_IO_TIMEOUT
+        );
+        assert_eq!(
+            daemon_command_response_timeout("POST /self-test/run-extra?worker=css\n"),
             DAEMON_COMMAND_IO_TIMEOUT
         );
     }

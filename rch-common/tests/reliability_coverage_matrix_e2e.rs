@@ -1292,6 +1292,47 @@ fn build_coverage_matrix() -> CoverageMatrix {
                     name_prefix: "smoke_disk_inode".into(),
                     tier: "smoke".into(),
                 },
+                // Build-pipeline scenario verdicts: cargo canary (remote build
+                // completed) + artifact retrieval (rsynced back AND hash-matched,
+                // with missing-vs-mismatch split) decided from the daemon
+                // self-test result; queue attach/cancel decided from the daemon's
+                // deterministic not-found refusal of a synthetic build id.
+                TestRef {
+                    file: "../../rch/src/commands/status.rs".into(),
+                    name_prefix: "smoke_canary_verdict".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../../rch/src/commands/status.rs".into(),
+                    name_prefix: "smoke_artifact_verdict".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../../rch/src/commands/status.rs".into(),
+                    name_prefix: "smoke_cancel_verdict".into(),
+                    tier: "smoke".into(),
+                },
+                // The self-test response timeout waits the per-worker build
+                // budget (+margin, capped) instead of the 10s default, so the
+                // canary client no longer spuriously times out (RCH-E504).
+                TestRef {
+                    file: "../../rch/src/commands/helpers.rs".into(),
+                    name_prefix: "self_test_run".into(),
+                    tier: "smoke".into(),
+                },
+                // Daemon canary robustness the live run surfaced: self-heal a
+                // wedged self-test fixture, and resolve cargo off the daemon's
+                // minimal PATH.
+                TestRef {
+                    file: "../../rchd/src/self_test.rs".into(),
+                    name_prefix: "self_test_main_rs_health".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/remote_compilation.rs".into(),
+                    name_prefix: "resolve_cargo_binary".into(),
+                    tier: "smoke".into(),
+                },
             ],
             artifact_assertions: vec![
                 "No real workers configured -> every real-fleet scenario Skip{smoke_no_real_workers}; \

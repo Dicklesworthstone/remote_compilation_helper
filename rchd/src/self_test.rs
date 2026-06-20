@@ -649,6 +649,20 @@ async fn run_single_worker_test(
     }
 }
 
+/// Canonical source of the self-test canary's `src/main.rs`. Kept as a constant
+/// so [`ensure_self_test_project`] can both create AND heal the fixture.
+const SELF_TEST_MAIN_RS: &str = "fn main() {\n    println!(\"rch self-test\");\n}\n";
+
+/// Whether the on-disk canary `main.rs` is still buildable as-is — i.e. it
+/// declares a `fn main`. The verification pipeline applies a test marker to
+/// `main.rs`, builds, then reverts; if a run is interrupted between apply and
+/// revert (or the revert is partial), the file can be left WITHOUT a `main`,
+/// which makes every future local reference build fail with E0601 and wedges the
+/// canary permanently. Detect that so we can heal it.
+fn self_test_main_rs_is_healthy(contents: &str) -> bool {
+    contents.contains("fn main(")
+}
+
 fn ensure_self_test_project() -> Result<PathBuf> {
     let cache_dir = default_self_test_dir()?;
     let project_dir = cache_dir.join("project");
@@ -667,10 +681,19 @@ fn ensure_self_test_project() -> Result<PathBuf> {
             .with_context(|| format!("Failed to write {:?}", cargo_toml))?;
     }
 
+    // Write `main.rs` when missing, and HEAL it when a previous interrupted
+    // marker apply/revert left it without a `fn main` (which would fail every
+    // local reference build and silently wedge the canary forever). Healing to
+    // the canonical baseline is safe: the file is a daemon-owned ephemeral
+    // fixture the marker cycle overwrites on each run anyway.
     let main_rs = src_dir.join("main.rs");
-    if !main_rs.exists() {
-        let contents = "fn main() {\n    println!(\"rch self-test\");\n}\n";
-        fs::write(&main_rs, contents).with_context(|| format!("Failed to write {:?}", main_rs))?;
+    let needs_main_rs = match fs::read_to_string(&main_rs) {
+        Ok(existing) => !self_test_main_rs_is_healthy(&existing),
+        Err(_) => true,
+    };
+    if needs_main_rs {
+        fs::write(&main_rs, SELF_TEST_MAIN_RS)
+            .with_context(|| format!("Failed to write {:?}", main_rs))?;
     }
 
     Ok(project_dir)
@@ -1028,6 +1051,22 @@ mod tests {
     }
 
     // ==================== SelfTestService tests ====================
+
+    #[test]
+    fn self_test_main_rs_health_detects_wedged_fixture() {
+        // The canonical baseline is healthy.
+        assert!(self_test_main_rs_is_healthy(SELF_TEST_MAIN_RS));
+        // A file still carrying a marker alongside main is healthy.
+        assert!(self_test_main_rs_is_healthy(
+            "fn main() {}\n#[allow(dead_code)] pub fn RCH_TEST_1() {}\n"
+        ));
+        // The real wedged shape observed in the field: only a leftover marker,
+        // no `fn main` -> E0601 on every build -> must be detected as unhealthy.
+        assert!(!self_test_main_rs_is_healthy(
+            "\n\n// RCH Self-Test Marker\n#[unsafe(no_mangle)]\n#[allow(dead_code)]\npub fn RCH_TEST_123() -> &'static str { \"RCH_TEST_123\" }\n"
+        ));
+        assert!(!self_test_main_rs_is_healthy(""));
+    }
 
     #[test]
     fn test_status_next_run_interval() {
