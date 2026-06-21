@@ -95,3 +95,8 @@ __pycache__/
 # to take effect on them; this only stops NEW files from being tracked.
 .ntm/logs/
 .ntm/pids/
+
+# Raw fleet SSH traces (contain worker IPs/temp paths) — kept locally as working artifacts, curated .md committed instead
+docs/evidence/fleet_deploy_*.txt
+docs/evidence/fleet_rollback_*.txt
+docs/evidence/fleet_deploy_audit_*.json
