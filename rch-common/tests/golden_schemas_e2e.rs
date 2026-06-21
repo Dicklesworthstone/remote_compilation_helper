@@ -476,6 +476,10 @@ fn incident_reason_code_vocabulary_is_frozen() {
         ("RCH-I015", "queue ambiguity"),
         ("RCH-I016", "disk full"),
         ("RCH-I017", "wrong user/path worker binary"),
+        // RCH-I018 added by bd-784xt (self-test canary tolerates heterogeneous
+        // toolchain codegen drift): an advisory pass distinct from a real
+        // miscompile/corruption. Intentional vocabulary extension.
+        ("RCH-I018", "toolchain drift"),
     ]
     .into_iter()
     .map(|(c, f)| (c.to_string(), f.to_string()))

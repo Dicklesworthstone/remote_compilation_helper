@@ -100,3 +100,6 @@ __pycache__/
 docs/evidence/fleet_deploy_*.txt
 docs/evidence/fleet_rollback_*.txt
 docs/evidence/fleet_deploy_audit_*.json
+
+# Isolated per-session build dirs (deploy/perf/version target dirs) — never commit
+/target_*/
