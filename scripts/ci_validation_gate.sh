@@ -60,6 +60,13 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+# python3 backs every stage record + the summary; fail fast with a clear message
+# rather than silently writing nothing.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "ci_validation_gate: python3 is required" >&2
+    exit 2
+fi
+
 mkdir -p "$OUT_DIR"
 STAGES_LOG="$OUT_DIR/stages.jsonl"
 AUDIT_JSON="$OUT_DIR/closed_bead_evidence.json"
@@ -110,8 +117,13 @@ cargo_stage() {
 echo "===== RCH validation gate (ocv9i.16.5) run_id=$RUN_ID =====" >&2
 
 # --- 1. dependency cycles -----------------------------------------------------
+# Capture br's full output FIRST, then grep a here-string. Piping `br` into
+# `grep -q` is unsafe here: grep -q closes the pipe on first match and, under
+# `set -o pipefail`, a SIGPIPE-killed `br` would make the pipeline non-zero and
+# spuriously report "cycles". The here-string has no upstream process to signal.
 if command -v br >/dev/null 2>&1; then
-    if br dep cycles 2>&1 | grep -qiE "no (dependency )?cycles"; then
+    cycles_out="$(br dep cycles 2>&1)"
+    if grep -qiE "no (dependency )?cycles" <<<"$cycles_out"; then
         record_stage "dep_cycles" "pass" 0 "" "bd-session-history-remediation-ocv9i.16.5" "no cycles"
     else
         record_stage "dep_cycles" "fail" 1 "RCH-GATE-DEP-CYCLE" \

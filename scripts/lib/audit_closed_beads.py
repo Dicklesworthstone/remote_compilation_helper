@@ -10,13 +10,14 @@ cites commands and log artifacts") mechanically, so a future agent cannot
 silently false-close a program bead.
 
 Severity model (calibrated against the live program — see ocv9i.16.5):
-  - FAIL : close_reason empty or trivially short (< MIN_REASON_CHARS) — no
-           evidence at all. Hard gate failure (exit 1).
-  - FAIL : (only with --strict) cites neither a command nor an artifact.
-  - WARN : cites a command OR an artifact but not both, or is otherwise thin —
-           reported for review, does not fail the gate by default.
-  - PASS : cites at least one command/test/commit AND at least one artifact /
-           matrix / schema / golden reference.
+  - PASS : the close_reason cites at least one SUBSTANTIVE evidence token — a
+           test run, a cargo/rch command, a REQ matrix row, a source/test/
+           script/artifact file, or a schema/golden reference.
+  - WARN : the close_reason cites ONLY a bare commit hash (no test/command/
+           artifact). Inspectable but thin — reported for review, not a hard
+           failure in the default mode. --strict promotes it to FAIL.
+  - FAIL : the close_reason is empty / trivially short (< MIN_REASON_CHARS) or
+           cites no evidence at all. Hard gate failure (exit 1).
 
 Outputs a JSON object to --out-json (and a copy to stdout) and a human summary
 to stderr. The JSON carries per-bead status so the gate's Markdown/JSON summary
@@ -91,7 +92,7 @@ def main() -> int:
     ap.add_argument("--prefix", default=PROGRAM_PREFIX, help="bead id prefix to scope the audit")
     ap.add_argument("--out-json", default="", help="write the JSON report to this path")
     ap.add_argument("--strict", action="store_true",
-                    help="treat a thin close (command XOR artifact) as a hard FAIL")
+                    help="promote a commit-only (thin) close from WARN to a hard FAIL")
     args = ap.parse_args()
 
     path = Path(args.beads)
