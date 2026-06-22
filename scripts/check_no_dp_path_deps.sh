@@ -50,7 +50,10 @@ abs_path_re='path[[:space:]]*=[[:space:]]*["'\''"]/'
 fail=0
 for m in "${manifests[@]}"; do
     [[ -f "$m" ]] || continue
-    hits="$(grep -nE "$abs_path_re" -- "$m" 2>/dev/null || true)"
+    # Match absolute-path deps but ignore full-line TOML comments — a commented-out
+    # `# path = "/dp/old"` must not trip the guard. Inline-table deps like
+    # `ftui = { path = "/dp/..." }` are mid-line (not comments) and still match.
+    hits="$(grep -nE "$abs_path_re" -- "$m" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
     if [[ -n "$hits" ]]; then
         echo "RCH-GATE-DP-PATH: absolute-path dependency in $m (breaks clean-checkout build — rch#23):" >&2
         while IFS= read -r line; do
