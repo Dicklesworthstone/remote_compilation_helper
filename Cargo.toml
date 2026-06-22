@@ -24,7 +24,7 @@ categories = ["development-tools", "command-line-utilities"]
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-toon-rust = { package = "tru", path = "/dp/toon_rust", version = "0.2.3" }
+toon-rust = { package = "tru", version = "0.2.3" }
 schemars = "0.8"
 
 # Async runtime
@@ -117,19 +117,19 @@ console = "0.16.2"
 # Markdown rendering
 pulldown-cmark = "0.13"
 
-# TUI (Terminal User Interface) — FrankenTUI native stack
-ftui = { path = "/dp/frankentui/crates/ftui", version = "0.4.0", default-features = false, features = ["runtime"] }
-ftui-core = { path = "/dp/frankentui/crates/ftui-core", version = "0.4.0" }
-ftui-render = { path = "/dp/frankentui/crates/ftui-render", version = "0.4.0" }
-ftui-style = { path = "/dp/frankentui/crates/ftui-style", version = "0.4.0" }
-ftui-text = { path = "/dp/frankentui/crates/ftui-text", version = "0.4.0" }
-ftui-layout = { path = "/dp/frankentui/crates/ftui-layout", version = "0.4.0" }
-ftui-widgets = { path = "/dp/frankentui/crates/ftui-widgets", version = "0.4.0" }
-ftui-tty = { path = "/dp/frankentui/crates/ftui-tty", version = "0.4.0" }
-ftui-backend = { path = "/dp/frankentui/crates/ftui-backend", version = "0.4.0" }
+# TUI (Terminal User Interface) — FrankenTUI native stack (published on crates.io)
+ftui = { version = "0.4", default-features = false, features = ["runtime"] }
+ftui-core = { version = "0.4" }
+ftui-render = { version = "0.4" }
+ftui-style = { version = "0.4" }
+ftui-text = { version = "0.4" }
+ftui-layout = { version = "0.4" }
+ftui-widgets = { version = "0.4" }
+ftui-tty = { version = "0.4" }
+ftui-backend = { version = "0.4" }
 
-# Rich terminal output (optional, for enhanced UI)
-rich_rust = { path = "/dp/rich_rust", version = "0.2.1" }
+# Rich terminal output (optional, for enhanced UI; published on crates.io)
+rich_rust = { version = "0.2" }
 
 # Internal crates
 # Use default-features = false for cross-platform compatibility (rich-ui uses Unix-only rich_rust)
