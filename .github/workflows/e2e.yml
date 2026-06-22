@@ -42,14 +42,6 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      # The workspace depends on these path deps under /dp (see ci.yml).
-      - name: Clone local path dependencies
-        run: |
-          sudo mkdir -p /dp
-          sudo chown "$USER" /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /dp/toon_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-06

@@ -34,13 +34,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Clone local path dependencies
-        run: |
-          sudo mkdir -p /dp
-          sudo chown $USER /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /dp/toon_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-06
@@ -67,6 +60,10 @@ jobs:
         run: |
           chmod +x scripts/check_runbooks_safe.sh
           ./scripts/check_runbooks_safe.sh
+      - name: Guard manifests against absolute-path (/dp) deps (rch#23)
+        run: |
+          chmod +x scripts/check_no_dp_path_deps.sh
+          ./scripts/check_no_dp_path_deps.sh
 
   # Validate GitHub Actions workflow syntax
   workflow_lint:
@@ -85,13 +82,6 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Clone local path dependencies
-        run: |
-          sudo mkdir -p /dp
-          sudo chown $USER /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /dp/toon_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-06
@@ -105,13 +95,6 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
-      - name: Clone local path dependencies
-        run: |
-          sudo mkdir -p /dp
-          sudo chown $USER /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /dp/toon_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-06
@@ -127,13 +110,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Clone local path dependencies
-        run: |
-          sudo mkdir -p /dp
-          sudo chown $USER /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /dp/toon_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -145,13 +121,6 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
-      - name: Clone local path dependencies
-        run: |
-          sudo mkdir -p /dp
-          sudo chown $USER /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /dp/toon_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-06
@@ -191,23 +160,6 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
-      - name: Clone local path dependencies (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          # macOS root filesystem is read-only, use /tmp on macOS, /dp on Linux
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
-            mkdir -p /tmp/dp
-            git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /tmp/dp/rich_rust
-            git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /tmp/dp/toon_rust
-            git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /tmp/dp/frankentui
-            sed -i '' 's|/dp/|/tmp/dp/|g' Cargo.toml
-          else
-            sudo mkdir -p /dp
-            sudo chown $USER /dp
-            git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
-            git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /dp/toon_rust
-            git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
-          fi
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-06
@@ -237,13 +189,6 @@ jobs:
     needs: [check, clippy]
     steps:
       - uses: actions/checkout@v4
-      - name: Clone local path dependencies
-        run: |
-          sudo mkdir -p /dp
-          sudo chown $USER /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /dp/toon_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-06
@@ -295,13 +240,6 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
-      - name: Clone local path dependencies
-        run: |
-          sudo mkdir -p /dp
-          sudo chown $USER /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /dp/toon_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-06
@@ -367,33 +305,6 @@ jobs:
     needs: [test, clippy]
     steps:
       - uses: actions/checkout@v4
-      - name: Clone local path dependencies (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          # macOS root filesystem is read-only, use /tmp on macOS, /dp on Linux
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
-            mkdir -p /tmp/dp
-            git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /tmp/dp/rich_rust
-            git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /tmp/dp/toon_rust
-            git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /tmp/dp/frankentui
-            sed -i '' 's|/dp/|/tmp/dp/|g' Cargo.toml
-          else
-            sudo mkdir -p /dp
-            sudo chown $USER /dp
-            git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
-            git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /dp/toon_rust
-            git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
-          fi
-      - name: Clone local path dependencies (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $driveRoot = [System.IO.Path]::GetPathRoot((Get-Location).Path)
-          $dp = Join-Path $driveRoot "dp"
-          New-Item -ItemType Directory -Force -Path $dp | Out-Null
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git (Join-Path $dp "rich_rust")
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git (Join-Path $dp "toon_rust")
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git (Join-Path $dp "frankentui")
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-06
@@ -431,13 +342,6 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
-      - name: Clone local path dependencies
-        run: |
-          sudo mkdir -p /dp
-          sudo chown $USER /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /dp/toon_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-06

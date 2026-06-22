@@ -410,18 +410,24 @@ detect_platform() {
 
     TARGET="${os}-${arch}"
 
-    # Map to release target triples used by GitHub Actions artifacts
+    # Map to release target triples used by GitHub Actions artifacts.
+    # RELEASE_TARGETS is an ordered candidate list: the download step tries each
+    # in turn and uses the first asset that actually exists in the release. This
+    # matters for linux-x86_64, where the preferred fully-static -musl asset is
+    # not always published (e.g. a dsr fallback release that cut only -gnu);
+    # falling back to -gnu keeps install working whenever either asset exists
+    # (rch#23).
     RELEASE_ARCHIVE_EXT="tar.gz"
-    RELEASE_TARGET=""
+    RELEASE_TARGETS=()
     case "${os}-${arch}" in
-        linux-x86_64)  RELEASE_TARGET="x86_64-unknown-linux-musl" ;;
-        linux-aarch64) RELEASE_TARGET="aarch64-unknown-linux-gnu" ;;
-        darwin-x86_64) RELEASE_TARGET="x86_64-apple-darwin" ;;
-        darwin-aarch64) RELEASE_TARGET="aarch64-apple-darwin" ;;
-        windows-x86_64) RELEASE_TARGET="x86_64-pc-windows-msvc"; RELEASE_ARCHIVE_EXT="zip" ;;
+        linux-x86_64)   RELEASE_TARGETS=("x86_64-unknown-linux-musl" "x86_64-unknown-linux-gnu") ;;
+        linux-aarch64)  RELEASE_TARGETS=("aarch64-unknown-linux-gnu") ;;
+        darwin-x86_64)  RELEASE_TARGETS=("x86_64-apple-darwin") ;;
+        darwin-aarch64) RELEASE_TARGETS=("aarch64-apple-darwin") ;;
+        windows-x86_64) RELEASE_TARGETS=("x86_64-pc-windows-msvc"); RELEASE_ARCHIVE_EXT="zip" ;;
     esac
-    if [[ -z "$RELEASE_TARGET" ]]; then
-        RELEASE_TARGET="$TARGET"
+    if [[ ${#RELEASE_TARGETS[@]} -eq 0 ]]; then
+        RELEASE_TARGETS=("$TARGET")
     fi
 
     success "Platform: $TARGET"
@@ -695,16 +701,23 @@ download_binaries() {
         fi
     fi
 
-    if [[ -n "$tag_name" && -n "$RELEASE_TARGET" ]]; then
-        local versioned_asset="rch-${tag_name}-${RELEASE_TARGET}.${asset_ext}"
-        local versioned_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${versioned_asset}"
-        info "Downloading $versioned_asset from $tag_name..."
-        if curl -fsSL "${PROXY_ARGS[@]}" "$versioned_url" -o "$TEMP_DIR/$versioned_asset" 2>/dev/null; then
-            downloaded=true
-            asset_name="$versioned_asset"
-            checksum_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${versioned_asset}.sha256"
-            checksum_tag="$tag_name"
-        fi
+    if [[ -n "$tag_name" && ${#RELEASE_TARGETS[@]} -gt 0 ]]; then
+        # Try each candidate target triple in preference order and use the first
+        # asset that actually exists in this release (rch#23: linux-x86_64 falls
+        # back from -musl to -gnu when only -gnu was published).
+        local candidate_target
+        for candidate_target in "${RELEASE_TARGETS[@]}"; do
+            local versioned_asset="rch-${tag_name}-${candidate_target}.${asset_ext}"
+            local versioned_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${versioned_asset}"
+            info "Downloading $versioned_asset from $tag_name..."
+            if curl -fsSL "${PROXY_ARGS[@]}" "$versioned_url" -o "$TEMP_DIR/$versioned_asset" 2>/dev/null; then
+                downloaded=true
+                asset_name="$versioned_asset"
+                checksum_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${versioned_asset}.sha256"
+                checksum_tag="$tag_name"
+                break
+            fi
+        done
     fi
 
     if [[ "$downloaded" != "true" ]]; then
