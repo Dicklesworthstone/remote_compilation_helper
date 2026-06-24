@@ -47,9 +47,20 @@ impl Drop for UpdateDownloadDir {
 }
 
 /// Download and verify a release.
+/// Decide whether to *enforce* sigstore signature verification for a release.
+///
+/// The signature is a hard gate only when a bundle is published, the operator
+/// has not passed `--skip-verify`, and `cosign` is available. On hosts without
+/// cosign (e.g. the worker fleet) verification degrades to a warning so
+/// `rch update` still works; the checksum is enforced regardless.
+fn should_enforce_signature(has_bundle: bool, skip_verify: bool, cosign_available: bool) -> bool {
+    has_bundle && !skip_verify && cosign_available
+}
+
 pub async fn download_release(
     ctx: &OutputContext,
     update: &UpdateCheck,
+    skip_verify: bool,
 ) -> Result<DownloadedRelease, UpdateError> {
     // Find the asset for our platform.
     let archive_asset = find_archive_asset(&update.assets, &update.latest_version.to_string())?;
@@ -111,24 +122,47 @@ pub async fn download_release(
             .iter()
             .find(|a| a.name == format!("{}.sigstore.json", archive_asset.name));
 
-        let signature_bundle_path = if let Some(sig_asset) = signature_bundle_asset {
-            if !ctx.is_json() {
-                println!("Verifying signature (sigstore bundle)...");
+        let cosign_available = which::which("cosign").is_ok();
+        let signature_bundle_path = match signature_bundle_asset {
+            Some(sig_asset) if should_enforce_signature(true, skip_verify, cosign_available) => {
+                if !ctx.is_json() {
+                    println!("Verifying signature (sigstore bundle)...");
+                }
+                let sig_path = asset_temp_path(temp_dir.path(), &sig_asset.name)?;
+                download_with_retry(
+                    &sig_asset.browser_download_url,
+                    &sig_path,
+                    &sig_asset.name,
+                    MAX_DOWNLOAD_ATTEMPTS,
+                )
+                .await?;
+                Some(sig_path)
             }
-            let sig_path = asset_temp_path(temp_dir.path(), &sig_asset.name)?;
-            download_with_retry(
-                &sig_asset.browser_download_url,
-                &sig_path,
-                &sig_asset.name,
-                MAX_DOWNLOAD_ATTEMPTS,
-            )
-            .await?;
-            Some(sig_path)
-        } else {
-            if !ctx.is_json() {
-                println!("Warning: No sigstore bundle available, skipping signature verification");
+            Some(_) => {
+                // A bundle was published but verification is disabled — either the
+                // operator passed --skip-verify or cosign is unavailable on this
+                // host. Degrade to a warning; the checksum below is still enforced.
+                if !ctx.is_json() {
+                    if skip_verify {
+                        println!(
+                            "Warning: skipping signature verification (--skip-verify); checksum still enforced"
+                        );
+                    } else {
+                        println!(
+                            "Warning: cosign not found in PATH; skipping signature verification (checksum still enforced)"
+                        );
+                    }
+                }
+                None
             }
-            None
+            None => {
+                if !ctx.is_json() {
+                    println!(
+                        "Warning: No sigstore bundle available, skipping signature verification"
+                    );
+                }
+                None
+            }
         };
 
         let verification = if let Some(bundle_path) = signature_bundle_path.as_deref() {
@@ -422,6 +456,18 @@ mod tests {
     use super::super::types::ReleaseAsset;
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn signature_enforced_only_with_bundle_cosign_and_no_skip() {
+        // Full enforcement: a bundle is published, no --skip-verify, cosign present.
+        assert!(should_enforce_signature(true, false, true));
+        // No bundle published -> nothing to enforce.
+        assert!(!should_enforce_signature(false, false, true));
+        // Operator opted out with --skip-verify.
+        assert!(!should_enforce_signature(true, true, true));
+        // cosign unavailable (e.g. the worker fleet) -> degrade to checksum-only.
+        assert!(!should_enforce_signature(true, false, false));
+    }
 
     fn test_asset(name: &str) -> ReleaseAsset {
         ReleaseAsset {
