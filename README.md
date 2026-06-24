@@ -137,7 +137,10 @@ cp target/release/rchd ~/.local/bin/
 
 ### Source Build Note
 
-This workspace currently uses FrankenTUI path dependencies (`ftui-*`) from `/dp/frankentui/crates/...` in `Cargo.toml`. Ensure that dependency tree is available when building from source in this environment.
+All dependencies — including the FrankenTUI (`ftui-*`), `rich_rust`, and TOON
+(`tru`) crates — resolve from crates.io, so a clean `git clone && cargo build`
+builds on any machine with no special directory layout or pre-cloned
+dependency tree required.
 
 ---
 
