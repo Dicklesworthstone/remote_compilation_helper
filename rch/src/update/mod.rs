@@ -100,7 +100,7 @@ pub async fn run_update(
     }
 
     // Download and verify
-    let download = download_release(ctx, &update_info).await?;
+    let download = download_release(ctx, &update_info, skip_verify).await?;
 
     if !download.checksum_verified {
         let asset = download
