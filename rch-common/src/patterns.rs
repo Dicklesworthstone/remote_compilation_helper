@@ -291,6 +291,41 @@ pub fn classify_command(cmd: &str) -> Classification {
     classify_command_inner(cmd, 0)
 }
 
+/// Detect a command that *would* be a compilation command if it weren't for an
+/// (unsafe / unhandled) pipe/redirect/background/subshell structure — i.e. one
+/// that the classifier declines purely because of its shell structure rather
+/// than because the underlying program is not a compiler (issue #24, item 3).
+///
+/// Returns the structural reason (e.g. "piped command", "subshell execution")
+/// when the leading program token IS a known compilation tool but the command
+/// is declined by Tier 1 structure analysis. Returns `None` otherwise (so the
+/// hint is only surfaced for genuine structure-driven declines, never for
+/// `ls | grep cargo` and friends).
+///
+/// Callers (the hook) can use this to emit an observable hint/warn when running
+/// on an orchestrator with `force_remote = true`, so the silent local fallback
+/// becomes visible.
+pub fn declined_compilation_due_to_structure(cmd: &str) -> Option<&'static str> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // If the full classifier already accepts (and will offload) it, there is no
+    // decline to report.
+    if classify_command(trimmed).is_compilation {
+        return None;
+    }
+    // Only report when Tier 1 structure analysis is the reason AND the leading
+    // program word is a recognized compilation tool.
+    let reason = check_structure(trimmed)?;
+    let normalized = normalize_command(trimmed);
+    if starts_with_compilation_command(normalized.as_ref()) {
+        Some(reason)
+    } else {
+        None
+    }
+}
+
 /// Maximum recursion depth for multi-command splitting.
 /// Depth 0 = top-level call that may split; depth 1 = sub-command (no further splitting).
 #[allow(dead_code)] // Reserved for future multi-command classification
@@ -317,6 +352,29 @@ fn classify_command_inner(cmd: &str, depth: u8) -> Classification {
         && let Some(result) = try_classify_compound_command(cmd)
     {
         return result;
+    }
+
+    // Tier 0.6: Wrapper / benign-suffix handling (only at depth 0).
+    //
+    // Handles the dominant agent invocation forms that would otherwise be
+    // rejected by Tier 1 structure analysis and silently fall back to local
+    // compilation (issue #24):
+    //   - `bash -c "cargo test ..."` / `sh -c "cargo test ..."` (extract inner)
+    //   - `cargo check --lib 2>&1 | head`  (pipe into a benign pager)
+    //   - `cargo test ... > file 2>&1`     (benign stdout/stderr file redirect)
+    //   - `cargo test ... &`               (backgrounding)
+    //
+    // We stay conservative: only the leading compilation command is offloaded,
+    // and the benign trailing structure is re-attached to the offloaded
+    // command's output stream (`rch exec -- <cmd> <suffix>`). We never offload
+    // when the pipeline transforms the command's INPUT or chains another build.
+    if depth == 0 && cmd.len() < MAX_SPLIT_INPUT_LEN {
+        if let Some(result) = try_classify_wrapped_command(cmd) {
+            return result;
+        }
+        if let Some(result) = try_classify_benign_suffix_command(cmd) {
+            return result;
+        }
     }
 
     // Tier 1: Structure analysis - reject complex shell structures
@@ -424,6 +482,423 @@ fn try_classify_compound_command(cmd: &str) -> Option<Classification> {
         prefix,
         last_segment.to_string(),
     ))
+}
+
+/// Benign pager/sink commands that may sit on the right-hand side of a pipe
+/// without transforming the build's *input*. Piping a compilation command's
+/// output into one of these is safe to offload — the offloaded command's
+/// output is simply re-piped into the same pager locally.
+///
+/// We intentionally keep this list small and conservative. Commands that
+/// would alter exit status semantics in a surprising way, or that consume
+/// and re-emit transformed data feeding a subsequent build, are excluded.
+const BENIGN_PAGER_COMMANDS: &[&str] = &[
+    "tee", "head", "cat", "grep", "less", "more", "tail", "wc", "rg",
+];
+
+/// Try to classify a `bash -c "<cmd>"` / `sh -c "<cmd>"` wrapper by extracting
+/// and classifying the inner command (issue #24, item 2).
+///
+/// On success the inner command is offloaded directly (the shell wrapper is
+/// dropped, since `rch exec -- <inner>` runs the same program). We mirror the
+/// `cd X && ...` compound handling: the inner command is classified at depth 0
+/// so it can itself be a compound / benign-suffix / further-wrapped command.
+///
+/// Conservative: we only handle the simple, single-quoted-string form
+/// `bash -c "<inner>"` with no trailing tokens after the inner string and no
+/// extra flags before `-c`. Anything more exotic falls through to Tier 1.
+fn try_classify_wrapped_command(cmd: &str) -> Option<Classification> {
+    let cmd = cmd.trim();
+
+    // Match `bash -c` or `sh -c` (also /bin/bash, /usr/bin/sh, etc.) followed by
+    // a single quoted argument that is the entire remainder of the command.
+    let rest = strip_shell_dash_c_prefix(cmd)?;
+    let rest = rest.trim_start();
+
+    // The remainder must be a single quoted string and nothing else after it.
+    let inner = extract_single_quoted_argument(rest)?;
+    if inner.trim().is_empty() {
+        return None;
+    }
+
+    // Classify the inner command at depth 0 so it can itself be compound or
+    // carry a benign suffix (e.g. `bash -c "cd x && cargo test > log 2>&1"`).
+    let inner_classification = classify_command_inner(&inner, 0);
+    if !inner_classification.is_compilation {
+        return None;
+    }
+
+    // Rebuild the command that should actually be offloaded. If the inner
+    // command was itself compound/suffixed, prefer its rewritten form so the
+    // prefix/suffix is preserved; otherwise the inner command is offloaded
+    // verbatim.
+    let (prefix, extracted) = match (
+        &inner_classification.command_prefix,
+        &inner_classification.extracted_command,
+    ) {
+        (Some(p), Some(e)) => (p.clone(), e.clone()),
+        _ => (String::new(), inner.trim().to_string()),
+    };
+
+    Some(Classification::compound_compilation(
+        inner_classification.kind?,
+        inner_classification.confidence,
+        "shell -c wrapper with compilation command",
+        prefix,
+        extracted,
+    ))
+}
+
+/// Strip a leading `bash -c` / `sh -c` (with optional absolute path) and return
+/// the remainder of the command. Returns `None` if the prefix does not match.
+fn strip_shell_dash_c_prefix(cmd: &str) -> Option<&str> {
+    // Split the leading whitespace-delimited words to inspect the shell + flag,
+    // but return a slice of the ORIGINAL string for the remainder so quoting in
+    // the inner argument is preserved.
+    let trimmed = cmd.trim_start();
+    let mut idx = 0;
+    let bytes = trimmed.as_bytes();
+
+    // Word 1: the shell executable.
+    let word1_end = next_word_end(bytes, idx)?;
+    let shell = &trimmed[idx..word1_end];
+    if !shell_basename_is(shell, "bash") && !shell_basename_is(shell, "sh") {
+        return None;
+    }
+    idx = skip_spaces(bytes, word1_end);
+
+    // Word 2: must be exactly `-c`.
+    let word2_end = next_word_end(bytes, idx)?;
+    if &trimmed[idx..word2_end] != "-c" {
+        return None;
+    }
+    idx = skip_spaces(bytes, word2_end);
+
+    if idx >= trimmed.len() {
+        return None;
+    }
+    Some(&trimmed[idx..])
+}
+
+/// Return true if `word`'s basename (after the last `/`) equals `name`.
+fn shell_basename_is(word: &str, name: &str) -> bool {
+    word.rsplit('/').next().map(|b| b == name).unwrap_or(false)
+}
+
+/// Index just past the end of the (unquoted) word starting at `start`.
+/// Returns `None` if `start` is already at end of input.
+fn next_word_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if start >= bytes.len() || bytes[start].is_ascii_whitespace() {
+        return None;
+    }
+    let mut i = start;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    Some(i)
+}
+
+/// Skip ASCII spaces/tabs starting at `start`, returning the next non-space index.
+fn skip_spaces(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Extract the contents of a single `"..."` or `'...'` quoted argument that
+/// spans the ENTIRE input (modulo surrounding whitespace). Returns `None` if
+/// the input is not exactly one quoted string (e.g. it has trailing tokens, or
+/// embedded unescaped quotes of the same kind that would terminate early).
+fn extract_single_quoted_argument(s: &str) -> Option<String> {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let quote = bytes[0];
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+
+    let mut out = String::with_capacity(s.len());
+    let mut i = 1;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Backslash escaping only applies inside double quotes (POSIX).
+        if quote == b'"' && b == b'\\' && i + 1 < bytes.len() {
+            out.push(bytes[i + 1] as char);
+            i += 2;
+            continue;
+        }
+        if b == quote {
+            // Closing quote: everything after must be whitespace only.
+            if s[i + 1..].trim().is_empty() {
+                return Some(out);
+            }
+            return None;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    // Unterminated quote.
+    None
+}
+
+/// Try to classify a compilation command followed ONLY by a benign trailing
+/// structure (issue #24, item 1):
+///   - backgrounding: `cargo test ... &`
+///   - benign stdout/stderr file redirect: `cargo test ... > file 2>&1`
+///   - pipe into a benign pager: `cargo check --lib 2>&1 | head`
+///
+/// The leading command (everything before the first top-level structural
+/// operator) is classified as a normal command. If it is a compilation
+/// command, the benign suffix is re-attached to the offloaded command so the
+/// shell re-applies it to `rch exec`'s output:
+///   `cargo check --lib 2>&1 | head` → `rch exec -- cargo check --lib 2>&1 | head`
+///
+/// Conservative rejections (fall through to Tier 1):
+///   - input redirects (`< file`) — transform the command's INPUT
+///   - pipes into anything not on `BENIGN_PAGER_COMMANDS` (could chain a build
+///     or transform data)
+///   - any subshell / command substitution / `&&` / `||` / `;` chaining
+///   - more than one pipe stage (keep it simple and safe)
+fn try_classify_benign_suffix_command(cmd: &str) -> Option<Classification> {
+    let cmd = cmd.trim();
+
+    // Bail out fast on chaining / subshell / capture / input-redirect forms;
+    // those are handled (or rejected) elsewhere and are never "benign suffix".
+    if cmd.contains("&&") || cmd.contains("||") || cmd.contains(';') {
+        return None;
+    }
+    if cmd.contains('(') || cmd.contains('`') || cmd.contains("$(") {
+        return None;
+    }
+
+    // Locate the first top-level (unquoted) structural boundary: a single `|`,
+    // a standalone trailing `&`, or a file-redirect `>` / `<`.
+    let boundary = find_first_structural_boundary(cmd)?;
+    let (leading_raw, suffix_raw) = cmd.split_at(boundary.byte_pos);
+    let leading = leading_raw.trim();
+    let suffix = suffix_raw; // keep the operator + whatever follows
+    if leading.is_empty() {
+        return None;
+    }
+
+    // Validate the suffix is benign for this boundary kind.
+    if !suffix_is_benign(boundary.kind, suffix) {
+        return None;
+    }
+
+    // Classify the leading command at depth 1 so it is treated as a single
+    // command (no further splitting / wrapper handling).
+    let leading_classification = classify_command_inner(leading, 1);
+    if !leading_classification.is_compilation {
+        return None;
+    }
+
+    // Re-attach the benign suffix to the offloaded command. We normalize the
+    // separating whitespace so the rebuilt command is `<leading> <suffix>`.
+    let extracted = format!("{} {}", leading, suffix.trim());
+
+    Some(Classification::compound_compilation(
+        leading_classification.kind?,
+        leading_classification.confidence,
+        "compilation command with benign trailing redirect/pipe/background",
+        String::new(),
+        extracted,
+    ))
+}
+
+/// Kind of structural boundary found at the top level of a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundaryKind {
+    /// A single `|` pipe.
+    Pipe,
+    /// A standalone trailing `&` (backgrounding).
+    Background,
+    /// A `>` / `>>` output file redirect.
+    OutputRedirect,
+    /// A `<` input file redirect (always rejected for offload).
+    InputRedirect,
+}
+
+struct StructuralBoundary {
+    byte_pos: usize,
+    kind: BoundaryKind,
+}
+
+/// Find the first top-level (unquoted) structural boundary in `cmd`, skipping
+/// fd-to-fd redirects like `2>&1` / `>&2` which are NOT boundaries (they belong
+/// to the preceding command and are safe to offload inline).
+fn find_first_structural_boundary(cmd: &str) -> Option<StructuralBoundary> {
+    let bytes = cmd.as_bytes();
+    let len = bytes.len();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' && !in_single {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if in_single || in_double {
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'|' => {
+                // `||` is chaining and is handled/rejected by the caller's guard,
+                // but be defensive.
+                if i + 1 < len && bytes[i + 1] == b'|' {
+                    return None;
+                }
+                return Some(StructuralBoundary {
+                    byte_pos: i,
+                    kind: BoundaryKind::Pipe,
+                });
+            }
+            b'&' => {
+                // `&&` is chaining (rejected by caller). A standalone `&` is
+                // backgrounding. `2>&1` / `>&2` are fd dups: prev byte is `>`.
+                if i + 1 < len && bytes[i + 1] == b'&' {
+                    return None;
+                }
+                let prev = if i > 0 { bytes[i - 1] } else { 0 };
+                if prev == b'>' {
+                    // part of an fd-to-fd redirect, not a boundary
+                    i += 1;
+                    continue;
+                }
+                return Some(StructuralBoundary {
+                    byte_pos: i,
+                    kind: BoundaryKind::Background,
+                });
+            }
+            b'>' => {
+                // Skip fd-to-fd redirects `>&` (e.g. 2>&1) — not a boundary.
+                if i + 1 < len && bytes[i + 1] == b'&' {
+                    i += 2;
+                    if i < len && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    continue;
+                }
+                // `>(` process substitution — leave for Tier 1 to reject.
+                if i + 1 < len && bytes[i + 1] == b'(' {
+                    return None;
+                }
+                return Some(StructuralBoundary {
+                    byte_pos: i,
+                    kind: BoundaryKind::OutputRedirect,
+                });
+            }
+            b'<' => {
+                if i + 1 < len && bytes[i + 1] == b'(' {
+                    return None;
+                }
+                return Some(StructuralBoundary {
+                    byte_pos: i,
+                    kind: BoundaryKind::InputRedirect,
+                });
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Validate that the trailing structure (operator + remainder) is benign for
+/// offloading, given the kind of the first boundary.
+fn suffix_is_benign(kind: BoundaryKind, suffix: &str) -> bool {
+    // The suffix must not itself contain a further top-level boundary that we
+    // haven't validated (e.g. `> log | tee x` or `| head | build`). We allow at
+    // most ONE structural stage by requiring that, after the first boundary,
+    // the remainder has no additional unquoted boundary — EXCEPT fd-to-fd dups.
+    match kind {
+        BoundaryKind::InputRedirect => false,
+        BoundaryKind::Background => {
+            // `cmd &` — only valid if `&` is the LAST meaningful token.
+            // Reject `cmd & other` (a second command after backgrounding).
+            let after = suffix.trim_start_matches('&').trim();
+            after.is_empty()
+        }
+        BoundaryKind::OutputRedirect => {
+            // `> file 2>&1`, `>> file`, `> a.log` — must not contain a further
+            // pipe / background / input redirect / chaining.
+            !suffix_has_disallowed_followup(suffix)
+        }
+        BoundaryKind::Pipe => {
+            // `| <pager> ...` — the RHS command word must be a benign pager and
+            // there must be no further pipe stage or chaining.
+            let rhs = suffix.trim_start_matches('|').trim();
+            if rhs.is_empty() {
+                return false;
+            }
+            let rhs_cmd = rhs.split_whitespace().next().unwrap_or("");
+            let rhs_base = rhs_cmd.rsplit('/').next().unwrap_or(rhs_cmd);
+            if !BENIGN_PAGER_COMMANDS.contains(&rhs_base) {
+                return false;
+            }
+            !suffix_has_disallowed_followup(rhs)
+        }
+    }
+}
+
+/// Returns true if `s` contains ANY further disallowed top-level structural
+/// operator (a pipe, backgrounding, or input redirect) anywhere after the
+/// initial benign stage. Output redirects (`> file`, `2>&1`) are allowed to
+/// repeat (e.g. `> out.log 2>&1`), but a pipe/background/input redirect mixed
+/// into the suffix means it is more than a single benign stage and must not be
+/// offloaded.
+///
+/// We scan the WHOLE string (not just the first boundary) so forms like
+/// `> a.log < in.txt` — where the dangerous `< in.txt` follows a benign `>` —
+/// are correctly rejected.
+fn suffix_has_disallowed_followup(s: &str) -> bool {
+    let mut rest = s;
+    loop {
+        match find_first_structural_boundary(rest) {
+            Some(b) => {
+                if matches!(
+                    b.kind,
+                    BoundaryKind::Pipe | BoundaryKind::Background | BoundaryKind::InputRedirect
+                ) {
+                    return true;
+                }
+                // Benign output redirect: advance past it and keep scanning the
+                // remainder for any disallowed operator.
+                let next = b.byte_pos + 1;
+                if next >= rest.len() {
+                    return false;
+                }
+                rest = &rest[next..];
+            }
+            None => return false,
+        }
+    }
 }
 
 /// Split a command on && only (simpler than split_multi_command).
@@ -646,11 +1121,26 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
         reason: Cow::Borrowed("command present"),
     });
 
-    // Tier 0.5: Compound command handling, mirroring classify_command_inner().
-    // Without this branch, diagnostics could reject a command such as
-    // `cd /repo && cargo build` while the hook classifier accepts it.
+    // Tier 0.5: Compound / wrapper / benign-suffix handling, mirroring
+    // classify_command_inner(). Without this branch, diagnostics could reject a
+    // command such as `cd /repo && cargo build`, `bash -c "cargo test"`, or
+    // `cargo check 2>&1 | head` while the hook classifier accepts and offloads
+    // it (issue #24).
     if cmd.len() < MAX_SPLIT_INPUT_LEN
-        && let Some(classification) = try_classify_compound_command(cmd)
+        && let Some((classification, structure_reason)) = try_classify_compound_command(cmd)
+            .map(|c| (c, "safe compound command with compilation suffix"))
+            .or_else(|| {
+                try_classify_wrapped_command(cmd)
+                    .map(|c| (c, "shell -c wrapper with compilation command"))
+            })
+            .or_else(|| {
+                try_classify_benign_suffix_command(cmd).map(|c| {
+                    (
+                        c,
+                        "compilation command with benign trailing redirect/pipe/background",
+                    )
+                })
+            })
     {
         let normalized = classification
             .extracted_command
@@ -661,7 +1151,7 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
             tier: 1,
             name: Cow::Borrowed(TIER_STRUCTURE_ANALYSIS),
             decision: TierDecision::Pass,
-            reason: Cow::Borrowed("safe compound command with compilation suffix"),
+            reason: Cow::Borrowed(structure_reason),
         });
         tiers.push(ClassificationTier {
             tier: 2,
@@ -1703,19 +2193,37 @@ mod tests {
     }
 
     #[test]
-    fn test_piped_command_not_intercepted() {
+    fn test_piped_to_benign_pager_intercepted() {
         let _guard = test_guard!();
+        // Issue #24: piping a compilation command's output into a benign pager
+        // (grep/head/tee/...) is now offloaded, with the pipe re-attached to the
+        // offloaded command's output.
         let result = classify_command("cargo build 2>&1 | grep error");
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("cargo build 2>&1 | grep error")
+        );
+    }
+
+    #[test]
+    fn test_piped_to_nonbenign_command_not_intercepted() {
+        let _guard = test_guard!();
+        // Piping into a non-pager command stays conservative (declined).
+        let result = classify_command("cargo build | xargs rm");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("piped"));
     }
 
     #[test]
-    fn test_backgrounded_not_intercepted() {
+    fn test_backgrounded_intercepted() {
         let _guard = test_guard!();
+        // Issue #24: a trailing `&` (backgrounding) is now offloaded.
         let result = classify_command("cargo build &");
-        assert!(!result.is_compilation);
-        assert!(result.reason.contains("background"));
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
+        assert_eq!(result.extracted_command.as_deref(), Some("cargo build &"));
     }
 
     #[test]
@@ -1732,16 +2240,30 @@ mod tests {
     }
 
     #[test]
-    fn test_redirected_not_intercepted() {
+    fn test_redirected_intercepted() {
         let _guard = test_guard!();
+        // Issue #24: a benign stdout/stderr file redirect is now offloaded with
+        // the redirect re-attached to the offloaded command's output.
         let result = classify_command("cargo build > log.txt");
-        assert!(!result.is_compilation);
-        assert!(result.reason.contains("redirect"));
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("cargo build > log.txt")
+        );
+
+        let result = classify_command("cargo test --workspace > out.log 2>&1");
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("cargo test --workspace > out.log 2>&1")
+        );
     }
 
     #[test]
     fn test_input_redirected_not_intercepted() {
         let _guard = test_guard!();
+        // Input redirects transform the command's INPUT and are never offloaded.
         let result = classify_command("cargo build < input.txt");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("input redirected"));
@@ -2221,25 +2743,29 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_bun_piped_commands_not_intercepted() {
+    fn test_bun_piped_to_benign_pager_intercepted() {
         let _guard = test_guard!();
-        // Piped commands should be rejected at Tier 1 (structure analysis)
+        // Issue #24: piping a bun test/typecheck into a benign pager is offloaded.
         let result = classify_command("bun test | grep error");
-        assert!(!result.is_compilation);
-        assert!(
-            result.reason.contains("piped"),
-            "Should be rejected as piped command"
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(result.kind, Some(CompilationKind::BunTest));
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("bun test | grep error")
         );
 
         // Piped with output filtering
         let result = classify_command("bun test 2>&1 | tee output.log");
-        assert!(!result.is_compilation);
-        assert!(result.reason.contains("piped"));
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("bun test 2>&1 | tee output.log")
+        );
 
         // Piped typecheck
         let result = classify_command("bun typecheck | head -20");
-        assert!(!result.is_compilation);
-        assert!(result.reason.contains("piped"));
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(result.kind, Some(CompilationKind::BunTypecheck));
     }
 
     #[test]
@@ -2263,24 +2789,27 @@ mod tests {
     }
 
     #[test]
-    fn test_bun_redirected_not_intercepted() {
+    fn test_bun_redirected_intercepted() {
         let _guard = test_guard!();
-        // Output redirection should be rejected at Tier 1
+        // Issue #24: a benign output redirect is offloaded.
         let result = classify_command("bun test > results.txt");
-        assert!(!result.is_compilation);
-        assert!(result.reason.contains("redirect"));
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("bun test > results.txt")
+        );
 
         let result = classify_command("bun typecheck > errors.log");
-        assert!(!result.is_compilation);
+        assert!(result.is_compilation, "got: {:?}", result.reason);
     }
 
     #[test]
-    fn test_bun_backgrounded_not_intercepted() {
+    fn test_bun_backgrounded_intercepted() {
         let _guard = test_guard!();
-        // Backgrounded commands should be rejected at Tier 1
+        // Issue #24: a trailing `&` is offloaded.
         let result = classify_command("bun test &");
-        assert!(!result.is_compilation);
-        assert!(result.reason.contains("background"));
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(result.extracted_command.as_deref(), Some("bun test &"));
     }
 
     #[test]
@@ -2351,11 +2880,21 @@ mod tests {
     #[test]
     fn test_classify_command_detailed_rejects_piped() {
         let _guard = test_guard!();
-        let detailed = classify_command_detailed("cargo build | tee log.txt");
+        // Pipe into a NON-benign command is still rejected at Tier 1. (A pipe
+        // into a benign pager like `tee` is now offloaded per issue #24.)
+        let detailed = classify_command_detailed("cargo build | xargs rm");
         assert!(!detailed.classification.is_compilation);
         let tier1 = detailed.tiers.iter().find(|t| t.tier.eq(&1)).unwrap();
         assert_eq!(tier1.decision, TierDecision::Reject);
         assert!(tier1.reason.contains("piped"));
+
+        // A pipe into a benign pager passes Tier 1 and is offloaded.
+        let detailed = classify_command_detailed("cargo build | tee log.txt");
+        assert!(detailed.classification.is_compilation);
+        assert_eq!(
+            detailed.classification.extracted_command.as_deref(),
+            Some("cargo build | tee log.txt")
+        );
     }
 
     #[test]
@@ -2745,30 +3284,40 @@ mod tests {
     }
 
     #[test]
-    fn test_cargo_nextest_piped_not_intercepted() {
+    fn test_cargo_nextest_piped_to_pager_intercepted() {
         let _guard = test_guard!();
-        // Piped commands should be rejected at Tier 1
+        // Issue #24: piping into a benign pager is offloaded.
         let result = classify_command("cargo nextest run | grep FAIL");
-        assert!(!result.is_compilation);
-        assert!(result.reason.contains("piped"));
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("cargo nextest run | grep FAIL")
+        );
     }
 
     #[test]
-    fn test_cargo_nextest_redirected_not_intercepted() {
+    fn test_cargo_nextest_redirected_intercepted() {
         let _guard = test_guard!();
-        // Redirected commands should be rejected at Tier 1
+        // Issue #24: a benign output redirect is offloaded.
         let result = classify_command("cargo nextest run > results.txt");
-        assert!(!result.is_compilation);
-        assert!(result.reason.contains("redirect"));
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("cargo nextest run > results.txt")
+        );
     }
 
     #[test]
-    fn test_cargo_nextest_backgrounded_not_intercepted() {
+    fn test_cargo_nextest_backgrounded_intercepted() {
         let _guard = test_guard!();
-        // Backgrounded commands should be rejected at Tier 1
+        // Issue #24: a trailing `&` is offloaded.
         let result = classify_command("cargo nextest run &");
-        assert!(!result.is_compilation);
-        assert!(result.reason.contains("background"));
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("cargo nextest run &")
+        );
     }
 
     // =========================================================================
@@ -2861,12 +3410,16 @@ mod tests {
     }
 
     #[test]
-    fn test_cargo_bench_piped_not_intercepted() {
+    fn test_cargo_bench_piped_to_pager_intercepted() {
         let _guard = test_guard!();
-        // Piped commands should be rejected at Tier 1
+        // Issue #24: piping into a benign pager (tee) is offloaded.
         let result = classify_command("cargo bench | tee output.txt");
-        assert!(!result.is_compilation);
-        assert!(result.reason.contains("piped"));
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(result.kind, Some(CompilationKind::CargoBench));
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("cargo bench | tee output.txt")
+        );
     }
 
     #[test]
@@ -3669,12 +4222,16 @@ mod tests {
         // --- Pipe preservation with split ---
 
         #[test]
-        fn test_classify_pipe_preserved_in_segment() {
+        fn test_classify_pipe_to_pager_preserved() {
             let _guard = test_guard!();
-            // Pipe within a segment is NOT a split point; segment stays whole
-            // and gets rejected by check_structure (piped command)
+            // Issue #24: a compilation command piped into a benign pager is
+            // offloaded with the pipe re-attached to the offloaded output.
             let result = classify_command("cargo build 2>&1 | tee log");
-            assert!(!result.is_compilation, "piped command should be rejected");
+            assert!(result.is_compilation, "got: {:?}", result.reason);
+            assert_eq!(
+                result.extracted_command.as_deref(),
+                Some("cargo build 2>&1 | tee log")
+            );
         }
 
         #[test]
@@ -3793,20 +4350,21 @@ mod tests {
     #[test]
     fn test_cow_borrowed_on_tier1_reject() {
         let _guard = test_guard!();
-        // Piped command -> Tier 1 structure analysis reject
-        let result = classify_command("cargo build | tee log");
+        // Pipe into a NON-benign command -> Tier 1 structure analysis reject
+        // (benign pagers like tee/head are now offloaded per issue #24).
+        let result = classify_command("cargo build | xargs rm");
         assert!(!result.is_compilation);
         assert_cow_borrowed(&result.reason, "Tier 1 piped command reason");
 
-        // Backgrounded command
-        let result = classify_command("cargo build &");
+        // Input redirect -> still rejected (transforms the command's INPUT)
+        let result = classify_command("cargo build < input.txt");
         assert!(!result.is_compilation);
-        assert_cow_borrowed(&result.reason, "Tier 1 backgrounded command reason");
+        assert_cow_borrowed(&result.reason, "Tier 1 input redirect reason");
 
-        // Output redirected
-        let result = classify_command("cargo build > log.txt");
+        // Subshell -> still rejected
+        let result = classify_command("cargo build $(echo args)");
         assert!(!result.is_compilation);
-        assert_cow_borrowed(&result.reason, "Tier 1 redirected command reason");
+        assert_cow_borrowed(&result.reason, "Tier 1 subshell reason");
     }
 
     #[test]
@@ -5302,42 +5860,13 @@ mod regression_classification {
     fn regression_shell_structure_exclusions() {
         let _guard = test_guard!();
         let cases = [
-            // Pipes
+            // Pipe into a NON-benign command -> still rejected (issue #24 only
+            // offloads pipes into benign pagers like tee/head/grep).
             Case {
-                cmd: "cargo build 2>&1 | grep error",
+                cmd: "cargo build 2>&1 | xargs rm",
                 expect_compilation: false,
                 expected_kind: None,
                 reason_contains: "piped",
-                min_confidence: 0.0,
-            },
-            Case {
-                cmd: "cargo test | tee output.log",
-                expect_compilation: false,
-                expected_kind: None,
-                reason_contains: "piped",
-                min_confidence: 0.0,
-            },
-            // Background
-            Case {
-                cmd: "cargo build &",
-                expect_compilation: false,
-                expected_kind: None,
-                reason_contains: "background",
-                min_confidence: 0.0,
-            },
-            // Output redirect
-            Case {
-                cmd: "cargo build > log.txt",
-                expect_compilation: false,
-                expected_kind: None,
-                reason_contains: "redirect",
-                min_confidence: 0.0,
-            },
-            Case {
-                cmd: "cargo build >> log.txt",
-                expect_compilation: false,
-                expected_kind: None,
-                reason_contains: "redirect",
                 min_confidence: 0.0,
             },
             // Input redirect
@@ -5411,6 +5940,149 @@ mod regression_classification {
             },
         ];
         run_cases(&cases);
+    }
+
+    // ------------------------------------------------------------------
+    // 10b. Benign trailing structure IS offloaded (issue #24).
+    //
+    // A compilation command followed only by a benign stdout/stderr redirect,
+    // a pipe into a benign pager (tee/head/cat/grep/less/...), or backgrounding
+    // is now extracted and offloaded, with the trailing structure re-attached
+    // to the offloaded command's output.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_benign_trailing_structure_offloaded() {
+        let _guard = test_guard!();
+        let expectations: &[(&str, CompilationKind, &str)] = &[
+            // Output redirects
+            (
+                "cargo build > log.txt",
+                CompilationKind::CargoBuild,
+                "cargo build > log.txt",
+            ),
+            (
+                "cargo build >> log.txt",
+                CompilationKind::CargoBuild,
+                "cargo build >> log.txt",
+            ),
+            (
+                "cargo test --workspace > out.log 2>&1",
+                CompilationKind::CargoTest,
+                "cargo test --workspace > out.log 2>&1",
+            ),
+            // Pipes into benign pagers
+            (
+                "cargo build 2>&1 | grep error",
+                CompilationKind::CargoBuild,
+                "cargo build 2>&1 | grep error",
+            ),
+            (
+                "cargo test | tee output.log",
+                CompilationKind::CargoTest,
+                "cargo test | tee output.log",
+            ),
+            (
+                "cargo check --lib 2>&1 | head",
+                CompilationKind::CargoCheck,
+                "cargo check --lib 2>&1 | head",
+            ),
+            // Backgrounding
+            (
+                "cargo build &",
+                CompilationKind::CargoBuild,
+                "cargo build &",
+            ),
+        ];
+        for (cmd, kind, extracted) in expectations {
+            let result = classify_command(cmd);
+            assert!(
+                result.is_compilation,
+                "'{cmd}' should be offloaded, got: {:?}",
+                result.reason
+            );
+            assert_eq!(result.kind, Some(*kind), "kind mismatch for '{cmd}'");
+            assert_eq!(
+                result.extracted_command.as_deref(),
+                Some(*extracted),
+                "extracted command mismatch for '{cmd}'"
+            );
+            // command_prefix is empty for benign-suffix (no leading prefix).
+            assert_eq!(result.command_prefix.as_deref(), Some(""));
+        }
+    }
+
+    #[test]
+    fn regression_unsafe_trailing_structure_still_rejected() {
+        let _guard = test_guard!();
+        // Stay conservative: these forms transform input / chain a build / pipe
+        // into a non-pager, and must NOT be offloaded.
+        let rejected = [
+            "cargo build < input.txt",           // input redirect
+            "cargo build | xargs rm",            // non-benign pipe target
+            "cargo build 2>&1 | grep e | sh",    // multi-stage pipe
+            "cargo test | tee log && cargo run", // chained build
+            "cargo build > a.log < in.txt",      // input redirect present
+        ];
+        for cmd in rejected {
+            let result = classify_command(cmd);
+            assert!(
+                !result.is_compilation,
+                "'{cmd}' should NOT be offloaded, got: {:?}",
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn regression_shell_dash_c_wrapper_offloaded() {
+        let _guard = test_guard!();
+        // Issue #24 item 2: bash -c / sh -c wrappers extract the inner command.
+        let result = classify_command("bash -c \"cargo test --workspace\"");
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(result.kind, Some(CompilationKind::CargoTest));
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("cargo test --workspace")
+        );
+
+        let result = classify_command("sh -c 'cargo build --release'");
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("cargo build --release")
+        );
+
+        // Absolute-path shell.
+        let result = classify_command("/bin/bash -c \"cargo check\"");
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+
+        // Inner compound is preserved (cd prefix kept).
+        let result = classify_command("bash -c \"cd /repo && cargo build\"");
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("cargo build"),
+            "inner compound should keep extracted command"
+        );
+        assert_eq!(result.command_prefix.as_deref(), Some("cd /repo && "));
+
+        // Inner benign suffix is preserved.
+        let result = classify_command("bash -c \"cargo test > log 2>&1\"");
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("cargo test > log 2>&1")
+        );
+
+        // Non-compilation inner -> not intercepted.
+        let result = classify_command("bash -c \"ls -la\"");
+        assert!(!result.is_compilation);
+
+        // Inner command that is itself a never-intercept stays declined.
+        let result = classify_command("bash -c \"cargo fmt\"");
+        assert!(!result.is_compilation);
     }
 
     // ------------------------------------------------------------------
@@ -5728,8 +6400,10 @@ mod regression_classification {
             tier3.reason
         );
 
-        // Piped command: should reject at Tier 1 (structure analysis)
-        let details = classify_command_detailed("cargo build | grep error");
+        // Pipe into a NON-benign command: rejected at Tier 1 (structure
+        // analysis). A pipe into a benign pager (grep/tee/head) is offloaded
+        // instead (issue #24), so use a non-pager target here.
+        let details = classify_command_detailed("cargo build | xargs rm");
         assert!(!details.classification.is_compilation);
         let tier1 = details.tiers.iter().find(|t| t.tier == 1).unwrap();
         assert_eq!(tier1.decision, TierDecision::Reject);
@@ -5815,9 +6489,9 @@ mod regression_classification {
             "ninja clean",
             "gcc --version",
             "rustc --version",
-            "cargo build | grep error",
-            "cargo build &",
-            "cargo build > log.txt",
+            "cargo build | xargs rm",
+            "cargo build < input.txt",
+            "cargo build || echo failed",
             "(cargo build)",
         ];
         for cmd in non_compilation_cmds {

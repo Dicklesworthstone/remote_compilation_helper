@@ -36,7 +36,8 @@ use rch_common::{
     RequiredRuntime, SelectedMode, SelectedWorker, SelectionReason, SelectionResponse,
     SelfHealingConfig, ToolchainInfo, TransferConfig, WorkerConfig, WorkerId,
     build_dependency_closure_plan_with_policy, build_invocation, classify_command,
-    default_socket_path, mock, normalize_project_path_with_policy,
+    declined_compilation_due_to_structure, default_socket_path, mock,
+    normalize_project_path_with_policy,
     path_topology::PathTopologyPolicy,
     redaction::{redact_path, redact_secrets},
     ui::{
@@ -1240,6 +1241,30 @@ async fn process_hook(input: HookInput) -> HookOutput {
                 "Non-compilation decision: {:.3}ms for '{}' ({})",
                 duration_ms, command, classification.reason
             );
+        }
+
+        // Issue #24, item 3: surface a hint when we decline a command that is a
+        // compilation command in disguise but whose pipe/redirect/background/
+        // subshell structure we can't safely offload. On an orchestrator with
+        // force_remote=true this would otherwise be an *invisible* local
+        // fallback (a silent rustc/cc storm). Only loads config on this rare
+        // path to avoid touching the hot non-compilation path.
+        if let Some(structure_reason) = declined_compilation_due_to_structure(command) {
+            let force_remote = load_config()
+                .map(|cfg| cfg.general.force_remote)
+                .unwrap_or(false);
+            if force_remote {
+                warn!(
+                    "⚠️ RCH: declined to offload compilation command due to shell structure \
+                     ({structure_reason}) while force_remote=true — running LOCALLY: '{command}'. \
+                     Run it as a bare command (no unsupported pipe/subshell) so it can be offloaded."
+                );
+            } else {
+                debug!(
+                    "RCH: declined to offload compilation command due to shell structure \
+                     ({structure_reason}): '{command}'"
+                );
+            }
         }
         return HookOutput::allow();
     }

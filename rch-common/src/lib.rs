@@ -190,7 +190,8 @@ pub use path_topology::{
 };
 pub use patterns::{
     Classification, ClassificationDetails, ClassificationTier, CompilationKind, TierDecision,
-    classify_command, classify_command_detailed, split_shell_commands,
+    classify_command, classify_command_detailed, declined_compilation_due_to_structure,
+    split_shell_commands,
 };
 pub use protocol::{HookInput, HookOutput, ToolInput};
 pub use queue_contract::{

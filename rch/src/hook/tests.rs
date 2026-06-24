@@ -806,25 +806,41 @@ fn test_classification_env_wrapped_commands() {
 #[test]
 fn test_classification_rejects_shell_metachars() {
     let _guard = test_guard!();
-    // Piped commands should not be intercepted
+    // Issue #24: benign trailing structure (pipe to pager / background /
+    // redirect) is now extracted and offloaded rather than declined.
     let result = classify_command("cargo build | tee log.txt");
-    assert!(!result.is_compilation);
-    assert!(result.reason.contains("pipe"));
+    assert!(result.is_compilation, "got: {:?}", result.reason);
+    assert_eq!(
+        result.extracted_command.as_deref(),
+        Some("cargo build | tee log.txt")
+    );
 
-    // Backgrounded commands should not be intercepted
     let result = classify_command("cargo build &");
-    assert!(!result.is_compilation);
-    assert!(result.reason.contains("background"));
+    assert!(result.is_compilation, "got: {:?}", result.reason);
+    assert_eq!(result.extracted_command.as_deref(), Some("cargo build &"));
 
-    // Redirected commands should not be intercepted
     let result = classify_command("cargo build > output.log");
-    assert!(!result.is_compilation);
-    assert!(result.reason.contains("redirect"));
+    assert!(result.is_compilation, "got: {:?}", result.reason);
+    assert_eq!(
+        result.extracted_command.as_deref(),
+        Some("cargo build > output.log")
+    );
 
-    // Subshell capture should not be intercepted
+    // Truly unsafe structures are still declined.
+    // Subshell capture should not be intercepted.
     let result = classify_command("result=$(cargo build)");
     assert!(!result.is_compilation);
     assert!(result.reason.contains("subshell"));
+
+    // Input redirect (transforms input) should not be intercepted.
+    let result = classify_command("cargo build < input.txt");
+    assert!(!result.is_compilation);
+    assert!(result.reason.contains("input"));
+
+    // Pipe into a non-pager command should not be intercepted.
+    let result = classify_command("cargo build | xargs rm");
+    assert!(!result.is_compilation);
+    assert!(result.reason.contains("pipe"));
 }
 
 #[test]
@@ -8128,8 +8144,9 @@ fn test_structured_log_output_per_tier() {
     assert_eq!(d.tiers[0].decision, TierDecision::Reject);
     assert!(!d.tiers[0].reason.is_empty());
 
-    // Tier 1 reject: piped command
-    let d = classify_command_detailed("cargo build | tee log");
+    // Tier 1 reject: input redirect (transforms input; still declined).
+    // Note: `cargo build | tee log` is now ACCEPTED (issue #24 benign pager).
+    let d = classify_command_detailed("cargo build < input.txt");
     assert!(
         d.tiers
             .iter()

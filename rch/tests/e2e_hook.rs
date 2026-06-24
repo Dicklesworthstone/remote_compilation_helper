@@ -830,14 +830,16 @@ fn test_hook_classification_details_piped_rejection() {
         .logger
         .info("TEST START: test_hook_classification_details_piped_rejection");
 
-    let detailed = classify_command_detailed("cargo build | tee log.txt");
+    // Issue #24: a pipe into a NON-benign command is still rejected at Tier 1.
+    // (Benign pagers such as `tee`/`head` are now offloaded instead.)
+    let detailed = classify_command_detailed("cargo build | xargs rm");
 
     // Should be rejected at Tier 1 (structure analysis)
     let tier1 = detailed.tiers.iter().find(|t| t.tier == 1).unwrap();
     assert_eq!(
         tier1.decision,
         TierDecision::Reject,
-        "Tier 1 should reject piped command"
+        "Tier 1 should reject pipe into non-pager command"
     );
     assert!(
         tier1.reason.contains("piped"),
@@ -846,6 +848,14 @@ fn test_hook_classification_details_piped_rejection() {
 
     // Final classification should be non-compilation
     assert!(!detailed.classification.is_compilation);
+
+    // A pipe into a benign pager IS now offloaded (Tier 1 passes).
+    let offloaded = classify_command_detailed("cargo build | tee log.txt");
+    assert!(offloaded.classification.is_compilation);
+    assert_eq!(
+        offloaded.classification.extracted_command.as_deref(),
+        Some("cargo build | tee log.txt")
+    );
 
     harness
         .logger

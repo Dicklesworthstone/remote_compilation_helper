@@ -39,9 +39,12 @@
 //!      not panic the classifier. CRITICAL fail-open property: a
 //!      panic in classify is the project's "exit non-zero blocks the
 //!      agent" worst case.
-//!   P6 `unquoted_top_level_metacharacters_are_not_intercepted` —
-//!      piped/redirected/backgrounded commands must NOT be intercepted
-//!      per AGENTS.md ("Piped/redirected/backgrounded commands").
+//!   P6 structural-suffix contract (issue #24) —
+//!      * a pipe into a NON-benign command, or an input redirect, MUST NOT
+//!        be intercepted (conservative decline);
+//!      * a pipe into a benign pager (tee/head/grep/...), a benign
+//!        stdout/stderr redirect, or backgrounding IS offloaded with the
+//!        trailing structure preserved verbatim in the extracted command.
 //!
 //! Each proptest runs ≥1024 cases by default; CI can scale via
 //! `PROPTEST_CASES=N`.
@@ -174,16 +177,22 @@ proptest! {
 // P6 — Unquoted top-level shell metacharacters disable interception
 // =============================================================================
 //
-// Per AGENTS.md "Commands NOT Intercepted (run locally)":
-//     * Piped/redirected/backgrounded commands
+// Structural-suffix contract (issue #24).
 //
-// The hook MUST NOT redirect a command like `cargo build | tee log.txt`
-// to a remote worker — the pipe target only exists locally. Similarly
-// `cargo test > out.log`, `cargo run &`, etc.
+// The classifier offloads a leading compilation command when the only
+// trailing structure is BENIGN:
+//   * a pipe into a benign pager (tee/head/cat/grep/less/...),
+//   * a benign stdout/stderr file redirect (`> out.log`, `2>&1`),
+//   * backgrounding (`&`).
+// In those cases the trailing structure is re-attached verbatim to the
+// offloaded command's output (`rch exec -- <cmd> <suffix>`), so a pipe
+// target that only exists locally still works (the offloaded command's
+// stdout is piped locally after `rch exec` returns it).
 //
-// We generate any documented compilation command (cargo build, cargo
-// test, gcc, etc.) and append an unquoted pipe/redirect/background
-// suffix. The classification must come back NOT intercepted.
+// It stays conservative and DECLINES (runs locally) when the structure
+// could change semantics: an input redirect (`< file`), a pipe into a
+// non-pager command, or any chaining/subshell. We generate documented
+// compilation commands and assert both halves of this contract.
 
 /// Compilation command prefixes that ARE normally intercepted. Pulled
 /// directly from AGENTS.md "Supported Commands" list. Kept as a
@@ -202,50 +211,82 @@ const NORMALLY_INTERCEPTED_PREFIXES: &[&str] = &[
     "make",
 ];
 
+// Benign pager commands that MAY sit on the RHS of a pipe and still be
+// offloaded (issue #24). Mirrors `BENIGN_PAGER_COMMANDS` in patterns.rs.
+const BENIGN_PAGERS: &[&str] = &[
+    "tee", "head", "cat", "grep", "less", "more", "tail", "wc", "rg",
+];
+
 proptest! {
-    /// Any documented compilation command becomes NOT intercepted once
-    /// it gains an unquoted top-level pipe/redirect/background. The
-    /// classifier must respect this even when the metacharacter appears
-    /// at varied positions in the command.
+    /// Issue #24: a documented compilation command piped into a NON-benign
+    /// command (anything not in the small pager allowlist) MUST NOT be
+    /// intercepted. We generate a random RHS word and `prop_assume!` it is
+    /// not a benign pager, so the property targets exactly the conservative
+    /// decline path.
     #[test]
-    fn p6_top_level_pipe_disables_interception(
+    fn p6_pipe_into_non_pager_disables_interception(
         prefix_idx in 0usize..NORMALLY_INTERCEPTED_PREFIXES.len(),
-        // Trailing args before the metacharacter — kept ASCII-safe so
-        // the shell tokenizer reads them as ordinary tokens.
+        // Trailing args before the pipe — kept ASCII-safe so the shell
+        // tokenizer reads them as ordinary tokens.
         middle in "[a-zA-Z0-9._\\-=/ ]{0,40}",
-        metachar in r"[|>&]",
-        suffix in "[a-zA-Z0-9._/\\-]{0,40}",
+        rhs in "[a-zA-Z][a-zA-Z0-9._\\-]{0,20}",
     ) {
+        // Only fire for RHS commands that are NOT benign pagers.
+        prop_assume!(!BENIGN_PAGERS.contains(&rhs.as_str()));
+
         let prefix = NORMALLY_INTERCEPTED_PREFIXES[prefix_idx];
-        // Baseline: the bare command (and middle args) IS intercepted.
-        // We assert this so the property fires only when the bare form
-        // would have been classified as compilation — protecting
-        // against a false-positive scenario where the prefix didn't
-        // generate compilation in the first place.
         let baseline = format!("{prefix} {middle}");
         let baseline_class = classify_command(baseline.trim());
         prop_assume!(baseline_class.is_compilation);
 
-        // Now add the metacharacter. Classification MUST flip to
-        // not-intercepted.
-        let piped = format!("{prefix} {middle} {metachar} {suffix}");
+        let piped = format!("{prefix} {middle} | {rhs}");
         let piped_class = classify_command(&piped);
         prop_assert!(
             !piped_class.is_compilation,
-            "unquoted top-level `{metachar}` must disable interception, \
+            "pipe into non-pager `{rhs}` must disable interception, \
              but {piped:?} classified as compilation ({piped_class:?})"
         );
     }
 }
 
 proptest! {
-    /// Trailing `&` (background) at the top level disables
-    /// interception. Separated from the `|>&` test because the `&`
-    /// inside the character class would also generate `&&` (logical AND)
-    /// which IS allowed in the chain prefix, complicating the assertion.
-    /// This test pins the bare trailing-& case explicitly.
+    /// Issue #24: a documented compilation command piped into a BENIGN pager
+    /// IS offloaded, with the entire pipeline preserved verbatim in the
+    /// extracted command (no rewriting that could change semantics).
     #[test]
-    fn p6b_trailing_ampersand_disables_interception(
+    fn p6b_pipe_into_pager_is_offloaded(
+        prefix_idx in 0usize..NORMALLY_INTERCEPTED_PREFIXES.len(),
+        middle in "[a-zA-Z0-9._\\-=/ ]{0,40}",
+        pager_idx in 0usize..BENIGN_PAGERS.len(),
+    ) {
+        let prefix = NORMALLY_INTERCEPTED_PREFIXES[prefix_idx];
+        let baseline = format!("{prefix} {middle}");
+        let baseline_class = classify_command(baseline.trim());
+        prop_assume!(baseline_class.is_compilation);
+
+        let pager = BENIGN_PAGERS[pager_idx];
+        let piped = format!("{} | {pager}", baseline.trim());
+        let piped_class = classify_command(&piped);
+        prop_assert!(
+            piped_class.is_compilation,
+            "pipe into benign pager `{pager}` must be offloaded, \
+             but {piped:?} declined ({piped_class:?})"
+        );
+        // The whole pipeline is preserved verbatim (re-attached to the
+        // offloaded command's output).
+        prop_assert_eq!(
+            piped_class.extracted_command.as_deref(),
+            Some(piped.as_str())
+        );
+    }
+}
+
+proptest! {
+    /// Issue #24: a trailing `&` (background) at the top level is now
+    /// OFFLOADED, with the `&` preserved on the extracted command so the
+    /// shell still backgrounds the offloaded build.
+    #[test]
+    fn p6c_trailing_ampersand_is_offloaded(
         prefix_idx in 0usize..NORMALLY_INTERCEPTED_PREFIXES.len(),
         middle in "[a-zA-Z0-9._\\-=/ ]{0,40}",
     ) {
@@ -254,12 +295,40 @@ proptest! {
         let baseline_class = classify_command(baseline.trim());
         prop_assume!(baseline_class.is_compilation);
 
-        let backgrounded = format!("{prefix} {middle} &");
+        let backgrounded = format!("{} &", baseline.trim());
         let bg_class = classify_command(&backgrounded);
         prop_assert!(
-            !bg_class.is_compilation,
-            "trailing top-level `&` must disable interception, \
-             but {backgrounded:?} classified as compilation ({bg_class:?})"
+            bg_class.is_compilation,
+            "trailing top-level `&` must be offloaded, \
+             but {backgrounded:?} declined ({bg_class:?})"
+        );
+        prop_assert_eq!(
+            bg_class.extracted_command.as_deref(),
+            Some(backgrounded.as_str())
+        );
+    }
+}
+
+proptest! {
+    /// An input redirect (`< file`) transforms the command's INPUT and must
+    /// NEVER be offloaded, regardless of the leading compilation command.
+    #[test]
+    fn p6d_input_redirect_disables_interception(
+        prefix_idx in 0usize..NORMALLY_INTERCEPTED_PREFIXES.len(),
+        middle in "[a-zA-Z0-9._\\-=/ ]{0,40}",
+        file in "[a-zA-Z0-9._/\\-]{1,30}",
+    ) {
+        let prefix = NORMALLY_INTERCEPTED_PREFIXES[prefix_idx];
+        let baseline = format!("{prefix} {middle}");
+        let baseline_class = classify_command(baseline.trim());
+        prop_assume!(baseline_class.is_compilation);
+
+        let redirected = format!("{} < {file}", baseline.trim());
+        let class = classify_command(&redirected);
+        prop_assert!(
+            !class.is_compilation,
+            "input redirect must disable interception, \
+             but {redirected:?} classified as compilation ({class:?})"
         );
     }
 }
@@ -284,20 +353,30 @@ fn known_inputs_classify_as_documented() {
         let c = classify_command(cmd);
         assert!(c.is_compilation, "documented compilation missed: {cmd:?}");
     }
-    // From AGENTS.md "Commands NOT Intercepted" — these must NOT be.
+    // These must NOT be intercepted (state-modifying, non-compilation, or
+    // structurally unsafe to offload).
     for cmd in [
         "bun install",
         "bun run dev",
         "bun test --watch",
-        "cargo build | tee log",
-        "cargo test > out.log",
-        "cargo run &",
         "echo hi",
+        "cargo build | xargs rm", // pipe into non-pager
+        "cargo build < in.txt",   // input redirect
+        "cargo build || echo x",  // chained
     ] {
         let c = classify_command(cmd);
-        assert!(
-            !c.is_compilation,
-            "documented non-intercept got intercepted: {cmd:?}"
-        );
+        assert!(!c.is_compilation, "non-intercept got intercepted: {cmd:?}");
+    }
+
+    // Issue #24: benign trailing structure IS now offloaded (with the
+    // structure preserved verbatim).
+    for (cmd, extracted) in [
+        ("cargo build | tee log", "cargo build | tee log"),
+        ("cargo test > out.log", "cargo test > out.log"),
+        ("cargo run &", "cargo run &"),
+    ] {
+        let c = classify_command(cmd);
+        assert!(c.is_compilation, "benign-suffix should offload: {cmd:?}");
+        assert_eq!(c.extracted_command.as_deref(), Some(extracted));
     }
 }

@@ -105,16 +105,24 @@ mod tests {
                 normalized, command);
         }
 
-        /// Property: commands with shell metacharacters are not classified as compilation.
-        /// All shell operators (pipes, redirects, subshells, chaining) are rejected for security.
+        /// Property: commands with UNSAFE shell metacharacters are not
+        /// classified as compilation. Subshells/command-substitution, input
+        /// redirects, and pipes into non-pager commands are still rejected.
+        ///
+        /// Note (issue #24): benign trailing structure — a pipe into a benign
+        /// pager, a benign stdout/stderr redirect, or backgrounding — is now
+        /// offloaded with the structure PRESERVED VERBATIM, which introduces no
+        /// injection (the offloaded command is the same text re-wrapped). Those
+        /// forms are covered by the dedicated benign-suffix tests instead.
         #[test]
         fn shell_metachar_rejected(
             prefix in "(cargo build|gcc -c|make|rustc) ",
             injection in prop::sample::select(vec![
-                "| cat /etc/passwd",
+                "| sh -s",
+                "| xargs rm -rf",
                 "$(whoami)",
                 "`id`",
-                "> /etc/passwd",
+                "< /etc/passwd",
             ])
         ) {
             let malicious = format!("{}{}", prefix, injection);
@@ -122,7 +130,7 @@ mod tests {
 
             let result = classify_command(&malicious);
 
-            // Invariant: pipes, subshells, redirects still reject
+            // Invariant: subshells, input redirects, non-pager pipes still reject
             prop_assert!(
                 !result.is_compilation,
                 "Shell metachar accepted: {} -> {:?}",
@@ -504,16 +512,32 @@ mod tests {
 
     #[test]
     fn regression_injection_pipe() {
+        // Issue #24: a pipe into a benign pager is offloaded with the pipe
+        // preserved verbatim (no injection — the extracted command is the same
+        // text re-wrapped as `rch exec -- <cmd>`).
         let result = classify_command("cargo build | tee log.txt");
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("cargo build | tee log.txt")
+        );
+
+        // A pipe into a non-pager command is still declined (conservative).
+        let result = classify_command("cargo build | sh");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("piped"));
     }
 
     #[test]
     fn regression_injection_background() {
+        // Issue #24: a trailing `&` is offloaded with the structure preserved.
         let result = classify_command("cargo build &");
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(result.extracted_command.as_deref(), Some("cargo build &"));
+
+        // `cmd & other` (second command after backgrounding) is still declined.
+        let result = classify_command("cargo build & rm -rf x");
         assert!(!result.is_compilation);
-        assert!(result.reason.contains("background"));
     }
 
     #[test]
