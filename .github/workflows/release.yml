@@ -295,6 +295,15 @@ jobs:
           echo "=== checksums.txt ==="
           cat checksums.txt
 
+      # Fail BEFORE publishing if any required target triple's archive +
+      # checksum is missing, so an incomplete release is never created. This is
+      # the prevention gate for rch#23 (a target the installer/updater asks for
+      # but the release never shipped). The REQUIRED set mirrors publish.needs.
+      - name: Gate — required release assets present (pre-publish)
+        run: |
+          chmod +x scripts/check_release_assets.sh
+          ./scripts/check_release_assets.sh --dir artifacts --tag "${{ needs.plan.outputs.tag }}"
+
       # SLSA Level 3 provenance attestation for supply chain security
       - name: Generate SLSA provenance
         uses: actions/attest-build-provenance@v2
@@ -519,6 +528,16 @@ jobs:
             artifacts/sbom.cdx.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Belt-and-suspenders: assert the LIVE published release actually contains
+      # every required archive + checksum (catches the release-upload action
+      # itself dropping a file after the pre-publish gate passed).
+      - name: Gate — published release assets present (post-publish)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x scripts/check_release_assets.sh
+          ./scripts/check_release_assets.sh --gh-release "${{ needs.plan.outputs.tag }}"
 
       - name: Summary
         run: |

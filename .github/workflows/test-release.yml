@@ -28,6 +28,10 @@ jobs:
             runs-on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             checksum_cmd: sha256sum
+          - name: linux-x86_64-musl
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            checksum_cmd: sha256sum
           - name: linux-aarch64
             runs-on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
@@ -59,6 +63,12 @@ jobs:
         with:
           shared-key: test-release-${{ matrix.target }}
           cache-on-failure: true
+
+      # musl is a fully static target; the linker needs musl-gcc. Only the
+      # musl matrix row hits this (no-op for every other target).
+      - name: Install musl tools (musl targets)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build (release) (unix)
         if: runner.os != 'Windows'

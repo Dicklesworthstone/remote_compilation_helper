@@ -64,6 +64,10 @@ jobs:
         run: |
           chmod +x scripts/check_no_dp_path_deps.sh
           ./scripts/check_no_dp_path_deps.sh
+      - name: Self-test release-asset-completeness gate (rch#23/#25 prevention)
+        run: |
+          chmod +x scripts/check_release_assets.sh
+          ./scripts/check_release_assets.sh --self-test
 
   # Validate GitHub Actions workflow syntax
   workflow_lint:
