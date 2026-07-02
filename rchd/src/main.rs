@@ -484,10 +484,8 @@ async fn main() -> Result<()> {
     }
 
     // Initialize worker selector
-    let worker_selector = Arc::new(WorkerSelector::with_config(
-        rch_config.selection.clone(),
-        rch_config.circuit.clone(),
-    ));
+    let mut worker_selector_inner =
+        WorkerSelector::with_config(rch_config.selection.clone(), rch_config.circuit.clone());
 
     // Verify and install Claude Code hook if needed (self-healing)
     if rch_config.self_healing.daemon_installs_hooks {
@@ -520,6 +518,38 @@ async fn main() -> Result<()> {
             config::DaemonConfig::default()
         }
     };
+
+    // Shared SSH connection pool for the daemon's per-worker background
+    // subsystems (health, telemetry, cache cleanup, stale-target reap, reclaim,
+    // toolchain probe). Historically each of these opened a throwaway
+    // `SshClient` per poll — a fresh ControlMaster spawned (and, with the
+    // openssh default ControlPersist, LEAKED) every ~30s per worker, flooding
+    // sshd and eventually tripping workers falsely DOWN. One warm master per
+    // worker is reused instead. Gated on the (previously dead) `connection_pooling`
+    // flag so it can be turned off if a site hits mux trouble; when `None` each
+    // subsystem falls back to its legacy throwaway path.
+    //
+    // The pool keeps a BOUNDED-idle master (ControlPersist=IdleFor(60)); the
+    // openssh crate's Forever default is deliberately avoided (see
+    // `control_persist_mode` — that default is exactly what leaked masters).
+    let ssh_pool: Option<Arc<rch_common::SshPool>> = if daemon_config.connection_pooling {
+        let pool_options = rch_common::SshOptions {
+            control_master: true,
+            control_persist_idle: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        info!("SSH connection pooling enabled (warm ControlMaster reuse)");
+        Some(Arc::new(rch_common::SshPool::new(pool_options)))
+    } else {
+        info!("SSH connection pooling disabled (per-call SSH sessions)");
+        None
+    };
+
+    // Attach the shared pool to the worker selector's toolchain preflight probe
+    // now that both the selector and the pool exist, then freeze the selector
+    // behind an Arc for the rest of the daemon.
+    worker_selector_inner.set_ssh_pool(ssh_pool.clone());
+    let worker_selector = Arc::new(worker_selector_inner);
 
     // Initialize build history
     let history = if let Some(ref path) = cli.history_file {
@@ -597,10 +627,10 @@ async fn main() -> Result<()> {
     }
 
     // Start cache cleanup scheduler
-    let cache_cleanup_scheduler = Arc::new(cache_cleanup::CacheCleanupScheduler::new(
-        worker_pool.clone(),
-        daemon_config.cache_cleanup,
-    ));
+    let cache_cleanup_scheduler = Arc::new(
+        cache_cleanup::CacheCleanupScheduler::new(worker_pool.clone(), daemon_config.cache_cleanup)
+            .with_ssh_pool(ssh_pool.clone()),
+    );
     let _cache_cleanup_handle = cache_cleanup_scheduler.start();
 
     // Start the worker-side stale per-job target dir reaper. The orchestrator hook
@@ -608,14 +638,17 @@ async fn main() -> Result<()> {
     // abandoned `.rch-target-*-job-*` dirs across ALL repos on each worker using
     // the same idle predicate (shared via rch_common::stale_target_reap).
     // Default-off for canary safety; env-overridable / opt-in via config.
-    let stale_target_reaper = Arc::new(stale_target_reap::StaleTargetReaper::new(
-        worker_pool.clone(),
-        // bd-28xs5: source the reaper config from the central remediation config
-        // (remediation.pooled_target) rather than rchd-local defaults; env knobs
-        // still override on top.
-        config::StaleTargetReapConfig::from_remediation(&rch_config.remediation)
-            .with_env_overrides(),
-    ));
+    let stale_target_reaper = Arc::new(
+        stale_target_reap::StaleTargetReaper::new(
+            worker_pool.clone(),
+            // bd-28xs5: source the reaper config from the central remediation config
+            // (remediation.pooled_target) rather than rchd-local defaults; env knobs
+            // still override on top.
+            config::StaleTargetReapConfig::from_remediation(&rch_config.remediation)
+                .with_env_overrides(),
+        )
+        .with_ssh_pool(ssh_pool.clone()),
+    );
     let _stale_target_reaper_handle = stale_target_reaper.start();
 
     // Create daemon context
@@ -739,7 +772,8 @@ async fn main() -> Result<()> {
     let health_config = health::HealthConfig::default();
     let health_monitor = health::HealthMonitor::new(worker_pool.clone(), health_config)
         .with_status_panel(worker_status_panel.clone())
-        .with_alert_manager(alert_manager.clone());
+        .with_alert_manager(alert_manager.clone())
+        .with_ssh_pool(ssh_pool.clone());
     let health_handle = health_monitor.start();
     info!("Health monitor started with alerting enabled");
 
@@ -748,7 +782,8 @@ async fn main() -> Result<()> {
         worker_pool.clone(),
         telemetry_store.clone(),
         TelemetryPollerConfig::default(),
-    );
+    )
+    .with_ssh_pool(ssh_pool.clone());
     let _telemetry_handle = telemetry_poller.start();
     info!("Telemetry poller started");
 
@@ -1044,6 +1079,15 @@ async fn main() -> Result<()> {
     }
     if let Some(handle) = cleanup_handle {
         handle.abort();
+    }
+
+    // Close the shared SSH connection pool so warm ControlMasters are torn down
+    // cleanly on shutdown rather than lingering until their idle timeout.
+    if let Some(pool) = &ssh_pool {
+        info!("Closing SSH connection pool...");
+        if let Err(e) = pool.close_all().await {
+            warn!("Error closing SSH connection pool: {}", e);
+        }
     }
 
     // Clean up socket

@@ -301,7 +301,10 @@ fn default_idle_threshold() -> u64 {
 }
 
 fn default_remote_base() -> String {
-    "/tmp/rch".to_string()
+    // Must agree with rch_common::default_remote_base and reclaim.rs — the
+    // managed `/data/tmp` ephemeral-build zone, not RAM-backed /tmp. See
+    // rch_common::default_remote_base for the rationale.
+    "/data/tmp/rch".to_string()
 }
 
 impl Default for CacheCleanupConfig {

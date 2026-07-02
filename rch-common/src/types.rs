@@ -1881,6 +1881,70 @@ impl CircuitStats {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
     }
+
+    /// Drive the circuit through a single health-check outcome and return the
+    /// resulting [`CircuitState`].
+    ///
+    /// This is the single, self-contained transition engine shared by every
+    /// circuit consumer (the daemon health monitor via
+    /// `WorkerState::record_health_check`, and the diagnostic `WorkerHealth`
+    /// panel via `WorkerHealth::observe`). Keeping the transition logic in ONE
+    /// place is what makes `WorkerState.circuit` (which selection reads) and the
+    /// diagnostic `WorkerHealth.circuit` agree.
+    ///
+    /// Behaviour:
+    /// - On a **healthy** outcome: if the circuit is Open and its cooldown has
+    ///   elapsed it first transitions Open → HalfOpen *before* crediting the
+    ///   success, so recovery needs exactly `success_threshold` clean probes
+    ///   (crediting a success against an Open circuit would be lost). Then the
+    ///   success is recorded and the circuit closes once the threshold is met.
+    /// - On an **unhealthy** outcome: the failure is recorded, the circuit opens
+    ///   if the closed-state open condition is met, and a HalfOpen probe failure
+    ///   reopens the circuit — UNLESS the failure was `transient` (a retryable
+    ///   transport blip that survived the in-check retries). A transient
+    ///   half-open failure neither reopens nor resets the cooldown, so a single
+    ///   network hiccup during recovery cannot bounce a worker back to Open.
+    /// - After either branch, an Open circuit past its cooldown is nudged to
+    ///   HalfOpen so probing resumes on the next poll even for a still-failing
+    ///   worker.
+    pub fn apply_health_outcome(
+        &mut self,
+        healthy: bool,
+        transient: bool,
+        config: &CircuitBreakerConfig,
+    ) -> CircuitState {
+        if healthy {
+            // Transition to half-open BEFORE crediting the success so the probe
+            // counts toward recovery. record_success() only increments the
+            // consecutive-success counter while in HalfOpen.
+            if self.state == CircuitState::Open && self.should_half_open(config) {
+                self.half_open();
+            }
+            self.record_success();
+            if self.should_close(config) {
+                self.close();
+            }
+        } else {
+            let was_half_open = self.state == CircuitState::HalfOpen;
+            self.record_failure();
+            if self.should_open(config) {
+                self.open();
+            } else if was_half_open && !transient {
+                // A real (non-transient) probe failure in half-open reopens the
+                // circuit and restarts the cooldown. A transient failure is
+                // ignored so a network blip can't undo an in-progress recovery.
+                self.open();
+            }
+        }
+
+        // Even for a still-failing worker, resume probing once the cooldown
+        // elapses so a recovered worker is retried promptly.
+        if self.state == CircuitState::Open && self.should_half_open(config) {
+            self.half_open();
+        }
+
+        self.state
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2348,8 +2412,15 @@ impl RetryConfig {
 }
 
 /// Default remote base path for project transfers.
+///
+/// Rooted under `/data/tmp` (the fleet-standard managed ephemeral-build zone)
+/// rather than `/tmp`: on the Linux workers `/tmp` is a RAM-backed tmpfs, so
+/// dispatched build artifacts placed there consume RAM and evade the disk-GC
+/// (sbh / datatmp-janitor) that watches `/data/tmp`. Keeping the remote base in
+/// the managed zone lets those reapers reclaim orphaned build trees. Must agree
+/// with the rchd cache-cleanup and reclaim `remote_base` defaults.
 pub fn default_remote_base() -> String {
-    "/tmp/rch".to_string()
+    "/data/tmp/rch".to_string()
 }
 
 /// Validate and normalize a remote base path.
@@ -3810,6 +3881,145 @@ retry_max = 2
     }
 
     #[test]
+    fn test_apply_health_outcome_opens_on_failure_threshold() {
+        let _guard = test_guard!();
+        // failure_threshold=3: three unhealthy outcomes open the circuit.
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            open_cooldown_secs: 300,
+            ..Default::default()
+        };
+        let mut stats = CircuitStats::new();
+        assert_eq!(
+            stats.apply_health_outcome(false, false, &config),
+            CircuitState::Closed
+        );
+        assert_eq!(
+            stats.apply_health_outcome(false, false, &config),
+            CircuitState::Closed
+        );
+        assert_eq!(
+            stats.apply_health_outcome(false, false, &config),
+            CircuitState::Open
+        );
+    }
+
+    #[test]
+    fn test_apply_health_outcome_half_open_two_probe_recovery() {
+        let _guard = test_guard!();
+        // success_threshold=2: recovery from Open needs exactly two clean probes.
+        // open_cooldown_secs=0 makes should_half_open() true immediately, so the
+        // engine's trailing nudge leaves an opened circuit already in HalfOpen —
+        // exactly the state a real daemon would be in on the next poll once the
+        // cooldown had elapsed. From HalfOpen the engine credits successes.
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            success_threshold: 2,
+            open_cooldown_secs: 0,
+            ..Default::default()
+        };
+        let mut stats = CircuitStats::new();
+        for _ in 0..3 {
+            stats.apply_health_outcome(false, false, &config);
+        }
+        // With a 0s cooldown the engine nudges Open -> HalfOpen immediately.
+        assert_eq!(stats.state(), CircuitState::HalfOpen);
+
+        // First healthy probe in half-open: one success credited, not yet closed.
+        let after_first = stats.apply_health_outcome(true, false, &config);
+        assert_eq!(after_first, CircuitState::HalfOpen);
+
+        // Second healthy probe: threshold met -> Closed.
+        let after_second = stats.apply_health_outcome(true, false, &config);
+        assert_eq!(after_second, CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_apply_health_outcome_transient_half_open_does_not_reopen() {
+        let _guard = test_guard!();
+        // A transient failure while half-open must NOT reset the recovery streak
+        // — a network blip can't undo an in-progress recovery.
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            success_threshold: 2,
+            open_cooldown_secs: 0,
+            ..Default::default()
+        };
+        let mut stats = CircuitStats::new();
+        for _ in 0..3 {
+            stats.apply_health_outcome(false, false, &config);
+        }
+        // 0s cooldown -> already nudged to HalfOpen.
+        assert_eq!(stats.state(), CircuitState::HalfOpen);
+
+        // One clean probe (1 of 2 needed).
+        assert_eq!(
+            stats.apply_health_outcome(true, false, &config),
+            CircuitState::HalfOpen
+        );
+
+        // Transient failure in half-open: stays HalfOpen (does NOT reopen the
+        // circuit or restart the cooldown). The key contrast with a real failure
+        // is that the circuit does not drop back to Open — probing continues in
+        // place, so recovery resumes immediately on the next clean probes rather
+        // than waiting out a fresh cooldown.
+        let after_transient = stats.apply_health_outcome(false, true, &config);
+        assert_eq!(after_transient, CircuitState::HalfOpen);
+
+        // Recovery still completes from half-open with the required clean probes.
+        assert_eq!(
+            stats.apply_health_outcome(true, false, &config),
+            CircuitState::HalfOpen
+        );
+        assert_eq!(
+            stats.apply_health_outcome(true, false, &config),
+            CircuitState::Closed
+        );
+    }
+
+    #[test]
+    fn test_apply_health_outcome_real_vs_transient_half_open_failure() {
+        let _guard = test_guard!();
+        // With a positive cooldown the difference is directly observable: a REAL
+        // half-open failure reopens the circuit (state -> Open, must wait out the
+        // cooldown again), whereas a TRANSIENT half-open failure keeps it in
+        // HalfOpen so recovery continues without a fresh cooldown.
+        //
+        // Manually drive to HalfOpen (open() + half_open()) so the positive
+        // cooldown doesn't force a real wallclock wait to reach half-open.
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            success_threshold: 2,
+            open_cooldown_secs: 300,
+            ..Default::default()
+        };
+
+        // Real failure path.
+        let mut real = CircuitStats::new();
+        real.open();
+        real.half_open();
+        assert_eq!(real.state(), CircuitState::HalfOpen);
+        let after_real = real.apply_health_outcome(false, false, &config);
+        assert_eq!(
+            after_real,
+            CircuitState::Open,
+            "a real half-open failure must reopen the circuit"
+        );
+
+        // Transient failure path (same starting state).
+        let mut transient = CircuitStats::new();
+        transient.open();
+        transient.half_open();
+        assert_eq!(transient.state(), CircuitState::HalfOpen);
+        let after_transient = transient.apply_health_outcome(false, true, &config);
+        assert_eq!(
+            after_transient,
+            CircuitState::HalfOpen,
+            "a transient half-open failure must NOT reopen the circuit"
+        );
+    }
+
+    #[test]
     fn test_circuit_stats_success_resets_consecutive_failures() {
         let _guard = test_guard!();
         let mut stats = CircuitStats::new();
@@ -4515,14 +4725,14 @@ retry_max = 2
     #[test]
     fn test_default_remote_base() {
         let _guard = test_guard!();
-        assert_eq!(default_remote_base(), "/tmp/rch");
+        assert_eq!(default_remote_base(), "/data/tmp/rch");
     }
 
     #[test]
     fn test_transfer_config_default_has_remote_base() {
         let _guard = test_guard!();
         let config = TransferConfig::default();
-        assert_eq!(config.remote_base, "/tmp/rch");
+        assert_eq!(config.remote_base, "/data/tmp/rch");
     }
 
     // ========================================================================

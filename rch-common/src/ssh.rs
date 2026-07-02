@@ -352,8 +352,23 @@ impl SshClient {
         self.connect().await
     }
 
-    /// Execute a command on the remote worker.
+    /// Execute a command on the remote worker using this client's configured
+    /// command timeout.
     pub async fn execute(&self, command: &str) -> Result<CommandResult> {
+        self.execute_with_timeout(command, self.options.command_timeout)
+            .await
+    }
+
+    /// Execute a command on the remote worker with an explicit per-call timeout.
+    ///
+    /// Used by the connection pool ([`SshPool::run_with_timeout`]) so a single
+    /// pooled client can serve calls with different timeouts (a fast health
+    /// probe vs. a slower cleanup) without mutating the shared client options.
+    pub async fn execute_with_timeout(
+        &self,
+        command: &str,
+        command_timeout: Duration,
+    ) -> Result<CommandResult> {
         let session = self.session.as_ref().context("Not connected to worker")?;
 
         let start = std::time::Instant::now();
@@ -426,7 +441,7 @@ impl SshClient {
             Ok::<_, anyhow::Error>((status, stdout, stderr))
         };
 
-        match tokio::time::timeout(self.options.command_timeout, execution_future).await {
+        match tokio::time::timeout(command_timeout, execution_future).await {
             Ok(result) => {
                 let (status, stdout, stderr) = result?;
                 let duration = start.elapsed();
@@ -455,9 +470,9 @@ impl SshClient {
                 // a timeout to avoid leaked remote processes.
                 warn!(
                     "Command timed out on {} after {:?}",
-                    self.config.id, self.options.command_timeout
+                    self.config.id, command_timeout
                 );
-                anyhow::bail!("Command timed out after {:?}", self.options.command_timeout);
+                anyhow::bail!("Command timed out after {:?}", command_timeout);
             }
         }
     }
@@ -792,6 +807,36 @@ impl SshPool {
     pub async fn active_connections(&self) -> usize {
         self.connections.read().await.len()
     }
+
+    /// Run a single command on a worker over a POOLED (warm, reused) connection,
+    /// bounded by `command_timeout`.
+    ///
+    /// This is the entry point daemon subsystems use instead of the throwaway
+    /// `SshClient::new().connect()...execute()...disconnect()` dance. It
+    /// [`get_or_connect`](Self::get_or_connect)s a live master (validating
+    /// liveness on borrow and reconnecting a dead one), runs exactly one command,
+    /// and — crucially — does NOT disconnect afterwards, keeping the
+    /// ControlMaster warm for the next call. That is the whole point: reuse one
+    /// master per worker instead of spawning (and, under the old code, leaking) a
+    /// fresh master for every telemetry/health/cleanup poll.
+    ///
+    /// The per-command timeout is applied via a temporary [`SshOptions`] override
+    /// on the pooled client so it does not disturb the pool's shared default
+    /// (e.g. a long build vs. a short health probe). The connect timeout and
+    /// control-master/persist settings come from the pool's options.
+    pub async fn run_with_timeout(
+        &self,
+        config: &WorkerConfig,
+        command: &str,
+        command_timeout: Duration,
+    ) -> Result<CommandResult> {
+        let client = self.get_or_connect(config).await?;
+        // Execute under a shared read lock: execute() needs only `&self`, so
+        // concurrent callers for the same worker can multiplex over the one
+        // master without serializing on a write lock.
+        let guard = client.read().await;
+        guard.execute_with_timeout(command, command_timeout).await
+    }
 }
 
 impl Default for SshPool {
@@ -928,6 +973,52 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(pool.active_connections().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_ssh_pool_reuses_single_entry_and_close_all_drops_to_zero() {
+        // Leak guard: repeated borrows of the SAME worker must reuse ONE pool
+        // entry (one warm master, not one-per-call), and close_all() must empty
+        // the pool. Uses the entry-creation path (get_or_create_client_entry) so
+        // the test needs no live SSH host; get_or_connect layers only a liveness
+        // probe + reconnect on top of this same entry map.
+        let _guard = test_guard!();
+        let options = SshOptions {
+            control_master: true,
+            control_persist_idle: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        let pool = SshPool::new(options);
+        let config = worker_config("worker-a", "192.168.1.100", "ubuntu", "~/.ssh/id_rsa");
+
+        for _ in 0..5 {
+            let _entry = pool.get_or_create_client_entry(&config).await;
+        }
+        assert_eq!(
+            pool.active_connections().await,
+            1,
+            "repeated borrows of one worker must reuse a single pool entry"
+        );
+
+        pool.close_all().await.expect("close_all should succeed");
+        assert_eq!(
+            pool.active_connections().await,
+            0,
+            "close_all must drop all pooled connections"
+        );
+    }
+
+    #[test]
+    fn test_pool_options_map_to_bounded_idle_persist() {
+        // Leak guard: the pool's mux options must map to a BOUNDED
+        // ControlPersist=IdleFor(60), never Closed/Forever. control_persist_mode
+        // is the single decision point configure_builder uses.
+        let _guard = test_guard!();
+        assert_eq!(
+            control_persist_mode(true, Some(Duration::from_secs(60))),
+            ControlPersistMode::IdleFor(NonZeroUsize::new(60).unwrap()),
+            "pool mux options must keep a warm master for a bounded idle window"
+        );
     }
 
     #[tokio::test]

@@ -188,8 +188,11 @@ pub struct CacheCleanupScheduler {
     last_cleanup: Arc<RwLock<HashMap<WorkerId, Instant>>>,
     /// First observed idle instant per worker (used for idle-threshold gating).
     idle_since: Arc<RwLock<HashMap<WorkerId, Instant>>>,
-    /// SSH options for cleanup commands.
+    /// SSH options for cleanup commands (throwaway fallback path).
     ssh_options: SshOptions,
+    /// Shared SSH connection pool. When `Some`, cleanup commands run over a warm
+    /// reused ControlMaster; when `None`, the legacy throwaway path is used.
+    ssh_pool: Option<Arc<rch_common::SshPool>>,
 }
 
 impl CacheCleanupScheduler {
@@ -201,7 +204,34 @@ impl CacheCleanupScheduler {
             last_cleanup: Arc::new(RwLock::new(HashMap::new())),
             idle_since: Arc::new(RwLock::new(HashMap::new())),
             ssh_options: SshOptions::default(),
+            ssh_pool: None,
         }
+    }
+
+    /// Attach a shared SSH connection pool for warm ControlMaster reuse.
+    #[must_use]
+    pub fn with_ssh_pool(mut self, pool: Option<Arc<rch_common::SshPool>>) -> Self {
+        self.ssh_pool = pool;
+        self
+    }
+
+    /// Run one remote command against a worker, using the shared pool (warm
+    /// master reuse) when configured, otherwise a throwaway SSH session.
+    async fn run_remote(
+        &self,
+        config: &rch_common::WorkerConfig,
+        command: &str,
+    ) -> anyhow::Result<rch_common::CommandResult> {
+        if let Some(pool) = &self.ssh_pool {
+            return pool
+                .run_with_timeout(config, command, self.ssh_options.command_timeout)
+                .await;
+        }
+        let mut ssh_client = SshClient::new(config.clone(), self.ssh_options.clone());
+        ssh_client.connect().await?;
+        let result = ssh_client.execute(command).await;
+        let _ = ssh_client.disconnect().await;
+        result
     }
 
     /// Start the cleanup scheduler.
@@ -365,11 +395,8 @@ impl CacheCleanupScheduler {
             self.config.min_free_gb,
         );
 
-        // Execute cleanup via SSH
-        let mut ssh_client = SshClient::new(config.clone(), self.ssh_options.clone());
-        ssh_client.connect().await?;
-
-        let result = ssh_client.execute(&cleanup_cmd).await?;
+        // Execute cleanup via SSH (pooled warm master when available).
+        let result = self.run_remote(&config, &cleanup_cmd).await?;
 
         // Update last cleanup time
         {
@@ -478,7 +505,7 @@ mod tests {
         assert_eq!(config.max_cache_age_hours, 72);
         assert_eq!(config.min_free_gb, 10);
         assert_eq!(config.idle_threshold_secs, 60);
-        assert_eq!(config.remote_base, "/tmp/rch");
+        assert_eq!(config.remote_base, "/data/tmp/rch");
     }
 
     #[test]

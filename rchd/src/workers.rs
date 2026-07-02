@@ -730,6 +730,30 @@ impl WorkerState {
         circuit.record_success();
     }
 
+    /// Drive the authoritative circuit through a single health-check outcome.
+    ///
+    /// This is the ONE write path the health monitor uses to move
+    /// `WorkerState.circuit` — the circuit the scheduler actually reads — so a
+    /// worker that fails a probe short-circuits out of selection and a recovered
+    /// worker rejoins, all through the shared
+    /// [`CircuitStats::apply_health_outcome`] engine. Returns
+    /// `(previous_state, new_state)` so the caller can detect transitions for
+    /// alerting/metrics without a second lock.
+    ///
+    /// `transient` flags a retryable transport blip that survived the in-check
+    /// retries; a transient half-open failure will not reopen the circuit.
+    pub async fn record_health_check(
+        &self,
+        healthy: bool,
+        transient: bool,
+        config: &CircuitBreakerConfig,
+    ) -> (CircuitState, CircuitState) {
+        let mut circuit = self.circuit.write().await;
+        let previous = circuit.state();
+        let new = circuit.apply_health_outcome(healthy, transient, config);
+        (previous, new)
+    }
+
     /// Record a failed operation for circuit breaker.
     pub async fn record_failure(&self, error_msg: Option<String>) {
         let mut circuit = self.circuit.write().await;
@@ -924,6 +948,14 @@ impl WorkerState {
         *self.lifecycle.write().await = WorkerLifecycle::new();
         *self.disabled_reason.write().await = None;
         self.disabled_at.store(0, Ordering::Relaxed);
+        // Also reset the circuit breaker — `WorkerState.circuit` is the single
+        // source of truth the scheduler reads, and re-enabling a worker whose
+        // circuit is still Open/HalfOpen would leave it short-circuited out of
+        // selection despite the operator explicitly bringing it back. This is a
+        // REAL reset (clears failure/success counters and error history), not a
+        // status flip. (Also clears last_error_msg, matching close_circuit.)
+        self.circuit.write().await.close();
+        *self.last_error_msg.write().await = None;
     }
 
     /// Check if worker is disabled (operator admin intent).
@@ -1387,7 +1419,10 @@ async fn refresh_worker_capabilities_for_worker(
 ) -> WorkerCapabilitiesRefreshInfo {
     let probe = tokio::time::timeout(
         CAPABILITIES_REFRESH_WORKER_BUDGET,
-        probe_worker_capabilities(&worker, CAPABILITIES_REFRESH_PROBE_TIMEOUT),
+        // On-demand capability refresh (the `rch workers capabilities` API path)
+        // uses a throwaway SSH session — it is a low-frequency operator query, not
+        // one of the ~30s periodic poll loops the shared pool exists to de-flood.
+        probe_worker_capabilities(&worker, CAPABILITIES_REFRESH_PROBE_TIMEOUT, None),
     )
     .await;
 
@@ -2123,6 +2158,61 @@ mod tests {
             None,
             "disabled_at should be None after enable()"
         );
+    }
+
+    #[tokio::test]
+    async fn test_record_health_check_drives_authoritative_circuit() {
+        // The health monitor's ONLY circuit write path is record_health_check;
+        // this is the circuit the scheduler reads via circuit_state(). Failures
+        // must open it, and a healthy streak must recover it — all through the
+        // shared apply_health_outcome engine.
+        let state = WorkerState::new(test_config("test"));
+        let cfg = CircuitBreakerConfig {
+            failure_threshold: 3,
+            success_threshold: 2,
+            open_cooldown_secs: 0,
+            ..Default::default()
+        };
+
+        // Starts Closed.
+        assert_eq!(state.circuit_state().await, Some(CircuitState::Closed));
+
+        // Three failures open the authoritative circuit.
+        for _ in 0..3 {
+            state.record_health_check(false, false, &cfg).await;
+        }
+        // With a 0s cooldown the engine immediately re-arms half-open after
+        // opening; the point is the circuit is no longer Closed, so selection
+        // sees it as non-healthy.
+        assert_ne!(state.circuit_state().await, Some(CircuitState::Closed));
+
+        // Two clean probes recover it to Closed.
+        state.record_health_check(true, false, &cfg).await;
+        let (_, new) = state.record_health_check(true, false, &cfg).await;
+        assert_eq!(new, CircuitState::Closed);
+        assert_eq!(state.circuit_state().await, Some(CircuitState::Closed));
+    }
+
+    #[tokio::test]
+    async fn test_enable_resets_authoritative_circuit() {
+        // enable() must REALLY reset the circuit the scheduler reads, not just
+        // flip lifecycle status — otherwise a re-enabled worker stays
+        // short-circuited out of selection.
+        let state = WorkerState::new(test_config("test"));
+
+        // Force the circuit Open, then record an error message.
+        state.open_circuit().await;
+        state.set_error("boom".to_string()).await;
+        assert_eq!(state.circuit_state().await, Some(CircuitState::Open));
+
+        // Operator re-enable must close the circuit and clear the error.
+        state.enable().await;
+        assert_eq!(
+            state.circuit_state().await,
+            Some(CircuitState::Closed),
+            "enable() must reset the authoritative circuit to Closed"
+        );
+        assert_eq!(state.last_error().await, None);
     }
 
     // --- Concurrent access tests ---

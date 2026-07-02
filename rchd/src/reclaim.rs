@@ -69,7 +69,9 @@ impl Default for ReclaimConfig {
             timeout: Duration::from_secs(120),
             min_idle_minutes: 10,
             protected_prefixes: vec![],
-            remote_base: "/tmp/rch".to_string(),
+            // Must agree with rch_common::default_remote_base and the rchd
+            // cache-cleanup default — the managed `/data/tmp` zone, not /tmp.
+            remote_base: "/data/tmp/rch".to_string(),
         }
     }
 }
@@ -349,6 +351,7 @@ pub struct ReclaimExecutor {
     history: Arc<BuildHistory>,
     config: ReclaimConfig,
     ssh_options: SshOptions,
+    ssh_pool: Option<Arc<rch_common::SshPool>>,
 }
 
 impl ReclaimExecutor {
@@ -359,7 +362,34 @@ impl ReclaimExecutor {
             history,
             config,
             ssh_options: SshOptions::default(),
+            ssh_pool: None,
         }
+    }
+
+    /// Attach a shared SSH connection pool for warm ControlMaster reuse.
+    #[must_use]
+    pub fn with_ssh_pool(mut self, pool: Option<Arc<rch_common::SshPool>>) -> Self {
+        self.ssh_pool = pool;
+        self
+    }
+
+    /// Run one remote command against a worker, using the shared pool (warm
+    /// master reuse) when configured, otherwise a throwaway SSH session.
+    async fn run_remote(
+        &self,
+        config: &rch_common::WorkerConfig,
+        command: &str,
+    ) -> anyhow::Result<rch_common::CommandResult> {
+        if let Some(pool) = &self.ssh_pool {
+            return pool
+                .run_with_timeout(config, command, self.ssh_options.command_timeout)
+                .await;
+        }
+        let mut ssh_client = SshClient::new(config.clone(), self.ssh_options.clone());
+        ssh_client.connect().await?;
+        let result = ssh_client.execute(command).await;
+        let _ = ssh_client.disconnect().await;
+        result
     }
 
     /// Evaluate and optionally execute reclaim on a single worker.
@@ -496,10 +526,7 @@ impl ReclaimExecutor {
             "Starting reclaim operation"
         );
 
-        let mut ssh_client = SshClient::new(config.clone(), self.ssh_options.clone());
-        ssh_client.connect().await?;
-
-        let result = ssh_client.execute(&cmd).await?;
+        let result = self.run_remote(&config, &cmd).await?;
         let duration = start.elapsed();
 
         let metrics = parse_reclaim_metrics(&result.stdout);
@@ -922,7 +949,7 @@ mod tests {
         assert_eq!(config.timeout, Duration::from_secs(120));
         assert_eq!(config.min_idle_minutes, 10);
         assert!(config.protected_prefixes.is_empty());
-        assert_eq!(config.remote_base, "/tmp/rch");
+        assert_eq!(config.remote_base, "/data/tmp/rch");
     }
 
     #[test]

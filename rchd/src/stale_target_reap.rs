@@ -174,6 +174,7 @@ pub struct StaleTargetReaper {
     pool: WorkerPool,
     config: StaleTargetReapConfig,
     ssh_options: SshOptions,
+    ssh_pool: Option<Arc<rch_common::SshPool>>,
 }
 
 impl StaleTargetReaper {
@@ -182,7 +183,34 @@ impl StaleTargetReaper {
             pool,
             config,
             ssh_options: SshOptions::default(),
+            ssh_pool: None,
         }
+    }
+
+    /// Attach a shared SSH connection pool for warm ControlMaster reuse.
+    #[must_use]
+    pub fn with_ssh_pool(mut self, pool: Option<Arc<rch_common::SshPool>>) -> Self {
+        self.ssh_pool = pool;
+        self
+    }
+
+    /// Run one remote command against a worker, using the shared pool (warm
+    /// master reuse) when configured, otherwise a throwaway SSH session.
+    async fn run_remote(
+        &self,
+        config: &rch_common::WorkerConfig,
+        command: &str,
+    ) -> anyhow::Result<rch_common::CommandResult> {
+        if let Some(pool) = &self.ssh_pool {
+            return pool
+                .run_with_timeout(config, command, self.ssh_options.command_timeout)
+                .await;
+        }
+        let mut ssh_client = SshClient::new(config.clone(), self.ssh_options.clone());
+        ssh_client.connect().await?;
+        let result = ssh_client.execute(command).await;
+        let _ = ssh_client.disconnect().await;
+        result
     }
 
     /// Spawn the background sweep loop. Returns the task handle.
@@ -311,10 +339,7 @@ impl StaleTargetReaper {
 
         debug!(worker = %worker_id, idle_minutes, "Starting stale-target sweep");
 
-        let mut ssh = SshClient::new(config.clone(), self.ssh_options.clone());
-        ssh.connect().await?;
-        let result = ssh.execute(&cmd).await;
-        let _ = ssh.disconnect().await;
+        let result = self.run_remote(&config, &cmd).await;
         let result = result?;
         ensure_sweep_command_success(&result)?;
 

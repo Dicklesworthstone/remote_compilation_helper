@@ -3402,7 +3402,7 @@ max_concurrent_workers = 3
 
         let base = RchConfig::default();
         info!("INPUT base: remote_base={}", base.transfer.remote_base);
-        assert_eq!(base.transfer.remote_base, "/tmp/rch");
+        assert_eq!(base.transfer.remote_base, "/data/tmp/rch");
 
         // Overlay with custom remote_base
         let overlay_toml = r#"

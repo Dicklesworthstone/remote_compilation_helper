@@ -290,6 +290,7 @@ pub struct TelemetryPoller {
     store: Arc<TelemetryStore>,
     config: TelemetryPollerConfig,
     poll_limit: Arc<tokio::sync::Semaphore>,
+    ssh_pool: Option<Arc<rch_common::SshPool>>,
 }
 
 impl TelemetryPoller {
@@ -304,7 +305,19 @@ impl TelemetryPoller {
             store,
             config,
             poll_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TELEMETRY_POLLS)),
+            ssh_pool: None,
         }
+    }
+
+    /// Attach a shared SSH connection pool for warm ControlMaster reuse. The
+    /// pooled vs. throwaway branch lives in
+    /// [`collect_telemetry_from_worker_pooled`] (the poller's SSH logic is a free
+    /// function, shared with the on-demand API path), so there is no per-struct
+    /// `run_remote` helper here.
+    #[must_use]
+    pub fn with_ssh_pool(mut self, pool: Option<Arc<rch_common::SshPool>>) -> Self {
+        self.ssh_pool = pool;
+        self
     }
 
     /// Start the polling loop in the background.
@@ -341,11 +354,12 @@ impl TelemetryPoller {
             let store = self.store.clone();
             let config = self.config.clone();
             let poll_limit = self.poll_limit.clone();
+            let ssh_pool = self.ssh_pool.clone();
             handles.push(tokio::spawn(async move {
                 // Bound concurrent SSH polls (see MAX_CONCURRENT_TELEMETRY_POLLS).
                 // The semaphore is never closed, so acquire_owned cannot fail.
                 let _permit = poll_limit.acquire_owned().await;
-                poll_worker(worker, store, config).await
+                poll_worker(worker, store, config, ssh_pool).await
             }));
         }
 
@@ -390,9 +404,22 @@ impl TelemetryPoller {
 /// Collect telemetry from a worker via SSH.
 ///
 /// Executes `rch-telemetry collect` on the remote worker and parses the result.
+/// Thin wrapper preserving the historical 2-arg signature (used by the on-demand
+/// API poll path, which has no shared pool available). Background poll cycles use
+/// [`collect_telemetry_from_worker_pooled`] to reuse a warm ControlMaster.
 pub async fn collect_telemetry_from_worker(
     worker: &WorkerState,
     ssh_timeout: Duration,
+) -> anyhow::Result<WorkerTelemetry> {
+    collect_telemetry_from_worker_pooled(worker, ssh_timeout, None).await
+}
+
+/// Collect telemetry from a worker via SSH, optionally reusing a shared SSH
+/// connection pool (warm ControlMaster) when `ssh_pool` is `Some`.
+pub async fn collect_telemetry_from_worker_pooled(
+    worker: &WorkerState,
+    ssh_timeout: Duration,
+    ssh_pool: Option<Arc<rch_common::SshPool>>,
 ) -> anyhow::Result<WorkerTelemetry> {
     // Snapshot the worker config and RELEASE the lock before any SSH work.
     // Holding `worker.config` across the (up to `ssh_timeout`) SSH round-trip
@@ -425,10 +452,19 @@ pub async fn collect_telemetry_from_worker(
         ..Default::default()
     };
 
-    let mut client = SshClient::new(worker_config, options);
-    client.connect().await?;
-    let result = client.execute(&command).await;
-    client.disconnect().await?;
+    // Reuse a warm ControlMaster via the shared pool when available; otherwise
+    // fall back to a throwaway connect+exec+disconnect (mirrors the pattern in
+    // TelemetryPoller::run_remote for the on-demand / no-pool paths).
+    let result = if let Some(pool) = &ssh_pool {
+        pool.run_with_timeout(&worker_config, &command, options.command_timeout)
+            .await
+    } else {
+        let mut client = SshClient::new(worker_config, options);
+        client.connect().await?;
+        let result = client.execute(&command).await;
+        let _ = client.disconnect().await;
+        result
+    };
 
     let result = result?;
 
@@ -476,6 +512,7 @@ async fn poll_worker(
     worker: Arc<WorkerState>,
     store: Arc<TelemetryStore>,
     config: TelemetryPollerConfig,
+    ssh_pool: Option<Arc<rch_common::SshPool>>,
 ) -> bool {
     let worker_id = worker.config.read().await.id.clone();
     let per_attempt = poll_hard_timeout(config.ssh_timeout);
@@ -484,7 +521,7 @@ async fn poll_worker(
     for attempt in 1..=TELEMETRY_POLL_ATTEMPTS {
         match tokio::time::timeout(
             per_attempt,
-            collect_telemetry_from_worker(&worker, config.ssh_timeout),
+            collect_telemetry_from_worker_pooled(&worker, config.ssh_timeout, ssh_pool.clone()),
         )
         .await
         {

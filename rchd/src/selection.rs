@@ -571,6 +571,10 @@ pub struct WorkerSelector {
     pub repo_convergence: Option<Arc<crate::repo_convergence::RepoConvergenceService>>,
     /// Optional unified reliability aggregator for multi-signal health (bd-vvmd.5.5).
     pub reliability: Option<Arc<crate::reliability::ReliabilityAggregator>>,
+    /// Optional shared SSH connection pool. When `Some`, the toolchain preflight
+    /// probe runs over a warm reused ControlMaster instead of a throwaway SSH
+    /// session; when `None`, the legacy throwaway path is used.
+    pub ssh_pool: Option<Arc<rch_common::SshPool>>,
 }
 
 /// Result of worker selection with reason.
@@ -612,6 +616,7 @@ impl WorkerSelector {
             admission_gate: None,
             repo_convergence: None,
             reliability: None,
+            ssh_pool: None,
         }
     }
 
@@ -626,6 +631,7 @@ impl WorkerSelector {
             admission_gate: None,
             repo_convergence: None,
             reliability: None,
+            ssh_pool: None,
         }
     }
 
@@ -645,6 +651,11 @@ impl WorkerSelector {
     /// Set the unified reliability aggregator for multi-signal health (bd-vvmd.5.5).
     pub fn set_reliability(&mut self, agg: Arc<crate::reliability::ReliabilityAggregator>) {
         self.reliability = Some(agg);
+    }
+
+    /// Attach a shared SSH connection pool for the toolchain preflight probe.
+    pub fn set_ssh_pool(&mut self, pool: Option<Arc<rch_common::SshPool>>) {
+        self.ssh_pool = pool;
     }
 
     /// Get a read-only view of the audit log entries.
@@ -2158,7 +2169,7 @@ impl WorkerSelector {
             });
         }
 
-        let result = probe_worker_toolchain(worker, &toolchain_name).await;
+        let result = probe_worker_toolchain(worker, &toolchain_name, self.ssh_pool.as_ref()).await;
         match result {
             Ok(()) => {
                 worker
@@ -3052,7 +3063,11 @@ fn rustc_version_key(value: &str) -> Option<String> {
     (!version.is_empty()).then(|| version.to_string())
 }
 
-async fn probe_worker_toolchain(worker: &WorkerState, toolchain_name: &str) -> Result<(), String> {
+async fn probe_worker_toolchain(
+    worker: &WorkerState,
+    toolchain_name: &str,
+    ssh_pool: Option<&Arc<rch_common::SshPool>>,
+) -> Result<(), String> {
     let worker_config = worker.config.read().await.clone();
     let ssh_options = SshOptions {
         connect_timeout: TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT,
@@ -3061,19 +3076,32 @@ async fn probe_worker_toolchain(worker: &WorkerState, toolchain_name: &str) -> R
         ..Default::default()
     };
 
-    let mut client = SshClient::new(worker_config, ssh_options);
-    client
-        .connect()
-        .await
-        .map_err(|err| format!("toolchain_preflight_connect_failed:{err}"))?;
-
     let escaped_toolchain = shell_escape::escape(std::borrow::Cow::from(toolchain_name));
     let command = format!(
         "rustup run {escaped_toolchain} rustc --version >/dev/null && rustup run {escaped_toolchain} cargo --version >/dev/null"
     );
 
-    let result = client.execute(&command).await;
-    let _ = client.disconnect().await;
+    // Pooled path: run over the warm shared ControlMaster (no per-probe master
+    // spawn/leak). The pool distinguishes connect failures internally, so map a
+    // pool error onto the same connect-failed reason string for callers.
+    let result = if let Some(pool) = ssh_pool {
+        pool.run_with_timeout(
+            &worker_config,
+            &command,
+            TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT,
+        )
+        .await
+        .map_err(|err| format!("toolchain_preflight_connect_failed:{err}"))
+    } else {
+        let mut client = SshClient::new(worker_config, ssh_options);
+        client
+            .connect()
+            .await
+            .map_err(|err| format!("toolchain_preflight_connect_failed:{err}"))?;
+        let result = client.execute(&command).await;
+        let _ = client.disconnect().await;
+        result.map_err(|err| format!("toolchain_preflight_command_error:{err}"))
+    };
 
     match result {
         Ok(output) if output.success() => Ok(()),
@@ -3082,7 +3110,7 @@ async fn probe_worker_toolchain(worker: &WorkerState, toolchain_name: &str) -> R
             output.exit_code,
             short_preflight_error(&output.stderr)
         )),
-        Err(err) => Err(format!("toolchain_preflight_command_error:{err}")),
+        Err(reason) => Err(reason),
     }
 }
 

@@ -50,9 +50,32 @@ const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[
     ".rch-target/",
     ".rch-target-*/",
     ".rch-tmp/",
+    // Go build/module/GOPATH caches injected into the managed remote build zone
+    // (see FORCED_MANAGED_ENV_KEYS). Protect them from rsync --delete for the
+    // same reason as .rch-target/.rch-tmp: a concurrent build to the same remote
+    // root must not wipe another build's in-flight Go cache.
+    ".rch-go/",
     ".franken_whisper/tools/ffmpeg/",
 ];
 const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str = ".rch-target";
+
+/// Environment variables whose values we ALWAYS rewrite to a managed,
+/// worker-scoped path under the synchronized remote project root — regardless of
+/// whether the local process forwarded them. These control where build
+/// tools drop large artifacts/scratch; if they inherit a host-only absolute path
+/// (e.g. a `.cargo/config.toml` `target-dir` of `/root/cass-ft-target`, or a
+/// `TMPDIR` on a volatile host mount) the remote build writes outside the managed
+/// `/data/tmp` zone the disk reapers watch, or fails outright. Forcing them into
+/// `<remote_path>/.rch-*` makes placement deterministic and reclaimable, and —
+/// because env precedence beats a `.cargo/config.toml` `target-dir` — covers
+/// wrapper/unclassified builds that never went through target-dir rewriting.
+const FORCED_MANAGED_ENV_KEYS: &[&str] = &[
+    "CARGO_TARGET_DIR",
+    "TMPDIR",
+    "GOCACHE",
+    "GOMODCACHE",
+    "GOPATH",
+];
 const CONFIG_EXCLUDE_REWRITES: &[(&str, &str)] = &[
     ("core.*", "core.[0-9]*"),
     (".core.*", ".core.[0-9]*"),
@@ -742,30 +765,64 @@ impl TransferPipeline {
         std::env::var(key).ok()
     }
 
+    /// Compute the managed, worker-scoped value (and the directory that must
+    /// exist for it) for an env var that we pin into the remote build zone.
+    ///
+    /// Returns `Some((value, ensure_dir))` for a managed key, or `None` for any
+    /// other key. This is the single source of truth for managed placement,
+    /// shared by [`Self::rewrite_remote_env_value`] (rewrites a forwarded value)
+    /// and [`Self::build_remote_env_plan`] (injects the key unconditionally). All
+    /// managed paths sit under `<remote_path>/.rch-*` so they land in the
+    /// managed `/data/tmp` build zone and are reclaimable.
+    fn managed_remote_env_value(&self, key: &str, remote_path: &str) -> Option<(String, String)> {
+        let go_base = format!("{remote_path}/.rch-go");
+        match key {
+            // Absolute or host-specific target directories are brittle on workers.
+            // Force a remote-scoped target dir rooted in the synchronized project.
+            "CARGO_TARGET_DIR" => {
+                let target_dir = self.remote_cargo_target_dir_for_remote_path(remote_path);
+                Some((target_dir.clone(), target_dir))
+            }
+            // Temporary directories may point to host-only volatile mounts.
+            // Keep temp files project-scoped on the worker for stability.
+            "TMPDIR" | "TMP" | "TEMP" => {
+                let temp_dir = format!("{remote_path}/.rch-tmp");
+                Some((temp_dir.clone(), temp_dir))
+            }
+            // Go build cache, module cache, and GOPATH — pin under the managed
+            // build zone so `go`/`bun`-orchestrated Go builds don't scatter large
+            // caches into host-global locations (~/.cache/go-build, ~/go).
+            "GOCACHE" => {
+                let dir = format!("{go_base}/cache");
+                Some((dir.clone(), dir))
+            }
+            "GOMODCACHE" => {
+                let dir = format!("{go_base}/mod");
+                Some((dir.clone(), dir))
+            }
+            "GOPATH" => {
+                let dir = format!("{go_base}/path");
+                Some((dir.clone(), dir))
+            }
+            _ => None,
+        }
+    }
+
     fn rewrite_remote_env_value(
         &self,
         key: &str,
         value: &str,
         remote_path: &str,
     ) -> (String, Option<String>, bool) {
-        match key {
-            // Absolute or host-specific target directories are brittle on workers.
-            // Force a remote-scoped target dir rooted in the synchronized project.
-            "CARGO_TARGET_DIR" => {
-                let target_dir = self.remote_cargo_target_dir_for_remote_path(remote_path);
-                (
-                    target_dir.clone(),
-                    Some(target_dir.clone()),
-                    target_dir != value,
-                )
+        // Delegate to the managed-placement helper so a forwarded ABSOLUTE value
+        // (e.g. an absolute `.cargo/config.toml` target-dir) is rewritten to the
+        // managed worker-scoped path. Non-managed keys pass through unchanged.
+        match self.managed_remote_env_value(key, remote_path) {
+            Some((managed_value, ensure_dir)) => {
+                let rewritten = managed_value != value;
+                (managed_value, Some(ensure_dir), rewritten)
             }
-            // Temporary directories may point to host-only volatile mounts (e.g. /data/tmp).
-            // Keep temp files project-scoped on the worker for stability.
-            "TMPDIR" | "TMP" | "TEMP" => {
-                let temp_dir = format!("{remote_path}/.rch-tmp");
-                (temp_dir.clone(), Some(temp_dir.clone()), temp_dir != value)
-            }
-            _ => (value.to_string(), None, false),
+            None => (value.to_string(), None, false),
         }
     }
 
@@ -817,6 +874,31 @@ impl TransferPipeline {
                 ensure_dirs.push(dir);
             }
 
+            parts.push(format!("{key}={escaped}"));
+            applied.push(key.to_string());
+        }
+
+        // Unconditionally inject the managed build-artifact env vars, regardless
+        // of what the local environment forwarded. Any of these already handled
+        // above (present in the env AND allowlisted) were rewritten to the same
+        // managed value, so skip them here to avoid a duplicate assignment; the
+        // rest are injected fresh. This is what forces wrapper/unclassified
+        // builds — which may never forward CARGO_TARGET_DIR/GOCACHE/etc. — to
+        // still drop artifacts inside the managed `/data/tmp` zone.
+        for &key in FORCED_MANAGED_ENV_KEYS {
+            if applied.iter().any(|k| k == key) {
+                continue;
+            }
+            let Some((managed_value, ensure_dir)) = self.managed_remote_env_value(key, remote_path)
+            else {
+                continue;
+            };
+            let Some(escaped) = shell_escape_value(&managed_value) else {
+                continue;
+            };
+            if !ensure_dirs.iter().any(|existing| existing == &ensure_dir) {
+                ensure_dirs.push(ensure_dir);
+            }
             parts.push(format!("{key}={escaped}"));
             applied.push(key.to_string());
         }
@@ -3211,13 +3293,13 @@ mod tests {
             TransferConfig::default(),
         );
 
-        assert_eq!(pipeline.remote_path(), "/tmp/rch/myproject/abc123");
+        assert_eq!(pipeline.remote_path(), "/data/tmp/rch/myproject/abc123");
     }
 
     #[test]
     fn test_is_safe_reap_path_accepts_real_project_dirs() {
         // The two shapes remote_path() actually produces.
-        assert!(is_safe_reap_path("/tmp/rch/myproject/abc123"));
+        assert!(is_safe_reap_path("/data/tmp/rch/myproject/abc123"));
         assert!(is_safe_reap_path(
             "/data/projects/coding_agent_session_search/9f8e7d6c"
         ));
@@ -3782,7 +3864,7 @@ mod tests {
         .with_color_mode(ColorMode::Always)
         .with_env_allowlist(vec!["RUSTFLAGS".to_string(), "CC".to_string()]);
 
-        assert_eq!(pipeline.remote_path(), "/tmp/rch/test-project/abc123");
+        assert_eq!(pipeline.remote_path(), "/data/tmp/rch/test-project/abc123");
     }
 
     #[test]
@@ -3804,7 +3886,7 @@ mod tests {
         .with_command_timeout(std::time::Duration::from_secs(300));
 
         // Just verify it builds without panic
-        assert_eq!(pipeline.remote_path(), "/tmp/rch/test-project/abc123");
+        assert_eq!(pipeline.remote_path(), "/data/tmp/rch/test-project/abc123");
     }
 
     #[test]
@@ -4037,8 +4119,8 @@ mod tests {
 
         let cmd = pipeline.build_sync_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -4089,8 +4171,8 @@ mod tests {
 
         let cmd = pipeline.build_sync_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -4126,26 +4208,29 @@ mod tests {
 
         let sync = pipeline.build_sync_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
         assert_portable_rsync_archive_args(&command_args(&sync));
 
         let sync_streaming = pipeline.build_sync_streaming_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
         assert_portable_rsync_archive_args(&command_args(&sync_streaming));
 
         let retrieve =
-            pipeline.build_retrieve_command(&worker, "/tmp/rch/test-project/abc123", &[]);
+            pipeline.build_retrieve_command(&worker, "/data/tmp/rch/test-project/abc123", &[]);
         assert_portable_rsync_archive_args(&command_args(&retrieve));
 
-        let retrieve_streaming =
-            pipeline.build_retrieve_streaming_command(&worker, "/tmp/rch/test-project/abc123", &[]);
+        let retrieve_streaming = pipeline.build_retrieve_streaming_command(
+            &worker,
+            "/data/tmp/rch/test-project/abc123",
+            &[],
+        );
         assert_portable_rsync_archive_args(&command_args(&retrieve_streaming));
     }
 
@@ -4178,7 +4263,7 @@ mod tests {
 
         let cmd = pipeline.build_retrieve_command(
             &worker,
-            "/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &["target/debug/**".to_string()],
         );
 
@@ -4252,7 +4337,7 @@ mod tests {
 
         let cmd = pipeline.build_retrieve_streaming_command(
             &worker,
-            "/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &["build/**".to_string()],
         );
 
@@ -4303,7 +4388,7 @@ mod tests {
 
         let cmd = pipeline.build_retrieve_streaming_command(
             &worker,
-            "/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &["target/release/**".to_string()],
         );
 
@@ -4452,6 +4537,132 @@ mod tests {
             "host-local tmpfs path should not be forwarded to worker"
         );
         assert!(command.contains(&worker_scoped_root));
+    }
+
+    #[test]
+    fn test_managed_env_injected_when_nothing_forwarded() {
+        let _guard = test_guard!();
+        // FIX 2: even with an EMPTY allowlist and no forwarded env, the managed
+        // build-artifact vars must be injected so wrapper/unclassified builds
+        // still land in the managed remote zone.
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_env_overrides(HashMap::new()); // nothing forwarded
+
+        let root = pipeline.remote_path();
+        let command = pipeline.build_remote_command("cargo build", None);
+
+        assert!(
+            command.contains(&format!("CARGO_TARGET_DIR='{}/.rch-target'", root)),
+            "CARGO_TARGET_DIR must be injected: {command}"
+        );
+        assert!(
+            command.contains(&format!("TMPDIR='{}/.rch-tmp'", root)),
+            "TMPDIR must be injected: {command}"
+        );
+        assert!(
+            command.contains(&format!("GOCACHE='{}/.rch-go/cache'", root)),
+            "GOCACHE must be injected: {command}"
+        );
+        assert!(
+            command.contains(&format!("GOMODCACHE='{}/.rch-go/mod'", root)),
+            "GOMODCACHE must be injected: {command}"
+        );
+        assert!(
+            command.contains(&format!("GOPATH='{}/.rch-go/path'", root)),
+            "GOPATH must be injected: {command}"
+        );
+        // Each managed dir must be mkdir'd before the build.
+        assert!(command.contains("mkdir -p"));
+        assert!(command.contains(&format!("{}/.rch-go/cache", root)));
+    }
+
+    #[test]
+    fn test_managed_env_overrides_absolute_forwarded_target_dir() {
+        let _guard = test_guard!();
+        // FIX 2: a forwarded ABSOLUTE CARGO_TARGET_DIR (e.g. from a
+        // .cargo/config.toml `target-dir` like /root/cass-ft-target) must be
+        // rewritten to the managed worker-scoped path, never forwarded verbatim.
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            "/root/cass-ft-target".to_string(),
+        );
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        // Note: NOT in the allowlist — the forced-injection pass must still
+        // rewrite it because the value came through env_overrides. (And even a
+        // fully-unforwarded build gets the managed value.)
+        .with_env_overrides(overrides);
+
+        let root = pipeline.remote_path();
+        let command = pipeline.build_remote_command("cargo build", None);
+
+        assert!(
+            command.contains(&format!("CARGO_TARGET_DIR='{}/.rch-target'", root)),
+            "absolute target-dir must be rewritten to managed path: {command}"
+        );
+        assert!(
+            !command.contains("/root/cass-ft-target"),
+            "host-absolute target-dir must NOT be forwarded: {command}"
+        );
+    }
+
+    #[test]
+    fn test_managed_env_no_duplicate_when_allowlisted() {
+        let _guard = test_guard!();
+        // A managed key that IS forwarded + allowlisted must appear exactly once
+        // (the allowlist pass and the forced-injection pass must not both emit it).
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            "/somewhere/else".to_string(),
+        );
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_env_allowlist(vec!["CARGO_TARGET_DIR".to_string()])
+        .with_env_overrides(overrides);
+
+        let command = pipeline.build_remote_command("cargo build", None);
+        let occurrences = command.matches("CARGO_TARGET_DIR=").count();
+        assert_eq!(
+            occurrences, 1,
+            "CARGO_TARGET_DIR must be assigned exactly once: {command}"
+        );
+    }
+
+    #[test]
+    fn test_rch_go_dir_excluded_from_rsync_delete() {
+        let _guard = test_guard!();
+        // FIX 2: the injected Go cache dir must be protected from rsync --delete,
+        // like .rch-target/.rch-tmp.
+        assert!(
+            REMOTE_RUNTIME_EXCLUDE_PATTERNS.contains(&".rch-go/"),
+            "REMOTE_RUNTIME_EXCLUDE_PATTERNS must protect .rch-go/"
+        );
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        );
+        let excludes = pipeline.get_effective_excludes();
+        assert!(
+            excludes.iter().any(|e| e == ".rch-go/"),
+            "effective excludes must include .rch-go/: {excludes:?}"
+        );
     }
 
     #[test]
@@ -4852,7 +5063,7 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
         )
         .with_remote_path_override("relative/path");
 
-        assert_eq!(pipeline.remote_path(), "/tmp/rch/project/def456");
+        assert_eq!(pipeline.remote_path(), "/data/tmp/rch/project/def456");
     }
 
     // ==========================================================================
@@ -5581,8 +5792,8 @@ Total file size: 123 bytes";
 
         let cmd = pipeline.build_sync_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -5619,8 +5830,8 @@ Total file size: 123 bytes";
 
         let cmd = pipeline.build_sync_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -5661,8 +5872,8 @@ Total file size: 123 bytes";
 
         let cmd = pipeline.build_sync_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -5705,8 +5916,8 @@ Total file size: 123 bytes";
 
         let cmd = pipeline.build_sync_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -5765,8 +5976,8 @@ Total file size: 123 bytes";
 
         let cmd = pipeline.build_sync_streaming_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -5818,8 +6029,8 @@ Total file size: 123 bytes";
 
         let cmd = pipeline.build_sync_streaming_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -6155,7 +6366,7 @@ Total file size: 123 bytes";
         };
         let cmd = pipeline.build_retrieve_command(
             &worker,
-            "/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &["target/debug/**".to_string()],
         );
         let args: Vec<String> = cmd
@@ -6234,7 +6445,7 @@ Total file size: 123 bytes";
         };
         let cmd = pipeline.build_retrieve_command(
             &worker,
-            "/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &["*.tsbuildinfo".to_string()],
         );
         let args: Vec<String> = cmd
@@ -6291,8 +6502,11 @@ Total file size: 123 bytes";
             priority: 100,
             tags: vec![],
         };
-        let cmd =
-            pipeline.build_retrieve_command(&worker, "/tmp/rch/test-project/abc123", &["*".into()]);
+        let cmd = pipeline.build_retrieve_command(
+            &worker,
+            "/data/tmp/rch/test-project/abc123",
+            &["*".into()],
+        );
         let args: Vec<String> = cmd
             .as_std()
             .get_args()
@@ -6356,7 +6570,7 @@ Total file size: 123 bytes";
         };
         let cmd = pipeline.build_retrieve_streaming_command(
             &worker,
-            "/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &["target/release/**".to_string()],
         );
         let args: Vec<String> = cmd
@@ -6406,7 +6620,7 @@ Total file size: 123 bytes";
         };
         let cmd = pipeline.build_retrieve_command(
             &worker,
-            "/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &["target/debug/**".to_string()],
         );
         let args: Vec<String> = cmd

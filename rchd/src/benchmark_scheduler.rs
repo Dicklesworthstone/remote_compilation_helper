@@ -825,6 +825,16 @@ impl BenchmarkScheduler {
             // Release slot
             self.pool.release_slots(worker_id, 1).await;
 
+            // Credit the worker's circuit breaker: a completed benchmark is a
+            // successful round-trip to the worker, so it should count toward
+            // closing/keeping-closed the authoritative WorkerState.circuit that
+            // selection reads (the circuit is otherwise only advanced by the
+            // health monitor). Without this, benchmark success touched neither
+            // circuit store — a documented gap in the unification.
+            if let Some(worker) = self.pool.get(worker_id).await {
+                worker.record_success().await;
+            }
+
             // Reset consecutive failure counter on success
             self.consecutive_failures.write().await.remove(worker_id);
 
