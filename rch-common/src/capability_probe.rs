@@ -120,6 +120,13 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
     s.push_str(
         "npmv=$(npm --version 2>/dev/null) && printf '%snpm_version=%s\\n' \"$P\" \"$npmv\"; ",
     );
+    // Nix: only report a version when a populated `/nix/store` also exists, since
+    // a `nix` binary without a store cannot build derivations (gates nix routing).
+    s.push_str(
+        "if [ -d /nix/store ] && [ -n \"$(ls -A /nix/store 2>/dev/null | head -n1)\" ]; then \
+           nixv=$(nix --version 2>/dev/null) && printf '%snix_version=%s\\n' \"$P\" \"$nixv\"; \
+         fi; ",
+    );
     // Disk roots: path;total_kb;avail_kb;avail_inodes (df -Pk and df -Pi).
     for root in &spec.disk_roots {
         let q = shq(root);
@@ -190,6 +197,7 @@ pub fn parse_capability_probe(stdout: &str) -> ProbedFacts {
             "bun_version" => f.runtimes.bun_version = Some(value.to_string()),
             "node_version" => f.runtimes.node_version = Some(value.to_string()),
             "npm_version" => f.runtimes.npm_version = Some(value.to_string()),
+            "nix_version" => f.runtimes.nix_version = Some(value.to_string()),
             "disk" => {
                 // path;total_kb;avail_kb;avail_inodes
                 let parts: Vec<&str> = value.split(';').collect();
@@ -236,6 +244,8 @@ pub struct CapabilityRequirement {
     pub needs_bun: bool,
     /// Whether a working `node` runtime is required.
     pub needs_node: bool,
+    /// Whether a working `nix` (binary + populated `/nix/store`) is required.
+    pub needs_nix: bool,
     /// Specific rustup toolchains the build needs (prefix-matched against the
     /// worker's installed toolchains, e.g. `nightly-2025-11-01` matches
     /// `nightly-2025-11-01-x86_64-unknown-linux-gnu`).
@@ -403,6 +413,12 @@ pub fn assess_admissibility(facts: &ProbedFacts, req: &CapabilityRequirement) ->
         return CapabilityVerdict::Rejected {
             reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
             detail: "node runtime not found at the configured user/path".to_string(),
+        };
+    }
+    if req.needs_nix && facts.runtimes.nix_version.is_none() {
+        return CapabilityVerdict::Rejected {
+            reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
+            detail: "nix (binary + populated /nix/store) not found on the worker".to_string(),
         };
     }
     CapabilityVerdict::Admissible

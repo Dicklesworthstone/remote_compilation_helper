@@ -658,6 +658,7 @@ mod tests {
                             bun_version,
                             node_version,
                             npm_version,
+                            nix_version: None,
                             num_cpus,
                             load_avg_1,
                             load_avg_5,
