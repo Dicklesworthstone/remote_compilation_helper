@@ -50,11 +50,22 @@ RCH currently recognizes and can offload:
 | Bun/TypeScript | `bun test`, `bun typecheck` |
 | C/C++ | `gcc`, `g++`, `clang`, `clang++` |
 | Build Systems | `make`, `cmake --build`, `ninja`, `meson compile` |
+| Nix | `nix build`, `nix-build`, `nix flake check`, `nix develop -c <cmd>`, `nix shell -c <cmd>` |
+
+Nix builds only route to workers that advertise a `nix` capability (a usable `nix`
+binary plus a populated `/nix/store`); on a fleet with no such worker they fall
+back to local execution (or are refused under `RCH_REQUIRE_REMOTE=1`, exactly as
+with Bun/Node). Nix outputs stay in the worker's `/nix/store` behind a `result`
+symlink, so these run as streaming, exit-status-only commands (no artifacts are
+copied back — the flake source is synced out, the build runs, the result stays
+remote).
 
 RCH explicitly does **not** intercept local-mutating or interactive patterns (examples):
 
 - Package management: `cargo install`, `cargo clean`, `bun install`, `bun add`, `bun remove`
 - Bun runners/dev: `bun run`, `bun build`, `bun dev`, `bun x` / `bunx`
+- Nix interactive/mutating: bare `nix develop` / `nix shell`, `nix run`, `nix repl`,
+  `nix profile`, `nix flake update`, `nix store gc`, `nix-env`, `nix-shell`
 - Watch/background/piped/redirected commands where deterministic offload is unsafe
 
 ---

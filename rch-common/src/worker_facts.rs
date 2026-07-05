@@ -92,6 +92,9 @@ pub struct RuntimeFacts {
     pub node_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub npm_version: Option<String>,
+    /// Nix version (from `nix --version`, gated on a populated `/nix/store`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nix_version: Option<String>,
 }
 
 /// One filesystem root's capacity (exact, path-scoped).

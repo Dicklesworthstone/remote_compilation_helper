@@ -1287,6 +1287,7 @@ fi",
             Some(CompilationKind::CmakeBuild) => "cmake build",
             Some(CompilationKind::Ninja) => "ninja",
             Some(CompilationKind::Meson) => "meson",
+            Some(CompilationKind::NixBuild) => "nix build",
             None => "unknown",
         };
 

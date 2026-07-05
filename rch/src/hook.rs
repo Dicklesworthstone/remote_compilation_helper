@@ -1967,6 +1967,8 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
 
             CompilationKind::BunTest | CompilationKind::BunTypecheck => RequiredRuntime::Bun,
 
+            CompilationKind::NixBuild => RequiredRuntime::Nix,
+
             _ => RequiredRuntime::None,
         },
         None => RequiredRuntime::None,

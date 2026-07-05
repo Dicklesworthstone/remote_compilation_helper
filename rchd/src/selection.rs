@@ -1309,6 +1309,7 @@ impl WorkerSelector {
                 RequiredRuntime::Rust => capabilities.has_rust(),
                 RequiredRuntime::Bun => capabilities.has_bun(),
                 RequiredRuntime::Node => capabilities.has_node(),
+                RequiredRuntime::Nix => capabilities.has_nix(),
             };
 
             let toolchain_mismatch =
@@ -1722,6 +1723,7 @@ impl WorkerSelector {
                 RequiredRuntime::Rust => worker.has_rust().await,
                 RequiredRuntime::Bun => worker.has_bun().await,
                 RequiredRuntime::Node => worker.has_node().await,
+                RequiredRuntime::Nix => worker.has_nix().await,
             };
 
             if excluded_worker_ids.contains(worker_id.as_str()) {
@@ -2705,6 +2707,7 @@ pub async fn select_worker_with_config(
             RequiredRuntime::Rust => worker.has_rust().await,
             RequiredRuntime::Bun => worker.has_bun().await,
             RequiredRuntime::Node => worker.has_node().await,
+            RequiredRuntime::Nix => worker.has_nix().await,
         };
 
         if !has_required_runtime {
@@ -4404,6 +4407,63 @@ mod tests {
             "Expected AllWorkersBusy, got {:?}",
             result.reason
         );
+    }
+
+    #[tokio::test]
+    async fn test_nix_runtime_gating(/* issue #26 */) {
+        // A fleet with only a Rust worker must REFUSE a nix build (no nix worker),
+        // and a nix-capable worker must be selected once present.
+        let pool = WorkerPool::new();
+
+        let rust_only = make_worker("rust-only", 8, 5.0);
+        rust_only
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(rust_only).await;
+
+        let selector = WorkerSelector::default();
+        let nix_request = SelectionRequest {
+            project: "test".to_string(),
+            command: Some("nix build .#foo".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Nix,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &nix_request).await;
+        assert!(
+            result.worker.is_none(),
+            "nix build must not route to a nix-less worker"
+        );
+        assert!(
+            matches!(result.reason, SelectionReason::NoWorkersWithRuntime(_)),
+            "Expected NoWorkersWithRuntime, got {:?}",
+            result.reason
+        );
+
+        // Now add a nix-capable worker; the nix build must route to it.
+        let nix_worker = make_worker("nix-1", 8, 5.0);
+        nix_worker
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                nix_version: Some("nix (Nix) 2.24.9".to_string()),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(nix_worker).await;
+
+        let result = selector.select(&pool, &nix_request).await;
+        let selected = result
+            .worker
+            .expect("a nix-capable worker should be selected");
+        assert_eq!(selected.config.read().await.id.as_str(), "nix-1");
     }
 
     #[tokio::test]

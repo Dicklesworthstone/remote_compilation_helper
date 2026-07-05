@@ -56,6 +56,8 @@ impl AdmitRecommendation {
 pub struct RequiredCapabilities {
     pub needs_cargo: bool,
     pub needs_bun: bool,
+    /// Whether the command requires nix (binary + populated `/nix/store`).
+    pub needs_nix: bool,
     /// rustup targets the command explicitly requests (`--target <triple>`).
     pub needs_targets: Vec<String>,
     /// Explicit toolchain overrides (`cargo +nightly-…`).
@@ -72,6 +74,7 @@ impl RequiredCapabilities {
             min_protocol,
             needs_cargo: self.needs_cargo,
             needs_bun: self.needs_bun,
+            needs_nix: self.needs_nix,
             needs_toolchains: self.needs_toolchains.clone(),
             ..CapabilityRequirement::default()
         }
@@ -122,6 +125,7 @@ fn family_token(kind: CompilationKind) -> &'static str {
         CompilationKind::Meson => "meson",
         CompilationKind::BunTest => "bun_test",
         CompilationKind::BunTypecheck => "bun_typecheck",
+        CompilationKind::NixBuild => "nix_build",
     }
 }
 
@@ -149,6 +153,7 @@ fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> Required
             kind,
             CompilationKind::BunTest | CompilationKind::BunTypecheck
         );
+        req.needs_nix = matches!(kind, CompilationKind::NixBuild);
     }
     // Scan tokens for `--target <triple>` / `--target=<triple>` and `+toolchain`.
     let tokens: Vec<&str> = command.split_whitespace().collect();
@@ -211,6 +216,7 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
             let part_req = derive_capabilities(part, c.kind);
             required.needs_cargo |= part_req.needs_cargo;
             required.needs_bun |= part_req.needs_bun;
+            required.needs_nix |= part_req.needs_nix;
             required.needs_targets.extend(part_req.needs_targets);
             required.needs_toolchains.extend(part_req.needs_toolchains);
         }

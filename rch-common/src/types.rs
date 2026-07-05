@@ -86,6 +86,8 @@ pub enum RequiredRuntime {
     Bun,
     /// Requires Node.js runtime.
     Node,
+    /// Requires the Nix package manager (nix binary + populated `/nix/store`).
+    Nix,
 }
 
 /// Per-command priority hint for worker selection.
@@ -710,6 +712,11 @@ pub struct WorkerCapabilities {
     /// npm version (from `npm --version`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub npm_version: Option<String>,
+    /// Nix version (from `nix --version`). Presence implies a usable nix binary
+    /// with an accompanying `/nix/store`, gating `nix build`/`nix develop -c`
+    /// routing to this worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nix_version: Option<String>,
 
     // Health metrics (bd-3eaa)
     /// Number of CPU cores on the worker.
@@ -774,6 +781,11 @@ impl WorkerCapabilities {
     /// Check if this worker has Rust installed.
     pub fn has_rust(&self) -> bool {
         self.rustc_version.is_some()
+    }
+
+    /// Check if this worker has Nix installed (nix binary + `/nix/store`).
+    pub fn has_nix(&self) -> bool {
+        self.nix_version.is_some()
     }
 
     /// Calculate load per core (1-minute load average / num_cpus).
@@ -2060,6 +2072,10 @@ impl CompilationConfig {
             Some(CompilationKind::CargoTest) | Some(CompilationKind::CargoNextest) => {
                 self.test_timeout_sec
             }
+            // Nix derivation builds can take a long time (fetch + compile large
+            // closures); give them the generous test-timeout bucket rather than
+            // the short build timeout so legitimate builds are not killed early.
+            Some(CompilationKind::NixBuild) => self.test_timeout_sec,
             // Builds, checks, clippy, and unknown use build timeout
             _ => self.build_timeout_sec,
         };
@@ -2265,6 +2281,8 @@ fn default_execution_allowlist() -> Vec<String> {
         "meson".to_string(),
         // Bun
         "bun".to_string(),
+        // Nix (covers both `nix build` and the legacy `nix-build`)
+        "nix".to_string(),
     ]
 }
 
@@ -3362,6 +3380,34 @@ retry_max = 2
 
         caps.bun_version = Some("1.0.25".to_string());
         assert!(caps.has_bun());
+    }
+
+    #[test]
+    fn test_worker_capabilities_has_nix() {
+        let _guard = test_guard!();
+        let mut caps = WorkerCapabilities::new();
+        assert!(!caps.has_nix());
+
+        caps.nix_version = Some("nix (Nix) 2.24.9".to_string());
+        assert!(caps.has_nix());
+    }
+
+    #[test]
+    fn test_nix_build_uses_generous_timeout() {
+        let _guard = test_guard!();
+        let cfg = CompilationConfig::default();
+        // Nix builds get the long test-timeout bucket, not the short build timeout.
+        assert_eq!(
+            cfg.timeout_for_kind(Some(CompilationKind::NixBuild)),
+            std::time::Duration::from_secs(cfg.test_timeout_sec)
+        );
+    }
+
+    #[test]
+    fn test_default_allowlist_includes_nix() {
+        let _guard = test_guard!();
+        let cfg = ExecutionConfig::default();
+        assert!(cfg.is_allowed("nix"));
     }
 
     #[test]

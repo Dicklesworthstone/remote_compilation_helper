@@ -431,6 +431,19 @@ fn probe_capabilities() -> WorkerCapabilities {
         }
     }
 
+    // Probe nix version. We require BOTH a working `nix --version` AND a
+    // populated `/nix/store`, since a `nix` binary alone (without a store) can't
+    // build derivations. This gates `nix build` / `nix develop -c` routing.
+    if nix_store_is_populated()
+        && let Ok(output) = Command::new("nix").args(["--version"]).output()
+        && output.status.success()
+    {
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !version.is_empty() {
+            capabilities.nix_version = Some(version);
+        }
+    }
+
     // Probe system health metrics (bd-3eaa)
     capabilities.num_cpus = probe_num_cpus();
     if let Some((load1, load5, load15)) = probe_load_average() {
@@ -478,6 +491,19 @@ fn resolve_topology_roots_from_env(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_ALIAS_PROJECT_ROOT));
     (canonical, alias)
+}
+
+/// Whether `/nix/store` exists and contains at least one entry.
+///
+/// A `nix` binary without a populated store cannot actually build derivations
+/// (every build resolves store paths), so capability detection requires both.
+/// This is a cheap directory read — we only need to know that SOME entry exists,
+/// so we stop at the first one.
+fn nix_store_is_populated() -> bool {
+    std::fs::read_dir("/nix/store")
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .is_some()
 }
 
 fn run_bun_version_command() -> Option<std::process::Output> {

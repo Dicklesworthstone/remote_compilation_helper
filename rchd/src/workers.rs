@@ -896,6 +896,11 @@ impl WorkerState {
         self.capabilities.read().await.has_rust()
     }
 
+    /// Check if this worker has Nix installed (nix binary + `/nix/store`).
+    pub async fn has_nix(&self) -> bool {
+        self.capabilities.read().await.has_nix()
+    }
+
     /// Disable the worker with an optional reason.
     /// Sets status to Disabled and records the timestamp and reason.
     pub async fn disable(&self, reason: Option<String>) {
@@ -2821,6 +2826,7 @@ mod tests {
         assert!(!state.has_bun().await);
         assert!(!state.has_node().await);
         assert!(!state.has_rust().await);
+        assert!(!state.has_nix().await);
 
         // Set capabilities with Rust
         let mut caps = WorkerCapabilities::new();

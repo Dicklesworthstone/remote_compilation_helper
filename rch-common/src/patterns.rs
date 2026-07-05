@@ -21,8 +21,22 @@ const TIER_FULL_CLASSIFICATION: &str = "full_classification";
 /// Keywords that indicate a potential compilation command.
 /// Used for SIMD-accelerated quick filtering (Tier 2).
 pub static COMPILATION_KEYWORDS: &[&str] = &[
-    "cargo", "rustc", "gcc", "g++", "clang", "clang++", "make", "cmake", "ninja", "meson", "cc",
-    "c++", "bun", "nextest",
+    "cargo",
+    "rustc",
+    "gcc",
+    "g++",
+    "clang",
+    "clang++",
+    "make",
+    "cmake",
+    "ninja",
+    "meson",
+    "cc",
+    "c++",
+    "bun",
+    "nextest",
+    "nix",
+    "nix-build",
 ];
 
 /// Commands that should NEVER be intercepted, even if they contain compilation keywords.
@@ -229,6 +243,16 @@ pub enum CompilationKind {
     BunTest,
     /// bun typecheck - Runs TypeScript type checking
     BunTypecheck,
+
+    // Nix commands
+    /// `nix build` / `nix-build` (derivation build), `nix flake check`
+    /// (evaluate + build all outputs), and the non-interactive
+    /// `nix develop -c <cmd>` / `nix shell -c <cmd>` forms.
+    ///
+    /// Nix outputs live in the worker's `/nix/store` behind a `result` symlink
+    /// that is meaningless on a nix-less local host, so these run as
+    /// streaming, no-artifact-return commands (exit status is the payload).
+    NixBuild,
 }
 
 impl CompilationKind {
@@ -274,6 +298,9 @@ impl CompilationKind {
             CompilationKind::Meson => "meson",
             // Bun commands
             CompilationKind::BunTest | CompilationKind::BunTypecheck => "bun",
+            // Nix commands. Both `nix build` and the legacy `nix-build` route
+            // through this kind; the canonical allowlist base name is "nix".
+            CompilationKind::NixBuild => "nix",
         }
     }
 }
@@ -1894,6 +1921,17 @@ fn classify_full(cmd: &str) -> Classification {
         }
     }
 
+    // Nix commands (the `nix` multi-tool and the legacy `nix-build`).
+    // Only build-like, NON-interactive, non-mutating invocations are offloaded;
+    // classify_nix uses an allowlist so everything else falls back to local.
+    if cmd.eq("nix-build")
+        || cmd.starts_with("nix-build ")
+        || cmd.eq("nix")
+        || cmd.starts_with("nix ")
+    {
+        return classify_nix(cmd);
+    }
+
     // Bun commands
     let mut tokens = cmd.split_whitespace();
     if tokens.next().is_some_and(|token| token.eq("bun")) {
@@ -2009,6 +2047,132 @@ fn classify_cargo(cmd: &str) -> Classification {
             }
         }
         _ => Classification::not_compilation("cargo subcommand not interceptable"),
+    }
+}
+
+/// Nix global flags (appearing BEFORE the subcommand) that consume the following
+/// whitespace-separated token as their value. Without skipping the value token
+/// we could read it AS the subcommand and either miss a real build or, worse,
+/// misclassify — so on any ambiguity we prefer to fall back to local execution.
+///
+/// This is a best-effort list of the common value-taking global flags; the
+/// two-value `--option NAME VALUE` form is handled separately. Space-attached
+/// (`--max-jobs=4`) forms carry their value in the same token and need no skip.
+const NIX_GLOBAL_VALUE_FLAGS: &[&str] = &[
+    "--extra-experimental-features",
+    "--experimental-features",
+    "--log-format",
+    "--max-jobs",
+    "-j",
+    "--cores",
+    "--builders",
+    "--store",
+    "--file",
+    "-f",
+    "-I",
+    "--include",
+];
+
+/// Classify a `nix ...` (multi-tool) or `nix-build ...` (legacy) command.
+///
+/// Offloadable (build-like, non-interactive, non-mutating):
+///   - `nix build ...`         → build a derivation
+///   - `nix-build ...`         → legacy derivation build
+///   - `nix flake check`       → evaluate + build ALL flake outputs
+///   - `nix develop -c <cmd>`  → run a command non-interactively in a dev shell
+///   - `nix shell -c <cmd>`    → run a command non-interactively with packages
+///
+/// NOT offloadable (declined here → local fallback):
+///   - bare `nix develop` / `nix shell`  → interactive shells
+///   - `nix run` / `nix repl`            → app execution / interactive
+///   - `nix flake metadata|show|update|lock|...`, `nix eval|search|...` → metadata
+///   - `nix profile|registry|store|copy|...`, `nix-env`, `nix-shell` (no keyword)
+///     → mutating / package management
+///
+/// Nix outputs never travel back (they live in the worker's `/nix/store`); these
+/// are streaming, exit-status-only commands. Requires the worker to have nix +
+/// a populated `/nix/store` and network access to fetch flake inputs — enforced
+/// by the `RequiredRuntime::Nix` capability gate in worker selection.
+fn classify_nix(cmd: &str) -> Classification {
+    // Legacy `nix-build` is unconditionally a derivation build.
+    if cmd.eq("nix-build") || cmd.starts_with("nix-build ") {
+        return Classification::compilation(
+            CompilationKind::NixBuild,
+            0.9,
+            "nix-build (legacy) derivation build",
+        );
+    }
+
+    let mut tokens = cmd.split_whitespace();
+    let _nix = tokens.next(); // "nix" (validated by caller)
+
+    // Locate the subcommand, skipping leading global flags (and their values).
+    let subcommand = loop {
+        let Some(tok) = tokens.next() else {
+            return Classification::not_compilation("bare nix command (no subcommand)");
+        };
+        if tok.starts_with('-') {
+            if tok.eq("--option") {
+                // `--option NAME VALUE` consumes two following tokens.
+                let _ = tokens.next();
+                let _ = tokens.next();
+            } else if !tok.contains('=') && NIX_GLOBAL_VALUE_FLAGS.contains(&tok) {
+                let _ = tokens.next();
+            }
+            continue;
+        }
+        break tok;
+    };
+
+    // Remaining tokens after the subcommand (for -c/--command and --help checks).
+    let rest: Vec<&str> = tokens.collect();
+    let wants_help = rest.iter().any(|t| t.eq(&"--help") || t.eq(&"-h"));
+    if wants_help {
+        return Classification::not_compilation("nix --help (not a build)");
+    }
+    let has_command_flag = rest.iter().any(|t| t.eq(&"-c") || t.eq(&"--command"));
+
+    match subcommand {
+        // `nix build` builds a derivation → offload (streaming, no artifact return).
+        "build" => {
+            Classification::compilation(CompilationKind::NixBuild, 0.9, "nix build derivation")
+        }
+        // `nix flake check` evaluates AND builds every flake output (CPU-heavy) →
+        // offload. Every other `nix flake <sub>` (metadata/show/update/lock/init/
+        // archive/...) is metadata or mutating and must stay local.
+        "flake" => {
+            let flake_sub = rest.iter().find(|t| !t.starts_with('-'));
+            if flake_sub == Some(&"check") {
+                Classification::compilation(
+                    CompilationKind::NixBuild,
+                    0.9,
+                    "nix flake check (evaluates + builds all outputs)",
+                )
+            } else {
+                Classification::not_compilation("nix flake subcommand is not a build")
+            }
+        }
+        // `nix develop -c <cmd>` / `nix shell -c <cmd>` run a command
+        // non-interactively in the environment → offload. Bare forms are
+        // interactive shells and must NOT be intercepted.
+        "develop" | "shell" => {
+            if has_command_flag {
+                let reason = if subcommand == "develop" {
+                    "nix develop -c (non-interactive command in dev shell)"
+                } else {
+                    "nix shell -c (non-interactive command with packages)"
+                };
+                Classification::compilation(CompilationKind::NixBuild, 0.9, reason)
+            } else {
+                Classification::not_compilation(
+                    "interactive nix shell (no -c/--command; not intercepted)",
+                )
+            }
+        }
+        // run / repl / eval / search / profile / registry / store / copy /
+        // path-info / why-depends / flake metadata|show|update / --version / ...
+        // are execution, mutation, or metadata: never intercepted.
+        _ => Classification::not_compilation("nix subcommand is not an offloadable build"),
     }
 }
 
@@ -2133,6 +2297,148 @@ mod tests {
         let result = classify_command("cargo +nightly build");
         assert!(result.is_compilation);
         assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
+    }
+
+    // ===================== Nix classification (issue #26) =====================
+
+    #[test]
+    fn test_nix_build_offloadable() {
+        let _guard = test_guard!();
+        for cmd in [
+            "nix build",
+            "nix build .#foo",
+            "nix build .#packages.x86_64-linux.default",
+            "nix build /path/to/flake#pkg",
+            "nix build --extra-experimental-features 'nix-command flakes' .#foo",
+            "nix --option sandbox true build .#foo",
+            "nix -j4 build .#foo",
+            "nix build nixpkgs#hello -o result-hello",
+        ] {
+            let result = classify_command(cmd);
+            assert!(result.is_compilation, "expected offload for `{cmd}`");
+            assert_eq!(result.kind, Some(CompilationKind::NixBuild), "`{cmd}`");
+            assert!(result.confidence >= 0.85, "`{cmd}` confidence too low");
+        }
+    }
+
+    #[test]
+    fn test_nix_build_legacy_offloadable() {
+        let _guard = test_guard!();
+        for cmd in ["nix-build", "nix-build .", "nix-build -A hello"] {
+            let result = classify_command(cmd);
+            assert!(result.is_compilation, "expected offload for `{cmd}`");
+            assert_eq!(result.kind, Some(CompilationKind::NixBuild), "`{cmd}`");
+        }
+    }
+
+    #[test]
+    fn test_nix_flake_check_offloadable_but_metadata_not() {
+        let _guard = test_guard!();
+        let check = classify_command("nix flake check");
+        assert!(check.is_compilation, "nix flake check should offload");
+        assert_eq!(check.kind, Some(CompilationKind::NixBuild));
+
+        for cmd in [
+            "nix flake metadata",
+            "nix flake show",
+            "nix flake update",
+            "nix flake lock",
+            "nix flake info",
+        ] {
+            let result = classify_command(cmd);
+            assert!(!result.is_compilation, "`{cmd}` must NOT offload");
+        }
+    }
+
+    #[test]
+    fn test_nix_develop_and_shell_only_with_command() {
+        let _guard = test_guard!();
+        // Non-interactive `-c`/`--command` forms are offloadable.
+        for cmd in [
+            "nix develop -c make",
+            "nix develop --command cargo build",
+            "nix develop .#dev -c bun test",
+            "nix shell nixpkgs#gcc -c make",
+            "nix shell nixpkgs#hello --command hello",
+        ] {
+            let result = classify_command(cmd);
+            assert!(result.is_compilation, "expected offload for `{cmd}`");
+            assert_eq!(result.kind, Some(CompilationKind::NixBuild), "`{cmd}`");
+        }
+        // Bare interactive shells must NOT be intercepted.
+        for cmd in ["nix develop", "nix develop .#dev", "nix shell nixpkgs#gcc"] {
+            let result = classify_command(cmd);
+            assert!(
+                !result.is_compilation,
+                "`{cmd}` is interactive; must run local"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nix_execution_and_mutation_not_offloaded() {
+        let _guard = test_guard!();
+        for cmd in [
+            "nix run .#app",
+            "nix run nixpkgs#hello",
+            "nix repl",
+            "nix eval .#foo",
+            "nix search nixpkgs hello",
+            "nix profile install nixpkgs#hello",
+            "nix registry list",
+            "nix store gc",
+            "nix copy --to ssh://host .#foo",
+            "nix path-info .#foo",
+            "nix --version",
+            "nix build --help",
+            "nix",
+        ] {
+            let result = classify_command(cmd);
+            assert!(!result.is_compilation, "`{cmd}` must NOT be intercepted");
+        }
+    }
+
+    #[test]
+    fn test_nix_legacy_mutating_tools_have_no_keyword() {
+        let _guard = test_guard!();
+        // `nix-env`, `nix-shell`, `nix-store`, ... only share the "nix-" prefix;
+        // they are NOT the `nix`/`nix-build` keywords, so Tier-2 rejects them
+        // before classification (no accidental interception).
+        for cmd in [
+            "nix-env -iA nixpkgs.hello",
+            "nix-shell",
+            "nix-shell -p gcc",
+            "nix-store --gc",
+            "nix-collect-garbage -d",
+            "nix-channel --update",
+        ] {
+            assert!(
+                !starts_with_compilation_command(cmd),
+                "`{cmd}` should not match any compilation keyword"
+            );
+            let result = classify_command(cmd);
+            assert!(!result.is_compilation, "`{cmd}` must NOT be intercepted");
+        }
+    }
+
+    #[test]
+    fn test_nix_build_maps_to_nix_runtime_base() {
+        let _guard = test_guard!();
+        assert_eq!(CompilationKind::NixBuild.command_base(), "nix");
+        assert!(!CompilationKind::NixBuild.is_test_command());
+    }
+
+    #[test]
+    fn test_nix_build_compound_and_wrapped() {
+        let _guard = test_guard!();
+        // Compound `cd X && nix build` should offload the nix build tail.
+        let compound = classify_command("cd /repo && nix build .#foo");
+        assert!(compound.is_compilation, "compound nix build should offload");
+        assert_eq!(compound.kind, Some(CompilationKind::NixBuild));
+        // `bash -c "nix build .#foo"` wrapper should offload the inner command.
+        let wrapped = classify_command("bash -c \"nix build .#foo\"");
+        assert!(wrapped.is_compilation, "wrapped nix build should offload");
+        assert_eq!(wrapped.kind, Some(CompilationKind::NixBuild));
     }
 
     #[test]

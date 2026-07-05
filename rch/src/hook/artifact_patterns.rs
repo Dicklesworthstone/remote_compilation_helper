@@ -55,6 +55,10 @@ pub(super) fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String
         | Some(CompilationKind::CmakeBuild)
         | Some(CompilationKind::Ninja)
         | Some(CompilationKind::Meson) => default_c_cpp_artifact_patterns(),
+        // Nix outputs live in the worker's `/nix/store` behind a `result`
+        // symlink that is meaningless on a nix-less local host, so nothing is
+        // synced back — the exit status is the payload (streaming only).
+        Some(CompilationKind::NixBuild) => Vec::new(),
         _ => default_rust_artifact_patterns(),
     }
 }
@@ -85,7 +89,9 @@ pub(super) fn get_custom_target_artifact_patterns(kind: Option<CompilationKind>)
     match kind {
         Some(CompilationKind::CargoTest)
         | Some(CompilationKind::CargoCheck)
-        | Some(CompilationKind::CargoClippy) => Vec::new(),
+        | Some(CompilationKind::CargoClippy)
+        // Nix builds never write into a cargo target dir and return no artifacts.
+        | Some(CompilationKind::NixBuild) => Vec::new(),
         Some(CompilationKind::CargoNextest) | Some(CompilationKind::CargoBench) => {
             // Test/bench artifacts are already a narrow allowlist; just rebase them
             // onto the target-dir root (the sync root IS the remote target dir).
@@ -153,7 +159,9 @@ pub(super) fn kind_produces_transferable_artifacts(kind: Option<CompilationKind>
         | Some(CompilationKind::CargoCheck)
         | Some(CompilationKind::CargoClippy)
         | Some(CompilationKind::BunTest)
-        | Some(CompilationKind::BunTypecheck) => false,
+        | Some(CompilationKind::BunTypecheck)
+        // Nix builds stream their result; outputs stay in the worker's /nix/store.
+        | Some(CompilationKind::NixBuild) => false,
         // Unclassified command: be conservative and treat a sync-back failure as
         // benign (we cannot prove a required artifact exists), matching the legacy
         // continue-on-warning behavior.

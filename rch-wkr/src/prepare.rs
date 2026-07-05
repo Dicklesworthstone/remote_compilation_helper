@@ -369,7 +369,9 @@ pub async fn prepare(
         RequiredRuntime::Bun | RequiredRuntime::Node => {
             prepare_node_like(project_root, runtime, log_dir, started).await
         }
-        RequiredRuntime::Rust | RequiredRuntime::None => Ok(PrepareReport {
+        // Nix fetches its own inputs into /nix/store at build time and needs no
+        // node_modules-style prepare step, so it is skipped like Rust/None.
+        RequiredRuntime::Rust | RequiredRuntime::None | RequiredRuntime::Nix => Ok(PrepareReport {
             runtime,
             action: PrepareAction::Skipped,
             fingerprint: None,
