@@ -128,6 +128,7 @@ pub fn runtime_label(runtime: &RequiredRuntime) -> &'static str {
         RequiredRuntime::Rust => "rust",
         RequiredRuntime::Bun => "bun",
         RequiredRuntime::Node => "node",
+        RequiredRuntime::Nix => "nix",
         RequiredRuntime::None => "none",
     }
 }
