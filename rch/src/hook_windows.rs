@@ -93,6 +93,13 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
 
             CompilationKind::BunTest | CompilationKind::BunTypecheck => RequiredRuntime::Bun,
 
+            // Mirror the Unix hook (hook.rs): a nix build must carry the Nix
+            // runtime so worker selection gates it to a nix-capable worker via
+            // `has_nix()`. Without this, a nix build offloaded from a Windows
+            // client fell through to `None` and could be dispatched to a
+            // non-nix worker (where it would fail) instead of being gated.
+            CompilationKind::NixBuild => RequiredRuntime::Nix,
+
             _ => RequiredRuntime::None,
         },
         None => RequiredRuntime::None,
