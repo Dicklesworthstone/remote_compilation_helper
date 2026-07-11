@@ -328,6 +328,14 @@ systemd_user_available() {
     return 1
 }
 
+system_rchd_service_active() {
+    if ! command_exists systemctl; then
+        return 1
+    fi
+
+    systemctl is-active --quiet rchd.service >/dev/null 2>&1
+}
+
 detect_service_manager() {
     local os
     os="$(uname -s)"
@@ -1724,6 +1732,12 @@ maybe_prompt_service() {
         return
     fi
 
+    if system_rchd_service_active; then
+        ENABLE_SERVICE="false"
+        info "System-level rchd.service is active; skipping duplicate user daemon setup."
+        return
+    fi
+
     local service_manager=""
     service_manager="$(detect_service_manager 2>/dev/null || true)"
     if [[ -z "$service_manager" ]]; then
@@ -2053,6 +2067,11 @@ restart_daemon_if_needed() {
     fi
 
     if [[ "$MODE" == "worker" ]]; then
+        return 0
+    fi
+
+    if system_rchd_service_active; then
+        info "System-level rchd.service is active; skipping user-daemon restart."
         return 0
     fi
 
@@ -2555,6 +2574,7 @@ Environment:
 Service Setup:
   On Linux:  systemd user service is offered during install (auto-accept in --easy-mode/--yes).
              Use --install-service to opt in without prompting.
+             An active system-level rchd.service suppresses duplicate user-daemon setup/restart.
              Lingering is enabled for reboot persistence when possible (requires sudo).
   On macOS:  launchd service is offered during install (auto-accept in --easy-mode/--yes).
              Use --install-service to opt in without prompting.

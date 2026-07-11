@@ -69,6 +69,7 @@ CONFIRM_CALLED=false
 CONFIRM_RESULT=0
 INTERACTIVE=true
 SERVICE_MANAGER="systemd"
+SYSTEM_RCHD_ACTIVE=false
 
 confirm() {
     CONFIRM_CALLED=true
@@ -90,6 +91,14 @@ detect_service_manager() {
     return 1
 }
 
+systemctl() {
+    if [[ "${1:-}" == "is-active" ]] && [[ "${2:-}" == "--quiet" ]] && [[ "${3:-}" == "rchd.service" ]]; then
+        [[ "$SYSTEM_RCHD_ACTIVE" == "true" ]]
+        return
+    fi
+    return 1
+}
+
 reset_env() {
     MODE="local"
     NO_SERVICE="false"
@@ -101,6 +110,7 @@ reset_env() {
     CONFIRM_RESULT=0
     INTERACTIVE=true
     SERVICE_MANAGER="systemd"
+    SYSTEM_RCHD_ACTIVE=false
 }
 
 assert_eq() {
@@ -133,7 +143,9 @@ run_case() {
 
     start_test "$name"
     local output
-    output=$(maybe_prompt_service 2>&1 || true)
+    local output_file="$TEST_DIR/run_case_${TESTS_RUN}.output"
+    maybe_prompt_service >"$output_file" 2>&1 || true
+    output="$(<"$output_file")"
 
     assert_eq "$name enable" "$expect_enable" "$ENABLE_SERVICE"
     assert_eq "$name confirm_called" "$expect_confirm" "$CONFIRM_CALLED"
@@ -195,7 +207,37 @@ SERVICE_MANAGER=""
 INSTALL_SERVICE="true"
 run_case "no_service_manager_opt_in" "false" "false" "Background service requested but no supported service manager detected"
 
-# Case 11: default runtime directory collision
+# Case 11: an active system-level daemon suppresses easy-mode user service setup
+reset_env
+EASY_MODE="true"
+SYSTEM_RCHD_ACTIVE=true
+run_case "system_daemon_suppresses_easy_mode" "false" "false" "System-level rchd.service is active"
+
+# Case 12: easy-mode restart does not address a user daemon on a system-service host
+start_test "system_daemon_suppresses_easy_mode_restart"
+restart_guard_root="$TEST_DIR/restart-guard"
+restart_guard_log="$restart_guard_root/rch.log"
+mkdir -p "$restart_guard_root/bin"
+cat > "$restart_guard_root/bin/rch" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$RCH_STUB_LOG"
+EOF
+chmod +x "$restart_guard_root/bin/rch"
+MODE="local"
+INSTALL_DIR="$restart_guard_root/bin"
+HOOK_BIN="rch"
+SYSTEM_RCHD_ACTIVE=true
+unset RCH_SKIP_DAEMON_RESTART
+export RCH_STUB_LOG="$restart_guard_log"
+restart_output=$(restart_daemon_if_needed 2>&1 || true)
+assert_contains "system_daemon restart log" "$restart_output" "skipping user-daemon restart"
+if [[ ! -e "$restart_guard_log" ]]; then
+    pass "system_daemon avoids rch daemon restart"
+else
+    fail "system_daemon should not invoke rch daemon restart"
+fi
+
+# Case 13: default runtime directory collision
 start_test "runtime_dir_collision_uses_private_directory"
 runtime_collision_root="$TEST_DIR/runtime-collision"
 mkdir -p "$runtime_collision_root"
@@ -204,7 +246,9 @@ INSTALL_DIR="$TEST_DIR/install-bin"
 CONFIG_DIR="$TEST_DIR/config"
 RUNTIME_DIR=""
 unset RCH_RUNTIME_DIR
-runtime_output=$(TMPDIR="$runtime_collision_root" create_directories 2>&1 || true)
+runtime_output_file="$TEST_DIR/runtime_collision.output"
+TMPDIR="$runtime_collision_root" create_directories >"$runtime_output_file" 2>&1 || true
+runtime_output="$(<"$runtime_output_file")"
 if [[ -d "$RUNTIME_DIR" && "$RUNTIME_DIR" == "$runtime_collision_root"/rch-runtime.* ]]; then
     pass "runtime_dir_collision_uses_private_directory"
 else

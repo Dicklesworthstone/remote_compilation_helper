@@ -89,6 +89,12 @@ fi
 if [[ "${SYSTEMCTL_MODE:-ok}" == "missing" ]]; then
     exit 1
 fi
+if [[ "${1:-}" == "is-active" ]] && [[ "${2:-}" == "--quiet" ]] && [[ "${3:-}" == "rchd.service" ]]; then
+    if [[ "${SYSTEM_RCHD_ACTIVE:-0}" == "1" ]]; then
+        exit 0
+    fi
+    exit 3
+fi
 exit 0
 EOF
     chmod +x "$bin_dir/systemctl"
@@ -159,7 +165,16 @@ esac
 EOF
     chmod +x "$pkg_dir/rchd"
 
-    tar -czf "$tarball" -C "$pkg_dir" rch rchd
+    cat > "$pkg_dir/rch-wkr" << 'EOF'
+#!/bin/bash
+case "$1" in
+    --version) echo "rch-wkr 0.1.0-test" ;;
+    *) exit 0 ;;
+esac
+EOF
+    chmod +x "$pkg_dir/rch-wkr"
+
+    tar -czf "$tarball" -C "$pkg_dir" rch rchd rch-wkr
     echo "$tarball"
 }
 
@@ -733,7 +748,7 @@ test_service_prompt_behavior() {
     case_dir="$TEST_DIR/prompt_decline"
     systemctl_log="$case_dir/systemctl.log"
     mkdir -p "$case_dir/bin" "$case_dir/config"
-    output=$(run_install_case "$case_dir/bin" "$case_dir/config" "$tarball" "" "n\n" "true" "$stub_bin" "$systemctl_log" "ok") || true
+    output=$(run_install_case "$case_dir/bin" "$case_dir/config" "$tarball" "" $'n\n' "true" "$stub_bin" "$systemctl_log" "ok") || true
     if [[ "$output" == *"Skipping background daemon setup"* ]]; then
         pass "Interactive decline skips background service"
     else
@@ -772,6 +787,26 @@ test_service_prompt_behavior() {
         pass "Missing service manager warns on opt-in"
     else
         fail "Missing service manager should warn on opt-in"
+    fi
+
+    # Case 8: active system-level rchd marks a pure-worker host and suppresses
+    # both user-service installation and the easy-mode user-daemon restart.
+    case_dir="$TEST_DIR/prompt_system_daemon"
+    systemctl_log="$case_dir/systemctl.log"
+    local home_dir="$case_dir/home"
+    local unit_file="$home_dir/.config/systemd/user/rchd.service"
+    mkdir -p "$case_dir/bin" "$case_dir/config" "$home_dir"
+    output=$(SYSTEM_RCHD_ACTIVE=1 run_install_case "$case_dir/bin" "$case_dir/config" "$tarball" "--easy-mode --yes" "" "false" "$stub_bin" "$systemctl_log" "ok" "$home_dir") || true
+    if [[ "$output" == *"System-level rchd.service is active; skipping duplicate user daemon setup."* ]] && \
+       [[ "$output" == *"System-level rchd.service is active; skipping user-daemon restart."* ]]; then
+        pass "System daemon suppresses easy-mode user daemon paths"
+    else
+        fail "System daemon should suppress easy-mode user daemon paths"
+    fi
+    if [[ ! -e "$unit_file" ]] && ! grep -q -- "--user enable" "$systemctl_log"; then
+        pass "System daemon avoids user unit installation"
+    else
+        fail "System daemon should avoid user unit installation"
     fi
 }
 
@@ -1020,21 +1055,25 @@ log ""
 log "Running E2E tests..."
 log ""
 
-test_help
-test_verify_only
-test_offline_install
-test_uninstall
-test_worker_mode
-test_service_install
-test_easy_mode
-test_ui_detection
-test_wsl_detection
-test_proxy_config
-test_lock_file
-test_config_generation
-test_service_prompt_behavior
-test_systemd_unit_generation
-test_launchd_unit_generation
+if [[ "${RCH_INSTALL_E2E_ONLY:-}" == "service-prompt" ]]; then
+    test_service_prompt_behavior
+else
+    test_help
+    test_verify_only
+    test_offline_install
+    test_uninstall
+    test_worker_mode
+    test_service_install
+    test_easy_mode
+    test_ui_detection
+    test_wsl_detection
+    test_proxy_config
+    test_lock_file
+    test_config_generation
+    test_service_prompt_behavior
+    test_systemd_unit_generation
+    test_launchd_unit_generation
+fi
 
 # ============================================================================
 # Summary
