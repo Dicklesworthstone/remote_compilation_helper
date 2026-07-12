@@ -139,9 +139,21 @@ fn detect_runtime_from_command(command: &str) -> RequiredRuntime {
                 return RequiredRuntime::Node;
             }
         }
-        Some("npx") if matches!(tokens.next(), Some("jest" | "vitest")) => {
-            return RequiredRuntime::Node;
-        }
+        Some("npx") => match tokens.next() {
+            Some("jest" | "vitest") => return RequiredRuntime::Node,
+            // `npx tsc --noEmit` needs node_modules installed before it can
+            // resolve types, so it must report the Node runtime to get prepare().
+            Some("tsc") => return RequiredRuntime::Node,
+            _ => {}
+        },
+        // Bare `tsc` likewise runs under Node and needs node_modules.
+        Some("tsc") => return RequiredRuntime::Node,
+        // Go resolves modules from the module cache; prepare() is a no-op for it,
+        // but the runtime must still be reported so the right prepare branch runs.
+        Some("go") => match tokens.next() {
+            Some("build" | "test" | "vet") => return RequiredRuntime::Go,
+            _ => {}
+        },
         _ => {}
     }
     RequiredRuntime::None

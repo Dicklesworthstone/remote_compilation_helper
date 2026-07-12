@@ -58,6 +58,10 @@ pub struct RequiredCapabilities {
     pub needs_bun: bool,
     /// Whether the command requires nix (binary + populated `/nix/store`).
     pub needs_nix: bool,
+    /// Whether the command requires the Go toolchain.
+    pub needs_go: bool,
+    /// Whether the command requires Node.js (e.g. `tsc` / `npx tsc`).
+    pub needs_node: bool,
     /// rustup targets the command explicitly requests (`--target <triple>`).
     pub needs_targets: Vec<String>,
     /// Explicit toolchain overrides (`cargo +nightly-…`).
@@ -75,6 +79,8 @@ impl RequiredCapabilities {
             needs_cargo: self.needs_cargo,
             needs_bun: self.needs_bun,
             needs_nix: self.needs_nix,
+            needs_go: self.needs_go,
+            needs_node: self.needs_node,
             needs_toolchains: self.needs_toolchains.clone(),
             ..CapabilityRequirement::default()
         }
@@ -126,6 +132,10 @@ fn family_token(kind: CompilationKind) -> &'static str {
         CompilationKind::BunTest => "bun_test",
         CompilationKind::BunTypecheck => "bun_typecheck",
         CompilationKind::NixBuild => "nix_build",
+        CompilationKind::GoBuild => "go_build",
+        CompilationKind::GoTest => "go_test",
+        CompilationKind::GoVet => "go_vet",
+        CompilationKind::Tsc => "tsc",
     }
 }
 
@@ -154,6 +164,11 @@ fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> Required
             CompilationKind::BunTest | CompilationKind::BunTypecheck
         );
         req.needs_nix = matches!(kind, CompilationKind::NixBuild);
+        req.needs_go = matches!(
+            kind,
+            CompilationKind::GoBuild | CompilationKind::GoTest | CompilationKind::GoVet
+        );
+        req.needs_node = matches!(kind, CompilationKind::Tsc);
     }
     // Scan tokens for `--target <triple>` / `--target=<triple>` and `+toolchain`.
     let tokens: Vec<&str> = command.split_whitespace().collect();
@@ -217,6 +232,8 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
             required.needs_cargo |= part_req.needs_cargo;
             required.needs_bun |= part_req.needs_bun;
             required.needs_nix |= part_req.needs_nix;
+            required.needs_go |= part_req.needs_go;
+            required.needs_node |= part_req.needs_node;
             required.needs_targets.extend(part_req.needs_targets);
             required.needs_toolchains.extend(part_req.needs_toolchains);
         }

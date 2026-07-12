@@ -444,6 +444,17 @@ fn probe_capabilities() -> WorkerCapabilities {
         }
     }
 
+    // Probe Go toolchain. Presence gates `go build`/`go test`/`go vet` routing to
+    // this worker via `has_go()`.
+    if let Ok(output) = Command::new("go").args(["version"]).output()
+        && output.status.success()
+    {
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !version.is_empty() {
+            capabilities.go_version = Some(version);
+        }
+    }
+
     // Probe system health metrics (bd-3eaa)
     capabilities.num_cpus = probe_num_cpus();
     if let Some((load1, load5, load15)) = probe_load_average() {

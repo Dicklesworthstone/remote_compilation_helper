@@ -1969,6 +1969,17 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
 
             CompilationKind::NixBuild => RequiredRuntime::Nix,
 
+            // Go builds/tests/vets must carry the Go runtime so worker selection
+            // gates them to a go-capable worker via `has_go()`. Falling through to
+            // the `_ => None` catch-all would disable capability gating entirely and
+            // dispatch `go build` to a worker with no Go toolchain.
+            CompilationKind::GoBuild | CompilationKind::GoTest | CompilationKind::GoVet => {
+                RequiredRuntime::Go
+            }
+
+            // `tsc` / `npx tsc` run under Node.
+            CompilationKind::Tsc => RequiredRuntime::Node,
+
             _ => RequiredRuntime::None,
         },
         None => RequiredRuntime::None,

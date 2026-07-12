@@ -602,6 +602,7 @@ pub async fn workers_capabilities(
                     RequiredRuntime::Bun => !caps.has_bun(),
                     RequiredRuntime::Node => !caps.has_node(),
                     RequiredRuntime::Nix => !caps.has_nix(),
+                    RequiredRuntime::Go => !caps.has_go(),
                     RequiredRuntime::None => false,
                 }
             })

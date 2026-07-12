@@ -1288,6 +1288,10 @@ fi",
             Some(CompilationKind::Ninja) => "ninja",
             Some(CompilationKind::Meson) => "meson",
             Some(CompilationKind::NixBuild) => "nix build",
+            Some(CompilationKind::GoBuild) => "go build",
+            Some(CompilationKind::GoTest) => "go test",
+            Some(CompilationKind::GoVet) => "go vet",
+            Some(CompilationKind::Tsc) => "tsc",
             None => "unknown",
         };
 

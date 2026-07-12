@@ -901,6 +901,11 @@ impl WorkerState {
         self.capabilities.read().await.has_nix()
     }
 
+    /// Whether this worker has the Go toolchain installed.
+    pub async fn has_go(&self) -> bool {
+        self.capabilities.read().await.has_go()
+    }
+
     /// Disable the worker with an optional reason.
     /// Sets status to Disabled and records the timestamp and reason.
     pub async fn disable(&self, reason: Option<String>) {

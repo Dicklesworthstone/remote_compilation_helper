@@ -120,6 +120,8 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
     s.push_str(
         "npmv=$(npm --version 2>/dev/null) && printf '%snpm_version=%s\\n' \"$P\" \"$npmv\"; ",
     );
+    // Go toolchain (PATH-resolved; advisory fact gating go build/test/vet routing).
+    s.push_str("gov=$(go version 2>/dev/null) && printf '%sgo_version=%s\\n' \"$P\" \"$gov\"; ");
     // Nix: only report a version when a populated `/nix/store` also exists, since
     // a `nix` binary without a store cannot build derivations (gates nix routing).
     s.push_str(
@@ -198,6 +200,7 @@ pub fn parse_capability_probe(stdout: &str) -> ProbedFacts {
             "node_version" => f.runtimes.node_version = Some(value.to_string()),
             "npm_version" => f.runtimes.npm_version = Some(value.to_string()),
             "nix_version" => f.runtimes.nix_version = Some(value.to_string()),
+            "go_version" => f.runtimes.go_version = Some(value.to_string()),
             "disk" => {
                 // path;total_kb;avail_kb;avail_inodes
                 let parts: Vec<&str> = value.split(';').collect();
@@ -244,6 +247,8 @@ pub struct CapabilityRequirement {
     pub needs_bun: bool,
     /// Whether a working `node` runtime is required.
     pub needs_node: bool,
+    /// Whether a working Go toolchain is required.
+    pub needs_go: bool,
     /// Whether a working `nix` (binary + populated `/nix/store`) is required.
     pub needs_nix: bool,
     /// Specific rustup toolchains the build needs (prefix-matched against the
@@ -419,6 +424,12 @@ pub fn assess_admissibility(facts: &ProbedFacts, req: &CapabilityRequirement) ->
         return CapabilityVerdict::Rejected {
             reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
             detail: "nix (binary + populated /nix/store) not found on the worker".to_string(),
+        };
+    }
+    if req.needs_go && facts.runtimes.go_version.is_none() {
+        return CapabilityVerdict::Rejected {
+            reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
+            detail: "go toolchain not found at the configured user/path".to_string(),
         };
     }
     CapabilityVerdict::Admissible
