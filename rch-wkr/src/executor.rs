@@ -462,14 +462,30 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
 
     // Use shell execution to properly handle quoted arguments and shell features
     // This matches how the SSH client executes commands (sh -c "...")
-    let mut child = Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(workdir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+
+    // For Node/Bun projects, put the project's own `node_modules/.bin` FIRST on
+    // PATH. Workers have no global `tsc`, so a bare `tsc --noEmit` would
+    // otherwise fail to resolve — and if we papered over that with a global
+    // install, a project pinned to an older TypeScript would be typechecked by a
+    // newer compiler and could report errors the user never sees locally.
+    // Resolving the project's own binary keeps remote results identical to local.
+    // `prepare()` (above) has already installed node_modules by this point.
+    if matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
+        let local_bin = Path::new(workdir).join("node_modules").join(".bin");
+        if local_bin.is_dir() {
+            let existing = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{}:{existing}", local_bin.display()));
+        }
+    }
+
+    let mut child = cmd.spawn()?;
 
     // Stream stdout
     let mut stdout = child.stdout.take().expect("Failed to capture stdout");

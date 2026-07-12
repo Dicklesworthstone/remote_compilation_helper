@@ -727,10 +727,26 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     let estimated_cores =
         estimate_cores_for_command(classification.kind, &command, &config.compilation);
 
-    // Detect toolchain
+    // Detect toolchain — ONLY for Rust kinds.
+    //
+    // `detect_toolchain` returns the ambient rustup toolchain (e.g. from
+    // rust-toolchain.toml, or the active default). Attaching it to a NON-Rust
+    // request is actively harmful: rchd runs a per-worker toolchain preflight, and
+    // a worker that does not happen to have that exact nightly installed fails it
+    // and is excluded as a HARD preflight failure. With every worker excluded the
+    // build falls back to LOCAL — so a `go build` on a box whose rustup default is
+    // `nightly-2026-07-11` would silently keep running on the orchestrator, which
+    // is precisely the bug this feature exists to fix. Go/TS/Bun/Nix builds need no
+    // rustup toolchain, so send none.
     let project_root = std::env::current_dir().ok();
-    let toolchain = if let Some(root) = &project_root {
-        detect_toolchain(root).ok()
+    let needs_rust_toolchain = matches!(
+        required_runtime_for_kind(classification.kind),
+        RequiredRuntime::Rust
+    );
+    let toolchain = if needs_rust_toolchain {
+        project_root
+            .as_ref()
+            .and_then(|root| detect_toolchain(root).ok())
     } else {
         None
     };
