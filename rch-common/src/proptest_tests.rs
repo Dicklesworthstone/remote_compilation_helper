@@ -661,7 +661,7 @@ mod tests {
                             node_version,
                             npm_version,
                             nix_version: None,
-                go_version: None,
+                            go_version: None,
                             num_cpus,
                             load_avg_1,
                             load_avg_5,

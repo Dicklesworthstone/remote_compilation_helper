@@ -2108,7 +2108,10 @@ fn classify_go(cmd: &str) -> Classification {
         }
         "test" => {
             // `-exec` runs an arbitrary local wrapper binary; keep it local.
-            if args.iter().any(|a| a.eq(&"-exec") || a.starts_with("-exec=")) {
+            if args
+                .iter()
+                .any(|a| a.eq(&"-exec") || a.starts_with("-exec="))
+            {
                 return Classification::not_compilation(
                     "go test -exec runs a local wrapper (not intercepted)",
                 );
