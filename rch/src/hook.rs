@@ -1103,8 +1103,9 @@ mod ssh;
 // sync-closure planners + verifier directly from `super::dependency_closure`.
 mod dependency_closure;
 use dependency_closure::{
-    DEPENDENCY_PREFLIGHT_CODE_POLICY, DEPENDENCY_PREFLIGHT_CODE_TIMEOUT,
-    DEPENDENCY_PREFLIGHT_CODE_UNKNOWN, DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY,
+    DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION, DEPENDENCY_PREFLIGHT_CODE_POLICY,
+    DEPENDENCY_PREFLIGHT_CODE_TIMEOUT, DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+    DEPENDENCY_PREFLIGHT_REMEDIATION_MATERIALIZATION, DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY,
     DEPENDENCY_PREFLIGHT_REMEDIATION_TIMEOUT, DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN,
     DEPENDENCY_PREFLIGHT_SCHEMA_VERSION, DependencyPreflightEvidence, DependencyPreflightFailure,
     DependencyPreflightReport, DependencyPreflightStatus,
@@ -1771,6 +1772,10 @@ fn classify_dependency_runtime_fail_open(
         .issues
         .iter()
         .any(|issue| issue.code == "path-policy-violation");
+    let has_materialization_failure = plan
+        .issues
+        .iter()
+        .any(|issue| issue.code == "materialization-closure-unavailable");
     let has_timeout = plan
         .fail_open_reason
         .as_deref()
@@ -1787,6 +1792,11 @@ fn classify_dependency_runtime_fail_open(
         (
             DEPENDENCY_PREFLIGHT_CODE_POLICY,
             DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY,
+        )
+    } else if has_materialization_failure {
+        (
+            DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION,
+            DEPENDENCY_PREFLIGHT_REMEDIATION_MATERIALIZATION,
         )
     } else if has_timeout {
         (
@@ -1829,6 +1839,8 @@ fn build_dependency_runtime_fail_open_report(
 ) -> DependencyPreflightReport {
     let status = if decision.reason_code == DEPENDENCY_PREFLIGHT_CODE_POLICY {
         DependencyPreflightStatus::PolicyViolation
+    } else if decision.reason_code == DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION {
+        DependencyPreflightStatus::MaterializationUnavailable
     } else if decision.reason_code == DEPENDENCY_PREFLIGHT_CODE_TIMEOUT {
         DependencyPreflightStatus::Timeout
     } else {
@@ -1862,6 +1874,7 @@ fn build_dependency_runtime_fail_open_report(
 
 fn should_force_local_fallback_for_runtime_fail_open(reason_code: &str) -> bool {
     reason_code == DEPENDENCY_PREFLIGHT_CODE_POLICY
+        || reason_code == DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION
 }
 
 fn command_uses_cargo_dependency_graph(kind: Option<CompilationKind>) -> bool {

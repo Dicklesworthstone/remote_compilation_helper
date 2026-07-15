@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     CargoPathDependencyEdge, CargoPathDependencyError, CargoPathDependencyErrorKind,
-    CargoPathDependencyGraph, CargoPathDependencyPackage, PathTopologyPolicy,
-    resolve_cargo_path_dependency_graph_with_policy,
+    CargoPathDependencyGraph, CargoPathDependencyPackage, CargoPathMaterializationClosure,
+    PathTopologyPolicy, resolve_cargo_path_dependency_graph_with_policy,
+    resolve_cargo_path_materialization_closure_with_policy,
 };
 
 /// Planner-level lifecycle state for dependency closure.
@@ -113,15 +114,59 @@ pub fn build_dependency_closure_plan_with_policy(
     entrypoint: &Path,
     policy: &PathTopologyPolicy,
 ) -> DependencyClosurePlan {
-    match resolve_cargo_path_dependency_graph_with_policy(entrypoint, policy) {
-        Ok(graph) => plan_dependency_closure_from_graph(&graph),
-        Err(error) => fail_open_plan_from_resolver_error(entrypoint, &error),
-    }
+    let graph = match resolve_cargo_path_dependency_graph_with_policy(entrypoint, policy) {
+        Ok(graph) => graph,
+        Err(error) => return fail_open_plan_from_resolver_error(entrypoint, &error),
+    };
+    let materialization_entrypoint = graph.workspace_root.as_deref().unwrap_or(entrypoint);
+    let materialization = match resolve_cargo_path_materialization_closure_with_policy(
+        materialization_entrypoint,
+        policy,
+    ) {
+        Ok(materialization) => materialization,
+        Err(error) => {
+            let mut plan = fail_open_plan_from_resolver_error(entrypoint, &error);
+            plan.issues.insert(
+                0,
+                DependencyPlanIssue {
+                    code: "materialization-closure-unavailable".to_string(),
+                    message: format!(
+                        "Cargo path materialization closure is unavailable: {}: {}",
+                        error.kind(),
+                        error.detail()
+                    ),
+                    risk: DependencyRiskClass::Critical,
+                    diagnostics: vec![
+                        format!(
+                            "materialization_entrypoint={}",
+                            materialization_entrypoint.display()
+                        ),
+                        format!("source_error_kind={}", error.kind()),
+                    ],
+                },
+            );
+            plan.fail_open_reason = Some(format!(
+                "materialization closure produced {}: {}",
+                error.kind(),
+                error.detail()
+            ));
+            return plan;
+        }
+    };
+
+    plan_dependency_closure_from_graph_and_materialization(&graph, Some(&materialization))
 }
 
 /// Convert a resolved graph into deterministic sync actions.
 pub fn plan_dependency_closure_from_graph(
     graph: &CargoPathDependencyGraph,
+) -> DependencyClosurePlan {
+    plan_dependency_closure_from_graph_and_materialization(graph, None)
+}
+
+fn plan_dependency_closure_from_graph_and_materialization(
+    graph: &CargoPathDependencyGraph,
+    materialization: Option<&CargoPathMaterializationClosure>,
 ) -> DependencyClosurePlan {
     let package_by_root: BTreeMap<PathBuf, CargoPathDependencyPackage> = graph
         .packages
@@ -185,7 +230,7 @@ pub fn plan_dependency_closure_from_graph(
     }
 
     let mut sync_order = Vec::with_capacity(order.len());
-    for (order_index, root) in order.iter().enumerate() {
+    for root in &order {
         let package =
             package_by_root
                 .get(root)
@@ -229,13 +274,86 @@ pub fn plan_dependency_closure_from_graph(
         };
 
         sync_order.push(DependencySyncAction {
-            order_index,
+            order_index: 0,
             package_root: package.package_root.clone(),
             manifest_path: package.manifest_path,
             package_name: package.package_name,
             risk,
             metadata,
         });
+    }
+
+    if let Some(materialization) = materialization {
+        let active_roots = graph
+            .packages
+            .iter()
+            .map(|package| package.package_root.clone())
+            .collect::<BTreeSet<_>>();
+        let materialization_roots = materialization
+            .root_packages
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut materialization_inbound: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+        let mut materialization_dependents: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+        for edge in &materialization.edges {
+            materialization_inbound
+                .entry(edge.to.clone())
+                .or_default()
+                .insert(edge.dependency_name.clone());
+            materialization_dependents
+                .entry(edge.to.clone())
+                .or_default()
+                .insert(edge.from.clone());
+        }
+
+        let mut materialization_only = Vec::new();
+        for package in &materialization.packages {
+            if active_roots.contains(&package.package_root) {
+                continue;
+            }
+
+            let reason = if package.workspace_member {
+                DependencySyncReason::WorkspaceMember
+            } else {
+                DependencySyncReason::TransitivePathDependency
+            };
+            let inbound_names = materialization_inbound
+                .get(&package.package_root)
+                .map(|set| set.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let dependents = materialization_dependents
+                .get(&package.package_root)
+                .map(|set| set.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+
+            materialization_only.push(DependencySyncAction {
+                order_index: 0,
+                package_root: package.package_root.clone(),
+                manifest_path: package.manifest_path.clone(),
+                package_name: package.package_name.clone(),
+                risk: classify_sync_risk(reason, dependents.len()),
+                metadata: DependencySyncMetadata {
+                    reason,
+                    workspace_member: package.workspace_member,
+                    root_package: materialization_roots.contains(&package.package_root),
+                    inbound_dependency_names: inbound_names,
+                    dependent_roots: dependents.clone(),
+                    notes: vec![
+                        format!("dependent_root_count={}", dependents.len()),
+                        "materialization_only=true".to_string(),
+                        "active_execution_edge=false".to_string(),
+                    ],
+                },
+            });
+        }
+
+        materialization_only.extend(sync_order);
+        sync_order = materialization_only;
+    }
+
+    for (order_index, action) in sync_order.iter_mut().enumerate() {
+        action.order_index = order_index;
     }
 
     let canonical_roots = sync_order
@@ -501,6 +619,98 @@ mod tests {
         assert_eq!(plan.issues.len(), 1);
         assert_eq!(plan.issues[0].code, "planner_non_deterministic_order");
         assert_eq!(plan.issues[0].risk, DependencyRiskClass::Critical);
+    }
+
+    #[test]
+    fn planner_unions_cycle_tolerant_materialization_without_changing_active_dag() {
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/data/projects/app/Cargo.toml"),
+            workspace_root: None,
+            root_packages: vec![PathBuf::from("/data/projects/app")],
+            packages: vec![
+                package("/data/projects/app", "app", false),
+                package("/data/projects/real_dep", "real_dep", false),
+            ],
+            edges: vec![edge(
+                "/data/projects/app",
+                "/data/projects/real_dep",
+                "real_dep",
+            )],
+        };
+        let materialization = CargoPathMaterializationClosure {
+            entry_manifest_path: graph.entry_manifest_path.clone(),
+            workspace_root: None,
+            root_packages: graph.root_packages.clone(),
+            packages: vec![
+                package("/data/projects/app", "app", false),
+                package("/data/projects/optional_a", "optional_a", false),
+                package("/data/projects/optional_b", "optional_b", false),
+                package("/data/projects/real_dep", "real_dep", false),
+            ],
+            edges: vec![
+                edge(
+                    "/data/projects/app",
+                    "/data/projects/optional_a",
+                    "optional_a",
+                ),
+                edge("/data/projects/app", "/data/projects/real_dep", "real_dep"),
+                edge(
+                    "/data/projects/optional_a",
+                    "/data/projects/optional_b",
+                    "optional_b",
+                ),
+                edge(
+                    "/data/projects/optional_b",
+                    "/data/projects/optional_a",
+                    "optional_a",
+                ),
+            ],
+        };
+
+        let plan =
+            plan_dependency_closure_from_graph_and_materialization(&graph, Some(&materialization));
+
+        assert!(
+            plan.is_ready(),
+            "inactive optional cycles are materialization evidence, not active DAG edges"
+        );
+        assert_eq!(
+            plan.sync_roots().into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                PathBuf::from("/data/projects/app"),
+                PathBuf::from("/data/projects/optional_a"),
+                PathBuf::from("/data/projects/optional_b"),
+                PathBuf::from("/data/projects/real_dep"),
+            ])
+        );
+        let real_dep_position = plan
+            .sync_order
+            .iter()
+            .position(|action| action.package_name == "real_dep")
+            .expect("active dependency action");
+        let app_position = plan
+            .sync_order
+            .iter()
+            .position(|action| action.package_name == "app")
+            .expect("active entry action");
+        assert!(
+            real_dep_position < app_position,
+            "active dependency-first order must remain intact"
+        );
+        for package_name in ["optional_a", "optional_b"] {
+            let action = plan
+                .sync_order
+                .iter()
+                .find(|action| action.package_name == package_name)
+                .expect("materialization-only action");
+            assert!(
+                action
+                    .metadata
+                    .notes
+                    .iter()
+                    .any(|note| note == "materialization_only=true")
+            );
+        }
     }
 
     #[test]

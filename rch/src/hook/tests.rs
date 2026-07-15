@@ -3579,6 +3579,30 @@ fn test_classify_dependency_runtime_fail_open_policy_violation() {
 }
 
 #[test]
+fn test_classify_dependency_runtime_fail_open_materialization_failure() {
+    let _guard = test_guard!();
+    let plan = make_fail_open_plan(
+        Some("materialization closure produced missing path dependency"),
+        vec![rch_common::DependencyPlanIssue {
+            code: "materialization-closure-unavailable".to_string(),
+            message: "inactive optional path dependency is missing".to_string(),
+            risk: rch_common::DependencyRiskClass::Critical,
+            diagnostics: vec!["dependency_name=optional_dep".to_string()],
+        }],
+    );
+
+    let decision = classify_dependency_runtime_fail_open(&plan);
+    assert_eq!(
+        decision.reason_code,
+        DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION
+    );
+    assert_eq!(
+        decision.remediation,
+        DEPENDENCY_PREFLIGHT_REMEDIATION_MATERIALIZATION
+    );
+}
+
+#[test]
 fn test_classify_dependency_runtime_fail_open_timeout_signal() {
     let _guard = test_guard!();
     let plan = make_fail_open_plan(
@@ -3646,10 +3670,36 @@ fn test_build_dependency_runtime_fail_open_report_uses_status_mapping() {
 }
 
 #[test]
-fn test_should_force_local_fallback_for_runtime_fail_open_policy_only() {
+fn test_build_dependency_runtime_fail_open_report_maps_materialization_failure() {
+    let _guard = test_guard!();
+    let worker = make_test_worker_config("worker-runtime-materialization");
+    let project_root = PathBuf::from("/data/projects/runtime-materialization");
+    let decision = DependencyRuntimeFailOpenDecision {
+        reason_code: DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION,
+        remediation: DEPENDENCY_PREFLIGHT_REMEDIATION_MATERIALIZATION,
+        detail: "optional path root unavailable".to_string(),
+    };
+
+    let report = build_dependency_runtime_fail_open_report(&worker, &project_root, &decision);
+    assert!(!report.verified);
+    assert_eq!(
+        report.reason_code,
+        Some(DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION)
+    );
+    assert_eq!(
+        report.evidence[0].status,
+        DependencyPreflightStatus::MaterializationUnavailable
+    );
+}
+
+#[test]
+fn test_should_force_local_fallback_for_unsafe_runtime_fail_open() {
     let _guard = test_guard!();
     assert!(should_force_local_fallback_for_runtime_fail_open(
         DEPENDENCY_PREFLIGHT_CODE_POLICY
+    ));
+    assert!(should_force_local_fallback_for_runtime_fail_open(
+        DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION
     ));
     assert!(!should_force_local_fallback_for_runtime_fail_open(
         DEPENDENCY_PREFLIGHT_CODE_UNKNOWN
