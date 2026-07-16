@@ -151,6 +151,7 @@ fn golden_admit_preflight_wasm() {
             "family": "cargo_build",
             "required": {
                 "needs_cargo": true,
+                "needs_zig": false,
                 "needs_bun": false,
                 "needs_nix": false,
                 "needs_go": false,
