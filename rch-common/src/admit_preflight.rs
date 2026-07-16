@@ -242,6 +242,7 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
             }
             let part_req = derive_capabilities(part, c.kind);
             required.needs_cargo |= part_req.needs_cargo;
+            required.needs_zig |= part_req.needs_zig;
             required.needs_bun |= part_req.needs_bun;
             required.needs_nix |= part_req.needs_nix;
             required.needs_go |= part_req.needs_go;
