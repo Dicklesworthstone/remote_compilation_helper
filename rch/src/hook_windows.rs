@@ -89,6 +89,7 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
             | CompilationKind::CargoDoc
             | CompilationKind::CargoNextest
             | CompilationKind::CargoBench
+            | CompilationKind::CargoZigbuild
             | CompilationKind::Rustc => RequiredRuntime::Rust,
 
             CompilationKind::BunTest | CompilationKind::BunTypecheck => RequiredRuntime::Bun,

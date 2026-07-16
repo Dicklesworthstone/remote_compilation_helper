@@ -10,7 +10,7 @@ use crate::toolchain::detect_toolchain;
 use crate::transfer::{
     SyncResult, TransferPipeline, compute_project_hash_with_dependency_roots_and_policy,
     default_bun_artifact_patterns, default_c_cpp_artifact_patterns, default_rust_artifact_patterns,
-    default_rust_test_artifact_patterns, project_id_from_path,
+    default_rust_test_artifact_patterns, default_zigbuild_artifact_patterns, project_id_from_path,
 };
 use crate::ui::console::RchConsole;
 use rch_common::errors::catalog::ErrorCode;
@@ -1992,6 +1992,11 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
             | CompilationKind::CargoDoc
             | CompilationKind::CargoNextest
             | CompilationKind::CargoBench
+            // A zig cross-build IS a cargo/Rust build, so the base runtime gate is
+            // Rust. Its extra needs — `zig` + `cargo-zigbuild` + the `--target`
+            // rustup std — are enforced by the finer `needs_zig`/`needs_targets`
+            // admission preflight, not by a separate RequiredRuntime.
+            | CompilationKind::CargoZigbuild
             | CompilationKind::Rustc => RequiredRuntime::Rust,
 
             CompilationKind::BunTest | CompilationKind::BunTypecheck => RequiredRuntime::Bun,

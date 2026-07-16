@@ -122,6 +122,13 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
     );
     // Go toolchain (PATH-resolved; advisory fact gating go build/test/vet routing).
     s.push_str("gov=$(go version 2>/dev/null) && printf '%sgo_version=%s\\n' \"$P\" \"$gov\"; ");
+    // Zig + cargo-zigbuild (PATH-resolved; gate `cargo zigbuild` cross-compile
+    // routing). BOTH are required: cargo-zigbuild drives the build, zig is the C
+    // compiler/cross-linker it shells out to. Reported as separate facts.
+    s.push_str("zv=$(zig version 2>/dev/null) && printf '%szig_version=%s\\n' \"$P\" \"$zv\"; ");
+    s.push_str(
+        "czv=$(cargo-zigbuild --version 2>/dev/null) && printf '%scargo_zigbuild_version=%s\\n' \"$P\" \"$czv\"; ",
+    );
     // Nix: only report a version when a populated `/nix/store` also exists, since
     // a `nix` binary without a store cannot build derivations (gates nix routing).
     s.push_str(
@@ -201,6 +208,10 @@ pub fn parse_capability_probe(stdout: &str) -> ProbedFacts {
             "npm_version" => f.runtimes.npm_version = Some(value.to_string()),
             "nix_version" => f.runtimes.nix_version = Some(value.to_string()),
             "go_version" => f.runtimes.go_version = Some(value.to_string()),
+            "zig_version" => f.runtimes.zig_version = Some(value.to_string()),
+            "cargo_zigbuild_version" => {
+                f.runtimes.cargo_zigbuild_version = Some(value.to_string())
+            }
             "disk" => {
                 // path;total_kb;avail_kb;avail_inodes
                 let parts: Vec<&str> = value.split(';').collect();
@@ -249,6 +260,9 @@ pub struct CapabilityRequirement {
     pub needs_node: bool,
     /// Whether a working Go toolchain is required.
     pub needs_go: bool,
+    /// Whether `zig` + `cargo-zigbuild` are required (a `cargo zigbuild`
+    /// cross-compile). Enforced ON TOP OF `needs_cargo` and `needs_targets`.
+    pub needs_zig: bool,
     /// Whether a working `nix` (binary + populated `/nix/store`) is required.
     pub needs_nix: bool,
     /// Specific rustup toolchains the build needs (prefix-matched against the
@@ -430,6 +444,19 @@ pub fn assess_admissibility(facts: &ProbedFacts, req: &CapabilityRequirement) ->
         return CapabilityVerdict::Rejected {
             reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
             detail: "go toolchain not found at the configured user/path".to_string(),
+        };
+    }
+    // Zig cross-build needs BOTH zig and cargo-zigbuild (the requested rustup
+    // target std is enforced by the needs_targets loop above). Missing either →
+    // this worker can't run it; if every candidate is rejected the build falls
+    // back to local, exactly like a missing rustup target.
+    if req.needs_zig
+        && (facts.runtimes.zig_version.is_none()
+            || facts.runtimes.cargo_zigbuild_version.is_none())
+    {
+        return CapabilityVerdict::Rejected {
+            reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
+            detail: "zig + cargo-zigbuild not found on the worker".to_string(),
         };
     }
     CapabilityVerdict::Admissible
