@@ -164,8 +164,10 @@ pub use bypass_recovery::{
 };
 pub use cargo_path_deps::{
     CargoPathDependencyEdge, CargoPathDependencyError, CargoPathDependencyErrorKind,
-    CargoPathDependencyGraph, CargoPathDependencyPackage, resolve_cargo_path_dependency_graph,
-    resolve_cargo_path_dependency_graph_with_policy,
+    CargoPathDependencyGraph, CargoPathDependencyPackage, CargoPathMaterializationClosure,
+    resolve_cargo_path_dependency_graph, resolve_cargo_path_dependency_graph_with_policy,
+    resolve_cargo_path_materialization_closure,
+    resolve_cargo_path_materialization_closure_with_policy,
 };
 pub use closure_explain::{
     ClosureExplainEntry, ClosureExplainReport, RootConvergence, RootSyncOutcome, derive_outcome,

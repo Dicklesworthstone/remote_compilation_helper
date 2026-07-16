@@ -727,10 +727,26 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     let estimated_cores =
         estimate_cores_for_command(classification.kind, &command, &config.compilation);
 
-    // Detect toolchain
+    // Detect toolchain — ONLY for Rust kinds.
+    //
+    // `detect_toolchain` returns the ambient rustup toolchain (e.g. from
+    // rust-toolchain.toml, or the active default). Attaching it to a NON-Rust
+    // request is actively harmful: rchd runs a per-worker toolchain preflight, and
+    // a worker that does not happen to have that exact nightly installed fails it
+    // and is excluded as a HARD preflight failure. With every worker excluded the
+    // build falls back to LOCAL — so a `go build` on a box whose rustup default is
+    // `nightly-2026-07-11` would silently keep running on the orchestrator, which
+    // is precisely the bug this feature exists to fix. Go/TS/Bun/Nix builds need no
+    // rustup toolchain, so send none.
     let project_root = std::env::current_dir().ok();
-    let toolchain = if let Some(root) = &project_root {
-        detect_toolchain(root).ok()
+    let needs_rust_toolchain = matches!(
+        required_runtime_for_kind(classification.kind),
+        RequiredRuntime::Rust
+    );
+    let toolchain = if needs_rust_toolchain {
+        project_root
+            .as_ref()
+            .and_then(|root| detect_toolchain(root).ok())
     } else {
         None
     };
@@ -1087,8 +1103,9 @@ mod ssh;
 // sync-closure planners + verifier directly from `super::dependency_closure`.
 mod dependency_closure;
 use dependency_closure::{
-    DEPENDENCY_PREFLIGHT_CODE_POLICY, DEPENDENCY_PREFLIGHT_CODE_TIMEOUT,
-    DEPENDENCY_PREFLIGHT_CODE_UNKNOWN, DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY,
+    DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION, DEPENDENCY_PREFLIGHT_CODE_POLICY,
+    DEPENDENCY_PREFLIGHT_CODE_TIMEOUT, DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+    DEPENDENCY_PREFLIGHT_REMEDIATION_MATERIALIZATION, DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY,
     DEPENDENCY_PREFLIGHT_REMEDIATION_TIMEOUT, DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN,
     DEPENDENCY_PREFLIGHT_SCHEMA_VERSION, DependencyPreflightEvidence, DependencyPreflightFailure,
     DependencyPreflightReport, DependencyPreflightStatus,
@@ -1755,6 +1772,10 @@ fn classify_dependency_runtime_fail_open(
         .issues
         .iter()
         .any(|issue| issue.code == "path-policy-violation");
+    let has_materialization_failure = plan
+        .issues
+        .iter()
+        .any(|issue| issue.code == "materialization-closure-unavailable");
     let has_timeout = plan
         .fail_open_reason
         .as_deref()
@@ -1771,6 +1792,11 @@ fn classify_dependency_runtime_fail_open(
         (
             DEPENDENCY_PREFLIGHT_CODE_POLICY,
             DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY,
+        )
+    } else if has_materialization_failure {
+        (
+            DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION,
+            DEPENDENCY_PREFLIGHT_REMEDIATION_MATERIALIZATION,
         )
     } else if has_timeout {
         (
@@ -1813,6 +1839,8 @@ fn build_dependency_runtime_fail_open_report(
 ) -> DependencyPreflightReport {
     let status = if decision.reason_code == DEPENDENCY_PREFLIGHT_CODE_POLICY {
         DependencyPreflightStatus::PolicyViolation
+    } else if decision.reason_code == DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION {
+        DependencyPreflightStatus::MaterializationUnavailable
     } else if decision.reason_code == DEPENDENCY_PREFLIGHT_CODE_TIMEOUT {
         DependencyPreflightStatus::Timeout
     } else {
@@ -1846,6 +1874,7 @@ fn build_dependency_runtime_fail_open_report(
 
 fn should_force_local_fallback_for_runtime_fail_open(reason_code: &str) -> bool {
     reason_code == DEPENDENCY_PREFLIGHT_CODE_POLICY
+        || reason_code == DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION
 }
 
 fn command_uses_cargo_dependency_graph(kind: Option<CompilationKind>) -> bool {
@@ -1968,6 +1997,17 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
             CompilationKind::BunTest | CompilationKind::BunTypecheck => RequiredRuntime::Bun,
 
             CompilationKind::NixBuild => RequiredRuntime::Nix,
+
+            // Go builds/tests/vets must carry the Go runtime so worker selection
+            // gates them to a go-capable worker via `has_go()`. Falling through to
+            // the `_ => None` catch-all would disable capability gating entirely and
+            // dispatch `go build` to a worker with no Go toolchain.
+            CompilationKind::GoBuild | CompilationKind::GoTest | CompilationKind::GoVet => {
+                RequiredRuntime::Go
+            }
+
+            // `tsc` / `npx tsc` run under Node.
+            CompilationKind::Tsc => RequiredRuntime::Node,
 
             _ => RequiredRuntime::None,
         },

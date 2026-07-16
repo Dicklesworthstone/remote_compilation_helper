@@ -88,6 +88,8 @@ pub enum RequiredRuntime {
     Node,
     /// Requires the Nix package manager (nix binary + populated `/nix/store`).
     Nix,
+    /// Requires the Go toolchain (`go` binary).
+    Go,
 }
 
 /// Per-command priority hint for worker selection.
@@ -717,6 +719,10 @@ pub struct WorkerCapabilities {
     /// routing to this worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nix_version: Option<String>,
+    /// Go toolchain version (from `go version`). Presence gates `go build`/
+    /// `go test`/`go vet` routing to this worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub go_version: Option<String>,
 
     // Health metrics (bd-3eaa)
     /// Number of CPU cores on the worker.
@@ -786,6 +792,11 @@ impl WorkerCapabilities {
     /// Check if this worker has Nix installed (nix binary + `/nix/store`).
     pub fn has_nix(&self) -> bool {
         self.nix_version.is_some()
+    }
+
+    /// Check if this worker has the Go toolchain installed.
+    pub fn has_go(&self) -> bool {
+        self.go_version.is_some()
     }
 
     /// Calculate load per core (1-minute load average / num_cpus).
@@ -2076,6 +2087,9 @@ impl CompilationConfig {
             // closures); give them the generous test-timeout bucket rather than
             // the short build timeout so legitimate builds are not killed early.
             Some(CompilationKind::NixBuild) => self.test_timeout_sec,
+            // Go test suites are long-running like cargo test; give them the
+            // test bucket rather than the short build timeout.
+            Some(CompilationKind::GoTest) => self.test_timeout_sec,
             // Builds, checks, clippy, and unknown use build timeout
             _ => self.build_timeout_sec,
         };
@@ -2283,6 +2297,10 @@ fn default_execution_allowlist() -> Vec<String> {
         "bun".to_string(),
         // Nix (covers both `nix build` and the legacy `nix-build`)
         "nix".to_string(),
+        // Go
+        "go".to_string(),
+        // TypeScript (covers both `tsc` and `npx tsc`; command_base is "tsc")
+        "tsc".to_string(),
     ]
 }
 
@@ -4949,8 +4967,13 @@ retry_max = 2
         // Unknown commands should not be allowed
         assert!(!config.is_allowed("python"));
         assert!(!config.is_allowed("npm"));
-        assert!(!config.is_allowed("go"));
         assert!(!config.is_allowed(""));
+        // `go` and `tsc` ARE allowed now that Go/TypeScript are offload targets.
+        // If they were missing from the allowlist the hook would fail open to
+        // LOCAL execution — classification would look correct while every build
+        // silently ran on the orchestrator.
+        assert!(config.is_allowed("go"));
+        assert!(config.is_allowed("tsc"));
     }
 
     #[test]

@@ -59,6 +59,17 @@ pub(super) fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String
         // symlink that is meaningless on a nix-less local host, so nothing is
         // synced back — the exit status is the payload (streaming only).
         Some(CompilationKind::NixBuild) => Vec::new(),
+        // Go and TypeScript kinds are stream-only by construction: the classifier
+        // only accepts the non-emitting forms (`go build` without `-o`, `go test`,
+        // `go vet`, `tsc --noEmit`), so there is no output file to bring home and
+        // the exit status is the payload. Emitting forms are declined in
+        // classify_go/classify_tsc and run locally. Falling through to the
+        // `_ => default_rust_artifact_patterns()` catch-all would sync back
+        // `target/**` — the wrong tree entirely.
+        Some(CompilationKind::GoBuild)
+        | Some(CompilationKind::GoTest)
+        | Some(CompilationKind::GoVet)
+        | Some(CompilationKind::Tsc) => Vec::new(),
         _ => default_rust_artifact_patterns(),
     }
 }
@@ -161,7 +172,13 @@ pub(super) fn kind_produces_transferable_artifacts(kind: Option<CompilationKind>
         | Some(CompilationKind::BunTest)
         | Some(CompilationKind::BunTypecheck)
         // Nix builds stream their result; outputs stay in the worker's /nix/store.
-        | Some(CompilationKind::NixBuild) => false,
+        | Some(CompilationKind::NixBuild)
+        // Go/TS: only non-emitting forms are ever offloaded (see classify_go /
+        // classify_tsc), so there is no required local artifact.
+        | Some(CompilationKind::GoBuild)
+        | Some(CompilationKind::GoTest)
+        | Some(CompilationKind::GoVet)
+        | Some(CompilationKind::Tsc) => false,
         // Unclassified command: be conservative and treat a sync-back failure as
         // benign (we cannot prove a required artifact exists), matching the legacy
         // continue-on-warning behavior.

@@ -371,7 +371,12 @@ pub async fn prepare(
         }
         // Nix fetches its own inputs into /nix/store at build time and needs no
         // node_modules-style prepare step, so it is skipped like Rust/None.
-        RequiredRuntime::Rust | RequiredRuntime::None | RequiredRuntime::Nix => Ok(PrepareReport {
+        // Go resolves its own modules from the module cache at build time and
+        // needs no node_modules-style prepare step, so it is skipped like Rust/Nix.
+        RequiredRuntime::Rust
+        | RequiredRuntime::None
+        | RequiredRuntime::Nix
+        | RequiredRuntime::Go => Ok(PrepareReport {
             runtime,
             action: PrepareAction::Skipped,
             fingerprint: None,

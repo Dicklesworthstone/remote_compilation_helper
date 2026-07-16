@@ -107,12 +107,14 @@ pub(super) const DEPENDENCY_PREFLIGHT_CODE_STALE: &str = "RCH-E411";
 pub(super) const DEPENDENCY_PREFLIGHT_CODE_UNKNOWN: &str = "RCH-E412";
 pub(super) const DEPENDENCY_PREFLIGHT_CODE_POLICY: &str = "RCH-E413";
 pub(super) const DEPENDENCY_PREFLIGHT_CODE_TIMEOUT: &str = "RCH-E414";
+pub(super) const DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION: &str = "RCH-E415";
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING: &str = "Ensure every dependency root in the closure is synced and Cargo.toml plus required source entrypoints exist remotely.";
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_STALE: &str = "One or more dependency roots were not refreshed; rerun after successful sync of skipped roots.";
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN: &str =
     "Dependency verification could not determine remote state; inspect sync/SSH logs and retry.";
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY: &str = "Path dependency topology policy failed; move dependencies under /data/projects (or /dp) and retry.";
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_TIMEOUT: &str = "Dependency planner timed out; rerun after system load decreases or investigate cargo metadata latency.";
+pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_MATERIALIZATION: &str = "Cargo path materialization is incomplete; repair the reported repository manifest/path dependency before retrying remote Cargo execution.";
 pub(super) const DEPENDENCY_PREFLIGHT_PROBE_BATCH_SIZE: usize = 128;
 const WORKSPACE_METADATA_SYNC_PATTERNS: &[&str] = &[
     "Cargo.toml",
@@ -131,6 +133,7 @@ pub(super) enum DependencyPreflightStatus {
     Stale,
     PolicyViolation,
     Timeout,
+    MaterializationUnavailable,
     Unknown,
 }
 
@@ -200,6 +203,7 @@ fn dependency_preflight_status_label(status: DependencyPreflightStatus) -> &'sta
         DependencyPreflightStatus::Stale => "stale",
         DependencyPreflightStatus::PolicyViolation => "policy_violation",
         DependencyPreflightStatus::Timeout => "timeout",
+        DependencyPreflightStatus::MaterializationUnavailable => "materialization_unavailable",
         DependencyPreflightStatus::Unknown => "unknown",
     }
 }
@@ -265,6 +269,15 @@ fn dependency_preflight_failure_reason(
         return Some((
             DEPENDENCY_PREFLIGHT_CODE_STALE,
             DEPENDENCY_PREFLIGHT_REMEDIATION_STALE,
+        ));
+    }
+    if evidence
+        .iter()
+        .any(|item| item.status == DependencyPreflightStatus::MaterializationUnavailable)
+    {
+        return Some((
+            DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION,
+            DEPENDENCY_PREFLIGHT_REMEDIATION_MATERIALIZATION,
         ));
     }
     if evidence

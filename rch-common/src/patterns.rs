@@ -37,6 +37,9 @@ pub static COMPILATION_KEYWORDS: &[&str] = &[
     "nextest",
     "nix",
     "nix-build",
+    "go",
+    "tsc",
+    "npx",
 ];
 
 /// Commands that should NEVER be intercepted, even if they contain compilation keywords.
@@ -93,6 +96,25 @@ pub static NEVER_INTERCEPT: &[&str] = &[
     "cargo nextest list",    // Lists tests only, doesn't run them
     "cargo nextest archive", // Creates test archives
     "cargo nextest show",    // Shows config/setup info
+    // Go commands that mutate local state, run programs, or are trivially fast.
+    // Only `go build` / `go test` / `go vet` are offloadable (see classify_go).
+    "go get",      // mutates go.mod / module cache
+    "go mod",      // mutates go.mod / go.sum
+    "go work",     // mutates go.work
+    "go install",  // writes a binary into local GOBIN
+    "go run",      // runs a program locally (may be interactive / long-lived)
+    "go generate", // executes arbitrary local codegen
+    "go fmt",      // rewrites local source files
+    "go clean",    // mutates local caches
+    "go env",      // trivial; also used to *set* local env
+    "go doc",      // trivial lookup
+    "go version",  // trivial
+    "go tool",     // arbitrary tool execution
+    "go list",     // metadata query; cheap, and agents parse it locally
+    // TypeScript: version/init are trivial or mutate local state
+    "tsc --version",
+    "tsc -v",
+    "tsc --init",
 ];
 
 /// Result of command classification.
@@ -244,6 +266,24 @@ pub enum CompilationKind {
     /// bun typecheck - Runs TypeScript type checking
     BunTypecheck,
 
+    // Go commands
+    //
+    // Only the non-emitting forms are offloaded. `go build -o <file>` writes a
+    // binary the caller expects to find locally, so classify_go declines it and
+    // it runs locally — a remote build whose artifact never came home would be a
+    // silent correctness bug. Plain `go build ./...` is a compile check that
+    // produces no output file, so exit status is the whole payload.
+    /// `go build ./...` (compile check; no `-o` output file)
+    GoBuild,
+    /// `go test ./...`
+    GoTest,
+    /// `go vet ./...`
+    GoVet,
+
+    // TypeScript
+    /// `tsc --noEmit` / `npx tsc --noEmit` (typecheck only; emitting runs stay local)
+    Tsc,
+
     // Nix commands
     /// `nix build` / `nix-build` (derivation build), `nix flake check`
     /// (evaluate + build all outputs), and the non-interactive
@@ -268,6 +308,7 @@ impl CompilationKind {
                 | CompilationKind::CargoNextest
                 | CompilationKind::CargoBench
                 | CompilationKind::BunTest
+                | CompilationKind::GoTest
         )
     }
 
@@ -301,6 +342,11 @@ impl CompilationKind {
             // Nix commands. Both `nix build` and the legacy `nix-build` route
             // through this kind; the canonical allowlist base name is "nix".
             CompilationKind::NixBuild => "nix",
+            // Go commands
+            CompilationKind::GoBuild | CompilationKind::GoTest | CompilationKind::GoVet => "go",
+            // TypeScript. Both `tsc` and `npx tsc` route through this kind; the
+            // canonical allowlist base name is "tsc".
+            CompilationKind::Tsc => "tsc",
         }
     }
 }
@@ -1972,7 +2018,115 @@ fn classify_full(cmd: &str) -> Classification {
         }
     }
 
+    // Go commands
+    if cmd.starts_with("go ") {
+        return classify_go(cmd);
+    }
+
+    // TypeScript: `tsc ...` and `npx tsc ...`.
+    //
+    // `npx` is not a normalize_command wrapper (it can run arbitrary packages),
+    // so match it explicitly here rather than stripping it globally.
+    if let Some(rest) = cmd
+        .strip_prefix("tsc ")
+        .or_else(|| cmd.strip_prefix("npx tsc "))
+    {
+        return classify_tsc(rest);
+    }
+
     Classification::not_compilation("no matching pattern")
+}
+
+/// Classify `tsc` / `npx tsc` invocations.
+///
+/// Only `--noEmit` typechecks are offloaded. An emitting `tsc` run writes `.js`
+/// / `.d.ts` / `.tsbuildinfo` into the local tree, and these kinds are
+/// stream-only (no artifact sync-back), so offloading an emitting run would
+/// return exit 0 with no output files — a silent correctness bug. Emitting runs
+/// stay local.
+///
+/// `args` is the command with the leading `tsc ` / `npx tsc ` already stripped.
+fn classify_tsc(args: &str) -> Classification {
+    let tokens = args.split_whitespace();
+    let mut no_emit = false;
+    for token in tokens {
+        // --watch is interactive and never terminates; never intercept.
+        if token.eq("-w") || token.eq("--watch") || token.eq("--watchFile") {
+            return Classification::not_compilation("tsc --watch is interactive (not intercepted)");
+        }
+        // tsc's flag parsing is case-insensitive (--noemit == --noEmit).
+        if token.eq_ignore_ascii_case("--noemit") {
+            no_emit = true;
+        }
+    }
+
+    if !no_emit {
+        return Classification::not_compilation(
+            "tsc without --noEmit emits output files locally (not intercepted)",
+        );
+    }
+
+    Classification::compilation(CompilationKind::Tsc, 0.95, "tsc --noEmit typecheck")
+}
+
+/// Classify `go` subcommands.
+///
+/// Only `build` (without `-o`), `test`, and `vet` are offloaded. Everything else
+/// is either local-state-mutating or trivially fast and is listed in
+/// [`NEVER_INTERCEPT`]; this function is the second line of defence.
+///
+/// `go build -o <file>` is deliberately NOT offloaded: it writes a binary the
+/// caller expects to find on the local filesystem, and Go kinds are stream-only
+/// (no artifact sync-back). Offloading it would report success while leaving no
+/// binary behind. Plain `go build ./...` writes nothing (it is a compile check),
+/// so exit status is the entire payload and it is safe to run remotely.
+fn classify_go(cmd: &str) -> Classification {
+    let mut tokens = cmd.split_whitespace();
+    // Skip the leading "go".
+    tokens.next();
+
+    let subcommand = match tokens.next() {
+        Some(sub) => sub,
+        None => return Classification::not_compilation("bare `go` is not a compilation command"),
+    };
+
+    // Remaining args, used for flag checks below.
+    let args: Vec<&str> = tokens.collect();
+
+    match subcommand {
+        "build" => {
+            // `-o <file>` (or `-o=<file>`) emits a binary locally — keep it local.
+            if args
+                .iter()
+                .any(|a| a.eq(&"-o") || a.starts_with("-o=") || a.eq(&"--output"))
+            {
+                return Classification::not_compilation(
+                    "go build -o emits a local binary (not intercepted)",
+                );
+            }
+            Classification::compilation(CompilationKind::GoBuild, 0.95, "go build command")
+        }
+        "test" => {
+            // `-exec` runs an arbitrary local wrapper binary; keep it local.
+            if args
+                .iter()
+                .any(|a| a.eq(&"-exec") || a.starts_with("-exec="))
+            {
+                return Classification::not_compilation(
+                    "go test -exec runs a local wrapper (not intercepted)",
+                );
+            }
+            // `-c` compiles the test binary to disk instead of running it.
+            if args.iter().any(|a| a.eq(&"-c")) {
+                return Classification::not_compilation(
+                    "go test -c emits a local test binary (not intercepted)",
+                );
+            }
+            Classification::compilation(CompilationKind::GoTest, 0.95, "go test command")
+        }
+        "vet" => Classification::compilation(CompilationKind::GoVet, 0.95, "go vet command"),
+        _ => Classification::not_compilation("go subcommand is not a compilation command"),
+    }
 }
 
 /// Classify cargo subcommands.
@@ -6588,11 +6742,23 @@ mod regression_classification {
                 reason_contains: "no compilation keyword",
                 min_confidence: 0.0,
             },
+            // Go is now a first-class offload target (previously this asserted
+            // "no compilation keyword", i.e. that `go build` was NOT intercepted
+            // and therefore ran locally on the orchestrator).
             Case {
                 cmd: "go build .",
+                expect_compilation: true,
+                expected_kind: Some(CompilationKind::GoBuild),
+                reason_contains: "go build command",
+                min_confidence: 0.9,
+            },
+            // …but an emitting `go build -o` still runs locally: Go kinds are
+            // stream-only, so offloading it would leave no binary behind.
+            Case {
+                cmd: "go build -o bin/app ./cmd/app",
                 expect_compilation: false,
                 expected_kind: None,
-                reason_contains: "no compilation keyword",
+                reason_contains: "emits a local binary",
                 min_confidence: 0.0,
             },
             Case {
@@ -7051,5 +7217,165 @@ mod regression_classification {
         assert_eq!(CompilationKind::Meson.command_base(), "meson");
         assert_eq!(CompilationKind::BunTest.command_base(), "bun");
         assert_eq!(CompilationKind::BunTypecheck.command_base(), "bun");
+    }
+}
+
+#[cfg(test)]
+mod tests_go_and_typescript {
+    use super::*;
+
+    fn kind_of(cmd: &str) -> Option<CompilationKind> {
+        classify_command(cmd).kind
+    }
+
+    // --- Go: the offloadable forms ---
+
+    #[test]
+    fn go_build_test_vet_are_classified() {
+        assert_eq!(kind_of("go build ./..."), Some(CompilationKind::GoBuild));
+        assert_eq!(kind_of("go test ./..."), Some(CompilationKind::GoTest));
+        assert_eq!(kind_of("go vet ./..."), Some(CompilationKind::GoVet));
+        // Real commands observed hammering the orchestrator.
+        assert_eq!(
+            kind_of("go test -tags=e2e ./e2e -run ^TestE2EAtomicAssignment$"),
+            Some(CompilationKind::GoTest)
+        );
+        assert_eq!(
+            kind_of("go test ./internal/robot ./internal/cli -run TestExitCode"),
+            Some(CompilationKind::GoTest)
+        );
+    }
+
+    #[test]
+    fn go_commands_clear_the_confidence_threshold() {
+        // Default confidence_threshold is 0.85; anything at or below it is never
+        // intercepted, which would silently keep these local.
+        for cmd in ["go build ./...", "go test ./...", "go vet ./..."] {
+            let c = classify_command(cmd);
+            assert!(
+                c.confidence > 0.85,
+                "{cmd} scored {} which does not clear the 0.85 threshold",
+                c.confidence
+            );
+        }
+    }
+
+    #[test]
+    fn go_test_is_a_test_command() {
+        // Drives cache affinity, the test-slot bucket, and the test timeout.
+        assert!(CompilationKind::GoTest.is_test_command());
+        assert!(!CompilationKind::GoBuild.is_test_command());
+        assert!(!CompilationKind::GoVet.is_test_command());
+    }
+
+    // --- Go: forms that MUST stay local (would otherwise lose artifacts) ---
+
+    #[test]
+    fn go_build_with_output_flag_is_not_offloaded() {
+        // Go kinds are stream-only (no artifact sync-back). Offloading an
+        // emitting build would report success and leave no binary behind.
+        assert_eq!(kind_of("go build -o bin/app ./cmd/app"), None);
+        assert_eq!(kind_of("go build -o=bin/app ./cmd/app"), None);
+    }
+
+    #[test]
+    fn go_test_c_and_exec_stay_local() {
+        assert_eq!(kind_of("go test -c ./pkg"), None);
+        assert_eq!(kind_of("go test -exec sudo ./pkg"), None);
+    }
+
+    #[test]
+    fn go_state_mutating_subcommands_are_never_intercepted() {
+        for cmd in [
+            "go get github.com/foo/bar",
+            "go mod tidy",
+            "go mod download",
+            "go install ./cmd/tool",
+            "go run main.go",
+            "go generate ./...",
+            "go fmt ./...",
+            "go clean -cache",
+            "go work sync",
+            "go env GOPATH",
+            "go version",
+            "go list ./...",
+            "go tool pprof",
+        ] {
+            assert_eq!(kind_of(cmd), None, "{cmd} must never be intercepted");
+        }
+    }
+
+    #[test]
+    fn go_prefixed_binaries_are_not_matched() {
+        // Keyword matching is whole-word, so these must not be treated as `go`.
+        assert_eq!(kind_of("gofmt -l ."), None);
+        assert_eq!(kind_of("golangci-lint run"), None);
+    }
+
+    // --- TypeScript ---
+
+    #[test]
+    fn tsc_noemit_is_classified() {
+        assert_eq!(kind_of("tsc --noEmit"), Some(CompilationKind::Tsc));
+        assert_eq!(kind_of("npx tsc --noEmit"), Some(CompilationKind::Tsc));
+        // Observed in the wild.
+        assert_eq!(
+            kind_of("npx tsc --noEmit --incremental false"),
+            Some(CompilationKind::Tsc)
+        );
+        // tsc flags are case-insensitive.
+        assert_eq!(kind_of("tsc --noemit"), Some(CompilationKind::Tsc));
+    }
+
+    #[test]
+    fn emitting_tsc_stays_local() {
+        // Without --noEmit, tsc writes .js/.d.ts into the local tree. Tsc is
+        // stream-only, so offloading it would silently produce no output.
+        assert_eq!(kind_of("tsc"), None);
+        assert_eq!(kind_of("tsc -p tsconfig.json"), None);
+        assert_eq!(kind_of("npx tsc --outDir dist"), None);
+    }
+
+    #[test]
+    fn tsc_watch_is_not_intercepted() {
+        assert_eq!(kind_of("tsc --noEmit --watch"), None);
+        assert_eq!(kind_of("tsc --noEmit -w"), None);
+    }
+
+    #[test]
+    fn tsc_trivial_forms_are_not_intercepted() {
+        assert_eq!(kind_of("tsc --version"), None);
+        assert_eq!(kind_of("tsc --init"), None);
+    }
+
+    #[test]
+    fn npx_non_tsc_is_not_intercepted() {
+        // "npx" is a compilation keyword only so `npx tsc` reaches classify_full;
+        // every other npx invocation must fall through.
+        assert_eq!(kind_of("npx jest"), None);
+        assert_eq!(kind_of("npx prettier --write ."), None);
+    }
+
+    // --- command_base drives the execution allowlist ---
+
+    #[test]
+    fn command_base_is_allowlisted() {
+        use crate::types::ExecutionConfig;
+        let exec = ExecutionConfig::default();
+        for kind in [
+            CompilationKind::GoBuild,
+            CompilationKind::GoTest,
+            CompilationKind::GoVet,
+            CompilationKind::Tsc,
+        ] {
+            let base = kind.command_base();
+            assert!(
+                exec.is_allowed(base),
+                "{base} missing from the execution allowlist — the hook would fail \
+                 open to LOCAL execution, silently losing offload"
+            );
+        }
+        assert_eq!(CompilationKind::GoBuild.command_base(), "go");
+        assert_eq!(CompilationKind::Tsc.command_base(), "tsc");
     }
 }

@@ -152,6 +152,9 @@ fn golden_admit_preflight_wasm() {
             "required": {
                 "needs_cargo": true,
                 "needs_bun": false,
+                "needs_nix": false,
+                "needs_go": false,
+                "needs_node": false,
                 "needs_targets": ["wasm32-unknown-unknown"],
                 "needs_toolchains": [],
             },

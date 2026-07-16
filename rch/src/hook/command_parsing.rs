@@ -285,10 +285,16 @@ pub(crate) fn estimate_cores_for_command(
         Some(
             CompilationKind::CargoCheck
             | CompilationKind::CargoClippy
-            | CompilationKind::BunTypecheck,
+            | CompilationKind::BunTypecheck
+            // `go vet` and `tsc --noEmit` are diagnostic passes, not builds.
+            | CompilationKind::GoVet
+            | CompilationKind::Tsc,
         ) => cargo_job_count_for_command(command)
             .unwrap_or(check_default)
             .max(1),
+        // Go: `-j/--jobs` is meaningless (go uses `-p`), so don't try to parse a
+        // cargo job count out of the command — take the default bucket directly.
+        Some(CompilationKind::GoBuild) => build_default.max(1),
         Some(_) => cargo_job_count_for_command(command)
             .unwrap_or(build_default)
             .max(1),

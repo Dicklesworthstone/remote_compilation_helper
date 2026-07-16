@@ -1237,9 +1237,49 @@ fi",
         };
 
         format!(
-            "export LC_ALL=C; touch {} && cd {} && {}{}",
-            escaped_remote_path, escaped_remote_path, ensure_dirs_command, execution_command
+            "export LC_ALL=C; touch {} && cd {} && {}{}{}",
+            escaped_remote_path,
+            escaped_remote_path,
+            self.node_modules_bootstrap(),
+            ensure_dirs_command,
+            execution_command
         )
+    }
+
+    /// Provision `node_modules` on the worker for TypeScript kinds.
+    ///
+    /// The project sync deliberately EXCLUDES `node_modules/` (see
+    /// `default_excludes`), and that exclusion is correct: node_modules holds
+    /// platform-native binaries, so rsyncing a macOS tree onto a Linux worker
+    /// would ship unusable `.node` files. rch-wkr has a `prepare()` hook that
+    /// installs dependencies — but the hook's build path executes the command
+    /// over plain SSH and never invokes `rch-wkr execute`, so on this path
+    /// nothing provisions them.
+    ///
+    /// Without this, `tsc --noEmit` on a worker finds no project-local
+    /// TypeScript, and `npx` silently downloads the unrelated `tsc` stub package
+    /// from the registry — which prints "This is not the tsc command you are
+    /// looking for" and exits 1, turning a passing local typecheck into a failing
+    /// remote build.
+    ///
+    /// Install only when `node_modules` is absent. The worker's project directory
+    /// persists between builds, so this is a one-time cost per project. `npm ci`
+    /// is preferred (lockfile-exact, so the worker typechecks with the SAME
+    /// TypeScript version as local); `npm install` is the fallback for projects
+    /// with no lockfile. Installer output is routed to stderr so it can never
+    /// pollute the command's stdout.
+    ///
+    /// Deliberately scoped to `Tsc` only: Bun kinds keep their existing behavior.
+    fn node_modules_bootstrap(&self) -> &'static str {
+        match self.compilation_kind {
+            Some(CompilationKind::Tsc) => {
+                "if [ -f package.json ] && [ ! -d node_modules ]; then \
+                 (npm ci --no-audit --no-fund --loglevel=error || \
+                  npm install --no-audit --no-fund --loglevel=error) 1>&2 || exit 1; \
+                 fi && "
+            }
+            _ => "",
+        }
     }
 
     /// Wrap a command with an external timeout to prevent zombie/stuck processes.
@@ -1288,6 +1328,10 @@ fi",
             Some(CompilationKind::Ninja) => "ninja",
             Some(CompilationKind::Meson) => "meson",
             Some(CompilationKind::NixBuild) => "nix build",
+            Some(CompilationKind::GoBuild) => "go build",
+            Some(CompilationKind::GoTest) => "go test",
+            Some(CompilationKind::GoVet) => "go vet",
+            Some(CompilationKind::Tsc) => "tsc",
             None => "unknown",
         };
 
