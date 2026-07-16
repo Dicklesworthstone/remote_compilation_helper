@@ -1034,6 +1034,9 @@ pub async fn admit(command: &str, ctx: &OutputContext) -> Result<()> {
     if req.needs_cargo {
         needs.push("cargo".to_string());
     }
+    if req.needs_zig {
+        needs.push("zig".to_string());
+    }
     if req.needs_bun {
         needs.push("bun".to_string());
     }
