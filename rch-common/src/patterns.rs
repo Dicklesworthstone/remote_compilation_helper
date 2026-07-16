@@ -22,6 +22,10 @@ const TIER_FULL_CLASSIFICATION: &str = "full_classification";
 /// Used for SIMD-accelerated quick filtering (Tier 2).
 pub static COMPILATION_KEYWORDS: &[&str] = &[
     "cargo",
+    // The standalone cargo-zigbuild binary (hyphenated) does NOT word-match
+    // "cargo", so it needs its own Tier-2 keyword or it is rejected before
+    // classify_full's `cargo-zigbuild` route ever runs.
+    "cargo-zigbuild",
     "rustc",
     "gcc",
     "g++",
