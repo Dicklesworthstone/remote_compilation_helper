@@ -1946,6 +1946,14 @@ EOF
 # ============================================================================
 
 setup_path() {
+    # Test harnesses and automation MUST set RCH_NO_RC=1: modifying the
+    # user's real shell rc from a non-interactive/CI context is how a test
+    # fixture's stub `rch` ended up shadowing the real binary on PATH for
+    # five days (2026-07-11..16 incident). Never remove this guard.
+    if [[ "${RCH_NO_RC:-}" == "1" ]]; then
+        info "RCH_NO_RC=1 set; skipping shell rc PATH modification"
+        return 0
+    fi
     if [[ ":$PATH:" == *":$INSTALL_DIR:"* ]]; then
         info "$INSTALL_DIR already in PATH"
         return 0
