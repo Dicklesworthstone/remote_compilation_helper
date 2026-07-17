@@ -1,11 +1,11 @@
 //! Telemetry storage and polling for worker metrics.
 
 use crate::events::EventBus;
-use crate::workers::{WorkerPool, WorkerState};
+use crate::workers::{AdminIntent, WorkerPool, WorkerState};
 use anyhow::Context;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use directories::ProjectDirs;
-use rch_common::{SshClient, SshOptions, WorkerStatus};
+use rch_common::{SshClient, SshOptions};
 use rch_telemetry::protocol::{
     ReceivedTelemetry, TelemetrySource, TestRunRecord, TestRunStats, WorkerTelemetry,
 };
@@ -381,11 +381,26 @@ impl TelemetryPoller {
     }
 
     async fn should_poll_worker(&self, worker: &WorkerState) -> bool {
-        let status = worker.status().await;
-        if matches!(
-            status,
-            WorkerStatus::Unreachable | WorkerStatus::Drained | WorkerStatus::Disabled
-        ) {
+        // Skip ONLY workers the operator has deliberately taken out of service
+        // (admin axis). We MUST keep polling health-excluded workers —
+        // Unreachable, and especially the `TemporaryBypass` /
+        // `RecoveredPendingCanary` quarantine states — because their recovery
+        // gate requires FRESH telemetry (`telemetry_ok`).
+        //
+        // The old code keyed off the legacy `status()`, which collapses every
+        // quarantine (`TemporaryBypass`/`RecoveredPendingCanary`) down to
+        // `Unreachable` and so skipped them. That created the fleet-wide
+        // stranding deadlock of the 2026-07-16 offload meltdown: circuit trips
+        // -> worker quarantined -> poller skips it -> telemetry goes stale ->
+        // `telemetry_ok=false` -> recovery probe `StayBypassed` forever, with a
+        // persisted record that a daemon restart merely re-applies. Gating on
+        // the admin axis instead lets a quarantined-but-recovered worker keep
+        // reporting telemetry so it can actually rejoin. Polling a genuinely
+        // down worker just times out (bounded by the poll concurrency cap +
+        // per-attempt timeout), which is the same cost the health monitor
+        // already pays by checking every worker each cycle.
+        let admin = worker.lifecycle().await.admin;
+        if matches!(admin, AdminIntent::Drained | AdminIntent::Disabled) {
             return false;
         }
 
@@ -557,6 +572,7 @@ async fn poll_worker(
 mod tests {
     use super::*;
     use rch_common::CompilationKind;
+    use rch_common::WorkerStatus;
     use rch_common::test_guard;
     use rch_telemetry::collect::cpu::{CpuTelemetry, LoadAverage};
     use rch_telemetry::collect::memory::MemoryTelemetry;
@@ -926,7 +942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_should_poll_worker_unreachable() {
+    async fn test_should_poll_worker_unreachable_is_still_polled() {
         use crate::workers::WorkerPool;
         use rch_common::WorkerId;
 
@@ -944,9 +960,40 @@ mod tests {
         let poller_config = TelemetryPollerConfig::default();
         let poller = TelemetryPoller::new(pool, store, poller_config);
 
-        // Unreachable workers should not be polled
+        // A health-excluded (Unreachable, admin=Active) worker MUST still be
+        // polled: fresh telemetry is its path back to healthy. Skipping it was
+        // the stranding deadlock (2026-07-16 offload meltdown).
         let should_poll = poller.should_poll_worker(&worker).await;
-        assert!(!should_poll);
+        assert!(should_poll);
+    }
+
+    #[tokio::test]
+    async fn test_should_poll_worker_quarantined_bypass_is_still_polled() {
+        use crate::workers::WorkerPool;
+        use rch_common::BypassFailureClass;
+        use rch_common::WorkerId;
+
+        let pool = WorkerPool::new();
+        pool.add_worker(create_worker_config("bypassed-worker"))
+            .await;
+
+        let worker = pool.get(&WorkerId::new("bypassed-worker")).await.unwrap();
+        // Quarantine it exactly as the bypass-recovery service does. Its legacy
+        // status() collapses to Unreachable, but its admin intent is still
+        // Active — the recovery gate needs telemetry_ok, so the poller MUST
+        // keep polling it. This is the specific state the old skip stranded.
+        worker.enter_bypass(BypassFailureClass::Ssh).await;
+        assert_eq!(worker.status().await, WorkerStatus::Unreachable);
+
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let poller_config = TelemetryPollerConfig::default();
+        let poller = TelemetryPoller::new(pool, store, poller_config);
+
+        let should_poll = poller.should_poll_worker(&worker).await;
+        assert!(
+            should_poll,
+            "a TemporaryBypass worker must be polled so it can recover"
+        );
     }
 
     #[tokio::test]
