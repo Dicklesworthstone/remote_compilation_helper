@@ -478,6 +478,8 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
     rch exec -- cargo build --release
     rch exec -- cargo test
     rch exec -- bun test
+    rch exec --base HEAD --clean-overlay --overlay-path src/lib.rs -- cargo test
+    rch exec --base HEAD --clean-overlay --no-overlay -- cargo check
 
 USAGE:
     This command is primarily used internally by the PreToolUse hook.
@@ -487,6 +489,23 @@ USAGE:
     This allows the hook to return immediately (<50ms) while the actual
     compilation runs as a normal command invocation."#)]
     Exec {
+        /// Git commit used as the clean source-tree baseline
+        #[arg(long, short = 'b', requires = "clean_overlay")]
+        base: Option<String>,
+        /// Transfer a clean Git baseline plus only explicit overlay paths
+        #[arg(long, requires = "base")]
+        clean_overlay: bool,
+        /// Repository-relative file or directory to overlay (repeatable)
+        #[arg(
+            long,
+            short = 'o',
+            requires = "clean_overlay",
+            conflicts_with = "no_overlay"
+        )]
+        overlay_path: Vec<PathBuf>,
+        /// Use the clean baseline without any working-tree overlay
+        #[arg(long, requires = "clean_overlay", conflicts_with = "overlay_path")]
+        no_overlay: bool,
         /// The compilation command to execute remotely
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
@@ -1938,7 +1957,13 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 handle_diagnose(command, dry_run, &ctx).await
             }
             Commands::Admit { command } => handle_admit(command, &ctx).await,
-            Commands::Exec { command } => hook::run_exec(command).await,
+            Commands::Exec {
+                base,
+                clean_overlay,
+                overlay_path,
+                no_overlay,
+                command,
+            } => hook::run_exec(base, clean_overlay, overlay_path, no_overlay, command).await,
             Commands::Hook { action } => handle_hook(action, &ctx).await,
             Commands::Agents { action } => handle_agents(action, &ctx).await,
             Commands::Completions { action } => handle_completions(action, &ctx),
@@ -4712,6 +4737,115 @@ mod tests {
         assert!(!cli.quiet);
         assert!(!cli.json);
         assert_eq!(cli.color, "auto");
+    }
+
+    #[test]
+    fn cli_parses_exec_clean_overlay_paths() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--base",
+            "HEAD",
+            "--clean-overlay",
+            "--overlay-path",
+            "src/lib.rs",
+            "--overlay-path",
+            "tests/slice.rs",
+            "--",
+            "cargo",
+            "test",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Exec {
+                base,
+                clean_overlay,
+                overlay_path,
+                no_overlay,
+                command,
+            }) => {
+                assert_eq!(base.as_deref(), Some("HEAD"));
+                assert!(clean_overlay);
+                assert_eq!(
+                    overlay_path,
+                    vec![PathBuf::from("src/lib.rs"), PathBuf::from("tests/slice.rs")]
+                );
+                assert!(!no_overlay);
+                assert_eq!(command, vec!["cargo", "test"]);
+            }
+            _ => fail_expected("Expected clean-overlay exec command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_exec_clean_base_without_overlay() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--base",
+            "HEAD",
+            "--clean-overlay",
+            "--no-overlay",
+            "--",
+            "cargo",
+            "check",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Exec {
+                base,
+                clean_overlay,
+                overlay_path,
+                no_overlay,
+                command,
+            }) => {
+                assert_eq!(base.as_deref(), Some("HEAD"));
+                assert!(clean_overlay);
+                assert!(overlay_path.is_empty());
+                assert!(no_overlay);
+                assert_eq!(command, vec!["cargo", "check"]);
+            }
+            _ => fail_expected("Expected base-only clean-overlay exec command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_clean_overlay_path_with_no_overlay() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--base",
+            "HEAD",
+            "--clean-overlay",
+            "--overlay-path",
+            "src/lib.rs",
+            "--no-overlay",
+            "--",
+            "cargo",
+            "check",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exec_help_declares_clean_overlay_capability_flags() {
+        let _guard = test_guard!();
+        let mut command = Cli::command();
+        let exec = command
+            .find_subcommand_mut("exec")
+            .expect("exec subcommand");
+        let help = exec.render_long_help().to_string();
+        for flag in [
+            "--base",
+            "--clean-overlay",
+            "--overlay-path",
+            "--no-overlay",
+        ] {
+            assert!(help.contains(flag), "exec help missing {flag}: {help}");
+        }
     }
 
     #[test]

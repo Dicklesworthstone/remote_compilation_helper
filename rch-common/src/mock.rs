@@ -456,7 +456,7 @@ impl MockSshClient {
         // Transient connect failures (retryable)
         if self
             .connect_failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_sub(1)
             })
             .is_ok()
@@ -516,7 +516,7 @@ impl MockSshClient {
         // Transient execute failures (retryable)
         if self
             .execute_failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_sub(1)
             })
             .is_ok()
@@ -798,7 +798,7 @@ impl MockRsync {
         // Transient failures (retryable)
         if self
             .sync_failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_sub(1)
             })
             .is_ok()
@@ -862,7 +862,7 @@ impl MockRsync {
         // Transient failures (retryable)
         if self
             .artifacts_failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_sub(1)
             })
             .is_ok()

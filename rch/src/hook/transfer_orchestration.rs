@@ -140,6 +140,7 @@ pub(super) async fn execute_remote_compilation(
     color_mode: ColorMode,
     build_id: Option<u64>,
     topology_policy: &PathTopologyPolicy,
+    clean_overlay: Option<&CleanOverlaySpec>,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
 
@@ -159,56 +160,92 @@ pub(super) async fn execute_remote_compilation(
     }
     let normalized_project_root = normalized_project.canonical_path().to_path_buf();
 
-    let dependency_plan =
-        build_dependency_runtime_plan(&normalized_project_root, kind, reporter, topology_policy);
-    let exact_dependency_closure_sync = command_uses_cargo_dependency_graph(kind);
-    if let Some(decision) = dependency_plan.fail_open_decision.as_ref() {
-        let report = build_dependency_runtime_fail_open_report(
-            &worker_config,
+    let exact_dependency_closure_sync =
+        clean_overlay.is_none() && command_uses_cargo_dependency_graph(kind);
+    let raw_sync_roots = if clean_overlay.is_some() {
+        // The immutable Git archive already contains every in-repository
+        // workspace member. Syncing ambient sibling roots here could reintroduce
+        // the peer dirt this mode exists to exclude, so clean-overlay starts
+        // with one primary root and lets unsupported external path dependencies
+        // fail closed during the remote build.
+        vec![normalized_project_root.clone()]
+    } else {
+        let dependency_plan = build_dependency_runtime_plan(
             &normalized_project_root,
-            decision,
+            kind,
+            reporter,
+            topology_policy,
         );
-        if let Ok(report_json) = serde_json::to_string(&report) {
-            reporter.verbose(&format!(
-                "[RCH] dependency planner fail-open report: {}",
-                report_json
-            ));
-        }
-        if exact_dependency_closure_sync
-            && should_force_local_fallback_for_runtime_fail_open(decision.reason_code)
-        {
+        if let Some(decision) = dependency_plan.fail_open_decision.as_ref() {
+            let report = build_dependency_runtime_fail_open_report(
+                &worker_config,
+                &normalized_project_root,
+                decision,
+            );
+            if let Ok(report_json) = serde_json::to_string(&report) {
+                reporter.verbose(&format!(
+                    "[RCH] dependency planner fail-open report: {}",
+                    report_json
+                ));
+            }
+            if exact_dependency_closure_sync
+                && should_force_local_fallback_for_runtime_fail_open(decision.reason_code)
+            {
+                warn!(
+                    "Dependency planner fail-open on {} [{}]: refusing remote Cargo execution and falling back local ({})",
+                    worker_config.id, decision.reason_code, decision.remediation
+                );
+                reporter.verbose(&format!(
+                    "[RCH] dependency planner fail-open [{}]: exact dependency closure required, forcing local fallback — {}",
+                    decision.reason_code, decision.remediation
+                ));
+                return Err(DependencyPreflightFailure::from_report(report).into());
+            }
             warn!(
-                "Dependency planner fail-open on {} [{}]: refusing remote Cargo execution and falling back local ({})",
+                "Dependency planner fail-open on {} [{}]: proceeding with primary-root-only sync ({})",
                 worker_config.id, decision.reason_code, decision.remediation
             );
             reporter.verbose(&format!(
-                "[RCH] dependency planner fail-open [{}]: exact dependency closure required, forcing local fallback — {}",
+                "[RCH] dependency planner fail-open [{}]: proceeding with primary root only — {}",
                 decision.reason_code, decision.remediation
             ));
-            return Err(DependencyPreflightFailure::from_report(report).into());
         }
-        warn!(
-            "Dependency planner fail-open on {} [{}]: proceeding with primary-root-only sync ({})",
-            worker_config.id, decision.reason_code, decision.remediation
-        );
-        reporter.verbose(&format!(
-            "[RCH] dependency planner fail-open [{}]: proceeding with primary root only — {}",
-            decision.reason_code, decision.remediation
-        ));
-    }
-    let raw_sync_roots = dependency_plan.sync_roots;
+        dependency_plan.sync_roots
+    };
     let project_id = project_id_from_path(&normalized_project_root);
-    let project_hash = compute_project_hash_with_dependency_roots_and_policy(
-        &normalized_project_root,
-        &raw_sync_roots,
-        topology_policy,
-    );
-    let sync_plan = build_sync_closure_plan(
+    let project_hash = if let Some(spec) = clean_overlay {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"rch-clean-overlay-remote-root-v1\0");
+        hasher.update(spec.base_commit().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(spec.overlay_fingerprint().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(uuid::Uuid::new_v4().as_bytes());
+        hasher.finalize().to_hex()[..16].to_string()
+    } else {
+        compute_project_hash_with_dependency_roots_and_policy(
+            &normalized_project_root,
+            &raw_sync_roots,
+            topology_policy,
+        )
+    };
+    let mut sync_plan = build_sync_closure_plan(
         &raw_sync_roots,
         &normalized_project_root,
         &project_hash,
         topology_policy,
     );
+    if clean_overlay.is_some() {
+        if sync_plan.len() != 1 || !sync_plan[0].is_primary {
+            anyhow::bail!(
+                "clean-overlay requires a single primary sync root; found {} roots",
+                sync_plan.len()
+            );
+        }
+        let remote_base = transfer_config.remote_base.trim_end_matches('/');
+        sync_plan[0].remote_root = format!("{remote_base}/{project_id}/{project_hash}");
+        sync_plan[0].root_hash.clone_from(&project_hash);
+    }
     let sync_roots = sync_plan
         .iter()
         .map(|entry| entry.local_root.clone())
@@ -275,8 +312,12 @@ pub(super) async fn execute_remote_compilation(
     // Ensure deterministic remote topology before any repo synchronization.
     ensure_worker_projects_topology(&worker_config, reporter, topology_policy).await?;
 
-    // Best-effort repo convergence for multi-repo dependency graphs.
-    maybe_sync_repo_set_with_repo_updater(&worker_config, &sync_roots, reporter).await;
+    // Best-effort repo convergence for ordinary multi-repo dependency graphs.
+    // A clean-overlay run already names an immutable base; mutating repositories
+    // behind that receipt would break the source identity guarantee.
+    if clean_overlay.is_none() {
+        maybe_sync_repo_set_with_repo_updater(&worker_config, &sync_roots, reporter).await;
+    }
 
     // Build transfer pipelines with color mode, command timeout, and compilation kind.
     // When the in-session watchdog is active it enforces the real build cap
@@ -344,6 +385,15 @@ pub(super) async fn execute_remote_compilation(
         .with_compilation_kind(kind)
         .with_remote_path_override(entry.remote_root.clone())
         .with_build_id(build_id);
+        if let Some(spec) = clean_overlay {
+            root_pipeline = root_pipeline
+                .with_sync_include_patterns(clean_overlay_include_patterns(
+                    &entry.local_root,
+                    spec.overlay_paths(),
+                )?)
+                .with_sync_delete(false)
+                .with_sync_checksum(true);
+        }
         if entry.mode == SyncClosureMode::WorkspaceMetadata {
             root_pipeline = root_pipeline
                 .with_sync_include_patterns(workspace_metadata_sync_patterns())
@@ -359,7 +409,12 @@ pub(super) async fn execute_remote_compilation(
             }
         }
 
-        if exact_dependency_closure_sync {
+        if let Some(spec) = clean_overlay {
+            reporter.verbose(&format!(
+                "[RCH] clean-overlay transfer estimator bypassed for immutable base {}",
+                spec.base_commit()
+            ));
+        } else if exact_dependency_closure_sync {
             reporter.verbose(&format!(
                 "[RCH] exact dependency closure sync required; bypassing transfer estimator for {}",
                 entry.local_root.display()
@@ -397,7 +452,30 @@ pub(super) async fn execute_remote_compilation(
             entry.local_root.display(),
             entry.remote_root.as_str()
         ));
-        let sync_attempt = if let Some(progress) = &mut upload_progress {
+        let sync_attempt = if let Some(spec) = clean_overlay {
+            spec.verify_archive_attributes(&entry.local_root).await?;
+            spec.verify_overlay_unchanged(&entry.local_root)?;
+            let base_result = root_pipeline
+                .materialize_git_archive(&worker_config, &entry.local_root, spec.base_commit())
+                .await?;
+            spec.verify_archive_attributes(&entry.local_root).await?;
+            let result = if spec.is_base_only() {
+                base_result
+            } else {
+                let overlay_result = if let Some(progress) = &mut upload_progress {
+                    root_pipeline
+                        .sync_to_remote_streaming(&worker_config, |line| {
+                            progress.update_from_line(line);
+                        })
+                        .await?
+                } else {
+                    root_pipeline.sync_to_remote(&worker_config).await?
+                };
+                merge_sync_result(&base_result, &overlay_result)
+            };
+            spec.verify_overlay_unchanged(&entry.local_root)?;
+            Ok(result)
+        } else if let Some(progress) = &mut upload_progress {
             root_pipeline
                 .sync_to_remote_streaming(&worker_config, |line| {
                     progress.update_from_line(line);
@@ -493,7 +571,7 @@ pub(super) async fn execute_remote_compilation(
     // a concurrent build on the same project. The heavy removal is detached on the
     // worker (a backgrounded rm); only a quick SSH dispatch is awaited here.
     // Best-effort; gated to the forwarded-CARGO_TARGET_DIR mode that makes per-job dirs.
-    if forwarded_cargo_target_dir.is_some() {
+    if clean_overlay.is_none() && forwarded_cargo_target_dir.is_some() {
         // Cheap, current-project-only reap: only this build's own repo dir is
         // swept for abandoned sibling per-job dirs. The durable cross-project
         // GC (every repo under the worker's sync-root) now runs OFF this
@@ -519,7 +597,7 @@ pub(super) async fn execute_remote_compilation(
         loop_ref.flush().await;
     }
 
-    if command_uses_cargo_dependency_graph(kind) {
+    if exact_dependency_closure_sync {
         verify_remote_dependency_manifests(&worker_config, &root_outcomes, reporter).await?;
     }
 

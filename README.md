@@ -463,6 +463,48 @@ RCH_REQUIRE_REMOTE=1 rch exec -- cargo test --workspace
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+### Clean Git overlays for shared working trees
+
+`rch exec` can build an immutable committed tree plus an explicit, repeatable
+set of local paths without transferring unrelated working-tree changes:
+
+```bash
+RCH_REQUIRE_REMOTE=1 rch exec \
+  --base HEAD \
+  --clean-overlay \
+  --overlay-path src/lib.rs \
+  --overlay-path tests/focused.rs \
+  -- cargo test --test focused
+
+RCH_REQUIRE_REMOTE=1 rch exec \
+  --base HEAD \
+  --clean-overlay \
+  --no-overlay \
+  -- cargo check --workspace --all-targets
+```
+
+The client resolves `--base` to a commit object, streams that Git archive into
+a fresh isolated worker path, and then uploads only the literal repository-
+relative `--overlay-path` selections. Modified and untracked files are
+supported; selected deletions, absolute/traversing paths, Git metadata,
+non-ASCII/backslash/control-character paths, case-only or otherwise ambiguous
+filesystem spellings, overlay symlinks, empty overlay directories, submodules,
+and Git archive `export-ignore`/`export-subst` attributes fail closed. Exactly
+one of one-or-more `--overlay-path` options or `--no-overlay` is required.
+Clean-overlay mode also implies remote-only execution even when
+`RCH_REQUIRE_REMOTE` was omitted, so a worker or transfer failure never falls
+back to the ambient local tree.
+Explicit clean-overlay execution also admits the read-only `cargo fmt --check`
+diagnostic, which the ordinary interception classifier intentionally leaves
+local.
+
+Clean-overlay currently materializes one Git repository. In-repository Cargo
+workspace members are present in the archive. External path dependencies are
+outside the source-identity guarantee: callers must independently ensure they
+cannot resolve to ambient worker state. The client re-fingerprints overlays
+after upload and refuses execution if their contents changed during admission
+or transfer.
+
 Do not batch several Cargo commands behind a shell wrapper such as
 `rch exec -- bash -lc "cargo test ... && cargo test ..."`. Shell-wrapped
 commands are classified as non-compilation for hook safety. Under

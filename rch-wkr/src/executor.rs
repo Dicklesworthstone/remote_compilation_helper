@@ -150,10 +150,11 @@ fn detect_runtime_from_command(command: &str) -> RequiredRuntime {
         Some("tsc") => return RequiredRuntime::Node,
         // Go resolves modules from the module cache; prepare() is a no-op for it,
         // but the runtime must still be reported so the right prepare branch runs.
-        Some("go") => match tokens.next() {
-            Some("build" | "test" | "vet") => return RequiredRuntime::Go,
-            _ => {}
-        },
+        Some("go") => {
+            if let Some("build" | "test" | "vet") = tokens.next() {
+                return RequiredRuntime::Go;
+            }
+        }
         _ => {}
     }
     RequiredRuntime::None

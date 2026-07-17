@@ -6,13 +6,15 @@
 use crate::config::load_config;
 use crate::error::{ArtifactRetrievalWarning, DaemonError, TransferError};
 use crate::status_types::format_bytes;
-use crate::toolchain::detect_toolchain;
+use crate::toolchain::{detect_toolchain, parse_channel_string};
 use crate::transfer::{
-    SyncResult, TransferPipeline, compute_project_hash_with_dependency_roots_and_policy,
+    SyncResult, TransferPipeline, clean_overlay_include_patterns,
+    compute_project_hash_with_dependency_roots_and_policy, configure_clean_git_command,
     default_bun_artifact_patterns, default_c_cpp_artifact_patterns, default_rust_artifact_patterns,
     default_rust_test_artifact_patterns, project_id_from_path,
 };
 use crate::ui::console::RchConsole;
+use anyhow::Context;
 use rch_common::errors::catalog::ErrorCode;
 use rch_common::repo_updater_contract::{
     REPO_UPDATER_ALLOW_OVERRIDE_ENV, REPO_UPDATER_ALLOWED_HOSTS_ENV, REPO_UPDATER_ALLOWLIST_ENV,
@@ -50,8 +52,10 @@ use rch_telemetry::protocol::{
     extract_piggybacked_telemetry,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
@@ -125,6 +129,55 @@ const RCH_WORKERS_ENV: &str = "RCH_WORKERS";
 /// (`remote_cargo_target_dir_name`) instead of the stable pooled name, for users
 /// who hit problems with the shared pool.
 const RCH_DISABLE_TARGET_REUSE_ENV: &str = "RCH_DISABLE_TARGET_REUSE";
+
+/// Validated source-tree policy for an explicit clean-overlay `rch exec` run.
+///
+/// The commit is resolved to an object ID before worker selection, and every
+/// overlay path is normalized relative to the Git toplevel. The transfer layer
+/// can therefore materialize an immutable base and upload only these paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CleanOverlaySpec {
+    base_commit: String,
+    overlay_paths: Vec<PathBuf>,
+    overlay_fingerprint: String,
+}
+
+impl CleanOverlaySpec {
+    pub(super) fn base_commit(&self) -> &str {
+        &self.base_commit
+    }
+
+    pub(super) fn overlay_paths(&self) -> &[PathBuf] {
+        &self.overlay_paths
+    }
+
+    pub(super) fn is_base_only(&self) -> bool {
+        self.overlay_paths.is_empty()
+    }
+
+    pub(super) fn overlay_fingerprint(&self) -> &str {
+        &self.overlay_fingerprint
+    }
+
+    pub(super) async fn verify_archive_attributes(
+        &self,
+        project_root: &Path,
+    ) -> anyhow::Result<()> {
+        validate_clean_overlay_archive_attributes(project_root, &self.base_commit).await
+    }
+
+    pub(super) fn verify_overlay_unchanged(&self, project_root: &Path) -> anyhow::Result<()> {
+        let current = clean_overlay_fingerprint(project_root, &self.overlay_paths)?;
+        if current != self.overlay_fingerprint {
+            anyhow::bail!(
+                "clean-overlay input changed after admission (expected {}, found {}); refusing remote execution",
+                self.overlay_fingerprint,
+                current
+            );
+        }
+        Ok(())
+    }
+}
 
 static HOOK_MODE_PANIC_FAIL_OPEN: AtomicBool = AtomicBool::new(false);
 static AUTOSTART_LOCK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -416,8 +469,13 @@ fn remote_required_refusal_summary(reason: &str) -> String {
     }
 }
 
-fn exit_with_local_fallback(command: &str, reporter: &HookReporter, reason: &str) -> ! {
-    let mut child = match local_fallback_command_for_policy(command, exec_requires_remote()) {
+fn exit_with_local_fallback(
+    command: &str,
+    reporter: &HookReporter,
+    reason: &str,
+    require_remote: bool,
+) -> ! {
+    let mut child = match local_fallback_command_for_policy(command, require_remote) {
         Ok(child) => child,
         Err(LocalFallbackRefusal::RemoteRequired) => {
             reporter.summary(&remote_required_refusal_summary(reason));
@@ -688,21 +746,665 @@ fn record_hook_incident(event: &IncidentEvent) {
     }
 }
 
-pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
+fn normalize_clean_overlay_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!(
+                    "clean-overlay path must be repository-relative without '..': {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        anyhow::bail!("clean-overlay path must not be empty or the repository root");
+    }
+    let normalized_label = normalized.to_str().ok_or_else(|| {
+        anyhow::anyhow!("clean-overlay path must be valid UTF-8: {}", path.display())
+    })?;
+    if !normalized_label.is_ascii() {
+        anyhow::bail!(
+            "clean-overlay path must contain only ASCII characters to avoid cross-platform filesystem aliases: {}",
+            path.display()
+        );
+    }
+    if normalized_label.contains('\\') || normalized_label.chars().any(char::is_control) {
+        anyhow::bail!(
+            "clean-overlay path may not contain backslashes or control characters: {}",
+            path.display()
+        );
+    }
+    Ok(normalized)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CleanBaseTreeEntry {
+    mode: u32,
+    path: PathBuf,
+}
+
+fn parse_clean_base_tree(output: &[u8]) -> anyhow::Result<Vec<CleanBaseTreeEntry>> {
+    let mut entries = Vec::new();
+    for record in output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            anyhow::bail!("clean-overlay base tree contains a malformed ls-tree record");
+        };
+        let metadata = std::str::from_utf8(&record[..tab])
+            .context("clean-overlay base tree metadata is not UTF-8")?;
+        let mut fields = metadata.split_ascii_whitespace();
+        let mode = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("clean-overlay base tree record has no mode"))?;
+        let object_type = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("clean-overlay base tree record has no object type"))?;
+        let _object_id = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("clean-overlay base tree record has no object ID"))?;
+        if fields.next().is_some() {
+            anyhow::bail!("clean-overlay base tree contains unexpected metadata fields");
+        }
+        let mode = u32::from_str_radix(mode, 8).context("parse clean-overlay Git tree mode")?;
+        if object_type != "blob" && !(mode == 0o160000 && object_type == "commit") {
+            anyhow::bail!("clean-overlay base tree contains unsupported object type {object_type}");
+        }
+        let path = std::str::from_utf8(&record[tab + 1..])
+            .context("clean-overlay base contains a non-UTF-8 Git path")?;
+        entries.push(CleanBaseTreeEntry {
+            mode,
+            path: PathBuf::from(path),
+        });
+    }
+    Ok(entries)
+}
+
+fn clean_overlay_path_has_exact_spelling(
+    project_root: &Path,
+    relative: &Path,
+) -> anyhow::Result<bool> {
+    let mut parent = project_root.to_path_buf();
+    for component in relative.components() {
+        let requested = component.as_os_str();
+        let mut found = false;
+        for entry in std::fs::read_dir(&parent)
+            .with_context(|| format!("read clean-overlay path parent {}", parent.display()))?
+        {
+            if entry?.file_name() == requested {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Ok(false);
+        }
+        parent.push(requested);
+    }
+    Ok(true)
+}
+
+fn validate_clean_overlay_live_path(project_root: &Path, relative: &Path) -> anyhow::Result<()> {
+    if !clean_overlay_path_has_exact_spelling(project_root, relative)? {
+        anyhow::bail!(
+            "clean-overlay path spelling does not exactly match the filesystem entry: {}",
+            relative.display()
+        );
+    }
+    let mut absolute = project_root.to_path_buf();
+    for component in relative.components() {
+        absolute.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&absolute).with_context(|| {
+            format!(
+                "clean-overlay path does not exist and deletions are unsupported: {}",
+                relative.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "clean-overlay overlays do not support symlinks: {}",
+                relative.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_clean_overlay_against_base(
+    project_root: &Path,
+    overlay_paths: &[PathBuf],
+    base_entries: &[CleanBaseTreeEntry],
+) -> anyhow::Result<()> {
+    for overlay in overlay_paths {
+        let overlay_label = overlay
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("clean-overlay path must be valid UTF-8"))?;
+        let overlay_components = overlay_label.split('/').collect::<Vec<_>>();
+        for entry in base_entries {
+            let base_label = entry
+                .path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("clean-overlay base path must be valid UTF-8"))?;
+            let base_components = base_label.split('/').collect::<Vec<_>>();
+            for (base, selected) in base_components.iter().zip(&overlay_components) {
+                if base == selected {
+                    continue;
+                }
+                if base.eq_ignore_ascii_case(selected) {
+                    anyhow::bail!(
+                        "clean-overlay path {} aliases differently spelled base path {}; case-only overlays are unsupported",
+                        overlay.display(),
+                        entry.path.display()
+                    );
+                }
+                break;
+            }
+        }
+        let overlay_prefix = format!("{overlay_label}/");
+        let metadata = std::fs::symlink_metadata(project_root.join(overlay))
+            .with_context(|| format!("inspect clean-overlay path {}", overlay.display()))?;
+        let exact = base_entries
+            .iter()
+            .find(|entry| entry.path == overlay.as_path());
+        let descendants = base_entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .path
+                    .to_str()
+                    .is_some_and(|path| path.starts_with(&overlay_prefix))
+            })
+            .collect::<Vec<_>>();
+
+        if metadata.is_dir() {
+            if exact.is_some() {
+                anyhow::bail!(
+                    "clean-overlay path changes a base file into a directory, which is unsupported: {}",
+                    overlay.display()
+                );
+            }
+            for entry in descendants {
+                if !clean_overlay_path_has_exact_spelling(project_root, &entry.path)? {
+                    anyhow::bail!(
+                        "clean-overlay directory omits or renames base path {}; selected deletions are unsupported",
+                        entry.path.display()
+                    );
+                }
+                let local = std::fs::symlink_metadata(project_root.join(&entry.path))
+                    .with_context(|| {
+                        format!("inspect base path under overlay {}", entry.path.display())
+                    })?;
+                let base_is_symlink = entry.mode == 0o120000;
+                if base_is_symlink != local.file_type().is_symlink()
+                    || (!base_is_symlink && !local.is_file())
+                {
+                    anyhow::bail!(
+                        "clean-overlay directory changes the type of base path {}, which is unsupported",
+                        entry.path.display()
+                    );
+                }
+            }
+        } else {
+            if !descendants.is_empty() {
+                anyhow::bail!(
+                    "clean-overlay path changes a base directory into a file, which is unsupported: {}",
+                    overlay.display()
+                );
+            }
+            if let Some(entry) = exact {
+                let base_is_symlink = entry.mode == 0o120000;
+                if base_is_symlink != metadata.file_type().is_symlink()
+                    || (!base_is_symlink && !metadata.is_file())
+                {
+                    anyhow::bail!(
+                        "clean-overlay path changes the type of a base path, which is unsupported: {}",
+                        overlay.display()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hash_clean_overlay_path(
+    project_root: &Path,
+    relative: &Path,
+    hasher: &mut blake3::Hasher,
+) -> anyhow::Result<()> {
+    let relative_label = relative.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "clean-overlay directory contains a non-UTF-8 path: {}",
+            relative.display()
+        )
+    })?;
+    if !relative_label.is_ascii() {
+        anyhow::bail!(
+            "clean-overlay paths must contain only ASCII characters to avoid cross-platform filesystem aliases: {}",
+            relative.display()
+        );
+    }
+    if relative_label.contains('\\') || relative_label.chars().any(char::is_control) {
+        anyhow::bail!(
+            "clean-overlay paths may not contain backslashes or control characters: {}",
+            relative.display()
+        );
+    }
+    if relative.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(".git"))
+    }) {
+        anyhow::bail!(
+            "clean-overlay paths may not contain Git metadata: {}",
+            relative.display()
+        );
+    }
+    let absolute = project_root.join(relative);
+    let metadata = std::fs::symlink_metadata(&absolute)
+        .with_context(|| format!("inspect clean-overlay input {}", relative.display()))?;
+    hasher.update(&(relative_label.len() as u64).to_le_bytes());
+    hasher.update(relative_label.as_bytes());
+    hasher.update(&(metadata.permissions().mode() & 0o7777).to_le_bytes());
+
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "clean-overlay overlays do not support symlinks: {}",
+            relative.display()
+        );
+    } else if metadata.is_dir() {
+        hasher.update(b"directory\0");
+        let mut children = std::fs::read_dir(&absolute)
+            .with_context(|| format!("read clean-overlay directory {}", relative.display()))?
+            .map(|entry| entry.map(|entry| relative.join(entry.file_name())))
+            .collect::<Result<Vec<_>, _>>()?;
+        children.sort();
+        if children.is_empty() {
+            anyhow::bail!(
+                "clean-overlay overlays do not support empty directories: {}",
+                relative.display()
+            );
+        }
+        for child in children {
+            hash_clean_overlay_path(project_root, &child, hasher)?;
+        }
+    } else if metadata.is_file() {
+        hasher.update(b"file\0");
+        hasher.update(&metadata.len().to_le_bytes());
+        let mut file = std::fs::File::open(&absolute)
+            .with_context(|| format!("open clean-overlay input {}", relative.display()))?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .with_context(|| format!("read clean-overlay input {}", relative.display()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    } else {
+        anyhow::bail!(
+            "clean-overlay path has unsupported file type: {}",
+            relative.display()
+        );
+    }
+    Ok(())
+}
+
+fn clean_overlay_fingerprint(
+    project_root: &Path,
+    overlay_paths: &[PathBuf],
+) -> anyhow::Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rch-clean-overlay-input-v1\0");
+    for path in overlay_paths {
+        validate_clean_overlay_live_path(project_root, path)?;
+        hash_clean_overlay_path(project_root, path, &mut hasher)?;
+        validate_clean_overlay_live_path(project_root, path)?;
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+async fn git_output_bytes(project_root: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    let mut command = Command::new("git");
+    configure_clean_git_command(&mut command);
+    let output = command
+        .current_dir(project_root)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("failed to run git in {}", project_root.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git {} failed: {}", args.join(" "), stderr.trim());
+    }
+    Ok(output.stdout)
+}
+
+async fn git_output(project_root: &Path, args: &[&str]) -> anyhow::Result<String> {
+    Ok(
+        String::from_utf8(git_output_bytes(project_root, args).await?)
+            .context("git returned non-UTF-8 output")?
+            .trim()
+            .to_string(),
+    )
+}
+
+fn contains_git_archive_transform_attribute(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        line.split_ascii_whitespace().skip(1).any(|token| {
+            let name = token
+                .trim_start_matches(['-', '!'])
+                .split_once('=')
+                .map_or(token.trim_start_matches(['-', '!']), |(name, _)| name);
+            matches!(name, "export-ignore" | "export-subst")
+        })
+    })
+}
+
+async fn validate_clean_overlay_archive_attributes(
+    project_root: &Path,
+    commit: &str,
+) -> anyhow::Result<()> {
+    let paths = git_output_bytes(
+        project_root,
+        &["ls-tree", "-rz", "--full-tree", "--name-only", commit],
+    )
+    .await?;
+    for path in paths
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = std::str::from_utf8(path)
+            .context("clean-overlay base contains a non-UTF-8 Git path")?;
+        if path != ".gitattributes" && !path.ends_with("/.gitattributes") {
+            continue;
+        }
+        let contents = git_show_optional(project_root, commit, path)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "failed to read known .gitattributes path {path} from clean-overlay base {commit}"
+                )
+            })?;
+        if contains_git_archive_transform_attribute(&contents) {
+            anyhow::bail!(
+                "clean-overlay base uses export-ignore/export-subst in {path}; refusing a non-checkout-equivalent Git archive"
+            );
+        }
+    }
+
+    let info_attributes = git_output(
+        project_root,
+        &["rev-parse", "--git-path", "info/attributes"],
+    )
+    .await?;
+    let info_attributes = if Path::new(&info_attributes).is_absolute() {
+        PathBuf::from(info_attributes)
+    } else {
+        project_root.join(info_attributes)
+    };
+    match std::fs::read_to_string(&info_attributes) {
+        Ok(contents) if contains_git_archive_transform_attribute(&contents) => {
+            anyhow::bail!(
+                "clean-overlay repository info/attributes uses export-ignore/export-subst; refusing a non-checkout-equivalent Git archive"
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "read clean-overlay repository attributes {}",
+                    info_attributes.display()
+                )
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn git_show_optional(
+    project_root: &Path,
+    commit: &str,
+    relative: &str,
+) -> anyhow::Result<Option<String>> {
+    let object = format!("{commit}:{relative}");
+    let mut command = Command::new("git");
+    configure_clean_git_command(&mut command);
+    let output = command
+        .current_dir(project_root)
+        .args(["show", "--no-ext-diff", &object])
+        .output()
+        .await
+        .with_context(|| format!("read {relative} from clean-overlay base {commit}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8(output.stdout).with_context(
+        || format!("{relative} in clean-overlay base is not UTF-8"),
+    )?))
+}
+
+async fn detect_clean_overlay_toolchain(
+    project_root: &Path,
+    spec: &CleanOverlaySpec,
+) -> anyhow::Result<Option<ToolchainInfo>> {
+    let toml_path = Path::new("rust-toolchain.toml");
+    let legacy_path = Path::new("rust-toolchain");
+    let toml_contents = if spec.overlay_paths().iter().any(|path| path == toml_path) {
+        Some(
+            std::fs::read_to_string(project_root.join(toml_path))
+                .context("read overlaid rust-toolchain.toml")?,
+        )
+    } else {
+        git_show_optional(project_root, spec.base_commit(), "rust-toolchain.toml").await?
+    };
+    if let Some(contents) = toml_contents {
+        let document = toml::from_str::<toml::Value>(&contents)
+            .context("parse rust-toolchain.toml from clean-overlay base")?;
+        let channel = document
+            .get("toolchain")
+            .and_then(|toolchain| toolchain.get("channel"))
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rust-toolchain.toml in clean-overlay base has no toolchain.channel"
+                )
+            })?;
+        return Ok(Some(parse_channel_string(channel)?));
+    }
+
+    let legacy_contents = if spec.overlay_paths().iter().any(|path| path == legacy_path) {
+        Some(
+            std::fs::read_to_string(project_root.join(legacy_path))
+                .context("read overlaid rust-toolchain")?,
+        )
+    } else {
+        git_show_optional(project_root, spec.base_commit(), "rust-toolchain").await?
+    };
+    if let Some(contents) = legacy_contents {
+        if let Ok(document) = toml::from_str::<toml::Value>(&contents)
+            && let Some(channel) = document
+                .get("toolchain")
+                .and_then(|toolchain| toolchain.get("channel"))
+                .and_then(toml::Value::as_str)
+        {
+            return Ok(Some(parse_channel_string(channel)?));
+        }
+        let channel = contents.trim();
+        if channel.is_empty() {
+            anyhow::bail!("rust-toolchain in clean-overlay base is empty");
+        }
+        return Ok(Some(parse_channel_string(channel)?));
+    }
+
+    // No committed override means the remote worker's default toolchain is the
+    // honest analogue. Consulting the ambient worktree here could let an
+    // unselected dirty rust-toolchain file influence the supposedly clean run.
+    Ok(None)
+}
+
+async fn prepare_clean_overlay_spec(
+    project_root: &Path,
+    base: Option<String>,
+    clean_overlay: bool,
+    overlay_paths: Vec<PathBuf>,
+    no_overlay: bool,
+) -> anyhow::Result<Option<CleanOverlaySpec>> {
+    if !clean_overlay {
+        if base.is_some() || !overlay_paths.is_empty() || no_overlay {
+            anyhow::bail!("--base, --overlay-path, and --no-overlay require --clean-overlay");
+        }
+        return Ok(None);
+    }
+
+    let base = base.ok_or_else(|| anyhow::anyhow!("--clean-overlay requires --base <COMMIT>"))?;
+    if base.trim().is_empty() || base.chars().any(char::is_control) {
+        anyhow::bail!("--base must be a non-empty Git revision without control characters");
+    }
+    if no_overlay == !overlay_paths.is_empty() {
+        anyhow::bail!(
+            "--clean-overlay requires exactly one of --no-overlay or at least one --overlay-path"
+        );
+    }
+
+    let git_toplevel = git_output(project_root, &["rev-parse", "--show-toplevel"]).await?;
+    let git_toplevel = std::fs::canonicalize(&git_toplevel)
+        .with_context(|| format!("canonicalize Git toplevel {git_toplevel}"))?;
+    let canonical_project_root = std::fs::canonicalize(project_root)
+        .with_context(|| format!("canonicalize project root {}", project_root.display()))?;
+    if git_toplevel != canonical_project_root {
+        anyhow::bail!(
+            "clean-overlay exec must run from the Git toplevel (current: {}, toplevel: {})",
+            canonical_project_root.display(),
+            git_toplevel.display()
+        );
+    }
+
+    let commit_expression = format!("{base}^{{commit}}");
+    let base_commit = git_output(
+        &canonical_project_root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &commit_expression,
+        ],
+    )
+    .await?;
+    if base_commit.is_empty() || !base_commit.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        anyhow::bail!("--base did not resolve to a hexadecimal commit object ID");
+    }
+    validate_clean_overlay_archive_attributes(&canonical_project_root, &base_commit).await?;
+    let base_tree = git_output_bytes(
+        &canonical_project_root,
+        &["ls-tree", "-rz", "--full-tree", &base_commit],
+    )
+    .await?;
+    let base_entries = parse_clean_base_tree(&base_tree)?;
+    if let Some(gitlink) = base_entries.iter().find(|entry| entry.mode == 0o160000) {
+        anyhow::bail!(
+            "clean-overlay does not support Git submodules yet (found {})",
+            gitlink.path.display()
+        );
+    }
+
+    let mut normalized_paths = BTreeSet::new();
+    for path in overlay_paths {
+        let normalized = normalize_clean_overlay_path(&path)?;
+        if normalized.components().any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(".git"))
+        }) {
+            anyhow::bail!(
+                "clean-overlay paths may not contain Git metadata: {}",
+                normalized.display()
+            );
+        }
+        validate_clean_overlay_live_path(&canonical_project_root, &normalized)?;
+        normalized_paths.insert(normalized);
+    }
+
+    let overlay_paths = normalized_paths.into_iter().collect::<Vec<_>>();
+    validate_clean_overlay_against_base(&canonical_project_root, &overlay_paths, &base_entries)?;
+    let overlay_fingerprint = clean_overlay_fingerprint(&canonical_project_root, &overlay_paths)?;
+
+    Ok(Some(CleanOverlaySpec {
+        base_commit,
+        overlay_paths,
+        overlay_fingerprint,
+    }))
+}
+
+fn is_clean_overlay_cargo_fmt_check(command_parts: &[String]) -> bool {
+    let mut parts = command_parts.iter();
+    let Some(program) = parts.next() else {
+        return false;
+    };
+    if Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some("cargo")
+    {
+        return false;
+    }
+    let Some(mut subcommand) = parts.next() else {
+        return false;
+    };
+    if subcommand.starts_with('+') {
+        let Some(next) = parts.next() else {
+            return false;
+        };
+        subcommand = next;
+    }
+    subcommand == "fmt" && parts.any(|part| part == "--check")
+}
+
+pub async fn run_exec(
+    base: Option<String>,
+    clean_overlay: bool,
+    overlay_paths: Vec<PathBuf>,
+    no_overlay: bool,
+    command_parts: Vec<String>,
+) -> anyhow::Result<()> {
     let command = join_exec_command(&command_parts);
     if command.is_empty() {
         anyhow::bail!("No command provided to exec");
     }
+    // A clean-overlay request can never fall back to the ambient local tree,
+    // even if the caller omitted RCH_REQUIRE_REMOTE. Doing so would silently
+    // defeat the entire peer-dirt exclusion guarantee.
+    let require_remote = exec_requires_remote() || clean_overlay;
 
     // Classify the command
     let classification = classify_command(&command);
-    if !classification.is_compilation {
+    let clean_overlay_fmt_check = clean_overlay && is_clean_overlay_cargo_fmt_check(&command_parts);
+    if !classification.is_compilation && !clean_overlay_fmt_check {
         // This should not normally happen because the hook only rewrites
         // compilations. Preserve the ordinary local behavior, but honor
         // RCH_REQUIRE_REMOTE for explicit `rch exec` invocations.
         warn!("exec called with non-compilation command: {}", command);
         let reporter = HookReporter::new(OutputVisibility::Summary);
-        exit_with_local_fallback(&command, &reporter, "non-compilation command");
+        exit_with_local_fallback(
+            &command,
+            &reporter,
+            "non-compilation command",
+            require_remote,
+        );
     }
 
     let config = match load_config() {
@@ -710,7 +1412,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
         Err(e) => {
             warn!("Failed to load config: {}, running locally", e);
             let reporter = HookReporter::new(OutputVisibility::Summary);
-            exit_with_local_fallback(&command, &reporter, "config unavailable");
+            exit_with_local_fallback(&command, &reporter, "config unavailable", require_remote);
         }
     };
 
@@ -739,14 +1441,27 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     // is precisely the bug this feature exists to fix. Go/TS/Bun/Nix builds need no
     // rustup toolchain, so send none.
     let project_root = std::env::current_dir().ok();
-    let needs_rust_toolchain = matches!(
-        required_runtime_for_kind(classification.kind),
-        RequiredRuntime::Rust
-    );
+    let clean_overlay_spec = prepare_clean_overlay_spec(
+        project_root.as_deref().unwrap_or_else(|| Path::new(".")),
+        base,
+        clean_overlay,
+        overlay_paths,
+        no_overlay,
+    )
+    .await?;
+    let needs_rust_toolchain = clean_overlay_fmt_check
+        || matches!(
+            required_runtime_for_kind(classification.kind),
+            RequiredRuntime::Rust
+        );
     let toolchain = if needs_rust_toolchain {
-        project_root
-            .as_ref()
-            .and_then(|root| detect_toolchain(root).ok())
+        if let (Some(root), Some(spec)) = (project_root.as_deref(), clean_overlay_spec.as_ref()) {
+            detect_clean_overlay_toolchain(root, spec).await?
+        } else {
+            project_root
+                .as_ref()
+                .and_then(|root| detect_toolchain(root).ok())
+        }
     } else {
         None
     };
@@ -764,7 +1479,11 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     );
 
     // Determine required runtime
-    let required_runtime = required_runtime_for_kind(classification.kind);
+    let required_runtime = if clean_overlay_fmt_check {
+        RequiredRuntime::Rust
+    } else {
+        required_runtime_for_kind(classification.kind)
+    };
     let command_priority = command_priority_from_env(&reporter);
     let wait_for_worker = queue_when_busy_enabled();
     let preferred_workers = preferred_workers_from_env();
@@ -795,7 +1514,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
             let socket_path = config.general.socket_path.clone();
             let socket_exists = Path::new(&socket_path).exists();
             let failure_kind = classify_socket_failure(&e, socket_exists);
-            let strict_remote = exec_requires_remote();
+            let strict_remote = require_remote;
             let canonical_socket = default_socket_path();
             let canonical_exists = Path::new(&canonical_socket).exists();
             let mismatch =
@@ -843,7 +1562,12 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                 // rather than panicking if that invariant is ever violated.
                 DaemonRecoveryAction::ProceedRemote => retry.unwrap_or_else(|| {
                     reporter.summary("[RCH] local (daemon unavailable)");
-                    exit_with_local_fallback(&command, &reporter, "daemon unavailable");
+                    exit_with_local_fallback(
+                        &command,
+                        &reporter,
+                        "daemon unavailable",
+                        require_remote,
+                    );
                 }),
                 // Fail-open convenience lane: record the fallback and run local.
                 DaemonRecoveryAction::LocalFallback => {
@@ -855,7 +1579,12 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                         now_unix_ms(),
                     ));
                     reporter.summary("[RCH] local (daemon unavailable)");
-                    exit_with_local_fallback(&command, &reporter, "daemon unavailable");
+                    exit_with_local_fallback(
+                        &command,
+                        &reporter,
+                        "daemon unavailable",
+                        require_remote,
+                    );
                 }
                 // Proof lane: record the refusal and fail closed.
                 // exit_with_local_fallback also refuses under proof mode and
@@ -868,7 +1597,12 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                         "daemon unavailable",
                         now_unix_ms(),
                     ));
-                    exit_with_local_fallback(&command, &reporter, "daemon unavailable");
+                    exit_with_local_fallback(
+                        &command,
+                        &reporter,
+                        "daemon unavailable",
+                        require_remote,
+                    );
                 }
             }
         }
@@ -877,7 +1611,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     // Check if a worker was assigned
     let Some(worker) = response.worker else {
         reporter.summary(&format!("[RCH] local ({})", response.reason));
-        exit_with_local_fallback(&command, &reporter, "no worker assigned");
+        exit_with_local_fallback(&command, &reporter, "no worker assigned", require_remote);
     };
 
     info!(
@@ -902,6 +1636,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
         config.output.color_mode,
         response.build_id,
         &topology_policy,
+        clean_overlay_spec.as_ref(),
     )
     .await;
     let remote_elapsed = remote_start.elapsed();
@@ -955,7 +1690,12 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                 // Toolchain failure - fall back to local
                 warn!("Remote toolchain failure, falling back to local");
                 reporter.summary(&format!("[RCH] local (toolchain missing on {})", worker.id));
-                exit_with_local_fallback(&command, &reporter, "remote toolchain missing");
+                exit_with_local_fallback(
+                    &command,
+                    &reporter,
+                    "remote toolchain missing",
+                    require_remote,
+                );
             } else if let Some(env_failure) =
                 detect_worker_system_dependency_failure(&result.stderr, result.exit_code)
             {
@@ -1003,7 +1743,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                     preflight_err.report_json()
                 ));
                 let fallback_reason = format!("dependency preflight failed: {evidence_summary}");
-                exit_with_local_fallback(&command, &reporter, &fallback_reason);
+                exit_with_local_fallback(&command, &reporter, &fallback_reason, require_remote);
             }
 
             // Check for transfer skip (not a failure)
@@ -1011,7 +1751,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                 && let TransferError::TransferSkipped { reason } = skip_err
             {
                 reporter.summary(&format!("[RCH] local ({})", reason));
-                exit_with_local_fallback(&command, &reporter, "transfer skipped");
+                exit_with_local_fallback(&command, &reporter, "transfer skipped", require_remote);
             }
 
             if classify_remote_pipeline_failure(&e)
@@ -1028,7 +1768,12 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
             // Other errors - run locally
             warn!("Remote execution failed: {}, running locally", e);
             reporter.summary("[RCH] local (remote execution failed)");
-            exit_with_local_fallback(&command, &reporter, "remote execution failed");
+            exit_with_local_fallback(
+                &command,
+                &reporter,
+                "remote execution failed",
+                require_remote,
+            );
         }
     }
 }
@@ -1467,6 +2212,7 @@ async fn handle_selection_response(
         config.output.color_mode,
         response.build_id,
         &topology_policy,
+        None,
     )
     .await;
     let remote_elapsed = remote_start.elapsed();

@@ -4263,25 +4263,6 @@ fn start_rchd_via_systemd_user(socket_path: &Path) -> Result<(), String> {
 }
 
 fn spawn_rchd(rchd_path: &Path, socket_path: &Path) -> Result<(), String> {
-    // Prefer the systemd-managed daemon when one exists. Spawning a detached
-    // competing rchd via nohup (below) is what historically caused the
-    // restart-storm: an agent's `rch exec` would auto-spawn an rchd that
-    // grabbed the socket and permanently blocked the systemd unit. Asking
-    // systemd to start its own unit is idempotent and keeps a single owner.
-    if cfg!(target_os = "linux") {
-        match start_rchd_via_systemd_user(socket_path) {
-            Ok(()) => return Ok(()),
-            Err(reason) => {
-                // Log to stderr so deploy issues (missing unit, wrong socket
-                // path) are diagnosable rather than silently degrading.
-                eprintln!(
-                    "rch: not using systemd --user rchd.service ({reason}); \
-                     falling back to direct spawn"
-                );
-            }
-        }
-    }
-
     let mut cmd = Command::new("nohup");
     cmd.arg(rchd_path)
         .arg("-s")
@@ -4348,12 +4329,31 @@ fn start_daemon_with_binary(
     }
 
     Err(format!(
-        "daemon process started but socket not found after {}s",
+        "daemon process started but did not accept connections within {}s",
         timeout.as_secs()
     ))
 }
 
 fn start_daemon_for_doctor(socket_path: &Path, timeout: Duration) -> Result<(), String> {
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    // Prefer the systemd-managed daemon in production. Keeping this policy out
+    // of `start_daemon_with_binary` makes explicit-binary tests deterministic
+    // and prevents them from consulting or starting the host's real service.
+    if cfg!(target_os = "linux") {
+        match start_rchd_via_systemd_user(socket_path) {
+            Ok(()) => return Ok(()),
+            Err(reason) => {
+                eprintln!(
+                    "rch: not using systemd --user rchd.service ({reason}); \
+                     falling back to direct spawn"
+                );
+            }
+        }
+    }
+
     start_daemon_with_binary(socket_path, &which_rchd_path(), timeout)
 }
 
@@ -7321,8 +7321,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_start_daemon_with_fake_rchd_creates_socket_file() {
-        // TEST START: start_daemon_with_binary uses -s socket path and waits for file
+    fn test_wait_for_socket_accepts_live_listener() {
+        let tmp = TempDir::new().unwrap();
+        let socket_path = tmp.path().join("live.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+
+        assert!(wait_for_socket(&socket_path, Duration::from_millis(50)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_start_daemon_with_fake_rchd_rejects_regular_socket_file() {
+        // A successful wrapper exit and a file at the requested `-s` path are
+        // not readiness; only a live Unix listener satisfies the contract.
         let tmp = TempDir::new().unwrap();
         let socket_path = tmp.path().join("daemon.sock");
         let fake_rchd = tmp.path().join("rchd");
@@ -7345,9 +7356,13 @@ exit 0\n"
         perms.set_mode(0o755);
         std::fs::set_permissions(&fake_rchd, perms).unwrap();
 
-        start_daemon_with_binary(&socket_path, &fake_rchd, Duration::from_secs(1)).unwrap();
-        assert!(socket_path.exists());
-        // TEST PASS: start_daemon_with_binary creates socket file
+        let error = start_daemon_with_binary(&socket_path, &fake_rchd, Duration::from_millis(50))
+            .unwrap_err();
+        assert!(error.contains("did not accept connections"));
+        assert!(
+            socket_path.is_file(),
+            "fake must receive the -s socket path"
+        );
     }
 
     #[cfg(unix)]

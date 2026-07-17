@@ -69,6 +69,486 @@ fn delegated_command(output: &HookOutput) -> &str {
     }
 }
 
+fn init_clean_overlay_test_repo() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().expect("create clean-overlay test repo");
+    let root = temp.path();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "rch-test@example.invalid"],
+        vec!["config", "user.name", "RCH Test"],
+    ] {
+        let status = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .status()
+            .expect("run git setup command");
+        assert!(status.success());
+    }
+    std::fs::create_dir_all(root.join("src")).expect("create src");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='overlay-fixture'\nversion='0.1.0'\n",
+    )
+    .expect("write manifest");
+    std::fs::write(root.join("src/lib.rs"), "pub fn baseline() {}\n").expect("write source");
+    let add = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["add", "Cargo.toml", "src/lib.rs"])
+        .status()
+        .expect("git add fixture");
+    assert!(add.success());
+    let commit = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["commit", "-q", "--no-gpg-sign", "-m", "fixture"])
+        .status()
+        .expect("git commit fixture");
+    assert!(commit.success());
+    temp
+}
+
+#[tokio::test]
+async fn clean_overlay_spec_accepts_base_only_and_resolves_commit() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    let spec =
+        prepare_clean_overlay_spec(repo.path(), Some("HEAD".to_string()), true, vec![], true)
+            .await
+            .expect("prepare base-only clean overlay")
+            .expect("clean-overlay spec");
+    assert!(spec.is_base_only());
+    assert!(matches!(spec.base_commit().len(), 40 | 64));
+    assert!(
+        spec.base_commit()
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    );
+}
+
+#[tokio::test]
+async fn clean_overlay_spec_requires_exactly_one_overlay_scope() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    let missing =
+        prepare_clean_overlay_spec(repo.path(), Some("HEAD".to_string()), true, vec![], false)
+            .await
+            .expect_err("missing overlay scope must fail");
+    assert!(missing.to_string().contains("exactly one"));
+
+    let conflicting = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".to_string()),
+        true,
+        vec![PathBuf::from("src/lib.rs")],
+        true,
+    )
+    .await
+    .expect_err("conflicting overlay scope must fail");
+    assert!(conflicting.to_string().contains("exactly one"));
+}
+
+#[tokio::test]
+async fn clean_overlay_spec_rejects_traversal_and_detects_source_churn() {
+    let _guard = test_guard!();
+    assert!(normalize_clean_overlay_path(Path::new("../peer.rs")).is_err());
+    assert!(normalize_clean_overlay_path(Path::new("/absolute.rs")).is_err());
+    assert!(normalize_clean_overlay_path(Path::new(r"src\backslash.rs")).is_err());
+    let non_ascii = normalize_clean_overlay_path(Path::new("src/caf\u{e9}.rs"))
+        .expect_err("non-ASCII overlay paths must fail closed");
+    assert!(non_ascii.to_string().contains("only ASCII"));
+
+    let repo = init_clean_overlay_test_repo();
+    std::fs::write(repo.path().join("src/lib.rs"), "pub fn overlay() {}\n")
+        .expect("write overlay source");
+    let spec = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".to_string()),
+        true,
+        vec![PathBuf::from("src/lib.rs")],
+        false,
+    )
+    .await
+    .expect("prepare clean overlay")
+    .expect("clean-overlay spec");
+    spec.verify_overlay_unchanged(repo.path())
+        .expect("unchanged overlay");
+
+    std::fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn changed_again() {}\n",
+    )
+    .expect("mutate overlay source");
+    let error = spec
+        .verify_overlay_unchanged(repo.path())
+        .expect_err("source churn must fail closed");
+    assert!(error.to_string().contains("changed after admission"));
+}
+
+#[tokio::test]
+async fn clean_overlay_post_admission_spelling_drift_fails_closed() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    let spec = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".to_string()),
+        true,
+        vec![PathBuf::from("src/lib.rs")],
+        false,
+    )
+    .await
+    .expect("prepare clean overlay")
+    .expect("clean-overlay spec");
+
+    std::fs::rename(
+        repo.path().join("src/lib.rs"),
+        repo.path().join("src/LIB.rs"),
+    )
+    .expect("change selected path spelling");
+    let error = spec
+        .verify_overlay_unchanged(repo.path())
+        .expect_err("post-admission spelling drift must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("spelling does not exactly match")
+    );
+}
+
+#[tokio::test]
+async fn clean_overlay_directory_rejects_nested_non_ascii_path() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    std::fs::write(repo.path().join("src/caf\u{e9}.rs"), "pub fn coffee() {}\n")
+        .expect("write non-ASCII nested path");
+
+    let error = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".to_string()),
+        true,
+        vec![PathBuf::from("src")],
+        false,
+    )
+    .await
+    .expect_err("nested non-ASCII overlay paths must fail closed");
+    assert!(error.to_string().contains("only ASCII"));
+}
+
+#[tokio::test]
+async fn clean_overlay_directory_rejects_nested_backslash_or_control_path() {
+    let _guard = test_guard!();
+    for relative in ["src/back\\slash.rs", "src/line\nbreak.rs"] {
+        let repo = init_clean_overlay_test_repo();
+        std::fs::write(repo.path().join(relative), "pub fn hazard() {}\n")
+            .expect("write nested portability hazard");
+
+        let error = prepare_clean_overlay_spec(
+            repo.path(),
+            Some("HEAD".to_string()),
+            true,
+            vec![PathBuf::from("src")],
+            false,
+        )
+        .await
+        .expect_err("nested backslash/control overlay paths must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("backslashes or control characters")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clean_overlay_spec_rejects_nested_symlink() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    std::os::unix::fs::symlink("/dev/null", repo.path().join("src/escape"))
+        .expect("create escaping fixture symlink");
+
+    let error = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".to_string()),
+        true,
+        vec![PathBuf::from("src")],
+        false,
+    )
+    .await
+    .expect_err("nested symlink escape must fail closed");
+    assert!(error.to_string().contains("do not support symlinks"));
+}
+
+#[tokio::test]
+async fn clean_overlay_spec_rejects_nested_git_metadata() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    std::fs::create_dir_all(repo.path().join("src/vendor/.GIT"))
+        .expect("create nested Git metadata fixture");
+
+    let error = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".to_string()),
+        true,
+        vec![PathBuf::from("src")],
+        false,
+    )
+    .await
+    .expect_err("nested Git metadata must fail closed");
+    assert!(error.to_string().contains("Git metadata"));
+}
+
+#[test]
+fn clean_overlay_exact_spelling_check_rejects_case_drift() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    assert!(
+        !clean_overlay_path_has_exact_spelling(repo.path(), Path::new("SRC/lib.rs"))
+            .expect("check path spelling")
+    );
+}
+
+#[tokio::test]
+async fn clean_overlay_directory_rejects_base_path_rename() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    std::fs::rename(
+        repo.path().join("src/lib.rs"),
+        repo.path().join("src/renamed.rs"),
+    )
+    .expect("rename tracked fixture path");
+
+    let error = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".to_string()),
+        true,
+        vec![PathBuf::from("src")],
+        false,
+    )
+    .await
+    .expect_err("directory overlay with base rename must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("selected deletions are unsupported")
+    );
+}
+
+#[tokio::test]
+async fn clean_overlay_rejects_case_only_base_directory_alias() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    std::fs::rename(repo.path().join("src"), repo.path().join("SRC"))
+        .expect("case-rename tracked fixture directory");
+
+    let error = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".to_string()),
+        true,
+        vec![PathBuf::from("SRC")],
+        false,
+    )
+    .await
+    .expect_err("case-only base alias must fail closed");
+    assert!(error.to_string().contains("case-only overlays"));
+}
+
+#[tokio::test]
+async fn clean_overlay_rejects_new_file_under_case_aliased_base_directory() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    std::fs::rename(repo.path().join("src"), repo.path().join("SRC"))
+        .expect("case-rename tracked fixture directory");
+    std::fs::write(repo.path().join("SRC/new.rs"), "pub fn new_file() {}\n")
+        .expect("write new file under case-aliased directory");
+
+    let error = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".to_string()),
+        true,
+        vec![PathBuf::from("SRC/new.rs")],
+        false,
+    )
+    .await
+    .expect_err("new file under case-aliased base directory must fail closed");
+    assert!(error.to_string().contains("case-only overlays"));
+}
+
+#[tokio::test]
+async fn clean_overlay_spec_rejects_empty_overlay_directory() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    std::fs::create_dir_all(repo.path().join("src/empty")).expect("create empty overlay fixture");
+
+    let error = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".to_string()),
+        true,
+        vec![PathBuf::from("src/empty")],
+        false,
+    )
+    .await
+    .expect_err("empty overlay directory must fail closed");
+    assert!(error.to_string().contains("empty directories"));
+}
+
+#[tokio::test]
+async fn clean_overlay_spec_rejects_gitlinks() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    let head = std::process::Command::new("git")
+        .current_dir(repo.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("resolve fixture HEAD");
+    assert!(head.status.success());
+    let head = String::from_utf8(head.stdout)
+        .expect("fixture HEAD is UTF-8")
+        .trim()
+        .to_string();
+    let cache_info = format!("160000,{head},vendor/submodule");
+    let update = std::process::Command::new("git")
+        .current_dir(repo.path())
+        .args(["update-index", "--add", "--cacheinfo", &cache_info])
+        .status()
+        .expect("add fixture gitlink");
+    assert!(update.success());
+    let commit = std::process::Command::new("git")
+        .current_dir(repo.path())
+        .args(["commit", "-q", "--no-gpg-sign", "-m", "add gitlink"])
+        .status()
+        .expect("commit fixture gitlink");
+    assert!(commit.success());
+
+    let error =
+        prepare_clean_overlay_spec(repo.path(), Some("HEAD".to_string()), true, vec![], true)
+            .await
+            .expect_err("gitlink must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("does not support Git submodules")
+    );
+}
+
+#[tokio::test]
+async fn clean_overlay_spec_rejects_git_archive_transform_attributes() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    std::fs::write(
+        repo.path().join(".gitattributes"),
+        "Cargo.toml export-ignore\nsrc/lib.rs export-subst\n",
+    )
+    .expect("write archive-transform attributes");
+    let add = std::process::Command::new("git")
+        .current_dir(repo.path())
+        .args(["add", ".gitattributes"])
+        .status()
+        .expect("add attributes fixture");
+    assert!(add.success());
+    let commit = std::process::Command::new("git")
+        .current_dir(repo.path())
+        .args(["commit", "-q", "--no-gpg-sign", "-m", "add attributes"])
+        .status()
+        .expect("commit attributes fixture");
+    assert!(commit.success());
+
+    let error =
+        prepare_clean_overlay_spec(repo.path(), Some("HEAD".to_string()), true, vec![], true)
+            .await
+            .expect_err("archive-transform attributes must fail closed");
+    assert!(error.to_string().contains("non-checkout-equivalent"));
+}
+
+#[tokio::test]
+async fn clean_overlay_spec_rejects_info_archive_transform_attributes() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    std::fs::write(
+        repo.path().join(".git/info/attributes"),
+        "Cargo.toml export-ignore\n",
+    )
+    .expect("write info attributes fixture");
+
+    let error =
+        prepare_clean_overlay_spec(repo.path(), Some("HEAD".to_string()), true, vec![], true)
+            .await
+            .expect_err("info archive-transform attributes must fail closed");
+    assert!(error.to_string().contains("info/attributes"));
+}
+
+#[tokio::test]
+async fn clean_overlay_rechecks_info_attributes_after_admission() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    let spec =
+        prepare_clean_overlay_spec(repo.path(), Some("HEAD".to_string()), true, vec![], true)
+            .await
+            .expect("prepare clean overlay")
+            .expect("clean-overlay spec");
+
+    std::fs::write(
+        repo.path().join(".git/info/attributes"),
+        "Cargo.toml export-ignore\n",
+    )
+    .expect("mutate info attributes after admission");
+    let error = spec
+        .verify_archive_attributes(repo.path())
+        .await
+        .expect_err("post-admission info attributes must fail closed");
+    assert!(error.to_string().contains("info/attributes"));
+}
+
+#[tokio::test]
+async fn clean_overlay_git_reads_ignore_replace_refs() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    let original = std::process::Command::new("git")
+        .current_dir(repo.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("resolve original fixture commit");
+    assert!(original.status.success());
+    let original = String::from_utf8(original.stdout)
+        .expect("original fixture commit is UTF-8")
+        .trim()
+        .to_string();
+
+    std::fs::write(repo.path().join("src/lib.rs"), "pub fn replacement() {}\n")
+        .expect("write replacement source");
+    let replacement_commit = std::process::Command::new("git")
+        .current_dir(repo.path())
+        .args(["commit", "-qam", "replacement", "--no-gpg-sign"])
+        .status()
+        .expect("commit replacement fixture");
+    assert!(replacement_commit.success());
+    let replacement = std::process::Command::new("git")
+        .current_dir(repo.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("resolve replacement fixture commit");
+    assert!(replacement.status.success());
+    let replacement = String::from_utf8(replacement.stdout)
+        .expect("replacement fixture commit is UTF-8")
+        .trim()
+        .to_string();
+    let replace = std::process::Command::new("git")
+        .current_dir(repo.path())
+        .args(["replace", &original, &replacement])
+        .status()
+        .expect("install fixture replace ref");
+    assert!(replace.success());
+
+    let source = git_show_optional(repo.path(), &original, "src/lib.rs")
+        .await
+        .expect("read original source without replacement")
+        .expect("original source exists");
+    assert_eq!(source, "pub fn baseline() {}\n");
+    let spec = prepare_clean_overlay_spec(repo.path(), Some(original.clone()), true, vec![], true)
+        .await
+        .expect("prepare original commit with replace ref present")
+        .expect("clean-overlay spec");
+    assert_eq!(spec.base_commit(), original);
+}
+
 // ------------------------------------------------------------------
 // join_exec_command tests — guard against the `.join(" ")` round-trip
 // corruption that was present when `rch exec --` rebuilt a command
@@ -87,6 +567,32 @@ fn join_exec_command_plain_args_unchanged() {
     // shell_words::split of the result should reproduce the original argv.
     let round_trip = shell_words::split(&joined).expect("valid shell words");
     assert_eq!(round_trip, parts);
+}
+
+#[test]
+fn clean_overlay_fmt_check_allowlist_is_exact_and_read_only() {
+    let _guard = test_guard!();
+    assert!(is_clean_overlay_cargo_fmt_check(&[
+        "cargo".into(),
+        "fmt".into(),
+        "--check".into(),
+    ]));
+    assert!(is_clean_overlay_cargo_fmt_check(&[
+        "/usr/bin/cargo".into(),
+        "+nightly".into(),
+        "fmt".into(),
+        "--all".into(),
+        "--check".into(),
+    ]));
+    assert!(!is_clean_overlay_cargo_fmt_check(&[
+        "cargo".into(),
+        "fmt".into(),
+    ]));
+    assert!(!is_clean_overlay_cargo_fmt_check(&[
+        "cargo".into(),
+        "metadata".into(),
+        "--check".into(),
+    ]));
 }
 
 #[test]
@@ -4662,6 +5168,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         ColorMode::Auto,
         None,
         &policy,
+        None,
     )
     .await;
 
@@ -4771,6 +5278,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         ColorMode::Auto,
         None,
         &policy,
+        None,
     )
     .await;
 
@@ -4791,6 +5299,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         ColorMode::Auto,
         None,
         &policy,
+        None,
     )
     .await;
 

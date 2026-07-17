@@ -3839,7 +3839,7 @@ patched_dep = { path = "../patched/patched_dep" }
         fs::write(
             project_root.join("Cargo.toml"),
             format!(
-                "[package]\nname = \"metadata_pipe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}",
+                "[package]\nname = \"metadata_pipe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\nresolver = \"2\"\n\n[dependencies]\n{deps}",
             ),
         )
         .expect("write manifest");
