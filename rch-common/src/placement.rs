@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::incident::{ControlState, IncidentReasonCode};
 use crate::schema_versions::{SchemaComponent, current_version};
+use crate::types::{WorkerSelectionDiagnostic, WorkerSelectionDiagnosticDecision};
 
 // ---------------------------------------------------------------------------
 // Canonical control vocabulary
@@ -453,8 +454,14 @@ pub struct RequestedWorkerFacts {
     pub has_required_runtime: bool,
     /// Worker already runs this project (active-project exclusion).
     pub project_excluded: bool,
+    /// Worker has enough configured total capacity for the request eventually.
+    pub has_total_capacity: bool,
     /// Worker has enough free slots for the request.
     pub has_free_slots: bool,
+    /// Stable incident class for a remaining selector denial, if any.
+    pub admission_denial_code: Option<IncidentReasonCode>,
+    /// Human-readable selector reason for a remaining admission denial.
+    pub admission_denial_reason: Option<String>,
 }
 
 impl RequestedWorkerFacts {
@@ -471,7 +478,10 @@ impl RequestedWorkerFacts {
             platform_matches: true,
             has_required_runtime: true,
             project_excluded: false,
+            has_total_capacity: true,
             has_free_slots: true,
+            admission_denial_code: None,
+            admission_denial_reason: None,
         }
     }
 
@@ -482,6 +492,56 @@ impl RequestedWorkerFacts {
             requested: Some(id.into()),
             exists: true,
             ..Self::none()
+        }
+    }
+
+    /// Build canonical requested-worker facts from daemon selection diagnostics.
+    #[must_use]
+    pub fn from_diagnostic(
+        requested: impl Into<String>,
+        worker: &WorkerSelectionDiagnostic,
+    ) -> Self {
+        let toolchain_inadmissible = worker
+            .reason_codes
+            .iter()
+            .any(|code| code.starts_with("toolchain."));
+        let admission_denial_code =
+            (worker.final_decision == WorkerSelectionDiagnosticDecision::Deny).then(|| {
+                if worker
+                    .reason_codes
+                    .iter()
+                    .any(|code| code == "pressure.critical")
+                {
+                    IncidentReasonCode::CriticalPressure
+                } else if worker.reason_codes.iter().any(|code| {
+                    code.starts_with("topology.")
+                        || code.starts_with("preflight.")
+                        || code.starts_with("convergence.")
+                        || code.starts_with("reliability.")
+                }) {
+                    IncidentReasonCode::HardPreflight
+                } else {
+                    IncidentReasonCode::NoAdmissibleWorkers
+                }
+            });
+        Self {
+            requested: Some(requested.into()),
+            exists: true,
+            admin_disabled: worker.status.eq_ignore_ascii_case("disabled"),
+            draining_or_drained: worker.status.to_ascii_lowercase().contains("drain"),
+            reachable: !worker.status.eq_ignore_ascii_case("unreachable"),
+            temporarily_bypassed: worker.circuit_state.eq_ignore_ascii_case("open")
+                || worker.status.to_ascii_lowercase().contains("bypass"),
+            platform_matches: !worker
+                .reason_codes
+                .iter()
+                .any(|code| code.contains("os_arch") || code.contains("platform")),
+            has_required_runtime: worker.runtime_available && !toolchain_inadmissible,
+            project_excluded: worker.active_project_excluded,
+            has_total_capacity: worker.total_slots >= worker.estimated_cores,
+            has_free_slots: worker.available_slots >= worker.estimated_cores,
+            admission_denial_code,
+            admission_denial_reason: admission_denial_code.map(|_| worker.final_reason.clone()),
         }
     }
 }
@@ -612,6 +672,15 @@ pub fn evaluate_requested_worker(facts: &RequestedWorkerFacts) -> RequestedWorke
             ),
         );
     }
+    if !facts.has_total_capacity {
+        return RequestedWorkerOutcome::refused(
+            RequestedWorkerStatus::NoFreeSlots,
+            IncidentReasonCode::InsufficientSlots,
+            format!(
+                "'{id}' cannot fit the requested core count; lower the request or request a larger worker"
+            ),
+        );
+    }
     if !facts.has_free_slots {
         return RequestedWorkerOutcome::refused(
             RequestedWorkerStatus::NoFreeSlots,
@@ -619,6 +688,28 @@ pub fn evaluate_requested_worker(facts: &RequestedWorkerFacts) -> RequestedWorke
             format!(
                 "'{id}' has no free slots right now; queue with RCH_QUEUE_WHEN_BUSY=1 or request another worker"
             ),
+        );
+    }
+    if let Some(code) = facts.admission_denial_code {
+        let reason = facts
+            .admission_denial_reason
+            .as_deref()
+            .unwrap_or("worker admission denied");
+        let next_action = match code {
+            IncidentReasonCode::CriticalPressure => format!(
+                "'{id}' failed admission under critical pressure ({reason}); remediate worker pressure or request another worker"
+            ),
+            IncidentReasonCode::HardPreflight => format!(
+                "'{id}' failed a hard preflight ({reason}); run `rch diagnose -- <command>`, remediate the preflight, or request another worker"
+            ),
+            _ => format!(
+                "'{id}' failed worker admission ({reason}); run `rch diagnose -- <command>` or request another worker"
+            ),
+        };
+        return RequestedWorkerOutcome::refused(
+            RequestedWorkerStatus::Unavailable,
+            code,
+            next_action,
         );
     }
     RequestedWorkerOutcome::honored()
@@ -920,6 +1011,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{RequiredRuntime, WorkerId, WorkerSelectionDiagnosticDecision};
     use std::collections::HashMap;
 
     /// Build an env getter over a fixed map (no process-env mutation, so tests
@@ -930,6 +1022,28 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         move |k: &str| map.get(k).cloned()
+    }
+
+    fn admissibility_diagnostic() -> WorkerSelectionDiagnostic {
+        WorkerSelectionDiagnostic {
+            worker_id: WorkerId::new("css"),
+            status: "healthy".to_string(),
+            circuit_state: "closed".to_string(),
+            pressure_state: "healthy".to_string(),
+            pressure_reason_code: "pressure.healthy".to_string(),
+            success_rate: Some(1.0),
+            min_success_rate: 0.8,
+            fallback_min_success_rate: 0.5,
+            required_runtime: RequiredRuntime::Rust,
+            runtime_available: true,
+            available_slots: 8,
+            total_slots: 8,
+            estimated_cores: 2,
+            active_project_excluded: false,
+            final_decision: WorkerSelectionDiagnosticDecision::Allow,
+            final_reason: "eligible".to_string(),
+            reason_codes: vec![],
+        }
     }
 
     // --- strict-remote precedence -----------------------------------------
@@ -1208,6 +1322,73 @@ mod tests {
             out.reason_code.as_deref(),
             Some(IncidentReasonCode::InsufficientSlots.code())
         );
+    }
+
+    #[test]
+    fn evaluate_insufficient_capacity_refused_without_queue_advice() {
+        let mut diagnostic = admissibility_diagnostic();
+        diagnostic.worker_id = WorkerId::new("tiny");
+        diagnostic.available_slots = 1;
+        diagnostic.total_slots = 1;
+        diagnostic.estimated_cores = 2;
+        let facts = RequestedWorkerFacts::from_diagnostic("tiny", &diagnostic);
+        let out = evaluate_requested_worker(&facts);
+        assert_eq!(out.status, RequestedWorkerStatus::NoFreeSlots);
+        assert_eq!(
+            out.reason_code.as_deref(),
+            Some(IncidentReasonCode::InsufficientSlots.code())
+        );
+        let next_action = out.next_action.expect("capacity refusal needs an action");
+        assert!(next_action.contains("lower the request"));
+        assert!(!next_action.contains("RCH_QUEUE_WHEN_BUSY"));
+    }
+
+    #[test]
+    fn diagnostic_toolchain_refusal_maps_to_missing_runtime_code() {
+        let mut diagnostic = admissibility_diagnostic();
+        diagnostic.final_decision = WorkerSelectionDiagnosticDecision::Deny;
+        diagnostic.final_reason = "toolchain version mismatch".to_string();
+        diagnostic.reason_codes = vec!["toolchain.version_mismatch".to_string()];
+        let facts = RequestedWorkerFacts::from_diagnostic("css", &diagnostic);
+        let out = evaluate_requested_worker(&facts);
+        assert_eq!(out.status, RequestedWorkerStatus::MissingRuntime);
+        assert_eq!(
+            out.reason_code.as_deref(),
+            Some(IncidentReasonCode::MissingRuntimeToolchainTarget.code())
+        );
+    }
+
+    #[test]
+    fn remaining_diagnostic_denials_never_report_honored() {
+        let cases = [
+            (
+                "critical pressure",
+                "pressure.critical",
+                IncidentReasonCode::CriticalPressure,
+            ),
+            (
+                "topology preflight failed",
+                "topology.preflight_failed",
+                IncidentReasonCode::HardPreflight,
+            ),
+            (
+                "success rate below fallback floor",
+                "health.below_fallback_min_success_rate",
+                IncidentReasonCode::NoAdmissibleWorkers,
+            ),
+        ];
+
+        for (reason, reason_code, expected_incident) in cases {
+            let mut diagnostic = admissibility_diagnostic();
+            diagnostic.final_decision = WorkerSelectionDiagnosticDecision::Deny;
+            diagnostic.final_reason = reason.to_string();
+            diagnostic.reason_codes = vec![reason_code.to_string()];
+            let facts = RequestedWorkerFacts::from_diagnostic("css", &diagnostic);
+            let out = evaluate_requested_worker(&facts);
+            assert!(out.status.is_refusal(), "{reason_code} must be refused");
+            assert_eq!(out.reason_code.as_deref(), Some(expected_incident.code()));
+            assert!(out.next_action.is_some());
+        }
     }
 
     #[test]

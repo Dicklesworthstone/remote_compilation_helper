@@ -35,10 +35,11 @@ use rch_common::{
     IncidentEventType, IncidentLedger, IncidentLedgerConfig, IncidentReasonCode, IncidentSource,
     OutputVisibility, REPO_UPDATER_CANONICAL_PROJECTS_ROOT, RepoUpdaterAdapterCommand,
     RepoUpdaterAdapterContract, RepoUpdaterAdapterRequest, RepoUpdaterOutputFormat,
-    RequiredRuntime, SelectedMode, SelectedWorker, SelectionReason, SelectionResponse,
+    RequestedWorkerFacts, RequestedWorkerOutcome, RequestedWorkerStatus, RequiredRuntime,
+    SelectedMode, SelectedWorker, SelectionDiagnostics, SelectionReason, SelectionResponse,
     SelfHealingConfig, ToolchainInfo, TransferConfig, WorkerConfig, WorkerId,
     build_dependency_closure_plan_with_policy, build_invocation, classify_command,
-    declined_compilation_due_to_structure, default_socket_path, mock,
+    declined_compilation_due_to_structure, default_socket_path, evaluate_requested_worker, mock,
     normalize_project_path_with_policy,
     path_topology::PathTopologyPolicy,
     redaction::{redact_path, redact_secrets},
@@ -431,6 +432,93 @@ fn dedupe_worker_ids(workers: Vec<WorkerId>) -> Vec<WorkerId> {
         }
     }
     deduped
+}
+
+fn requested_worker_outcome(
+    requested: &WorkerId,
+    diagnostics: Option<&SelectionDiagnostics>,
+) -> RequestedWorkerOutcome {
+    let Some(diagnostics) = diagnostics else {
+        return RequestedWorkerOutcome::requested();
+    };
+    let Some(worker) = diagnostics
+        .workers
+        .iter()
+        .find(|worker| worker.worker_id == *requested)
+    else {
+        return evaluate_requested_worker(&RequestedWorkerFacts {
+            requested: Some(requested.to_string()),
+            exists: false,
+            ..RequestedWorkerFacts::none()
+        });
+    };
+
+    evaluate_requested_worker(&RequestedWorkerFacts::from_diagnostic(
+        requested.to_string(),
+        worker,
+    ))
+}
+
+fn requested_worker_refusal_summary(
+    requested_workers: &[WorkerId],
+    response: &SelectionResponse,
+) -> Option<String> {
+    if requested_workers.is_empty() || response.worker.is_some() {
+        return None;
+    }
+
+    let outcomes = requested_workers
+        .iter()
+        .map(|worker| {
+            (
+                worker,
+                requested_worker_outcome(worker, response.diagnostics.as_ref()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let preferred_status = match response.reason {
+        SelectionReason::AllWorkersBusy => Some(RequestedWorkerStatus::NoFreeSlots),
+        SelectionReason::NoWorkersWithRuntime(_) => Some(RequestedWorkerStatus::MissingRuntime),
+        SelectionReason::AllCircuitsOpen => Some(RequestedWorkerStatus::TemporarilyBypassed),
+        _ => None,
+    };
+    let selected = preferred_status
+        .and_then(|status| {
+            outcomes
+                .iter()
+                .find(|(_, outcome)| outcome.status == status)
+        })
+        .or_else(|| {
+            outcomes
+                .iter()
+                .find(|(_, outcome)| outcome.status.is_refusal())
+        });
+    let requested = requested_workers
+        .iter()
+        .map(WorkerId::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    if let Some((_, outcome)) = selected {
+        let code = outcome.reason_code.as_deref().unwrap_or("RCH-I001");
+        let next_action = outcome
+            .next_action
+            .as_deref()
+            .unwrap_or("run `rch diagnose -- <command>` and request an admissible worker");
+        Some(format!(
+            "[{code}] requested worker set [{requested}] refused ({}); {next_action}",
+            outcome.status.as_str()
+        ))
+    } else {
+        Some(format!(
+            "[RCH-I001] requested worker set [{requested}] refused ({}); run `rch diagnose -- <command>` and request an admissible worker",
+            response.reason
+        ))
+    }
+}
+
+fn selected_worker_is_requested(worker: &WorkerId, requested_workers: &[WorkerId]) -> bool {
+    requested_workers.is_empty() || requested_workers.contains(worker)
 }
 
 fn local_fallback_command(command: &str) -> std::process::Command {
@@ -1608,11 +1696,57 @@ pub async fn run_exec(
         }
     };
 
+    let requested_refusal = requested_worker_refusal_summary(&preferred_workers, &response);
+
     // Check if a worker was assigned
     let Some(worker) = response.worker else {
-        reporter.summary(&format!("[RCH] local ({})", response.reason));
-        exit_with_local_fallback(&command, &reporter, "no worker assigned", require_remote);
+        let reason = requested_refusal.unwrap_or_else(|| response.reason.to_string());
+        reporter.summary(&format!("[RCH] local ({reason})"));
+        exit_with_local_fallback(&command, &reporter, &reason, require_remote);
     };
+
+    if !selected_worker_is_requested(&worker.id, &preferred_workers) {
+        let requested = preferred_workers
+            .iter()
+            .map(WorkerId::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        let reason = format!(
+            "[RCH-I001] daemon selected unrequested worker '{}' for requested set [{}]; upgrade and restart rchd to the same version as rch, or request another worker",
+            worker.id, requested
+        );
+
+        // A pre-fix daemon may already have reserved slots and opened an
+        // active-build record for the out-of-set worker. Release both before
+        // refusing so the client-side mixed-version guard cannot leak capacity.
+        let release_error = release_worker(
+            &config.general.socket_path,
+            &worker.id,
+            estimated_cores,
+            response.build_id,
+            Some(EXIT_BUILD_ERROR),
+            None,
+            None,
+            None,
+        )
+        .await
+        .err();
+        if let Some(error) = release_error.as_ref() {
+            warn!(
+                "Failed to release unrequested worker {} after selection refusal: {}",
+                worker.id, error
+            );
+        }
+        let reason = if let Some(error) = release_error {
+            format!(
+                "{reason}; reservation release was not acknowledged ({error}); restart rchd and verify capacity before retrying"
+            )
+        } else {
+            reason
+        };
+        reporter.summary(&format!("[RCH] local ({reason})"));
+        exit_with_local_fallback(&command, &reporter, &reason, require_remote);
+    }
 
     info!(
         "Selected worker: {} at {}@{} ({} slots remaining after reservation, speed {:.1})",

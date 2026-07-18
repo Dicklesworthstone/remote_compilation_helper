@@ -724,9 +724,13 @@ impl WorkerSelector {
         };
 
         if eligible.is_empty() {
-            // Try last-success fallback if enabled
-            if let Some(fallback_worker_id) =
-                self.try_fallback(pool, request, excluded_worker_ids).await
+            // Explicit worker requests are remote allow-sets. Affinity fallback
+            // is valid only for automatic selection; otherwise a cached worker
+            // could escape the requested set after admission or reservation
+            // changes.
+            if request.preferred_workers.is_empty()
+                && let Some(fallback_worker_id) =
+                    self.try_fallback(pool, request, excluded_worker_ids).await
             {
                 // Record fallback selection in audit log
                 self.record_audit_entry(
@@ -1377,6 +1381,15 @@ impl WorkerSelector {
                 } else if let Some(reason) = cached_toolchain_failure {
                     push_reason_code(&mut reason_codes, "toolchain.preflight_failed");
                     (WorkerSelectionDiagnosticDecision::Deny, reason)
+                } else if total_slots < request.estimated_cores {
+                    push_reason_code(&mut reason_codes, "slots.request_exceeds_capacity");
+                    (
+                        WorkerSelectionDiagnosticDecision::Deny,
+                        format!(
+                            "requested cores {} exceed total slots {total_slots}",
+                            request.estimated_cores
+                        ),
+                    )
                 } else if available_slots < request.estimated_cores {
                     push_reason_code(&mut reason_codes, "slots.insufficient");
                     (
@@ -1690,6 +1703,7 @@ impl WorkerSelector {
             .map(|id| id.as_str())
             .collect();
         let has_preferred = !preferred_set.is_empty();
+        let mut matched_preferred_worker = false;
 
         let mut eligible: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
         let mut preferred: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
@@ -1700,12 +1714,25 @@ impl WorkerSelector {
         let mut filtered_by_convergence = 0usize;
         let mut filtered_by_pressure = 0usize;
         let mut filtered_by_slots = 0usize;
+        let mut filtered_by_capacity = 0usize;
         let mut filtered_by_active_project = 0usize;
         let mut any_has_runtime = false;
 
         for worker in workers {
             let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
-            let worker_id = worker.config.read().await.id.clone();
+            let (worker_id, total_slots) = {
+                let config = worker.config.read().await;
+                (config.id.clone(), config.total_slots)
+            };
+
+            // An explicit worker request is an allow-set, not a scoring hint.
+            // Ignore every worker outside that set before applying admission so
+            // retries, affinity, and fail-open health paths cannot silently
+            // escape to a different remote worker.
+            if has_preferred && !preferred_set.contains(worker_id.as_str()) {
+                continue;
+            }
+            matched_preferred_worker = true;
 
             // Filter by circuit state
             match circuit_state {
@@ -1770,13 +1797,16 @@ impl WorkerSelector {
             }
 
             // Filter by slot availability
-            if worker.available_slots().await < request.estimated_cores {
-                filtered_by_slots += 1;
+            let available_slots = worker.available_slots().await;
+            if available_slots < request.estimated_cores {
+                if total_slots < request.estimated_cores {
+                    filtered_by_capacity += 1;
+                } else {
+                    filtered_by_slots += 1;
+                }
                 debug!(
-                    "Worker {} excluded: insufficient slots ({} < {})",
-                    worker_id,
-                    worker.available_slots().await,
-                    request.estimated_cores
+                    "Worker {} excluded: insufficient slots (available={}, total={}, requested={})",
+                    worker_id, available_slots, total_slots, request.estimated_cores
                 );
                 continue;
             }
@@ -2048,12 +2078,12 @@ impl WorkerSelector {
                     "Worker {} excluded: success_rate {:.2} < min {:.2}",
                     worker_id, success_rate, self.config.min_success_rate
                 );
-                if has_preferred && preferred_set.contains(worker_id.as_str()) {
-                    preferred_without_health.push((worker.clone(), circuit_state));
-                    continue;
-                }
                 if success_rate >= self.config.affinity.fallback_min_success_rate {
-                    eligible_without_health.push((worker.clone(), circuit_state));
+                    if has_preferred && preferred_set.contains(worker_id.as_str()) {
+                        preferred_without_health.push((worker.clone(), circuit_state));
+                    } else {
+                        eligible_without_health.push((worker.clone(), circuit_state));
+                    }
                 }
                 continue;
             }
@@ -2064,6 +2094,10 @@ impl WorkerSelector {
             eligible.push((worker, circuit_state));
         }
 
+        if has_preferred && !matched_preferred_worker {
+            return Err(SelectionReason::NoMatchingWorkers);
+        }
+
         if !any_has_runtime && !matches!(request.required_runtime, RequiredRuntime::None) {
             return Err(SelectionReason::NoWorkersWithRuntime(format!(
                 "{:?}",
@@ -2071,7 +2105,9 @@ impl WorkerSelector {
             )));
         }
 
-        // Return preferred workers if available, otherwise all eligible
+        // Explicit requests are already enforced as an allow-set above. Keep
+        // the separate vectors so requested workers retain the existing
+        // below-health-threshold fallback behavior.
         if has_preferred && !preferred.is_empty() {
             return Ok(preferred);
         }
@@ -2082,7 +2118,16 @@ impl WorkerSelector {
             return Ok(eligible);
         }
 
-        if filtered_by_active_project > 0
+        if has_preferred && filtered_by_slots > 0 {
+            // Returning an empty eligible set maps to AllWorkersBusy in
+            // select_with_exclusions. That keeps RCH_QUEUE_WHEN_BUSY polling
+            // the same requested allow-set instead of selecting an unrelated
+            // worker. If several workers were requested, one busy requested
+            // worker is enough to make waiting useful.
+            return Ok(Vec::new());
+        }
+
+        if (filtered_by_active_project > 0 || (filtered_by_capacity > 0 && filtered_by_slots == 0))
             && preferred_without_health.is_empty()
             && eligible_without_health.is_empty()
         {
@@ -2090,6 +2135,7 @@ impl WorkerSelector {
                 no_admissible_workers_summary_with_active_project(
                     filtered_by_pressure,
                     filtered_by_slots,
+                    filtered_by_capacity,
                     filtered_by_hard_preflight,
                     filtered_by_health,
                     filtered_by_active_project,
@@ -2108,11 +2154,16 @@ impl WorkerSelector {
                 "All candidate workers failed hard preflight checks (count={})",
                 filtered_by_hard_preflight
             );
-            if filtered_by_pressure > 0 || filtered_by_slots > 0 || filtered_by_health > 0 {
+            if filtered_by_pressure > 0
+                || filtered_by_slots > 0
+                || filtered_by_capacity > 0
+                || filtered_by_health > 0
+            {
                 return Err(SelectionReason::NoAdmissibleWorkers(
                     no_admissible_workers_summary(
                         filtered_by_pressure,
                         filtered_by_slots,
+                        filtered_by_capacity,
                         filtered_by_hard_preflight,
                         filtered_by_health,
                     ),
@@ -2149,6 +2200,10 @@ impl WorkerSelector {
                 "No workers meet min_success_rate {:.2}; falling back to workers below threshold",
                 self.config.min_success_rate
             );
+        }
+
+        if has_preferred && eligible_without_health.is_empty() {
+            return Err(SelectionReason::NoMatchingWorkers);
         }
 
         Ok(eligible_without_health)
@@ -2673,17 +2728,28 @@ pub async fn select_worker_with_config(
         .map(|id| id.as_str())
         .collect();
     let has_preferred = !preferred_set.is_empty();
+    let mut matched_preferred_worker = false;
 
     // Filter workers by circuit state and slot availability
     let mut eligible: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
     let mut preferred: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
     let mut all_circuits_open = true;
     let mut any_has_slots = false;
+    let mut any_has_capacity = false;
     let mut any_has_runtime = false;
+    let mut filtered_by_capacity = 0usize;
 
     for worker in workers {
         let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
-        let worker_id = worker.config.read().await.id.clone();
+        let (worker_id, total_slots) = {
+            let config = worker.config.read().await;
+            (config.id.clone(), config.total_slots)
+        };
+
+        if has_preferred && !preferred_set.contains(worker_id.as_str()) {
+            continue;
+        }
+        matched_preferred_worker = true;
 
         match circuit_state {
             CircuitState::Open => {
@@ -2723,6 +2789,16 @@ pub async fn select_worker_with_config(
 
         any_has_runtime = true;
 
+        if total_slots < request.estimated_cores {
+            filtered_by_capacity += 1;
+            debug!(
+                "Worker {} excluded: requested cores exceed capacity ({} > {})",
+                worker_id, request.estimated_cores, total_slots
+            );
+            continue;
+        }
+        any_has_capacity = true;
+
         // Check slot availability
         if worker.available_slots().await < request.estimated_cores {
             debug!(
@@ -2744,16 +2820,17 @@ pub async fn select_worker_with_config(
         eligible.push((worker, circuit_state));
     }
 
-    let mut candidates = if has_preferred && !preferred.is_empty() {
-        preferred
-    } else {
-        if has_preferred {
-            debug!("Preferred workers not eligible; falling back to all eligible workers");
-        }
-        eligible
-    };
+    let mut candidates = if has_preferred { preferred } else { eligible };
 
     if candidates.is_empty() {
+        if has_preferred && !matched_preferred_worker {
+            return SelectionResult {
+                worker: None,
+                reason: SelectionReason::NoMatchingWorkers,
+                diagnostics: None,
+            };
+        }
+
         // Check if no workers have required runtime (before other checks)
         if !any_has_runtime && !matches!(request.required_runtime, RequiredRuntime::None) {
             return SelectionResult {
@@ -2770,6 +2847,16 @@ pub async fn select_worker_with_config(
             return SelectionResult {
                 worker: None,
                 reason: SelectionReason::AllCircuitsOpen,
+                diagnostics: None,
+            };
+        }
+
+        if !any_has_capacity && filtered_by_capacity > 0 {
+            return SelectionResult {
+                worker: None,
+                reason: SelectionReason::NoAdmissibleWorkers(format!(
+                    "insufficient_total_slots={filtered_by_capacity}"
+                )),
                 diagnostics: None,
             };
         }
@@ -2962,6 +3049,7 @@ fn push_reason_code(reason_codes: &mut Vec<String>, reason_code: &'static str) {
 fn no_admissible_workers_summary(
     critical_pressure: usize,
     insufficient_slots: usize,
+    insufficient_capacity: usize,
     hard_preflight: usize,
     health_below_fallback: usize,
 ) -> String {
@@ -2971,6 +3059,9 @@ fn no_admissible_workers_summary(
     }
     if insufficient_slots > 0 {
         parts.push(format!("insufficient_slots={insufficient_slots}"));
+    }
+    if insufficient_capacity > 0 {
+        parts.push(format!("insufficient_total_slots={insufficient_capacity}"));
     }
     if health_below_fallback > 0 {
         parts.push(format!("health_below_fallback={health_below_fallback}"));
@@ -2985,6 +3076,7 @@ fn no_admissible_workers_summary(
 fn no_admissible_workers_summary_with_active_project(
     critical_pressure: usize,
     insufficient_slots: usize,
+    insufficient_capacity: usize,
     hard_preflight: usize,
     health_below_fallback: usize,
     active_project_exclusion: usize,
@@ -2992,6 +3084,7 @@ fn no_admissible_workers_summary_with_active_project(
     let mut summary = no_admissible_workers_summary(
         critical_pressure,
         insufficient_slots,
+        insufficient_capacity,
         hard_preflight,
         health_below_fallback,
     );
@@ -3706,7 +3799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_select_worker_falls_back_when_preferred_unavailable() {
+    async fn test_select_worker_refuses_when_requested_worker_unavailable() {
         let pool = WorkerPool::new();
         pool.add_worker(
             make_worker("available", 8, 50.0)
@@ -3732,8 +3825,8 @@ mod tests {
         let config = CircuitBreakerConfig::default();
 
         let result = select_worker_with_config(&pool, &request, &weights, &config).await;
-        let selected = result.worker.expect("Expected fallback to eligible worker");
-        assert_eq!(selected.config.read().await.id.as_str(), "available");
+        assert!(result.worker.is_none());
+        assert_eq!(result.reason, SelectionReason::NoMatchingWorkers);
     }
 
     #[tokio::test]
@@ -4173,7 +4266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_preferred_worker_overrides_health_fallback_threshold() {
+    async fn test_requested_worker_below_health_fallback_threshold_is_refused() {
         let pool = WorkerPool::new();
 
         let preferred = make_worker("preferred", 8, 95.0);
@@ -4206,8 +4299,26 @@ mod tests {
         };
 
         let result = selector.select(&pool, &request).await;
-        let selected = result.worker.expect("Expected preferred worker");
-        assert_eq!(selected.config.read().await.id.as_str(), "preferred");
+        assert!(result.worker.is_none());
+        assert_eq!(result.reason, SelectionReason::NoWorkersPassedHealth);
+        let diagnostics = result
+            .diagnostics
+            .expect("health refusal should include diagnostics");
+        let requested = diagnostics
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id.as_str() == "preferred")
+            .expect("requested worker diagnostic");
+        assert_eq!(
+            requested.final_decision,
+            WorkerSelectionDiagnosticDecision::Deny
+        );
+        assert!(
+            requested
+                .reason_codes
+                .iter()
+                .any(|code| code == "health.below_fallback_min_success_rate")
+        );
     }
 
     #[test]
@@ -5459,6 +5570,207 @@ mod tests {
         let selected = result.worker.expect("Expected a worker");
         // Preferred workers take precedence even with Fastest strategy
         assert_eq!(selected.config.read().await.id.as_str(), "preferred");
+    }
+
+    #[tokio::test]
+    async fn test_worker_selector_refuses_outside_requested_worker_set() {
+        let pool = WorkerPool::new();
+        pool.add_worker(
+            make_worker("available", 8, 90.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
+
+        let selector = WorkerSelector::new();
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("missing")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        assert_eq!(result.reason, SelectionReason::NoMatchingWorkers);
+        assert!(result.diagnostics.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_worker_selector_busy_request_never_escapes_to_affinity_fallback() {
+        let pool = WorkerPool::new();
+        pool.add_worker(
+            make_worker("requested", 2, 50.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
+        pool.add_worker(make_worker("fallback", 8, 90.0).config.read().await.clone())
+            .await;
+        let requested = pool.get(&WorkerId::new("requested")).await.unwrap();
+        assert!(requested.reserve_slots(2).await);
+
+        let selector = WorkerSelector::new();
+        selector.record_success("fallback", "test-project").await;
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("requested")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+        assert!(result.diagnostics.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_worker_selector_active_project_exclusion_never_escapes_request() {
+        let pool = WorkerPool::new();
+        pool.add_worker(
+            make_worker("requested", 8, 50.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
+        pool.add_worker(
+            make_worker("available", 8, 90.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
+
+        let selector = WorkerSelector::new();
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("requested")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+        let excluded = HashSet::from(["requested".to_string()]);
+
+        let result = selector
+            .select_with_exclusions(&pool, &request, &excluded)
+            .await;
+        assert!(result.worker.is_none());
+        assert!(matches!(
+            result.reason,
+            SelectionReason::NoAdmissibleWorkers(ref summary)
+                if summary.contains("active_project_exclusion=1")
+        ));
+        assert!(result.diagnostics.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_worker_selector_impossible_requested_capacity_is_terminal() {
+        let pool = WorkerPool::new();
+        pool.add_worker(
+            make_worker("requested", 1, 50.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
+        pool.add_worker(
+            make_worker("available", 8, 90.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
+
+        let selector = WorkerSelector::new();
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("requested")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        assert!(matches!(
+            result.reason,
+            SelectionReason::NoAdmissibleWorkers(ref summary)
+                if summary.contains("insufficient_total_slots=1")
+        ));
+        let diagnostics = result.diagnostics.expect("capacity refusal diagnostics");
+        let requested = diagnostics
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id.as_str() == "requested")
+            .expect("requested worker diagnostic");
+        assert!(
+            requested
+                .reason_codes
+                .iter()
+                .any(|code| code == "slots.request_exceeds_capacity")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_worker_selector_automatic_mixed_busy_and_undersized_remains_queueable() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_worker("busy", 4, 50.0).config.read().await.clone())
+            .await;
+        pool.add_worker(
+            make_worker("undersized", 1, 90.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
+        let busy = pool.get(&WorkerId::new("busy")).await.unwrap();
+        assert!(busy.reserve_slots(4).await);
+
+        let selector = WorkerSelector::new();
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
     }
 
     // =========================================================================

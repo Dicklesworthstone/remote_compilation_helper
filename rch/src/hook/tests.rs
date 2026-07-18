@@ -1458,6 +1458,41 @@ fn test_parse_preferred_workers_dedupes_ordered_values() {
     assert_eq!(ids, vec!["ts2", "vmi1", "vmi2"]);
 }
 
+#[test]
+fn test_requested_worker_refusal_summary_is_stable_and_actionable() {
+    let _guard = test_guard!();
+    let response = SelectionResponse {
+        worker: None,
+        reason: SelectionReason::NoMatchingWorkers,
+        build_id: None,
+        diagnostics: None,
+    };
+
+    let summary = requested_worker_refusal_summary(&[WorkerId::new("missing")], &response)
+        .expect("explicit request should produce a refusal summary");
+    assert!(summary.starts_with("[RCH-I001]"));
+    assert!(summary.contains("requested worker set [missing]"));
+    assert!(summary.contains("run `rch diagnose -- <command>`"));
+}
+
+#[test]
+fn test_selected_worker_must_belong_to_requested_set() {
+    let _guard = test_guard!();
+    let requested = [WorkerId::new("worker-a"), WorkerId::new("worker-b")];
+    assert!(selected_worker_is_requested(
+        &WorkerId::new("worker-b"),
+        &requested
+    ));
+    assert!(!selected_worker_is_requested(
+        &WorkerId::new("worker-c"),
+        &requested
+    ));
+    assert!(selected_worker_is_requested(
+        &WorkerId::new("automatic"),
+        &[]
+    ));
+}
+
 // =========================================================================
 // Mock daemon socket tests
 // =========================================================================
@@ -1655,6 +1690,205 @@ async fn test_daemon_query_sends_preferred_workers() {
     let response = result.expect("Query should succeed");
     let worker = response.worker.expect("Should have worker");
     assert_eq!(worker.id.as_str(), "ts2");
+}
+
+#[tokio::test]
+async fn test_daemon_query_releases_worker_outside_requested_set() {
+    let socket_path = format!(
+        "/tmp/rch_test_daemon_unrequested_{}_{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind mock daemon socket");
+    let socket_path_clone = socket_path.clone();
+
+    let daemon_handle = tokio::spawn(async move {
+        {
+            let (stream, _) = listener.accept().await.expect("accept selection request");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = TokioBufReader::new(reader);
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .await
+                .expect("read selection request");
+            assert!(request_line.contains("worker=requested"));
+
+            let response = SelectionResponse {
+                worker: Some(SelectedWorker {
+                    id: WorkerId::new("unrequested"),
+                    host: "mock.host.local".to_string(),
+                    user: "mockuser".to_string(),
+                    identity_file: "~/.ssh/mock_key".to_string(),
+                    slots_available: 6,
+                    speed_score: 90.0,
+                }),
+                reason: SelectionReason::Success,
+                build_id: Some(42),
+                diagnostics: None,
+            };
+            let body = serde_json::to_string(&response).unwrap();
+            let http_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            writer
+                .write_all(http_response.as_bytes())
+                .await
+                .expect("write selection response");
+            writer.shutdown().await.expect("close selection response");
+        }
+
+        let (stream, _) =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), listener.accept())
+                .await
+                .expect("client did not release unrequested worker")
+                .expect("accept release request");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = TokioBufReader::new(reader);
+        let mut release_line = String::new();
+        reader
+            .read_line(&mut release_line)
+            .await
+            .expect("read release request");
+        assert!(release_line.starts_with("POST /release-worker?"));
+        assert!(release_line.contains("worker=unrequested"));
+        assert!(release_line.contains("slots=2"));
+        assert!(release_line.contains("build_id=42"));
+        assert!(release_line.contains("exit_code=1"));
+        writer
+            .write_all(b"HTTP/1.0 200 OK\r\n\r\n{}\n")
+            .await
+            .expect("ack release");
+        writer.flush().await.expect("flush release ack");
+    });
+
+    let response = query_daemon(
+        &socket_path,
+        "test-project",
+        2,
+        "cargo build",
+        None,
+        RequiredRuntime::None,
+        CommandPriority::Normal,
+        0,
+        Some(1234),
+        false,
+        &[WorkerId::new("requested")],
+    )
+    .await
+    .expect("query should return a structured refusal");
+
+    daemon_handle.await.expect("mock daemon task panicked");
+    let _ = std::fs::remove_file(&socket_path_clone);
+    assert!(response.worker.is_none());
+    assert_eq!(response.reason, SelectionReason::NoMatchingWorkers);
+    assert_eq!(response.build_id, None);
+}
+
+#[tokio::test]
+async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() {
+    let socket_path = format!(
+        "/tmp/rch_test_daemon_unrequested_release_failure_{}_{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind mock daemon socket");
+    let socket_path_clone = socket_path.clone();
+
+    let daemon_handle = tokio::spawn(async move {
+        {
+            let (stream, _) = listener.accept().await.expect("accept selection request");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = TokioBufReader::new(reader);
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .await
+                .expect("read selection request");
+
+            let response = SelectionResponse {
+                worker: Some(SelectedWorker {
+                    id: WorkerId::new("unrequested"),
+                    host: "mock.host.local".to_string(),
+                    user: "mockuser".to_string(),
+                    identity_file: "~/.ssh/mock_key".to_string(),
+                    slots_available: 6,
+                    speed_score: 90.0,
+                }),
+                reason: SelectionReason::Success,
+                build_id: Some(43),
+                diagnostics: None,
+            };
+            let body = serde_json::to_string(&response).unwrap();
+            let http_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            writer
+                .write_all(http_response.as_bytes())
+                .await
+                .expect("write selection response");
+            writer.shutdown().await.expect("close selection response");
+        }
+
+        let (stream, _) =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), listener.accept())
+                .await
+                .expect("client did not attempt release")
+                .expect("accept release request");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = TokioBufReader::new(reader);
+        let mut release_line = String::new();
+        reader
+            .read_line(&mut release_line)
+            .await
+            .expect("read release request");
+        assert!(release_line.contains("worker=unrequested"));
+        assert!(release_line.contains("build_id=43"));
+        writer
+            .write_all(b"HTTP/1.0 500 Internal Server Error\r\n\r\n{}\n")
+            .await
+            .expect("reject release");
+        writer.flush().await.expect("flush release rejection");
+    });
+
+    let response = query_daemon(
+        &socket_path,
+        "test-project",
+        2,
+        "cargo build",
+        None,
+        RequiredRuntime::None,
+        CommandPriority::Normal,
+        0,
+        Some(1234),
+        false,
+        &[WorkerId::new("requested")],
+    )
+    .await
+    .expect("release failure should remain a structured selection refusal");
+
+    daemon_handle.await.expect("mock daemon task panicked");
+    let _ = std::fs::remove_file(&socket_path_clone);
+    assert!(response.worker.is_none());
+    assert!(matches!(
+        response.reason,
+        SelectionReason::SelectionError(ref message)
+            if message.contains("release was not acknowledged")
+                && message.contains("restart rchd")
+    ));
+    assert_eq!(response.build_id, None);
 }
 
 #[tokio::test]

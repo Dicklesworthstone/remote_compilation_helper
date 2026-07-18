@@ -78,9 +78,9 @@
         "estimated_cores": 2,
         "active_project_excluded": false,
         "final_decision": "deny",
-        "final_reason": "available slots 1 < 2",
+        "final_reason": "requested cores 2 exceed total slots 1",
         "reason_codes": [
-          "slots.insufficient"
+          "slots.request_exceeds_capacity"
         ]
       },
       {
