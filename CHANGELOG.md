@@ -8,9 +8,67 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ---
 
-## [Unreleased] (since v1.0.50)
+## [Unreleased] (since v1.0.51)
 
 No unreleased changes yet.
+
+---
+
+## [v1.0.51] -- 2026-07-22 (release)
+
+### Fixed
+
+- **The bypass↔telemetry stranding deadlock that silently dropped the whole fleet
+  to local builds.** A circuit trip quarantined a worker and persisted a
+  `BypassRecord`; the telemetry poller then skipped quarantined workers, but the
+  bypass recovery gate requires *fresh telemetry* before promoting a worker — so a
+  quarantined worker could never produce the evidence needed for its own recovery.
+  Restarting `rchd` did not help, because `reconcile_on_start` re-applied the
+  persisted record. Meanwhile every offload fell back to local execution with no
+  fleet-level signal (root cause of the 2026-07-16 offload meltdown).
+  `should_poll_worker` now gates on the **admin** axis (`AdminIntent::Drained |
+  Disabled`) instead of `WorkerStatus`, which collapses every quarantine state into
+  `Unreachable`.
+- **`rch workers enable` is now durable.** The enable handler deletes the persisted
+  bypass record (mirroring `rejoin`), so an operator re-enable survives a daemon
+  restart instead of being re-quarantined from disk on the next start.
+- **Health probes no longer cascade into fleet-wide quarantine.** Health checks get
+  their own SSH ControlMaster pool, separate from the shared build/telemetry pool.
+  The health probe is what opens the circuit that quarantines a worker, so a single
+  wedged control socket could previously false-fail every probe at once.
+- **`cargo zigbuild` is no longer dispatched to workers that cannot run it.**
+  `CargoZigbuild` mapped to `RequiredRuntime::Rust`, and the finer `needs_zig` check
+  is only enforced by `assess_admissibility`, which the daemon's selection path never
+  calls — so any rustc-capable worker was admitted. On a worker without
+  cargo-zigbuild the build fails with `error: no such command: 'zigbuild'`, which
+  matches neither `is_toolchain_failure` nor `detect_worker_system_dependency_failure`,
+  so the nonzero exit reached the user verbatim instead of falling open to local.
+
+### Added
+
+- **`cargo zigbuild` cross-compile offload.** New `CompilationKind::CargoZigbuild`
+  covering both `cargo zigbuild ...` and the standalone `cargo-zigbuild` binary
+  (build forms only). Artifact retrieval is triple-aware — cargo-zigbuild always
+  builds for an explicit `--target`, so output lands under
+  `target/<triple>/<profile>/`, which the ordinary Rust globs miss entirely — with
+  triple-nested cache excludes on the custom-`CARGO_TARGET_DIR` path.
+- **`RequiredRuntime::Zig`**, gated on `WorkerCapabilities::has_zig()`, which requires
+  **both** `zig` and `cargo-zigbuild`: zig alone cannot run the subcommand, and
+  cargo-zigbuild alone cannot link (it shells out to `zig cc`). `rch-wkr` probes both.
+- **Fleet-degraded alarm.** `rchd` now emits an edge-triggered warning when ≥75% of
+  the last 20 selections returned no worker (clearing at ≤40%), so a fleet-wide silent
+  local fallback is visible in the daemon journal instead of only in per-hook output.
+
+### Upgrade notes
+
+- **Upgrade `rch-wkr` on workers, not just the orchestrators.** Worker selection reads
+  capabilities from `rch-wkr capabilities` JSON. Until the new `rch-wkr` is deployed,
+  `zig_version`/`cargo_zigbuild_version` are absent, `has_zig()` is false, and
+  zigbuilds run locally rather than offloading — the safe direction, and it
+  self-resolves on worker upgrade.
+- `RequiredRuntime` gained a `Zig` variant, which appears in the `SelectionRequest`
+  wire format. Keep `rch` and `rchd` at the same version, as with the Go/TypeScript
+  offload in 1.0.48.
 
 ---
 
