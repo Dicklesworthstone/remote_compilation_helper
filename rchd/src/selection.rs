@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const DEFAULT_NETWORK_SCORE: f64 = 0.5;
 const NETWORK_LATENCY_HALF_LIFE_MS: f64 = 200.0;
@@ -3108,14 +3108,79 @@ fn selection_outcome_label(reason: &SelectionReason) -> &'static str {
     }
 }
 
+/// Rolling window of recent worker-selection outcomes, used to raise a
+/// DAEMON-LEVEL, edge-triggered signal when a SUSTAINED fraction of offload
+/// requests get no worker — i.e. offloading is silently falling back to LOCAL
+/// across the whole fleet. This is the invisible failure mode of the 2026-07-16
+/// meltdown: the per-invocation "no workers, running locally" `warn!` lives in
+/// the ephemeral hook process nobody watches, so a fleet-wide outage (stranded
+/// workers, toolchain skew) produced ZERO daemon-side alarm while trj melted.
+/// Emitting from the daemon (persistent journal) makes it observable.
+struct NoWorkerTracker {
+    /// `true` = a worker was selected; `false` = no worker (local fallback).
+    recent: VecDeque<bool>,
+    /// Edge-trigger latch so we log once per outage episode, not per request.
+    alarm_active: bool,
+}
+
+/// How many recent selections define the window.
+const NO_WORKER_WINDOW: usize = 20;
+/// Fire the alarm when at least this fraction of the window got no worker.
+const NO_WORKER_FIRE_FRACTION: f64 = 0.75;
+/// Clear it once the no-worker fraction falls back to this (hysteresis).
+const NO_WORKER_CLEAR_FRACTION: f64 = 0.40;
+
+static NO_WORKER_TRACKER: std::sync::Mutex<NoWorkerTracker> =
+    std::sync::Mutex::new(NoWorkerTracker {
+        recent: VecDeque::new(),
+        alarm_active: false,
+    });
+
+/// Record one selection outcome and, once a full window has accumulated, emit a
+/// daemon-level warning when offloading is failing fleet-wide (and an info line
+/// when it recovers). Edge-triggered via `alarm_active`.
+fn record_no_worker_outcome(got_worker: bool) {
+    let mut t = NO_WORKER_TRACKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    t.recent.push_back(got_worker);
+    while t.recent.len() > NO_WORKER_WINDOW {
+        t.recent.pop_front();
+    }
+    if t.recent.len() < NO_WORKER_WINDOW {
+        return;
+    }
+    let no_worker = t.recent.iter().filter(|&&g| !g).count();
+    let frac = no_worker as f64 / t.recent.len() as f64;
+    if !t.alarm_active && frac >= NO_WORKER_FIRE_FRACTION {
+        t.alarm_active = true;
+        warn!(
+            "⚠️ RCH FLEET DEGRADED: {:.0}% of the last {} offload requests got NO worker — \
+             compilation is falling back to LOCAL fleet-wide. Likely stranded workers or \
+             rustc-toolchain skew. Check `rch status` (worker health) and worker nightly parity.",
+            frac * 100.0,
+            NO_WORKER_WINDOW
+        );
+    } else if t.alarm_active && frac <= NO_WORKER_CLEAR_FRACTION {
+        t.alarm_active = false;
+        info!(
+            "RCH fleet offloading recovered ({:.0}% no-worker over last {} requests)",
+            frac * 100.0,
+            NO_WORKER_WINDOW
+        );
+    }
+}
+
 fn record_selection_metrics(reason: &SelectionReason, duration: Duration) {
     metrics::observe_reliability_decision("selection", selection_outcome_label(reason), duration);
-    if !matches!(
+    let got_worker = matches!(
         reason,
         SelectionReason::Success
             | SelectionReason::AffinityPinned
             | SelectionReason::AffinityFallback
-    ) {
+    );
+    record_no_worker_outcome(got_worker);
+    if !got_worker {
         metrics::inc_local_fallback_reason(selection_reason_label(reason));
         // Remediation observability (bead 14.5): a non-success selection means
         // the command falls back to local — record the admission decision by

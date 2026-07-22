@@ -980,6 +980,7 @@ mod tests {
             version: "0.0.0-test",
             pid: std::process::id(),
             queue_timeout_secs: 300,
+            bypass_store: None,
         }
     }
 
