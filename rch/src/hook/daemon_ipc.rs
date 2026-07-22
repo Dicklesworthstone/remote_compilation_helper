@@ -162,6 +162,43 @@ pub(crate) async fn query_daemon(
             )
         })??;
 
+    if let Some(worker) = response.worker.as_ref()
+        && !selected_worker_is_requested(&worker.id, preferred_workers)
+    {
+        warn!(
+            "Daemon selected unrequested worker {} for explicit request; releasing reservation and refusing remote execution",
+            worker.id
+        );
+        let release_error = release_worker(
+            socket_path,
+            &worker.id,
+            cores,
+            response.build_id,
+            Some(EXIT_BUILD_ERROR),
+            None,
+            None,
+            None,
+        )
+        .await
+        .err();
+        if let Some(error) = release_error.as_ref() {
+            warn!(
+                "Failed to release unrequested worker {} after selection refusal: {}",
+                worker.id, error
+            );
+        }
+        return Ok(SelectionResponse {
+            worker: None,
+            reason: release_error.map_or(SelectionReason::NoMatchingWorkers, |error| {
+                SelectionReason::SelectionError(format!(
+                    "[RCH-I001] unrequested worker reservation release was not acknowledged: {error}; restart rchd and verify capacity before retrying"
+                ))
+            }),
+            build_id: None,
+            diagnostics: response.diagnostics,
+        });
+    }
+
     Ok(response)
 }
 
@@ -178,13 +215,13 @@ pub(crate) async fn release_worker(
     timing: Option<&CommandTimingBreakdown>,
 ) -> anyhow::Result<()> {
     if !Path::new(socket_path).exists() {
-        return Ok(()); // Ignore if daemon gone
+        anyhow::bail!("daemon socket is missing; release was not acknowledged");
     }
 
     let stream = match timeout(Duration::from_secs(2), UnixStream::connect(socket_path)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(e.into()),
-        Err(_) => return Ok(()), // Timeout connecting — daemon likely busy, don't block hook
+        Err(_) => anyhow::bail!("daemon connection timed out; release was not acknowledged"),
     };
     let (reader, mut writer) = stream.into_split();
 
@@ -219,10 +256,28 @@ pub(crate) async fn release_worker(
     writer.write_all(request.as_bytes()).await?;
     writer.flush().await?;
 
-    // Read response line (to ensure daemon processed it) with timeout
+    // The daemon writes its HTTP status only after processing the release.
+    // Require that acknowledgement so callers never report a reservation as
+    // released when the socket disappeared, timed out, or returned an error.
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    let _ = timeout(Duration::from_secs(5), reader.read_line(&mut line)).await;
+    let bytes_read = timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("daemon response timed out; release was not acknowledged")
+        })??;
+    if bytes_read == 0 {
+        anyhow::bail!("daemon closed the connection; release was not acknowledged");
+    }
+    let mut status = line.split_whitespace();
+    let protocol = status.next().unwrap_or_default();
+    let code = status.next().unwrap_or_default();
+    if !protocol.starts_with("HTTP/") || code != "200" {
+        anyhow::bail!(
+            "daemon returned non-success release acknowledgement: {}",
+            line.trim()
+        );
+    }
 
     Ok(())
 }

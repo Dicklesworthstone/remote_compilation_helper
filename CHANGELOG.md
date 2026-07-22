@@ -8,9 +8,36 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ---
 
-## [Unreleased] (since v1.0.18)
+## [Unreleased] (since v1.0.50)
 
 No unreleased changes yet.
+
+---
+
+## [v1.0.50] -- 2026-07-17 (release)
+
+### Added
+
+- **Fail-closed clean-overlay remote proofs for shared working trees.** `rch
+  exec` now accepts an immutable `--base <commit>` plus `--clean-overlay` and
+  explicit `--overlay-path` selections (or `--no-overlay`). The remote source
+  tree is built from `git archive` and only the selected, validated paths are
+  overlaid, so unrelated local dirt cannot enter a proof build. The pipeline
+  rejects deletions, type changes, symlink or submodule surfaces, ambiguous
+  spellings, export-affecting attributes, source mutation during capture, and
+  post-transfer fingerprint drift. Clean-overlay execution is remote-only and
+  never falls back to the ambient local tree.
+
+### Fixed
+
+- **Shell suffix classification is byte-faithful and fail-closed.** Benign
+  pipes, redirects, and backgrounding remain offloadable without rewriting
+  file-descriptor adjacency, while embedded newlines and carriage returns are
+  rejected before a command can be re-emitted.
+- **Release gates remain deterministic inside isolated overlays.** Doctor
+  startup probes now honor explicit test binaries, generated Cargo fixtures
+  declare standalone workspaces, and compact harness directory identifiers keep
+  Unix-domain socket paths below the platform limit.
 
 ---
 

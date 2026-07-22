@@ -267,8 +267,16 @@ fn summarize_capabilities(caps: &rch_common::WorkerCapabilities) -> String {
 /// structured refusal instead of a silent swap
 /// (bd-...remediation-ocv9i.13.5).
 fn build_diagnose_placement(worker_selection: &Option<DiagnoseWorkerSelection>) -> PlacementPlan {
-    let mut plan = resolve_placement(|key| std::env::var(key).ok());
+    refine_diagnose_placement(
+        resolve_placement(|key| std::env::var(key).ok()),
+        worker_selection,
+    )
+}
 
+fn refine_diagnose_placement(
+    mut plan: PlacementPlan,
+    worker_selection: &Option<DiagnoseWorkerSelection>,
+) -> PlacementPlan {
     let effective_worker = worker_selection
         .as_ref()
         .and_then(|s| s.worker.as_ref())
@@ -277,59 +285,49 @@ fn build_diagnose_placement(worker_selection: &Option<DiagnoseWorkerSelection>) 
 
     // Refine the requested-worker outcome from the live selection diagnostics.
     if let Some(requested) = plan.requested_worker.clone() {
-        // A comma list requests several; evaluate the primary (first) entry.
-        let primary = requested
+        let requested_workers = requested
             .split(',')
             .map(str::trim)
-            .find(|s| !s.is_empty())
-            .unwrap_or("");
-        let outcome = match worker_selection
+            .filter(|worker| !worker.is_empty())
+            .collect::<Vec<_>>();
+        let effective_requested = effective_worker
+            .as_deref()
+            .filter(|effective| requested_workers.contains(effective));
+        let outcome = if let Some(effective) = effective_requested {
+            evaluate_requested_worker(&RequestedWorkerFacts::admissible(effective))
+        } else if let Some(diagnostics) = worker_selection
             .as_ref()
-            .and_then(|s| s.diagnostics.as_ref())
+            .and_then(|selection| selection.diagnostics.as_ref())
         {
-            Some(diag) => {
-                match diag
-                    .workers
-                    .iter()
-                    .find(|w| w.worker_id.as_str() == primary)
-                {
-                    Some(wd) => {
-                        let facts = RequestedWorkerFacts {
-                            requested: Some(primary.to_string()),
-                            exists: true,
-                            admin_disabled: wd.status.eq_ignore_ascii_case("disabled"),
-                            draining_or_drained: wd.status.to_ascii_lowercase().contains("drain"),
-                            reachable: !wd.status.eq_ignore_ascii_case("unreachable"),
-                            temporarily_bypassed: wd.circuit_state.eq_ignore_ascii_case("open")
-                                || wd.status.to_ascii_lowercase().contains("bypass"),
-                            platform_matches: !wd
-                                .reason_codes
-                                .iter()
-                                .any(|c| c.contains("os_arch") || c.contains("platform")),
-                            has_required_runtime: wd.runtime_available,
-                            project_excluded: wd.active_project_excluded,
-                            has_free_slots: wd.available_slots >= wd.estimated_cores,
-                        };
-                        evaluate_requested_worker(&facts)
-                    }
-                    // Requested worker is not among the configured workers.
-                    None => evaluate_requested_worker(&RequestedWorkerFacts {
-                        requested: Some(primary.to_string()),
-                        exists: false,
-                        ..RequestedWorkerFacts::none()
-                    }),
-                }
-            }
-            // No diagnostics (daemon unreachable / not intercepted): leave the
-            // outcome as "requested, pending fleet evaluation" but record honor
-            // when the effective worker matches the request.
-            None => {
-                if effective_worker.as_deref() == Some(primary) {
-                    evaluate_requested_worker(&RequestedWorkerFacts::admissible(primary))
-                } else {
-                    RequestedWorkerOutcome::requested()
-                }
-            }
+            requested_workers
+                .iter()
+                .map(|requested| {
+                    diagnostics
+                        .workers
+                        .iter()
+                        .find(|worker| worker.worker_id.as_str() == *requested)
+                        .map_or_else(
+                            || {
+                                evaluate_requested_worker(&RequestedWorkerFacts {
+                                    requested: Some((*requested).to_string()),
+                                    exists: false,
+                                    ..RequestedWorkerFacts::none()
+                                })
+                            },
+                            |worker| {
+                                evaluate_requested_worker(&RequestedWorkerFacts::from_diagnostic(
+                                    (*requested).to_string(),
+                                    worker,
+                                ))
+                            },
+                        )
+                })
+                .find(|outcome| outcome.status.is_refusal())
+                .unwrap_or_else(RequestedWorkerOutcome::requested)
+        } else {
+            // Daemon unreachable / not intercepted: the request remains
+            // pending fleet evaluation unless an in-set worker was selected.
+            RequestedWorkerOutcome::requested()
         };
         plan = plan.with_requested_worker_outcome(outcome);
     }
@@ -3369,6 +3367,59 @@ mod tests {
             summary: summary.to_string(),
             remediation: None,
         }
+    }
+
+    #[test]
+    fn diagnose_multi_worker_allow_set_honors_selected_member() {
+        let plan =
+            resolve_placement(|key| (key == "RCH_WORKER").then(|| "busy,available".to_string()));
+        let diagnostics = rch_common::SelectionDiagnostics {
+            required_runtime: RequiredRuntime::None,
+            estimated_cores: 2,
+            min_success_rate: 0.8,
+            fallback_min_success_rate: 0.5,
+            active_project_exclusion_count: 0,
+            workers: vec![rch_common::WorkerSelectionDiagnostic {
+                worker_id: rch_common::WorkerId::new("busy"),
+                status: "healthy".to_string(),
+                circuit_state: "closed".to_string(),
+                pressure_state: "healthy".to_string(),
+                pressure_reason_code: "pressure.healthy".to_string(),
+                success_rate: Some(1.0),
+                min_success_rate: 0.8,
+                fallback_min_success_rate: 0.5,
+                required_runtime: RequiredRuntime::None,
+                runtime_available: true,
+                available_slots: 0,
+                total_slots: 8,
+                estimated_cores: 2,
+                active_project_excluded: false,
+                final_decision: rch_common::WorkerSelectionDiagnosticDecision::Deny,
+                final_reason: "available slots 0 < 2".to_string(),
+                reason_codes: vec!["slots.insufficient".to_string()],
+            }],
+        };
+        let selection = Some(DiagnoseWorkerSelection {
+            estimated_cores: 2,
+            cargo_jobs: None,
+            worker: Some(rch_common::SelectedWorker {
+                id: rch_common::WorkerId::new("available"),
+                host: "worker.example".to_string(),
+                user: "builder".to_string(),
+                identity_file: "~/.ssh/id_rsa".to_string(),
+                slots_available: 6,
+                speed_score: 90.0,
+            }),
+            reason: rch_common::SelectionReason::Success,
+            diagnostics: Some(diagnostics),
+        });
+
+        let refined = refine_diagnose_placement(plan, &selection);
+        assert_eq!(
+            refined.requested_worker_outcome.status,
+            rch_common::RequestedWorkerStatus::Honored
+        );
+        assert_eq!(refined.effective_worker.as_deref(), Some("available"));
     }
 
     #[test]

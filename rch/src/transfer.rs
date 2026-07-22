@@ -22,7 +22,7 @@ use shell_escape::escape;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -233,6 +233,59 @@ fn escape_rsync_filter_literal_component(name: &str) -> Cow<'_, str> {
         }
     }
     Cow::Owned(escaped)
+}
+
+/// Build anchored, literal rsync include filters for clean-overlay paths.
+///
+/// Every ancestor directory is included so rsync can descend through the final
+/// catch-all exclude. Glob metacharacters in real file names are escaped, which
+/// prevents a selected path such as `src/star*.rs` from widening the upload.
+pub(crate) fn clean_overlay_include_patterns(
+    project_root: &Path,
+    overlay_paths: &[PathBuf],
+) -> Result<Vec<String>> {
+    let mut patterns = BTreeSet::new();
+    for relative in overlay_paths {
+        let mut escaped_parts = Vec::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(part) => {
+                    let part = part.to_str().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "clean-overlay path is not valid UTF-8: {}",
+                            relative.display()
+                        )
+                    })?;
+                    escaped_parts.push(escape_rsync_filter_literal_component(part).into_owned());
+                }
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    anyhow::bail!(
+                        "clean-overlay path is not repository-relative: {}",
+                        relative.display()
+                    );
+                }
+            }
+        }
+        if escaped_parts.is_empty() {
+            anyhow::bail!("clean-overlay path must not select the repository root");
+        }
+
+        for end in 1..escaped_parts.len() {
+            patterns.insert(format!("/{}/", escaped_parts[..end].join("/")));
+        }
+
+        let escaped_path = escaped_parts.join("/");
+        let metadata = std::fs::symlink_metadata(project_root.join(relative))
+            .with_context(|| format!("inspect clean-overlay path {}", relative.display()))?;
+        if metadata.file_type().is_dir() {
+            patterns.insert(format!("/{escaped_path}/"));
+            patterns.insert(format!("/{escaped_path}/***"));
+        } else {
+            patterns.insert(format!("/{escaped_path}"));
+        }
+    }
+    Ok(patterns.into_iter().collect())
 }
 
 fn artifact_patterns_allow_top_level_entry(artifact_patterns: &[String], entry_name: &str) -> bool {
@@ -452,6 +505,41 @@ pub fn parse_rchignore_content(content: &str) -> Vec<String> {
         .collect()
 }
 
+/// Isolate Git reads used to construct a clean-overlay receipt from ambient
+/// repository-selection variables and configuration that can rewrite objects
+/// or archive contents.
+pub(crate) fn configure_clean_git_command(command: &mut Command) {
+    const REPOSITORY_ENV: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ];
+    for key in REPOSITORY_ENV {
+        command.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-c")
+        .arg("core.attributesFile=/dev/null")
+        .arg("-c")
+        .arg("tar.umask=0022");
+}
+
 /// Transfer pipeline for remote compilation.
 pub struct TransferPipeline {
     /// Local project root.
@@ -501,6 +589,8 @@ pub struct TransferPipeline {
     sync_include_patterns: Option<Vec<String>>,
     /// Whether sync-to-remote should delete extraneous files remotely.
     sync_delete: bool,
+    /// Whether uploads must compare file contents instead of size and mtime.
+    sync_checksum: bool,
     /// Build ID for tracking and cancellation.
     build_id: Option<u64>,
 }
@@ -593,6 +683,7 @@ impl TransferPipeline {
             remote_cargo_target_dir_name: DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME.to_string(),
             sync_include_patterns: None,
             sync_delete: true,
+            sync_checksum: false,
             build_id: None,
         }
     }
@@ -633,6 +724,12 @@ impl TransferPipeline {
     /// Control whether sync-to-remote deletes extraneous remote files.
     pub fn with_sync_delete(mut self, delete: bool) -> Self {
         self.sync_delete = delete;
+        self
+    }
+
+    /// Force content checks for sync-to-remote uploads.
+    pub fn with_sync_checksum(mut self, checksum: bool) -> Self {
+        self.sync_checksum = checksum;
         self
     }
 
@@ -1514,6 +1611,9 @@ fi",
         if self.sync_delete {
             cmd.arg("--delete"); // Remove extraneous files from destination
         }
+        if self.sync_checksum {
+            cmd.arg("--checksum");
+        }
 
         // Create remote directory implicitly using rsync-path wrapper
         // This saves a separate SSH handshake for 'mkdir -p'
@@ -1581,6 +1681,9 @@ fi",
         if self.sync_delete {
             cmd.arg("--delete"); // Remove extraneous files from destination
         }
+        if self.sync_checksum {
+            cmd.arg("--checksum");
+        }
 
         // Create remote directory implicitly using rsync-path wrapper
         cmd.arg("--rsync-path")
@@ -1619,6 +1722,135 @@ fi",
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd
+    }
+
+    /// Materialize an immutable Git commit directly into this pipeline's fresh
+    /// remote project root without creating a local branch, worktree, clone, or
+    /// staging directory. The archive is streamed from `git archive` to `tar`
+    /// over SSH; the destination must not already exist.
+    #[cfg(unix)]
+    pub async fn materialize_git_archive(
+        &self,
+        worker: &WorkerConfig,
+        git_root: &Path,
+        base_commit: &str,
+    ) -> Result<SyncResult> {
+        if use_mock_transport(worker) {
+            return Ok(SyncResult {
+                bytes_transferred: 0,
+                files_transferred: 0,
+                duration_ms: 0,
+            });
+        }
+        if !matches!(base_commit.len(), 40 | 64)
+            || !base_commit.chars().all(|ch| ch.is_ascii_hexdigit())
+        {
+            anyhow::bail!("clean-overlay base must be a full hexadecimal commit object ID");
+        }
+
+        let remote_path = self.remote_path();
+        let escaped_remote_path = escape(Cow::from(remote_path.as_str()));
+        let remote_script = format!(
+            "if [ -e {path} ]; then echo 'clean-overlay destination already exists' >&2; exit 73; fi\n\
+             umask 0022\n\
+             mkdir -p {path}\n\
+             TAR_OPTIONS='' tar -xf - -C {path}",
+            path = escaped_remote_path
+        );
+
+        let mut archive = Command::new("git");
+        configure_clean_git_command(&mut archive);
+        archive
+            .current_dir(git_root)
+            .arg("archive")
+            .arg("--format=tar")
+            .arg(base_commit)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut archive_child = archive
+            .spawn()
+            .with_context(|| format!("spawn git archive for {base_commit}"))?;
+        let mut archive_stdout = archive_child
+            .stdout
+            .take()
+            .context("git archive stdout unavailable")?;
+
+        let destination = format!("{}@{}", worker.user, worker.host);
+        let identity_file = shellexpand::tilde(&worker.identity_file);
+        let mut ssh = Command::new("ssh");
+        ssh.arg("-o").arg("BatchMode=yes");
+        ssh.arg("-o").arg("StrictHostKeyChecking=accept-new");
+        ssh.arg("-o").arg(format!(
+            "ConnectTimeout={}",
+            self.ssh_options.connect_timeout.as_secs().max(1)
+        ));
+        ssh.arg("-i").arg(identity_file.as_ref());
+        if let Some(interval) = self.ssh_options.server_alive_interval {
+            let secs = interval.as_secs();
+            if secs > 0 {
+                ssh.arg("-o").arg(format!("ServerAliveInterval={secs}"));
+            }
+        }
+        let escaped_script = escape(Cow::from(remote_script.as_str()));
+        ssh.arg(&destination)
+            .arg(format!("sh -c {escaped_script}"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut ssh_child = ssh
+            .spawn()
+            .with_context(|| format!("spawn clean-overlay archive SSH to {destination}"))?;
+        let mut ssh_stdin = ssh_child
+            .stdin
+            .take()
+            .context("clean-overlay SSH stdin unavailable")?;
+
+        let start = std::time::Instant::now();
+        let transfer = async move {
+            let copy_archive = async move {
+                let bytes = tokio::io::copy(&mut archive_stdout, &mut ssh_stdin).await?;
+                ssh_stdin.shutdown().await?;
+                Ok::<u64, std::io::Error>(bytes)
+            };
+            let (copied, archive_output, ssh_output) = tokio::join!(
+                copy_archive,
+                archive_child.wait_with_output(),
+                ssh_child.wait_with_output()
+            );
+            Ok::<_, anyhow::Error>((copied?, archive_output?, ssh_output?))
+        };
+        let (bytes_transferred, archive_output, ssh_output) =
+            tokio::time::timeout(self.ssh_options.command_timeout, transfer)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "clean-overlay archive transfer timed out after {:?}",
+                        self.ssh_options.command_timeout
+                    )
+                })??;
+
+        if !archive_output.status.success() {
+            anyhow::bail!(
+                "git archive failed for {base_commit}: {}",
+                String::from_utf8_lossy(&archive_output.stderr).trim()
+            );
+        }
+        if !ssh_output.status.success() {
+            anyhow::bail!(
+                "remote clean-overlay archive extraction failed (exit {:?}): {}",
+                ssh_output.status.code(),
+                String::from_utf8_lossy(&ssh_output.stderr).trim()
+            );
+        }
+
+        Ok(SyncResult {
+            bytes_transferred,
+            files_transferred: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
     }
 
     /// Synchronize local project to remote worker.
@@ -6015,6 +6247,141 @@ Total file size: 123 bytes";
     }
 
     #[test]
+    fn clean_overlay_include_patterns_are_anchored_literal_and_traversable() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().expect("create include-pattern fixture");
+        std::fs::create_dir_all(root.path().join("src/nested")).expect("create nested source");
+        std::fs::write(
+            root.path().join("src/nested/star*.rs"),
+            "fn selected() {}\n",
+        )
+        .expect("write selected source");
+
+        let patterns =
+            clean_overlay_include_patterns(root.path(), &[PathBuf::from("src/nested/star*.rs")])
+                .expect("build clean-overlay filters");
+
+        assert_eq!(
+            patterns,
+            vec![
+                "/src/".to_string(),
+                "/src/nested/".to_string(),
+                r"/src/nested/star\*.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn clean_overlay_directory_pattern_includes_only_selected_subtree() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().expect("create directory-pattern fixture");
+        std::fs::create_dir_all(root.path().join("src/selected")).expect("create selected dir");
+
+        let patterns =
+            clean_overlay_include_patterns(root.path(), &[PathBuf::from("src/selected")])
+                .expect("build directory clean-overlay filters");
+
+        assert_eq!(
+            patterns,
+            vec![
+                "/src/".to_string(),
+                "/src/selected/".to_string(),
+                "/src/selected/***".to_string(),
+            ]
+        );
+        assert!(!patterns.iter().any(|pattern| pattern.contains("peer")));
+    }
+
+    #[test]
+    fn clean_overlay_sync_commands_force_content_checks() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/workspace-root"),
+            "workspace-root".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_sync_include_patterns(vec!["/src/".to_string(), "/src/lib.rs".to_string()])
+        .with_sync_delete(false)
+        .with_sync_checksum(true);
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+
+        for command in [
+            pipeline.build_sync_command(
+                &worker,
+                "mockuser@mock://worker:/data/tmp/rch/workspace-root/abc123",
+                "/data/tmp/rch/workspace-root/abc123",
+                &[],
+            ),
+            pipeline.build_sync_streaming_command(
+                &worker,
+                "mockuser@mock://worker:/data/tmp/rch/workspace-root/abc123",
+                "/data/tmp/rch/workspace-root/abc123",
+                &[],
+            ),
+        ] {
+            let args = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(args.iter().any(|arg| arg == "--checksum"));
+            assert!(!args.iter().any(|arg| arg == "--delete"));
+            assert!(
+                args.windows(2)
+                    .any(|window| window == ["--include", "/src/lib.rs"])
+            );
+            assert!(args.windows(2).any(|window| window == ["--exclude", "*"]));
+        }
+    }
+
+    #[test]
+    fn clean_overlay_git_command_clears_ambient_repository_selection() {
+        let _guard = test_guard!();
+        let mut command = Command::new("git");
+        command
+            .env("GIT_DIR", "/tmp/peer.git")
+            .env("GIT_WORK_TREE", "/tmp/peer-worktree")
+            .env("GIT_CONFIG_COUNT", "1");
+        configure_clean_git_command(&mut command);
+
+        let environment = command.as_std().get_envs().collect::<Vec<_>>();
+        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_COUNT"] {
+            assert!(
+                environment
+                    .iter()
+                    .any(|(candidate, value)| *candidate == key && value.is_none()),
+                "{key} must be removed from clean Git commands: {environment:?}"
+            );
+        }
+        assert!(environment.iter().any(|(key, value)| {
+            *key == "GIT_NO_REPLACE_OBJECTS"
+                && value.is_some_and(|value| value == std::ffi::OsStr::new("1"))
+        }));
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|window| { window == ["-c", "core.attributesFile=/dev/null"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-c", "tar.umask=0022"])
+        );
+    }
+
+    #[test]
     fn test_build_sync_streaming_command_metadata_only_sync_omits_delete_and_uses_includes() {
         let _guard = test_guard!();
         let pipeline = TransferPipeline::new(
@@ -6317,6 +6684,10 @@ Total file size: 123 bytes";
         assert_eq!(
             escape_rsync_filter_literal_component("array[0].c").as_ref(),
             r"array\[0].c"
+        );
+        assert_eq!(
+            escape_rsync_filter_literal_component(r"back\slash.rs").as_ref(),
+            r"back\slash.rs"
         );
         // TEST PASS: wildcard-looking local names stay literal in filter rules.
     }
