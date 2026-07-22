@@ -740,6 +740,13 @@ fn extract_single_quoted_argument(s: &str) -> Option<String> {
 fn try_classify_benign_suffix_command(cmd: &str) -> Option<Classification> {
     let cmd = cmd.trim();
 
+    // This helper runs before the general Tier 1 structure check. Reject line
+    // breaks here too, or a redirect/pipe on the first line can make a second
+    // shell command look like part of an otherwise benign suffix.
+    if cmd.bytes().any(|byte| matches!(byte, b'\n' | b'\r')) {
+        return None;
+    }
+
     // Bail out fast on chaining / subshell / capture / input-redirect forms;
     // those are handled (or rejected) elsewhere and are never "benign suffix".
     if cmd.contains("&&") || cmd.contains("||") || cmd.contains(';') {
@@ -771,9 +778,10 @@ fn try_classify_benign_suffix_command(cmd: &str) -> Option<Classification> {
         return None;
     }
 
-    // Re-attach the benign suffix to the offloaded command. We normalize the
-    // separating whitespace so the rebuilt command is `<leading> <suffix>`.
-    let extracted = format!("{} {}", leading, suffix.trim());
+    // Preserve the validated command verbatim. Rebuilding it with normalized
+    // whitespace changes the meaning of adjacent file-descriptor redirects:
+    // `cargo build 2>errors.txt` must not become `cargo build 2 >errors.txt`.
+    let extracted = cmd.to_string();
 
     Some(Classification::compound_compilation(
         leading_classification.kind?,
@@ -2697,6 +2705,19 @@ mod tests {
         let result = classify_command("cargo build\r\nrm -rf /");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("newline"));
+
+        for command in [
+            "cargo build > out.log\nrm -rf /",
+            "cargo build | tee out.log\r\nrm -rf /",
+            "cargo build &\nrm -rf /",
+        ] {
+            let result = classify_command(command);
+            assert!(
+                !result.is_compilation,
+                "newline-bearing benign suffix must fail closed: {command:?}"
+            );
+            assert!(result.reason.contains("newline"), "{result:?}");
+        }
     }
 
     #[test]
@@ -2718,6 +2739,18 @@ mod tests {
             result.extracted_command.as_deref(),
             Some("cargo test --workspace > out.log 2>&1")
         );
+
+        // File-descriptor redirects must remain byte-for-byte adjacent. A
+        // space before `>` turns the descriptor into a command argument.
+        for command in [
+            "cargo build 2>errors.txt",
+            "cargo build 2>>errors.txt",
+            "cargo build >out.log 2>&1",
+        ] {
+            let result = classify_command(command);
+            assert!(result.is_compilation, "got: {:?}", result.reason);
+            assert_eq!(result.extracted_command.as_deref(), Some(command));
+        }
     }
 
     #[test]

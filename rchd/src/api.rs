@@ -2401,12 +2401,32 @@ async fn handle_select_worker(
 
 /// Handle a release-worker request.
 async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> Result<()> {
-    let canonical_release = request
-        .build_id
-        .and_then(|build_id| ctx.history.active_build(build_id))
-        .map(|state| (WorkerId::new(state.worker_id), state.slots));
-    let (release_worker_id, release_slots) =
-        canonical_release.unwrap_or_else(|| (request.worker_id.clone(), request.slots));
+    let exit_code = request.exit_code.unwrap_or(0);
+    let (release_worker_id, release_slots, record) = if let Some(build_id) = request.build_id {
+        let Some(state) = ctx.history.take_active_build(build_id) else {
+            // A build-id release is canonical and idempotent. If the active
+            // record is already gone, the original release was processed; do
+            // not fall back to caller-provided slots and accidentally release
+            // capacity reserved by a later build.
+            debug!(
+                "Ignoring duplicate release for completed build {}",
+                build_id
+            );
+            return Ok(());
+        };
+        let release_worker_id = WorkerId::new(state.worker_id.clone());
+        let release_slots = state.slots;
+        let record = ctx.history.record_completed_build(
+            state,
+            exit_code,
+            request.duration_ms,
+            request.bytes_transferred,
+            request.timing,
+        );
+        (release_worker_id, release_slots, Some(record))
+    } else {
+        (request.worker_id.clone(), request.slots, None)
+    };
 
     debug!(
         "Releasing {} slots on worker {}",
@@ -2416,49 +2436,39 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
         .release_slots(&release_worker_id, release_slots)
         .await;
 
-    if let Some(build_id) = request.build_id {
-        let exit_code = request.exit_code.unwrap_or(0);
-        let record = ctx.history.finish_active_build(
-            build_id,
-            exit_code,
-            request.duration_ms,
-            request.bytes_transferred,
-            request.timing,
+    if let Some(ref rec) = record {
+        if !cfg!(test) {
+            metrics::dec_active_builds("remote");
+            let outcome = if exit_code == 0 { "success" } else { "failure" };
+            metrics::inc_build_total(outcome, "remote");
+        }
+        ctx.events.emit(
+            "build_completed",
+            &serde_json::json!({
+                "build_id": rec.id,
+                "project_id": rec.project_id,
+                "worker_id": rec.worker_id,
+                "command": rec.command,
+                "exit_code": rec.exit_code,
+                "duration_ms": rec.duration_ms,
+                "location": format!("{:?}", rec.location),
+            }),
         );
-        if let Some(ref rec) = record {
-            if !cfg!(test) {
-                metrics::dec_active_builds("remote");
-                let outcome = if exit_code == 0 { "success" } else { "failure" };
-                metrics::inc_build_total(outcome, "remote");
+
+        // Only successful command completions are positive worker-health
+        // signals. A nonzero command exit is a build/test result, not an
+        // infrastructure failure for the worker circuit.
+        if let Some(ref worker_id) = rec.worker_id {
+            if let Some(worker) = ctx.pool.get(&rch_common::WorkerId::new(worker_id)).await
+                && exit_code == 0
+            {
+                worker.record_success().await;
             }
-            ctx.events.emit(
-                "build_completed",
-                &serde_json::json!({
-                    "build_id": rec.id,
-                    "project_id": rec.project_id,
-                    "worker_id": rec.worker_id,
-                    "command": rec.command,
-                    "exit_code": rec.exit_code,
-                    "duration_ms": rec.duration_ms,
-                    "location": format!("{:?}", rec.location),
-                }),
-            );
 
-            // Only successful command completions are positive worker-health
-            // signals. A nonzero command exit is a build/test result, not an
-            // infrastructure failure for the worker circuit.
-            if let Some(ref worker_id) = rec.worker_id {
-                if let Some(worker) = ctx.pool.get(&rch_common::WorkerId::new(worker_id)).await
-                    && exit_code == 0
-                {
-                    worker.record_success().await;
-                }
-
-                if exit_code == 0 {
-                    ctx.worker_selector
-                        .record_success(worker_id, &rec.project_id)
-                        .await;
-                }
+            if exit_code == 0 {
+                ctx.worker_selector
+                    .record_success(worker_id, &rec.project_id)
+                    .await;
             }
         }
     }
@@ -3983,7 +3993,7 @@ mod tests {
             project: "test".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
-            estimated_cores: 8, // Request more than total slots
+            estimated_cores: 2,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -3996,6 +4006,105 @@ mod tests {
             .unwrap();
         assert!(response.worker.is_none());
         assert_eq!(response.reason, SelectionReason::AllWorkersBusy);
+    }
+
+    #[tokio::test]
+    async fn test_handle_select_worker_requested_busy_does_not_use_available_alternate() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("requested", 4)).await;
+        pool.add_worker(make_test_worker("alternate", 8)).await;
+
+        let requested = pool.get(&WorkerId::new("requested")).await.unwrap();
+        assert!(requested.reserve_slots(4).await);
+
+        let ctx = make_test_context(pool);
+        let request = SelectionRequest {
+            project: "test".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("requested")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let response = handle_select_worker(&ctx, request, false, None)
+            .await
+            .unwrap();
+        assert!(response.worker.is_none());
+        assert_eq!(response.reason, SelectionReason::AllWorkersBusy);
+        assert!(response.diagnostics.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_handle_select_worker_requested_busy_queue_waits_for_requested_worker() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("requested", 4)).await;
+        pool.add_worker(make_test_worker("alternate", 8)).await;
+
+        let requested = pool.get(&WorkerId::new("requested")).await.unwrap();
+        assert!(requested.reserve_slots(4).await);
+        let release_target = requested.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            release_target.release_slots(4).await;
+        });
+
+        let ctx = make_test_context(pool);
+        let request = SelectionRequest {
+            project: "test".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("requested")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let response = handle_select_worker(&ctx, request, true, Some(2))
+            .await
+            .unwrap();
+        let selected = response
+            .worker
+            .expect("requested worker should become available");
+        assert_eq!(selected.id.as_str(), "requested");
+    }
+
+    #[tokio::test]
+    async fn test_handle_select_worker_impossible_requested_capacity_never_queues() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("requested", 1)).await;
+        pool.add_worker(make_test_worker("alternate", 8)).await;
+        let ctx = make_test_context(pool);
+        let request = SelectionRequest {
+            project: "test".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("requested")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(200),
+            handle_select_worker(&ctx, request, true, Some(2)),
+        )
+        .await
+        .expect("impossible capacity must return without entering the queue")
+        .unwrap();
+        assert!(response.worker.is_none());
+        assert!(matches!(
+            response.reason,
+            SelectionReason::NoAdmissibleWorkers(ref summary)
+                if summary.contains("insufficient_total_slots=1")
+        ));
     }
 
     #[tokio::test]
@@ -5591,6 +5700,117 @@ mod tests {
 
         assert_eq!(worker.available_slots().await, 8);
         assert!(ctx.history.active_build(build_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_release_worker_build_id_is_idempotent() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+
+        let ctx = make_test_context(pool.clone());
+        let build = ctx.history.start_active_build(
+            "test-project".to_string(),
+            "worker1".to_string(),
+            "cargo build".to_string(),
+            12345,
+            4,
+            rch_common::BuildLocation::Remote,
+        );
+        let build_id = build.id;
+        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+        assert!(worker.reserve_slots(4).await);
+
+        let release = || ReleaseRequest {
+            worker_id: WorkerId::new("worker1"),
+            slots: 4,
+            build_id: Some(build_id),
+            exit_code: Some(1),
+            duration_ms: None,
+            bytes_transferred: None,
+            timing: None,
+        };
+        handle_release_worker(&ctx, release()).await.unwrap();
+        assert_eq!(worker.available_slots().await, 8);
+
+        // Simulate a later build reserving capacity before a duplicate/late
+        // release for the completed build arrives.
+        assert!(worker.reserve_slots(2).await);
+        handle_release_worker(&ctx, release()).await.unwrap();
+        assert_eq!(worker.available_slots().await, 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_handle_release_worker_concurrent_duplicates_claim_build_once() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool.clone());
+        let build = ctx.history.start_active_build(
+            "test-project".to_string(),
+            "worker1".to_string(),
+            "cargo build".to_string(),
+            12345,
+            4,
+            rch_common::BuildLocation::Remote,
+        );
+        let build_id = build.id;
+        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+        assert!(worker.reserve_slots(4).await);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let spawn_release = |ctx: DaemonContext, barrier: Arc<tokio::sync::Barrier>| {
+            tokio::spawn(async move {
+                barrier.wait().await;
+                handle_release_worker(
+                    &ctx,
+                    ReleaseRequest {
+                        worker_id: WorkerId::new("worker1"),
+                        slots: 4,
+                        build_id: Some(build_id),
+                        exit_code: Some(1),
+                        duration_ms: None,
+                        bytes_transferred: None,
+                        timing: None,
+                    },
+                )
+                .await
+            })
+        };
+        let first = spawn_release(ctx.clone(), barrier.clone());
+        let second = spawn_release(ctx.clone(), barrier.clone());
+        barrier.wait().await;
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+
+        assert_eq!(worker.available_slots().await, 8);
+        assert!(ctx.history.active_build(build_id).is_none());
+        assert_eq!(
+            ctx.history
+                .recent(10)
+                .iter()
+                .filter(|record| record.id == build_id)
+                .count(),
+            1
+        );
+
+        // A later duplicate remains a no-op after new capacity is reserved.
+        assert!(worker.reserve_slots(2).await);
+        handle_release_worker(
+            &ctx,
+            ReleaseRequest {
+                worker_id: WorkerId::new("worker1"),
+                slots: 4,
+                build_id: Some(build_id),
+                exit_code: Some(1),
+                duration_ms: None,
+                bytes_transferred: None,
+                timing: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(worker.available_slots().await, 6);
     }
 
     #[tokio::test]

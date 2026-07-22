@@ -10,6 +10,7 @@ use rch_common::{
     ToolchainInfo, WorkerId,
 };
 use std::io::Read;
+use std::path::PathBuf;
 
 /// Run the PreToolUse hook.
 ///
@@ -27,7 +28,16 @@ pub async fn run_hook() -> anyhow::Result<()> {
 ///
 /// On non-Unix platforms we do not support daemon-based offloading, so `rch exec`
 /// simply runs the provided command via the local shell.
-pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
+pub async fn run_exec(
+    base: Option<String>,
+    clean_overlay: bool,
+    overlay_paths: Vec<PathBuf>,
+    no_overlay: bool,
+    command_parts: Vec<String>,
+) -> anyhow::Result<()> {
+    if clean_overlay || base.is_some() || !overlay_paths.is_empty() || no_overlay {
+        anyhow::bail!("clean-overlay remote execution is not supported on non-Unix clients");
+    }
     let command = command_parts.join(" ");
     if command.is_empty() {
         anyhow::bail!("No command provided to exec");

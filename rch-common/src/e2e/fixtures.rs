@@ -161,6 +161,9 @@ version = "{}"
 edition = "2024"
 
 [dependencies]
+
+[workspace]
+resolver = "3"
 "#,
             self.name, self.version
         )
@@ -831,6 +834,9 @@ name = "{package_name}"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+resolver = "3"
+
 [dependencies]
 {dependencies_block}"#
     )
@@ -928,6 +934,10 @@ mod tests {
         let cargo_toml = project.cargo_toml();
         assert!(cargo_toml.contains("name = \"test-project\""));
         assert!(cargo_toml.contains("edition = \"2024\""));
+        assert!(
+            cargo_toml.contains("[workspace]\nresolver = \"3\""),
+            "standalone project fixtures must not inherit an enclosing workspace"
+        );
     }
 
     #[test]
@@ -943,6 +953,15 @@ mod tests {
         let input = HookInputFixture::custom("cargo test --release");
         let json = input.to_json();
         assert!(json.contains("\"command\": \"cargo test --release\""));
+    }
+
+    #[test]
+    fn multi_repo_manifest_is_a_standalone_workspace() {
+        let manifest = cargo_toml("standalone_fixture", &[]);
+        assert!(
+            manifest.contains("[workspace]\nresolver = \"3\""),
+            "multi-repo fixtures must not inherit an enclosing workspace"
+        );
     }
 
     #[cfg(unix)]

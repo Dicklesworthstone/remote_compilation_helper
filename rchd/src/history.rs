@@ -433,7 +433,18 @@ impl BuildHistory {
         timing: Option<CommandTimingBreakdown>,
     ) -> Option<BuildRecord> {
         let state = self.take_active_build(build_id)?;
+        Some(self.record_completed_build(state, exit_code, duration_ms, bytes_transferred, timing))
+    }
 
+    /// Record a completed build from an active state already claimed by the caller.
+    pub fn record_completed_build(
+        &self,
+        state: ActiveBuildState,
+        exit_code: i32,
+        duration_ms: Option<u64>,
+        bytes_transferred: Option<u64>,
+        timing: Option<CommandTimingBreakdown>,
+    ) -> BuildRecord {
         let duration_ms =
             duration_ms.unwrap_or_else(|| state.started_at_mono.elapsed().as_millis() as u64);
         let record = BuildRecord {
@@ -452,7 +463,7 @@ impl BuildHistory {
         };
 
         self.record(record.clone());
-        Some(record)
+        record
     }
 
     /// Claim an active build for deterministic finalization.
