@@ -98,6 +98,13 @@ pub struct RuntimeFacts {
     /// Go toolchain version (from `go version`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub go_version: Option<String>,
+    /// Zig version (from `zig version`). Gates `cargo zigbuild` routing together
+    /// with `cargo_zigbuild_version` — both must be present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zig_version: Option<String>,
+    /// cargo-zigbuild version (from `cargo-zigbuild --version`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_zigbuild_version: Option<String>,
 }
 
 /// One filesystem root's capacity (exact, path-scoped).

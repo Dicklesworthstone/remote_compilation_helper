@@ -11,7 +11,7 @@ use crate::transfer::{
     SyncResult, TransferPipeline, clean_overlay_include_patterns,
     compute_project_hash_with_dependency_roots_and_policy, configure_clean_git_command,
     default_bun_artifact_patterns, default_c_cpp_artifact_patterns, default_rust_artifact_patterns,
-    default_rust_test_artifact_patterns, project_id_from_path,
+    default_rust_test_artifact_patterns, default_zigbuild_artifact_patterns, project_id_from_path,
 };
 use crate::ui::console::RchConsole;
 use anyhow::Context;
@@ -2873,6 +2873,17 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
             | CompilationKind::CargoNextest
             | CompilationKind::CargoBench
             | CompilationKind::Rustc => RequiredRuntime::Rust,
+
+            // A zig cross-build is a cargo build, but plain `RequiredRuntime::Rust`
+            // is NOT a sufficient gate: `needs_zig` is only enforced by
+            // `assess_admissibility`, which the daemon's selection path never
+            // calls (only fleet smoke tests and bypass recovery do). A Rust-capable
+            // worker without `cargo-zigbuild` would therefore be selected and fail
+            // with `error: no such command: 'zigbuild'` — which is not a rustup
+            // message, so `is_toolchain_failure` doesn't recognize it and the
+            // nonzero exit is surfaced to the user verbatim instead of falling open
+            // to local. Zig gets its own runtime so selection gates on `has_zig()`.
+            CompilationKind::CargoZigbuild => RequiredRuntime::Zig,
 
             CompilationKind::BunTest | CompilationKind::BunTypecheck => RequiredRuntime::Bun,
 

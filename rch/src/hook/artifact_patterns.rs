@@ -47,6 +47,9 @@ pub(super) fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String
         Some(CompilationKind::Rustc)
         | Some(CompilationKind::CargoBuild)
         | Some(CompilationKind::CargoDoc) => default_rust_artifact_patterns(),
+        // Zig cross-builds write to target/<triple>/<profile>/, so they need the
+        // triple-aware globs — the plain rust patterns would miss the binary.
+        Some(CompilationKind::CargoZigbuild) => default_zigbuild_artifact_patterns(),
         Some(CompilationKind::Gcc)
         | Some(CompilationKind::Gpp)
         | Some(CompilationKind::Clang)
@@ -116,6 +119,37 @@ pub(super) fn get_custom_target_artifact_patterns(kind: Option<CompilationKind>)
                 })
                 .collect()
         }
+        // Zig cross-build in a custom CARGO_TARGET_DIR: outputs live at
+        // `<triple>/<profile>/` (one level deeper than a normal build), so both the
+        // output globs and the cache excludes must be triple-aware. The standard
+        // `<profile>/incremental/` excludes wouldn't catch `<triple>/release/…`, so
+        // add the nested forms before the (prefix-stripped) zigbuild output globs.
+        Some(CompilationKind::CargoZigbuild) => {
+            let mut patterns: Vec<String> = CARGO_TARGET_CACHE_EXCLUDES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            // Triple-nested cache trees: target/<triple>/<profile>/{incremental,.fingerprint,build}/
+            patterns.extend(
+                [
+                    "- */release/incremental/",
+                    "- */release/.fingerprint/",
+                    "- */release/build/",
+                    "- */debug/incremental/",
+                    "- */debug/.fingerprint/",
+                    "- */debug/build/",
+                ]
+                .iter()
+                .map(|s| (*s).to_string()),
+            );
+            patterns.extend(get_artifact_patterns(kind).into_iter().map(|pattern| {
+                pattern
+                    .strip_prefix("target/")
+                    .unwrap_or(pattern.as_str())
+                    .to_string()
+            }));
+            patterns
+        }
         // CargoBuild / CargoDoc / Rustc (the `_` arm) previously synced the WHOLE
         // per-job remote target dir via `**`, dragging deps/, incremental/,
         // .fingerprint/, and build/ back on every build. Capture only the build
@@ -155,6 +189,9 @@ pub(super) fn kind_produces_transferable_artifacts(kind: Option<CompilationKind>
         Some(CompilationKind::CargoBuild)
         | Some(CompilationKind::CargoDoc)
         | Some(CompilationKind::Rustc)
+        // Zig cross-build produces a real binary under target/<triple>/ that the
+        // caller needs locally, so a failed sync-back is a build failure.
+        | Some(CompilationKind::CargoZigbuild)
         | Some(CompilationKind::Gcc)
         | Some(CompilationKind::Gpp)
         | Some(CompilationKind::Clang)

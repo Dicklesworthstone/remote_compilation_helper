@@ -373,10 +373,13 @@ pub async fn prepare(
         // node_modules-style prepare step, so it is skipped like Rust/None.
         // Go resolves its own modules from the module cache at build time and
         // needs no node_modules-style prepare step, so it is skipped like Rust/Nix.
+        // Zig cross-builds are cargo builds — cargo resolves the registry itself
+        // and `zig` ships its own bundled libc/headers, so nothing to prepare.
         RequiredRuntime::Rust
         | RequiredRuntime::None
         | RequiredRuntime::Nix
-        | RequiredRuntime::Go => Ok(PrepareReport {
+        | RequiredRuntime::Go
+        | RequiredRuntime::Zig => Ok(PrepareReport {
             runtime,
             action: PrepareAction::Skipped,
             fingerprint: None,

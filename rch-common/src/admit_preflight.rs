@@ -62,6 +62,9 @@ pub struct RequiredCapabilities {
     pub needs_go: bool,
     /// Whether the command requires Node.js (e.g. `tsc` / `npx tsc`).
     pub needs_node: bool,
+    /// Whether the command requires `zig` + `cargo-zigbuild` (a zig cross-build).
+    /// This is on TOP of `needs_cargo` and the requested `needs_targets`.
+    pub needs_zig: bool,
     /// rustup targets the command explicitly requests (`--target <triple>`).
     pub needs_targets: Vec<String>,
     /// Explicit toolchain overrides (`cargo +nightly-…`).
@@ -81,6 +84,7 @@ impl RequiredCapabilities {
             needs_nix: self.needs_nix,
             needs_go: self.needs_go,
             needs_node: self.needs_node,
+            needs_zig: self.needs_zig,
             needs_toolchains: self.needs_toolchains.clone(),
             ..CapabilityRequirement::default()
         }
@@ -120,6 +124,7 @@ fn family_token(kind: CompilationKind) -> &'static str {
         CompilationKind::CargoDoc => "cargo_doc",
         CompilationKind::CargoNextest => "cargo_nextest",
         CompilationKind::CargoBench => "cargo_bench",
+        CompilationKind::CargoZigbuild => "cargo_zigbuild",
         CompilationKind::Rustc => "rustc",
         CompilationKind::Gcc => "gcc",
         CompilationKind::Gpp => "gpp",
@@ -150,6 +155,9 @@ fn is_rust_kind(kind: CompilationKind) -> bool {
             | CompilationKind::CargoDoc
             | CompilationKind::CargoNextest
             | CompilationKind::CargoBench
+            // A zig cross-build runs through cargo, so it needs the cargo toolchain
+            // too (plus zig — see `needs_zig` in derive_capabilities).
+            | CompilationKind::CargoZigbuild
             | CompilationKind::Rustc
     )
 }
@@ -169,6 +177,10 @@ fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> Required
             CompilationKind::GoBuild | CompilationKind::GoTest | CompilationKind::GoVet
         );
         req.needs_node = matches!(kind, CompilationKind::Tsc);
+        // A zig cross-build additionally needs zig + cargo-zigbuild on the worker.
+        // The requested `--target` std is captured by the needs_targets scan below,
+        // exactly as for a plain `cargo build --target ...`.
+        req.needs_zig = matches!(kind, CompilationKind::CargoZigbuild);
     }
     // Scan tokens for `--target <triple>` / `--target=<triple>` and `+toolchain`.
     let tokens: Vec<&str> = command.split_whitespace().collect();
@@ -230,6 +242,7 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
             }
             let part_req = derive_capabilities(part, c.kind);
             required.needs_cargo |= part_req.needs_cargo;
+            required.needs_zig |= part_req.needs_zig;
             required.needs_bun |= part_req.needs_bun;
             required.needs_nix |= part_req.needs_nix;
             required.needs_go |= part_req.needs_go;

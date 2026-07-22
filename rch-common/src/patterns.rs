@@ -22,6 +22,10 @@ const TIER_FULL_CLASSIFICATION: &str = "full_classification";
 /// Used for SIMD-accelerated quick filtering (Tier 2).
 pub static COMPILATION_KEYWORDS: &[&str] = &[
     "cargo",
+    // The standalone cargo-zigbuild binary (hyphenated) does NOT word-match
+    // "cargo", so it needs its own Tier-2 keyword or it is rejected before
+    // classify_full's `cargo-zigbuild` route ever runs.
+    "cargo-zigbuild",
     "rustc",
     "gcc",
     "g++",
@@ -237,6 +241,13 @@ pub enum CompilationKind {
     CargoNextest,
     /// cargo bench - run benchmarks
     CargoBench,
+    /// `cargo zigbuild` / `cargo-zigbuild zigbuild` — a cargo build that uses
+    /// zig as the C compiler + cross-linker (`cargo-zigbuild`). It IS a Rust
+    /// build (RequiredRuntime::Rust), but additionally needs `zig` +
+    /// `cargo-zigbuild` on the worker and the requested `--target` rustup std.
+    /// Unlike Go/Nix it PRODUCES a real binary under `target/<triple>/<profile>/`,
+    /// so its artifacts must sync back (see artifact_patterns).
+    CargoZigbuild,
     /// rustc invocation
     Rustc,
 
@@ -326,6 +337,10 @@ impl CompilationKind {
             | CompilationKind::CargoDoc
             | CompilationKind::CargoBench => "cargo",
             CompilationKind::CargoNextest => "cargo", // cargo nextest, base is still cargo
+            // `cargo zigbuild` runs through cargo; the standalone `cargo-zigbuild`
+            // binary is normalized to this kind too. Base "cargo" so it matches
+            // the existing cargo allowlist entry.
+            CompilationKind::CargoZigbuild => "cargo",
             CompilationKind::Rustc => "rustc",
             // C/C++ commands
             CompilationKind::Gcc => "gcc",
@@ -1851,6 +1866,12 @@ fn classify_full(cmd: &str) -> Classification {
         return classify_cargo(cmd);
     }
 
+    // `cargo-zigbuild` invoked as a standalone binary (this is what `cargo
+    // zigbuild ...` execs). Note the hyphen: it does NOT match `cargo ` above.
+    if cmd.starts_with("cargo-zigbuild ") || cmd.eq("cargo-zigbuild") {
+        return classify_cargo_zigbuild(cmd);
+    }
+
     // rustc
     if cmd.starts_with("rustc ") || cmd.eq("rustc") {
         return Classification::compilation(CompilationKind::Rustc, 0.95, "rustc invocation");
@@ -2191,6 +2212,13 @@ fn classify_cargo(cmd: &str) -> Classification {
             )
         }
         "bench" => Classification::compilation(CompilationKind::CargoBench, 0.90, "cargo bench"),
+        // `cargo zigbuild ...` — cross-compile via zig. Same offload shape as
+        // `cargo build` (produces a real artifact under target/<triple>/), but
+        // gated additionally on the worker having zig + cargo-zigbuild + the
+        // requested rustup target (enforced downstream by needs_zig/needs_targets).
+        "zigbuild" => {
+            Classification::compilation(CompilationKind::CargoZigbuild, 0.95, "cargo zigbuild")
+        }
         "nextest" => {
             // cargo nextest has subcommands: run, list, archive, show
             // Only intercept "run" - the actual test execution
@@ -2209,6 +2237,47 @@ fn classify_cargo(cmd: &str) -> Classification {
             }
         }
         _ => Classification::not_compilation("cargo subcommand not interceptable"),
+    }
+}
+
+/// Classify the standalone `cargo-zigbuild` binary (what `cargo zigbuild ...`
+/// execs). Only the artifact-producing build forms are offloaded:
+///
+/// - `cargo-zigbuild zigbuild ...` → cross-build via zig (the canonical form)
+/// - `cargo-zigbuild build ...` → same, spelled with the plain subcommand
+///
+/// Everything else (`check`, `test`, `run`, metadata) is declined here and runs
+/// locally, matching the conservative stance in `classify_cargo` for non-build
+/// forms. All accepted forms map to `CompilationKind::CargoZigbuild`.
+fn classify_cargo_zigbuild(cmd: &str) -> Classification {
+    let mut tokens = cmd.split_whitespace();
+    // Token 0: "cargo-zigbuild" (already validated by caller).
+    let _bin = tokens.next();
+
+    // Skip an optional +toolchain override and leading global flags, mirroring
+    // classify_cargo so `cargo-zigbuild +nightly zigbuild ...` still classifies.
+    const CARGO_VALUE_FLAGS: &[&str] = &["--color", "-Z", "-C", "--config"];
+    let subcommand = loop {
+        let Some(tok) = tokens.next() else {
+            return Classification::not_compilation("bare cargo-zigbuild command");
+        };
+        if tok.starts_with('+') {
+            continue;
+        }
+        if tok.starts_with('-') {
+            if !tok.contains('=') && CARGO_VALUE_FLAGS.contains(&tok) {
+                let _ = tokens.next();
+            }
+            continue;
+        }
+        break tok;
+    };
+
+    match subcommand {
+        "zigbuild" | "build" | "b" => {
+            Classification::compilation(CompilationKind::CargoZigbuild, 0.95, "cargo-zigbuild build")
+        }
+        _ => Classification::not_compilation("cargo-zigbuild subcommand not interceptable"),
     }
 }
 

@@ -514,6 +514,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                                     RequiredRuntime::Node => !caps.has_node(),
                                     RequiredRuntime::Nix => !caps.has_nix(),
                                     RequiredRuntime::Go => !caps.has_go(),
+                                    RequiredRuntime::Zig => !caps.has_zig(),
                                     RequiredRuntime::None => false,
                                 }
                             })
@@ -1031,6 +1032,9 @@ pub async fn admit(command: &str, ctx: &OutputContext) -> Result<()> {
     let mut needs: Vec<String> = Vec::new();
     if req.needs_cargo {
         needs.push("cargo".to_string());
+    }
+    if req.needs_zig {
+        needs.push("zig".to_string());
     }
     if req.needs_bun {
         needs.push("bun".to_string());

@@ -1315,6 +1315,7 @@ impl WorkerSelector {
                 RequiredRuntime::Node => capabilities.has_node(),
                 RequiredRuntime::Nix => capabilities.has_nix(),
                 RequiredRuntime::Go => capabilities.has_go(),
+                RequiredRuntime::Zig => capabilities.has_zig(),
             };
 
             let toolchain_mismatch =
@@ -1753,6 +1754,7 @@ impl WorkerSelector {
                 RequiredRuntime::Node => worker.has_node().await,
                 RequiredRuntime::Nix => worker.has_nix().await,
                 RequiredRuntime::Go => worker.has_go().await,
+                RequiredRuntime::Zig => worker.has_zig().await,
             };
 
             if excluded_worker_ids.contains(worker_id.as_str()) {
@@ -2777,6 +2779,7 @@ pub async fn select_worker_with_config(
             RequiredRuntime::Node => worker.has_node().await,
             RequiredRuntime::Nix => worker.has_nix().await,
             RequiredRuntime::Go => worker.has_go().await,
+            RequiredRuntime::Zig => worker.has_zig().await,
         };
 
         if !has_required_runtime {

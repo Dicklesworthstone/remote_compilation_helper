@@ -1415,6 +1415,7 @@ fi",
             Some(CompilationKind::CargoClippy) => "cargo clippy",
             Some(CompilationKind::CargoDoc) => "cargo doc",
             Some(CompilationKind::CargoBench) => "cargo bench",
+            Some(CompilationKind::CargoZigbuild) => "cargo zigbuild",
             Some(CompilationKind::Rustc) => "rustc",
             Some(CompilationKind::Gcc) => "gcc",
             Some(CompilationKind::Gpp) => "g++",
@@ -3444,6 +3445,27 @@ pub fn default_rust_artifact_patterns() -> Vec<String> {
         "target/debug/**".to_string(),
         "target/release/**".to_string(),
         "target/doc/**".to_string(),
+        "target/.rustc_info.json".to_string(),
+        "target/CACHEDIR.TAG".to_string(),
+    ]
+}
+
+/// Default artifact patterns for `cargo zigbuild` cross-compiles.
+///
+/// cargo-zigbuild always builds for an explicit `--target <triple>`, so cargo
+/// writes its outputs under `target/<triple>/<profile>/` rather than the plain
+/// `target/<profile>/` that [`default_rust_artifact_patterns`] captures. The
+/// `target/*/…` globs (one `*` = the triple component) bring the cross-compiled
+/// binary/libs home; the non-cross paths are kept too so a `--target` matching
+/// the host still syncs, and for the odd zigbuild without `--target`.
+pub fn default_zigbuild_artifact_patterns() -> Vec<String> {
+    vec![
+        // Cross-compile outputs: target/<triple>/<profile>/**
+        "target/*/debug/**".to_string(),
+        "target/*/release/**".to_string(),
+        // Non-cross (host-target) outputs, same as a plain cargo build.
+        "target/debug/**".to_string(),
+        "target/release/**".to_string(),
         "target/.rustc_info.json".to_string(),
         "target/CACHEDIR.TAG".to_string(),
     ]

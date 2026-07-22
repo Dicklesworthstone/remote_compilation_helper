@@ -90,6 +90,8 @@ pub enum RequiredRuntime {
     Nix,
     /// Requires the Go toolchain (`go` binary).
     Go,
+    /// Requires the zig cross-compilation toolchain (`cargo-zigbuild` + `zig`).
+    Zig,
 }
 
 /// Per-command priority hint for worker selection.
@@ -723,6 +725,16 @@ pub struct WorkerCapabilities {
     /// `go test`/`go vet` routing to this worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub go_version: Option<String>,
+    /// Zig version (from `zig version`). `cargo zigbuild` shells out to `zig`
+    /// as the linker/C toolchain, so the bare `zig` binary is necessary but not
+    /// sufficient — see [`WorkerCapabilities::has_zig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zig_version: Option<String>,
+    /// cargo-zigbuild version (from `cargo-zigbuild --version`). Probed as the
+    /// hyphenated binary rather than `cargo zigbuild --version`, which the
+    /// subcommand's own parser rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_zigbuild_version: Option<String>,
 
     // Health metrics (bd-3eaa)
     /// Number of CPU cores on the worker.
@@ -797,6 +809,19 @@ impl WorkerCapabilities {
     /// Check if this worker has the Go toolchain installed.
     pub fn has_go(&self) -> bool {
         self.go_version.is_some()
+    }
+
+    /// Check if this worker can run `cargo zigbuild` cross-compiles.
+    ///
+    /// Requires BOTH halves of the toolchain: the `cargo-zigbuild` cargo
+    /// subcommand and the `zig` binary it drives as the linker. Either one
+    /// alone fails at build time with an error the remote-result heuristics do
+    /// not recognize as infrastructure (`error: no such command: 'zigbuild'` is
+    /// not a rustup message), so the exit code would be surfaced verbatim
+    /// instead of falling open to local. Gating both here keeps that failure
+    /// out of the user's build.
+    pub fn has_zig(&self) -> bool {
+        self.zig_version.is_some() && self.cargo_zigbuild_version.is_some()
     }
 
     /// Calculate load per core (1-minute load average / num_cpus).
@@ -3408,6 +3433,26 @@ retry_max = 2
 
         caps.nix_version = Some("nix (Nix) 2.24.9".to_string());
         assert!(caps.has_nix());
+    }
+
+    #[test]
+    fn test_worker_capabilities_has_zig_requires_both_halves() {
+        let _guard = test_guard!();
+        let mut caps = WorkerCapabilities::new();
+        assert!(!caps.has_zig());
+
+        // `zig` alone cannot run `cargo zigbuild` — cargo would report
+        // `no such command: 'zigbuild'`.
+        caps.zig_version = Some("0.14.1".to_string());
+        assert!(!caps.has_zig());
+
+        // cargo-zigbuild alone cannot link — it shells out to `zig cc`.
+        caps.zig_version = None;
+        caps.cargo_zigbuild_version = Some("cargo-zigbuild 0.23.0".to_string());
+        assert!(!caps.has_zig());
+
+        caps.zig_version = Some("0.14.1".to_string());
+        assert!(caps.has_zig());
     }
 
     #[test]

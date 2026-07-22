@@ -101,6 +101,12 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
             | CompilationKind::CargoBench
             | CompilationKind::Rustc => RequiredRuntime::Rust,
 
+            // Mirror the Unix hook (hook.rs): a zig cross-build needs its own
+            // runtime gate so selection requires `has_zig()` (cargo-zigbuild +
+            // zig). `RequiredRuntime::Rust` alone would admit a worker that
+            // fails with `error: no such command: 'zigbuild'`.
+            CompilationKind::CargoZigbuild => RequiredRuntime::Zig,
+
             CompilationKind::BunTest | CompilationKind::BunTypecheck => RequiredRuntime::Bun,
 
             // Mirror the Unix hook (hook.rs): a nix build must carry the Nix
