@@ -130,6 +130,7 @@ pub fn runtime_label(runtime: &RequiredRuntime) -> &'static str {
         RequiredRuntime::Node => "node",
         RequiredRuntime::Nix => "nix",
         RequiredRuntime::Go => "go",
+        RequiredRuntime::Zig => "zig",
         RequiredRuntime::None => "none",
     }
 }

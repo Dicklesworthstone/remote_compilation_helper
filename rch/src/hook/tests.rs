@@ -3351,6 +3351,33 @@ fn test_feature_and_triple_parsing_from_command() {
 }
 
 #[test]
+fn test_zigbuild_requires_the_zig_runtime_not_bare_rust() {
+    let _guard = test_guard!();
+    // A zig cross-build must NOT be gated as an ordinary Rust build: worker
+    // selection would then admit any rustc-capable worker, and a worker without
+    // `cargo-zigbuild` fails with `error: no such command: 'zigbuild'`, which
+    // `is_toolchain_failure` does not recognize — so the nonzero exit reaches
+    // the user verbatim instead of falling open to local.
+    assert_eq!(
+        required_runtime_for_kind(Some(CompilationKind::CargoZigbuild)),
+        RequiredRuntime::Zig
+    );
+    // The ordinary cargo kinds keep the plain Rust gate.
+    for kind in [
+        CompilationKind::CargoBuild,
+        CompilationKind::CargoTest,
+        CompilationKind::CargoCheck,
+        CompilationKind::Rustc,
+    ] {
+        assert_eq!(
+            required_runtime_for_kind(Some(kind)),
+            RequiredRuntime::Rust,
+            "{kind:?} must stay on the Rust runtime gate"
+        );
+    }
+}
+
+#[test]
 fn test_kind_produces_transferable_artifacts() {
     let _guard = test_guard!();
     // Build/doc/rustc + C/C++/build-system kinds produce required artifacts.

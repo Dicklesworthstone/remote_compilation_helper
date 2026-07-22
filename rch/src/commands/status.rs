@@ -514,6 +514,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                                     RequiredRuntime::Node => !caps.has_node(),
                                     RequiredRuntime::Nix => !caps.has_nix(),
                                     RequiredRuntime::Go => !caps.has_go(),
+                                    RequiredRuntime::Zig => !caps.has_zig(),
                                     RequiredRuntime::None => false,
                                 }
                             })

@@ -906,6 +906,11 @@ impl WorkerState {
         self.capabilities.read().await.has_go()
     }
 
+    /// Whether this worker can run `cargo zigbuild` (cargo-zigbuild + zig).
+    pub async fn has_zig(&self) -> bool {
+        self.capabilities.read().await.has_zig()
+    }
+
     /// Disable the worker with an optional reason.
     /// Sets status to Disabled and records the timestamp and reason.
     pub async fn disable(&self, reason: Option<String>) {

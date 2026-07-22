@@ -2872,12 +2872,18 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
             | CompilationKind::CargoDoc
             | CompilationKind::CargoNextest
             | CompilationKind::CargoBench
-            // A zig cross-build IS a cargo/Rust build, so the base runtime gate is
-            // Rust. Its extra needs — `zig` + `cargo-zigbuild` + the `--target`
-            // rustup std — are enforced by the finer `needs_zig`/`needs_targets`
-            // admission preflight, not by a separate RequiredRuntime.
-            | CompilationKind::CargoZigbuild
             | CompilationKind::Rustc => RequiredRuntime::Rust,
+
+            // A zig cross-build is a cargo build, but plain `RequiredRuntime::Rust`
+            // is NOT a sufficient gate: `needs_zig` is only enforced by
+            // `assess_admissibility`, which the daemon's selection path never
+            // calls (only fleet smoke tests and bypass recovery do). A Rust-capable
+            // worker without `cargo-zigbuild` would therefore be selected and fail
+            // with `error: no such command: 'zigbuild'` — which is not a rustup
+            // message, so `is_toolchain_failure` doesn't recognize it and the
+            // nonzero exit is surfaced to the user verbatim instead of falling open
+            // to local. Zig gets its own runtime so selection gates on `has_zig()`.
+            CompilationKind::CargoZigbuild => RequiredRuntime::Zig,
 
             CompilationKind::BunTest | CompilationKind::BunTypecheck => RequiredRuntime::Bun,
 

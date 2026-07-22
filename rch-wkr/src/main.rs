@@ -455,6 +455,28 @@ fn probe_capabilities() -> WorkerCapabilities {
         }
     }
 
+    // Probe the zig cross-compilation toolchain. Both halves are required: the
+    // `cargo-zigbuild` subcommand and the `zig` binary it drives as linker.
+    // Probed as the hyphenated binary because `cargo zigbuild --version` is
+    // rejected by cargo-zigbuild's own argument parser. Gates `cargo zigbuild`
+    // routing via `has_zig()`.
+    if let Ok(output) = Command::new("zig").args(["version"]).output()
+        && output.status.success()
+    {
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !version.is_empty() {
+            capabilities.zig_version = Some(version);
+        }
+    }
+    if let Ok(output) = Command::new("cargo-zigbuild").args(["--version"]).output()
+        && output.status.success()
+    {
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !version.is_empty() {
+            capabilities.cargo_zigbuild_version = Some(version);
+        }
+    }
+
     // Probe system health metrics (bd-3eaa)
     capabilities.num_cpus = probe_num_cpus();
     if let Some((load1, load5, load15)) = probe_load_average() {

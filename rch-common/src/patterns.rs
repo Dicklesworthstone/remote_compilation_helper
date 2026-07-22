@@ -2242,8 +2242,10 @@ fn classify_cargo(cmd: &str) -> Classification {
 
 /// Classify the standalone `cargo-zigbuild` binary (what `cargo zigbuild ...`
 /// execs). Only the artifact-producing build forms are offloaded:
-///   - `cargo-zigbuild zigbuild ...`  → cross-build via zig (the canonical form)
-///   - `cargo-zigbuild build ...`     → same, spelled with the plain subcommand
+///
+/// - `cargo-zigbuild zigbuild ...` → cross-build via zig (the canonical form)
+/// - `cargo-zigbuild build ...` → same, spelled with the plain subcommand
+///
 /// Everything else (`check`, `test`, `run`, metadata) is declined here and runs
 /// locally, matching the conservative stance in `classify_cargo` for non-build
 /// forms. All accepted forms map to `CompilationKind::CargoZigbuild`.
