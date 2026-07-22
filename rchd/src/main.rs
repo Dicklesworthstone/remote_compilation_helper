@@ -150,6 +150,12 @@ pub struct DaemonContext {
     pub pid: u32,
     /// Maximum time a build can wait in queue (seconds) before timing out.
     pub queue_timeout_secs: u64,
+    /// Durable bypass-record store (shared with the bypass recovery service).
+    /// `handle_worker_enable` deletes a worker's record here so an operator
+    /// re-enable is durable — otherwise `reconcile_on_start` re-quarantines the
+    /// worker from the persisted record on the next daemon restart. `None` in
+    /// test contexts that don't exercise bypass recovery.
+    pub bypass_store: Option<Arc<tokio::sync::Mutex<BypassRecordStore>>>,
 }
 
 /// Result of one bind attempt — distinguishes "socket is held by another
@@ -737,6 +743,14 @@ async fn main() -> Result<()> {
         event_bus.clone(),
     ));
 
+    // The durable bypass-record store is shared between the bypass recovery
+    // service (which reads/writes records) and the DaemonContext (so
+    // `handle_worker_enable` can delete a record on operator re-enable). Create
+    // it here so both hold the same Arc.
+    let bypass_store = Arc::new(Mutex::new(BypassRecordStore::load(
+        default_bypass_record_path(),
+    )));
+
     let context = DaemonContext {
         pool: worker_pool.clone(),
         worker_selector: worker_selector.clone(),
@@ -754,6 +768,7 @@ async fn main() -> Result<()> {
         version: env!("CARGO_PKG_VERSION"),
         pid: std::process::id(),
         queue_timeout_secs: daemon_config.queue.timeout_secs,
+        bypass_store: Some(bypass_store.clone()),
     };
 
     // Start active build cleanup background task
@@ -768,12 +783,31 @@ async fn main() -> Result<()> {
     let metrics_interval = Duration::from_secs(cli.metrics_reset_interval.max(1));
     let metrics_dashboard = Arc::new(Mutex::new(MetricsDashboard::new(metrics_interval)));
 
+    // Health checks get their OWN dedicated ControlMaster pool, independent of
+    // the shared build/telemetry `ssh_pool`. The health probe is what opens the
+    // circuit that quarantines a worker out of scheduling; routing it through the
+    // shared pool means a single wedged/leaked ControlMaster socket false-fails
+    // EVERY health probe and can quarantine the whole fleet at once (a trigger of
+    // the 2026-07-16 offload meltdown). A separate pool (separate control sockets)
+    // keeps a build/telemetry-pool wedge from cascading into fleet-wide bypass,
+    // while still giving health checks warm-connection reuse.
+    let health_ssh_pool: Option<Arc<rch_common::SshPool>> = if daemon_config.connection_pooling {
+        let pool_options = rch_common::SshOptions {
+            control_master: true,
+            control_persist_idle: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        Some(Arc::new(rch_common::SshPool::new(pool_options)))
+    } else {
+        None
+    };
+
     // Start health monitor with alert manager integration
     let health_config = health::HealthConfig::default();
     let health_monitor = health::HealthMonitor::new(worker_pool.clone(), health_config)
         .with_status_panel(worker_status_panel.clone())
         .with_alert_manager(alert_manager.clone())
-        .with_ssh_pool(ssh_pool.clone());
+        .with_ssh_pool(health_ssh_pool.clone());
     let health_handle = health_monitor.start();
     info!("Health monitor started with alerting enabled");
 
@@ -818,9 +852,7 @@ async fn main() -> Result<()> {
     let bypass_prober = SshRecoveryProber::new(telemetry_store.clone(), bypass_config.clone());
     let bypass_recovery = BypassRecoveryService::new(
         worker_pool.clone(),
-        Arc::new(Mutex::new(BypassRecordStore::load(
-            default_bypass_record_path(),
-        ))),
+        bypass_store.clone(),
         bypass_prober,
         bypass_config,
     );
@@ -1355,6 +1387,7 @@ mod tests {
             version: "0.1.0-test",
             pid: std::process::id(),
             queue_timeout_secs: 300,
+            bypass_store: None,
         };
 
         assert_eq!(context.socket_path, "/tmp/test.sock");
@@ -1405,6 +1438,7 @@ mod tests {
             version: env!("CARGO_PKG_VERSION"),
             pid: std::process::id(),
             queue_timeout_secs: 300,
+            bypass_store: None,
         };
 
         assert_eq!(context.pool.len(), 1);
@@ -1457,6 +1491,7 @@ mod tests {
             version: "0.1.0",
             pid: 12345,
             queue_timeout_secs: 300,
+            bypass_store: None,
         };
 
         assert_eq!(context.history.len(), 1);
@@ -1492,6 +1527,7 @@ mod tests {
             version: "0.1.0",
             pid: 1234,
             queue_timeout_secs: 300,
+            bypass_store: None,
         };
 
         // Clone the context
@@ -1546,6 +1582,7 @@ mod tests {
             version: "0.1.0",
             pid: 1234,
             queue_timeout_secs: 300,
+            bypass_store: None,
         };
 
         // Wait a small amount
@@ -1598,6 +1635,7 @@ mod tests {
             version: "0.1.0",
             pid: 1234,
             queue_timeout_secs: 300,
+            bypass_store: None,
         };
 
         assert_eq!(context.pool.len(), 5);

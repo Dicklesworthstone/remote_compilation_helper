@@ -1498,6 +1498,15 @@ pub async fn handle_worker_enable(
         Some(worker) => {
             let old_status = worker.status().await;
             worker.enable().await;
+            // Operator re-enable must be DURABLE: delete the worker's persisted
+            // bypass record too. `worker.enable()` only resets the in-memory
+            // lifecycle/circuit; if the record survives, `reconcile_on_start`
+            // re-quarantines the worker from it on the next daemon restart (and
+            // the live recovery loop can re-touch it). Mirrors `rejoin`'s
+            // `store.remove(worker_id)`. (2026-07-16 offload meltdown follow-up.)
+            if let Some(store) = &ctx.bypass_store {
+                let _ = store.lock().await.remove(worker_id.as_str());
+            }
             WorkerStateResponse {
                 status: "ok".to_string(),
                 worker_id: worker_id.to_string(),

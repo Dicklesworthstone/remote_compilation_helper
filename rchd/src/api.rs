@@ -3438,6 +3438,7 @@ mod tests {
             version: "0.1.0",
             pid: 1234,
             queue_timeout_secs: 300,
+            bypass_store: None,
         }
     }
 
