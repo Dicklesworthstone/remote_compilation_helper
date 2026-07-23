@@ -600,6 +600,7 @@ struct PartialCompilationConfig {
     test_timeout_sec: Option<u64>,
     bun_timeout_sec: Option<u64>,
     external_timeout_enabled: Option<bool>,
+    allow_local_fallback: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1196,6 +1197,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "compilation.test_timeout_sec",
         "compilation.bun_timeout_sec",
         "compilation.external_timeout_enabled",
+        "compilation.allow_local_fallback",
         "transfer.compression_level",
         "transfer.exclude_patterns",
         "environment.allowlist",
@@ -1298,6 +1300,14 @@ fn apply_layer(
         set_source(
             sources,
             "compilation.external_timeout_enabled",
+            source.clone(),
+        );
+    }
+    if let Some(allow_local_fallback) = layer.compilation.allow_local_fallback {
+        config.compilation.allow_local_fallback = allow_local_fallback;
+        set_source(
+            sources,
+            "compilation.allow_local_fallback",
             source.clone(),
         );
     }
@@ -1642,6 +1652,9 @@ fn merge_compilation(
     }
     if overlay.external_timeout_enabled != default.external_timeout_enabled {
         base.external_timeout_enabled = overlay.external_timeout_enabled;
+    }
+    if overlay.allow_local_fallback != default.allow_local_fallback {
+        base.allow_local_fallback = overlay.allow_local_fallback;
     }
 }
 

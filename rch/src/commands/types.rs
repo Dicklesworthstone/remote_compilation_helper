@@ -251,6 +251,7 @@ pub struct ConfigCompilationSection {
     pub test_timeout_sec: u64,
     pub bun_timeout_sec: u64,
     pub external_timeout_enabled: bool,
+    pub allow_local_fallback: bool,
 }
 
 /// Transfer configuration section.

@@ -581,6 +581,148 @@ fn exit_with_local_fallback(
 }
 
 // ---------------------------------------------------------------------------
+// FIX 1: remote-failure fallback must prefer a bigger worker, not the local
+// orchestrator. On a worker-fault build failure `run_exec` retries on a
+// higher-capacity worker (ranked from daemon telemetry) before ever touching
+// local execution, and any terminal local fallback is gated by
+// `compilation.allow_local_fallback` so the orchestrator is not flooded.
+// ---------------------------------------------------------------------------
+
+/// Env override for the maximum number of remote workers to try for one build
+/// (the first attempt plus capacity-ranked retries). Clamped to at least 1.
+const RCH_MAX_REMOTE_ATTEMPTS_ENV: &str = "RCH_MAX_REMOTE_ATTEMPTS";
+/// Default cap on remote attempts per build (first worker + up to two retries).
+const DEFAULT_MAX_REMOTE_ATTEMPTS: u32 = 3;
+
+fn max_remote_attempts() -> u32 {
+    std::env::var(RCH_MAX_REMOTE_ATTEMPTS_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .map(|value| value.max(1))
+        .unwrap_or(DEFAULT_MAX_REMOTE_ATTEMPTS)
+}
+
+/// Terminal local-fallback for a remote FAILURE, gated so a failed remote build
+/// only runs on the local orchestrator when the operator permits it.
+///
+/// Fails closed (exit `EXIT_BUILD_ERROR`) when remote execution is required
+/// (`require_remote` / proof mode / `RCH_REQUIRE_REMOTE`) OR when
+/// `compilation.allow_local_fallback = false`. Otherwise runs the command
+/// locally exactly like [`exit_with_local_fallback`]. Emits the user-facing
+/// summary itself in every branch. Never returns.
+fn exit_with_gated_local_fallback(
+    command: &str,
+    reporter: &HookReporter,
+    reason: &str,
+    require_remote: bool,
+    allow_local_fallback: bool,
+) -> ! {
+    if require_remote {
+        // Canonical remote-required refusal (proof mode / RCH_REQUIRE_REMOTE).
+        exit_with_local_fallback(command, reporter, reason, true);
+    }
+    if !allow_local_fallback {
+        warn!(
+            "Local fallback disabled (compilation.allow_local_fallback=false); refusing to run '{}' on the orchestrator after remote failure: {reason}",
+            mask_sensitive_command(command)
+        );
+        reporter.summary(&format!(
+            "[RCH] refusing local fallback (compilation.allow_local_fallback=false; {reason})"
+        ));
+        std::process::exit(EXIT_BUILD_ERROR);
+    }
+    reporter.summary(&format!("[RCH] local ({reason})"));
+    exit_with_local_fallback(command, reporter, reason, false)
+}
+
+/// A remote build failed for a *worker-fault* reason (OOM/signal-kill, missing
+/// worker system dependency, missing toolchain, or a generic pipeline error):
+/// retry it on a different, higher-capacity worker before the terminal action.
+struct RetryableRemoteFault {
+    /// Human-readable reason for logs (why this worker failed).
+    log_reason: String,
+    /// The worker that just failed (already released).
+    failed_worker: WorkerId,
+    /// What to do once every eligible worker is exhausted.
+    on_exhaust: RemoteFaultExhaustAction,
+}
+
+/// Terminal action taken once capacity-aware retries are exhausted.
+enum RemoteFaultExhaustAction {
+    /// Surface the remote failure by exiting with this code. Used for OOM /
+    /// signal kills: a crate that OOMs every worker must NOT then be run on (and
+    /// likely OOM) the orchestrator, so this never falls back to local.
+    ExitWithCode { code: i32, summary: String },
+    /// Exit with a code after emitting worker-system-dependency remediation.
+    ExitWithEnvRemediation {
+        code: i32,
+        summary: String,
+        remediation: String,
+    },
+    /// Fall back to local, gated by `allow_local_fallback` / `require_remote`.
+    GatedLocalFallback { reason: String },
+}
+
+/// Fetch daemon status, rank the remaining workers by capacity, and re-query the
+/// daemon pinned to the biggest untried worker. Returns the fresh selection
+/// response plus the chosen worker id, or `None` when no bigger worker can serve.
+#[allow(clippy::too_many_arguments)]
+async fn try_retry_on_bigger_worker(
+    socket_path: &str,
+    project: &str,
+    estimated_cores: u32,
+    remote_command: &str,
+    toolchain: Option<&ToolchainInfo>,
+    required_runtime: RequiredRuntime,
+    command_priority: CommandPriority,
+    tried_workers: &[WorkerId],
+    worker_pin: &[WorkerId],
+    reporter: &HookReporter,
+) -> Option<(SelectionResponse, WorkerId)> {
+    let status = match crate::status_display::query_daemon_full_status().await {
+        Ok(status) => status,
+        Err(e) => {
+            reporter.verbose(&format!(
+                "[RCH] retry: could not fetch worker status ({e}); no bigger worker to try"
+            ));
+            return None;
+        }
+    };
+    let snapshots = build_capacity_snapshots(&status);
+    let chosen = pick_bigger_worker(snapshots.as_slice(), tried_workers, worker_pin)?;
+    let preferred = vec![chosen.clone()];
+    match query_daemon(
+        socket_path,
+        project,
+        estimated_cores,
+        remote_command,
+        toolchain,
+        required_runtime,
+        command_priority,
+        0,
+        Some(std::process::id()),
+        false, // do not block waiting on one specific worker during a retry
+        &preferred,
+    )
+    .await
+    {
+        Ok(response) if response.worker.is_some() => Some((response, chosen)),
+        Ok(_) => {
+            reporter.verbose(&format!(
+                "[RCH] retry: bigger worker {chosen} is not currently admissible; ending retries"
+            ));
+            None
+        }
+        Err(e) => {
+            reporter.verbose(&format!(
+                "[RCH] retry: re-query for {chosen} failed ({e}); ending retries"
+            ));
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Hook daemon-recovery: socket-failure classification, configured-vs-canonical
 // socket mismatch detection, and durable structured-incident emission
 // (bd-session-history-remediation-ocv9i.3.1).
@@ -1696,218 +1838,386 @@ pub async fn run_exec(
         }
     };
 
-    let requested_refusal = requested_worker_refusal_summary(&preferred_workers, &response);
+    // FIX 1: capacity-aware remote-failure fallback loop.
+    //
+    // A worker-fault failure (OOM/signal-kill, missing worker system dependency,
+    // missing toolchain, or a generic pipeline error) must NOT immediately revert
+    // the heavy compile to the local orchestrator (which floods the box that runs
+    // the whole fleet). Instead we retry on a different, higher-capacity worker
+    // ranked from daemon telemetry; local execution is a last resort gated by
+    // `compilation.allow_local_fallback`. Genuine build/test failures and
+    // SSH-timeout fail-closed cases stay terminal (retrying wastes fleet cycles).
+    let allow_local_fallback = config.compilation.allow_local_fallback;
+    let max_attempts = max_remote_attempts();
+    let mut tried_workers: Vec<WorkerId> = Vec::new();
+    // The worker set requested for the CURRENT `response`. Attempt 1 uses the
+    // operator's env pin (`RCH_WORKER(S)`); each retry pins the chosen bigger
+    // worker so the daemon reserves exactly it.
+    let mut current_query_preferred = preferred_workers.clone();
+    let mut attempt: u32 = 1;
+    let mut response = response;
 
-    // Check if a worker was assigned
-    let Some(worker) = response.worker else {
-        let reason = requested_refusal.unwrap_or_else(|| response.reason.to_string());
-        reporter.summary(&format!("[RCH] local ({reason})"));
-        exit_with_local_fallback(&command, &reporter, &reason, require_remote);
-    };
+    loop {
+        // Only the first iteration can observe an unassigned worker: a retry
+        // re-query replaces `response` solely when it carries a worker.
+        let Some(worker) = response.worker.clone() else {
+            let reason = requested_worker_refusal_summary(&preferred_workers, &response)
+                .unwrap_or_else(|| response.reason.to_string());
+            exit_with_gated_local_fallback(
+                &command,
+                &reporter,
+                &reason,
+                require_remote,
+                allow_local_fallback,
+            );
+        };
 
-    if !selected_worker_is_requested(&worker.id, &preferred_workers) {
-        let requested = preferred_workers
-            .iter()
-            .map(WorkerId::as_str)
-            .collect::<Vec<_>>()
-            .join(",");
-        let reason = format!(
-            "[RCH-I001] daemon selected unrequested worker '{}' for requested set [{}]; upgrade and restart rchd to the same version as rch, or request another worker",
-            worker.id, requested
+        if !selected_worker_is_requested(&worker.id, &current_query_preferred) {
+            let requested = current_query_preferred
+                .iter()
+                .map(WorkerId::as_str)
+                .collect::<Vec<_>>()
+                .join(",");
+            let reason = format!(
+                "[RCH-I001] daemon selected unrequested worker '{}' for requested set [{}]; upgrade and restart rchd to the same version as rch, or request another worker",
+                worker.id, requested
+            );
+
+            // A pre-fix daemon may already have reserved slots and opened an
+            // active-build record for the out-of-set worker. Release both before
+            // refusing so the client-side mixed-version guard cannot leak capacity.
+            let release_error = release_worker(
+                &config.general.socket_path,
+                &worker.id,
+                estimated_cores,
+                response.build_id,
+                Some(EXIT_BUILD_ERROR),
+                None,
+                None,
+                None,
+            )
+            .await
+            .err();
+            if let Some(error) = release_error.as_ref() {
+                warn!(
+                    "Failed to release unrequested worker {} after selection refusal: {}",
+                    worker.id, error
+                );
+            }
+            let reason = if let Some(error) = release_error {
+                format!(
+                    "{reason}; reservation release was not acknowledged ({error}); restart rchd and verify capacity before retrying"
+                )
+            } else {
+                reason
+            };
+            reporter.summary(&format!("[RCH] local ({reason})"));
+            exit_with_local_fallback(&command, &reporter, &reason, require_remote);
+        }
+
+        info!(
+            "Selected worker: {} at {}@{} ({} slots remaining after reservation, speed {:.1}){}",
+            worker.id,
+            worker.user,
+            worker.host,
+            worker.slots_available,
+            worker.speed_score,
+            if attempt > 1 {
+                format!(" [remote retry {attempt}/{max_attempts}]")
+            } else {
+                String::new()
+            }
         );
 
-        // A pre-fix daemon may already have reserved slots and opened an
-        // active-build record for the out-of-set worker. Release both before
-        // refusing so the client-side mixed-version guard cannot leak capacity.
-        let release_error = release_worker(
+        tried_workers.push(worker.id.clone());
+
+        // Execute remote compilation pipeline (topology_policy was built earlier
+        // from the loaded config so diagnostics reference configured roots).
+        let remote_start = Instant::now();
+        let result = execute_remote_compilation(
+            &worker,
+            &remote_command,
+            config.transfer.clone(),
+            config.environment.allowlist.clone(),
+            forwarded_cargo_target_dir.clone(),
+            &config.compilation,
+            toolchain.as_ref(),
+            classification.kind,
+            &reporter,
+            &config.general.socket_path,
+            config.output.color_mode,
+            response.build_id,
+            &topology_policy,
+            clean_overlay_spec.as_ref(),
+        )
+        .await;
+        let remote_elapsed = remote_start.elapsed();
+
+        // Release worker slots
+        let release_exit_code = result
+            .as_ref()
+            .map(|ok| ok.exit_code)
+            .unwrap_or(EXIT_BUILD_ERROR);
+        let release_timing = result.as_ref().ok().map(|ok| {
+            let mut timing = ok.timing.clone();
+            timing.total = Some(remote_elapsed);
+            timing
+        });
+        if let Err(e) = release_worker(
             &config.general.socket_path,
             &worker.id,
             estimated_cores,
             response.build_id,
-            Some(EXIT_BUILD_ERROR),
+            Some(release_exit_code),
             None,
             None,
-            None,
+            release_timing.as_ref(),
         )
         .await
-        .err();
-        if let Some(error) = release_error.as_ref() {
-            warn!(
-                "Failed to release unrequested worker {} after selection refusal: {}",
-                worker.id, error
-            );
+        {
+            warn!("Failed to release worker slots: {}", e);
         }
-        let reason = if let Some(error) = release_error {
-            format!(
-                "{reason}; reservation release was not acknowledged ({error}); restart rchd and verify capacity before retrying"
-            )
-        } else {
-            reason
-        };
-        reporter.summary(&format!("[RCH] local ({reason})"));
-        exit_with_local_fallback(&command, &reporter, &reason, require_remote);
-    }
 
-    info!(
-        "Selected worker: {} at {}@{} ({} slots remaining after reservation, speed {:.1})",
-        worker.id, worker.user, worker.host, worker.slots_available, worker.speed_score
-    );
-
-    // Execute remote compilation pipeline (topology_policy was built earlier
-    // from the loaded config so diagnostics reference configured roots).
-    let remote_start = Instant::now();
-    let result = execute_remote_compilation(
-        &worker,
-        &remote_command,
-        config.transfer.clone(),
-        config.environment.allowlist.clone(),
-        forwarded_cargo_target_dir,
-        &config.compilation,
-        toolchain.as_ref(),
-        classification.kind,
-        &reporter,
-        &config.general.socket_path,
-        config.output.color_mode,
-        response.build_id,
-        &topology_policy,
-        clean_overlay_spec.as_ref(),
-    )
-    .await;
-    let remote_elapsed = remote_start.elapsed();
-
-    // Release worker slots
-    let release_exit_code = result
-        .as_ref()
-        .map(|ok| ok.exit_code)
-        .unwrap_or(EXIT_BUILD_ERROR);
-    let release_timing = result.as_ref().ok().map(|ok| {
-        let mut timing = ok.timing.clone();
-        timing.total = Some(remote_elapsed);
-        timing
-    });
-    if let Err(e) = release_worker(
-        &config.general.socket_path,
-        &worker.id,
-        estimated_cores,
-        response.build_id,
-        Some(release_exit_code),
-        None,
-        None,
-        release_timing.as_ref(),
-    )
-    .await
-    {
-        warn!("Failed to release worker slots: {}", e);
-    }
-
-    // Handle result and exit with appropriate code
-    match result {
-        Ok(result) => {
-            if result.exit_code == 0 {
-                reporter.summary(&format!(
-                    "[RCH] remote {} ({})",
-                    worker.id,
-                    format_duration_ms(remote_elapsed)
-                ));
-                // Record successful build
-                let is_test = classification
-                    .kind
-                    .map(|kind| kind.is_test_command())
-                    .unwrap_or(false);
-                if let Err(e) =
-                    record_build(&config.general.socket_path, &worker.id, &project, is_test).await
+        // Classify the outcome. Terminal cases (success, real build/test failure,
+        // preflight/transfer-skip decisions, SSH-timeout fail-closed) exit here;
+        // worker-fault cases yield a `RetryableRemoteFault` handled below.
+        let fault: RetryableRemoteFault = match result {
+            Ok(result) => {
+                if result.exit_code == 0 {
+                    reporter.summary(&format!(
+                        "[RCH] remote {} ({})",
+                        worker.id,
+                        format_duration_ms(remote_elapsed)
+                    ));
+                    // Record successful build
+                    let is_test = classification
+                        .kind
+                        .map(|kind| kind.is_test_command())
+                        .unwrap_or(false);
+                    if let Err(e) =
+                        record_build(&config.general.socket_path, &worker.id, &project, is_test)
+                            .await
+                    {
+                        warn!("Failed to record build: {}", e);
+                    }
+                    std::process::exit(0);
+                } else if is_toolchain_failure(&result.stderr, result.exit_code) {
+                    // Worker missing the toolchain — another worker may have it.
+                    warn!(
+                        "Remote toolchain failure on {}; will retry on another worker if available",
+                        worker.id
+                    );
+                    RetryableRemoteFault {
+                        log_reason: "remote toolchain missing".to_string(),
+                        failed_worker: worker.id.clone(),
+                        on_exhaust: RemoteFaultExhaustAction::GatedLocalFallback {
+                            reason: format!("toolchain missing on {}", worker.id),
+                        },
+                    }
+                } else if let Some(env_failure) =
+                    detect_worker_system_dependency_failure(&result.stderr, result.exit_code)
                 {
-                    warn!("Failed to record build: {}", e);
+                    // Worker missing a system dependency — another worker may have it.
+                    let error = ErrorCode::BuildEnvError;
+                    warn!(
+                        "Remote worker build-environment failure on {} [{}]: {}; will retry on another worker if available",
+                        worker.id,
+                        error.code_string(),
+                        env_failure.log_detail()
+                    );
+                    RetryableRemoteFault {
+                        log_reason: format!(
+                            "worker build-environment failure ({})",
+                            env_failure.summary()
+                        ),
+                        failed_worker: worker.id.clone(),
+                        on_exhaust: RemoteFaultExhaustAction::ExitWithEnvRemediation {
+                            code: result.exit_code,
+                            summary: format!(
+                                "[RCH] remote {} failed [{}] {}",
+                                worker.id,
+                                error.code_string(),
+                                env_failure.summary()
+                            ),
+                            remediation: format!(
+                                "[RCH] remediation [{}]: {}",
+                                error.code_string(),
+                                env_failure.remediation()
+                            ),
+                        },
+                    }
+                } else if let Some(signal) = is_signal_killed(result.exit_code) {
+                    // Signal kill (137/SIGKILL == OOM, etc.): the small worker
+                    // could not hold the build. Retry on a BIGGER worker; if all
+                    // are exhausted surface the failure rather than OOM the
+                    // orchestrator by falling back to local.
+                    warn!(
+                        "Remote build killed by {} (exit {}) on {} — likely resource exhaustion; will retry on a bigger worker if available",
+                        signal_name(signal),
+                        result.exit_code,
+                        worker.id
+                    );
+                    RetryableRemoteFault {
+                        log_reason: format!(
+                            "killed by {} (exit {})",
+                            signal_name(signal),
+                            result.exit_code
+                        ),
+                        failed_worker: worker.id.clone(),
+                        on_exhaust: RemoteFaultExhaustAction::ExitWithCode {
+                            code: result.exit_code,
+                            summary: format!(
+                                "[RCH] remote {} killed ({})",
+                                worker.id,
+                                signal_name(signal)
+                            ),
+                        },
+                    }
+                } else {
+                    // Genuine build/test failure — the crate is broken and fails
+                    // identically on every worker, so do NOT retry or flood local.
+                    reporter.summary(&format!(
+                        "[RCH] remote {} failed (exit {})",
+                        worker.id, result.exit_code
+                    ));
+                    std::process::exit(result.exit_code);
                 }
-                std::process::exit(0);
-            } else if is_toolchain_failure(&result.stderr, result.exit_code) {
-                // Toolchain failure - fall back to local
-                warn!("Remote toolchain failure, falling back to local");
-                reporter.summary(&format!("[RCH] local (toolchain missing on {})", worker.id));
-                exit_with_local_fallback(
-                    &command,
-                    &reporter,
-                    "remote toolchain missing",
-                    require_remote,
-                );
-            } else if let Some(env_failure) =
-                detect_worker_system_dependency_failure(&result.stderr, result.exit_code)
-            {
-                let error = ErrorCode::BuildEnvError;
-                warn!(
-                    "Remote worker build-environment failure on {} [{}]: {}",
-                    worker.id,
-                    error.code_string(),
-                    env_failure.log_detail()
-                );
-                reporter.summary(&format!(
-                    "[RCH] remote {} failed [{}] {}",
-                    worker.id,
-                    error.code_string(),
-                    env_failure.summary()
-                ));
-                reporter.verbose(&format!(
-                    "[RCH] remediation [{}]: {}",
-                    error.code_string(),
-                    env_failure.remediation()
-                ));
-                std::process::exit(result.exit_code);
-            } else {
-                // Command failed remotely - exit with the same code
-                reporter.summary(&format!(
-                    "[RCH] remote {} failed (exit {})",
-                    worker.id, result.exit_code
-                ));
-                std::process::exit(result.exit_code);
             }
-        }
-        Err(e) => {
-            if let Some(preflight_err) = e.downcast_ref::<DependencyPreflightFailure>() {
-                let evidence_summary = preflight_err.evidence_summary();
-                warn!(
-                    "Dependency preflight blocked remote execution [{}]: {}; evidence='{}'",
-                    preflight_err.reason_code, preflight_err.remediation, evidence_summary
-                );
-                reporter.summary(&format!(
-                    "[RCH] local (dependency preflight {}: {}; evidence: {})",
-                    preflight_err.reason_code, preflight_err.remediation, evidence_summary
-                ));
-                reporter.verbose(&format!(
-                    "[RCH] dependency preflight report: {}",
-                    preflight_err.report_json()
-                ));
-                let fallback_reason = format!("dependency preflight failed: {evidence_summary}");
-                exit_with_local_fallback(&command, &reporter, &fallback_reason, require_remote);
-            }
+            Err(e) => {
+                if let Some(preflight_err) = e.downcast_ref::<DependencyPreflightFailure>() {
+                    // Project-specific: retrying a different worker cannot help.
+                    let evidence_summary = preflight_err.evidence_summary();
+                    warn!(
+                        "Dependency preflight blocked remote execution [{}]: {}; evidence='{}'",
+                        preflight_err.reason_code, preflight_err.remediation, evidence_summary
+                    );
+                    reporter.summary(&format!(
+                        "[RCH] local (dependency preflight {}: {}; evidence: {})",
+                        preflight_err.reason_code, preflight_err.remediation, evidence_summary
+                    ));
+                    reporter.verbose(&format!(
+                        "[RCH] dependency preflight report: {}",
+                        preflight_err.report_json()
+                    ));
+                    let fallback_reason =
+                        format!("dependency preflight failed: {evidence_summary}");
+                    exit_with_local_fallback(&command, &reporter, &fallback_reason, require_remote);
+                }
 
-            // Check for transfer skip (not a failure)
-            if let Some(skip_err) = e.downcast_ref::<TransferError>()
-                && let TransferError::TransferSkipped { reason } = skip_err
-            {
-                reporter.summary(&format!("[RCH] local ({})", reason));
-                exit_with_local_fallback(&command, &reporter, "transfer skipped", require_remote);
-            }
+                // Transfer skip (a "run locally instead" decision, not a failure).
+                if let Some(skip_err) = e.downcast_ref::<TransferError>()
+                    && let TransferError::TransferSkipped { reason } = skip_err
+                {
+                    reporter.summary(&format!("[RCH] local ({})", reason));
+                    exit_with_local_fallback(
+                        &command,
+                        &reporter,
+                        "transfer skipped",
+                        require_remote,
+                    );
+                }
 
-            if classify_remote_pipeline_failure(&e)
-                == RemotePipelineFailurePolicy::FailClosedNoLocalFallback
-            {
+                if classify_remote_pipeline_failure(&e)
+                    == RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+                {
+                    warn!(
+                        "Remote execution failed on {} with SSH timeout; refusing local fallback: {}",
+                        worker.id, e
+                    );
+                    reporter.summary(&remote_pipeline_failure_summary(&worker.id));
+                    std::process::exit(EXIT_BUILD_ERROR);
+                }
+
+                // Generic pipeline failure — retry on a different worker first.
                 warn!(
-                    "Remote execution failed on {} with SSH timeout; refusing local fallback: {}",
+                    "Remote execution failed on {}: {}; will retry on another worker if available",
                     worker.id, e
                 );
-                reporter.summary(&remote_pipeline_failure_summary(&worker.id));
-                std::process::exit(EXIT_BUILD_ERROR);
+                RetryableRemoteFault {
+                    log_reason: "remote execution failed".to_string(),
+                    failed_worker: worker.id.clone(),
+                    on_exhaust: RemoteFaultExhaustAction::GatedLocalFallback {
+                        reason: "remote execution failed".to_string(),
+                    },
+                }
             }
+        };
 
-            // Other errors - run locally
-            warn!("Remote execution failed: {}, running locally", e);
-            reporter.summary("[RCH] local (remote execution failed)");
-            exit_with_local_fallback(
-                &command,
+        // Worker-fault failure: try a bigger/different worker before going terminal.
+        if attempt < max_attempts {
+            if let Some((next_response, next_worker)) = try_retry_on_bigger_worker(
+                &config.general.socket_path,
+                &project,
+                estimated_cores,
+                &remote_command,
+                toolchain.as_ref(),
+                required_runtime,
+                command_priority,
+                &tried_workers,
+                &preferred_workers,
                 &reporter,
-                "remote execution failed",
-                require_remote,
-            );
+            )
+            .await
+            {
+                attempt += 1;
+                warn!(
+                    "Remote build {} on {}; retrying on higher-capacity worker {} (attempt {}/{})",
+                    fault.log_reason, fault.failed_worker, next_worker, attempt, max_attempts
+                );
+                reporter.summary(&format!(
+                    "[RCH] retry on bigger worker {} (attempt {}/{}) after {} on {}",
+                    next_worker, attempt, max_attempts, fault.log_reason, fault.failed_worker
+                ));
+                current_query_preferred = vec![next_worker];
+                response = next_response;
+                continue;
+            }
+        }
+
+        // Retries exhausted (or no bigger worker available): terminal action.
+        match fault.on_exhaust {
+            RemoteFaultExhaustAction::ExitWithCode { code, summary } => {
+                warn!(
+                    "Remote build failed and no higher-capacity worker was available after {} attempt(s); surfacing exit {}",
+                    tried_workers.len(),
+                    code
+                );
+                reporter.summary(&summary);
+                std::process::exit(code);
+            }
+            RemoteFaultExhaustAction::ExitWithEnvRemediation {
+                code,
+                summary,
+                remediation,
+            } => {
+                warn!(
+                    "Remote build failed (worker environment) and no other worker was available after {} attempt(s); surfacing exit {}",
+                    tried_workers.len(),
+                    code
+                );
+                reporter.summary(&summary);
+                reporter.verbose(&remediation);
+                std::process::exit(code);
+            }
+            RemoteFaultExhaustAction::GatedLocalFallback { reason } => {
+                warn!(
+                    "Remote build failed on all {} tried worker(s); {}",
+                    tried_workers.len(),
+                    if allow_local_fallback && !require_remote {
+                        "falling back to local"
+                    } else {
+                        "refusing local fallback"
+                    }
+                );
+                let reason = format!("{reason}; remote retries exhausted");
+                exit_with_gated_local_fallback(
+                    &command,
+                    &reporter,
+                    &reason,
+                    require_remote,
+                    allow_local_fallback,
+                );
+            }
         }
     }
 }
@@ -2067,6 +2377,13 @@ pub(crate) use command_parsing::{cargo_job_count_for_command, estimate_cores_for
 // the sibling transfer-orchestration (and cargo_target_dir) modules.
 mod formatting;
 use formatting::{estimate_local_time_ms, format_duration_ms};
+
+// Capacity-aware worker selection for the remote-failure fallback loop (FIX 1):
+// on a worker-fault build failure `run_exec` retries on a bigger / higher-RAM
+// worker rather than flooding the local orchestrator. The pure ranking lives in
+// this submodule so it is unit-testable without a live daemon.
+mod fallback_selection;
+use fallback_selection::{build_capacity_snapshots, pick_bigger_worker};
 
 fn is_test_kind(kind: Option<CompilationKind>) -> bool {
     matches!(

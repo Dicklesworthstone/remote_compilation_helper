@@ -89,6 +89,82 @@ fn normalize_config_exclude_pattern(pattern: &str) -> &str {
         .unwrap_or(pattern)
 }
 
+/// A *linked* git worktree records its git state indirection in a `.git` FILE
+/// (not a `.git` directory) whose sole meaningful line is
+/// `gitdir: <parent-repo>/.git/worktrees/<name>`.
+///
+/// That absolute path points back into the PARENT repository's `.git`, which
+/// does NOT exist on a remote worker after the rsync. Shipping the `.git` file
+/// verbatim therefore leaves a dangling pointer: any git/cargo step that tries
+/// to resolve the repository on the worker fails, and the hook fails open with
+/// `[RCH] local (remote execution failed)` — silently changing which machine/OS
+/// actually ran the build. See [`git_worktree_upload_exclude`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkedWorktreeGitPointer {
+    /// The `gitdir` target parsed from the `.git` file, verbatim as written
+    /// (normally an absolute path into the parent repo's `.git/worktrees/…`).
+    pub(crate) gitdir: String,
+}
+
+/// Parse the `gitdir:` pointer out of a linked-worktree `.git` file's contents.
+///
+/// Git writes exactly one `gitdir: <path>` line; we tolerate leading/trailing
+/// whitespace, blank lines, and CRLF. Returns `None` for a normal (non-pointer)
+/// `.git` file body.
+pub(crate) fn parse_worktree_gitdir_pointer(contents: &str) -> Option<LinkedWorktreeGitPointer> {
+    for line in contents.lines() {
+        if let Some(rest) = line.trim().strip_prefix("gitdir:") {
+            let gitdir = rest.trim();
+            if !gitdir.is_empty() {
+                return Some(LinkedWorktreeGitPointer {
+                    gitdir: gitdir.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Detect whether `project_root` is a *linked git worktree* — i.e. its `.git`
+/// entry is a regular FILE holding a `gitdir:` pointer, rather than a real
+/// `.git` directory (normal repo) or absent (no VCS).
+///
+/// Returns the parsed pointer when so, else `None`.
+pub(crate) fn detect_linked_worktree_git_pointer(
+    project_root: &Path,
+) -> Option<LinkedWorktreeGitPointer> {
+    let git_path = project_root.join(".git");
+    // `symlink_metadata` so a `.git` symlink is not transparently followed to a
+    // directory — we only treat a genuine regular file as a worktree pointer.
+    let metadata = std::fs::symlink_metadata(&git_path).ok()?;
+    if !metadata.file_type().is_file() {
+        // A real `.git/` directory (normal repo) or a symlink — leave the
+        // existing `.git/` directory exclusion to handle it.
+        return None;
+    }
+    let contents = std::fs::read_to_string(&git_path).ok()?;
+    parse_worktree_gitdir_pointer(&contents)
+}
+
+/// If `project_root` is a linked git worktree, return the anchored rsync exclude
+/// (`/.git`) that keeps its dangling `.git` FILE out of the upload, paired with
+/// the parsed pointer (for diagnostics).
+///
+/// The default upload excludes already drop the whole `.git/` *directory* for
+/// normal repos, and builds succeed on the worker with no git metadata at all.
+/// The `.git/` pattern (trailing slash) matches only directories, though, so a
+/// worktree's `.git` FILE would otherwise slip through and be synced as a
+/// dangling pointer. Excluding it yields exactly the same git-free remote source
+/// tree a normal repo already produces, so the build proceeds instead of failing
+/// open to local. The leading `/` anchors the rule to the transfer root so it
+/// only affects the project root's own `.git`, never a nested one.
+pub(crate) fn git_worktree_upload_exclude(
+    project_root: &Path,
+) -> Option<(String, LinkedWorktreeGitPointer)> {
+    detect_linked_worktree_git_pointer(project_root)
+        .map(|pointer| ("/.git".to_string(), pointer))
+}
+
 fn add_portable_rsync_archive_args(cmd: &mut Command) {
     // `-a` includes owner/group preservation. Across independently provisioned
     // workers those metadata IDs are not portable and can turn an otherwise
@@ -1048,6 +1124,27 @@ impl TransferPipeline {
         for pattern in REMOTE_RUNTIME_EXCLUDE_PATTERNS {
             if !excludes.iter().any(|existing| existing == pattern) {
                 excludes.push((*pattern).to_string());
+            }
+        }
+
+        // Linked git worktree: its `.git` is a FILE pointing back into the parent
+        // repo (`gitdir: …/.git/worktrees/<name>`). That path does not exist on
+        // the worker, so syncing the file verbatim leaves a dangling pointer that
+        // breaks remote git/cargo resolution and forces a fail-open to local. The
+        // `.git/` directory exclude above only matches directories, so the FILE
+        // slips through unless we exclude it explicitly. Normal repos already sync
+        // with NO `.git` at all and build fine, so this just gives the worktree the
+        // same git-free remote source tree.
+        if let Some((worktree_git_exclude, pointer)) =
+            git_worktree_upload_exclude(&self.project_root)
+        {
+            if !excludes.iter().any(|existing| *existing == worktree_git_exclude) {
+                info!(
+                    "Linked git worktree detected at {} (gitdir: {}); excluding dangling '.git' file from upload so the remote build resolves git-free like a normal repo",
+                    self.project_root.display(),
+                    pointer.gitdir
+                );
+                excludes.push(worktree_git_exclude);
             }
         }
 
@@ -5471,6 +5568,115 @@ node_modules/
         assert!(effective.contains(&".rch-target/".to_string()));
         assert!(effective.contains(&".rch-tmp/".to_string()));
         assert!(effective.contains(&".franken_whisper/tools/ffmpeg/".to_string()));
+    }
+
+    #[test]
+    fn test_parse_worktree_gitdir_pointer_valid() {
+        let _guard = test_guard!();
+        let pointer = parse_worktree_gitdir_pointer(
+            "gitdir: /data/projects/rch/.git/worktrees/feature-x\n",
+        )
+        .expect("linked worktree pointer");
+        assert_eq!(
+            pointer.gitdir,
+            "/data/projects/rch/.git/worktrees/feature-x"
+        );
+    }
+
+    #[test]
+    fn test_parse_worktree_gitdir_pointer_tolerates_whitespace_and_crlf() {
+        let _guard = test_guard!();
+        // Leading blank line, CRLF, and surrounding spaces must all be tolerated.
+        let pointer =
+            parse_worktree_gitdir_pointer("\r\n  gitdir:   ../super/.git/worktrees/wt \r\n")
+                .expect("linked worktree pointer");
+        assert_eq!(pointer.gitdir, "../super/.git/worktrees/wt");
+    }
+
+    #[test]
+    fn test_parse_worktree_gitdir_pointer_rejects_non_pointer() {
+        let _guard = test_guard!();
+        // A real `.git` dir never has file contents; a malformed / empty pointer
+        // must not be treated as a worktree.
+        assert!(parse_worktree_gitdir_pointer("").is_none());
+        assert!(parse_worktree_gitdir_pointer("gitdir:").is_none());
+        assert!(parse_worktree_gitdir_pointer("gitdir:   ").is_none());
+        assert!(parse_worktree_gitdir_pointer("ref: refs/heads/main").is_none());
+    }
+
+    #[test]
+    fn test_detect_linked_worktree_git_pointer_file_vs_dir_vs_absent() {
+        let _guard = test_guard!();
+
+        // 1) Linked worktree: `.git` is a FILE with a gitdir pointer -> detected.
+        let wt = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            wt.path().join(".git"),
+            "gitdir: /data/projects/rch/.git/worktrees/wt\n",
+        )
+        .expect("write .git file");
+        let detected =
+            detect_linked_worktree_git_pointer(wt.path()).expect("worktree should be detected");
+        assert_eq!(detected.gitdir, "/data/projects/rch/.git/worktrees/wt");
+
+        // 2) Normal repo: `.git` is a DIRECTORY -> not a linked worktree.
+        let normal = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(normal.path().join(".git")).expect("create .git dir");
+        assert!(detect_linked_worktree_git_pointer(normal.path()).is_none());
+
+        // 3) No VCS at all -> None.
+        let bare = tempfile::tempdir().expect("create temp dir");
+        assert!(detect_linked_worktree_git_pointer(bare.path()).is_none());
+    }
+
+    #[test]
+    fn test_get_effective_excludes_neutralizes_worktree_git_file() {
+        let _guard = test_guard!();
+        // A linked worktree's dangling `.git` FILE must be excluded from upload,
+        // in ADDITION to the normal `.git/` directory exclude.
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            temp_dir.path().join(".git"),
+            "gitdir: /data/projects/super/.git/worktrees/wt\n",
+        )
+        .expect("write worktree .git file");
+
+        let pipeline = TransferPipeline::new(
+            temp_dir.path().to_path_buf(),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        );
+
+        let effective = pipeline.get_effective_excludes();
+        assert!(
+            effective.contains(&"/.git".to_string()),
+            "worktree `.git` file must be excluded from upload; got {effective:?}"
+        );
+        // The directory-form exclude is still present for the normal case.
+        assert!(effective.contains(&".git/".to_string()));
+    }
+
+    #[test]
+    fn test_get_effective_excludes_no_worktree_exclude_for_normal_repo() {
+        let _guard = test_guard!();
+        // A normal repo (`.git` directory) must NOT get the `/.git` file exclude.
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp_dir.path().join(".git")).expect("create .git dir");
+
+        let pipeline = TransferPipeline::new(
+            temp_dir.path().to_path_buf(),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        );
+
+        let effective = pipeline.get_effective_excludes();
+        assert!(
+            !effective.contains(&"/.git".to_string()),
+            "normal repo must not get the worktree file exclude; got {effective:?}"
+        );
+        assert!(effective.contains(&".git/".to_string()));
     }
 
     #[test]
