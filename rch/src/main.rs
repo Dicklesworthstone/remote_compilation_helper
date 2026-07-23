@@ -536,6 +536,27 @@ compilation commands to remote workers."#)]
         action: AgentsAction,
     },
 
+    /// Install the canonical cargo shim so ALL agents offload (not just Claude Code)
+    #[command(after_help = r#"EXAMPLES:
+    rch shim install              # Install the cargo offload shim (fail-closed)
+    rch shim install --allow-local-fallback  # Offload but allow local under load
+    rch shim status               # Check install, version, PATH order, local builds
+    rch shim uninstall            # Remove the shim
+
+The Claude Code hook only covers Claude Code. Codex, plain shells, scripts, and
+CI invoke `cargo` directly with no hook to catch them, so their builds compile
+locally on this box. The shim sits on PATH ahead of ~/.cargo/bin and routes
+offloadable cargo subcommands through `rch exec`. It is loop-safe, fails open if
+rch is unavailable, and leaves rust-analyzer (`--message-format`) builds local.
+
+Install ONLY on dispatcher boxes (that offload OUT). NEVER on a worker box: a
+worker runs cargo via rch-wkr to execute offloaded builds, and the shim would
+re-offload/loop."#)]
+    Shim {
+        #[command(subcommand)]
+        action: ShimAction,
+    },
+
     /// Generate and install shell completion scripts
     #[command(after_help = r#"EXAMPLES:
     # Generate completions to stdout
@@ -1493,6 +1514,21 @@ impl HookAction {
 }
 
 #[derive(Subcommand)]
+enum ShimAction {
+    /// Install (or refresh) the canonical cargo shim
+    Install {
+        /// Offload but allow local fallback under load (default is fail-closed:
+        /// queue for a worker and never build locally).
+        #[arg(long)]
+        allow_local_fallback: bool,
+    },
+    /// Show shim install state, version, PATH order, and local builds
+    Status,
+    /// Remove the cargo shim
+    Uninstall,
+}
+
+#[derive(Subcommand)]
 enum AgentsAction {
     /// List detected AI coding agents
     List {
@@ -1965,6 +2001,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 command,
             } => hook::run_exec(base, clean_overlay, overlay_path, no_overlay, command).await,
             Commands::Hook { action } => handle_hook(action, &ctx).await,
+            Commands::Shim { action } => handle_shim(action, &ctx),
             Commands::Agents { action } => handle_agents(action, &ctx).await,
             Commands::Completions { action } => handle_completions(action, &ctx),
             Commands::Doctor {
@@ -3982,6 +4019,16 @@ async fn handle_hook(action: HookAction, ctx: &OutputContext) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn handle_shim(action: ShimAction, ctx: &OutputContext) -> Result<()> {
+    match action {
+        ShimAction::Install {
+            allow_local_fallback,
+        } => commands::shim_install(!allow_local_fallback, ctx),
+        ShimAction::Status => commands::shim_status(ctx),
+        ShimAction::Uninstall => commands::shim_uninstall(ctx),
+    }
 }
 
 async fn handle_agents(action: AgentsAction, ctx: &OutputContext) -> Result<()> {

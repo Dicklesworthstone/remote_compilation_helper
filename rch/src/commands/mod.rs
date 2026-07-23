@@ -17,6 +17,7 @@ mod helpers;
 mod hook;
 mod init;
 mod queue;
+mod shim;
 mod speedscore;
 mod status;
 mod sync;
@@ -33,6 +34,9 @@ pub use daemon::{
 
 // Re-export hook commands for backward compatibility
 pub use hook::{hook_install, hook_status, hook_test, hook_uninstall};
+
+// Re-export cargo-shim commands
+pub use shim::{shim_install, shim_status, shim_uninstall};
 
 // Re-export status/diagnostics commands for backward compatibility
 pub use status::{admit, check, diagnose, self_test, status_overview};
