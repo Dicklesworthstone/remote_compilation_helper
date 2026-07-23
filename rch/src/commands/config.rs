@@ -18,7 +18,7 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs";
+const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs";
 
 fn print_file_validation(
     label: &str,
@@ -130,6 +130,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 test_timeout_sec: config.compilation.test_timeout_sec,
                 bun_timeout_sec: config.compilation.bun_timeout_sec,
                 external_timeout_enabled: config.compilation.external_timeout_enabled,
+                allow_local_fallback: config.compilation.allow_local_fallback,
             },
             transfer: ConfigTransferSection {
                 compression_level: config.transfer.compression_level,
@@ -325,6 +326,15 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         format_with_source(
             "compilation.external_timeout_enabled",
             &style.value(&config.compilation.external_timeout_enabled.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("allow_local_fallback"),
+        format_with_source(
+            "compilation.allow_local_fallback",
+            &style.value(&config.compilation.allow_local_fallback.to_string()),
             &value_sources
         )
     );
@@ -701,6 +711,12 @@ pub(super) fn collect_value_sources(
         &mut values,
         "compilation.external_timeout_enabled",
         config.compilation.external_timeout_enabled.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "compilation.allow_local_fallback",
+        config.compilation.allow_local_fallback.to_string(),
         sources,
     );
     push_value_source(
@@ -1102,6 +1118,9 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
         "compilation.external_timeout_enabled" => {
             config.compilation.external_timeout_enabled = parse_bool(value, key)?;
         }
+        "compilation.allow_local_fallback" => {
+            config.compilation.allow_local_fallback = parse_bool(value, key)?;
+        }
         "transfer.compression_level" => {
             let level = parse_u32(value, key)?;
             if level > 19 {
@@ -1252,6 +1271,10 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
             config.compilation.external_timeout_enabled =
                 defaults.compilation.external_timeout_enabled;
             config.compilation.external_timeout_enabled.to_string()
+        }
+        "compilation.allow_local_fallback" => {
+            config.compilation.allow_local_fallback = defaults.compilation.allow_local_fallback;
+            config.compilation.allow_local_fallback.to_string()
         }
         "transfer.compression_level" => {
             config.transfer.compression_level = defaults.transfer.compression_level;
@@ -1430,6 +1453,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                         "test_timeout_sec": config.compilation.test_timeout_sec,
                         "bun_timeout_sec": config.compilation.bun_timeout_sec,
                         "external_timeout_enabled": config.compilation.external_timeout_enabled,
+                        "allow_local_fallback": config.compilation.allow_local_fallback,
                     },
                     "transfer": {
                         "compression_level": config.transfer.compression_level,
@@ -1952,6 +1976,12 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
         config.compilation.external_timeout_enabled,
         defaults.compilation.external_timeout_enabled,
         "compilation.external_timeout_enabled"
+    );
+    diff_field!(
+        "compilation.allow_local_fallback",
+        config.compilation.allow_local_fallback,
+        defaults.compilation.allow_local_fallback,
+        "compilation.allow_local_fallback"
     );
 
     // Transfer section

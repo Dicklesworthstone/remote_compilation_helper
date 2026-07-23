@@ -2037,6 +2037,20 @@ pub struct CompilationConfig {
     /// Default: true. Set to false to disable timeout wrapping entirely.
     #[serde(default = "default_external_timeout_enabled")]
     pub external_timeout_enabled: bool,
+    /// Whether a remote build FAILURE may fall back to LOCAL execution on the
+    /// orchestrator once every eligible remote worker has been exhausted.
+    ///
+    /// On a remote failure the hook first retries the build on a *different,
+    /// higher-capacity* worker (see `run_exec`'s worker-fallback loop). Local
+    /// execution runs the heavy compile on the orchestrator that coordinates the
+    /// whole fleet, so it is a genuine last resort and can flood that box. This
+    /// flag gates it. Default `true` preserves the historical fail-open behavior
+    /// (local only when no worker can serve); set to `false` on an orchestrator
+    /// to refuse local fallback and fail the build closed instead. `force_remote`
+    /// / proof mode / `RCH_REQUIRE_REMOTE` still override this by refusing local
+    /// unconditionally.
+    #[serde(default = "default_allow_local_fallback")]
+    pub allow_local_fallback: bool,
 }
 
 impl Default for CompilationConfig {
@@ -2052,6 +2066,7 @@ impl Default for CompilationConfig {
             test_timeout_sec: default_test_timeout(),
             bun_timeout_sec: default_bun_timeout(),
             external_timeout_enabled: default_external_timeout_enabled(),
+            allow_local_fallback: default_allow_local_fallback(),
         }
     }
 }
@@ -2089,6 +2104,13 @@ fn default_bun_timeout() -> u64 {
 
 /// Default: external timeout protection is enabled.
 fn default_external_timeout_enabled() -> bool {
+    true
+}
+
+/// Default: permit last-resort local fallback after remote workers are
+/// exhausted. Set `compilation.allow_local_fallback = false` to fail closed and
+/// keep heavy compiles off the orchestrator entirely.
+fn default_allow_local_fallback() -> bool {
     true
 }
 

@@ -456,6 +456,7 @@ mod tests {
                 test_timeout_sec: 1800,
                 bun_timeout_sec: 600,
                 external_timeout_enabled: true,
+                allow_local_fallback: true,
             },
             transfer: ConfigTransferSection {
                 compression_level: 6,
