@@ -263,11 +263,7 @@ mod tests {
             Some(WorkerId::new("healthy"))
         );
         assert_eq!(
-            pick_bigger_worker(
-                &snaps,
-                &[WorkerId::new("healthy")],
-                &[]
-            ),
+            pick_bigger_worker(&snaps, &[WorkerId::new("healthy")], &[]),
             Some(WorkerId::new("unknown"))
         );
     }

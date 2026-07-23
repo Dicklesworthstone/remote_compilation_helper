@@ -36,7 +36,7 @@ set -euo pipefail
 # Configuration
 # ============================================================================
 
-INSTALLER_VERSION="1.0.51"
+INSTALLER_VERSION="1.0.52"
 VERSION="${VERSION:-}"  # Set dynamically based on install mode
 REPO_URL="https://github.com/Dicklesworthstone/remote_compilation_helper"
 GITHUB_REPO="Dicklesworthstone/remote_compilation_helper"

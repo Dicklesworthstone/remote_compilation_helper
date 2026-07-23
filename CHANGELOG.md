@@ -8,9 +8,41 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ---
 
-## [Unreleased] (since v1.0.51)
+## [Unreleased] (since v1.0.52)
 
 No unreleased changes yet.
+
+---
+
+## [v1.0.52] -- 2026-07-23 (release)
+
+### Added
+
+- **`rch shim install|status|uninstall` — the canonical cargo offload wrapper.**
+  rch only auto-intercepts builds via the Claude Code PreToolUse hook, so Codex,
+  plain shells, scripts, and CI — which invoke `cargo` directly with no hook — were
+  compiling **locally** on orchestrator boxes, defeating the point of rch. rch already
+  honored a cargo-wrapper contract (it sets `RCH_CARGO_WRAPPER_BYPASS=1` on local
+  fallback) but never shipped the wrapper, so every box hand-rolled one or had none.
+  This ships the ONE canonical wrapper as a first-class command:
+  - harness-agnostic — every agent that runs `cargo` via `PATH` now offloads;
+  - loop-safe (honors `RCH_CARGO_WRAPPER_BYPASS`), fails open if `rch` is absent, and
+    leaves rust-analyzer (`--message-format`) builds local;
+  - offloads only `build|test|check|clippy|bench|doc|nextest`; everything else is local;
+  - installs to a dedicated `~/.rch/shims/` (not `~/.local/bin`, which acfs manages);
+  - `--allow-local-fallback` toggles fail-open; default is fail-closed (queue for a
+    worker, never build locally) — appropriate for a dispatcher box;
+  - `rch shim status` reports version drift, `PATH` order, and any local builds running.
+
+  Install **only** on dispatcher boxes (that offload OUT); never on a worker box (a
+  worker runs cargo via `rch-wkr` and the shim would re-offload/loop). Part of a larger
+  effort tracked as an epic (dispatcher `general.role`, a loud local-build alarm, and
+  install/watchdog durability to follow).
+
+### Fixed
+
+- Tidied two nightly-clippy findings (`collapsible_if`, `manual_contains`) in the
+  linked-git-worktree upload path so the tree is clean under `-D warnings`.
 
 ---
 

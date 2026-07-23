@@ -1305,11 +1305,7 @@ fn apply_layer(
     }
     if let Some(allow_local_fallback) = layer.compilation.allow_local_fallback {
         config.compilation.allow_local_fallback = allow_local_fallback;
-        set_source(
-            sources,
-            "compilation.allow_local_fallback",
-            source.clone(),
-        );
+        set_source(sources, "compilation.allow_local_fallback", source.clone());
     }
 
     if let Some(compression) = layer.transfer.compression_level {
