@@ -161,8 +161,7 @@ pub(crate) fn detect_linked_worktree_git_pointer(
 pub(crate) fn git_worktree_upload_exclude(
     project_root: &Path,
 ) -> Option<(String, LinkedWorktreeGitPointer)> {
-    detect_linked_worktree_git_pointer(project_root)
-        .map(|pointer| ("/.git".to_string(), pointer))
+    detect_linked_worktree_git_pointer(project_root).map(|pointer| ("/.git".to_string(), pointer))
 }
 
 fn add_portable_rsync_archive_args(cmd: &mut Command) {
@@ -1137,15 +1136,14 @@ impl TransferPipeline {
         // same git-free remote source tree.
         if let Some((worktree_git_exclude, pointer)) =
             git_worktree_upload_exclude(&self.project_root)
+            && !excludes.contains(&worktree_git_exclude)
         {
-            if !excludes.iter().any(|existing| *existing == worktree_git_exclude) {
-                info!(
-                    "Linked git worktree detected at {} (gitdir: {}); excluding dangling '.git' file from upload so the remote build resolves git-free like a normal repo",
-                    self.project_root.display(),
-                    pointer.gitdir
-                );
-                excludes.push(worktree_git_exclude);
-            }
+            info!(
+                "Linked git worktree detected at {} (gitdir: {}); excluding dangling '.git' file from upload so the remote build resolves git-free like a normal repo",
+                self.project_root.display(),
+                pointer.gitdir
+            );
+            excludes.push(worktree_git_exclude);
         }
 
         // Read and merge .rchignore if present
@@ -5573,10 +5571,9 @@ node_modules/
     #[test]
     fn test_parse_worktree_gitdir_pointer_valid() {
         let _guard = test_guard!();
-        let pointer = parse_worktree_gitdir_pointer(
-            "gitdir: /data/projects/rch/.git/worktrees/feature-x\n",
-        )
-        .expect("linked worktree pointer");
+        let pointer =
+            parse_worktree_gitdir_pointer("gitdir: /data/projects/rch/.git/worktrees/feature-x\n")
+                .expect("linked worktree pointer");
         assert_eq!(
             pointer.gitdir,
             "/data/projects/rch/.git/worktrees/feature-x"

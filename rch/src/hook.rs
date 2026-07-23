@@ -2144,8 +2144,8 @@ pub async fn run_exec(
         };
 
         // Worker-fault failure: try a bigger/different worker before going terminal.
-        if attempt < max_attempts {
-            if let Some((next_response, next_worker)) = try_retry_on_bigger_worker(
+        if attempt < max_attempts
+            && let Some((next_response, next_worker)) = try_retry_on_bigger_worker(
                 &config.general.socket_path,
                 &project,
                 estimated_cores,
@@ -2158,20 +2158,19 @@ pub async fn run_exec(
                 &reporter,
             )
             .await
-            {
-                attempt += 1;
-                warn!(
-                    "Remote build {} on {}; retrying on higher-capacity worker {} (attempt {}/{})",
-                    fault.log_reason, fault.failed_worker, next_worker, attempt, max_attempts
-                );
-                reporter.summary(&format!(
-                    "[RCH] retry on bigger worker {} (attempt {}/{}) after {} on {}",
-                    next_worker, attempt, max_attempts, fault.log_reason, fault.failed_worker
-                ));
-                current_query_preferred = vec![next_worker];
-                response = next_response;
-                continue;
-            }
+        {
+            attempt += 1;
+            warn!(
+                "Remote build {} on {}; retrying on higher-capacity worker {} (attempt {}/{})",
+                fault.log_reason, fault.failed_worker, next_worker, attempt, max_attempts
+            );
+            reporter.summary(&format!(
+                "[RCH] retry on bigger worker {} (attempt {}/{}) after {} on {}",
+                next_worker, attempt, max_attempts, fault.log_reason, fault.failed_worker
+            ));
+            current_query_preferred = vec![next_worker];
+            response = next_response;
+            continue;
         }
 
         // Retries exhausted (or no bigger worker available): terminal action.
