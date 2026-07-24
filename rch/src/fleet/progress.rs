@@ -164,7 +164,24 @@ impl FleetProgress {
     }
 
     /// Mark a worker as failed.
+    ///
+    /// The per-worker failure reason renders on an indicatif progress bar that is
+    /// `ProgressDrawTarget::hidden()` whenever stdout is not a terminal — so an
+    /// installer/CI/captured `rch fleet deploy` would otherwise see only the
+    /// aggregate `Failed: N` with no worker name or reason (rch#34). To keep a
+    /// by-design refusal (e.g. an OS/arch guard protecting a worker's good binary)
+    /// legible in ALL output modes, always emit a durable `tracing` event, and —
+    /// when the progress bar is hidden — also print a plain stderr line.
     pub async fn worker_failed(&self, worker_id: &str, error: &str) {
+        tracing::warn!(
+            target: "rch::fleet::deploy",
+            worker = %worker_id,
+            error = %error,
+            "fleet deploy: worker leg failed",
+        );
+        if !self.visible {
+            eprintln!("[RCH] fleet deploy: worker {worker_id} failed — {error}");
+        }
         let mut workers = self.workers.lock().await;
         if let Some(wp) = workers.get_mut(worker_id) {
             wp.phase = DeployPhase::Failed;

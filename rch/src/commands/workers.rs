@@ -1425,12 +1425,34 @@ pub async fn workers_compare(worker_ids: &[String], ctx: &OutputContext) -> Resu
     Ok(())
 }
 
+/// Confirm a destructive operator action, failing *legibly* when stdin is not a
+/// terminal.
+///
+/// `dialoguer::Confirm::interact()` surfaces a bare `IO error: not a terminal`
+/// when the command runs from an agent, CI job, or script — a cryptic failure for
+/// an operation whose entire remedy is one flag, and exactly the kind of
+/// illegible refusal that forces callers into folklore (same contract as the
+/// fail-closed exec refusals in rch#31/#35). Detect the non-interactive case up
+/// front and name the flag that fixes it.
+fn confirm_or_explain_non_interactive(prompt: &str) -> Result<bool> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "'{prompt}' needs an interactive confirmation but stdin is not a terminal; \
+             re-run with -y/--yes to confirm non-interactively (or --json for machine output)"
+        );
+    }
+    Ok(dialoguer::Confirm::new()
+        .with_prompt(prompt)
+        .default(false)
+        .interact()?)
+}
+
 /// Drain a worker (requires daemon).
 ///
 /// If `skip_confirm` is false, prompts for confirmation before draining.
 pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputContext) -> Result<()> {
-    use dialoguer::Confirm;
-
     let style = ctx.theme();
 
     // Check if daemon is running
@@ -1466,10 +1488,7 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
             "  {} Active builds will be allowed to complete.",
             StatusIndicator::Info.display(style)
         );
-        let confirmed = Confirm::new()
-            .with_prompt("Drain this worker?")
-            .default(false)
-            .interact()?;
+        let confirmed = confirm_or_explain_non_interactive("Drain this worker?")?;
         if !confirmed {
             println!("{} Aborted.", StatusIndicator::Info.display(style));
             return Ok(());
@@ -1640,8 +1659,6 @@ pub async fn workers_disable(
     skip_confirm: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    use dialoguer::Confirm;
-
     let style = ctx.theme();
 
     let socket_path_str = configured_socket_path()?;
@@ -1679,10 +1696,7 @@ pub async fn workers_disable(
                 StatusIndicator::Info.display(style)
             );
         }
-        let confirmed = Confirm::new()
-            .with_prompt("Disable this worker?")
-            .default(false)
-            .interact()?;
+        let confirmed = confirm_or_explain_non_interactive("Disable this worker?")?;
         if !confirmed {
             println!("{} Aborted.", StatusIndicator::Info.display(style));
             return Ok(());

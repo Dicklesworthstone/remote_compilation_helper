@@ -458,6 +458,12 @@ pub struct RequestedWorkerFacts {
     pub has_total_capacity: bool,
     /// Worker has enough free slots for the request.
     pub has_free_slots: bool,
+    /// Estimated core count for the request (the `-j` lever the reader can lower).
+    /// Retained so a capacity refusal can name the concrete numbers that collided
+    /// and the exact `-j` value that would fit (rch#35).
+    pub estimated_cores: u32,
+    /// The worker's total configured slots (its hard capacity ceiling).
+    pub total_slots: u32,
     /// Stable incident class for a remaining selector denial, if any.
     pub admission_denial_code: Option<IncidentReasonCode>,
     /// Human-readable selector reason for a remaining admission denial.
@@ -480,6 +486,8 @@ impl RequestedWorkerFacts {
             project_excluded: false,
             has_total_capacity: true,
             has_free_slots: true,
+            estimated_cores: 0,
+            total_slots: 0,
             admission_denial_code: None,
             admission_denial_reason: None,
         }
@@ -540,6 +548,8 @@ impl RequestedWorkerFacts {
             project_excluded: worker.active_project_excluded,
             has_total_capacity: worker.total_slots >= worker.estimated_cores,
             has_free_slots: worker.available_slots >= worker.estimated_cores,
+            estimated_cores: worker.estimated_cores,
+            total_slots: worker.total_slots,
             admission_denial_code,
             admission_denial_reason: admission_denial_code.map(|_| worker.final_reason.clone()),
         }
@@ -673,12 +683,26 @@ pub fn evaluate_requested_worker(facts: &RequestedWorkerFacts) -> RequestedWorke
         );
     }
     if !facts.has_total_capacity {
+        // Name the two counts that collided and the exact `-j` value that fits, so
+        // the reader is not left guessing that `-j` is the lever — the common
+        // trigger is an unbounded `cargo build`/`run` that inherited the configured
+        // `build_slots` default against a deliberately small pinned worker (rch#35).
+        let next_action = if facts.total_slots > 0 && facts.estimated_cores > 0 {
+            format!(
+                "'{id}' has {total} total slot(s) but the request is estimated at {cores} core(s); \
+                 pass -j {total} (or fewer), or request a larger worker",
+                total = facts.total_slots,
+                cores = facts.estimated_cores,
+            )
+        } else {
+            format!(
+                "'{id}' cannot fit the requested core count; lower the request (-j) or request a larger worker"
+            )
+        };
         return RequestedWorkerOutcome::refused(
             RequestedWorkerStatus::NoFreeSlots,
             IncidentReasonCode::InsufficientSlots,
-            format!(
-                "'{id}' cannot fit the requested core count; lower the request or request a larger worker"
-            ),
+            next_action,
         );
     }
     if !facts.has_free_slots {
@@ -1339,7 +1363,20 @@ mod tests {
             Some(IncidentReasonCode::InsufficientSlots.code())
         );
         let next_action = out.next_action.expect("capacity refusal needs an action");
-        assert!(next_action.contains("lower the request"));
+        // Names the concrete counts and the -j lever (rch#35), not just a vague
+        // "lower the request", and still carries no queue advice.
+        assert!(
+            next_action.contains("1 total slot"),
+            "should name total slots: {next_action}"
+        );
+        assert!(
+            next_action.contains("2 core"),
+            "should name estimated cores: {next_action}"
+        );
+        assert!(
+            next_action.contains("-j 1"),
+            "should name the exact -j value that fits: {next_action}"
+        );
         assert!(!next_action.contains("RCH_QUEUE_WHEN_BUSY"));
     }
 

@@ -3,7 +3,7 @@ use super::*;
 // keep them `pub(super)`; they are test-only so they are imported here rather
 // than re-exported into the non-test hook namespace).
 use super::artifact_patterns::{
-    get_artifact_patterns, get_custom_target_artifact_patterns,
+    get_artifact_patterns, get_custom_target_artifact_patterns, get_project_artifact_patterns,
     kind_produces_transferable_artifacts,
 };
 use super::cargo_target_dir::{
@@ -1456,6 +1456,38 @@ fn test_parse_preferred_workers_dedupes_ordered_values() {
     let workers = dedupe_worker_ids(parse_preferred_workers(" ts2, vmi1,,ts2 , vmi2 "));
     let ids: Vec<&str> = workers.iter().map(|worker| worker.as_str()).collect();
     assert_eq!(ids, vec!["ts2", "vmi1", "vmi2"]);
+}
+
+#[test]
+fn test_remote_required_refusal_retryable_classification() {
+    let _guard = test_guard!();
+    // rch#31: transient capacity/daemon refusals are retryable (distinct exit
+    // code 103); permanent per-invocation refusals stay EXIT_BUILD_ERROR.
+    for retryable in [
+        "daemon unavailable",
+        "no worker assigned",
+        "transfer skipped",
+        "remote execution failed",
+    ] {
+        assert!(
+            remote_required_refusal_is_retryable(retryable),
+            "{retryable} should be retryable"
+        );
+        assert!(
+            remote_required_refusal_summary(retryable).contains("retryable"),
+            "{retryable} summary should carry the typed retryable marker"
+        );
+    }
+    for permanent in ["non-compilation command", "config unavailable"] {
+        assert!(
+            !remote_required_refusal_is_retryable(permanent),
+            "{permanent} should NOT be retryable"
+        );
+        assert!(
+            !remote_required_refusal_summary(permanent).contains("retryable"),
+            "{permanent} summary must not claim retryable"
+        );
+    }
 }
 
 #[test]
@@ -5296,6 +5328,49 @@ edition = "2024"
 }
 
 #[test]
+fn test_build_sync_closure_plan_collapses_intra_workspace_members() {
+    let _guard = test_guard!();
+    // rch#33: building AT a workspace root, its members arrive as separate sync
+    // roots physically inside the primary Full root. They are already covered by
+    // the primary sync, so their redundant per-member Full entries must collapse
+    // to a single planned root (restoring #8, without regressing the foreign-
+    // workspace metadata path exercised by the sibling test above).
+    let (temp_dir, policy) = topology_tempdir();
+    let workspace_root = temp_dir.path().join("workspace");
+    let alpha = workspace_root.join("crates/alpha");
+    let beta = workspace_root.join("crates/beta");
+    let gamma = workspace_root.join("crates/gamma");
+    for dir in [&alpha, &beta, &gamma] {
+        std::fs::create_dir_all(dir).expect("create member dir");
+    }
+
+    let plan = build_sync_closure_plan(
+        &[
+            workspace_root.clone(),
+            alpha.clone(),
+            beta.clone(),
+            gamma.clone(),
+        ],
+        &workspace_root,
+        "ws_hash",
+        &policy,
+    );
+
+    assert_eq!(
+        plan.len(),
+        1,
+        "intra-workspace members must collapse to the single workspace root, got {:?}",
+        plan.iter()
+            .map(|e| e.local_root.clone())
+            .collect::<Vec<_>>()
+    );
+    let primary = &plan[0];
+    assert!(primary.is_primary, "the sole root must be the primary");
+    assert_eq!(primary.local_root, workspace_root);
+    assert_eq!(primary.mode, SyncClosureMode::Full);
+}
+
+#[test]
 fn test_build_dependency_runtime_plan_keeps_workspace_member_roots() {
     let _guard = test_guard!();
     let (temp_dir, policy) = topology_tempdir();
@@ -6141,6 +6216,61 @@ fn test_custom_target_artifact_patterns_for_diagnostic_commands_are_skipped() {
     assert!(
         get_custom_target_artifact_patterns(Some(CompilationKind::CargoClippy)).is_empty(),
         "cargo clippy output is streamed; do not sync a custom target dir"
+    );
+}
+
+#[test]
+fn test_project_artifact_patterns_drop_target_prefixed_globs_under_custom_target_sync() {
+    let _guard = test_guard!();
+
+    // rch#30: with a forwarded CARGO_TARGET_DIR, the project-root phase must not
+    // carry any `target/`-prefixed patterns — those belong exclusively to the
+    // custom-target phase. For cargo build/doc/rustc (all-`target/` globs) the
+    // filtered list is empty, so the project-root retrieval is skipped entirely.
+    for kind in [
+        CompilationKind::CargoBuild,
+        CompilationKind::CargoDoc,
+        CompilationKind::Rustc,
+        CompilationKind::CargoZigbuild,
+    ] {
+        let with_custom = get_project_artifact_patterns(Some(kind), true);
+        assert!(
+            with_custom.is_empty(),
+            "{kind:?}: all project-root patterns are target/-prefixed and must drop under a custom target sync, got {with_custom:?}"
+        );
+        // Without a custom target dir the behavior is unchanged (full patterns).
+        assert_eq!(
+            get_project_artifact_patterns(Some(kind), false),
+            get_artifact_patterns(Some(kind)),
+            "{kind:?}: project-root patterns must be unchanged without a custom target sync"
+        );
+    }
+}
+
+#[test]
+fn test_project_artifact_patterns_keep_non_target_reports_under_custom_target_sync() {
+    let _guard = test_guard!();
+
+    // rch#30: non-`target/` project-root artifacts (tarpaulin/junit/cobertura,
+    // C/C++ outputs, bun coverage) still land at the project root regardless of
+    // CARGO_TARGET_DIR, so they must survive the custom-target-sync filter.
+    let test_patterns = get_project_artifact_patterns(Some(CompilationKind::CargoTest), true);
+    assert!(
+        test_patterns.iter().all(|p| !p.starts_with("target/")),
+        "no target/-prefixed patterns should remain: {test_patterns:?}"
+    );
+    for expected in ["tarpaulin-report.html", "cobertura.xml", "junit.xml"] {
+        assert!(
+            test_patterns.iter().any(|p| p == expected),
+            "expected non-target report {expected} to be retained: {test_patterns:?}"
+        );
+    }
+
+    // C/C++ builds have no target/ patterns at all, so nothing is filtered.
+    assert_eq!(
+        get_project_artifact_patterns(Some(CompilationKind::Gcc), true),
+        get_artifact_patterns(Some(CompilationKind::Gcc)),
+        "C/C++ project-root outputs are unaffected by a custom cargo target dir"
     );
 }
 

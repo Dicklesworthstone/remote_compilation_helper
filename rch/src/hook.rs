@@ -120,6 +120,15 @@ const EXIT_SIGNAL_BASE: i32 = 128;
 /// Pairs with the `RCH-E309 BuildArtifactMissing` diagnostic on stderr.
 const EXIT_ARTIFACT_TRANSFER_FAILED: i32 = 102;
 
+/// Exit code for a fail-closed refusal that is *retryable* — the build did not run
+/// because no worker could be assigned right now (all slots busy) or the daemon was
+/// momentarily unavailable, NOT because the toolchain crashed or the build failed.
+/// A distinct code lets wrapper scripts and agents back off and retry instead of
+/// treating a transient refusal as a real failure (rch#31). Refusals that are
+/// *permanent* for the current invocation (a non-compilation command, unreadable
+/// config) keep [`EXIT_BUILD_ERROR`].
+const EXIT_REMOTE_REQUIRED_REFUSED: i32 = 103;
+
 const RCH_CARGO_WRAPPER_BYPASS_ENV: &str = "RCH_CARGO_WRAPPER_BYPASS";
 const RCH_REQUIRE_REMOTE_ENV: &str = "RCH_REQUIRE_REMOTE";
 const RCH_WORKER_ENV: &str = "RCH_WORKER";
@@ -459,10 +468,18 @@ fn requested_worker_outcome(
     ))
 }
 
-fn requested_worker_refusal_summary(
+/// A structured requested-worker refusal: the human summary line plus the stable
+/// incident reason code, so both the stream summary (#31) and the durable
+/// incident ledger (#35) draw from one selection decision.
+struct RequestedWorkerRefusal {
+    summary: String,
+    reason_code: IncidentReasonCode,
+}
+
+fn requested_worker_refusal(
     requested_workers: &[WorkerId],
     response: &SelectionResponse,
-) -> Option<String> {
+) -> Option<RequestedWorkerRefusal> {
     if requested_workers.is_empty() || response.worker.is_some() {
         return None;
     }
@@ -499,22 +516,80 @@ fn requested_worker_refusal_summary(
         .collect::<Vec<_>>()
         .join(",");
 
-    if let Some((_, outcome)) = selected {
+    let (code, summary) = if let Some((_, outcome)) = selected {
         let code = outcome.reason_code.as_deref().unwrap_or("RCH-I001");
         let next_action = outcome
             .next_action
             .as_deref()
             .unwrap_or("run `rch diagnose -- <command>` and request an admissible worker");
-        Some(format!(
-            "[{code}] requested worker set [{requested}] refused ({}); {next_action}",
-            outcome.status.as_str()
-        ))
+        (
+            code.to_string(),
+            format!(
+                "[{code}] requested worker set [{requested}] refused ({}); {next_action}",
+                outcome.status.as_str()
+            ),
+        )
     } else {
-        Some(format!(
-            "[RCH-I001] requested worker set [{requested}] refused ({}); run `rch diagnose -- <command>` and request an admissible worker",
-            response.reason
-        ))
-    }
+        (
+            "RCH-I001".to_string(),
+            format!(
+                "[RCH-I001] requested worker set [{requested}] refused ({}); run `rch diagnose -- <command>` and request an admissible worker",
+                response.reason
+            ),
+        )
+    };
+    let reason_code =
+        IncidentReasonCode::from_code_str(&code).unwrap_or(IncidentReasonCode::NoAdmissibleWorkers);
+    Some(RequestedWorkerRefusal {
+        summary,
+        reason_code,
+    })
+}
+
+/// Test-only projection of [`requested_worker_refusal`] onto just its summary
+/// line, keeping the stable-and-actionable summary contract under test while
+/// production code consumes the full structured refusal (summary + reason code).
+#[cfg(test)]
+fn requested_worker_refusal_summary(
+    requested_workers: &[WorkerId],
+    response: &SelectionResponse,
+) -> Option<String> {
+    requested_worker_refusal(requested_workers, response).map(|refusal| refusal.summary)
+}
+
+/// Build a durable incident row for a requested-worker refusal (RCH-I0nn), so the
+/// "your pin could not be honored" failure the allow-set fix exists for leaves a
+/// postmortem trace even when the summary line is suppressed at stock visibility
+/// (rch#35). Mirrors the shape of the socket-failure incidents already recorded.
+fn build_requested_worker_refusal_incident(
+    reason_code: IncidentReasonCode,
+    requested_workers: &[WorkerId],
+    project: &str,
+    command_fingerprint: &str,
+    strict_remote: bool,
+    now_ms: u64,
+) -> IncidentEvent {
+    let requested = requested_workers
+        .iter()
+        .map(WorkerId::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    IncidentEvent::new(
+        IncidentEventType::Selection,
+        reason_code,
+        IncidentSource::Hook,
+        project,
+        command_fingerprint,
+        SelectedMode::Local,
+        !strict_remote,
+        now_ms,
+    )
+    .with_detail("requested_worker_set", requested)
+    .with_detail("refusal", "requested_worker")
+    .with_control(ControlState {
+        strict_remote_policy: strict_remote,
+        ..ControlState::default()
+    })
 }
 
 fn selected_worker_is_requested(worker: &WorkerId, requested_workers: &[WorkerId]) -> bool {
@@ -546,12 +621,25 @@ fn local_fallback_command_for_policy(
     }
 }
 
+/// Whether a fail-closed refusal for `reason` is retryable (transient capacity /
+/// daemon unavailability) versus permanent for this invocation (a non-compilation
+/// command, unreadable config). Retryable refusals get [`EXIT_REMOTE_REQUIRED_REFUSED`]
+/// so wrappers can back off; permanent ones keep [`EXIT_BUILD_ERROR`] (rch#31).
+fn remote_required_refusal_is_retryable(reason: &str) -> bool {
+    !matches!(reason, "non-compilation command" | "config unavailable")
+}
+
 fn remote_required_refusal_summary(reason: &str) -> String {
     if reason == "non-compilation command" {
         format!(
             "[RCH] remote required; refusing local fallback [{}] ({reason})",
             ErrorCode::BuildUnknownCommand.code_string()
         )
+    } else if remote_required_refusal_is_retryable(reason) {
+        // Typed, retryable marker so agents react to a signal instead of encoding
+        // folklore ("empty rc=1 means slot busy") — the message is now always
+        // emitted (summary_critical) and the exit code is distinct.
+        format!("[RCH] remote required; refusing local fallback ({reason}) — retryable")
     } else {
         format!("[RCH] remote required; refusing local fallback ({reason})")
     }
@@ -566,7 +654,14 @@ fn exit_with_local_fallback(
     let mut child = match local_fallback_command_for_policy(command, require_remote) {
         Ok(child) => child,
         Err(LocalFallbackRefusal::RemoteRequired) => {
-            reporter.summary(&remote_required_refusal_summary(reason));
+            // The one line explaining a non-zero exit MUST reach the agent even at
+            // stock `output.visibility = "none"` — otherwise a fail-closed refusal
+            // is an indistinguishable empty rc=1 (rch#31). Route it through the
+            // always-on stderr channel, and give retryable refusals a distinct code.
+            reporter.summary_critical(&remote_required_refusal_summary(reason));
+            if remote_required_refusal_is_retryable(reason) {
+                std::process::exit(EXIT_REMOTE_REQUIRED_REFUSED);
+            }
             std::process::exit(EXIT_BUILD_ERROR);
         }
     };
@@ -626,7 +721,9 @@ fn exit_with_gated_local_fallback(
             "Local fallback disabled (compilation.allow_local_fallback=false); refusing to run '{}' on the orchestrator after remote failure: {reason}",
             mask_sensitive_command(command)
         );
-        reporter.summary(&format!(
+        // Fail-closed refusal: the line explaining the non-zero exit must reach the
+        // agent even at stock visibility (rch#31).
+        reporter.summary_critical(&format!(
             "[RCH] refusing local fallback (compilation.allow_local_fallback=false; {reason})"
         ));
         std::process::exit(EXIT_BUILD_ERROR);
@@ -1861,7 +1958,22 @@ pub async fn run_exec(
         // Only the first iteration can observe an unassigned worker: a retry
         // re-query replaces `response` solely when it carries a worker.
         let Some(worker) = response.worker.clone() else {
-            let reason = requested_worker_refusal_summary(&preferred_workers, &response)
+            let requested_refusal = requested_worker_refusal(&preferred_workers, &response);
+            // A pin that could not be honored is the exact failure the allow-set fix
+            // exists for; record a durable incident row so postmortems have a trace
+            // even when the summary line is suppressed at stock visibility (rch#35).
+            if let Some(refusal) = requested_refusal.as_ref() {
+                record_hook_incident(&build_requested_worker_refusal_incident(
+                    refusal.reason_code,
+                    &preferred_workers,
+                    &project,
+                    &redact_secrets(&command),
+                    require_remote,
+                    now_unix_ms(),
+                ));
+            }
+            let reason = requested_refusal
+                .map(|refusal| refusal.summary)
                 .unwrap_or_else(|| response.reason.to_string());
             exit_with_gated_local_fallback(
                 &command,
@@ -2124,7 +2236,9 @@ pub async fn run_exec(
                         "Remote execution failed on {} with SSH timeout; refusing local fallback: {}",
                         worker.id, e
                     );
-                    reporter.summary(&remote_pipeline_failure_summary(&worker.id));
+                    // Fail-closed refusal: the line explaining the non-zero exit must
+                    // reach the agent even at stock visibility (rch#31).
+                    reporter.summary_critical(&remote_pipeline_failure_summary(&worker.id));
                     std::process::exit(EXIT_BUILD_ERROR);
                 }
 
@@ -2181,7 +2295,9 @@ pub async fn run_exec(
                     tried_workers.len(),
                     code
                 );
-                reporter.summary(&summary);
+                // Terminal non-zero exit: the line explaining it must reach the
+                // agent even at stock visibility (rch#31).
+                reporter.summary_critical(&summary);
                 std::process::exit(code);
             }
             RemoteFaultExhaustAction::ExitWithEnvRemediation {
@@ -2194,7 +2310,9 @@ pub async fn run_exec(
                     tried_workers.len(),
                     code
                 );
-                reporter.summary(&summary);
+                // Terminal non-zero exit: the line explaining it must reach the
+                // agent even at stock visibility (rch#31).
+                reporter.summary_critical(&summary);
                 reporter.verbose(&remediation);
                 std::process::exit(code);
             }
@@ -2235,6 +2353,16 @@ impl HookReporter {
         if self.visibility != OutputVisibility::None {
             eprintln!("{}", message);
         }
+    }
+
+    /// Emit a message that MUST reach the operator/agent regardless of the
+    /// configured output visibility. Reserved for the one line explaining a
+    /// non-zero exit — a fail-closed refusal or a hard error — which visibility
+    /// settings (progress/celebration chrome) must never suppress. Same
+    /// always-on-stderr contract as the RCH-E309 artifact-transfer diagnostic
+    /// (rch#31).
+    fn summary_critical(&self, message: &str) {
+        eprintln!("{}", message);
     }
 
     fn verbose(&self, message: &str) {
@@ -2841,7 +2969,7 @@ async fn handle_selection_response(
                     "Remote execution pipeline failed on {} with SSH timeout; refusing local fallback: {}",
                     worker.id, e
                 );
-                reporter.summary(&remote_pipeline_failure_summary(&worker.id));
+                reporter.summary_critical(&remote_pipeline_failure_summary(&worker.id));
                 return HookOutput::allow_with_modified_command(format!(
                     "exit {}",
                     EXIT_BUILD_ERROR

@@ -22,7 +22,7 @@
 //! are private to this module.
 
 use super::artifact_patterns::{
-    get_artifact_patterns, get_custom_target_artifact_patterns,
+    get_custom_target_artifact_patterns, get_project_artifact_patterns,
     kind_produces_transferable_artifacts,
 };
 use super::cargo_target_dir::{
@@ -777,107 +777,118 @@ pub(super) async fn execute_remote_compilation(
             );
             loop_ref.flush().await;
         }
-        info!("Retrieving build artifacts...");
-        reporter.verbose("[RCH] artifacts: retrieving...");
-        let artifact_patterns = get_artifact_patterns(kind);
-        let heartbeat_state_download = heartbeat_loop
-            .as_ref()
-            .map(BuildHeartbeatLoop::shared_state);
-        let mut download_progress = if progress_enabled {
-            Some(TransferProgress::download(
-                output_ctx,
-                "Retrieving artifacts",
-                reporter.visibility == OutputVisibility::None,
-            ))
-        } else {
-            None
-        };
+        // Project-root artifact retrieval. When a custom CARGO_TARGET_DIR is
+        // forwarded, the build's `target/` outputs are retrieved exclusively by
+        // the custom-target phase below; the project-root phase must not carry
+        // `target/`-prefixed patterns, or it re-materializes stale worker-side
+        // `<project>/target/` residue onto the local project-root filesystem the
+        // custom target dir exists to protect, and a failed stale-residue pull
+        // spuriously fails an otherwise-complete build (rch#30). For cargo
+        // build/doc/rustc the filtered list is empty, so the phase is skipped.
+        let artifact_patterns =
+            get_project_artifact_patterns(kind, forwarded_cargo_target_dir.is_some());
+        if !artifact_patterns.is_empty() {
+            info!("Retrieving build artifacts...");
+            reporter.verbose("[RCH] artifacts: retrieving...");
+            let heartbeat_state_download = heartbeat_loop
+                .as_ref()
+                .map(BuildHeartbeatLoop::shared_state);
+            let mut download_progress = if progress_enabled {
+                Some(TransferProgress::download(
+                    output_ctx,
+                    "Retrieving artifacts",
+                    reporter.visibility == OutputVisibility::None,
+                ))
+            } else {
+                None
+            };
 
-        let retrieval = if let Some(progress) = &mut download_progress {
-            pipeline
-                .retrieve_artifacts_streaming(&worker_config, &artifact_patterns, |line| {
-                    progress.update_from_line(line);
-                    if let Some(state) = heartbeat_state_download.as_ref() {
-                        mark_heartbeat_progress(state);
-                    }
-                })
-                .await
-        } else {
-            pipeline
-                .retrieve_artifacts(&worker_config, &artifact_patterns)
-                .await
-        };
+            let retrieval = if let Some(progress) = &mut download_progress {
+                pipeline
+                    .retrieve_artifacts_streaming(&worker_config, &artifact_patterns, |line| {
+                        progress.update_from_line(line);
+                        if let Some(state) = heartbeat_state_download.as_ref() {
+                            mark_heartbeat_progress(state);
+                        }
+                    })
+                    .await
+            } else {
+                pipeline
+                    .retrieve_artifacts(&worker_config, &artifact_patterns)
+                    .await
+            };
 
-        match retrieval {
-            Ok(artifact_result) => {
-                info!(
-                    "Artifacts retrieved: {} files, {} bytes in {}ms",
-                    artifact_result.files_transferred,
-                    artifact_result.bytes_transferred,
-                    artifact_result.duration_ms
-                );
-                reporter.verbose(&format!(
-                    "[RCH] artifacts done: {} files, {} bytes in {}ms",
-                    artifact_result.files_transferred,
-                    artifact_result.bytes_transferred,
-                    artifact_result.duration_ms
-                ));
-                if let Some(progress) = &mut download_progress {
-                    progress.apply_summary(
-                        artifact_result.bytes_transferred,
+            match retrieval {
+                Ok(artifact_result) => {
+                    info!(
+                        "Artifacts retrieved: {} files, {} bytes in {}ms",
                         artifact_result.files_transferred,
+                        artifact_result.bytes_transferred,
+                        artifact_result.duration_ms
                     );
-                    progress.finish();
+                    reporter.verbose(&format!(
+                        "[RCH] artifacts done: {} files, {} bytes in {}ms",
+                        artifact_result.files_transferred,
+                        artifact_result.bytes_transferred,
+                        artifact_result.duration_ms
+                    ));
+                    if let Some(progress) = &mut download_progress {
+                        progress.apply_summary(
+                            artifact_result.bytes_transferred,
+                            artifact_result.files_transferred,
+                        );
+                        progress.finish();
+                    }
+                    artifacts_result = Some(match artifacts_result.take() {
+                        Some(existing) => merge_sync_result(&existing, &artifact_result),
+                        None => artifact_result,
+                    });
                 }
-                artifacts_result = Some(match artifacts_result.take() {
-                    Some(existing) => merge_sync_result(&existing, &artifact_result),
-                    None => artifact_result,
-                });
+                Err(e) => {
+                    artifacts_failed = true;
+
+                    // Extract rsync exit code from error message if present
+                    let error_str = e.to_string();
+                    let rsync_exit_code = error_str.find("exit code").and_then(|_| {
+                        error_str
+                            .split("exit code")
+                            .nth(1)
+                            .and_then(|s| s.split(':').next())
+                            .and_then(|s| {
+                                s.trim()
+                                    .trim_start_matches("Some(")
+                                    .trim_end_matches(')')
+                                    .parse()
+                                    .ok()
+                            })
+                    });
+
+                    // Create structured warning (bd-1q3p)
+                    let warning = ArtifactRetrievalWarning::new(
+                        worker_config.id.as_str(),
+                        artifact_patterns.clone(),
+                        &error_str,
+                        rsync_exit_code,
+                    );
+
+                    warn!("Failed to retrieve artifacts: {}", e);
+
+                    // Show detailed warning in verbose mode or when not in machine mode
+                    if !console.is_machine() {
+                        reporter.verbose(&warning.format_warning());
+                    } else {
+                        // For machine mode, output JSON warning
+                        debug!("Artifact retrieval warning (JSON): {}", warning.to_json());
+                        reporter.verbose("[RCH] artifacts failed (continuing)");
+                    }
+
+                    if let Some(progress) = &mut download_progress {
+                        progress.finish_error(&e.to_string());
+                    }
+                    // Continue anyway - compilation succeeded
+                }
             }
-            Err(e) => {
-                artifacts_failed = true;
-
-                // Extract rsync exit code from error message if present
-                let error_str = e.to_string();
-                let rsync_exit_code = error_str.find("exit code").and_then(|_| {
-                    error_str
-                        .split("exit code")
-                        .nth(1)
-                        .and_then(|s| s.split(':').next())
-                        .and_then(|s| {
-                            s.trim()
-                                .trim_start_matches("Some(")
-                                .trim_end_matches(')')
-                                .parse()
-                                .ok()
-                        })
-                });
-
-                // Create structured warning (bd-1q3p)
-                let warning = ArtifactRetrievalWarning::new(
-                    worker_config.id.as_str(),
-                    artifact_patterns.clone(),
-                    &error_str,
-                    rsync_exit_code,
-                );
-
-                warn!("Failed to retrieve artifacts: {}", e);
-
-                // Show detailed warning in verbose mode or when not in machine mode
-                if !console.is_machine() {
-                    reporter.verbose(&warning.format_warning());
-                } else {
-                    // For machine mode, output JSON warning
-                    debug!("Artifact retrieval warning (JSON): {}", warning.to_json());
-                    reporter.verbose("[RCH] artifacts failed (continuing)");
-                }
-
-                if let Some(progress) = &mut download_progress {
-                    progress.finish_error(&e.to_string());
-                }
-                // Continue anyway - compilation succeeded
-            }
-        }
+        } // end: project-root artifact retrieval (skipped when patterns empty)
 
         if let Some(local_target_dir) = forwarded_cargo_target_dir.as_ref() {
             let remote_target_path = pipeline.remote_cargo_target_dir();

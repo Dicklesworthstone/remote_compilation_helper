@@ -854,6 +854,10 @@ pub(super) fn build_sync_closure_plan(
     topology_policy: &PathTopologyPolicy,
 ) -> Vec<SyncClosurePlanEntry> {
     let mut ordered_entries = std::collections::BTreeSet::<(PathBuf, SyncClosureMode)>::new();
+    // The entry/project root is a `Full` sync root that rsyncs its whole tree,
+    // so any dependency root physically inside it is already covered. Compute it
+    // up front so intra-primary members can be collapsed instead of re-synced.
+    let primary_root = canonicalize_sync_root_for_plan(normalized_project_root, topology_policy);
     for root in sync_roots {
         let canonicalized = canonicalize_sync_root_for_plan(root, topology_policy);
         if !is_within_sync_topology(&canonicalized, topology_policy) {
@@ -866,6 +870,17 @@ pub(super) fn build_sync_closure_plan(
             );
             continue;
         }
+        // Intra-workspace collapse (rch#33, restoring #8's behavior scoped so the
+        // #29d0d63 foreign-workspace metadata path is untouched): a member root
+        // physically inside the primary `Full` root is transferred as part of the
+        // primary tree, so its own `Full` entry — and the enclosing-workspace
+        // metadata entry, which is the primary itself — are pure redundancy that
+        // costs one SSH+rsync round-trip per member. Foreign-workspace path deps
+        // (outside the primary root) keep today's member-`Full` + workspace-
+        // metadata handling below.
+        if canonicalized != primary_root && canonicalized.starts_with(&primary_root) {
+            continue;
+        }
         ordered_entries.insert((canonicalized.clone(), SyncClosureMode::Full));
         if let Some(workspace_root) =
             enclosing_workspace_root_for_sync_root(&canonicalized, topology_policy)
@@ -874,7 +889,6 @@ pub(super) fn build_sync_closure_plan(
         }
     }
 
-    let primary_root = canonicalize_sync_root_for_plan(normalized_project_root, topology_policy);
     ordered_entries.insert((primary_root.clone(), SyncClosureMode::Full));
     let full_roots: Vec<PathBuf> = ordered_entries
         .iter()

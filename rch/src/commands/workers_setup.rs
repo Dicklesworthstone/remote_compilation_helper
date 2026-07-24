@@ -688,13 +688,15 @@ fn alias_topology_check_cmd(alias: &Path, canonical: &Path) -> String {
     let canonical_display = canonical.display().to_string();
     let c_slash = shell_escape_str(&path_display_with_trailing_slash(&canonical_display));
     format!(
-        "if [ ! -e {a} ] && [ ! -L {a} ]; then printf 'MISSING'; \
+        "canonical_real=$(readlink -f -- {c} 2>/dev/null || printf '%s' {c}); \
+if [ ! -e {a} ] && [ ! -L {a} ]; then printf 'MISSING'; \
 elif [ -L {a} ]; then target=$(readlink -- {a} 2>/dev/null || true); \
-canonical_real=$(readlink -f -- {c} 2>/dev/null || printf '%s' {c}); \
 target_real=$(readlink -f -- {a} 2>/dev/null || true); \
 if [ \"$target\" = {c} ] || [ \"$target\" = {c_slash} ] || [ \"$target_real\" = \"$canonical_real\" ]; then printf 'CORRECT'; \
 else printf 'WRONG_TARGET:%s' \"$target\"; fi; \
-else printf 'NOT_SYMLINK'; fi"
+else alias_real=$(readlink -f -- {a} 2>/dev/null || true); \
+if [ -n \"$alias_real\" ] && [ \"$alias_real\" = \"$canonical_real\" ]; then printf 'CORRECT'; \
+else printf 'NOT_SYMLINK'; fi; fi"
     )
 }
 
@@ -719,11 +721,16 @@ target_real=$(readlink -f -- {a} 2>/dev/null || true); \
 if [ \"$target\" = {c} ] || [ \"$target\" = {c_slash} ] || [ \"$target_real\" = \"$canonical_real\" ]; then return 0; fi; \
 update_stderr=$(ln -sfn -- {c} {a} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path=%s:target=%s:%s\\n' {a} {c} \"$update_stderr\" >&2; return 43; }}; \
 elif [ -e {a} ]; then \
+alias_real=$(readlink -f -- {a} 2>/dev/null || true); \
+if [ -n \"$alias_real\" ] && [ \"$alias_real\" = \"$canonical_real\" ]; then return 0; fi; \
 printf 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path=%s\\n' {a} >&2; return 42; \
 else \
 create_stderr=$(ln -s -- {c} {a} 2>&1) && return 0; \
 if [ -L {a} ]; then ensure_alias_symlink; return $?; fi; \
-if [ -e {a} ]; then printf 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path=%s\\n' {a} >&2; return 42; fi; \
+if [ -e {a} ]; then \
+alias_real=$(readlink -f -- {a} 2>/dev/null || true); \
+if [ -n \"$alias_real\" ] && [ \"$alias_real\" = \"$canonical_real\" ]; then return 0; fi; \
+printf 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path=%s\\n' {a} >&2; return 42; fi; \
 printf 'RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path=%s:target=%s:%s\\n' {a} {c} \"$create_stderr\" >&2; return 44; \
 fi; \
 }}; ensure_alias_symlink"

@@ -135,11 +135,16 @@ fn build_worker_projects_topology_cmd(topology_policy: &PathTopologyPolicy) -> S
              update_stderr=$(ln -sfn -- {canonical} {alias} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path=%s:target=%s:%s\\n' {alias} {canonical} \"$update_stderr\" >&2; return 43; }}; \
            fi; \
          elif [ -e {alias} ]; then \
+           alias_real=$(readlink -f -- {alias} 2>/dev/null || true); \
+           if [ -n \"$alias_real\" ] && [ \"$alias_real\" = \"$canonical_real\" ]; then return 0; fi; \
            printf 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path=%s\\n' {alias} >&2; return 42; \
          else \
            create_stderr=$(ln -s -- {canonical} {alias} 2>&1) && return 0; \
            if [ -L {alias} ]; then ensure_alias_symlink; return $?; fi; \
-           if [ -e {alias} ]; then printf 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path=%s\\n' {alias} >&2; return 42; fi; \
+           if [ -e {alias} ]; then \
+             alias_real=$(readlink -f -- {alias} 2>/dev/null || true); \
+             if [ -n \"$alias_real\" ] && [ \"$alias_real\" = \"$canonical_real\" ]; then return 0; fi; \
+             printf 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path=%s\\n' {alias} >&2; return 42; fi; \
            printf 'RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path=%s:target=%s:%s\\n' {alias} {canonical} \"$create_stderr\" >&2; return 44; \
          fi; \
          }}; \
@@ -169,12 +174,24 @@ pub(super) async fn ensure_worker_projects_topology(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // A non-symlink alias that does NOT resolve to the canonical root is a
+        // path_topology *policy* problem, not a worker fault — every worker will
+        // refuse it identically. Name the config sources so operators fix the
+        // policy instead of triaging (or "repairing") a healthy worker (rch#32).
+        let policy_hint = if stderr.contains("RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK") {
+            "; the alias root is a plain directory that does not resolve to the canonical root — \
+             this is a [path_topology] policy conflict (RCH_ALIAS_PROJECT_ROOT / \
+             RCH_CANONICAL_PROJECT_ROOT), not a worker fault; every worker refuses it identically"
+        } else {
+            ""
+        };
         anyhow::bail!(
-            "remote topology preflight failed on {} (status {:?}): stdout='{}' stderr='{}'",
+            "remote topology preflight failed on {} (status {:?}): stdout='{}' stderr='{}'{}",
             worker.id,
             output.status.code(),
             stdout,
-            stderr
+            stderr,
+            policy_hint
         );
     }
     reporter.verbose(&format!(
@@ -560,6 +577,70 @@ exec /bin/ln \"$@\"\n",
             std::fs::read_link(&alias_root).expect("alias symlink target"),
             real_root,
             "alias should not be rewritten when it resolves to the configured canonical root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_worker_projects_topology_cmd_accepts_identity_policy() {
+        let _guard = test_guard!();
+
+        // rch#32: an identity policy (alias root == canonical root, a plain
+        // directory) is accepted host-side, so the worker preflight must accept it
+        // too — a non-symlink alias whose realpath equals canonical is satisfied,
+        // not refused with RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK on every worker.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path().join("scratch");
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let policy = PathTopologyPolicy::new(root.clone(), root.clone());
+        let output = std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(build_worker_projects_topology_cmd(&policy))
+            .output()
+            .expect("run topology command");
+
+        assert!(
+            output.status.success(),
+            "identity policy (alias == canonical directory) must be accepted; status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("RCH_TOPOLOGY_OK"),
+            "identity policy preflight should emit OK, not a per-worker refusal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_worker_projects_topology_cmd_still_refuses_unrelated_dir_alias() {
+        let _guard = test_guard!();
+
+        // The realpath-equality relaxation must NOT admit a non-symlink alias that
+        // resolves somewhere OTHER than canonical — that stays a structured exit-42.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let canonical = temp_dir.path().join("canonical");
+        let alias = temp_dir.path().join("alias");
+        std::fs::create_dir_all(&canonical).expect("create canonical");
+        std::fs::create_dir_all(&alias).expect("create unrelated alias dir");
+
+        let policy = PathTopologyPolicy::new(canonical, alias);
+        let output = std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(build_worker_projects_topology_cmd(&policy))
+            .output()
+            .expect("run topology command");
+
+        assert!(
+            !output.status.success(),
+            "an unrelated non-symlink alias directory must still be refused"
+        );
+        assert_eq!(output.status.code(), Some(42));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK"),
+            "refusal must keep its structured error code"
         );
     }
 }

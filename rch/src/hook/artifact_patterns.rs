@@ -77,6 +77,42 @@ pub(super) fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String
     }
 }
 
+/// Artifact patterns for the sync-back that lands in the LOCAL project root
+/// (as opposed to a forwarded custom `CARGO_TARGET_DIR`).
+///
+/// When a custom-target sync is active (`custom_target_sync == true`) the build's
+/// `target/` outputs are retrieved *exclusively* by the custom-target phase into
+/// the forwarded `CARGO_TARGET_DIR` (via [`get_custom_target_artifact_patterns`]).
+/// The project-root phase must therefore NOT carry any `target/`-prefixed
+/// patterns: the remote build never writes into `<remote project>/target/` under
+/// a forwarded target dir, so such a pull can only re-materialize *stale*
+/// worker-side `target/` residue onto the local project-root filesystem — the
+/// exact filesystem a custom `CARGO_TARGET_DIR` exists to protect (rch#30). It
+/// also decouples the shared `artifacts_failed` flag from a doomed stale-residue
+/// pull, removing the spurious `RCH-E309` that a failed project-root `target/`
+/// retrieval would otherwise raise for a build whose real outputs all arrived via
+/// the custom phase.
+///
+/// Non-`target/` project-root artifacts are preserved — tarpaulin/junit/cobertura
+/// reports, C/C++ outputs (`build/`, `bin/`, `*.o`, …), and bun coverage all still
+/// land at the project root regardless of `CARGO_TARGET_DIR`. When the filtered
+/// list is empty (the common cargo build/doc/rustc case, whose patterns are all
+/// `target/`-prefixed) the caller skips the project-root retrieval entirely.
+pub(super) fn get_project_artifact_patterns(
+    kind: Option<CompilationKind>,
+    custom_target_sync: bool,
+) -> Vec<String> {
+    let patterns = get_artifact_patterns(kind);
+    if custom_target_sync {
+        patterns
+            .into_iter()
+            .filter(|pattern| !pattern.starts_with("target/"))
+            .collect()
+    } else {
+        patterns
+    }
+}
+
 /// Rsync filter entries that, prefixed onto an artifact pattern list, are emitted
 /// as `--exclude` rules BEFORE the `--include` rules (rsync first-match-wins). They
 /// strip cargo's per-job *cache* state out of a custom-`CARGO_TARGET_DIR` sync-back
