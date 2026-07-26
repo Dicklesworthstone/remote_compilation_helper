@@ -3352,12 +3352,16 @@ fn build_remote_shell_command(remote_cmd: &str) -> String {
 async fn ensure_worker_projects_topology(
     worker: &WorkerConfig,
     reporter: &HookReporter,
+    topology_policy: &PathTopologyPolicy,
 ) -> anyhow::Result<()> {
     if should_skip_remote_preflight(worker) {
         reporter.verbose("[RCH] topology preflight skipped in mock mode");
         return Ok(());
     }
 
+    let canonical_root = topology_policy.canonical_root().to_string_lossy();
+    let alias_root = topology_policy.alias_root().to_string_lossy();
+    let canonical_root_with_slash = format!("{canonical_root}/");
     let topology_cmd = format!(
         "set -e; \
          if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then mkdir -p {canonical}; fi; \
@@ -3366,15 +3370,14 @@ async fn ensure_worker_projects_topology(
            target=$(readlink {alias} 2>/dev/null || true); \
            if [ \"$target\" != {canonical} ] && [ \"$target\" != {canonical_slash} ]; then ln -sfn {canonical} {alias}; fi; \
          elif [ -e {alias} ]; then \
-           echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; exit 42; \
+           if [ ! -d {alias} ]; then echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; exit 42; fi; \
          else \
            ln -s {canonical} {alias}; \
          fi; \
          echo RCH_TOPOLOGY_OK",
-        canonical = shell_escape::escape(DEFAULT_CANONICAL_PROJECT_ROOT.into()),
-        canonical_slash =
-            shell_escape::escape(format!("{}/", DEFAULT_CANONICAL_PROJECT_ROOT).into()),
-        alias = shell_escape::escape(DEFAULT_ALIAS_PROJECT_ROOT.into())
+        canonical = shell_escape::escape(canonical_root.to_string().into()),
+        canonical_slash = shell_escape::escape(canonical_root_with_slash.into()),
+        alias = shell_escape::escape(alias_root.to_string().into())
     );
 
     let output = run_worker_ssh_command(worker, &topology_cmd, Duration::from_secs(20)).await?;
@@ -3390,8 +3393,10 @@ async fn ensure_worker_projects_topology(
         );
     }
     reporter.verbose(&format!(
-        "[RCH] topology preflight ok on {} (/dp -> /data/projects enforced)",
-        worker.id
+        "[RCH] topology preflight ok on {} ({} -> {} enforced)",
+        worker.id,
+        topology_policy.alias_root().display(),
+        topology_policy.canonical_root().display()
     ));
     Ok(())
 }
@@ -4238,11 +4243,17 @@ impl RemoteSyncLayout {
         }
     }
 
+    #[cfg(test)]
     fn outer_workspace_safe(project_hash: &str) -> Self {
+        Self::outer_workspace_safe_with_remote_base(project_hash, "/tmp/rch")
+    }
+
+    fn outer_workspace_safe_with_remote_base(project_hash: &str, remote_base: &str) -> Self {
         let layout_id = safe_remote_layout_id(project_hash);
+        let remote_base = remote_base.trim_end_matches('/');
         Self {
             workspace_isolation: RemoteWorkspaceIsolation::OuterWorkspaceSafe,
-            canonical_remote_root: format!("/tmp/rch-sync/{layout_id}/projects"),
+            canonical_remote_root: format!("{remote_base}-sync/{layout_id}/projects"),
         }
     }
 
@@ -5118,8 +5129,7 @@ for root in roots:
         seen.add(manifest)
         with open(manifest, "r", encoding="utf-8") as handle:
             original = handle.read()
-        rewritten = replace_sources(original)
-        rewritten = rewrite_manifest_path_attrs(rewritten, manifest)
+        rewritten = rewrite_manifest_path_attrs(original, manifest)
         if rewritten != original:
             with open(manifest, "w", encoding="utf-8") as handle:
                 handle.write(rewritten)
@@ -5934,7 +5944,10 @@ async fn execute_remote_compilation(
         topology_policy,
     );
     let remote_layout = if exact_dependency_closure_sync {
-        RemoteSyncLayout::outer_workspace_safe(&project_hash)
+        RemoteSyncLayout::outer_workspace_safe_with_remote_base(
+            &project_hash,
+            &transfer_config.remote_base,
+        )
     } else {
         RemoteSyncLayout::worker_canonical()
     };
@@ -6018,7 +6031,7 @@ async fn execute_remote_compilation(
     ));
 
     // Ensure deterministic remote topology before any repo synchronization.
-    ensure_worker_projects_topology(&worker_config, reporter).await?;
+    ensure_worker_projects_topology(&worker_config, reporter, topology_policy).await?;
 
     // Best-effort repo convergence for multi-repo dependency graphs.
     maybe_sync_repo_set_with_repo_updater(&worker_config, &sync_roots, reporter).await;
@@ -13214,6 +13227,20 @@ edition = "2024"
     }
 
     #[test]
+    fn test_outer_workspace_safe_layout_honors_custom_remote_base() {
+        let _guard = test_guard!();
+        let layout = RemoteSyncLayout::outer_workspace_safe_with_remote_base(
+            "feedfacecafebeef00112233",
+            "/data/rch",
+        );
+
+        assert_eq!(
+            layout.canonical_remote_root(),
+            "/data/rch-sync/feedfacecafebeef/projects"
+        );
+    }
+
+    #[test]
     fn test_outer_workspace_safe_remote_command_topology_rewrite_handles_manifest_and_alias_paths()
     {
         let _guard = test_guard!();
@@ -13452,6 +13479,112 @@ edition = "2024"
         assert!(command.contains("python3 -"));
         assert!(command.contains("RCH_MANIFEST_REWRITE_CHANGED"));
         assert!(command.contains("/tmp/rch-sync/1234567890abcdef/projects"));
+    }
+
+    #[test]
+    fn test_remote_manifest_rewrite_only_changes_path_attributes() {
+        let _guard = test_guard!();
+        let (temp_dir, policy) = topology_tempdir();
+        let project_root = temp_dir.path().join("project");
+        let dep_root = temp_dir.path().join("dep");
+        std::fs::create_dir_all(&project_root).expect("create project");
+        std::fs::create_dir_all(&dep_root).expect("create dep");
+
+        std::fs::write(
+            project_root.join("Cargo.toml"),
+            r#"[package]
+name = "project"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dep = { path = "../dep" }
+"#,
+        )
+        .expect("write project manifest");
+
+        let source_marker = format!("{}/non_path_metadata", temp_dir.path().display());
+        std::fs::write(
+            dep_root.join("Cargo.toml"),
+            format!(
+                r#"[package]
+name = "dep"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.rch]
+source = "{source_marker}"
+"#
+            ),
+        )
+        .expect("write dep manifest");
+
+        let remote_base = temp_dir.path().join("remote/rch");
+        let layout = RemoteSyncLayout::outer_workspace_safe_with_remote_base(
+            "abc123abc123abc1",
+            &remote_base.to_string_lossy(),
+        );
+        let plan = build_sync_closure_plan_with_layout(
+            &[project_root.clone(), dep_root.clone()],
+            &project_root,
+            "rewrite_attrs_only_hash",
+            &policy,
+            &layout,
+        );
+        let outcomes = plan
+            .into_iter()
+            .map(|entry| {
+                std::fs::create_dir_all(&entry.remote_root).expect("create remote root");
+                std::fs::copy(
+                    entry.local_root.join("Cargo.toml"),
+                    entry.remote_root.join("Cargo.toml"),
+                )
+                .expect("copy manifest to remote root");
+                (entry, SyncRootOutcome::Synced)
+            })
+            .collect::<Vec<_>>();
+
+        let dep_remote_root = outcomes
+            .iter()
+            .find_map(|(entry, _)| {
+                (entry.local_root == dep_root).then(|| entry.remote_root.clone())
+            })
+            .expect("dep remote root");
+        let project_remote_root = outcomes
+            .iter()
+            .find_map(|(entry, _)| {
+                (entry.local_root == project_root).then(|| entry.remote_root.clone())
+            })
+            .expect("project remote root");
+
+        let command = build_remote_manifest_path_rewrite_command(&outcomes, &policy, &layout)
+            .expect("rewrite command");
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .expect("run rewrite command");
+        assert!(
+            output.status.success(),
+            "rewrite command failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let rewritten_project =
+            std::fs::read_to_string(Path::new(&project_remote_root).join("Cargo.toml"))
+                .expect("read rewritten project manifest");
+        assert!(
+            rewritten_project.contains(&format!(r#"path = "{dep_remote_root}""#)),
+            "dependency path attribute should point at synced remote root: {rewritten_project}"
+        );
+
+        let rewritten_dep = std::fs::read_to_string(Path::new(&dep_remote_root).join("Cargo.toml"))
+            .expect("read dep manifest");
+        assert!(
+            rewritten_dep.contains(&source_marker),
+            "non-path manifest text must not be topology-rewritten: {rewritten_dep}"
+        );
     }
 
     #[test]
