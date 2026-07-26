@@ -2563,12 +2563,36 @@ fn toolchain_capability_mismatch(
         return None;
     }
 
+    let worker_raw = capabilities.rustc_version.as_deref()?;
+    let channel = toolchain.channel.trim();
+    if is_floating_rust_channel(channel) {
+        return (!worker_rustc_matches_channel(worker_raw, channel)).then(|| {
+            format!(
+                "rustc_channel_mismatch:local={channel}:worker={}",
+                rustc_version_key(worker_raw).unwrap_or_else(|| worker_raw.to_string())
+            )
+        });
+    }
+
     let local = rustc_version_key(&toolchain.full_version)?;
-    let worker = capabilities
-        .rustc_version
-        .as_deref()
-        .and_then(rustc_version_key)?;
+    let worker = rustc_version_key(worker_raw)?;
     (local != worker).then(|| format!("rustc_version_mismatch:local={local}:worker={worker}"))
+}
+
+fn is_floating_rust_channel(channel: &str) -> bool {
+    matches!(channel, "stable" | "beta" | "nightly")
+}
+
+fn worker_rustc_matches_channel(worker_raw: &str, channel: &str) -> bool {
+    let Some(worker) = rustc_version_key(worker_raw) else {
+        return false;
+    };
+    match channel {
+        "nightly" => worker.contains("-nightly"),
+        "beta" => worker.contains("-beta"),
+        "stable" => !worker.contains("-nightly") && !worker.contains("-beta"),
+        _ => false,
+    }
 }
 
 fn rustc_version_key(value: &str) -> Option<String> {
@@ -3623,7 +3647,13 @@ mod tests {
             rustc_version: Some("rustc 1.95.0-nightly (abcdef 2026-03-01)".to_string()),
             ..Default::default()
         };
-        assert!(toolchain_capability_mismatch(Some(&local), &caps).is_some());
+        assert!(toolchain_capability_mismatch(Some(&local), &caps).is_none());
+
+        let stable = ToolchainInfo {
+            channel: "stable".to_string(),
+            ..local.clone()
+        };
+        assert!(toolchain_capability_mismatch(Some(&stable), &caps).is_some());
 
         let dated = ToolchainInfo {
             date: Some("2026-05-01".to_string()),
