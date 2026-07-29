@@ -2434,7 +2434,8 @@ use dependency_closure::{
 // directly from `super::remote_result`.
 mod remote_result;
 use remote_result::{
-    detect_worker_system_dependency_failure, is_signal_killed, is_toolchain_failure, signal_name,
+    detect_cargo_workspace_inheritance_failure, detect_worker_system_dependency_failure,
+    is_signal_killed, is_toolchain_failure, signal_name,
 };
 
 // The remote cargo target-dir resolution / naming / command-rewrite cluster
