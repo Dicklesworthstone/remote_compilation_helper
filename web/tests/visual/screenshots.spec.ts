@@ -6,6 +6,11 @@ async function settleAnimations(page: Page) {
   await page.waitForTimeout(500);
 }
 
+test.skip(
+  ({ browserName, isMobile }) => browserName !== 'chromium' || isMobile,
+  'Visual baselines are tracked for desktop Chromium only.'
+);
+
 test('visual: dashboard full page snapshot', async ({ page }) => {
   console.log('[visual] TEST START: dashboard full page snapshot');
 

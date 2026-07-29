@@ -48,6 +48,10 @@ const WORKER_SELECTION_PANIC_US: u64 = 50_000; // 50ms
 
 /// Number of samples for statistical significance
 const SAMPLE_COUNT: usize = 100;
+/// Minimum mean latency where coefficient-of-variation is meaningful.
+const TIMING_CONSISTENCY_CV_MIN_MEAN_US: u64 = 50;
+/// Maximum allowed coefficient-of-variation once measurements are above noise floor.
+const TIMING_CONSISTENCY_MAX_CV: f64 = 2.0;
 
 // =============================================================================
 // Statistical Utilities
@@ -664,6 +668,12 @@ async fn test_classification_timing_consistency() {
         }
 
         let stats = TimingStats::compute(&samples);
+        let classification = classify_command(cmd);
+        let (budget_us, panic_us) = if classification.is_compilation {
+            (COMPILE_BUDGET_US, COMPILE_PANIC_US)
+        } else {
+            (NON_COMPILE_BUDGET_US, NON_COMPILE_PANIC_US)
+        };
 
         // Coefficient of variation (CV) should be reasonable
         // CV = stddev / mean - lower is more consistent
@@ -682,21 +692,42 @@ async fn test_classification_timing_consistency() {
                 ("cmd".to_string(), cmd.to_string()),
                 ("mean_us".to_string(), stats.mean_us.to_string()),
                 ("p50_us".to_string(), stats.p50_us.to_string()),
+                ("p95_us".to_string(), stats.p95_us.to_string()),
+                ("p99_us".to_string(), stats.p99_us.to_string()),
                 ("stddev_us".to_string(), format!("{:.1}", stats.stddev_us)),
                 ("cv".to_string(), format!("{:.2}", cv)),
                 ("min_us".to_string(), stats.min_us.to_string()),
                 ("max_us".to_string(), stats.max_us.to_string()),
+                ("budget_us".to_string(), budget_us.to_string()),
+                ("panic_us".to_string(), panic_us.to_string()),
             ],
         );
 
-        // CV should be less than 1.0 for consistent timing
-        // (stddev less than mean)
         assert!(
-            cv < 2.0,
-            "Command '{}' timing too variable: CV={:.2}",
+            stats.max_us < panic_us,
+            "Command '{}' exceeded panic threshold: max {}us > {}us",
             cmd,
-            cv
+            stats.max_us,
+            panic_us
         );
+        assert!(
+            stats.p99_us <= budget_us,
+            "Command '{}' p99 exceeded budget: {}us > {}us",
+            cmd,
+            stats.p99_us,
+            budget_us
+        );
+
+        // At tiny means, one scheduler hiccup can dominate CV while absolute
+        // latency remains far under the documented hook budget.
+        if stats.mean_us >= TIMING_CONSISTENCY_CV_MIN_MEAN_US {
+            assert!(
+                cv < TIMING_CONSISTENCY_MAX_CV,
+                "Command '{}' timing too variable: CV={:.2}",
+                cmd,
+                cv
+            );
+        }
     }
 
     logger.info("Timing consistency test passed");

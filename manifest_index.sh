@@ -9,19 +9,21 @@ set -euo pipefail
 
 manifest_entries() {
   cat <<'MANIFEST_EOF'
-c75a92396c85f475c70407daeb701f82941e20f551df446897865389042df127  .claude/skills/rch/SKILL.md
-a1453213c677ea95576dc4694a1322dfc6c36e62123e013791f2f6ceb06b151e  .claude/skills/rch/assets/workers-template.toml
-284b423271685b94c1ad11c30ff2a40e084af2b2b727c553522372b32d623464  .claude/skills/rch/references/COMMANDS.md
-2264a71e3b6aa4bbe8deeccb4fcb0b6c24da7af7280a5d8d69789a195cf2c5ef  .claude/skills/rch/references/HOOKS.md
-8eca0114755171a2c6fbc61f2693c21df9d83f3f0cf091cee033fc8364d72dbc  .claude/skills/rch/references/TROUBLESHOOTING.md
-8b5721ff489f211424859e681c2e9a6b8d907367a5179a34925c060811d2500b  .claude/skills/rch/references/WORKERS.md
-80ae77f487d1c9c1a0168a598ad919b1cf8b266482c3b9c32b94519056de56dd  .claude/skills/rch/scripts/validate-setup.sh
-f9b8937d4f50fba956f2df24f6a0e43633a78d932175d62c48f1bc5c5b43bc64  .claude/skills/remote-compilation-helper-setup/SKILL.md
-a1453213c677ea95576dc4694a1322dfc6c36e62123e013791f2f6ceb06b151e  .claude/skills/remote-compilation-helper-setup/assets/workers-template.toml
-2264a71e3b6aa4bbe8deeccb4fcb0b6c24da7af7280a5d8d69789a195cf2c5ef  .claude/skills/remote-compilation-helper-setup/references/HOOKS.md
-8eca0114755171a2c6fbc61f2693c21df9d83f3f0cf091cee033fc8364d72dbc  .claude/skills/remote-compilation-helper-setup/references/TROUBLESHOOTING.md
-8b5721ff489f211424859e681c2e9a6b8d907367a5179a34925c060811d2500b  .claude/skills/remote-compilation-helper-setup/references/WORKERS.md
-80ae77f487d1c9c1a0168a598ad919b1cf8b266482c3b9c32b94519056de56dd  .claude/skills/remote-compilation-helper-setup/scripts/validate-setup.sh
+e28c635b0dc93fd3289b97834ce37bf9c856cac0394b2a9d6cd929a229bd201c  .claude/skills/rch/SKILL.md
+ce560d0df5c3fa39962339d4a887bfbff6fb659ec3ddc320e53cd311c4f8e6cf  .claude/skills/rch/assets/workers-template.toml
+ad3a15555c717d7ec351938a741d791dafd4599795a6891b293de767f5d528af  .claude/skills/rch/references/COMMANDS.md
+60bc06b1e100188e78be3abfdcc28a15c038e96763a2ca2caa8594e1d50d0a0c  .claude/skills/rch/references/CONFIGURATION.md
+a9d2b280dc866987029a757debb2f507cd048638ef0ea1d18b2cc8a21a5f22bd  .claude/skills/rch/references/HOOKS.md
+a486979e19f25d27ac308a057d20a1ea09bc09c47805232029359131d4dee9b5  .claude/skills/rch/references/OPERATIONS.md
+2c6286a6d5f8289c3c7046bbdfa9669205ed7ae616fa38d10622d835f9583305  .claude/skills/rch/references/TROUBLESHOOTING.md
+9c4b4e7e0679c9a618f5ea881759865959e2970f2a3296b75977d50241bf8a5d  .claude/skills/rch/references/WORKERS.md
+21d13636cc465aeeceef2271361666216e72f51dd20edbc9d84d79acda71e8f5  .claude/skills/rch/scripts/validate-setup.sh
+737d8b37b12f7003c90f07a7d62645fcb8035286f6148b5aeea2cdf68d2c3900  .claude/skills/remote-compilation-helper-setup/SKILL.md
+ce560d0df5c3fa39962339d4a887bfbff6fb659ec3ddc320e53cd311c4f8e6cf  .claude/skills/remote-compilation-helper-setup/assets/workers-template.toml
+a9d2b280dc866987029a757debb2f507cd048638ef0ea1d18b2cc8a21a5f22bd  .claude/skills/remote-compilation-helper-setup/references/HOOKS.md
+2c6286a6d5f8289c3c7046bbdfa9669205ed7ae616fa38d10622d835f9583305  .claude/skills/remote-compilation-helper-setup/references/TROUBLESHOOTING.md
+9c4b4e7e0679c9a618f5ea881759865959e2970f2a3296b75977d50241bf8a5d  .claude/skills/remote-compilation-helper-setup/references/WORKERS.md
+21d13636cc465aeeceef2271361666216e72f51dd20edbc9d84d79acda71e8f5  .claude/skills/remote-compilation-helper-setup/scripts/validate-setup.sh
 MANIFEST_EOF
 }
 

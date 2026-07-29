@@ -362,6 +362,7 @@ mod tests {
                 pressure_memory_pressure: None,
                 pressure_telemetry_age_secs: None,
                 pressure_telemetry_fresh: None,
+                bypass: None,
             },
             WorkerStatusFromApi {
                 id: "worker-2".to_string(),
@@ -387,6 +388,7 @@ mod tests {
                 pressure_memory_pressure: None,
                 pressure_telemetry_age_secs: None,
                 pressure_telemetry_fresh: None,
+                bypass: None,
             },
         ]
     }

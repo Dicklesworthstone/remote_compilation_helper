@@ -73,7 +73,7 @@ EOF
 rch init
 
 # Validate syntax
-rch config check
+rch config validate
 ```
 
 **Common TOML mistakes**:
@@ -85,17 +85,26 @@ rch config check
 
 ## Daemon
 
+The daemon and hook self-heal each other. Prefer the managed commands below over
+manual socket/process surgery — **never `rm` the socket or `kill` "stale" rchd by
+hand**; that races the self-healing loop.
+
 | Symptom | Check | Fix |
 |---------|-------|-----|
-| Not running | `pgrep rchd` | `rchd &` or `systemctl --user start rchd` |
-| Socket missing | `ls /tmp/rch.sock` | Start daemon |
-| Socket stale | Socket exists but daemon dead | `rm /tmp/rch.sock && rchd` |
-| Permission denied | `ls -la /tmp/rch.sock` | Check socket permissions |
-| Crashes | `rchd --foreground --verbose` | Check logs for error |
+| Not running | `rch daemon status` | `rch daemon start` (or `systemctl --user start rchd`) |
+| Socket missing/refused | `rch --json daemon status` | `rch daemon restart` |
+| Socket stale | Socket exists but daemon dead | `rch daemon restart` (do **not** `rm` it) |
+| Permission denied | `rch doctor` | `rch doctor --fix` |
+| Crashes | `rch daemon logs -n 200` | Inspect logs; `rch doctor --fix` |
 
-**Daemon logs**: `journalctl --user -u rchd -f`
+The socket path is **not** fixed at `/tmp/rch.sock` — it resolves to
+`$XDG_RUNTIME_DIR/rch.sock`, then `~/.cache/rch/rch.sock`, then `/tmp/rch.sock`.
+Query the real path with `rch --json daemon status`; never hardcode it.
 
-**Deep debug**: `rchd --foreground --log-level=debug`
+**Daemon logs**: `rch daemon logs -n 200` (rotated by default) or
+`journalctl --user -u rchd -f`.
+
+**Deep debug**: `RCH_LOG_LEVEL=debug rch daemon logs -n 200`.
 
 ---
 
@@ -103,10 +112,10 @@ rch config check
 
 | Symptom | Check | Fix |
 |---------|-------|-----|
-| Not registered | `cat ~/.claude/settings.json \| jq '.hooks.PreToolUse'` | `rch hook install` |
+| Not registered | `rch hook status` | `rch hook install` |
 | Binary not found | `which rch` | Ensure rch is in PATH |
-| Returns error | `echo '{"tool":"Bash","input":{"command":"cargo check"}}' \| rch hook` | Reinstall rch |
-| Not intercepting | `rch classify "cargo build"` | Verify command is supported |
+| Returns error | `rch hook test` | Reinstall rch |
+| Not intercepting | `rch diagnose "cargo build"` | Verify command is supported |
 
 **Commands never intercepted** (by design):
 - `bun install/add/remove` (package management)
@@ -116,10 +125,8 @@ rch config check
 
 **Test hook directly**:
 ```bash
-echo '{"tool":"Bash","input":{"command":"cargo build"}}' | rch hook
-# Expect: {"allow":true,"output":"..."}
-
-RCH_DRY_RUN=1 cargo check  # Logs decision without remote execution
+rch hook test                          # Built-in sample-command hook self-test
+rch diagnose "cargo check" --dry-run   # Show the decision without remote execution
 ```
 
 ---
@@ -128,8 +135,8 @@ RCH_DRY_RUN=1 cargo check  # Logs decision without remote execution
 
 | Symptom | Check | Fix |
 |---------|-------|-----|
-| No workers | `rch workers status` | Add workers to config |
-| No slots | `rch workers list --verbose` | Wait or add more workers |
+| No workers | `rch status --fleet` + `rch admit "cargo build"` | Find the real cause (absent vs overloaded vs missing capability). **Do not** edit `workers.toml` or `rch workers disable` for transient illness — bypass + canary auto-rejoins. Only add workers if the fleet is genuinely under-provisioned. |
+| No slots | `rch status --fleet` / `rch queue` | Queue/wait (`RCH_QUEUE_WHEN_BUSY=1`) rather than reflexively adding workers |
 | Can't connect | `ssh -i key user@host "echo ok"` | Fix SSH (see above) |
 | Missing toolchain | `ssh worker "which rustc bun"` | Install on worker |
 | Transfer fails | `rsync -avz --dry-run ./src/ worker:/tmp/t/` | Check disk space, rsync version |
@@ -154,15 +161,15 @@ RCH_DRY_RUN=1 cargo check  # Logs decision without remote execution
 
 **Check network**: `ping -c 5 worker`
 
-**Debug transfer**: `RCH_LOG=debug cargo build 2>&1 | grep transfer`
+**Debug transfer**: `RCH_LOG_LEVEL=debug rch diagnose "cargo build" 2>&1 | grep transfer`
 
 ---
 
 ## Debug Mode
 
 ```bash
-export RCH_LOG=debug    # or trace for maximum detail
-cargo build             # Logs show hook decisions
+export RCH_LOG_LEVEL=debug    # or trace for maximum detail
+rch diagnose "cargo build"    # Logs show the hook/offload decision
 
 # Levels: error, warn, info, debug, trace
 ```

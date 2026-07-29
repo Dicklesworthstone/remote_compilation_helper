@@ -15,6 +15,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: 2
+  RUSTUP_TOOLCHAIN: nightly-2026-06-06
 
 jobs:
   build:
@@ -26,6 +27,10 @@ jobs:
           - name: linux-x86_64
             runs-on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            checksum_cmd: sha256sum
+          - name: linux-x86_64-musl
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-musl
             checksum_cmd: sha256sum
           - name: linux-aarch64
             runs-on: ubuntu-24.04-arm
@@ -51,7 +56,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-01-01
+          toolchain: nightly-2026-06-06
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
@@ -59,8 +64,19 @@ jobs:
           shared-key: test-release-${{ matrix.target }}
           cache-on-failure: true
 
-      - name: Build (release)
+      # musl is a fully static target; the linker needs musl-gcc. Only the
+      # musl matrix row hits this (no-op for every other target).
+      - name: Install musl tools (musl targets)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build (release) (unix)
+        if: runner.os != 'Windows'
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (release) (windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked --no-default-features --target ${{ matrix.target }}
 
       - name: Verify binaries exist (unix)
         if: runner.os != 'Windows'
@@ -74,7 +90,6 @@ jobs:
         shell: pwsh
         run: |
           if (!(Test-Path "target/${{ matrix.target }}/release/rch.exe")) { throw "missing rch.exe" }
-          if (!(Test-Path "target/${{ matrix.target }}/release/rchd.exe")) { throw "missing rchd.exe" }
           if (!(Test-Path "target/${{ matrix.target }}/release/rch-wkr.exe")) { throw "missing rch-wkr.exe" }
 
       - name: Smoke test (version) (unix)
@@ -89,7 +104,6 @@ jobs:
         shell: pwsh
         run: |
           & "target/${{ matrix.target }}/release/rch.exe" --version
-          & "target/${{ matrix.target }}/release/rchd.exe" --version
           & "target/${{ matrix.target }}/release/rch-wkr.exe" --version
 
       - name: Package (unix)
@@ -109,7 +123,7 @@ jobs:
           $Tag = "pr-${{ github.event.pull_request.number || github.run_id }}-$($env:GITHUB_SHA.Substring(0,7))"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $Archive = "dist/rch-$Tag-${{ matrix.target }}.zip"
-          Compress-Archive -Path target/${{ matrix.target }}/release/rch.exe,target/${{ matrix.target }}/release/rchd.exe,target/${{ matrix.target }}/release/rch-wkr.exe -DestinationPath $Archive
+          Compress-Archive -Path target/${{ matrix.target }}/release/rch.exe,target/${{ matrix.target }}/release/rch-wkr.exe -DestinationPath $Archive
           $Hash = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLower()
           "$Hash  rch-$Tag-${{ matrix.target }}.zip" | Out-File -FilePath "$Archive.sha256" -Encoding ascii -NoNewline
 

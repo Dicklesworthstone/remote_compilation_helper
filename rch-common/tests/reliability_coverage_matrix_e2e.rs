@@ -385,6 +385,44 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        RequirementRow {
+            id: "REQ-PERF-002".into(),
+            description:
+                "Remediation hot-path performance budgets + regression suite (admit preflight, \
+                 incident append/read, output-mode detection, config load, rejection aggregation)"
+                    .into(),
+            domain: "performance_budget".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.16.7".into(),
+            test_refs: vec![
+                TestRef {
+                    file: "remediation_hotpath_budget_e2e.rs".into(),
+                    name_prefix: "budget_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "remediation_hotpath_budget_e2e.rs".into(),
+                    name_prefix: "remediation_hotpath_budgets_emit_jsonl".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../../scripts/e2e_perf_budgets.sh".into(),
+                    name_prefix: "e2e_perf_budgets".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "Admit preflight under compilation budget; non-compilation reject under 1ms".into(),
+                "Incident append/read measured with record counts and cold/warm cache cases".into(),
+                "Output-mode detection on the non-compilation budget".into(),
+                "JSONL timing records carry run_id/bead_id/scenario/event/status/\
+                 command_fingerprint/duration_ms/budget_ms/p95_ms/p99_ms/detail"
+                    .into(),
+                "CI cargo-bench gate + waiver mechanism (perf_budget_waivers.json)".into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
         // ---------------------------------------------------------------
         // Domain: Redaction & Retention
         // ---------------------------------------------------------------
@@ -590,6 +628,861 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        // ---------------------------------------------------------------
+        // Domain: Deferred Proof Replay
+        // ---------------------------------------------------------------
+        RequirementRow {
+            id: "REQ-PROOF-001".into(),
+            description: "Deferred proof replay conveyor + state machine: revalidate source \
+                          before replay, honor every safety block, never starve interactive \
+                          work, and publish queued/blocked/replaying/passed/failed/stale"
+                .into(),
+            domain: "proof_replay".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.5.3".into(),
+            test_refs: vec![TestRef {
+                file: "proof_replay_conveyor_e2e.rs".into(),
+                name_prefix: "e2e_proof_replay_".into(),
+                tier: "smoke".into(),
+            }],
+            artifact_assertions: vec![
+                "Recovery after disk pressure: queued under pressure, replays once it clears"
+                    .into(),
+                "Source changed while queued transitions to stale and is never replayed".into(),
+                "Capability still missing stays blocked with reason RCH-I006".into(),
+                "Worker eligible after canary rejoin transitions queued -> replaying".into(),
+                "Replay never bypasses a safety block; concurrency cap + FIFO fairness \
+                 prevent interactive starvation"
+                    .into(),
+                "Published record carries state token + stable RCH-Innn reason code".into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
+        // ---------------------------------------------------------------
+        // Domain: Hook Daemon-Recovery
+        // ---------------------------------------------------------------
+        RequirementRow {
+            id: "REQ-HOOK-001".into(),
+            description: "Hook socket-failure recovery: classify missing/refused/stale socket and \
+                          configured-vs-canonical socket-path mismatch, record a durable \
+                          structured incident, autostart + retry once, then proceed remotely or \
+                          fall back (fail-open) / refuse (proof mode) loudly"
+                .into(),
+            domain: "hook_recovery".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.3.1".into(),
+            test_refs: vec![TestRef {
+                file: "hook_socket_recovery_incident_e2e.rs".into(),
+                name_prefix: "e2e_hook_socket_".into(),
+                tier: "smoke".into(),
+            }],
+            artifact_assertions: vec![
+                "Refused/stale/missing socket records DaemonSocketRefused (RCH-I010) with the \
+                 socket_failure failure class"
+                    .into(),
+                "Wrong configured socket records the configured/canonical mismatch with home \
+                 paths redacted"
+                    .into(),
+                "Daemon start success records only the detection incident (no terminal fallback)"
+                    .into(),
+                "Daemon start failure records LocalFallback (RCH-I011) with fallback allowed"
+                    .into(),
+                "Proof-mode refusal records ProofRefusal (RCH-I012) fail-closed (no fallback)"
+                    .into(),
+                "Incidents survive a process restart and carry a stable RCH-Innn reason token"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
+        RequirementRow {
+            id: "REQ-OBS-001".into(),
+            description: "Prometheus + OpenTelemetry instrumentation for remediation states \
+                          (incident, admission/fallback, proof, queue, worker eligibility, \
+                          temporary bypass, canary, disk pressure, telemetry freshness, artifact \
+                          retrieval, self-healing) with bounded-cardinality labels and redacted, \
+                          OTel-compatible span attributes"
+                .into(),
+            domain: "observability".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.14.5".into(),
+            test_refs: vec![
+                TestRef {
+                    // Lives in rch-telemetry/tests/ (the metrics depend on
+                    // prometheus/opentelemetry, which rch-common does not pull in).
+                    file: "../../rch-telemetry/tests/remediation_metrics_e2e.rs".into(),
+                    name_prefix: "remediation_metrics_scrape_traces_and_evidence".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../../rch-telemetry/src/remediation.rs".into(),
+                    name_prefix: "register_is_idempotent_and_exposes_all_specs".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "Every remediation metric family appears in a Prometheus scrape with bounded labels"
+                    .into(),
+                "Incident spans carry stable attributes (event_type, reason_code, source, \
+                 selected_mode, command_fingerprint, project_id) plus worker/queue/job ids"
+                    .into(),
+                "No raw command text, home/absolute paths, or secret-shaped values appear in \
+                 metric labels or span attributes (path hashed to blake3:, token masked)"
+                    .into(),
+                "JSONL evidence emitted with run_id, bead_id, scenario, metric_name, labels, \
+                 value, status, and detail"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
+        RequirementRow {
+            id: "REQ-UX-002".into(),
+            description: "Human dashboard TUI + web remediation views: compact status bands \
+                          (desired/live fleet, admissibility, proof queue, jobs, disk pressure, \
+                          telemetry freshness, recent incidents) each tagged operator-action / \
+                          self-healing / normal-fail-open, assembled once by the daemon and \
+                          rendered identically by TUI, CLI, and web with no secret leakage"
+                .into(),
+            domain: "ux_quality".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.14.4".into(),
+            test_refs: vec![
+                TestRef {
+                    // Golden + dashboard-data-adapter + no-leak checks for the
+                    // pure assembler (rch_common::remediation_view).
+                    file: "remediation_view_golden_e2e.rs".into(),
+                    name_prefix: "dashboard_states_have_expected_posture".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "remediation_view_golden_e2e.rs".into(),
+                    name_prefix: "no_secret_leaks_across_render_modes".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // TUI overlay snapshot tests for the seven mandated states.
+                    file: "../../rch/src/tui/widgets.rs".into(),
+                    name_prefix: "test_remediation_overlay_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // E2E runner: dump-state view, redaction, CLI envelope, web surface.
+                    file: "../../scripts/e2e_remediation_views.sh".into(),
+                    name_prefix: "e2e_remediation_views".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "All eight remediation bands render in canonical order on TUI, CLI, and web".into(),
+                "Each band and the overall posture is classified operator-action / self-healing / \
+                 normal-fail-open and the seven dashboard states map to the expected class"
+                    .into(),
+                "No hostnames, SSH users, filesystem paths, or secret-shaped values appear in the \
+                 serialized view across JSON (pretty/compact) and Debug renderings"
+                    .into(),
+                "E2E JSONL emitted with run_id, bead_id, scenario, event, status, route_or_view, \
+                 reason_code, duration_ms, and detail"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
+        RequirementRow {
+            id: "REQ-PLACEMENT-001".into(),
+            description: "First-class placement / visibility / strict-remote controls: a canonical \
+                          control registry + pure env->PlacementPlan resolver that never silently \
+                          drops a knob (RCH_FORCE_REMOTE vs RCH_REQUIRE_REMOTE force-vs-require, \
+                          queue-when-busy, wait timeout, visibility, target-dir), and a \
+                          requested-worker admissibility evaluator that yields a structured refusal \
+                          (reason code + next action) instead of a silent worker swap. Surfaced via \
+                          `rch diagnose` (JSON + human) and `rch capabilities`"
+                .into(),
+            domain: "ux_quality".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.13.5".into(),
+            test_refs: vec![
+                TestRef {
+                    // Golden wire-form + schema pin for PlacementPlan and the
+                    // requested-worker refusal vocabulary.
+                    file: "placement_golden_e2e.rs".into(),
+                    name_prefix: "golden_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // Pure resolver + admissibility evaluator unit tests.
+                    file: "../src/placement.rs".into(),
+                    name_prefix: "evaluate_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // E2E runner: env-control scenarios over `rch diagnose --json`.
+                    file: "../../scripts/e2e_placement_controls.sh".into(),
+                    name_prefix: "e2e_placement_controls".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "RCH_FORCE_REMOTE resolves to force_remote (fail-open) and RCH_REQUIRE_REMOTE to \
+                 require_remote (fail-closed); both-set yields a precedence diagnostic"
+                    .into(),
+                "Each requested-worker refusal class (unavailable, admin_disabled, \
+                 temporarily_bypassed, wrong_platform, missing_runtime, project_excluded, \
+                 no_free_slots) maps to a stable RCH-Innn reason code and a next action"
+                    .into(),
+                "Unrecognized / superseded control values surface a diagnostic rather than being \
+                 silently ignored"
+                    .into(),
+                "E2E JSONL emitted with run_id, bead_id, command, requested_worker, \
+                 effective_worker, strict_remote_policy, queue_policy, visibility_mode, status, \
+                 reason_code, duration_ms, and detail"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
+        RequirementRow {
+            id: "REQ-DISCOVERY-001".into(),
+            description: "Agent discovery surfaces for remediation workflows: `rch capabilities \
+                          --json` lists reason-code families (RCH-E/R/I, with the small incident \
+                          registry enumerated in full) and placement/fallback policies (fail-open, \
+                          force-remote, require-remote/proof, queue); `rch robot-docs guide` carries \
+                          machine-readable remediation_workflows (admit-before-proof, proof mode, \
+                          worker bypass/auto-rejoin, fleet status, force resync, queue \
+                          attach/cancel, real-fleet smoke) keyed to real commands; `--help-json` \
+                          resolves and is structurally valid for every real nested path; shell \
+                          completions include the new remediation commands/flags"
+                .into(),
+            domain: "ux_quality".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.13.4".into(),
+            test_refs: vec![
+                TestRef {
+                    // Contract tests over the built binary: capabilities families/
+                    // policies, robot-docs workflows, --help-json schema-check,
+                    // stream separation, TOON parity, completions coverage.
+                    file: "../../rch/tests/integration/discovery_surfaces.rs".into(),
+                    name_prefix: "test_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // E2E runner: drives the discovery commands and emits JSONL
+                    // evidence keyed by bead id and command path.
+                    file: "../../scripts/e2e_discovery_surfaces.sh".into(),
+                    name_prefix: "e2e_discovery_surfaces".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "capabilities.reason_code_families includes RCH-E, RCH-R, and RCH-I; the RCH-I \
+                 family enumerates the incident registry including RCH-I011 (local fallback) and \
+                 RCH-I012 (proof refusal)"
+                    .into(),
+                "capabilities.policies includes require_remote (fail-closed, reason_code RCH-I012), \
+                 force_remote (fail-open), fail_open, and queue_when_busy, each with next-action \
+                 text"
+                    .into(),
+                "robot-docs guide remediation_workflows covers the seven named workflows with \
+                 runnable commands and next-action/observe text; proof_mode references \
+                 RCH_REQUIRE_REMOTE and RCH-I012"
+                    .into(),
+                "--help-json resolves to the correct leaf for every real nested path and rejects \
+                 unknown paths; stdout stays pure JSON while diagnostics stay on stderr"
+                    .into(),
+                "E2E JSONL emitted with run_id, bead_id, command_path, surface, status, and detail"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
+        RequirementRow {
+            id: "REQ-CONFIG-ROLLOUT-001".into(),
+            description: "Remediation config rollout across install/init/upgrade/doctor surfaces: \
+                          old configs without [remediation] deserialize to safe defaults (no \
+                          migration step) and partial sections merge per-field; `rch config \
+                          validate/lint/doctor` and the top-level `rch doctor` (run by the \
+                          installer/easy-mode) report unsafe/out-of-range/contradictory remediation \
+                          settings with concrete remediation; `rch config diff` shows changed \
+                          remediation knobs and `rch config export --format json` includes the \
+                          remediation section with operator paths redacted; `rch init` writes a \
+                          documented [remediation] block without overwriting operator choices"
+                .into(),
+            domain: "ux_quality".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.17.2".into(),
+            test_refs: vec![
+                TestRef {
+                    // Merge/upgrade behavior + surface wiring driven against the
+                    // built binary via RCH_CONFIG_DIR.
+                    file: "../../rch/tests/integration/config_remediation_rollout.rs".into(),
+                    name_prefix: "config_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // E2E runner: drives the config surfaces over a crafted config
+                    // and emits JSONL evidence keyed by bead id and surface.
+                    file: "../../scripts/e2e_config_rollout.sh".into(),
+                    name_prefix: "e2e_config_rollout".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "An old config without a [remediation] section deserializes with the whole \
+                 section defaulted (RemediationConfig::default()); partial sections merge per-field"
+                    .into(),
+                "config validate/lint/doctor and the top-level doctor surface \
+                 RemediationConfig::validate() findings (LINT-E101/W101, DOC-E100/W100, the \
+                 doctor remediation_config check) each with a concrete next step"
+                    .into(),
+                "config diff shows changed remediation knobs (e.g. \
+                 remediation.policy.hook_exec_fail_open) and config export --format json includes \
+                 the remediation section with operator home paths redacted to /home/<redacted>/"
+                    .into(),
+                "Disabling fail-open / proof-fail-closed is accepted without error; an \
+                 out-of-range knob (auto_rejoin.check_interval_secs=0) is reported as an error"
+                    .into(),
+                "E2E JSONL emitted with run_id, bead_id, surface, command, status, and detail"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
+        RequirementRow {
+            id: "REQ-CONFIG-ROLLOUT-002".into(),
+            description: "Config rollout E2E logs and golden tests: integration scenarios over temp \
+                          config homes AND project configs (default install writes/loads the \
+                          [remediation] block; a project .rch/config.toml override is attributed to \
+                          the project file via `config show --sources`; invalid config; \
+                          upgrade-from-old); golden output proves config-command JSON envelope \
+                          stability, TOON parity, and useful remediation text; E2E script emits \
+                          self-validated JSONL with run_id, bead_id, scenario, event, status, \
+                          reason_code, config_source, path, detail. Unit coverage of the schema/\
+                          default helpers and redaction utilities is provided by 17.1 \
+                          (remediation_config_golden_e2e.rs / redaction_policy_golden_e2e.rs)"
+                .into(),
+            domain: "e2e_scripts".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.17.3".into(),
+            test_refs: vec![
+                TestRef {
+                    // Adds default-install, project-override, golden-envelope and
+                    // TOON-parity tests to the rollout suite.
+                    file: "../../rch/tests/integration/config_remediation_rollout.rs".into(),
+                    name_prefix: "config_lint_golden".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // E2E runner emitting the bead's required JSONL field set, with
+                    // an in-script schema self-validator.
+                    file: "../../scripts/e2e_config_rollout_logs.sh".into(),
+                    name_prefix: "e2e_config_rollout_logs".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // Schema/default + redaction unit/golden coverage (17.1).
+                    file: "remediation_config_golden_e2e.rs".into(),
+                    name_prefix: "golden_".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "Integration scenarios cover default install (init writes [remediation], loads \
+                 clean), project override (attributed to project: source via config show \
+                 --sources), invalid config, and upgrade-from-old"
+                    .into(),
+                "Golden config-command output proves envelope stability (success/command/\
+                 api_version), lowercase LintSeverity, the LINT-W101 code, and actionable \
+                 remediation text; config lint --format toon carries the same code and field"
+                    .into(),
+                "E2E script emits one JSONL record per scenario/event with run_id, bead_id, \
+                 scenario, event, status, reason_code, config_source, path, detail and \
+                 self-validates the field set"
+                    .into(),
+                "Schema/default helpers and redaction utilities have unit + golden coverage in \
+                 17.1's remediation_config_golden_e2e.rs and redaction_policy_golden_e2e.rs"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
+        // ---------------------------------------------------------------
+        // Domain: Desired-state fleet reconciliation (epic ocv9i.2)
+        // ---------------------------------------------------------------
+        RequirementRow {
+            id: "REQ-FLEET-001".into(),
+            description: "Desired-state fleet reconciliation: `rch status --fleet` reports \
+                          desired vs live workers (ready / missing-from-fleet / \
+                          recovered-not-rejoined / admin-disabled / temporary-bypass / \
+                          unreachable / facts-unknown / command-ineligible / unconfigured), \
+                          classifies the dominant problem (cloud disappearance, local \
+                          overload, disk pressure, missing capability, admin intent, \
+                          daemon/config drift), and raises absence alerts for workers absent \
+                          beyond the policy threshold — without treating a transient bypass \
+                          as a permanent desired-state edit (no-admissible-workers coverage)"
+                .into(),
+            domain: "fleet_reconciliation".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.2".into(),
+            test_refs: vec![
+                TestRef {
+                    // 2.1: desired-state inventory + live eligibility diff (capacity
+                    // collapse explanation, empty fleet, stable serialized tokens).
+                    file: "../src/fleet_diff.rs".into(),
+                    name_prefix: "fleet_diff_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // 2.2: FleetProblemClass + compute_fleet_status + absence alerts +
+                    // stable-shape (golden) serialization.
+                    file: "../src/fleet_status.rs".into(),
+                    name_prefix: "absence_alerts_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // CLI/E2E surface: `rch status --fleet --json` for empty and
+                    // all-absent fleets. Deep classification is proven by the unit
+                    // tests above; the live binary run is deferred to CI (stale-binary
+                    // precedent), so the .sh existence check is skipped by the matrix.
+                    file: "../../scripts/e2e_fleet_reconciliation.sh".into(),
+                    name_prefix: "e2e_fleet_reconciliation".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "Empty fleet is explained with zero ready/desired (fleet_diff::empty_fleet_is_explained, \
+                 fleet_status::empty_fleet_is_healthy_with_no_alerts)"
+                    .into(),
+                "All-absent / capacity collapse is classified (fleet_diff::fleet_diff_explains_capacity_collapse, \
+                 fleet_status::cloud_disappearance_when_hosts_missing)"
+                    .into(),
+                "Absence alerts respect the threshold and sort longest-absent first \
+                 (fleet_status::absence_alerts_respect_threshold_and_sort_longest_first; \
+                 ready_worker_never_raises_absence_alert)"
+                    .into(),
+                "Stable JSON token/shape golden checks (fleet_diff::fleet_diff_serializes_with_stable_tokens, \
+                 fleet_status::report_serializes_with_stable_shape)"
+                    .into(),
+                "rch status --fleet --json emits a well-formed report for empty and all-absent \
+                 fleets; E2E JSONL fields: run_id, bead_id, scenario, event, status, reason_code, \
+                 problem_class, detail"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
+        // ---------------------------------------------------------------
+        // Domain: OS/arch-aware fleet update + post-deploy validation
+        // (epic ocv9i.7)
+        // ---------------------------------------------------------------
+        RequirementRow {
+            id: "REQ-FLEET-002".into(),
+            description: "OS/arch-aware post-deploy validation runs against the EXACT remote \
+                          user/path RCH invokes (never root / login-default / bare PATH-resolved \
+                          rch-wkr): probes `uname`/`file`/`--version`, a liveness handshake, and a \
+                          capabilities/protocol-JSON handshake. A wrong-OS/arch binary \
+                          (`Exec format error`) is marked not eligible with reason_code \
+                          `os_arch_mismatch`; a version-skewed/corrupt binary that runs but cannot \
+                          emit parseable WorkerCapabilities JSON is marked not eligible with \
+                          `capabilities_handshake_failed`; any other non-zero exit is \
+                          `post_deploy_validation_failed`. Covers the Darwin-controller -> \
+                          Linux-worker regression."
+                .into(),
+            domain: "fleet_update".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.7.3".into(),
+            test_refs: vec![
+                TestRef {
+                    // Exact-path command builders (uname/file/--version, health,
+                    // capabilities) — all shell-escaped to $HOME.
+                    file: "../../rch/src/fleet/executor.rs".into(),
+                    name_prefix: "post_deploy_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // Exact-path / liveness classifier: Exec format error ->
+                    // os_arch_mismatch; generic non-zero -> validation failure.
+                    file: "../../rch/src/fleet/executor.rs".into(),
+                    name_prefix: "classify_post_deploy".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // Capabilities/protocol handshake classifier: unparseable JSON
+                    // -> capabilities_handshake_failed; Exec format error ->
+                    // os_arch_mismatch; valid JSON (incl. {}) -> eligible.
+                    file: "../../rch/src/fleet/executor.rs".into(),
+                    name_prefix: "capabilities_handshake_".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "Exact-path probes are shell-escaped to $HOME, never a bare PATH-resolved rch-wkr \
+                 (executor::post_deploy_validation_runs_the_exact_quoted_path, \
+                 post_deploy_capabilities_command_runs_the_exact_quoted_path, \
+                 post_deploy_health_command_runs_the_exact_quoted_path)"
+                    .into(),
+                "Exec format error (exit 126 or kernel message) -> NotEligible{os_arch_mismatch} on \
+                 both the --version and capabilities probes — the Darwin->Linux regression \
+                 (executor::classify_post_deploy_marks_exec_format_ineligible, \
+                 capabilities_handshake_exec_format_is_os_arch_mismatch)"
+                    .into(),
+                "Binary that runs but emits unparseable WorkerCapabilities JSON -> \
+                 NotEligible{capabilities_handshake_failed}; valid JSON incl. all-defaults {} -> \
+                 Eligible (executor::capabilities_handshake_unparseable_json_is_ineligible, \
+                 capabilities_handshake_valid_json_is_eligible)"
+                    .into(),
+                "Generic non-zero exit -> NotEligible{post_deploy_validation_failed} \
+                 (executor::classify_post_deploy_generic_failure_and_success, \
+                 capabilities_handshake_nonzero_exit_is_generic_failure)"
+                    .into(),
+                "Structured ineligibility log fields worker/step/reason_code/detail where step is \
+                 exact_path_version|health|capabilities_handshake \
+                 (executor::verify_installation warn!/info! tracing)"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
+        // ---------------------------------------------------------------
+        // Domain: Release provenance + signature/checksum + deploy audit
+        // (epic ocv9i.7, bead .7.4)
+        // ---------------------------------------------------------------
+        RequirementRow {
+            id: "REQ-FLEET-003".into(),
+            description: "Release provenance and signature/checksum verification gate fleet binary \
+                          deploys BEFORE transfer: target-triple match, expected-checksum match, \
+                          and signature validity are checked under a policy. A wrong-triple, \
+                          checksum-mismatch, invalid-signature, or (under strict policy) \
+                          missing-signature/checksum artifact is REJECTED fail-closed with a stable \
+                          provenance_* reason_code; an artifact with no material is allowed only \
+                          when policy permits a dev artifact, recording an explicit reason. A \
+                          FleetDeployAuditRecord captures run_id, bead_id, worker_id, remote \
+                          user/path, artifact/release id, target_triple, previous artifact, \
+                          deployed_at/duration_ms, verification_status, rollback_status, \
+                          reason_code, trigger, and detail."
+                .into(),
+            domain: "fleet_update".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.7.4".into(),
+            test_refs: vec![
+                TestRef {
+                    // Pure verification verdicts: verified / dev-allowed / rejected.
+                    file: "../src/fleet_provenance.rs".into(),
+                    name_prefix: "good_signature".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/fleet_provenance.rs".into(),
+                    name_prefix: "checksum_mismatch".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/fleet_provenance.rs".into(),
+                    name_prefix: "wrong_target_triple".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/fleet_provenance.rs".into(),
+                    name_prefix: "dev_artifact".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // Deploy audit record shape + serde stability.
+                    file: "../src/fleet_provenance.rs".into(),
+                    name_prefix: "audit_record".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "Target triple is the highest-priority gate: a wrong-triple artifact is rejected \
+                 even with a valid signature (fleet_provenance::wrong_target_triple_is_rejected_even_with_valid_signature)"
+                    .into(),
+                "Checksum mismatch -> Rejected{provenance_checksum_mismatch}; case-insensitive match \
+                 -> Verified (fleet_provenance::checksum_mismatch_is_rejected, \
+                 checksum_comparison_is_case_insensitive, checksum_only_match_is_verified)"
+                    .into(),
+                "Signature: invalid -> Rejected{provenance_signature_invalid} under any policy; \
+                 missing under STRICT -> Rejected{provenance_signature_missing}; good signature -> \
+                 Verified (fleet_provenance::invalid_signature_is_rejected_under_any_policy, \
+                 missing_signature_under_strict_policy_is_rejected, good_signature_and_checksum_is_verified)"
+                    .into(),
+                "Dev artifact with no material -> DevArtifactAllowed{explicit reason} under \
+                 dev-friendly policy, but Rejected{provenance_unverifiable} when dev artifacts are \
+                 forbidden; require_checksum with nothing to compare -> Rejected{provenance_checksum_missing} \
+                 (fleet_provenance::dev_artifact_is_allowed_with_explicit_reason, \
+                 dev_artifact_without_allowance_is_unverifiable, require_checksum_without_value_is_rejected)"
+                    .into(),
+                "FleetDeployAuditRecord carries verification_status/rollback_status/reason_code + \
+                 previous_artifact_id and survives a serde roundtrip; verdict serializes with a stable \
+                 snake_case status tag; schema component FleetDeployAudit is version-pinned 1.0.0 \
+                 (fleet_provenance::audit_record_from_verdict_carries_status_and_reason, \
+                 audit_record_serde_roundtrip_is_stable, verdict_is_tagged_with_snake_case_status, \
+                 schema_version_is_pinned)"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
+        // ---------------------------------------------------------------
+        // Domain: Real-fleet smoke/soak validation profile (bead .16.6)
+        // ---------------------------------------------------------------
+        RequirementRow {
+            id: "REQ-SMOKE-001".into(),
+            description: "Real-fleet smoke/soak validation profile planning + skip/refusal logic: a \
+                          bounded profile (daemon reachability, desired-vs-live fleet, exact \
+                          user/path capabilities, disk/inode admission, cargo canary, artifact \
+                          retrieval, queue attach/cancel, proof-mode refusal) plans WHICH scenarios \
+                          run, which SKIP with a stable reason (no real workers, dry-run, \
+                          single-worker selection), and which are EXPECTED to fail closed \
+                          (proof-mode refusal when remote execution is unavailable). Emits a \
+                          structured SmokeProfileEvent JSONL record."
+                .into(),
+            domain: "smoke_validation".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.16.6".into(),
+            test_refs: vec![
+                TestRef {
+                    file: "../src/fleet_smoke_profile.rs".into(),
+                    name_prefix: "no_workers".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/fleet_smoke_profile.rs".into(),
+                    name_prefix: "proof_refusal".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/fleet_smoke_profile.rs".into(),
+                    name_prefix: "single_worker".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/fleet_smoke_profile.rs".into(),
+                    name_prefix: "event_serde".into(),
+                    tier: "smoke".into(),
+                },
+                // Consumer: `rch self-test --smoke` builds inputs from config +
+                // daemon reachability, runs the foundation planner, and emits the
+                // SmokeProfileEvent JSONL trace (single source of truth = the
+                // foundation; live per-worker SSH execution is the operator
+                // procedure, paired with .7.4's deploy E2E).
+                TestRef {
+                    file: "../../rch/src/commands/status.rs".into(),
+                    name_prefix: "smoke_planned_events".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../../rch/src/commands/status.rs".into(),
+                    name_prefix: "build_smoke_inputs".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../../scripts/e2e_real_fleet_smoke.sh".into(),
+                    name_prefix: "e2e".into(),
+                    tier: "smoke".into(),
+                },
+                // Mock-SSH integration for the capabilities scenario executor
+                // (composes the 12.2 capability-probe + admissibility foundation).
+                TestRef {
+                    file: "../../rch/src/fleet/executor.rs".into(),
+                    name_prefix: "smoke_capabilities".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../../rch/src/fleet/executor.rs".into(),
+                    name_prefix: "smoke_disk_inode".into(),
+                    tier: "smoke".into(),
+                },
+                // Build-pipeline scenario verdicts: cargo canary (remote build
+                // completed) + artifact retrieval (rsynced back AND hash-matched,
+                // with missing-vs-mismatch split) decided from the daemon
+                // self-test result; queue attach/cancel decided from the daemon's
+                // deterministic not-found refusal of a synthetic build id.
+                TestRef {
+                    file: "../../rch/src/commands/status.rs".into(),
+                    name_prefix: "smoke_canary_verdict".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../../rch/src/commands/status.rs".into(),
+                    name_prefix: "smoke_artifact_verdict".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../../rch/src/commands/status.rs".into(),
+                    name_prefix: "smoke_cancel_verdict".into(),
+                    tier: "smoke".into(),
+                },
+                // The self-test response timeout waits the per-worker build
+                // budget (+margin, capped) instead of the 10s default, so the
+                // canary client no longer spuriously times out (RCH-E504).
+                TestRef {
+                    file: "../../rch/src/commands/helpers.rs".into(),
+                    name_prefix: "self_test_run".into(),
+                    tier: "smoke".into(),
+                },
+                // Daemon canary robustness the live run surfaced: self-heal a
+                // wedged self-test fixture, and resolve cargo off the daemon's
+                // minimal PATH.
+                TestRef {
+                    file: "../../rchd/src/self_test.rs".into(),
+                    name_prefix: "self_test_main_rs_health".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/remote_compilation.rs".into(),
+                    name_prefix: "resolve_cargo_binary".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "No real workers configured -> every real-fleet scenario Skip{smoke_no_real_workers}; \
+                 daemon reachability still runs (fleet_smoke_profile::no_workers_skips_all_real_scenarios_and_marks_overall_skipped)"
+                    .into(),
+                "Proof-mode refusal is EXPECTED (fail-closed) when remote execution is unavailable, \
+                 and Skip{smoke_remote_available} when it is available — asserted even under --dry-run \
+                 (fleet_smoke_profile::proof_refusal_skipped_when_remote_available, \
+                 dry_run_marks_buildy_scenarios_dry_but_still_asserts_proof_refusal)"
+                    .into(),
+                "A single --worker selection skips the fleet-wide desired-vs-live scenario \
+                 with reason smoke_not_selected while per-worker scenarios still run \
+                 (fleet_smoke_profile::single_worker_selection_skips_fleet_wide_scenario)"
+                    .into(),
+                "Plan covers every scenario once in run order; full fleet executes 7 scenarios; soak \
+                 mode is carried into the plan (fleet_smoke_profile::plan_covers_every_scenario_once_in_order, \
+                 full_fleet_runs_all_per_worker_scenarios, soak_mode_is_carried_into_the_plan)"
+                    .into(),
+                "SmokeProfileEvent JSONL carries run_id/bead_id/worker_id/scenario/event/status/reason_code/\
+                 command_fingerprint/duration_ms/remote_target_dir/artifact_summary and survives a serde \
+                 roundtrip; daemon-only scenarios drop worker_id \
+                 (fleet_smoke_profile::event_serde_roundtrip_is_stable, planned_event_carries_fields_and_omits_worker_for_daemon_scenario)"
+                    .into(),
+                "Consumer `rch self-test --smoke [--dry-run] [--soak]` derives inputs from config + a \
+                 daemon /health probe (remote_execution_available = daemon up AND workers configured), \
+                 runs plan_smoke_profile, and emits the planned JSONL trace; scripts/e2e_real_fleet_smoke.sh \
+                 drives the safe --dry-run --json surface for empty_fleet/all_absent and self-validates \
+                 the plan (8 scenarios) + SmokeProfileEvent fields \
+                 (status::tests::{build_smoke_inputs_maps_environment_and_flags, smoke_planned_events_cover_every_scenario_with_reasons})"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
+        // ---------------------------------------------------------------
+        // Domain: Load fairness / storm control
+        // ---------------------------------------------------------------
+        RequirementRow {
+            id: "REQ-LOAD-001".into(),
+            description: "Multi-agent load fairness and storm control: a deterministic mock-worker \
+                          E2E launches many concurrent build/test/check jobs with varied runtimes, \
+                          slot requests, project roots, and proof/fail-open policies, then proves the \
+                          scheduler/admission/queue/fallback/observability stay coherent under \
+                          contention — fairness/load-spreading, no duplicate remote job ids, no \
+                          unbounded local fallback storm, no stuck wrapper without attach/cancel \
+                          guidance, and no work to a temporarily-bypassed / admin-disabled / \
+                          capability-inadmissible worker. Emits SmokeProfileEvent JSONL (with \
+                          local_job_id, remote_job_id, queue_depth, selected_worker, \
+                          fallback_decision, detail) and a StormSummary of regression statistics. \
+                          Drives the real job_identity + queue_contract primitives."
+                .into(),
+            domain: "load_fairness".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.10.4".into(),
+            test_refs: vec![
+                // Mock-worker E2E: concurrent swarm upholds all five invariants,
+                // load spreads, ids unique, bounded queue, proof fail-closed,
+                // ineligible workers idle, cancellation clean, JSONL persisted.
+                TestRef {
+                    file: "storm_control_e2e.rs".into(),
+                    name_prefix: "e2e_storm_".into(),
+                    tier: "smoke".into(),
+                },
+                // Foundation unit tests: simulator + summary + invariant checkers
+                // (including non-vacuous detector tests).
+                TestRef {
+                    file: "../src/storm_control.rs".into(),
+                    name_prefix: "healthy_storm_upholds_all_invariants".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/storm_control.rs".into(),
+                    name_prefix: "fairness_spreads_load".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/storm_control.rs".into(),
+                    name_prefix: "unique_remote_job_ids".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/storm_control.rs".into(),
+                    name_prefix: "proof_jobs_refuse".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/storm_control.rs".into(),
+                    name_prefix: "ineligible_workers_never_receive_work".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/storm_control.rs".into(),
+                    name_prefix: "detector_catches_".into(),
+                    tier: "smoke".into(),
+                },
+                // The load-mode planning surface (ProfileMode::Load +
+                // LoadStormControl scenario token + JSONL field setters).
+                TestRef {
+                    file: "../src/fleet_smoke_profile.rs".into(),
+                    name_prefix: "load_mode_is_carried_into_the_plan".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/fleet_smoke_profile.rs".into(),
+                    name_prefix: "load_event_setters_populate_jsonl_fields".into(),
+                    tier: "smoke".into(),
+                },
+                // Shell E2E that runs the deterministic mock-worker storm suite.
+                TestRef {
+                    file: "../../scripts/e2e_storm_control.sh".into(),
+                    name_prefix: "e2e_storm_control".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "A 64-job concurrent swarm (varied runtime/slots/roots, mixed proof/force/fail-open) \
+                 upholds all five invariants; every wrapper resolves to a definite disposition \
+                 (storm_control_e2e::e2e_storm_concurrent_swarm_upholds_all_invariants)"
+                    .into(),
+                "Load spreads within tolerance across a heterogeneous fleet; no schedulable worker is \
+                 starved (storm_control_e2e::e2e_storm_load_spreads_across_the_fleet, check_load_fairness)"
+                    .into(),
+                "Every admitted job gets a unique remote_job_id; a forged collision is detected \
+                 (storm_control::{unique_remote_job_ids_under_storm, detector_catches_duplicate_remote_ids})"
+                    .into(),
+                "A bounded queue keeps local fallback bounded; an impossibly-tight cap flags the storm, \
+                 proving the checker is non-vacuous (storm_control_e2e::e2e_storm_bounded_queue_prevents_fallback_storm)"
+                    .into(),
+                "Proof (strict-remote) jobs fail closed — they refuse, never fall back to local — with \
+                 the proof reason code (storm_control_e2e::e2e_storm_proof_jobs_fail_closed_never_local)"
+                    .into(),
+                "Temporarily-bypassed / admin-disabled / capability-inadmissible workers are never \
+                 selected and stay at 0 utilization; a forged selection is detected \
+                 (storm_control_e2e::e2e_storm_ineligible_workers_never_selected, detector_catches_ineligible_selection)"
+                    .into(),
+                "Cancelled and not-started jobs carry attach/cancel guidance; a started job with no \
+                 terminal event is flagged as a stuck wrapper (storm_control::{detector_catches_stuck_wrapper}, \
+                 storm_control_e2e::e2e_storm_cancellation_leaves_no_stuck_wrapper)"
+                    .into(),
+                "StormSummary records total_jobs, remote_successes, local_fallbacks, proof_refusals, \
+                 queue_timeouts, cancellations, p95_queue_wait_ms, p95_end_to_end_ms, and per-worker \
+                 slot utilization; the SmokeProfileEvent JSONL trace is persisted to an isolated temp \
+                 dir with the full field set and no user files touched \
+                 (storm_control_e2e::{e2e_storm_records_summary_statistics, e2e_storm_jsonl_log_persisted_with_full_field_set})"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
     ];
 
     let total = requirements.len();
@@ -639,12 +1532,16 @@ const KNOWN_TEST_FILES: &[&str] = &[
     "local_remote_parity_e2e.rs",
     "deterministic_replay_e2e.rs",
     "performance_budget_e2e.rs",
+    "remediation_hotpath_budget_e2e.rs",
+    "proof_replay_conveyor_e2e.rs",
+    "hook_socket_recovery_incident_e2e.rs",
     "redaction_retention_e2e.rs",
     "contract_drift_e2e.rs",
     "feature_flags_rollout_e2e.rs",
     "reliability_doctor_e2e.rs",
     "ux_regression_e2e.rs",
     "smoke.rs",
+    "storm_control_e2e.rs",
 ];
 
 // ===========================================================================

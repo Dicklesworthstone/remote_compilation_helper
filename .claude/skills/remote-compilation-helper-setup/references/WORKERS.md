@@ -23,7 +23,7 @@ score = available_slots × priority × locality_bonus
 1. **Available slots**: `total_slots - active_jobs`
 2. **Priority**: tiebreaker when slots equal
 3. **Locality**: bonus for workers with cached project data
-4. **Tags**: project can require specific tags via `.rch.toml`
+4. **Tags**: project can require specific tags via `.rch/config.toml`
 
 ## Multi-Worker Example
 
@@ -103,7 +103,7 @@ tags = ["rust", "bun", "cpp"]
 
 Projects require tags:
 ```toml
-# .rch.toml in project root
+# .rch/config.toml in project root
 required_tags = ["rust", "fast"]
 ```
 

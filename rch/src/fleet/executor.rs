@@ -10,6 +10,7 @@
 //! Backup failures are non-fatal and never block deployment.
 
 use crate::fleet::audit::AuditLogger;
+use crate::fleet::history::HistoryManager;
 use crate::fleet::plan::{DeploymentPlan, DeploymentStatus, DeploymentStrategy};
 use crate::fleet::progress::{DeployPhase, FleetProgress};
 use crate::fleet::rollback::{
@@ -22,14 +23,26 @@ use anyhow::Result;
 
 use crate::error::{FleetError, SshError};
 use futures::future::BoxFuture;
+use rch_common::capability_probe::{
+    CapabilityRequirement, CapabilityVerdict, ProbeSpec, assess_admissibility,
+    build_capability_probe_script, parse_capability_probe, remote_worker_binary_path,
+};
+use rch_common::disk_pressure_report::{
+    DiskRootKind, PressureLevel, PressureThresholds, assess_root,
+};
+use rch_common::fleet_provenance::{
+    ArtifactProvenance, FleetDeployAuditRecord, ProvenancePolicy, ProvenanceVerdict,
+    SignatureCheck, verify_artifact_provenance,
+};
+use rch_common::fleet_smoke_profile::{SmokeProfileEvent, SmokeScenario};
 use rch_common::ssh_utils::shell_escape_path_with_home;
-use rch_common::{WorkerConfig, WorkerId};
+use rch_common::{IncidentReasonCode, WorkerCapabilities, WorkerConfig, WorkerId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -48,6 +61,17 @@ pub enum FleetResult {
     },
     /// Canary deployment failed validation.
     CanaryFailed { reason: String },
+    /// Canary succeeded but `auto_promote` is off, so the rest of the fleet is
+    /// intentionally NOT yet deployed. Distinct from `Success` so operators and
+    /// JSON consumers never read a partial canary rollout as a finished one.
+    CanaryPending {
+        /// Workers deployed in the canary batch.
+        promoted: usize,
+        /// Workers still running the previous version, awaiting promotion.
+        remaining: usize,
+        skipped: usize,
+        failed: usize,
+    },
     /// Deployment was aborted.
     Aborted { reason: String },
 }
@@ -120,6 +144,9 @@ impl FleetExecutor {
         let mut deployed = 0;
         let mut skipped = 0;
         let mut failed = 0;
+        // Set when a canary succeeds but auto_promote is off: the count of
+        // workers intentionally left on the previous version.
+        let mut canary_pending_remaining: Option<usize> = None;
 
         // Clone strategy to avoid borrow issues
         let strategy = plan.strategy.clone();
@@ -215,31 +242,37 @@ impl FleetExecutor {
                     }
                 }
 
-                // Deploy to remaining workers if auto_promote is enabled
-                if auto_promote && canary_count < worker_count {
-                    if !ctx.is_json() {
-                        println!("  {} Deploying to remaining workers...", style.muted("→"));
-                    }
-                    let remaining_results = self
-                        .deploy_batch(
-                            &mut plan,
-                            canary_count..worker_count,
-                            self.parallelism,
-                            ctx,
-                            progress.clone(),
-                        )
-                        .await?;
-
-                    for (idx, success) in remaining_results {
-                        if success {
-                            if plan.workers[idx].status == DeploymentStatus::Skipped {
-                                skipped += 1;
-                            } else {
-                                deployed += 1;
-                            }
-                        } else {
-                            failed += 1;
+                // Deploy to remaining workers if auto_promote is enabled;
+                // otherwise leave them on the previous version and record the
+                // pending count so the caller doesn't report a finished rollout.
+                if canary_count < worker_count {
+                    if auto_promote {
+                        if !ctx.is_json() {
+                            println!("  {} Deploying to remaining workers...", style.muted("→"));
                         }
+                        let remaining_results = self
+                            .deploy_batch(
+                                &mut plan,
+                                canary_count..worker_count,
+                                self.parallelism,
+                                ctx,
+                                progress.clone(),
+                            )
+                            .await?;
+
+                        for (idx, success) in remaining_results {
+                            if success {
+                                if plan.workers[idx].status == DeploymentStatus::Skipped {
+                                    skipped += 1;
+                                } else {
+                                    deployed += 1;
+                                }
+                            } else {
+                                failed += 1;
+                            }
+                        }
+                    } else {
+                        canary_pending_remaining = Some(worker_count - canary_count);
                     }
                 }
             }
@@ -306,11 +339,20 @@ impl FleetExecutor {
         // Finish progress display
         progress.finish();
 
-        Ok(FleetResult::Success {
-            deployed,
-            skipped,
-            failed,
-        })
+        if let Some(remaining) = canary_pending_remaining {
+            Ok(FleetResult::CanaryPending {
+                promoted: deployed,
+                remaining,
+                skipped,
+                failed,
+            })
+        } else {
+            Ok(FleetResult::Success {
+                deployed,
+                skipped,
+                failed,
+            })
+        }
     }
 
     /// Deploy a batch of workers in parallel.
@@ -331,6 +373,11 @@ impl FleetExecutor {
         let style = ctx.theme();
         let is_json = ctx.is_json();
 
+        // Active release-provenance policy for this deploy run (bd-...-7.4).
+        // Resolved once; `ProvenancePolicy` is `Copy` so each spawned task gets
+        // its own copy.
+        let policy = resolve_provenance_policy();
+
         for idx in range.clone() {
             let permit = semaphore.clone().acquire_owned().await?;
             let worker_id = plan.workers[idx].worker_id.clone();
@@ -340,6 +387,9 @@ impl FleetExecutor {
             let progress = progress.clone();
             let worker_configs = self.worker_configs.clone();
             let local_binary = self.local_binary.clone();
+            // Correlation id for the provenance audit trail: the deployment plan
+            // id, shared across every worker in this run.
+            let run_id = plan.id.to_string();
 
             let handle = tokio::spawn(async move {
                 let _permit = permit;
@@ -377,9 +427,13 @@ impl FleetExecutor {
 
                 // Backup phase - create backup of current binary (best-effort, non-fatal)
                 // This runs before upload to capture the existing version
+                let mut previous_artifact_id: Option<String> = None;
                 if let Ok(mut rollback_manager) = RollbackManager::new() {
                     match backup_before_deploy(&worker_config, &mut rollback_manager).await {
                         Ok(Some(backup)) => {
+                            // Records the previously-installed artifact for the
+                            // provenance audit/rollback trail (bd-...-7.4).
+                            previous_artifact_id = Some(backup.version.clone());
                             debug!(
                                 worker = %worker_id,
                                 version = %backup.version,
@@ -397,6 +451,65 @@ impl FleetExecutor {
 
                 // Upload phase - create remote directory and copy binary
                 progress.set_phase(&worker_id, DeployPhase::Uploading).await;
+
+                // Guard against clobbering a worker's good binary with one built
+                // for the wrong OS/arch (e.g. pushing a macOS binary onto a
+                // linux/amd64 worker => `Exec format error`). Runs before SCP so
+                // a mismatch never overwrites the existing binary.
+                if let Err(e) = ensure_binary_matches_worker(&worker_config, &local_binary).await {
+                    progress.worker_failed(&worker_id, &format!("{}", e)).await;
+                    return (idx, worker_id, false, DeploymentStatus::Failed);
+                }
+
+                // Release-provenance gate (bd-...-7.4): prove this is the
+                // intended artifact for this worker before transfer, and record
+                // the verdict to the append-only audit trail. Fails closed on a
+                // `Rejected` verdict (wrong triple / checksum mismatch / invalid
+                // or — under strict policy — missing signature), leaving the
+                // worker's existing binary untouched.
+                //
+                // The worker's target triple is only needed to check it against a
+                // release manifest's declared triple, so the (3-round-trip) SSH
+                // discovery runs ONLY when a sidecar manifest is present. The
+                // common path — a locally-built binary with no manifest — adds no
+                // SSH and reuses the checksum `copy_binary_via_scp` computes
+                // anyway; `ensure_binary_matches_worker` above remains the
+                // OS/arch backstop.
+                let gate_start = Instant::now();
+                let worker_triple = if provenance_manifest_path(&local_binary).exists() {
+                    discover_worker_target_facts(&worker_config)
+                        .await
+                        .and_then(|facts| worker_target_triple(&facts))
+                } else {
+                    None
+                };
+                let (verdict, provenance) =
+                    run_provenance_gate(&local_binary, worker_triple.as_deref(), &policy).await;
+                let mut audit = FleetDeployAuditRecord::from_verdict(
+                    run_id.clone(),
+                    PROVENANCE_BEAD_ID,
+                    worker_id.as_str(),
+                    worker_config.user.as_str(),
+                    REMOTE_WORKER_BINARY,
+                    &provenance,
+                    previous_artifact_id.clone(),
+                    now_unix_ms(),
+                    &verdict,
+                    "operator",
+                    provenance_detail(&verdict),
+                );
+                audit.set_duration_ms(
+                    u64::try_from(gate_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                );
+                persist_provenance_audit(&audit);
+
+                if !verdict.may_transfer() {
+                    let reason = verdict.reason_code().unwrap_or("provenance_rejected");
+                    progress
+                        .worker_failed(&worker_id, &format!("provenance gate rejected: {reason}"))
+                        .await;
+                    return (idx, worker_id, false, DeploymentStatus::Failed);
+                }
 
                 if let Err(e) = create_remote_directory(&worker_config).await {
                     progress
@@ -493,6 +606,881 @@ async fn create_remote_directory(worker: &WorkerConfig) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("mkdir failed: {}", e))
 }
 
+// =============================================================================
+// Binary / worker platform compatibility guard
+// =============================================================================
+//
+// A controller must never overwrite a worker's good binary with one built for
+// the wrong OS/arch. Pushing a macOS Mach-O onto a linux/amd64 worker leaves
+// every invocation failing with `Exec format error` (exit 126). We detect the
+// local binary's executable format from its magic bytes and the worker's
+// platform from `uname`, and refuse the deploy on mismatch *before* the
+// existing binary is replaced.
+
+/// Operating-system family of an executable or a remote worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryOs {
+    Linux,
+    MacOs,
+    Windows,
+}
+
+impl BinaryOs {
+    fn as_str(self) -> &'static str {
+        match self {
+            BinaryOs::Linux => "linux",
+            BinaryOs::MacOs => "macos",
+            BinaryOs::Windows => "windows",
+        }
+    }
+}
+
+/// CPU architecture of an executable or a remote worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryArch {
+    X86_64,
+    Aarch64,
+    X86,
+    Arm,
+}
+
+impl BinaryArch {
+    fn as_str(self) -> &'static str {
+        match self {
+            BinaryArch::X86_64 => "x86_64",
+            BinaryArch::Aarch64 => "aarch64",
+            BinaryArch::X86 => "x86",
+            BinaryArch::Arm => "arm",
+        }
+    }
+}
+
+/// OS + arch of an executable or worker. `arch == None` means the arch could
+/// not be determined (e.g. a universal/fat Mach-O, or an unrecognised
+/// `uname -m`); in that case we only enforce the OS match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BinaryPlatform {
+    os: BinaryOs,
+    arch: Option<BinaryArch>,
+}
+
+impl std::fmt::Display for BinaryPlatform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.arch {
+            Some(arch) => write!(f, "{}/{}", self.os.as_str(), arch.as_str()),
+            None => write!(f, "{}/unknown", self.os.as_str()),
+        }
+    }
+}
+
+/// Number of header bytes that are sufficient to classify ELF, Mach-O and PE
+/// executables (magic + machine/cputype fields all live in the first 20 bytes).
+const BINARY_MAGIC_PROBE_LEN: usize = 20;
+
+/// Classify a local executable from its leading magic bytes.
+///
+/// Returns `None` when the format is unrecognised, in which case the guard
+/// fails open (the post-deploy health check remains the backstop).
+fn detect_binary_platform(header: &[u8]) -> Option<BinaryPlatform> {
+    // PE / Windows ("MZ").
+    if header.len() >= 2 && &header[0..2] == b"MZ" {
+        return Some(BinaryPlatform {
+            os: BinaryOs::Windows,
+            arch: None,
+        });
+    }
+
+    // ELF: 0x7F 'E' 'L' 'F'.
+    if header.len() >= 20 && header[0..4] == [0x7F, b'E', b'L', b'F'] {
+        // EI_DATA at offset 5: 1 = little-endian, 2 = big-endian.
+        let little_endian = header[5] != 2;
+        // e_machine: 2-byte field at offset 18.
+        let machine = if little_endian {
+            u16::from_le_bytes([header[18], header[19]])
+        } else {
+            u16::from_be_bytes([header[18], header[19]])
+        };
+        let arch = match machine {
+            0x3E => Some(BinaryArch::X86_64),  // EM_X86_64
+            0xB7 => Some(BinaryArch::Aarch64), // EM_AARCH64
+            0x03 => Some(BinaryArch::X86),     // EM_386
+            0x28 => Some(BinaryArch::Arm),     // EM_ARM
+            _ => None,
+        };
+        return Some(BinaryPlatform {
+            os: BinaryOs::Linux,
+            arch,
+        });
+    }
+
+    // Mach-O (single-arch). Magic stored in native endianness:
+    //   little-endian on disk: CF FA ED FE (64-bit) / CE FA ED FE (32-bit)
+    //   cross-endian:          FE ED FA CF / FE ED FA CE
+    if header.len() >= 8 {
+        let magic = &header[0..4];
+        let is_macho_le = magic == [0xCF, 0xFA, 0xED, 0xFE] || magic == [0xCE, 0xFA, 0xED, 0xFE];
+        let is_macho_be = magic == [0xFE, 0xED, 0xFA, 0xCF] || magic == [0xFE, 0xED, 0xFA, 0xCE];
+        if is_macho_le || is_macho_be {
+            // cputype: 4-byte field at offset 4, in the same endianness as magic.
+            let cputype = if is_macho_le {
+                u32::from_le_bytes([header[4], header[5], header[6], header[7]])
+            } else {
+                u32::from_be_bytes([header[4], header[5], header[6], header[7]])
+            };
+            let arch = match cputype {
+                0x0100_0007 => Some(BinaryArch::X86_64),  // CPU_TYPE_X86_64
+                0x0100_000C => Some(BinaryArch::Aarch64), // CPU_TYPE_ARM64
+                0x0000_0007 => Some(BinaryArch::X86),     // CPU_TYPE_X86
+                0x0000_000C => Some(BinaryArch::Arm),     // CPU_TYPE_ARM
+                _ => None,
+            };
+            return Some(BinaryPlatform {
+                os: BinaryOs::MacOs,
+                arch,
+            });
+        }
+
+        // Universal / fat Mach-O: FAT_MAGIC 0xCAFEBABE (and byte-swapped). Such
+        // a binary contains multiple slices, so we only assert the macOS OS.
+        if magic == [0xCA, 0xFE, 0xBA, 0xBE] || magic == [0xBE, 0xBA, 0xFE, 0xCA] {
+            return Some(BinaryPlatform {
+                os: BinaryOs::MacOs,
+                arch: None,
+            });
+        }
+    }
+
+    None
+}
+
+/// Parse `uname -s` / `uname -m` output into a worker platform.
+///
+/// `uname_s` is the kernel name (`Linux`, `Darwin`, ...) and `uname_m` is the
+/// machine hardware name (`x86_64`, `aarch64`, `arm64`, ...). Returns `None`
+/// when the OS is unrecognised so the guard fails open.
+fn parse_worker_platform(uname_s: &str, uname_m: &str) -> Option<BinaryPlatform> {
+    let os = match uname_s.trim().to_ascii_lowercase().as_str() {
+        "linux" => BinaryOs::Linux,
+        "darwin" => BinaryOs::MacOs,
+        s if s.contains("mingw") || s.contains("msys") || s.contains("cygwin") => BinaryOs::Windows,
+        _ => return None,
+    };
+
+    let arch = match uname_m.trim().to_ascii_lowercase().as_str() {
+        "x86_64" | "amd64" => Some(BinaryArch::X86_64),
+        "aarch64" | "arm64" => Some(BinaryArch::Aarch64),
+        "i386" | "i486" | "i586" | "i686" | "x86" => Some(BinaryArch::X86),
+        m if m.starts_with("armv") || m == "arm" => Some(BinaryArch::Arm),
+        _ => None,
+    };
+
+    Some(BinaryPlatform { os, arch })
+}
+
+/// Whether a binary built for `local` can execute on a `worker` platform.
+///
+/// The OS must match exactly. The arch must match when both are known; an
+/// unknown arch on either side (universal binary, unrecognised `uname -m`)
+/// degrades to an OS-only check rather than a false rejection.
+fn platforms_compatible(local: BinaryPlatform, worker: BinaryPlatform) -> bool {
+    if local.os != worker.os {
+        return false;
+    }
+    match (local.arch, worker.arch) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
+/// Read the leading magic bytes of a local binary.
+fn read_binary_header(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; BINARY_MAGIC_PROBE_LEN];
+    let mut read = 0;
+    while read < buf.len() {
+        match file.read(&mut buf[read..])? {
+            0 => break,
+            n => read += n,
+        }
+    }
+    buf.truncate(read);
+    Ok(buf)
+}
+
+/// Detect a worker's platform via `uname`.
+async fn detect_worker_platform(worker: &WorkerConfig) -> Option<BinaryPlatform> {
+    let ssh = SshExecutor::new(worker);
+    let output = ssh
+        .run_command("uname -s; uname -m")
+        .await
+        .ok()
+        .filter(CommandOutput::success)?;
+    let mut lines = output.stdout.lines();
+    let uname_s = lines.next()?;
+    let uname_m = lines.next().unwrap_or("");
+    parse_worker_platform(uname_s, uname_m)
+}
+
+// =============================================================================
+// Per-worker target-triple discovery and artifact resolution
+// (bd-session-history-remediation-ocv9i.7.1, elaborating P0 6h54q)
+// =============================================================================
+//
+// `rch update --fleet` must select the rch-wkr artifact matching each WORKER's
+// target triple, never assume the controller's own OS/arch. The 6h54q guard
+// refuses a proven mismatch *at deploy time*; this adds the upstream half:
+// discover each worker's triple and resolve the compatible artifact ahead of
+// time, failing closed when none exists.
+
+/// C runtime flavor for linux targets. RCH ships linux binaries as static
+/// `musl` builds, so `musl` is the default expectation; `gnu` is recorded when
+/// a worker clearly lacks musl, and `unknown` when undetermined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // wired into the deploy flow by bead 7.2
+enum LinuxLibc {
+    Musl,
+    Gnu,
+    Unknown,
+}
+
+/// Facts discovered about a worker needed to pick its fleet-update artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // fields consumed by the deploy-flow integration (bead 7.2)
+struct WorkerTargetFacts {
+    /// OS + CPU arch (from `uname`).
+    platform: BinaryPlatform,
+    /// libc flavor (linux only; ignored for macOS).
+    libc: LinuxLibc,
+    /// The SSH user the controller connects as.
+    remote_user: String,
+    /// The currently-installed `rch-wkr` path on the worker, if found.
+    rch_wkr_path: Option<String>,
+}
+
+/// Map a worker's discovered facts to its Rust target triple. Returns `None`
+/// when the OS/arch could not be classified (caller must fail closed).
+///
+/// Linux defaults to `musl` (RCH's static release flavor) unless a worker was
+/// positively detected as `gnu`-only. Mirrors the os/arch→triple mapping used
+/// by the self-update path so fleet and self artifacts name workers
+/// identically.
+#[allow(dead_code)] // consumed by the deploy-flow integration (bead 7.2)
+fn worker_target_triple(facts: &WorkerTargetFacts) -> Option<String> {
+    let arch = facts.platform.arch?;
+    let arch_str = match arch {
+        BinaryArch::X86_64 => "x86_64",
+        BinaryArch::Aarch64 => "aarch64",
+        // 32-bit targets are not part of the fleet release matrix.
+        BinaryArch::X86 | BinaryArch::Arm => return None,
+    };
+    match facts.platform.os {
+        BinaryOs::Linux => {
+            let libc = match facts.libc {
+                LinuxLibc::Gnu => "gnu",
+                // musl is the default static release flavor.
+                LinuxLibc::Musl | LinuxLibc::Unknown => "musl",
+            };
+            Some(format!("{arch_str}-unknown-linux-{libc}"))
+        }
+        BinaryOs::MacOs => Some(format!("{arch_str}-apple-darwin")),
+        // Windows workers are not part of the fleet.
+        BinaryOs::Windows => None,
+    }
+}
+
+/// A fleet-update artifact available to deploy, identified by the target triple
+/// it was built for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the deploy-flow integration (bead 7.2)
+struct FleetArtifact {
+    /// Artifact file name (e.g. `rch-wkr-v1.0.27-x86_64-unknown-linux-musl`).
+    name: String,
+    /// The Rust target triple this artifact targets.
+    target_triple: String,
+}
+
+/// Failure to resolve a compatible artifact for a worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the deploy-flow integration (bead 7.2)
+enum ArtifactResolveError {
+    /// The worker's target triple could not be determined.
+    UnknownTriple { worker_id: String },
+    /// No available artifact matches the worker's triple.
+    NoCompatibleArtifact {
+        worker_id: String,
+        triple: String,
+        available: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for ArtifactResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArtifactResolveError::UnknownTriple { worker_id } => write!(
+                f,
+                "cannot resolve fleet artifact for {worker_id}: worker target triple is unknown"
+            ),
+            ArtifactResolveError::NoCompatibleArtifact {
+                worker_id,
+                triple,
+                available,
+            } => write!(
+                f,
+                "no fleet artifact for {worker_id} (target {triple}); available: [{}]",
+                available.join(", ")
+            ),
+        }
+    }
+}
+
+/// Resolve the artifact matching a worker's target triple, failing **closed**
+/// when none is compatible. An artifact matches when its `target_triple` equals
+/// the worker triple or its `name` contains the triple as a substring (release
+/// asset names embed the triple).
+#[allow(dead_code)] // consumed by the deploy-flow integration (bead 7.2)
+fn resolve_worker_artifact<'a>(
+    worker_id: &str,
+    triple: &str,
+    artifacts: &'a [FleetArtifact],
+) -> Result<&'a FleetArtifact, ArtifactResolveError> {
+    artifacts
+        .iter()
+        .find(|a| a.target_triple == triple || a.name.contains(triple))
+        .ok_or_else(|| ArtifactResolveError::NoCompatibleArtifact {
+            worker_id: worker_id.to_string(),
+            triple: triple.to_string(),
+            available: artifacts.iter().map(|a| a.target_triple.clone()).collect(),
+        })
+}
+
+/// Discover a worker's target facts over SSH: `uname`, libc flavor, the SSH
+/// user, and the current `rch-wkr` path. Returns `None` when the platform
+/// cannot be classified (caller fails closed).
+#[allow(dead_code)] // invoked by the deploy-flow integration (bead 7.2)
+async fn discover_worker_target_facts(worker: &WorkerConfig) -> Option<WorkerTargetFacts> {
+    let platform = detect_worker_platform(worker).await?;
+    let ssh = SshExecutor::new(worker);
+
+    // libc detection (linux only): a musl loader under /lib indicates musl;
+    // `ldd --version` mentioning GNU indicates gnu. Best-effort.
+    let libc = if platform.os == BinaryOs::Linux {
+        match ssh
+            .run_command(
+                "ls /lib/ld-musl-* >/dev/null 2>&1 && echo musl || (ldd --version 2>&1 | head -1)",
+            )
+            .await
+        {
+            Ok(out) if out.success() => {
+                let lower = out.stdout.to_ascii_lowercase();
+                if lower.contains("musl") {
+                    LinuxLibc::Musl
+                } else if lower.contains("gnu") || lower.contains("glibc") {
+                    LinuxLibc::Gnu
+                } else {
+                    LinuxLibc::Unknown
+                }
+            }
+            _ => LinuxLibc::Unknown,
+        }
+    } else {
+        LinuxLibc::Unknown
+    };
+
+    let rch_wkr_path = match ssh
+        .run_command("command -v rch-wkr 2>/dev/null || echo ~/.local/bin/rch-wkr")
+        .await
+    {
+        Ok(out) if out.success() => out.stdout.lines().next().map(str::to_string),
+        _ => None,
+    };
+
+    Some(WorkerTargetFacts {
+        platform,
+        libc,
+        remote_user: worker.user.clone(),
+        rch_wkr_path,
+    })
+}
+
+// =============================================================================
+// Release-provenance verification gate
+// (bd-session-history-remediation-ocv9i.7.4)
+// =============================================================================
+//
+// Before a fleet `rch-wkr` binary is pushed to a worker, prove it is the
+// intended release artifact for that worker (target-triple match + expected
+// checksum + signature/provenance) under the active policy, and record the
+// verdict to an append-only audit trail. The pure decision logic lives in
+// `rch_common::fleet_provenance`; this module supplies the I/O: computing the
+// local checksum, running cosign verification, and reading a sidecar manifest.
+
+/// Owning bead for the provenance audit-trail records.
+const PROVENANCE_BEAD_ID: &str = "bd-session-history-remediation-ocv9i.7.4";
+
+/// Env var selecting the fleet provenance policy. `strict` => fail closed on a
+/// missing/invalid signature or an uncheckable checksum; unset/other =>
+/// dev-friendly (verify whatever material exists; allow an explicitly-noted dev
+/// artifact). Defaulting to dev-friendly keeps a fleet of locally-built binaries
+/// deploying (fail-open) while still auditing the dev-artifact reason.
+const FLEET_PROVENANCE_ENV: &str = "RCH_FLEET_PROVENANCE";
+
+/// Resolve the active provenance policy from the environment.
+fn resolve_provenance_policy() -> ProvenancePolicy {
+    ProvenancePolicy::from_env_value(std::env::var(FLEET_PROVENANCE_ENV).ok().as_deref())
+}
+
+/// Sidecar provenance manifest path for a local artifact:
+/// `<binary>.provenance.json`.
+fn provenance_manifest_path(local_binary: &Path) -> PathBuf {
+    let mut name = local_binary.as_os_str().to_os_string();
+    name.push(".provenance.json");
+    PathBuf::from(name)
+}
+
+/// Load the artifact provenance for `local_binary`. Prefers a sidecar
+/// `<binary>.provenance.json` manifest (release deploy); falls back to a
+/// dev-artifact record targeting `fallback_triple` (a locally-built fleet
+/// binary with no release manifest).
+fn load_artifact_provenance(local_binary: &Path, fallback_triple: &str) -> ArtifactProvenance {
+    let manifest = provenance_manifest_path(local_binary);
+    match std::fs::read(&manifest) {
+        Ok(bytes) => match serde_json::from_slice::<ArtifactProvenance>(&bytes) {
+            Ok(provenance) => return provenance,
+            Err(e) => warn!(
+                path = %manifest.display(),
+                error = %e,
+                "provenance manifest present but unparseable; treating as dev artifact"
+            ),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(
+            path = %manifest.display(),
+            error = %e,
+            "could not read provenance manifest; treating as dev artifact"
+        ),
+    }
+    let name = local_binary
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("rch-wkr")
+        .to_string();
+    ArtifactProvenance::dev_artifact(name, fallback_triple)
+}
+
+/// Evaluate the artifact's signature material against the local binary. No
+/// material => `Absent`; a declared bundle that verifies => `Valid`; a declared
+/// bundle that fails to verify (including cosign unavailable) => `Invalid`, so a
+/// signed-but-unverifiable artifact fails closed.
+async fn evaluate_signature_check(
+    provenance: &ArtifactProvenance,
+    local_binary: &Path,
+) -> SignatureCheck {
+    let Some(sig) = provenance.signature.as_ref() else {
+        return SignatureCheck::Absent;
+    };
+    let bundle = PathBuf::from(&sig.bundle_ref);
+    match crate::update::verify::verify_signature(local_binary, &bundle).await {
+        Ok(true) => SignatureCheck::Valid,
+        Ok(false) => SignatureCheck::Invalid,
+        Err(e) => {
+            warn!(
+                bundle = %sig.bundle_ref,
+                error = %e,
+                "signature verification failed; treating as invalid (fail closed)"
+            );
+            SignatureCheck::Invalid
+        }
+    }
+}
+
+/// Run the full provenance gate for `local_binary` against `worker_triple` under
+/// `policy`, returning the verdict and the resolved provenance. Computes the
+/// local checksum and evaluates the signature as side effects; the decision
+/// itself is the pure [`verify_artifact_provenance`].
+///
+/// When `worker_triple` is `None` (the platform could not be discovered), the
+/// artifact is judged against its own declared triple so an undiscoverable
+/// platform cannot cause a false `WRONG_TARGET_TRIPLE` rejection — the checksum
+/// and signature gates still apply.
+async fn run_provenance_gate(
+    local_binary: &Path,
+    worker_triple: Option<&str>,
+    policy: &ProvenancePolicy,
+) -> (ProvenanceVerdict, ArtifactProvenance) {
+    let fallback = worker_triple.unwrap_or("unknown");
+    let provenance = load_artifact_provenance(local_binary, fallback);
+    // Only hash the (potentially large) binary when there is an expected checksum
+    // to compare against; with none, `verify_artifact_provenance` ignores the
+    // actual checksum, so hashing every worker in the common no-manifest dev path
+    // would be wasted work on top of the hash `copy_binary_via_scp` already does.
+    let actual_sha = if provenance.expected_sha256.is_some() {
+        local_file_sha256_hex(local_binary).ok()
+    } else {
+        None
+    };
+    let signature_check = evaluate_signature_check(&provenance, local_binary).await;
+    let effective_triple =
+        worker_triple.map_or_else(|| provenance.target_triple.clone(), str::to_string);
+    let verdict = verify_artifact_provenance(
+        &provenance,
+        &effective_triple,
+        actual_sha.as_deref(),
+        signature_check,
+        policy,
+    );
+    (verdict, provenance)
+}
+
+/// Human-readable audit detail for a provenance verdict.
+fn provenance_detail(verdict: &ProvenanceVerdict) -> String {
+    match verdict {
+        ProvenanceVerdict::Verified => "artifact provenance verified".to_string(),
+        ProvenanceVerdict::DevArtifactAllowed { reason } => reason.clone(),
+        ProvenanceVerdict::Rejected { detail, .. } => detail.clone(),
+    }
+}
+
+/// Best-effort persistence of a provenance audit record. A failure to write the
+/// audit trail must never fail a deploy, so errors are logged and swallowed.
+fn persist_provenance_audit(record: &FleetDeployAuditRecord) {
+    match HistoryManager::new() {
+        Ok(history) => {
+            if let Err(e) = history.record_provenance_audit(record) {
+                warn!(
+                    worker = %record.worker_id,
+                    error = %e,
+                    "failed to persist provenance audit record"
+                );
+            }
+        }
+        Err(e) => warn!(error = %e, "failed to open history manager for provenance audit"),
+    }
+}
+
+/// Current wall-clock time as Unix epoch milliseconds (saturating to 0 before
+/// the epoch, which cannot happen in practice).
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+// =============================================================================
+// Real-fleet smoke scenario executors
+// (bd-session-history-remediation-ocv9i.16.6, Part 2)
+// =============================================================================
+//
+// SSH-coupled execution of the per-worker smoke scenarios, composing the pure
+// 12.2 capability-probe + admissibility foundation. Each executor is generic
+// over `CommandRunner` so it is mock-SSH integration-testable WITHOUT a live
+// worker (the bead's "integration tests use mock SSH/mock workers" target). The
+// smoke command's live runner (commands/status.rs `self_test_smoke`) is wired to
+// these in the Part 2 continuation; until then they are exercised by the
+// mock-SSH integration tests below.
+
+/// Exact-user/path capability probe spec for a worker's installed `rch-wkr`. The
+/// path is the exact configured binary location (no PATH resolution), matching
+/// the .7.3 exact-user/path validation discipline.
+fn smoke_capability_probe_spec(worker: &WorkerConfig) -> ProbeSpec {
+    // Use the ABSOLUTE binary path: the probe script shell-quotes it, so a
+    // literal `~` would never expand and every worker would look like it has a
+    // missing binary (the live-fleet bug the mock tests masked by injecting an
+    // already-expanded path). Mirrors the daemon bypass-recovery prober.
+    ProbeSpec::new(worker.user.clone(), remote_worker_binary_path(&worker.user))
+}
+
+/// Execute the WorkerCapabilitiesExactUserPath smoke scenario against a worker:
+/// run the exact-user/path capability probe, parse it, and assess it against
+/// `req`. A probe that yields no parseable facts (the binary is missing or
+/// unusable as the configured user) is a rejection, never a silent pass. Generic
+/// over the runner so it is mock-SSH integration-testable.
+async fn run_smoke_capabilities_with_runner<R: CommandRunner>(
+    worker: &WorkerConfig,
+    req: &CapabilityRequirement,
+    runner: &R,
+) -> Result<CapabilityVerdict, FleetSshError> {
+    let spec = smoke_capability_probe_spec(worker);
+    let script = build_capability_probe_script(&spec);
+    let output = runner.run_command(&script).await?;
+    let facts = parse_capability_probe(&output.stdout);
+    // An empty parse (no worker version AND no os) means the probe produced no
+    // usable facts: treat as a rejection rather than handing empty facts to
+    // assess_admissibility (which assumes a reachable probe).
+    if facts.worker.is_none() && facts.os.is_none() {
+        return Ok(CapabilityVerdict::Rejected {
+            reason: IncidentReasonCode::WrongUserPathWorkerBinary,
+            detail: format!(
+                "capability probe at {REMOTE_WORKER_BINARY} produced no parseable facts as user {} (binary missing or unreachable)",
+                worker.user
+            ),
+        });
+    }
+    Ok(assess_admissibility(&facts, req))
+}
+
+/// The capability requirement the smoke capabilities scenario asserts: a usable
+/// Rust build worker (cargo present) speaking at least the minimum wire protocol.
+///
+/// `min_protocol` is intentionally **0**. The shipping `rch-wkr` has no
+/// `--protocol-version` subcommand, so the probe reports protocol 0; any
+/// positive floor would reject EVERY real worker — the de04443 / bd-woidb
+/// gotcha, where a positive floor "traps the whole fleet" (the bypass-recovery
+/// `SshRecoveryProber` keeps it at 0 for the same reason). Raise this only in
+/// lockstep with adding that subcommand to `rch-wkr`.
+fn smoke_capability_requirement() -> CapabilityRequirement {
+    CapabilityRequirement::rust(0)
+}
+
+/// Execute the DiskInodeAdmission smoke scenario against a worker: probe the
+/// configured build `roots`' disk + inode headroom (`df -Pk`/`df -Pi` at the
+/// exact paths) and return the WORST [`PressureLevel`] across them. `Critical`
+/// means an offloaded build would risk `No space left on device`; no probed
+/// roots (none configured, or df gave nothing) is `Unknown`. The caller treats
+/// both `Critical` and `Unknown` as a failed admission — never a silent pass.
+/// Generic over the runner for mock-SSH integration testing.
+async fn run_smoke_disk_inode_with_runner<R: CommandRunner>(
+    worker: &WorkerConfig,
+    roots: &[String],
+    thresholds: &PressureThresholds,
+    runner: &R,
+) -> Result<PressureLevel, FleetSshError> {
+    let mut spec = smoke_capability_probe_spec(worker);
+    spec.disk_roots = roots.to_vec();
+    let script = build_capability_probe_script(&spec);
+    let output = runner.run_command(&script).await?;
+    let facts = parse_capability_probe(&output.stdout);
+    if facts.disk_roots.is_empty() {
+        return Ok(PressureLevel::Unknown);
+    }
+    Ok(facts
+        .disk_roots
+        .iter()
+        .map(|root| assess_root(DiskRootKind::TempRoot, Some(root), thresholds).worst())
+        .fold(PressureLevel::Ok, PressureLevel::worse))
+}
+
+/// Execute the per-worker SSH-probe smoke scenarios that have clean executors —
+/// `WorkerCapabilitiesExactUserPath` and `DiskInodeAdmission` — against one
+/// worker and return the lifecycle JSONL events (`started` then `passed`/`failed`
+/// per scenario). The other five scenarios are daemon/pipeline-level and are
+/// composed by the live runner from existing daemon calls, not as standalone SSH
+/// probes. Generic over the runner so the live wiring is mock-SSH
+/// integration-testable WITHOUT a real fleet.
+///
+/// A scenario "passes" only on an affirmatively-good verdict: capabilities must
+/// be [`CapabilityVerdict::Admissible`]; disk/inode must be strictly better than
+/// `Critical`/`Unknown` (both of which mean an offloaded build could hit
+/// `No space left on device` — never a silent pass). An SSH error is a `failed`
+/// outcome carrying the worker-unreachable reason, never a swallowed pass.
+async fn run_smoke_worker_scenarios_with_runner<R: CommandRunner>(
+    run_id: &str,
+    bead_id: &str,
+    worker: &WorkerConfig,
+    disk_roots: &[String],
+    thresholds: &PressureThresholds,
+    runner: &R,
+) -> Vec<SmokeProfileEvent> {
+    let mut events = Vec::with_capacity(4);
+    let worker_id = worker.id.to_string();
+
+    // --- WorkerCapabilitiesExactUserPath ---
+    let scenario = SmokeScenario::WorkerCapabilitiesExactUserPath;
+    events.push(SmokeProfileEvent::started(
+        run_id,
+        bead_id,
+        Some(worker_id.clone()),
+        scenario,
+    ));
+    let started = std::time::Instant::now();
+    let cap_result =
+        run_smoke_capabilities_with_runner(worker, &smoke_capability_requirement(), runner).await;
+    let cap_ms = smoke_elapsed_ms(started);
+    let cap_fingerprint = Some("rch-wkr capability probe (exact user/path)".to_string());
+    events.push(match cap_result {
+        Ok(CapabilityVerdict::Admissible) => SmokeProfileEvent::outcome(
+            run_id,
+            bead_id,
+            Some(worker_id.clone()),
+            scenario,
+            true,
+            None,
+            cap_fingerprint,
+            cap_ms,
+        ),
+        Ok(CapabilityVerdict::Rejected { reason, .. }) => SmokeProfileEvent::outcome(
+            run_id,
+            bead_id,
+            Some(worker_id.clone()),
+            scenario,
+            false,
+            Some(reason.code().to_string()),
+            cap_fingerprint,
+            cap_ms,
+        ),
+        Err(_) => SmokeProfileEvent::outcome(
+            run_id,
+            bead_id,
+            Some(worker_id.clone()),
+            scenario,
+            false,
+            Some(SMOKE_WORKER_UNREACHABLE.to_string()),
+            cap_fingerprint,
+            cap_ms,
+        ),
+    });
+
+    // --- DiskInodeAdmission ---
+    let scenario = SmokeScenario::DiskInodeAdmission;
+    events.push(SmokeProfileEvent::started(
+        run_id,
+        bead_id,
+        Some(worker_id.clone()),
+        scenario,
+    ));
+    let started = std::time::Instant::now();
+    let disk_result =
+        run_smoke_disk_inode_with_runner(worker, disk_roots, thresholds, runner).await;
+    let disk_ms = smoke_elapsed_ms(started);
+    let disk_fingerprint = Some("df -Pk / df -Pi (build root headroom)".to_string());
+    events.push(match disk_result {
+        Ok(level) if !matches!(level, PressureLevel::Critical | PressureLevel::Unknown) => {
+            SmokeProfileEvent::outcome(
+                run_id,
+                bead_id,
+                Some(worker_id.clone()),
+                scenario,
+                true,
+                None,
+                disk_fingerprint,
+                disk_ms,
+            )
+        }
+        Ok(level) => SmokeProfileEvent::outcome(
+            run_id,
+            bead_id,
+            Some(worker_id.clone()),
+            scenario,
+            false,
+            // `Critical` maps to the operator-resolvable incident code
+            // (`rch error explain RCH-Innn`); `Unknown` (cannot assess) has no
+            // incident code, so it gets a descriptive token.
+            Some(match level {
+                PressureLevel::Critical => IncidentReasonCode::CriticalPressure.code().to_string(),
+                _ => "disk_pressure_unknown".to_string(),
+            }),
+            disk_fingerprint,
+            disk_ms,
+        ),
+        Err(_) => SmokeProfileEvent::outcome(
+            run_id,
+            bead_id,
+            Some(worker_id),
+            scenario,
+            false,
+            Some(SMOKE_WORKER_UNREACHABLE.to_string()),
+            disk_fingerprint,
+            disk_ms,
+        ),
+    });
+
+    events
+}
+
+/// Reason-code token for an SSH transport failure during a smoke probe. There is
+/// no `IncidentReasonCode` for raw worker unreachability (the capability/disk
+/// codes describe *binary*/*headroom* problems, not transport), so the smoke
+/// trace uses a descriptive snake_case token — the same convention the .7.3 fleet
+/// validation uses for reasons without an incident code.
+const SMOKE_WORKER_UNREACHABLE: &str = "worker_unreachable";
+
+/// Milliseconds elapsed since `started`, saturating into `u64`.
+fn smoke_elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Production wrapper: run the per-worker smoke SSH scenarios over real SSH and
+/// return the lifecycle JSONL events. Called by the `rch self-test --smoke` live
+/// runner (commands/status.rs) for each target worker on a non-dry-run pass.
+pub(crate) async fn run_smoke_worker_scenarios(
+    run_id: &str,
+    bead_id: &str,
+    worker: &WorkerConfig,
+    disk_roots: &[String],
+) -> Vec<SmokeProfileEvent> {
+    let ssh = SshExecutor::new(worker);
+    run_smoke_worker_scenarios_with_runner(
+        run_id,
+        bead_id,
+        worker,
+        disk_roots,
+        &PressureThresholds::default(),
+        &ssh,
+    )
+    .await
+}
+
+/// Refuse to deploy a binary whose OS/arch is incompatible with the worker.
+///
+/// Fails open (returns `Ok`) when either side cannot be classified — the
+/// post-deploy health check stays as the final backstop — but fails loudly on a
+/// *proven* mismatch so a controller never clobbers a worker's good binary with
+/// an `Exec format error` time bomb.
+async fn ensure_binary_matches_worker(worker: &WorkerConfig, local_binary: &Path) -> Result<()> {
+    let header = match read_binary_header(local_binary) {
+        Ok(header) => header,
+        Err(e) => {
+            warn!(
+                worker = %worker.id,
+                path = %local_binary.display(),
+                error = %e,
+                "Could not read local binary header for platform check; proceeding"
+            );
+            return Ok(());
+        }
+    };
+
+    let local_platform = match detect_binary_platform(&header) {
+        Some(platform) => platform,
+        None => {
+            warn!(
+                worker = %worker.id,
+                path = %local_binary.display(),
+                "Unrecognised local binary format; skipping platform pre-check"
+            );
+            return Ok(());
+        }
+    };
+
+    let worker_platform = match detect_worker_platform(worker).await {
+        Some(platform) => platform,
+        None => {
+            warn!(
+                worker = %worker.id,
+                "Could not determine worker platform via uname; skipping platform pre-check"
+            );
+            return Ok(());
+        }
+    };
+
+    if platforms_compatible(local_platform, worker_platform) {
+        debug!(
+            worker = %worker.id,
+            local = %local_platform,
+            remote = %worker_platform,
+            "Binary platform matches worker"
+        );
+        return Ok(());
+    }
+
+    Err(FleetError::BinaryPlatformMismatch {
+        worker_id: worker.id.0.clone(),
+        local: local_platform.to_string(),
+        worker: worker_platform.to_string(),
+    }
+    .into())
+}
+
 /// Copy the binary to the worker via SCP.
 ///
 /// Uploads to a temporary file in the target directory, then atomically renames
@@ -515,26 +1503,64 @@ async fn copy_binary_via_scp(worker: &WorkerConfig, local_binary: &Path) -> Resu
         .await
         .map_err(|e| anyhow::anyhow!("scp failed: {}", e))?;
 
-    let finalize_cmd = finalize_staged_binary_command(&staging_path, remote_path)?;
+    // Atomic, rollback-safe switch (bd-...-7.2): chmod + checksum-verify +
+    // startup-validate the staged temp binary, and only `mv` it into place if
+    // all of that succeeds. `set -e` aborts BEFORE the rename on any failure
+    // (truncated/corrupt transfer => checksum mismatch; wrong arch/bad binary
+    // => `--version` exec error), so the previously working binary stays live.
+    let expected_sha256 = local_file_sha256_hex(local_binary)
+        .map_err(|e| anyhow::anyhow!("hash local binary {}: {}", local_binary.display(), e))?;
+    let finalize_cmd = staged_install_command(&staging_path, remote_path, &expected_sha256)?;
     let output = ssh
         .run_command(&finalize_cmd)
         .await
-        .map_err(|e| anyhow::anyhow!("finalize staged binary failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("staged install failed: {}", e))?;
 
     if output.success() {
         return Ok(());
     }
 
+    // Validation/checksum failed (or an interrupted transfer): the rename never
+    // ran, so the old binary is intact. Best-effort remove the staged temp.
     if let Ok(staging_path) = remote_shell_path(&staging_path) {
         let cleanup_cmd = format!("rm -f {staging_path}");
         let _ = ssh.run_command(&cleanup_cmd).await;
     }
 
     Err(anyhow::anyhow!(
-        "finalize staged binary failed with exit {}: {}",
+        "staged install rejected before switch (exit {}: {}); previous binary left active",
         output.exit_code,
         output.stderr.trim()
     ))
+}
+
+/// Streaming SHA-256 of a local file as a lowercase hex string. Matches the
+/// worker's `sha256sum` so a corrupt/truncated transfer is caught before the
+/// atomic switch.
+fn local_file_sha256_hex(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex_lower(&hasher.finalize()))
+}
+
+/// Lowercase hex encoding of a byte slice.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Set executable permissions on the remote binary.
@@ -547,23 +1573,193 @@ async fn set_executable_permissions(worker: &WorkerConfig) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("chmod failed: {}", e))
 }
 
-/// Verify the installation by running health check.
-///
-/// Uses `SshExecutor::run_command()` for consistent behavior and logging.
+// =============================================================================
+// Post-deploy exact user/path validation
+// (bd-session-history-remediation-ocv9i.7.3)
+// =============================================================================
+
+/// Eligibility verdict from validating the deployed binary at the EXACT path
+/// (and as the user) RCH will actually invoke it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PostDeployEligibility {
+    Eligible,
+    /// The deployed binary cannot run on this worker (most commonly an
+    /// `Exec format error` from an OS/arch mismatch). The worker must be marked
+    /// not eligible; `reason_code` is a stable token for incident/proof/
+    /// admission surfaces.
+    NotEligible {
+        reason_code: &'static str,
+        detail: String,
+    },
+}
+
+/// Build the post-deploy validation command. Runs against the EXACT remote
+/// path RCH invokes (shell-escaped, never the bare PATH-resolved `rch-wkr`
+/// which could be a different binary), as the connecting worker user (the SSH
+/// session is already that user — NOT root, NOT a login-default path). Probes
+/// `uname`, `file`, and `<path> --version` so a wrong-OS/arch binary surfaces
+/// as a non-zero exit / `Exec format error`.
+fn post_deploy_validation_command(remote_path: &str) -> Result<String> {
+    let p = remote_shell_path(remote_path)?;
+    Ok(format!(
+        "uname -s -m; file {p} 2>/dev/null || true; {p} --version"
+    ))
+}
+
+/// Classify the exact-path validation result. `Exec format error` (exit 126 or
+/// the kernel message) means the binary is built for the wrong OS/arch and the
+/// worker is not eligible; any other non-zero exit is a generic validation
+/// failure.
+fn classify_post_deploy(exit_code: i32, stderr: &str) -> PostDeployEligibility {
+    let trimmed = stderr.trim();
+    if exit_code == 126 || trimmed.contains("Exec format error") {
+        return PostDeployEligibility::NotEligible {
+            reason_code: "os_arch_mismatch",
+            detail: format!(
+                "deployed rch-wkr is not executable on this worker (exit {exit_code}: {trimmed}); \
+                the binary architecture does not match the worker"
+            ),
+        };
+    }
+    if exit_code != 0 {
+        return PostDeployEligibility::NotEligible {
+            reason_code: "post_deploy_validation_failed",
+            detail: format!("post-deploy validation failed (exit {exit_code}: {trimmed})"),
+        };
+    }
+    PostDeployEligibility::Eligible
+}
+
+/// Build the post-deploy liveness command. Runs the EXACT remote path's
+/// `health` subcommand (shell-escaped to `$HOME`, never the bare PATH-resolved
+/// `rch-wkr`) so the binary RCH actually invokes is the one probed.
+fn post_deploy_health_command(remote_path: &str) -> Result<String> {
+    let p = remote_shell_path(remote_path)?;
+    Ok(format!("{p} health"))
+}
+
+/// Build the post-deploy capabilities / protocol-handshake command. Runs the
+/// EXACT remote path's `capabilities` subcommand (shell-escaped to `$HOME`) so a
+/// wrong-OS/arch binary surfaces as an `Exec format error` and a
+/// protocol-incompatible (version-skewed / corrupt) binary surfaces as
+/// non-parseable JSON on stdout.
+fn post_deploy_capabilities_command(remote_path: &str) -> Result<String> {
+    let p = remote_shell_path(remote_path)?;
+    Ok(format!("{p} capabilities"))
+}
+
+/// Classify the result of the capabilities / protocol handshake. The deployed
+/// binary must both (a) run cleanly (no `Exec format error`, zero exit) and
+/// (b) emit a parseable `WorkerCapabilities` JSON document on stdout. A binary
+/// that runs but cannot produce valid protocol JSON is marked not eligible with
+/// a stable `capabilities_handshake_failed` reason code — this catches a
+/// version-skewed or corrupt binary that survives `--version` but cannot speak
+/// the daemon protocol. The exact-path classifier remains the single source of
+/// truth for the `Exec format error` / non-zero-exit cases.
+fn classify_capabilities_handshake(
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) -> PostDeployEligibility {
+    match classify_post_deploy(exit_code, stderr) {
+        PostDeployEligibility::Eligible => {}
+        not_eligible => return not_eligible,
+    }
+    match serde_json::from_str::<WorkerCapabilities>(stdout.trim()) {
+        Ok(_) => PostDeployEligibility::Eligible,
+        Err(e) => PostDeployEligibility::NotEligible {
+            reason_code: "capabilities_handshake_failed",
+            detail: format!(
+                "deployed rch-wkr ran but did not emit parseable WorkerCapabilities JSON \
+                 (protocol handshake failed: {e})"
+            ),
+        },
+    }
+}
+
 async fn verify_installation(worker: &WorkerConfig) -> Result<()> {
     let ssh = SshExecutor::new(worker);
+    let worker_id = worker.id.as_str();
+
+    // Log the ineligible outcome with structured fields (worker, step, stable
+    // reason code, detail) and build the deploy-failing error carrying the
+    // reason code for incident/proof/admission surfaces.
+    let ineligible =
+        |step: &'static str, reason_code: &'static str, detail: String| -> anyhow::Error {
+            warn!(
+                worker = worker_id,
+                step,
+                reason_code,
+                detail = %detail,
+                "post-deploy validation marked worker ineligible"
+            );
+            FleetError::HealthCheckFailed {
+                reason: format!("[{reason_code}] {detail}"),
+            }
+            .into()
+        };
+
+    // 1. Exact user/path validation (bd-...-7.3): run `<exact path> --version`
+    //    (+ uname/file) as the worker user. An Exec format error here marks the
+    //    worker not eligible with a stable reason code — the post-deploy
+    //    backstop for the pre-deploy/staged arch guards.
+    let validation_cmd = post_deploy_validation_command(REMOTE_WORKER_BINARY)?;
+    let validation = ssh
+        .run_command(&validation_cmd)
+        .await
+        .map_err(|e| anyhow::anyhow!("post-deploy validation failed: {}", e))?;
+    if let PostDeployEligibility::NotEligible {
+        reason_code,
+        detail,
+    } = classify_post_deploy(validation.exit_code, &validation.stderr)
+    {
+        return Err(ineligible("exact_path_version", reason_code, detail));
+    }
+
+    // 2. Liveness handshake via the same EXACT path.
+    let health_cmd = post_deploy_health_command(REMOTE_WORKER_BINARY)?;
     let output = ssh
-        .run_command("~/.local/bin/rch-wkr health")
+        .run_command(&health_cmd)
         .await
         .map_err(|e| anyhow::anyhow!("health check failed: {}", e))?;
 
     if !output.success() {
+        let stderr = output.stderr.trim();
+        if let PostDeployEligibility::NotEligible {
+            reason_code,
+            detail,
+        } = classify_post_deploy(output.exit_code, stderr)
+        {
+            return Err(ineligible("health", reason_code, detail));
+        }
         return Err(FleetError::HealthCheckFailed {
-            reason: output.stderr.trim().to_string(),
+            reason: stderr.to_string(),
         }
         .into());
     }
 
+    // 3. Capabilities / protocol handshake via the same EXACT path (bd-...-7.3):
+    //    the binary must emit parseable WorkerCapabilities JSON, proving it both
+    //    runs and speaks the daemon protocol. A version-skewed/corrupt binary
+    //    that passes `--version` but cannot produce protocol JSON is marked not
+    //    eligible with a stable reason code for incident/proof/admission.
+    let capabilities_cmd = post_deploy_capabilities_command(REMOTE_WORKER_BINARY)?;
+    let caps = ssh
+        .run_command(&capabilities_cmd)
+        .await
+        .map_err(|e| anyhow::anyhow!("capabilities handshake failed: {}", e))?;
+    if let PostDeployEligibility::NotEligible {
+        reason_code,
+        detail,
+    } = classify_capabilities_handshake(caps.exit_code, &caps.stdout, &caps.stderr)
+    {
+        return Err(ineligible("capabilities_handshake", reason_code, detail));
+    }
+
+    info!(
+        worker = worker_id,
+        "post-deploy validation passed (exact-path version, health, capabilities handshake)"
+    );
     Ok(())
 }
 
@@ -586,11 +1782,34 @@ fn remote_shell_path(remote_path: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("invalid remote path contains control characters"))
 }
 
-fn finalize_staged_binary_command(staging_path: &str, final_path: &str) -> Result<String> {
+/// Build the atomic, rollback-safe install script for a staged worker binary
+/// (bd-...-7.2).
+///
+/// Under `set -e`, in order: make the staged temp executable, verify its
+/// SHA-256 against `expected_sha256` (catches a truncated/corrupt transfer),
+/// run `--version` FROM THE TEMP PATH (catches a wrong-arch/broken binary via
+/// an `Exec format error`), and only then `mv -f` it over the live binary. Any
+/// earlier failure exits non-zero before the rename, so the previously working
+/// binary is never replaced by a bad one.
+fn staged_install_command(
+    staging_path: &str,
+    final_path: &str,
+    expected_sha256: &str,
+) -> Result<String> {
+    let staged = remote_shell_path(staging_path)?;
+    let final_path = remote_shell_path(final_path)?;
+    // expected_sha256 is our own lowercase hex (64 chars, [0-9a-f]); guard
+    // anyway so a non-hex value can never inject shell.
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow::anyhow!("invalid expected sha256 digest"));
+    }
     Ok(format!(
-        "set -e; chmod +x {staged}; mv -f {staged} {final_path}",
-        staged = remote_shell_path(staging_path)?,
-        final_path = remote_shell_path(final_path)?
+        "set -e; \
+         chmod +x {staged}; \
+         actual=$(sha256sum {staged} | cut -d' ' -f1); \
+         [ \"$actual\" = \"{expected_sha256}\" ] || {{ echo \"checksum mismatch: $actual != {expected_sha256}\" >&2; exit 1; }}; \
+         {staged} --version >/dev/null 2>&1 || {{ echo \"staged binary failed --version (wrong arch or corrupt)\" >&2; exit 1; }}; \
+         mv -f {staged} {final_path}"
     ))
 }
 
@@ -605,6 +1824,20 @@ fn finalize_staged_binary_command(staging_path: &str, final_path: &str) -> Resul
 /// - Returns `Ok(None)` on any error (logged at WARN level)
 /// - Returns `Ok(Some(backup))` on success
 ///
+/// True if a worker-reported version string is safe to interpolate into the
+/// shell commands (cp/sha256sum/rm) that manage its backup file, and into the
+/// backup path stored for rollback. The version is parsed from an untrusted
+/// `<binary> --version`, so a corrupt or hostile binary could report a token
+/// carrying shell metacharacters, command substitution, or globs. Restrict to
+/// the conventional version charset; anything else is rejected rather than
+/// risking word-splitting/injection.
+fn is_safe_version_token(version: &str) -> bool {
+    !version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
 /// The backup is registered in the local rollback registry for later rollback.
 /// Old backups exceeding MAX_BACKUPS_PER_WORKER are automatically pruned.
 pub async fn backup_before_deploy(
@@ -665,6 +1898,21 @@ async fn backup_before_deploy_with_runner<R: CommandRunner>(
             return Ok(None);
         }
     };
+
+    // `version` is interpolated UNQUOTED into the backup path used by cp /
+    // sha256sum / rm here AND (via WorkerBackup.remote_path) by the rollback
+    // path. Reject any version with characters outside the conventional set so a
+    // corrupt or hostile worker binary cannot inject shell into those commands.
+    // Validating once at the source keeps every downstream command safe without
+    // escaping each call site; the rollback path reuses the same stored path.
+    if !is_safe_version_token(&version) {
+        warn!(
+            worker = %worker.id,
+            version = %version,
+            "Skipping backup: worker-reported version contains unsafe characters"
+        );
+        return Ok(None);
+    }
 
     info!(worker = %worker.id, version = %version, "Creating backup before deploy");
 
@@ -829,6 +2077,55 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"status\":\"CanaryFailed\""));
         assert!(json.contains("Health check failed"));
+    }
+
+    #[test]
+    fn fleet_result_canary_pending_serializes_distinctly_from_success() {
+        // Regression (bd-review-canary-success-misreport): a canary with
+        // auto_promote off must NOT serialize as Success — a JSON consumer
+        // would otherwise read a partial rollout as finished.
+        let pending = FleetResult::CanaryPending {
+            promoted: 5,
+            remaining: 95,
+            skipped: 0,
+            failed: 0,
+        };
+        let json = serde_json::to_string(&pending).unwrap();
+        assert!(json.contains("\"status\":\"CanaryPending\""));
+        assert!(json.contains("\"promoted\":5"));
+        assert!(json.contains("\"remaining\":95"));
+        // Must be distinguishable from Success with the same deployed count.
+        let success = serde_json::to_string(&FleetResult::Success {
+            deployed: 5,
+            skipped: 0,
+            failed: 0,
+        })
+        .unwrap();
+        assert_ne!(json, success);
+        assert!(!json.contains("\"status\":\"Success\""));
+    }
+
+    #[test]
+    fn fleet_result_canary_pending_round_trips() {
+        let pending = FleetResult::CanaryPending {
+            promoted: 2,
+            remaining: 6,
+            skipped: 1,
+            failed: 0,
+        };
+        let json = serde_json::to_string(&pending).unwrap();
+        let back: FleetResult = serde_json::from_str(&json).unwrap();
+        match back {
+            FleetResult::CanaryPending {
+                promoted,
+                remaining,
+                skipped,
+                failed,
+            } => {
+                assert_eq!((promoted, remaining, skipped, failed), (2, 6, 1, 0));
+            }
+            other => panic!("expected CanaryPending, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1085,17 +2382,200 @@ mod tests {
     }
 
     #[test]
-    fn finalize_staged_binary_command_renames_temp_binary_into_place() -> Result<()> {
-        let command = finalize_staged_binary_command(
+    fn staged_install_command_validates_then_renames_in_order() -> Result<()> {
+        let sha = "a".repeat(64);
+        let command = staged_install_command(
             "~/.local/bin/.rch-wkr.tmp.123.456",
             REMOTE_WORKER_BINARY,
+            &sha,
         )?;
 
+        // chmod, checksum, --version, then mv — with mv strictly last.
+        assert!(command.contains("set -e"));
         assert!(command.contains("chmod +x \"$HOME/.local/bin/.rch-wkr.tmp.123.456\""));
+        assert!(command.contains("sha256sum \"$HOME/.local/bin/.rch-wkr.tmp.123.456\""));
+        assert!(
+            command.contains(&sha),
+            "expected digest embedded for comparison"
+        );
+        assert!(command.contains("\"$HOME/.local/bin/.rch-wkr.tmp.123.456\" --version"));
         assert!(command.contains(
             "mv -f \"$HOME/.local/bin/.rch-wkr.tmp.123.456\" \"$HOME/.local/bin/rch-wkr\""
         ));
+        // Rollback-safety: the rename must be the LAST step (after both guards),
+        // so a failed checksum/version (set -e) never reaches it.
+        let mv_pos = command.find("mv -f").expect("mv present");
+        let sha_pos = command.find("sha256sum").expect("checksum present");
+        let ver_pos = command.find("--version").expect("version present");
+        assert!(
+            mv_pos > sha_pos && mv_pos > ver_pos,
+            "mv must come after both guards"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn staged_install_command_rejects_non_hex_digest() {
+        // A non-hex/short digest must never be embedded into the shell script.
+        assert!(
+            staged_install_command("~/.local/bin/.rch-wkr.tmp.1", REMOTE_WORKER_BINARY, "nope")
+                .is_err()
+        );
+        assert!(
+            staged_install_command(
+                "~/.local/bin/.rch-wkr.tmp.1",
+                REMOTE_WORKER_BINARY,
+                "abc; rm -rf /"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_file_sha256_matches_known_vector() {
+        // SHA-256("") = e3b0c442...; SHA-256("abc") = ba7816bf...
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            local_file_sha256_hex(&empty).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let abc = dir.path().join("abc");
+        std::fs::write(&abc, b"abc").unwrap();
+        assert_eq!(
+            local_file_sha256_hex(&abc).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn post_deploy_validation_runs_the_exact_quoted_path() -> Result<()> {
+        // Must invoke the EXACT path (shell-escaped to $HOME), never the bare
+        // PATH-resolved `rch-wkr`.
+        let cmd = post_deploy_validation_command(REMOTE_WORKER_BINARY)?;
+        assert!(cmd.contains("\"$HOME/.local/bin/rch-wkr\" --version"));
+        assert!(cmd.contains("uname -s -m"));
+        // Never a bare `rch-wkr --version` (would PATH-resolve to a different
+        // binary than the one RCH invokes).
+        assert!(!cmd.contains(" rch-wkr --version"));
+        Ok(())
+    }
+
+    #[test]
+    fn classify_post_deploy_marks_exec_format_ineligible() {
+        // The exact 6h54q Darwin-controller -> Linux-worker regression: the
+        // pushed binary triggers `Exec format error` (exit 126).
+        match classify_post_deploy(126, "sh: 1: rch-wkr: Exec format error") {
+            PostDeployEligibility::NotEligible { reason_code, .. } => {
+                assert_eq!(reason_code, "os_arch_mismatch");
+            }
+            other => panic!("expected NotEligible(os_arch_mismatch), got {other:?}"),
+        }
+        // Message without the 126 exit code is still caught.
+        assert!(matches!(
+            classify_post_deploy(1, "Exec format error"),
+            PostDeployEligibility::NotEligible {
+                reason_code: "os_arch_mismatch",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn classify_post_deploy_generic_failure_and_success() {
+        assert!(matches!(
+            classify_post_deploy(2, "some other error"),
+            PostDeployEligibility::NotEligible {
+                reason_code: "post_deploy_validation_failed",
+                ..
+            }
+        ));
+        assert_eq!(classify_post_deploy(0, ""), PostDeployEligibility::Eligible);
+    }
+
+    #[test]
+    fn post_deploy_capabilities_command_runs_the_exact_quoted_path() -> Result<()> {
+        // Must invoke the EXACT shell-escaped path's `capabilities` subcommand,
+        // never the bare PATH-resolved `rch-wkr`.
+        let cmd = post_deploy_capabilities_command(REMOTE_WORKER_BINARY)?;
+        assert!(cmd.contains("\"$HOME/.local/bin/rch-wkr\" capabilities"));
+        assert!(!cmd.contains(" rch-wkr capabilities"));
+        Ok(())
+    }
+
+    #[test]
+    fn post_deploy_health_command_runs_the_exact_quoted_path() -> Result<()> {
+        let cmd = post_deploy_health_command(REMOTE_WORKER_BINARY)?;
+        assert!(cmd.contains("\"$HOME/.local/bin/rch-wkr\" health"));
+        assert!(!cmd.contains(" rch-wkr health"));
+        Ok(())
+    }
+
+    #[test]
+    fn capabilities_handshake_valid_json_is_eligible() {
+        // A binary that runs cleanly and emits parseable WorkerCapabilities JSON
+        // (even the all-defaults `{}`) passes the protocol handshake.
+        assert_eq!(
+            classify_capabilities_handshake(0, "{}", ""),
+            PostDeployEligibility::Eligible
+        );
+        let full = r#"{"rustc_version":"rustc 1.80.0","num_cpus":32,"disk_free_gb":120.5}"#;
+        assert_eq!(
+            classify_capabilities_handshake(0, full, ""),
+            PostDeployEligibility::Eligible
+        );
+        // Surrounding whitespace/newlines from the SSH transport are tolerated.
+        assert_eq!(
+            classify_capabilities_handshake(0, "  {}\n", ""),
+            PostDeployEligibility::Eligible
+        );
+    }
+
+    #[test]
+    fn capabilities_handshake_unparseable_json_is_ineligible() {
+        // The binary ran (exit 0) but did not emit protocol JSON — e.g. a
+        // version-skewed/corrupt binary that printed a banner instead. This must
+        // be caught by the handshake, not silently accepted.
+        match classify_capabilities_handshake(0, "not json at all", "") {
+            PostDeployEligibility::NotEligible { reason_code, .. } => {
+                assert_eq!(reason_code, "capabilities_handshake_failed");
+            }
+            other => panic!("expected NotEligible(capabilities_handshake_failed), got {other:?}"),
+        }
+        // Empty stdout is likewise not valid protocol JSON.
+        assert!(matches!(
+            classify_capabilities_handshake(0, "", ""),
+            PostDeployEligibility::NotEligible {
+                reason_code: "capabilities_handshake_failed",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn capabilities_handshake_exec_format_is_os_arch_mismatch() {
+        // The Darwin-controller -> Linux-worker regression must also be caught on
+        // the capabilities probe: an Exec format error here is an os/arch
+        // mismatch, never a protocol-handshake failure.
+        match classify_capabilities_handshake(126, "", "sh: 1: rch-wkr: Exec format error") {
+            PostDeployEligibility::NotEligible { reason_code, .. } => {
+                assert_eq!(reason_code, "os_arch_mismatch");
+            }
+            other => panic!("expected NotEligible(os_arch_mismatch), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capabilities_handshake_nonzero_exit_is_generic_failure() {
+        // A non-zero exit that is not an Exec format error is a generic
+        // post-deploy validation failure, and stdout is not even parsed.
+        match classify_capabilities_handshake(1, "{}", "some transient error") {
+            PostDeployEligibility::NotEligible { reason_code, .. } => {
+                assert_eq!(reason_code, "post_deploy_validation_failed");
+            }
+            other => panic!("expected NotEligible(post_deploy_validation_failed), got {other:?}"),
+        }
     }
 
     #[test]
@@ -1104,6 +2584,313 @@ mod tests {
 
         assert!(staging_path.starts_with("~/.local/bin/.rch-wkr.tmp."));
         assert_ne!(staging_path, REMOTE_WORKER_BINARY);
+    }
+
+    // ========================
+    // Binary / worker platform guard tests
+    // ========================
+
+    fn elf_header(machine: u16, little_endian: bool) -> Vec<u8> {
+        let mut h = vec![0u8; BINARY_MAGIC_PROBE_LEN];
+        h[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+        h[4] = 2; // EI_CLASS = 64-bit
+        h[5] = if little_endian { 1 } else { 2 };
+        let bytes = if little_endian {
+            machine.to_le_bytes()
+        } else {
+            machine.to_be_bytes()
+        };
+        h[18] = bytes[0];
+        h[19] = bytes[1];
+        h
+    }
+
+    fn macho_header(magic: [u8; 4], cputype: u32, little_endian: bool) -> Vec<u8> {
+        let mut h = vec![0u8; BINARY_MAGIC_PROBE_LEN];
+        h[0..4].copy_from_slice(&magic);
+        let bytes = if little_endian {
+            cputype.to_le_bytes()
+        } else {
+            cputype.to_be_bytes()
+        };
+        h[4..8].copy_from_slice(&bytes);
+        h
+    }
+
+    #[test]
+    fn detect_binary_platform_recognises_linux_elf() {
+        let platform = detect_binary_platform(&elf_header(0x3E, true)).unwrap();
+        assert_eq!(platform.os, BinaryOs::Linux);
+        assert_eq!(platform.arch, Some(BinaryArch::X86_64));
+
+        let aarch = detect_binary_platform(&elf_header(0xB7, true)).unwrap();
+        assert_eq!(aarch.arch, Some(BinaryArch::Aarch64));
+    }
+
+    #[test]
+    fn detect_binary_platform_recognises_macho() {
+        // 64-bit little-endian arm64 Mach-O (CF FA ED FE).
+        let arm =
+            detect_binary_platform(&macho_header([0xCF, 0xFA, 0xED, 0xFE], 0x0100_000C, true))
+                .unwrap();
+        assert_eq!(arm.os, BinaryOs::MacOs);
+        assert_eq!(arm.arch, Some(BinaryArch::Aarch64));
+
+        // 64-bit little-endian x86_64 Mach-O.
+        let x86 =
+            detect_binary_platform(&macho_header([0xCF, 0xFA, 0xED, 0xFE], 0x0100_0007, true))
+                .unwrap();
+        assert_eq!(x86.arch, Some(BinaryArch::X86_64));
+    }
+
+    #[test]
+    fn detect_binary_platform_recognises_fat_macho_as_unknown_arch() {
+        let fat = detect_binary_platform(&[0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 2]).unwrap();
+        assert_eq!(fat.os, BinaryOs::MacOs);
+        assert_eq!(fat.arch, None);
+    }
+
+    #[test]
+    fn detect_binary_platform_returns_none_for_garbage() {
+        assert!(detect_binary_platform(&[0x00, 0x01, 0x02, 0x03]).is_none());
+        assert!(detect_binary_platform(&[]).is_none());
+    }
+
+    // ========================
+    // Target-triple discovery + artifact resolution (bd-...-7.1)
+    // ========================
+
+    fn facts(os: BinaryOs, arch: Option<BinaryArch>, libc: LinuxLibc) -> WorkerTargetFacts {
+        WorkerTargetFacts {
+            platform: BinaryPlatform { os, arch },
+            libc,
+            remote_user: "ubuntu".to_string(),
+            rch_wkr_path: Some("~/.local/bin/rch-wkr".to_string()),
+        }
+    }
+
+    #[test]
+    fn worker_target_triple_linux_defaults_to_musl() {
+        // Linux x86_64 with unknown libc => musl (RCH's static release flavor).
+        assert_eq!(
+            worker_target_triple(&facts(
+                BinaryOs::Linux,
+                Some(BinaryArch::X86_64),
+                LinuxLibc::Unknown
+            ))
+            .as_deref(),
+            Some("x86_64-unknown-linux-musl")
+        );
+        // Explicit musl.
+        assert_eq!(
+            worker_target_triple(&facts(
+                BinaryOs::Linux,
+                Some(BinaryArch::X86_64),
+                LinuxLibc::Musl
+            ))
+            .as_deref(),
+            Some("x86_64-unknown-linux-musl")
+        );
+        // gnu detected.
+        assert_eq!(
+            worker_target_triple(&facts(
+                BinaryOs::Linux,
+                Some(BinaryArch::X86_64),
+                LinuxLibc::Gnu
+            ))
+            .as_deref(),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        // aarch64 linux.
+        assert_eq!(
+            worker_target_triple(&facts(
+                BinaryOs::Linux,
+                Some(BinaryArch::Aarch64),
+                LinuxLibc::Musl
+            ))
+            .as_deref(),
+            Some("aarch64-unknown-linux-musl")
+        );
+    }
+
+    #[test]
+    fn worker_target_triple_macos_and_unsupported() {
+        assert_eq!(
+            worker_target_triple(&facts(
+                BinaryOs::MacOs,
+                Some(BinaryArch::Aarch64),
+                LinuxLibc::Unknown
+            ))
+            .as_deref(),
+            Some("aarch64-apple-darwin")
+        );
+        assert_eq!(
+            worker_target_triple(&facts(
+                BinaryOs::MacOs,
+                Some(BinaryArch::X86_64),
+                LinuxLibc::Unknown
+            ))
+            .as_deref(),
+            Some("x86_64-apple-darwin")
+        );
+        // Unknown arch, 32-bit, and Windows are not in the fleet matrix.
+        assert!(worker_target_triple(&facts(BinaryOs::Linux, None, LinuxLibc::Musl)).is_none());
+        assert!(
+            worker_target_triple(&facts(
+                BinaryOs::Linux,
+                Some(BinaryArch::X86),
+                LinuxLibc::Musl
+            ))
+            .is_none()
+        );
+        assert!(
+            worker_target_triple(&facts(
+                BinaryOs::Windows,
+                Some(BinaryArch::X86_64),
+                LinuxLibc::Unknown
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_worker_artifact_matches_by_triple_and_name() {
+        let artifacts = vec![
+            FleetArtifact {
+                name: "rch-wkr-v1-x86_64-unknown-linux-musl".to_string(),
+                target_triple: "x86_64-unknown-linux-musl".to_string(),
+            },
+            FleetArtifact {
+                name: "rch-wkr-v1-aarch64-apple-darwin".to_string(),
+                target_triple: "aarch64-apple-darwin".to_string(),
+            },
+        ];
+        // Exact triple match.
+        let got = resolve_worker_artifact("w1", "x86_64-unknown-linux-musl", &artifacts).unwrap();
+        assert_eq!(got.target_triple, "x86_64-unknown-linux-musl");
+        // Match by name substring when target_triple field differs.
+        let by_name = vec![FleetArtifact {
+            name: "rch-wkr-aarch64-apple-darwin.tar.gz".to_string(),
+            target_triple: "darwin-aarch64".to_string(),
+        }];
+        assert!(resolve_worker_artifact("w2", "aarch64-apple-darwin", &by_name).is_ok());
+    }
+
+    #[test]
+    fn resolve_worker_artifact_fails_closed_with_no_match() {
+        // The exact 6h54q failure mode: a darwin controller's artifacts only,
+        // resolving for a linux worker => fail closed, never reuse a darwin one.
+        let darwin_only = vec![FleetArtifact {
+            name: "rch-wkr-aarch64-apple-darwin".to_string(),
+            target_triple: "aarch64-apple-darwin".to_string(),
+        }];
+        let err =
+            resolve_worker_artifact("linux-worker", "x86_64-unknown-linux-musl", &darwin_only)
+                .unwrap_err();
+        match err {
+            ArtifactResolveError::NoCompatibleArtifact {
+                worker_id,
+                triple,
+                available,
+            } => {
+                assert_eq!(worker_id, "linux-worker");
+                assert_eq!(triple, "x86_64-unknown-linux-musl");
+                assert_eq!(available, vec!["aarch64-apple-darwin".to_string()]);
+            }
+            other => panic!("expected NoCompatibleArtifact, got {other:?}"),
+        }
+        // Empty artifact set also fails closed.
+        assert!(resolve_worker_artifact("w", "x86_64-unknown-linux-musl", &[]).is_err());
+    }
+
+    #[test]
+    fn parse_worker_platform_normalises_uname() {
+        let linux = parse_worker_platform("Linux", "x86_64").unwrap();
+        assert_eq!(linux.os, BinaryOs::Linux);
+        assert_eq!(linux.arch, Some(BinaryArch::X86_64));
+
+        let mac = parse_worker_platform("Darwin", "arm64").unwrap();
+        assert_eq!(mac.os, BinaryOs::MacOs);
+        assert_eq!(mac.arch, Some(BinaryArch::Aarch64));
+
+        // amd64 alias and unknown arch degrade gracefully.
+        assert_eq!(
+            parse_worker_platform("Linux", "amd64").unwrap().arch,
+            Some(BinaryArch::X86_64)
+        );
+        assert_eq!(
+            parse_worker_platform("Linux", "riscv64").unwrap().arch,
+            None
+        );
+        assert!(parse_worker_platform("Plan9", "x86_64").is_none());
+    }
+
+    #[test]
+    fn platforms_compatible_rejects_the_p0_failure_mode() {
+        // The exact bug: a macOS/arm64 controller binary pushed onto a
+        // linux/amd64 worker.
+        let mac_binary = BinaryPlatform {
+            os: BinaryOs::MacOs,
+            arch: Some(BinaryArch::Aarch64),
+        };
+        let linux_worker = BinaryPlatform {
+            os: BinaryOs::Linux,
+            arch: Some(BinaryArch::X86_64),
+        };
+        assert!(!platforms_compatible(mac_binary, linux_worker));
+    }
+
+    #[test]
+    fn platforms_compatible_rejects_arch_mismatch_same_os() {
+        let arm_linux = BinaryPlatform {
+            os: BinaryOs::Linux,
+            arch: Some(BinaryArch::Aarch64),
+        };
+        let x86_linux = BinaryPlatform {
+            os: BinaryOs::Linux,
+            arch: Some(BinaryArch::X86_64),
+        };
+        assert!(!platforms_compatible(arm_linux, x86_linux));
+    }
+
+    #[test]
+    fn platforms_compatible_accepts_exact_match_and_unknown_arch() {
+        let x86_linux = BinaryPlatform {
+            os: BinaryOs::Linux,
+            arch: Some(BinaryArch::X86_64),
+        };
+        assert!(platforms_compatible(x86_linux, x86_linux));
+
+        // Unknown arch on either side degrades to an OS-only match.
+        let unknown_linux = BinaryPlatform {
+            os: BinaryOs::Linux,
+            arch: None,
+        };
+        assert!(platforms_compatible(unknown_linux, x86_linux));
+        assert!(platforms_compatible(x86_linux, unknown_linux));
+    }
+
+    #[test]
+    fn read_binary_header_reads_leading_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-elf");
+        std::fs::write(&path, elf_header(0x3E, true)).unwrap();
+        let header = read_binary_header(&path).unwrap();
+        let platform = detect_binary_platform(&header).unwrap();
+        assert_eq!(platform.os, BinaryOs::Linux);
+        assert_eq!(platform.arch, Some(BinaryArch::X86_64));
+    }
+
+    #[tokio::test]
+    async fn ensure_binary_matches_worker_fails_open_on_unreadable_binary() {
+        let worker = test_worker_config();
+        let missing = PathBuf::from("/nonexistent/path/rch-wkr");
+        // Unreadable local binary => fail open (Ok), backstopped by health check.
+        assert!(
+            ensure_binary_matches_worker(&worker, &missing)
+                .await
+                .is_ok()
+        );
     }
 
     // ========================
@@ -1151,5 +2938,676 @@ mod tests {
 
         assert!(result.is_none());
         assert!(manager.get_latest_backup(&worker.id.0).is_none());
+    }
+
+    #[test]
+    fn is_safe_version_token_accepts_conventional_and_rejects_metachars() {
+        for ok in ["1.0.0", "0.2.2", "1.2.3-rc.1+build.5", "rch_wkr-2024"] {
+            assert!(is_safe_version_token(ok), "{ok} should be accepted");
+        }
+        assert!(!is_safe_version_token(""), "empty must be rejected");
+        for bad in [
+            "1.0.0;rm",
+            "$(touch x)",
+            "1.0 0",
+            "1.0`id`",
+            "v*",
+            "a|b",
+            "a&b",
+            "a>b",
+            "a/b",
+            "a\nb",
+        ] {
+            assert!(!is_safe_version_token(bad), "{bad} should be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_before_deploy_rejects_unsafe_version_token() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+
+        let worker = test_worker_config();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut manager = RollbackManager::with_path(temp_dir.path()).unwrap();
+
+        // A corrupt/hostile binary reports a version with a shell metacharacter:
+        // split_whitespace().nth(1) => "1.0.0;rm", which must be rejected before
+        // it reaches cp/sha256sum/rm. The cp mock returns success so that if the
+        // validation regressed, a backup WOULD be created and the assertions
+        // below would fail.
+        let mock = MockSshExecutor::new()
+            .with_command("--version", MockCommandResult::ok("rch-wkr 1.0.0;rm"))
+            .with_command("mkdir -p", MockCommandResult::ok(""))
+            .with_command("df -Pm", MockCommandResult::ok("500"))
+            .with_command("cp ", MockCommandResult::ok(""));
+
+        let result = backup_before_deploy_with_runner(&worker, &mut manager, &mock)
+            .await
+            .unwrap();
+
+        assert!(result.is_none(), "unsafe version must skip the backup");
+        assert!(manager.get_latest_backup(&worker.id.0).is_none());
+    }
+
+    // ========================
+    // Release-provenance gate tests (bd-...-ocv9i.7.4)
+    // ========================
+
+    use rch_common::fleet_provenance::{SignatureMaterial, reason_code};
+
+    const TEST_TRIPLE: &str = "x86_64-unknown-linux-musl";
+
+    /// Write a fake binary into a temp dir and return (dir, path).
+    fn fake_binary(content: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rch-wkr");
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn provenance_manifest_path_appends_suffix() {
+        let p = provenance_manifest_path(Path::new("/tmp/rch-wkr"));
+        assert_eq!(p, PathBuf::from("/tmp/rch-wkr.provenance.json"));
+    }
+
+    #[test]
+    fn provenance_detail_renders_each_verdict() {
+        assert_eq!(
+            provenance_detail(&ProvenanceVerdict::Verified),
+            "artifact provenance verified"
+        );
+        assert_eq!(
+            provenance_detail(&ProvenanceVerdict::DevArtifactAllowed {
+                reason: "because dev".to_string()
+            }),
+            "because dev"
+        );
+        assert_eq!(
+            provenance_detail(&ProvenanceVerdict::Rejected {
+                reason_code: reason_code::CHECKSUM_MISMATCH.to_string(),
+                detail: "bad hash".to_string()
+            }),
+            "bad hash"
+        );
+    }
+
+    #[test]
+    fn load_artifact_provenance_falls_back_to_dev_artifact() {
+        let (_dir, bin) = fake_binary(b"hello");
+        let prov = load_artifact_provenance(&bin, TEST_TRIPLE);
+        assert_eq!(prov.target_triple, TEST_TRIPLE);
+        assert_eq!(prov.artifact_id, "rch-wkr");
+        assert!(prov.expected_sha256.is_none());
+        assert!(prov.signature.is_none());
+        assert!(prov.release_id.is_none());
+    }
+
+    #[test]
+    fn load_artifact_provenance_reads_sidecar_manifest() {
+        let (_dir, bin) = fake_binary(b"hello");
+        let manifest = ArtifactProvenance {
+            artifact_id: "rch-wkr-v1.0.42".to_string(),
+            release_id: Some("v1.0.42".to_string()),
+            target_triple: "aarch64-apple-darwin".to_string(),
+            expected_sha256: Some("deadbeef".to_string()),
+            signature: Some(SignatureMaterial {
+                bundle_ref: "/nonexistent/bundle.json".to_string(),
+                identity_pattern: "^https://example$".to_string(),
+            }),
+            builder_identity: Some("ci".to_string()),
+            expected_protocol_version: Some(2),
+        };
+        std::fs::write(
+            provenance_manifest_path(&bin),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // The fallback triple is ignored when a manifest is present.
+        let loaded = load_artifact_provenance(&bin, TEST_TRIPLE);
+        assert_eq!(loaded, manifest);
+    }
+
+    #[test]
+    fn load_artifact_provenance_unparseable_manifest_falls_back() {
+        let (_dir, bin) = fake_binary(b"hello");
+        std::fs::write(provenance_manifest_path(&bin), b"{ not json").unwrap();
+        let prov = load_artifact_provenance(&bin, TEST_TRIPLE);
+        assert_eq!(prov.target_triple, TEST_TRIPLE);
+        assert!(prov.expected_sha256.is_none());
+    }
+
+    // Scenario: local development artifact policy — a locally-built binary with
+    // no manifest is allowed under the dev-friendly default, with an explicit
+    // recorded reason.
+    #[tokio::test]
+    async fn gate_dev_artifact_under_dev_friendly_is_allowed() {
+        let (_dir, bin) = fake_binary(b"a local dev binary");
+        let (verdict, prov) =
+            run_provenance_gate(&bin, Some(TEST_TRIPLE), &ProvenancePolicy::dev_friendly()).await;
+        assert!(verdict.may_transfer());
+        assert_eq!(verdict.verification_status(), "dev_allowed");
+        assert_eq!(prov.target_triple, TEST_TRIPLE);
+    }
+
+    // Scenario: missing material under STRICT policy fails closed (the deploy
+    // path would refuse the transfer).
+    #[tokio::test]
+    async fn gate_dev_artifact_under_strict_is_rejected() {
+        let (_dir, bin) = fake_binary(b"a local dev binary");
+        let (verdict, _prov) =
+            run_provenance_gate(&bin, Some(TEST_TRIPLE), &ProvenancePolicy::STRICT).await;
+        assert!(!verdict.may_transfer());
+        // STRICT requires a checksum first; a dev artifact has none.
+        assert_eq!(verdict.reason_code(), Some(reason_code::CHECKSUM_MISSING));
+    }
+
+    // Scenario: a manifest whose expected checksum matches the artifact verifies
+    // even without a signature under dev-friendly policy.
+    #[tokio::test]
+    async fn gate_manifest_matching_checksum_is_verified() {
+        let (_dir, bin) = fake_binary(b"release artifact bytes");
+        let sha = local_file_sha256_hex(&bin).unwrap();
+        let manifest = ArtifactProvenance {
+            artifact_id: "rch-wkr-v1.0.42".to_string(),
+            release_id: Some("v1.0.42".to_string()),
+            target_triple: TEST_TRIPLE.to_string(),
+            expected_sha256: Some(sha),
+            signature: None,
+            builder_identity: Some("github-actions".to_string()),
+            expected_protocol_version: Some(1),
+        };
+        std::fs::write(
+            provenance_manifest_path(&bin),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let (verdict, _prov) =
+            run_provenance_gate(&bin, Some(TEST_TRIPLE), &ProvenancePolicy::dev_friendly()).await;
+        assert_eq!(verdict, ProvenanceVerdict::Verified);
+    }
+
+    // Scenario: a manifest declaring a checksum that does NOT match the artifact
+    // fails closed (truncated/tampered transfer).
+    #[tokio::test]
+    async fn gate_manifest_checksum_mismatch_is_rejected() {
+        let (_dir, bin) = fake_binary(b"release artifact bytes");
+        let manifest = ArtifactProvenance {
+            artifact_id: "rch-wkr-v1.0.42".to_string(),
+            release_id: Some("v1.0.42".to_string()),
+            target_triple: TEST_TRIPLE.to_string(),
+            expected_sha256: Some(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            ),
+            signature: None,
+            builder_identity: None,
+            expected_protocol_version: None,
+        };
+        std::fs::write(
+            provenance_manifest_path(&bin),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let (verdict, _prov) =
+            run_provenance_gate(&bin, Some(TEST_TRIPLE), &ProvenancePolicy::dev_friendly()).await;
+        assert_eq!(verdict.reason_code(), Some(reason_code::CHECKSUM_MISMATCH));
+        assert!(!verdict.may_transfer());
+    }
+
+    // Scenario: wrong target triple — a manifest built for a different platform
+    // than the worker is refused regardless of checksum.
+    #[tokio::test]
+    async fn gate_wrong_target_triple_is_rejected() {
+        let (_dir, bin) = fake_binary(b"release artifact bytes");
+        let sha = local_file_sha256_hex(&bin).unwrap();
+        let manifest = ArtifactProvenance {
+            artifact_id: "rch-wkr".to_string(),
+            release_id: None,
+            target_triple: "aarch64-apple-darwin".to_string(),
+            expected_sha256: Some(sha),
+            signature: None,
+            builder_identity: None,
+            expected_protocol_version: None,
+        };
+        std::fs::write(
+            provenance_manifest_path(&bin),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // Worker is linux/musl, artifact targets macOS => rejected.
+        let (verdict, _prov) =
+            run_provenance_gate(&bin, Some(TEST_TRIPLE), &ProvenancePolicy::dev_friendly()).await;
+        assert_eq!(
+            verdict.reason_code(),
+            Some(reason_code::WRONG_TARGET_TRIPLE)
+        );
+        assert!(!verdict.may_transfer());
+    }
+
+    // When the worker triple is undiscoverable, a manifest artifact is judged
+    // against its own declared triple (no false WRONG_TARGET_TRIPLE), with the
+    // checksum still gating.
+    #[tokio::test]
+    async fn gate_unknown_worker_triple_judges_on_checksum() {
+        let (_dir, bin) = fake_binary(b"release artifact bytes");
+        let sha = local_file_sha256_hex(&bin).unwrap();
+        let manifest = ArtifactProvenance {
+            artifact_id: "rch-wkr".to_string(),
+            release_id: None,
+            target_triple: "aarch64-apple-darwin".to_string(),
+            expected_sha256: Some(sha),
+            signature: None,
+            builder_identity: None,
+            expected_protocol_version: None,
+        };
+        std::fs::write(
+            provenance_manifest_path(&bin),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let (verdict, _prov) =
+            run_provenance_gate(&bin, None, &ProvenancePolicy::dev_friendly()).await;
+        assert_eq!(verdict, ProvenanceVerdict::Verified);
+    }
+
+    // ========================
+    // Smoke capabilities scenario executor — mock-SSH integration (bd-...-16.6 Part 2)
+    // ========================
+
+    fn smoke_worker() -> WorkerConfig {
+        WorkerConfig {
+            user: "rch".to_string(),
+            ..Default::default()
+        }
+    }
+
+    // A healthy worker that reports a usable exact-path rch-wkr + cargo +
+    // protocol >= required is Admissible.
+    #[tokio::test]
+    async fn smoke_capabilities_admits_healthy_worker() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let probe_out = "RCH_FACT os=linux\nRCH_FACT arch=x86_64\nRCH_FACT user=rch\n\
+RCH_FACT rch_wkr_path=/home/rch/.local/bin/rch-wkr\nRCH_FACT worker_version=1.0.41\n\
+RCH_FACT worker_protocol=3\nRCH_FACT cargo_version=cargo 1.98.0-nightly\n\
+RCH_FACT toolchain=nightly\nRCH_FACT target=x86_64-unknown-linux-gnu\n\
+RCH_FACT disk=/data/tmp;1048576;524288;900000\n";
+        // The probe runs as one multi-line script; match a substring it embeds.
+        let mock = MockSshExecutor::new()
+            .with_command("--protocol-version", MockCommandResult::ok(probe_out));
+        let verdict = run_smoke_capabilities_with_runner(
+            &smoke_worker(),
+            &CapabilityRequirement::rust(1),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(verdict, CapabilityVerdict::Admissible);
+    }
+
+    // The probe ran (os present) but the exact-path binary produced no version
+    // as the configured user => Rejected (root-good / user-broken).
+    #[tokio::test]
+    async fn smoke_capabilities_rejects_binary_unusable_as_user() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let probe_out = "RCH_FACT os=linux\nRCH_FACT arch=x86_64\nRCH_FACT user=rch\n";
+        let mock = MockSshExecutor::new()
+            .with_command("--protocol-version", MockCommandResult::ok(probe_out));
+        let verdict = run_smoke_capabilities_with_runner(
+            &smoke_worker(),
+            &CapabilityRequirement::rust(1),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(verdict, CapabilityVerdict::Rejected { .. }));
+    }
+
+    // An empty probe (worker unreachable / no facts) is a rejection, never a
+    // silent pass — the cardinal safety invariant.
+    #[tokio::test]
+    async fn smoke_capabilities_unreachable_probe_is_rejected_not_passed() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let mock =
+            MockSshExecutor::new().with_command("--protocol-version", MockCommandResult::ok(""));
+        let verdict = run_smoke_capabilities_with_runner(
+            &smoke_worker(),
+            &CapabilityRequirement::rust(1),
+            &mock,
+        )
+        .await
+        .unwrap();
+        match verdict {
+            CapabilityVerdict::Rejected { reason, .. } => {
+                assert_eq!(reason, IncidentReasonCode::WrongUserPathWorkerBinary);
+            }
+            other => panic!("expected Rejected for an unreachable probe, got {other:?}"),
+        }
+    }
+
+    // A protocol below the requirement is rejected even though the binary runs.
+    #[tokio::test]
+    async fn smoke_capabilities_rejects_protocol_below_requirement() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let probe_out = "RCH_FACT os=linux\nRCH_FACT arch=x86_64\nRCH_FACT user=rch\n\
+RCH_FACT rch_wkr_path=/home/rch/.local/bin/rch-wkr\nRCH_FACT worker_version=1.0.41\n\
+RCH_FACT worker_protocol=1\nRCH_FACT cargo_version=cargo 1.98.0-nightly\n\
+RCH_FACT target=x86_64-unknown-linux-gnu\n";
+        let mock = MockSshExecutor::new()
+            .with_command("--protocol-version", MockCommandResult::ok(probe_out));
+        let verdict = run_smoke_capabilities_with_runner(
+            &smoke_worker(),
+            &CapabilityRequirement::rust(3),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(verdict, CapabilityVerdict::Rejected { .. }));
+    }
+
+    // The smoke default requirement uses min_protocol=0 because the shipping
+    // rch-wkr has NO --protocol-version subcommand. A worker that runs --version
+    // but reports no protocol (=> 0) must STILL be admitted, or the scenario
+    // would reject the entire real fleet (the de04443 / bd-woidb gotcha).
+    #[tokio::test]
+    async fn smoke_capabilities_default_admits_worker_without_protocol_version() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        // Real-fleet shape: version present, NO worker_protocol line, cargo present.
+        let probe_out = "RCH_FACT os=linux\nRCH_FACT arch=x86_64\nRCH_FACT user=rch\n\
+RCH_FACT rch_wkr_path=/home/rch/.local/bin/rch-wkr\nRCH_FACT worker_version=1.0.41\n\
+RCH_FACT cargo_version=cargo 1.98.0-nightly\n";
+        let mock = MockSshExecutor::new()
+            .with_command("--protocol-version", MockCommandResult::ok(probe_out));
+        let verdict = run_smoke_capabilities_with_runner(
+            &smoke_worker(),
+            &smoke_capability_requirement(),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            verdict,
+            CapabilityVerdict::Admissible,
+            "min_protocol=0 must admit a real worker lacking --protocol-version"
+        );
+    }
+
+    // ========================
+    // Smoke disk/inode admission executor — mock-SSH integration (bd-...-16.6 Part 2)
+    // ========================
+
+    // Comfortable disk + inode headroom => Ok (admissible).
+    #[tokio::test]
+    async fn smoke_disk_inode_ok_with_headroom() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        // total=1048576KB, avail=524288KB (50%), inodes=900000.
+        let probe_out = "RCH_FACT disk=/data/tmp;1048576;524288;900000\n";
+        let mock = MockSshExecutor::new().with_command("df -Pk", MockCommandResult::ok(probe_out));
+        let level = run_smoke_disk_inode_with_runner(
+            &smoke_worker(),
+            &["/data/tmp".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(level, PressureLevel::Ok);
+    }
+
+    // Byte exhaustion (avail <= critical pct) => Critical (failed admission).
+    #[tokio::test]
+    async fn smoke_disk_inode_critical_on_low_bytes() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        // avail=10240/1048576 ~= 1% <= 5% critical.
+        let probe_out = "RCH_FACT disk=/data/tmp;1048576;10240;900000\n";
+        let mock = MockSshExecutor::new().with_command("df -Pk", MockCommandResult::ok(probe_out));
+        let level = run_smoke_disk_inode_with_runner(
+            &smoke_worker(),
+            &["/data/tmp".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(level, PressureLevel::Critical);
+    }
+
+    // Inode exhaustion is critical even with plenty of bytes free.
+    #[tokio::test]
+    async fn smoke_disk_inode_critical_on_low_inodes() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        // bytes 50% (Ok) but inodes=5000 < 10000 critical.
+        let probe_out = "RCH_FACT disk=/data/tmp;1048576;524288;5000\n";
+        let mock = MockSshExecutor::new().with_command("df -Pk", MockCommandResult::ok(probe_out));
+        let level = run_smoke_disk_inode_with_runner(
+            &smoke_worker(),
+            &["/data/tmp".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(level, PressureLevel::Critical);
+    }
+
+    // No probed roots (df returned nothing) => Unknown, never a silent pass.
+    #[tokio::test]
+    async fn smoke_disk_inode_unknown_when_no_roots() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let mock = MockSshExecutor::new().with_command(
+            "--protocol-version",
+            MockCommandResult::ok("RCH_FACT os=linux\n"),
+        );
+        let level = run_smoke_disk_inode_with_runner(
+            &smoke_worker(),
+            &[],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(level, PressureLevel::Unknown);
+    }
+
+    // The worst level across multiple roots wins (one critical root fails the run).
+    #[tokio::test]
+    async fn smoke_disk_inode_worst_root_wins() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let probe_out = "RCH_FACT disk=/data/tmp;1048576;524288;900000\n\
+RCH_FACT disk=/var/cache;1048576;10240;900000\n";
+        let mock = MockSshExecutor::new().with_command("df -Pk", MockCommandResult::ok(probe_out));
+        let level = run_smoke_disk_inode_with_runner(
+            &smoke_worker(),
+            &["/data/tmp".to_string(), "/var/cache".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(level, PressureLevel::Critical);
+    }
+
+    // ========================
+    // Per-worker live runner orchestrator — mock-SSH integration (bd-...-16.6 Part 3)
+    // ========================
+
+    fn smoke_worker_named(id: &str) -> WorkerConfig {
+        WorkerConfig {
+            id: WorkerId(id.to_string()),
+            user: "rch".to_string(),
+            ..Default::default()
+        }
+    }
+
+    // The smoke capability probe must target an ABSOLUTE binary path. The probe
+    // script single-quotes it, so a literal `~/.local/bin/rch-wkr` would never
+    // expand and EVERY real worker would be rejected as binary-missing (the
+    // live-fleet bug the mock tests masked by injecting an expanded path).
+    #[test]
+    fn smoke_capability_probe_spec_uses_absolute_path() {
+        let spec = smoke_capability_probe_spec(&smoke_worker()); // user "rch"
+        assert_eq!(spec.rch_wkr_path, "/home/rch/.local/bin/rch-wkr");
+        assert!(!spec.rch_wkr_path.contains('~'));
+        let root = WorkerConfig {
+            user: "root".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            smoke_capability_probe_spec(&root).rch_wkr_path,
+            "/root/.local/bin/rch-wkr"
+        );
+    }
+
+    // A healthy worker (good caps + comfortable disk) yields started+passed for
+    // BOTH per-worker scenarios, scoped to the worker, in stable order.
+    #[tokio::test]
+    async fn smoke_worker_scenarios_all_pass_on_healthy_worker() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let probe_out = "RCH_FACT os=linux\nRCH_FACT arch=x86_64\nRCH_FACT user=rch\n\
+RCH_FACT rch_wkr_path=/home/rch/.local/bin/rch-wkr\nRCH_FACT worker_version=1.0.41\n\
+RCH_FACT cargo_version=cargo 1.98.0-nightly\n\
+RCH_FACT disk=/tmp/rch;1048576;524288;900000\n";
+        // The full multi-line probe script embeds both `--protocol-version` and
+        // `df -Pk`; one mock entry keyed on a shared substring serves both calls.
+        let mock = MockSshExecutor::new()
+            .with_command("RCH_FACT", MockCommandResult::ok(probe_out))
+            .with_command("--protocol-version", MockCommandResult::ok(probe_out));
+        let events = run_smoke_worker_scenarios_with_runner(
+            "run-x",
+            "bd-...-16.6",
+            &smoke_worker_named("css"),
+            &["/tmp/rch".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await;
+        // started, passed (capabilities); started, passed (disk).
+        assert_eq!(events.len(), 4);
+        let tokens: Vec<(&str, &str)> = events
+            .iter()
+            .map(|e| (e.scenario.as_str(), e.event.as_str()))
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                ("worker_capabilities_exact_user_path", "started"),
+                ("worker_capabilities_exact_user_path", "passed"),
+                ("disk_inode_admission", "started"),
+                ("disk_inode_admission", "passed"),
+            ]
+        );
+        for e in &events {
+            assert_eq!(e.worker_id.as_deref(), Some("css"));
+            assert_eq!(e.run_id, "run-x");
+        }
+        // Passing outcomes carry no reason code.
+        for e in events.iter().filter(|e| e.event == "passed") {
+            assert!(e.reason_code.is_none());
+        }
+    }
+
+    // A missing/broken binary fails capabilities (with the incident code) but the
+    // disk probe still runs and passes — scenarios are independent.
+    #[tokio::test]
+    async fn smoke_worker_scenarios_capabilities_fail_disk_pass() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        // os present but NO worker version => Rejected(WrongUserPathWorkerBinary);
+        // disk facts still present and comfortable.
+        let probe_out = "RCH_FACT os=linux\nRCH_FACT arch=x86_64\nRCH_FACT user=rch\n\
+RCH_FACT disk=/tmp/rch;1048576;524288;900000\n";
+        let mock = MockSshExecutor::new()
+            .with_command("RCH_FACT", MockCommandResult::ok(probe_out))
+            .with_command("--protocol-version", MockCommandResult::ok(probe_out));
+        let events = run_smoke_worker_scenarios_with_runner(
+            "run-y",
+            "bd-...-16.6",
+            &smoke_worker_named("hz1"),
+            &["/tmp/rch".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await;
+        let cap = events
+            .iter()
+            .find(|e| e.scenario == "worker_capabilities_exact_user_path" && e.event == "failed")
+            .expect("capabilities failed event");
+        assert_eq!(cap.status, "fail");
+        assert_eq!(
+            cap.reason_code.as_deref(),
+            Some(IncidentReasonCode::WrongUserPathWorkerBinary.code())
+        );
+        // Disk still ran and passed.
+        assert!(
+            events
+                .iter()
+                .any(|e| e.scenario == "disk_inode_admission" && e.event == "passed")
+        );
+    }
+
+    // Critical disk pressure is a failed admission carrying the incident code,
+    // never a silent pass.
+    #[tokio::test]
+    async fn smoke_worker_scenarios_disk_critical_fails() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let probe_out = "RCH_FACT os=linux\nRCH_FACT user=rch\n\
+RCH_FACT rch_wkr_path=/home/rch/.local/bin/rch-wkr\nRCH_FACT worker_version=1.0.41\n\
+RCH_FACT cargo_version=cargo 1.98.0-nightly\n\
+RCH_FACT disk=/tmp/rch;1048576;10240;900000\n";
+        let mock = MockSshExecutor::new()
+            .with_command("RCH_FACT", MockCommandResult::ok(probe_out))
+            .with_command("--protocol-version", MockCommandResult::ok(probe_out));
+        let events = run_smoke_worker_scenarios_with_runner(
+            "run-z",
+            "bd-...-16.6",
+            &smoke_worker_named("hz1"),
+            &["/tmp/rch".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await;
+        let disk = events
+            .iter()
+            .find(|e| e.scenario == "disk_inode_admission" && e.event == "failed")
+            .expect("disk failed event");
+        assert_eq!(
+            disk.reason_code.as_deref(),
+            Some(IncidentReasonCode::CriticalPressure.code())
+        );
+    }
+
+    // An unreachable worker fails BOTH scenarios with the worker_unreachable
+    // token — an SSH transport error is never swallowed into a pass.
+    #[tokio::test]
+    async fn smoke_worker_scenarios_unreachable_fails_both() {
+        use crate::fleet::ssh::MockSshExecutor;
+        let mock = MockSshExecutor::unreachable();
+        let events = run_smoke_worker_scenarios_with_runner(
+            "run-w",
+            "bd-...-16.6",
+            &smoke_worker_named("dead"),
+            &["/tmp/rch".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await;
+        let failed: Vec<&str> = events
+            .iter()
+            .filter(|e| e.event == "failed")
+            .map(|e| e.scenario.as_str())
+            .collect();
+        assert_eq!(
+            failed,
+            vec![
+                "worker_capabilities_exact_user_path",
+                "disk_inode_admission"
+            ]
+        );
+        for e in events.iter().filter(|e| e.event == "failed") {
+            assert_eq!(e.reason_code.as_deref(), Some("worker_unreachable"));
+        }
     }
 }

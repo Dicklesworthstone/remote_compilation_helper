@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 // Re-export platform-independent utilities for backwards compatibility
 pub use crate::ssh_utils::{
@@ -32,6 +32,20 @@ const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 /// Maximum size for command output (stdout/stderr) to prevent OOM (10MB).
 const MAX_OUTPUT_SIZE: u64 = 10 * 1024 * 1024;
 
+const HEALTH_CHECK_COMMAND: &str = "echo ok";
+
+fn is_expected_health_check_output(stdout: &str) -> bool {
+    stdout
+        .trim()
+        .lines()
+        .last()
+        .is_some_and(is_health_check_sentinel)
+}
+
+fn is_health_check_sentinel(line: &str) -> bool {
+    matches!(line.trim(), "ok")
+}
+
 /// SSH connection options.
 #[derive(Debug, Clone)]
 pub struct SshOptions {
@@ -45,8 +59,12 @@ pub struct SshOptions {
     pub server_alive_interval: Option<Duration>,
     /// How long the SSH ControlMaster should remain alive while idle.
     ///
-    /// `None` preserves the OpenSSH crate default (`ControlPersist=yes`).
-    /// `Some(0s)` sets `ControlPersist=no` (close after initial connection).
+    /// Only applies when `control_master` is true (connection reuse). `Some(n)`
+    /// with n > 0 keeps the master warm for n idle seconds (`ControlPersist=Ns`).
+    /// `Some(0s)`/`None`, or ANY non-mux per-call session, closes the master
+    /// after the initial connection (`ControlPersist=no`). The OpenSSH crate
+    /// `ControlPersist=yes` (forever) default is never used — it leaked a
+    /// master process per per-call SSH. See `control_persist_mode`.
     pub control_persist_idle: Option<Duration>,
     /// SSH control master mode for connection reuse.
     pub control_master: bool,
@@ -147,6 +165,13 @@ impl SshClient {
         self.session.is_some()
     }
 
+    fn is_configured_for(&self, config: &WorkerConfig) -> bool {
+        self.config.id == config.id
+            && self.config.host == config.host
+            && self.config.user == config.user
+            && self.config.identity_file == config.identity_file
+    }
+
     /// Connect to the remote worker.
     pub async fn connect(&mut self) -> Result<()> {
         if self.session.is_some() {
@@ -182,7 +207,9 @@ impl SshClient {
             }
         };
 
-        info!("Connected to {} ({})", self.config.id, self.config.host);
+        // debug, not info: the telemetry pool connects to every worker each poll
+        // cycle, so at info this floods the daemon log (8M+ lines / multi-GB).
+        debug!("Connected to {} ({})", self.config.id, self.config.host);
         self.session = Some(session);
         Ok(())
     }
@@ -227,31 +254,28 @@ impl SshClient {
             builder.keyfile(identity_path.as_ref());
         }
 
-        // Enable control master for connection reuse
-        if control_master {
-            if let Some(idle) = self.options.control_persist_idle {
-                if idle.is_zero() {
-                    builder.control_persist(ControlPersist::ClosedAfterInitialConnection);
-                } else {
-                    match usize::try_from(idle.as_secs()) {
-                        Ok(secs) => {
-                            if let Some(nonzero) = NonZeroUsize::new(secs) {
-                                builder.control_persist(ControlPersist::IdleFor(nonzero));
-                            } else {
-                                builder
-                                    .control_persist(ControlPersist::ClosedAfterInitialConnection);
-                            }
-                        }
-                        Err(_) => {
-                            warn!(
-                                "control_persist_idle too large ({}s); ignoring override",
-                                idle.as_secs()
-                            );
-                        }
-                    }
-                }
+        // Always pin ControlPersist explicitly. The openssh crate ALWAYS
+        // spawns a control-master; leaving it unset defaults to
+        // `ControlPersist=yes` (Forever), which leaks a master process for
+        // every short-lived per-call SSH (telemetry/health/capabilities run
+        // with control_master=false). ClosedAfterInitialConnection lets
+        // non-mux masters self-terminate; only the explicit mux-reuse path
+        // with a configured idle keeps a warm master.
+        match control_persist_mode(control_master, self.options.control_persist_idle) {
+            ControlPersistMode::IdleFor(nonzero) => {
+                builder.control_persist(ControlPersist::IdleFor(nonzero));
             }
+            ControlPersistMode::TooLarge(secs) => {
+                warn!("control_persist_idle too large ({secs}s); closing after initial connection");
+                builder.control_persist(ControlPersist::ClosedAfterInitialConnection);
+            }
+            ControlPersistMode::Closed => {
+                builder.control_persist(ControlPersist::ClosedAfterInitialConnection);
+            }
+        }
 
+        // Control-master socket directory only matters when reusing connections.
+        if control_master {
             // Use a short control directory path to stay within the Unix domain
             // socket path limit (104 bytes on macOS, 108 on Linux).  The openssh
             // crate appends a `%C` hash (~32 chars) to form the socket filename,
@@ -304,13 +328,47 @@ impl SshClient {
         if let Some(session) = self.session.take() {
             debug!("Disconnecting from {}", self.config.id);
             session.close().await?;
-            info!("Disconnected from {}", self.config.id);
+            // debug, not info: paired with the connect log above; floods at info.
+            debug!("Disconnected from {}", self.config.id);
         }
         Ok(())
     }
 
-    /// Execute a command on the remote worker.
+    /// Force a fresh connection, dropping any existing (possibly dead) session.
+    ///
+    /// [`connect`](Self::connect) is a no-op when a `Session` object already
+    /// exists, so a pooled client whose underlying SSH ControlMaster has died
+    /// cannot recover through it. `reconnect` tears the stale session down first
+    /// (closing it best-effort — a dead master may itself error on close, but
+    /// [`disconnect`](Self::disconnect) `take()`s the session before closing so
+    /// it is gone regardless) and then establishes a new one.
+    pub async fn reconnect(&mut self) -> Result<()> {
+        if let Err(e) = self.disconnect().await {
+            debug!(
+                "Ignoring error closing stale session to {} before reconnect: {}",
+                self.config.id, e
+            );
+        }
+        self.connect().await
+    }
+
+    /// Execute a command on the remote worker using this client's configured
+    /// command timeout.
     pub async fn execute(&self, command: &str) -> Result<CommandResult> {
+        self.execute_with_timeout(command, self.options.command_timeout)
+            .await
+    }
+
+    /// Execute a command on the remote worker with an explicit per-call timeout.
+    ///
+    /// Used by the connection pool ([`SshPool::run_with_timeout`]) so a single
+    /// pooled client can serve calls with different timeouts (a fast health
+    /// probe vs. a slower cleanup) without mutating the shared client options.
+    pub async fn execute_with_timeout(
+        &self,
+        command: &str,
+        command_timeout: Duration,
+    ) -> Result<CommandResult> {
         let session = self.session.as_ref().context("Not connected to worker")?;
 
         let start = std::time::Instant::now();
@@ -383,7 +441,7 @@ impl SshClient {
             Ok::<_, anyhow::Error>((status, stdout, stderr))
         };
 
-        match tokio::time::timeout(self.options.command_timeout, execution_future).await {
+        match tokio::time::timeout(command_timeout, execution_future).await {
             Ok(result) => {
                 let (status, stdout, stderr) = result?;
                 let duration = start.elapsed();
@@ -412,9 +470,9 @@ impl SshClient {
                 // a timeout to avoid leaked remote processes.
                 warn!(
                     "Command timed out on {} after {:?}",
-                    self.config.id, self.options.command_timeout
+                    self.config.id, command_timeout
                 );
-                anyhow::bail!("Command timed out after {:?}", self.options.command_timeout);
+                anyhow::bail!("Command timed out after {:?}", command_timeout);
             }
         }
     }
@@ -574,8 +632,8 @@ impl SshClient {
 
     /// Check if the worker is reachable via SSH.
     pub async fn health_check(&self) -> Result<bool> {
-        match self.execute("echo ok").await {
-            Ok(result) => Ok(result.success() && result.stdout.trim() == "ok"),
+        match self.execute(HEALTH_CHECK_COMMAND).await {
+            Ok(result) => Ok(result.success() && is_expected_health_check_output(&result.stdout)),
             Err(e) => {
                 warn!("Health check failed for {}: {}", self.config.id, e);
                 Ok(false)
@@ -602,56 +660,115 @@ impl SshPool {
     }
 
     /// Get or create a connection to a worker.
+    ///
+    /// Validates liveness on borrow: a pooled `SshClient` reports
+    /// [`is_connected`](SshClient::is_connected) purely from the presence of a
+    /// `Session` object, which cannot detect that the underlying SSH
+    /// ControlMaster has died (idle `ControlPersist` expiry, a network blip, or
+    /// the remote `sshd` being restarted). Returning such a client hands the
+    /// caller a dead master, and its next `execute()` fails with
+    /// broken-pipe/connection-closed and no chance to recover. So before reusing
+    /// a connected client this probes it with a lightweight health check, and on
+    /// failure reconnects once under the per-worker write lock.
     pub async fn get_or_connect(&self, config: &WorkerConfig) -> Result<Arc<RwLock<SshClient>>> {
-        let worker_id = config.id.clone();
+        let shared_client = self.get_or_create_client_entry(config).await;
 
-        // Fast path: check if we already have a valid connection (read lock)
-        {
-            let connections = self.connections.read().await;
-            if let Some(client) = connections.get(&worker_id) {
-                let client_guard = client.read().await;
-                if client_guard.is_connected() {
-                    debug!("Reusing existing connection to {}", worker_id);
-                    return Ok(client.clone());
-                }
-            }
+        // Fast path: reuse only a session that is both present AND verified live.
+        // The probe needs `&self` only (health_check → execute), so it runs under
+        // a shared read lock and never blocks other borrowers of this worker.
+        let reusable = {
+            let guard = shared_client.read().await;
+            guard.is_connected() && guard.health_check().await.unwrap_or(false)
+        };
+        if reusable {
+            debug!("Reusing live connection to {}", config.id);
+            return Ok(shared_client);
         }
 
-        // Slow path: acquire write lock and double-check before creating connection
-        // This prevents TOCTOU race where multiple tasks create duplicate connections
-        let mut connections = self.connections.write().await;
-
-        // Double-check under write lock: another task may have added a connection
-        if let Some(client) = connections.get(&worker_id) {
-            let client_guard = client.read().await;
-            if client_guard.is_connected() {
-                debug!(
-                    "Reusing connection added by concurrent task to {}",
-                    worker_id
-                );
-                return Ok(client.clone());
-            }
-            // Connection exists but is disconnected - we'll replace it below
-        }
-
-        // Create new connection but don't connect yet
-        let client = SshClient::new(config.clone(), self.options.clone());
-        let shared_client = Arc::new(RwLock::new(client));
-        connections.insert(worker_id.clone(), shared_client.clone());
-
-        // Drop the write lock on the entire pool before performing network I/O
-        drop(connections);
-
-        // Perform the slow connection process while holding only the lock for this specific worker
+        // Slow path: (re)connect under the per-worker write lock. Re-evaluate the
+        // state here because another task may have connected/reconnected while we
+        // waited for the lock, and to distinguish "never connected" (connect)
+        // from "session exists but the master is dead" (reconnect).
         let mut client_guard = shared_client.write().await;
-        // Double check it wasn't connected while we waited for the write lock
         if !client_guard.is_connected() {
             client_guard.connect().await?;
+        } else if !client_guard.health_check().await.unwrap_or(false) {
+            warn!(
+                "Pooled SSH connection to {} failed liveness probe; reconnecting",
+                config.id
+            );
+            client_guard.reconnect().await?;
         }
         // Drop write lock before returning
         drop(client_guard);
 
         Ok(shared_client)
+    }
+
+    async fn get_or_create_client_entry(&self, config: &WorkerConfig) -> Arc<RwLock<SshClient>> {
+        let worker_id = config.id.clone();
+
+        loop {
+            let existing_client = {
+                let connections = self.connections.read().await;
+                connections.get(&worker_id).cloned()
+            };
+
+            if let Some(client) = existing_client {
+                let is_configured_for_worker = {
+                    let guard = client.read().await;
+                    guard.is_configured_for(config)
+                };
+                if is_configured_for_worker {
+                    return client;
+                }
+
+                let replacement = Arc::new(RwLock::new(SshClient::new(
+                    config.clone(),
+                    self.options.clone(),
+                )));
+                let replaced = {
+                    let mut connections = self.connections.write().await;
+                    if connections
+                        .get(&worker_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &client))
+                    {
+                        connections.insert(worker_id.clone(), replacement.clone());
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                if replaced {
+                    debug!(
+                        "Replaced SSH connection entry for {} after endpoint config changed",
+                        worker_id
+                    );
+                    return replacement;
+                }
+
+                continue;
+            }
+
+            let new_client = Arc::new(RwLock::new(SshClient::new(
+                config.clone(),
+                self.options.clone(),
+            )));
+            let inserted = {
+                let mut connections = self.connections.write().await;
+                if connections.contains_key(&worker_id) {
+                    false
+                } else {
+                    connections.insert(worker_id.clone(), new_client.clone());
+                    true
+                }
+            };
+
+            if inserted {
+                return new_client;
+            }
+        }
     }
 
     /// Close a specific connection.
@@ -689,6 +806,36 @@ impl SshPool {
     /// Get the number of active connections.
     pub async fn active_connections(&self) -> usize {
         self.connections.read().await.len()
+    }
+
+    /// Run a single command on a worker over a POOLED (warm, reused) connection,
+    /// bounded by `command_timeout`.
+    ///
+    /// This is the entry point daemon subsystems use instead of the throwaway
+    /// `SshClient::new().connect()...execute()...disconnect()` dance. It
+    /// [`get_or_connect`](Self::get_or_connect)s a live master (validating
+    /// liveness on borrow and reconnecting a dead one), runs exactly one command,
+    /// and — crucially — does NOT disconnect afterwards, keeping the
+    /// ControlMaster warm for the next call. That is the whole point: reuse one
+    /// master per worker instead of spawning (and, under the old code, leaking) a
+    /// fresh master for every telemetry/health/cleanup poll.
+    ///
+    /// The per-command timeout is applied via a temporary [`SshOptions`] override
+    /// on the pooled client so it does not disturb the pool's shared default
+    /// (e.g. a long build vs. a short health probe). The connect timeout and
+    /// control-master/persist settings come from the pool's options.
+    pub async fn run_with_timeout(
+        &self,
+        config: &WorkerConfig,
+        command: &str,
+        command_timeout: Duration,
+    ) -> Result<CommandResult> {
+        let client = self.get_or_connect(config).await?;
+        // Execute under a shared read lock: execute() needs only `&self`, so
+        // concurrent callers for the same worker can multiplex over the one
+        // master without serializing on a write lock.
+        let guard = client.read().await;
+        guard.execute_with_timeout(command, command_timeout).await
     }
 }
 
@@ -750,6 +897,163 @@ mod tests {
         let client = SshClient::new(config.clone(), SshOptions::default());
         assert_eq!(client.worker_id().as_str(), "test-worker");
         assert!(!client.is_connected());
+    }
+
+    #[test]
+    fn test_expected_health_check_output_accepts_sentinel_as_last_line() {
+        let _guard = test_guard!();
+
+        assert!(is_expected_health_check_output("ok\n"));
+        assert!(is_expected_health_check_output("login banner\nok\n"));
+        assert!(!is_expected_health_check_output(""));
+        assert!(!is_expected_health_check_output("not ok\n"));
+        assert!(!is_expected_health_check_output("ok\npost-command noise\n"));
+    }
+
+    fn worker_config(id: &str, host: &str, user: &str, identity_file: &str) -> WorkerConfig {
+        WorkerConfig {
+            id: WorkerId::new(id),
+            host: host.to_string(),
+            user: user.to_string(),
+            identity_file: identity_file.to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec!["rust".to_string()],
+        }
+    }
+
+    #[test]
+    fn test_ssh_client_configured_for_ignores_scheduling_fields() {
+        let _guard = test_guard!();
+        let config = worker_config("worker-a", "192.168.1.100", "ubuntu", "~/.ssh/id_rsa");
+        let client = SshClient::new(config.clone(), SshOptions::default());
+
+        let mut scheduling_only_change = config;
+        scheduling_only_change.total_slots = 16;
+        scheduling_only_change.priority = 250;
+        scheduling_only_change.tags = vec!["rust".to_string(), "gpu".to_string()];
+
+        assert!(client.is_configured_for(&scheduling_only_change));
+    }
+
+    #[test]
+    fn test_ssh_client_configured_for_detects_endpoint_changes() {
+        let _guard = test_guard!();
+        let config = worker_config("worker-a", "192.168.1.100", "ubuntu", "~/.ssh/id_rsa");
+        let client = SshClient::new(config, SshOptions::default());
+
+        assert!(!client.is_configured_for(&worker_config(
+            "worker-a",
+            "192.168.1.101",
+            "ubuntu",
+            "~/.ssh/id_rsa",
+        )));
+        assert!(!client.is_configured_for(&worker_config(
+            "worker-a",
+            "192.168.1.100",
+            "admin",
+            "~/.ssh/id_rsa",
+        )));
+        assert!(!client.is_configured_for(&worker_config(
+            "worker-a",
+            "192.168.1.100",
+            "ubuntu",
+            "~/.ssh/other_key",
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_ssh_pool_reuses_matching_disconnected_entry() {
+        let _guard = test_guard!();
+        let pool = SshPool::default();
+        let config = worker_config("worker-a", "192.168.1.100", "ubuntu", "~/.ssh/id_rsa");
+
+        let first = pool.get_or_create_client_entry(&config).await;
+        let second = pool.get_or_create_client_entry(&config).await;
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(pool.active_connections().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_ssh_pool_reuses_single_entry_and_close_all_drops_to_zero() {
+        // Leak guard: repeated borrows of the SAME worker must reuse ONE pool
+        // entry (one warm master, not one-per-call), and close_all() must empty
+        // the pool. Uses the entry-creation path (get_or_create_client_entry) so
+        // the test needs no live SSH host; get_or_connect layers only a liveness
+        // probe + reconnect on top of this same entry map.
+        let _guard = test_guard!();
+        let options = SshOptions {
+            control_master: true,
+            control_persist_idle: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        let pool = SshPool::new(options);
+        let config = worker_config("worker-a", "192.168.1.100", "ubuntu", "~/.ssh/id_rsa");
+
+        for _ in 0..5 {
+            let _entry = pool.get_or_create_client_entry(&config).await;
+        }
+        assert_eq!(
+            pool.active_connections().await,
+            1,
+            "repeated borrows of one worker must reuse a single pool entry"
+        );
+
+        pool.close_all().await.expect("close_all should succeed");
+        assert_eq!(
+            pool.active_connections().await,
+            0,
+            "close_all must drop all pooled connections"
+        );
+    }
+
+    #[test]
+    fn test_pool_options_map_to_bounded_idle_persist() {
+        // Leak guard: the pool's mux options must map to a BOUNDED
+        // ControlPersist=IdleFor(60), never Closed/Forever. control_persist_mode
+        // is the single decision point configure_builder uses.
+        let _guard = test_guard!();
+        assert_eq!(
+            control_persist_mode(true, Some(Duration::from_secs(60))),
+            ControlPersistMode::IdleFor(NonZeroUsize::new(60).unwrap()),
+            "pool mux options must keep a warm master for a bounded idle window"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssh_pool_replaces_stale_entry_when_endpoint_changes() {
+        let _guard = test_guard!();
+        let pool = SshPool::default();
+        let old_config = worker_config("worker-a", "192.168.1.100", "ubuntu", "~/.ssh/id_rsa");
+        let new_config = worker_config("worker-a", "192.168.1.101", "admin", "~/.ssh/new_key");
+
+        let stale = pool.get_or_create_client_entry(&old_config).await;
+        let replacement = pool.get_or_create_client_entry(&new_config).await;
+
+        assert!(!Arc::ptr_eq(&stale, &replacement));
+        assert_eq!(pool.active_connections().await, 1);
+
+        let replacement_guard = replacement.read().await;
+        assert!(replacement_guard.is_configured_for(&new_config));
+    }
+
+    #[tokio::test]
+    async fn test_health_check_reports_not_alive_without_session() {
+        // get_or_connect's liveness probe relies on health_check() returning a
+        // non-true value (without erroring) for a client that has no live
+        // session, so a dead/empty pooled entry is reconnected rather than
+        // falsely handed back as "reused". execute() errors "Not connected",
+        // which health_check() maps to Ok(false).
+        let _guard = test_guard!();
+        let config = worker_config("worker-a", "192.168.1.100", "ubuntu", "~/.ssh/id_rsa");
+        let client = SshClient::new(config, SshOptions::default());
+        assert!(!client.is_connected());
+        let alive = client
+            .health_check()
+            .await
+            .expect("health_check maps execution errors to Ok(false), never Err");
+        assert!(!alive, "a client with no session must not report as alive");
     }
 
     #[test]
@@ -853,7 +1157,13 @@ mod tests {
 
                 // shell_escape only quotes values that need it (contain special chars)
                 // Simple alphanumeric strings may be returned unquoted
-                let escaped = result.unwrap();
+                let escaped = match result {
+                    Some(escaped) => escaped,
+                    None => {
+                        prop_assert!(false, "Should accept safe value: {:?}", s);
+                        String::new()
+                    }
+                };
                 if s.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_') {
                     // Values with special chars should be quoted
                     prop_assert!(escaped.starts_with('\'') || escaped.contains('\''),
@@ -872,7 +1182,13 @@ mod tests {
                 let result = shell_escape_value(&value);
                 prop_assert!(result.is_some());
 
-                let escaped = result.unwrap();
+                let escaped = match result {
+                    Some(escaped) => escaped,
+                    None => {
+                        prop_assert!(false, "Should escape single quote: {}", value);
+                        String::new()
+                    }
+                };
                 // shell_escape uses '\'' style (end string, escaped quote, start string)
                 prop_assert!(escaped.contains("'\\''"),
                     "Should escape single quote: {} -> {}", value, escaped);
@@ -947,10 +1263,13 @@ mod tests {
 
             // Multiple single quotes
             let result = shell_escape_value("'''");
-            assert!(result.is_some());
-            let escaped = result.unwrap();
             // shell_escape uses '\'' style for each single quote
-            assert_eq!(escaped.matches("'\\''").count(), 3);
+            assert_eq!(
+                result
+                    .as_deref()
+                    .map(|escaped| escaped.matches("'\\''").count()),
+                Some(3)
+            );
 
             // Unicode
             let result = shell_escape_value("日本語");
@@ -1070,5 +1389,69 @@ mod tests {
                 assert!(escaped.is_some(), "Should escape: {:?}", value);
             }
         }
+    }
+}
+
+/// How an SSH session's `ControlPersist` should be configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlPersistMode {
+    /// Close the control-master once the initial connection ends (ControlPersist=no).
+    Closed,
+    /// Keep a warm control-master for the given idle seconds (ControlPersist=Ns).
+    IdleFor(NonZeroUsize),
+    /// Requested idle exceeded usize; caller falls back to Closed.
+    TooLarge(u64),
+}
+
+/// Decide `ControlPersist` for an SSH session. A warm master is kept ONLY for the
+/// explicit connection-reuse path (`control_master` + a configured non-zero idle);
+/// every other case closes after the initial connection so per-call SSH sessions
+/// (telemetry/health/capabilities) cannot leak `ControlPersist=yes` masters.
+fn control_persist_mode(control_master: bool, idle: Option<Duration>) -> ControlPersistMode {
+    match idle {
+        Some(idle) if control_master && !idle.is_zero() => match usize::try_from(idle.as_secs()) {
+            Ok(secs) => match NonZeroUsize::new(secs) {
+                Some(nonzero) => ControlPersistMode::IdleFor(nonzero),
+                None => ControlPersistMode::Closed,
+            },
+            Err(_) => ControlPersistMode::TooLarge(idle.as_secs()),
+        },
+        _ => ControlPersistMode::Closed,
+    }
+}
+
+#[cfg(test)]
+mod control_persist_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn non_mux_sessions_never_persist_forever() {
+        // The per-call paths (control_master=false) must close after use.
+        assert_eq!(
+            control_persist_mode(false, None),
+            ControlPersistMode::Closed
+        );
+        assert_eq!(
+            control_persist_mode(false, Some(Duration::from_secs(60))),
+            ControlPersistMode::Closed
+        );
+    }
+
+    #[test]
+    fn mux_without_idle_closes() {
+        assert_eq!(control_persist_mode(true, None), ControlPersistMode::Closed);
+        assert_eq!(
+            control_persist_mode(true, Some(Duration::from_secs(0))),
+            ControlPersistMode::Closed
+        );
+    }
+
+    #[test]
+    fn mux_with_idle_keeps_warm() {
+        assert_eq!(
+            control_persist_mode(true, Some(Duration::from_secs(60))),
+            ControlPersistMode::IdleFor(NonZeroUsize::new(60).unwrap())
+        );
     }
 }

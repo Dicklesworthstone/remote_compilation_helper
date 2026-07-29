@@ -18,7 +18,7 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete";
+const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs";
 
 fn print_file_validation(
     label: &str,
@@ -122,6 +122,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
             compilation: ConfigCompilationSection {
                 confidence_threshold: config.compilation.confidence_threshold,
                 min_local_time_ms: config.compilation.min_local_time_ms,
+                remote_speedup_threshold: config.compilation.remote_speedup_threshold,
                 build_slots: config.compilation.build_slots,
                 test_slots: config.compilation.test_slots,
                 check_slots: config.compilation.check_slots,
@@ -129,6 +130,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 test_timeout_sec: config.compilation.test_timeout_sec,
                 bun_timeout_sec: config.compilation.bun_timeout_sec,
                 external_timeout_enabled: config.compilation.external_timeout_enabled,
+                allow_local_fallback: config.compilation.allow_local_fallback,
             },
             transfer: ConfigTransferSection {
                 compression_level: config.transfer.compression_level,
@@ -257,6 +259,15 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
     );
     println!(
         "  {} = {}",
+        style.key("remote_speedup_threshold"),
+        format_with_source(
+            "compilation.remote_speedup_threshold",
+            &style.value(&config.compilation.remote_speedup_threshold.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
         style.key("build_slots"),
         format_with_source(
             "compilation.build_slots",
@@ -315,6 +326,15 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         format_with_source(
             "compilation.external_timeout_enabled",
             &style.value(&config.compilation.external_timeout_enabled.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("allow_local_fallback"),
+        format_with_source(
+            "compilation.allow_local_fallback",
+            &style.value(&config.compilation.allow_local_fallback.to_string()),
             &value_sources
         )
     );
@@ -647,6 +667,12 @@ pub(super) fn collect_value_sources(
     );
     push_value_source(
         &mut values,
+        "compilation.remote_speedup_threshold",
+        config.compilation.remote_speedup_threshold.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
         "compilation.build_slots",
         config.compilation.build_slots.to_string(),
         sources,
@@ -685,6 +711,12 @@ pub(super) fn collect_value_sources(
         &mut values,
         "compilation.external_timeout_enabled",
         config.compilation.external_timeout_enabled.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "compilation.allow_local_fallback",
+        config.compilation.allow_local_fallback.to_string(),
         sources,
     );
     push_value_source(
@@ -972,14 +1004,47 @@ pub fn config_validate(ctx: &OutputContext) -> Result<()> {
 
 /// Set a configuration value.
 pub fn config_set(key: &str, value: &str, ctx: &OutputContext) -> Result<()> {
+    config_set_at(&default_config_path()?, key, value, ctx)
+}
+
+/// Resolve the default on-disk config path (`<config_dir>/config.toml`),
+/// creating the config directory if needed.
+///
+/// Exposed so the reliability doctor's `--fix` executor writes to the same file
+/// the CLI's `config get/set` use.
+pub(crate) fn default_config_path() -> Result<PathBuf> {
     let config_dir = config_dir().context("Could not determine config directory")?;
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("Failed to create config directory: {:?}", config_dir))?;
-    let config_path = config_dir.join("config.toml");
-    config_set_at(&config_path, key, value, ctx)
+    Ok(config_dir.join("config.toml"))
 }
 
 fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext) -> Result<()> {
+    apply_config_set(config_path, key, value)?;
+
+    if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok(
+            "config set",
+            ConfigSetResponse {
+                key: key.to_string(),
+                value: value.to_string(),
+                config_path: config_path.display().to_string(),
+            },
+        ));
+    } else {
+        println!("Updated {:?}: {} = {}", config_path, key, value);
+    }
+    Ok(())
+}
+
+/// Apply a single `key=value` mutation to the on-disk config, with no stdout or
+/// JSON output.
+///
+/// Shared by the `config set` command (which adds its own success output) and
+/// the reliability doctor's `--fix` executor, which must not emit its own
+/// `ApiResponse` envelope into the doctor's single JSON document. Performs the
+/// same parse → mutate → validate → atomic-rewrite as `config set`.
+pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Result<()> {
     let mut config = if config_path.exists() {
         let contents = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read {:?}", config_path))?;
@@ -1020,6 +1085,18 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
         "compilation.min_local_time_ms" => {
             config.compilation.min_local_time_ms = parse_u64(value, key)?;
         }
+        "compilation.remote_speedup_threshold" => {
+            let threshold = parse_f64(value, key)?;
+            if !threshold.is_finite() || threshold <= 0.0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "compilation.remote_speedup_threshold".to_string(),
+                    reason: format!("value {} is not a positive finite number", threshold),
+                    suggestion: "Use a positive speedup ratio such as 1.0 or 1.2".to_string(),
+                }
+                .into());
+            }
+            config.compilation.remote_speedup_threshold = threshold;
+        }
         "compilation.build_slots" => {
             config.compilation.build_slots = parse_u32(value, key)?;
         }
@@ -1040,6 +1117,9 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
         }
         "compilation.external_timeout_enabled" => {
             config.compilation.external_timeout_enabled = parse_bool(value, key)?;
+        }
+        "compilation.allow_local_fallback" => {
+            config.compilation.allow_local_fallback = parse_bool(value, key)?;
         }
         "transfer.compression_level" => {
             let level = parse_u32(value, key)?;
@@ -1071,6 +1151,18 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
         "output.first_run_complete" | "first_run_complete" => {
             config.output.first_run_complete = parse_bool(value, key)?;
         }
+        "self_healing.hook_starts_daemon" => {
+            config.self_healing.hook_starts_daemon = parse_bool(value, key)?;
+        }
+        "self_healing.daemon_installs_hooks" => {
+            config.self_healing.daemon_installs_hooks = parse_bool(value, key)?;
+        }
+        "self_healing.auto_start_cooldown_secs" => {
+            config.self_healing.auto_start_cooldown_secs = parse_u64(value, key)?;
+        }
+        "self_healing.auto_start_timeout_secs" => {
+            config.self_healing.auto_start_timeout_secs = parse_u64(value, key)?;
+        }
         _ => {
             return Err(ConfigError::InvalidValue {
                 field: key.to_string(),
@@ -1094,18 +1186,6 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
     std::fs::write(config_path, format!("{}\n", contents))
         .with_context(|| format!("Failed to write {:?}", config_path))?;
 
-    if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok(
-            "config set",
-            ConfigSetResponse {
-                key: key.to_string(),
-                value: value.to_string(),
-                config_path: config_path.display().to_string(),
-            },
-        ));
-    } else {
-        println!("Updated {:?}: {} = {}", config_path, key, value);
-    }
     Ok(())
 }
 
@@ -1158,6 +1238,11 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
             config.compilation.min_local_time_ms = defaults.compilation.min_local_time_ms;
             config.compilation.min_local_time_ms.to_string()
         }
+        "compilation.remote_speedup_threshold" => {
+            config.compilation.remote_speedup_threshold =
+                defaults.compilation.remote_speedup_threshold;
+            config.compilation.remote_speedup_threshold.to_string()
+        }
         "compilation.build_slots" => {
             config.compilation.build_slots = defaults.compilation.build_slots;
             config.compilation.build_slots.to_string()
@@ -1186,6 +1271,10 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
             config.compilation.external_timeout_enabled =
                 defaults.compilation.external_timeout_enabled;
             config.compilation.external_timeout_enabled.to_string()
+        }
+        "compilation.allow_local_fallback" => {
+            config.compilation.allow_local_fallback = defaults.compilation.allow_local_fallback;
+            config.compilation.allow_local_fallback.to_string()
         }
         "transfer.compression_level" => {
             config.transfer.compression_level = defaults.transfer.compression_level;
@@ -1259,10 +1348,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             println!("export RCH_ENABLED={}", config.general.enabled);
             println!("export RCH_LOG_LEVEL=\"{}\"", config.general.log_level);
             println!("export RCH_VISIBILITY=\"{}\"", config.output.visibility);
-            println!(
-                "export RCH_DAEMON_SOCKET=\"{}\"",
-                config.general.socket_path
-            );
+            println!("export RCH_SOCKET_PATH=\"{}\"", config.general.socket_path);
             println!(
                 "export RCH_CONFIDENCE_THRESHOLD={}",
                 config.compilation.confidence_threshold
@@ -1270,6 +1356,10 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             println!(
                 "export RCH_MIN_LOCAL_TIME_MS={}",
                 config.compilation.min_local_time_ms
+            );
+            println!(
+                "export RCH_REMOTE_SPEEDUP_THRESHOLD={}",
+                config.compilation.remote_speedup_threshold
             );
             println!(
                 "export RCH_BUILD_TIMEOUT_SEC={}",
@@ -1288,7 +1378,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                 config.compilation.external_timeout_enabled
             );
             println!(
-                "export RCH_TRANSFER_ZSTD_LEVEL={}",
+                "export RCH_COMPRESSION_LEVEL={}",
                 config.transfer.compression_level
             );
             println!(
@@ -1304,7 +1394,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             println!("RCH_ENABLED={}", config.general.enabled);
             println!("RCH_LOG_LEVEL={}", config.general.log_level);
             println!("RCH_VISIBILITY={}", config.output.visibility);
-            println!("RCH_DAEMON_SOCKET={}", config.general.socket_path);
+            println!("RCH_SOCKET_PATH={}", config.general.socket_path);
             println!(
                 "RCH_CONFIDENCE_THRESHOLD={}",
                 config.compilation.confidence_threshold
@@ -1312,6 +1402,10 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             println!(
                 "RCH_MIN_LOCAL_TIME_MS={}",
                 config.compilation.min_local_time_ms
+            );
+            println!(
+                "RCH_REMOTE_SPEEDUP_THRESHOLD={}",
+                config.compilation.remote_speedup_threshold
             );
             println!(
                 "RCH_BUILD_TIMEOUT_SEC={}",
@@ -1327,7 +1421,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                 config.compilation.external_timeout_enabled
             );
             println!(
-                "RCH_TRANSFER_ZSTD_LEVEL={}",
+                "RCH_COMPRESSION_LEVEL={}",
                 config.transfer.compression_level
             );
             println!(
@@ -1351,6 +1445,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                     "compilation": {
                         "confidence_threshold": config.compilation.confidence_threshold,
                         "min_local_time_ms": config.compilation.min_local_time_ms,
+                        "remote_speedup_threshold": config.compilation.remote_speedup_threshold,
                         "build_slots": config.compilation.build_slots,
                         "test_slots": config.compilation.test_slots,
                         "check_slots": config.compilation.check_slots,
@@ -1358,6 +1453,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                         "test_timeout_sec": config.compilation.test_timeout_sec,
                         "bun_timeout_sec": config.compilation.bun_timeout_sec,
                         "external_timeout_enabled": config.compilation.external_timeout_enabled,
+                        "allow_local_fallback": config.compilation.allow_local_fallback,
                     },
                     "transfer": {
                         "compression_level": config.transfer.compression_level,
@@ -1365,7 +1461,12 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                     },
                     "environment": {
                         "allowlist": config.environment.allowlist,
-                    }
+                    },
+                    // Redacted so any operator paths (proof store, incident
+                    // ledger, disk roots, remote base) never leak into an export
+                    // (bd-...remediation-ocv9i.17.2).
+                    "remediation": serde_json::to_value(config.remediation.redacted())
+                        .unwrap_or(serde_json::Value::Null),
                 }),
             ));
         }
@@ -1505,6 +1606,31 @@ pub fn config_lint(ctx: &OutputContext) -> Result<()> {
             remediation:
                 "Short timeouts may cause builds to fail prematurely. Consider at least 300s"
                     .to_string(),
+        });
+    }
+
+    // Check 7: Remediation knobs (bd-...remediation-ocv9i.17.2). Surface the
+    // central RemediationConfig validation findings so operators learn about
+    // unsafe, contradictory, or out-of-range remediation settings here rather
+    // than discovering drift at runtime.
+    for issue in config.remediation.validate() {
+        let (severity, code) = match issue.severity {
+            rch_common::remediation_config::IssueSeverity::Error => {
+                (LintSeverity::Error, "LINT-E101")
+            }
+            rch_common::remediation_config::IssueSeverity::Warning => {
+                (LintSeverity::Warning, "LINT-W101")
+            }
+        };
+        issues.push(LintIssue {
+            severity,
+            code: code.to_string(),
+            message: format!("{}: {}", issue.field, issue.message),
+            remediation: format!(
+                "Adjust `{}` under [remediation] (or the matching RCH_REMEDIATION_* env var); \
+                 re-check with `rch config doctor`.",
+                issue.field
+            ),
         });
     }
 
@@ -1714,6 +1840,31 @@ pub fn config_edit(project: bool, user: bool, workers: bool, ctx: &OutputContext
 }
 
 /// Show configuration values that differ from defaults.
+/// Flatten a JSON object into `dotted.key -> rendered-scalar` entries
+/// (e.g. `remediation.policy.hook_exec_fail_open -> true`). Nested objects
+/// recurse; strings render without surrounding quotes, all other leaves use
+/// their compact JSON form. Used by `config diff` to compare the remediation
+/// section field-by-field without hand-listing every knob.
+fn flatten_json_scalars(
+    prefix: &str,
+    value: &serde_json::Value,
+    out: &mut std::collections::BTreeMap<String, String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                flatten_json_scalars(&format!("{prefix}.{k}"), v, out);
+            }
+        }
+        serde_json::Value::String(s) => {
+            out.insert(prefix.to_string(), s.clone());
+        }
+        other => {
+            out.insert(prefix.to_string(), other.to_string());
+        }
+    }
+}
+
 pub fn config_diff(ctx: &OutputContext) -> Result<()> {
     use rch_common::RchConfig;
 
@@ -1779,6 +1930,12 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
         "compilation.min_local_time_ms"
     );
     diff_field!(
+        "compilation.remote_speedup_threshold",
+        config.compilation.remote_speedup_threshold,
+        defaults.compilation.remote_speedup_threshold,
+        "compilation.remote_speedup_threshold"
+    );
+    diff_field!(
         "compilation.build_slots",
         config.compilation.build_slots,
         defaults.compilation.build_slots,
@@ -1819,6 +1976,12 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
         config.compilation.external_timeout_enabled,
         defaults.compilation.external_timeout_enabled,
         "compilation.external_timeout_enabled"
+    );
+    diff_field!(
+        "compilation.allow_local_fallback",
+        config.compilation.allow_local_fallback,
+        defaults.compilation.allow_local_fallback,
+        "compilation.allow_local_fallback"
     );
 
     // Transfer section
@@ -1937,6 +2100,35 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
             default: format!("[{}]", defaults.environment.allowlist.join(", ")),
             source,
         });
+    }
+
+    // Remediation section (bd-...remediation-ocv9i.17.2): a generic redacted
+    // diff so every changed knob is visible — with operator paths redacted —
+    // without hand-listing ~40 fields. The effective value is redacted before
+    // comparison so a changed proof-store/ledger/disk-root/remote-base path is
+    // never exported in the clear.
+    {
+        let current = serde_json::to_value(config.remediation.redacted()).unwrap_or_default();
+        let default = serde_json::to_value(&defaults.remediation).unwrap_or_default();
+        let mut cur_flat = std::collections::BTreeMap::new();
+        let mut def_flat = std::collections::BTreeMap::new();
+        flatten_json_scalars("remediation", &current, &mut cur_flat);
+        flatten_json_scalars("remediation", &default, &mut def_flat);
+        for (key, cur_val) in &cur_flat {
+            let def_val = def_flat.get(key).cloned().unwrap_or_default();
+            if *cur_val != def_val {
+                let source = sources
+                    .get(key.as_str())
+                    .map(|s| format!("{:?}", s))
+                    .unwrap_or_else(|| "config".to_string());
+                entries.push(ConfigDiffEntry {
+                    key: key.clone(),
+                    current: cur_val.clone(),
+                    default: def_val,
+                    source,
+                });
+            }
+        }
     }
 
     let total_changes = entries.len();
@@ -2098,6 +2290,13 @@ fn parse_string_list(value: &str, key: &str) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    fn plain_context() -> OutputContext {
+        OutputContext::new(crate::ui::context::OutputConfig {
+            force_mode: Some(crate::ui::context::OutputMode::Plain),
+            ..Default::default()
+        })
+    }
 
     // -------------------------------------------------------------------------
     // parse_bool Tests
@@ -2283,5 +2482,102 @@ mod tests {
         let _guard = test_guard!();
         let result = parse_string_list("  a  ,  b  ", "test_key").unwrap();
         assert_eq!(result, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn collect_value_sources_includes_remote_speedup_threshold() {
+        let _guard = test_guard!();
+        let mut config = RchConfig::default();
+        config.compilation.remote_speedup_threshold = 1.75;
+        let mut sources = config::ConfigSourceMap::new();
+        sources.insert(
+            "compilation.remote_speedup_threshold".to_string(),
+            ConfigValueSource::EnvVar("RCH_REMOTE_SPEEDUP_THRESHOLD".to_string()),
+        );
+
+        let values = collect_value_sources(&config, &sources);
+        let entry = values
+            .iter()
+            .find(|value| value.key == "compilation.remote_speedup_threshold")
+            .expect("remote speedup threshold is exposed");
+
+        assert_eq!(entry.value, "1.75");
+        assert_eq!(entry.source, "env:RCH_REMOTE_SPEEDUP_THRESHOLD");
+    }
+
+    #[test]
+    fn apply_config_set_persists_self_healing_hook_starts_daemon() {
+        // The reliability doctor's --fix path and the documented remediation
+        // `rch config set self_healing.hook_starts_daemon true` both flow
+        // through apply_config_set; before this key was wired it hit the
+        // unknown-key arm and the remediation was silently broken.
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        apply_config_set(&config_path, "self_healing.hook_starts_daemon", "true")
+            .expect("set self_healing.hook_starts_daemon");
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        assert!(config.self_healing.hook_starts_daemon);
+
+        apply_config_set(&config_path, "self_healing.daemon_installs_hooks", "true")
+            .expect("set self_healing.daemon_installs_hooks");
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        assert!(config.self_healing.daemon_installs_hooks);
+        // Idempotent: re-applying the same value succeeds and stays true.
+        apply_config_set(&config_path, "self_healing.hook_starts_daemon", "true")
+            .expect("re-apply is idempotent");
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        assert!(config.self_healing.hook_starts_daemon);
+    }
+
+    #[test]
+    fn config_set_and_reset_remote_speedup_threshold() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let ctx = plain_context();
+
+        config_set_at(
+            &config_path,
+            "compilation.remote_speedup_threshold",
+            "2.25",
+            &ctx,
+        )
+        .expect("set remote speedup threshold");
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        assert!((config.compilation.remote_speedup_threshold - 2.25).abs() < 0.0001);
+
+        config_reset_at(&config_path, "compilation.remote_speedup_threshold", &ctx)
+            .expect("reset remote speedup threshold");
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        assert!(
+            (config.compilation.remote_speedup_threshold
+                - RchConfig::default().compilation.remote_speedup_threshold)
+                .abs()
+                < 0.0001
+        );
+    }
+
+    #[test]
+    fn config_set_rejects_invalid_remote_speedup_threshold() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let ctx = plain_context();
+
+        let result = config_set_at(
+            &config_path,
+            "compilation.remote_speedup_threshold",
+            "NaN",
+            &ctx,
+        );
+
+        assert!(result.is_err());
     }
 }

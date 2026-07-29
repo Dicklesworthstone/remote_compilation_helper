@@ -50,11 +50,22 @@ RCH currently recognizes and can offload:
 | Bun/TypeScript | `bun test`, `bun typecheck` |
 | C/C++ | `gcc`, `g++`, `clang`, `clang++` |
 | Build Systems | `make`, `cmake --build`, `ninja`, `meson compile` |
+| Nix | `nix build`, `nix-build`, `nix flake check`, `nix develop -c <cmd>`, `nix shell -c <cmd>` |
+
+Nix builds only route to workers that advertise a `nix` capability (a usable `nix`
+binary plus a populated `/nix/store`); on a fleet with no such worker they fall
+back to local execution (or are refused under `RCH_REQUIRE_REMOTE=1`, exactly as
+with Bun/Node). Nix outputs stay in the worker's `/nix/store` behind a `result`
+symlink, so these run as streaming, exit-status-only commands (no artifacts are
+copied back — the flake source is synced out, the build runs, the result stays
+remote).
 
 RCH explicitly does **not** intercept local-mutating or interactive patterns (examples):
 
 - Package management: `cargo install`, `cargo clean`, `bun install`, `bun add`, `bun remove`
 - Bun runners/dev: `bun run`, `bun build`, `bun dev`, `bun x` / `bunx`
+- Nix interactive/mutating: bare `nix develop` / `nix shell`, `nix run`, `nix repl`,
+  `nix profile`, `nix flake update`, `nix store gc`, `nix-env`, `nix-shell`
 - Watch/background/piped/redirected commands where deterministic offload is unsafe
 
 ---
@@ -137,7 +148,10 @@ cp target/release/rchd ~/.local/bin/
 
 ### Source Build Note
 
-This workspace currently uses FrankenTUI path dependencies (`ftui-*`) from `/dp/frankentui/crates/...` in `Cargo.toml`. Ensure that dependency tree is available when building from source in this environment.
+All dependencies — including the FrankenTUI (`ftui-*`), `rich_rust`, and TOON
+(`tru`) crates — resolve from crates.io, so a clean `git clone && cargo build`
+builds on any machine with no special directory layout or pre-cloned
+dependency tree required.
 
 ---
 
@@ -368,6 +382,34 @@ JSON responses use a stable envelope (`api_version`, `timestamp`, `success`, `da
 
 ---
 
+## Placement Controls
+
+Worker placement, strict-remote, queue, wait-timeout, visibility, and target-dir
+behavior are first-class, canonical controls — not folklore. The authoritative
+list is discoverable at runtime (`rch capabilities --json`), and the resolved
+plan for any command is shown by `rch diagnose <command> --json` under
+`data.placement` (and in the human `Placement Controls` section):
+
+| Control | Env (aliases) | Effect |
+|---|---|---|
+| Requested worker | `RCH_WORKER` (`RCH_WORKERS`) | Request specific worker(s) by id. Still passes capability/admission checks; an inadmissible requested worker is **refused** with a stable `RCH-Innn` reason code and a next action — never silently swapped. |
+| Requested profile | `RCH_PRESET` | Named execution profile (recorded as `requested_profile`). |
+| Strict remote (fail-closed) | `RCH_REQUIRE_REMOTE` | Refuse local fallback (proof mode). Takes precedence over `RCH_FORCE_REMOTE`. |
+| Force remote (fail-open) | `RCH_FORCE_REMOTE` | Always attempt offload (bypass local-time/speedup gating) but still fail open to local. Distinct from `RCH_REQUIRE_REMOTE`. |
+| Queue when busy | `RCH_QUEUE_WHEN_BUSY` (default `1`) | Wait for a busy worker instead of falling back to local. Set `0` to disable. |
+| Wait timeout | `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (`RCH_DAEMON_RESPONSE_TIMEOUT_SECS`) | Max seconds to wait for a queued worker. |
+| Visibility | `RCH_VISIBILITY=none\|summary\|verbose` (`RCH_QUIET`, `RCH_VERBOSE`) | Hook output verbosity. |
+| Target dir | `RCH_DISABLE_TARGET_REUSE` | Legacy unique-per-job remote target dir instead of the pooled, reuse-friendly dir. |
+
+The resolved plan reports `requested_worker`, `requested_profile`,
+`effective_worker`, `strict_remote_policy`, `queue_policy`, `visibility_mode`,
+`wait_timeout_ms`, `target_dir_policy`, the requested-worker admissibility
+outcome, and a `diagnostics` list. Any control value that cannot be applied as
+written (an unrecognized value or a superseded alias) surfaces a diagnostic
+rather than being silently ignored.
+
+---
+
 ## Monitoring and Observability
 
 RCH exposes observability through daemon APIs and metrics:
@@ -420,6 +462,48 @@ When local fallback is not acceptable, set `RCH_REQUIRE_REMOTE=1` on the
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo test --workspace
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+### Clean Git overlays for shared working trees
+
+`rch exec` can build an immutable committed tree plus an explicit, repeatable
+set of local paths without transferring unrelated working-tree changes:
+
+```bash
+RCH_REQUIRE_REMOTE=1 rch exec \
+  --base HEAD \
+  --clean-overlay \
+  --overlay-path src/lib.rs \
+  --overlay-path tests/focused.rs \
+  -- cargo test --test focused
+
+RCH_REQUIRE_REMOTE=1 rch exec \
+  --base HEAD \
+  --clean-overlay \
+  --no-overlay \
+  -- cargo check --workspace --all-targets
+```
+
+The client resolves `--base` to a commit object, streams that Git archive into
+a fresh isolated worker path, and then uploads only the literal repository-
+relative `--overlay-path` selections. Modified and untracked files are
+supported; selected deletions, absolute/traversing paths, Git metadata,
+non-ASCII/backslash/control-character paths, case-only or otherwise ambiguous
+filesystem spellings, overlay symlinks, empty overlay directories, submodules,
+and Git archive `export-ignore`/`export-subst` attributes fail closed. Exactly
+one of one-or-more `--overlay-path` options or `--no-overlay` is required.
+Clean-overlay mode also implies remote-only execution even when
+`RCH_REQUIRE_REMOTE` was omitted, so a worker or transfer failure never falls
+back to the ambient local tree.
+Explicit clean-overlay execution also admits the read-only `cargo fmt --check`
+diagnostic, which the ordinary interception classifier intentionally leaves
+local.
+
+Clean-overlay currently materializes one Git repository. In-repository Cargo
+workspace members are present in the archive. External path dependencies are
+outside the source-identity guarantee: callers must independently ensure they
+cannot resolve to ambient worker state. The client re-fingerprints overlays
+after upload and refuses execution if their contents changed during admission
+or transfer.
 
 Do not batch several Cargo commands behind a shell wrapper such as
 `rch exec -- bash -lc "cargo test ... && cargo test ..."`. Shell-wrapped

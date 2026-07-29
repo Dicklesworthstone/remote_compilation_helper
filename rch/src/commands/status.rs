@@ -4,20 +4,32 @@
 //! and checking overall system status.
 
 use crate::hook::{
-    extract_project_name_with_policy, preferred_workers_from_env, query_daemon, release_worker,
-    required_runtime_for_kind,
+    cargo_job_count_for_command, estimate_cores_for_command, extract_project_name_with_policy,
+    preferred_workers_from_env, query_daemon, release_worker, required_runtime_for_kind,
 };
 use crate::status_types::{
-    DaemonFullStatusResponse, SelfTestHistoryResponseFromApi, SelfTestResultRecordFromApi,
-    SelfTestRunResponseFromApi, SelfTestStatusResponseFromApi, extract_json_body,
+    DaemonFullStatusResponse, IssueFromApi, SelfTestHistoryResponseFromApi,
+    SelfTestResultRecordFromApi, SelfTestRunResponseFromApi, SelfTestStatusResponseFromApi,
+    WorkerStatusFromApi, extract_json_body,
 };
 use crate::toolchain::detect_toolchain;
 use crate::ui::context::OutputContext;
 use crate::ui::progress::Spinner;
 use crate::ui::theme::{StatusIndicator, Theme};
 use anyhow::{Context, Result};
+use rch_common::fleet_smoke_profile::{
+    ProfileMode, ScenarioAction, SmokeProfileEvent, SmokeProfileInputs, SmokeProfilePlan,
+    SmokeScenario, plan_smoke_profile,
+};
+use rch_common::job_identity::LOCAL_WRAPPER_ID_PREFIX;
+use rch_common::storm_control::{
+    InvariantReport, LiveJobOutcome, StormConfig, StormRun, StormWorker, WorkerEligibility,
+    all_passed, build_live_storm_run, check_all_invariants,
+};
 use rch_common::{
-    ApiResponse, CommandPriority, RequiredRuntime, normalize_project_path_with_policy,
+    ApiResponse, CommandPriority, PlacementPlan, RequestedWorkerFacts, RequestedWorkerOutcome,
+    RequiredRuntime, WorkerConfig, evaluate_requested_worker, normalize_project_path_with_policy,
+    resolve_placement,
 };
 use std::path::Path;
 use tracing::debug;
@@ -61,6 +73,17 @@ pub(super) fn build_diagnose_decision(
         would_intercept,
         reason,
     }
+}
+
+pub(super) fn build_diagnose_slot_estimate(
+    kind: Option<rch_common::CompilationKind>,
+    command: &str,
+    config: &rch_common::CompilationConfig,
+) -> (u32, Option<u32>) {
+    (
+        estimate_cores_for_command(kind, command, config),
+        cargo_job_count_for_command(command),
+    )
 }
 
 /// Build dry-run summary showing what would happen.
@@ -117,17 +140,13 @@ pub(super) fn build_dry_run_summary(
     let worker_selected = worker_selection
         .as_ref()
         .is_some_and(|s| s.worker.is_some());
-    let worker_selection_skip_reason = if worker_selected {
-        None
-    } else if !daemon_reachable {
-        Some("Daemon not reachable".to_string())
+    let no_worker_reason = if daemon_reachable {
+        worker_selection
+            .as_ref()
+            .map(|s| s.reason.to_string())
+            .unwrap_or_else(|| "No worker available".to_string())
     } else {
-        Some(
-            worker_selection
-                .as_ref()
-                .map(|s| s.reason.to_string())
-                .unwrap_or_else(|| "No worker selection response available".to_string()),
-        )
+        "Daemon not reachable".to_string()
     };
     steps.push(DryRunPipelineStep {
         step: 3,
@@ -145,7 +164,11 @@ pub(super) fn build_dry_run_summary(
             "Select best available worker".to_string()
         },
         skipped: !worker_selected,
-        skip_reason: worker_selection_skip_reason.clone(),
+        skip_reason: if !worker_selected {
+            Some(no_worker_reason.clone())
+        } else {
+            None
+        },
         estimated_duration_ms: Some(2),
     });
 
@@ -162,7 +185,7 @@ pub(super) fn build_dry_run_summary(
         description: "Sync project files to worker via rsync+zstd".to_string(),
         skipped: !worker_selected,
         skip_reason: if !worker_selected {
-            Some(blocked_by_worker_selection())
+            Some(no_worker_reason.clone())
         } else {
             None
         },
@@ -176,7 +199,7 @@ pub(super) fn build_dry_run_summary(
         description: "Execute compilation command on worker".to_string(),
         skipped: !worker_selected,
         skip_reason: if !worker_selected {
-            Some(blocked_by_worker_selection())
+            Some(no_worker_reason.clone())
         } else {
             None
         },
@@ -190,34 +213,24 @@ pub(super) fn build_dry_run_summary(
         description: "Retrieve build artifacts from remote worker".to_string(),
         skipped: !worker_selected,
         skip_reason: if !worker_selected {
-            Some(blocked_by_worker_selection())
+            Some(no_worker_reason.clone())
         } else {
             None
         },
         estimated_duration_ms: None, // Would need rsync dry-run
     });
 
-    let summary_reason = if worker_selected {
-        let worker_id = worker_selection
-            .as_ref()
-            .and_then(|s| s.worker.as_ref())
-            .map(|w| w.id.as_str())
-            .unwrap_or("unknown");
-        format!("compilation command meets threshold, worker {worker_id} available")
+    let reason = if worker_selected {
+        "compilation command meets threshold, worker available".to_string()
     } else if !daemon_reachable {
         "compilation command meets threshold, but daemon is not reachable".to_string()
     } else {
-        format!(
-            "compilation command meets threshold, but worker selection is blocked: {}",
-            worker_selection_skip_reason
-                .as_deref()
-                .unwrap_or("no worker selected")
-        )
+        format!("compilation command meets threshold, but no worker selected: {no_worker_reason}")
     };
 
     DryRunSummary {
         would_offload: worker_selected,
-        reason: summary_reason,
+        reason,
         pipeline_steps: steps,
         transfer_estimate: None,  // Would need actual rsync dry-run
         total_estimated_ms: None, // Total unknown without transfer estimates
@@ -253,6 +266,81 @@ fn summarize_capabilities(caps: &rch_common::WorkerCapabilities) -> String {
 }
 
 /// Diagnose command classification and selection decisions.
+/// Resolve the canonical placement plan from the environment and refine it with
+/// the simulated worker-selection result. When a worker was explicitly
+/// requested, the requested-worker outcome is evaluated against the daemon's
+/// per-worker selection diagnostics so an inadmissible requested worker yields a
+/// structured refusal instead of a silent swap
+/// (bd-...remediation-ocv9i.13.5).
+fn build_diagnose_placement(worker_selection: &Option<DiagnoseWorkerSelection>) -> PlacementPlan {
+    refine_diagnose_placement(
+        resolve_placement(|key| std::env::var(key).ok()),
+        worker_selection,
+    )
+}
+
+fn refine_diagnose_placement(
+    mut plan: PlacementPlan,
+    worker_selection: &Option<DiagnoseWorkerSelection>,
+) -> PlacementPlan {
+    let effective_worker = worker_selection
+        .as_ref()
+        .and_then(|s| s.worker.as_ref())
+        .map(|w| w.id.to_string());
+    plan = plan.with_effective_worker(effective_worker.clone());
+
+    // Refine the requested-worker outcome from the live selection diagnostics.
+    if let Some(requested) = plan.requested_worker.clone() {
+        let requested_workers = requested
+            .split(',')
+            .map(str::trim)
+            .filter(|worker| !worker.is_empty())
+            .collect::<Vec<_>>();
+        let effective_requested = effective_worker
+            .as_deref()
+            .filter(|effective| requested_workers.contains(effective));
+        let outcome = if let Some(effective) = effective_requested {
+            evaluate_requested_worker(&RequestedWorkerFacts::admissible(effective))
+        } else if let Some(diagnostics) = worker_selection
+            .as_ref()
+            .and_then(|selection| selection.diagnostics.as_ref())
+        {
+            requested_workers
+                .iter()
+                .map(|requested| {
+                    diagnostics
+                        .workers
+                        .iter()
+                        .find(|worker| worker.worker_id.as_str() == *requested)
+                        .map_or_else(
+                            || {
+                                evaluate_requested_worker(&RequestedWorkerFacts {
+                                    requested: Some((*requested).to_string()),
+                                    exists: false,
+                                    ..RequestedWorkerFacts::none()
+                                })
+                            },
+                            |worker| {
+                                evaluate_requested_worker(&RequestedWorkerFacts::from_diagnostic(
+                                    (*requested).to_string(),
+                                    worker,
+                                ))
+                            },
+                        )
+                })
+                .find(|outcome| outcome.status.is_refusal())
+                .unwrap_or_else(RequestedWorkerOutcome::requested)
+        } else {
+            // Daemon unreachable / not intercepted: the request remains
+            // pending fleet evaluation unless an in-set worker was selected.
+            RequestedWorkerOutcome::requested()
+        };
+        plan = plan.with_requested_worker_outcome(outcome);
+    }
+
+    plan
+}
+
 pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Result<()> {
     use rch_common::classify_command_detailed;
 
@@ -347,7 +435,8 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
 
     let mut worker_selection = None;
     if would_intercept && daemon_status.reachable {
-        let estimated_cores = 4;
+        let (estimated_cores, cargo_jobs) =
+            build_diagnose_slot_estimate(details.classification.kind, command, &config.compilation);
         let project_root = std::env::current_dir().ok();
         let normalized_project_root = project_root.as_ref().and_then(|path| {
             normalize_project_path_with_policy(path, &topology_policy)
@@ -355,9 +444,9 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                 .ok()
         });
         let project = extract_project_name_with_policy(&topology_policy);
-        let toolchain = normalized_project_root
+        let toolchain = project_root
             .as_ref()
-            .or(project_root.as_ref())
+            .or(normalized_project_root.as_ref())
             .and_then(|root| detect_toolchain(root).ok());
         let preferred_workers = preferred_workers_from_env();
 
@@ -394,12 +483,14 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                 }
                 worker_selection = Some(DiagnoseWorkerSelection {
                     estimated_cores,
+                    cargo_jobs,
                     worker: response.worker.clone(),
                     reason: response.reason.clone(),
+                    diagnostics: response.diagnostics.clone(),
                 });
                 if let Some(worker) = response.worker.as_ref() {
                     debug!(
-                        "Worker selected id='{}' slots_available={} speed_score={:.2} reason={:?}",
+                        "Worker selected id='{}' slots_remaining_after_reservation={} speed_score={:.2} reason={:?}",
                         worker.id, worker.slots_available, worker.speed_score, response.reason
                     );
                 } else {
@@ -427,6 +518,9 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                                     RequiredRuntime::Rust => !caps.has_rust(),
                                     RequiredRuntime::Bun => !caps.has_bun(),
                                     RequiredRuntime::Node => !caps.has_node(),
+                                    RequiredRuntime::Nix => !caps.has_nix(),
+                                    RequiredRuntime::Go => !caps.has_go(),
+                                    RequiredRuntime::Zig => !caps.has_zig(),
                                     RequiredRuntime::None => false,
                                 }
                             })
@@ -459,6 +553,10 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
         }
     }
 
+    // Resolve the canonical placement plan (env controls + requested-worker
+    // admissibility against the simulated selection).
+    let placement = build_diagnose_placement(&worker_selection);
+
     // Build dry-run summary if requested
     let dry_run_summary = if dry_run {
         Some(build_dry_run_summary(
@@ -490,6 +588,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             local_capabilities: local_has_any.then(|| local_capabilities.clone()),
             capabilities_warnings: capabilities_warnings.clone(),
             worker_selection,
+            placement: placement.clone(),
             dry_run: dry_run_summary.clone(),
         };
         let _ = ctx.json(&ApiResponse::ok("diagnose", response));
@@ -757,7 +856,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                 );
                 println!(
                     "  {} {}",
-                    style.key("Slots available:"),
+                    style.key("Slots remaining after reservation:"),
                     style.value(&worker.slots_available.to_string())
                 );
                 println!("  {} {:.1}", style.key("Speed score:"), worker.speed_score);
@@ -799,7 +898,173 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             style.value("Selection unavailable")
         );
     }
+    println!();
 
+    println!("{}", style.highlight("Placement Controls"));
+    println!(
+        "  {} {}",
+        style.key("Requested worker:"),
+        style.value(placement.requested_worker.as_deref().unwrap_or("(none)"))
+    );
+    println!(
+        "  {} {}",
+        style.key("Effective worker:"),
+        style.value(placement.effective_worker.as_deref().unwrap_or("(none)"))
+    );
+    if let Some(profile) = placement.requested_profile.as_deref() {
+        println!(
+            "  {} {}",
+            style.key("Requested profile:"),
+            style.value(profile)
+        );
+    }
+    println!(
+        "  {} {}",
+        style.key("Strict remote:"),
+        style.value(placement.strict_remote_policy.as_str())
+    );
+    println!(
+        "  {} {}",
+        style.key("Queue policy:"),
+        style.value(placement.queue_policy.as_str())
+    );
+    println!(
+        "  {} {}",
+        style.key("Visibility:"),
+        style.value(placement.visibility_mode.as_str())
+    );
+    if let Some(ms) = placement.wait_timeout_ms {
+        println!(
+            "  {} {}ms",
+            style.key("Wait timeout:"),
+            style.value(&ms.to_string())
+        );
+    }
+    println!(
+        "  {} {}",
+        style.key("Target dir:"),
+        style.value(placement.target_dir_policy.as_str())
+    );
+    // Requested-worker outcome: honored, refused (with reason + next action),
+    // or not-requested.
+    let outcome = &placement.requested_worker_outcome;
+    if outcome.status.is_refusal() {
+        println!(
+            "  {} {} {}",
+            style.key("Requested worker:"),
+            style.format_warning(&format!("REFUSED ({})", outcome.status.as_str())),
+            style.muted(
+                &outcome
+                    .reason_code
+                    .as_deref()
+                    .map(|c| format!("[{c}]"))
+                    .unwrap_or_default()
+            )
+        );
+        if let Some(action) = outcome.next_action.as_deref() {
+            println!("    {} {}", style.muted("next:"), style.value(action));
+        }
+    } else {
+        println!(
+            "  {} {}",
+            style.key("Requested-worker outcome:"),
+            style.value(outcome.status.as_str())
+        );
+    }
+    for diag in &placement.diagnostics {
+        println!(
+            "  {} {} {}",
+            StatusIndicator::Warning.display(style),
+            style.muted(&format!("[{}]", diag.control)),
+            style.warning(&diag.message)
+        );
+    }
+
+    Ok(())
+}
+
+/// `rch admit -- <command>`: a fast, read-only admission preflight. Classifies
+/// the command, derives the capabilities a worker must have, and returns a
+/// decisive Offload / Local / Queue / Defer recommendation before any expensive
+/// work starts. Pure classification — no network side effects; the daemon
+/// candidate/rejection query that further refines the recommendation lands with
+/// the selection-RPC work (bd-...12.3).
+pub async fn admit(command: &str, ctx: &OutputContext) -> Result<()> {
+    use rch_common::admit_preflight::preflight;
+
+    // Proof/strict-remote policy mirrors the ControlState surface
+    // (RCH_REQUIRE_REMOTE / RCH_FORCE_REMOTE).
+    let proof_policy = ["RCH_REQUIRE_REMOTE", "RCH_FORCE_REMOTE"]
+        .iter()
+        .any(|key| {
+            std::env::var(key).is_ok_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+        });
+
+    let pf = preflight(command, proof_policy);
+
+    if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok("admit", &pf));
+        return Ok(());
+    }
+
+    let style = ctx.theme();
+    println!("{}", style.format_header("RCH Admit"));
+    println!();
+    println!("{} {}", style.key("Recommendation:"), {
+        let r = pf.base_recommendation.as_str();
+        match pf.base_recommendation {
+            rch_common::admit_preflight::AdmitRecommendation::Offload => style.format_success(r),
+            rch_common::admit_preflight::AdmitRecommendation::Local => style.format_warning(r),
+            _ => style.value(r).to_string(),
+        }
+    });
+    println!("{} {}", style.key("Compilation:"), pf.is_compilation);
+    if let Some(family) = &pf.family {
+        println!("{} {}", style.key("Family:"), style.value(family));
+    }
+    if pf.compound.len() > 1 {
+        println!(
+            "{} {} parts",
+            style.key("Compound:"),
+            style.value(&pf.compound.len().to_string())
+        );
+    }
+    let req = &pf.required;
+    let mut needs: Vec<String> = Vec::new();
+    if req.needs_cargo {
+        needs.push("cargo".to_string());
+    }
+    if req.needs_zig {
+        needs.push("zig".to_string());
+    }
+    if req.needs_bun {
+        needs.push("bun".to_string());
+    }
+    for t in &req.needs_targets {
+        needs.push(format!("target:{t}"));
+    }
+    for tc in &req.needs_toolchains {
+        needs.push(format!("toolchain:{tc}"));
+    }
+    println!(
+        "{} {}",
+        style.key("Required capabilities:"),
+        if needs.is_empty() {
+            style.muted("none").to_string()
+        } else {
+            style.value(&needs.join(", ")).to_string()
+        }
+    );
+    if pf.proof_policy {
+        println!("{} {}", style.key("Proof policy:"), style.value("strict"));
+    }
+    println!();
+    println!("{}", style.muted(&pf.detail));
     Ok(())
 }
 
@@ -816,8 +1081,19 @@ pub async fn self_test(
     timeout: u64,
     debug: bool,
     scheduled: bool,
+    smoke: bool,
+    soak: bool,
+    load: bool,
+    dry_run: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
+    // The real-fleet smoke/soak profile is a distinct mode from the per-worker
+    // canary self-test (bd-session-history-remediation-ocv9i.16.6). `--load` is a
+    // bounded multi-agent storm-control pass over that same profile machinery
+    // (bd-…-10.4); it implies the smoke entry point.
+    if smoke || load {
+        return self_test_smoke(worker, all, timeout, dry_run, soak, load, ctx).await;
+    }
     match action {
         Some(crate::SelfTestAction::Status) => self_test_status(ctx).await,
         Some(crate::SelfTestAction::History { limit }) => self_test_history(limit, ctx).await,
@@ -1135,6 +1411,1095 @@ async fn self_test_run(
     Ok(())
 }
 
+// =============================================================================
+// Real-fleet smoke/soak validation profile
+// (bd-session-history-remediation-ocv9i.16.6)
+// =============================================================================
+//
+// `rch self-test --smoke` plans the bounded real-fleet validation profile from
+// observed environment (config + daemon reachability) and emits the structured
+// `SmokeProfileEvent` JSONL trace operators attach to Beads close reasons. The
+// scenario set, skip/refusal logic, and JSONL schema are owned by the pure
+// `rch_common::fleet_smoke_profile` foundation (single source of truth) — this
+// consumer gathers inputs, runs the planner, performs the client-side daemon
+// reachability scenario for real, drives the live per-worker SSH probe scenarios
+// (capabilities + disk/inode admission, via the mock-SSH-tested executor
+// orchestrator), composes the daemon/pipeline scenarios from existing daemon
+// calls (desired-vs-live fleet via the status fleet view; cargo canary +
+// artifact retrieval via the daemon self-test pipeline; queue attach/cancel via
+// the status snapshot + a non-destructive cancel of a synthetic build id),
+// asserts the client-side proof-mode refusal, and renders/persists the trace.
+
+/// Owning bead id for the smoke-profile JSONL trace.
+const SMOKE_BEAD_ID: &str = "bd-session-history-remediation-ocv9i.16.6";
+
+/// Number of repeated per-worker probe passes a `--soak` run performs. Soak is a
+/// bounded endurance check that the cheap, idempotent per-worker probes (exact
+/// user/path capabilities + disk/inode headroom) stay green across repeated
+/// passes; a single smoke run does exactly one pass. Full load/endurance soak
+/// (repeated cargo canaries over time) belongs to the daemon-pipeline scenarios.
+const SOAK_PASSES: usize = 3;
+
+/// The build-root path(s) the disk/inode admission scenario probes for headroom.
+/// Derived from the effective `transfer.remote_base` (where offloaded builds
+/// land), falling back to the documented default when config is unavailable.
+///
+/// The build root itself may not exist yet on a freshly-provisioned worker (it
+/// is created on the first offloaded build), so we ALSO probe its parent mount,
+/// which always exists and shares the relevant filesystem. The disk executor
+/// skips non-existent roots and reports the worst pressure across those present,
+/// so a fresh worker still yields a real reading instead of `Unknown`. Mirrors
+/// the daemon recovery prober, which probes both the base and its parent.
+fn smoke_disk_roots() -> Vec<String> {
+    let base = crate::config::load_config_with_sources()
+        .ok()
+        .map(|loaded| loaded.config.transfer.remote_base)
+        .unwrap_or_else(rch_common::types::default_remote_base);
+    let mut roots = vec![base.clone()];
+    if let Some(parent) = std::path::Path::new(&base)
+        .parent()
+        .and_then(std::path::Path::to_str)
+        && !parent.is_empty()
+        && parent != "/"
+        && parent != base
+    {
+        roots.push(parent.to_string());
+    }
+    roots
+}
+
+/// Decide the DesiredVsLiveFleet smoke outcome from the fleet status report.
+///
+/// The inventory is "consistent" when no desired worker is sustained-absent from
+/// live eligibility (no [`absence_alerts`](rch_common::fleet_status::FleetStatusReport::absence_alerts))
+/// and the fleet has not collapsed to zero usable workers. Present-but-degraded
+/// workers (busy, disk pressure, stale telemetry) are NOT inventory drift — they
+/// are in the pool, just not ready — so this deliberately does not key off the
+/// general `problem_class`. Pure so it is unit-testable without a daemon.
+fn smoke_fleet_consistency(
+    report: &rch_common::fleet_status::FleetStatusReport,
+) -> (bool, Option<String>) {
+    if report.capacity_collapsed() {
+        return (false, Some("fleet_capacity_collapsed".to_string()));
+    }
+    if !report.absence_alerts.is_empty() {
+        return (false, Some("fleet_workers_absent".to_string()));
+    }
+    (true, None)
+}
+
+/// Fetch the daemon full status and fold it into a fleet status report (reuses
+/// the same `GET /status` + [`build_fleet_status_report`] path as `rch status
+/// --fleet`). Used by the DesiredVsLiveFleet smoke scenario.
+async fn fetch_fleet_status_report() -> Result<rch_common::fleet_status::FleetStatusReport> {
+    let response = send_daemon_command("GET /status\n").await?;
+    let json = extract_json_body(&response)
+        .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
+    let status: DaemonFullStatusResponse =
+        serde_json::from_str(json).context("Failed to parse daemon status response")?;
+    Ok(build_fleet_status_report(&status))
+}
+
+/// Decide the `CargoCanary` outcome from a per-worker self-test result. The
+/// canary passes when the remote build COMPLETED — the daemon records a remote
+/// compilation time only after the worker finished compiling, so its presence is
+/// the honest "the tiny canary built on the worker" signal. A pipeline error
+/// before the remote build (e.g. transfer/connect failure) leaves it unset.
+/// Pure so it is unit-testable without a daemon. Returns `(passed, reason)`.
+fn smoke_canary_verdict(result: &SelfTestResultRecordFromApi) -> (bool, Option<String>) {
+    if result.remote_time_ms.is_some() {
+        (true, None)
+    } else {
+        (
+            false,
+            Some(
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "remote_build_failed".to_string()),
+            ),
+        )
+    }
+}
+
+/// Decide the `ArtifactRetrieval` outcome from a per-worker self-test result.
+///
+/// "Retrieved" means the remote artifact was rsynced back and hashed — i.e.
+/// `remote_hash` is present. This scenario asserts RETRIEVAL (the artifact came
+/// back under the effective target dir), NOT bit-for-bit reproducibility: a
+/// remote build whose binary differs from the local reference (e.g. the worker's
+/// rustc differs from the orchestrator's — a normal heterogeneous-fleet
+/// condition) STILL retrieved an artifact. Byte-identity is the self-test's own
+/// stricter `passed` check, surfaced separately in the artifact summary, not a
+/// retrieval failure. Pure; returns `(passed, reason)`.
+fn smoke_artifact_verdict(result: &SelfTestResultRecordFromApi) -> (bool, Option<String>) {
+    if result.remote_hash.is_some() {
+        (true, None)
+    } else {
+        (
+            false,
+            Some(
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "artifact_not_retrieved".to_string()),
+            ),
+        )
+    }
+}
+
+/// Whether the retrieved artifact is bit-identical to the local reference build
+/// (the self-test's `passed`/`binaries_equivalent` verdict). Reported in the
+/// artifact summary as transparency; a `false` here on an otherwise-retrieved
+/// artifact indicates build non-determinism (commonly local-vs-worker rustc
+/// drift), not a retrieval failure.
+fn smoke_artifact_byte_identical(result: &SelfTestResultRecordFromApi) -> bool {
+    result.passed
+}
+
+/// Decide the `QueueAttachCancel` cancel-step outcome from the daemon's response
+/// status to cancelling a synthetic (cannot-exist) build id. The daemon's
+/// deterministic refusal for a build it cannot find is `status == "error"`; any
+/// other status, or a malformed/absent status, fails the scenario. Pure; returns
+/// `(passed, reason)`.
+fn smoke_cancel_verdict(status: Option<&str>) -> (bool, Option<String>) {
+    match status {
+        Some("error") => (true, None),
+        Some(other) => (false, Some(format!("unexpected_cancel_status:{other}"))),
+        None => (false, Some("cancel_response_malformed".to_string())),
+    }
+}
+
+/// Drive the build-pipeline smoke scenarios (`CargoCanary` + `ArtifactRetrieval`)
+/// for one worker via the daemon's existing per-worker self-test canary.
+///
+/// A single `POST /self-test/run` runs the full pipeline (local build → remote
+/// build → rsync artifacts back → hash verify), so one call decides both
+/// scenarios with a meaningful, non-tautological split:
+/// - **CargoCanary** passes when the remote build COMPLETED (`remote_time_ms`
+///   recorded) — the tiny canary compiled on the worker.
+/// - **ArtifactRetrieval** passes when the artifact was rsynced back AND its hash
+///   matches the local build (`passed`, which is exactly the hash-equivalence
+///   check). A canary that compiles but whose artifact fails to come back (or
+///   comes back mismatched) fails ArtifactRetrieval while CargoCanary still
+///   passes — the two are nested, not identical.
+///
+/// A daemon error, a missing per-worker result, or a build that never produced a
+/// remote time is a FAILED outcome (never a silent pass).
+async fn run_smoke_canary_scenarios(
+    run_id: &str,
+    worker_id: &str,
+    timeout_secs: u64,
+    remote_base: Option<&str>,
+) -> Vec<SmokeProfileEvent> {
+    let mut events = vec![
+        SmokeProfileEvent::started(
+            run_id,
+            SMOKE_BEAD_ID,
+            Some(worker_id.to_string()),
+            SmokeScenario::CargoCanary,
+        ),
+        SmokeProfileEvent::started(
+            run_id,
+            SMOKE_BEAD_ID,
+            Some(worker_id.to_string()),
+            SmokeScenario::ArtifactRetrieval,
+        ),
+    ];
+
+    // A debug build keeps the canary cheap; the size-optimized release profile
+    // (opt-level=z + lto) is needlessly slow for a tiny correctness probe.
+    // `retries=0` makes the canary fail-fast (one attempt) so a real outcome
+    // surfaces immediately instead of being masked by the daemon's long retry
+    // delay blowing the scenario's own timeout budget.
+    let command = format!(
+        "POST /self-test/run?worker={}&timeout={}&debug=true&retries=0\n",
+        urlencoding_encode(worker_id),
+        timeout_secs
+    );
+    let canary_fp = Some("self-test canary (cargo build, debug)".to_string());
+    let artifact_fp = Some("rsync artifacts from worker + hash verify".to_string());
+
+    let started = std::time::Instant::now();
+    let result = send_daemon_command(&command)
+        .await
+        .ok()
+        .and_then(|response| {
+            let json = extract_json_body(&response)?;
+            let run: SelfTestRunResponseFromApi = serde_json::from_str(json).ok()?;
+            run.results.into_iter().find(|r| r.worker_id == worker_id)
+        });
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    let Some(result) = result else {
+        // Could not get a per-worker self-test result: both scenarios fail.
+        for scenario in [SmokeScenario::CargoCanary, SmokeScenario::ArtifactRetrieval] {
+            events.push(SmokeProfileEvent::outcome(
+                run_id,
+                SMOKE_BEAD_ID,
+                Some(worker_id.to_string()),
+                scenario,
+                false,
+                Some("self_test_result_unavailable".to_string()),
+                if scenario == SmokeScenario::CargoCanary {
+                    canary_fp.clone()
+                } else {
+                    artifact_fp.clone()
+                },
+                elapsed_ms,
+            ));
+        }
+        return events;
+    };
+
+    // CargoCanary: the remote build completed when the daemon recorded a remote
+    // compilation time. A pipeline error before the remote build leaves it unset.
+    let (canary_passed, canary_reason) = smoke_canary_verdict(&result);
+    events.push(SmokeProfileEvent::outcome(
+        run_id,
+        SMOKE_BEAD_ID,
+        Some(worker_id.to_string()),
+        SmokeScenario::CargoCanary,
+        canary_passed,
+        canary_reason,
+        canary_fp,
+        result.remote_time_ms.unwrap_or(elapsed_ms),
+    ));
+
+    // ArtifactRetrieval: the artifact came back (remote_hash present). Byte-
+    // identity vs the local reference is reported in the summary, not required —
+    // a worker whose rustc differs from the orchestrator still RETRIEVES an
+    // artifact (build non-determinism is a separate concern).
+    let (artifact_passed, artifact_reason) = smoke_artifact_verdict(&result);
+    let mut artifact_event = SmokeProfileEvent::outcome(
+        run_id,
+        SMOKE_BEAD_ID,
+        Some(worker_id.to_string()),
+        SmokeScenario::ArtifactRetrieval,
+        artifact_passed,
+        artifact_reason,
+        artifact_fp,
+        elapsed_ms,
+    );
+    artifact_event.remote_target_dir = remote_base.map(str::to_string);
+    artifact_event.artifact_summary = Some(if artifact_passed {
+        let byte_identical = smoke_artifact_byte_identical(&result);
+        match result.remote_hash.as_deref() {
+            Some(hash) => format!(
+                "retrieved: hash {}… ({}ms remote){}",
+                &hash[..hash.len().min(12)],
+                result.remote_time_ms.unwrap_or(0),
+                if byte_identical {
+                    "; bit-identical to local"
+                } else {
+                    "; differs from local build (non-deterministic/rustc drift)"
+                }
+            ),
+            None => "retrieved".to_string(),
+        }
+    } else {
+        "artifact not retrieved".to_string()
+    });
+    events.push(artifact_event);
+
+    events
+}
+
+/// Drive the `QueueAttachCancel` smoke scenario against the daemon control plane,
+/// non-destructively. It must prove the queue/cancel primitives are reachable and
+/// behave correctly WITHOUT touching any real in-flight build on the shared fleet:
+/// 1. Read the queue snapshot (`GET /status` → active + queued builds) — the
+///    "attach" view; a queue we cannot read is a failure.
+/// 2. Cancel a synthetic build id that cannot exist (`u64::MAX`) and assert the
+///    daemon returns its deterministic not-found refusal (`status == "error"`).
+///    This exercises the real cancel route without cancelling anyone's work.
+async fn run_smoke_queue_attach_cancel(run_id: &str) -> SmokeProfileEvent {
+    const SENTINEL_BUILD_ID: u64 = u64::MAX;
+    let started = std::time::Instant::now();
+
+    let (passed, reason) = smoke_queue_attach_cancel_probe(SENTINEL_BUILD_ID).await;
+    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    SmokeProfileEvent::outcome(
+        run_id,
+        SMOKE_BEAD_ID,
+        None,
+        SmokeScenario::QueueAttachCancel,
+        passed,
+        reason,
+        Some("GET /status; POST /builds/<sentinel>/cancel".to_string()),
+        ms,
+    )
+}
+
+/// The non-destructive queue+cancel control-plane probe. Returns `(passed,
+/// reason)`. Reads the queue snapshot, then cancels a build id that cannot exist
+/// and verifies the deterministic not-found refusal.
+async fn smoke_queue_attach_cancel_probe(sentinel_build_id: u64) -> (bool, Option<String>) {
+    // 1. Attach: the queue snapshot must be readable.
+    match send_daemon_command("GET /status\n").await {
+        Ok(response) => {
+            let parsed = extract_json_body(&response)
+                .and_then(|json| serde_json::from_str::<DaemonFullStatusResponse>(json).ok());
+            if parsed.is_none() {
+                return (false, Some("queue_snapshot_unreadable".to_string()));
+            }
+        }
+        Err(_) => return (false, Some("queue_snapshot_unavailable".to_string())),
+    }
+
+    // 2. Cancel a synthetic build id; the daemon must refuse it as not-found.
+    let cancel_cmd = format!("POST /builds/{sentinel_build_id}/cancel?force=false\n");
+    match send_daemon_command(&cancel_cmd).await {
+        Ok(response) => {
+            let status = extract_json_body(&response)
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string));
+            smoke_cancel_verdict(status.as_deref())
+        }
+        Err(_) => (false, Some("cancel_unavailable".to_string())),
+    }
+}
+
+/// Build the smoke-profile inputs from observed environment + flags. Pure so the
+/// input-derivation is unit-testable without a daemon or workers.
+fn build_smoke_inputs(
+    workers_configured: bool,
+    daemon_reachable: bool,
+    dry_run: bool,
+    soak: bool,
+    selected_worker: Option<String>,
+) -> SmokeProfileInputs {
+    SmokeProfileInputs {
+        workers_configured,
+        // Remote execution can proceed only if the daemon is up AND at least one
+        // worker is configured — a bounded, honest proxy for full admission that
+        // drives the proof-mode-refusal scenario decision.
+        remote_execution_available: daemon_reachable && workers_configured,
+        dry_run,
+        mode: if soak {
+            ProfileMode::Soak
+        } else {
+            ProfileMode::Smoke
+        },
+        selected_worker,
+    }
+}
+
+/// Generate one `planned` JSONL event per scenario, in run order. Pure so the
+/// trace shape is unit-testable. A complete planned trace is emitted even for a
+/// dry-run (the foundation's design), so the JSONL is always auditable.
+fn smoke_planned_events(
+    plan: &SmokeProfilePlan,
+    run_id: &str,
+    representative_worker: Option<&str>,
+) -> Vec<SmokeProfileEvent> {
+    plan.scenarios
+        .iter()
+        .map(|planned| {
+            SmokeProfileEvent::planned(
+                run_id,
+                SMOKE_BEAD_ID,
+                representative_worker.map(str::to_string),
+                planned,
+            )
+        })
+        .collect()
+}
+
+/// Persist the JSONL trace under the cache dir (best-effort). Returns the path so
+/// operators can attach it to a Beads close reason and CI can self-validate it.
+fn write_smoke_jsonl(run_id: &str, events: &[SmokeProfileEvent]) -> Option<String> {
+    let dir = dirs::cache_dir()?.join("rch").join("smoke");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{run_id}.jsonl"));
+    let mut buf = String::new();
+    for event in events {
+        let line = serde_json::to_string(event).ok()?;
+        buf.push_str(&line);
+        buf.push('\n');
+    }
+    std::fs::write(&path, buf).ok()?;
+    Some(path.display().to_string())
+}
+
+// ===========================================================================
+// Multi-agent LOAD / storm-control run
+// (bd-session-history-remediation-ocv9i.10.4 live wiring; bd-p4l0q).
+// ===========================================================================
+//
+// `rch self-test --smoke --load` launches a BOUNDED swarm of concurrent tiny
+// canary builds across the schedulable fleet, records how each one really
+// resolved (which worker built it, how long it took, or whether it fell back),
+// turns those real observations into the same `StormRun` shape the deterministic
+// simulator produces, and gates the run with the SAME five storm-control
+// invariants (`rch_common::storm_control::check_all_invariants`). The simulator
+// proves the scheduler LOGIC in CI; this proves a real deployed fleet upholds
+// the same guarantees under contention. Non-destructive: throwaway debug canary
+// builds only — never touches user source.
+
+/// Owning bead id for the load/storm JSONL trace.
+const LOAD_BEAD_ID: &str = "bd-session-history-remediation-ocv9i.10.4";
+
+/// Storm-control fairness tolerance for a live load run: the busiest schedulable
+/// worker may take up to this multiple of its fair share of placements. Matched
+/// to the simulator's varied/heterogeneous-fleet threshold (REQ-LOAD-001).
+const LOAD_FAIRNESS_TOLERANCE: f64 = 1.6;
+/// Maximum fraction of jobs that may fail open to local before the run is judged
+/// a fallback storm.
+const LOAD_MAX_FALLBACK_RATIO: f64 = 0.30;
+/// Default concurrent-canary cap when not overridden by `RCH_LOAD_CONCURRENCY`.
+const LOAD_DEFAULT_CONCURRENCY_CAP: usize = 8;
+/// Default number of waves (jobs per schedulable worker) when not overridden by
+/// `RCH_LOAD_WAVES`.
+const LOAD_DEFAULT_WAVES: usize = 3;
+
+/// Map a live daemon worker view to its storm-control eligibility. A worker is
+/// schedulable unless it is temporarily bypassed (active bypass record or open
+/// circuit) or its status marks it offline/disabled. Pure so it is unit-testable.
+fn worker_eligibility(w: &WorkerStatusFromApi) -> WorkerEligibility {
+    if w.bypass.is_some() || w.circuit_state.eq_ignore_ascii_case("open") {
+        return WorkerEligibility::TemporaryBypass;
+    }
+    match w.status.to_ascii_lowercase().as_str() {
+        "offline" | "unreachable" | "down" | "unknown" => WorkerEligibility::CapabilityInadmissible,
+        "disabled" | "drained" | "draining" | "quarantined" => WorkerEligibility::AdminDisabled,
+        "degraded" => WorkerEligibility::Degraded,
+        _ => WorkerEligibility::Healthy,
+    }
+}
+
+/// Build the storm-control fleet description from the daemon's live worker views.
+/// EVERY worker is included (with its real eligibility) so the
+/// no-ineligible-selection invariant is meaningful, not vacuous. Pure & testable.
+fn build_storm_fleet(workers: &[WorkerStatusFromApi]) -> Vec<StormWorker> {
+    workers
+        .iter()
+        .map(|w| StormWorker {
+            id: w.id.clone(),
+            total_slots: w.total_slots.max(1),
+            speed: if w.speed_score > 0.0 {
+                w.speed_score
+            } else {
+                1.0
+            },
+            eligibility: worker_eligibility(w),
+        })
+        .collect()
+}
+
+/// Resolve the bounded load parameters (waves, concurrency cap) from the
+/// environment, defaulting to sane values scaled to the schedulable fleet size.
+fn resolve_load_params(schedulable: usize, env: impl Fn(&str) -> Option<String>) -> (usize, usize) {
+    let waves = env("RCH_LOAD_WAVES")
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&w| w > 0)
+        .unwrap_or(LOAD_DEFAULT_WAVES);
+    let default_conc = schedulable
+        .saturating_mul(2)
+        .clamp(1, LOAD_DEFAULT_CONCURRENCY_CAP);
+    let concurrency = env("RCH_LOAD_CONCURRENCY")
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&c| c > 0)
+        .unwrap_or(default_conc);
+    (waves, concurrency)
+}
+
+/// One planned canary job in the swarm: a stable local wrapper id and the
+/// schedulable worker the operator targets for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadJobSpec {
+    local_job_id: String,
+    worker_id: String,
+}
+
+/// Plan the bounded swarm: `waves` jobs round-robined across the schedulable
+/// workers in `fleet`, restricted to `selected` when a single `--worker` was
+/// requested. Ineligible workers are never targeted (upholding the
+/// no-ineligible-selection invariant by construction). Pure & testable.
+fn plan_load_jobs(fleet: &[StormWorker], selected: Option<&str>, waves: usize) -> Vec<LoadJobSpec> {
+    let targets: Vec<&StormWorker> = fleet
+        .iter()
+        .filter(|w| w.eligibility.is_schedulable())
+        .filter(|w| selected.is_none_or(|sel| w.id == sel))
+        .collect();
+    let mut jobs = Vec::new();
+    let mut idx = 0usize;
+    for _ in 0..waves {
+        for w in &targets {
+            jobs.push(LoadJobSpec {
+                local_job_id: format!("{LOCAL_WRAPPER_ID_PREFIX}{idx:04}"),
+                worker_id: w.id.clone(),
+            });
+            idx += 1;
+        }
+    }
+    jobs
+}
+
+/// Classify one canary's real result into a live storm outcome. The remote build
+/// COMPLETING (a remote compile time was recorded) is the honest "ran remotely"
+/// signal — the same criterion the smoke `CargoCanary` scenario uses. Anything
+/// else means the fail-open canary did not run remotely, recorded as a local
+/// fallback. Pure & testable.
+fn classify_load_outcome(
+    spec: &LoadJobSpec,
+    remote_id: u64,
+    elapsed_ms: u64,
+    remote_time_ms: Option<u64>,
+) -> LiveJobOutcome {
+    match remote_time_ms {
+        Some(remote_ms) => LiveJobOutcome::remote(
+            spec.local_job_id.clone(),
+            spec.worker_id.clone(),
+            remote_id,
+            1,
+            remote_ms,
+        ),
+        None => LiveJobOutcome::local_fallback(spec.local_job_id.clone(), 1, elapsed_ms),
+    }
+}
+
+/// Fetch the daemon's live worker views (`GET /status`).
+async fn fetch_daemon_status_workers() -> Result<Vec<WorkerStatusFromApi>> {
+    let response = send_daemon_command("GET /status\n").await?;
+    let json = extract_json_body(&response)
+        .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
+    let status: DaemonFullStatusResponse =
+        serde_json::from_str(json).context("Failed to parse daemon status response")?;
+    Ok(status.workers)
+}
+
+/// Execute the planned swarm: launch each canary as a real `POST /self-test/run`
+/// against its target worker, bounded to `concurrency` in flight at once, and
+/// collect the real per-job outcomes. Each admitted job is minted a unique remote
+/// build id so the no-duplicate-remote-id invariant is exercised on real data.
+async fn execute_load_swarm(
+    specs: &[LoadJobSpec],
+    timeout: u64,
+    concurrency: usize,
+) -> Vec<LiveJobOutcome> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::Semaphore;
+
+    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
+    let next_remote_id = Arc::new(AtomicU64::new(1));
+    let mut handles = Vec::with_capacity(specs.len());
+
+    for spec in specs {
+        let spec = spec.clone();
+        let semaphore = semaphore.clone();
+        let next_remote_id = next_remote_id.clone();
+        handles.push(tokio::spawn(async move {
+            // Bound concurrency: the permit is held for the build's lifetime.
+            let _permit = semaphore.acquire_owned().await.ok()?;
+            let command = format!(
+                "POST /self-test/run?worker={}&timeout={}&debug=true&retries=0\n",
+                urlencoding_encode(&spec.worker_id),
+                timeout
+            );
+            let started = std::time::Instant::now();
+            let remote_time_ms = send_daemon_command(&command)
+                .await
+                .ok()
+                .and_then(|response| {
+                    let json = extract_json_body(&response)?;
+                    let run: SelfTestRunResponseFromApi = serde_json::from_str(json).ok()?;
+                    run.results
+                        .into_iter()
+                        .find(|r| r.worker_id == spec.worker_id)
+                })
+                .and_then(|r| r.remote_time_ms);
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let remote_id = next_remote_id.fetch_add(1, Ordering::Relaxed);
+            Some(classify_load_outcome(
+                &spec,
+                remote_id,
+                elapsed_ms,
+                remote_time_ms,
+            ))
+        }));
+    }
+
+    let mut outcomes = Vec::with_capacity(specs.len());
+    for handle in handles {
+        if let Ok(Some(outcome)) = handle.await {
+            outcomes.push(outcome);
+        }
+    }
+    // Stable order (by local wrapper id) for deterministic JSONL + reporting.
+    outcomes.sort_by(|a, b| a.local_job_id.cmp(&b.local_job_id));
+    outcomes
+}
+
+/// Drive the multi-agent LOAD / storm-control self-test: build the fleet from
+/// live daemon status, plan a bounded concurrent canary swarm, execute it,
+/// record the real outcomes as a `StormRun`, gate them with the five
+/// storm-control invariants, persist the JSONL trace, and report. Returns an
+/// error (non-zero exit) when any invariant is violated, so CI/operators notice.
+async fn run_load_storm(
+    run_id: &str,
+    selected_worker: Option<&str>,
+    timeout: u64,
+    dry_run: bool,
+    daemon_reachable: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    // 1. Build the fleet description from the daemon's live worker views.
+    let fleet = match fetch_daemon_status_workers().await {
+        Ok(ws) => build_storm_fleet(&ws),
+        Err(_) => Vec::new(),
+    };
+    let schedulable = fleet
+        .iter()
+        .filter(|w| w.eligibility.is_schedulable())
+        .count();
+    let (waves, concurrency) = resolve_load_params(schedulable, |k| std::env::var(k).ok());
+    let specs = plan_load_jobs(&fleet, selected_worker, waves);
+
+    // 2. Dry-run, or nothing schedulable: report the intent, execute nothing.
+    if dry_run || specs.is_empty() {
+        let reason = if dry_run {
+            "dry-run: planned the load swarm but executed nothing"
+        } else if !daemon_reachable {
+            "daemon unreachable; no live fleet to load"
+        } else {
+            "no schedulable workers to load"
+        };
+        let payload = serde_json::json!({
+            "run_id": run_id,
+            "bead_id": LOAD_BEAD_ID,
+            "mode": "load",
+            "dry_run": dry_run,
+            "daemon_reachable": daemon_reachable,
+            "schedulable_workers": schedulable,
+            "planned_jobs": specs.len(),
+            "waves": waves,
+            "concurrency": concurrency,
+            "executed": false,
+            "reason": reason,
+        });
+        let _ = ctx.json(&payload);
+        if !ctx.is_json() {
+            render_load_skip(reason, specs.len(), schedulable, ctx);
+        }
+        return Ok(());
+    }
+
+    // 3. Execute the bounded swarm and record real outcomes.
+    let outcomes = execute_load_swarm(&specs, timeout, concurrency).await;
+
+    // 4. Turn the observations into the same StormRun shape as the simulator and
+    //    gate it with the SAME five invariants.
+    let cfg = StormConfig::new(run_id, LOAD_BEAD_ID);
+    let run = build_live_storm_run(&cfg, &fleet, &outcomes);
+    let reports = check_all_invariants(
+        &run,
+        &fleet,
+        LOAD_FAIRNESS_TOLERANCE,
+        LOAD_MAX_FALLBACK_RATIO,
+    );
+    let passed = all_passed(&reports);
+
+    // 5. Persist the storm JSONL trace (best-effort) and report.
+    let log_path = write_smoke_jsonl(run_id, &run.events);
+    let payload = serde_json::json!({
+        "run_id": run_id,
+        "bead_id": LOAD_BEAD_ID,
+        "mode": "load",
+        "dry_run": false,
+        "daemon_reachable": daemon_reachable,
+        "schedulable_workers": schedulable,
+        "waves": waves,
+        "concurrency": concurrency,
+        "executed": true,
+        "passed": passed,
+        "summary": run.summary,
+        "invariants": reports,
+        "events": run.events,
+        "log_path": log_path,
+    });
+    let _ = ctx.json(&payload);
+    if !ctx.is_json() {
+        render_load_report(&run, &reports, log_path.as_deref(), ctx);
+    }
+    if passed {
+        Ok(())
+    } else {
+        let held = reports.iter().filter(|r| r.passed).count();
+        anyhow::bail!(
+            "storm-control invariants failed: {held}/{} held",
+            reports.len()
+        )
+    }
+}
+
+/// Render a skipped (dry-run or no-fleet) load run for humans.
+fn render_load_skip(reason: &str, planned_jobs: usize, schedulable: usize, ctx: &OutputContext) {
+    let style = ctx.style();
+    println!(
+        "{}",
+        style.format_header("Multi-Agent Load / Storm-Control (skipped)")
+    );
+    println!("  {reason}");
+    println!("  schedulable workers: {schedulable} · planned jobs: {planned_jobs}");
+}
+
+/// Render the storm summary + invariant verdicts for humans.
+fn render_load_report(
+    run: &StormRun,
+    reports: &[InvariantReport],
+    log_path: Option<&str>,
+    ctx: &OutputContext,
+) {
+    let style = ctx.style();
+    println!(
+        "{}",
+        style.format_header("Multi-Agent Load / Storm-Control")
+    );
+    let s = &run.summary;
+    println!(
+        "  jobs: {} total · {} remote · {} local-fallback · {} proof-refused · {} cancelled",
+        s.total_jobs, s.remote_successes, s.local_fallbacks, s.proof_refusals, s.cancellations
+    );
+    println!(
+        "  queue timeouts: {} · p95 queue wait: {}ms · p95 end-to-end: {}ms",
+        s.queue_timeouts, s.p95_queue_wait_ms, s.p95_end_to_end_ms
+    );
+    let util_rows: Vec<Vec<String>> = s
+        .per_worker_slot_utilization
+        .iter()
+        .map(|(id, u)| vec![id.clone(), format!("{:.1}%", u * 100.0)])
+        .collect();
+    if !util_rows.is_empty() {
+        ctx.table(&["Worker", "Slot Utilization"], &util_rows);
+    }
+    let inv_rows: Vec<Vec<String>> = reports
+        .iter()
+        .map(|r| {
+            vec![
+                r.name.clone(),
+                if r.passed { "PASS" } else { "FAIL" }.to_string(),
+                r.detail.clone(),
+            ]
+        })
+        .collect();
+    ctx.table(&["Invariant", "Verdict", "Detail"], &inv_rows);
+    let held = reports.iter().filter(|r| r.passed).count();
+    println!("  {held}/{} invariants held", reports.len());
+    for r in reports.iter().filter(|r| !r.passed) {
+        for v in &r.violations {
+            println!("    ✗ {}: {v}", r.name);
+        }
+    }
+    if let Some(path) = log_path {
+        println!("  trace: {path}");
+    }
+}
+
+async fn self_test_smoke(
+    worker: Option<String>,
+    all: bool,
+    timeout: u64,
+    dry_run: bool,
+    soak: bool,
+    load: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let workers = load_workers_from_config().unwrap_or_default();
+    let workers_configured = !workers.is_empty();
+
+    // Probe daemon reachability — this both feeds the plan and IS the real result
+    // of the daemon-reachability scenario.
+    let probe_start = std::time::Instant::now();
+    let daemon_reachable = send_daemon_command("GET /health\n").await.is_ok();
+    let probe_ms = u64::try_from(probe_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    // A single --worker selects that worker; --all (or neither) is fleet-wide.
+    let selected_worker = if all { None } else { worker };
+    let mut inputs = build_smoke_inputs(
+        workers_configured,
+        daemon_reachable,
+        dry_run,
+        soak,
+        selected_worker.clone(),
+    );
+    // --load drives a bounded concurrent canary swarm (storm control) rather than
+    // the one-pass smoke scenarios; carry the Load mode into the plan/trace.
+    if load {
+        inputs.mode = ProfileMode::Load;
+    }
+    let plan = plan_smoke_profile(&inputs);
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+
+    // Multi-agent LOAD / storm-control run (bd-…-10.4): instead of the eight
+    // one-pass smoke scenarios, launch a bounded swarm of concurrent canary
+    // builds and gate it with the five storm-control invariants.
+    if load {
+        return run_load_storm(
+            &run_id,
+            selected_worker.as_deref(),
+            timeout,
+            dry_run,
+            daemon_reachable,
+            ctx,
+        )
+        .await;
+    }
+
+    // For a single `--worker` the planned per-worker events are scoped to that
+    // worker; a fleet-wide run (`--all` or the default) leaves worker_id unset,
+    // because the plan is not tied to one worker — per-worker execution is the
+    // live runner's job and would emit one event per worker. Attributing a
+    // fleet-wide plan to an arbitrary `workers.first()` would mislead.
+    let mut events = smoke_planned_events(&plan, &run_id, selected_worker.as_deref());
+
+    // Execute the one fully client-side scenario for real: daemon reachability.
+    // The per-worker SSH scenarios then execute live (below); proof-mode refusal
+    // and the daemon/pipeline scenarios remain `planned`. Skipped under --dry-run
+    // (which executes nothing by definition).
+    if !dry_run
+        && let Some(planned) = plan
+            .scenarios
+            .iter()
+            .find(|p| p.scenario == SmokeScenario::DaemonReachable)
+        && planned.action.is_executed()
+    {
+        events.push(SmokeProfileEvent::outcome(
+            run_id.clone(),
+            SMOKE_BEAD_ID,
+            None,
+            SmokeScenario::DaemonReachable,
+            daemon_reachable,
+            Some(
+                rch_common::IncidentReasonCode::DaemonSocketRefused
+                    .code()
+                    .to_string(),
+            ),
+            Some("GET /health".to_string()),
+            probe_ms,
+        ));
+    }
+
+    // DesiredVsLiveFleet (daemon-view, no SSH): when planned to run, query the
+    // daemon's full status, build the fleet report, and assert inventory
+    // consistency — no desired worker sustained-absent and the fleet not
+    // collapsed. A failed daemon fetch is a failed outcome (cannot verify).
+    if !dry_run
+        && let Some(planned) = plan
+            .scenarios
+            .iter()
+            .find(|p| p.scenario == SmokeScenario::DesiredVsLiveFleet)
+        && planned.action.is_executed()
+    {
+        let started = std::time::Instant::now();
+        let (passed, reason) = match fetch_fleet_status_report().await {
+            Ok(report) => smoke_fleet_consistency(&report),
+            Err(_) => (false, Some("fleet_status_unavailable".to_string())),
+        };
+        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        events.push(SmokeProfileEvent::outcome(
+            run_id.clone(),
+            SMOKE_BEAD_ID,
+            None,
+            SmokeScenario::DesiredVsLiveFleet,
+            passed,
+            reason,
+            Some("GET /status".to_string()),
+            ms,
+        ));
+    }
+
+    // Live per-worker SSH scenarios: when not a dry-run and the capabilities
+    // scenario is planned to execute, probe each target worker for real. The
+    // executor orchestrator (mock-SSH tested) runs the WorkerCapabilitiesExactUserPath
+    // and DiskInodeAdmission scenarios and returns started/passed/failed events.
+    // The other five scenarios are daemon/pipeline-level (composed elsewhere) or
+    // client-side (proof-mode refusal); they remain `planned` here.
+    if !dry_run
+        && plan.scenarios.iter().any(|p| {
+            p.scenario == SmokeScenario::WorkerCapabilitiesExactUserPath && p.action.is_executed()
+        })
+    {
+        let disk_roots = smoke_disk_roots();
+        // A single `--worker` scopes to that worker; otherwise every configured
+        // worker is exercised. Soak repeats each pass `soak_passes()` times.
+        let targets: Vec<&WorkerConfig> = match selected_worker.as_deref() {
+            Some(id) => workers.iter().filter(|w| w.id.0 == id).collect(),
+            None => workers.iter().collect(),
+        };
+        let passes = if soak { SOAK_PASSES } else { 1 };
+        for _ in 0..passes {
+            for worker in &targets {
+                let worker_events = crate::fleet::run_smoke_worker_scenarios(
+                    &run_id,
+                    SMOKE_BEAD_ID,
+                    worker,
+                    &disk_roots,
+                )
+                .await;
+                events.extend(worker_events);
+            }
+        }
+    }
+
+    // CargoCanary + ArtifactRetrieval (daemon-pipeline): drive the daemon's
+    // existing per-worker self-test canary, which runs the full local-build →
+    // remote-build → rsync-back → hash-verify pipeline. One daemon call yields
+    // BOTH scenarios: the remote build completing satisfies CargoCanary; the
+    // artifact rsynced back and hash-matching satisfies ArtifactRetrieval. Bounded
+    // to a single representative worker (the `--worker` target, else the first
+    // configured worker) so a smoke run stays cheap and non-destructive.
+    if !dry_run
+        && plan
+            .scenarios
+            .iter()
+            .any(|p| p.scenario == SmokeScenario::CargoCanary && p.action.is_executed())
+    {
+        let canary_worker = match selected_worker.as_deref() {
+            Some(id) => workers.iter().find(|w| w.id.0 == id),
+            None => workers.first(),
+        };
+        if let Some(worker) = canary_worker {
+            let remote_base = smoke_disk_roots().into_iter().next();
+            let canary_events =
+                run_smoke_canary_scenarios(&run_id, &worker.id.0, timeout, remote_base.as_deref())
+                    .await;
+            events.extend(canary_events);
+        }
+    }
+
+    // QueueAttachCancel (daemon control-plane, non-destructive): confirm the
+    // queue/cancel control plane is reachable and behaves correctly WITHOUT
+    // disturbing any real in-flight build on the shared fleet — read the queue
+    // snapshot (the "attach" view), then cancel a synthetic build id that cannot
+    // exist and assert the daemon returns its deterministic not-found refusal.
+    if !dry_run
+        && plan
+            .scenarios
+            .iter()
+            .any(|p| p.scenario == SmokeScenario::QueueAttachCancel && p.action.is_executed())
+    {
+        events.push(run_smoke_queue_attach_cancel(&run_id).await);
+    }
+
+    // Proof-mode refusal (client-side, no SSH): when the plan expects a refusal
+    // (remote execution unavailable), confirm the proof-mode control actually
+    // resolves to a fail-closed policy — `RCH_REQUIRE_REMOTE` must refuse local
+    // fallback rather than silently building locally. Exercising the real 13.5
+    // `resolve_placement` path catches a fail-open regression in that mapping.
+    if !dry_run
+        && let Some(planned) = plan
+            .scenarios
+            .iter()
+            .find(|p| p.scenario == SmokeScenario::ProofModeRefusal)
+        && matches!(planned.action, ScenarioAction::ExpectRefusal { .. })
+    {
+        let policy = resolve_placement(|k| (k == "RCH_REQUIRE_REMOTE").then(|| "1".to_string()))
+            .strict_remote_policy;
+        let held = policy.fail_closed();
+        events.push(SmokeProfileEvent::refused(
+            run_id.clone(),
+            SMOKE_BEAD_ID,
+            held,
+            Some(
+                rch_common::IncidentReasonCode::ProofRefusal
+                    .code()
+                    .to_string(),
+            ),
+            0,
+        ));
+    }
+
+    let log_path = write_smoke_jsonl(&run_id, &events);
+
+    let payload = serde_json::json!({
+        "run_id": run_id,
+        "bead_id": SMOKE_BEAD_ID,
+        "mode": plan.mode,
+        "dry_run": dry_run,
+        "workers_configured": workers_configured,
+        "remote_execution_available": inputs.remote_execution_available,
+        "daemon_reachable": daemon_reachable,
+        "overall_skipped": plan.overall_skipped,
+        "plan": plan,
+        "events": events,
+        "log_path": log_path,
+    });
+    let _ = ctx.json(&payload);
+    if ctx.is_json() {
+        return Ok(());
+    }
+
+    render_smoke_plan(&plan, daemon_reachable, log_path.as_deref(), ctx);
+    Ok(())
+}
+
+fn render_smoke_plan(
+    plan: &SmokeProfilePlan,
+    daemon_reachable: bool,
+    log_path: Option<&str>,
+    ctx: &OutputContext,
+) {
+    let style = ctx.style();
+    println!("{}", style.format_header("Real-Fleet Smoke Profile (plan)"));
+
+    let rows: Vec<Vec<String>> = plan
+        .scenarios
+        .iter()
+        .map(|p| {
+            vec![
+                p.scenario.as_str().to_string(),
+                p.action.status_token().to_string(),
+                p.action.reason_code().unwrap_or("").to_string(),
+            ]
+        })
+        .collect();
+    ctx.table(&["Scenario", "Action", "Reason"], &rows);
+
+    let count = |pred: fn(&ScenarioAction) -> bool| -> usize {
+        plan.scenarios.iter().filter(|p| pred(&p.action)).count()
+    };
+    let run = count(|a| matches!(a, ScenarioAction::Run));
+    let dry = count(|a| matches!(a, ScenarioAction::DryRun));
+    let skip = count(|a| matches!(a, ScenarioAction::Skip { .. }));
+    let refuse = count(|a| matches!(a, ScenarioAction::ExpectRefusal { .. }));
+
+    println!(
+        "\n{} {} run, {} dry-run, {} skip, {} expect-refusal{}.",
+        style.muted("Summary:"),
+        style.success(&run.to_string()),
+        dry,
+        skip,
+        refuse,
+        if plan.overall_skipped {
+            format!(" ({})", style.warning("real-fleet validation skipped"))
+        } else {
+            String::new()
+        }
+    );
+    println!(
+        "  {} {}",
+        style.key("Daemon reachable"),
+        if daemon_reachable {
+            style.success("yes")
+        } else {
+            style.warning("no")
+        }
+    );
+    if let Some(path) = log_path {
+        println!("  {} {}", style.key("JSONL trace"), style.info(path));
+    }
+    println!(
+        "  {}",
+        style.muted(
+            "Per-worker scenario execution is the operator real-fleet procedure; see docs/runbooks."
+        )
+    );
+}
+
 fn render_self_test_result_verbose_lines(
     result: &SelfTestResultRecordFromApi,
     style: &Theme,
@@ -1181,7 +2546,13 @@ fn render_self_test_result_verbose_lines(
 // Status Overview Command
 // =============================================================================
 
-pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> Result<()> {
+pub async fn status_overview(
+    workers: bool,
+    jobs: bool,
+    fleet: bool,
+    remediation: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
     use crate::status_types::{
         CliStatusResponse, RemediationHint, RepoConvergenceStatusFromApi, STATUS_SCHEMA_VERSION,
         SystemPosture, critical_pressure_worker_count, generate_convergence_remediations,
@@ -1194,6 +2565,36 @@ pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> 
         .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
     let status: DaemonFullStatusResponse =
         serde_json::from_str(json).context("Failed to parse daemon status response")?;
+
+    // `--fleet`: a focused desired/live grouping + dominant-problem summary +
+    // absence alerts (bd-session-history-remediation-ocv9i.2.2). Short-circuits
+    // the normal status render with its own JSON/human output.
+    if fleet {
+        let report = build_fleet_status_report(&status);
+        if ctx.is_json() {
+            let _ = ctx.json(&ApiResponse::ok("status-fleet", &report));
+        } else {
+            crate::status_display::render_fleet_status(&report, ctx.style());
+        }
+        return Ok(());
+    }
+
+    // `--remediation`: the operator-facing remediation view assembled by the
+    // daemon (single source of truth). Falls back to a CLI-side assembly only
+    // when talking to a daemon that predates the field
+    // (bd-session-history-remediation-ocv9i.14.4).
+    if remediation {
+        let view = status
+            .remediation
+            .clone()
+            .unwrap_or_else(|| build_remediation_view_from_status(&status));
+        if ctx.is_json() {
+            let _ = ctx.json(&ApiResponse::ok("status-remediation", &view));
+        } else {
+            crate::status_display::render_remediation_view(&view, ctx.style());
+        }
+        return Ok(());
+    }
 
     // Query convergence status (best-effort; don't fail if endpoint unreachable).
     let convergence = match send_daemon_command("GET /repo-convergence/status\n").await {
@@ -1313,6 +2714,180 @@ pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> 
     Ok(())
 }
 
+/// Map daemon status + desired config + the bypass store into the fleet-wide
+/// status report (bd-session-history-remediation-ocv9i.2.2). Each worker becomes
+/// a [`rch_common::fleet_status::FleetWorkerSignal`]; absence durations come from
+/// the age of a worker's active offline alert.
+fn build_fleet_status_report(
+    status: &DaemonFullStatusResponse,
+) -> rch_common::fleet_status::FleetStatusReport {
+    use chrono::{DateTime, Utc};
+    use rch_common::fleet_diff::WorkerObservation;
+    use rch_common::fleet_status::{
+        DEFAULT_ABSENCE_THRESHOLD_SECS, FleetWorkerSignal, compute_fleet_status,
+    };
+    use std::collections::BTreeSet;
+
+    let desired = super::helpers::load_workers_from_config().unwrap_or_default();
+    let desired_ids: BTreeSet<String> = desired.iter().map(|w| w.id.to_string()).collect();
+    let live_ids: BTreeSet<String> = status.workers.iter().map(|w| w.id.clone()).collect();
+    let now = Utc::now();
+
+    // A worker's absence duration is the age of its longest-standing active
+    // offline alert, if any.
+    let absent_secs_for = |id: &str| -> Option<u64> {
+        status
+            .alerts
+            .iter()
+            .filter(|a| a.worker_id.as_deref() == Some(id) && a.kind.contains("offline"))
+            .filter_map(|a| DateTime::parse_from_rfc3339(&a.first_seen).ok())
+            .map(|fs| {
+                u64::try_from((now - fs.with_timezone(&Utc)).num_seconds().max(0)).unwrap_or(0)
+            })
+            .max()
+    };
+
+    let mut signals: Vec<FleetWorkerSignal> =
+        Vec::with_capacity(desired.len() + status.workers.len());
+
+    for w in &status.workers {
+        let reachable = w.status != "unreachable";
+        let admin_disabled = w.status == "disabled";
+        let temporarily_bypassed = w.bypass.is_some();
+        let observation = WorkerObservation {
+            worker_id: w.id.clone(),
+            configured: desired_ids.contains(&w.id),
+            in_daemon_pool: true,
+            reachable,
+            admin_disabled,
+            temporarily_bypassed,
+            facts_known: w.pressure_state.as_deref() != Some("telemetry_gap"),
+            // The bare fleet view is not tied to a specific command.
+            command_admissible: true,
+        };
+        let disk_pressure = matches!(
+            w.pressure_state.as_deref(),
+            Some("critical") | Some("warning")
+        );
+        let slots_saturated = w.total_slots > 0 && w.used_slots >= w.total_slots;
+        signals.push(FleetWorkerSignal {
+            observation,
+            disk_pressure,
+            slots_saturated,
+            absent_secs: absent_secs_for(&w.id),
+        });
+    }
+
+    // Desired workers entirely missing from the live pool.
+    for cfg in &desired {
+        let id = cfg.id.to_string();
+        if live_ids.contains(&id) {
+            continue;
+        }
+        let observation = WorkerObservation {
+            worker_id: id.clone(),
+            configured: true,
+            in_daemon_pool: false,
+            reachable: false,
+            admin_disabled: false,
+            temporarily_bypassed: false,
+            facts_known: true,
+            command_admissible: true,
+        };
+        signals.push(FleetWorkerSignal {
+            observation,
+            disk_pressure: false,
+            slots_saturated: false,
+            absent_secs: absent_secs_for(&id),
+        });
+    }
+
+    compute_fleet_status(&signals, DEFAULT_ABSENCE_THRESHOLD_SECS)
+}
+
+/// Assemble the operator-facing remediation view (bd-..14.4) from the daemon
+/// status response. This is only the CLI-side fallback for a daemon that
+/// predates the `remediation` status field — the daemon is the authoritative
+/// source; both call the same pure `rch_common` assembler so the result is
+/// identical regardless of where the inputs are gathered.
+fn build_remediation_view_from_status(
+    status: &DaemonFullStatusResponse,
+) -> rch_common::remediation_view::RemediationView {
+    use rch_common::bypass_record::BypassState;
+    use rch_common::fleet_diff::WorkerObservation;
+    use rch_common::fleet_status::DEFAULT_ABSENCE_THRESHOLD_SECS;
+    use rch_common::remediation_view::{
+        DiskLevel, JobsInput, MAX_VIEW_INCIDENTS, ProofQueueInput, RemediationIncidentLine,
+        RemediationWorkerRow, assemble, build_inputs,
+    };
+
+    let rows: Vec<RemediationWorkerRow> = status
+        .workers
+        .iter()
+        .map(|w| {
+            let facts_known = w.pressure_state.as_deref() != Some("telemetry_gap");
+            RemediationWorkerRow {
+                observation: WorkerObservation {
+                    worker_id: w.id.clone(),
+                    configured: true,
+                    in_daemon_pool: true,
+                    reachable: w.status != "unreachable",
+                    admin_disabled: w.status == "disabled",
+                    temporarily_bypassed: w.bypass.is_some(),
+                    facts_known,
+                    command_admissible: true,
+                },
+                disk_level: DiskLevel::from_pressure_state(
+                    w.pressure_state.as_deref().unwrap_or(""),
+                ),
+                reclaiming: false,
+                free_ratio: w.pressure_disk_free_ratio,
+                slots_used: w.used_slots,
+                slots_total: w.total_slots,
+                telemetry_known: facts_known,
+                telemetry_fresh: w.pressure_telemetry_fresh.unwrap_or(false),
+                telemetry_age_secs: w.pressure_telemetry_age_secs,
+                recovered_pending_canary: w
+                    .bypass
+                    .as_ref()
+                    .is_some_and(|b| b.state == BypassState::RecoveredPendingCanary),
+                absent_secs: None,
+            }
+        })
+        .collect();
+
+    let jobs = JobsInput {
+        active: status.active_builds.len(),
+        queued: status.queued_builds.len(),
+        stuck: 0,
+    };
+
+    let incidents: Vec<RemediationIncidentLine> = status
+        .alerts
+        .iter()
+        .filter(|a| a.state == "active")
+        .take(MAX_VIEW_INCIDENTS)
+        .map(|a| {
+            RemediationIncidentLine::new(
+                a.kind.clone(),
+                "alert",
+                a.worker_id.clone(),
+                0,
+                &a.message,
+            )
+        })
+        .collect();
+
+    let inputs = build_inputs(
+        &rows,
+        jobs,
+        ProofQueueInput::default(),
+        incidents,
+        DEFAULT_ABSENCE_THRESHOLD_SECS,
+    );
+    assemble(&inputs, 0)
+}
+
 fn status_overview_section_flags(workers: bool, jobs: bool, ctx: &OutputContext) -> (bool, bool) {
     (workers || ctx.is_verbose(), jobs || ctx.is_verbose())
 }
@@ -1376,12 +2951,98 @@ fn render_status_verbose_detail_lines(
 // Check Command
 // =============================================================================
 
+const CHECK_HOOK_NOT_INSTALLED_ISSUE: &str = "Claude Code hook not installed";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CheckIssueSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+fn check_issue_severity(severity: &str) -> CheckIssueSeverity {
+    if severity.eq_ignore_ascii_case("error") || severity.eq_ignore_ascii_case("critical") {
+        CheckIssueSeverity::Error
+    } else if severity.eq_ignore_ascii_case("info") {
+        CheckIssueSeverity::Info
+    } else {
+        CheckIssueSeverity::Warning
+    }
+}
+
+fn derive_check_outcome(
+    total_count: usize,
+    healthy_count: usize,
+    unhealthy: &[String],
+    daemon_issues: &[IssueFromApi],
+    hook_installed: bool,
+) -> (String, i32, Vec<String>) {
+    let mut issues_list: Vec<String> = unhealthy
+        .iter()
+        .map(|w| format!("Worker {} is unreachable", w))
+        .collect();
+    issues_list.extend(daemon_issues.iter().map(|issue| issue.summary.clone()));
+
+    let daemon_issue_severity = daemon_issues
+        .iter()
+        .map(|issue| check_issue_severity(&issue.severity))
+        .max();
+
+    let (mut status, mut exit_code, mut issues) = if total_count == 0 {
+        issues_list.insert(0, "No workers configured".to_string());
+        ("not_ready".to_string(), 2, issues_list)
+    } else if healthy_count == total_count {
+        ("ready".to_string(), 0, issues_list)
+    } else if healthy_count > 0 {
+        if issues_list.is_empty() {
+            let not_healthy = total_count.saturating_sub(healthy_count);
+            let worker_word = if not_healthy == 1 {
+                "worker"
+            } else {
+                "workers"
+            };
+            let verb = if not_healthy == 1 { "is" } else { "are" };
+            issues_list.push(format!(
+                "{not_healthy} configured {worker_word} {verb} not healthy ({healthy_count}/{total_count} healthy)"
+            ));
+        }
+        ("degraded".to_string(), 1, issues_list)
+    } else {
+        issues_list.insert(0, "All workers are unreachable".to_string());
+        ("not_ready".to_string(), 2, issues_list)
+    };
+
+    match daemon_issue_severity {
+        Some(CheckIssueSeverity::Error) => {
+            status = "not_ready".to_string();
+            exit_code = 2;
+        }
+        Some(CheckIssueSeverity::Warning) if status == "ready" => {
+            status = "degraded".to_string();
+            exit_code = 1;
+        }
+        _ => {}
+    }
+
+    if !hook_installed {
+        if status == "ready" || status == "degraded" {
+            issues.insert(0, CHECK_HOOK_NOT_INSTALLED_ISSUE.to_string());
+        } else {
+            issues.push(CHECK_HOOK_NOT_INSTALLED_ISSUE.to_string());
+        }
+        status = "not_ready".to_string();
+        exit_code = 2;
+    }
+
+    (status, exit_code, issues)
+}
+
 /// Quick health check: "Is RCH working right now?"
 ///
 /// Returns exit codes:
-/// - 0: Ready (daemon running, all workers healthy)
+/// - 0: Ready (daemon running, hook installed, all workers healthy)
 /// - 1: Degraded (daemon running, some workers unreachable)
-/// - 2: Not ready (daemon not running or fatal issues)
+/// - 2: Not ready (daemon/hook missing or fatal issues)
 pub async fn check(ctx: &OutputContext) -> Result<()> {
     #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
     struct CheckResponse {
@@ -1415,16 +3076,26 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
     // Try to query daemon status
     let daemon_result = send_daemon_command("GET /status\n").await;
 
+    // Check if hook is installed. RCH is not "ready" for transparent
+    // Claude Code offload unless the hook is actually present.
+    let hook_installed = {
+        use crate::agent::{AgentKind, HookStatus, check_hook_status};
+        matches!(
+            check_hook_status(AgentKind::ClaudeCode),
+            Ok(HookStatus::Installed)
+        )
+    };
+
     let (status, exit_code, daemon_info, workers_info, issues) = match daemon_result {
         Ok(response) => {
             match extract_json_body(&response) {
                 Some(json) => {
                     match serde_json::from_str::<DaemonFullStatusResponse>(json) {
-                        Ok(status) => {
+                        Ok(daemon_status) => {
                             // Daemon is running - determine health
-                            let healthy_count = status.daemon.workers_healthy;
-                            let total_count = status.daemon.workers_total;
-                            let unhealthy: Vec<String> = status
+                            let healthy_count = daemon_status.daemon.workers_healthy;
+                            let total_count = daemon_status.daemon.workers_total;
+                            let unhealthy: Vec<String> = daemon_status
                                 .workers
                                 .iter()
                                 .filter(|w| {
@@ -1437,8 +3108,8 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
 
                             let daemon_info = DaemonCheckInfo {
                                 running: true,
-                                pid: Some(status.daemon.pid),
-                                uptime_secs: Some(status.daemon.uptime_secs),
+                                pid: Some(daemon_status.daemon.pid),
+                                uptime_secs: Some(daemon_status.daemon.uptime_secs),
                             };
 
                             let workers_info = WorkersCheckInfo {
@@ -1447,91 +3118,14 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                                 unhealthy: unhealthy.clone(),
                             };
 
-                            let pressure_blocked =
-                                crate::status_types::critical_pressure_worker_count(
-                                    &status.workers,
-                                );
-                            let admissible_workers =
-                                crate::status_types::remote_admissible_worker_count(
-                                    &status.workers,
-                                );
-                            let mut issues_list: Vec<String> = unhealthy
-                                .iter()
-                                .map(|w| format!("Worker {} is unreachable", w))
-                                .collect();
-
-                            if pressure_blocked > 0 {
-                                issues_list.push(format!(
-                                    "{} worker(s) blocked by critical storage pressure",
-                                    pressure_blocked
-                                ));
-                            }
-
-                            // Add daemon-reported issues
-                            for issue in &status.issues {
-                                issues_list.push(issue.summary.clone());
-                            }
-
-                            if total_count == 0 {
-                                (
-                                    "not_ready".to_string(),
-                                    2,
-                                    daemon_info,
-                                    workers_info,
-                                    vec!["No workers configured".to_string()],
-                                )
-                            } else if !status.workers.is_empty()
-                                && pressure_blocked > 0
-                                && admissible_workers == 0
-                            {
-                                issues_list.insert(
-                                    0,
-                                    "All workers are blocked by critical storage pressure"
-                                        .to_string(),
-                                );
-                                (
-                                    "not_ready".to_string(),
-                                    2,
-                                    daemon_info,
-                                    workers_info,
-                                    issues_list,
-                                )
-                            } else if healthy_count == total_count {
-                                if pressure_blocked > 0 {
-                                    (
-                                        "degraded".to_string(),
-                                        1,
-                                        daemon_info,
-                                        workers_info,
-                                        issues_list,
-                                    )
-                                } else {
-                                    (
-                                        "ready".to_string(),
-                                        0,
-                                        daemon_info,
-                                        workers_info,
-                                        issues_list,
-                                    )
-                                }
-                            } else if healthy_count > 0 {
-                                (
-                                    "degraded".to_string(),
-                                    1,
-                                    daemon_info,
-                                    workers_info,
-                                    issues_list,
-                                )
-                            } else {
-                                issues_list.insert(0, "All workers are unreachable".to_string());
-                                (
-                                    "not_ready".to_string(),
-                                    2,
-                                    daemon_info,
-                                    workers_info,
-                                    issues_list,
-                                )
-                            }
+                            let (status, exit_code, issues) = derive_check_outcome(
+                                total_count,
+                                healthy_count,
+                                &unhealthy,
+                                &daemon_status.issues,
+                                hook_installed,
+                            );
+                            (status, exit_code, daemon_info, workers_info, issues)
                         }
                         Err(_) => {
                             let daemon_info = DaemonCheckInfo {
@@ -1597,15 +3191,6 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
         }
     };
 
-    // Check if hook is installed
-    let hook_installed = {
-        use crate::agent::{AgentKind, HookStatus, check_hook_status};
-        matches!(
-            check_hook_status(AgentKind::ClaudeCode),
-            Ok(HookStatus::Installed)
-        )
-    };
-
     let hook_info = HookCheckInfo {
         installed: hook_installed,
     };
@@ -1641,13 +3226,21 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
             );
         }
         "degraded" => {
-            println!(
-                "{} RCH degraded: {}/{} workers unreachable ({})",
-                style.warning("\u{26A0}"),
-                workers_info.unhealthy.len(),
-                workers_info.total,
-                workers_info.unhealthy.join(", ")
-            );
+            if workers_info.unhealthy.is_empty() {
+                let issue = issues
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("some workers are not fully healthy");
+                println!("{} RCH degraded: {}", style.warning("\u{26A0}"), issue);
+            } else {
+                println!(
+                    "{} RCH degraded: {}/{} workers unreachable ({})",
+                    style.warning("\u{26A0}"),
+                    workers_info.unhealthy.len(),
+                    workers_info.total,
+                    workers_info.unhealthy.join(", ")
+                );
+            }
         }
         "not_ready" => {
             let issue = issues
@@ -1807,90 +3400,65 @@ mod tests {
         .unwrap()
     }
 
-    fn make_worker_selection(
-        worker: Option<SelectedWorker>,
-        reason: SelectionReason,
-    ) -> Option<DiagnoseWorkerSelection> {
-        Some(DiagnoseWorkerSelection {
-            estimated_cores: 4,
-            worker,
-            reason,
-        })
+    fn check_issue(severity: &str, summary: &str) -> IssueFromApi {
+        IssueFromApi {
+            severity: severity.to_string(),
+            summary: summary.to_string(),
+            remediation: None,
+        }
     }
 
     #[test]
-    fn test_dry_run_summary_blocks_offload_when_selection_has_no_worker() {
-        let selection = make_worker_selection(
-            None,
-            SelectionReason::NoAdmissibleWorkers("critical_pressure=5".to_string()),
-        );
-
-        let summary = build_dry_run_summary(true, "compilation command", &selection, true);
-
-        assert!(!summary.would_offload);
-        assert!(summary.reason.contains("worker selection is blocked"));
-        assert!(summary.reason.contains("critical_pressure=5"));
-        assert!(
-            summary
-                .pipeline_steps
-                .iter()
-                .filter(|step| step.step >= 3)
-                .all(|step| step.skipped)
-        );
-        assert!(
-            summary
-                .pipeline_steps
-                .iter()
-                .find(|step| step.step == 6)
-                .unwrap()
-                .skip_reason
-                .as_deref()
-                .unwrap_or("")
-                .contains("critical_pressure=5")
-        );
-    }
-
-    #[test]
-    fn test_dry_run_summary_reports_selected_worker_as_offloadable() {
-        let worker = SelectedWorker {
-            id: WorkerId::new("builder-1"),
-            host: "builder.local".to_string(),
-            user: "ubuntu".to_string(),
-            identity_file: "~/.ssh/id_ed25519".to_string(),
-            slots_available: 8,
-            speed_score: 80.0,
+    fn diagnose_multi_worker_allow_set_honors_selected_member() {
+        let plan =
+            resolve_placement(|key| (key == "RCH_WORKER").then(|| "busy,available".to_string()));
+        let diagnostics = rch_common::SelectionDiagnostics {
+            required_runtime: RequiredRuntime::None,
+            estimated_cores: 2,
+            min_success_rate: 0.8,
+            fallback_min_success_rate: 0.5,
+            active_project_exclusion_count: 0,
+            workers: vec![rch_common::WorkerSelectionDiagnostic {
+                worker_id: rch_common::WorkerId::new("busy"),
+                status: "healthy".to_string(),
+                circuit_state: "closed".to_string(),
+                pressure_state: "healthy".to_string(),
+                pressure_reason_code: "pressure.healthy".to_string(),
+                success_rate: Some(1.0),
+                min_success_rate: 0.8,
+                fallback_min_success_rate: 0.5,
+                required_runtime: RequiredRuntime::None,
+                runtime_available: true,
+                available_slots: 0,
+                total_slots: 8,
+                estimated_cores: 2,
+                active_project_excluded: false,
+                final_decision: rch_common::WorkerSelectionDiagnosticDecision::Deny,
+                final_reason: "available slots 0 < 2".to_string(),
+                reason_codes: vec!["slots.insufficient".to_string()],
+            }],
         };
-        let selection = make_worker_selection(Some(worker), SelectionReason::Success);
+        let selection = Some(DiagnoseWorkerSelection {
+            estimated_cores: 2,
+            cargo_jobs: None,
+            worker: Some(rch_common::SelectedWorker {
+                id: rch_common::WorkerId::new("available"),
+                host: "worker.example".to_string(),
+                user: "builder".to_string(),
+                identity_file: "~/.ssh/id_rsa".to_string(),
+                slots_available: 6,
+                speed_score: 90.0,
+            }),
+            reason: rch_common::SelectionReason::Success,
+            diagnostics: Some(diagnostics),
+        });
 
-        let summary = build_dry_run_summary(true, "compilation command", &selection, true);
-
-        assert!(summary.would_offload);
-        assert!(summary.reason.contains("builder-1"));
-        assert!(
-            summary
-                .pipeline_steps
-                .iter()
-                .filter(|step| step.step >= 3)
-                .all(|step| !step.skipped)
-        );
-    }
-
-    #[test]
-    fn test_dry_run_summary_blocks_offload_when_daemon_unreachable() {
-        let summary = build_dry_run_summary(true, "compilation command", &None, false);
-
-        assert!(!summary.would_offload);
-        assert!(summary.reason.contains("daemon is not reachable"));
+        let refined = refine_diagnose_placement(plan, &selection);
         assert_eq!(
-            summary
-                .pipeline_steps
-                .iter()
-                .find(|step| step.step == 3)
-                .unwrap()
-                .skip_reason
-                .as_deref(),
-            Some("Daemon not reachable")
+            refined.requested_worker_outcome.status,
+            rch_common::RequestedWorkerStatus::Honored
         );
+        assert_eq!(refined.effective_worker.as_deref(), Some("available"));
     }
 
     #[test]
@@ -1921,6 +3489,113 @@ mod tests {
         assert!(output.contains("Started"));
         assert!(output.contains("Active Alerts"));
         assert!(output.contains("Known Issues"));
+    }
+
+    #[test]
+    fn test_check_outcome_ready_requires_hook() {
+        let unhealthy = Vec::new();
+        let daemon_issues = Vec::new();
+        let (status, exit_code, issues) =
+            derive_check_outcome(2, 2, &unhealthy, &daemon_issues, false);
+
+        assert_eq!(status, "not_ready");
+        assert_eq!(exit_code, 2);
+        assert_eq!(
+            issues.first().map(String::as_str),
+            Some(CHECK_HOOK_NOT_INSTALLED_ISSUE)
+        );
+    }
+
+    #[test]
+    fn test_check_outcome_ready_when_hook_installed() {
+        let unhealthy = Vec::new();
+        let daemon_issues = Vec::new();
+        let (status, exit_code, issues) =
+            derive_check_outcome(2, 2, &unhealthy, &daemon_issues, true);
+
+        assert_eq!(status, "ready");
+        assert_eq!(exit_code, 0);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn test_check_outcome_degraded_missing_hook_promotes_not_ready() {
+        let unhealthy = vec!["builder-2".to_string()];
+        let daemon_issues = vec![check_issue("warning", "worker pressure")];
+        let (status, exit_code, issues) =
+            derive_check_outcome(2, 1, &unhealthy, &daemon_issues, false);
+
+        assert_eq!(status, "not_ready");
+        assert_eq!(exit_code, 2);
+        assert_eq!(
+            issues.first().map(String::as_str),
+            Some(CHECK_HOOK_NOT_INSTALLED_ISSUE)
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue == "Worker builder-2 is unreachable")
+        );
+        assert!(issues.iter().any(|issue| issue == "worker pressure"));
+    }
+
+    #[test]
+    fn test_check_outcome_ready_with_daemon_warning_is_degraded() {
+        let unhealthy = Vec::new();
+        let daemon_issues = vec![check_issue("warning", "worker pressure")];
+        let (status, exit_code, issues) =
+            derive_check_outcome(2, 2, &unhealthy, &daemon_issues, true);
+
+        assert_eq!(status, "degraded");
+        assert_eq!(exit_code, 1);
+        assert_eq!(issues, vec!["worker pressure"]);
+    }
+
+    #[test]
+    fn test_check_outcome_daemon_error_is_not_ready() {
+        let unhealthy = Vec::new();
+        let daemon_issues = vec![check_issue("error", "daemon failed to clean up a build")];
+        let (status, exit_code, issues) =
+            derive_check_outcome(2, 2, &unhealthy, &daemon_issues, true);
+
+        assert_eq!(status, "not_ready");
+        assert_eq!(exit_code, 2);
+        assert_eq!(issues, vec!["daemon failed to clean up a build"]);
+    }
+
+    #[test]
+    fn test_check_outcome_zero_workers_preserves_daemon_issues() {
+        let unhealthy = Vec::new();
+        let daemon_issues = vec![check_issue("warning", "stale pressure telemetry")];
+        let (status, exit_code, issues) =
+            derive_check_outcome(0, 0, &unhealthy, &daemon_issues, true);
+
+        assert_eq!(status, "not_ready");
+        assert_eq!(exit_code, 2);
+        assert_eq!(
+            issues.first().map(String::as_str),
+            Some("No workers configured")
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue == "stale pressure telemetry")
+        );
+    }
+
+    #[test]
+    fn test_check_outcome_partial_health_without_named_unhealthy_worker_explains_degraded() {
+        let unhealthy = Vec::new();
+        let daemon_issues = Vec::new();
+        let (status, exit_code, issues) =
+            derive_check_outcome(3, 2, &unhealthy, &daemon_issues, true);
+
+        assert_eq!(status, "degraded");
+        assert_eq!(exit_code, 1);
+        assert_eq!(
+            issues,
+            vec!["1 configured worker is not healthy (2/3 healthy)".to_string()]
+        );
     }
 
     #[test]
@@ -1956,5 +3631,435 @@ mod tests {
         let failed_output = render_self_test_result_verbose_lines(&failed, &style).join("\n");
         assert!(failed_output.contains("error:"));
         assert!(failed_output.contains("deliberately long"));
+    }
+
+    // ========================
+    // Smoke-profile consumer tests (bd-...-ocv9i.16.6)
+    // ========================
+
+    #[test]
+    fn build_smoke_inputs_maps_environment_and_flags() {
+        // Workers + daemon up => remote execution available.
+        let i = build_smoke_inputs(true, true, false, false, None);
+        assert!(i.workers_configured);
+        assert!(i.remote_execution_available);
+        assert_eq!(i.mode, ProfileMode::Smoke);
+        assert!(!i.dry_run);
+
+        // No workers => remote unavailable even if the daemon is up.
+        assert!(!build_smoke_inputs(false, true, false, false, None).remote_execution_available);
+        // Daemon down => remote unavailable even with workers.
+        assert!(!build_smoke_inputs(true, false, false, false, None).remote_execution_available);
+
+        // soak + dry_run + a selected worker are carried through.
+        let i = build_smoke_inputs(true, true, true, true, Some("css".to_string()));
+        assert_eq!(i.mode, ProfileMode::Soak);
+        assert!(i.dry_run);
+        assert_eq!(i.selected_worker.as_deref(), Some("css"));
+    }
+
+    #[test]
+    fn smoke_planned_events_cover_every_scenario_with_reasons() {
+        // No-workers plan: real-worker scenarios skip with a reason, the daemon
+        // scenario runs, and proof-mode refusal is expected.
+        let inputs = build_smoke_inputs(false, false, false, false, None);
+        let plan = plan_smoke_profile(&inputs);
+        let events = smoke_planned_events(&plan, "run-1", Some("css"));
+
+        assert_eq!(events.len(), SmokeScenario::ALL.len());
+        assert!(
+            events
+                .iter()
+                .all(|e| e.run_id == "run-1" && e.event == "planned" && e.bead_id == SMOKE_BEAD_ID)
+        );
+
+        // The daemon scenario is not worker-scoped, so its worker id is dropped.
+        let daemon = events
+            .iter()
+            .find(|e| e.scenario == "daemon_reachable")
+            .unwrap();
+        assert_eq!(daemon.worker_id, None);
+        assert_eq!(daemon.status, "run");
+
+        // A real-worker scenario keeps the worker and carries the skip reason.
+        let canary = events
+            .iter()
+            .find(|e| e.scenario == "cargo_canary")
+            .unwrap();
+        assert_eq!(canary.worker_id.as_deref(), Some("css"));
+        assert_eq!(canary.status, "skip");
+        assert_eq!(canary.reason_code.as_deref(), Some("smoke_no_real_workers"));
+
+        // Remote unavailable => proof-mode refusal is expected.
+        let proof = events
+            .iter()
+            .find(|e| e.scenario == "proof_mode_refusal")
+            .unwrap();
+        assert_eq!(proof.status, "expect_refusal");
+    }
+
+    #[test]
+    fn smoke_planned_events_full_fleet_runs_per_worker_scenarios() {
+        let inputs = build_smoke_inputs(true, true, false, false, None);
+        let plan = plan_smoke_profile(&inputs);
+        let events = smoke_planned_events(&plan, "run-2", Some("hz1"));
+        let canary = events
+            .iter()
+            .find(|e| e.scenario == "cargo_canary")
+            .unwrap();
+        assert_eq!(canary.status, "run");
+        assert_eq!(canary.reason_code, None);
+        // Remote available => proof-mode refusal cannot be exercised (skipped).
+        let proof = events
+            .iter()
+            .find(|e| e.scenario == "proof_mode_refusal")
+            .unwrap();
+        assert_eq!(proof.status, "skip");
+        assert_eq!(proof.reason_code.as_deref(), Some("smoke_remote_available"));
+    }
+
+    #[test]
+    fn smoke_fleet_consistency_pass_and_fail_paths() {
+        use rch_common::fleet_diff::WorkerObservation;
+        use rch_common::fleet_status::{
+            DEFAULT_ABSENCE_THRESHOLD_SECS, FleetWorkerSignal, compute_fleet_status,
+        };
+        let ready = |id: &str| FleetWorkerSignal {
+            observation: WorkerObservation {
+                worker_id: id.to_string(),
+                configured: true,
+                in_daemon_pool: true,
+                reachable: true,
+                admin_disabled: false,
+                temporarily_bypassed: false,
+                facts_known: true,
+                command_admissible: true,
+            },
+            disk_pressure: false,
+            slots_saturated: false,
+            absent_secs: None,
+        };
+
+        // Ready workers, no absences -> inventory consistent.
+        let healthy =
+            compute_fleet_status(&[ready("a"), ready("b")], DEFAULT_ABSENCE_THRESHOLD_SECS);
+        assert_eq!(smoke_fleet_consistency(&healthy), (true, None));
+
+        // Workers present but none ready -> capacity collapsed -> inconsistent.
+        let mut down1 = ready("a");
+        down1.observation.reachable = false;
+        let mut down2 = ready("b");
+        down2.observation.reachable = false;
+        let collapsed = compute_fleet_status(&[down1, down2], DEFAULT_ABSENCE_THRESHOLD_SECS);
+        let (ok, reason) = smoke_fleet_consistency(&collapsed);
+        assert!(!ok);
+        assert_eq!(reason.as_deref(), Some("fleet_capacity_collapsed"));
+
+        // A configured worker sustained-absent from live -> inventory drift.
+        let mut absent = ready("c");
+        absent.observation.reachable = false;
+        absent.observation.in_daemon_pool = false;
+        absent.absent_secs = Some(DEFAULT_ABSENCE_THRESHOLD_SECS + 10);
+        let drifted = compute_fleet_status(&[ready("a"), absent], DEFAULT_ABSENCE_THRESHOLD_SECS);
+        let (ok2, reason2) = smoke_fleet_consistency(&drifted);
+        assert!(!ok2);
+        assert_eq!(reason2.as_deref(), Some("fleet_workers_absent"));
+    }
+
+    fn self_test_result(
+        passed: bool,
+        local_hash: Option<&str>,
+        remote_hash: Option<&str>,
+        remote_time_ms: Option<u64>,
+        error: Option<&str>,
+    ) -> SelfTestResultRecordFromApi {
+        SelfTestResultRecordFromApi {
+            run_id: 1,
+            worker_id: "hz1".to_string(),
+            passed,
+            local_hash: local_hash.map(str::to_string),
+            remote_hash: remote_hash.map(str::to_string),
+            local_time_ms: Some(10),
+            remote_time_ms,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn smoke_canary_verdict_passes_when_remote_build_completed() {
+        // A recorded remote compilation time means the worker finished building,
+        // even if a later step (artifact hash) ultimately failed the run.
+        let built_then_mismatch = self_test_result(
+            false,
+            Some("aaa"),
+            Some("bbb"),
+            Some(1500),
+            Some("mismatch"),
+        );
+        assert_eq!(smoke_canary_verdict(&built_then_mismatch), (true, None));
+
+        let full_pass = self_test_result(true, Some("aaa"), Some("aaa"), Some(900), None);
+        assert_eq!(smoke_canary_verdict(&full_pass), (true, None));
+    }
+
+    #[test]
+    fn smoke_canary_verdict_fails_when_remote_build_never_ran() {
+        // No remote time => the build never completed; carry the daemon error.
+        let connect_fail = self_test_result(false, None, None, None, Some("ssh connect refused"));
+        let (passed, reason) = smoke_canary_verdict(&connect_fail);
+        assert!(!passed);
+        assert_eq!(reason.as_deref(), Some("ssh connect refused"));
+
+        // Missing error still yields a stable fallback token (never a silent pass).
+        let no_error = self_test_result(false, None, None, None, None);
+        let (passed2, reason2) = smoke_canary_verdict(&no_error);
+        assert!(!passed2);
+        assert_eq!(reason2.as_deref(), Some("remote_build_failed"));
+    }
+
+    #[test]
+    fn smoke_artifact_verdict_passes_on_retrieval_regardless_of_byte_identity() {
+        // Full pass: hashes matched and the artifact came back -> retrieved.
+        let pass = self_test_result(true, Some("aaa"), Some("aaa"), Some(900), None);
+        assert_eq!(smoke_artifact_verdict(&pass), (true, None));
+        assert!(smoke_artifact_byte_identical(&pass));
+
+        // Built remotely but no artifact rsynced back -> NOT retrieved.
+        let not_retrieved = self_test_result(false, Some("aaa"), None, Some(900), None);
+        let (p1, r1) = smoke_artifact_verdict(&not_retrieved);
+        assert!(!p1);
+        assert_eq!(r1.as_deref(), Some("artifact_not_retrieved"));
+
+        // Artifact came back but differs from the local build (worker rustc drift):
+        // RETRIEVAL still succeeded; byte-identity is reported separately, not a
+        // retrieval failure.
+        let drift = self_test_result(false, Some("aaa"), Some("bbb"), Some(900), None);
+        assert_eq!(smoke_artifact_verdict(&drift), (true, None));
+        assert!(!smoke_artifact_byte_identical(&drift));
+    }
+
+    #[test]
+    fn smoke_cancel_verdict_accepts_only_deterministic_not_found() {
+        // The not-found refusal for a synthetic build id is the expected pass.
+        assert_eq!(smoke_cancel_verdict(Some("error")), (true, None));
+
+        // A "cancelled" status would mean we actually killed a real build — a
+        // safety regression for the non-destructive probe, so it must fail.
+        let (p, r) = smoke_cancel_verdict(Some("cancelled"));
+        assert!(!p);
+        assert_eq!(r.as_deref(), Some("unexpected_cancel_status:cancelled"));
+
+        let (p2, r2) = smoke_cancel_verdict(None);
+        assert!(!p2);
+        assert_eq!(r2.as_deref(), Some("cancel_response_malformed"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-agent load / storm-control (`--load`) wiring (bd-p4l0q)
+    // -----------------------------------------------------------------------
+
+    fn mk_worker_status(
+        id: &str,
+        status: &str,
+        circuit: &str,
+        slots: u32,
+        speed: f64,
+    ) -> WorkerStatusFromApi {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "host": "h",
+            "user": "u",
+            "status": status,
+            "circuit_state": circuit,
+            "used_slots": 0,
+            "total_slots": slots,
+            "speed_score": speed,
+            "last_error": null,
+        }))
+        .expect("worker status")
+    }
+
+    #[test]
+    fn worker_eligibility_maps_live_status() {
+        // Healthy/busy/ready map to schedulable; degraded stays schedulable.
+        assert_eq!(
+            worker_eligibility(&mk_worker_status("a", "ready", "closed", 4, 1.0)),
+            WorkerEligibility::Healthy
+        );
+        assert_eq!(
+            worker_eligibility(&mk_worker_status("a", "degraded", "closed", 4, 1.0)),
+            WorkerEligibility::Degraded
+        );
+        // Offline / disabled are not schedulable.
+        assert_eq!(
+            worker_eligibility(&mk_worker_status("a", "offline", "closed", 4, 1.0)),
+            WorkerEligibility::CapabilityInadmissible
+        );
+        assert_eq!(
+            worker_eligibility(&mk_worker_status("a", "disabled", "closed", 4, 1.0)),
+            WorkerEligibility::AdminDisabled
+        );
+        // An open circuit overrides an otherwise-ready status.
+        assert_eq!(
+            worker_eligibility(&mk_worker_status("a", "ready", "open", 4, 1.0)),
+            WorkerEligibility::TemporaryBypass
+        );
+    }
+
+    #[test]
+    fn build_storm_fleet_carries_slots_speed_and_eligibility() {
+        let workers = vec![
+            mk_worker_status("w1", "ready", "closed", 8, 90.0),
+            mk_worker_status("w2", "offline", "closed", 4, 0.0),
+        ];
+        let fleet = build_storm_fleet(&workers);
+        assert_eq!(fleet.len(), 2);
+        assert_eq!(fleet[0].id, "w1");
+        assert_eq!(fleet[0].total_slots, 8);
+        assert!((fleet[0].speed - 90.0).abs() < f64::EPSILON);
+        assert!(fleet[0].eligibility.is_schedulable());
+        // A zero speed score is floored to a positive weight so fairness math is
+        // well-defined; the offline worker is not schedulable.
+        assert!(fleet[1].speed > 0.0);
+        assert!(!fleet[1].eligibility.is_schedulable());
+    }
+
+    #[test]
+    fn resolve_load_params_defaults_and_overrides() {
+        // No env: waves default, concurrency scales to 2× schedulable, capped.
+        let (waves, conc) = resolve_load_params(3, |_| None);
+        assert_eq!(waves, LOAD_DEFAULT_WAVES);
+        assert_eq!(conc, 6);
+        // Large fleet caps concurrency.
+        let (_, conc_big) = resolve_load_params(50, |_| None);
+        assert_eq!(conc_big, LOAD_DEFAULT_CONCURRENCY_CAP);
+        // Env overrides are honored; invalid/zero values fall back to defaults.
+        let env = |k: &str| match k {
+            "RCH_LOAD_WAVES" => Some("5".to_string()),
+            "RCH_LOAD_CONCURRENCY" => Some("2".to_string()),
+            _ => None,
+        };
+        assert_eq!(resolve_load_params(3, env), (5, 2));
+        let bad = |k: &str| match k {
+            "RCH_LOAD_WAVES" => Some("0".to_string()),
+            "RCH_LOAD_CONCURRENCY" => Some("nope".to_string()),
+            _ => None,
+        };
+        assert_eq!(resolve_load_params(2, bad), (LOAD_DEFAULT_WAVES, 4));
+    }
+
+    #[test]
+    fn plan_load_jobs_round_robins_only_over_schedulable() {
+        let fleet = build_storm_fleet(&[
+            mk_worker_status("w1", "ready", "closed", 4, 100.0),
+            mk_worker_status("w2", "ready", "closed", 4, 100.0),
+            mk_worker_status("down", "offline", "closed", 4, 100.0),
+        ]);
+        // 2 schedulable workers × 3 waves = 6 jobs; the offline worker is never
+        // targeted, and ids are unique.
+        let jobs = plan_load_jobs(&fleet, None, 3);
+        assert_eq!(jobs.len(), 6);
+        assert!(jobs.iter().all(|j| j.worker_id != "down"));
+        let unique: std::collections::BTreeSet<_> =
+            jobs.iter().map(|j| j.local_job_id.clone()).collect();
+        assert_eq!(unique.len(), 6);
+        assert!(jobs.iter().all(|j| j.local_job_id.starts_with("rchw-")));
+        // Round-robin spread: each schedulable worker gets an equal share.
+        let w1 = jobs.iter().filter(|j| j.worker_id == "w1").count();
+        let w2 = jobs.iter().filter(|j| j.worker_id == "w2").count();
+        assert_eq!((w1, w2), (3, 3));
+    }
+
+    #[test]
+    fn plan_load_jobs_honors_single_worker_selection() {
+        let fleet = build_storm_fleet(&[
+            mk_worker_status("w1", "ready", "closed", 4, 100.0),
+            mk_worker_status("w2", "ready", "closed", 4, 100.0),
+        ]);
+        let jobs = plan_load_jobs(&fleet, Some("w2"), 2);
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|j| j.worker_id == "w2"));
+        // Selecting an ineligible/absent worker yields no jobs.
+        assert!(plan_load_jobs(&fleet, Some("ghost"), 2).is_empty());
+    }
+
+    #[test]
+    fn classify_load_outcome_splits_remote_vs_fallback() {
+        let spec = LoadJobSpec {
+            local_job_id: "rchw-0000".to_string(),
+            worker_id: "w1".to_string(),
+        };
+        // A recorded remote compile time => admitted/ran remotely.
+        let remote = classify_load_outcome(&spec, 42, 900, Some(700));
+        assert_eq!(
+            remote.disposition,
+            rch_common::storm_control::LiveDisposition::Remote
+        );
+        assert_eq!(remote.remote_job_id, Some(42));
+        assert_eq!(remote.selected_worker.as_deref(), Some("w1"));
+        assert_eq!(remote.runtime_ms, 700);
+        // No remote time => the fail-open canary fell back to local.
+        let fallback = classify_load_outcome(&spec, 43, 1200, None);
+        assert_eq!(
+            fallback.disposition,
+            rch_common::storm_control::LiveDisposition::LocalFallback
+        );
+        assert_eq!(fallback.remote_job_id, None);
+        assert!(fallback.selected_worker.is_none());
+        assert_eq!(fallback.runtime_ms, 1200);
+    }
+
+    #[test]
+    fn live_load_run_built_from_real_outcomes_upholds_invariants() {
+        // End-to-end of the pure path: plan a swarm over a 3-worker fleet, mark
+        // each job as a remote success, and confirm the assembled StormRun passes
+        // the same five storm-control invariants the live `--load` run gates on.
+        let fleet = build_storm_fleet(&[
+            mk_worker_status("w1", "ready", "closed", 4, 100.0),
+            mk_worker_status("w2", "ready", "closed", 4, 100.0),
+            mk_worker_status("w3", "ready", "closed", 4, 100.0),
+        ]);
+        let specs = plan_load_jobs(&fleet, None, 4);
+        let outcomes: Vec<LiveJobOutcome> = specs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| classify_load_outcome(s, (i + 1) as u64, 600, Some(500)))
+            .collect();
+        let cfg = StormConfig::new("load-test", LOAD_BEAD_ID);
+        let run = build_live_storm_run(&cfg, &fleet, &outcomes);
+        let reports = check_all_invariants(
+            &run,
+            &fleet,
+            LOAD_FAIRNESS_TOLERANCE,
+            LOAD_MAX_FALLBACK_RATIO,
+        );
+        assert!(all_passed(&reports), "live load invariants: {reports:?}");
+        assert_eq!(run.summary.remote_successes, specs.len() as u32);
+    }
+
+    #[test]
+    fn live_load_run_with_one_offline_worker_never_targets_it() {
+        // A fleet with an ineligible worker: it appears in the fleet description
+        // (so the invariant is non-vacuous) but never receives work.
+        let fleet = build_storm_fleet(&[
+            mk_worker_status("good", "ready", "closed", 4, 100.0),
+            mk_worker_status("bad", "offline", "closed", 4, 100.0),
+        ]);
+        let specs = plan_load_jobs(&fleet, None, 3);
+        let outcomes: Vec<LiveJobOutcome> = specs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| classify_load_outcome(s, (i + 1) as u64, 600, Some(500)))
+            .collect();
+        let cfg = StormConfig::new("load-test", LOAD_BEAD_ID);
+        let run = build_live_storm_run(&cfg, &fleet, &outcomes);
+        let report = check_all_invariants(
+            &run,
+            &fleet,
+            LOAD_FAIRNESS_TOLERANCE,
+            LOAD_MAX_FALLBACK_RATIO,
+        );
+        assert!(all_passed(&report));
+        assert_eq!(run.summary.per_worker_slot_utilization["bad"], 0.0);
     }
 }

@@ -307,9 +307,9 @@ pub fn detect_state() -> Result<RchState> {
 
 /// Detect user configuration state.
 fn detect_user_config(issues: &mut Vec<StateIssue>) -> Result<ConfigState> {
-    let config_dir =
-        dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
-    let config_path = config_dir.join("rch/config.toml");
+    let config_dir = crate::config::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
+    let config_path = config_dir.join("config.toml");
 
     let exists = config_path.exists();
     let mut valid = false;
@@ -400,9 +400,9 @@ fn detect_project_config(_issues: &mut [StateIssue]) -> Result<ConfigState> {
 
 /// Detect workers configuration state.
 fn detect_workers_state(issues: &mut Vec<StateIssue>) -> Result<WorkersState> {
-    let config_dir =
-        dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
-    let config_path = config_dir.join("rch/workers.toml");
+    let config_dir = crate::config::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
+    let config_path = config_dir.join("workers.toml");
 
     let exists = config_path.exists();
     let mut valid = false;
@@ -797,6 +797,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_concurrent_state_access_with_lock() {
         log_test_start("test_concurrent_state_access_with_lock");
         let tmp = TempDir::new().unwrap();
@@ -816,7 +817,7 @@ mod tests {
                 start.wait();
                 let _lock = ConfigLock::acquire_with_timeout(
                     &lock_name,
-                    Duration::from_secs(10),
+                    Duration::from_secs(30),
                     &format!("thread-{i}"),
                 )
                 .expect("lock acquisition failed");

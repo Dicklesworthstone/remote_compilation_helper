@@ -89,6 +89,12 @@ fi
 if [[ "${SYSTEMCTL_MODE:-ok}" == "missing" ]]; then
     exit 1
 fi
+if [[ "${1:-}" == "is-active" ]] && [[ "${2:-}" == "--quiet" ]] && [[ "${3:-}" == "rchd.service" ]]; then
+    if [[ "${SYSTEM_RCHD_ACTIVE:-0}" == "1" ]]; then
+        exit 0
+    fi
+    exit 3
+fi
 exit 0
 EOF
     chmod +x "$bin_dir/systemctl"
@@ -138,28 +144,52 @@ create_prompt_tarball() {
 
     mkdir -p "$pkg_dir"
 
+    # STUB CONTRACT: these fixtures must never be mistakable for the real
+    # binaries. Every invocation announces itself on stderr, and anything
+    # other than --version FAILS with exit 97. In particular `doctor` must
+    # never fake success: a stub that answered "All checks passed" while
+    # silently no-oping real commands masked a broken PATH for five days
+    # (2026-07-11..16 incident).
     cat > "$pkg_dir/rch" << 'EOF'
 #!/bin/bash
+echo "rch TEST STUB (e2e_install_test.sh fixture) — NOT the real rch" >&2
 case "$1" in
     --version) echo "rch 0.1.0-test" ;;
-    doctor) echo "All checks passed"; exit 0 ;;
-    agents) echo "No agents detected"; exit 0 ;;
-    completions) exit 0 ;;
-    *) exit 0 ;;
+    *)
+        echo "rch TEST STUB: refusing to fake '$*'" >&2
+        exit 97
+        ;;
 esac
 EOF
     chmod +x "$pkg_dir/rch"
 
     cat > "$pkg_dir/rchd" << 'EOF'
 #!/bin/bash
+echo "rchd TEST STUB (e2e_install_test.sh fixture) — NOT the real rchd" >&2
 case "$1" in
     --version) echo "rchd 0.1.0-test" ;;
-    *) exit 0 ;;
+    *)
+        echo "rchd TEST STUB: refusing to fake '$*'" >&2
+        exit 97
+        ;;
 esac
 EOF
     chmod +x "$pkg_dir/rchd"
 
-    tar -czf "$tarball" -C "$pkg_dir" rch rchd
+    cat > "$pkg_dir/rch-wkr" << 'EOF'
+#!/bin/bash
+echo "rch-wkr TEST STUB (e2e_install_test.sh fixture) — NOT the real rch-wkr" >&2
+case "$1" in
+    --version) echo "rch-wkr 0.1.0-test" ;;
+    *)
+        echo "rch-wkr TEST STUB: refusing to fake '$*'" >&2
+        exit 97
+        ;;
+esac
+EOF
+    chmod +x "$pkg_dir/rch-wkr"
+
+    tar -czf "$tarball" -C "$pkg_dir" rch rchd rch-wkr
     echo "$tarball"
 }
 
@@ -175,16 +205,25 @@ run_install_case() {
     local systemctl_mode="$9"
     local home_dir="${10:-}"
 
+    # SAFETY: the installer must NEVER see the tester's real HOME. Running
+    # install.sh with the real HOME let its "Add to PATH?" step append the
+    # test fixture's bin dir (containing stub rch binaries) to the real
+    # ~/.zshrc — silently shadowing the production rch for every shell
+    # (2026-07-11..16 incident). Every case gets a sandbox HOME, and
+    # RCH_NO_RC=1 is exported as a second, independent layer.
+    if [[ -z "$home_dir" ]]; then
+        home_dir="$TEST_DIR/sandbox_home_${TEST_COUNT:-0}_$RANDOM"
+    fi
+    mkdir -p "$home_dir"
+
     local output
     local status=0
 
     if [[ "$use_script" == "true" ]]; then
         if command -v script >/dev/null 2>&1; then
             local cmd
-            cmd="RCH_INSTALL_DIR=\"$install_dir\" RCH_CONFIG_DIR=\"$config_dir\" RCH_SKIP_DOCTOR=1 RCH_NO_HOOK=1 NO_GUM=1 SYSTEMCTL_LOG=\"$systemctl_log\" SYSTEMCTL_MODE=\"$systemctl_mode\" PATH=\"$stub_bin:$PATH\""
-            if [[ -n "$home_dir" ]]; then
-                cmd="$cmd HOME=\"$home_dir\""
-            fi
+            cmd="RCH_INSTALL_DIR=\"$install_dir\" RCH_CONFIG_DIR=\"$config_dir\" RCH_SKIP_DOCTOR=1 RCH_NO_HOOK=1 RCH_NO_RC=1 NO_GUM=1 SYSTEMCTL_LOG=\"$systemctl_log\" SYSTEMCTL_MODE=\"$systemctl_mode\" PATH=\"$stub_bin:$PATH\""
+            cmd="$cmd HOME=\"$home_dir\""
             cmd="$cmd \"$PROJECT_ROOT/install.sh\" --offline \"$tarball\" $extra_args"
             output=$(printf '%s' "$input_data" | script -q /dev/null -c "$cmd" 2>&1) || status=$?
         else
@@ -192,30 +231,18 @@ run_install_case() {
             return 2
         fi
     else
-        if [[ -n "$home_dir" ]]; then
-            output=$(printf '%s' "$input_data" | \
-                SYSTEMCTL_LOG="$systemctl_log" \
-                SYSTEMCTL_MODE="$systemctl_mode" \
-                PATH="$stub_bin:$PATH" \
-                HOME="$home_dir" \
-                RCH_INSTALL_DIR="$install_dir" \
-                RCH_CONFIG_DIR="$config_dir" \
-                RCH_SKIP_DOCTOR=1 \
-                RCH_NO_HOOK=1 \
-                NO_GUM=1 \
-                "$PROJECT_ROOT/install.sh" --offline "$tarball" $extra_args 2>&1) || status=$?
-        else
-            output=$(printf '%s' "$input_data" | \
-                SYSTEMCTL_LOG="$systemctl_log" \
-                SYSTEMCTL_MODE="$systemctl_mode" \
-                PATH="$stub_bin:$PATH" \
-                RCH_INSTALL_DIR="$install_dir" \
-                RCH_CONFIG_DIR="$config_dir" \
-                RCH_SKIP_DOCTOR=1 \
-                RCH_NO_HOOK=1 \
-                NO_GUM=1 \
-                "$PROJECT_ROOT/install.sh" --offline "$tarball" $extra_args 2>&1) || status=$?
-        fi
+        output=$(printf '%s' "$input_data" | \
+            SYSTEMCTL_LOG="$systemctl_log" \
+            SYSTEMCTL_MODE="$systemctl_mode" \
+            PATH="$stub_bin:$PATH" \
+            HOME="$home_dir" \
+            RCH_INSTALL_DIR="$install_dir" \
+            RCH_CONFIG_DIR="$config_dir" \
+            RCH_SKIP_DOCTOR=1 \
+            RCH_NO_HOOK=1 \
+            RCH_NO_RC=1 \
+            NO_GUM=1 \
+            "$PROJECT_ROOT/install.sh" --offline "$tarball" $extra_args 2>&1) || status=$?
     fi
 
     echo "$output"
@@ -273,11 +300,15 @@ test_verify_only() {
     local test_install_dir="$TEST_DIR/verify_test/bin"
     mkdir -p "$test_install_dir"
 
+    local verify_home="$TEST_DIR/verify_test/home"
+    mkdir -p "$verify_home"
     local output
     local status=0
-    output=$(RCH_INSTALL_DIR="$test_install_dir" \
+    output=$(HOME="$verify_home" \
+             RCH_INSTALL_DIR="$test_install_dir" \
              RCH_CONFIG_DIR="$TEST_DIR/verify_test/config" \
              RCH_NO_HOOK=1 \
+             RCH_NO_RC=1 \
              NO_GUM=1 \
              "$PROJECT_ROOT/install.sh" --verify-only 2>&1) || status=$?
 
@@ -301,38 +332,50 @@ test_offline_install() {
 
     mkdir -p "$pkg_dir" "$install_dir" "$config_dir"
 
-    # Create mock binaries
+    # Create mock binaries (self-identifying, fail-loud — see stub contract
+    # in create_prompt_tarball).
     cat > "$pkg_dir/rch" << 'EOF'
 #!/bin/bash
+echo "rch TEST STUB (offline-install fixture) — NOT the real rch" >&2
 case "$1" in
     --version) echo "rch 0.1.0-test" ;;
-    doctor) echo "All checks passed"; exit 0 ;;
-    agents) echo "No agents detected"; exit 0 ;;
-    completions) echo "Completions not supported in test mode"; exit 0 ;;
-    *) exit 0 ;;
+    *)
+        echo "rch TEST STUB: refusing to fake '$*'" >&2
+        exit 97
+        ;;
 esac
 EOF
     chmod +x "$pkg_dir/rch"
 
     cat > "$pkg_dir/rchd" << 'EOF'
 #!/bin/bash
+echo "rchd TEST STUB (offline-install fixture) — NOT the real rchd" >&2
 case "$1" in
     --version) echo "rchd 0.1.0-test" ;;
-    *) exit 0 ;;
+    *)
+        echo "rchd TEST STUB: refusing to fake '$*'" >&2
+        exit 97
+        ;;
 esac
 EOF
     chmod +x "$pkg_dir/rchd"
 
-    # Create tarball
-    tar -czf "$TEST_DIR/rch-test.tar.gz" -C "$pkg_dir" rch rchd
+    # Create tarball (all three binaries — the installer requires rch-wkr)
+    cp "$pkg_dir/rch" "$pkg_dir/rch-wkr"
+    tar -czf "$TEST_DIR/rch-test.tar.gz" -C "$pkg_dir" rch rchd rch-wkr
 
-    # Run offline install
+    # Run offline install (sandboxed HOME + RCH_NO_RC: never touch the
+    # tester's real shell rc — see run_install_case).
+    local offline_home="$TEST_DIR/offline_home"
+    mkdir -p "$offline_home"
     local output
     local status=0
-    output=$(RCH_INSTALL_DIR="$install_dir" \
+    output=$(HOME="$offline_home" \
+             RCH_INSTALL_DIR="$install_dir" \
              RCH_CONFIG_DIR="$config_dir" \
              RCH_SKIP_DOCTOR=1 \
              RCH_NO_HOOK=1 \
+             RCH_NO_RC=1 \
              NO_GUM=1 \
              "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-test.tar.gz" --yes 2>&1) || status=$?
 
@@ -377,11 +420,16 @@ test_uninstall() {
     # Create mock config
     echo "test config" > "$config_dir/daemon.toml"
 
-    # Run uninstall
+    # Run uninstall (sandboxed HOME + RCH_NO_RC: never touch the tester's
+    # real shell rc — see run_install_case).
+    local uninstall_home="$TEST_DIR/uninstall_home"
+    mkdir -p "$uninstall_home"
     local output
-    output=$(RCH_INSTALL_DIR="$install_dir" \
+    output=$(HOME="$uninstall_home" \
+             RCH_INSTALL_DIR="$install_dir" \
              RCH_CONFIG_DIR="$config_dir" \
              RCH_NO_HOOK=1 \
+             RCH_NO_RC=1 \
              NO_GUM=1 \
              "$PROJECT_ROOT/install.sh" --uninstall --yes 2>&1) || true
 
@@ -473,22 +521,34 @@ test_easy_mode() {
 
     mkdir -p "$pkg_dir" "$install_dir" "$config_dir"
 
-    # Create mock binaries with doctor support
+    # Create mock binaries with doctor support. This stub's doctor exists so
+    # the easy-mode test can observe the installer invoking it — the output
+    # says SIMULATED loudly so it can never be mistaken for a real health
+    # check (see stub contract in create_prompt_tarball).
     cat > "$pkg_dir/rch" << 'EOF'
 #!/bin/bash
+echo "rch TEST STUB (easy-mode fixture) — NOT the real rch" >&2
 case "$1" in
     --version) echo "rch 0.1.0-test" ;;
-    doctor) echo "RCH Doctor: All checks passed"; exit 0 ;;
-    agents) echo "Detected agents: none"; exit 0 ;;
-    completions) exit 0 ;;
-    *) exit 0 ;;
+    doctor) echo "RCH Doctor [TEST STUB]: SIMULATED result — all checks passed (no real checks ran)"; exit 0 ;;
+    *)
+        echo "rch TEST STUB: refusing to fake '$*'" >&2
+        exit 97
+        ;;
 esac
 EOF
     chmod +x "$pkg_dir/rch"
 
     cat > "$pkg_dir/rchd" << 'EOF'
 #!/bin/bash
-echo "rchd 0.1.0-test"
+echo "rchd TEST STUB (easy-mode fixture) — NOT the real rchd" >&2
+case "$1" in
+    --version) echo "rchd 0.1.0-test" ;;
+    *)
+        echo "rchd TEST STUB: refusing to fake '$*'" >&2
+        exit 97
+        ;;
+esac
 EOF
     chmod +x "$pkg_dir/rchd"
 
@@ -638,22 +698,37 @@ test_config_generation() {
 
     mkdir -p "$pkg_dir" "$install_dir"
 
-    # Create mock binaries
+    # Create mock binaries (self-identifying, fail-loud — see stub contract
+    # in create_prompt_tarball). The installer requires all three binaries
+    # in the tarball, including rch-wkr.
     cat > "$pkg_dir/rch" << 'EOF'
 #!/bin/bash
-echo "rch 0.1.0-test"
+echo "rch TEST STUB (config fixture) — NOT the real rch" >&2
+case "$1" in
+    --version) echo "rch 0.1.0-test" ;;
+    *)
+        echo "rch TEST STUB: refusing to fake '$*'" >&2
+        exit 97
+        ;;
+esac
 EOF
     chmod +x "$pkg_dir/rch"
     cp "$pkg_dir/rch" "$pkg_dir/rchd"
+    cp "$pkg_dir/rch" "$pkg_dir/rch-wkr"
 
-    tar -czf "$TEST_DIR/rch-config.tar.gz" -C "$pkg_dir" rch rchd
+    tar -czf "$TEST_DIR/rch-config.tar.gz" -C "$pkg_dir" rch rchd rch-wkr
 
-    # Install
+    # Install (sandboxed HOME + RCH_NO_RC: never touch the tester's real
+    # shell rc — see run_install_case).
+    local config_home="$TEST_DIR/config_home"
+    mkdir -p "$config_home"
     local output
-    output=$(RCH_INSTALL_DIR="$install_dir" \
+    output=$(HOME="$config_home" \
+             RCH_INSTALL_DIR="$install_dir" \
              RCH_CONFIG_DIR="$config_dir" \
              RCH_SKIP_DOCTOR=1 \
              RCH_NO_HOOK=1 \
+             RCH_NO_RC=1 \
              NO_GUM=1 \
              "$PROJECT_ROOT/install.sh" --offline "$TEST_DIR/rch-config.tar.gz" --yes 2>&1) || true
 
@@ -733,7 +808,7 @@ test_service_prompt_behavior() {
     case_dir="$TEST_DIR/prompt_decline"
     systemctl_log="$case_dir/systemctl.log"
     mkdir -p "$case_dir/bin" "$case_dir/config"
-    output=$(run_install_case "$case_dir/bin" "$case_dir/config" "$tarball" "" "n\n" "true" "$stub_bin" "$systemctl_log" "ok") || true
+    output=$(run_install_case "$case_dir/bin" "$case_dir/config" "$tarball" "" $'n\n' "true" "$stub_bin" "$systemctl_log" "ok") || true
     if [[ "$output" == *"Skipping background daemon setup"* ]]; then
         pass "Interactive decline skips background service"
     else
@@ -772,6 +847,26 @@ test_service_prompt_behavior() {
         pass "Missing service manager warns on opt-in"
     else
         fail "Missing service manager should warn on opt-in"
+    fi
+
+    # Case 8: active system-level rchd marks a pure-worker host and suppresses
+    # both user-service installation and the easy-mode user-daemon restart.
+    case_dir="$TEST_DIR/prompt_system_daemon"
+    systemctl_log="$case_dir/systemctl.log"
+    local home_dir="$case_dir/home"
+    local unit_file="$home_dir/.config/systemd/user/rchd.service"
+    mkdir -p "$case_dir/bin" "$case_dir/config" "$home_dir"
+    output=$(SYSTEM_RCHD_ACTIVE=1 run_install_case "$case_dir/bin" "$case_dir/config" "$tarball" "--easy-mode --yes" "" "false" "$stub_bin" "$systemctl_log" "ok" "$home_dir") || true
+    if [[ "$output" == *"System-level rchd.service is active; skipping duplicate user daemon setup."* ]] && \
+       [[ "$output" == *"System-level rchd.service is active; skipping user-daemon restart."* ]]; then
+        pass "System daemon suppresses easy-mode user daemon paths"
+    else
+        fail "System daemon should suppress easy-mode user daemon paths"
+    fi
+    if [[ ! -e "$unit_file" ]] && ! grep -q -- "--user enable" "$systemctl_log"; then
+        pass "System daemon avoids user unit installation"
+    else
+        fail "System daemon should avoid user unit installation"
     fi
 }
 
@@ -1020,21 +1115,25 @@ log ""
 log "Running E2E tests..."
 log ""
 
-test_help
-test_verify_only
-test_offline_install
-test_uninstall
-test_worker_mode
-test_service_install
-test_easy_mode
-test_ui_detection
-test_wsl_detection
-test_proxy_config
-test_lock_file
-test_config_generation
-test_service_prompt_behavior
-test_systemd_unit_generation
-test_launchd_unit_generation
+if [[ "${RCH_INSTALL_E2E_ONLY:-}" == "service-prompt" ]]; then
+    test_service_prompt_behavior
+else
+    test_help
+    test_verify_only
+    test_offline_install
+    test_uninstall
+    test_worker_mode
+    test_service_install
+    test_easy_mode
+    test_ui_detection
+    test_wsl_detection
+    test_proxy_config
+    test_lock_file
+    test_config_generation
+    test_service_prompt_behavior
+    test_systemd_unit_generation
+    test_launchd_unit_generation
+fi
 
 # ============================================================================
 # Summary

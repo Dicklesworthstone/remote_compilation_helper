@@ -85,6 +85,55 @@ export interface StatusResponse {
   recent_builds: BuildRecord[];
   issues: Issue[];
   stats: BuildStats;
+  /** Operator-facing remediation view assembled by the daemon
+   * (bd-session-history-remediation-ocv9i.14.4). Optional for older daemons. */
+  remediation?: RemediationView;
+}
+
+// Operator-facing remediation view (mirror of
+// `rch_common::remediation_view::RemediationView`).
+export type RemediationActionClass =
+  | 'healthy'
+  | 'normal_fail_open'
+  | 'self_healing_in_progress'
+  | 'operator_action_required';
+
+export type BandSeverity = 'ok' | 'info' | 'warn' | 'critical';
+
+export type RemediationBandId =
+  | 'desired_fleet'
+  | 'live_eligibility'
+  | 'admissible_workers'
+  | 'proof_queue'
+  | 'active_jobs'
+  | 'disk_pressure'
+  | 'telemetry_freshness'
+  | 'incidents';
+
+export interface RemediationBand {
+  id: RemediationBandId;
+  title: string;
+  severity: BandSeverity;
+  action_class: RemediationActionClass;
+  headline: string;
+  detail_lines: string[];
+  reason_code?: string;
+}
+
+export interface RemediationIncidentLine {
+  reason_code: string;
+  event_type: string;
+  worker_id?: string;
+  age_secs: number;
+  summary: string;
+}
+
+export interface RemediationView {
+  schema_version: string;
+  generated_at_unix_ms: number;
+  overall: RemediationActionClass;
+  bands: RemediationBand[];
+  incidents: RemediationIncidentLine[];
 }
 
 export interface HealthResponse {

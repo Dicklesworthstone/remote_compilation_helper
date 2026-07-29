@@ -1,9 +1,14 @@
 //! Cargo local path-dependency graph resolver.
 //!
-//! The resolver builds a deterministic graph of local `path` dependencies using
-//! a two-phase strategy:
+//! The resolver builds a deterministic active graph of local `path` dependencies
+//! using a two-phase strategy:
 //! 1. `cargo metadata` (primary source of truth when available)
 //! 2. Recursive manifest parsing fallback (for malformed metadata and metadata failures)
+//!
+//! A separate manifest-derived materialization closure covers every local path
+//! that Cargo may need under another feature, target, or test selection. Keeping
+//! that closure separate preserves Cargo's cycle-free active execution graph
+//! while still making inactive optional cycles available to remote workers.
 //!
 //! Every discovered path is normalized through [`PathTopologyPolicy`] to enforce
 //! canonical-root safety and stable path identity.
@@ -28,6 +33,27 @@ pub struct CargoPathDependencyGraph {
     /// Reachable local packages in deterministic order.
     pub packages: Vec<CargoPathDependencyPackage>,
     /// Reachable path-dependency edges in deterministic order.
+    pub edges: Vec<CargoPathDependencyEdge>,
+}
+
+/// Deterministic, cycle-tolerant closure of local Cargo packages that must be
+/// materialized on a remote worker.
+///
+/// Unlike [`CargoPathDependencyGraph`], this closure includes inactive optional,
+/// development, build, target-specific, workspace-inherited, and path-patched
+/// edges. Its edges are evidence, not an execution DAG, and may contain cycles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CargoPathMaterializationClosure {
+    /// Canonical path to the entry manifest used for resolution.
+    pub entry_manifest_path: PathBuf,
+    /// Canonical workspace root when entrypoint is a workspace manifest.
+    pub workspace_root: Option<PathBuf>,
+    /// Canonical root packages used as traversal roots (sorted).
+    pub root_packages: Vec<PathBuf>,
+    /// Every reachable local package in deterministic order.
+    pub packages: Vec<CargoPathDependencyPackage>,
+    /// Every reachable path-dependency edge in deterministic order.
+    /// Cycles are retained and do not make the closure invalid.
     pub edges: Vec<CargoPathDependencyEdge>,
 }
 
@@ -214,6 +240,30 @@ pub fn resolve_cargo_path_dependency_graph_with_policy(
         policy,
         invoke_cargo_metadata,
     )
+}
+
+/// Resolve every local Cargo package that may need source materialization using
+/// the default topology policy.
+pub fn resolve_cargo_path_materialization_closure(
+    entrypoint: &Path,
+) -> Result<CargoPathMaterializationClosure, CargoPathDependencyError> {
+    resolve_cargo_path_materialization_closure_with_policy(
+        entrypoint,
+        &PathTopologyPolicy::default(),
+    )
+}
+
+/// Resolve every local Cargo package that may need source materialization using
+/// an explicit topology policy.
+///
+/// Resolution is manifest-only by design: it never imports user-home Cargo
+/// configuration, and it includes inactive edges that `cargo metadata` omits.
+pub fn resolve_cargo_path_materialization_closure_with_policy(
+    entrypoint: &Path,
+    policy: &PathTopologyPolicy,
+) -> Result<CargoPathMaterializationClosure, CargoPathDependencyError> {
+    let entry_manifest = resolve_entry_manifest(entrypoint, policy)?;
+    resolve_materialization_from_manifests(&entry_manifest, policy)
 }
 
 fn resolve_cargo_path_dependency_graph_with_policy_and_provider<F>(
@@ -1076,6 +1126,7 @@ struct ManifestDocument {
     workspace_path_dependencies: BTreeMap<String, String>,
     patch_path_dependencies: BTreeMap<String, String>,
     path_dependencies: Vec<ManifestDependency>,
+    materialization_path_dependencies: Vec<ManifestDependency>,
 }
 
 #[derive(Debug, Clone)]
@@ -1163,6 +1214,303 @@ fn resolve_from_manifest_fallback(
     }
 
     finalize_graph(entry_manifest_path.to_path_buf(), partial)
+}
+
+fn resolve_materialization_from_manifests(
+    entry_manifest_path: &Path,
+    policy: &PathTopologyPolicy,
+) -> Result<CargoPathMaterializationClosure, CargoPathDependencyError> {
+    let entry_manifest = read_manifest_document(entry_manifest_path)?;
+    let entry_root = entry_manifest_path.parent().ok_or_else(|| {
+        CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::ManifestParseFailure,
+            format!(
+                "entry manifest has no parent: {}",
+                entry_manifest_path.display()
+            ),
+        )
+        .with_manifest_path(entry_manifest_path)
+    })?;
+    let entry_root = normalize_path_for_policy(
+        entry_root,
+        policy,
+        Some(entry_manifest_path),
+        None,
+        "normalize materialization entry root",
+    )?;
+
+    let mut partial = PartialGraph::default();
+    if entry_manifest.has_workspace {
+        partial.workspace_root = Some(entry_root.clone());
+    }
+    let workspace_path_dependencies = entry_manifest.workspace_path_dependencies.clone();
+    let patch_path_dependencies = entry_manifest.patch_path_dependencies.clone();
+    let workspace_member_manifests = expand_workspace_members(
+        &entry_root,
+        &entry_manifest.workspace_members,
+        entry_manifest_path,
+    )?;
+    let workspace_member_set = workspace_member_manifests
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let include_entry_manifest =
+        entry_manifest.package_name.is_some() || workspace_member_set.is_empty();
+
+    let mut manifest_cache = BTreeMap::from([(entry_manifest_path.to_path_buf(), entry_manifest)]);
+    let mut visited = BTreeSet::new();
+
+    for manifest_path in &workspace_member_set {
+        visit_manifest_for_materialization(
+            manifest_path,
+            policy,
+            &entry_root,
+            &workspace_member_set,
+            &workspace_path_dependencies,
+            &patch_path_dependencies,
+            true,
+            &mut partial,
+            &mut manifest_cache,
+            &mut visited,
+        )?;
+    }
+    if include_entry_manifest {
+        visit_manifest_for_materialization(
+            entry_manifest_path,
+            policy,
+            &entry_root,
+            &workspace_member_set,
+            &workspace_path_dependencies,
+            &patch_path_dependencies,
+            true,
+            &mut partial,
+            &mut manifest_cache,
+            &mut visited,
+        )?;
+    }
+
+    for (dependency_name, raw_dependency_path) in workspace_path_dependencies
+        .iter()
+        .chain(patch_path_dependencies.iter())
+    {
+        let dependency_candidate = resolve_dependency_candidate(&entry_root, raw_dependency_path);
+        let (_, dependency_manifest) = resolve_materialization_dependency_manifest(
+            &dependency_candidate,
+            policy,
+            entry_manifest_path,
+            dependency_name,
+        )?;
+        visit_manifest_for_materialization(
+            &dependency_manifest,
+            policy,
+            &entry_root,
+            &workspace_member_set,
+            &workspace_path_dependencies,
+            &patch_path_dependencies,
+            false,
+            &mut partial,
+            &mut manifest_cache,
+            &mut visited,
+        )?;
+    }
+
+    Ok(finalize_materialization_closure(
+        entry_manifest_path.to_path_buf(),
+        partial,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_manifest_for_materialization(
+    manifest_path: &Path,
+    policy: &PathTopologyPolicy,
+    workspace_root: &Path,
+    workspace_member_manifests: &BTreeSet<PathBuf>,
+    workspace_path_dependencies: &BTreeMap<String, String>,
+    patch_path_dependencies: &BTreeMap<String, String>,
+    mark_workspace_member: bool,
+    partial: &mut PartialGraph,
+    manifest_cache: &mut BTreeMap<PathBuf, ManifestDocument>,
+    visited: &mut BTreeSet<PathBuf>,
+) -> Result<(), CargoPathDependencyError> {
+    let manifest_root = manifest_path.parent().ok_or_else(|| {
+        CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::ManifestParseFailure,
+            format!("manifest has no parent: {}", manifest_path.display()),
+        )
+        .with_manifest_path(manifest_path)
+    })?;
+    let package_root = normalize_path_for_policy(
+        manifest_root,
+        policy,
+        Some(manifest_path),
+        None,
+        "normalize materialization package root",
+    )?;
+    let canonical_manifest = package_root.join("Cargo.toml");
+    if !canonical_manifest.is_file() {
+        return Err(CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::ManifestParseFailure,
+            format!("manifest file missing: {}", canonical_manifest.display()),
+        )
+        .with_manifest_path(canonical_manifest));
+    }
+
+    if !visited.insert(package_root.clone()) {
+        if mark_workspace_member {
+            partial.add_root(package_root.clone());
+            if let Some(package) = partial.packages.get_mut(&package_root) {
+                package.workspace_member = true;
+            }
+        }
+        return Ok(());
+    }
+
+    let manifest = if let Some(cached) = manifest_cache.get(&canonical_manifest) {
+        cached.clone()
+    } else {
+        let parsed = read_manifest_document(&canonical_manifest)?;
+        manifest_cache.insert(canonical_manifest.clone(), parsed.clone());
+        parsed
+    };
+
+    let workspace_member =
+        mark_workspace_member || workspace_member_manifests.contains(&canonical_manifest);
+    partial.add_package(
+        package_root.clone(),
+        canonical_manifest.clone(),
+        manifest
+            .package_name
+            .clone()
+            .unwrap_or_else(|| default_package_name(&package_root)),
+        workspace_member,
+    );
+    if workspace_member {
+        partial.add_root(package_root.clone());
+    }
+
+    for dependency in &manifest.materialization_path_dependencies {
+        let Some(dependency_candidate) = resolve_manifest_dependency_candidate(
+            &package_root,
+            workspace_root,
+            dependency,
+            workspace_path_dependencies,
+            patch_path_dependencies,
+        ) else {
+            continue;
+        };
+        let (dependency_root, dependency_manifest) = resolve_materialization_dependency_manifest(
+            &dependency_candidate,
+            policy,
+            &canonical_manifest,
+            &dependency.dependency_name,
+        )?;
+
+        partial.add_edge(
+            package_root.clone(),
+            dependency_root,
+            dependency.dependency_name.clone(),
+        );
+        visit_manifest_for_materialization(
+            &dependency_manifest,
+            policy,
+            workspace_root,
+            workspace_member_manifests,
+            workspace_path_dependencies,
+            patch_path_dependencies,
+            false,
+            partial,
+            manifest_cache,
+            visited,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn resolve_materialization_dependency_manifest(
+    dependency_candidate: &Path,
+    policy: &PathTopologyPolicy,
+    declaring_manifest: &Path,
+    dependency_name: &str,
+) -> Result<(PathBuf, PathBuf), CargoPathDependencyError> {
+    validate_absolute_dependency_scope(
+        dependency_candidate,
+        policy,
+        declaring_manifest,
+        dependency_name,
+        "materialization dependency path policy violation",
+    )?;
+    if !dependency_candidate.exists() {
+        return Err(CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::MissingPathDependency,
+            format!(
+                "materialization dependency path does not exist: {}",
+                dependency_candidate.display()
+            ),
+        )
+        .with_manifest_path(declaring_manifest)
+        .with_dependency_name(dependency_name.to_string())
+        .with_dependency_path(dependency_candidate));
+    }
+
+    let dependency_root = normalize_path_for_policy(
+        dependency_candidate,
+        policy,
+        Some(declaring_manifest),
+        Some(dependency_name),
+        "normalize materialization dependency path",
+    )?;
+    let dependency_manifest = dependency_root.join("Cargo.toml");
+    if !dependency_manifest.is_file() {
+        return Err(CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::MissingPathDependency,
+            format!(
+                "materialization dependency manifest missing: {}",
+                dependency_manifest.display()
+            ),
+        )
+        .with_manifest_path(declaring_manifest)
+        .with_dependency_name(dependency_name.to_string())
+        .with_dependency_path(dependency_manifest.clone()));
+    }
+
+    Ok((dependency_root, dependency_manifest))
+}
+
+fn finalize_materialization_closure(
+    entry_manifest_path: PathBuf,
+    partial: PartialGraph,
+) -> CargoPathMaterializationClosure {
+    let packages = partial
+        .packages
+        .iter()
+        .map(|(root, package)| CargoPathDependencyPackage {
+            package_root: root.clone(),
+            manifest_path: package.manifest_path.clone(),
+            package_name: package.package_name.clone(),
+            workspace_member: package.workspace_member,
+        })
+        .collect();
+    let edges = partial
+        .adjacency
+        .iter()
+        .flat_map(|(from, tails)| {
+            tails.iter().map(|tail| CargoPathDependencyEdge {
+                from: from.clone(),
+                to: tail.to.clone(),
+                dependency_name: tail.dependency_name.clone(),
+            })
+        })
+        .collect();
+
+    CargoPathMaterializationClosure {
+        entry_manifest_path,
+        workspace_root: partial.workspace_root,
+        root_packages: partial.roots.into_iter().collect(),
+        packages,
+        edges,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1433,17 +1781,48 @@ fn read_manifest_document(
         .unwrap_or_default();
 
     let mut path_dependencies = Vec::new();
-    collect_dependency_specs(table.get("dependencies"), &mut path_dependencies);
-    collect_dependency_specs(table.get("build-dependencies"), &mut path_dependencies);
+    collect_dependency_specs(table.get("dependencies"), &mut path_dependencies, false);
+    collect_dependency_specs(
+        table.get("build-dependencies"),
+        &mut path_dependencies,
+        false,
+    );
 
     if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
         for target_config in targets.values() {
             if let Some(target_table) = target_config.as_table() {
-                collect_dependency_specs(target_table.get("dependencies"), &mut path_dependencies);
+                collect_dependency_specs(
+                    target_table.get("dependencies"),
+                    &mut path_dependencies,
+                    false,
+                );
                 collect_dependency_specs(
                     target_table.get("build-dependencies"),
                     &mut path_dependencies,
+                    false,
                 );
+            }
+        }
+    }
+
+    let mut materialization_path_dependencies = Vec::new();
+    for dependency_table in ["dependencies", "build-dependencies", "dev-dependencies"] {
+        collect_dependency_specs(
+            table.get(dependency_table),
+            &mut materialization_path_dependencies,
+            true,
+        );
+    }
+    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
+        for target_config in targets.values() {
+            if let Some(target_table) = target_config.as_table() {
+                for dependency_table in ["dependencies", "build-dependencies", "dev-dependencies"] {
+                    collect_dependency_specs(
+                        target_table.get(dependency_table),
+                        &mut materialization_path_dependencies,
+                        true,
+                    );
+                }
             }
         }
     }
@@ -1455,12 +1834,14 @@ fn read_manifest_document(
         workspace_path_dependencies,
         patch_path_dependencies,
         path_dependencies,
+        materialization_path_dependencies,
     })
 }
 
 fn collect_dependency_specs(
     maybe_table_value: Option<&toml::Value>,
     collector: &mut Vec<ManifestDependency>,
+    include_optional: bool,
 ) {
     let Some(table) = maybe_table_value.and_then(toml::Value::as_table) else {
         return;
@@ -1475,10 +1856,11 @@ fn collect_dependency_specs(
                 });
             }
             toml::Value::Table(dependency_table) => {
-                if dependency_table
-                    .get("optional")
-                    .and_then(toml::Value::as_bool)
-                    .unwrap_or(false)
+                if !include_optional
+                    && dependency_table
+                        .get("optional")
+                        .and_then(toml::Value::as_bool)
+                        .unwrap_or(false)
                 {
                     continue;
                 }
@@ -2088,17 +2470,198 @@ optional_a = { path = "../optional_a", optional = true }
 
         let graph = resolve_cargo_path_dependency_graph_with_policy(&app_root, &fixture.policy())
             .expect("optional cycle should not poison active dependency closure");
+        let materialization =
+            resolve_cargo_path_materialization_closure_with_policy(&app_root, &fixture.policy())
+                .expect("optional cycle should terminate in materialization closure");
 
         let app_root = app_root.canonicalize().expect("canonical app");
         let real_dep_root = real_dep_root.canonicalize().expect("canonical real dep");
+        let optional_a_root = optional_a_root
+            .canonicalize()
+            .expect("canonical optional a");
+        let optional_b_root = optional_b_root
+            .canonicalize()
+            .expect("canonical optional b");
         assert_eq!(graph.root_packages, vec![app_root.clone()]);
         assert_eq!(
             graph.edges,
             vec![CargoPathDependencyEdge {
-                from: app_root,
-                to: real_dep_root,
+                from: app_root.clone(),
+                to: real_dep_root.clone(),
                 dependency_name: "real_dep".to_string(),
             }]
+        );
+
+        let materialized_roots = materialization
+            .packages
+            .iter()
+            .map(|package| package.package_root.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            materialized_roots,
+            BTreeSet::from([
+                app_root.clone(),
+                real_dep_root.clone(),
+                optional_a_root.clone(),
+                optional_b_root.clone(),
+            ]),
+            "inactive optional packages must still be available for remote materialization"
+        );
+        assert_eq!(
+            materialization
+                .edges
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                CargoPathDependencyEdge {
+                    from: app_root.clone(),
+                    to: real_dep_root,
+                    dependency_name: "real_dep".to_string(),
+                },
+                CargoPathDependencyEdge {
+                    from: optional_a_root.clone(),
+                    to: optional_b_root.clone(),
+                    dependency_name: "optional_b".to_string(),
+                },
+                CargoPathDependencyEdge {
+                    from: optional_b_root,
+                    to: optional_a_root.clone(),
+                    dependency_name: "optional_a".to_string(),
+                },
+                CargoPathDependencyEdge {
+                    from: app_root,
+                    to: optional_a_root,
+                    dependency_name: "optional_a".to_string(),
+                },
+            ]),
+            "materialization evidence should retain the optional cycle without traversing forever"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_closure_covers_every_manifest_path_dependency_class() {
+        let fixture = TopologyFixture::new("materialization-all-kinds");
+        let scenario_root = fixture
+            .canonical_root
+            .join("materialization_all_dependency_kinds");
+        let workspace_root = scenario_root.join("workspace");
+        let app_root = workspace_root.join("app");
+        let build_dep_root = scenario_root.join("build_dep");
+        let dev_dep_root = scenario_root.join("dev_dep");
+        let optional_dep_root = scenario_root.join("optional_dep");
+        let patched_dep_root = scenario_root.join("patched_dep");
+        let target_dep_root = scenario_root.join("target_dep");
+        let transitive_dep_root = scenario_root.join("transitive_dep");
+        let unused_patch_dep_root = scenario_root.join("unused_patch_dep");
+        let workspace_dep_root = scenario_root.join("workspace_dep");
+
+        write_lib_crate(&build_dep_root, "build_dep", &[]);
+        write_lib_crate(&dev_dep_root, "dev_dep", &[]);
+        write_lib_crate(
+            &optional_dep_root,
+            "optional_dep",
+            &[("transitive_dep", "../transitive_dep")],
+        );
+        write_lib_crate(&patched_dep_root, "patched_dep", &[]);
+        write_lib_crate(&target_dep_root, "target_dep", &[]);
+        write_lib_crate(&transitive_dep_root, "transitive_dep", &[]);
+        write_lib_crate(&unused_patch_dep_root, "unused_patch_dep", &[]);
+        write_lib_crate(&workspace_dep_root, "workspace_dep", &[]);
+
+        fs::create_dir_all(app_root.join("src")).expect("create app src");
+        fs::write(
+            app_root.join("Cargo.toml"),
+            r#"[package]
+name = "materialization_app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+optional_dep = { path = "../../optional_dep", optional = true }
+patched_dep = "0.1"
+workspace_dep = { workspace = true, optional = true }
+
+[build-dependencies]
+build_dep = { path = "../../build_dep" }
+
+[dev-dependencies]
+dev_dep = { path = "../../dev_dep" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+target_dep = { path = "../../target_dep" }
+"#,
+        )
+        .expect("write app manifest");
+        fs::write(app_root.join("src/lib.rs"), "pub fn app() {}\n").expect("write app lib");
+        fs::create_dir_all(&workspace_root).expect("create workspace root");
+        fs::write(
+            workspace_root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["app"]
+resolver = "3"
+
+[workspace.dependencies]
+workspace_dep = { path = "../workspace_dep" }
+
+[patch.crates-io]
+patched_dep = { path = "../patched_dep" }
+unused_patch_dep = { path = "../unused_patch_dep" }
+"#,
+        )
+        .expect("write workspace manifest");
+
+        let first = resolve_cargo_path_materialization_closure_with_policy(
+            &workspace_root,
+            &fixture.policy(),
+        )
+        .expect("resolve complete materialization closure");
+        let second = resolve_cargo_path_materialization_closure_with_policy(
+            &workspace_root,
+            &fixture.policy(),
+        )
+        .expect("repeat complete materialization closure");
+        assert_eq!(first, second, "materialization must be deterministic");
+
+        let expected_roots = [
+            &app_root,
+            &build_dep_root,
+            &dev_dep_root,
+            &optional_dep_root,
+            &patched_dep_root,
+            &target_dep_root,
+            &transitive_dep_root,
+            &unused_patch_dep_root,
+            &workspace_dep_root,
+        ]
+        .into_iter()
+        .map(|root| root.canonicalize().expect("canonical fixture package"))
+        .collect::<BTreeSet<_>>();
+        let observed_roots = first
+            .packages
+            .iter()
+            .map(|package| package.package_root.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(observed_roots, expected_roots);
+
+        let dependency_names = first
+            .edges
+            .iter()
+            .map(|edge| edge.dependency_name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            dependency_names,
+            BTreeSet::from([
+                "build_dep",
+                "dev_dep",
+                "optional_dep",
+                "patched_dep",
+                "target_dep",
+                "transitive_dep",
+                "workspace_dep",
+            ]),
+            "normal, build, dev, target, optional, workspace, patch, and transitive paths must all materialize"
         );
     }
 
@@ -3276,7 +3839,7 @@ patched_dep = { path = "../patched/patched_dep" }
         fs::write(
             project_root.join("Cargo.toml"),
             format!(
-                "[package]\nname = \"metadata_pipe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}",
+                "[package]\nname = \"metadata_pipe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\nresolver = \"2\"\n\n[dependencies]\n{deps}",
             ),
         )
         .expect("write manifest");

@@ -70,6 +70,59 @@ pub fn is_claude_code_installed() -> bool {
     claude_code_dir().map(|p| p.exists()).unwrap_or(false)
 }
 
+/// Extract the `rch` PreToolUse hook command from parsed Claude Code settings.
+///
+/// Pure (no filesystem) so the daemon's startup consistency check can run it
+/// against fixtures rather than the real user settings file. Returns the
+/// command string of the first PreToolUse hook whose first token is the `rch`
+/// binary — across the nested format
+/// (`{"matcher": "Bash", "hooks": [{"command": "rch"}]}`), the legacy flat
+/// format (`{"command": "rch"}`), and bare-string hooks. Returns `None` when
+/// no rch hook is present.
+#[must_use]
+pub fn rch_pretooluse_hook_command(settings: &Value) -> Option<String> {
+    let arr = settings.get("hooks")?.get("PreToolUse")?.as_array()?;
+    for hook in arr {
+        // New nested format.
+        if let Some(inner_hooks) = hook.get("hooks").and_then(|h| h.as_array()) {
+            for inner in inner_hooks {
+                if let Some(cmd) = inner.get("command").and_then(|c| c.as_str())
+                    && is_rch_hook_command(cmd)
+                {
+                    return Some(cmd.to_string());
+                }
+            }
+        }
+        // Legacy flat format.
+        if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
+            && is_rch_hook_command(cmd)
+        {
+            return Some(cmd.to_string());
+        }
+        // Bare-string hook.
+        if let Some(cmd) = hook.as_str()
+            && is_rch_hook_command(cmd)
+        {
+            return Some(cmd.to_string());
+        }
+    }
+    None
+}
+
+/// Read the installed `rch` PreToolUse hook command from the user's Claude Code
+/// `settings.json`, if present.
+///
+/// Returns `None` when the settings file is absent, unreadable, malformed, or
+/// contains no rch hook. Never mutates the file — this is a read-only probe for
+/// the daemon's startup consistency check.
+#[must_use]
+pub fn installed_rch_hook_command() -> Option<String> {
+    let settings_path = claude_code_settings_path()?;
+    let content = fs::read_to_string(&settings_path).ok()?;
+    let settings: Value = serde_json::from_str(&content).ok()?;
+    rch_pretooluse_hook_command(&settings)
+}
+
 /// Checks if the RCH hook is installed in Claude Code settings.
 fn check_claude_code_hook_installed() -> Result<bool> {
     let settings_path = match claude_code_settings_path() {
@@ -87,38 +140,7 @@ fn check_claude_code_hook_installed() -> Result<bool> {
     let settings: Value =
         serde_json::from_str(&content).context("Failed to parse Claude Code settings")?;
 
-    // Check for PreToolUse hook with rch
-    if let Some(hooks) = settings.get("hooks")
-        && let Some(pre_tool_use) = hooks.get("PreToolUse")
-        && let Some(arr) = pre_tool_use.as_array()
-    {
-        for hook in arr {
-            // Check new format: {"matcher": "Bash", "hooks": [{"type": "command", "command": "rch"}]}
-            if let Some(inner_hooks) = hook.get("hooks").and_then(|h| h.as_array()) {
-                for inner in inner_hooks {
-                    if let Some(cmd) = inner.get("command").and_then(|c| c.as_str())
-                        && is_rch_hook_command(cmd)
-                    {
-                        return Ok(true);
-                    }
-                }
-            }
-            // Check old format: {"command": "rch"} (for backwards compatibility)
-            if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
-                && is_rch_hook_command(cmd)
-            {
-                return Ok(true);
-            }
-            // Also check for string hooks
-            if let Some(cmd) = hook.as_str()
-                && is_rch_hook_command(cmd)
-            {
-                return Ok(true);
-            }
-        }
-    }
-
-    Ok(false)
+    Ok(rch_pretooluse_hook_command(&settings).is_some())
 }
 
 /// Writes content to a file atomically using a temporary file.
@@ -384,6 +406,50 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    // =========================================================================
+    // rch_pretooluse_hook_command — pure hook extractor for startup checks
+    // =========================================================================
+
+    #[test]
+    fn pretooluse_hook_command_reads_nested_format() {
+        let settings = json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "Bash", "hooks": [{ "type": "command", "command": "/usr/local/bin/rch" }] }
+                ]
+            }
+        });
+        assert_eq!(
+            rch_pretooluse_hook_command(&settings).as_deref(),
+            Some("/usr/local/bin/rch")
+        );
+    }
+
+    #[test]
+    fn pretooluse_hook_command_reads_legacy_flat_and_string_forms() {
+        let flat = json!({ "hooks": { "PreToolUse": [{ "command": "rch" }] } });
+        assert_eq!(rch_pretooluse_hook_command(&flat).as_deref(), Some("rch"));
+        let string_form = json!({ "hooks": { "PreToolUse": ["rch --flag"] } });
+        assert_eq!(
+            rch_pretooluse_hook_command(&string_form).as_deref(),
+            Some("rch --flag")
+        );
+    }
+
+    #[test]
+    fn pretooluse_hook_command_none_when_absent_or_foreign() {
+        assert_eq!(rch_pretooluse_hook_command(&json!({})), None);
+        assert_eq!(
+            rch_pretooluse_hook_command(&json!({ "hooks": { "PreToolUse": [] } })),
+            None
+        );
+        // A non-rch hook (false-positive guard: "archive" contains "rch").
+        let foreign = json!({
+            "hooks": { "PreToolUse": [{ "hooks": [{ "command": "archive --now" }] }] }
+        });
+        assert_eq!(rch_pretooluse_hook_command(&foreign), None);
+    }
 
     // =========================================================================
     // is_rch_hook_command — guard against the `contains("rch")` bug

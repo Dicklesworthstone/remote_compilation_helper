@@ -14,6 +14,7 @@ import type {
   SpeedScoreHistoryResponse,
   SpeedScoreListResponse,
   BenchmarkResults,
+  RemediationView,
 } from '../../src/lib/types';
 
 export const mockDaemonStatus: DaemonStatusInfo = {
@@ -84,6 +85,7 @@ export const mockRecentBuilds: BuildRecord[] = [
     duration_ms: 4821,
     started_at: '2026-01-01T11:50:00.000Z',
     completed_at: '2026-01-01T11:50:04.821Z',
+    location: 'remote',
   },
   {
     id: 98,
@@ -94,6 +96,7 @@ export const mockRecentBuilds: BuildRecord[] = [
     duration_ms: 3120,
     started_at: '2026-01-01T11:40:00.000Z',
     completed_at: '2026-01-01T11:40:03.120Z',
+    location: 'remote',
   },
 ];
 
@@ -107,19 +110,99 @@ export const mockIssues: Issue[] = [
 
 export const mockStats: BuildStats = {
   total_builds: 128,
-  successful_builds: 120,
-  failed_builds: 8,
-  total_duration_ms: 502_000,
+  success_count: 120,
+  failure_count: 8,
+  remote_count: 96,
+  local_count: 32,
   avg_duration_ms: 3922,
+};
+
+// A degraded-but-self-healing remediation view: one worker temporarily
+// bypassed (auto-rejoin), others healthy. Mirrors the daemon-assembled,
+// redacted RemediationView (bd-session-history-remediation-ocv9i.14.4).
+export const mockRemediationView: RemediationView = {
+  schema_version: '1.0.0',
+  generated_at_unix_ms: 1_700_000_000_000,
+  overall: 'self_healing_in_progress',
+  bands: [
+    {
+      id: 'desired_fleet',
+      title: 'Desired Fleet',
+      severity: 'ok',
+      action_class: 'healthy',
+      headline: '2/3 worker(s) ready',
+      detail_lines: ['desired 3 · eligible 2 · bypassed 1 · disabled 0 · unreachable 0 · missing 0'],
+      reason_code: 'healthy',
+    },
+    {
+      id: 'live_eligibility',
+      title: 'Live Eligibility',
+      severity: 'warn',
+      action_class: 'self_healing_in_progress',
+      headline: '2 of 3 desired worker(s) eligible',
+      detail_lines: ['1 temporarily bypassed (auto-rejoin)'],
+    },
+    {
+      id: 'admissible_workers',
+      title: 'Admissible Workers',
+      severity: 'ok',
+      action_class: 'healthy',
+      headline: '2 of 2 live worker(s) can run a command now',
+      detail_lines: [],
+    },
+    {
+      id: 'proof_queue',
+      title: 'Proof Queue',
+      severity: 'ok',
+      action_class: 'healthy',
+      headline: 'no proofs pending',
+      detail_lines: [],
+    },
+    {
+      id: 'active_jobs',
+      title: 'Active Jobs',
+      severity: 'info',
+      action_class: 'healthy',
+      headline: '1 active · 0 queued',
+      detail_lines: [],
+    },
+    {
+      id: 'disk_pressure',
+      title: 'Disk Pressure',
+      severity: 'ok',
+      action_class: 'healthy',
+      headline: 'no disk pressure',
+      detail_lines: [],
+    },
+    {
+      id: 'telemetry_freshness',
+      title: 'Telemetry Freshness',
+      severity: 'ok',
+      action_class: 'healthy',
+      headline: '2 worker(s) reporting fresh telemetry',
+      detail_lines: [],
+    },
+    {
+      id: 'incidents',
+      title: 'Recent Incidents',
+      severity: 'ok',
+      action_class: 'healthy',
+      headline: 'no recent incidents',
+      detail_lines: [],
+    },
+  ],
+  incidents: [],
 };
 
 export const mockStatusResponse: StatusResponse = {
   daemon: mockDaemonStatus,
   workers: mockWorkers,
   active_builds: mockActiveBuilds,
+  queued_builds: [],
   recent_builds: mockRecentBuilds,
   issues: mockIssues,
   stats: mockStats,
+  remediation: mockRemediationView,
 };
 
 export const mockHealthResponse: HealthResponse = {
@@ -265,7 +348,6 @@ export function mockSpeedScoreResponse(workerId: string): SpeedScoreResponse {
 
 export function mockSpeedScoreHistoryResponse(
   workerId: string,
-  days = 7,
   limit = 10
 ): SpeedScoreHistoryResponse {
   const history = mockSpeedScoreHistory[workerId] ?? [];
@@ -276,6 +358,7 @@ export function mockSpeedScoreHistoryResponse(
       total: history.length,
       offset: 0,
       limit,
+      has_more: history.length > limit,
     },
   };
 }

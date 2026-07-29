@@ -5,9 +5,11 @@
 
 use crate::error::TransferError;
 use anyhow::{Context, Result};
+use glob::Pattern;
 use rch_common::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
 use rch_common::ssh_utils::{
-    EnvPrefix, is_retryable_transport_error, is_valid_env_key, shell_escape_value,
+    EnvPrefix, is_retryable_transport_error, is_retryable_transport_error_text, is_valid_env_key,
+    shell_escape_value,
 };
 use rch_common::{
     ColorMode, CommandResult, CompilationKind, PathTopologyPolicy, RetryConfig, ToolchainInfo,
@@ -20,7 +22,7 @@ use shell_escape::escape;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -48,23 +50,323 @@ const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[
     ".rch-target/",
     ".rch-target-*/",
     ".rch-tmp/",
+    // Go build/module/GOPATH caches injected into the managed remote build zone
+    // (see FORCED_MANAGED_ENV_KEYS). Protect them from rsync --delete for the
+    // same reason as .rch-target/.rch-tmp: a concurrent build to the same remote
+    // root must not wipe another build's in-flight Go cache.
+    ".rch-go/",
     ".franken_whisper/tools/ffmpeg/",
 ];
 const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str = ".rch-target";
-const LEGACY_CORE_DUMP_EXCLUDE_REWRITES: &[(&str, &str)] =
-    &[("core.*", "core.[0-9]*"), (".core.*", ".core.[0-9]*")];
+
+/// Environment variables whose values we ALWAYS rewrite to a managed,
+/// worker-scoped path under the synchronized remote project root — regardless of
+/// whether the local process forwarded them. These control where build
+/// tools drop large artifacts/scratch; if they inherit a host-only absolute path
+/// (e.g. a `.cargo/config.toml` `target-dir` of `/root/cass-ft-target`, or a
+/// `TMPDIR` on a volatile host mount) the remote build writes outside the managed
+/// `/data/tmp` zone the disk reapers watch, or fails outright. Forcing them into
+/// `<remote_path>/.rch-*` makes placement deterministic and reclaimable, and —
+/// because env precedence beats a `.cargo/config.toml` `target-dir` — covers
+/// wrapper/unclassified builds that never went through target-dir rewriting.
+const FORCED_MANAGED_ENV_KEYS: &[&str] = &[
+    "CARGO_TARGET_DIR",
+    "TMPDIR",
+    "GOCACHE",
+    "GOMODCACHE",
+    "GOPATH",
+];
+const CONFIG_EXCLUDE_REWRITES: &[(&str, &str)] = &[
+    ("core.*", "core.[0-9]*"),
+    (".core.*", ".core.[0-9]*"),
+    (".git/objects/", ".git/"),
+];
 
 fn normalize_config_exclude_pattern(pattern: &str) -> &str {
-    LEGACY_CORE_DUMP_EXCLUDE_REWRITES
+    CONFIG_EXCLUDE_REWRITES
         .iter()
         .find_map(|(legacy, replacement)| (*legacy == pattern).then_some(*replacement))
         .unwrap_or(pattern)
+}
+
+/// A *linked* git worktree records its git state indirection in a `.git` FILE
+/// (not a `.git` directory) whose sole meaningful line is
+/// `gitdir: <parent-repo>/.git/worktrees/<name>`.
+///
+/// That absolute path points back into the PARENT repository's `.git`, which
+/// does NOT exist on a remote worker after the rsync. Shipping the `.git` file
+/// verbatim therefore leaves a dangling pointer: any git/cargo step that tries
+/// to resolve the repository on the worker fails, and the hook fails open with
+/// `[RCH] local (remote execution failed)` — silently changing which machine/OS
+/// actually ran the build. See [`git_worktree_upload_exclude`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkedWorktreeGitPointer {
+    /// The `gitdir` target parsed from the `.git` file, verbatim as written
+    /// (normally an absolute path into the parent repo's `.git/worktrees/…`).
+    pub(crate) gitdir: String,
+}
+
+/// Parse the `gitdir:` pointer out of a linked-worktree `.git` file's contents.
+///
+/// Git writes exactly one `gitdir: <path>` line; we tolerate leading/trailing
+/// whitespace, blank lines, and CRLF. Returns `None` for a normal (non-pointer)
+/// `.git` file body.
+pub(crate) fn parse_worktree_gitdir_pointer(contents: &str) -> Option<LinkedWorktreeGitPointer> {
+    for line in contents.lines() {
+        if let Some(rest) = line.trim().strip_prefix("gitdir:") {
+            let gitdir = rest.trim();
+            if !gitdir.is_empty() {
+                return Some(LinkedWorktreeGitPointer {
+                    gitdir: gitdir.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Detect whether `project_root` is a *linked git worktree* — i.e. its `.git`
+/// entry is a regular FILE holding a `gitdir:` pointer, rather than a real
+/// `.git` directory (normal repo) or absent (no VCS).
+///
+/// Returns the parsed pointer when so, else `None`.
+pub(crate) fn detect_linked_worktree_git_pointer(
+    project_root: &Path,
+) -> Option<LinkedWorktreeGitPointer> {
+    let git_path = project_root.join(".git");
+    // `symlink_metadata` so a `.git` symlink is not transparently followed to a
+    // directory — we only treat a genuine regular file as a worktree pointer.
+    let metadata = std::fs::symlink_metadata(&git_path).ok()?;
+    if !metadata.file_type().is_file() {
+        // A real `.git/` directory (normal repo) or a symlink — leave the
+        // existing `.git/` directory exclusion to handle it.
+        return None;
+    }
+    let contents = std::fs::read_to_string(&git_path).ok()?;
+    parse_worktree_gitdir_pointer(&contents)
+}
+
+/// If `project_root` is a linked git worktree, return the anchored rsync exclude
+/// (`/.git`) that keeps its dangling `.git` FILE out of the upload, paired with
+/// the parsed pointer (for diagnostics).
+///
+/// The default upload excludes already drop the whole `.git/` *directory* for
+/// normal repos, and builds succeed on the worker with no git metadata at all.
+/// The `.git/` pattern (trailing slash) matches only directories, though, so a
+/// worktree's `.git` FILE would otherwise slip through and be synced as a
+/// dangling pointer. Excluding it yields exactly the same git-free remote source
+/// tree a normal repo already produces, so the build proceeds instead of failing
+/// open to local. The leading `/` anchors the rule to the transfer root so it
+/// only affects the project root's own `.git`, never a nested one.
+pub(crate) fn git_worktree_upload_exclude(
+    project_root: &Path,
+) -> Option<(String, LinkedWorktreeGitPointer)> {
+    detect_linked_worktree_git_pointer(project_root).map(|pointer| ("/.git".to_string(), pointer))
+}
+
+fn add_portable_rsync_archive_args(cmd: &mut Command) {
+    // `-a` includes owner/group preservation. Across independently provisioned
+    // workers those metadata IDs are not portable and can turn an otherwise
+    // writable sync into a fail-open chgrp failure.
+    cmd.arg("--no-owner").arg("--no-group");
+}
+
+/// Anchor an artifact retrieval pattern so rsync only matches it at the
+/// transfer source root, NOT at any arbitrary depth in the source tree.
+/// Closes RCH bug `d7xc3` ("Artifact retrieval must not dirty local source
+/// checkout"). Unanchored patterns like `target/debug/**` would match
+/// `<root>/target/debug/foo` AND `<root>/anything/target/debug/foo` — the
+/// second branch lets a hostile or stale remote layout (e.g., another
+/// agent's build tree at `<root>/some-crate/target/...`) drift into the
+/// retrieval set and overwrite a local file.
+///
+/// Rules (rsync filter semantics):
+///   * pattern already starts with `/`  → leave as-is (already anchored)
+///   * pattern starts with `**/`        → leave as-is (explicit recursion)
+///   * otherwise                        → prepend `/` to anchor
+///
+/// Empty / whitespace-only patterns are returned unchanged so the caller
+/// can decide whether to drop them; we do not silently mutate junk input.
+fn anchor_retrieval_pattern(pattern: &str) -> String {
+    let trimmed = pattern.trim_start();
+    if trimmed.is_empty() {
+        return pattern.to_string();
+    }
+    if trimmed.starts_with('/') || trimmed.starts_with("**/") {
+        return pattern.to_string();
+    }
+    format!("/{}", pattern)
+}
+
+/// An artifact-pattern entry that begins with the rsync-style `- ` marker is an
+/// EXCLUDE rule, not an include. Returns the exclude payload (the text after the
+/// marker) so the retrieve builders can emit it as `--exclude` BEFORE the include
+/// rules — rsync evaluates filter rules in order with first-match-wins, so an
+/// up-front exclude (e.g. cargo's `incremental/`/`.fingerprint/`/`build/` cache
+/// trees, `*.d` dep files) keeps those bytes from ever transferring even though a
+/// broad include like `debug/**` would otherwise match them. See
+/// `hook::artifact_patterns::CARGO_TARGET_CACHE_EXCLUDES`.
+fn artifact_pattern_exclude(pattern: &str) -> Option<&str> {
+    pattern.strip_prefix("- ")
+}
+
+/// Partition an artifact-pattern list into `(excludes, includes)`. Exclude
+/// entries (`- <pat>`) yield their bare payload (the `- ` marker stripped);
+/// everything else is an include pattern, preserved verbatim and in order. The
+/// include list is what the existing root/source-integrity helpers consume, so
+/// they never mistake an exclude marker for an artifact root.
+fn partition_artifact_filters(artifact_patterns: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut excludes = Vec::new();
+    let mut includes = Vec::new();
+    for pattern in artifact_patterns {
+        match artifact_pattern_exclude(pattern) {
+            Some(payload) => excludes.push(payload.to_string()),
+            None => includes.push(pattern.clone()),
+        }
+    }
+    (excludes, includes)
+}
+
+/// Compute the set of "allowed top-level roots" implied by anchored
+/// artifact patterns. Used to build the `--exclude` belt-and-suspenders
+/// for retrieval: anything at the rsync transfer root that ISN'T in this
+/// set gets explicitly excluded, regardless of pattern matching quirks.
+///
+/// For each anchored pattern, the first path component after the leading
+/// `/` is the implied root. Glob metacharacters in that component (e.g.,
+/// `*.tsbuildinfo`) disable the implication for that pattern — we can't
+/// safely derive a single root from a glob, so we conservatively allow
+/// the rsync source root to be scanned for that pattern.
+fn allowed_artifact_roots(artifact_patterns: &[String]) -> std::collections::BTreeSet<String> {
+    let mut roots = std::collections::BTreeSet::new();
+    for pattern in artifact_patterns {
+        let anchored = anchor_retrieval_pattern(pattern);
+        let after_slash = anchored.trim_start_matches('/');
+        let first = after_slash.split('/').next().unwrap_or("");
+        if first.is_empty() {
+            continue;
+        }
+        if has_rsync_glob_meta(first) {
+            // Top-level glob (e.g., `*.tsbuildinfo`) — can't derive a
+            // single allowed root. The caller's `--include` rule will
+            // accept matching files at the source root; we don't add a
+            // root exclusion that would block them.
+            continue;
+        }
+        roots.insert(first.to_string());
+    }
+    roots
 }
 
 fn has_rsync_glob_meta(pattern: &str) -> bool {
     pattern
         .chars()
         .any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
+}
+
+fn top_level_artifact_pattern_matches_entry(pattern: &str, entry_name: &str) -> bool {
+    let anchored = anchor_retrieval_pattern(pattern);
+    if anchored.starts_with("**/") {
+        return false;
+    }
+
+    let after_slash = anchored.trim_start_matches('/');
+    let first = after_slash.split('/').next().unwrap_or("");
+    if first.is_empty() {
+        return false;
+    }
+    if first == "*" {
+        // `*` is used by the C/C++ defaults as a best-effort way to fetch
+        // newly-created root-level outputs. It is too broad to prove that an
+        // existing local top-level entry is an artifact, so it must not disable
+        // the source-integrity exclude guard for source files/directories.
+        return false;
+    }
+    if first == entry_name {
+        return true;
+    }
+    has_rsync_glob_meta(first)
+        && Pattern::new(first)
+            .map(|pattern| pattern.matches(entry_name))
+            .unwrap_or(false)
+}
+
+fn escape_rsync_filter_literal_component(name: &str) -> Cow<'_, str> {
+    if !has_rsync_glob_meta(name) {
+        return Cow::Borrowed(name);
+    }
+
+    let mut escaped = String::with_capacity(name.len());
+    for ch in name.chars() {
+        match ch {
+            '\\' => escaped.push_str(r"\\"),
+            '*' | '?' | '[' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    Cow::Owned(escaped)
+}
+
+/// Build anchored, literal rsync include filters for clean-overlay paths.
+///
+/// Every ancestor directory is included so rsync can descend through the final
+/// catch-all exclude. Glob metacharacters in real file names are escaped, which
+/// prevents a selected path such as `src/star*.rs` from widening the upload.
+pub(crate) fn clean_overlay_include_patterns(
+    project_root: &Path,
+    overlay_paths: &[PathBuf],
+) -> Result<Vec<String>> {
+    let mut patterns = BTreeSet::new();
+    for relative in overlay_paths {
+        let mut escaped_parts = Vec::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(part) => {
+                    let part = part.to_str().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "clean-overlay path is not valid UTF-8: {}",
+                            relative.display()
+                        )
+                    })?;
+                    escaped_parts.push(escape_rsync_filter_literal_component(part).into_owned());
+                }
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    anyhow::bail!(
+                        "clean-overlay path is not repository-relative: {}",
+                        relative.display()
+                    );
+                }
+            }
+        }
+        if escaped_parts.is_empty() {
+            anyhow::bail!("clean-overlay path must not select the repository root");
+        }
+
+        for end in 1..escaped_parts.len() {
+            patterns.insert(format!("/{}/", escaped_parts[..end].join("/")));
+        }
+
+        let escaped_path = escaped_parts.join("/");
+        let metadata = std::fs::symlink_metadata(project_root.join(relative))
+            .with_context(|| format!("inspect clean-overlay path {}", relative.display()))?;
+        if metadata.file_type().is_dir() {
+            patterns.insert(format!("/{escaped_path}/"));
+            patterns.insert(format!("/{escaped_path}/***"));
+        } else {
+            patterns.insert(format!("/{escaped_path}"));
+        }
+    }
+    Ok(patterns.into_iter().collect())
+}
+
+fn artifact_patterns_allow_top_level_entry(artifact_patterns: &[String], entry_name: &str) -> bool {
+    artifact_patterns
+        .iter()
+        .any(|pattern| top_level_artifact_pattern_matches_entry(pattern, entry_name))
 }
 
 fn first_path_component(pattern: &str) -> Option<&str> {
@@ -218,10 +520,33 @@ async fn execute_rsync_with_retry(
         let child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("rsync I/O error: {}", e))?;
-        child
+        let output = child
             .wait_with_output()
             .await
-            .map_err(|e| anyhow::anyhow!("rsync I/O error: {}", e))
+            .map_err(|e| anyhow::anyhow!("rsync I/O error: {}", e))?;
+        // A process that RAN but exited non-zero on a *transient transport*
+        // error must surface as Err so retry_with_backoff classifies and
+        // retries it. `wait_with_output` returns Ok for any exit status, so
+        // without this the retry subsystem was inert for the exact failure
+        // (flaky SSH → rsync exit 12/30/10, "connection unexpectedly closed")
+        // it exists to handle. The full stderr is embedded so the retry layer's
+        // re-classification agrees. Non-retryable non-zero exits return
+        // Ok(output) unchanged, so the caller's existing failure handling
+        // (exit-code/stderr reporting, partial-transfer checks) is preserved.
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if is_retryable_transport_error_text(&stderr) {
+                return Err(anyhow::anyhow!(
+                    "rsync transport error (exit {}): {}",
+                    output
+                        .status
+                        .code()
+                        .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+                    stderr
+                ));
+            }
+        }
+        Ok(output)
     })
     .await
 }
@@ -253,6 +578,41 @@ pub fn parse_rchignore_content(content: &str) -> Vec<String> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(|line| line.to_string())
         .collect()
+}
+
+/// Isolate Git reads used to construct a clean-overlay receipt from ambient
+/// repository-selection variables and configuration that can rewrite objects
+/// or archive contents.
+pub(crate) fn configure_clean_git_command(command: &mut Command) {
+    const REPOSITORY_ENV: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ];
+    for key in REPOSITORY_ENV {
+        command.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-c")
+        .arg("core.attributesFile=/dev/null")
+        .arg("-c")
+        .arg("tar.umask=0022");
 }
 
 /// Transfer pipeline for remote compilation.
@@ -304,6 +664,8 @@ pub struct TransferPipeline {
     sync_include_patterns: Option<Vec<String>>,
     /// Whether sync-to-remote should delete extraneous files remotely.
     sync_delete: bool,
+    /// Whether uploads must compare file contents instead of size and mtime.
+    sync_checksum: bool,
     /// Build ID for tracking and cancellation.
     build_id: Option<u64>,
 }
@@ -396,6 +758,7 @@ impl TransferPipeline {
             remote_cargo_target_dir_name: DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME.to_string(),
             sync_include_patterns: None,
             sync_delete: true,
+            sync_checksum: false,
             build_id: None,
         }
     }
@@ -436,6 +799,12 @@ impl TransferPipeline {
     /// Control whether sync-to-remote deletes extraneous remote files.
     pub fn with_sync_delete(mut self, delete: bool) -> Self {
         self.sync_delete = delete;
+        self
+    }
+
+    /// Force content checks for sync-to-remote uploads.
+    pub fn with_sync_checksum(mut self, checksum: bool) -> Self {
+        self.sync_checksum = checksum;
         self
     }
 
@@ -568,30 +937,64 @@ impl TransferPipeline {
         std::env::var(key).ok()
     }
 
+    /// Compute the managed, worker-scoped value (and the directory that must
+    /// exist for it) for an env var that we pin into the remote build zone.
+    ///
+    /// Returns `Some((value, ensure_dir))` for a managed key, or `None` for any
+    /// other key. This is the single source of truth for managed placement,
+    /// shared by [`Self::rewrite_remote_env_value`] (rewrites a forwarded value)
+    /// and [`Self::build_remote_env_plan`] (injects the key unconditionally). All
+    /// managed paths sit under `<remote_path>/.rch-*` so they land in the
+    /// managed `/data/tmp` build zone and are reclaimable.
+    fn managed_remote_env_value(&self, key: &str, remote_path: &str) -> Option<(String, String)> {
+        let go_base = format!("{remote_path}/.rch-go");
+        match key {
+            // Absolute or host-specific target directories are brittle on workers.
+            // Force a remote-scoped target dir rooted in the synchronized project.
+            "CARGO_TARGET_DIR" => {
+                let target_dir = self.remote_cargo_target_dir_for_remote_path(remote_path);
+                Some((target_dir.clone(), target_dir))
+            }
+            // Temporary directories may point to host-only volatile mounts.
+            // Keep temp files project-scoped on the worker for stability.
+            "TMPDIR" | "TMP" | "TEMP" => {
+                let temp_dir = format!("{remote_path}/.rch-tmp");
+                Some((temp_dir.clone(), temp_dir))
+            }
+            // Go build cache, module cache, and GOPATH — pin under the managed
+            // build zone so `go`/`bun`-orchestrated Go builds don't scatter large
+            // caches into host-global locations (~/.cache/go-build, ~/go).
+            "GOCACHE" => {
+                let dir = format!("{go_base}/cache");
+                Some((dir.clone(), dir))
+            }
+            "GOMODCACHE" => {
+                let dir = format!("{go_base}/mod");
+                Some((dir.clone(), dir))
+            }
+            "GOPATH" => {
+                let dir = format!("{go_base}/path");
+                Some((dir.clone(), dir))
+            }
+            _ => None,
+        }
+    }
+
     fn rewrite_remote_env_value(
         &self,
         key: &str,
         value: &str,
         remote_path: &str,
     ) -> (String, Option<String>, bool) {
-        match key {
-            // Absolute or host-specific target directories are brittle on workers.
-            // Force a remote-scoped target dir rooted in the synchronized project.
-            "CARGO_TARGET_DIR" => {
-                let target_dir = self.remote_cargo_target_dir_for_remote_path(remote_path);
-                (
-                    target_dir.clone(),
-                    Some(target_dir.clone()),
-                    target_dir != value,
-                )
+        // Delegate to the managed-placement helper so a forwarded ABSOLUTE value
+        // (e.g. an absolute `.cargo/config.toml` target-dir) is rewritten to the
+        // managed worker-scoped path. Non-managed keys pass through unchanged.
+        match self.managed_remote_env_value(key, remote_path) {
+            Some((managed_value, ensure_dir)) => {
+                let rewritten = managed_value != value;
+                (managed_value, Some(ensure_dir), rewritten)
             }
-            // Temporary directories may point to host-only volatile mounts (e.g. /data/tmp).
-            // Keep temp files project-scoped on the worker for stability.
-            "TMPDIR" | "TMP" | "TEMP" => {
-                let temp_dir = format!("{remote_path}/.rch-tmp");
-                (temp_dir.clone(), Some(temp_dir.clone()), temp_dir != value)
-            }
-            _ => (value.to_string(), None, false),
+            None => (value.to_string(), None, false),
         }
     }
 
@@ -647,6 +1050,31 @@ impl TransferPipeline {
             applied.push(key.to_string());
         }
 
+        // Unconditionally inject the managed build-artifact env vars, regardless
+        // of what the local environment forwarded. Any of these already handled
+        // above (present in the env AND allowlisted) were rewritten to the same
+        // managed value, so skip them here to avoid a duplicate assignment; the
+        // rest are injected fresh. This is what forces wrapper/unclassified
+        // builds — which may never forward CARGO_TARGET_DIR/GOCACHE/etc. — to
+        // still drop artifacts inside the managed `/data/tmp` zone.
+        for &key in FORCED_MANAGED_ENV_KEYS {
+            if applied.iter().any(|k| k == key) {
+                continue;
+            }
+            let Some((managed_value, ensure_dir)) = self.managed_remote_env_value(key, remote_path)
+            else {
+                continue;
+            };
+            let Some(escaped) = shell_escape_value(&managed_value) else {
+                continue;
+            };
+            if !ensure_dirs.iter().any(|existing| existing == &ensure_dir) {
+                ensure_dirs.push(ensure_dir);
+            }
+            parts.push(format!("{key}={escaped}"));
+            applied.push(key.to_string());
+        }
+
         let prefix = if parts.is_empty() {
             String::new()
         } else {
@@ -698,6 +1126,26 @@ impl TransferPipeline {
             }
         }
 
+        // Linked git worktree: its `.git` is a FILE pointing back into the parent
+        // repo (`gitdir: …/.git/worktrees/<name>`). That path does not exist on
+        // the worker, so syncing the file verbatim leaves a dangling pointer that
+        // breaks remote git/cargo resolution and forces a fail-open to local. The
+        // `.git/` directory exclude above only matches directories, so the FILE
+        // slips through unless we exclude it explicitly. Normal repos already sync
+        // with NO `.git` at all and build fine, so this just gives the worktree the
+        // same git-free remote source tree.
+        if let Some((worktree_git_exclude, pointer)) =
+            git_worktree_upload_exclude(&self.project_root)
+            && !excludes.contains(&worktree_git_exclude)
+        {
+            info!(
+                "Linked git worktree detected at {} (gitdir: {}); excluding dangling '.git' file from upload so the remote build resolves git-free like a normal repo",
+                self.project_root.display(),
+                pointer.gitdir
+            );
+            excludes.push(worktree_git_exclude);
+        }
+
         // Read and merge .rchignore if present
         let rchignore_path = self.project_root.join(".rchignore");
         if let Ok(patterns) = parse_rchignore(&rchignore_path) {
@@ -717,6 +1165,70 @@ impl TransferPipeline {
             }
         }
 
+        excludes
+    }
+
+    /// Belt-and-suspenders source-integrity guard for retrieval (RCH bug
+    /// `d7xc3`). Scans the LOCAL project root's top-level entries and
+    /// returns a list of explicit `--exclude /<entry>` rules for every
+    /// entry that ISN'T in the allowed-artifact-roots set. Rsync's filter
+    /// semantics: anchored excludes match only at the rsync transfer
+    /// root, so this rules out an entire class of source-overwrite bugs
+    /// (unanchored artifact patterns, malformed includes, hostile remote
+    /// layouts) by stopping rsync from even descending into known-source
+    /// top-level directories like `rch/`, `rch-common/`, etc.
+    ///
+    /// Why scan LOCAL not remote: the local project root mirrors the
+    /// remote source tree (we uploaded it). Listing local is fast (one
+    /// `read_dir`) and avoids an extra SSH round-trip. The threat model
+    /// is "stale or hostile remote tree dirties local source"; if our
+    /// LOCAL layout is being tampered with, the operator has bigger
+    /// problems than this retrieve.
+    fn local_source_roots_to_exclude(
+        &self,
+        allowed_roots: &BTreeSet<String>,
+        artifact_patterns: &[String],
+    ) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&self.project_root) else {
+            // Project root unreadable → nothing to exclude here. Other
+            // retrieval excludes (REMOTE_RUNTIME_EXCLUDE_PATTERNS, the
+            // final `--exclude "*"`) still apply, so retrieval remains
+            // safe; we just lose the explicit belt-and-suspenders layer.
+            return Vec::new();
+        };
+        let mut excludes: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if name.is_empty() || name == "." || name == ".." {
+                continue;
+            }
+            if allowed_roots.contains(name) {
+                // Permit descent into this artifact root.
+                continue;
+            }
+            if artifact_patterns_allow_top_level_entry(artifact_patterns, name) {
+                // Permit exact top-level artifact files and top-level artifact
+                // globs such as `*.tsbuildinfo`. Otherwise an existing local
+                // artifact file would be excluded before the later include rule
+                // can refresh it from the worker.
+                continue;
+            }
+            // Anchor with leading `/` so the exclude matches ONLY at the
+            // rsync transfer root, not at any nested depth.
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let name = escape_rsync_filter_literal_component(name);
+            let exclude = if is_dir {
+                format!("/{name}/")
+            } else {
+                format!("/{name}")
+            };
+            excludes.push(exclude);
+        }
+        // Deterministic order so test assertions and tracing logs are stable.
+        excludes.sort();
         excludes
     }
 
@@ -832,6 +1344,16 @@ impl TransferPipeline {
         // - https://github.com/oven-sh/bun/issues/6751 (multiple test files cause hangs)
         // The `timeout` command provides a hard kill that works even for CPU-bound loops.
         let timeout_wrapped_command = self.wrap_with_external_timeout(&colored_command);
+        // Wall-clock cap in seconds for the pgid-tracked path's watchdog (0 = disabled).
+        // Same source of truth as `wrap_with_external_timeout`, applied via an
+        // in-session group-kill watchdog instead of `timeout(1)` (see build_id branch).
+        let external_timeout_secs = if self.compilation_config.external_timeout_enabled() {
+            self.compilation_config
+                .timeout_for_kind(self.compilation_kind)
+                .as_secs()
+        } else {
+            0
+        };
 
         // Ensure remote-scoped env directories exist before build execution.
         let ensure_dirs_command = if env_plan.ensure_dirs.is_empty() {
@@ -855,20 +1377,51 @@ impl TransferPipeline {
             let remote_run_dir = Self::remote_run_dir_for_root(&remote_path);
             let escaped_pgid_file = escape(Cow::from(remote_pgid_file));
             let escaped_run_dir = escape(Cow::from(remote_run_dir));
-            let escaped_command = escape(Cow::from(timeout_wrapped_command.as_str()));
+            // For the pgid-tracked path we do NOT use the `timeout(1)` wrapper:
+            // `timeout --foreground` only signals its direct child, so a livelocked
+            // test binary (and its fixtures) that the test harness spawned survive
+            // the cap and reparent to init as 20-45h PPID-1 orphans. Instead we run
+            // the raw command and arm an in-session watchdog that, at the wall-clock
+            // cap, SIGKILLs the whole process group (`-$pgid`) — the SAME group the
+            // daemon's stuck-detector kills (`cancellation.rs`). One group, both
+            // reapers, entire tree. Killing the group includes the leader `sh -c`,
+            // but that is a child of the ssh `sh -s`, so the outer shell still
+            // reports 137 (128+SIGKILL) for clean timeout exit semantics.
+            let escaped_command = escape(Cow::from(colored_command.as_str()));
+            // The watchdog program (single-quoted, no inner single quotes):
+            //   $1 = pgid file, $2 = timeout secs (0 disables), $3.. = command.
+            // Record $$ (session-leader pgid) so the daemon kill path keeps working.
+            // NOTE: group kill is `kill -KILL -PGID` with NO `--`. dash's (/bin/sh)
+            // kill builtin mishandles `kill -KILL -- -PGID` (the `--` makes it a
+            // no-op), so `--` would silently fail to reap on the Ubuntu fleet. The
+            // `-PGID` form works in both dash and bash.
+            // The timer subshell MUST run with stdio detached from the SSH
+            // channel: `kill "$__w"` reaps only the subshell, and its `sleep`
+            // child reparents to init still holding any inherited pipe FDs.
+            // Without the redirects, sshd cannot see EOF on the channel until
+            // the orphaned sleep expires, so every successful build held the
+            // session for the full timeout and the client misreported it as
+            // "SSH command timed out" (#20).
+            let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
+if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) >/dev/null 2>&1 </dev/null & __w=$!; fi; \
+wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
 
             format!(
                 "mkdir -p {} && rm -f {} && \
 if command -v setsid >/dev/null 2>&1; then \
-setsid sh -c 'echo $$ > \"$1\"; shift; exec \"$@\"' rch-build {} sh -lc {}; \
+setsid sh -c '{}' rch-build {} {} sh -lc {}; \
 else \
-sh -c 'echo $$ > \"$1\"; shift; exec \"$@\"' rch-build {} sh -lc {}; \
+sh -c '{}' rch-build {} {} sh -lc {}; \
 fi",
                 escaped_run_dir,
                 escaped_pgid_file,
+                watchdog,
                 escaped_pgid_file,
+                external_timeout_secs,
                 escaped_command,
+                watchdog,
                 escaped_pgid_file,
+                external_timeout_secs,
                 escaped_command,
             )
         } else {
@@ -876,9 +1429,49 @@ fi",
         };
 
         format!(
-            "export LC_ALL=C; touch {} && cd {} && {}{}",
-            escaped_remote_path, escaped_remote_path, ensure_dirs_command, execution_command
+            "export LC_ALL=C; touch {} && cd {} && {}{}{}",
+            escaped_remote_path,
+            escaped_remote_path,
+            self.node_modules_bootstrap(),
+            ensure_dirs_command,
+            execution_command
         )
+    }
+
+    /// Provision `node_modules` on the worker for TypeScript kinds.
+    ///
+    /// The project sync deliberately EXCLUDES `node_modules/` (see
+    /// `default_excludes`), and that exclusion is correct: node_modules holds
+    /// platform-native binaries, so rsyncing a macOS tree onto a Linux worker
+    /// would ship unusable `.node` files. rch-wkr has a `prepare()` hook that
+    /// installs dependencies — but the hook's build path executes the command
+    /// over plain SSH and never invokes `rch-wkr execute`, so on this path
+    /// nothing provisions them.
+    ///
+    /// Without this, `tsc --noEmit` on a worker finds no project-local
+    /// TypeScript, and `npx` silently downloads the unrelated `tsc` stub package
+    /// from the registry — which prints "This is not the tsc command you are
+    /// looking for" and exits 1, turning a passing local typecheck into a failing
+    /// remote build.
+    ///
+    /// Install only when `node_modules` is absent. The worker's project directory
+    /// persists between builds, so this is a one-time cost per project. `npm ci`
+    /// is preferred (lockfile-exact, so the worker typechecks with the SAME
+    /// TypeScript version as local); `npm install` is the fallback for projects
+    /// with no lockfile. Installer output is routed to stderr so it can never
+    /// pollute the command's stdout.
+    ///
+    /// Deliberately scoped to `Tsc` only: Bun kinds keep their existing behavior.
+    fn node_modules_bootstrap(&self) -> &'static str {
+        match self.compilation_kind {
+            Some(CompilationKind::Tsc) => {
+                "if [ -f package.json ] && [ ! -d node_modules ]; then \
+                 (npm ci --no-audit --no-fund --loglevel=error || \
+                  npm install --no-audit --no-fund --loglevel=error) 1>&2 || exit 1; \
+                 fi && "
+            }
+            _ => "",
+        }
     }
 
     /// Wrap a command with an external timeout to prevent zombie/stuck processes.
@@ -917,6 +1510,7 @@ fi",
             Some(CompilationKind::CargoClippy) => "cargo clippy",
             Some(CompilationKind::CargoDoc) => "cargo doc",
             Some(CompilationKind::CargoBench) => "cargo bench",
+            Some(CompilationKind::CargoZigbuild) => "cargo zigbuild",
             Some(CompilationKind::Rustc) => "rustc",
             Some(CompilationKind::Gcc) => "gcc",
             Some(CompilationKind::Gpp) => "g++",
@@ -926,6 +1520,11 @@ fi",
             Some(CompilationKind::CmakeBuild) => "cmake build",
             Some(CompilationKind::Ninja) => "ninja",
             Some(CompilationKind::Meson) => "meson",
+            Some(CompilationKind::NixBuild) => "nix build",
+            Some(CompilationKind::GoBuild) => "go build",
+            Some(CompilationKind::GoTest) => "go test",
+            Some(CompilationKind::GoVet) => "go vet",
+            Some(CompilationKind::Tsc) => "tsc",
             None => "unknown",
         };
 
@@ -966,14 +1565,12 @@ fi",
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
 
-        cmd.arg("-az")
-            .arg("--dry-run")
-            .arg("--stats")
-            .arg("-e")
-            .arg(format!(
-                "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5",
-                escaped_identity
-            ));
+        cmd.arg("-az");
+        add_portable_rsync_archive_args(&mut cmd);
+        cmd.arg("--dry-run").arg("--stats").arg("-e").arg(format!(
+            "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5",
+            escaped_identity
+        ));
 
         for pattern in &effective_excludes {
             cmd.arg("--exclude").arg(pattern);
@@ -1100,13 +1697,17 @@ fi",
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
         let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
 
-        cmd.arg("-az") // Archive mode + compression
-            .arg("--stats") // Structured output for parse_rsync_bytes/files
+        cmd.arg("-az"); // Archive mode + compression
+        add_portable_rsync_archive_args(&mut cmd);
+        cmd.arg("--stats") // Structured output for parse_rsync_bytes/files
             .arg("-e")
             .arg(ssh_command);
 
         if self.sync_delete {
             cmd.arg("--delete"); // Remove extraneous files from destination
+        }
+        if self.sync_checksum {
+            cmd.arg("--checksum");
         }
 
         // Create remote directory implicitly using rsync-path wrapper
@@ -1165,14 +1766,18 @@ fi",
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
         let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
 
-        cmd.arg("-az") // Archive mode + compression
-            .arg("--info=progress2")
+        cmd.arg("-az"); // Archive mode + compression
+        add_portable_rsync_archive_args(&mut cmd);
+        cmd.arg("--info=progress2")
             .arg("--info=stats2")
             .arg("-e")
             .arg(ssh_command);
 
         if self.sync_delete {
             cmd.arg("--delete"); // Remove extraneous files from destination
+        }
+        if self.sync_checksum {
+            cmd.arg("--checksum");
         }
 
         // Create remote directory implicitly using rsync-path wrapper
@@ -1212,6 +1817,135 @@ fi",
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd
+    }
+
+    /// Materialize an immutable Git commit directly into this pipeline's fresh
+    /// remote project root without creating a local branch, worktree, clone, or
+    /// staging directory. The archive is streamed from `git archive` to `tar`
+    /// over SSH; the destination must not already exist.
+    #[cfg(unix)]
+    pub async fn materialize_git_archive(
+        &self,
+        worker: &WorkerConfig,
+        git_root: &Path,
+        base_commit: &str,
+    ) -> Result<SyncResult> {
+        if use_mock_transport(worker) {
+            return Ok(SyncResult {
+                bytes_transferred: 0,
+                files_transferred: 0,
+                duration_ms: 0,
+            });
+        }
+        if !matches!(base_commit.len(), 40 | 64)
+            || !base_commit.chars().all(|ch| ch.is_ascii_hexdigit())
+        {
+            anyhow::bail!("clean-overlay base must be a full hexadecimal commit object ID");
+        }
+
+        let remote_path = self.remote_path();
+        let escaped_remote_path = escape(Cow::from(remote_path.as_str()));
+        let remote_script = format!(
+            "if [ -e {path} ]; then echo 'clean-overlay destination already exists' >&2; exit 73; fi\n\
+             umask 0022\n\
+             mkdir -p {path}\n\
+             TAR_OPTIONS='' tar -xf - -C {path}",
+            path = escaped_remote_path
+        );
+
+        let mut archive = Command::new("git");
+        configure_clean_git_command(&mut archive);
+        archive
+            .current_dir(git_root)
+            .arg("archive")
+            .arg("--format=tar")
+            .arg(base_commit)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut archive_child = archive
+            .spawn()
+            .with_context(|| format!("spawn git archive for {base_commit}"))?;
+        let mut archive_stdout = archive_child
+            .stdout
+            .take()
+            .context("git archive stdout unavailable")?;
+
+        let destination = format!("{}@{}", worker.user, worker.host);
+        let identity_file = shellexpand::tilde(&worker.identity_file);
+        let mut ssh = Command::new("ssh");
+        ssh.arg("-o").arg("BatchMode=yes");
+        ssh.arg("-o").arg("StrictHostKeyChecking=accept-new");
+        ssh.arg("-o").arg(format!(
+            "ConnectTimeout={}",
+            self.ssh_options.connect_timeout.as_secs().max(1)
+        ));
+        ssh.arg("-i").arg(identity_file.as_ref());
+        if let Some(interval) = self.ssh_options.server_alive_interval {
+            let secs = interval.as_secs();
+            if secs > 0 {
+                ssh.arg("-o").arg(format!("ServerAliveInterval={secs}"));
+            }
+        }
+        let escaped_script = escape(Cow::from(remote_script.as_str()));
+        ssh.arg(&destination)
+            .arg(format!("sh -c {escaped_script}"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut ssh_child = ssh
+            .spawn()
+            .with_context(|| format!("spawn clean-overlay archive SSH to {destination}"))?;
+        let mut ssh_stdin = ssh_child
+            .stdin
+            .take()
+            .context("clean-overlay SSH stdin unavailable")?;
+
+        let start = std::time::Instant::now();
+        let transfer = async move {
+            let copy_archive = async move {
+                let bytes = tokio::io::copy(&mut archive_stdout, &mut ssh_stdin).await?;
+                ssh_stdin.shutdown().await?;
+                Ok::<u64, std::io::Error>(bytes)
+            };
+            let (copied, archive_output, ssh_output) = tokio::join!(
+                copy_archive,
+                archive_child.wait_with_output(),
+                ssh_child.wait_with_output()
+            );
+            Ok::<_, anyhow::Error>((copied?, archive_output?, ssh_output?))
+        };
+        let (bytes_transferred, archive_output, ssh_output) =
+            tokio::time::timeout(self.ssh_options.command_timeout, transfer)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "clean-overlay archive transfer timed out after {:?}",
+                        self.ssh_options.command_timeout
+                    )
+                })??;
+
+        if !archive_output.status.success() {
+            anyhow::bail!(
+                "git archive failed for {base_commit}: {}",
+                String::from_utf8_lossy(&archive_output.stderr).trim()
+            );
+        }
+        if !ssh_output.status.success() {
+            anyhow::bail!(
+                "remote clean-overlay archive extraction failed (exit {:?}): {}",
+                ssh_output.status.code(),
+                String::from_utf8_lossy(&ssh_output.stderr).trim()
+            );
+        }
+
+        Ok(SyncResult {
+            bytes_transferred,
+            files_transferred: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
     }
 
     /// Synchronize local project to remote worker.
@@ -1291,28 +2025,23 @@ fi",
             .into());
         }
 
-        // Verify transfer completed successfully by checking for partial transfer indicators.
-        // rsync can exit with code 0 even if interrupted mid-file in some edge cases.
-        // Look for warning signs in stderr that indicate incomplete transfer.
-        if !stderr.is_empty() {
-            let stderr_lower = stderr.to_lowercase();
-            let partial_indicators = [
-                "partial transfer",
-                "connection unexpectedly closed",
-                "write error",
-                "read error",
-                "truncated file",
-            ];
-            if let Some(indicator) = partial_indicators
-                .iter()
-                .find(|ind| stderr_lower.contains(*ind))
-            {
-                warn!(
-                    "rsync reported potential partial transfer (matched '{}'): {}",
-                    indicator,
-                    stderr.lines().next().unwrap_or(&stderr)
-                );
+        // rsync can exit 0 even when interrupted mid-file in edge cases. Treat a
+        // partial-transfer indicator on a "successful" sync as a failure rather
+        // than warning and returning Ok: otherwise the hook reports success, the
+        // remote source tree is incomplete, and the remote build compiles
+        // stale/partial sources, returning a trusted-but-wrong result.
+        if let Some(indicator) = detect_partial_transfer(&stderr) {
+            warn!(
+                "rsync exited 0 but reported a partial transfer (matched '{}'): {}",
+                indicator,
+                stderr.lines().next().unwrap_or(&stderr)
+            );
+            return Err(TransferError::SyncFailed {
+                reason: format!("partial transfer despite exit 0 ({indicator})"),
+                exit_code: output.status.code(),
+                stderr: stderr.to_string(),
             }
+            .into());
         }
 
         info!("Sync completed in {}ms", duration.as_millis());
@@ -1367,26 +2096,50 @@ fi",
 
         debug!("Effective exclude patterns: {:?}", effective_excludes);
 
-        let cmd = self.build_sync_streaming_command(
-            worker,
-            &destination,
-            &escaped_remote_path,
-            &effective_excludes,
-        );
+        // Rebuilt per retry attempt: rsync consumes its `Command`, and a
+        // transient SSH/rsync drop on this streaming path must reconnect from a
+        // fresh command rather than fail the whole transfer with zero retries.
+        let build_cmd = || {
+            self.build_sync_streaming_command(
+                worker,
+                &destination,
+                &escaped_remote_path,
+                &effective_excludes,
+            )
+        };
 
         debug!(
             "Running (streaming): rsync {:?}",
-            cmd.as_std().get_args().collect::<Vec<_>>()
+            build_cmd().as_std().get_args().collect::<Vec<_>>()
         );
 
         let retry_config = self.effective_rsync_retry_config();
-        let transfer_timeout =
-            std::time::Duration::from_millis(retry_config.total_timeout_ms.max(1));
-        let (output, duration_ms) =
-            run_command_streaming(cmd, "sync_to_remote_streaming", transfer_timeout, |line| {
+        let (output, duration_ms) = run_command_streaming_with_retry(
+            &retry_config,
+            "sync_to_remote_streaming",
+            build_cmd,
+            |line| {
                 on_line(line);
-            })
-            .await?;
+            },
+        )
+        .await?;
+
+        // Same exit-0-but-incomplete guard as the non-streaming sync_to_remote:
+        // run_command_streaming returns the combined stdout+stderr, so scan it for
+        // partial-transfer indicators and fail rather than report a success that
+        // would feed the remote build stale/partial sources.
+        if let Some(indicator) = detect_partial_transfer(&output) {
+            warn!(
+                "streaming rsync exited 0 but reported a partial transfer (matched '{}')",
+                indicator
+            );
+            return Err(TransferError::SyncFailed {
+                reason: format!("partial transfer despite exit 0 ({indicator})"),
+                exit_code: None,
+                stderr: output,
+            }
+            .into());
+        }
 
         Ok(SyncResult {
             bytes_transferred: parse_rsync_bytes(&output),
@@ -1680,8 +2433,9 @@ fi",
         // --stats is required so parse_rsync_bytes/parse_rsync_files can read transfer
         // counts from stdout; without it rsync produces no output and the parsers
         // return 0, causing a false "No artifacts retrieved" warning.
-        cmd.arg("-az")
-            .arg("--stats")
+        cmd.arg("-az");
+        add_portable_rsync_archive_args(&mut cmd);
+        cmd.arg("--stats")
             .arg("--safe-links")
             .arg("-e")
             .arg(ssh_command);
@@ -1704,11 +2458,35 @@ fi",
         // empty parents of excluded files (side effect of --include="*/")
         cmd.arg("--prune-empty-dirs");
 
+        // Split caller-supplied EXCLUDE rules (`- <pat>`) from INCLUDE patterns.
+        // Excludes (e.g. cargo cache trees in a custom-target sync) must be emitted
+        // first so rsync's first-match-wins ordering keeps them from transferring;
+        // only the include patterns feed the root/source-integrity helpers below.
+        let (caller_excludes, include_patterns) = partition_artifact_filters(artifact_patterns);
+
         // Apply retrieval-safe excludes before the directory include so rsync
         // never descends into known junk trees like `.beads/recovery_*` on the
         // worker, while still allowing traversal into declared artifact roots.
-        for pattern in self.get_retrieval_excludes(artifact_patterns) {
+        for pattern in self.get_retrieval_excludes(&include_patterns) {
             cmd.arg("--exclude").arg(pattern);
+        }
+
+        // Caller-supplied excludes (cargo `incremental/`, `.fingerprint/`,
+        // `build/`, `*.d`, …) — emitted before the includes so a broad output
+        // include like `debug/**` cannot drag the cache trees back.
+        for pattern in &caller_excludes {
+            cmd.arg("--exclude").arg(pattern);
+        }
+
+        // Source-integrity guard (RCH bug d7xc3): explicitly exclude every
+        // top-level entry in the local project root that ISN'T an allowed
+        // artifact root. Defends against unanchored pattern matching, malformed
+        // includes, or a stale remote tree pulling source files into the local
+        // checkout. The excludes are emitted BEFORE the directory include so
+        // rsync evaluates them first and refuses to descend into source dirs.
+        let allowed_roots = allowed_artifact_roots(&include_patterns);
+        for exclude in self.local_source_roots_to_exclude(&allowed_roots, &include_patterns) {
+            cmd.arg("--exclude").arg(exclude);
         }
 
         // Essential: Include all directories so rsync can traverse to match patterns.
@@ -1716,9 +2494,12 @@ fi",
         // like "target/" to check for matches.
         cmd.arg("--include").arg("*/");
 
-        // Include only specified artifact patterns
-        for pattern in artifact_patterns {
-            cmd.arg("--include").arg(pattern);
+        // Include only specified artifact patterns, anchored at the rsync
+        // transfer root via `anchor_retrieval_pattern` (RCH bug d7xc3) so
+        // a pattern like `target/debug/**` cannot match `<root>/anything/
+        // target/debug/...` at arbitrary depth.
+        for pattern in &include_patterns {
+            cmd.arg("--include").arg(anchor_retrieval_pattern(pattern));
         }
         cmd.arg("--exclude").arg("*"); // Exclude everything else
 
@@ -1746,8 +2527,9 @@ fi",
 
         let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
 
-        cmd.arg("-az")
-            .arg("--info=progress2")
+        cmd.arg("-az");
+        add_portable_rsync_archive_args(&mut cmd);
+        cmd.arg("--info=progress2")
             .arg("--info=stats2")
             .arg("--safe-links")
             .arg("-e")
@@ -1770,17 +2552,36 @@ fi",
         // Prune empty directories to prevent cluttering local project
         cmd.arg("--prune-empty-dirs");
 
+        // Split caller-supplied EXCLUDE rules (`- <pat>`) from INCLUDE patterns;
+        // see build_retrieve_command for the rationale (first-match-wins ordering).
+        let (caller_excludes, include_patterns) = partition_artifact_filters(artifact_patterns);
+
         // Reuse the retrieval-safe excludes so streaming downloads skip stale
         // worker-local junk trees without excluding legitimate artifact roots.
-        for pattern in self.get_retrieval_excludes(artifact_patterns) {
+        for pattern in self.get_retrieval_excludes(&include_patterns) {
             cmd.arg("--exclude").arg(pattern);
+        }
+
+        // Caller-supplied excludes (cargo cache trees, `*.d`, …) emitted before
+        // the includes so a broad output include cannot drag them back.
+        for pattern in &caller_excludes {
+            cmd.arg("--exclude").arg(pattern);
+        }
+
+        // Source-integrity guard (RCH bug d7xc3): see build_retrieve_command.
+        // Same belt-and-suspenders defense applied to the streaming variant.
+        let allowed_roots = allowed_artifact_roots(&include_patterns);
+        for exclude in self.local_source_roots_to_exclude(&allowed_roots, &include_patterns) {
+            cmd.arg("--exclude").arg(exclude);
         }
 
         // Essential: Include all directories so rsync can traverse to match patterns.
         cmd.arg("--include").arg("*/");
 
-        for pattern in artifact_patterns {
-            cmd.arg("--include").arg(pattern);
+        // Artifact include patterns are anchored (RCH bug d7xc3) so they can
+        // only match at the rsync transfer root.
+        for pattern in &include_patterns {
+            cmd.arg("--include").arg(anchor_retrieval_pattern(pattern));
         }
         cmd.arg("--exclude").arg("*");
 
@@ -1922,6 +2723,22 @@ fi",
             .into());
         }
 
+        // An exit-0 partial download leaves the local artifact tree incomplete;
+        // fail rather than report success (see sync_to_remote).
+        if let Some(indicator) = detect_partial_transfer(&stderr) {
+            warn!(
+                "rsync exited 0 but reported a partial artifact retrieval (matched '{}'): {}",
+                indicator,
+                stderr.lines().next().unwrap_or(&stderr)
+            );
+            return Err(TransferError::SyncFailed {
+                reason: format!("partial artifact retrieval despite exit 0 ({indicator})"),
+                exit_code: output.status.code(),
+                stderr: stderr.clone(),
+            }
+            .into());
+        }
+
         let bytes_transferred = parse_rsync_bytes(&stdout);
         let files_transferred = parse_rsync_files(&stdout);
 
@@ -1984,26 +2801,43 @@ fi",
             remote_path, worker.id
         );
 
-        let cmd =
-            self.build_retrieve_streaming_command(worker, &escaped_remote_path, artifact_patterns);
+        // Rebuilt per retry attempt (see `sync_to_remote_streaming`): a transient
+        // transport drop while pulling artifacts must reconnect and retry instead
+        // of failing the build's artifact return outright.
+        let build_cmd = || {
+            self.build_retrieve_streaming_command(worker, &escaped_remote_path, artifact_patterns)
+        };
 
         debug!(
             "Running artifact retrieval (streaming): rsync {:?}",
-            cmd.as_std().get_args().collect::<Vec<_>>()
+            build_cmd().as_std().get_args().collect::<Vec<_>>()
         );
 
         let retry_config = self.effective_rsync_retry_config();
-        let transfer_timeout =
-            std::time::Duration::from_millis(retry_config.total_timeout_ms.max(1));
-        let (output, duration_ms) = run_command_streaming(
-            cmd,
+        let (output, duration_ms) = run_command_streaming_with_retry(
+            &retry_config,
             "retrieve_artifacts_streaming",
-            transfer_timeout,
+            build_cmd,
             |line| {
                 on_line(line);
             },
         )
         .await?;
+
+        // An exit-0 partial download leaves the local artifact tree incomplete;
+        // fail rather than report success (see retrieve_artifacts).
+        if let Some(indicator) = detect_partial_transfer(&output) {
+            warn!(
+                "streaming rsync exited 0 but reported a partial artifact retrieval (matched '{}')",
+                indicator
+            );
+            return Err(TransferError::SyncFailed {
+                reason: format!("partial artifact retrieval despite exit 0 ({indicator})"),
+                exit_code: None,
+                stderr: output,
+            }
+            .into());
+        }
 
         Ok(SyncResult {
             bytes_transferred: parse_rsync_bytes(&output),
@@ -2055,6 +2889,134 @@ fi",
             Ok(())
         }
     }
+
+    /// Best-effort reaping of *stale* sibling per-job target dirs for this
+    /// project on the worker.
+    ///
+    /// rch gives every forwarded-`CARGO_TARGET_DIR` build a per-job target dir
+    /// (`.rch-target-<worker>-job-<id>-<ts>-<seq>`). Such a dir can stay in active
+    /// use far beyond a single command — a long-running build keeps writing into
+    /// it, and one was observed accumulating ~11.5h of build artifacts. So a
+    /// per-job dir must *never* be removed merely because some build finished; that
+    /// could clip a build still in flight. Instead we remove only dirs that
+    /// have seen **no file activity for `idle_hours`** — i.e. finished/abandoned
+    /// ones. A dir idle that long cannot be a live job (an active build touches its
+    /// dir continuously), so this never races a concurrent build on the same
+    /// project, even when multiple agents build it on the same worker at once.
+    ///
+    /// The sweep is confined to the *single current project dir* (`remote_path()`),
+    /// reaping only its abandoned sibling per-job dirs. The expensive cross-project
+    /// full-tree scan has moved OFF this per-dispatch path into the durable
+    /// daemon-side worker sweep (`rchd::stale_target_reap`), which scans every
+    /// project under the worker's `remote_base` on a background interval. Both
+    /// share the idle predicate via `rch_common::stale_target_reap` so they cannot
+    /// drift; this orchestrator side stays cheap (one `cd` + a two-glob loop).
+    ///
+    /// The staleness check looks at the dir itself *and* any descendant (file or
+    /// subdir): a recent deep file means an active build (a top-dir-mtime-only
+    /// check would miss it, because the top dir mtime can go stale while deep
+    /// incremental artifacts keep changing), while a recent *dir* mtime means a
+    /// freshly-created target — e.g. a concurrent build that has `mkdir`'d its dir
+    /// but not yet written a file (a files-only check would wrongly reap it). The
+    /// removal *itself* is detached on the worker (a backgrounded `rm`), so the
+    /// potentially-large reclaim runs concurrently with the build — only a quick
+    /// SSH dispatch is awaited here. Failures are swallowed — reaping is
+    /// opportunistic, never load-bearing.
+    pub async fn reap_stale_sibling_per_job_target_dirs(
+        &self,
+        worker: &WorkerConfig,
+        idle_hours: u32,
+    ) {
+        let project_dir = self.remote_path();
+        let current = self.remote_cargo_target_dir_name.clone();
+
+        // Hard safety guards. Both values are rch-generated and should be simple
+        // path tokens; refuse anything that could escape the intended
+        // `<project_dir>/.rch-target-*` scope or inject shell syntax. The reap
+        // script embeds these unescaped (inside double quotes), so this guard is
+        // the security boundary. The predicate + safety checks are shared with the
+        // daemon-side worker sweep (`rchd::stale_target_reap`) via
+        // `rch_common::stale_target_reap` so the two can't drift.
+        if !rch_common::stale_target_reap::is_safe_reap_path(&project_dir)
+            || !rch_common::stale_target_reap::is_safe_reap_token(&current)
+        {
+            warn!(
+                "stale-target reap: refusing unsafe inputs (project_dir={:?}, current={:?})",
+                project_dir, current
+            );
+            return;
+        }
+        // Never below a 1h floor, no matter how the threshold was configured.
+        let idle_minutes = rch_common::stale_target_reap::idle_minutes_from_hours(idle_hours);
+
+        if use_mock_transport(worker) {
+            debug!(
+                "Mock stale-target reap in {} on {} (idle>{}h)",
+                project_dir, worker.id, idle_hours
+            );
+            return;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (worker, idle_minutes);
+        }
+
+        #[cfg(unix)]
+        {
+            // For each per-job sibling dir apply the SHARED reap predicate
+            // (`rch_common::stale_target_reap::reap_loop_body`): keep it if the dir
+            // OR any descendant was modified within the idle window (an active or
+            // just-created build); otherwise remove it. This job's own dir is
+            // always excluded. The glob list is the shared `REAP_GLOBS`.
+            let globs = rch_common::stale_target_reap::REAP_GLOBS.join(" ");
+            let loop_body =
+                rch_common::stale_target_reap::reap_loop_body(idle_minutes, Some(&current), "", "");
+            let script = format!(
+                "cd \"{project_dir}\" 2>/dev/null || exit 0; \
+                 for d in {globs}; do {loop_body} done"
+            );
+            // Detach on the worker so a large reclaim runs concurrently with the
+            // build rather than blocking it. The script contains no single quotes
+            // (inputs are charset-restricted above), so single-quoting is safe.
+            let remote_command = format!("nohup sh -c '{script}' >/dev/null 2>&1 &");
+
+            let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
+            if let Err(e) = client.connect().await {
+                debug!(
+                    "stale-target reap skipped (ssh connect failed on {}): {}",
+                    worker.id, e
+                );
+                return;
+            }
+            if let Err(e) = client.execute(&remote_command).await {
+                debug!("stale-target reap dispatch failed on {}: {}", worker.id, e);
+            }
+            if let Err(e) = client.disconnect().await {
+                debug!(
+                    "stale-target reap: ssh disconnect warning on {}: {}",
+                    worker.id, e
+                );
+            }
+        }
+    }
+}
+
+// The stale-target reap safety predicates now live in
+// `rch_common::stale_target_reap` so the orchestrator reaper (here) and the
+// daemon-side worker sweep (`rchd::stale_target_reap`) share a single source of
+// truth and cannot drift. These thin wrappers preserve the local test surface.
+
+/// See [`rch_common::stale_target_reap::is_safe_reap_path`].
+#[cfg(test)]
+fn is_safe_reap_path(s: &str) -> bool {
+    rch_common::stale_target_reap::is_safe_reap_path(s)
+}
+
+/// See [`rch_common::stale_target_reap::is_safe_reap_token`].
+#[cfg(test)]
+fn is_safe_reap_token(s: &str) -> bool {
+    rch_common::stale_target_reap::is_safe_reap_token(s)
 }
 
 /// Result of a file synchronization operation.
@@ -2105,6 +3067,8 @@ fn parse_rsync_bytes(output: &str) -> u64 {
 
 /// Parse files transferred from rsync output.
 fn parse_rsync_files(output: &str) -> u32 {
+    let mut total_files = None;
+
     for line in output.lines() {
         if let Some(rest) = line.strip_prefix("Number of files transferred:")
             && let Some(count) = rest.split_whitespace().next()
@@ -2116,14 +3080,14 @@ fn parse_rsync_files(output: &str) -> u32 {
             && let Some(count) = rest.split_whitespace().next()
             && let Ok(parsed) = count.replace(',', "").parse::<u32>()
         {
-            return parsed;
+            total_files = Some(parsed);
         }
     }
 
     // If we couldn't parse structured stats, return 0 rather than guessing.
     // The previous heuristic of counting non-empty lines was unreliable as it
     // would count progress lines, stats, and error messages as files.
-    0
+    total_files.unwrap_or(0)
 }
 
 // =============================================================================
@@ -2264,6 +3228,152 @@ where
     }
 
     Ok((combined, start.elapsed().as_millis() as u64))
+}
+
+/// Scan rsync output for indicators that a transfer was incomplete despite a
+/// zero exit code.
+///
+/// rsync usually exits non-zero on a partial transfer, but it can exit 0 while
+/// interrupted mid-file in edge cases. Trusting that success is dangerous: for
+/// an upload the remote build then compiles stale/partial sources and returns a
+/// trusted-but-wrong result; for a download the local artifact tree is silently
+/// incomplete. Returns the first matched indicator, if any, so the caller can
+/// fail the transfer instead of reporting success.
+///
+/// Note: callers on the streaming path pass the combined stdout+stderr (rsync
+/// runs without `-v`, so it emits progress/stats — not a per-file listing — and
+/// these phrases do not appear benignly).
+fn detect_partial_transfer(output: &str) -> Option<&'static str> {
+    if output.is_empty() {
+        return None;
+    }
+    const PARTIAL_INDICATORS: [&str; 5] = [
+        "partial transfer",
+        "connection unexpectedly closed",
+        "write error",
+        "read error",
+        "truncated file",
+    ];
+    let lower = output.to_lowercase();
+    PARTIAL_INDICATORS
+        .into_iter()
+        .find(|ind| lower.contains(ind))
+}
+
+/// Decide whether a [`run_command_streaming`] failure is a transient transport
+/// error worth retrying.
+///
+/// `run_command_streaming` reports a non-zero rsync exit as
+/// `TransferError::SyncFailed { stderr, .. }`, whose `Display` is only
+/// `"Project sync failed: rsync failed"` — the transport signature lives in the
+/// captured `stderr`, NOT in the error chain. So the generic
+/// `is_retryable_transport_error` (which walks `err.chain()` strings) would
+/// classify every streaming rsync drop as fatal. We therefore inspect the
+/// captured `stderr` directly for `SyncFailed`, and fall back to the error-chain
+/// classifier for everything else (spawn I/O errors, the streaming-timeout
+/// `bail!`, etc.).
+fn streaming_error_is_retryable(err: &anyhow::Error) -> bool {
+    if let Some(TransferError::SyncFailed { stderr, .. }) = err.downcast_ref::<TransferError>() {
+        return is_retryable_transport_error_text(stderr);
+    }
+    is_retryable_transport_error(err)
+}
+
+/// Streaming counterpart of [`execute_rsync_with_retry`].
+///
+/// `run_command_streaming` consumes its `Command` (so it cannot be retried in
+/// place) and surfaces transport failures inside a `TransferError::SyncFailed`
+/// whose `Display` omits the stderr — which is why this loop is hand-rolled
+/// rather than delegating to `retry_with_backoff`. Each attempt rebuilds the
+/// command via `build_command`, runs it under the *remaining* total budget
+/// (mirroring `retry_with_backoff`'s per-attempt timeout accounting), and on a
+/// transient transport failure backs off and retries up to `max_attempts`.
+///
+/// `on_line` is re-invoked from scratch on every attempt (rsync restarts from
+/// the beginning). All call sites use it purely for progress/heartbeat display,
+/// which tolerates repetition; do not route side-effecting work through it.
+async fn run_command_streaming_with_retry<F>(
+    config: &RetryConfig,
+    operation_name: &str,
+    build_command: impl Fn() -> Command,
+    mut on_line: F,
+) -> Result<(String, u64)>
+where
+    F: FnMut(&str),
+{
+    let start = std::time::Instant::now();
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 0..config.max_attempts {
+        // Stop before a retry once the total budget is spent.
+        if attempt > 0 && !config.should_retry(attempt, start.elapsed()) {
+            debug!(
+                "{}: total timeout exceeded after {} attempts",
+                operation_name, attempt
+            );
+            break;
+        }
+
+        // Exponential backoff with jitter for retries only.
+        if attempt > 0 {
+            let delay = config.delay_for_attempt(attempt);
+            debug!(
+                "{}: attempt {}/{} after {}ms delay",
+                operation_name,
+                attempt + 1,
+                config.max_attempts,
+                delay.as_millis()
+            );
+            sleep(delay).await;
+        }
+
+        // The per-attempt timeout is the remaining total budget, so the sum of
+        // all attempts stays bounded by `total_timeout_ms` exactly as the
+        // non-streaming retry path does.
+        let elapsed_ms = start.elapsed().as_millis();
+        let remaining_ms = if elapsed_ms >= config.total_timeout_ms as u128 {
+            1
+        } else {
+            (config.total_timeout_ms - elapsed_ms as u64).max(1)
+        };
+        let attempt_timeout = std::time::Duration::from_millis(remaining_ms);
+
+        let cmd = build_command();
+        match run_command_streaming(cmd, operation_name, attempt_timeout, &mut on_line).await {
+            Ok(result) => {
+                if attempt > 0 {
+                    info!(
+                        "{}: succeeded on attempt {}/{}",
+                        operation_name,
+                        attempt + 1,
+                        config.max_attempts
+                    );
+                }
+                return Ok(result);
+            }
+            Err(err) => {
+                if !streaming_error_is_retryable(&err) {
+                    debug!(
+                        "{}: non-retryable error on attempt {}: {}",
+                        operation_name,
+                        attempt + 1,
+                        err
+                    );
+                    return Err(err);
+                }
+                warn!(
+                    "{}: retryable error on attempt {}/{}: {}",
+                    operation_name,
+                    attempt + 1,
+                    config.max_attempts,
+                    err
+                );
+                last_error = Some(err);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{}: all retries exhausted", operation_name)))
 }
 
 fn normalize_hash_root(path: &Path, policy: &PathTopologyPolicy) -> PathBuf {
@@ -2435,6 +3545,27 @@ pub fn default_rust_artifact_patterns() -> Vec<String> {
     ]
 }
 
+/// Default artifact patterns for `cargo zigbuild` cross-compiles.
+///
+/// cargo-zigbuild always builds for an explicit `--target <triple>`, so cargo
+/// writes its outputs under `target/<triple>/<profile>/` rather than the plain
+/// `target/<profile>/` that [`default_rust_artifact_patterns`] captures. The
+/// `target/*/…` globs (one `*` = the triple component) bring the cross-compiled
+/// binary/libs home; the non-cross paths are kept too so a `--target` matching
+/// the host still syncs, and for the odd zigbuild without `--target`.
+pub fn default_zigbuild_artifact_patterns() -> Vec<String> {
+    vec![
+        // Cross-compile outputs: target/<triple>/<profile>/**
+        "target/*/debug/**".to_string(),
+        "target/*/release/**".to_string(),
+        // Non-cross (host-target) outputs, same as a plain cargo build.
+        "target/debug/**".to_string(),
+        "target/release/**".to_string(),
+        "target/.rustc_info.json".to_string(),
+        "target/CACHEDIR.TAG".to_string(),
+    ]
+}
+
 /// Minimal artifact patterns for Rust test-only commands.
 ///
 /// Test runs stream their output via stdout/stderr and don't need the full
@@ -2506,10 +3637,9 @@ pub fn default_c_cpp_artifact_patterns() -> Vec<String> {
         "*.lib".to_string(),
         // Executables (Windows)
         "*.exe".to_string(),
-        // We also want to include executables in the root, but rsync include/exclude logic
-        // makes "just executables" hard. We'll include all files in root that don't match excludes.
-        // The "*/" in retrieve_artifacts covers directories.
-        // We include "*" to catch files in the root (like the output binary).
+        // Best-effort root-level outputs (like `a.out`) when they are newly
+        // created remotely. Existing local top-level entries stay protected by
+        // the retrieval source-integrity guard.
         "*".to_string(),
     ]
 }
@@ -2522,6 +3652,31 @@ mod tests {
     use rch_common::test_guard;
     use serial_test::serial;
 
+    fn arg_pair_position(args: &[String], flag: &str, value: &str) -> Option<usize> {
+        args.windows(2).position(|window| {
+            matches!(window, [observed_flag, observed_value]
+                if observed_flag.as_str() == flag && observed_value.as_str() == value)
+        })
+    }
+
+    fn command_args(cmd: &Command) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect()
+    }
+
+    fn assert_portable_rsync_archive_args(args: &[String]) {
+        assert!(
+            args.iter().any(|arg| arg == "--no-owner"),
+            "rsync archive mode must not preserve owner metadata across workers"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "--no-group"),
+            "rsync archive mode must not preserve group metadata across workers"
+        );
+    }
+
     #[test]
     fn test_remote_path() {
         let _guard = test_guard!();
@@ -2532,7 +3687,202 @@ mod tests {
             TransferConfig::default(),
         );
 
-        assert_eq!(pipeline.remote_path(), "/tmp/rch/myproject/abc123");
+        assert_eq!(pipeline.remote_path(), "/data/tmp/rch/myproject/abc123");
+    }
+
+    #[test]
+    fn test_is_safe_reap_path_accepts_real_project_dirs() {
+        // The two shapes remote_path() actually produces.
+        assert!(is_safe_reap_path("/data/tmp/rch/myproject/abc123"));
+        assert!(is_safe_reap_path(
+            "/data/projects/coding_agent_session_search/9f8e7d6c"
+        ));
+    }
+
+    #[test]
+    fn test_is_safe_reap_path_rejects_dangerous_inputs() {
+        assert!(!is_safe_reap_path(""));
+        assert!(!is_safe_reap_path("/"));
+        assert!(!is_safe_reap_path("relative/path")); // not absolute
+        assert!(!is_safe_reap_path("/toplevel")); // < 2 segments
+        assert!(!is_safe_reap_path("/data/../etc")); // parent traversal
+        // Shell metacharacters / quotes / globs / spaces must all be rejected so
+        // the unescaped embedding in the reap script cannot be subverted.
+        for bad in [
+            "/data/projects/a b",
+            "/data/projects/a'b",
+            "/data/projects/a\"b",
+            "/data/projects/a$b",
+            "/data/projects/a`b",
+            "/data/projects/a;b",
+            "/data/projects/a|b",
+            "/data/projects/a*b",
+            "/data/projects/a&b",
+        ] {
+            assert!(!is_safe_reap_path(bad), "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_is_safe_reap_token_guards_basenames() {
+        // A real per-job dir basename is accepted.
+        assert!(is_safe_reap_token(
+            ".rch-target-ts2-job-29863360510034113-1780109474952075077-0"
+        ));
+        // Path separators, traversal, and shell metacharacters are rejected.
+        assert!(!is_safe_reap_token(""));
+        assert!(!is_safe_reap_token("."));
+        assert!(!is_safe_reap_token(".."));
+        assert!(!is_safe_reap_token("a/b"));
+        assert!(!is_safe_reap_token("a b"));
+        assert!(!is_safe_reap_token("a'b"));
+        assert!(!is_safe_reap_token("a$b"));
+        assert!(!is_safe_reap_token("a*b"));
+    }
+
+    /// End-to-end behavioral test for the cheap CURRENT-PROJECT-ONLY orchestrator
+    /// reaper: actually run the generated script (under POSIX `sh`, single-quote
+    /// wrapped exactly like the dispatch site) against a fake repo dir holding
+    /// idle, live, current-job, and empty sibling per-job dirs and assert which
+    /// survive. The expensive cross-project full-tree sweep moved to the daemon;
+    /// the orchestrator now only `cd`s into the one repo dir and globs its
+    /// siblings, always excluding the current job's own dir.
+    #[cfg(unix)]
+    #[test]
+    fn test_current_project_reap_script_reaps_idle_keeps_live_current_and_empty() {
+        use std::fs;
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("create repo root");
+        // The single repo dir the orchestrator `cd`s into (>=2 segments deep so it
+        // passes is_safe_reap_path; the script itself just `cd`s into it verbatim).
+        let project_dir = tmp.path().join("repo");
+        fs::create_dir_all(&project_dir).expect("mkdir repo dir");
+
+        // Helper: a per-job sibling dir with one artifact, optionally aged past the
+        // idle window via `touch -t` (portable GNU/BSD).
+        let make = |name: &str, aged: bool| -> std::path::PathBuf {
+            let d = project_dir.join(name);
+            fs::create_dir_all(d.join("deps")).expect("mkdir per-job dir");
+            fs::write(d.join("deps/a.rlib"), b"x").expect("write artifact");
+            if aged {
+                let ok = Command::new("find")
+                    .arg(&d)
+                    .args(["-exec", "touch", "-t", "202601010000", "{}", ";"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                assert!(ok, "aging {name} should succeed");
+            }
+            d
+        };
+
+        let current = ".rch-target-host-job-9-999-1";
+        let idle = make(".rch-target-host-job-1-111-0", true);
+        let idle_pid = make(".rch-target-host-pid-2-222-0", true);
+        let live = make(".rch-target-host-job-3-333-0", false);
+        let current_dir = make(current, true); // aged but must be EXCLUDED by name
+        // Empty just-created dir (mkdir, no first write) must be kept.
+        let empty = project_dir.join(".rch-target-host-job-4-444-0");
+        fs::create_dir_all(&empty).expect("mkdir empty dir");
+        // A non-rch sibling must never match the glob.
+        let bystander = project_dir.join("target");
+        fs::create_dir_all(&bystander).expect("mkdir bystander");
+
+        // Build the script EXACTLY as the reaper does (shared globs + loop body,
+        // excluding the current job dir), then run it single-quote wrapped.
+        let globs = rch_common::stale_target_reap::REAP_GLOBS.join(" ");
+        let loop_body = rch_common::stale_target_reap::reap_loop_body(720, Some(current), "", "");
+        let project_dir_str = project_dir.to_str().unwrap();
+        let script = format!(
+            "cd \"{project_dir_str}\" 2>/dev/null || exit 0; \
+             for d in {globs}; do {loop_body} done"
+        );
+        // Guard: no single quote of its own (it is single-quote wrapped at dispatch
+        // — `reap_loop_body`'s `awk '{{print $1}}'` is only emitted in the METRICS
+        // variant; the orchestrator passes empty counters so no awk/quotes appear).
+        assert!(
+            !script.contains('\''),
+            "orchestrator script must contain no single quotes: {script}"
+        );
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sh -c '{script}'"))
+            .status()
+            .expect("run reap script");
+        assert!(status.success(), "reap script should exit 0");
+
+        assert!(!idle.exists(), "idle -job- sibling must be reaped");
+        assert!(!idle_pid.exists(), "idle -pid- sibling must be reaped");
+        assert!(live.exists(), "freshly-touched sibling must be kept");
+        assert!(
+            current_dir.exists(),
+            "the current job's own dir must NEVER be reaped (excluded by name)"
+        );
+        assert!(empty.exists(), "empty just-created dir must be kept");
+        assert!(bystander.exists(), "non-rch `target` must never be touched");
+    }
+
+    /// The orchestrator `cd`s into the repo dir verbatim, so a SYMLINKED project
+    /// dir is followed transparently by `cd` (no `pwd -P` needed) and its idle
+    /// siblings are still reaped while the live one survives.
+    #[cfg(unix)]
+    #[test]
+    fn test_current_project_reap_script_follows_symlinked_project_dir() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        let base = tempdir().expect("create base");
+        let physical = base.path().join("data_repo");
+        fs::create_dir_all(&physical).expect("mkdir physical repo dir");
+        let link = base.path().join("home_repo");
+        symlink(&physical, &link).expect("create symlink to physical repo dir");
+
+        let make = |name: &str, aged: bool| -> std::path::PathBuf {
+            let d = physical.join(name);
+            fs::create_dir_all(d.join("deps")).expect("mkdir per-job dir");
+            fs::write(d.join("deps/a.rlib"), b"x").expect("write artifact");
+            if aged {
+                let ok = Command::new("find")
+                    .arg(&d)
+                    .args(["-exec", "touch", "-t", "202601010000", "{}", ";"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                assert!(ok, "aging {name} should succeed");
+            }
+            d
+        };
+
+        let idle = make(".rch-target-host-job-1-111-0", true);
+        let live = make(".rch-target-host-job-2-222-1", false);
+
+        // Pass the SYMLINK path as the project dir — `cd <symlink>` follows it.
+        let link_str = link.to_str().unwrap();
+        let globs = rch_common::stale_target_reap::REAP_GLOBS.join(" ");
+        let loop_body = rch_common::stale_target_reap::reap_loop_body(720, None, "", "");
+        let script = format!(
+            "cd \"{link_str}\" 2>/dev/null || exit 0; \
+             for d in {globs}; do {loop_body} done"
+        );
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sh -c '{script}'"))
+            .status()
+            .expect("run reap script");
+        assert!(status.success(), "reap script should exit 0");
+
+        assert!(
+            !idle.exists(),
+            "idle sibling behind a SYMLINKED project dir must be reaped"
+        );
+        assert!(
+            live.exists(),
+            "live sibling must be preserved via the symlinked project dir"
+        );
     }
 
     #[test]
@@ -2601,6 +3951,13 @@ mod tests {
         // Test "Number of files:" format (alternate rsync output)
         let output = "Number of files: 100\nsome other line";
         assert_eq!(parse_rsync_files(output), 100);
+    }
+
+    #[test]
+    fn test_parse_rsync_files_prefers_transferred_count_over_total_tree_count() {
+        let _guard = test_guard!();
+        let output = "Number of files: 28,779 (reg: 20,000, dir: 8,779)\nNumber of files transferred: 42\nTotal bytes sent: 1,271,299";
+        assert_eq!(parse_rsync_files(output), 42);
     }
 
     #[test]
@@ -2901,7 +4258,7 @@ mod tests {
         .with_color_mode(ColorMode::Always)
         .with_env_allowlist(vec!["RUSTFLAGS".to_string(), "CC".to_string()]);
 
-        assert_eq!(pipeline.remote_path(), "/tmp/rch/test-project/abc123");
+        assert_eq!(pipeline.remote_path(), "/data/tmp/rch/test-project/abc123");
     }
 
     #[test]
@@ -2923,7 +4280,7 @@ mod tests {
         .with_command_timeout(std::time::Duration::from_secs(300));
 
         // Just verify it builds without panic
-        assert_eq!(pipeline.remote_path(), "/tmp/rch/test-project/abc123");
+        assert_eq!(pipeline.remote_path(), "/data/tmp/rch/test-project/abc123");
     }
 
     #[test]
@@ -3156,8 +4513,8 @@ mod tests {
 
         let cmd = pipeline.build_sync_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -3208,8 +4565,8 @@ mod tests {
 
         let cmd = pipeline.build_sync_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -3221,6 +4578,54 @@ mod tests {
 
         assert!(args.iter().any(|arg| arg == "--compress-choice=zstd"));
         assert!(args.iter().any(|arg| arg == "--compress-level=7"));
+    }
+
+    #[test]
+    fn test_rsync_commands_disable_owner_and_group_preservation() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let pipeline = TransferPipeline::new(
+            temp_dir.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let sync = pipeline.build_sync_command(
+            &worker,
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
+            &[],
+        );
+        assert_portable_rsync_archive_args(&command_args(&sync));
+
+        let sync_streaming = pipeline.build_sync_streaming_command(
+            &worker,
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
+            &[],
+        );
+        assert_portable_rsync_archive_args(&command_args(&sync_streaming));
+
+        let retrieve =
+            pipeline.build_retrieve_command(&worker, "/data/tmp/rch/test-project/abc123", &[]);
+        assert_portable_rsync_archive_args(&command_args(&retrieve));
+
+        let retrieve_streaming = pipeline.build_retrieve_streaming_command(
+            &worker,
+            "/data/tmp/rch/test-project/abc123",
+            &[],
+        );
+        assert_portable_rsync_archive_args(&command_args(&retrieve_streaming));
     }
 
     #[test]
@@ -3252,7 +4657,7 @@ mod tests {
 
         let cmd = pipeline.build_retrieve_command(
             &worker,
-            "/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &["target/debug/**".to_string()],
         );
 
@@ -3262,21 +4667,13 @@ mod tests {
             .map(|arg| arg.to_string_lossy().to_string())
             .collect();
 
-        let beads_exclude = args
-            .windows(2)
-            .position(|window| window == ["--exclude", ".beads/"])
-            .expect("missing .beads exclude");
-        let recovery_exclude = args
-            .windows(2)
-            .position(|window| window == ["--exclude", ".beads/recovery_*/"])
+        let beads_exclude =
+            arg_pair_position(&args, "--exclude", ".beads/").expect("missing .beads exclude");
+        let recovery_exclude = arg_pair_position(&args, "--exclude", ".beads/recovery_*/")
             .expect("missing .beads recovery exclude");
-        let custom_exclude = args
-            .windows(2)
-            .position(|window| window == ["--exclude", "custom-cache/"])
+        let custom_exclude = arg_pair_position(&args, "--exclude", "custom-cache/")
             .expect("missing custom cache exclude");
-        let target_exclude = args
-            .windows(2)
-            .position(|window| window == ["--exclude", "target/"]);
+        let target_exclude = arg_pair_position(&args, "--exclude", "target/");
         let rlib_exclude = args
             .windows(2)
             .position(|window| window == ["--exclude", "*.rlib"]);
@@ -3284,9 +4681,13 @@ mod tests {
             .windows(2)
             .position(|window| window == ["--include", "*/"])
             .expect("missing directory include");
+        // RCH bug d7xc3: artifact patterns are now anchored at the rsync
+        // source root via `anchor_retrieval_pattern`, so `target/debug/**`
+        // is emitted as `/target/debug/**` to prevent it from floating
+        // and matching e.g. `<root>/anything/target/debug/...`.
         let target_include = args
             .windows(2)
-            .position(|window| window == ["--include", "target/debug/**"])
+            .position(|window| window == ["--include", "/target/debug/**"])
             .expect("missing artifact include");
 
         assert!(beads_exclude < include_dirs);
@@ -3330,7 +4731,7 @@ mod tests {
 
         let cmd = pipeline.build_retrieve_streaming_command(
             &worker,
-            "/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &["build/**".to_string()],
         );
 
@@ -3353,8 +4754,8 @@ mod tests {
         );
         assert!(
             args.windows(2)
-                .any(|window| window == ["--include", "build/**"]),
-            "streaming retrieval should include requested artifact patterns"
+                .any(|window| window == ["--include", "/build/**"]),
+            "streaming retrieval should include the anchored form of requested artifact patterns (RCH bug d7xc3)"
         );
     }
 
@@ -3381,7 +4782,7 @@ mod tests {
 
         let cmd = pipeline.build_retrieve_streaming_command(
             &worker,
-            "/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &["target/release/**".to_string()],
         );
 
@@ -3397,8 +4798,8 @@ mod tests {
         );
         assert!(
             args.windows(2)
-                .any(|window| window == ["--include", "target/release/**"]),
-            "streaming retrieval should still include requested artifact patterns"
+                .any(|window| window == ["--include", "/target/release/**"]),
+            "streaming retrieval should still include requested artifact patterns (anchored per RCH bug d7xc3)"
         );
         assert!(args.windows(2).any(|window| window == ["--exclude", "*"]));
     }
@@ -3533,6 +4934,132 @@ mod tests {
     }
 
     #[test]
+    fn test_managed_env_injected_when_nothing_forwarded() {
+        let _guard = test_guard!();
+        // FIX 2: even with an EMPTY allowlist and no forwarded env, the managed
+        // build-artifact vars must be injected so wrapper/unclassified builds
+        // still land in the managed remote zone.
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_env_overrides(HashMap::new()); // nothing forwarded
+
+        let root = pipeline.remote_path();
+        let command = pipeline.build_remote_command("cargo build", None);
+
+        assert!(
+            command.contains(&format!("CARGO_TARGET_DIR='{}/.rch-target'", root)),
+            "CARGO_TARGET_DIR must be injected: {command}"
+        );
+        assert!(
+            command.contains(&format!("TMPDIR='{}/.rch-tmp'", root)),
+            "TMPDIR must be injected: {command}"
+        );
+        assert!(
+            command.contains(&format!("GOCACHE='{}/.rch-go/cache'", root)),
+            "GOCACHE must be injected: {command}"
+        );
+        assert!(
+            command.contains(&format!("GOMODCACHE='{}/.rch-go/mod'", root)),
+            "GOMODCACHE must be injected: {command}"
+        );
+        assert!(
+            command.contains(&format!("GOPATH='{}/.rch-go/path'", root)),
+            "GOPATH must be injected: {command}"
+        );
+        // Each managed dir must be mkdir'd before the build.
+        assert!(command.contains("mkdir -p"));
+        assert!(command.contains(&format!("{}/.rch-go/cache", root)));
+    }
+
+    #[test]
+    fn test_managed_env_overrides_absolute_forwarded_target_dir() {
+        let _guard = test_guard!();
+        // FIX 2: a forwarded ABSOLUTE CARGO_TARGET_DIR (e.g. from a
+        // .cargo/config.toml `target-dir` like /root/cass-ft-target) must be
+        // rewritten to the managed worker-scoped path, never forwarded verbatim.
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            "/root/cass-ft-target".to_string(),
+        );
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        // Note: NOT in the allowlist — the forced-injection pass must still
+        // rewrite it because the value came through env_overrides. (And even a
+        // fully-unforwarded build gets the managed value.)
+        .with_env_overrides(overrides);
+
+        let root = pipeline.remote_path();
+        let command = pipeline.build_remote_command("cargo build", None);
+
+        assert!(
+            command.contains(&format!("CARGO_TARGET_DIR='{}/.rch-target'", root)),
+            "absolute target-dir must be rewritten to managed path: {command}"
+        );
+        assert!(
+            !command.contains("/root/cass-ft-target"),
+            "host-absolute target-dir must NOT be forwarded: {command}"
+        );
+    }
+
+    #[test]
+    fn test_managed_env_no_duplicate_when_allowlisted() {
+        let _guard = test_guard!();
+        // A managed key that IS forwarded + allowlisted must appear exactly once
+        // (the allowlist pass and the forced-injection pass must not both emit it).
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            "/somewhere/else".to_string(),
+        );
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_env_allowlist(vec!["CARGO_TARGET_DIR".to_string()])
+        .with_env_overrides(overrides);
+
+        let command = pipeline.build_remote_command("cargo build", None);
+        let occurrences = command.matches("CARGO_TARGET_DIR=").count();
+        assert_eq!(
+            occurrences, 1,
+            "CARGO_TARGET_DIR must be assigned exactly once: {command}"
+        );
+    }
+
+    #[test]
+    fn test_rch_go_dir_excluded_from_rsync_delete() {
+        let _guard = test_guard!();
+        // FIX 2: the injected Go cache dir must be protected from rsync --delete,
+        // like .rch-target/.rch-tmp.
+        assert!(
+            REMOTE_RUNTIME_EXCLUDE_PATTERNS.contains(&".rch-go/"),
+            "REMOTE_RUNTIME_EXCLUDE_PATTERNS must protect .rch-go/"
+        );
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        );
+        let excludes = pipeline.get_effective_excludes();
+        assert!(
+            excludes.iter().any(|e| e == ".rch-go/"),
+            "effective excludes must include .rch-go/: {excludes:?}"
+        );
+    }
+
+    #[test]
     fn test_build_remote_command_uses_custom_remote_cargo_target_dir_name() {
         let _guard = test_guard!();
         let mut overrides = HashMap::new();
@@ -3612,6 +5139,28 @@ mod tests {
     }
 
     #[test]
+    fn test_build_remote_command_preserves_inline_env_before_toolchain_runner() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_compilation_kind(Some(CompilationKind::CargoBuild));
+
+        let command = pipeline.build_remote_command(
+            "RUSTFLAGS='-C target-cpu=native' cargo build",
+            Some(&ToolchainInfo::new("nightly", None, "")),
+        );
+
+        assert!(
+            command.contains("RUSTFLAGS='-C target-cpu=native' rustup run nightly cargo build")
+        );
+        assert!(!command.contains("rustup run nightly RUSTFLAGS="));
+    }
+
+    #[test]
     fn test_build_remote_command_records_remote_pgid_for_cancellation() {
         let _guard = test_guard!();
         let pipeline = TransferPipeline::new(
@@ -3632,6 +5181,219 @@ mod tests {
         assert!(command.contains("echo $$ > \"$1\""));
         assert!(command.contains("setsid sh -c"));
         assert!(command.contains(&remote_pgid_file));
+    }
+
+    #[test]
+    fn test_build_id_path_uses_group_kill_watchdog_not_foreground_timeout() {
+        // The pgid-tracked path must group-kill the whole session at the wall-clock
+        // cap (so a livelocked test binary + fixtures are reaped together), NOT use
+        // `timeout --foreground` (which only kills its direct child -> 20-45h orphans).
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_build_id(Some(7))
+        .with_compilation_kind(Some(CompilationKind::CargoTest));
+
+        let command = pipeline.build_remote_command("cargo test", None);
+
+        // Watchdog group-kill of the recorded pgid (no `--`: dash mishandles it).
+        assert!(
+            command.contains("kill -KILL -\"$__p\""),
+            "build_id path must SIGKILL the whole process group: {command}"
+        );
+        assert!(
+            !command.contains("kill -KILL -- -"),
+            "must not use the `--` form (broken in dash): {command}"
+        );
+        // The default cargo-test cap (1800s) is passed to the watchdog as an arg.
+        assert!(
+            command.contains("1800 sh -lc"),
+            "watchdog must receive the test timeout (1800s): {command}"
+        );
+        assert!(
+            command.contains("wait \"$__c\""),
+            "watchdog must wait on the job"
+        );
+        // The build_id path must NOT shell out to `timeout --foreground` (the bug).
+        assert!(
+            !command.contains("--foreground"),
+            "build_id path must not use timeout --foreground: {command}"
+        );
+        // The timer subshell must detach stdio: its orphaned `sleep` otherwise
+        // holds the SSH channel's pipe FDs open after a successful build, so
+        // the session lasts the full cap and the client misreports a timeout (#20).
+        assert!(
+            command.contains(") >/dev/null 2>&1 </dev/null &"),
+            "watchdog timer subshell must redirect stdio away from the channel: {command}"
+        );
+    }
+
+    /// Functional proof: a SIGTERM-ignoring grandchild that the test harness forked
+    /// is fully reaped by the watchdog at the cap. Under the old `timeout
+    /// --foreground` behavior the grandchild would orphan and survive. Linux-only
+    /// (needs setsid + process-group signaling); the build/CI workers are Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_watchdog_reaps_forking_orphan_at_cap() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        if !Command::new("sh")
+            .arg("-c")
+            .arg("command -v setsid")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("setsid unavailable; skipping functional watchdog test");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("rch-wd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pgf = dir.join("job.pgid");
+        let marker = dir.join("grandchild-alive");
+        let _ = std::fs::remove_file(&pgf);
+        let _ = std::fs::remove_file(&marker);
+
+        // Exactly the production watchdog program (build_id branch).
+        let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
+if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) >/dev/null 2>&1 </dev/null & __w=$!; fi; \
+wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
+
+        // Job forks a grandchild that IGNORES SIGTERM and loops forever (a livelock
+        // that only a group SIGKILL can stop), then waits on it.
+        let inner = format!(
+            "( trap '' TERM; touch '{}'; while true; do sleep 1; done ) & gc=$!; trap '' TERM; wait $gc",
+            marker.display()
+        );
+
+        let mut child = Command::new("setsid")
+            .arg("sh")
+            .arg("-c")
+            .arg(watchdog)
+            .arg("rch-build")
+            .arg(pgf.to_str().unwrap())
+            .arg("2") // 2-second cap
+            .arg("sh")
+            .arg("-lc")
+            .arg(&inner)
+            // Detach all stdio: otherwise the forked grandchild inherits libtest's
+            // captured stdout pipe and the harness blocks waiting for EOF.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        // Grandchild must come up.
+        let start = Instant::now();
+        while !marker.exists() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(marker.exists(), "grandchild should have started");
+        let pgid = std::fs::read_to_string(&pgf).unwrap().trim().to_string();
+        assert!(pgid.parse::<i64>().unwrap() > 1, "recorded a real pgid");
+
+        // The session leader must die from the cap within a few seconds.
+        let mut exited = false;
+        let wstart = Instant::now();
+        while wstart.elapsed() < Duration::from_secs(8) {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Safety net: ensure nothing leaks regardless of assertions.
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -KILL -- -{pgid} 2>/dev/null"))
+            .status();
+        let _ = child.wait();
+
+        assert!(
+            exited,
+            "watchdog should have killed the session at the ~2s cap"
+        );
+
+        // The whole process group (incl. the TERM-ignoring grandchild) must be gone.
+        std::thread::sleep(Duration::from_millis(300));
+        let group_alive = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -0 -- -{pgid} 2>/dev/null"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !group_alive,
+            "process group {pgid} (with the SIGTERM-ignoring grandchild) must be fully reaped"
+        );
+    }
+
+    /// Functional proof of the #20 fix: after a SUCCESSFUL fast job, the
+    /// watchdog session must release its stdout pipe (EOF) immediately — long
+    /// before the timeout cap. Before the fix, the timer subshell's orphaned
+    /// `sleep` inherited the pipe write-end, so EOF only arrived when the full
+    /// cap expired and every remote build appeared to hang for build_timeout_sec.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_watchdog_releases_output_pipe_immediately_on_success() {
+        use std::io::Read;
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("rch-wd-eof-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pgf = dir.join("job.pgid");
+        let _ = std::fs::remove_file(&pgf);
+
+        // Exactly the production watchdog program (build_id branch).
+        let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
+if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) >/dev/null 2>&1 </dev/null & __w=$!; fi; \
+wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
+
+        // Generous 20s cap; the job itself completes instantly. EOF must NOT
+        // wait for the cap.
+        let start = Instant::now();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(watchdog)
+            .arg("rch-build")
+            .arg(pgf.to_str().unwrap())
+            .arg("20")
+            .arg("sh")
+            .arg("-c")
+            .arg("echo job-done")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        let eof_after = start.elapsed();
+        let status = child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(status.success(), "fast job must exit 0: {status:?}");
+        assert!(out.contains("job-done"), "job output must arrive: {out:?}");
+        assert!(
+            eof_after < Duration::from_secs(5),
+            "stdout EOF must arrive promptly after job success, not at the \
+             timeout cap (took {eof_after:?})"
+        );
     }
 
     #[test]
@@ -3695,7 +5457,7 @@ mod tests {
         )
         .with_remote_path_override("relative/path");
 
-        assert_eq!(pipeline.remote_path(), "/tmp/rch/project/def456");
+        assert_eq!(pipeline.remote_path(), "/data/tmp/rch/project/def456");
     }
 
     // ==========================================================================
@@ -3705,9 +5467,9 @@ mod tests {
     #[test]
     fn test_parse_rchignore_content_basic() {
         let _guard = test_guard!();
-        let content = "target/\n.git/objects/\nnode_modules/";
+        let content = "target/\n.git/\nnode_modules/";
         let patterns = parse_rchignore_content(content);
-        assert_eq!(patterns, vec!["target/", ".git/objects/", "node_modules/"]);
+        assert_eq!(patterns, vec!["target/", ".git/", "node_modules/"]);
     }
 
     #[test]
@@ -3715,12 +5477,12 @@ mod tests {
         let _guard = test_guard!();
         let content = r#"# Build artifacts
 target/
-# Git internals
-.git/objects/
+# Git metadata
+.git/
 # Node stuff
 node_modules/"#;
         let patterns = parse_rchignore_content(content);
-        assert_eq!(patterns, vec!["target/", ".git/objects/", "node_modules/"]);
+        assert_eq!(patterns, vec!["target/", ".git/", "node_modules/"]);
     }
 
     #[test]
@@ -3729,21 +5491,21 @@ node_modules/"#;
         let content = r#"
 target/
 
-.git/objects/
+.git/
 
 
 node_modules/
 "#;
         let patterns = parse_rchignore_content(content);
-        assert_eq!(patterns, vec!["target/", ".git/objects/", "node_modules/"]);
+        assert_eq!(patterns, vec!["target/", ".git/", "node_modules/"]);
     }
 
     #[test]
     fn test_parse_rchignore_content_trims_whitespace() {
         let _guard = test_guard!();
-        let content = "  target/  \n\t.git/objects/\t\n   node_modules/   ";
+        let content = "  target/  \n\t.git/\t\n   node_modules/   ";
         let patterns = parse_rchignore_content(content);
-        assert_eq!(patterns, vec!["target/", ".git/objects/", "node_modules/"]);
+        assert_eq!(patterns, vec!["target/", ".git/", "node_modules/"]);
     }
 
     #[test]
@@ -3796,9 +5558,122 @@ node_modules/
         for pattern in &default_excludes {
             assert!(effective.contains(pattern));
         }
+        assert!(effective.contains(&".git/".to_string()));
+        assert!(
+            !effective.contains(&".git/objects/".to_string()),
+            "default upload excludes must avoid syncing a partial .git tree"
+        );
         assert!(effective.contains(&".rch-target/".to_string()));
         assert!(effective.contains(&".rch-tmp/".to_string()));
         assert!(effective.contains(&".franken_whisper/tools/ffmpeg/".to_string()));
+    }
+
+    #[test]
+    fn test_parse_worktree_gitdir_pointer_valid() {
+        let _guard = test_guard!();
+        let pointer =
+            parse_worktree_gitdir_pointer("gitdir: /data/projects/rch/.git/worktrees/feature-x\n")
+                .expect("linked worktree pointer");
+        assert_eq!(
+            pointer.gitdir,
+            "/data/projects/rch/.git/worktrees/feature-x"
+        );
+    }
+
+    #[test]
+    fn test_parse_worktree_gitdir_pointer_tolerates_whitespace_and_crlf() {
+        let _guard = test_guard!();
+        // Leading blank line, CRLF, and surrounding spaces must all be tolerated.
+        let pointer =
+            parse_worktree_gitdir_pointer("\r\n  gitdir:   ../super/.git/worktrees/wt \r\n")
+                .expect("linked worktree pointer");
+        assert_eq!(pointer.gitdir, "../super/.git/worktrees/wt");
+    }
+
+    #[test]
+    fn test_parse_worktree_gitdir_pointer_rejects_non_pointer() {
+        let _guard = test_guard!();
+        // A real `.git` dir never has file contents; a malformed / empty pointer
+        // must not be treated as a worktree.
+        assert!(parse_worktree_gitdir_pointer("").is_none());
+        assert!(parse_worktree_gitdir_pointer("gitdir:").is_none());
+        assert!(parse_worktree_gitdir_pointer("gitdir:   ").is_none());
+        assert!(parse_worktree_gitdir_pointer("ref: refs/heads/main").is_none());
+    }
+
+    #[test]
+    fn test_detect_linked_worktree_git_pointer_file_vs_dir_vs_absent() {
+        let _guard = test_guard!();
+
+        // 1) Linked worktree: `.git` is a FILE with a gitdir pointer -> detected.
+        let wt = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            wt.path().join(".git"),
+            "gitdir: /data/projects/rch/.git/worktrees/wt\n",
+        )
+        .expect("write .git file");
+        let detected =
+            detect_linked_worktree_git_pointer(wt.path()).expect("worktree should be detected");
+        assert_eq!(detected.gitdir, "/data/projects/rch/.git/worktrees/wt");
+
+        // 2) Normal repo: `.git` is a DIRECTORY -> not a linked worktree.
+        let normal = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(normal.path().join(".git")).expect("create .git dir");
+        assert!(detect_linked_worktree_git_pointer(normal.path()).is_none());
+
+        // 3) No VCS at all -> None.
+        let bare = tempfile::tempdir().expect("create temp dir");
+        assert!(detect_linked_worktree_git_pointer(bare.path()).is_none());
+    }
+
+    #[test]
+    fn test_get_effective_excludes_neutralizes_worktree_git_file() {
+        let _guard = test_guard!();
+        // A linked worktree's dangling `.git` FILE must be excluded from upload,
+        // in ADDITION to the normal `.git/` directory exclude.
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            temp_dir.path().join(".git"),
+            "gitdir: /data/projects/super/.git/worktrees/wt\n",
+        )
+        .expect("write worktree .git file");
+
+        let pipeline = TransferPipeline::new(
+            temp_dir.path().to_path_buf(),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        );
+
+        let effective = pipeline.get_effective_excludes();
+        assert!(
+            effective.contains(&"/.git".to_string()),
+            "worktree `.git` file must be excluded from upload; got {effective:?}"
+        );
+        // The directory-form exclude is still present for the normal case.
+        assert!(effective.contains(&".git/".to_string()));
+    }
+
+    #[test]
+    fn test_get_effective_excludes_no_worktree_exclude_for_normal_repo() {
+        let _guard = test_guard!();
+        // A normal repo (`.git` directory) must NOT get the `/.git` file exclude.
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp_dir.path().join(".git")).expect("create .git dir");
+
+        let pipeline = TransferPipeline::new(
+            temp_dir.path().to_path_buf(),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        );
+
+        let effective = pipeline.get_effective_excludes();
+        assert!(
+            !effective.contains(&"/.git".to_string()),
+            "normal repo must not get the worktree file exclude; got {effective:?}"
+        );
+        assert!(effective.contains(&".git/".to_string()));
     }
 
     #[test]
@@ -3899,6 +5774,32 @@ node_modules/
         assert!(effective.contains(&"core.[0-9]*".to_string()));
         assert!(effective.contains(&".core.[0-9]*".to_string()));
         assert_eq!(effective.iter().filter(|p| *p == "core.[0-9]*").count(), 1);
+    }
+
+    #[test]
+    fn test_get_effective_excludes_rewrites_legacy_git_objects_exclude() {
+        let _guard = test_guard!();
+        let config = TransferConfig {
+            exclude_patterns: vec![
+                "target/".to_string(),
+                ".git/objects/".to_string(),
+                "node_modules/".to_string(),
+            ],
+            ..TransferConfig::default()
+        };
+
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/nonexistent/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            config,
+        );
+
+        let effective = pipeline.get_effective_excludes();
+
+        assert!(effective.contains(&".git/".to_string()));
+        assert!(!effective.contains(&".git/objects/".to_string()));
+        assert_eq!(effective.iter().filter(|p| *p == ".git/").count(), 1);
     }
 
     // ==========================================================================
@@ -4049,6 +5950,78 @@ Total file size: 123 bytes";
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn test_execute_rsync_with_retry_retries_transient_transport_failure() {
+        // Regression: a process that RAN but exited non-zero on a transient
+        // transport error (rsync exit 12 / "connection unexpectedly closed")
+        // must be RETRIED. Previously wait_with_output()'s Ok-on-any-exit made
+        // retry_with_backoff return on attempt 0 — the retry subsystem was inert.
+        let _guard = test_guard!();
+        let retry_config = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            jitter_factor: 0.0,
+            total_timeout_ms: 5_000,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        let err = execute_rsync_with_retry(&retry_config, "transient_rsync", move || {
+            calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(
+                "echo 'rsync: connection unexpectedly closed (0 bytes received)' >&2; exit 12",
+            );
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd
+        })
+        .await
+        .expect_err("transient transport failure should exhaust retries as Err");
+        assert!(err.to_string().contains("transport error"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "must retry up to max_attempts on a retryable transport failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_rsync_with_retry_does_not_retry_non_transport_failure() {
+        // A non-zero exit that is NOT a transport error returns Ok(output) with
+        // a non-success status (so the caller's existing failure handling runs)
+        // and is NOT retried.
+        let _guard = test_guard!();
+        let retry_config = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            jitter_factor: 0.0,
+            total_timeout_ms: 5_000,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        let output = execute_rsync_with_retry(&retry_config, "fatal_rsync", move || {
+            calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg("echo 'rsync: mkstemp failed: Permission denied' >&2; exit 23");
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd
+        })
+        .await
+        .expect("non-transport failure returns Ok(output) for caller handling");
+        assert!(!output.status.success());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must NOT retry a non-transport failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn test_run_command_streaming_times_out_hanging_child() {
         let _guard = test_guard!();
         let mut cmd = Command::new("sleep");
@@ -4073,6 +6046,209 @@ Total file size: 123 bytes";
         assert!(
             err.to_string()
                 .contains("test_streaming_rsync: timed out after 25ms")
+        );
+    }
+
+    #[test]
+    fn test_streaming_error_is_retryable_reads_syncfailed_stderr() {
+        // The whole point of the streaming classifier: TransferError::SyncFailed's
+        // Display is only "Project sync failed: rsync failed", so the transport
+        // signature must be read from the captured `stderr`, not the error chain.
+        let _guard = test_guard!();
+        let transient: anyhow::Error = TransferError::SyncFailed {
+            reason: "rsync failed".to_string(),
+            exit_code: Some(12),
+            stderr: "rsync: connection unexpectedly closed (0 bytes received)".to_string(),
+        }
+        .into();
+        assert!(
+            streaming_error_is_retryable(&transient),
+            "transport stderr inside SyncFailed must classify as retryable"
+        );
+
+        let fatal: anyhow::Error = TransferError::SyncFailed {
+            reason: "rsync failed".to_string(),
+            exit_code: Some(23),
+            stderr: "rsync: mkstemp failed: Permission denied".to_string(),
+        }
+        .into();
+        assert!(
+            !streaming_error_is_retryable(&fatal),
+            "permission-denied stderr inside SyncFailed must NOT be retryable"
+        );
+
+        // Non-SyncFailed errors fall back to the error-chain classifier.
+        assert!(streaming_error_is_retryable(&anyhow::anyhow!(
+            "op: timed out after 25ms"
+        )));
+        assert!(!streaming_error_is_retryable(&anyhow::anyhow!(
+            "Failed to execute rsync"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_command_streaming_with_retry_retries_transient_transport_failure() {
+        // Regression (bd-review-transfer-streaming-noretry): streaming
+        // upload/retrieve called run_command_streaming directly, so a transient
+        // rsync transport drop failed the whole transfer with zero retries. The
+        // wrapper must classify the SyncFailed stderr and retry to max_attempts.
+        let _guard = test_guard!();
+        let retry_config = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            jitter_factor: 0.0,
+            total_timeout_ms: 5_000,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        let lines = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lines_in = std::sync::Arc::clone(&lines);
+        let err = run_command_streaming_with_retry(
+            &retry_config,
+            "transient_streaming_rsync",
+            move || {
+                calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut cmd = Command::new("sh");
+                cmd.arg("-c").arg(
+                    "echo 'rsync: connection unexpectedly closed (0 bytes received)' >&2; exit 12",
+                );
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+                cmd
+            },
+            |_line| {
+                lines_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("transient transport failure should exhaust retries as Err");
+        assert!(
+            err.to_string().contains("Project sync failed"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "must retry up to max_attempts on a retryable transport failure"
+        );
+        assert!(
+            lines.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "on_line must be re-invoked on every attempt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_command_streaming_with_retry_does_not_retry_non_transport_failure() {
+        let _guard = test_guard!();
+        let retry_config = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            jitter_factor: 0.0,
+            total_timeout_ms: 5_000,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        run_command_streaming_with_retry(
+            &retry_config,
+            "fatal_streaming_rsync",
+            move || {
+                calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut cmd = Command::new("sh");
+                cmd.arg("-c")
+                    .arg("echo 'rsync: mkstemp failed: Permission denied' >&2; exit 23");
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+                cmd
+            },
+            |_| {},
+        )
+        .await
+        .expect_err("non-transport streaming failure should fail fast as Err");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must NOT retry a non-transport failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_command_streaming_with_retry_recovers_after_transient() {
+        // A transient drop on the first attempt followed by success proves the
+        // streaming path now reconnects instead of failing the whole transfer.
+        let _guard = test_guard!();
+        let retry_config = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            jitter_factor: 0.0,
+            total_timeout_ms: 5_000,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        let (out, _ms) = run_command_streaming_with_retry(
+            &retry_config,
+            "recovering_streaming_rsync",
+            move || {
+                let n = calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut cmd = Command::new("sh");
+                if n == 0 {
+                    cmd.arg("-c")
+                        .arg("echo 'rsync: connection unexpectedly closed' >&2; exit 12");
+                } else {
+                    cmd.arg("-c")
+                        .arg("echo 'sent 100 bytes  received 50 bytes'; exit 0");
+                }
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+                cmd
+            },
+            |_| {},
+        )
+        .await
+        .expect("should recover on the second attempt");
+        assert!(out.contains("received"), "stdout should be captured: {out}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "should succeed on the second attempt"
+        );
+    }
+
+    #[test]
+    fn test_detect_partial_transfer_matches_indicators() {
+        // Regression (bd-review-transfer-partial-warn-only): exit-0 rsync output
+        // carrying a partial-transfer indicator must be detectable so the
+        // upload/download paths fail instead of reporting trusted-but-wrong
+        // success.
+        let _guard = test_guard!();
+        assert_eq!(detect_partial_transfer(""), None);
+        assert_eq!(
+            detect_partial_transfer("sent 100 bytes  received 50 bytes  total size 4096"),
+            None
+        );
+        assert_eq!(
+            detect_partial_transfer("rsync: connection unexpectedly closed (0 bytes received)"),
+            Some("connection unexpectedly closed")
+        );
+        assert_eq!(
+            detect_partial_transfer(
+                "rsync warning: some files vanished\npartial transfer (code 23)"
+            ),
+            Some("partial transfer")
+        );
+        assert_eq!(
+            detect_partial_transfer("rsync: read error: Connection reset by peer"),
+            Some("read error")
+        );
+        // Case-insensitive.
+        assert_eq!(
+            detect_partial_transfer("WRITE ERROR: broken pipe (32)"),
+            Some("write error")
         );
     }
 
@@ -4118,8 +6294,8 @@ Total file size: 123 bytes";
 
         let cmd = pipeline.build_sync_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -4156,8 +6332,8 @@ Total file size: 123 bytes";
 
         let cmd = pipeline.build_sync_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -4198,8 +6374,8 @@ Total file size: 123 bytes";
 
         let cmd = pipeline.build_sync_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -4242,8 +6418,8 @@ Total file size: 123 bytes";
 
         let cmd = pipeline.build_sync_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -4270,6 +6446,141 @@ Total file size: 123 bytes";
         assert!(
             args.windows(2).any(|window| window == ["--exclude", "*"]),
             "metadata-only syncs should exclude everything else"
+        );
+    }
+
+    #[test]
+    fn clean_overlay_include_patterns_are_anchored_literal_and_traversable() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().expect("create include-pattern fixture");
+        std::fs::create_dir_all(root.path().join("src/nested")).expect("create nested source");
+        std::fs::write(
+            root.path().join("src/nested/star*.rs"),
+            "fn selected() {}\n",
+        )
+        .expect("write selected source");
+
+        let patterns =
+            clean_overlay_include_patterns(root.path(), &[PathBuf::from("src/nested/star*.rs")])
+                .expect("build clean-overlay filters");
+
+        assert_eq!(
+            patterns,
+            vec![
+                "/src/".to_string(),
+                "/src/nested/".to_string(),
+                r"/src/nested/star\*.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn clean_overlay_directory_pattern_includes_only_selected_subtree() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().expect("create directory-pattern fixture");
+        std::fs::create_dir_all(root.path().join("src/selected")).expect("create selected dir");
+
+        let patterns =
+            clean_overlay_include_patterns(root.path(), &[PathBuf::from("src/selected")])
+                .expect("build directory clean-overlay filters");
+
+        assert_eq!(
+            patterns,
+            vec![
+                "/src/".to_string(),
+                "/src/selected/".to_string(),
+                "/src/selected/***".to_string(),
+            ]
+        );
+        assert!(!patterns.iter().any(|pattern| pattern.contains("peer")));
+    }
+
+    #[test]
+    fn clean_overlay_sync_commands_force_content_checks() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/workspace-root"),
+            "workspace-root".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_sync_include_patterns(vec!["/src/".to_string(), "/src/lib.rs".to_string()])
+        .with_sync_delete(false)
+        .with_sync_checksum(true);
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+
+        for command in [
+            pipeline.build_sync_command(
+                &worker,
+                "mockuser@mock://worker:/data/tmp/rch/workspace-root/abc123",
+                "/data/tmp/rch/workspace-root/abc123",
+                &[],
+            ),
+            pipeline.build_sync_streaming_command(
+                &worker,
+                "mockuser@mock://worker:/data/tmp/rch/workspace-root/abc123",
+                "/data/tmp/rch/workspace-root/abc123",
+                &[],
+            ),
+        ] {
+            let args = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(args.iter().any(|arg| arg == "--checksum"));
+            assert!(!args.iter().any(|arg| arg == "--delete"));
+            assert!(
+                args.windows(2)
+                    .any(|window| window == ["--include", "/src/lib.rs"])
+            );
+            assert!(args.windows(2).any(|window| window == ["--exclude", "*"]));
+        }
+    }
+
+    #[test]
+    fn clean_overlay_git_command_clears_ambient_repository_selection() {
+        let _guard = test_guard!();
+        let mut command = Command::new("git");
+        command
+            .env("GIT_DIR", "/tmp/peer.git")
+            .env("GIT_WORK_TREE", "/tmp/peer-worktree")
+            .env("GIT_CONFIG_COUNT", "1");
+        configure_clean_git_command(&mut command);
+
+        let environment = command.as_std().get_envs().collect::<Vec<_>>();
+        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_COUNT"] {
+            assert!(
+                environment
+                    .iter()
+                    .any(|(candidate, value)| *candidate == key && value.is_none()),
+                "{key} must be removed from clean Git commands: {environment:?}"
+            );
+        }
+        assert!(environment.iter().any(|(key, value)| {
+            *key == "GIT_NO_REPLACE_OBJECTS"
+                && value.is_some_and(|value| value == std::ffi::OsStr::new("1"))
+        }));
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|window| { window == ["-c", "core.attributesFile=/dev/null"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-c", "tar.umask=0022"])
         );
     }
 
@@ -4302,8 +6613,8 @@ Total file size: 123 bytes";
 
         let cmd = pipeline.build_sync_streaming_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -4355,8 +6666,8 @@ Total file size: 123 bytes";
 
         let cmd = pipeline.build_sync_streaming_command(
             &worker,
-            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
-            "/tmp/rch/test-project/abc123",
+            "mockuser@mock://worker:/data/tmp/rch/test-project/abc123",
+            "/data/tmp/rch/test-project/abc123",
             &[],
         );
 
@@ -4370,5 +6681,602 @@ Total file size: 123 bytes";
             args.iter().any(|arg| arg == "--delete"),
             "normal streaming syncs should retain delete semantics"
         );
+    }
+
+    // =========================================================================
+    // Source-Integrity Hardening Tests (RCH bug d7xc3)
+    // =========================================================================
+    //
+    // These tests pin the contract that artifact retrieval cannot dirty the
+    // local source checkout, regardless of the pattern shape or what other
+    // agents may have left on the remote worker. The fix has three layers:
+    //
+    //   1. anchor_retrieval_pattern: every artifact pattern is anchored at
+    //      the rsync source root with leading `/`.
+    //   2. allowed_artifact_roots: derive the implied top-level allowed roots
+    //      from anchored patterns; non-glob top-level components only.
+    //   3. local_source_roots_to_exclude: emit explicit `--exclude /<entry>`
+    //      rules for every top-level entry in the local project root that
+    //      isn't an allowed artifact root.
+    //
+    // Together these mean: even if rsync's filter semantics had a subtle
+    // bug, AND a malicious/stale remote tree contained source files at
+    // unexpected paths, AND the artifact patterns were too permissive,
+    // rsync STILL refuses to descend into local source roots.
+
+    #[test]
+    fn anchor_retrieval_pattern_prepends_slash_when_unanchored() {
+        // TEST START: bare patterns get anchored
+        assert_eq!(
+            anchor_retrieval_pattern("target/debug/**"),
+            "/target/debug/**"
+        );
+        assert_eq!(
+            anchor_retrieval_pattern("target/release/**"),
+            "/target/release/**"
+        );
+        assert_eq!(anchor_retrieval_pattern("coverage/**"), "/coverage/**");
+        assert_eq!(
+            anchor_retrieval_pattern("*.tsbuildinfo"),
+            "/*.tsbuildinfo",
+            "top-level glob files must still be anchored"
+        );
+        // TEST PASS: unanchored patterns get a leading `/`
+    }
+
+    #[test]
+    fn anchor_retrieval_pattern_preserves_already_anchored() {
+        // TEST START: patterns starting with `/` are passthrough
+        assert_eq!(
+            anchor_retrieval_pattern("/target/debug/**"),
+            "/target/debug/**"
+        );
+        assert_eq!(anchor_retrieval_pattern("/coverage/**"), "/coverage/**");
+        // TEST PASS: already-anchored patterns are returned unchanged
+    }
+
+    #[test]
+    fn anchor_retrieval_pattern_preserves_recursive_globstar() {
+        // TEST START: explicit recursion via `**/` is intentional, leave alone
+        assert_eq!(
+            anchor_retrieval_pattern("**/junit.xml"),
+            "**/junit.xml",
+            "explicit recursive globstar must be preserved"
+        );
+        // TEST PASS: explicit `**/` patterns pass through
+    }
+
+    #[test]
+    fn anchor_retrieval_pattern_handles_edge_cases() {
+        // TEST START: empty and whitespace patterns are returned unchanged
+        assert_eq!(anchor_retrieval_pattern(""), "");
+        assert_eq!(anchor_retrieval_pattern("   "), "   ");
+        // TEST PASS: caller decides what to do with junk input
+    }
+
+    #[test]
+    fn allowed_artifact_roots_derives_first_component() {
+        // TEST START: implied allowed roots = first path component of each
+        // anchored pattern, glob components excluded.
+        let patterns = vec![
+            "target/debug/**".to_string(),
+            "target/release/**".to_string(),
+            "coverage/**".to_string(),
+            "*.tsbuildinfo".to_string(),
+            "/build/output/**".to_string(),
+        ];
+        let roots = allowed_artifact_roots(&patterns);
+        assert!(roots.contains("target"));
+        assert!(roots.contains("coverage"));
+        assert!(roots.contains("build"));
+        // Top-level glob patterns cannot contribute a single allowed root.
+        assert!(!roots.iter().any(|r| r.contains('*')));
+        // TEST PASS: derived allowed roots
+    }
+
+    #[test]
+    fn allowed_artifact_roots_handles_empty_input() {
+        // TEST START: defensive — empty patterns yields empty set
+        let roots = allowed_artifact_roots(&[]);
+        assert!(roots.is_empty());
+        // TEST PASS: empty input is safe
+    }
+
+    #[test]
+    fn local_source_roots_to_exclude_emits_explicit_rules_for_each_top_level_source_entry() {
+        // TEST START: scan local project root, emit `--exclude /<entry>/`
+        // for every top-level dir that ISN'T an allowed artifact root.
+        // This is the belt-and-suspenders defense — even if rsync filters
+        // are subtly wrong, these explicit anchored excludes pin source
+        // roots out of the retrieval set.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("rch")).expect("mkdir rch");
+        std::fs::create_dir(temp.path().join("rch-common")).expect("mkdir rch-common");
+        std::fs::create_dir(temp.path().join("rchd")).expect("mkdir rchd");
+        std::fs::create_dir(temp.path().join("target")).expect("mkdir target");
+        std::fs::write(temp.path().join("Cargo.toml"), b"[workspace]\n").expect("write toml");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let artifact_patterns = ["target/debug/**".to_string()];
+        let allowed = allowed_artifact_roots(&artifact_patterns);
+        let excludes = pipeline.local_source_roots_to_exclude(&allowed, &artifact_patterns);
+
+        // target/ MUST NOT be excluded — it's the artifact root.
+        assert!(
+            !excludes.iter().any(|e| e == "/target/"),
+            "target/ is an allowed artifact root and must NOT be in the exclude set"
+        );
+        // Every other source dir MUST be excluded (anchored with leading `/`).
+        assert!(
+            excludes.iter().any(|e| e == "/rch/"),
+            "rch/ source dir must be excluded; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == "/rch-common/"),
+            "rch-common/ source dir must be excluded; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == "/rchd/"),
+            "rchd/ source dir must be excluded; got {excludes:?}"
+        );
+        // Top-level files also excluded, with no trailing slash.
+        assert!(
+            excludes.iter().any(|e| e == "/Cargo.toml"),
+            "top-level files must be excluded (no trailing slash); got {excludes:?}"
+        );
+        // Excludes are sorted for stability.
+        let mut sorted = excludes.clone();
+        sorted.sort();
+        assert_eq!(excludes, sorted, "excludes must be sorted for determinism");
+        // TEST PASS: source-root exclusion contract
+    }
+
+    #[test]
+    fn local_source_roots_to_exclude_does_not_hide_top_level_glob_artifacts() {
+        // TEST START: Bun/typecheck retrieval includes top-level globs such
+        // as `*.tsbuildinfo`. If the local file already exists, the
+        // source-integrity guard must not emit a prior exclude that prevents
+        // rsync from refreshing it.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("src")).expect("mkdir src");
+        std::fs::write(temp.path().join("Cargo.toml"), b"[workspace]\n").expect("write toml");
+        std::fs::write(temp.path().join("tsconfig.tsbuildinfo"), b"old").expect("write artifact");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let artifact_patterns = ["*.tsbuildinfo".to_string()];
+        let allowed = allowed_artifact_roots(&artifact_patterns);
+        let excludes = pipeline.local_source_roots_to_exclude(&allowed, &artifact_patterns);
+
+        assert!(
+            !excludes.iter().any(|e| e == "/tsconfig.tsbuildinfo"),
+            "declared top-level glob artifact must not be source-excluded; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == "/Cargo.toml"),
+            "unrelated top-level files must still be source-excluded; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == "/src/"),
+            "source directories must still be source-excluded; got {excludes:?}"
+        );
+        // TEST PASS: top-level artifact glob stays retrievable without
+        // opening unrelated source entries.
+    }
+
+    #[test]
+    fn catch_all_pattern_does_not_prove_literal_star_entry_is_artifact() {
+        // TEST START: a catch-all retrieval pattern may fetch newly-created
+        // root outputs, but it must not prove that a local source entry named
+        // `*` is safe to overwrite.
+        assert!(!top_level_artifact_pattern_matches_entry("*", "*"));
+        assert_eq!(escape_rsync_filter_literal_component("*").as_ref(), r"\*");
+        assert_eq!(
+            escape_rsync_filter_literal_component("question?mark.c").as_ref(),
+            r"question\?mark.c"
+        );
+        assert_eq!(
+            escape_rsync_filter_literal_component("array[0].c").as_ref(),
+            r"array\[0].c"
+        );
+        assert_eq!(
+            escape_rsync_filter_literal_component(r"back\slash.rs").as_ref(),
+            r"back\slash.rs"
+        );
+        // TEST PASS: wildcard-looking local names stay literal in filter rules.
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_source_roots_to_exclude_keeps_catch_all_from_unprotecting_source_entries() {
+        // TEST START: C/C++ retrieval includes a catch-all `*` for newly
+        // created root-level outputs. That pattern must not make every
+        // existing local source entry look safe to overwrite.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("src")).expect("mkdir src");
+        std::fs::write(
+            temp.path().join("main.c"),
+            b"int main(void) { return 0; }\n",
+        )
+        .expect("write source file");
+        std::fs::write(temp.path().join("*"), b"literal star source\n")
+            .expect("write literal star source file");
+        std::fs::write(temp.path().join("question?mark.c"), b"int q(void);\n")
+            .expect("write literal question source file");
+        std::fs::write(temp.path().join("array[0].c"), b"int a(void);\n")
+            .expect("write literal bracket source file");
+        std::fs::write(temp.path().join("Makefile"), b"all:\n\tcc main.c\n")
+            .expect("write makefile");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let artifact_patterns = ["*".to_string()];
+        let allowed = allowed_artifact_roots(&artifact_patterns);
+        let excludes = pipeline.local_source_roots_to_exclude(&allowed, &artifact_patterns);
+
+        assert!(
+            excludes.iter().any(|e| e == "/src/"),
+            "catch-all artifact pattern must not unprotect source directories; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == "/main.c"),
+            "catch-all artifact pattern must not unprotect existing source files; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == "/Makefile"),
+            "catch-all artifact pattern must not unprotect existing build files; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == r"/\*"),
+            "literal local filenames with rsync glob syntax must be excluded literally; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == r"/question\?mark.c"),
+            "literal question-mark filenames must not become rsync wildcards; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == r"/array\[0].c"),
+            "literal bracket filenames must not become rsync character classes; got {excludes:?}"
+        );
+        // TEST PASS: catch-all retrieval stays subordinate to source protection.
+    }
+
+    #[test]
+    fn local_source_roots_to_exclude_handles_unreadable_project_root() {
+        // TEST START: defensive — if project_root is unreadable, we get an
+        // empty exclude list (not a panic). Other retrieval guards still
+        // apply, so retrieval remains safe.
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            std::path::PathBuf::from("/this/path/does/not/exist/anywhere/d7xc3-test"),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let allowed = std::collections::BTreeSet::new();
+        let excludes = pipeline.local_source_roots_to_exclude(&allowed, &[]);
+        assert!(
+            excludes.is_empty(),
+            "unreadable project_root must yield empty excludes (got {excludes:?})"
+        );
+        // TEST PASS: unreadable root is non-fatal
+    }
+
+    #[test]
+    fn build_retrieve_command_excludes_local_source_dirs_at_anchored_paths() {
+        // TEST START: integration test — build the retrieve command for a
+        // workspace-shaped local project and verify both layers fire:
+        //
+        //   (a) The artifact pattern is anchored.
+        //   (b) Every top-level source dir gets an explicit anchored exclude
+        //       BEFORE the directory `--include "*/"`.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("rch")).expect("mkdir rch");
+        std::fs::create_dir(temp.path().join("rch-common")).expect("mkdir rch-common");
+        std::fs::create_dir(temp.path().join("rchd")).expect("mkdir rchd");
+        std::fs::create_dir(temp.path().join("rch-wkr")).expect("mkdir rch-wkr");
+        std::fs::create_dir(temp.path().join("target")).expect("mkdir target");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+        let cmd = pipeline.build_retrieve_command(
+            &worker,
+            "/data/tmp/rch/test-project/abc123",
+            &["target/debug/**".to_string()],
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        // (a) Artifact pattern anchored.
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--include", "/target/debug/**"]),
+            "artifact pattern must be emitted in anchored form (RCH bug d7xc3); got args = {args:?}"
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w == ["--include", "target/debug/**"]),
+            "unanchored pattern form must NOT be emitted (RCH bug d7xc3)"
+        );
+
+        // (b) All four workspace source dirs explicitly excluded with anchored form.
+        for src in ["/rch/", "/rch-common/", "/rchd/", "/rch-wkr/"] {
+            assert!(
+                args.windows(2).any(|w| w == ["--exclude", src]),
+                "{src} must be in the exclude set (source-integrity guard); got args = {args:?}"
+            );
+        }
+
+        // The artifact root MUST NOT be in the source-exclude set.
+        assert!(
+            !args.windows(2).any(|w| w == ["--exclude", "/target/"]),
+            "target/ is the allowed artifact root and must NOT be source-excluded"
+        );
+
+        // Ordering: source-excludes are emitted BEFORE the `--include "*/"`
+        // directive so rsync evaluates them first and refuses to descend.
+        let include_dirs_pos = args
+            .windows(2)
+            .position(|w| w == ["--include", "*/"])
+            .expect("missing directory include");
+        let first_source_exclude_pos = args
+            .windows(2)
+            .position(|w| w == ["--exclude", "/rch/"])
+            .expect("missing /rch/ exclude");
+        assert!(
+            first_source_exclude_pos < include_dirs_pos,
+            "source-integrity excludes must be applied BEFORE --include */"
+        );
+        // TEST PASS: source-integrity guard wired through both helpers
+    }
+
+    #[test]
+    fn build_retrieve_command_keeps_existing_top_level_glob_artifact_retrievable() {
+        // TEST START: command-level proof for the Bun/default artifact case.
+        // A local tsbuildinfo file must not be excluded before the artifact
+        // include can match it.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("src")).expect("mkdir src");
+        std::fs::write(temp.path().join("tsconfig.tsbuildinfo"), b"old").expect("write artifact");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+        let cmd = pipeline.build_retrieve_command(
+            &worker,
+            "/data/tmp/rch/test-project/abc123",
+            &["*.tsbuildinfo".to_string()],
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--include", "/*.tsbuildinfo"]),
+            "top-level glob artifact must be emitted in anchored form; got args = {args:?}"
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w == ["--exclude", "/tsconfig.tsbuildinfo"]),
+            "existing top-level artifact must not be excluded before its include; got args = {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--exclude", "/src/"]),
+            "source directories must remain protected; got args = {args:?}"
+        );
+        // TEST PASS: command preserves both source guard and top-level glob retrieval.
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_retrieve_command_with_catch_all_still_excludes_existing_source_entries() {
+        // TEST START: command-level proof for the C/C++ catch-all artifact
+        // pattern. The broad include may fetch new root outputs, but it must
+        // not run before source excludes for existing entries.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("src")).expect("mkdir src");
+        std::fs::write(
+            temp.path().join("main.c"),
+            b"int main(void) { return 0; }\n",
+        )
+        .expect("write source file");
+        std::fs::write(temp.path().join("*"), b"literal star source\n")
+            .expect("write literal star source file");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+        let cmd = pipeline.build_retrieve_command(
+            &worker,
+            "/data/tmp/rch/test-project/abc123",
+            &["*".into()],
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        let include_dirs_pos = args
+            .windows(2)
+            .position(|w| w == ["--include", "*/"])
+            .expect("missing directory include");
+        let catch_all_include_pos = args
+            .windows(2)
+            .position(|w| w == ["--include", "/*"])
+            .expect("missing anchored catch-all include");
+        let src_exclude_pos = args
+            .windows(2)
+            .position(|w| w == ["--exclude", "/src/"])
+            .expect("missing /src/ exclude");
+        let main_exclude_pos = args
+            .windows(2)
+            .position(|w| w == ["--exclude", "/main.c"])
+            .expect("missing /main.c exclude");
+        let literal_star_exclude_pos = args
+            .windows(2)
+            .position(|w| w == ["--exclude", r"/\*"])
+            .expect("missing escaped literal star exclude");
+
+        assert!(src_exclude_pos < include_dirs_pos);
+        assert!(main_exclude_pos < include_dirs_pos);
+        assert!(literal_star_exclude_pos < include_dirs_pos);
+        assert!(include_dirs_pos < catch_all_include_pos);
+        assert!(
+            !args.windows(2).any(|w| w == ["--exclude", "/*"]),
+            "literal local star source must not become a broad /* exclude; got args = {args:?}"
+        );
+        // TEST PASS: broad include remains behind source-integrity excludes.
+    }
+
+    #[test]
+    fn build_retrieve_streaming_command_also_applies_source_integrity_guard() {
+        // TEST START: parity check — the streaming variant must apply the
+        // same guard. If they drift, the bug returns under one code path.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("src")).expect("mkdir src");
+        std::fs::create_dir(temp.path().join("target")).expect("mkdir target");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+        let cmd = pipeline.build_retrieve_streaming_command(
+            &worker,
+            "/data/tmp/rch/test-project/abc123",
+            &["target/release/**".to_string()],
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--include", "/target/release/**"]),
+            "streaming variant must anchor patterns (RCH bug d7xc3)"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--exclude", "/src/"]),
+            "streaming variant must apply source-integrity excludes (RCH bug d7xc3)"
+        );
+        // TEST PASS: streaming + non-streaming have identical safety contract
+    }
+
+    #[test]
+    fn build_retrieve_command_with_absolute_cargo_target_dir_still_safe() {
+        // TEST START: simulate the original d7xc3 scenario — operator set
+        // CARGO_TARGET_DIR to an ABSOLUTE path outside the project (e.g.,
+        // /tmp/rch-target-foo). The artifact pattern is still `target/...`
+        // (relative to project), but no target/ exists locally. Our guard
+        // must STILL prevent any local source dir from being a retrieval
+        // candidate.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("rch")).expect("mkdir rch");
+        std::fs::create_dir(temp.path().join("rch-common")).expect("mkdir rch-common");
+        // NO target/ dir locally — simulates absolute CARGO_TARGET_DIR.
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+        let cmd = pipeline.build_retrieve_command(
+            &worker,
+            "/data/tmp/rch/test-project/abc123",
+            &["target/debug/**".to_string()],
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.windows(2).any(|w| w == ["--exclude", "/rch/"]),
+            "source-integrity excludes must fire even when local target/ is absent"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--exclude", "/rch-common/"]),
+            "all local top-level source dirs must be excluded"
+        );
+        // TEST PASS: absolute CARGO_TARGET_DIR case
     }
 }

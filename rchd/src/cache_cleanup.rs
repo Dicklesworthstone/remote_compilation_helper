@@ -56,6 +56,7 @@ struct CleanupMetrics {
     free_before_gb: f64,
     free_after_gb: f64,
     low_disk_mode: bool,
+    remove_errors: u64,
 }
 
 fn cleanup_threshold_kb(min_free_gb: u64) -> u64 {
@@ -66,17 +67,41 @@ fn build_cleanup_command(escaped_base: &str, max_cache_age_hours: u64, min_free_
     let max_age_minutes = max_cache_age_hours.saturating_mul(60);
     let threshold_kb = cleanup_threshold_kb(min_free_gb);
     let active_grace_minutes = 5_u64;
+    // Worker-side orphan watchdog: a pgid-tracked job whose `.pgid` file is older
+    // than this AND whose process group still contains a member running this long
+    // is a stuck/orphaned build (escaped the in-session watchdog via ssh-drop or a
+    // daemon restart). 240 min is far above any legitimate test cap (default 30
+    // min), and the dual age check (file mtime + member elapsed time) prevents a
+    // reused pgid from ever matching. See transfer.rs build_id watchdog.
+    let orphan_after_minutes = 240_u64;
     format!(
         "set -u; \
          base={base}; \
          max_age_minutes={max_age_minutes}; \
          threshold_kb={threshold_kb}; \
          active_grace_minutes={active_grace_minutes}; \
+         orphan_after_minutes={orphan_after_minutes}; \
          if [ ! -d \"$base\" ]; then mkdir -p \"$base\"; fi; \
          before_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          if [ -z \"$before_kb\" ]; then before_kb=0; fi; \
-         removed=0; freed_kb=0; low_disk=0; \
+         removed=0; freed_kb=0; low_disk=0; remove_errors=0; orphans_killed=0; \
          if [ \"$before_kb\" -lt \"$threshold_kb\" ]; then low_disk=1; fi; \
+         if [ -d /tmp/rch-run ]; then \
+           for pgf in /tmp/rch-run/*/*.pgid; do \
+             [ -f \"$pgf\" ] || continue; \
+             pg=$(cat \"$pgf\" 2>/dev/null); \
+             case \"$pg\" in ''|*[!0-9]*) continue ;; esac; \
+             [ \"$pg\" -gt 1 ] || continue; \
+             [ -n \"$(find \"$pgf\" -mmin +\"$orphan_after_minutes\" -print 2>/dev/null)\" ] || continue; \
+             if ! kill -0 -\"$pg\" 2>/dev/null; then rm -f \"$pgf\" 2>/dev/null; continue; fi; \
+             oldest=$(pgrep -g \"$pg\" 2>/dev/null | while IFS= read -r p; do ps -o etimes= -p \"$p\" 2>/dev/null; done | tr -d ' ' | sort -n | tail -1); \
+             case \"$oldest\" in ''|*[!0-9]*) continue ;; esac; \
+             if [ \"$oldest\" -ge $((orphan_after_minutes * 60)) ]; then \
+               if kill -KILL -\"$pg\" 2>/dev/null; then orphans_killed=$((orphans_killed + 1)); fi; \
+               rm -f \"$pgf\" 2>/dev/null; \
+             fi; \
+           done; \
+         fi; \
          candidates=$(mktemp /tmp/rch-cleanup.XXXXXX); \
          if [ \"$low_disk\" -eq 1 ]; then \
            find \"$base\" -mindepth 2 -maxdepth 2 -type d -printf '%T@ %p\\n' 2>/dev/null \
@@ -91,9 +116,13 @@ fn build_cleanup_command(escaped_base: &str, max_cache_age_hours: u64, min_free_
            recent_active=$(find \"$dir\" -type f -mmin -\"$active_grace_minutes\" -print -quit 2>/dev/null || true); \
            if [ -n \"$recent_active\" ]; then continue; fi; \
            size_kb=$(du -sk \"$dir\" 2>/dev/null | awk '{{print $1}}'); \
-           rm -rf \"$dir\" 2>/dev/null || true; \
-           removed=$((removed + 1)); \
-           if [ -n \"$size_kb\" ]; then freed_kb=$((freed_kb + size_kb)); fi; \
+           if [ -z \"$size_kb\" ]; then size_kb=0; fi; \
+           if rm -rf \"$dir\" 2>/dev/null; then \
+             removed=$((removed + 1)); \
+             freed_kb=$((freed_kb + size_kb)); \
+           else \
+             remove_errors=$((remove_errors + 1)); \
+           fi; \
            if [ \"$low_disk\" -eq 1 ]; then \
              current_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
              if [ -n \"$current_kb\" ] && [ \"$current_kb\" -ge \"$threshold_kb\" ]; then break; fi; \
@@ -102,11 +131,13 @@ fn build_cleanup_command(escaped_base: &str, max_cache_age_hours: u64, min_free_
          rm -f \"$candidates\"; \
          after_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          if [ -z \"$after_kb\" ]; then after_kb=0; fi; \
-         printf 'RCH_CLEANUP_METRICS removed=%s freed_kb=%s before_kb=%s after_kb=%s low_disk=%s\\n' \"$removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$low_disk\"",
+         printf 'RCH_CLEANUP_METRICS removed=%s freed_kb=%s before_kb=%s after_kb=%s low_disk=%s remove_errors=%s orphans_killed=%s\\n' \"$removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$low_disk\" \"$remove_errors\" \"$orphans_killed\"; \
+         if [ \"$remove_errors\" -gt 0 ]; then exit 1; fi",
         base = escaped_base,
         max_age_minutes = max_age_minutes,
         threshold_kb = threshold_kb,
         active_grace_minutes = active_grace_minutes,
+        orphan_after_minutes = orphan_after_minutes,
     )
 }
 
@@ -120,6 +151,7 @@ fn parse_cleanup_metrics(stdout: &str) -> Option<CleanupMetrics> {
     let mut before_kb = None;
     let mut after_kb = None;
     let mut low_disk = None;
+    let mut remove_errors = None;
 
     for token in line.split_whitespace().skip(1) {
         let Some((key, value)) = token.split_once('=') else {
@@ -131,6 +163,7 @@ fn parse_cleanup_metrics(stdout: &str) -> Option<CleanupMetrics> {
             "before_kb" => before_kb = value.parse::<u64>().ok(),
             "after_kb" => after_kb = value.parse::<u64>().ok(),
             "low_disk" => low_disk = Some(value == "1"),
+            "remove_errors" => remove_errors = value.parse::<u64>().ok(),
             _ => {}
         }
     }
@@ -141,6 +174,7 @@ fn parse_cleanup_metrics(stdout: &str) -> Option<CleanupMetrics> {
         free_before_gb: before_kb.unwrap_or(0) as f64 / (1024.0 * 1024.0),
         free_after_gb: after_kb.unwrap_or(0) as f64 / (1024.0 * 1024.0),
         low_disk_mode: low_disk.unwrap_or(false),
+        remove_errors: remove_errors.unwrap_or(0),
     })
 }
 
@@ -154,8 +188,11 @@ pub struct CacheCleanupScheduler {
     last_cleanup: Arc<RwLock<HashMap<WorkerId, Instant>>>,
     /// First observed idle instant per worker (used for idle-threshold gating).
     idle_since: Arc<RwLock<HashMap<WorkerId, Instant>>>,
-    /// SSH options for cleanup commands.
+    /// SSH options for cleanup commands (throwaway fallback path).
     ssh_options: SshOptions,
+    /// Shared SSH connection pool. When `Some`, cleanup commands run over a warm
+    /// reused ControlMaster; when `None`, the legacy throwaway path is used.
+    ssh_pool: Option<Arc<rch_common::SshPool>>,
 }
 
 impl CacheCleanupScheduler {
@@ -167,7 +204,34 @@ impl CacheCleanupScheduler {
             last_cleanup: Arc::new(RwLock::new(HashMap::new())),
             idle_since: Arc::new(RwLock::new(HashMap::new())),
             ssh_options: SshOptions::default(),
+            ssh_pool: None,
         }
+    }
+
+    /// Attach a shared SSH connection pool for warm ControlMaster reuse.
+    #[must_use]
+    pub fn with_ssh_pool(mut self, pool: Option<Arc<rch_common::SshPool>>) -> Self {
+        self.ssh_pool = pool;
+        self
+    }
+
+    /// Run one remote command against a worker, using the shared pool (warm
+    /// master reuse) when configured, otherwise a throwaway SSH session.
+    async fn run_remote(
+        &self,
+        config: &rch_common::WorkerConfig,
+        command: &str,
+    ) -> anyhow::Result<rch_common::CommandResult> {
+        if let Some(pool) = &self.ssh_pool {
+            return pool
+                .run_with_timeout(config, command, self.ssh_options.command_timeout)
+                .await;
+        }
+        let mut ssh_client = SshClient::new(config.clone(), self.ssh_options.clone());
+        ssh_client.connect().await?;
+        let result = ssh_client.execute(command).await;
+        let _ = ssh_client.disconnect().await;
+        result
     }
 
     /// Start the cleanup scheduler.
@@ -331,11 +395,8 @@ impl CacheCleanupScheduler {
             self.config.min_free_gb,
         );
 
-        // Execute cleanup via SSH
-        let mut ssh_client = SshClient::new(config.clone(), self.ssh_options.clone());
-        ssh_client.connect().await?;
-
-        let result = ssh_client.execute(&cleanup_cmd).await?;
+        // Execute cleanup via SSH (pooled warm master when available).
+        let result = self.run_remote(&config, &cleanup_cmd).await?;
 
         // Update last cleanup time
         {
@@ -349,12 +410,13 @@ impl CacheCleanupScheduler {
             .as_ref()
             .map(|m| {
                 format!(
-                    "removed={}, freed_mb={}, before_free_gb={:.2}, after_free_gb={:.2}, low_disk={}",
+                    "removed={}, freed_mb={}, before_free_gb={:.2}, after_free_gb={:.2}, low_disk={}, remove_errors={}",
                     m.removed_dirs,
                     m.freed_bytes / (1024 * 1024),
                     m.free_before_gb,
                     m.free_after_gb,
-                    m.low_disk_mode
+                    m.low_disk_mode,
+                    m.remove_errors
                 )
             })
             .unwrap_or_else(|| "metrics=unavailable".to_string());
@@ -382,8 +444,9 @@ impl CacheCleanupScheduler {
             })
         } else {
             let error_msg = format!(
-                "Cleanup command failed with exit code {} (stderr: {})",
+                "Cleanup command failed with exit code {} ({}, stderr: {})",
                 result.exit_code,
+                metrics_summary,
                 result.stderr.trim()
             );
             warn!(
@@ -442,7 +505,7 @@ mod tests {
         assert_eq!(config.max_cache_age_hours, 72);
         assert_eq!(config.min_free_gb, 10);
         assert_eq!(config.idle_threshold_secs, 60);
-        assert_eq!(config.remote_base, "/tmp/rch");
+        assert_eq!(config.remote_base, "/data/tmp/rch");
     }
 
     #[test]
@@ -1001,13 +1064,14 @@ mod tests {
     #[test]
     fn test_parse_cleanup_metrics_parses_emitted_line() {
         let _guard = test_guard!();
-        let stdout = "noise\nRCH_CLEANUP_METRICS removed=4 freed_kb=2048 before_kb=4096 after_kb=6144 low_disk=1\n";
+        let stdout = "noise\nRCH_CLEANUP_METRICS removed=4 freed_kb=2048 before_kb=4096 after_kb=6144 low_disk=1 remove_errors=2\n";
         let metrics = parse_cleanup_metrics(stdout).expect("expected parse result");
         assert_eq!(metrics.removed_dirs, 4);
         assert_eq!(metrics.freed_bytes, 2 * 1024 * 1024);
         assert!((metrics.free_before_gb - (4096.0 / (1024.0 * 1024.0))).abs() < f64::EPSILON);
         assert!((metrics.free_after_gb - (6144.0 / (1024.0 * 1024.0))).abs() < f64::EPSILON);
         assert!(metrics.low_disk_mode);
+        assert_eq!(metrics.remove_errors, 2);
     }
 
     #[test]
@@ -1018,7 +1082,39 @@ mod tests {
         assert!(command.contains("active_grace_minutes=5"));
         assert!(command.contains("-mmin -\"$active_grace_minutes\""));
         assert!(command.contains("case \"$dir\" in \"$base\"/*)"));
+        assert!(command.contains("if rm -rf \"$dir\""));
+        assert!(command.contains("remove_errors=$((remove_errors + 1))"));
+        assert!(command.contains("if [ \"$remove_errors\" -gt 0 ]; then exit 1; fi"));
         assert!(command.contains("RCH_CLEANUP_METRICS"));
         assert!(command.contains("low_disk"));
+        assert!(command.contains("remove_errors"));
+    }
+
+    #[test]
+    fn test_build_cleanup_command_orphan_sweeper_guards() {
+        // The worker-side orphan sweeper must reap stuck pgid groups but be
+        // hardened against pgid reuse and against ever touching pid 0/1.
+        let _guard = test_guard!();
+        let command = build_cleanup_command("'/tmp/rch'", 72, 10);
+        // Threshold wired (240 min).
+        assert!(command.contains("orphan_after_minutes=240"));
+        // Scans only the fixed run-dir.
+        assert!(command.contains("for pgf in /tmp/rch-run/*/*.pgid"));
+        // pgid must be all-digits and > 1 (never signal pid 0/1 / "kill -- -1").
+        assert!(command.contains("case \"$pg\" in ''|*[!0-9]*) continue ;; esac"));
+        assert!(command.contains("[ \"$pg\" -gt 1 ] || continue"));
+        // Only sweep files older than the threshold.
+        assert!(command.contains("-mmin +\"$orphan_after_minutes\""));
+        // Liveness check before kill; clean up dead-group files (no `--`: dash).
+        assert!(command.contains("kill -0 -\"$pg\""));
+        // Reuse guard: a group member must actually have been running that long.
+        assert!(command.contains("pgrep -g \"$pg\""));
+        assert!(command.contains("ps -o etimes= -p \"$p\""));
+        assert!(command.contains("[ \"$oldest\" -ge $((orphan_after_minutes * 60)) ]"));
+        // The actual group kill + accounting (no `--`: broken in dash).
+        assert!(command.contains("kill -KILL -\"$pg\""));
+        assert!(!command.contains("kill -KILL -- -"));
+        assert!(command.contains("orphans_killed=$((orphans_killed + 1))"));
+        assert!(command.contains("orphans_killed=%s"));
     }
 }

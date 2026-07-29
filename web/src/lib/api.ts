@@ -5,6 +5,7 @@ import type {
   BudgetStatusResponse,
   SpeedScoreHistoryResponse,
   SpeedScoreListResponse,
+  RemediationView,
 } from './types';
 
 // Default to local daemon socket proxy
@@ -66,6 +67,14 @@ export const api = {
   },
 
   /**
+   * Get the operator-facing remediation view (stable, redacted JSON)
+   * (bd-session-history-remediation-ocv9i.14.4).
+   */
+  async getRemediation(): Promise<RemediationView> {
+    return fetchJson<RemediationView>('/api/remediation');
+  },
+
+  /**
    * Get basic health check
    */
   async getHealth(): Promise<HealthResponse> {
@@ -95,6 +104,14 @@ export const api = {
         'Accept': 'text/plain',
       },
     });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new ApiError(
+        `API request failed: ${response.statusText}`,
+        response.status,
+        text
+      );
+    }
     return response.text();
   },
 

@@ -523,31 +523,18 @@ impl RemediationPipeline {
         }
 
         // Determine response status
-        let status = if aborted {
-            ProcessTriageResponseStatus::Failed
-        } else if any_escalated && !any_executed {
-            ProcessTriageResponseStatus::EscalatedNoAction
-        } else if any_executed && (any_failed || any_escalated) {
-            ProcessTriageResponseStatus::PartiallyApplied
-        } else if any_executed {
-            ProcessTriageResponseStatus::Applied
-        } else {
-            ProcessTriageResponseStatus::RejectedByPolicy
-        };
-
-        let failure = if aborted {
-            Some(ProcessTriageFailure {
-                kind: ProcessTriageFailureKind::Timeout,
-                code: "PT_PIPELINE_TIMEOUT".to_string(),
-                message: abort_reason.clone().unwrap_or_default(),
-                remediation: vec![
-                    "Increase pipeline timeout budget".to_string(),
-                    "Reduce number of candidate processes per run".to_string(),
-                ],
-            })
-        } else {
-            None
-        };
+        let any_skipped = action_results
+            .iter()
+            .any(|result| result.outcome == ProcessTriageActionOutcome::Skipped);
+        let status = derive_pipeline_status(
+            aborted,
+            any_executed,
+            any_escalated,
+            any_failed,
+            any_skipped,
+        );
+        let failure =
+            pipeline_failure_for_status(status, aborted, any_failed, abort_reason.as_deref());
 
         let response = ProcessTriageResponse {
             schema_version: PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION.to_string(),
@@ -755,6 +742,71 @@ fn process_triage_status_label(status: &ProcessTriageResponseStatus) -> &'static
         ProcessTriageResponseStatus::RejectedByPolicy => "rejected_by_policy",
         ProcessTriageResponseStatus::Failed => "failure",
     }
+}
+
+fn derive_pipeline_status(
+    aborted: bool,
+    any_executed: bool,
+    any_escalated: bool,
+    any_failed: bool,
+    any_skipped: bool,
+) -> ProcessTriageResponseStatus {
+    if aborted {
+        ProcessTriageResponseStatus::Failed
+    } else if any_executed && (any_failed || any_escalated) {
+        ProcessTriageResponseStatus::PartiallyApplied
+    } else if any_executed {
+        ProcessTriageResponseStatus::Applied
+    } else if any_failed {
+        ProcessTriageResponseStatus::Failed
+    } else if any_escalated {
+        ProcessTriageResponseStatus::EscalatedNoAction
+    } else if any_skipped {
+        ProcessTriageResponseStatus::Applied
+    } else {
+        ProcessTriageResponseStatus::RejectedByPolicy
+    }
+}
+
+fn pipeline_failure_for_status(
+    status: ProcessTriageResponseStatus,
+    aborted: bool,
+    any_failed: bool,
+    abort_reason: Option<&str>,
+) -> Option<ProcessTriageFailure> {
+    if aborted {
+        return Some(ProcessTriageFailure {
+            kind: ProcessTriageFailureKind::Timeout,
+            code: "PT_PIPELINE_TIMEOUT".to_string(),
+            message: abort_reason
+                .unwrap_or("Pipeline timeout exceeded")
+                .to_string(),
+            remediation: vec![
+                "Increase pipeline timeout budget".to_string(),
+                "Reduce number of candidate processes per run".to_string(),
+            ],
+        });
+    }
+
+    if any_failed
+        && matches!(
+            status,
+            ProcessTriageResponseStatus::Failed | ProcessTriageResponseStatus::PartiallyApplied
+        )
+    {
+        return Some(ProcessTriageFailure {
+            kind: ProcessTriageFailureKind::ExecutorRuntimeError,
+            code: "PT_ACTION_FAILED".to_string(),
+            message: "One or more permitted remediation actions failed during execution"
+                .to_string(),
+            remediation: vec![
+                "Review per-action results for failed PIDs and signals".to_string(),
+                "Verify worker process ownership and signal permissions".to_string(),
+            ],
+        });
+    }
+
+    None
 }
 
 fn process_triage_action_outcome_label(outcome: &ProcessTriageActionOutcome) -> &'static str {
@@ -1707,6 +1759,37 @@ mod tests {
         );
         // Partial = some executed, some escalated
         assert_eq!(resp.status, ProcessTriageResponseStatus::PartiallyApplied);
+    }
+
+    #[test]
+    fn test_pipeline_status_reports_all_execution_failures_as_failed() {
+        let _guard = test_guard!();
+
+        let status = derive_pipeline_status(false, false, false, true, false);
+
+        assert_eq!(status, ProcessTriageResponseStatus::Failed);
+    }
+
+    #[test]
+    fn test_pipeline_status_keeps_partial_action_failure_visible() {
+        let _guard = test_guard!();
+
+        let status = derive_pipeline_status(false, true, false, true, false);
+        let failure = pipeline_failure_for_status(status, false, true, None)
+            .expect("action failure should include a failure payload");
+
+        assert_eq!(status, ProcessTriageResponseStatus::PartiallyApplied);
+        assert_eq!(failure.kind, ProcessTriageFailureKind::ExecutorRuntimeError);
+        assert_eq!(failure.code, "PT_ACTION_FAILED");
+    }
+
+    #[test]
+    fn test_pipeline_status_treats_skipped_stale_process_as_applied() {
+        let _guard = test_guard!();
+
+        let status = derive_pipeline_status(false, false, false, false, true);
+
+        assert_eq!(status, ProcessTriageResponseStatus::Applied);
     }
 
     #[tokio::test]

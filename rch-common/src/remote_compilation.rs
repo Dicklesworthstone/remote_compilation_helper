@@ -9,7 +9,9 @@
 //! 5. Syncing artifacts back
 //! 6. Comparing binary hashes to verify correctness
 
-use crate::binary_hash::{BinaryHashResult, binaries_equivalent, compute_binary_hash};
+use crate::binary_hash::{
+    BinaryHashResult, CanaryVerdict, binary_contains_marker, classify_canary, compute_binary_hash,
+};
 use crate::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
 use crate::ssh::{SshClient, SshOptions};
 use crate::test_change::{TestChangeGuard, TestCodeChange};
@@ -18,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use shell_escape::escape;
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -48,6 +50,12 @@ pub struct VerificationResult {
     pub error: Option<String>,
     /// The test marker ID that was embedded in the binary.
     pub test_marker: String,
+    /// The canary verdict token (bd-784xt): `reproduced` (byte-equivalent),
+    /// `toolchain_drift` (bytes differ but the worker is healthy — advisory PASS),
+    /// `miscompile` (same-toolchain byte mismatch — FAIL), or `missing_marker`
+    /// (the build is corrupt / not ours — FAIL). [`Self::success`] is true for the
+    /// first two. See [`crate::binary_hash::CanaryVerdict`].
+    pub verdict: String,
 }
 
 /// Configuration for a remote compilation test.
@@ -69,6 +77,54 @@ pub struct RemoteCompilationTest {
     pub remote_base: String,
     /// Unique suffix appended to the remote project directory for this test run.
     pub remote_path_suffix: String,
+}
+
+/// Resolve the `cargo` executable for the LOCAL reference build.
+///
+/// The daemon runs with a minimal, systemd-style `PATH` (e.g.
+/// `/usr/local/bin:/usr/bin:...`) that does NOT include `~/.cargo/bin`, so a bare
+/// `Command::new("cargo")` fails with ENOENT and silently wedges the self-test
+/// canary. Resolve robustly: honor an explicit `CARGO` override, then the rustup
+/// default at `$HOME/.cargo/bin/cargo`, and only fall back to a bare `cargo`
+/// (PATH lookup) when neither is present.
+fn resolve_cargo_binary() -> std::ffi::OsString {
+    resolve_cargo_binary_from(std::env::var_os("CARGO"), std::env::var_os("HOME"))
+}
+
+/// Pure core of [`resolve_cargo_binary`]: pick the cargo executable from an
+/// explicit `CARGO` override and a `HOME` directory. Split out so the resolution
+/// order is unit-testable without mutating process-global env vars.
+fn resolve_cargo_binary_from(
+    cargo_override: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> std::ffi::OsString {
+    if let Some(explicit) = cargo_override
+        && !explicit.is_empty()
+    {
+        return explicit;
+    }
+    if let Some(home) = home {
+        let candidate = PathBuf::from(home).join(".cargo").join("bin").join("cargo");
+        if candidate.is_file() {
+            return candidate.into_os_string();
+        }
+    }
+    std::ffi::OsString::from("cargo")
+}
+
+/// Read the Cargo package name from `<project>/Cargo.toml` (the `[package] name`
+/// field). Cargo names the built binary after the package (not the directory),
+/// so the verification hash step must resolve the artifact by package name.
+/// Returns `None` if the manifest is absent/unparseable or has no package name.
+fn cargo_package_name(project: &Path) -> Option<String> {
+    let manifest = std::fs::read_to_string(project.join("Cargo.toml")).ok()?;
+    let table = toml::from_str::<toml::Table>(&manifest).ok()?;
+    table
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .and_then(|pkg| pkg.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn use_mock_transport(worker: &WorkerConfig) -> bool {
@@ -105,6 +161,55 @@ fn join_remote_path(base: &str, child: &str) -> String {
     } else {
         format!("{base}/{child}")
     }
+}
+
+/// Shell-snippet name of the variable that [`remote_cargo_home_base_prelude`]
+/// assigns the isolated-CARGO_HOME staging base into.
+pub const RCH_CARGO_HOME_BASE_VAR: &str = "RCH_CH_BASE";
+
+/// Basename prefix of every isolated CARGO_HOME staging dir. Cleanup/reaper
+/// passes (in-tree and external, e.g. sbh) match on this exact prefix, so it
+/// must never change.
+pub const RCH_CARGO_HOME_PREFIX: &str = "rch-cargo-home-";
+
+/// A POSIX-`sh` statement that resolves the temp base for isolated CARGO_HOME
+/// staging dirs **on the worker, at job-execution time**, into the shell
+/// variable [`RCH_CARGO_HOME_BASE_VAR`].
+///
+/// Why resolve remotely rather than bake a path in from the client: these dirs
+/// are created and used on the *worker*, and the worker's correct temp location
+/// (`$TMPDIR`, fleet-wide `/data/tmp`) is what matters, not the orchestrating
+/// client's. Critically, rchd runs under systemd and so does **not** inherit
+/// PAM's `/etc/environment` (where `TMPDIR=/data/tmp` lives) — but a build
+/// dispatched over SSH may, and either way the explicit `/data/tmp` fallback
+/// keeps these (potentially large, long-lived) caches off a tmpfs `/tmp` that
+/// would otherwise eat RAM.
+///
+/// Resolution order: `$TMPDIR` (if set and a real directory) → `/data/tmp`
+/// (if it exists) → `/tmp`.
+pub fn remote_cargo_home_base_prelude() -> String {
+    format!(
+        "{var}=\"${{TMPDIR:-}}\"; \
+         [ -n \"${{{var}}}\" ] && [ -d \"${{{var}}}\" ] || {var}=/data/tmp; \
+         [ -d \"${{{var}}}\" ] || {var}=/tmp",
+        var = RCH_CARGO_HOME_BASE_VAR
+    )
+}
+
+/// The shell expression (referencing the variable set by
+/// [`remote_cargo_home_base_prelude`]) for an isolated CARGO_HOME staging dir
+/// whose unique `suffix` is already path-safe. Keeps the
+/// [`RCH_CARGO_HOME_PREFIX`] basename so cleanup matching still works.
+///
+/// Returns an unquoted expression that must be embedded in a context where the
+/// shell expands `$VAR` (i.e. inside double quotes or bare); both call sites
+/// double-quote it.
+pub fn remote_cargo_home_expr(suffix: &str) -> String {
+    format!(
+        "${{{var}}}/{prefix}{suffix}",
+        var = RCH_CARGO_HOME_BASE_VAR,
+        prefix = RCH_CARGO_HOME_PREFIX
+    )
 }
 
 impl Default for RemoteCompilationTest {
@@ -231,19 +336,46 @@ impl RemoteCompilationTest {
             .with_context(|| format!("Failed to hash remote binary: {:?}", remote_binary_path))?;
         info!("Remote hash: {}", &remote_hash.code_hash[..16]);
 
-        // 7. Compare
-        let success = binaries_equivalent(&local_hash, &remote_hash);
+        // 7. Classify the canary verdict (bd-784xt). Byte-for-byte identity to the
+        // orchestrator's reference build is ADVISORY: a healthy worker whose rustc
+        // nightly differs legitimately produces different codegen, so a strict
+        // equality check false-failed healthy workers on a heterogeneous fleet.
+        // The injected marker proves the binary is the build we asked for (catches
+        // corruption / a stale artifact); a byte mismatch on a *confirmed-
+        // identical* toolchain is a genuine miscompile. Toolchain parity is not
+        // probed in this path, so a mismatch with the marker present resolves to
+        // advisory drift (PASS) rather than a false failure.
+        let marker_present =
+            binary_contains_marker(&remote_binary_path, &test_marker).unwrap_or(true);
+        let verdict = classify_canary(&local_hash, &remote_hash, marker_present, None);
+        let success = verdict.passed();
         let total_ms = start.elapsed().as_millis() as u64;
 
+        let local_short = &local_hash.code_hash[..local_hash.code_hash.len().min(16)];
+        let remote_short = &remote_hash.code_hash[..remote_hash.code_hash.len().min(16)];
         let error = if success {
-            info!("Verification PASSED: Binary hashes match");
+            if verdict.is_advisory() {
+                info!(
+                    "Verification PASSED (advisory {}): worker healthy; codegen differs from the \
+                     orchestrator toolchain (local={local_short} remote={remote_short})",
+                    verdict.reason_code().unwrap_or("RCH-I018"),
+                );
+            } else {
+                info!("Verification PASSED: remote build reproduced the reference binary");
+            }
             None
         } else {
-            let msg = format!(
-                "Binary hash mismatch: local={} remote={}",
-                &local_hash.code_hash[..16],
-                &remote_hash.code_hash[..16]
-            );
+            let code = verdict.reason_code().unwrap_or("RCH-E203");
+            let msg = if verdict == CanaryVerdict::MissingMarker {
+                format!(
+                    "[{code}] canary missing test marker '{test_marker}' — remote build is corrupt or not ours"
+                )
+            } else {
+                format!(
+                    "[{code}] canary {} — local={local_short} remote={remote_short}",
+                    verdict.as_str(),
+                )
+            };
             warn!("Verification FAILED: {}", msg);
             Some(msg)
         };
@@ -259,6 +391,7 @@ impl RemoteCompilationTest {
             total_ms,
             error,
             test_marker,
+            verdict: verdict.as_str().to_string(),
         })
     }
 
@@ -291,14 +424,33 @@ impl RemoteCompilationTest {
     }
 
     /// Get the binary name to verify.
+    ///
+    /// Prefers an explicit override, then the actual Cargo package name from the
+    /// project's `Cargo.toml` (cargo names the binary after the PACKAGE, with `-`
+    /// normalized to `_`), and only falls back to the directory name. The
+    /// directory-name heuristic is wrong whenever the dir and package names
+    /// differ — e.g. the self-test fixture lives in a `project/` dir but its
+    /// package is `rch_self_test`, so the produced binary is `rch_self_test`, not
+    /// `project`; reading Cargo.toml makes the hash step find the real artifact.
     fn get_binary_name(&self) -> String {
-        self.binary_name.clone().unwrap_or_else(|| {
-            self.test_project
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .replace('-', "_")
-        })
+        if let Some(name) = self.binary_name.clone() {
+            return name;
+        }
+        // An empty project path is not a real project root: `cargo_package_name`
+        // would join "Cargo.toml" against an empty path and read `<cwd>/Cargo.toml`,
+        // misattributing the binary to whatever package the process happens to run
+        // in. Only consult the manifest for a real path; otherwise fall through to
+        // the file-name / "unknown" fallback.
+        if !self.test_project.as_os_str().is_empty()
+            && let Some(pkg) = cargo_package_name(&self.test_project)
+        {
+            return pkg.replace('-', "_");
+        }
+        self.test_project
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .replace('-', "_")
     }
 
     /// Get the remote project path on the worker.
@@ -326,15 +478,21 @@ impl RemoteCompilationTest {
         )
     }
 
-    /// Build the isolated remote CARGO_HOME path for a single build attempt.
-    fn remote_cargo_home_path(&self, session_id: u32, timestamp: u128) -> String {
+    /// Build the isolated remote CARGO_HOME shell *expression* for a single
+    /// build attempt. The temp base is resolved on the worker at execution time
+    /// (see [`remote_cargo_home_base_prelude`]), honoring `$TMPDIR` / `/data/tmp`
+    /// rather than hardcoding `/tmp`, so large caches stay off a tmpfs `/tmp`.
+    /// The returned string references the prelude's shell variable and must be
+    /// used in a `$VAR`-expanding (double-quoted) context.
+    fn remote_cargo_home_path(&self, session_id: &str) -> String {
         let worker_id = sanitize_remote_path_component(self.worker.id.as_str(), "worker");
-        format!("/tmp/rch-cargo-home-{worker_id}-{session_id}-{timestamp}")
+        let session_id = sanitize_remote_path_component(session_id, "session");
+        remote_cargo_home_expr(&format!("{worker_id}-{session_id}"))
     }
 
     /// Build the project locally.
     async fn build_local(&self) -> Result<()> {
-        let mut cmd = Command::new("cargo");
+        let mut cmd = Command::new(resolve_cargo_binary());
         cmd.arg("build");
 
         if self.release_mode {
@@ -343,6 +501,12 @@ impl RemoteCompilationTest {
 
         cmd.current_dir(&self.test_project)
             .env("CARGO_INCREMENTAL", "0") // Disable incremental for reproducibility
+            // Pin the output to the test project's own `target/` so the produced
+            // binary lands exactly where `local_binary_path()` reads it. The
+            // daemon inherits a process-wide `CARGO_TARGET_DIR` (it redirects its
+            // OWN builds to a shared cache); left unoverridden it sends the canary
+            // binary there instead, and the subsequent local-hash step fails.
+            .env("CARGO_TARGET_DIR", self.test_project.join("target"))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -395,8 +559,17 @@ impl RemoteCompilationTest {
         let mut client = SshClient::new(self.worker.clone(), self.ssh_options.clone());
         client.connect().await?;
         let mkdir_cmd = format!("mkdir -p -- {}", escaped_remote_path);
-        let mkdir_result = client.execute(&mkdir_cmd).await?;
-        client.disconnect().await?;
+        // Always disconnect, even on error/timeout — see the build path below: a
+        // dropped RemoteChild is not reaped while the ControlMaster is alive, so
+        // `?` before disconnect() would leak the remote process.
+        let mkdir_result = client.execute(&mkdir_cmd).await;
+        if let Err(e) = client.disconnect().await {
+            warn!(
+                "Failed to disconnect from {} after remote mkdir: {}",
+                self.worker.id, e
+            );
+        }
+        let mkdir_result = mkdir_result?;
 
         if !mkdir_result.success() {
             bail!("Failed to create remote directory: {}", mkdir_result.stderr);
@@ -412,6 +585,8 @@ impl RemoteCompilationTest {
 
         let mut cmd = Command::new("rsync");
         cmd.arg("-az")
+            .arg("--no-owner")
+            .arg("--no-group")
             .arg("--delete")
             .arg("--exclude")
             .arg("target/")
@@ -447,16 +622,16 @@ impl RemoteCompilationTest {
         let remote_path = self.remote_project_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
 
-        // Generate unique cargo home and target dir per worker session to prevent cache lock contention
-        let session_id = std::process::id();
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let cargo_home = self.remote_cargo_home_path(session_id, timestamp);
+        // Generate a unique cargo home per build attempt to prevent cache lock contention.
+        let session_id = Uuid::new_v4().simple().to_string();
+        // `cargo_home` is a shell *expression* (`${RCH_CH_BASE}/rch-cargo-home-…`)
+        // resolved on the worker by the prelude below — double-quote it (not
+        // shell-escape) so `$RCH_CH_BASE` expands; its suffix is charset-safe.
+        let cargo_home = self.remote_cargo_home_path(&session_id);
+        let quoted_cargo_home = format!("\"{cargo_home}\"");
         let cargo_target_dir = format!("{}/target", remote_path);
-        let escaped_cargo_home = escape(Cow::from(&cargo_home));
         let escaped_cargo_target_dir = escape(Cow::from(&cargo_target_dir));
+        let cargo_home_base_prelude = remote_cargo_home_base_prelude();
 
         let cargo_args = if self.release_mode {
             "cargo build --release"
@@ -465,14 +640,14 @@ impl RemoteCompilationTest {
         };
         // Preserve the cargo status after removing the isolated cache.
         let build_cmd = format!(
-            "mkdir -p -- {} {} && cd {} && CARGO_HOME={} CARGO_TARGET_DIR={} CARGO_INCREMENTAL=0 {}; status=$?; rm -rf -- {}; exit $status",
-            escaped_cargo_home,
+            "{cargo_home_base_prelude}; mkdir -p -- {} {} && cd {} && CARGO_HOME={} CARGO_TARGET_DIR={} CARGO_INCREMENTAL=0 {}; status=$?; rm -rf -- {}; exit $status",
+            quoted_cargo_home,
             escaped_cargo_target_dir,
             escaped_remote_path,
-            escaped_cargo_home,
+            quoted_cargo_home,
             escaped_cargo_target_dir,
             cargo_args,
-            escaped_cargo_home
+            quoted_cargo_home
         );
 
         debug!(
@@ -499,8 +674,22 @@ impl RemoteCompilationTest {
 
         let mut client = SshClient::new(self.worker.clone(), self.ssh_options.clone());
         client.connect().await?;
-        let result = client.execute(&build_cmd).await?;
-        client.disconnect().await?;
+        // Capture the result and ALWAYS disconnect, even on error/timeout. On an
+        // execute() timeout the inner RemoteChild is dropped, but dropping it does
+        // NOT kill the remote process while the SSH ControlMaster is alive — only
+        // closing the session (disconnect) reaps it. Propagating `?` straight from
+        // execute() would skip disconnect() and leak a timed-out `cargo build`
+        // that keeps burning worker CPU and holding cache/target locks until sshd
+        // reaps it. The disconnect error is best-effort and must not mask the
+        // primary build error.
+        let result = client.execute(&build_cmd).await;
+        if let Err(e) = client.disconnect().await {
+            warn!(
+                "Failed to disconnect from {} after remote build: {}",
+                self.worker.id, e
+            );
+        }
+        let result = result?;
 
         if !result.success() {
             bail!(
@@ -545,6 +734,8 @@ impl RemoteCompilationTest {
 
         let mut cmd = Command::new("rsync");
         cmd.arg("-az")
+            .arg("--no-owner")
+            .arg("--no-group")
             .arg("-e")
             .arg(format!(
                 "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
@@ -583,6 +774,64 @@ mod tests {
     use crate::testing::{TestLogger, TestPhase};
     use crate::types::WorkerId;
 
+    #[test]
+    fn resolve_cargo_binary_prefers_override_then_rustup_then_path() {
+        use std::ffi::OsString;
+
+        // An explicit CARGO override always wins.
+        assert_eq!(
+            resolve_cargo_binary_from(Some(OsString::from("/opt/cargo")), None),
+            OsString::from("/opt/cargo")
+        );
+
+        // An empty override is ignored (falls through to HOME / PATH).
+        assert_eq!(
+            resolve_cargo_binary_from(Some(OsString::new()), None),
+            OsString::from("cargo")
+        );
+
+        // With no override and no rustup cargo present under HOME, fall back to a
+        // bare `cargo` (PATH lookup).
+        let empty_home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_cargo_binary_from(None, Some(empty_home.path().as_os_str().to_os_string())),
+            OsString::from("cargo")
+        );
+
+        // When `$HOME/.cargo/bin/cargo` exists (the rustup default the daemon's
+        // minimal PATH omits), resolve to it absolutely.
+        let home = tempfile::tempdir().unwrap();
+        let cargo_bin = home.path().join(".cargo").join("bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        let cargo_path = cargo_bin.join("cargo");
+        std::fs::write(&cargo_path, b"#!/bin/sh\n").unwrap();
+        assert_eq!(
+            resolve_cargo_binary_from(None, Some(home.path().as_os_str().to_os_string())),
+            cargo_path.into_os_string()
+        );
+    }
+
+    #[test]
+    fn cargo_package_name_reads_package_not_directory() {
+        // The self-test fixture's real shape: a `project/` dir whose package is
+        // `rch_self_test` — cargo names the binary after the package, so reading
+        // the directory name (`project`) would look for a non-existent artifact.
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("Cargo.toml"),
+            "[package]\nname = \"rch_self_test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        assert_eq!(cargo_package_name(&proj).as_deref(), Some("rch_self_test"));
+
+        // No manifest -> None (caller falls back to the directory name).
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(cargo_package_name(&empty), None);
+    }
+
     fn init_test_logging() {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
@@ -620,6 +869,7 @@ mod tests {
             total_ms: 5300,
             error: None,
             test_marker: "RCH_TEST_12345".to_string(),
+            verdict: "reproduced".to_string(),
         };
 
         logger.log(TestPhase::Execute, "Serializing VerificationResult to JSON");
@@ -667,6 +917,7 @@ mod tests {
             total_ms: 3100,
             error: Some("Binary hash mismatch".to_string()),
             test_marker: "RCH_TEST_99999".to_string(),
+            verdict: "reproduced".to_string(),
         };
 
         logger.log(TestPhase::Verify, "Checking failed verification result");
@@ -708,6 +959,7 @@ mod tests {
             total_ms: 18200,
             error: Some("Size mismatch: 5000 vs 5001".to_string()),
             test_marker: "RCH_FULL_TEST".to_string(),
+            verdict: "reproduced".to_string(),
         };
 
         logger.log(TestPhase::Execute, "Serializing result with all fields");
@@ -1193,19 +1445,94 @@ mod tests {
         };
 
         let test = RemoteCompilationTest::new(worker, PathBuf::from("/home/user/project"));
-        let cargo_home = test.remote_cargo_home_path(7, 42);
+        let cargo_home = test.remote_cargo_home_path("run/7 with spaces");
         logger.log_with_data(
             TestPhase::Verify,
             "Computed sanitized cargo home",
             serde_json::json!({ "cargo_home": &cargo_home }),
         );
 
+        // The worker_id/session_id are still sanitized into the basename, but the
+        // base is now a worker-resolved shell variable (honoring $TMPDIR /
+        // /data/tmp) instead of a hardcoded /tmp.
         assert_eq!(
             cargo_home,
-            "/tmp/rch-cargo-home-worker-one-with-spaces-7-42"
+            "${RCH_CH_BASE}/rch-cargo-home-worker-one-with-spaces-run-7-with-spaces"
         );
 
         logger.pass();
+    }
+
+    /// The prelude must never bake in `/tmp`: it resolves the staging base on the
+    /// worker from `$TMPDIR` → `/data/tmp` → `/tmp` at execution time. rchd runs
+    /// under systemd without PAM's `/etc/environment`, so this explicit resolution
+    /// (not a client-baked path) is what keeps caches off a tmpfs `/tmp`.
+    #[test]
+    fn cargo_home_base_prelude_does_not_hardcode_tmp() {
+        let prelude = remote_cargo_home_base_prelude();
+        // Sets the documented variable, references $TMPDIR and /data/tmp.
+        assert!(prelude.contains(RCH_CARGO_HOME_BASE_VAR), "{prelude}");
+        assert!(
+            prelude.contains("$TMPDIR") || prelude.contains("${TMPDIR"),
+            "{prelude}"
+        );
+        assert!(prelude.contains("/data/tmp"), "{prelude}");
+        // The guards must inspect the shell variable's value, not the literal
+        // string "RCH_CH_BASE"; otherwise the prelude falls through to /tmp.
+        assert!(prelude.contains("[ -n \"${RCH_CH_BASE}\" ]"), "{prelude}");
+        assert!(prelude.contains("[ -d \"${RCH_CH_BASE}\" ]"), "{prelude}");
+        assert!(!prelude.contains("[ -n \"RCH_CH_BASE\" ]"), "{prelude}");
+        assert!(!prelude.contains("[ -d \"RCH_CH_BASE\" ]"), "{prelude}");
+        // /tmp only as the last-resort fallback, never as the leading base.
+        assert!(
+            !prelude.contains("/tmp/rch"),
+            "must not bake a /tmp path: {prelude}"
+        );
+    }
+
+    /// End-to-end behavioral check of the prelude's resolution order, executed
+    /// under POSIX `sh` so a regression in the snippet is actually caught.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_home_base_prelude_resolves_tmpdir_first_then_data_tmp() {
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        let prelude = remote_cargo_home_base_prelude();
+        let var = RCH_CARGO_HOME_BASE_VAR;
+        // Run the prelude then echo the resolved base, under controlled $TMPDIR.
+        let run = |tmpdir_env: Option<&str>| -> String {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg(format!("{prelude}; printf '%s' \"${var}\""));
+            cmd.env_remove("TMPDIR");
+            if let Some(v) = tmpdir_env {
+                cmd.env("TMPDIR", v);
+            }
+            let out = cmd.output().expect("run prelude under sh");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        // $TMPDIR set to a real dir wins.
+        let dir = tempdir().expect("tempdir");
+        let real = dir.path().to_str().unwrap();
+        assert_eq!(run(Some(real)), real, "a real $TMPDIR must be honored");
+
+        // $TMPDIR unset → /data/tmp if it exists, else /tmp. Either is acceptable
+        // and proves we never depend on $TMPDIR being present (the systemd case).
+        let resolved = run(None);
+        assert!(
+            resolved == "/data/tmp" || resolved == "/tmp",
+            "unset $TMPDIR must fall back to /data/tmp or /tmp, got {resolved:?}"
+        );
+
+        // A bogus $TMPDIR (not a directory) must be rejected in favor of the
+        // existing fallback, never used blindly.
+        let bogus = run(Some("/nonexistent-rch-tmpdir-xyz"));
+        assert!(
+            bogus == "/data/tmp" || bogus == "/tmp",
+            "a non-directory $TMPDIR must be rejected, got {bogus:?}"
+        );
     }
 
     #[test]
@@ -1234,6 +1561,7 @@ mod tests {
             total_ms: 8500,
             error: None,
             test_marker: "RCH_TEST_1".to_string(),
+            verdict: "reproduced".to_string(),
         };
 
         // Verify timing breakdown makes sense
@@ -1701,6 +2029,7 @@ mod tests {
             total_ms: 0,
             error: None,
             test_marker: "ZERO".to_string(),
+            verdict: "reproduced".to_string(),
         };
 
         logger.log(TestPhase::Execute, "Serializing zero-timing result");
@@ -1740,6 +2069,7 @@ mod tests {
             total_ms: u64::MAX,
             error: None,
             test_marker: "MAX".to_string(),
+            verdict: "reproduced".to_string(),
         };
 
         logger.log(TestPhase::Execute, "Serializing max-timing result");

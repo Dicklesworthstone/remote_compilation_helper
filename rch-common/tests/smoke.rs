@@ -22,11 +22,13 @@
 //!
 //! This implements bead bd-2val: Create Infrastructure Smoke Test
 
+use anyhow::{Context, Result, anyhow};
 use rch_common::e2e::{
     LogLevel, LogSource, TestConfigError, TestLoggerBuilder, TestWorkersConfig,
     should_skip_worker_check,
 };
 use rch_common::ssh::{KnownHostsPolicy, SshClient, SshOptions};
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -44,6 +46,10 @@ fn fixtures_root() -> PathBuf {
 /// Get the hello_world fixture directory.
 fn hello_world_fixture_dir() -> PathBuf {
     fixtures_root().join("hello_world")
+}
+
+fn shell_escape_arg(value: &str) -> String {
+    shell_escape::escape(Cow::Borrowed(value)).into_owned()
 }
 
 /// Skip the test if no real workers are available.
@@ -98,7 +104,7 @@ fn get_test_worker(config: &TestWorkersConfig) -> Option<&rch_common::e2e::TestW
 ///
 /// If any step fails, the test provides clear error messages for debugging.
 #[tokio::test]
-async fn test_infrastructure_smoke() {
+async fn test_infrastructure_smoke() -> Result<()> {
     let start_time = Instant::now();
 
     // Step 1: Logging Setup
@@ -142,7 +148,7 @@ async fn test_infrastructure_smoke() {
             ],
         );
         logger.print_summary();
-        return;
+        return Ok(());
     };
 
     let worker_count = config.enabled_workers().len();
@@ -166,7 +172,7 @@ async fn test_infrastructure_smoke() {
     let Some(worker_entry) = get_test_worker(&config) else {
         logger.error("No enabled worker found - cannot proceed with smoke test");
         logger.print_summary();
-        return;
+        return Ok(());
     };
 
     logger.log_with_context(
@@ -227,7 +233,7 @@ async fn test_infrastructure_smoke() {
                 ],
             );
             logger.print_summary();
-            panic!("Smoke test failed: SSH connection failed: {e}");
+            return Err(anyhow!("Smoke test failed: SSH connection failed: {e}"));
         }
     }
 
@@ -247,13 +253,15 @@ async fn test_infrastructure_smoke() {
             } else {
                 logger.error(format!("Unexpected echo output: {}", result.stdout));
                 client.disconnect().await.ok();
-                panic!("Smoke test failed: echo command produced unexpected output");
+                return Err(anyhow!(
+                    "Smoke test failed: echo command produced unexpected output"
+                ));
             }
         }
         Err(e) => {
             logger.error(format!("Echo command failed: {e}"));
             client.disconnect().await.ok();
-            panic!("Smoke test failed: echo command failed: {e}");
+            return Err(anyhow!("Smoke test failed: echo command failed: {e}"));
         }
     }
 
@@ -267,13 +275,16 @@ async fn test_infrastructure_smoke() {
 
     let fixture_dir = hello_world_fixture_dir();
     let remote_path = format!("{}/smoke_test", config.settings.remote_work_dir);
+    let escaped_remote_path = shell_escape_arg(&remote_path);
 
     // Create remote directory
-    let mkdir_cmd = format!("mkdir -p {}", remote_path);
+    let mkdir_cmd = format!("mkdir -p -- {escaped_remote_path}");
     if let Err(e) = client.execute(&mkdir_cmd).await {
         logger.error(format!("Failed to create remote directory: {e}"));
         client.disconnect().await.ok();
-        panic!("Smoke test failed: could not create remote directory");
+        return Err(anyhow!(
+            "Smoke test failed: could not create remote directory"
+        ));
     }
 
     // Sync fixture using rsync
@@ -281,6 +292,8 @@ async fn test_infrastructure_smoke() {
     let rsync_output = std::process::Command::new("rsync")
         .args([
             "-avz",
+            "--no-owner",
+            "--no-group",
             "--delete",
             "--exclude=target",
             "-e",
@@ -291,7 +304,7 @@ async fn test_infrastructure_smoke() {
             &format!("{}/", fixture_dir.display()),
             &format!(
                 "{}@{}:{}/",
-                worker_config.user, worker_config.host, remote_path
+                worker_config.user, worker_config.host, escaped_remote_path
             ),
         ])
         .output();
@@ -316,18 +329,21 @@ async fn test_infrastructure_smoke() {
             logger.error(format!("rsync failed: {stderr}"));
             cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Smoke test failed: rsync failed: {stderr}");
+            return Err(anyhow!("Smoke test failed: rsync failed: {stderr}"));
         }
         Err(e) => {
             logger.error(format!("Failed to run rsync: {e}"));
             cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Smoke test failed: could not run rsync: {e}");
+            return Err(anyhow!("Smoke test failed: could not run rsync: {e}"));
         }
     }
 
     // Verify sync by listing files
-    match client.execute(&format!("ls -la {}", remote_path)).await {
+    match client
+        .execute(&format!("ls -la {escaped_remote_path}"))
+        .await
+    {
         Ok(result) => {
             let has_cargo_toml = result.stdout.contains("Cargo.toml");
             logger.log_with_context(
@@ -340,14 +356,14 @@ async fn test_infrastructure_smoke() {
                 logger.error("Cargo.toml not found on remote after sync");
                 cleanup_remote(&mut client, &remote_path).await;
                 client.disconnect().await.ok();
-                panic!("Smoke test failed: Cargo.toml not synced");
+                return Err(anyhow!("Smoke test failed: Cargo.toml not synced"));
             }
         }
         Err(e) => {
             logger.error(format!("Failed to verify remote files: {e}"));
             cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Smoke test failed: could not verify remote files");
+            return Err(anyhow!("Smoke test failed: could not verify remote files"));
         }
     }
 
@@ -359,7 +375,7 @@ async fn test_infrastructure_smoke() {
         vec![("step".to_string(), "5/8".to_string())],
     );
 
-    let build_cmd = format!("cd {} && cargo build 2>&1", remote_path);
+    let build_cmd = format!("cd {escaped_remote_path} && cargo build 2>&1");
     let build_start = Instant::now();
 
     match client.execute(&build_cmd).await {
@@ -391,14 +407,16 @@ async fn test_infrastructure_smoke() {
                 );
                 cleanup_remote(&mut client, &remote_path).await;
                 client.disconnect().await.ok();
-                panic!("Smoke test failed: cargo build failed on remote");
+                return Err(anyhow!("Smoke test failed: cargo build failed on remote"));
             }
         }
         Err(e) => {
             logger.error(format!("Remote build command failed: {e}"));
             cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Smoke test failed: remote build command error: {e}");
+            return Err(anyhow!(
+                "Smoke test failed: remote build command error: {e}"
+            ));
         }
     }
 
@@ -411,22 +429,26 @@ async fn test_infrastructure_smoke() {
     );
 
     // Create local temp directory for artifacts
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let local_target = temp_dir.path().join("target");
-    std::fs::create_dir_all(&local_target).expect("Failed to create local target dir");
+    std::fs::create_dir_all(&local_target).context("Failed to create local target dir")?;
 
     let retrieve_start = Instant::now();
     let retrieve_output = std::process::Command::new("rsync")
         .args([
             "-avz",
+            "--no-owner",
+            "--no-group",
             "-e",
             &format!(
                 "ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -i {}",
                 worker_config.identity_file
             ),
             &format!(
-                "{}@{}:{}/target/debug/hello_world",
-                worker_config.user, worker_config.host, remote_path
+                "{}@{}:{}",
+                worker_config.user,
+                worker_config.host,
+                shell_escape_arg(&format!("{remote_path}/target/debug/hello_world"))
             ),
             &format!("{}/", local_target.display()),
         ])
@@ -455,7 +477,7 @@ async fn test_infrastructure_smoke() {
             logger.error(format!("Failed to retrieve artifacts: {e}"));
             cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Smoke test failed: artifact retrieval failed: {e}");
+            return Err(anyhow!("Smoke test failed: artifact retrieval failed: {e}"));
         }
     }
 
@@ -485,12 +507,26 @@ async fn test_infrastructure_smoke() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&binary_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&binary_path, perms).ok();
+            match std::fs::metadata(&binary_path) {
+                Ok(metadata) => {
+                    let mut perms = metadata.permissions();
+                    perms.set_mode(0o755);
+                    if let Err(e) = std::fs::set_permissions(&binary_path, perms) {
+                        logger.warn(format!("Could not mark retrieved binary executable: {e}"));
+                    }
+                }
+                Err(e) => {
+                    logger.warn(format!(
+                        "Could not inspect retrieved binary permissions: {e}"
+                    ));
+                }
+            }
         }
 
-        match std::process::Command::new(&binary_path).output() {
+        match std::process::Command::new("./hello_world")
+            .current_dir(&local_target)
+            .output()
+        {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let output_ok = stdout.contains("Hello");
@@ -521,10 +557,9 @@ async fn test_infrastructure_smoke() {
     } else {
         logger.warn("Binary not found locally - may be architecture mismatch");
         // Verify it exists on remote instead
-        match client
-            .execute(&format!("{}/target/debug/hello_world", remote_path))
-            .await
-        {
+        let remote_binary_path =
+            shell_escape_arg(&format!("{remote_path}/target/debug/hello_world"));
+        match client.execute(&remote_binary_path).await {
             Ok(result) => {
                 logger.log_with_context(
                     LogLevel::Info,
@@ -589,15 +624,16 @@ async fn test_infrastructure_smoke() {
     logger.print_summary();
 
     // Final assertion
-    assert!(
-        !logger.has_errors(),
-        "Smoke test completed but had errors logged"
-    );
+    if logger.has_errors() {
+        return Err(anyhow!("Smoke test completed but had errors logged"));
+    }
+
+    Ok(())
 }
 
 /// Helper to clean up remote directory
 async fn cleanup_remote(client: &mut SshClient, remote_path: &str) {
-    let cmd = format!("rm -rf {}", remote_path);
+    let cmd = format!("rm -rf -- {}", shell_escape_arg(remote_path));
     let _ = client.execute(&cmd).await;
 }
 

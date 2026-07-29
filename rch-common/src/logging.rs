@@ -168,7 +168,23 @@ fn build_writer(
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let file_name = path.file_name().unwrap_or_else(|| OsStr::new("rch.log"));
-        let appender = tracing_appender::rolling::daily(dir, file_name);
+        // Retention cap for daily-rotated logs. The bare `rolling::daily`
+        // helper keeps every file forever, which is how a file-logging
+        // setup would silently fill the disk. Default to a week; allow
+        // operators to override via env without touching the public
+        // LogConfig struct (which would be a SemVer break since it has
+        // no #[non_exhaustive] attribute).
+        let max_files = std::env::var("RCH_LOG_MAX_FILES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(7);
+        let appender = tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix(file_name.to_string_lossy().into_owned())
+            .max_log_files(max_files)
+            .build(dir)
+            .map_err(|e| anyhow::anyhow!("failed to build rolling log appender: {e}"))?;
         let (non_blocking, guard) = tracing_appender::non_blocking(appender);
         let writer = BoxMakeWriter::new(base_writer.and(non_blocking));
         Ok((writer, Some(guard)))

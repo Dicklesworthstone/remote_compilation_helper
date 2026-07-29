@@ -5,8 +5,8 @@
 //! and enable easier testing.
 
 use rch_common::{
-    Classification, ClassificationTier, RequiredRuntime, SelectedWorker, SelectionReason,
-    WorkerCapabilities, WorkerConfig,
+    Classification, ClassificationTier, PlacementPlan, RequiredRuntime, SelectedWorker,
+    SelectionDiagnostics, SelectionReason, WorkerCapabilities, WorkerConfig,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -243,6 +243,7 @@ pub struct ConfigGeneralSection {
 pub struct ConfigCompilationSection {
     pub confidence_threshold: f64,
     pub min_local_time_ms: u64,
+    pub remote_speedup_threshold: f64,
     pub build_slots: u32,
     pub test_slots: u32,
     pub check_slots: u32,
@@ -250,6 +251,7 @@ pub struct ConfigCompilationSection {
     pub test_timeout_sec: u64,
     pub bun_timeout_sec: u64,
     pub external_timeout_enabled: bool,
+    pub allow_local_fallback: bool,
 }
 
 /// Transfer configuration section.
@@ -417,6 +419,12 @@ pub struct DiagnoseResponse {
     pub capabilities_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_selection: Option<DiagnoseWorkerSelection>,
+    /// Canonical placement control plan resolved from the environment: the
+    /// requested/effective worker, strict-remote/queue/visibility/wait-timeout
+    /// /target-dir policies, the requested-worker admissibility outcome, and any
+    /// control diagnostics. This is the surface agents should read before
+    /// forcing local/remote behavior (bd-...remediation-ocv9i.13.5).
+    pub placement: PlacementPlan,
     /// Dry-run summary showing the full pipeline (only present when --dry-run is used).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dry_run: Option<DryRunSummary>,
@@ -452,8 +460,12 @@ pub struct DiagnoseDaemonStatus {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DiagnoseWorkerSelection {
     pub estimated_cores: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cargo_jobs: Option<u32>,
     pub worker: Option<SelectedWorker>,
     pub reason: SelectionReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<SelectionDiagnostics>,
 }
 
 /// Pipeline step for dry-run output.
@@ -605,8 +617,14 @@ pub struct DoctorFixApplied {
 }
 
 /// Overall doctor command response for JSON output.
+///
+/// **t05 — envelope harmonization:** carries `schema_version` matching
+/// the reliability-mode response. Sourced from the central schema-
+/// versions registry so cross-component drift is caught by the
+/// registry's pinned-snapshot test.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DoctorResponse {
+    pub schema_version: String,
     pub checks: Vec<DoctorCheck>,
     pub summary: DoctorSummary,
     pub fixes_applied: Vec<DoctorFixApplied>,

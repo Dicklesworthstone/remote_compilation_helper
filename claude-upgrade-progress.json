@@ -1,5 +1,5 @@
 {
-  "status": "in_progress",
+  "status": "completed",
   "current": null,
   "completed": [
     "anyhow",
@@ -57,12 +57,5 @@
     "proptest"
   ],
   "failed": [],
-  "pending": [
-    "opentelemetry",
-    "opentelemetry-otlp",
-    "opentelemetry_sdk",
-    "tokio-cron-scheduler",
-    "tower",
-    "tracing-opentelemetry"
-  ]
+  "pending": []
 }

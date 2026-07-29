@@ -1,0 +1,24 @@
+{
+  "run": {
+    "id": 28,
+    "run_type": "manual",
+    "started_at": "2026-06-21T03:45:39.651901466+00:00",
+    "completed_at": "2026-06-21T03:45:47.836122029+00:00",
+    "workers_tested": 1,
+    "workers_passed": 1,
+    "workers_failed": 0,
+    "duration_ms": 8184
+  },
+  "results": [
+    {
+      "run_id": 28,
+      "worker_id": "hz2",
+      "passed": true,
+      "local_hash": "770654ff8204f7e12dd915b28fcd4b1cf2cb4a15102496fd6e61f840541c226d",
+      "remote_hash": "4d5b5c5264c83b6f3b8f1f4adfbb50be836314d7cb77e5bfd795ce350d800814",
+      "local_time_ms": 330,
+      "remote_time_ms": 1646,
+      "error": null
+    }
+  ]
+}

@@ -86,6 +86,12 @@ pub enum RequiredRuntime {
     Bun,
     /// Requires Node.js runtime.
     Node,
+    /// Requires the Nix package manager (nix binary + populated `/nix/store`).
+    Nix,
+    /// Requires the Go toolchain (`go` binary).
+    Go,
+    /// Requires the zig cross-compilation toolchain (`cargo-zigbuild` + `zig`).
+    Zig,
 }
 
 /// Per-command priority hint for worker selection.
@@ -192,6 +198,13 @@ pub enum SelectionReason {
     /// Worker assigned via last-success fallback (all others unavailable).
     AffinityFallback,
 }
+
+/// Wire protocol version for daemon `/select-worker` responses.
+///
+/// This is intentionally separate from the broader CLI API envelope version:
+/// selection responses are emitted as a raw [`SelectionResponse`] on the hook
+/// hot path, so the client needs a small explicit compatibility marker.
+pub const SELECTION_RESPONSE_PROTOCOL_VERSION: u64 = 1;
 
 impl std::fmt::Display for SelectionReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -387,7 +400,13 @@ fn default_weight_network() -> f64 {
     0.1
 }
 fn default_weight_priority() -> f64 {
-    0.1
+    // Worker priority is a first-class selection factor: operators set high
+    // priority on preferred boxes (e.g. fast dedicated workers) and expect them
+    // to actually receive work. At the old 0.1 a top-priority worker gained at
+    // most +0.1 to its balanced score — too weak to overcome a warm-cache or
+    // lower-latency competitor, so the highest-priority workers could sit idle
+    // indefinitely. Load/slots still throttle a high-priority worker as it fills.
+    0.5
 }
 fn default_half_open_penalty() -> f64 {
     0.5
@@ -496,6 +515,78 @@ pub struct SelectionResponse {
     /// Optional build ID assigned by the daemon (for active build tracking).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_id: Option<u64>,
+    /// Optional per-worker selector diagnostics for machine-readable triage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<SelectionDiagnostics>,
+}
+
+/// Final selector decision for a worker considered during routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerSelectionDiagnosticDecision {
+    /// Worker passed hard gates and normal health threshold.
+    Allow,
+    /// Worker failed normal health threshold but passed fallback threshold.
+    FallbackCandidate,
+    /// Worker was denied by a hard gate or both health thresholds.
+    Deny,
+}
+
+/// Per-worker selector facts captured at worker-selection time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkerSelectionDiagnostic {
+    /// Worker ID.
+    pub worker_id: WorkerId,
+    /// Worker lifecycle/status label.
+    pub status: String,
+    /// Circuit breaker state label.
+    pub circuit_state: String,
+    /// Current normalized pressure state.
+    pub pressure_state: String,
+    /// Stable pressure reason code.
+    pub pressure_reason_code: String,
+    /// Rolling selector success rate, where available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_rate: Option<f64>,
+    /// Normal selection success-rate threshold.
+    pub min_success_rate: f64,
+    /// Last-success fallback success-rate threshold.
+    pub fallback_min_success_rate: f64,
+    /// Required runtime for this command.
+    pub required_runtime: RequiredRuntime,
+    /// Whether this worker has the required runtime.
+    pub runtime_available: bool,
+    /// Available slots at selection time.
+    pub available_slots: u32,
+    /// Total configured slots.
+    pub total_slots: u32,
+    /// Estimated slots requested by this command.
+    pub estimated_cores: u32,
+    /// Whether this worker was excluded because it already runs this project.
+    pub active_project_excluded: bool,
+    /// Final per-worker selector decision.
+    pub final_decision: WorkerSelectionDiagnosticDecision,
+    /// Human-readable final reason.
+    pub final_reason: String,
+    /// Stable machine-readable reasons collected for this worker.
+    pub reason_codes: Vec<String>,
+}
+
+/// Machine-readable worker selector diagnostics for a selection request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SelectionDiagnostics {
+    /// Required runtime for this command.
+    pub required_runtime: RequiredRuntime,
+    /// Estimated slots requested by this command.
+    pub estimated_cores: u32,
+    /// Normal success-rate threshold.
+    pub min_success_rate: f64,
+    /// Last-success fallback success-rate threshold.
+    pub fallback_min_success_rate: f64,
+    /// Count of workers excluded because they already run this project.
+    pub active_project_exclusion_count: usize,
+    /// One diagnostic entry per configured worker.
+    pub workers: Vec<WorkerSelectionDiagnostic>,
 }
 
 /// Request to release reserved worker slots.
@@ -625,6 +716,25 @@ pub struct WorkerCapabilities {
     /// npm version (from `npm --version`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub npm_version: Option<String>,
+    /// Nix version (from `nix --version`). Presence implies a usable nix binary
+    /// with an accompanying `/nix/store`, gating `nix build`/`nix develop -c`
+    /// routing to this worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nix_version: Option<String>,
+    /// Go toolchain version (from `go version`). Presence gates `go build`/
+    /// `go test`/`go vet` routing to this worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub go_version: Option<String>,
+    /// Zig version (from `zig version`). `cargo zigbuild` shells out to `zig`
+    /// as the linker/C toolchain, so the bare `zig` binary is necessary but not
+    /// sufficient — see [`WorkerCapabilities::has_zig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zig_version: Option<String>,
+    /// cargo-zigbuild version (from `cargo-zigbuild --version`). Probed as the
+    /// hyphenated binary rather than `cargo zigbuild --version`, which the
+    /// subcommand's own parser rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_zigbuild_version: Option<String>,
 
     // Health metrics (bd-3eaa)
     /// Number of CPU cores on the worker.
@@ -689,6 +799,29 @@ impl WorkerCapabilities {
     /// Check if this worker has Rust installed.
     pub fn has_rust(&self) -> bool {
         self.rustc_version.is_some()
+    }
+
+    /// Check if this worker has Nix installed (nix binary + `/nix/store`).
+    pub fn has_nix(&self) -> bool {
+        self.nix_version.is_some()
+    }
+
+    /// Check if this worker has the Go toolchain installed.
+    pub fn has_go(&self) -> bool {
+        self.go_version.is_some()
+    }
+
+    /// Check if this worker can run `cargo zigbuild` cross-compiles.
+    ///
+    /// Requires BOTH halves of the toolchain: the `cargo-zigbuild` cargo
+    /// subcommand and the `zig` binary it drives as the linker. Either one
+    /// alone fails at build time with an error the remote-result heuristics do
+    /// not recognize as infrastructure (`error: no such command: 'zigbuild'` is
+    /// not a rustup message), so the exit code would be surfaced verbatim
+    /// instead of falling open to local. Gating both here keeps that failure
+    /// out of the user's build.
+    pub fn has_zig(&self) -> bool {
+        self.zig_version.is_some() && self.cargo_zigbuild_version.is_some()
     }
 
     /// Calculate load per core (1-minute load average / num_cpus).
@@ -805,6 +938,135 @@ pub struct RchConfig {
     /// Path topology overrides for project root directories.
     #[serde(default)]
     pub path_topology: PathTopologyConfig,
+    /// Doctor / reliability subsystem configuration (verdict webhooks).
+    #[serde(default)]
+    pub doctor: DoctorConfig,
+    /// Session-history remediation knobs: the central schema and default policy
+    /// for temporary bypass, auto-rejoin, reconciliation, proof, incident
+    /// ledger, build-root, pooled targets, telemetry freshness, log retention,
+    /// disk pressure, and smoke defaults (bd-...remediation-ocv9i.17.1).
+    #[serde(default)]
+    pub remediation: crate::remediation_config::RemediationConfig,
+}
+
+/// Doctor reliability subsystem configuration.
+///
+/// Currently carries the verdict-transition webhook surface. Kept as its own
+/// section (`[doctor]`) so future doctor knobs land here rather than bloating
+/// the top-level config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctorConfig {
+    /// Verdict-transition webhook destinations.
+    #[serde(default)]
+    pub webhooks: DoctorWebhooksConfig,
+}
+
+/// Webhook notification surface for reliability verdict transitions.
+///
+/// Fires when `rch doctor --reliability --watch` observes a verdict change
+/// (`Healthy → Degraded`, `Degraded → Failing`, etc.). Each endpoint selects
+/// which transitions it cares about and how the payload is formatted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctorWebhooksConfig {
+    /// Named webhook destinations. Empty = no webhook dispatch.
+    #[serde(default)]
+    pub endpoints: Vec<DoctorWebhookEndpoint>,
+    /// Maximum number of in-flight webhook deliveries. Bounds memory and
+    /// outbound connection pressure: when the queue is full, a transition's
+    /// delivery is dropped (and journaled) rather than growing unboundedly.
+    /// Per-process, shared across all endpoints.
+    #[serde(default = "default_webhook_max_inflight")]
+    pub max_inflight: usize,
+}
+
+// Manual `Default` so the in-code default matches the serde default
+// (`#[derive(Default)]` would give `max_inflight = 0`, diverging from a
+// from-TOML load that fills in 16).
+impl Default for DoctorWebhooksConfig {
+    fn default() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            max_inflight: default_webhook_max_inflight(),
+        }
+    }
+}
+
+/// A single webhook destination for verdict transitions.
+///
+/// SECRETS ARE NEVER STORED HERE. Routing keys, bearer tokens, and signing
+/// secrets are referenced by the *name* of an environment variable
+/// (`*_env` fields) read at dispatch time. There is deliberately no
+/// `secret` / `routing_key` / `bearer_token` / `password` field on this
+/// struct (enforced by `test_no_inline_secret_fields`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctorWebhookEndpoint {
+    /// Operator-facing name (appears in logs and the audit trail).
+    pub name: String,
+    /// Destination URL.
+    pub url: String,
+    /// Payload format.
+    #[serde(default)]
+    pub format: DoctorWebhookFormat,
+    /// Transition predicates that arm this endpoint. Empty = never fire.
+    /// Supported: `healthy_to_degraded`, `degraded_to_failing`,
+    /// `any_to_failing`, `any_to_degraded`, `failing_to_healthy`,
+    /// `degraded_to_healthy`, `any_to_healthy`, `any_to_any`.
+    #[serde(default)]
+    pub on_transitions: Vec<String>,
+    /// Maximum retry attempts after the first try fails.
+    #[serde(default = "default_webhook_retry_max")]
+    pub retry_max: u32,
+    /// Base backoff between retries (milliseconds); doubles each attempt.
+    #[serde(default = "default_webhook_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
+    /// Per-attempt request timeout (milliseconds).
+    #[serde(default = "default_webhook_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Per-endpoint kill switch.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Name of the env var holding the PagerDuty Events API routing key.
+    /// Required for `format = "pagerduty"`. Read at runtime, never stored.
+    #[serde(default)]
+    pub routing_key_env: Option<String>,
+    /// Name of the env var holding a bearer token sent as
+    /// `Authorization: Bearer <token>`. Read at runtime, never stored.
+    #[serde(default)]
+    pub bearer_token_env: Option<String>,
+    /// Name of the env var holding an HMAC-SHA256 signing secret. When set,
+    /// the body is signed and the signature sent as `X-RCH-Signature:
+    /// sha256=<hex>`. Read at runtime, never stored.
+    #[serde(default)]
+    pub signing_secret_env: Option<String>,
+}
+
+/// Built-in webhook payload formats.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorWebhookFormat {
+    /// Opinionated RCH JSON schema (default).
+    #[default]
+    GenericJson,
+    /// Slack Block Kit payload.
+    Slack,
+    /// PagerDuty Events API v2 payload.
+    Pagerduty,
+}
+
+fn default_webhook_max_inflight() -> usize {
+    16
+}
+
+fn default_webhook_retry_max() -> u32 {
+    3
+}
+
+fn default_webhook_retry_backoff_ms() -> u64 {
+    200
+}
+
+fn default_webhook_timeout_ms() -> u64 {
+    5000
 }
 
 /// Worker health alerting configuration.
@@ -1446,12 +1708,20 @@ impl CircuitStats {
     }
 
     /// Get the error rate in the current window (0.0-1.0).
+    ///
+    /// Computed over the bounded recent-results window (the last
+    /// `CIRCUIT_HISTORY_SIZE` health checks) rather than the unbounded lifetime
+    /// `window_successes`/`window_failures` counters. A long-lived daemon polling
+    /// distant workers accumulates occasional transient failures over days; with a
+    /// lifetime ratio a currently-healthy worker could stay gated (circuit kept
+    /// open, depressed health score) until the daemon was restarted. A recency
+    /// window lets the rate self-heal as fresh successes age out old failures.
     pub fn error_rate(&self) -> f64 {
-        let total = self.window_successes + self.window_failures;
-        if total == 0 {
+        if self.recent_results.is_empty() {
             return 0.0;
         }
-        self.window_failures as f64 / total as f64
+        let failures = self.recent_results.iter().filter(|&&ok| !ok).count();
+        failures as f64 / self.recent_results.len() as f64
     }
 
     /// Record a successful operation.
@@ -1503,9 +1773,10 @@ impl CircuitStats {
             return true;
         }
 
-        // Open if error rate exceeds threshold (with minimum 5 samples)
-        let total = self.window_successes + self.window_failures;
-        if total >= 5 && self.error_rate() >= config.error_rate_threshold {
+        // Open if error rate exceeds threshold (with a minimum sample size).
+        // Counts samples in the bounded recent-results window so the gate
+        // reflects recent behavior, matching error_rate() above.
+        if self.recent_results.len() >= 5 && self.error_rate() >= config.error_rate_threshold {
             return true;
         }
 
@@ -1594,18 +1865,26 @@ impl CircuitStats {
             self.consecutive_failures = 0;
             self.consecutive_successes = 0;
             self.active_probes = 0;
-            // Reset the window on close
+            // Reset the window on close, INCLUDING the recent-results history
+            // that error_rate() now reads. Otherwise a freshly-recovered circuit
+            // would still compute a high error rate from the pre-failure samples
+            // and immediately re-open (flapping). Matches the original intent of
+            // resetting the error-rate inputs when the circuit recovers.
             self.window_successes = 0;
             self.window_failures = 0;
+            self.recent_results.clear();
         }
     }
 
     /// Reset the rolling window counters.
     ///
     /// Called periodically to ensure the window reflects recent activity.
+    /// Also clears the recent-results history that `error_rate()` is computed
+    /// from, so a reset truly zeroes the observed error rate.
     pub fn reset_window(&mut self) {
         self.window_successes = 0;
         self.window_failures = 0;
+        self.recent_results.clear();
     }
 
     /// Get recent health check results for history visualization.
@@ -1649,6 +1928,70 @@ impl CircuitStats {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
+    }
+
+    /// Drive the circuit through a single health-check outcome and return the
+    /// resulting [`CircuitState`].
+    ///
+    /// This is the single, self-contained transition engine shared by every
+    /// circuit consumer (the daemon health monitor via
+    /// `WorkerState::record_health_check`, and the diagnostic `WorkerHealth`
+    /// panel via `WorkerHealth::observe`). Keeping the transition logic in ONE
+    /// place is what makes `WorkerState.circuit` (which selection reads) and the
+    /// diagnostic `WorkerHealth.circuit` agree.
+    ///
+    /// Behaviour:
+    /// - On a **healthy** outcome: if the circuit is Open and its cooldown has
+    ///   elapsed it first transitions Open → HalfOpen *before* crediting the
+    ///   success, so recovery needs exactly `success_threshold` clean probes
+    ///   (crediting a success against an Open circuit would be lost). Then the
+    ///   success is recorded and the circuit closes once the threshold is met.
+    /// - On an **unhealthy** outcome: the failure is recorded, the circuit opens
+    ///   if the closed-state open condition is met, and a HalfOpen probe failure
+    ///   reopens the circuit — UNLESS the failure was `transient` (a retryable
+    ///   transport blip that survived the in-check retries). A transient
+    ///   half-open failure neither reopens nor resets the cooldown, so a single
+    ///   network hiccup during recovery cannot bounce a worker back to Open.
+    /// - After either branch, an Open circuit past its cooldown is nudged to
+    ///   HalfOpen so probing resumes on the next poll even for a still-failing
+    ///   worker.
+    pub fn apply_health_outcome(
+        &mut self,
+        healthy: bool,
+        transient: bool,
+        config: &CircuitBreakerConfig,
+    ) -> CircuitState {
+        if healthy {
+            // Transition to half-open BEFORE crediting the success so the probe
+            // counts toward recovery. record_success() only increments the
+            // consecutive-success counter while in HalfOpen.
+            if self.state == CircuitState::Open && self.should_half_open(config) {
+                self.half_open();
+            }
+            self.record_success();
+            if self.should_close(config) {
+                self.close();
+            }
+        } else {
+            let was_half_open = self.state == CircuitState::HalfOpen;
+            self.record_failure();
+            if self.should_open(config) {
+                self.open();
+            } else if was_half_open && !transient {
+                // A real (non-transient) probe failure in half-open reopens the
+                // circuit and restarts the cooldown. A transient failure is
+                // ignored so a network blip can't undo an in-progress recovery.
+                self.open();
+            }
+        }
+
+        // Even for a still-failing worker, resume probing once the cooldown
+        // elapses so a recovered worker is retried promptly.
+        if self.state == CircuitState::Open && self.should_half_open(config) {
+            self.half_open();
+        }
+
+        self.state
     }
 }
 
@@ -1694,6 +2037,20 @@ pub struct CompilationConfig {
     /// Default: true. Set to false to disable timeout wrapping entirely.
     #[serde(default = "default_external_timeout_enabled")]
     pub external_timeout_enabled: bool,
+    /// Whether a remote build FAILURE may fall back to LOCAL execution on the
+    /// orchestrator once every eligible remote worker has been exhausted.
+    ///
+    /// On a remote failure the hook first retries the build on a *different,
+    /// higher-capacity* worker (see `run_exec`'s worker-fallback loop). Local
+    /// execution runs the heavy compile on the orchestrator that coordinates the
+    /// whole fleet, so it is a genuine last resort and can flood that box. This
+    /// flag gates it. Default `true` preserves the historical fail-open behavior
+    /// (local only when no worker can serve); set to `false` on an orchestrator
+    /// to refuse local fallback and fail the build closed instead. `force_remote`
+    /// / proof mode / `RCH_REQUIRE_REMOTE` still override this by refusing local
+    /// unconditionally.
+    #[serde(default = "default_allow_local_fallback")]
+    pub allow_local_fallback: bool,
 }
 
 impl Default for CompilationConfig {
@@ -1709,6 +2066,7 @@ impl Default for CompilationConfig {
             test_timeout_sec: default_test_timeout(),
             bun_timeout_sec: default_bun_timeout(),
             external_timeout_enabled: default_external_timeout_enabled(),
+            allow_local_fallback: default_allow_local_fallback(),
         }
     }
 }
@@ -1749,6 +2107,13 @@ fn default_external_timeout_enabled() -> bool {
     true
 }
 
+/// Default: permit last-resort local fallback after remote workers are
+/// exhausted. Set `compilation.allow_local_fallback = false` to fail closed and
+/// keep heavy compiles off the orchestrator entirely.
+fn default_allow_local_fallback() -> bool {
+    true
+}
+
 impl CompilationConfig {
     /// Returns the appropriate external timeout for the given compilation kind.
     ///
@@ -1765,6 +2130,13 @@ impl CompilationConfig {
             Some(CompilationKind::CargoTest) | Some(CompilationKind::CargoNextest) => {
                 self.test_timeout_sec
             }
+            // Nix derivation builds can take a long time (fetch + compile large
+            // closures); give them the generous test-timeout bucket rather than
+            // the short build timeout so legitimate builds are not killed early.
+            Some(CompilationKind::NixBuild) => self.test_timeout_sec,
+            // Go test suites are long-running like cargo test; give them the
+            // test bucket rather than the short build timeout.
+            Some(CompilationKind::GoTest) => self.test_timeout_sec,
             // Builds, checks, clippy, and unknown use build timeout
             _ => self.build_timeout_sec,
         };
@@ -1970,6 +2342,12 @@ fn default_execution_allowlist() -> Vec<String> {
         "meson".to_string(),
         // Bun
         "bun".to_string(),
+        // Nix (covers both `nix build` and the legacy `nix-build`)
+        "nix".to_string(),
+        // Go
+        "go".to_string(),
+        // TypeScript (covers both `tsc` and `npx tsc`; command_base is "tsc")
+        "tsc".to_string(),
     ]
 }
 
@@ -2117,8 +2495,15 @@ impl RetryConfig {
 }
 
 /// Default remote base path for project transfers.
+///
+/// Rooted under `/data/tmp` (the fleet-standard managed ephemeral-build zone)
+/// rather than `/tmp`: on the Linux workers `/tmp` is a RAM-backed tmpfs, so
+/// dispatched build artifacts placed there consume RAM and evade the disk-GC
+/// (sbh / datatmp-janitor) that watches `/data/tmp`. Keeping the remote base in
+/// the managed zone lets those reapers reclaim orphaned build trees. Must agree
+/// with the rchd cache-cleanup and reclaim `remote_base` defaults.
 pub fn default_remote_base() -> String {
-    "/tmp/rch".to_string()
+    "/data/tmp/rch".to_string()
 }
 
 /// Validate and normalize a remote base path.
@@ -2262,8 +2647,9 @@ fn default_excludes() -> Vec<String> {
         "target/".to_string(),
         "*.rlib".to_string(),
         "*.rmeta".to_string(),
-        // Git objects (large, regenerated on clone)
-        ".git/objects/".to_string(),
+        // Git metadata is large, often permission-sensitive on workers, and
+        // a partial `.git/` tree is not reliable for build scripts anyway.
+        ".git/".to_string(),
         // Node.js / Bun dependencies (massive, reinstalled on worker)
         "node_modules/".to_string(),
         // Bun cache and runtime files
@@ -2845,6 +3231,128 @@ mod tests {
     use super::*;
     use crate::test_guard;
 
+    /// Verdict-webhook config must NEVER carry an inline secret. Operators
+    /// reference secrets by env-var name (`*_env`); the resolved value is
+    /// read at dispatch time and never persisted to the cache or config TOML.
+    /// This guards against a future careless `pub secret: String` addition.
+    #[test]
+    fn test_no_inline_secret_fields() {
+        let endpoint = DoctorWebhookEndpoint {
+            name: "ops".to_string(),
+            url: "https://example.com/hook".to_string(),
+            format: DoctorWebhookFormat::Pagerduty,
+            on_transitions: vec!["any_to_failing".to_string()],
+            retry_max: 3,
+            retry_backoff_ms: 200,
+            timeout_ms: 5000,
+            enabled: true,
+            routing_key_env: Some("RCH_PAGERDUTY_ROUTING_KEY".to_string()),
+            bearer_token_env: Some("RCH_WEBHOOK_BEARER".to_string()),
+            signing_secret_env: Some("RCH_WEBHOOK_HMAC".to_string()),
+        };
+        // Serialize to a JSON object and inspect the *keys*. The forbidden
+        // field names must be entirely absent; only `*_env` references survive.
+        let value = serde_json::to_value(&endpoint).unwrap();
+        let obj = value.as_object().expect("endpoint serializes to an object");
+        for forbidden in ["secret", "routing_key", "bearer_token", "password", "token"] {
+            assert!(
+                !obj.contains_key(forbidden),
+                "endpoint config must not expose an inline `{forbidden}` field"
+            );
+        }
+        assert!(obj.contains_key("routing_key_env"));
+        assert!(obj.contains_key("bearer_token_env"));
+        assert!(obj.contains_key("signing_secret_env"));
+    }
+
+    #[test]
+    fn test_webhook_format_toml_spelling() {
+        // The config TOML uses snake_case spellings. TOML documents are tables
+        // at the root, so a bare enum cannot be (de)serialized standalone —
+        // verify the wire spelling through a `format = "..."` table field, the
+        // shape it actually appears in within the config.
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct FormatWrap {
+            format: DoctorWebhookFormat,
+        }
+        let rendered = toml::to_string(&FormatWrap {
+            format: DoctorWebhookFormat::GenericJson,
+        })
+        .unwrap();
+        assert!(
+            rendered.contains("format = \"generic_json\""),
+            "unexpected TOML: {rendered}"
+        );
+        let slack: FormatWrap = toml::from_str("format = \"slack\"").unwrap();
+        assert_eq!(slack.format, DoctorWebhookFormat::Slack);
+        let pd: FormatWrap = toml::from_str("format = \"pagerduty\"").unwrap();
+        assert_eq!(pd.format, DoctorWebhookFormat::Pagerduty);
+    }
+
+    #[test]
+    fn test_doctor_webhooks_defaults() {
+        let cfg = DoctorWebhooksConfig::default();
+        assert!(cfg.endpoints.is_empty());
+        assert_eq!(cfg.max_inflight, 16);
+        // RchConfig wires the section in with serde(default), so an empty
+        // config still yields an empty (never-firing) webhook surface.
+        let rch: RchConfig = toml::from_str("").unwrap();
+        assert!(rch.doctor.webhooks.endpoints.is_empty());
+    }
+
+    #[test]
+    fn test_doctor_webhook_endpoint_parses_from_toml() {
+        let toml_src = r#"
+[doctor.webhooks]
+max_inflight = 8
+
+[[doctor.webhooks.endpoints]]
+name = "ops-slack"
+url = "https://hooks.slack.com/services/T0/B0/x"
+format = "slack"
+on_transitions = ["healthy_to_degraded", "any_to_failing"]
+retry_max = 2
+"#;
+        let cfg: RchConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.doctor.webhooks.max_inflight, 8);
+        assert_eq!(cfg.doctor.webhooks.endpoints.len(), 1);
+        let ep = &cfg.doctor.webhooks.endpoints[0];
+        assert_eq!(ep.name, "ops-slack");
+        assert_eq!(ep.format, DoctorWebhookFormat::Slack);
+        assert_eq!(ep.on_transitions.len(), 2);
+        assert_eq!(ep.retry_max, 2);
+        // Defaults filled in for omitted fields.
+        assert_eq!(ep.retry_backoff_ms, 200);
+        assert_eq!(ep.timeout_ms, 5000);
+        assert!(ep.enabled);
+    }
+
+    fn assert_golden_json(
+        actual: serde_json::Value,
+        expected: &serde_json::Value,
+        fixture_path: &str,
+    ) {
+        if &actual == expected {
+            return;
+        }
+
+        let actual_json = serde_json::to_string_pretty(&actual).expect("actual JSON renders");
+        let expected_json = serde_json::to_string_pretty(expected).expect("expected JSON renders");
+        assert_eq!(
+            &actual,
+            expected,
+            "golden mismatch in {fixture_path}\n\
+             expected_blake3={}\n\
+             actual_blake3={}\n\
+             bless path: review the semantic diff, update the fixture expected_* field, \
+             and record both hashes in the Beads closeout.\n\
+             expected:\n{expected_json}\n\
+             actual:\n{actual_json}",
+            blake3::hash(expected_json.as_bytes()),
+            blake3::hash(actual_json.as_bytes())
+        );
+    }
+
     #[test]
     fn test_circuit_state_default() {
         let _guard = test_guard!();
@@ -2937,6 +3445,54 @@ mod tests {
 
         caps.bun_version = Some("1.0.25".to_string());
         assert!(caps.has_bun());
+    }
+
+    #[test]
+    fn test_worker_capabilities_has_nix() {
+        let _guard = test_guard!();
+        let mut caps = WorkerCapabilities::new();
+        assert!(!caps.has_nix());
+
+        caps.nix_version = Some("nix (Nix) 2.24.9".to_string());
+        assert!(caps.has_nix());
+    }
+
+    #[test]
+    fn test_worker_capabilities_has_zig_requires_both_halves() {
+        let _guard = test_guard!();
+        let mut caps = WorkerCapabilities::new();
+        assert!(!caps.has_zig());
+
+        // `zig` alone cannot run `cargo zigbuild` — cargo would report
+        // `no such command: 'zigbuild'`.
+        caps.zig_version = Some("0.14.1".to_string());
+        assert!(!caps.has_zig());
+
+        // cargo-zigbuild alone cannot link — it shells out to `zig cc`.
+        caps.zig_version = None;
+        caps.cargo_zigbuild_version = Some("cargo-zigbuild 0.23.0".to_string());
+        assert!(!caps.has_zig());
+
+        caps.zig_version = Some("0.14.1".to_string());
+        assert!(caps.has_zig());
+    }
+
+    #[test]
+    fn test_nix_build_uses_generous_timeout() {
+        let _guard = test_guard!();
+        let cfg = CompilationConfig::default();
+        // Nix builds get the long test-timeout bucket, not the short build timeout.
+        assert_eq!(
+            cfg.timeout_for_kind(Some(CompilationKind::NixBuild)),
+            std::time::Duration::from_secs(cfg.test_timeout_sec)
+        );
+    }
+
+    #[test]
+    fn test_default_allowlist_includes_nix() {
+        let _guard = test_guard!();
+        let cfg = ExecutionConfig::default();
+        assert!(cfg.is_allowed("nix"));
     }
 
     #[test]
@@ -3207,6 +3763,7 @@ mod tests {
             }),
             reason: SelectionReason::Success,
             build_id: None,
+            diagnostics: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -3221,11 +3778,68 @@ mod tests {
             worker: None,
             reason: SelectionReason::AllWorkersBusy,
             build_id: None,
+            diagnostics: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"worker\":null"));
         assert!(json.contains("\"reason\":\"all_workers_busy\""));
+    }
+
+    #[test]
+    fn golden_selection_response_with_no_workers_passed_health_diagnostics() {
+        let _guard = test_guard!();
+        const FIXTURE_PATH: &str =
+            "../../tests/goldens/ft_4tp7g/selection_diagnostics_no_workers_passed_health.json";
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/goldens/ft_4tp7g/selection_diagnostics_no_workers_passed_health.json"
+        ))
+        .expect("selection diagnostics golden fixture parses");
+        assert_eq!(
+            fixture["schema_version"],
+            "rch.golden.selection_diagnostics.v1"
+        );
+
+        let response = SelectionResponse {
+            worker: None,
+            reason: SelectionReason::NoWorkersPassedHealth,
+            build_id: None,
+            diagnostics: Some(SelectionDiagnostics {
+                required_runtime: RequiredRuntime::Rust,
+                estimated_cores: 2,
+                min_success_rate: 0.8,
+                fallback_min_success_rate: 0.5,
+                active_project_exclusion_count: 0,
+                workers: vec![WorkerSelectionDiagnostic {
+                    worker_id: WorkerId::new("fixture-worker"),
+                    status: "healthy".to_string(),
+                    circuit_state: "closed".to_string(),
+                    pressure_state: "healthy".to_string(),
+                    pressure_reason_code: "pressure.ok".to_string(),
+                    success_rate: Some(0.2),
+                    min_success_rate: 0.8,
+                    fallback_min_success_rate: 0.5,
+                    required_runtime: RequiredRuntime::Rust,
+                    runtime_available: true,
+                    available_slots: 8,
+                    total_slots: 8,
+                    estimated_cores: 2,
+                    active_project_excluded: false,
+                    final_decision: WorkerSelectionDiagnosticDecision::Deny,
+                    final_reason: "success_rate 0.20 < fallback 0.50".to_string(),
+                    reason_codes: vec![
+                        "health.below_min_success_rate".to_string(),
+                        "health.below_fallback_min_success_rate".to_string(),
+                    ],
+                }],
+            }),
+        };
+
+        assert_golden_json(
+            serde_json::to_value(&response).expect("response serializes"),
+            &fixture["expected_response"],
+            FIXTURE_PATH,
+        );
     }
 
     #[test]
@@ -3242,6 +3856,7 @@ mod tests {
             }),
             reason: SelectionReason::Success,
             build_id: None,
+            diagnostics: None,
         };
 
         let json = serde_json::to_string(&original).unwrap();
@@ -3368,6 +3983,171 @@ mod tests {
 
         stats.record_failure(); // 5 samples: 2 success, 3 failures = 60% error rate
         assert!(stats.should_open(&config));
+    }
+
+    #[test]
+    fn test_circuit_close_clears_recent_results_no_flap() {
+        let _guard = test_guard!();
+        // Regression: error_rate() is computed over recent_results, so close()
+        // must clear that history or a recovered circuit immediately re-opens
+        // on stale pre-failure samples (flapping).
+        let mut stats = CircuitStats::new();
+        let config = CircuitBreakerConfig {
+            error_rate_threshold: 0.5,
+            ..Default::default()
+        };
+        for _ in 0..6 {
+            stats.record_failure();
+        }
+        assert!(stats.should_open(&config));
+        stats.open();
+        // Recover via half-open probes, then close.
+        stats.half_open();
+        stats.record_success();
+        stats.record_success();
+        stats.close();
+        // Error rate must be reset and the circuit must NOT immediately re-open.
+        assert_eq!(stats.error_rate(), 0.0);
+        assert!(!stats.should_open(&config));
+    }
+
+    #[test]
+    fn test_apply_health_outcome_opens_on_failure_threshold() {
+        let _guard = test_guard!();
+        // failure_threshold=3: three unhealthy outcomes open the circuit.
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            open_cooldown_secs: 300,
+            ..Default::default()
+        };
+        let mut stats = CircuitStats::new();
+        assert_eq!(
+            stats.apply_health_outcome(false, false, &config),
+            CircuitState::Closed
+        );
+        assert_eq!(
+            stats.apply_health_outcome(false, false, &config),
+            CircuitState::Closed
+        );
+        assert_eq!(
+            stats.apply_health_outcome(false, false, &config),
+            CircuitState::Open
+        );
+    }
+
+    #[test]
+    fn test_apply_health_outcome_half_open_two_probe_recovery() {
+        let _guard = test_guard!();
+        // success_threshold=2: recovery from Open needs exactly two clean probes.
+        // open_cooldown_secs=0 makes should_half_open() true immediately, so the
+        // engine's trailing nudge leaves an opened circuit already in HalfOpen —
+        // exactly the state a real daemon would be in on the next poll once the
+        // cooldown had elapsed. From HalfOpen the engine credits successes.
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            success_threshold: 2,
+            open_cooldown_secs: 0,
+            ..Default::default()
+        };
+        let mut stats = CircuitStats::new();
+        for _ in 0..3 {
+            stats.apply_health_outcome(false, false, &config);
+        }
+        // With a 0s cooldown the engine nudges Open -> HalfOpen immediately.
+        assert_eq!(stats.state(), CircuitState::HalfOpen);
+
+        // First healthy probe in half-open: one success credited, not yet closed.
+        let after_first = stats.apply_health_outcome(true, false, &config);
+        assert_eq!(after_first, CircuitState::HalfOpen);
+
+        // Second healthy probe: threshold met -> Closed.
+        let after_second = stats.apply_health_outcome(true, false, &config);
+        assert_eq!(after_second, CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_apply_health_outcome_transient_half_open_does_not_reopen() {
+        let _guard = test_guard!();
+        // A transient failure while half-open must NOT reset the recovery streak
+        // — a network blip can't undo an in-progress recovery.
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            success_threshold: 2,
+            open_cooldown_secs: 0,
+            ..Default::default()
+        };
+        let mut stats = CircuitStats::new();
+        for _ in 0..3 {
+            stats.apply_health_outcome(false, false, &config);
+        }
+        // 0s cooldown -> already nudged to HalfOpen.
+        assert_eq!(stats.state(), CircuitState::HalfOpen);
+
+        // One clean probe (1 of 2 needed).
+        assert_eq!(
+            stats.apply_health_outcome(true, false, &config),
+            CircuitState::HalfOpen
+        );
+
+        // Transient failure in half-open: stays HalfOpen (does NOT reopen the
+        // circuit or restart the cooldown). The key contrast with a real failure
+        // is that the circuit does not drop back to Open — probing continues in
+        // place, so recovery resumes immediately on the next clean probes rather
+        // than waiting out a fresh cooldown.
+        let after_transient = stats.apply_health_outcome(false, true, &config);
+        assert_eq!(after_transient, CircuitState::HalfOpen);
+
+        // Recovery still completes from half-open with the required clean probes.
+        assert_eq!(
+            stats.apply_health_outcome(true, false, &config),
+            CircuitState::HalfOpen
+        );
+        assert_eq!(
+            stats.apply_health_outcome(true, false, &config),
+            CircuitState::Closed
+        );
+    }
+
+    #[test]
+    fn test_apply_health_outcome_real_vs_transient_half_open_failure() {
+        let _guard = test_guard!();
+        // With a positive cooldown the difference is directly observable: a REAL
+        // half-open failure reopens the circuit (state -> Open, must wait out the
+        // cooldown again), whereas a TRANSIENT half-open failure keeps it in
+        // HalfOpen so recovery continues without a fresh cooldown.
+        //
+        // Manually drive to HalfOpen (open() + half_open()) so the positive
+        // cooldown doesn't force a real wallclock wait to reach half-open.
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            success_threshold: 2,
+            open_cooldown_secs: 300,
+            ..Default::default()
+        };
+
+        // Real failure path.
+        let mut real = CircuitStats::new();
+        real.open();
+        real.half_open();
+        assert_eq!(real.state(), CircuitState::HalfOpen);
+        let after_real = real.apply_health_outcome(false, false, &config);
+        assert_eq!(
+            after_real,
+            CircuitState::Open,
+            "a real half-open failure must reopen the circuit"
+        );
+
+        // Transient failure path (same starting state).
+        let mut transient = CircuitStats::new();
+        transient.open();
+        transient.half_open();
+        assert_eq!(transient.state(), CircuitState::HalfOpen);
+        let after_transient = transient.apply_health_outcome(false, true, &config);
+        assert_eq!(
+            after_transient,
+            CircuitState::HalfOpen,
+            "a transient half-open failure must NOT reopen the circuit"
+        );
     }
 
     #[test]
@@ -4076,14 +4856,14 @@ mod tests {
     #[test]
     fn test_default_remote_base() {
         let _guard = test_guard!();
-        assert_eq!(default_remote_base(), "/tmp/rch");
+        assert_eq!(default_remote_base(), "/data/tmp/rch");
     }
 
     #[test]
     fn test_transfer_config_default_has_remote_base() {
         let _guard = test_guard!();
         let config = TransferConfig::default();
-        assert_eq!(config.remote_base, "/tmp/rch");
+        assert_eq!(config.remote_base, "/data/tmp/rch");
     }
 
     // ========================================================================
@@ -4254,8 +5034,13 @@ mod tests {
         // Unknown commands should not be allowed
         assert!(!config.is_allowed("python"));
         assert!(!config.is_allowed("npm"));
-        assert!(!config.is_allowed("go"));
         assert!(!config.is_allowed(""));
+        // `go` and `tsc` ARE allowed now that Go/TypeScript are offload targets.
+        // If they were missing from the allowlist the hook would fail open to
+        // LOCAL execution — classification would look correct while every build
+        // silently ran on the orchestrator.
+        assert!(config.is_allowed("go"));
+        assert!(config.is_allowed("tsc"));
     }
 
     #[test]

@@ -399,131 +399,172 @@ fn test_hook_ignores_non_compilation() {
 }
 
 #[test]
-fn test_hook_ignores_piped_commands() {
+fn test_hook_offloads_benign_piped_commands() {
     let _guard = test_guard!();
-    let harness = create_hook_harness("hook_ignores_piped").unwrap();
+    let harness = create_hook_harness("hook_offloads_benign_piped").unwrap();
 
     harness
         .logger
-        .info("TEST START: test_hook_ignores_piped_commands");
+        .info("TEST START: test_hook_offloads_benign_piped_commands");
 
-    // Piped cargo build
+    // Issue #24: pipes into benign pagers are preserved and offloaded.
     let result = classify_and_log(&harness, "cargo build | tee log");
     harness
         .assert(
-            !result.is_compilation,
-            "piped cargo build should NOT be intercepted",
+            result.is_compilation,
+            "cargo build piped into tee should be intercepted",
         )
         .unwrap();
-    assert!(
-        result.reason.contains("piped"),
-        "Reason should mention piped"
+    assert_eq!(
+        result.extracted_command.as_deref(),
+        Some("cargo build | tee log")
     );
 
     // Piped with grep
     let result = classify_and_log(&harness, "cargo build 2>&1 | grep error");
     harness
         .assert(
-            !result.is_compilation,
-            "piped command should NOT be intercepted",
+            result.is_compilation,
+            "cargo build piped into grep should be intercepted",
         )
         .unwrap();
+    assert_eq!(
+        result.extracted_command.as_deref(),
+        Some("cargo build 2>&1 | grep error")
+    );
 
     // Piped bun test
     let result = classify_and_log(&harness, "bun test | grep PASS");
     harness
         .assert(
+            result.is_compilation,
+            "bun test piped into grep should be intercepted",
+        )
+        .unwrap();
+    assert_eq!(
+        result.extracted_command.as_deref(),
+        Some("bun test | grep PASS")
+    );
+
+    // Pipes into non-pagers remain fail-closed.
+    let result = classify_and_log(&harness, "cargo build | xargs rm");
+    harness
+        .assert(
             !result.is_compilation,
-            "piped bun test should NOT be intercepted",
+            "cargo build piped into xargs must not be intercepted",
         )
         .unwrap();
 
     harness
         .logger
-        .info("TEST PASS: test_hook_ignores_piped_commands");
+        .info("TEST PASS: test_hook_offloads_benign_piped_commands");
     harness.mark_passed();
 }
 
 #[test]
-fn test_hook_ignores_redirected_commands() {
+fn test_hook_offloads_output_redirected_commands() {
     let _guard = test_guard!();
-    let harness = create_hook_harness("hook_ignores_redirected").unwrap();
+    let harness = create_hook_harness("hook_offloads_output_redirected").unwrap();
 
     harness
         .logger
-        .info("TEST START: test_hook_ignores_redirected_commands");
+        .info("TEST START: test_hook_offloads_output_redirected_commands");
 
-    // Output redirection
+    // Issue #24: output-only redirects are preserved and offloaded.
     let result = classify_and_log(&harness, "cargo build > output.txt");
     harness
         .assert(
-            !result.is_compilation,
-            "redirected cargo build should NOT be intercepted",
+            result.is_compilation,
+            "stdout-redirected cargo build should be intercepted",
         )
         .unwrap();
-    assert!(
-        result.reason.contains("redirect"),
-        "Reason should mention redirect"
+    assert_eq!(
+        result.extracted_command.as_deref(),
+        Some("cargo build > output.txt")
     );
 
     // Stderr redirection
     let result = classify_and_log(&harness, "cargo build 2> errors.txt");
     harness
         .assert(
-            !result.is_compilation,
-            "stderr redirected should NOT be intercepted",
+            result.is_compilation,
+            "stderr-redirected cargo build should be intercepted",
         )
         .unwrap();
+    assert_eq!(
+        result.extracted_command.as_deref(),
+        Some("cargo build 2> errors.txt")
+    );
 
     // Combined redirection
     let result = classify_and_log(&harness, "cargo build > out.txt 2>&1");
     harness
         .assert(
+            result.is_compilation,
+            "combined output redirect should be intercepted",
+        )
+        .unwrap();
+    assert_eq!(
+        result.extracted_command.as_deref(),
+        Some("cargo build > out.txt 2>&1")
+    );
+
+    // Input redirects alter the compiler's input and remain fail-closed.
+    let result = classify_and_log(&harness, "cargo build < input.txt");
+    harness
+        .assert(
             !result.is_compilation,
-            "combined redirect should NOT be intercepted",
+            "input-redirected cargo build must not be intercepted",
         )
         .unwrap();
 
     harness
         .logger
-        .info("TEST PASS: test_hook_ignores_redirected_commands");
+        .info("TEST PASS: test_hook_offloads_output_redirected_commands");
     harness.mark_passed();
 }
 
 #[test]
-fn test_hook_ignores_background_commands() {
+fn test_hook_offloads_background_commands() {
     let _guard = test_guard!();
-    let harness = create_hook_harness("hook_ignores_background").unwrap();
+    let harness = create_hook_harness("hook_offloads_background").unwrap();
 
     harness
         .logger
-        .info("TEST START: test_hook_ignores_background_commands");
+        .info("TEST START: test_hook_offloads_background_commands");
 
-    // Backgrounded cargo build
+    // Issue #24: trailing background operators are preserved and offloaded.
     let result = classify_and_log(&harness, "cargo build &");
     harness
         .assert(
-            !result.is_compilation,
-            "backgrounded cargo build should NOT be intercepted",
+            result.is_compilation,
+            "backgrounded cargo build should be intercepted",
         )
         .unwrap();
-    assert!(
-        result.reason.contains("background"),
-        "Reason should mention background"
-    );
+    assert_eq!(result.extracted_command.as_deref(), Some("cargo build &"));
 
     // Backgrounded bun test
     let result = classify_and_log(&harness, "bun test &");
     harness
         .assert(
+            result.is_compilation,
+            "backgrounded bun test should be intercepted",
+        )
+        .unwrap();
+    assert_eq!(result.extracted_command.as_deref(), Some("bun test &"));
+
+    // A command after the background operator is not a benign suffix.
+    let result = classify_and_log(&harness, "cargo build & echo done");
+    harness
+        .assert(
             !result.is_compilation,
-            "backgrounded bun test should NOT be intercepted",
+            "backgrounded cargo build followed by another command must not be intercepted",
         )
         .unwrap();
 
     harness
         .logger
-        .info("TEST PASS: test_hook_ignores_background_commands");
+        .info("TEST PASS: test_hook_offloads_background_commands");
     harness.mark_passed();
 }
 
@@ -830,14 +871,16 @@ fn test_hook_classification_details_piped_rejection() {
         .logger
         .info("TEST START: test_hook_classification_details_piped_rejection");
 
-    let detailed = classify_command_detailed("cargo build | tee log.txt");
+    // Issue #24: a pipe into a NON-benign command is still rejected at Tier 1.
+    // (Benign pagers such as `tee`/`head` are now offloaded instead.)
+    let detailed = classify_command_detailed("cargo build | xargs rm");
 
     // Should be rejected at Tier 1 (structure analysis)
     let tier1 = detailed.tiers.iter().find(|t| t.tier == 1).unwrap();
     assert_eq!(
         tier1.decision,
         TierDecision::Reject,
-        "Tier 1 should reject piped command"
+        "Tier 1 should reject pipe into non-pager command"
     );
     assert!(
         tier1.reason.contains("piped"),
@@ -846,6 +889,14 @@ fn test_hook_classification_details_piped_rejection() {
 
     // Final classification should be non-compilation
     assert!(!detailed.classification.is_compilation);
+
+    // A pipe into a benign pager IS now offloaded (Tier 1 passes).
+    let offloaded = classify_command_detailed("cargo build | tee log.txt");
+    assert!(offloaded.classification.is_compilation);
+    assert_eq!(
+        offloaded.classification.extracted_command.as_deref(),
+        Some("cargo build | tee log.txt")
+    );
 
     harness
         .logger

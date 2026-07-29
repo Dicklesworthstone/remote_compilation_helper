@@ -1,7 +1,18 @@
 'use client';
 
-import { useEffect, useState, useRef } from 'react';
-import { Server, History, Settings, Activity, Home, Menu, X, Sun, Moon } from 'lucide-react';
+import { useEffect, useState, useRef, useSyncExternalStore } from 'react';
+import {
+  Server,
+  History,
+  Settings,
+  Activity,
+  Home,
+  Menu,
+  X,
+  Sun,
+  Moon,
+  ShieldCheck,
+} from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { AnimatePresence, motion } from 'motion/react';
@@ -12,12 +23,24 @@ import { Button } from '@/components/ui/button';
 const navItems = [
   { href: '/', icon: Home, label: 'Overview' },
   { href: '/workers', icon: Server, label: 'Workers' },
+  { href: '/remediation', icon: ShieldCheck, label: 'Remediation' },
   { href: '/builds', icon: History, label: 'Build History' },
   { href: '/metrics', icon: Activity, label: 'Metrics' },
   { href: '/settings', icon: Settings, label: 'Settings' },
 ];
 
 const STORAGE_KEY = 'rch.sidebar.open';
+function subscribeToMount(): () => void {
+  return () => {};
+}
+
+function getMountedSnapshot(): boolean {
+  return true;
+}
+
+function getServerMountedSnapshot(): boolean {
+  return false;
+}
 
 interface SidebarContentProps {
   pathname: string;
@@ -56,7 +79,7 @@ function SidebarContent({ pathname, onNavigate, variant }: SidebarContentProps) 
                   {isActive && (
                     <motion.div
                       layoutId={`active-nav-${variant}`}
-                      className="absolute inset-0 bg-surface-elevated rounded-lg"
+                      className="pointer-events-none absolute inset-0 bg-surface-elevated rounded-lg"
                       initial={false}
                       transition={{ type: 'spring', stiffness: 500, damping: 30 }}
                     />
@@ -83,11 +106,11 @@ function SidebarContent({ pathname, onNavigate, variant }: SidebarContentProps) 
 
 function ThemeToggle() {
   const { resolvedTheme, setTheme } = useTheme();
-  const [mounted, setMounted] = useState(false);
-
-  useEffect(() => {
-    setMounted(true);
-  }, []);
+  const mounted = useSyncExternalStore(
+    subscribeToMount,
+    getMountedSnapshot,
+    getServerMountedSnapshot
+  );
 
   const isDark = resolvedTheme === 'dark';
   const label = isDark ? 'Switch to light theme' : 'Switch to dark theme';

@@ -207,6 +207,78 @@ async fn fetch_specific_version(
     })
 }
 
+/// Maximum attempts for a GitHub API metadata fetch.
+const MAX_API_ATTEMPTS: u32 = 4;
+
+/// Backoff schedule waited before the 2nd/3rd/4th API attempts (~22s total).
+const API_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+];
+
+/// GitHub API responses (rate limiting, abuse detection, upstream 5xx) are
+/// retryable on 5xx and 429; everything else is terminal.
+fn is_retryable_api_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// Run a single-shot GitHub API GET with retry-and-backoff for transient
+/// failures (connection/timeout errors and retryable HTTP statuses). `op`
+/// returns `Ok(Some(_))` on success, `Ok(None)` to signal a transient HTTP
+/// status worth retrying, and `Err(_)` for a terminal failure.
+async fn api_get_with_retry<T, F, Fut>(label: &str, op: F) -> Result<T, UpdateError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<T>, UpdateError>>,
+{
+    let mut last_err: Option<UpdateError> = None;
+
+    for attempt in 1..=MAX_API_ATTEMPTS {
+        match op().await {
+            Ok(Some(value)) => return Ok(value),
+            // Transient HTTP status flagged by the caller.
+            Ok(None) if attempt < MAX_API_ATTEMPTS => {
+                let wait = backoff_for(attempt);
+                tracing::warn!(
+                    "{label} attempt {attempt}/{MAX_API_ATTEMPTS} hit a transient status; \
+                     retrying in {wait:?}"
+                );
+                tokio::time::sleep(wait).await;
+            }
+            Ok(None) => {
+                return Err(last_err.unwrap_or_else(|| {
+                    UpdateError::CheckFailed(format!(
+                        "{label} failed after {MAX_API_ATTEMPTS} attempts (transient status)"
+                    ))
+                }));
+            }
+            // Connection/timeout errors are transient; retry them too.
+            Err(e) if matches!(e, UpdateError::NetworkError(_)) && attempt < MAX_API_ATTEMPTS => {
+                let wait = backoff_for(attempt);
+                tracing::warn!(
+                    "{label} attempt {attempt}/{MAX_API_ATTEMPTS} failed ({e}); \
+                     retrying in {wait:?}"
+                );
+                last_err = Some(e);
+                tokio::time::sleep(wait).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        UpdateError::CheckFailed(format!("{label} failed after {MAX_API_ATTEMPTS} attempts"))
+    }))
+}
+
+fn backoff_for(attempt: u32) -> Duration {
+    API_BACKOFF
+        .get((attempt - 1) as usize)
+        .copied()
+        .unwrap_or_else(|| API_BACKOFF[API_BACKOFF.len() - 1])
+}
+
 /// Fetch all releases from GitHub.
 async fn fetch_releases() -> Result<Vec<ReleaseInfo>, UpdateError> {
     let url = format!(
@@ -214,73 +286,94 @@ async fn fetch_releases() -> Result<Vec<ReleaseInfo>, UpdateError> {
         GITHUB_API_BASE, REPO_OWNER, REPO_NAME
     );
 
-    let client = build_http_client()?;
-    let response = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", format!("rch/{}", env!("CARGO_PKG_VERSION")))
-        .send()
-        .await
-        .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
+    api_get_with_retry("Fetching releases", || async {
+        let client = build_http_client()?;
+        let response = client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", format!("rch/{}", env!("CARGO_PKG_VERSION")))
+            .send()
+            .await
+            .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
 
-    if !response.status().is_success() {
-        return Err(UpdateError::CheckFailed(format!(
-            "GitHub API returned {}",
-            response.status()
-        )));
-    }
+        let status = response.status();
+        if !status.is_success() {
+            if is_retryable_api_status(status) {
+                // Signal transient → retry.
+                return Ok(None);
+            }
+            return Err(UpdateError::CheckFailed(format!(
+                "GitHub API returned {status}"
+            )));
+        }
 
-    let releases: Vec<ReleaseInfo> = response
-        .json()
-        .await
-        .map_err(|e| UpdateError::CheckFailed(format!("Failed to parse releases: {}", e)))?;
-
-    Ok(releases)
+        let releases: Vec<ReleaseInfo> = response
+            .json()
+            .await
+            .map_err(|e| UpdateError::CheckFailed(format!("Failed to parse releases: {}", e)))?;
+        Ok(Some(releases))
+    })
+    .await
 }
 
 /// Fetch a single release from a URL.
 async fn fetch_release_from_url(url: &str) -> Result<ReleaseInfo, UpdateError> {
-    let client = build_http_client()?;
-    let response = client
-        .get(url)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", format!("rch/{}", env!("CARGO_PKG_VERSION")))
-        .send()
-        .await
-        .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
+    api_get_with_retry("Fetching release", || async {
+        let client = build_http_client()?;
+        let response = client
+            .get(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", format!("rch/{}", env!("CARGO_PKG_VERSION")))
+            .send()
+            .await
+            .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
 
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(UpdateError::CheckFailed("Release not found".to_string()));
-    }
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            // 404 is terminal — the requested release genuinely does not exist.
+            return Err(UpdateError::CheckFailed("Release not found".to_string()));
+        }
 
-    if !response.status().is_success() {
-        return Err(UpdateError::CheckFailed(format!(
-            "GitHub API returned {}",
-            response.status()
-        )));
-    }
+        if !status.is_success() {
+            if is_retryable_api_status(status) {
+                return Ok(None);
+            }
+            return Err(UpdateError::CheckFailed(format!(
+                "GitHub API returned {status}"
+            )));
+        }
 
-    let release: ReleaseInfo = response
-        .json()
-        .await
-        .map_err(|e| UpdateError::CheckFailed(format!("Failed to parse release: {}", e)))?;
-
-    Ok(release)
+        let release: ReleaseInfo = response
+            .json()
+            .await
+            .map_err(|e| UpdateError::CheckFailed(format!("Failed to parse release: {}", e)))?;
+        Ok(Some(release))
+    })
+    .await
 }
 
 /// Filter releases by channel.
 fn filter_by_channel(releases: &[ReleaseInfo], channel: Channel) -> Option<&ReleaseInfo> {
-    releases.iter().find(|r| {
-        if r.draft {
-            return false;
-        }
+    releases
+        .iter()
+        .filter_map(|release| {
+            if release.draft {
+                return None;
+            }
 
-        match channel {
-            Channel::Stable => !r.prerelease,
-            Channel::Beta => r.prerelease,
-            Channel::Nightly => true, // Accept any, prefer latest
-        }
-    })
+            let version = Version::parse(&release.tag_name).ok()?;
+            let is_prerelease = release.prerelease || version.is_prerelease();
+
+            let matches_channel = match channel {
+                Channel::Stable => !is_prerelease,
+                Channel::Beta => is_prerelease,
+                Channel::Nightly => true,
+            };
+
+            matches_channel.then_some((version, release))
+        })
+        .max_by(|(left_version, _), (right_version, _)| left_version.cmp(right_version))
+        .map(|(_, release)| release)
 }
 
 /// Compute changelog diff by collecting release notes from versions between current and target.
@@ -309,16 +402,21 @@ fn compute_changelog_diff(
             && let Some(ref body) = release.body
             && !body.trim().is_empty()
         {
-            notes.push(format!("## {}\n{}", release.tag_name, body));
+            notes.push((version, format!("## {}\n{}", release.tag_name, body)));
         }
     }
 
     if notes.is_empty() {
         None
     } else {
-        // Reverse to show oldest first (chronological order)
-        notes.reverse();
-        Some(notes.join("\n\n---\n\n"))
+        notes.sort_by(|(left_version, _), (right_version, _)| left_version.cmp(right_version));
+        Some(
+            notes
+                .into_iter()
+                .map(|(_, note)| note)
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n"),
+        )
     }
 }
 
@@ -340,6 +438,27 @@ mod tests {
         let version = get_current_version().unwrap();
         // Should parse successfully - checking the struct is valid
         assert!(!version.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_is_retryable_api_status() {
+        use reqwest::StatusCode;
+
+        assert!(is_retryable_api_status(StatusCode::GATEWAY_TIMEOUT)); // 504
+        assert!(is_retryable_api_status(StatusCode::BAD_GATEWAY)); // 502
+        assert!(is_retryable_api_status(StatusCode::SERVICE_UNAVAILABLE)); // 503
+        assert!(is_retryable_api_status(StatusCode::TOO_MANY_REQUESTS)); // 429
+
+        assert!(!is_retryable_api_status(StatusCode::NOT_FOUND)); // 404
+        assert!(!is_retryable_api_status(StatusCode::UNAUTHORIZED)); // 401
+        assert!(!is_retryable_api_status(StatusCode::FORBIDDEN)); // 403
+    }
+
+    #[test]
+    fn test_api_backoff_is_bounded() {
+        let total: Duration = API_BACKOFF.iter().copied().sum();
+        assert_eq!(API_BACKOFF.len() as u32, MAX_API_ATTEMPTS - 1);
+        assert!(total <= Duration::from_secs(45));
     }
 
     #[test]
@@ -372,6 +491,135 @@ mod tests {
 
         let beta = filter_by_channel(&releases, Channel::Beta).unwrap();
         assert_eq!(beta.tag_name, "v0.2.0-beta.1");
+    }
+
+    #[test]
+    fn test_filter_by_channel_selects_highest_semver_not_first_release() {
+        let releases = vec![
+            ReleaseInfo {
+                tag_name: "v1.0.1".to_string(),
+                name: "Backfilled patch".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.2.0".to_string(),
+                name: "Actual latest".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.1.0".to_string(),
+                name: "Intermediate".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+        ];
+
+        let stable = filter_by_channel(&releases, Channel::Stable).unwrap();
+        assert_eq!(stable.tag_name, "v1.2.0");
+    }
+
+    #[test]
+    fn test_filter_by_channel_selects_highest_prerelease_semver() {
+        let releases = vec![
+            ReleaseInfo {
+                tag_name: "v1.0.0-beta.2".to_string(),
+                name: "Older beta".to_string(),
+                prerelease: true,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.0.0-beta.10".to_string(),
+                name: "Newer beta".to_string(),
+                prerelease: true,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+        ];
+
+        let beta = filter_by_channel(&releases, Channel::Beta).unwrap();
+        assert_eq!(beta.tag_name, "v1.0.0-beta.10");
+    }
+
+    #[test]
+    fn test_filter_by_channel_skips_unparseable_release_tags() {
+        let releases = vec![
+            ReleaseInfo {
+                tag_name: "nightly-build".to_string(),
+                name: "Invalid tag".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.2.0".to_string(),
+                name: "Valid tag".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+        ];
+
+        let stable = filter_by_channel(&releases, Channel::Stable).unwrap();
+        assert_eq!(stable.tag_name, "v1.2.0");
+    }
+
+    #[test]
+    fn test_filter_by_channel_stable_rejects_prerelease_tag_even_without_github_flag() {
+        let releases = vec![
+            ReleaseInfo {
+                tag_name: "v2.0.0-beta.1".to_string(),
+                name: "Misflagged prerelease".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.2.0".to_string(),
+                name: "Stable".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+        ];
+
+        let stable = filter_by_channel(&releases, Channel::Stable).unwrap();
+        assert_eq!(stable.tag_name, "v1.2.0");
+
+        let beta = filter_by_channel(&releases, Channel::Beta).unwrap();
+        assert_eq!(beta.tag_name, "v2.0.0-beta.1");
     }
 
     #[test]
@@ -415,7 +663,7 @@ mod tests {
             },
         ];
 
-        // Nightly should accept any release, preferring first (latest)
+        // Nightly accepts any release and chooses the highest semantic version.
         let nightly = filter_by_channel(&releases, Channel::Nightly).unwrap();
         assert_eq!(nightly.tag_name, "v0.3.0-alpha.1");
     }
@@ -442,7 +690,7 @@ mod tests {
             published_at: None,
         }];
 
-        // Beta channel requires prerelease flag
+        // Beta channel requires prerelease semantics.
         assert!(filter_by_channel(&releases, Channel::Beta).is_none());
     }
 
@@ -630,6 +878,54 @@ mod tests {
         let diff = compute_changelog_diff(&releases, &current, &target).unwrap();
 
         // Should be in chronological order (oldest first)
+        let first_pos = diff.find("v1.1.0").unwrap();
+        let second_pos = diff.find("v1.2.0").unwrap();
+        let third_pos = diff.find("v1.3.0").unwrap();
+
+        assert!(first_pos < second_pos);
+        assert!(second_pos < third_pos);
+    }
+
+    #[test]
+    fn test_compute_changelog_diff_sorts_unsorted_release_input() {
+        let releases = vec![
+            ReleaseInfo {
+                tag_name: "v1.1.0".to_string(),
+                name: "First".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("First".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.3.0".to_string(),
+                name: "Third".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("Third".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.2.0".to_string(),
+                name: "Second".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("Second".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+        ];
+
+        let current = Version::parse("v1.0.0").unwrap();
+        let target = Version::parse("v1.3.0").unwrap();
+
+        let diff = compute_changelog_diff(&releases, &current, &target).unwrap();
+
         let first_pos = diff.find("v1.1.0").unwrap();
         let second_pos = diff.find("v1.2.0").unwrap();
         let third_pos = diff.find("v1.3.0").unwrap();

@@ -4,6 +4,7 @@
 //! capabilities for the rch-wkr worker agent across all configured remote workers.
 
 mod audit;
+pub mod doctor;
 mod dry_run;
 mod executor;
 mod history;
@@ -28,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 pub use audit::{AuditEventType, AuditLogger, DeploymentAuditEntry};
 pub use dry_run::{DryRunResult, PotentialIssue, PredictedAction, WorkerPrediction};
+pub(crate) use executor::run_smoke_worker_scenarios;
 pub use executor::{FleetExecutor, FleetResult};
 pub use history::{DeploymentHistoryEntry, HistoryManager};
 pub use plan::{
@@ -179,7 +181,7 @@ pub async fn deploy(
 
     // Per-fleet cooperative lock — prevents two concurrent deploys from
     // racing on worker state (bd-5z2wa). Held for the rest of this function
-    // via RAII; drop removes the file.
+    // via RAII; drop removes only the lock body this process wrote.
     let _fleet_lock = match lock::acquire("fleet-deploy") {
         Ok(guard) => guard,
         Err(err) => {
@@ -263,6 +265,32 @@ pub async fn deploy(
                     } else {
                         style.muted("0")
                     }
+                );
+            }
+            FleetResult::CanaryPending {
+                promoted,
+                remaining,
+                skipped,
+                failed,
+            } => {
+                println!();
+                println!(
+                    "  {} Canary deployed to {} worker(s); {} still on the previous version \
+                    (auto_promote off — fleet NOT fully rolled out). Skipped: {}, Failed: {}",
+                    StatusIndicator::Warning.display(style),
+                    style.success(&promoted.to_string()),
+                    style.highlight(&remaining.to_string()),
+                    style.muted(&skipped.to_string()),
+                    if failed > 0 {
+                        style.error(&failed.to_string())
+                    } else {
+                        style.muted("0")
+                    }
+                );
+                println!(
+                    "  {} Promote the rest with a full `rch fleet deploy` (or re-run with \
+                    auto-promote).",
+                    style.muted("→")
                 );
             }
             FleetResult::CanaryFailed { reason } => {

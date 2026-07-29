@@ -102,10 +102,21 @@ async fn compute_sha256(file_path: &std::path::Path) -> Result<String, UpdateErr
         }
 
         use sha2::Digest;
-        Ok(format!("{:x}", hasher.finalize()))
+        Ok(bytes_to_lower_hex(hasher.finalize()))
     })
     .await
     .map_err(|e| UpdateError::InstallFailed(format!("Task failed: {}", e)))?
+}
+
+fn bytes_to_lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = bytes.as_ref();
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 /// Expected GitHub Actions OIDC issuer for sigstore verification.
@@ -138,15 +149,15 @@ const RCH_RELEASE_IDENTITY_PATTERN: &str = r"^https://github\.com/Dicklesworthst
 ///
 /// Wildcard patterns (`.*`) are intentionally NOT used as they would accept
 /// any sigstore signature, defeating supply chain security.
-async fn verify_signature(
+pub(crate) async fn verify_signature(
     file_path: &std::path::Path,
     bundle_path: &std::path::Path,
 ) -> Result<bool, UpdateError> {
-    let cosign_path = which("cosign").map_err(|_| {
+    which("cosign").map_err(|_| {
         UpdateError::SignatureVerificationFailed("cosign not found in PATH".to_string())
     })?;
 
-    let output = Command::new(cosign_path)
+    let output = Command::new("cosign")
         .arg("verify-blob")
         .arg("--bundle")
         .arg(bundle_path)
@@ -185,7 +196,7 @@ pub fn verify_sha256_bytes(content: &[u8], expected: &str) -> Result<(), UpdateE
 
     let mut hasher = sha2::Sha256::new();
     hasher.update(content);
-    let actual = format!("{:x}", hasher.finalize());
+    let actual = bytes_to_lower_hex(hasher.finalize());
 
     if actual.eq_ignore_ascii_case(expected) {
         Ok(())
@@ -313,13 +324,10 @@ mod tests {
         let nonexistent = temp.path().join("does_not_exist.bin");
 
         let result = verify_checksum(&nonexistent, "0".repeat(64).as_str()).await;
-        assert!(result.is_err());
-        match result {
-            Err(UpdateError::InstallFailed(msg)) => {
-                assert!(msg.contains("Failed to open file"));
-            }
-            _ => panic!("Expected InstallFailed error"),
-        }
+        assert!(matches!(
+            result,
+            Err(UpdateError::InstallFailed(msg)) if msg.contains("Failed to open file")
+        ));
     }
 
     #[tokio::test]
@@ -437,7 +445,7 @@ mod tests {
         let mut hasher = sha2::Sha256::new();
         use sha2::Digest;
         hasher.update(b"hello world");
-        let expected = format!("{:x}", hasher.finalize());
+        let expected = bytes_to_lower_hex(hasher.finalize());
 
         let result = verify_checksum_and_signature(&file_path, &expected, None)
             .await
@@ -471,14 +479,10 @@ mod tests {
         std::fs::write(&bundle_path, b"\x00\x01\x02 totally not a real bundle").unwrap();
 
         let result = verify_signature(&file_path, &bundle_path).await;
-        match result {
-            Err(UpdateError::SignatureVerificationFailed(_)) => { /* expected */ }
-            Ok(false) => { /* also acceptable: explicit rejection */ }
-            other => panic!(
-                "expected SignatureVerificationFailed or Ok(false), got {:?}",
-                other
-            ),
-        }
+        assert!(matches!(
+            result,
+            Err(UpdateError::SignatureVerificationFailed(_)) | Ok(false)
+        ));
         // TEST PASS: invalid bundle rejected
     }
 

@@ -11,10 +11,11 @@ use crate::workers::{WorkerPool, WorkerState};
 use rch_common::mock::{self, MockConfig, MockSshClient};
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CircuitStats, SshClient, SshOptions, WorkerStatus,
+    is_retryable_transport_error,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
@@ -33,6 +34,41 @@ const DEFAULT_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Threshold for degraded status (slow response).
 const DEGRADED_THRESHOLD_MS: u64 = 5000;
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Derive the health-facing [`WorkerStatus`] from a circuit state and the latest
+/// check outcome. This is the single mapping shared by the diagnostic
+/// [`WorkerHealth`] panel and the authoritative health-monitor loop, so the two
+/// never disagree about what a given circuit state "means":
+/// - Open      -> Unreachable (short-circuited out of scheduling)
+/// - HalfOpen  -> Degraded (probing recovery)
+/// - Closed    -> Degraded if the last check failed or was slow, else Healthy
+fn derive_worker_status(
+    circuit_state: CircuitState,
+    healthy: bool,
+    response_time_ms: u64,
+    config: &HealthConfig,
+) -> WorkerStatus {
+    match circuit_state {
+        CircuitState::Open => WorkerStatus::Unreachable,
+        CircuitState::HalfOpen => WorkerStatus::Degraded,
+        CircuitState::Closed => {
+            if !healthy {
+                // Failed but circuit not open yet -> Degraded
+                WorkerStatus::Degraded
+            } else if response_time_ms > config.degraded_threshold_ms {
+                // Slow response -> Degraded
+                WorkerStatus::Degraded
+            } else {
+                // Healthy and fast
+                WorkerStatus::Healthy
+            }
+        }
+    }
+}
 
 /// Health monitor configuration.
 #[derive(Debug, Clone)]
@@ -70,6 +106,12 @@ pub struct HealthCheckResult {
     pub response_time_ms: u64,
     /// Error message if failed.
     pub error: Option<String>,
+    /// Whether an (unhealthy) result was caused by a *transient* transport
+    /// error (retryable connect/timeout blip) that survived the in-check
+    /// retries. Always `false` for healthy results. Fed to the circuit engine so
+    /// a transient failure during half-open recovery does not reopen the circuit
+    /// or restart its cooldown. See [`CircuitStats::apply_health_outcome`].
+    pub transient: bool,
     /// Timestamp of the check.
     #[allow(dead_code)] // May be used for monitoring metrics
     pub checked_at: Instant,
@@ -81,6 +123,7 @@ impl HealthCheckResult {
             healthy: true,
             response_time_ms,
             error: None,
+            transient: false,
             checked_at: Instant::now(),
         }
     }
@@ -90,6 +133,19 @@ impl HealthCheckResult {
             healthy: false,
             response_time_ms: 0,
             error: Some(error),
+            transient: false,
+            checked_at: Instant::now(),
+        }
+    }
+
+    /// Construct a failure result flagged as caused by a transient transport
+    /// error (retried but still failing).
+    fn transient_failure(error: String) -> Self {
+        Self {
+            healthy: false,
+            response_time_ms: 0,
+            error: Some(error),
+            transient: true,
             checked_at: Instant::now(),
         }
     }
@@ -141,86 +197,60 @@ impl WorkerHealth {
 
     /// Update health state based on check result.
     ///
-    /// This drives circuit breaker state transitions based on health check outcomes:
-    /// - On success: records success, may close half-open circuit
-    /// - On failure: records failure, may open circuit
+    /// This drives circuit breaker state transitions based on health check
+    /// outcomes by delegating to the single shared engine
+    /// [`CircuitStats::apply_health_outcome`], so this diagnostic circuit stays
+    /// in lockstep with the authoritative `WorkerState.circuit` that the
+    /// scheduler reads. See [`Self::observe`], which is the same logic split out
+    /// so the health-monitor loop can drive both circuits from one outcome.
     pub fn update(&mut self, result: HealthCheckResult, config: &HealthConfig, worker_id: &str) {
+        let healthy = result.healthy;
+        let transient = result.transient;
+        let response_time_ms = result.response_time_ms;
+        self.last_error = if healthy { None } else { result.error.clone() };
+        self.last_result = Some(result);
+        self.observe(healthy, transient, response_time_ms, config, worker_id);
+    }
+
+    /// Apply a single health outcome to the diagnostic circuit and recompute the
+    /// worker status. Shared with [`Self::update`]; used directly by the
+    /// health-monitor loop to mirror the authoritative outcome (already applied
+    /// to `WorkerState.circuit`) into this panel-facing copy.
+    pub fn observe(
+        &mut self,
+        healthy: bool,
+        transient: bool,
+        response_time_ms: u64,
+        config: &HealthConfig,
+        worker_id: &str,
+    ) {
         let prior_circuit_state = self.circuit.state();
 
-        if result.healthy {
-            // Record success in circuit stats
-            self.circuit.record_success();
-            self.last_error = None;
+        let new_circuit_state =
+            self.circuit
+                .apply_health_outcome(healthy, transient, &config.circuit);
 
-            // Check if circuit should close (half-open -> closed)
-            if self.circuit.should_close(&config.circuit) {
-                info!(
-                    "Worker {} circuit closing: {} consecutive successes",
-                    worker_id, config.circuit.success_threshold
-                );
-                self.circuit.close();
-            }
-        } else {
-            // Record failure in circuit stats
-            self.circuit.record_failure();
-            self.last_error = result.error.clone();
+        self.current_status =
+            derive_worker_status(new_circuit_state, healthy, response_time_ms, config);
 
-            // Check if circuit should open (closed -> open)
-            if self.circuit.should_open(&config.circuit) {
-                info!(
-                    "Worker {} circuit opening: {} consecutive failures",
-                    worker_id,
-                    self.circuit.consecutive_failures()
-                );
-                self.circuit.open();
-            } else if self.circuit.state() == CircuitState::HalfOpen {
-                // Failure in half-open means reopen circuit
-                info!(
-                    "Worker {} circuit reopening: probe failed in half-open state",
-                    worker_id
-                );
-                self.circuit.open();
-            }
-        }
-
-        // Check if circuit should transition to half-open (open -> half-open)
-        if self.circuit.state() == CircuitState::Open
-            && self.circuit.should_half_open(&config.circuit)
-        {
-            info!(
-                "Worker {} circuit transitioning to half-open: cooldown elapsed",
-                worker_id
-            );
-            self.circuit.half_open();
-        }
-
-        // Determine status based on circuit state and check result
-        self.current_status = match self.circuit.state() {
-            CircuitState::Open => WorkerStatus::Unreachable,
-            CircuitState::HalfOpen => WorkerStatus::Degraded,
-            CircuitState::Closed => {
-                if !result.healthy {
-                    // Failed but circuit not open yet -> Degraded
-                    WorkerStatus::Degraded
-                } else if result.response_time_ms > config.degraded_threshold_ms {
-                    // Slow response -> Degraded
-                    WorkerStatus::Degraded
-                } else {
-                    // Healthy and fast
-                    WorkerStatus::Healthy
-                }
-            }
-        };
-
-        // Log state transitions
-        let new_circuit_state = self.circuit.state();
         if prior_circuit_state != new_circuit_state {
             info!(
                 "Worker {} circuit state: {:?} -> {:?}",
                 worker_id, prior_circuit_state, new_circuit_state
             );
         }
+    }
 
+    /// Record the last check result on this diagnostic copy (and refresh the
+    /// derived `last_error`). Used by the health-monitor loop, which drives the
+    /// circuit via [`Self::observe`] (not [`Self::update`]) and separately stores
+    /// the full result so diagnostics/panels keep the error text and latency.
+    pub fn set_last_result(&mut self, result: HealthCheckResult) {
+        self.last_error = if result.healthy {
+            None
+        } else {
+            result.error.clone()
+        };
         self.last_result = Some(result);
     }
 
@@ -271,10 +301,16 @@ pub struct HealthMonitor {
     health_states: Arc<RwLock<std::collections::HashMap<String, WorkerHealth>>>,
     /// Whether monitor is running.
     running: Arc<RwLock<bool>>,
+    /// Wake signal for prompt shutdown while the monitor is sleeping between checks.
+    shutdown: Arc<Notify>,
     /// Optional worker status panel for log output.
     status_panel: Option<Arc<Mutex<WorkerStatusPanel>>>,
     /// Optional alert manager for worker health alerting.
     alert_manager: Option<Arc<AlertManager>>,
+    /// Optional shared SSH connection pool. When `Some`, health/capability
+    /// probes run over a warm reused ControlMaster; when `None`, per-call
+    /// throwaway SSH sessions are used.
+    ssh_pool: Option<Arc<rch_common::SshPool>>,
 }
 
 impl HealthMonitor {
@@ -285,9 +321,18 @@ impl HealthMonitor {
             config,
             health_states: Arc::new(RwLock::new(std::collections::HashMap::new())),
             running: Arc::new(RwLock::new(false)),
+            shutdown: Arc::new(Notify::new()),
             status_panel: None,
             alert_manager: None,
+            ssh_pool: None,
         }
+    }
+
+    /// Attach a shared SSH connection pool for warm ControlMaster reuse.
+    #[must_use]
+    pub fn with_ssh_pool(mut self, pool: Option<Arc<rch_common::SshPool>>) -> Self {
+        self.ssh_pool = pool;
+        self
     }
 
     /// Attach a worker status panel for periodic output.
@@ -310,8 +355,10 @@ impl HealthMonitor {
         let config = self.config.clone();
         let health_states = self.health_states.clone();
         let running = self.running.clone();
+        let shutdown = self.shutdown.clone();
         let status_panel = self.status_panel.clone();
         let alert_manager = self.alert_manager.clone();
+        let ssh_pool = self.ssh_pool.clone();
 
         tokio::spawn(async move {
             *running.write().await = true;
@@ -323,7 +370,13 @@ impl HealthMonitor {
             );
 
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    () = shutdown.notified() => {
+                        info!("Health monitor stopping");
+                        break;
+                    }
+                }
 
                 if !*running.read().await {
                     info!("Health monitor stopping");
@@ -346,7 +399,7 @@ impl HealthMonitor {
                     drop(worker_config_guard);
 
                     let previous_effective_status = worker.status().await;
-                    let result = check_worker_health(&worker, &config).await;
+                    let result = check_worker_health(&worker, &config, ssh_pool.as_ref()).await;
 
                     // Record health check latency metric
                     if result.healthy {
@@ -359,11 +412,15 @@ impl HealthMonitor {
                         metrics::set_worker_last_seen(&worker_id, now);
                     }
 
-                    // Update health state, tracking previous status for alerting
-                    let mut states = health_states.write().await;
-                    let health = states.entry(worker_id.clone()).or_default();
-                    let previous_circuit_state = health.circuit_state();
-                    health.update(result.clone(), &config, &worker_id);
+                    // Drive the AUTHORITATIVE circuit on WorkerState — the one the
+                    // scheduler reads — through the shared engine. This is what
+                    // makes a failing worker actually short-circuit out of
+                    // selection and a recovered worker rejoin. The old code drove
+                    // only the ephemeral WorkerHealth.circuit below, which
+                    // selection never consulted.
+                    let (previous_circuit_state, new_circuit_state) = worker
+                        .record_health_check(result.healthy, result.transient, &config.circuit)
+                        .await;
 
                     if result.healthy {
                         worker.set_last_latency_ms(Some(result.response_time_ms));
@@ -371,10 +428,30 @@ impl HealthMonitor {
                         worker.set_last_latency_ms(None);
                     }
 
-                    // Log status changes
-                    let new_status = health.status();
+                    // Derive the health-facing status from the authoritative
+                    // circuit outcome via the shared mapping, then apply it to the
+                    // worker lifecycle (respecting admin intent / quarantine).
+                    let new_status = derive_worker_status(
+                        new_circuit_state,
+                        result.healthy,
+                        result.response_time_ms,
+                        &config,
+                    );
                     let effective_status = worker.apply_health_status(new_status).await;
-                    let new_circuit_state = health.circuit_state();
+
+                    // Mirror the same outcome into the diagnostic WorkerHealth so
+                    // get_health()/all_health_states()/the status panel keep
+                    // reporting a circuit consistent with the authoritative one.
+                    let mut states = health_states.write().await;
+                    let health = states.entry(worker_id.clone()).or_default();
+                    health.observe(
+                        result.healthy,
+                        result.transient,
+                        result.response_time_ms,
+                        &config,
+                        &worker_id,
+                    );
+                    health.set_last_result(result.clone());
 
                     // Track unreachable workers for all-workers-offline alert
                     if effective_status == WorkerStatus::Unreachable {
@@ -444,9 +521,14 @@ impl HealthMonitor {
                         // This runs in the background to avoid slowing down health checks
                         let worker_clone = worker.clone();
                         let timeout = config.check_timeout;
+                        let probe_pool = ssh_pool.clone();
                         tokio::spawn(async move {
-                            if let Some(capabilities) =
-                                probe_worker_capabilities(&worker_clone, timeout).await
+                            if let Some(capabilities) = probe_worker_capabilities(
+                                &worker_clone,
+                                timeout,
+                                probe_pool.as_ref(),
+                            )
+                            .await
                             {
                                 worker_clone.set_capabilities(capabilities).await;
                             }
@@ -479,6 +561,7 @@ impl HealthMonitor {
     #[allow(dead_code)] // Will be used for graceful shutdown
     pub async fn stop(&self) {
         *self.running.write().await = false;
+        self.shutdown.notify_waiters();
     }
 
     /// Get health state for a worker.
@@ -503,6 +586,7 @@ impl HealthMonitor {
 async fn check_worker_health(
     worker: &Arc<WorkerState>,
     config: &HealthConfig,
+    ssh_pool: Option<&Arc<rch_common::SshPool>>,
 ) -> HealthCheckResult {
     let start = Instant::now();
 
@@ -523,8 +607,8 @@ async fn check_worker_health(
                 Ok(result) => {
                     let duration = start.elapsed();
                     let _ = client.disconnect().await;
-                    if result.success() && result.stdout.trim() == "health_check" {
-                        return HealthCheckResult::success(duration.as_millis() as u64);
+                    if result.success() && result.stdout.trim().eq("health_check") {
+                        return HealthCheckResult::success(duration_millis_u64(duration));
                     }
                     return HealthCheckResult::failure(format!(
                         "Unexpected response: exit={}, stdout={}",
@@ -549,34 +633,134 @@ async fn check_worker_health(
         ..Default::default()
     };
 
-    let mut client = SshClient::new(worker_config.clone(), ssh_options);
+    let worker_config = worker_config.clone();
 
-    // Try to connect and run a simple command
-    match client.connect().await {
-        Ok(()) => {
-            // Run a simple echo command
-            match client.execute("echo health_check").await {
-                Ok(result) => {
-                    let duration = start.elapsed();
-                    let _ = client.disconnect().await;
+    // Retry a *retryable* transport error (connect/timeout blip) a couple of
+    // times with a short backoff before recording a circuit failure. A single
+    // packet-loss window or a momentarily-busy sshd otherwise trips the breaker
+    // and drops an otherwise-healthy worker out of scheduling until the next
+    // clean poll. Non-retryable failures (auth, host-key, resolution) fail fast
+    // — retrying can't help and just delays the correct verdict.
+    const MAX_ATTEMPTS: u32 = 3; // 1 initial + 2 retries
+    const RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
-                    if result.success() && result.stdout.trim() == "health_check" {
-                        HealthCheckResult::success(duration.as_millis() as u64)
-                    } else {
-                        HealthCheckResult::failure(format!(
-                            "Unexpected response: exit={}, stdout={}",
-                            result.exit_code,
-                            result.stdout.trim()
-                        ))
-                    }
+    let mut last_error: Option<HealthProbeError> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let attempt_start = Instant::now();
+        match probe_health_once(&worker_config, ssh_options.clone(), ssh_pool).await {
+            Ok(()) => {
+                let duration = attempt_start.elapsed();
+                return HealthCheckResult::success(duration_millis_u64(duration));
+            }
+            Err(err) => {
+                let retryable = err.retryable;
+                if retryable && attempt < MAX_ATTEMPTS {
+                    debug!(
+                        "Worker {} health probe attempt {}/{} hit retryable transport error ({}); retrying",
+                        worker_config.id, attempt, MAX_ATTEMPTS, err.message
+                    );
+                    last_error = Some(err);
+                    tokio::time::sleep(RETRY_BACKOFF).await;
+                    continue;
                 }
-                Err(e) => {
-                    let _ = client.disconnect().await;
-                    HealthCheckResult::failure(format!("Command failed: {}", e))
-                }
+                last_error = Some(err);
+                break;
             }
         }
-        Err(e) => HealthCheckResult::failure(format!("Connection failed: {}", e)),
+    }
+
+    // All attempts exhausted (or a fast-fail non-retryable error). Flag the
+    // result as `transient` when the underlying failure was a retryable
+    // transport error so the circuit engine treats a persistent-but-transient
+    // failure during half-open recovery as a blip (does not reopen). A drop of
+    // `start` is intentional here — the retried duration is not a meaningful
+    // latency signal for a failed check.
+    let _ = start;
+    match last_error {
+        Some(err) if err.retryable => HealthCheckResult::transient_failure(err.message),
+        Some(err) => HealthCheckResult::failure(err.message),
+        None => HealthCheckResult::failure("Health check failed (no result)".to_string()),
+    }
+}
+
+/// Classified failure from a single health-probe attempt.
+struct HealthProbeError {
+    message: String,
+    retryable: bool,
+}
+
+/// Perform ONE health-probe attempt (connect + `echo health_check`) against a
+/// worker over a throwaway SSH session. Returns `Ok(())` on the expected
+/// sentinel, or a classified [`HealthProbeError`] otherwise. The retry policy
+/// lives in the caller ([`check_worker_health`]).
+async fn probe_health_once(
+    worker_config: &rch_common::WorkerConfig,
+    ssh_options: SshOptions,
+    ssh_pool: Option<&Arc<rch_common::SshPool>>,
+) -> Result<(), HealthProbeError> {
+    // Pooled path: run over the warm shared ControlMaster. run_with_timeout
+    // collapses connect+execute into one call; classify any error as retryable
+    // via the shared transport-error heuristic so the caller's retry/transient
+    // logic still applies.
+    if let Some(pool) = ssh_pool {
+        let command_timeout = ssh_options.command_timeout;
+        return match pool
+            .run_with_timeout(worker_config, "echo health_check", command_timeout)
+            .await
+        {
+            Ok(result) => classify_health_output(&result),
+            Err(e) => {
+                let retryable = is_retryable_transport_error(&e);
+                Err(HealthProbeError {
+                    message: format!("Health probe failed: {}", e),
+                    retryable,
+                })
+            }
+        };
+    }
+
+    let mut client = SshClient::new(worker_config.clone(), ssh_options);
+
+    match client.connect().await {
+        Ok(()) => match client.execute("echo health_check").await {
+            Ok(result) => {
+                let _ = client.disconnect().await;
+                classify_health_output(&result)
+            }
+            Err(e) => {
+                let _ = client.disconnect().await;
+                let retryable = is_retryable_transport_error(&e);
+                Err(HealthProbeError {
+                    message: format!("Command failed: {}", e),
+                    retryable,
+                })
+            }
+        },
+        Err(e) => {
+            let retryable = is_retryable_transport_error(&e);
+            Err(HealthProbeError {
+                message: format!("Connection failed: {}", e),
+                retryable,
+            })
+        }
+    }
+}
+
+/// Map a health-probe command result onto the expected `echo health_check`
+/// sentinel. A command that ran but produced the wrong output is not a transport
+/// blip (not retryable).
+fn classify_health_output(result: &rch_common::CommandResult) -> Result<(), HealthProbeError> {
+    if result.success() && result.stdout.trim().eq("health_check") {
+        Ok(())
+    } else {
+        Err(HealthProbeError {
+            message: format!(
+                "Unexpected response: exit={}, stdout={}",
+                result.exit_code,
+                result.stdout.trim()
+            ),
+            retryable: false,
+        })
     }
 }
 
@@ -587,7 +771,7 @@ pub async fn probe_worker(worker: &WorkerState) -> HealthCheckResult {
     // Wrap in Arc for compatibility
     let config_clone = worker.config.read().await.clone();
     let worker_arc = Arc::new(WorkerState::new(config_clone));
-    check_worker_health(&worker_arc, &config).await
+    check_worker_health(&worker_arc, &config, None).await
 }
 
 /// Probe worker capabilities (Bun, Node, Rust versions).
@@ -597,6 +781,7 @@ pub async fn probe_worker(worker: &WorkerState) -> HealthCheckResult {
 pub async fn probe_worker_capabilities(
     worker: &Arc<WorkerState>,
     timeout: Duration,
+    ssh_pool: Option<&Arc<rch_common::SshPool>>,
 ) -> Option<rch_common::WorkerCapabilities> {
     use rch_common::{SshClient, SshOptions, WorkerCapabilities};
 
@@ -620,13 +805,56 @@ pub async fn probe_worker_capabilities(
         ..Default::default()
     };
 
+    // Try to run rch-wkr capabilities command
+    // Handle PATH vs ~/.local/bin lookup
+    let cmd = "if command -v rch-wkr >/dev/null 2>&1; then rch-wkr capabilities; else ~/.local/bin/rch-wkr capabilities; fi";
+
+    // Pooled path: run over the warm shared ControlMaster.
+    if let Some(pool) = ssh_pool {
+        match pool.run_with_timeout(&worker_config, cmd, timeout).await {
+            Ok(result) => {
+                if result.success() {
+                    match serde_json::from_str::<WorkerCapabilities>(&result.stdout) {
+                        Ok(capabilities) => {
+                            debug!(
+                                "Worker {} capabilities: rustc={:?}, bun={:?}, node={:?}",
+                                worker_config.id,
+                                capabilities.rustc_version,
+                                capabilities.bun_version,
+                                capabilities.node_version
+                            );
+                            return Some(capabilities);
+                        }
+                        Err(e) => {
+                            debug!(
+                                "Worker {} capabilities JSON parse failed: {} (output: {})",
+                                worker_config.id,
+                                e,
+                                result.stdout.trim()
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
+                        "Worker {} capabilities probe failed (rch-wkr may not be installed): exit={}",
+                        worker_config.id, result.exit_code
+                    );
+                }
+            }
+            Err(e) => {
+                debug!(
+                    "Worker {} capabilities probe (pooled) failed: {}",
+                    worker_config.id, e
+                );
+            }
+        }
+        return None;
+    }
+
     let mut client = SshClient::new(worker_config.clone(), ssh_options);
 
     match client.connect().await {
         Ok(()) => {
-            // Try to run rch-wkr capabilities command
-            // Handle PATH vs ~/.local/bin lookup
-            let cmd = "if command -v rch-wkr >/dev/null 2>&1; then rch-wkr capabilities; else ~/.local/bin/rch-wkr capabilities; fi";
             match client.execute(cmd).await {
                 Ok(result) => {
                     let _ = client.disconnect().await;
@@ -690,6 +918,12 @@ mod tests {
     use rch_common::test_guard;
     use rch_common::{WorkerConfig, WorkerId};
     use std::sync::OnceLock;
+
+    #[test]
+    fn test_duration_millis_u64_saturates() {
+        let _guard = test_guard!();
+        assert_eq!(duration_millis_u64(Duration::from_secs(u64::MAX)), u64::MAX);
+    }
 
     fn test_lock() -> &'static Mutex<()> {
         static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -924,6 +1158,102 @@ mod tests {
     }
 
     #[test]
+    fn test_transient_failure_in_half_open_does_not_reopen() {
+        let _guard = test_guard!();
+        // A TRANSIENT half-open failure must NOT reopen the circuit (contrast
+        // with test_circuit_reopens_on_failure_in_half_open above). This is what
+        // stops a single retryable transport blip during recovery from bouncing
+        // a worker back to Unreachable.
+        let config_fast = HealthConfig {
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 2,
+                open_cooldown_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config_slow = HealthConfig {
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 2,
+                open_cooldown_secs: 60,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut health = WorkerHealth::default();
+
+        // Drive to half-open.
+        for _ in 0..2 {
+            health.update(
+                HealthCheckResult::failure("Error".to_string()),
+                &config_fast,
+                "test-worker",
+            );
+        }
+        assert_eq!(health.circuit_state(), CircuitState::HalfOpen);
+
+        // A TRANSIENT failure in half-open (slow cooldown) must stay HalfOpen.
+        health.update(
+            HealthCheckResult::transient_failure("blip".to_string()),
+            &config_slow,
+            "test-worker",
+        );
+        assert_eq!(
+            health.circuit_state(),
+            CircuitState::HalfOpen,
+            "transient half-open failure must not reopen the circuit"
+        );
+    }
+
+    #[test]
+    fn test_transient_failure_result_carries_flag() {
+        let _guard = test_guard!();
+        let transient = HealthCheckResult::transient_failure("timed out".to_string());
+        assert!(!transient.healthy);
+        assert!(transient.transient);
+        // Plain failures/successes are NOT flagged transient.
+        assert!(!HealthCheckResult::failure("nope".to_string()).transient);
+        assert!(!HealthCheckResult::success(10).transient);
+    }
+
+    #[test]
+    fn test_update_and_observe_agree_on_circuit() {
+        let _guard = test_guard!();
+        // update() and observe() must drive the circuit identically (update
+        // delegates to observe). Feed the same outcome sequence to two
+        // WorkerHealth copies via the two entry points and assert equal state.
+        let config = HealthConfig {
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 2,
+                success_threshold: 2,
+                open_cooldown_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut via_update = WorkerHealth::default();
+        let mut via_observe = WorkerHealth::default();
+
+        let outcomes = [(false, false), (false, false), (true, false), (true, false)];
+        for (healthy, transient) in outcomes {
+            let result = if healthy {
+                HealthCheckResult::success(10)
+            } else if transient {
+                HealthCheckResult::transient_failure("t".to_string())
+            } else {
+                HealthCheckResult::failure("f".to_string())
+            };
+            via_update.update(result, &config, "w");
+            via_observe.observe(healthy, transient, 10, &config, "w");
+            assert_eq!(
+                via_update.circuit_state(),
+                via_observe.circuit_state(),
+                "update() and observe() diverged"
+            );
+        }
+    }
+
+    #[test]
     fn test_circuit_stats_accessors() {
         let _guard = test_guard!();
         let config = HealthConfig::default();
@@ -958,7 +1288,7 @@ mod tests {
             tags: vec![],
         });
 
-        let result = check_worker_health(&Arc::new(worker), &HealthConfig::default()).await;
+        let result = check_worker_health(&Arc::new(worker), &HealthConfig::default(), None).await;
         assert!(!result.healthy);
     }
 
@@ -1635,6 +1965,7 @@ mod tests {
         .await;
 
         let worker = pool.get(&worker_id).await.unwrap();
+        assert!(worker.reserve_slots(1).await);
         worker.drain().await;
 
         let monitor = HealthMonitor::new(
@@ -1733,7 +2064,7 @@ mod tests {
         };
         let worker = Arc::new(WorkerState::new(worker_config));
 
-        let capabilities = probe_worker_capabilities(&worker, Duration::from_secs(5)).await;
+        let capabilities = probe_worker_capabilities(&worker, Duration::from_secs(5), None).await;
 
         clear_mock_overrides();
 
@@ -1765,7 +2096,7 @@ mod tests {
         };
         let worker = Arc::new(WorkerState::new(worker_config));
 
-        let result = check_worker_health(&worker, &HealthConfig::default()).await;
+        let result = check_worker_health(&worker, &HealthConfig::default(), None).await;
 
         clear_mock_overrides();
 
@@ -1793,7 +2124,7 @@ mod tests {
         };
         let worker = Arc::new(WorkerState::new(worker_config));
 
-        let result = check_worker_health(&worker, &HealthConfig::default()).await;
+        let result = check_worker_health(&worker, &HealthConfig::default(), None).await;
 
         clear_mock_overrides();
 

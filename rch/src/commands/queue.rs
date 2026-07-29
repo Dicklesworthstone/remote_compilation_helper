@@ -22,6 +22,9 @@ use super::send_daemon_command;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
+const PROJECT_DISPLAY_MAX_CHARS: usize = 30;
+const PROJECT_DISPLAY_PREFIX: &str = "...";
+
 /// Display build queue - active builds and worker availability.
 ///
 /// When `follow` is true, streams daemon events (like `tail -f`) instead of
@@ -134,11 +137,7 @@ pub async fn queue_status(watch: bool, follow: bool, ctx: &OutputContext) -> Res
                 );
 
                 // Show project
-                let project_display = if build.project_id.len() > 30 {
-                    format!("...{}", &build.project_id[build.project_id.len() - 27..])
-                } else {
-                    build.project_id.clone()
-                };
+                let project_display = format_project_id_for_queue(&build.project_id);
                 println!(
                     "      {} {}",
                     style.muted("project:"),
@@ -192,11 +191,7 @@ pub async fn queue_status(watch: bool, follow: bool, ctx: &OutputContext) -> Res
                 );
 
                 // Show project
-                let project_display = if build.project_id.len() > 30 {
-                    format!("...{}", &build.project_id[build.project_id.len() - 27..])
-                } else {
-                    build.project_id.clone()
-                };
+                let project_display = format_project_id_for_queue(&build.project_id);
                 println!(
                     "      {} {}  {} {}",
                     style.muted("project:"),
@@ -333,6 +328,24 @@ fn render_worker_availability_verbose_line(worker: &WorkerStatusFromApi, style: 
         style.muted("circuit:"),
         circuit_display
     )
+}
+
+fn format_project_id_for_queue(project_id: &str) -> String {
+    if project_id.chars().count() <= PROJECT_DISPLAY_MAX_CHARS {
+        return project_id.to_string();
+    }
+
+    let tail_chars =
+        PROJECT_DISPLAY_MAX_CHARS.saturating_sub(PROJECT_DISPLAY_PREFIX.chars().count());
+    let tail = project_id
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{PROJECT_DISPLAY_PREFIX}{tail}")
 }
 
 /// Stream daemon build events (like `tail -f`).
@@ -777,6 +790,35 @@ mod tests {
     fn format_build_duration_multiple_hours() {
         let _guard = test_guard!();
         assert_eq!(format_build_duration(7380), "2h 3m"); // 2h 3m
+    }
+
+    #[test]
+    fn project_id_display_keeps_short_paths_unchanged() {
+        let _guard = test_guard!();
+        assert_eq!(
+            format_project_id_for_queue("/tmp/rch/project"),
+            "/tmp/rch/project"
+        );
+    }
+
+    #[test]
+    fn project_id_display_truncates_ascii_from_start() {
+        let _guard = test_guard!();
+        assert_eq!(
+            format_project_id_for_queue("abcdefghijklmnopqrstuvwxyz0123456789"),
+            "...jklmnopqrstuvwxyz0123456789"
+        );
+    }
+
+    #[test]
+    fn project_id_display_handles_multibyte_paths() {
+        let _guard = test_guard!();
+        let project_id = format!("/tmp/rch/{}/target", "é".repeat(20));
+        let display = format_project_id_for_queue(&project_id);
+
+        assert!(display.starts_with(PROJECT_DISPLAY_PREFIX));
+        assert!(display.ends_with("/target"));
+        assert!(display.chars().count() <= PROJECT_DISPLAY_MAX_CHARS);
     }
 
     #[test]

@@ -61,6 +61,7 @@
 //! - `RCH_TEST_LOGGING=0`: Force disable (fastest, no I/O)
 //! - Default: Enabled in CI (`CI=true`), disabled locally
 
+pub mod injection;
 mod log;
 
 pub use log::{

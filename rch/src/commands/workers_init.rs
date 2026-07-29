@@ -3,6 +3,7 @@
 //! This module contains commands for adding new workers interactively
 //! and discovering potential workers from SSH config.
 
+use crate::config::{WorkerEntry, WorkersConfig};
 use crate::error::ConfigError;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
@@ -284,28 +285,7 @@ pub async fn workers_init(yes: bool, ctx: &OutputContext) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
         .join("workers.toml");
 
-    // Build TOML content
-    let mut toml_content = String::new();
-    for w in &workers {
-        toml_content.push_str("[[workers]]\n");
-        toml_content.push_str(&format!("id = \"{}\"\n", w.id));
-        toml_content.push_str(&format!("host = \"{}\"\n", w.host));
-        toml_content.push_str(&format!("user = \"{}\"\n", w.user));
-        toml_content.push_str(&format!("identity_file = \"{}\"\n", w.identity_file));
-        toml_content.push_str(&format!("total_slots = {}\n", w.total_slots));
-        toml_content.push_str(&format!("priority = {}\n", w.priority));
-        if !w.tags.is_empty() {
-            toml_content.push_str(&format!(
-                "tags = [{}]\n",
-                w.tags
-                    .iter()
-                    .map(|t| format!("\"{}\"", t))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        toml_content.push('\n');
-    }
+    let toml_content = serialize_workers_config(&workers)?;
 
     std::fs::write(&config_path, toml_content).context("Failed to write workers.toml")?;
 
@@ -349,6 +329,26 @@ pub async fn workers_init(yes: bool, ctx: &OutputContext) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn serialize_workers_config(workers: &[WorkerConfig]) -> Result<String> {
+    let config = WorkersConfig {
+        workers: workers
+            .iter()
+            .map(|worker| WorkerEntry {
+                id: worker.id.to_string(),
+                host: worker.host.clone(),
+                user: worker.user.clone(),
+                identity_file: worker.identity_file.clone(),
+                total_slots: worker.total_slots,
+                priority: worker.priority,
+                tags: worker.tags.clone(),
+                enabled: true,
+            })
+            .collect(),
+    };
+
+    toml::to_string_pretty(&config).context("Failed to serialize workers.toml")
 }
 
 // =============================================================================
@@ -586,4 +586,42 @@ echo "ARCH:$(uname -m 2>/dev/null || echo unknown)""#;
         arch,
         rust_version,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rch_common::test_guard;
+
+    #[test]
+    fn serialize_workers_config_escapes_toml_strings() {
+        let _guard = test_guard!();
+        let attempted_injection = "worker.example\"\n[[workers]]\nid = \"injected";
+        let workers = vec![WorkerConfig {
+            id: WorkerId::new("safe-worker"),
+            host: attempted_injection.to_string(),
+            user: "ubuntu\"admin".to_string(),
+            identity_file: "/tmp/key path/with\\slash\"and-quote".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec!["rust\"fast".to_string(), "gpu\nprod".to_string()],
+        }];
+
+        let rendered = serialize_workers_config(&workers).expect("serialize workers config");
+        let parsed: WorkersConfig =
+            toml::from_str(&rendered).expect("serialized workers config must parse");
+
+        assert_eq!(parsed.workers.len(), 1);
+        assert_eq!(parsed.workers[0].id, "safe-worker");
+        assert_eq!(parsed.workers[0].host, attempted_injection);
+        assert_eq!(parsed.workers[0].user, "ubuntu\"admin");
+        assert_eq!(
+            parsed.workers[0].identity_file,
+            "/tmp/key path/with\\slash\"and-quote"
+        );
+        assert_eq!(
+            parsed.workers[0].tags,
+            vec!["rust\"fast".to_string(), "gpu\nprod".to_string()]
+        );
+    }
 }

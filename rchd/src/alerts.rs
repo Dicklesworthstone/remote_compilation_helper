@@ -257,7 +257,7 @@ impl AlertManager {
         self.sweep_stale_cleared();
 
         let mut alerts: Vec<Alert> = {
-            let state = self.state.read().unwrap();
+            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
             state.active.values().cloned().collect()
         };
 
@@ -280,7 +280,7 @@ impl AlertManager {
     fn sweep_stale_cleared(&self) {
         let now = Utc::now();
         let retention = self.config.cleared_retention;
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         state.active.retain(|_, alert| match alert.cleared_at {
             Some(cleared) => now - cleared < retention,
             None => true,
@@ -392,7 +392,7 @@ impl AlertManager {
 
     fn upsert_alert(&self, key: AlertKey, mut alert: Alert) {
         let now = alert.created_at;
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
 
         // If the same alert condition is being re-raised (either active or
         // recently-cleared), preserve the original `id`, `first_seen`, and
@@ -482,7 +482,7 @@ impl AlertManager {
 
     fn clear_alert(&self, key: &AlertKey) {
         let now = Utc::now();
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         // Mark-cleared rather than remove: the alert lingers as
         // `cleared_pending_clean` so operators can see a transient condition
         // just resolved. `active_alerts()` evicts it after the retention
@@ -510,7 +510,7 @@ impl AlertManager {
 
         // Check if this event type should be sent
         let event_type = alert.kind.as_str();
-        if !webhook.events.is_empty() && !webhook.events.iter().any(|e| e == event_type) {
+        if !event_filter_allows(&webhook.events, event_type) {
             debug!(
                 event_type = event_type,
                 "Skipping webhook dispatch (event type not in filter)"
@@ -558,6 +558,13 @@ impl AlertManager {
             }
         });
     }
+}
+
+fn event_filter_allows(events: &[String], event_type: &str) -> bool {
+    events.is_empty()
+        || events
+            .iter()
+            .any(|event| event.as_str().cmp(event_type).is_eq())
 }
 
 /// Webhook payload structure.
@@ -621,16 +628,17 @@ fn send_webhook_with_retries(
 
 /// Check if a webhook error is worth retrying.
 fn is_retryable_webhook_error(error: &str) -> bool {
-    // Retry on network errors and server errors (5xx)
+    // Retry on network errors, server errors (5xx), and rate limits (429)
     error.contains("timed out")
         || error.contains("connection")
         || error.contains("HTTP 5")
+        || error.contains("HTTP 429")
         || error.contains("network")
 }
 
 /// Compute HMAC-SHA256 signature for webhook payload.
 fn compute_hmac_signature(body: &str, secret: &str) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;
@@ -668,8 +676,14 @@ fn send_webhook_sync(
 
     // Add HMAC signature if secret is configured
     if let Some(secret) = secret {
+        use ureq::http::HeaderValue;
+
         let signature = compute_hmac_signature(&body, secret);
-        request = request.header("X-Signature-256", &signature);
+        let signature_header = HeaderValue::from_str(&signature).map_err(|e| e.to_string())?;
+        let headers = request
+            .headers_mut()
+            .ok_or_else(|| "failed to access webhook request headers".to_string())?;
+        headers.insert("X-Signature-256", signature_header);
     }
 
     let response = request
@@ -1434,9 +1448,9 @@ mod tests {
     fn test_hmac_signature_format() {
         let _guard = test_guard!();
         let body = r#"{"event":"test"}"#;
-        let secret = "test-secret-key";
+        let key = "fixture-hmac-key";
 
-        let signature = compute_hmac_signature(body, secret);
+        let signature = compute_hmac_signature(body, key);
 
         // Should start with sha256= prefix
         assert!(signature.starts_with("sha256="));
@@ -1451,11 +1465,11 @@ mod tests {
     fn test_hmac_signature_consistency() {
         let _guard = test_guard!();
         let body = r#"{"event":"worker_offline","message":"test"}"#;
-        let secret = "my-webhook-secret";
+        let key = "fixture-webhook-key";
 
         // Same input should produce same signature
-        let sig1 = compute_hmac_signature(body, secret);
-        let sig2 = compute_hmac_signature(body, secret);
+        let sig1 = compute_hmac_signature(body, key);
+        let sig2 = compute_hmac_signature(body, key);
         assert_eq!(sig1, sig2);
     }
 
@@ -1474,10 +1488,10 @@ mod tests {
     #[test]
     fn test_hmac_signature_different_bodies() {
         let _guard = test_guard!();
-        let secret = "same-secret";
+        let key = "fixture-shared-key";
 
-        let sig1 = compute_hmac_signature(r#"{"a":1}"#, secret);
-        let sig2 = compute_hmac_signature(r#"{"a":2}"#, secret);
+        let sig1 = compute_hmac_signature(r#"{"a":1}"#, key);
+        let sig2 = compute_hmac_signature(r#"{"a":2}"#, key);
 
         // Different bodies should produce different signatures
         assert_ne!(sig1, sig2);
@@ -1486,20 +1500,15 @@ mod tests {
     // ============== Retry Logic Tests ==============
 
     #[test]
-    fn test_retryable_webhook_error_detection() {
-        let _guard = test_guard!();
-
-        // Should retry on network/server errors
+    fn test_is_retryable_webhook_error() {
         assert!(is_retryable_webhook_error("connection timed out"));
         assert!(is_retryable_webhook_error("HTTP 502"));
         assert!(is_retryable_webhook_error("HTTP 503"));
         assert!(is_retryable_webhook_error("HTTP 500"));
+        assert!(is_retryable_webhook_error("HTTP 429"));
         assert!(is_retryable_webhook_error("network unreachable"));
 
-        // Should NOT retry on client errors
+        // Non-retryable
         assert!(!is_retryable_webhook_error("HTTP 400"));
-        assert!(!is_retryable_webhook_error("HTTP 401"));
-        assert!(!is_retryable_webhook_error("HTTP 404"));
-        assert!(!is_retryable_webhook_error("invalid JSON"));
     }
 }

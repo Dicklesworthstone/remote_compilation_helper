@@ -5,8 +5,11 @@
 use anyhow::{Context, Result};
 use rch_common::{RchConfig, SelfTestConfig, WorkerConfig, validate_remote_base};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
+
+const RCH_CONFIG_DIR_ENV: &str = "RCH_CONFIG_DIR";
 
 /// Default config directory name.
 const CONFIG_DIR_NAME: &str = "rch";
@@ -48,6 +51,10 @@ pub struct DaemonConfig {
     /// Worker cache cleanup settings.
     #[serde(default)]
     pub cache_cleanup: CacheCleanupConfig,
+
+    /// Stale per-job `.rch-target-*` directory reaper settings.
+    #[serde(default)]
+    pub stale_target_reap: StaleTargetReapConfig,
 
     /// Build queue settings.
     #[serde(default)]
@@ -102,7 +109,143 @@ impl Default for DaemonConfig {
             connection_pooling: true,
             log_level: "info".to_string(),
             cache_cleanup: CacheCleanupConfig::default(),
+            stale_target_reap: StaleTargetReapConfig::default(),
             queue: QueueConfig::default(),
+        }
+    }
+}
+
+/// Configuration for the daemon-side worker sweep that reaps *stale* per-job
+/// `.rch-target-*-job-*` / `.rch-target-*-pid-*` directories across **all**
+/// project dirs under each worker's `remote_base`.
+///
+/// This complements the orchestrator-hook reaper (which only reaps the single
+/// repo being built): orphaned per-job target dirs in repos nobody is currently
+/// rch-building accumulate forever otherwise. Ships **default-OFF** in this
+/// release: it is an autonomous periodic deleter pointed at `/data/projects`, the
+/// exact class of mechanism behind a prior fleet-wide carnage incident, so it is
+/// opt-in until canary-soaked (then the default may flip to ON). Enable with
+/// `enabled = true` or env `RCH_WORKER_REAP_ENABLE=1`; conservative thresholds
+/// apply once on (120-minute sweep interval, 12h idle floor).
+///
+/// `remote_base` is the **remote repo sync-root** — the directory rch rsyncs each
+/// repo into on the worker (`<sync-root>/<repo>`), with per-job target dirs
+/// landing directly inside as `<sync-root>/<repo>/.rch-target-*-job-*`. This is
+/// the canonical remote root from `[path_topology]` (the value
+/// `rch::hook::map_sync_root_to_remote_root` uses via `policy.canonical_root()`
+/// when translating a local repo path to its on-worker destination), NOT the
+/// `cache_cleanup`/`transfer` `/tmp/rch` base. It therefore defaults to
+/// [`rch_common::DEFAULT_CANONICAL_PROJECT_ROOT`] (`/data/projects`) so the sweep
+/// scans exactly where rch actually places per-job dirs and cannot drift.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleTargetReapConfig {
+    /// Enable the periodic worker-side stale-target sweep.
+    #[serde(default = "default_worker_reap_enabled")]
+    pub enabled: bool,
+
+    /// Sweep interval in minutes.
+    #[serde(default = "default_worker_reap_interval_mins")]
+    pub interval_mins: u64,
+
+    /// Idle threshold in hours: a per-job dir is reaped only if neither it nor any
+    /// descendant has been modified within this window. Floored at 1h.
+    #[serde(default = "default_worker_reap_idle_hours")]
+    pub idle_hours: u32,
+
+    /// Remote repo sync-root holding `<repo>/.rch-target-*-job-*` (the on-worker
+    /// destination rch rsyncs each repo into). Defaults to the canonical project
+    /// root (`/data/projects`); override only if your `[path_topology]`
+    /// `canonical_root` differs on the workers.
+    #[serde(default = "default_reaper_remote_base")]
+    pub remote_base: String,
+}
+
+fn default_worker_reap_enabled() -> bool {
+    // Default-OFF: opt-in until canary-soaked. This is an autonomous periodic
+    // deleter targeting /data/projects; do not auto-arm it fleet-wide in one
+    // release. Flip to `true` (and bump the release) after a soak.
+    false
+}
+
+fn default_worker_reap_interval_mins() -> u64 {
+    120
+}
+
+fn default_worker_reap_idle_hours() -> u32 {
+    12
+}
+
+/// Default scan base for the worker-side reaper: the remote repo sync-root where
+/// rch places per-job target dirs (`<sync-root>/<repo>/.rch-target-*-job-*`).
+///
+/// This is the canonical project root (`/data/projects`), the SAME value
+/// `rch::hook::map_sync_root_to_remote_root` resolves via `policy.canonical_root()`
+/// when picking the on-worker rsync destination — so the reaper tracks rch's real
+/// sync target and cannot drift. It is deliberately NOT the `/tmp/rch`
+/// `cache_cleanup`/`transfer` base (no per-job target dirs live there).
+fn default_reaper_remote_base() -> String {
+    rch_common::DEFAULT_CANONICAL_PROJECT_ROOT.to_string()
+}
+
+impl Default for StaleTargetReapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_worker_reap_enabled(),
+            interval_mins: default_worker_reap_interval_mins(),
+            idle_hours: default_worker_reap_idle_hours(),
+            remote_base: default_reaper_remote_base(),
+        }
+    }
+}
+
+impl StaleTargetReapConfig {
+    /// Apply environment-variable overrides, mirroring the hook's env knobs so
+    /// operators can tune the daemon sweep without editing config files.
+    ///
+    /// - `RCH_WORKER_REAP_DISABLE=1` (or `true`) force-disables the sweep.
+    /// - `RCH_WORKER_REAP_INTERVAL_MINS` overrides the sweep interval (min 1).
+    /// - `RCH_STALE_TARGET_REAP_HOURS` overrides the idle threshold (shared with
+    ///   the orchestrator reaper), floored at 1h.
+    pub fn with_env_overrides(mut self) -> Self {
+        // Opt-in enable (the feature ships default-OFF). Applied before DISABLE so
+        // that an explicit DISABLE always wins as the safety override.
+        if let Ok(v) = std::env::var("RCH_WORKER_REAP_ENABLE") {
+            let v = v.trim().to_ascii_lowercase();
+            if v == "1" || v == "true" || v == "yes" {
+                self.enabled = true;
+            }
+        }
+        if let Ok(v) = std::env::var("RCH_WORKER_REAP_DISABLE") {
+            let v = v.trim().to_ascii_lowercase();
+            if v == "1" || v == "true" || v == "yes" {
+                self.enabled = false;
+            }
+        }
+        if let Ok(v) = std::env::var("RCH_WORKER_REAP_INTERVAL_MINS")
+            && let Ok(mins) = v.trim().parse::<u64>()
+        {
+            self.interval_mins = mins.max(1);
+        }
+        if let Ok(v) = std::env::var("RCH_STALE_TARGET_REAP_HOURS")
+            && let Ok(hours) = v.trim().parse::<u32>()
+        {
+            self.idle_hours = hours.max(rch_common::stale_target_reap::MIN_IDLE_HOURS);
+        }
+        self
+    }
+
+    /// Build the reaper config from the central remediation config
+    /// (`remediation.pooled_target`) instead of this module's hardcoded defaults
+    /// (bd-28xs5). Env overrides ([`Self::with_env_overrides`]) still apply on
+    /// top of the result. The [`Default`] impl mirrors the central defaults; the
+    /// `drift_guard_stale_target_reap` test fails if the two ever diverge.
+    #[must_use]
+    pub fn from_remediation(rem: &rch_common::remediation_config::RemediationConfig) -> Self {
+        Self {
+            enabled: rem.pooled_target.reaper_enabled,
+            interval_mins: rem.pooled_target.reaper_interval_mins,
+            idle_hours: rem.pooled_target.reaper_idle_hours,
+            remote_base: rem.pooled_target.remote_base.clone(),
         }
     }
 }
@@ -158,7 +301,10 @@ fn default_idle_threshold() -> u64 {
 }
 
 fn default_remote_base() -> String {
-    "/tmp/rch".to_string()
+    // Must agree with rch_common::default_remote_base and reclaim.rs — the
+    // managed `/data/tmp` ephemeral-build zone, not RAM-backed /tmp. See
+    // rch_common::default_remote_base for the rationale.
+    "/data/tmp/rch".to_string()
 }
 
 impl Default for CacheCleanupConfig {
@@ -273,8 +419,22 @@ fn default_priority() -> u32 {
 
 /// Get the configuration directory path.
 pub fn config_dir() -> Option<PathBuf> {
+    if let Some(path) = config_dir_from_env_value(std::env::var_os(RCH_CONFIG_DIR_ENV).as_deref()) {
+        return Some(path);
+    }
+
     directories::ProjectDirs::from("com", "rch", CONFIG_DIR_NAME)
         .map(|dirs| dirs.config_dir().to_path_buf())
+}
+
+fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
+    let raw = value?;
+    if raw.is_empty() {
+        return None;
+    }
+
+    let expanded = shellexpand::tilde(&raw.to_string_lossy()).into_owned();
+    Some(PathBuf::from(expanded))
 }
 
 /// Load daemon configuration from file.
@@ -466,6 +626,39 @@ mod tests {
         assert_eq!(config.socket_path, expected_socket);
         assert_eq!(config.health_check_interval_secs, 30);
         assert!(config.connection_pooling);
+    }
+
+    /// Drift guard (bd-28xs5): the reaper config built from the central
+    /// `RemediationConfig` defaults must reproduce this module's own
+    /// `StaleTargetReapConfig::default()`. Fails if the central `pooled_target`
+    /// defaults diverge from the rchd reaper defaults.
+    #[test]
+    fn drift_guard_stale_target_reap() {
+        let _guard = test_guard!();
+        let from_cfg = StaleTargetReapConfig::from_remediation(
+            &rch_common::remediation_config::RemediationConfig::default(),
+        );
+        let runtime = StaleTargetReapConfig::default();
+        assert_eq!(from_cfg.enabled, runtime.enabled);
+        assert_eq!(from_cfg.interval_mins, runtime.interval_mins);
+        assert_eq!(from_cfg.idle_hours, runtime.idle_hours);
+        assert_eq!(from_cfg.remote_base, runtime.remote_base);
+    }
+
+    #[test]
+    fn test_config_dir_env_value_override() {
+        let _guard = test_guard!();
+        let path = config_dir_from_env_value(Some(OsStr::new("~/rch-daemon-config")));
+        assert_eq!(
+            path,
+            Some(PathBuf::from(format!(
+                "{}/rch-daemon-config",
+                std::env::var("HOME").expect("HOME should be set for tests")
+            )))
+        );
+
+        assert_eq!(config_dir_from_env_value(Some(OsStr::new(""))), None);
+        assert_eq!(config_dir_from_env_value(None), None);
     }
 
     #[test]

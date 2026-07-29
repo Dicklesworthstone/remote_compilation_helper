@@ -17,7 +17,12 @@ use std::sync::{Arc, Mutex};
 use crate::ErrorCode;
 
 /// Schema version for the RCH <-> repo_updater adapter contract.
-pub const REPO_UPDATER_CONTRACT_SCHEMA_VERSION: &str = "1.0.0";
+///
+/// Sourced from the central [`crate::schema_versions`] registry so cross-component
+/// drift is caught by the registry's pinned-snapshot test.
+pub const REPO_UPDATER_CONTRACT_SCHEMA_VERSION: &str = crate::schema_versions::current_version(
+    crate::schema_versions::SchemaComponent::RepoUpdaterContract,
+);
 /// Canonical projects root expected on workers.
 pub const REPO_UPDATER_CANONICAL_PROJECTS_ROOT: &str = "/data/projects";
 /// Required alias for compatibility with existing tooling.

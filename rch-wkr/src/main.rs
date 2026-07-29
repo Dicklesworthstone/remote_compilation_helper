@@ -18,7 +18,11 @@ use tracing::info;
 
 #[derive(Parser)]
 #[command(name = "rch-wkr")]
-#[command(author, version, about = "RCH worker agent - remote execution")]
+#[command(
+    author,
+    version = rch_common::build_version_value_static(),
+    about = "RCH worker agent - remote execution"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -385,7 +389,6 @@ fn print_system_info() {
 /// This function detects installed runtimes (Rust, Bun, Node.js, npm)
 /// and returns a WorkerCapabilities struct suitable for JSON serialization.
 fn probe_capabilities() -> WorkerCapabilities {
-    use std::path::Path;
     use std::process::Command;
 
     let mut capabilities = WorkerCapabilities::new();
@@ -399,21 +402,7 @@ fn probe_capabilities() -> WorkerCapabilities {
     }
 
     // Probe bun version
-    let bun_cmd = if let Ok(output) = Command::new("bun").args(["--version"]).output() {
-        Some(output)
-    } else {
-        // Fallback: try ~/.bun/bin/bun
-        if let Ok(home) = std::env::var("HOME") {
-            let bun_path = std::path::Path::new(&home).join(".bun/bin/bun");
-            if bun_path.exists() {
-                Command::new(bun_path).args(["--version"]).output().ok()
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
+    let bun_cmd = run_bun_version_command();
 
     if let Some(output) = bun_cmd
         && output.status.success()
@@ -442,6 +431,52 @@ fn probe_capabilities() -> WorkerCapabilities {
         }
     }
 
+    // Probe nix version. We require BOTH a working `nix --version` AND a
+    // populated `/nix/store`, since a `nix` binary alone (without a store) can't
+    // build derivations. This gates `nix build` / `nix develop -c` routing.
+    if nix_store_is_populated()
+        && let Ok(output) = Command::new("nix").args(["--version"]).output()
+        && output.status.success()
+    {
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !version.is_empty() {
+            capabilities.nix_version = Some(version);
+        }
+    }
+
+    // Probe Go toolchain. Presence gates `go build`/`go test`/`go vet` routing to
+    // this worker via `has_go()`.
+    if let Ok(output) = Command::new("go").args(["version"]).output()
+        && output.status.success()
+    {
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !version.is_empty() {
+            capabilities.go_version = Some(version);
+        }
+    }
+
+    // Probe the zig cross-compilation toolchain. Both halves are required: the
+    // `cargo-zigbuild` subcommand and the `zig` binary it drives as linker.
+    // Probed as the hyphenated binary because `cargo zigbuild --version` is
+    // rejected by cargo-zigbuild's own argument parser. Gates `cargo zigbuild`
+    // routing via `has_zig()`.
+    if let Ok(output) = Command::new("zig").args(["version"]).output()
+        && output.status.success()
+    {
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !version.is_empty() {
+            capabilities.zig_version = Some(version);
+        }
+    }
+    if let Ok(output) = Command::new("cargo-zigbuild").args(["--version"]).output()
+        && output.status.success()
+    {
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !version.is_empty() {
+            capabilities.cargo_zigbuild_version = Some(version);
+        }
+    }
+
     // Probe system health metrics (bd-3eaa)
     capabilities.num_cpus = probe_num_cpus();
     if let Some((load1, load5, load15)) = probe_load_average() {
@@ -454,10 +489,8 @@ fn probe_capabilities() -> WorkerCapabilities {
         capabilities.disk_total_gb = Some(total_gb);
     }
 
-    let (topology_ok, topology_issue) = probe_projects_topology(
-        Path::new(DEFAULT_CANONICAL_PROJECT_ROOT),
-        Path::new(DEFAULT_ALIAS_PROJECT_ROOT),
-    );
+    let (canonical_root, alias_root) = resolved_topology_roots();
+    let (topology_ok, topology_issue) = probe_projects_topology(&canonical_root, &alias_root);
     capabilities.projects_root_ok = Some(topology_ok);
     capabilities.projects_root_issue = topology_issue;
     capabilities.projects_root_checked_at_unix_ms = Some(current_unix_ms());
@@ -465,10 +498,78 @@ fn probe_capabilities() -> WorkerCapabilities {
     capabilities
 }
 
+/// Resolve the worker's topology roots, honoring `RCH_WKR_CANONICAL_ROOT` /
+/// `RCH_WKR_ALIAS_ROOT` (set in the worker's systemd unit or shell profile)
+/// and falling back to the compile-time defaults. Hosts that don't ship
+/// `/data/projects` + `/dp` need this so capability probes don't always
+/// report `projects_root_ok = false` and get excluded by daemon preflight.
+/// See rch#15.
+fn resolved_topology_roots() -> (std::path::PathBuf, std::path::PathBuf) {
+    resolve_topology_roots_from_env(
+        std::env::var_os("RCH_WKR_CANONICAL_ROOT"),
+        std::env::var_os("RCH_WKR_ALIAS_ROOT"),
+    )
+}
+
+fn resolve_topology_roots_from_env(
+    canonical_env: Option<std::ffi::OsString>,
+    alias_env: Option<std::ffi::OsString>,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let canonical = canonical_env
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_CANONICAL_PROJECT_ROOT));
+    let alias = alias_env
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_ALIAS_PROJECT_ROOT));
+    (canonical, alias)
+}
+
+/// Whether `/nix/store` exists and contains at least one entry.
+///
+/// A `nix` binary without a populated store cannot actually build derivations
+/// (every build resolves store paths), so capability detection requires both.
+/// This is a cheap directory read — we only need to know that SOME entry exists,
+/// so we stop at the first one.
+fn nix_store_is_populated() -> bool {
+    std::fs::read_dir("/nix/store")
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .is_some()
+}
+
+fn run_bun_version_command() -> Option<std::process::Output> {
+    if let Ok(output) = std::process::Command::new("bun")
+        .args(["--version"])
+        .output()
+    {
+        return Some(output);
+    }
+
+    let mut command = std::process::Command::new("bun");
+    if let Some(path) = path_with_home_bun_bin(std::env::var_os("HOME"), std::env::var_os("PATH")) {
+        command.env("PATH", path);
+    }
+    command.args(["--version"]).output().ok()
+}
+
+fn path_with_home_bun_bin(
+    home: Option<std::ffi::OsString>,
+    current_path: Option<std::ffi::OsString>,
+) -> Option<std::ffi::OsString> {
+    let home = home.filter(|value| !value.is_empty())?;
+    let mut paths = vec![std::path::PathBuf::from(home).join(".bun/bin")];
+    if let Some(current_path) = current_path {
+        paths.extend(std::env::split_paths(&current_path));
+    }
+    std::env::join_paths(paths).ok()
+}
+
 fn current_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or_default()
 }
 
@@ -516,7 +617,7 @@ fn probe_projects_topology(
 
     let canonical_real =
         std::fs::canonicalize(canonical_root).unwrap_or_else(|_| canonical_root.to_path_buf());
-    let target_real = std::fs::canonicalize(&resolved_target).unwrap_or(resolved_target.clone());
+    let target_real = std::fs::canonicalize(&resolved_target).unwrap_or(resolved_target);
     if canonical_real != target_real {
         return (
             false,
@@ -577,16 +678,14 @@ fn probe_load_average() -> Option<(f64, f64, f64)> {
 /// Probe disk space for project workspace filesystem (free and total in GB).
 ///
 /// We intentionally prefer the project roots because /tmp may be a small tmpfs
-/// on some workers and can produce false pressure signals.
+/// on some workers and can produce false pressure signals. Roots honor
+/// `RCH_WKR_CANONICAL_ROOT` / `RCH_WKR_ALIAS_ROOT` (see rch#15).
 fn probe_disk_space() -> Option<(f64, f64)> {
     use std::path::Path;
-    [
-        Path::new(DEFAULT_CANONICAL_PROJECT_ROOT),
-        Path::new(DEFAULT_ALIAS_PROJECT_ROOT),
-        Path::new("/tmp"),
-    ]
-    .iter()
-    .find_map(|path| probe_disk_space_for(path))
+    let (canonical, alias) = resolved_topology_roots();
+    [canonical.as_path(), alias.as_path(), Path::new("/tmp")]
+        .iter()
+        .find_map(|path| probe_disk_space_for(path))
 }
 
 fn probe_disk_space_for(path: &std::path::Path) -> Option<(f64, f64)> {
@@ -643,13 +742,13 @@ fn parse_nproc_stdout(stdout: &str) -> Option<u32> {
 
 fn parse_proc_loadavg(contents: &str) -> Option<(f64, f64, f64)> {
     let parts: Vec<&str> = contents.split_whitespace().collect();
-    if parts.len() < 3 {
+    let [load1, load5, load15, ..] = parts.as_slice() else {
         return None;
-    }
+    };
 
-    let load1 = parts[0].parse::<f64>().ok()?;
-    let load5 = parts[1].parse::<f64>().ok()?;
-    let load15 = parts[2].parse::<f64>().ok()?;
+    let load1 = load1.parse::<f64>().ok()?;
+    let load5 = load5.parse::<f64>().ok()?;
+    let load15 = load15.parse::<f64>().ok()?;
     Some((load1, load5, load15))
 }
 
@@ -668,13 +767,13 @@ fn parse_uptime_loadavg(output: &str) -> Option<(f64, f64, f64)> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    if parts.len() < 3 {
+    let [load1, load5, load15, ..] = parts.as_slice() else {
         return None;
-    }
+    };
 
-    let load1 = parts[0].parse::<f64>().ok()?;
-    let load5 = parts[1].parse::<f64>().ok()?;
-    let load15 = parts[2].parse::<f64>().ok()?;
+    let load1 = load1.parse::<f64>().ok()?;
+    let load5 = load5.parse::<f64>().ok()?;
+    let load15 = load15.parse::<f64>().ok()?;
     Some((load1, load5, load15))
 }
 
@@ -683,12 +782,12 @@ fn parse_df_posix_kb(stdout: &str) -> Option<(u64, u64)> {
     // POSIX format: Filesystem 1024-blocks Used Available Capacity Mounted on
     for line in stdout.lines().skip(1) {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 4 {
-            // parts[1] = total 1K blocks, parts[3] = available 1K blocks
-            let total_kb = parts[1].parse::<u64>().ok()?;
-            let avail_kb = parts[3].parse::<u64>().ok()?;
-            return Some((total_kb, avail_kb));
-        }
+        let [_, total_kb, _, avail_kb, ..] = parts.as_slice() else {
+            continue;
+        };
+        let total_kb = total_kb.parse::<u64>().ok()?;
+        let avail_kb = avail_kb.parse::<u64>().ok()?;
+        return Some((total_kb, avail_kb));
     }
     None
 }
@@ -696,25 +795,10 @@ fn parse_df_posix_kb(stdout: &str) -> Option<(u64, u64)> {
 async fn run_benchmark(format: OutputFormat) -> Result<()> {
     info!("Running benchmark...");
 
-    // Create a simple benchmark project with a unique name
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temp_dir = std::env::temp_dir().join(format!("rch-benchmark-{}", timestamp));
-    std::fs::create_dir_all(&temp_dir)?;
-
-    // RAII guard: any early return via `?` below (write failures, spawn
-    // failures) would previously skip the trailing `remove_dir_all` and
-    // leak the temp build tree. Benchmarks run on every worker selection
-    // round, so that leak compounds over a long-running daemon.
-    struct DirGuard(std::path::PathBuf);
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let _cleanup = DirGuard(temp_dir.clone());
+    let temp_dir = tempfile::Builder::new()
+        .prefix("rch-benchmark-")
+        .tempdir()?;
+    let temp_path = temp_dir.path();
 
     // Write a simple Rust project
     let cargo_toml = r#"
@@ -725,7 +809,7 @@ edition = "2021"
 
 [dependencies]
 "#;
-    std::fs::write(temp_dir.join("Cargo.toml"), cargo_toml)?;
+    std::fs::write(temp_path.join("Cargo.toml"), cargo_toml)?;
 
     let main_rs = r#"
 fn main() {
@@ -733,14 +817,14 @@ fn main() {
     println!("Sum: {}", sum);
 }
 "#;
-    std::fs::create_dir_all(temp_dir.join("src"))?;
-    std::fs::write(temp_dir.join("src/main.rs"), main_rs)?;
+    std::fs::create_dir_all(temp_path.join("src"))?;
+    std::fs::write(temp_path.join("src/main.rs"), main_rs)?;
 
     // Time the build
     let start = std::time::Instant::now();
     let output = std::process::Command::new("cargo")
         .args(["build", "--release"])
-        .current_dir(&temp_dir)
+        .current_dir(temp_path)
         .output()?;
 
     let elapsed = start.elapsed();
@@ -761,13 +845,40 @@ fn main() {
             }
         }
     } else {
-        println!(
+        anyhow::bail!(
             "Benchmark failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            benchmark_failure_summary(&output.stdout, &output.stderr)
         );
     }
 
     Ok(())
+}
+
+fn benchmark_failure_summary(stdout: &[u8], stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return truncate_for_error(&stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return truncate_for_error(&stdout);
+    }
+
+    "cargo build exited unsuccessfully without output".to_string()
+}
+
+fn truncate_for_error(message: &str) -> String {
+    const MAX_LEN: usize = 2048;
+    if message.len() <= MAX_LEN {
+        return message.to_string();
+    }
+
+    let mut end = MAX_LEN;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &message[..end])
 }
 
 #[cfg(test)]
@@ -790,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_parses_execute_with_toolchain() {
+    fn test_cli_parses_execute_with_toolchain() -> Result<()> {
         let _guard = test_guard!();
         println!("TEST START: test_cli_parses_execute_with_toolchain");
         let cli = Cli::try_parse_from([
@@ -807,33 +918,32 @@ mod tests {
         .expect("cli parse should succeed");
 
         assert!(cli.verbose);
-        match cli.command {
-            Commands::Execute {
-                workdir,
-                command,
-                toolchain,
-            } => {
-                assert_eq!(workdir, "/tmp");
-                assert_eq!(command, "echo hello");
-                assert_eq!(toolchain.as_deref(), Some("nightly"));
-            }
-            _ => panic!("expected execute command"),
-        }
+        let Commands::Execute {
+            workdir,
+            command,
+            toolchain,
+        } = cli.command
+        else {
+            anyhow::bail!("expected execute command");
+        };
+        assert_eq!(workdir, "/tmp");
+        assert_eq!(command, "echo hello");
+        assert_eq!(toolchain.as_deref(), Some("nightly"));
         println!("TEST PASS: test_cli_parses_execute_with_toolchain");
+        Ok(())
     }
 
     #[test]
-    fn test_cli_parses_cleanup_default_age() {
+    fn test_cli_parses_cleanup_default_age() -> Result<()> {
         let _guard = test_guard!();
         println!("TEST START: test_cli_parses_cleanup_default_age");
         let cli = Cli::try_parse_from(["rch-wkr", "cleanup"]).expect("cli parse should succeed");
-        match cli.command {
-            Commands::Cleanup { max_age_hours } => {
-                assert_eq!(max_age_hours, 168);
-            }
-            _ => panic!("expected cleanup command"),
-        }
+        let Commands::Cleanup { max_age_hours } = cli.command else {
+            anyhow::bail!("expected cleanup command");
+        };
+        assert_eq!(max_age_hours, 168);
         println!("TEST PASS: test_cli_parses_cleanup_default_age");
+        Ok(())
     }
 
     #[test]
@@ -901,6 +1011,27 @@ mod tests {
         println!("TEST PASS: test_parse_df_posix_kb_parses_total_and_available");
     }
 
+    #[test]
+    fn test_benchmark_failure_summary_prefers_stderr() {
+        let _guard = test_guard!();
+        let summary = benchmark_failure_summary(b"stdout detail", b"stderr detail");
+        assert_eq!(summary, "stderr detail");
+    }
+
+    #[test]
+    fn test_benchmark_failure_summary_falls_back_to_stdout() {
+        let _guard = test_guard!();
+        let summary = benchmark_failure_summary(b"stdout detail", b"");
+        assert_eq!(summary, "stdout detail");
+    }
+
+    #[test]
+    fn test_benchmark_failure_summary_handles_empty_output() {
+        let _guard = test_guard!();
+        let summary = benchmark_failure_summary(b"", b"");
+        assert_eq!(summary, "cargo build exited unsuccessfully without output");
+    }
+
     fn make_temp_topology_paths(
         test_name: &str,
     ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
@@ -918,6 +1049,28 @@ mod tests {
         let alias = base.join("dp");
         std::fs::create_dir_all(&canonical).expect("create canonical root");
         (base, canonical, alias)
+    }
+
+    #[test]
+    fn test_path_with_home_bun_bin_prepends_standard_bun_install_dir() {
+        let _guard = test_guard!();
+        let path = path_with_home_bun_bin(
+            Some(std::ffi::OsString::from("/home/tester")),
+            Some(std::ffi::OsString::from("/usr/bin:/bin")),
+        )
+        .expect("path should be built");
+
+        let paths: Vec<std::path::PathBuf> = std::env::split_paths(&path).collect();
+        assert_eq!(paths[0], std::path::PathBuf::from("/home/tester/.bun/bin"));
+        assert!(paths.contains(&std::path::PathBuf::from("/usr/bin")));
+        assert!(paths.contains(&std::path::PathBuf::from("/bin")));
+    }
+
+    #[test]
+    fn test_path_with_home_bun_bin_ignores_empty_home() {
+        let _guard = test_guard!();
+        assert!(path_with_home_bun_bin(Some(std::ffi::OsString::new()), None).is_none());
+        assert!(path_with_home_bun_bin(None, None).is_none());
     }
 
     #[cfg(unix)]
@@ -959,6 +1112,34 @@ mod tests {
         assert_eq!(issue.as_deref(), Some("canonical_missing"));
 
         std::fs::remove_dir_all(&base).expect("cleanup temp topology");
+    }
+
+    #[test]
+    fn test_resolve_topology_roots_from_env_uses_overrides() {
+        let _guard = test_guard!();
+        let canonical_override = std::ffi::OsString::from("/worker/projects");
+        let alias_override = std::ffi::OsString::from("/worker/dp");
+
+        let (canonical, alias) = resolve_topology_roots_from_env(
+            Some(canonical_override.clone()),
+            Some(alias_override.clone()),
+        );
+
+        assert_eq!(canonical, std::path::PathBuf::from(canonical_override));
+        assert_eq!(alias, std::path::PathBuf::from(alias_override));
+    }
+
+    #[test]
+    fn test_resolve_topology_roots_from_env_falls_back_for_empty_values() {
+        let _guard = test_guard!();
+        let (canonical, alias) =
+            resolve_topology_roots_from_env(None, Some(std::ffi::OsString::new()));
+
+        assert_eq!(
+            canonical,
+            std::path::PathBuf::from(DEFAULT_CANONICAL_PROJECT_ROOT)
+        );
+        assert_eq!(alias, std::path::PathBuf::from(DEFAULT_ALIAS_PROJECT_ROOT));
     }
 
     #[cfg(unix)]
@@ -1010,11 +1191,4 @@ mod tests {
 
         std::fs::remove_dir_all(&base).expect("cleanup temp topology");
     }
-}
-
-// Global test logging initialization - enables JSONL output for all unit tests
-#[cfg(test)]
-#[ctor::ctor]
-fn init_test_logging() {
-    rch_common::testing::init_global_test_logging();
 }

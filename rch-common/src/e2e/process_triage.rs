@@ -8,7 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// Stable schema version for the process-triage integration contract.
-pub const PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION: &str = "1.0.0";
+///
+/// Sourced from the central [`crate::schema_versions`] registry so cross-component
+/// drift is caught by the registry's pinned-snapshot test.
+pub const PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION: &str = crate::schema_versions::current_version(
+    crate::schema_versions::SchemaComponent::ProcessTriageContract,
+);
 
 /// Stable command surface for invoking the process-triage adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

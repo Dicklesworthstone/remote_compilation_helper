@@ -92,13 +92,64 @@ pub fn config_doctor(ctx: &OutputContext) -> Result<()> {
     check_file_permissions(&mut diagnostics);
 
     // Check 6: Daemon status
-    check_daemon_status(&mut diagnostics);
+    check_daemon_status(&config, &mut diagnostics);
+
+    // Check 7: Remediation knobs (bd-...remediation-ocv9i.17.2)
+    check_remediation_config(&config, &mut diagnostics);
 
     output_doctor_results(ctx, diagnostics)
 }
 
+/// Check 7: validate the central remediation knobs
+/// (bd-...remediation-ocv9i.17.2).
+///
+/// Maps each `RemediationConfig::validate()` finding to a doctor diagnostic so
+/// unsafe, contradictory, or out-of-range remediation settings are reported
+/// here with a concrete next step. When everything validates, emit one Info so
+/// operators can see the section was checked (defaults apply where unset).
+fn check_remediation_config(config: &RchConfig, diagnostics: &mut Vec<DoctorDiagnostic>) {
+    let issues = config.remediation.validate();
+    if issues.is_empty() {
+        diagnostics.push(DoctorDiagnostic {
+            severity: DoctorSeverity::Info,
+            code: "DOC-I100".to_string(),
+            message: "Remediation settings are valid".to_string(),
+            detail: Some(
+                "All [remediation] knobs are within safe ranges (defaults apply where unset)."
+                    .to_string(),
+            ),
+            remediation: None,
+        });
+        return;
+    }
+    for issue in issues {
+        let (severity, code) = match issue.severity {
+            rch_common::remediation_config::IssueSeverity::Error => {
+                (DoctorSeverity::Error, "DOC-E100")
+            }
+            rch_common::remediation_config::IssueSeverity::Warning => {
+                (DoctorSeverity::Warning, "DOC-W100")
+            }
+        };
+        diagnostics.push(DoctorDiagnostic {
+            severity,
+            code: code.to_string(),
+            message: format!("{}: {}", issue.field, issue.message),
+            detail: None,
+            remediation: Some(format!(
+                "Adjust `{}` under [remediation] (or the matching RCH_REMEDIATION_* env var).",
+                issue.field
+            )),
+        });
+    }
+}
+
+fn configured_socket_path(config: &RchConfig) -> PathBuf {
+    PathBuf::from(shellexpand::tilde(&config.general.socket_path).into_owned())
+}
+
 fn check_socket_path(config: &RchConfig, diagnostics: &mut Vec<DoctorDiagnostic>) {
-    let socket_path = PathBuf::from(&config.general.socket_path);
+    let socket_path = configured_socket_path(config);
 
     // Check if parent directory exists and is writable
     if let Some(parent) = socket_path.parent() {
@@ -334,14 +385,8 @@ fn check_file_permissions(diagnostics: &mut Vec<DoctorDiagnostic>) {
     }
 }
 
-fn check_daemon_status(diagnostics: &mut Vec<DoctorDiagnostic>) {
-    // Try to connect to daemon socket
-    let config = match config::load_config() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let socket_path = PathBuf::from(&config.general.socket_path);
+fn check_daemon_status(config: &RchConfig, diagnostics: &mut Vec<DoctorDiagnostic>) {
+    let socket_path = configured_socket_path(config);
 
     #[cfg(unix)]
     {
@@ -485,4 +530,20 @@ fn output_doctor_results(ctx: &OutputContext, diagnostics: Vec<DoctorDiagnostic>
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_socket_path_expands_tilde() {
+        let mut config = RchConfig::default();
+        config.general.socket_path = "~/rch-config-doctor.sock".to_string();
+
+        let socket_path = configured_socket_path(&config);
+
+        assert_ne!(socket_path, PathBuf::from("~/rch-config-doctor.sock"));
+        assert!(socket_path.ends_with("rch-config-doctor.sock"));
+    }
 }

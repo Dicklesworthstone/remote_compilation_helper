@@ -34,6 +34,14 @@ env:
   CARGO_TERM_COLOR: always
   # Reduce network retries for faster failure
   CARGO_NET_RETRY: 2
+  # Pin the toolchain at the env level so that *every* `cargo` invocation in
+  # this workflow uses nightly-2026-06-06 — the version dtolnay/rust-toolchain
+  # installs (with the per-job `targets:`) below. Without this, the in-repo
+  # rust-toolchain.toml (channel = "nightly") would redirect cargo to the
+  # *latest* nightly, which doesn't have the per-target stdlib installed → all
+  # release jobs fail with `can't find crate for \`core\``. RUSTUP_TOOLCHAIN
+  # takes precedence over both rust-toolchain.toml and `rustup override`.
+  RUSTUP_TOOLCHAIN: nightly-2026-06-06
 
 jobs:
   # Validate tag and plan the release
@@ -61,8 +69,8 @@ jobs:
             exit 1
           fi
 
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Building release for tag: $TAG (version: $VERSION)"
 
   # Build for Linux x86_64 (GNU libc)
@@ -72,14 +80,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Clone rich_rust dependency
-        run: |
-          sudo mkdir -p /dp
-          sudo chown "$(id -un)" /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
           targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
         with:
@@ -107,14 +110,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Clone rich_rust dependency
-        run: |
-          sudo mkdir -p /dp
-          sudo chown "$(id -un)" /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
           targets: x86_64-unknown-linux-musl
       - name: Install musl-tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -144,14 +142,9 @@ jobs:
     timeout-minutes: 30  # Faster with native compilation
     steps:
       - uses: actions/checkout@v4
-      - name: Clone rich_rust dependency
-        run: |
-          sudo mkdir -p /dp
-          sudo chown "$(id -un)" /dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
         with:
@@ -178,14 +171,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Clone rich_rust dependency
-        run: |
-          mkdir -p /tmp/dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /tmp/dp/rich_rust
-          sudo ln -sf /tmp/dp /dp 2>/dev/null || true
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
           targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
@@ -212,14 +200,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Clone rich_rust dependency
-        run: |
-          mkdir -p /tmp/dp
-          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /tmp/dp/rich_rust
-          sudo ln -sf /tmp/dp /dp 2>/dev/null || true
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
@@ -248,7 +231,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
         with:
@@ -278,9 +261,17 @@ jobs:
       - build-linux-x86_64
       - build-linux-x86_64-musl
       - build-linux-aarch64
-      - build-macos-x86_64
       - build-macos-aarch64
-      - build-windows-x86_64
+      # Intentionally NOT in publish.needs:
+      # - build-windows-x86_64: pre-existing compile errors in rch
+      #   (E0282/E0425/E0432/E0433/E0599), unrelated to the rest of the
+      #   workspace; fleet doesn't target Windows.
+      # - build-macos-x86_64: GitHub-hosted macos-13 (Intel) runner pool
+      #   has been queuing 20+ minutes per attempt, blocking the release
+      #   indefinitely. The fleet's only Mac is Apple Silicon (aarch64),
+      #   covered by build-macos-aarch64 above. The job still runs and its
+      #   artifact will upload if it eventually gets a runner.
+      # Re-add either when the corresponding build is reliable again.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -300,9 +291,18 @@ jobs:
         run: |
           cd artifacts
           # Combine all individual checksum files
-          cat *.sha256 | sort > checksums.txt
+          cat ./*.sha256 | sort > checksums.txt
           echo "=== checksums.txt ==="
           cat checksums.txt
+
+      # Fail BEFORE publishing if any required target triple's archive +
+      # checksum is missing, so an incomplete release is never created. This is
+      # the prevention gate for rch#23 (a target the installer/updater asks for
+      # but the release never shipped). The REQUIRED set mirrors publish.needs.
+      - name: Gate — required release assets present (pre-publish)
+        run: |
+          chmod +x scripts/check_release_assets.sh
+          ./scripts/check_release_assets.sh --dir artifacts --tag "${{ needs.plan.outputs.tag }}"
 
       # SLSA Level 3 provenance attestation for supply chain security
       - name: Generate SLSA provenance
@@ -321,7 +321,7 @@ jobs:
           syft dir:. -o spdx-json > artifacts/sbom.spdx.json
           syft dir:. -o cyclonedx-json > artifacts/sbom.cdx.json
           echo "Generated SBOMs:"
-          ls -la artifacts/sbom.*
+          find artifacts -maxdepth 1 -name 'sbom.*' -exec ls -la {} +
 
       # Sigstore signing for additional verification
       - name: Install cosign
@@ -330,14 +330,19 @@ jobs:
       - name: Sign release artifacts with Sigstore
         run: |
           cd artifacts
-          for f in rch-*.tar.gz rch-*.zip; do
+          for f in ./rch-*.tar.gz ./rch-*.zip; do
             if [[ -f "$f" ]]; then
               echo "Signing $f..."
               cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
             fi
           done
           echo "=== Sigstore bundles created ==="
-          ls -la *.sigstore.json 2>/dev/null || echo "No bundles created"
+          signed_bundle=$(find . -maxdepth 1 -name '*.sigstore.json' -print -quit)
+          if [[ -n "$signed_bundle" ]]; then
+            find . -maxdepth 1 -name '*.sigstore.json' -exec ls -la {} +
+          else
+            echo "No bundles created"
+          fi
 
       # Bundle the Claude Code skill for installation
       - name: Bundle skill
@@ -421,7 +426,6 @@ jobs:
           Write-Host ""
           Write-Host "Installed binaries:" -ForegroundColor Cyan
           Write-Host "  - $InstallDir\rch.exe     (client CLI)"
-          Write-Host "  - $InstallDir\rchd.exe    (daemon)"
           Write-Host "  - $InstallDir\rch-wkr.exe (worker)"
           Write-Host ""
 
@@ -442,14 +446,6 @@ jobs:
       - name: Generate release notes
         id: release_notes
         run: |
-          # Get commits since last tag
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          if [ -n "$PREV_TAG" ]; then
-            COMMITS=$(git log --oneline "$PREV_TAG..HEAD" | head -20)
-          else
-            COMMITS=$(git log --oneline -20)
-          fi
-
           cat > release_notes.md << EOF
           ## What's Changed
 
@@ -533,18 +529,30 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Belt-and-suspenders: assert the LIVE published release actually contains
+      # every required archive + checksum (catches the release-upload action
+      # itself dropping a file after the pre-publish gate passed).
+      - name: Gate — published release assets present (post-publish)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x scripts/check_release_assets.sh
+          ./scripts/check_release_assets.sh --gh-release "${{ needs.plan.outputs.tag }}"
+
       - name: Summary
         run: |
-          echo "## Release Published Successfully" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Tag:** ${{ needs.plan.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** ${{ needs.plan.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          ls -1 artifacts/ | while read f; do
-            echo "- \`$f\`" >> $GITHUB_STEP_SUMMARY
-          done
+          {
+            echo "## Release Published Successfully"
+            echo ""
+            echo "**Tag:** ${{ needs.plan.outputs.tag }}"
+            echo "**Version:** ${{ needs.plan.outputs.version }}"
+            echo ""
+            echo "### Artifacts"
+            echo ""
+            find artifacts -maxdepth 1 -type f -printf '%f\n' | sort | while IFS= read -r f; do
+              echo "- \`$f\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Publish rch-common to crates.io (library crate only)
   # Binary crates are not published - users install via GitHub releases
@@ -558,12 +566,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Note: rich_rust is only needed for default features (rich-ui)
-      # We publish with --no-default-features so no local dependencies needed
-
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
 
       - name: Verify version matches tag
         run: |
@@ -615,10 +620,12 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          echo "## Crates.io Publish" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [[ -n "${CARGO_REGISTRY_TOKEN:-}" ]]; then
-            echo "✅ Published or confirmed rch-common v${{ needs.plan.outputs.version }} on crates.io" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "⚠️ Skipped - CARGO_REGISTRY_TOKEN not configured" >> $GITHUB_STEP_SUMMARY
-          fi
+          {
+            echo "## Crates.io Publish"
+            echo ""
+            if [[ -n "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+              echo "✅ Published or confirmed rch-common v${{ needs.plan.outputs.version }} on crates.io"
+            else
+              echo "⚠️ Skipped - CARGO_REGISTRY_TOKEN not configured"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -69,7 +69,9 @@ impl Default for ReclaimConfig {
             timeout: Duration::from_secs(120),
             min_idle_minutes: 10,
             protected_prefixes: vec![],
-            remote_base: "/tmp/rch".to_string(),
+            // Must agree with rch_common::default_remote_base and the rchd
+            // cache-cleanup default — the managed `/data/tmp` zone, not /tmp.
+            remote_base: "/data/tmp/rch".to_string(),
         }
     }
 }
@@ -231,9 +233,9 @@ fn build_reclaim_command(
     };
 
     let remove_action = if dry_run {
-        "dry_removed=$((dry_removed + 1))"
+        "dry_removed=$((dry_removed + 1)); freed_kb=$((freed_kb + size_kb))"
     } else {
-        "rm -rf \"$dir\" 2>/dev/null || true; removed=$((removed + 1))"
+        "if rm -rf \"$dir\" 2>/dev/null; then removed=$((removed + 1)); freed_kb=$((freed_kb + size_kb)); else remove_errors=$((remove_errors + 1)); fi"
     };
 
     format!(
@@ -243,10 +245,10 @@ fn build_reclaim_command(
          max_dirs={max_dirs}; \
          max_freed_kb={max_freed_kb}; \
          threshold_kb={threshold_kb}; \
-         if [ ! -d \"$base\" ]; then echo 'RCH_RECLAIM_METRICS removed=0 dry_removed=0 freed_kb=0 before_kb=0 after_kb=0 candidates=0 protected=0'; exit 0; fi; \
+         if [ ! -d \"$base\" ]; then echo 'RCH_RECLAIM_METRICS removed=0 dry_removed=0 freed_kb=0 before_kb=0 after_kb=0 candidates=0 protected=0 remove_errors=0'; exit 0; fi; \
          before_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          if [ -z \"$before_kb\" ]; then before_kb=0; fi; \
-         removed=0; dry_removed=0; freed_kb=0; candidates=0; protected=0; \
+         removed=0; dry_removed=0; freed_kb=0; candidates=0; protected=0; remove_errors=0; \
          tmpfile=$(mktemp /tmp/rch-reclaim.XXXXXX); \
          find \"$base\" -mindepth 2 -maxdepth 2 -type d -printf '%T@ %p\\n' 2>/dev/null \
            | sort -n | sed 's/^[^ ]* //' > \"$tmpfile\"; \
@@ -261,7 +263,6 @@ fn build_reclaim_command(
            size_kb=$(du -sk \"$dir\" 2>/dev/null | awk '{{print $1}}'); \
            if [ -z \"$size_kb\" ]; then size_kb=0; fi; \
            {remove_action}; \
-           freed_kb=$((freed_kb + size_kb)); \
            if [ $((removed + dry_removed)) -ge \"$max_dirs\" ]; then break; fi; \
            if [ \"$freed_kb\" -ge \"$max_freed_kb\" ]; then break; fi; \
            current_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
@@ -270,8 +271,9 @@ fn build_reclaim_command(
          rm -f \"$tmpfile\"; \
          after_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          if [ -z \"$after_kb\" ]; then after_kb=0; fi; \
-         printf 'RCH_RECLAIM_METRICS removed=%s dry_removed=%s freed_kb=%s before_kb=%s after_kb=%s candidates=%s protected=%s\\n' \
-           \"$removed\" \"$dry_removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$candidates\" \"$protected\"",
+         printf 'RCH_RECLAIM_METRICS removed=%s dry_removed=%s freed_kb=%s before_kb=%s after_kb=%s candidates=%s protected=%s remove_errors=%s\\n' \
+           \"$removed\" \"$dry_removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$candidates\" \"$protected\" \"$remove_errors\"; \
+         if [ \"$remove_errors\" -gt 0 ]; then exit 1; fi",
         base = escaped_base,
         min_idle_minutes = min_idle_minutes,
         max_dirs = max_dirs,
@@ -292,6 +294,7 @@ struct ReclaimMetrics {
     free_after_gb: f64,
     candidates: u32,
     protected: u32,
+    remove_errors: u32,
 }
 
 fn parse_reclaim_metrics(stdout: &str) -> Option<ReclaimMetrics> {
@@ -304,6 +307,7 @@ fn parse_reclaim_metrics(stdout: &str) -> Option<ReclaimMetrics> {
     let mut after_kb = None;
     let mut candidates = None;
     let mut protected = None;
+    let mut remove_errors = None;
 
     for token in line.split_whitespace().skip(1) {
         // Skip malformed tokens rather than aborting the whole line.
@@ -320,6 +324,7 @@ fn parse_reclaim_metrics(stdout: &str) -> Option<ReclaimMetrics> {
             "after_kb" => after_kb = value.parse::<u64>().ok(),
             "candidates" => candidates = value.parse::<u32>().ok(),
             "protected" => protected = value.parse::<u32>().ok(),
+            "remove_errors" => remove_errors = value.parse::<u32>().ok(),
             _ => {}
         }
     }
@@ -332,6 +337,7 @@ fn parse_reclaim_metrics(stdout: &str) -> Option<ReclaimMetrics> {
         free_after_gb: after_kb.unwrap_or(0) as f64 / (1024.0 * 1024.0),
         candidates: candidates.unwrap_or(0),
         protected: protected.unwrap_or(0),
+        remove_errors: remove_errors.unwrap_or(0),
     })
 }
 
@@ -345,6 +351,7 @@ pub struct ReclaimExecutor {
     history: Arc<BuildHistory>,
     config: ReclaimConfig,
     ssh_options: SshOptions,
+    ssh_pool: Option<Arc<rch_common::SshPool>>,
 }
 
 impl ReclaimExecutor {
@@ -355,7 +362,34 @@ impl ReclaimExecutor {
             history,
             config,
             ssh_options: SshOptions::default(),
+            ssh_pool: None,
         }
+    }
+
+    /// Attach a shared SSH connection pool for warm ControlMaster reuse.
+    #[must_use]
+    pub fn with_ssh_pool(mut self, pool: Option<Arc<rch_common::SshPool>>) -> Self {
+        self.ssh_pool = pool;
+        self
+    }
+
+    /// Run one remote command against a worker, using the shared pool (warm
+    /// master reuse) when configured, otherwise a throwaway SSH session.
+    async fn run_remote(
+        &self,
+        config: &rch_common::WorkerConfig,
+        command: &str,
+    ) -> anyhow::Result<rch_common::CommandResult> {
+        if let Some(pool) = &self.ssh_pool {
+            return pool
+                .run_with_timeout(config, command, self.ssh_options.command_timeout)
+                .await;
+        }
+        let mut ssh_client = SshClient::new(config.clone(), self.ssh_options.clone());
+        ssh_client.connect().await?;
+        let result = ssh_client.execute(command).await;
+        let _ = ssh_client.disconnect().await;
+        result
     }
 
     /// Evaluate and optionally execute reclaim on a single worker.
@@ -492,18 +526,16 @@ impl ReclaimExecutor {
             "Starting reclaim operation"
         );
 
-        let mut ssh_client = SshClient::new(config.clone(), self.ssh_options.clone());
-        ssh_client.connect().await?;
-
-        let result = ssh_client.execute(&cmd).await?;
+        let result = self.run_remote(&config, &cmd).await?;
         let duration = start.elapsed();
 
         let metrics = parse_reclaim_metrics(&result.stdout);
 
         if result.exit_code != 0 {
             let error_msg = format!(
-                "Reclaim command failed: exit={} stderr={}",
+                "Reclaim command failed: exit={} remove_errors={} stderr={}",
                 result.exit_code,
+                metrics.as_ref().map(|m| m.remove_errors).unwrap_or(0),
                 result.stderr.trim()
             );
             warn!(
@@ -812,8 +844,12 @@ mod tests {
         // Budget limits
         assert!(cmd.contains("max_dirs=50"));
         assert!(cmd.contains("max_freed_kb=51200"));
+        assert!(cmd.contains("if rm -rf \"$dir\""));
+        assert!(cmd.contains("remove_errors=$((remove_errors + 1))"));
+        assert!(cmd.contains("if [ \"$remove_errors\" -gt 0 ]; then exit 1; fi"));
         // Metrics marker
         assert!(cmd.contains("RCH_RECLAIM_METRICS"));
+        assert!(cmd.contains("remove_errors"));
     }
 
     #[test]
@@ -866,7 +902,7 @@ mod tests {
     #[test]
     fn parse_reclaim_metrics_success() {
         let _guard = test_guard!();
-        let stdout = "noise\nRCH_RECLAIM_METRICS removed=3 dry_removed=0 freed_kb=2048 before_kb=8192 after_kb=10240 candidates=10 protected=2\n";
+        let stdout = "noise\nRCH_RECLAIM_METRICS removed=3 dry_removed=0 freed_kb=2048 before_kb=8192 after_kb=10240 candidates=10 protected=2 remove_errors=1\n";
         let metrics = parse_reclaim_metrics(stdout).expect("should parse");
 
         assert_eq!(metrics.removed, 3);
@@ -876,17 +912,19 @@ mod tests {
         assert!((metrics.free_after_gb - (10240.0 / (1024.0 * 1024.0))).abs() < f64::EPSILON);
         assert_eq!(metrics.candidates, 10);
         assert_eq!(metrics.protected, 2);
+        assert_eq!(metrics.remove_errors, 1);
     }
 
     #[test]
     fn parse_reclaim_metrics_dry_run() {
         let _guard = test_guard!();
-        let stdout = "RCH_RECLAIM_METRICS removed=0 dry_removed=5 freed_kb=4096 before_kb=8192 after_kb=8192 candidates=8 protected=1\n";
+        let stdout = "RCH_RECLAIM_METRICS removed=0 dry_removed=5 freed_kb=4096 before_kb=8192 after_kb=8192 candidates=8 protected=1 remove_errors=0\n";
         let metrics = parse_reclaim_metrics(stdout).expect("should parse");
 
         assert_eq!(metrics.removed, 0);
         assert_eq!(metrics.dry_removed, 5);
         assert_eq!(metrics.freed_bytes, 4096 * 1024);
+        assert_eq!(metrics.remove_errors, 0);
     }
 
     #[test]
@@ -911,7 +949,7 @@ mod tests {
         assert_eq!(config.timeout, Duration::from_secs(120));
         assert_eq!(config.min_idle_minutes, 10);
         assert!(config.protected_prefixes.is_empty());
-        assert_eq!(config.remote_base, "/tmp/rch");
+        assert_eq!(config.remote_base, "/data/tmp/rch");
     }
 
     #[test]

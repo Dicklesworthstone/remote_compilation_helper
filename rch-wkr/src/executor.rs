@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use rch_common::types::RequiredRuntime;
+use std::io::Write as _;
 use std::path::Path;
 use std::process::Stdio;
 use thiserror::Error;
@@ -9,12 +10,35 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::{debug, error, info};
 
+/// Best-effort write of a worker-side message to the real stderr (the SSH
+/// channel relayed to the client). Unlike `eprintln!`, this never panics if the
+/// channel is broken — important on the output-truncation path, which is reached
+/// precisely when the client's stream has already failed (and release builds use
+/// `panic = "abort"`, so a panic here would abort the process).
+fn eprintln_best_effort(msg: &str) {
+    let _ = writeln!(std::io::stderr(), "{msg}");
+}
+
 /// Error returned when a command exits with a non-zero status.
 #[derive(Debug, Error)]
 #[error("Command failed with exit code: {exit_code}")]
 pub struct CommandFailed {
     pub exit_code: i32,
 }
+
+/// Sentinel exit code returned when worker-side dependency prepare
+/// (`bun install` / `npm install`) fails or times out *before* the user command
+/// runs. Distinct from a real build/test exit 1 so the client can report
+/// "remote dependency install failed" instead of a misleading user-command
+/// failure (bd-review-wkr-prepare-exit-collision). Chosen below 124 to avoid the
+/// shell-reserved range (124 timeout, 125-127 shell, 128+ signals).
+pub const EXIT_PREPARE_FAILED: i32 = 121;
+
+/// Sentinel exit code returned when the command exited 0 but its output stream
+/// to the client was truncated by a relay write/read error. The (success) exit
+/// status and the (incomplete) output are then inconsistent, so report a failure
+/// rather than a trusted-but-partial result (bd-review-wkr-output-truncation).
+pub const EXIT_OUTPUT_TRUNCATED: i32 = 122;
 
 /// Strip leading `VAR=value` shell env assignments from a command.
 /// Returns the remainder. Tokens that look like flags (`-foo`) or that
@@ -52,17 +76,24 @@ fn strip_leading_env_assignments(command: &str) -> &str {
     }
 }
 
-/// Return true if `command` starts with `prefix` followed by a word
-/// boundary (whitespace or end-of-string). Avoids the substring-prefix
-/// false-positive that would match `npm test` against `npm test:foo`.
-fn starts_with_word(command: &str, prefix: &str) -> bool {
-    if !command.starts_with(prefix) {
-        return false;
-    }
-    match command.as_bytes().get(prefix.len()) {
-        None => true,
-        Some(c) if c.is_ascii_whitespace() => true,
-        _ => false,
+/// Return true for script names that should have dependencies prepared before
+/// worker execution.
+fn is_test_or_typecheck_script(script: &str) -> bool {
+    matches!(script, "test" | "typecheck")
+        || script
+            .strip_prefix("test:")
+            .is_some_and(|suffix| !suffix.is_empty())
+        || script
+            .strip_prefix("typecheck:")
+            .is_some_and(|suffix| !suffix.is_empty())
+}
+
+fn next_package_manager_token<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    loop {
+        match tokens.next()? {
+            "--if-present" | "--silent" | "-s" => {}
+            token => return Some(token),
+        }
     }
 }
 
@@ -74,40 +105,57 @@ fn starts_with_word(command: &str, prefix: &str) -> bool {
 /// Rust command never accidentally triggers `bun install`.
 fn detect_runtime_from_command(command: &str) -> RequiredRuntime {
     let after_env = strip_leading_env_assignments(command);
-    // Bun: `bun test`, `bun typecheck`, `bun run test` (script runner form).
-    if let Some(rest) = after_env
-        .strip_prefix("bun ")
-        .or_else(|| after_env.strip_prefix("bun\t"))
-    {
-        let mut tokens = rest.split_whitespace();
-        let first = tokens.next().unwrap_or("");
-        if matches!(first, "test" | "typecheck") {
-            return RequiredRuntime::Bun;
+
+    let mut tokens = after_env.split_whitespace();
+    match tokens.next() {
+        Some("bun") => match tokens.next() {
+            Some("test" | "typecheck") => return RequiredRuntime::Bun,
+            Some("run")
+                if next_package_manager_token(&mut tokens)
+                    .is_some_and(is_test_or_typecheck_script) =>
+            {
+                return RequiredRuntime::Bun;
+            }
+            _ => {}
+        },
+        Some("npm") => match tokens.next() {
+            Some("test") => return RequiredRuntime::Node,
+            Some("run" | "run-script")
+                if next_package_manager_token(&mut tokens)
+                    .is_some_and(is_test_or_typecheck_script) =>
+            {
+                return RequiredRuntime::Node;
+            }
+            _ => {}
+        },
+        Some("yarn" | "pnpm") => {
+            let first = next_package_manager_token(&mut tokens);
+            let script = if matches!(first, Some("run")) {
+                next_package_manager_token(&mut tokens)
+            } else {
+                first
+            };
+            if script.is_some_and(is_test_or_typecheck_script) {
+                return RequiredRuntime::Node;
+            }
         }
-        // `bun run test` / `bun run typecheck` — the script-runner form.
-        // Note: `bun run` arbitrary-script can mean anything (build, dev,
-        // ...), so we only auto-prepare for the well-known test scripts.
-        if first == "run"
-            && let Some(second) = tokens.next()
-            && matches!(second, "test" | "typecheck")
-        {
-            return RequiredRuntime::Bun;
+        Some("npx") => match tokens.next() {
+            Some("jest" | "vitest") => return RequiredRuntime::Node,
+            // `npx tsc --noEmit` needs node_modules installed before it can
+            // resolve types, so it must report the Node runtime to get prepare().
+            Some("tsc") => return RequiredRuntime::Node,
+            _ => {}
+        },
+        // Bare `tsc` likewise runs under Node and needs node_modules.
+        Some("tsc") => return RequiredRuntime::Node,
+        // Go resolves modules from the module cache; prepare() is a no-op for it,
+        // but the runtime must still be reported so the right prepare branch runs.
+        Some("go") => {
+            if let Some("build" | "test" | "vet") = tokens.next() {
+                return RequiredRuntime::Go;
+            }
         }
-    }
-    // Plain Node test runners. Word-boundary match avoids `npm test:foo`
-    // accidentally matching `npm test`.
-    for prefix in [
-        "npm test",
-        "npm run test",
-        "npm run-script test",
-        "yarn test",
-        "pnpm test",
-        "npx jest",
-        "npx vitest",
-    ] {
-        if starts_with_word(after_env, prefix) {
-            return RequiredRuntime::Node;
-        }
+        _ => {}
     }
     RequiredRuntime::None
 }
@@ -137,6 +185,18 @@ mod runtime_detection_tests {
         );
         assert_eq!(
             detect_runtime_from_command("bun run typecheck"),
+            RequiredRuntime::Bun
+        );
+        assert_eq!(
+            detect_runtime_from_command("bun run test:integration"),
+            RequiredRuntime::Bun
+        );
+        assert_eq!(
+            detect_runtime_from_command("bun run typecheck:ci"),
+            RequiredRuntime::Bun
+        );
+        assert_eq!(
+            detect_runtime_from_command("bun run --if-present test:integration"),
             RequiredRuntime::Bun
         );
         // `bun run` of anything else is NOT a test runner — don't auto-prepare.
@@ -175,12 +235,8 @@ mod runtime_detection_tests {
             detect_runtime_from_command("bun testfoo"),
             RequiredRuntime::None
         );
-        // `npm test:integration` is NOT plain npm test (it's a script).
-        // Both should be classified as Node since they need node_modules,
-        // but the detection logic specifically only matches `npm test` at
-        // word boundary — `npm test:integration` has `:` after `test` so it
-        // matches as `npm test` if no boundary check. starts_with_word
-        // requires whitespace, so this returns None.
+        // npm script names need `run`; `npm test:integration` is not the
+        // `npm test` lifecycle command and should not be matched by prefix.
         assert_eq!(
             detect_runtime_from_command("npm test:integration"),
             RequiredRuntime::None
@@ -202,11 +258,47 @@ mod runtime_detection_tests {
             RequiredRuntime::Node
         );
         assert_eq!(
+            detect_runtime_from_command("npm run test:integration"),
+            RequiredRuntime::Node
+        );
+        assert_eq!(
+            detect_runtime_from_command("npm run-script typecheck:ci"),
+            RequiredRuntime::Node
+        );
+        assert_eq!(
+            detect_runtime_from_command("npm run --if-present test"),
+            RequiredRuntime::Node
+        );
+        assert_eq!(
             detect_runtime_from_command("yarn test"),
             RequiredRuntime::Node
         );
         assert_eq!(
+            detect_runtime_from_command("yarn run test:integration"),
+            RequiredRuntime::Node
+        );
+        assert_eq!(
+            detect_runtime_from_command("yarn typecheck:ci"),
+            RequiredRuntime::Node
+        );
+        assert_eq!(
+            detect_runtime_from_command("yarn --silent test:integration"),
+            RequiredRuntime::Node
+        );
+        assert_eq!(
             detect_runtime_from_command("pnpm test"),
+            RequiredRuntime::Node
+        );
+        assert_eq!(
+            detect_runtime_from_command("pnpm run test:integration"),
+            RequiredRuntime::Node
+        );
+        assert_eq!(
+            detect_runtime_from_command("pnpm typecheck:ci"),
+            RequiredRuntime::Node
+        );
+        assert_eq!(
+            detect_runtime_from_command("pnpm --silent run test"),
             RequiredRuntime::Node
         );
         assert_eq!(
@@ -273,11 +365,23 @@ mod runtime_detection_tests {
     }
 
     #[test]
-    fn test_starts_with_word_basic() {
-        assert!(starts_with_word("npm test", "npm test"));
-        assert!(starts_with_word("npm test foo", "npm test"));
-        assert!(!starts_with_word("npm test:foo", "npm test"));
-        assert!(!starts_with_word("npm testfoo", "npm test"));
+    fn test_is_test_or_typecheck_script() {
+        assert!(is_test_or_typecheck_script("test"));
+        assert!(is_test_or_typecheck_script("test:integration"));
+        assert!(is_test_or_typecheck_script("typecheck"));
+        assert!(is_test_or_typecheck_script("typecheck:ci"));
+        assert!(!is_test_or_typecheck_script("testfoo"));
+        assert!(!is_test_or_typecheck_script("typechecker"));
+        assert!(!is_test_or_typecheck_script("build"));
+    }
+
+    #[test]
+    fn test_next_package_manager_token_skips_safe_no_value_flags() {
+        let mut tokens = ["--silent", "--if-present", "test"].into_iter();
+        assert_eq!(next_package_manager_token(&mut tokens), Some("test"));
+
+        let mut tokens = ["--workspace", "test"].into_iter();
+        assert_eq!(next_package_manager_token(&mut tokens), Some("--workspace"));
     }
 }
 
@@ -317,6 +421,11 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
                     report.action,
                     crate::prepare::PrepareAction::Failed | crate::prepare::PrepareAction::Timeout
                 ) {
+                    let log_hint = report
+                        .install_log_path
+                        .as_ref()
+                        .map(|p| format!(" (install log: {})", p.display()))
+                        .unwrap_or_default();
                     if let Some(p) = &report.install_log_path {
                         error!(
                             target: "rch::wkr::executor",
@@ -325,7 +434,18 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
                             p.display()
                         );
                     }
-                    return Err(CommandFailed { exit_code: 1 }.into());
+                    // Write to the worker's real stderr (relayed over SSH to the
+                    // client) with a distinct exit code, so the client reports a
+                    // dependency-install failure rather than a misleading
+                    // user-command exit 1 — the user command never ran.
+                    eprintln_best_effort(&format!(
+                        "rch-wkr: remote dependency install ({runtime:?}) did not finish cleanly ({:?}); the command was not run{log_hint}",
+                        report.action
+                    ));
+                    return Err(CommandFailed {
+                        exit_code: EXIT_PREPARE_FAILED,
+                    }
+                    .into());
                 }
             }
             Err(e) => {
@@ -343,19 +463,40 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
 
     // Use shell execution to properly handle quoted arguments and shell features
     // This matches how the SSH client executes commands (sh -c "...")
-    let mut child = Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(workdir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+
+    // For Node/Bun projects, put the project's own `node_modules/.bin` FIRST on
+    // PATH. Workers have no global `tsc`, so a bare `tsc --noEmit` would
+    // otherwise fail to resolve — and if we papered over that with a global
+    // install, a project pinned to an older TypeScript would be typechecked by a
+    // newer compiler and could report errors the user never sees locally.
+    // Resolving the project's own binary keeps remote results identical to local.
+    // `prepare()` (above) has already installed node_modules by this point.
+    if matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
+        let local_bin = Path::new(workdir).join("node_modules").join(".bin");
+        if local_bin.is_dir() {
+            let existing = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{}:{existing}", local_bin.display()));
+        }
+    }
+
+    let mut child = cmd.spawn()?;
 
     // Stream stdout
     let mut stdout = child.stdout.take().expect("Failed to capture stdout");
     let mut stderr = child.stderr.take().expect("Failed to capture stderr");
 
+    // Each relay task returns `true` only if it drained the child pipe to EOF and
+    // relayed every byte to the client. A read error (child output incomplete) or
+    // a write/flush error (the SSH channel back to the client closed/back-pressured
+    // then failed) returns `false` so the caller knows the client saw a truncated
+    // stream and must not trust a "success" exit status.
     let stdout_task = tokio::spawn(async move {
         let mut buffer = [0u8; 4096];
         let mut out = tokio::io::stdout();
@@ -365,19 +506,20 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
                 Ok(n) => {
                     if let Err(e) = out.write_all(&buffer[..n]).await {
                         error!("Failed to write to stdout: {}", e);
-                        break;
+                        return false;
                     }
                     if let Err(e) = out.flush().await {
                         error!("Failed to flush stdout: {}", e);
-                        break;
+                        return false;
                     }
                 }
                 Err(e) => {
                     error!("Failed to read from command stdout: {}", e);
-                    break;
+                    return false;
                 }
             }
         }
+        true
     });
 
     let stderr_task = tokio::spawn(async move {
@@ -389,29 +531,48 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
                 Ok(n) => {
                     if let Err(e) = err.write_all(&buffer[..n]).await {
                         error!("Failed to write to stderr: {}", e);
-                        break;
+                        return false;
                     }
                     if let Err(e) = err.flush().await {
                         error!("Failed to flush stderr: {}", e);
-                        break;
+                        return false;
                     }
                 }
                 Err(e) => {
                     error!("Failed to read from command stderr: {}", e);
-                    break;
+                    return false;
                 }
             }
         }
+        true
     });
 
     // Wait for process to complete
     let status = child.wait().await?;
 
-    // Wait for output tasks
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    // Wait for output tasks; a panicked relay task (JoinError) is treated as a
+    // non-clean relay.
+    let stdout_relayed = stdout_task.await.unwrap_or(false);
+    let stderr_relayed = stderr_task.await.unwrap_or(false);
 
     if status.success() {
+        if !stdout_relayed || !stderr_relayed {
+            // Exit status says success, but the client only received a truncated
+            // output stream. Reporting success would make the result and the
+            // (incomplete) output inconsistent — the client would trust a build
+            // whose output it never fully saw. Surface a distinct failure so the
+            // client fails open / retries instead.
+            error!(
+                "Command exited 0 but output relay was truncated (stdout_ok={stdout_relayed}, stderr_ok={stderr_relayed})"
+            );
+            eprintln_best_effort(
+                "rch-wkr: command exited 0 but its output stream to the client was truncated; reporting failure to avoid a trusted-but-incomplete result",
+            );
+            return Err(CommandFailed {
+                exit_code: EXIT_OUTPUT_TRUNCATED,
+            }
+            .into());
+        }
         debug!("Command completed successfully");
         Ok(())
     } else {
@@ -541,6 +702,27 @@ mod tests {
     }
 
     // === Exit Code Capture Tests ===
+
+    #[test]
+    fn test_worker_sentinel_exit_codes_are_distinct() {
+        // Regression: a prepare failure (bd-review-wkr-prepare-exit-collision) and
+        // a truncated-output success (bd-review-wkr-output-truncation) must each
+        // have a sentinel exit code that the client can distinguish from a real
+        // build/test exit 1, from success, and from each other — and must stay
+        // out of the shell-reserved range (124 timeout, 125-127 shell, 128+
+        // signals).
+        assert_ne!(EXIT_PREPARE_FAILED, 0);
+        assert_ne!(EXIT_PREPARE_FAILED, 1);
+        assert_ne!(EXIT_OUTPUT_TRUNCATED, 0);
+        assert_ne!(EXIT_OUTPUT_TRUNCATED, 1);
+        assert_ne!(EXIT_PREPARE_FAILED, EXIT_OUTPUT_TRUNCATED);
+        for code in [EXIT_PREPARE_FAILED, EXIT_OUTPUT_TRUNCATED] {
+            assert!(
+                (2..124).contains(&code),
+                "sentinel {code} should be a plain, non-reserved exit code"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_execute_exit_code_zero() {

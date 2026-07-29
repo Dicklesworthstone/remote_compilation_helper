@@ -13,6 +13,10 @@ const MIN_BUILD_AGE_SECS: u64 = 30;
 const TRIAGE_BUDGET_MS: u64 = 50;
 const REMEDIATION_CONFIDENCE_THRESHOLD: f64 = 0.85;
 
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct StuckEvidenceInput {
     hook_alive: bool,
@@ -236,7 +240,7 @@ impl ActiveBuildCleanup {
                 .await;
         }
 
-        let elapsed_ms = triage_started.elapsed().as_millis() as u64;
+        let elapsed_ms = duration_millis_u64(triage_started.elapsed());
         if elapsed_ms > TRIAGE_BUDGET_MS {
             warn!(
                 "Stuck detector triage loop exceeded budget: {}ms > {}ms (active_builds={})",
@@ -281,6 +285,12 @@ mod tests {
     use proptest::prelude::*;
     use rch_common::BuildHeartbeatPhase;
     use rch_common::test_guard;
+
+    #[test]
+    fn test_duration_millis_u64_saturates() {
+        let _guard = test_guard!();
+        assert_eq!(duration_millis_u64(Duration::from_secs(u64::MAX)), u64::MAX);
+    }
 
     fn heartbeat_phase_strategy() -> impl Strategy<Value = BuildHeartbeatPhase> {
         prop_oneof![

@@ -17,6 +17,11 @@
 //! ```
 
 use chrono::{Duration as ChronoDuration, Utc};
+use rch_common::fleet_diff::WorkerObservation;
+use rch_common::remediation_view::{
+    DiskLevel, JobsInput, ProofQueueInput, RemediationView, RemediationWorkerRow, assemble,
+    build_inputs,
+};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -613,6 +618,135 @@ pub fn mock_state_accessible(high_contrast: bool, color_blind: ColorBlindMode) -
     state.high_contrast = high_contrast;
     state.color_blind = color_blind;
     state
+}
+
+// ============================================================================
+// Remediation view fixtures (bd-session-history-remediation-ocv9i.14.4)
+//
+// Built through the real rch_common assembler so the fixtures exercise the same
+// classification path the daemon uses, and the seven mandated dashboard states
+// stay in lockstep with the foundation.
+// ============================================================================
+
+/// A healthy, command-admissible worker row for remediation fixtures.
+fn rem_ready_row(id: &str) -> RemediationWorkerRow {
+    RemediationWorkerRow {
+        observation: WorkerObservation {
+            worker_id: id.to_string(),
+            configured: true,
+            in_daemon_pool: true,
+            reachable: true,
+            admin_disabled: false,
+            temporarily_bypassed: false,
+            facts_known: true,
+            command_admissible: true,
+        },
+        disk_level: DiskLevel::Ok,
+        reclaiming: false,
+        free_ratio: Some(0.7),
+        slots_used: 2,
+        slots_total: 8,
+        telemetry_known: true,
+        telemetry_fresh: true,
+        telemetry_age_secs: Some(5),
+        recovered_pending_canary: false,
+        absent_secs: None,
+    }
+}
+
+fn rem_view(
+    rows: &[RemediationWorkerRow],
+    jobs: JobsInput,
+    proof: ProofQueueInput,
+) -> RemediationView {
+    let inputs = build_inputs(rows, jobs, proof, Vec::new(), 300);
+    assemble(&inputs, 1_700_000_000_000)
+}
+
+/// Healthy fleet: every band nominal.
+pub fn mock_remediation_view_healthy() -> RemediationView {
+    rem_view(
+        &[
+            rem_ready_row("css"),
+            rem_ready_row("ovh-a"),
+            rem_ready_row("ovh-b"),
+        ],
+        JobsInput {
+            active: 1,
+            queued: 0,
+            stuck: 0,
+        },
+        ProofQueueInput::default(),
+    )
+}
+
+/// Degraded: one worker temporarily bypassed (self-healing in progress).
+pub fn mock_remediation_view_degraded() -> RemediationView {
+    let mut bypassed = rem_ready_row("ovh-a");
+    bypassed.observation.temporarily_bypassed = true;
+    rem_view(
+        &[rem_ready_row("css"), bypassed, rem_ready_row("ovh-b")],
+        JobsInput::default(),
+        ProofQueueInput::default(),
+    )
+}
+
+/// No admissible workers: all live but none has trustworthy capability facts.
+pub fn mock_remediation_view_no_admissible() -> RemediationView {
+    let mut a = rem_ready_row("css");
+    a.observation.facts_known = false;
+    let mut b = rem_ready_row("ovh-a");
+    b.observation.facts_known = false;
+    rem_view(&[a, b], JobsInput::default(), ProofQueueInput::default())
+}
+
+/// Proof queued: deferred-proof conveyor working through queued/replaying.
+pub fn mock_remediation_view_proof_queued() -> RemediationView {
+    rem_view(
+        &[rem_ready_row("css"), rem_ready_row("ovh-a")],
+        JobsInput::default(),
+        ProofQueueInput {
+            queued: 3,
+            replaying: 1,
+            ..ProofQueueInput::default()
+        },
+    )
+}
+
+/// Disk pressure: a worker at critical pressure with no reclaim (operator).
+pub fn mock_remediation_view_disk_pressure() -> RemediationView {
+    let mut crit = rem_ready_row("css");
+    crit.disk_level = DiskLevel::Critical;
+    crit.free_ratio = Some(0.02);
+    rem_view(
+        &[crit, rem_ready_row("ovh-a")],
+        JobsInput::default(),
+        ProofQueueInput::default(),
+    )
+}
+
+/// Stale telemetry: a worker's telemetry exceeds the freshness window.
+pub fn mock_remediation_view_stale_telemetry() -> RemediationView {
+    let mut stale = rem_ready_row("css");
+    stale.telemetry_fresh = false;
+    stale.telemetry_age_secs = Some(1200);
+    rem_view(
+        &[stale, rem_ready_row("ovh-a")],
+        JobsInput::default(),
+        ProofQueueInput::default(),
+    )
+}
+
+/// Auto-rejoin pending: a recovered worker probing back in (self-healing).
+pub fn mock_remediation_view_auto_rejoin_pending() -> RemediationView {
+    let mut canary = rem_ready_row("css");
+    canary.observation.temporarily_bypassed = true;
+    canary.recovered_pending_canary = true;
+    rem_view(
+        &[canary, rem_ready_row("ovh-a")],
+        JobsInput::default(),
+        ProofQueueInput::default(),
+    )
 }
 
 #[cfg(test)]

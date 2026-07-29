@@ -4,7 +4,6 @@
 use crate::error::PlatformError;
 use crate::error::{DaemonError, SshError};
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use rch_common::{RequiredRuntime, WorkerConfig, WorkerId};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,6 +15,24 @@ use tokio::net::UnixStream;
 const DAEMON_COMMAND_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(unix)]
 const DAEMON_COMMAND_IO_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(unix)]
+const DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Extra wall-clock margin added on top of a self-test's per-worker `timeout`
+/// budget when waiting for the daemon response. The daemon caps each worker's
+/// whole canary (local build → remote build → rsync-back → hash verify) at the
+/// requested `timeout`, runs workers in parallel, and then serializes the
+/// report; this margin covers that scheduling/serialization overhead so the
+/// client does not give up a few seconds before a build that is about to land.
+#[cfg(unix)]
+const DAEMON_SELF_TEST_RESPONSE_MARGIN_SECS: u64 = 60;
+/// Hard ceiling on the self-test response timeout, so a pathological
+/// `timeout=<huge>` query cannot wedge the client forever.
+#[cfg(unix)]
+const DAEMON_SELF_TEST_RESPONSE_TIMEOUT_CAP: Duration = Duration::from_secs(3600);
+/// Fallback self-test budget when the `POST /self-test/run` request carries no
+/// `timeout` param. Mirrors the CLI `--timeout` default (300s).
+#[cfg(unix)]
+const DAEMON_SELF_TEST_DEFAULT_TIMEOUT_SECS: u64 = 300;
 
 // ============================================================================
 // Path helpers
@@ -23,8 +40,19 @@ const DAEMON_COMMAND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Get the default socket path.
 /// Uses XDG_RUNTIME_DIR if available, falls back to ~/.cache/rch/rch.sock, then /tmp/rch.sock.
+#[cfg(test)]
 pub fn default_socket_path() -> String {
     rch_common::default_socket_path()
+}
+
+/// Resolve the daemon socket path from the active RCH configuration.
+///
+/// Commands that talk to `rchd` must use this instead of the compiled-in
+/// default; otherwise a custom `general.socket_path` can start the daemon on
+/// one socket while hooks and status commands query another.
+pub(crate) fn configured_socket_path() -> Result<String> {
+    let config = crate::config::load_config()?;
+    Ok(shellexpand::tilde(&config.general.socket_path).into_owned())
 }
 
 // ============================================================================
@@ -100,6 +128,9 @@ pub fn runtime_label(runtime: &RequiredRuntime) -> &'static str {
         RequiredRuntime::Rust => "rust",
         RequiredRuntime::Bun => "bun",
         RequiredRuntime::Node => "node",
+        RequiredRuntime::Nix => "nix",
+        RequiredRuntime::Go => "go",
+        RequiredRuntime::Zig => "zig",
         RequiredRuntime::None => "none",
     }
 }
@@ -508,6 +539,47 @@ mod tests {
         assert_eq!(urlencoding_encode("hello world"), "hello%20world");
         assert_eq!(urlencoding_encode("a/b?c=d"), "a%2Fb%3Fc%3Dd");
     }
+
+    #[test]
+    fn configured_socket_path_uses_active_config() -> Result<()> {
+        let _guard = rch_common::test_guard!();
+        struct ResetConfigOverride;
+        impl Drop for ResetConfigOverride {
+            fn drop(&mut self) {
+                crate::config::set_test_config_override(None);
+            }
+        }
+
+        let mut config = rch_common::RchConfig::default();
+        config.general.socket_path = "/tmp/rch-custom-test.sock".to_string();
+        crate::config::set_test_config_override(Some(config));
+        let _reset = ResetConfigOverride;
+
+        let socket_path = configured_socket_path().context("configured socket path")?;
+
+        assert_eq!(socket_path, "/tmp/rch-custom-test.sock");
+        Ok(())
+    }
+
+    #[test]
+    fn toml_u32_field_accepts_valid_unsigned_range() -> Result<()> {
+        let entry: toml::Value =
+            toml::from_str("total_slots = 12\npriority = 42\n").context("parse worker toml")?;
+
+        assert_eq!(toml_u32_field_or(&entry, "total_slots", 8), 12);
+        assert_eq!(toml_u32_field_or(&entry, "priority", 100), 42);
+        Ok(())
+    }
+
+    #[test]
+    fn toml_u32_field_rejects_negative_and_overflow_values() -> Result<()> {
+        let entry: toml::Value = toml::from_str("total_slots = -1\npriority = 4294967296\n")
+            .context("parse worker toml")?;
+
+        assert_eq!(toml_u32_field_or(&entry, "total_slots", 8), 8);
+        assert_eq!(toml_u32_field_or(&entry, "priority", 100), 100);
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -522,7 +594,7 @@ pub fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = test_config_dir_override() {
         return Some(dir);
     }
-    ProjectDirs::from("com", "rch", "rch").map(|dirs| dirs.config_dir().to_path_buf())
+    crate::config::config_dir()
 }
 
 #[cfg(test)]
@@ -597,14 +669,8 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
             .get("identity_file")
             .and_then(|v| v.as_str())
             .unwrap_or("~/.ssh/id_rsa");
-        let total_slots = entry
-            .get("total_slots")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(8) as u32;
-        let priority = entry
-            .get("priority")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(100) as u32;
+        let total_slots = toml_u32_field_or(entry, "total_slots", 8);
+        let priority = toml_u32_field_or(entry, "priority", 100);
         let tags: Vec<String> = entry
             .get("tags")
             .and_then(|v| v.as_array())
@@ -629,6 +695,14 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
     Ok(workers)
 }
 
+fn toml_u32_field_or(entry: &toml::Value, key: &str, default: u32) -> u32 {
+    entry
+        .get(key)
+        .and_then(|value| value.as_integer())
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(default)
+}
+
 // ============================================================================
 // Daemon communication helpers
 // ============================================================================
@@ -644,9 +718,8 @@ pub async fn send_daemon_command(_command: &str) -> Result<String> {
 /// Helper to send command to daemon socket.
 #[cfg(unix)]
 pub async fn send_daemon_command(command: &str) -> Result<String> {
-    let config = crate::config::load_config()?;
-    let expanded = shellexpand::tilde(&config.general.socket_path);
-    let socket_path = Path::new(expanded.as_ref());
+    let socket_path_str = configured_socket_path()?;
+    let socket_path = Path::new(&socket_path_str);
     if !socket_path.exists() {
         return Err(DaemonError::SocketNotFound {
             socket_path: socket_path.display().to_string(),
@@ -677,14 +750,82 @@ async fn send_daemon_command_to_socket(socket_path: &Path, command: &str) -> Res
 
     let mut reader = BufReader::new(reader);
     let mut response = String::new();
-    tokio::time::timeout(
-        DAEMON_COMMAND_IO_TIMEOUT,
-        reader.read_to_string(&mut response),
-    )
-    .await
-    .context("Timed out waiting for daemon response")??;
+    let response_timeout = daemon_command_response_timeout(command);
+    tokio::time::timeout(response_timeout, reader.read_to_string(&mut response))
+        .await
+        .context("Timed out waiting for daemon response")??;
 
     Ok(response)
+}
+
+#[cfg(unix)]
+fn daemon_command_response_timeout(command: &str) -> Duration {
+    if daemon_command_is_capabilities_refresh(command) {
+        DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT
+    } else if let Some(budget) = daemon_command_self_test_budget(command) {
+        // A self-test run blocks the daemon for the duration of a real canary
+        // build, which routinely exceeds the default 10s IO timeout. Wait for
+        // the worker budget plus a fixed margin (capped), never less than the
+        // default IO timeout. Without this the client times out (RCH-E504)
+        // while the daemon is still building.
+        let secs = budget
+            .saturating_add(DAEMON_SELF_TEST_RESPONSE_MARGIN_SECS)
+            .min(DAEMON_SELF_TEST_RESPONSE_TIMEOUT_CAP.as_secs());
+        Duration::from_secs(secs).max(DAEMON_COMMAND_IO_TIMEOUT)
+    } else {
+        DAEMON_COMMAND_IO_TIMEOUT
+    }
+}
+
+/// If `command` is a `POST /self-test/run` request, return its per-worker
+/// `timeout` budget in seconds (the CLI default when the param is absent).
+/// Returns `None` for any other command.
+#[cfg(unix)]
+fn daemon_command_self_test_budget(command: &str) -> Option<u64> {
+    let request_target = command
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("");
+    let rest = request_target.strip_prefix("/self-test/run")?;
+    // Accept the bare path and the query form, but not a different route that
+    // merely shares the prefix (e.g. `/self-test/run-extra`).
+    let query = match rest {
+        "" => "",
+        q => q.strip_prefix('?')?,
+    };
+    let budget = query
+        .split('&')
+        .filter_map(|param| {
+            let mut kv = param.splitn(2, '=');
+            let key = kv.next().unwrap_or("");
+            let value = kv.next().unwrap_or("");
+            (key == "timeout")
+                .then(|| value.parse::<u64>().ok())
+                .flatten()
+        })
+        .next()
+        .unwrap_or(DAEMON_SELF_TEST_DEFAULT_TIMEOUT_SECS);
+    Some(budget)
+}
+
+#[cfg(unix)]
+fn daemon_command_is_capabilities_refresh(command: &str) -> bool {
+    let request_target = command
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("");
+    let Some(query) = request_target.strip_prefix("/workers/capabilities?") else {
+        return false;
+    };
+
+    query.split('&').any(|param| {
+        let mut kv = param.splitn(2, '=');
+        let key = kv.next().unwrap_or("");
+        let value = kv.next().unwrap_or("");
+        key == "refresh" && (value == "1" || value.eq_ignore_ascii_case("true"))
+    })
 }
 
 #[cfg(all(test, unix))]
@@ -731,5 +872,89 @@ mod daemon_command_tests {
         assert!(response.contains("\"ok\":true"));
         server.await.context("server task")??;
         Ok(())
+    }
+
+    #[test]
+    fn capabilities_refresh_command_gets_extended_response_timeout() {
+        assert_eq!(
+            daemon_command_response_timeout("GET /workers/capabilities?refresh=true\n"),
+            DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT
+        );
+        assert_eq!(
+            daemon_command_response_timeout("GET /workers/capabilities?worker=all&refresh=1\n"),
+            DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn ordinary_daemon_commands_keep_default_response_timeout() {
+        assert_eq!(
+            daemon_command_response_timeout("GET /workers/capabilities\n"),
+            DAEMON_COMMAND_IO_TIMEOUT
+        );
+        assert_eq!(
+            daemon_command_response_timeout("GET /workers/capabilities?refresh=false\n"),
+            DAEMON_COMMAND_IO_TIMEOUT
+        );
+        assert_eq!(
+            daemon_command_response_timeout("GET /status\n"),
+            DAEMON_COMMAND_IO_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn self_test_run_command_waits_for_worker_budget_plus_margin() {
+        // A self-test canary blocks the daemon for the whole build; the client
+        // must wait the requested per-worker budget plus the fixed margin.
+        assert_eq!(
+            daemon_command_response_timeout("POST /self-test/run?worker=css&timeout=180\n"),
+            Duration::from_secs(180 + DAEMON_SELF_TEST_RESPONSE_MARGIN_SECS)
+        );
+        // Param order / extra params must not matter.
+        assert_eq!(
+            daemon_command_response_timeout(
+                "POST /self-test/run?debug=true&timeout=120&worker=hz1\n"
+            ),
+            Duration::from_secs(120 + DAEMON_SELF_TEST_RESPONSE_MARGIN_SECS)
+        );
+    }
+
+    #[test]
+    fn self_test_run_without_timeout_uses_default_budget() {
+        assert_eq!(
+            daemon_command_response_timeout("POST /self-test/run\n"),
+            Duration::from_secs(
+                DAEMON_SELF_TEST_DEFAULT_TIMEOUT_SECS + DAEMON_SELF_TEST_RESPONSE_MARGIN_SECS
+            )
+        );
+        assert_eq!(
+            daemon_command_response_timeout("POST /self-test/run?all=true\n"),
+            Duration::from_secs(
+                DAEMON_SELF_TEST_DEFAULT_TIMEOUT_SECS + DAEMON_SELF_TEST_RESPONSE_MARGIN_SECS
+            )
+        );
+    }
+
+    #[test]
+    fn self_test_run_response_timeout_is_capped() {
+        // A pathological huge timeout cannot wedge the client past the cap.
+        assert_eq!(
+            daemon_command_response_timeout("POST /self-test/run?timeout=999999999\n"),
+            DAEMON_SELF_TEST_RESPONSE_TIMEOUT_CAP
+        );
+    }
+
+    #[test]
+    fn self_test_status_and_lookalike_routes_keep_default_timeout() {
+        // The status/history reads are quick; only the run blocks. And a route
+        // that merely shares the prefix must not be mistaken for the run route.
+        assert_eq!(
+            daemon_command_response_timeout("GET /self-test/status\n"),
+            DAEMON_COMMAND_IO_TIMEOUT
+        );
+        assert_eq!(
+            daemon_command_response_timeout("POST /self-test/run-extra?worker=css\n"),
+            DAEMON_COMMAND_IO_TIMEOUT
+        );
     }
 }

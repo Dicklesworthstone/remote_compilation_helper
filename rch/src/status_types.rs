@@ -2,8 +2,10 @@
 //!
 //! These types mirror the response structures from rchd's /status API endpoint.
 
+use rch_common::remediation_view::RemediationView;
 use rch_common::{
-    BuildCancellationMetadata, CommandTimingBreakdown, SavedTimeStats, WorkerCapabilities,
+    BuildCancellationMetadata, BypassRecord, CommandTimingBreakdown, SavedTimeStats,
+    WorkerCapabilities,
 };
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +28,11 @@ pub struct DaemonFullStatusResponse {
     /// Saved time statistics from remote builds.
     #[serde(default)]
     pub saved_time: Option<SavedTimeStats>,
+    /// Operator-facing remediation view assembled by the daemon
+    /// (bd-session-history-remediation-ocv9i.14.4). `None` when talking to a
+    /// daemon that predates the field; otherwise always present.
+    #[serde(default)]
+    pub remediation: Option<RemediationView>,
 }
 
 /// Daemon metadata from API.
@@ -96,6 +103,10 @@ pub struct WorkerStatusFromApi {
     /// Whether the latest telemetry sample is fresh enough for high-confidence decisions.
     #[serde(default)]
     pub pressure_telemetry_fresh: Option<bool>,
+    /// Active temporary-bypass record, if this worker is currently quarantined
+    /// on the transient-eligibility axis (bd-session-history-remediation-ocv9i.1.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass: Option<BypassRecord>,
 }
 
 /// Worker capabilities information from API.
@@ -105,6 +116,21 @@ pub struct WorkerCapabilitiesFromApi {
     pub host: String,
     pub user: String,
     pub capabilities: WorkerCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<WorkerCapabilitiesRefreshFromApi>,
+}
+
+/// Freshness metadata for worker capabilities returned by the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerCapabilitiesRefreshFromApi {
+    #[serde(default)]
+    pub attempted: bool,
+    #[serde(default)]
+    pub live: bool,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Worker capabilities response from API.
@@ -299,7 +325,11 @@ pub struct RepoConvergenceStatusFromApi {
 // ============================================================================
 
 /// Schema version for the CLI status JSON envelope.
-pub const STATUS_SCHEMA_VERSION: &str = "1.0.0";
+///
+/// Sourced from the central [`rch_common::schema_versions`] registry so
+/// cross-component drift is caught by the registry's pinned-snapshot test.
+pub const STATUS_SCHEMA_VERSION: &str =
+    rch_common::schema_version(rch_common::SchemaComponent::Status);
 
 /// System-level posture summarizing whether builds go remote or fall back local.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -467,7 +497,14 @@ pub fn generate_worker_remediations(workers: &[WorkerStatusFromApi]) -> Vec<Reme
                         reason_code: "pressure_telemetry_gap".into(),
                         severity: "warning".into(),
                         message: format!("Worker {} storage telemetry stale or missing", w.id),
-                        suggested_action: format!("rch workers probe {}", w.id),
+                        // Telemetry ingest is daemon-driven (TelemetryPoller /
+                        // piggyback POST /telemetry/ingest). `rch workers probe`
+                        // is an SSH connectivity check and does not call
+                        // TelemetryStore::ingest(). Pointing agents at it
+                        // produced confident-wrong runs (issue #16).
+                        suggested_action:
+                            "wait for next telemetry poll, or run `rch daemon restart` to force a fresh poll cycle"
+                                .to_string(),
                         worker_id: Some(w.id.clone()),
                     });
                 }
@@ -697,10 +734,46 @@ pub struct SpeedScoreHistoryResponseFromApi {
 }
 
 /// Worker status for SpeedScore list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkerStatusFromSpeedScoreApi {
     pub status: String,
     pub circuit_state: String,
+}
+
+fn default_speedscore_circuit_state() -> String {
+    "unknown".to_string()
+}
+
+impl<'de> Deserialize<'de> for WorkerStatusFromSpeedScoreApi {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum WireStatus {
+            Text(String),
+            Object {
+                status: String,
+                #[serde(default = "default_speedscore_circuit_state")]
+                circuit_state: String,
+            },
+        }
+
+        match WireStatus::deserialize(deserializer)? {
+            WireStatus::Text(status) => Ok(Self {
+                status,
+                circuit_state: default_speedscore_circuit_state(),
+            }),
+            WireStatus::Object {
+                status,
+                circuit_state,
+            } => Ok(Self {
+                status,
+                circuit_state,
+            }),
+        }
+    }
 }
 
 /// SpeedScore list entry.
@@ -766,6 +839,30 @@ mod tests {
     use super::*;
     use rch_common::test_guard;
 
+    fn assert_golden_json(
+        actual: serde_json::Value,
+        expected: &serde_json::Value,
+        fixture_path: &str,
+    ) {
+        if &actual == expected {
+            return;
+        }
+
+        let actual_json = serde_json::to_string_pretty(&actual).expect("actual JSON renders");
+        let expected_json = serde_json::to_string_pretty(expected).expect("expected JSON renders");
+        panic!(
+            "golden mismatch in {fixture_path}\n\
+             expected_blake3={}\n\
+             actual_blake3={}\n\
+             bless path: review the semantic diff, update the fixture expected_* field, \
+             and record both hashes in the Beads closeout.\n\
+             expected:\n{expected_json}\n\
+             actual:\n{actual_json}",
+            blake3::hash(expected_json.as_bytes()),
+            blake3::hash(actual_json.as_bytes())
+        );
+    }
+
     #[test]
     fn test_format_duration() {
         let _guard = test_guard!();
@@ -788,6 +885,97 @@ mod tests {
         let _guard = test_guard!();
         let response = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"test\": 1}";
         assert_eq!(extract_json_body(response), Some("{\"test\": 1}"));
+    }
+
+    #[test]
+    fn test_speedscore_list_accepts_string_worker_status() {
+        let _guard = test_guard!();
+        let json = serde_json::json!({
+            "workers": [
+                {
+                    "worker_id": "vmi1227854",
+                    "speedscore": null,
+                    "status": "healthy"
+                }
+            ]
+        });
+
+        let response: SpeedScoreListResponseFromApi = serde_json::from_value(json).unwrap();
+        assert_eq!(response.workers.len(), 1);
+        assert_eq!(response.workers[0].status.status, "healthy");
+        assert_eq!(response.workers[0].status.circuit_state, "unknown");
+    }
+
+    #[test]
+    fn test_speedscore_list_still_accepts_object_worker_status() {
+        let _guard = test_guard!();
+        let json = serde_json::json!({
+            "workers": [
+                {
+                    "worker_id": "vmi1227854",
+                    "speedscore": null,
+                    "status": {
+                        "status": "degraded",
+                        "circuit_state": "half_open"
+                    }
+                }
+            ]
+        });
+
+        let response: SpeedScoreListResponseFromApi = serde_json::from_value(json).unwrap();
+        assert_eq!(response.workers.len(), 1);
+        assert_eq!(response.workers[0].status.status, "degraded");
+        assert_eq!(response.workers[0].status.circuit_state, "half_open");
+    }
+
+    #[test]
+    fn golden_speedscore_list_accepts_current_and_legacy_status_shapes() {
+        let _guard = test_guard!();
+        const FIXTURE_PATH: &str =
+            "../../tests/goldens/ft_4tp7g/speedscore_list_status_shapes.json";
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/goldens/ft_4tp7g/speedscore_list_status_shapes.json"
+        ))
+        .expect("speedscore status-shape golden parses");
+        assert_eq!(
+            fixture["schema_version"],
+            "rch.golden.speedscore_list_status_shapes.v1"
+        );
+
+        let response: SpeedScoreListResponseFromApi =
+            serde_json::from_value(fixture["raw_response"].clone())
+                .expect("speedscore list parses from golden raw response");
+        let actual_statuses = response
+            .workers
+            .iter()
+            .map(|worker| {
+                serde_json::json!({
+                    "worker_id": worker.worker_id.as_str(),
+                    "status": worker.status.status.as_str(),
+                    "circuit_state": worker.status.circuit_state.as_str(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_golden_json(
+            serde_json::Value::Array(actual_statuses),
+            &fixture["expected_statuses"],
+            FIXTURE_PATH,
+        );
+
+        let unsupported = serde_json::from_value::<SpeedScoreListResponseFromApi>(
+            fixture["unsupported_raw_response"].clone(),
+        )
+        .expect_err("unsupported worker status shape should fail to deserialize");
+        let unsupported_error = unsupported.to_string();
+        assert!(
+            unsupported_error.contains(
+                fixture["expected_unsupported_error_contains"]
+                    .as_str()
+                    .expect("expected unsupported error substring")
+            ),
+            "unsupported status error changed: {unsupported_error}"
+        );
     }
 
     #[test]
@@ -1309,6 +1497,7 @@ mod tests {
             },
             test_stats: None,
             saved_time: None,
+            remediation: None,
         }
     }
 
@@ -1402,6 +1591,7 @@ mod tests {
             pressure_memory_pressure: None,
             pressure_telemetry_age_secs: None,
             pressure_telemetry_fresh: None,
+            bypass: None,
         }
     }
 

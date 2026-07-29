@@ -72,7 +72,7 @@ impl Default for VerificationConfig {
             rsync_compression: 3,
             exclude_patterns: vec![
                 "target/".to_string(),
-                ".git/objects/".to_string(),
+                ".git/".to_string(),
                 "node_modules/".to_string(),
             ],
             clean_before_build: false,
@@ -458,6 +458,8 @@ impl RemoteCompilationTest {
         let mut cmd = Command::new("rsync");
         cmd.args([
             "-az",
+            "--no-owner",
+            "--no-group",
             "--compress-level",
             &self.config.rsync_compression.to_string(),
             "--delete",
@@ -511,6 +513,8 @@ impl RemoteCompilationTest {
         let mut cmd = Command::new("rsync");
         cmd.args([
             "-az",
+            "--no-owner",
+            "--no-group",
             "--compress-level",
             &self.config.rsync_compression.to_string(),
             "-e",

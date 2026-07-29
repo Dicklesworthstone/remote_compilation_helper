@@ -6,10 +6,15 @@ use super::types::UpdateError;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static LOCK_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Lock to prevent concurrent updates.
 pub struct UpdateLock {
     path: PathBuf,
+    body: String,
 }
 
 impl UpdateLock {
@@ -40,7 +45,8 @@ impl UpdateLock {
         loop {
             match exclusive_create(&path) {
                 Ok(mut file) => {
-                    write!(file, "{}", std::process::id()).map_err(|e| {
+                    let body = new_lock_body();
+                    file.write_all(body.as_bytes()).map_err(|e| {
                         // Clean up our half-written file so a later sweep
                         // doesn't see a malformed PID and choke.
                         let _ = fs::remove_file(&path);
@@ -50,12 +56,16 @@ impl UpdateLock {
                         let _ = fs::remove_file(&path);
                         UpdateError::InstallFailed(format!("Failed to sync lock file: {}", e))
                     })?;
-                    return Ok(Self { path });
+                    return Ok(Self { path, body });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let existing_pid = read_pid(&path);
-                    let holder_alive = existing_pid.is_some_and(is_process_running);
-                    if holder_alive {
+                    let Some(existing_pid) = read_pid(&path) else {
+                        // A missing or malformed PID is ambiguous: it can be a
+                        // lock owner that created the file and has not written
+                        // the PID yet. Do not sweep it as stale.
+                        return Err(UpdateError::LockHeld);
+                    };
+                    if is_process_running(existing_pid) {
                         return Err(UpdateError::LockHeld);
                     }
                     if attempted_sweep {
@@ -87,14 +97,9 @@ impl UpdateLock {
     pub fn is_locked() -> bool {
         if let Ok(path) = get_lock_path()
             && path.exists()
-            && let Ok(mut file) = File::open(&path)
+            && let Some(pid) = read_pid(&path)
         {
-            let mut contents = String::new();
-            if file.read_to_string(&mut contents).is_ok()
-                && let Ok(pid) = contents.trim().parse::<u32>()
-            {
-                return is_process_running(pid);
-            }
+            return is_process_running(pid);
         }
         false
     }
@@ -102,8 +107,12 @@ impl UpdateLock {
 
 impl Drop for UpdateLock {
     fn drop(&mut self) {
-        // Remove the lock file
-        let _ = fs::remove_file(&self.path);
+        // Only remove the exact lock file this guard created. A newer
+        // process may have reacquired the lock after the file was manually
+        // removed or swept; unconditional removal would clear that fresh lock.
+        if read_lock_body(&self.path).as_deref() == Some(self.body.as_str()) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -123,20 +132,37 @@ fn exclusive_create(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
-/// Read the PID recorded in the lock file, if any.
-fn read_pid(path: &Path) -> Option<u32> {
+/// Produce a lock-file body that remains backward-compatible with old
+/// PID-only files by keeping the PID as the first whitespace-delimited token.
+fn new_lock_body() -> String {
+    let timestamp_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let counter = LOCK_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{} {timestamp_ns:x} {counter:x}", std::process::id())
+}
+
+/// Read the complete lock body.
+fn read_lock_body(path: &Path) -> Option<String> {
     let mut file = File::open(path).ok()?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).ok()?;
-    contents.trim().parse().ok()
+    Some(contents)
 }
 
-/// Remove the lock file ONLY if the PID it contains still matches what we
-/// previously observed. This avoids swiping a lock that a fresh process
-/// just grabbed between our read and our remove.
-fn try_sweep_stale(path: &Path, observed_pid: Option<u32>) -> bool {
+/// Read the PID recorded in the lock file, if any.
+fn read_pid(path: &Path) -> Option<u32> {
+    let contents = read_lock_body(path)?;
+    contents.split_whitespace().next()?.parse().ok()
+}
+
+/// Remove the lock file ONLY if the dead PID it contains still matches what we
+/// previously observed. This avoids swiping a lock that a fresh process just
+/// grabbed between our read and our remove.
+fn try_sweep_stale(path: &Path, observed_pid: u32) -> bool {
     let current = read_pid(path);
-    if current != observed_pid {
+    if current != Some(observed_pid) {
         return false;
     }
     match fs::remove_file(path) {
@@ -244,11 +270,9 @@ mod tests {
         let path = get_lock_path().unwrap();
 
         // Read the lock file and verify it contains our PID
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let file_pid: u32 = contents.trim().parse().unwrap();
         let our_pid = std::process::id();
 
-        assert_eq!(file_pid, our_pid);
+        assert_eq!(read_pid(&path), Some(our_pid));
 
         drop(lock);
     }
@@ -295,6 +319,28 @@ mod tests {
     }
 
     #[test]
+    fn test_malformed_lock_is_not_swept() {
+        let _guard = test_lock().lock().unwrap();
+        let path = get_lock_path().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        std::fs::write(&path, "").unwrap();
+
+        let result = UpdateLock::acquire();
+        assert!(
+            matches!(result, Err(UpdateError::LockHeld)),
+            "expected LockHeld for malformed lock"
+        );
+        assert!(path.exists(), "malformed lock must not be swept");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn test_is_locked_with_active_lock() {
         let _guard = test_lock().lock().unwrap();
         // Clear any existing lock first
@@ -310,6 +356,47 @@ mod tests {
 
         // Now should report as locked
         assert!(UpdateLock::is_locked());
+    }
+
+    #[test]
+    fn test_drop_preserves_replaced_lock_body() {
+        let _guard = test_lock().lock().unwrap();
+        let path = get_lock_path().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let old_lock = UpdateLock::acquire().expect("old lock acquire");
+        let replacement_body = new_lock_body();
+        std::fs::write(&path, &replacement_body).expect("replace lock body");
+
+        drop(old_lock);
+
+        let body_after_old_drop =
+            std::fs::read_to_string(&path).expect("replacement lock should remain");
+        assert_eq!(body_after_old_drop, replacement_body);
+
+        let replacement_lock = UpdateLock {
+            path: path.clone(),
+            body: replacement_body,
+        };
+        drop(replacement_lock);
+        assert!(!path.exists(), "replacement owner should remove its lock");
+    }
+
+    #[test]
+    fn test_read_pid_accepts_tokenized_lock_body() {
+        let _guard = test_lock().lock().unwrap();
+        let path = get_lock_path().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        std::fs::write(&path, "12345 abc def").unwrap();
+
+        assert_eq!(read_pid(&path), Some(12345));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -346,11 +433,11 @@ mod tests {
         let first = UpdateLock::acquire().expect("first acquire");
         // Our own PID is running, so a second attempt must see
         // `LockHeld` rather than sweeping and overwriting.
-        match UpdateLock::acquire() {
-            Err(UpdateError::LockHeld) => {}
-            Err(other) => panic!("expected LockHeld, got {:?}", other),
-            Ok(_) => panic!("expected LockHeld, second acquire unexpectedly succeeded"),
-        }
+        let result = UpdateLock::acquire();
+        assert!(
+            matches!(result, Err(UpdateError::LockHeld)),
+            "expected LockHeld for second acquire"
+        );
         drop(first);
 
         // After drop, a fresh acquire should succeed again.
@@ -359,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn test_acquire_is_atomic_across_threads() {
+    fn test_acquire_is_atomic_across_threads() -> Result<(), String> {
         // Regression: only one of N concurrent acquirers may succeed.
         // With `File::create`, two threads could both race past a stale
         // sweep and both overwrite the lock file with their own PID.
@@ -385,7 +472,7 @@ mod tests {
             match h.join().expect("join") {
                 Ok(lock) => successes.push(lock),
                 Err(UpdateError::LockHeld) => lock_held += 1,
-                Err(other) => panic!("unexpected error: {:?}", other),
+                Err(other) => return Err(format!("unexpected error: {other:?}")),
             }
         }
         assert_eq!(
@@ -398,5 +485,6 @@ mod tests {
             thread_count,
             "all acquires must resolve to either success or LockHeld"
         );
+        Ok(())
     }
 }

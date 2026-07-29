@@ -36,7 +36,7 @@ set -euo pipefail
 # Configuration
 # ============================================================================
 
-INSTALLER_VERSION="1.0.16"
+INSTALLER_VERSION="1.0.52"
 VERSION="${VERSION:-}"  # Set dynamically based on install mode
 REPO_URL="https://github.com/Dicklesworthstone/remote_compilation_helper"
 GITHUB_REPO="Dicklesworthstone/remote_compilation_helper"
@@ -328,6 +328,14 @@ systemd_user_available() {
     return 1
 }
 
+system_rchd_service_active() {
+    if ! command_exists systemctl; then
+        return 1
+    fi
+
+    systemctl is-active --quiet rchd.service >/dev/null 2>&1
+}
+
 detect_service_manager() {
     local os
     os="$(uname -s)"
@@ -410,18 +418,24 @@ detect_platform() {
 
     TARGET="${os}-${arch}"
 
-    # Map to release target triples used by GitHub Actions artifacts
+    # Map to release target triples used by GitHub Actions artifacts.
+    # RELEASE_TARGETS is an ordered candidate list: the download step tries each
+    # in turn and uses the first asset that actually exists in the release. This
+    # matters for linux-x86_64, where the preferred fully-static -musl asset is
+    # not always published (e.g. a dsr fallback release that cut only -gnu);
+    # falling back to -gnu keeps install working whenever either asset exists
+    # (rch#23).
     RELEASE_ARCHIVE_EXT="tar.gz"
-    RELEASE_TARGET=""
+    RELEASE_TARGETS=()
     case "${os}-${arch}" in
-        linux-x86_64)  RELEASE_TARGET="x86_64-unknown-linux-musl" ;;
-        linux-aarch64) RELEASE_TARGET="aarch64-unknown-linux-gnu" ;;
-        darwin-x86_64) RELEASE_TARGET="x86_64-apple-darwin" ;;
-        darwin-aarch64) RELEASE_TARGET="aarch64-apple-darwin" ;;
-        windows-x86_64) RELEASE_TARGET="x86_64-pc-windows-msvc"; RELEASE_ARCHIVE_EXT="zip" ;;
+        linux-x86_64)   RELEASE_TARGETS=("x86_64-unknown-linux-musl" "x86_64-unknown-linux-gnu") ;;
+        linux-aarch64)  RELEASE_TARGETS=("aarch64-unknown-linux-gnu") ;;
+        darwin-x86_64)  RELEASE_TARGETS=("x86_64-apple-darwin") ;;
+        darwin-aarch64) RELEASE_TARGETS=("aarch64-apple-darwin") ;;
+        windows-x86_64) RELEASE_TARGETS=("x86_64-pc-windows-msvc"); RELEASE_ARCHIVE_EXT="zip" ;;
     esac
-    if [[ -z "$RELEASE_TARGET" ]]; then
-        RELEASE_TARGET="$TARGET"
+    if [[ ${#RELEASE_TARGETS[@]} -eq 0 ]]; then
+        RELEASE_TARGETS=("$TARGET")
     fi
 
     success "Platform: $TARGET"
@@ -695,16 +709,23 @@ download_binaries() {
         fi
     fi
 
-    if [[ -n "$tag_name" && -n "$RELEASE_TARGET" ]]; then
-        local versioned_asset="rch-${tag_name}-${RELEASE_TARGET}.${asset_ext}"
-        local versioned_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${versioned_asset}"
-        info "Downloading $versioned_asset from $tag_name..."
-        if curl -fsSL "${PROXY_ARGS[@]}" "$versioned_url" -o "$TEMP_DIR/$versioned_asset" 2>/dev/null; then
-            downloaded=true
-            asset_name="$versioned_asset"
-            checksum_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${versioned_asset}.sha256"
-            checksum_tag="$tag_name"
-        fi
+    if [[ -n "$tag_name" && ${#RELEASE_TARGETS[@]} -gt 0 ]]; then
+        # Try each candidate target triple in preference order and use the first
+        # asset that actually exists in this release (rch#23: linux-x86_64 falls
+        # back from -musl to -gnu when only -gnu was published).
+        local candidate_target
+        for candidate_target in "${RELEASE_TARGETS[@]}"; do
+            local versioned_asset="rch-${tag_name}-${candidate_target}.${asset_ext}"
+            local versioned_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${versioned_asset}"
+            info "Downloading $versioned_asset from $tag_name..."
+            if curl -fsSL "${PROXY_ARGS[@]}" "$versioned_url" -o "$TEMP_DIR/$versioned_asset" 2>/dev/null; then
+                downloaded=true
+                asset_name="$versioned_asset"
+                checksum_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${versioned_asset}.sha256"
+                checksum_tag="$tag_name"
+                break
+            fi
+        done
     fi
 
     if [[ "$downloaded" != "true" ]]; then
@@ -1711,6 +1732,12 @@ maybe_prompt_service() {
         return
     fi
 
+    if system_rchd_service_active; then
+        ENABLE_SERVICE="false"
+        info "System-level rchd.service is active; skipping duplicate user daemon setup."
+        return
+    fi
+
     local service_manager=""
     service_manager="$(detect_service_manager 2>/dev/null || true)"
     if [[ -z "$service_manager" ]]; then
@@ -1919,6 +1946,14 @@ EOF
 # ============================================================================
 
 setup_path() {
+    # Test harnesses and automation MUST set RCH_NO_RC=1: modifying the
+    # user's real shell rc from a non-interactive/CI context is how a test
+    # fixture's stub `rch` ended up shadowing the real binary on PATH for
+    # five days (2026-07-11..16 incident). Never remove this guard.
+    if [[ "${RCH_NO_RC:-}" == "1" ]]; then
+        info "RCH_NO_RC=1 set; skipping shell rc PATH modification"
+        return 0
+    fi
     if [[ ":$PATH:" == *":$INSTALL_DIR:"* ]]; then
         info "$INSTALL_DIR already in PATH"
         return 0
@@ -2040,6 +2075,11 @@ restart_daemon_if_needed() {
     fi
 
     if [[ "$MODE" == "worker" ]]; then
+        return 0
+    fi
+
+    if system_rchd_service_active; then
+        info "System-level rchd.service is active; skipping user-daemon restart."
         return 0
     fi
 
@@ -2542,6 +2582,7 @@ Environment:
 Service Setup:
   On Linux:  systemd user service is offered during install (auto-accept in --easy-mode/--yes).
              Use --install-service to opt in without prompting.
+             An active system-level rchd.service suppresses duplicate user-daemon setup/restart.
              Lingering is enabled for reboot persistence when possible (requires sudo).
   On macOS:  launchd service is offered during install (auto-accept in --easy-mode/--yes).
              Use --install-service to opt in without prompting.

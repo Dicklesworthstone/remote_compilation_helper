@@ -35,7 +35,7 @@ echo "Worker: $RCH_WORKER"
 echo "Command: $RCH_COMMAND"
 
 # Custom logic here
-rsync -a ~/.cache/sccache/ $RCH_WORKER:/tmp/sccache/
+rsync -a --no-owner --no-group ~/.cache/sccache/ $RCH_WORKER:/tmp/sccache/
 ```
 
 ### Post-Build Hooks

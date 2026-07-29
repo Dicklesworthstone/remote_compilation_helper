@@ -89,7 +89,7 @@ export default function DashboardPage() {
     toast('Retrying connection...');
     try {
       await mutate();
-    } catch (err) {
+    } catch {
       toast.error('Retry failed');
     } finally {
       setIsRetrying(false);

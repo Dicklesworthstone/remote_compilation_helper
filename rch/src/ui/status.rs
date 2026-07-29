@@ -550,6 +550,7 @@ mod tests {
             },
             test_stats: None,
             saved_time: None,
+            remediation: None,
         }
     }
 

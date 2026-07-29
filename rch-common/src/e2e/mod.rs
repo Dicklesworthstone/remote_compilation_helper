@@ -52,6 +52,7 @@
 //! - **Full Build Pipeline**: End-to-end compilation offloading
 //! - **Fleet Deployment**: Multi-worker scenarios
 
+pub mod fault_injection;
 pub mod fixtures;
 pub mod harness;
 pub mod logging;
@@ -60,6 +61,9 @@ pub mod test_workers;
 pub mod verification;
 
 // Re-export commonly used items
+pub use fault_injection::{
+    ELF_MAGIC, FaultFixture, FaultScenario, MACH_O_64_MAGIC, SimulatedDiskStats,
+};
 pub use fixtures::{
     DEFAULT_MULTI_REPO_ALIAS_ROOT, DEFAULT_MULTI_REPO_CANONICAL_ROOT,
     DEFAULT_MULTI_REPO_FIXTURE_NAMESPACE, DaemonConfigFixture, FixtureFailureMode, FixtureLayer,

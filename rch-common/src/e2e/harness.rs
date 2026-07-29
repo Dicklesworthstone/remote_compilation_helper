@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::logging::{
     LogLevel, LogSource, RELIABILITY_EVENT_SCHEMA_VERSION, ReliabilityContext,
@@ -574,12 +575,14 @@ impl TestHarness {
         // Clean up stale artifacts from previous test runs (older than 1 hour)
         cleanup_stale_test_artifacts(&config.temp_dir, Duration::from_secs(3600));
 
-        // Create unique test directory
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
-        let test_dir =
-            config
-                .temp_dir
-                .join(format!("{}_{}", test_name.replace("::", "_"), timestamp));
+        // Keep the filesystem component compact. RCH intentionally places
+        // remote TMPDIR beneath the project root, and embedding a descriptive
+        // test name plus timestamp here can push descendant Unix socket paths
+        // beyond sockaddr_un::sun_path (108 bytes on Linux). The descriptive
+        // name remains in every log and reliability event; a 48-bit random id
+        // is ample isolation for ephemeral per-process test directories.
+        let instance_id = Uuid::new_v4().simple().to_string();
+        let test_dir = config.temp_dir.join(&instance_id[..12]);
 
         std::fs::create_dir_all(&test_dir)?;
 
@@ -1050,7 +1053,13 @@ impl TestHarness {
             stage: stage.to_string(),
             command_name: command.name.clone(),
             invoked_program: invoked_program.clone(),
-            invoked_args: invoked_args.clone(),
+            // Route invoked args through the shared secret redactor before they
+            // land in the JSONL artifact (bd-53ga7): a `--token <secret>` or
+            // `KEY=secret` arg must not survive into the recorded transcript.
+            invoked_args: invoked_args
+                .iter()
+                .map(|a| crate::redaction::redact_secrets(a))
+                .collect(),
             exit_code: result.exit_code,
             duration_ms: result.duration.as_millis() as u64,
             required_success: command.required_success,
@@ -1352,6 +1361,49 @@ impl TestHarness {
         } else {
             Err(HarnessError::ProcessNotFound(name.to_string()))
         }
+    }
+
+    /// Wait for a managed process to exit without killing it.
+    pub fn wait_for_process_exit(
+        &self,
+        name: &str,
+        timeout: Duration,
+    ) -> HarnessResult<ExitStatus> {
+        self.logger
+            .debug(format!("Waiting for process to exit: {name} ({timeout:?})"));
+
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            let exit_status = {
+                let mut processes = self.managed_processes.lock().unwrap();
+                let Some(info) = processes.get_mut(name) else {
+                    return Err(HarnessError::ProcessNotFound(name.to_string()));
+                };
+
+                match info.try_exit_status() {
+                    Some(status) => {
+                        self.logger.debug(format!(
+                            "Process {name} exited after {:?} with status: {:?}",
+                            start.elapsed(),
+                            status
+                        ));
+                        Some(status)
+                    }
+                    None => None,
+                }
+            };
+
+            if let Some(status) = exit_status {
+                self.managed_processes.lock().unwrap().remove(name);
+                return Ok(status);
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        self.logger
+            .error(format!("Timeout waiting for process to exit: {name}"));
+        Err(HarnessError::Timeout(timeout))
     }
 
     /// Stop all managed processes
@@ -2033,6 +2085,26 @@ mod tests {
 
         assert!(harness.test_dir().exists());
         // Will cleanup on drop
+    }
+
+    #[test]
+    fn test_harness_directory_leaf_stays_compact_for_unix_sockets() {
+        let harness = TestHarnessBuilder::new(
+            "a_descriptive_test_name_that_must_not_expand_the_filesystem_path",
+        )
+        .cleanup_on_success(true)
+        .build()
+        .unwrap();
+
+        let leaf = harness
+            .test_dir()
+            .file_name()
+            .and_then(OsStr::to_str)
+            .expect("test directory should have a UTF-8 instance id");
+        assert_eq!(leaf.len(), 12);
+        assert!(leaf.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        harness.mark_passed();
     }
 
     #[test]

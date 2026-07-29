@@ -8,9 +8,313 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ---
 
-## [Unreleased] (since v1.0.18)
+## [Unreleased] (since v1.0.52)
 
 No unreleased changes yet.
+
+---
+
+## [v1.0.52] -- 2026-07-23 (release)
+
+### Added
+
+- **`rch shim install|status|uninstall` — the canonical cargo offload wrapper.**
+  rch only auto-intercepts builds via the Claude Code PreToolUse hook, so Codex,
+  plain shells, scripts, and CI — which invoke `cargo` directly with no hook — were
+  compiling **locally** on orchestrator boxes, defeating the point of rch. rch already
+  honored a cargo-wrapper contract (it sets `RCH_CARGO_WRAPPER_BYPASS=1` on local
+  fallback) but never shipped the wrapper, so every box hand-rolled one or had none.
+  This ships the ONE canonical wrapper as a first-class command:
+  - harness-agnostic — every agent that runs `cargo` via `PATH` now offloads;
+  - loop-safe (honors `RCH_CARGO_WRAPPER_BYPASS`), fails open if `rch` is absent, and
+    leaves rust-analyzer (`--message-format`) builds local;
+  - offloads only `build|test|check|clippy|bench|doc|nextest`; everything else is local;
+  - installs to a dedicated `~/.rch/shims/` (not `~/.local/bin`, which acfs manages);
+  - `--allow-local-fallback` toggles fail-open; default is fail-closed (queue for a
+    worker, never build locally) — appropriate for a dispatcher box;
+  - `rch shim status` reports version drift, `PATH` order, and any local builds running.
+
+  Install **only** on dispatcher boxes (that offload OUT); never on a worker box (a
+  worker runs cargo via `rch-wkr` and the shim would re-offload/loop). Part of a larger
+  effort tracked as an epic (dispatcher `general.role`, a loud local-build alarm, and
+  install/watchdog durability to follow).
+
+### Fixed
+
+- Tidied two nightly-clippy findings (`collapsible_if`, `manual_contains`) in the
+  linked-git-worktree upload path so the tree is clean under `-D warnings`.
+
+---
+
+## [v1.0.51] -- 2026-07-22 (release)
+
+### Fixed
+
+- **The bypass↔telemetry stranding deadlock that silently dropped the whole fleet
+  to local builds.** A circuit trip quarantined a worker and persisted a
+  `BypassRecord`; the telemetry poller then skipped quarantined workers, but the
+  bypass recovery gate requires *fresh telemetry* before promoting a worker — so a
+  quarantined worker could never produce the evidence needed for its own recovery.
+  Restarting `rchd` did not help, because `reconcile_on_start` re-applied the
+  persisted record. Meanwhile every offload fell back to local execution with no
+  fleet-level signal (root cause of the 2026-07-16 offload meltdown).
+  `should_poll_worker` now gates on the **admin** axis (`AdminIntent::Drained |
+  Disabled`) instead of `WorkerStatus`, which collapses every quarantine state into
+  `Unreachable`.
+- **`rch workers enable` is now durable.** The enable handler deletes the persisted
+  bypass record (mirroring `rejoin`), so an operator re-enable survives a daemon
+  restart instead of being re-quarantined from disk on the next start.
+- **Health probes no longer cascade into fleet-wide quarantine.** Health checks get
+  their own SSH ControlMaster pool, separate from the shared build/telemetry pool.
+  The health probe is what opens the circuit that quarantines a worker, so a single
+  wedged control socket could previously false-fail every probe at once.
+- **`cargo zigbuild` is no longer dispatched to workers that cannot run it.**
+  `CargoZigbuild` mapped to `RequiredRuntime::Rust`, and the finer `needs_zig` check
+  is only enforced by `assess_admissibility`, which the daemon's selection path never
+  calls — so any rustc-capable worker was admitted. On a worker without
+  cargo-zigbuild the build fails with `error: no such command: 'zigbuild'`, which
+  matches neither `is_toolchain_failure` nor `detect_worker_system_dependency_failure`,
+  so the nonzero exit reached the user verbatim instead of falling open to local.
+
+### Added
+
+- **`cargo zigbuild` cross-compile offload.** New `CompilationKind::CargoZigbuild`
+  covering both `cargo zigbuild ...` and the standalone `cargo-zigbuild` binary
+  (build forms only). Artifact retrieval is triple-aware — cargo-zigbuild always
+  builds for an explicit `--target`, so output lands under
+  `target/<triple>/<profile>/`, which the ordinary Rust globs miss entirely — with
+  triple-nested cache excludes on the custom-`CARGO_TARGET_DIR` path.
+- **`RequiredRuntime::Zig`**, gated on `WorkerCapabilities::has_zig()`, which requires
+  **both** `zig` and `cargo-zigbuild`: zig alone cannot run the subcommand, and
+  cargo-zigbuild alone cannot link (it shells out to `zig cc`). `rch-wkr` probes both.
+- **Fleet-degraded alarm.** `rchd` now emits an edge-triggered warning when ≥75% of
+  the last 20 selections returned no worker (clearing at ≤40%), so a fleet-wide silent
+  local fallback is visible in the daemon journal instead of only in per-hook output.
+
+### Upgrade notes
+
+- **Upgrade `rch-wkr` on workers, not just the orchestrators.** Worker selection reads
+  capabilities from `rch-wkr capabilities` JSON. Until the new `rch-wkr` is deployed,
+  `zig_version`/`cargo_zigbuild_version` are absent, `has_zig()` is false, and
+  zigbuilds run locally rather than offloading — the safe direction, and it
+  self-resolves on worker upgrade.
+- `RequiredRuntime` gained a `Zig` variant, which appears in the `SelectionRequest`
+  wire format. Keep `rch` and `rchd` at the same version, as with the Go/TypeScript
+  offload in 1.0.48.
+
+---
+
+## [v1.0.50] -- 2026-07-17 (release)
+
+### Added
+
+- **Fail-closed clean-overlay remote proofs for shared working trees.** `rch
+  exec` now accepts an immutable `--base <commit>` plus `--clean-overlay` and
+  explicit `--overlay-path` selections (or `--no-overlay`). The remote source
+  tree is built from `git archive` and only the selected, validated paths are
+  overlaid, so unrelated local dirt cannot enter a proof build. The pipeline
+  rejects deletions, type changes, symlink or submodule surfaces, ambiguous
+  spellings, export-affecting attributes, source mutation during capture, and
+  post-transfer fingerprint drift. Clean-overlay execution is remote-only and
+  never falls back to the ambient local tree.
+
+### Fixed
+
+- **Shell suffix classification is byte-faithful and fail-closed.** Benign
+  pipes, redirects, and backgrounding remain offloadable without rewriting
+  file-descriptor adjacency, while embedded newlines and carriage returns are
+  rejected before a command can be re-emitted.
+- **Release gates remain deterministic inside isolated overlays.** Doctor
+  startup probes now honor explicit test binaries, generated Cargo fixtures
+  declare standalone workspaces, and compact harness directory identifiers keep
+  Unix-domain socket paths below the platform limit.
+
+---
+
+## [v1.0.41] -- 2026-06-08 (release)
+
+### Added
+
+- **Autonomous worker-side stale-target reaper (default-OFF).** `rchd` gains an
+  optional periodic background sweep that SSHes each healthy worker every
+  `interval_mins` (default 120) and reaps abandoned per-job `.rch-target-*-job-*`
+  / `.rch-target-*-pid-*` dirs idle >`idle_hours` (default 12h) across **all**
+  repos under the worker's canonical project root — closing the gap where the
+  orchestrator hook only ever reaps the single repo currently being built (the
+  ~1.6 TB-across-the-fleet accumulation). Shares one predicate with the hook
+  reaper (`rch_common::stale_target_reap`) so the two cannot drift. Depth-robust
+  (`find -maxdepth 8 -prune`, catches nested workspace members), canonicalizes a
+  symlinked base, and re-asserts a ≥2-path-segment guard on the resolved root.
+  **Ships default-OFF** (this is an autonomous periodic deleter targeting
+  `/data/projects`); enable per-host with `RCH_WORKER_REAP_ENABLE=1` or
+  `[stale_target_reap] enabled = true`, disable with `RCH_WORKER_REAP_DISABLE=1`.
+
+### Changed
+
+- **Orchestrator hook reaper reverted to cheap current-project-only.** With the
+  daemon now handling cross-repo GC, the hook reaper no longer does a full
+  `find` over the canonical root on every build dispatch (the v1.0.38/39
+  behavior) — it again sweeps only the just-built repo's sibling per-job dirs via
+  a `cd`-based glob (which also follows a symlinked project dir natively). This
+  removes the per-dispatch full-tree walk.
+
+### Fixes
+
+- **`rch daemon restart` now cycles a systemd-managed rchd.** On hosts where
+  rchd runs as a systemd `--user` (or system) unit, the old socket-shutdown +
+  spawn path could not restart the unit (systemd respawned the old on-disk
+  image; the manual spawn deferred to systemd and exited), leaving a stale
+  binary running. `rch daemon restart` now detects a systemd-managed rchd and
+  restarts via `systemctl [--user] restart rchd`, falling back to the manual
+  path for user-launched daemons and macOS launchd.
+- **`rch update` retries transient download/checksum failures.** GitHub
+  `502/503/504`/`429` and request timeouts on the release asset or its `.sha256`
+  sidecar are now retried with bounded backoff (4 attempts, 2s/5s/15s) instead
+  of aborting (the "Checksum not found" symptom was a 504 on the sidecar). A
+  genuine checksum **mismatch** (corruption) and a `404` (asset absent) remain
+  hard failures.
+
+---
+
+## [v1.0.40] -- 2026-06-08 (release)
+
+### Fixes
+
+- **`rch exec` reaps the whole test process group at the runtime cap.** Killing
+  only the direct child left grandchildren (test servers, fixtures) orphaned —
+  observed as 20-45h orphan trees pinning worker resources. The cap now reaps the
+  entire process group. (Also tightens `rchd` cache-cleanup and cancellation
+  handling.)
+
+---
+
+## [v1.0.39] -- 2026-06-08 (release)
+
+### Fixes
+
+- **Stale-target reaper now works when the canonical root is a symlink on the
+  worker.** v1.0.38 rooted the sweep at the orchestrator's `canonical_root`, but
+  on a real worker that path is frequently a symlink (the macOS orchestrator
+  passes `/Users/<u>/projects`, which is a symlink to `/data/projects` on the
+  worker) and `find <symlink>` does not descend the target without `-L`. The
+  reaper was therefore a silent no-op for builds dispatched from such an
+  orchestrator (found by live canary testing). The generated reap script now
+  canonicalizes the root and the live-dir path at runtime (`cd … && pwd -P`)
+  before walking, so `find` traverses the real tree and the live-dir exclusion
+  still matches the physical paths `find` emits. `-L` is deliberately *not* used
+  (following arbitrary in-tree symlinks during a root-owned delete sweep is
+  unsafe). A defense-in-depth check re-asserts the ≥2-path-segment invariant on
+  the *resolved* root before any `find`/`rm`.
+
+---
+
+## [v1.0.38] -- 2026-06-08 (release)
+
+### Fixes
+
+- **Stale-target reaper now sweeps every project under the canonical root.**
+  The reaper (added in v1.0.34) only ever swept the *current* build's project
+  directory, so once a project stopped dispatching builds its abandoned per-job
+  `.rch-target-<host>-job-*` dirs were never revisited and accumulated forever
+  (observed: 72 dirs / 332G on a single worker). It now roots its sweep at the
+  same `canonical_root` (`/data/projects`) where per-job dirs are actually
+  created, using a depth-robust `find -maxdepth 8 -type d -name
+  '.rch-target-*-job-*' -o -name '.rch-target-*-pid-*' -prune` that matches
+  top-level repos, canonical `<id>/<hash>` layouts, and nested workspace members
+  alike (the old fixed-depth `*/*/` glob silently missed both 1-level and
+  3+-level dirs). The `is_safe_reap_path` guard, the >12h newest-descendant idle
+  check (no `-type f`, so a freshly `mkdir`'d concurrent build survives — the
+  v1.0.35 race fix), and full-path exclusion of the live job dir are all
+  preserved; the live dir is excluded by exact path and a fresh project's dirs
+  are protected by the idle check.
+
+- **Isolated CARGO_HOME staging honors `TMPDIR`.** Per-job cargo-home dirs were
+  hardcoded under `/tmp` (`/tmp/rch-cargo-home-*`), which eats RAM on workers
+  with a tmpfs `/tmp`. The base is now resolved on the worker at execution time
+  to `$TMPDIR` (if a real directory) → `/data/tmp` (if present) → `/tmp`. The
+  `rch-cargo-home-` basename prefix is unchanged so external cleanup (sbh) still
+  matches, and the resolution is done in shell with all values double-quoted, so
+  a hostile `$TMPDIR` cannot inject. (rchd under systemd does not inherit PAM's
+  `/etc/environment`, so the resolution is explicit rather than relying on the
+  daemon's inherited env.)
+
+---
+
+## [v1.0.37] -- 2026-06-02 (release)
+
+### Fixes
+
+- **rchd: enforce a single instance via systemd cgroup detection** to stop
+  orphan/duplicate daemons (no-op on macOS / non-unit hosts).
+
+---
+
+## [v1.0.36] -- 2026-06-02 (release)
+
+### Fixes
+
+- **rch-common: pin a finite ControlPersist** to stop the SSH control-master
+  leak (leaked masters + telemetry gap). Corrects the `control_persist_idle`
+  documentation accordingly.
+
+---
+
+## [v1.0.35] -- 2026-05-30 (release)
+
+### Fixes
+
+- **Stale-target reaper: don't reap a just-created sibling.** The reaper's
+  recency check used `find -type f`, which finds nothing in a per-job dir that
+  a *concurrent* build has just `mkdir`'d but not yet written a file into — so it
+  could delete an active build's target dir (the build then fails and must
+  retry). The check now considers the directory itself and any descendant
+  (`find <dir> -mmin -N`), so a freshly-created dir is kept by its own recent
+  mtime while genuinely-abandoned dirs are still reaped. Also corrected the
+  reaper's doc comments (it does not assert per-job dirs are "reused", and the
+  call awaits a quick SSH dispatch rather than adding zero latency).
+
+---
+
+## [v1.0.34] -- 2026-05-30 (release)
+
+### Worker disk hygiene
+
+- **Reap abandoned per-job remote target directories.** Forwarded-`CARGO_TARGET_DIR`
+  builds get a per-job target dir on the worker
+  (`.rch-target-<worker>-job-<id>-<ts>-<seq>`) that rch previously never cleaned
+  up, so they accumulated until worker disks filled (observed on a worker whose
+  single btrfs root hit 100% from ~600G of stale per-job dirs). After each sync,
+  rch now opportunistically removes sibling per-job dirs on the chosen worker
+  whose **newest file is older than an idle threshold** (default **12h**,
+  overridable via `RCH_STALE_TARGET_REAP_HOURS`, floored at 1h). Because per-job
+  dirs are *reused* across an agent's edit-compile-fix loop, the reaper keys on
+  recent file activity so an in-progress incremental cache is always preserved —
+  it never clips a live build or races a concurrent build on the same project,
+  even with multiple agents building it on the same worker. The removal is
+  detached on the worker and best-effort, so it adds no latency to the build.
+  Inputs are charset-guarded before being embedded in the remote reap script.
+
+---
+
+## [v1.0.25] -- 2026-05-14
+
+### Dependency and release maintenance
+
+- Switched local-owner libraries to the current `/dp` checkouts: FrankenTUI
+  crates now resolve from `/dp/frankentui`, TOON resolves from
+  `/dp/toon_rust`, and `rich_rust` resolves from `/dp/rich_rust`.
+- Refreshed Rust direct dependencies and lockfile, including `reqwest`,
+  `sha2`, `hmac`, `rusqlite`, `proptest`, `insta`, `terminal_size`,
+  `whoami`, `fastrand`, and security-sensitive transitive TLS crates.
+- Removed the `rich_rust/full` feature from RCH's default rich UI path,
+  dropping unmaintained `syntect` transitive dependencies that were not
+  needed by the codebase.
+- Updated the web dashboard dependency stack to current compatible releases
+  and added a `postcss` override so `npm audit` remains clean while Next.js
+  ships its pinned nested dependency.
+- Hardened the release workflow so all release and publish jobs recreate the
+  `/dp` local dependency layout, including Windows builds and crates.io dry
+  runs.
 
 ---
 

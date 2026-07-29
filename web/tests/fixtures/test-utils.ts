@@ -7,6 +7,7 @@ import type {
   SpeedScoreResponse,
   SpeedScoreHistoryResponse,
   SpeedScoreListResponse,
+  RemediationView,
 } from '../../src/lib/types';
 import {
   mockStatusResponse,
@@ -14,6 +15,7 @@ import {
   mockReadyResponse,
   mockBudgetResponse,
   mockMetricsText,
+  mockRemediationView,
   mockSpeedScoreResponse,
   mockSpeedScoreHistoryResponse,
   mockSpeedScoreListResponse,
@@ -25,10 +27,14 @@ type ApiMockOverrides = {
   ready?: ReadyResponse;
   budget?: BudgetStatusResponse;
   metrics?: string;
+  remediation?: RemediationView;
   speedscores?: SpeedScoreListResponse;
   speedscoreForWorker?: (workerId: string) => SpeedScoreResponse;
   speedscoreHistoryForWorker?: (workerId: string, days?: number, limit?: number) => SpeedScoreHistoryResponse;
 };
+
+const daemonMetricsUrl = (url: URL) =>
+  url.origin === 'http://localhost:9100' && url.pathname === '/metrics';
 
 export async function mockApiResponses(
   page: Page,
@@ -39,6 +45,14 @@ export async function mockApiResponses(
   const ready = overrides.ready ?? mockReadyResponse;
   const budget = overrides.budget ?? mockBudgetResponse;
   const metrics = overrides.metrics ?? mockMetricsText;
+  const remediation = overrides.remediation ?? mockRemediationView;
+
+  // Register the more-specific /api/remediation route before the generic
+  // /status route so it is matched first.
+  await page.route('**/api/remediation', async (route) => {
+    console.log('[mock] Intercepting /api/remediation');
+    await route.fulfill({ json: remediation });
+  });
 
   await page.route('**/status', async (route) => {
     console.log('[mock] Intercepting /status');
@@ -60,7 +74,7 @@ export async function mockApiResponses(
     await route.fulfill({ json: budget });
   });
 
-  await page.route('**/metrics', async (route) => {
+  await page.route(daemonMetricsUrl, async (route) => {
     console.log('[mock] Intercepting /metrics');
     await route.fulfill({ body: metrics, contentType: 'text/plain' });
   });

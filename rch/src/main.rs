@@ -8,10 +8,12 @@
 
 pub mod agent;
 mod cache;
+mod cache_gc;
 mod commands;
 mod completions;
 mod config;
 mod doctor;
+mod doctor_webhooks;
 pub mod error;
 pub mod fleet;
 #[cfg_attr(not(unix), path = "hook_windows.rs")]
@@ -30,9 +32,10 @@ mod update;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
-use rch_common::{ApiResponse, LogConfig, init_logging};
+use rch_common::{ApiError, ApiResponse, ErrorCode, LogConfig, init_logging};
 use schemars::schema_for;
 use std::env;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use ui::{ColorChoice, OutputConfig, OutputContext, OutputFormat};
@@ -41,7 +44,7 @@ use ui::{ColorChoice, OutputConfig, OutputContext, OutputFormat};
 #[command(name = "rch")]
 #[command(
     author,
-    version,
+    version = rch_common::build_version_value_static(),
     about = "Remote Compilation Helper - transparent compilation offloading",
     long_about = "Remote Compilation Helper (RCH) transparently offloads compilation commands \
                   to remote workers. When invoked without a subcommand, RCH runs as a Claude Code \
@@ -74,13 +77,15 @@ ENVIRONMENT VARIABLES:
     RCH_PROFILE           Profile to use: dev, prod, test (sets defaults below)
     RCH_LOG_LEVEL         Logging level: trace, debug, info, warn, error, off
     RCH_LOG_FORMAT        Log format: pretty, json, compact
-    RCH_DAEMON_SOCKET     Path to daemon Unix socket
+    RCH_SOCKET_PATH       Path to daemon Unix socket
     RCH_DAEMON_TIMEOUT_MS Timeout for daemon communication (default: 5000)
     RCH_SSH_KEY           Path to SSH private key for worker connections
     RCH_SSH_SERVER_ALIVE_INTERVAL_SECS  SSH keepalive interval (ServerAliveInterval)
     RCH_SSH_CONTROL_PERSIST_SECS        SSH ControlPersist idle seconds (0 disables persistence)
-    RCH_TRANSFER_ZSTD_LEVEL  Compression level 1-22 (default: 3)
+    RCH_COMPRESSION_LEVEL Compression level 1-22 (default: 3)
     RCH_ENV_ALLOWLIST     Comma-separated env vars to forward (e.g., RUSTFLAGS,CARGO_TARGET_DIR)
+    RCH_MIN_LOCAL_TIME_MS Minimum local runtime estimate required before offload
+    RCH_REMOTE_SPEEDUP_THRESHOLD Minimum predicted remote speedup ratio before offload
     RCH_VISIBILITY        Hook output visibility: none, summary, verbose
     RCH_VERBOSE           Convenience: sets visibility=verbose when true
     RCH_QUIET             Force visibility=none when true
@@ -283,6 +288,18 @@ Use 'disable' to mark a worker as unavailable (optionally with --reason)."#)]
         /// Show active jobs
         #[arg(short = 'J', long)]
         jobs: bool,
+
+        /// Show the fleet-wide desired/live worker grouping, dominant problem
+        /// class, and absence alerts (workers absent from eligibility too long)
+        #[arg(long)]
+        fleet: bool,
+
+        /// Show the operator-facing remediation view: compact status bands
+        /// (desired/live fleet, admissibility, proof queue, jobs, disk pressure,
+        /// telemetry freshness, recent incidents) tagged operator-action /
+        /// self-healing / normal fail-open.
+        #[arg(long)]
+        remediation: bool,
     },
 
     /// Quick health check - is RCH working?
@@ -295,9 +312,9 @@ Use 'disable' to mark a worker as unavailable (optionally with --reason)."#)]
     rch check --json        # Machine-readable output
 
 EXIT CODES:
-    0   Ready - daemon running, all workers healthy
+    0   Ready - daemon running, hook installed, all workers healthy
     1   Degraded - daemon running, some workers unreachable
-    2   Not ready - daemon not running or fatal issues
+    2   Not ready - daemon/hook missing or fatal issues
 
 USAGE:
     # CI/CD health gate
@@ -360,6 +377,41 @@ to clean up. Use --force to immediately terminate with SIGKILL."#)]
         dry_run: bool,
     },
 
+    /// Force-resync stale worker caches for a project's path-dependency closure
+    #[command(after_help = r#"EXAMPLES:
+    rch sync --project .                 # Preview: what force-resync would invalidate
+    rch sync --force --worker css        # Invalidate css's RCH cache + trigger resync
+    rch sync --force --all               # Force-resync every configured worker
+    rch sync --force --all --dry-run     # Preview the apply plan, take no action
+    rch sync --force --worker css --json # Machine-readable report
+
+Force-resync invalidates the RCH-managed worker cache (under transfer.remote_base)
+for the target project and its path-dependency closure, then triggers a daemon
+convergence repair so the closure re-syncs on the next build. It NEVER deletes
+anything outside the RCH-managed base: canonical source mirrors are refused, not
+wiped. Without --force (or with --dry-run) it only previews the plan."#)]
+    Sync {
+        /// Apply the destructive cache invalidation (without this, preview only)
+        #[arg(long)]
+        force: bool,
+
+        /// Target a specific worker by id
+        #[arg(long, short = 'w')]
+        worker: Option<String>,
+
+        /// Apply to all configured workers
+        #[arg(long, short = 'a')]
+        all: bool,
+
+        /// Project whose closure to force-resync (defaults to current directory)
+        #[arg(long, short = 'p')]
+        project: Option<PathBuf>,
+
+        /// Preview the plan without taking any destructive action
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+    },
+
     /// View and manage RCH configuration
     #[command(after_help = r#"EXAMPLES:
     rch config show           # Display effective config
@@ -371,6 +423,22 @@ to clean up. Use --force to immediately terminate with SIGKILL."#)]
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+
+    /// Manage project caches on remote workers (br-4zm6u)
+    ///
+    /// Cache management without running a build. Useful for pre-warming
+    /// workers ahead of an interactive session so the first compilation
+    /// in that session uses an already-synced remote tree.
+    #[command(after_help = r#"EXAMPLES:
+    rch cache warm                                # Warm cache on all healthy workers
+    rch cache warm --workers css                  # Warm cache on specific worker
+    rch cache warm --workers css --workers vmi1   # Warm cache on multiple workers
+    rch cache warm --project /path/to/project     # Warm cache for a non-cwd project
+    rch cache warm --json                         # Emit per-worker results as JSON"#)]
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
     },
 
     /// Explain why a command would or wouldn't be offloaded
@@ -389,6 +457,18 @@ to clean up. Use --force to immediately terminate with SIGKILL."#)]
         dry_run: bool,
     },
 
+    /// Preflight a command's admission before expensive work
+    ///
+    /// Read-only and side-effect free: classifies the command, derives the
+    /// capabilities a worker must have to run it, and returns a decisive
+    /// offload/local/queue/defer recommendation. Use `--json` for the
+    /// machine-readable envelope.
+    Admit {
+        /// Command to preflight (quote or pass as multiple args)
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+
     /// Execute a compilation command on a remote worker
     ///
     /// This command is typically invoked by the PreToolUse hook to perform
@@ -398,6 +478,8 @@ to clean up. Use --force to immediately terminate with SIGKILL."#)]
     rch exec -- cargo build --release
     rch exec -- cargo test
     rch exec -- bun test
+    rch exec --base HEAD --clean-overlay --overlay-path src/lib.rs -- cargo test
+    rch exec --base HEAD --clean-overlay --no-overlay -- cargo check
 
 USAGE:
     This command is primarily used internally by the PreToolUse hook.
@@ -407,6 +489,23 @@ USAGE:
     This allows the hook to return immediately (<50ms) while the actual
     compilation runs as a normal command invocation."#)]
     Exec {
+        /// Git commit used as the clean source-tree baseline
+        #[arg(long, short = 'b', requires = "clean_overlay")]
+        base: Option<String>,
+        /// Transfer a clean Git baseline plus only explicit overlay paths
+        #[arg(long, requires = "base")]
+        clean_overlay: bool,
+        /// Repository-relative file or directory to overlay (repeatable)
+        #[arg(
+            long,
+            short = 'o',
+            requires = "clean_overlay",
+            conflicts_with = "no_overlay"
+        )]
+        overlay_path: Vec<PathBuf>,
+        /// Use the clean baseline without any working-tree overlay
+        #[arg(long, requires = "clean_overlay", conflicts_with = "overlay_path")]
+        no_overlay: bool,
         /// The compilation command to execute remotely
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
@@ -435,6 +534,27 @@ compilation commands to remote workers."#)]
     Agents {
         #[command(subcommand)]
         action: AgentsAction,
+    },
+
+    /// Install the canonical cargo shim so ALL agents offload (not just Claude Code)
+    #[command(after_help = r#"EXAMPLES:
+    rch shim install              # Install the cargo offload shim (fail-closed)
+    rch shim install --allow-local-fallback  # Offload but allow local under load
+    rch shim status               # Check install, version, PATH order, local builds
+    rch shim uninstall            # Remove the shim
+
+The Claude Code hook only covers Claude Code. Codex, plain shells, scripts, and
+CI invoke `cargo` directly with no hook to catch them, so their builds compile
+locally on this box. The shim sits on PATH ahead of ~/.cargo/bin and routes
+offloadable cargo subcommands through `rch exec`. It is loop-safe, fails open if
+rch is unavailable, and leaves rust-analyzer (`--message-format`) builds local.
+
+Install ONLY on dispatcher boxes (that offload OUT). NEVER on a worker box: a
+worker runs cargo via rch-wkr to execute offloaded builds, and the shim would
+re-offload/loop."#)]
+    Shim {
+        #[command(subcommand)]
+        action: ShimAction,
     },
 
     /// Generate and install shell completion scripts
@@ -484,6 +604,12 @@ CHECKS PERFORMED:
     Hooks           - Claude Code hook installed
     Workers         - Connectivity (with --verbose)
     Reliability     - topology, repo convergence, disk pressure, process debt"#)]
+    /// Look up RCH-Ennn / RCH-Rnnn error and reason codes (operator ergonomics)
+    Error {
+        #[command(subcommand)]
+        sub: ErrorSubcommand,
+    },
+
     Doctor {
         /// Attempt to fix safe issues (e.g., key permissions)
         #[arg(long)]
@@ -504,6 +630,69 @@ CHECKS PERFORMED:
         /// Include schema compatibility checks in reliability mode
         #[arg(long, requires = "reliability")]
         check_schemas: bool,
+
+        /// Strict mode: promote `Degraded` verdict to exit code 2 (warnings
+        /// treated as failures). For tight CI gates. Mutually exclusive with
+        /// `--lenient`. Only meaningful with `--reliability`.
+        #[arg(long, requires = "reliability", conflicts_with = "lenient")]
+        strict: bool,
+
+        /// Lenient mode: demote `Failing` verdict to exit code 1 (logs only,
+        /// never blocks). For non-blocking tripwires. Mutually exclusive with
+        /// `--strict`. Only meaningful with `--reliability`.
+        #[arg(long, requires = "reliability", conflicts_with = "strict")]
+        lenient: bool,
+
+        /// Subset of probes to run, comma-separated. Default = `all`.
+        /// Valid values: `all`, `topology`, `convergence`, `pressure`,
+        /// `triage`, `helpers`, `rollout`, `schema`. Multi-scope:
+        /// `--scope topology,pressure`. Only meaningful with `--reliability`.
+        #[arg(
+            long,
+            requires = "reliability",
+            default_value = "all",
+            value_name = "SCOPES"
+        )]
+        scope: String,
+
+        /// Continuous monitoring mode: re-runs the reliability doctor every
+        /// `--watch-interval` seconds and emits diff-aware output until SIGINT.
+        /// Only meaningful with `--reliability`. Mutually exclusive with `--fix`.
+        #[arg(long, requires = "reliability", conflicts_with = "fix")]
+        watch: bool,
+
+        /// Seconds between sweeps in `--watch` mode. Clamped by the CLI
+        /// handler to 1..=3600. Default: 5.
+        #[arg(long, requires = "watch", default_value = "5", value_name = "SECONDS")]
+        watch_interval: u64,
+
+        /// In `--watch` mode, emit output only when the verdict OR the
+        /// diagnostic set changes versus the prior sweep (suppresses
+        /// unchanged iterations).
+        #[arg(long, requires = "watch")]
+        transitions_only: bool,
+
+        /// On `--watch` exit, write a final summary JSON to PATH (sweep
+        /// count, transition count, final verdict). Useful for tmux/split-
+        /// window setups and CI tripwires.
+        #[arg(long, requires = "watch", value_name = "PATH")]
+        watch_snapshot: Option<PathBuf>,
+
+        /// Render the operator runbook for a specific RCH-Rnnn code as
+        /// Markdown on stdout (br-62u24.20). Pastes cleanly into PagerDuty
+        /// / Slack / wiki pages. Mutually exclusive with the regular
+        /// reliability sweep — when this flag is set, no probes run.
+        #[arg(long, value_name = "CODE", conflicts_with_all = ["fix", "watch"])]
+        runbook: Option<String>,
+
+        /// List every reason code that has an authored runbook
+        /// (br-62u24.20). Mutually exclusive with `--runbook <code>`
+        /// (which renders one) and with the regular sweep.
+        #[arg(
+            long = "runbook-list",
+            conflicts_with_all = ["fix", "watch", "runbook"]
+        )]
+        runbook_list: bool,
     },
 
     /// Verify remote compilation by running a self-test
@@ -538,11 +727,29 @@ CHECKS PERFORMED:
         /// Run using scheduled settings (ignores worker selection flags)
         #[arg(long)]
         scheduled: bool,
+        /// Run the real-fleet smoke/soak validation profile (planner + JSONL trace)
+        #[arg(long)]
+        smoke: bool,
+        /// Soak mode: repeat the live per-worker probe pass several times to
+        /// check stability across passes (use with --smoke; a no-op on --dry-run)
+        #[arg(long)]
+        soak: bool,
+        /// Load mode: launch a bounded swarm of concurrent canary builds across
+        /// the fleet and gate it with the storm-control invariants (implies the
+        /// smoke profile; honors --worker/--all/--timeout; --dry-run plans only)
+        #[arg(long)]
+        load: bool,
+        /// Plan only; do not execute scenarios (use with --smoke)
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Update RCH binaries on local machine and/or workers
-    #[command(after_help = r#"EXAMPLES:
+    #[command(
+        visible_alias = "upgrade",
+        after_help = r#"EXAMPLES:
     rch update --check          # Check for available updates
+    rch upgrade --check         # Same as 'rch update --check'
     rch update                  # Update to latest stable
     rch update --channel=beta   # Update to beta channel
     rch update --version=v0.3.0 # Install specific version
@@ -550,7 +757,8 @@ CHECKS PERFORMED:
     rch update --dry-run        # Preview what would happen
     rch update --rollback       # Restore previous version
     rch update --verify         # Check installation integrity
-    rch update --skip-verify    # Skip checksum verification (dangerous)"#)]
+    rch update --skip-verify    # Skip checksum verification (dangerous)"#
+    )]
     Update {
         /// Check for updates without installing
         #[arg(long)]
@@ -798,6 +1006,30 @@ enum SchemaAction {
 }
 
 #[derive(Subcommand)]
+enum ErrorSubcommand {
+    /// Print details for a specific code (e.g. RCH-R104, RCH-E001).
+    /// Operators paste a code from a log line and get description + remediation.
+    Explain {
+        /// The code to look up (whitespace and case tolerated; one of:
+        /// RCH-Rnnn for reliability codes, RCH-Ennn for error codes).
+        code: String,
+        /// Emit JSON envelope instead of the human-readable form.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List every known code in both namespaces (RCH-Ennn + RCH-Rnnn).
+    List {
+        /// Filter to a single category (snake_case; e.g. `disk_pressure`,
+        /// `worker`, `topology`). Empty = all categories.
+        #[arg(long)]
+        category: Option<String>,
+        /// Emit JSON envelope instead of the human-readable form.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum RobotDocsAction {
     /// Print the agent-oriented operating guide
     Guide,
@@ -882,8 +1114,47 @@ enum WorkersAction {
         #[arg(short = 'a', long)]
         all: bool,
     },
-    /// Run speed benchmarks
-    Benchmark,
+    /// Run speed benchmarks against one or more workers (br-ifq7s)
+    #[command(after_help = r#"EXAMPLES:
+    rch workers benchmark             # Benchmark every configured worker
+    rch workers benchmark css         # Benchmark one specific worker
+    rch workers benchmark --all       # Equivalent to no worker id (explicit form)
+    rch workers benchmark css --force # Re-run even if recently benchmarked"#)]
+    Benchmark {
+        /// Worker ID to benchmark. Omit (or use --all) to benchmark every
+        /// configured worker.
+        #[arg(value_name = "WORKER_ID", conflicts_with = "all")]
+        worker_id: Option<String>,
+
+        /// Benchmark every configured worker. Equivalent to omitting the
+        /// worker-id positional, but explicit for scripted invocations.
+        #[arg(long, conflicts_with = "worker_id")]
+        all: bool,
+
+        /// Re-run the benchmark even if the worker was benchmarked
+        /// recently (the recency check is informational today; the
+        /// flag is plumbed through so a future bead can wire it to a
+        /// "skip if measured within N minutes" gate without a CLI break).
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Side-by-side comparison of SpeedScore data across workers (br-ifq7s)
+    ///
+    /// Fetches the latest stored SpeedScore for each named worker from the
+    /// daemon and renders a leader-highlighted table. Workers without a
+    /// recorded SpeedScore are shown with dash cells. A one-line
+    /// recommendation names the best overall worker.
+    #[command(after_help = r#"EXAMPLES:
+    rch workers compare css dlx          # Compare two workers
+    rch workers compare css dlx vmi1     # Compare three+
+    rch workers compare css dlx --json   # Machine-readable response"#)]
+    Compare {
+        /// Worker IDs to compare. Order is preserved in the rendered
+        /// columns. At least 2 IDs required; clap enforces via num_args.
+        #[arg(value_name = "WORKER_ID", num_args = 2..)]
+        worker_ids: Vec<String>,
+    },
 
     /// Drain a worker (stop accepting new jobs, finish current ones)
     ///
@@ -1033,7 +1304,8 @@ impl WorkersAction {
             WorkersAction::List { .. } => "list",
             WorkersAction::Capabilities { .. } => "capabilities",
             WorkersAction::Probe { .. } => "probe",
-            WorkersAction::Benchmark => "benchmark",
+            WorkersAction::Benchmark { .. } => "benchmark",
+            WorkersAction::Compare { .. } => "compare",
             WorkersAction::Drain { .. } => "drain",
             WorkersAction::Enable { .. } => "enable",
             WorkersAction::Disable { .. } => "disable",
@@ -1044,6 +1316,51 @@ impl WorkersAction {
             WorkersAction::Init { .. } => "init",
         }
     }
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Pre-sync project sources to one or more workers without running a build.
+    ///
+    /// Useful to warm caches ahead of an interactive session so the first
+    /// compilation in the session uses an already-uploaded remote tree.
+    /// Reuses the standard `TransferPipeline::sync_to_remote` path so the
+    /// upload semantics match a real build (incremental rsync + .rchignore
+    /// honored + zstd compression).
+    Warm {
+        /// Worker IDs to warm (repeatable). Default: every configured worker.
+        ///
+        /// Currently the warm path issues one `sync_to_remote` per worker
+        /// sequentially; if a worker is unreachable, the remaining workers
+        /// still warm successfully (per-worker results reported separately).
+        #[arg(long, value_name = "WORKER_ID")]
+        workers: Vec<String>,
+
+        /// Project root to warm. Default: current working directory.
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+    },
+
+    /// Prune stale local staging trees under the configured remote_base to
+    /// bound disk usage (bd-s3433).
+    ///
+    /// Safe by default: a bare `rch cache clean` is a DRY RUN that only reports
+    /// what would be removed. Pass `--execute` to actually delete. Trees
+    /// modified within `--older` are kept (an in-flight build keeps its tree
+    /// fresh), and every path is validated as a safe reap path before removal.
+    Clean {
+        /// Only prune trees idle at least this long (e.g. `30m`, `24h`, `7d`).
+        #[arg(long, value_name = "DURATION", default_value = "24h")]
+        older: String,
+
+        /// Restrict to a single project's staging trees (the project id dir).
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+
+        /// Actually delete (default is a dry-run report only).
+        #[arg(long)]
+        execute: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1194,6 +1511,21 @@ impl HookAction {
             HookAction::Status => "status",
         }
     }
+}
+
+#[derive(Subcommand)]
+enum ShimAction {
+    /// Install (or refresh) the canonical cargo shim
+    Install {
+        /// Offload but allow local fallback under load (default is fail-closed:
+        /// queue for a worker and never build locally).
+        #[arg(long)]
+        allow_local_fallback: bool,
+    },
+    /// Show shim install state, version, PATH order, and local builds
+    Status,
+    /// Remove the cargo shim
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -1396,6 +1728,37 @@ enum FleetAction {
         #[arg(long)]
         worker: Option<String>,
     },
+
+    /// Run reliability diagnostics across the whole fleet
+    #[command(after_help = r#"EXAMPLES:
+    rch fleet doctor --reliability                     # Fleet-wide health (worst verdict wins)
+    rch fleet doctor --reliability --json              # Machine-readable envelope
+    rch fleet doctor --reliability --scope pressure    # Narrow check across all workers
+    rch fleet doctor --reliability --workers css,bil   # Only these workers
+    rch fleet doctor --reliability --fix --fleet-confirm  # Apply fixes fleet-wide"#)]
+    Doctor {
+        /// Run the reliability probe suite (required; reserved for future modes)
+        #[arg(long)]
+        reliability: bool,
+        /// Probe scope(s), comma-separated (default: all)
+        #[arg(long, value_delimiter = ',')]
+        scope: Vec<String>,
+        /// Apply remediations on each worker (requires --fleet-confirm)
+        #[arg(long)]
+        fix: bool,
+        /// Safety gate required to actually apply --fix fleet-wide
+        #[arg(long)]
+        fleet_confirm: bool,
+        /// Keep going after a worker's fix fails (default: halt)
+        #[arg(long)]
+        continue_on_failure: bool,
+        /// Restrict to specific worker(s), comma-separated
+        #[arg(long)]
+        workers: Option<String>,
+        /// Per-worker probe timeout in seconds (default: 10)
+        #[arg(long, default_value = "10")]
+        worker_timeout: u64,
+    },
 }
 
 fn machine_output_requested(format: Option<&str>, json_flag: bool) -> bool {
@@ -1436,13 +1799,38 @@ fn base_log_level_for_cli(cli: &Cli) -> String {
 /// Multi-threaded runtime spawns one thread per CPU core (64 cores = 128MB stack allocations).
 /// Current-thread runtime uses a single thread, drastically reducing startup time.
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn main() {
+    let args: Vec<OsString> = env::args_os().collect();
+    let wants_machine_output = top_level_machine_output_requested(&args);
+
+    if let Err(error) = run(args).await {
+        if wants_machine_output {
+            let response: ApiResponse<()> =
+                ApiResponse::err(top_level_command_label(), top_level_api_error(&error));
+            match serde_json::to_string_pretty(&response) {
+                Ok(json) => println!("{json}"),
+                Err(serialize_error) => {
+                    eprintln!("Error: {error:#}");
+                    eprintln!("Failed to serialize JSON error response: {serialize_error}");
+                }
+            }
+        } else {
+            eprintln!("Error: {error:#}");
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run(args: Vec<OsString>) -> Result<()> {
     // Handle dynamic shell completions (exits if handling a completion request)
     CompleteEnv::with_factory(Cli::command).complete();
 
     // Early check for --help-json to handle it before full clap parsing
     // (which would fail on subcommands that require further arguments)
-    let args: Vec<String> = env::args().collect();
+    let args: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     if args.iter().any(|a| a == "--help-json") {
         let subcommand_path: Vec<String> = args
             .iter()
@@ -1479,7 +1867,18 @@ async fn main() -> Result<()> {
     } else if cli.quiet {
         log_config = log_config.with_level("error");
     }
-    let _logging_guards = init_logging(&log_config)?;
+    // Logging is best-effort diagnostics and must NEVER hard-fail a command.
+    // Most critically: a non-zero exit from the PreToolUse hook (the no-subcommand
+    // path below) is interpreted by Claude Code as "deny" and BLOCKS the user's
+    // command — so an init failure (e.g. an unwritable RCH_LOG_FILE directory)
+    // must degrade to no-logging and continue, not propagate and exit non-zero.
+    let _logging_guards = match init_logging(&log_config) {
+        Ok(guards) => Some(guards),
+        Err(error) => {
+            eprintln!("rch: logging initialization failed ({error:#}); continuing without logging");
+            None
+        }
+    };
 
     // br-4zf3p: emit one INFO event so agents (and `rch ... --verbose`)
     // can verify the CLI override actually took effect. Silent flags are
@@ -1566,7 +1965,12 @@ async fn main() -> Result<()> {
             Commands::Init { yes, skip_test } => commands::init_wizard(yes, skip_test, &ctx).await,
             Commands::Daemon { action } => handle_daemon(action, &ctx).await,
             Commands::Workers { action } => handle_workers(action, &ctx).await,
-            Commands::Status { workers, jobs } => handle_status(workers, jobs, &ctx).await,
+            Commands::Status {
+                workers,
+                jobs,
+                fleet,
+                remediation,
+            } => handle_status(workers, jobs, fleet, remediation, &ctx).await,
             Commands::Check => commands::check(&ctx).await,
             Commands::Queue { watch, follow } => commands::queue_status(watch, follow, &ctx).await,
             Commands::Cancel {
@@ -1576,12 +1980,28 @@ async fn main() -> Result<()> {
                 yes,
                 dry_run,
             } => commands::cancel_build(build_id, all, force, yes, dry_run, &ctx).await,
+            Commands::Sync {
+                force,
+                worker,
+                all,
+                project,
+                dry_run,
+            } => commands::sync_force(force, worker, all, project, dry_run, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
+            Commands::Cache { action } => handle_cache(action, &ctx).await,
             Commands::Diagnose { command, dry_run } => {
                 handle_diagnose(command, dry_run, &ctx).await
             }
-            Commands::Exec { command } => hook::run_exec(command).await,
+            Commands::Admit { command } => handle_admit(command, &ctx).await,
+            Commands::Exec {
+                base,
+                clean_overlay,
+                overlay_path,
+                no_overlay,
+                command,
+            } => hook::run_exec(base, clean_overlay, overlay_path, no_overlay, command).await,
             Commands::Hook { action } => handle_hook(action, &ctx).await,
+            Commands::Shim { action } => handle_shim(action, &ctx),
             Commands::Agents { action } => handle_agents(action, &ctx).await,
             Commands::Completions { action } => handle_completions(action, &ctx),
             Commands::Doctor {
@@ -1590,7 +2010,35 @@ async fn main() -> Result<()> {
                 install_deps,
                 reliability,
                 check_schemas,
-            } => handle_doctor(fix, dry_run, install_deps, reliability, check_schemas, &ctx).await,
+                strict,
+                lenient,
+                scope,
+                watch,
+                watch_interval,
+                transitions_only,
+                watch_snapshot,
+                runbook,
+                runbook_list,
+            } => {
+                handle_doctor(
+                    fix,
+                    dry_run,
+                    install_deps,
+                    reliability,
+                    check_schemas,
+                    strict,
+                    lenient,
+                    scope,
+                    watch,
+                    watch_interval,
+                    transitions_only,
+                    watch_snapshot,
+                    runbook,
+                    runbook_list,
+                    &ctx,
+                )
+                .await
+            }
             Commands::SelfTest {
                 action,
                 worker,
@@ -1599,9 +2047,14 @@ async fn main() -> Result<()> {
                 timeout,
                 debug,
                 scheduled,
+                smoke,
+                soak,
+                load,
+                dry_run,
             } => {
                 commands::self_test(
-                    action, worker, all, project, timeout, debug, scheduled, &ctx,
+                    action, worker, all, project, timeout, debug, scheduled, smoke, soak, load,
+                    dry_run, &ctx,
                 )
                 .await
             }
@@ -1671,9 +2124,60 @@ async fn main() -> Result<()> {
             } => handle_web(port, no_open, prod, &ctx).await,
             Commands::Capabilities => handle_capabilities_command(&ctx),
             Commands::RobotDocs { action } => handle_robot_docs(action, &ctx),
+            Commands::Error { sub } => handle_error_explain(sub, &ctx),
             Commands::Schema { action } => handle_schema_command(action, &ctx),
         },
     }
+}
+
+fn top_level_machine_output_requested(args: &[OsString]) -> bool {
+    if env::var_os("RCH_JSON").is_some_and(|value| value != "0" && !value.is_empty())
+        || env::var_os("RCH_OUTPUT_FORMAT").is_some_and(|value| !value.is_empty())
+        || env::var_os("TOON_DEFAULT_FORMAT").is_some_and(|value| !value.is_empty())
+    {
+        return true;
+    }
+
+    for arg in args.iter().skip(1) {
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+
+        match arg {
+            "--json" | "-j" | "--help-json" | "--capabilities" | "--schema" | "--robot-triage" => {
+                return true;
+            }
+            "--format" | "-F" => {
+                return true;
+            }
+            _ if arg.starts_with("--format=") => return true,
+            _ => {}
+        }
+    }
+
+    false
+}
+
+fn top_level_api_error(error: &anyhow::Error) -> ApiError {
+    let details = format!("{error:#}");
+    let code = if details.contains("TOML parse error")
+        || details.contains("Invalid TOML syntax")
+        || details.contains("Failed to parse workers config")
+    {
+        ErrorCode::ConfigParseError
+    } else if details.contains("Failed to parse") || details.contains("Failed to decode") {
+        ErrorCode::InternalSerdeError
+    } else if details.contains("Failed to read") {
+        ErrorCode::ConfigReadError
+    } else {
+        ErrorCode::InternalStateError
+    };
+
+    ApiError::from_code(code).with_details(details)
+}
+
+fn top_level_command_label() -> &'static str {
+    "rch"
 }
 
 /// Handle 'rch schema' subcommands.
@@ -2037,6 +2541,10 @@ struct CapabilitiesOutput {
     env_vars: Vec<EnvVarCapability>,
     /// Copy-paste-ready commands agents should try first.
     recommended_commands: Vec<RecommendedCommand>,
+    /// Stable reason/error code families agents can discover and look up.
+    reason_code_families: Vec<ReasonCodeFamily>,
+    /// Placement / fallback policies (fail-open, force-remote, proof, queue).
+    policies: Vec<PolicyCapability>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -2086,10 +2594,61 @@ struct RecommendedCommand {
     purpose: String,
 }
 
+/// A family of stable reason/error codes agents can discover and look up.
+///
+/// The large catalogs (`RCH-E`, `RCH-R`) are enumerable at runtime via
+/// `rch error list --json`; the small incident registry (`RCH-I`) is enumerated
+/// in full here because it is not (yet) resolvable through `rch error explain`.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct ReasonCodeFamily {
+    /// Stable code prefix, e.g. "RCH-E", "RCH-R", "RCH-I".
+    family: String,
+    /// Human-readable family name.
+    name: String,
+    /// What this family covers.
+    description: String,
+    /// Inclusive code range, e.g. "RCH-E001..RCH-E599".
+    code_range: String,
+    /// Command (or surface) that explains a single code from this family.
+    lookup: String,
+    /// Command (or surface) that enumerates this family.
+    enumerate: String,
+    /// Representative or (for small families) exhaustive code list.
+    examples: Vec<ReasonCodeExample>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct ReasonCodeExample {
+    code: String,
+    meaning: String,
+}
+
+/// A placement / fallback policy an agent can rely on.
+///
+/// Proof-mode (`require_remote`, fail-closed) and force-mode (`force_remote`,
+/// fail-open) are the two most-conflated controls; making them first-class here
+/// keeps the fail-open vs fail-closed distinction discoverable instead of
+/// folklore.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct PolicyCapability {
+    /// Stable policy id, e.g. "fail_open", "force_remote", "require_remote".
+    id: String,
+    /// Governing environment variable, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env_var: Option<String>,
+    /// What the policy does.
+    behavior: String,
+    /// Reason code emitted when the policy refuses or falls back, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<String>,
+    /// What an agent should do to observe or act on this policy.
+    next_action: String,
+}
+
 fn build_capabilities_output() -> CapabilitiesOutput {
     CapabilitiesOutput {
         contract_version: "rch.capabilities.v1".to_string(),
-        schema_version: "1.0".to_string(),
+        schema_version: "1.1".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         build_timestamp: option_env!("RCH_BUILD_TIMESTAMP").map(|s| s.to_string()),
         runtimes: vec![
@@ -2199,6 +2758,8 @@ fn build_capabilities_output() -> CapabilitiesOutput {
         exit_codes: exit_code_capabilities(),
         env_vars: env_var_capabilities(),
         recommended_commands: recommended_commands(),
+        reason_code_families: reason_code_families(),
+        policies: policies(),
     }
 }
 
@@ -2221,6 +2782,24 @@ fn handle_capabilities_command(ctx: &OutputContext) -> Result<()> {
         ctx.key_value("Version", &output.version);
         ctx.key_value("Commands", &output.commands.len().to_string());
         ctx.key_value("Output formats", &output.output_formats.join(", "));
+        ctx.key_value(
+            "Reason-code families",
+            &output
+                .reason_code_families
+                .iter()
+                .map(|f| f.family.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        ctx.key_value(
+            "Policies",
+            &output
+                .policies
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
         ctx.print("");
         ctx.print("Recommended agent entry points:");
         for command in &output.recommended_commands {
@@ -2253,7 +2832,7 @@ fn command_category(name: &str) -> &'static str {
     match name {
         "init" | "hook" | "agents" | "completions" => "setup",
         "status" | "check" | "queue" | "speedscore" | "dashboard" | "web" => "monitoring",
-        "daemon" | "workers" | "cancel" | "exec" | "update" | "fleet" => "management",
+        "daemon" | "workers" | "cancel" | "sync" | "exec" | "update" | "fleet" => "management",
         "config" => "configuration",
         "diagnose" | "doctor" | "self-test" | "schema" => "debugging",
         "capabilities" | "robot-docs" => "agent-docs",
@@ -2304,7 +2883,7 @@ fn exit_code_capabilities() -> Vec<ExitCodeCapability> {
 }
 
 fn env_var_capabilities() -> Vec<EnvVarCapability> {
-    vec![
+    let mut caps = vec![
         EnvVarCapability {
             name: "RCH_OUTPUT_FORMAT".to_string(),
             effect: "Set machine output format: json or toon; implies machine output.".to_string(),
@@ -2327,7 +2906,7 @@ fn env_var_capabilities() -> Vec<EnvVarCapability> {
             effect: "Disable ANSI color output.".to_string(),
         },
         EnvVarCapability {
-            name: "RCH_DAEMON_SOCKET".to_string(),
+            name: "RCH_SOCKET_PATH".to_string(),
             effect: "Override daemon Unix socket path.".to_string(),
         },
         EnvVarCapability {
@@ -2339,10 +2918,42 @@ fn env_var_capabilities() -> Vec<EnvVarCapability> {
             effect: "Enable mock SSH for tests and offline verification.".to_string(),
         },
         EnvVarCapability {
+            name: "RCH_COMPRESSION_LEVEL".to_string(),
+            effect: "Override transfer compression level.".to_string(),
+        },
+        EnvVarCapability {
+            name: "RCH_MIN_LOCAL_TIME_MS".to_string(),
+            effect: "Override the local-runtime threshold used before offload.".to_string(),
+        },
+        EnvVarCapability {
+            name: "RCH_REMOTE_SPEEDUP_THRESHOLD".to_string(),
+            effect: "Override the predicted remote speedup ratio required before offload."
+                .to_string(),
+        },
+        EnvVarCapability {
             name: "RCH_VISIBILITY".to_string(),
             effect: "Control hook output visibility: none, summary, or verbose.".to_string(),
         },
-    ]
+    ];
+
+    // Append the canonical placement/visibility/strict/queue/wait controls from
+    // the single-source registry so agents discover them instead of relying on
+    // folklore (bd-...remediation-ocv9i.13.5). De-dup against names already
+    // listed above (e.g. RCH_VISIBILITY).
+    for control in rch_common::placement_controls() {
+        if caps.iter().any(|c| c.name == control.canonical_env) {
+            continue;
+        }
+        let mut effect = format!("{} [{}]", control.description, control.value_form);
+        if !control.aliases.is_empty() {
+            effect.push_str(&format!(" (aliases: {})", control.aliases.join(", ")));
+        }
+        caps.push(EnvVarCapability {
+            name: control.canonical_env.to_string(),
+            effect,
+        });
+    }
+    caps
 }
 
 fn recommended_commands() -> Vec<RecommendedCommand> {
@@ -2364,7 +2975,7 @@ fn recommended_commands() -> Vec<RecommendedCommand> {
             purpose: "Fast readiness probe with stable exit codes.".to_string(),
         },
         RecommendedCommand {
-            command: "rch diagnose \"cargo test\" --json".to_string(),
+            command: "rch diagnose --json \"cargo test\"".to_string(),
             purpose: "Explain whether a command will be offloaded.".to_string(),
         },
         RecommendedCommand {
@@ -2374,11 +2985,179 @@ fn recommended_commands() -> Vec<RecommendedCommand> {
     ]
 }
 
+/// Stable reason/error code families for agent discovery.
+///
+/// `RCH-E` and `RCH-R` are large and enumerable via `rch error list --json`, so
+/// only representative examples are inlined. `RCH-I` is small and is now also
+/// resolvable through `rch error explain` / `rch error list`; it is still
+/// enumerated in full here straight from the
+/// [`IncidentReasonCode`](rch_common::incident::IncidentReasonCode) registry
+/// (no drift).
+fn reason_code_families() -> Vec<ReasonCodeFamily> {
+    use rch_common::incident::IncidentReasonCode;
+
+    let incident_examples: Vec<ReasonCodeExample> = IncidentReasonCode::ALL
+        .iter()
+        .map(|reason| ReasonCodeExample {
+            code: reason.code().to_string(),
+            meaning: reason.failure_class().to_string(),
+        })
+        .collect();
+    let incident_range = match (
+        IncidentReasonCode::ALL.first(),
+        IncidentReasonCode::ALL.last(),
+    ) {
+        (Some(first), Some(last)) => format!("{}..{}", first.code(), last.code()),
+        _ => "RCH-I001..".to_string(),
+    };
+
+    vec![
+        ReasonCodeFamily {
+            family: "RCH-E".to_string(),
+            name: "Operational error catalog".to_string(),
+            description:
+                "Configuration, network/SSH, worker, build, transfer, and internal errors carried \
+                 in the JSON error envelope's `error.code`."
+                    .to_string(),
+            code_range: "RCH-E001..RCH-E599".to_string(),
+            lookup: "rch error explain RCH-E100".to_string(),
+            enumerate: "rch error list --json".to_string(),
+            examples: vec![
+                ReasonCodeExample {
+                    code: "RCH-E001".to_string(),
+                    meaning: "configuration not found".to_string(),
+                },
+                ReasonCodeExample {
+                    code: "RCH-E100".to_string(),
+                    meaning: "SSH connection failed".to_string(),
+                },
+                ReasonCodeExample {
+                    code: "RCH-E300".to_string(),
+                    meaning: "build compilation failed".to_string(),
+                },
+            ],
+        },
+        ReasonCodeFamily {
+            family: "RCH-R".to_string(),
+            name: "Reliability reason codes".to_string(),
+            description:
+                "Topology/fleet, disk-pressure, process-debt/cancellation, and repo-convergence \
+                 reliability states surfaced by `rch status` and `rch doctor --reliability`."
+                    .to_string(),
+            code_range: "RCH-R001..RCH-R3xx".to_string(),
+            lookup: "rch error explain RCH-R101".to_string(),
+            enumerate: "rch error list --json".to_string(),
+            examples: vec![
+                ReasonCodeExample {
+                    code: "RCH-R006".to_string(),
+                    meaning: "all workers unhealthy".to_string(),
+                },
+                ReasonCodeExample {
+                    code: "RCH-R101".to_string(),
+                    meaning: "worker disk pressure critical".to_string(),
+                },
+                ReasonCodeExample {
+                    code: "RCH-R302".to_string(),
+                    meaning: "repo convergence drift".to_string(),
+                },
+            ],
+        },
+        ReasonCodeFamily {
+            family: "RCH-I".to_string(),
+            name: "Incident / refusal reason codes".to_string(),
+            description:
+                "Stable failure classes emitted when a build is steered, refused, deferred, or \
+                 falls back (selection, admission, proof, fallback, artifact, worker lifecycle). \
+                 Resolvable via `rch error explain RCH-Innn` and `rch error list --json`; live \
+                 occurrences surface in incident events and `rch status --remediation`."
+                    .to_string(),
+            code_range: incident_range,
+            lookup: "rch error explain RCH-I012".to_string(),
+            enumerate: "rch error list --json".to_string(),
+            examples: incident_examples,
+        },
+    ]
+}
+
+/// Placement / fallback policies an agent can rely on. Keeps the fail-open vs
+/// fail-closed distinction (the most-conflated control pair) first-class.
+fn policies() -> Vec<PolicyCapability> {
+    vec![
+        PolicyCapability {
+            id: "fail_open".to_string(),
+            env_var: None,
+            behavior:
+                "Default. If remote execution is unavailable or unsafe, the command runs locally \
+                 instead of blocking."
+                    .to_string(),
+            reason_code: Some("RCH-I011".to_string()),
+            next_action: "If you expected offload, inspect `rch status --remediation --json` and \
+                 `rch diagnose --json \"<cmd>\"`."
+                .to_string(),
+        },
+        PolicyCapability {
+            id: "force_remote".to_string(),
+            env_var: Some("RCH_FORCE_REMOTE".to_string()),
+            behavior:
+                "Always attempt offload, bypassing the local-time and predicted-speedup gating, \
+                 but still fail open to local execution if offload cannot proceed."
+                    .to_string(),
+            reason_code: Some("RCH-I011".to_string()),
+            next_action:
+                "Force an offload attempt; confirm routing with `rch diagnose --json \"<cmd>\"`."
+                    .to_string(),
+        },
+        PolicyCapability {
+            id: "require_remote".to_string(),
+            env_var: Some("RCH_REQUIRE_REMOTE".to_string()),
+            behavior:
+                "Proof mode: fail closed. Refuse local fallback entirely. Takes precedence over \
+                 RCH_FORCE_REMOTE."
+                    .to_string(),
+            reason_code: Some("RCH-I012".to_string()),
+            next_action:
+                "Run proofs as `RCH_REQUIRE_REMOTE=1 rch exec -- <build cmd>`; a refusal surfaces \
+                 RCH-I012 instead of silently running locally."
+                    .to_string(),
+        },
+        PolicyCapability {
+            id: "queue_when_busy".to_string(),
+            env_var: Some("RCH_QUEUE_WHEN_BUSY".to_string()),
+            behavior:
+                "Default on. Wait for a busy-but-eligible worker instead of falling back to local. \
+                 Set to 0 to disable queueing."
+                    .to_string(),
+            reason_code: None,
+            next_action: "Tune the wait with RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS; watch with \
+                 `rch queue --follow`."
+                .to_string(),
+        },
+    ]
+}
+
+/// A concise, machine-readable remediation workflow for agents. Each entry maps
+/// an operator workflow to the *real* commands that deliver it today, plus how
+/// to observe its state — never an aspirational command that does not exist.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct RemediationWorkflow {
+    /// Stable workflow id, e.g. "admit_before_proof", "proof_mode".
+    id: String,
+    /// One-line summary of the workflow.
+    summary: String,
+    /// Commands an agent runs, in order.
+    commands: Vec<String>,
+    /// How to observe the resulting state (status surface, reason code), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observe: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 struct RobotDocsGuideOutput {
     contract_version: String,
     guide: String,
     canonical_commands: Vec<RecommendedCommand>,
+    /// Concise remediation workflows keyed to real commands.
+    remediation_workflows: Vec<RemediationWorkflow>,
     output_contracts: Vec<String>,
     safety_notes: Vec<String>,
 }
@@ -2390,6 +3169,7 @@ fn handle_robot_docs(action: RobotDocsAction, ctx: &OutputContext) -> Result<()>
                 contract_version: "rch.robot_docs.v1".to_string(),
                 guide: robot_docs_guide_text().to_string(),
                 canonical_commands: recommended_commands(),
+                remediation_workflows: remediation_workflows(),
                 output_contracts: vec![
                     "Use --json or --format toon for parseable stdout.".to_string(),
                     "Diagnostics, progress, and remediation text belong on stderr.".to_string(),
@@ -2427,7 +3207,7 @@ First commands to try:
   rch capabilities --json         Machine-readable command/env/exit-code map
   rch check --json                Fast readiness status
   rch status --workers --jobs --json
-  rch diagnose "cargo test" --json
+  rch diagnose --json "cargo test"
   rch doctor --dry-run --json
 
 Output rules:
@@ -2447,8 +3227,8 @@ Common workflows:
     rch check --json
 
   Explain routing:
-    rch diagnose "cargo build --release" --json
-    rch diagnose "bun test" --json
+    rch diagnose --json "cargo build --release"
+    rch diagnose --json "bun test"
 
   Inspect fleet health:
     rch workers list --json
@@ -2458,7 +3238,148 @@ Common workflows:
   Repair safely:
     rch doctor --dry-run --json
     rch config validate --json
+
+Remediation workflows (machine-readable list under `remediation_workflows`):
+  Admit before proof:
+    rch admit --json "cargo test"        # offload/local/queue/defer + required caps
+    RCH_REQUIRE_REMOTE=1 rch exec -- cargo test
+
+  Proof mode (queued / refused / replayed):
+    RCH_REQUIRE_REMOTE=1 rch exec -- cargo test --workspace
+    # fail-closed: a refusal is RCH-I012 (never a silent local run).
+    # queue/replay is daemon-driven; observe the proof_queue band in
+    rch status --remediation --json
+
+  Worker temporary bypass and auto-rejoin:
+    rch workers drain <id>               # manual: stop sending new jobs
+    rch workers enable <id>              # manual: bring it back
+    # transient bypass + auto-rejoin are automatic; observe per-worker state in
+    rch status --workers --json
+
+  Fleet status:
+    rch status --fleet --json
+    rch fleet status --json
+
+  Force resync (stale path-dependency roots):
+    # convergence/resync is daemon-driven today; observe drift with
+    rch doctor --reliability --scope convergence --json
+    rch status --remediation --json
+
+  Queue attach / cancel:
+    rch queue --json
+    rch queue --follow
+    rch cancel <id>   |   rch cancel --all --yes
+
+  Real-fleet smoke validation:
+    rch self-test --all --json
+    rch self-test status --json
+    rch self-test history --limit 10 --json
+
+Dashboards and metrics:
+  rch dashboard                          # interactive TUI (press 'R' for remediation)
+  rch web                                # web dashboard incl. /remediation route
+  rchd serves Prometheus metrics (rch_remediation_* families) at its /metrics endpoint.
 "#
+}
+
+/// Concise remediation workflows for agents, keyed to the commands that deliver
+/// them today. Surfaces under `remediation_workflows` in `rch robot-docs guide
+/// --json`. Every command listed here resolves against the real CLI surface —
+/// where a workflow has no dedicated command yet (e.g. one-shot force-resync),
+/// the observation surface is documented honestly instead.
+fn remediation_workflows() -> Vec<RemediationWorkflow> {
+    vec![
+        RemediationWorkflow {
+            id: "admit_before_proof".to_string(),
+            summary: "Preflight admissibility, then run the build in proof mode.".to_string(),
+            commands: vec![
+                "rch admit --json \"cargo test\"".to_string(),
+                "RCH_REQUIRE_REMOTE=1 rch exec -- cargo test".to_string(),
+            ],
+            observe: Some(
+                "admit returns an offload/local/queue/defer recommendation plus the capabilities a \
+                 worker must have."
+                    .to_string(),
+            ),
+        },
+        RemediationWorkflow {
+            id: "proof_mode".to_string(),
+            summary: "Fail-closed remote proof; refusal is RCH-I012, queue/replay is daemon-driven."
+                .to_string(),
+            commands: vec![
+                "RCH_REQUIRE_REMOTE=1 rch exec -- cargo test --workspace".to_string(),
+            ],
+            observe: Some(
+                "rch status --remediation --json shows the proof_queue band (queued/blocked/\
+                 replaying/failed); a refusal surfaces RCH-I012 rather than a silent local run."
+                    .to_string(),
+            ),
+        },
+        RemediationWorkflow {
+            id: "worker_bypass_rejoin".to_string(),
+            summary: "Drain/enable a worker; transient bypass and auto-rejoin are automatic."
+                .to_string(),
+            commands: vec![
+                "rch workers drain <id>".to_string(),
+                "rch workers enable <id>".to_string(),
+            ],
+            observe: Some(
+                "rch status --workers --json (or rch workers list --json) reports the per-worker \
+                 bypass record: reason, next probe, and auto-rejoin posture."
+                    .to_string(),
+            ),
+        },
+        RemediationWorkflow {
+            id: "fleet_status".to_string(),
+            summary: "Fleet-wide desired/live grouping, dominant problem class, and absence alerts."
+                .to_string(),
+            commands: vec![
+                "rch status --fleet --json".to_string(),
+                "rch fleet status --json".to_string(),
+            ],
+            observe: None,
+        },
+        RemediationWorkflow {
+            id: "force_resync".to_string(),
+            summary: "Force-resync stale path-dependency roots: invalidate the RCH-managed worker \
+                      cache and trigger closure re-sync."
+                .to_string(),
+            commands: vec![
+                "rch sync --project . --json".to_string(),
+                "rch sync --force --worker <id> --json".to_string(),
+                "rch sync --force --all --json".to_string(),
+            ],
+            observe: Some(
+                "Preview (no --force) lists the planned cache invalidations and any refusals; \
+                 --force invalidates only paths strictly under transfer.remote_base (canonical \
+                 source mirrors are refused, never wiped) and triggers a daemon convergence \
+                 repair. rch status --remediation --json shows the repo_convergence band \
+                 (RCH-R3xx) clearing afterward."
+                    .to_string(),
+            ),
+        },
+        RemediationWorkflow {
+            id: "queue_attach_cancel".to_string(),
+            summary: "Inspect the build queue and cancel active or queued builds.".to_string(),
+            commands: vec![
+                "rch queue --json".to_string(),
+                "rch queue --follow".to_string(),
+                "rch cancel <id>".to_string(),
+                "rch cancel --all --yes".to_string(),
+            ],
+            observe: None,
+        },
+        RemediationWorkflow {
+            id: "real_fleet_smoke".to_string(),
+            summary: "Run a real-fleet smoke/self-test and read its history.".to_string(),
+            commands: vec![
+                "rch self-test --all --json".to_string(),
+                "rch self-test status --json".to_string(),
+                "rch self-test history --limit 10 --json".to_string(),
+            ],
+            observe: None,
+        },
+    ]
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -2508,7 +3429,7 @@ fn handle_robot_triage(ctx: &OutputContext) -> Result<()> {
         ],
         safety_notes: vec![
             "Run mutating commands with --dry-run first when the flag exists.".to_string(),
-            "Use `rch diagnose <command> --json` before forcing local/remote behavior.".to_string(),
+            "Use `rch diagnose --json <command>` before forcing local/remote behavior.".to_string(),
             "If RCH cannot safely offload, it fails open instead of blocking builds.".to_string(),
         ],
     };
@@ -2545,7 +3466,7 @@ async fn handle_daemon(action: DaemonAction, ctx: &OutputContext) -> Result<()> 
             commands::daemon_restart(yes, ctx).await?;
         }
         DaemonAction::Status => {
-            commands::daemon_status(ctx)?;
+            commands::daemon_status(ctx).await?;
         }
         DaemonAction::Logs { lines } => {
             commands::daemon_logs(lines, ctx)?;
@@ -2568,8 +3489,20 @@ async fn handle_workers(action: WorkersAction, ctx: &OutputContext) -> Result<()
         WorkersAction::Probe { worker, all } => {
             commands::workers_probe(worker, all, ctx).await?;
         }
-        WorkersAction::Benchmark => {
-            commands::workers_benchmark(ctx).await?;
+        WorkersAction::Benchmark {
+            worker_id,
+            all: _,
+            force,
+        } => {
+            // `--all` is the explicit form of "no worker_id"; both
+            // resolve to None here and the command runs against every
+            // configured worker. `--force` is plumbed through for a
+            // future recency-check; the underlying benchmark function
+            // always runs today regardless.
+            commands::workers_benchmark_filtered(worker_id.as_deref(), force, ctx).await?;
+        }
+        WorkersAction::Compare { worker_ids } => {
+            commands::workers_compare(&worker_ids, ctx).await?;
         }
         WorkersAction::Drain { worker, yes } => {
             commands::workers_drain(&worker, yes, ctx).await?;
@@ -2619,8 +3552,14 @@ async fn handle_workers(action: WorkersAction, ctx: &OutputContext) -> Result<()
     Ok(())
 }
 
-async fn handle_status(workers: bool, jobs: bool, ctx: &OutputContext) -> Result<()> {
-    commands::status_overview(workers, jobs, ctx).await?;
+async fn handle_status(
+    workers: bool,
+    jobs: bool,
+    fleet: bool,
+    remediation: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    commands::status_overview(workers, jobs, fleet, remediation, ctx).await?;
     Ok(())
 }
 
@@ -2678,6 +3617,392 @@ async fn handle_diagnose(command: Vec<String>, dry_run: bool, ctx: &OutputContex
     Ok(())
 }
 
+async fn handle_admit(command: Vec<String>, ctx: &OutputContext) -> Result<()> {
+    let joined = command.join(" ");
+    commands::admit(&joined, ctx).await
+}
+
+/// `rch cache warm` per-worker result (br-4zm6u). Emitted in the JSON
+/// envelope under `data.workers[]` so consumers can summarize per-worker
+/// success/failure programmatically without parsing the human output.
+#[derive(Debug, serde::Serialize)]
+struct CacheWarmWorkerResult {
+    worker_id: String,
+    success: bool,
+    bytes_transferred: u64,
+    files_transferred: u64,
+    duration_ms: u64,
+    /// Only populated on failure. Operators read this to triage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// `rch cache warm` aggregate response. Carries every per-worker entry
+/// plus a top-level summary so consumers can grep for "all-ok" without
+/// iterating the array.
+#[derive(Debug, serde::Serialize)]
+struct CacheWarmResponse {
+    project_root: String,
+    project_id: String,
+    project_hash: String,
+    workers_total: usize,
+    workers_succeeded: usize,
+    workers_failed: usize,
+    bytes_transferred: u64,
+    files_transferred: u64,
+    duration_ms: u64,
+    workers: Vec<CacheWarmWorkerResult>,
+}
+
+async fn handle_cache(action: CacheAction, ctx: &OutputContext) -> Result<()> {
+    match action {
+        CacheAction::Warm { workers, project } => handle_cache_warm(workers, project, ctx).await,
+        CacheAction::Clean {
+            older,
+            project,
+            execute,
+        } => handle_cache_clean(older, project, execute, ctx).await,
+    }
+}
+
+/// `rch cache clean`: prune stale local staging trees under the configured
+/// `transfer.remote_base`. Dry-run unless `execute`. (bd-s3433)
+async fn handle_cache_clean(
+    older: String,
+    project: Option<String>,
+    execute: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let min_age = cache_gc::parse_human_duration(&older)
+        .map_err(|e| anyhow::anyhow!("invalid --older value: {e}"))?;
+
+    let config = crate::config::load_config().unwrap_or_default();
+    let remote_base = PathBuf::from(&config.transfer.remote_base);
+
+    let now = std::time::SystemTime::now();
+    let trees =
+        cache_gc::enumerate_staging_trees(&remote_base, project.as_deref(), now).map_err(|e| {
+            anyhow::anyhow!("failed to enumerate staging trees under {remote_base:?}: {e}")
+        })?;
+    let plan =
+        cache_gc::plan_staging_gc(&trees, cache_gc::StagingGcPolicy { min_age }, &remote_base);
+
+    let style = ctx.theme();
+    if execute {
+        let outcome = cache_gc::execute_staging_gc(&plan, &remote_base);
+        if ctx.is_json() {
+            let _ = ctx.json(&ApiResponse::ok("cache clean", &outcome));
+        } else {
+            println!(
+                "Pruned {} tree(s), reclaimed {} ({} failed)",
+                outcome.removed_count,
+                cache_gc::human_bytes(outcome.removed_bytes),
+                outcome.failed.len()
+            );
+        }
+    } else if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok("cache clean", &plan));
+    } else {
+        println!(
+            "Dry run over {} ({} tree(s), {} total). Would prune {} tree(s), reclaim {}.",
+            remote_base.display(),
+            plan.entries.len(),
+            cache_gc::human_bytes(plan.total_bytes),
+            plan.prunable_count,
+            cache_gc::human_bytes(plan.prunable_bytes)
+        );
+        for e in plan
+            .entries
+            .iter()
+            .filter(|e| matches!(e.action, cache_gc::GcAction::Prune))
+        {
+            println!(
+                "  prune {} ({}, idle {}s)",
+                e.path,
+                cache_gc::human_bytes(e.size_bytes),
+                e.age_secs
+            );
+        }
+        println!("  {} pass --execute to actually delete", style.muted("→"));
+    }
+    Ok(())
+}
+
+fn resolve_cache_warm_project_root(
+    project_root: PathBuf,
+    policy: &rch_common::path_topology::PathTopologyPolicy,
+) -> Result<PathBuf> {
+    let project_root = if project_root.is_absolute() {
+        project_root
+    } else {
+        std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("cannot determine cwd for project path: {e}"))?
+            .join(project_root)
+    };
+
+    if !project_root.exists() {
+        anyhow::bail!("project root does not exist: {}", project_root.display());
+    }
+    if !project_root.is_dir() {
+        anyhow::bail!(
+            "project root is not a directory: {}",
+            project_root.display()
+        );
+    }
+
+    let normalized =
+        rch_common::path_topology::normalize_project_path_with_policy(&project_root, policy)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "project path normalization failed for {}: {e}",
+                    project_root.display()
+                )
+            })?;
+
+    Ok(normalized.canonical_path().to_path_buf())
+}
+
+/// `rch cache warm` implementation (br-4zm6u): pre-syncs project sources
+/// to one or more workers via `TransferPipeline::sync_to_remote` WITHOUT
+/// running a compilation step. Surfaces per-worker outcomes so an
+/// operator triaging a worker outage can see exactly which workers
+/// failed to warm and why.
+///
+/// Failure policy: a single worker failure does NOT abort the warm
+/// across remaining workers — the loop continues and the final summary
+/// reports `workers_succeeded` / `workers_failed`. The process exits 0
+/// if at least one worker warmed; non-zero (exit 1) if all workers
+/// failed. This mirrors the fail-open philosophy from AGENTS.md (other
+/// workers should still be usable even if one is down).
+async fn handle_cache_warm(
+    worker_filter: Vec<String>,
+    project: Option<PathBuf>,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let style = ctx.theme();
+    let rch_config = config::load_config().map_err(|e| anyhow::anyhow!("load config: {e}"))?;
+    let topology_policy = rch_config.path_topology.to_policy();
+    let project_root = match project {
+        Some(p) => p,
+        None => std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("cannot determine project root from cwd: {e}"))?,
+    };
+    let project_root = resolve_cache_warm_project_root(project_root, &topology_policy)?;
+    let project_id = transfer::project_id_from_path(&project_root);
+    // Use the production hash entry point (`_with_dependency_roots_and_policy`)
+    // — the other two variants are #[cfg(test)]-gated convenience wrappers.
+    // Empty deps matches the cache-warm contract: warm only the named
+    // project, no path-dep closure crawling. The configured topology
+    // policy must still match the hook path or the warmed hash/path is
+    // different from the first real build.
+    let project_hash = transfer::compute_project_hash_with_dependency_roots_and_policy(
+        &project_root,
+        &[],
+        &topology_policy,
+    );
+
+    let all_workers = commands::load_workers_from_config()
+        .map_err(|e| anyhow::anyhow!("load workers config: {e}"))?;
+    if all_workers.is_empty() {
+        anyhow::bail!("no workers configured; run `rch workers add <host>` first");
+    }
+    // Filter by --workers flag if supplied. A filter that names no
+    // existing worker is a configuration error — fail fast so the
+    // operator notices the typo instead of getting a silent no-op.
+    let selected: Vec<_> = if worker_filter.is_empty() {
+        all_workers
+    } else {
+        let filter_set: std::collections::BTreeSet<&str> =
+            worker_filter.iter().map(String::as_str).collect();
+        let known_ids: std::collections::BTreeSet<String> =
+            all_workers.iter().map(|w| w.id.to_string()).collect();
+        let missing: Vec<&str> = filter_set
+            .iter()
+            .copied()
+            .filter(|id| !known_ids.contains(*id))
+            .collect();
+        if !missing.is_empty() {
+            // Show the actual configured worker list (not the post-filter
+            // empty set) so the operator can spot a typo or stale id.
+            anyhow::bail!(
+                "unknown worker id(s) in --workers filter: {}; configured workers: {}",
+                missing.join(", "),
+                ctx_worker_ids(&all_workers)
+            );
+        }
+        all_workers
+            .into_iter()
+            .filter(|w| filter_set.contains(w.id.as_str()))
+            .collect()
+    };
+
+    tracing::info!(
+        target: "rch::cache::warm",
+        project_root = %project_root.display(),
+        project_id = %project_id,
+        project_hash = %project_hash,
+        worker_count = selected.len(),
+        "cache.warm.start",
+    );
+
+    if !ctx.is_json() {
+        eprintln!(
+            "{} {}",
+            style.format_header("Cache warm"),
+            style.muted(&format!(
+                "project={} ({}/{}) workers={}",
+                project_root.display(),
+                project_id,
+                &project_hash[..project_hash.len().min(12)],
+                selected.len(),
+            )),
+        );
+    }
+
+    let cache_warm_started_at = std::time::Instant::now();
+    let transfer_config = rch_config.transfer;
+    let mut results: Vec<CacheWarmWorkerResult> = Vec::with_capacity(selected.len());
+    let mut total_bytes: u64 = 0;
+    let mut total_files: u64 = 0;
+    let mut succeeded: usize = 0;
+    let mut failed: usize = 0;
+
+    for worker in &selected {
+        // Each worker gets its own TransferPipeline so state (env
+        // overrides, color mode, estimated bytes) cannot leak across
+        // warm targets.
+        let pipeline = transfer::TransferPipeline::new(
+            project_root.clone(),
+            project_id.clone(),
+            project_hash.clone(),
+            transfer_config.clone(),
+        );
+        let started = std::time::Instant::now();
+        match pipeline.sync_to_remote(worker).await {
+            Ok(sync_result) => {
+                succeeded += 1;
+                total_bytes += sync_result.bytes_transferred;
+                total_files += u64::from(sync_result.files_transferred);
+                tracing::info!(
+                    target: "rch::cache::warm",
+                    worker = %worker.id,
+                    bytes = sync_result.bytes_transferred,
+                    files = sync_result.files_transferred,
+                    duration_ms = sync_result.duration_ms,
+                    "cache.warm.worker.ok",
+                );
+                if !ctx.is_json() {
+                    eprintln!(
+                        "  {} {}: {} bytes, {} files, {}ms",
+                        style.format_success("✓"),
+                        style.highlight(worker.id.as_str()),
+                        sync_result.bytes_transferred,
+                        sync_result.files_transferred,
+                        sync_result.duration_ms,
+                    );
+                }
+                results.push(CacheWarmWorkerResult {
+                    worker_id: worker.id.to_string(),
+                    success: true,
+                    bytes_transferred: sync_result.bytes_transferred,
+                    files_transferred: u64::from(sync_result.files_transferred),
+                    duration_ms: sync_result.duration_ms,
+                    error: None,
+                });
+            }
+            Err(err) => {
+                failed += 1;
+                let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let error_msg = err.to_string();
+                tracing::warn!(
+                    target: "rch::cache::warm",
+                    worker = %worker.id,
+                    error = %error_msg,
+                    duration_ms,
+                    "cache.warm.worker.failed",
+                );
+                if !ctx.is_json() {
+                    eprintln!(
+                        "  {} {}: {}",
+                        style.format_error("✗"),
+                        style.highlight(worker.id.as_str()),
+                        style.error(&error_msg),
+                    );
+                }
+                results.push(CacheWarmWorkerResult {
+                    worker_id: worker.id.to_string(),
+                    success: false,
+                    bytes_transferred: 0,
+                    files_transferred: 0,
+                    duration_ms,
+                    error: Some(error_msg),
+                });
+            }
+        }
+    }
+
+    let total_duration_ms =
+        u64::try_from(cache_warm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let response = CacheWarmResponse {
+        project_root: project_root.display().to_string(),
+        project_id: project_id.clone(),
+        project_hash: project_hash.clone(),
+        workers_total: selected.len(),
+        workers_succeeded: succeeded,
+        workers_failed: failed,
+        bytes_transferred: total_bytes,
+        files_transferred: total_files,
+        duration_ms: total_duration_ms,
+        workers: results,
+    };
+
+    if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok("cache.warm", &response));
+    } else {
+        eprintln!();
+        eprintln!(
+            "{} {}/{} workers warmed, {} bytes, {} files, {}ms total",
+            style.format_header("Summary"),
+            style.highlight(&succeeded.to_string()),
+            style.highlight(&selected.len().to_string()),
+            style.highlight(&total_bytes.to_string()),
+            style.highlight(&total_files.to_string()),
+            style.highlight(&total_duration_ms.to_string()),
+        );
+    }
+
+    tracing::info!(
+        target: "rch::cache::warm",
+        workers_succeeded = succeeded,
+        workers_failed = failed,
+        bytes = total_bytes,
+        files = total_files,
+        duration_ms = total_duration_ms,
+        "cache.warm.complete",
+    );
+
+    // Exit policy: at least one worker warmed → 0; all failed → 1.
+    // This is friendlier than "any failure = non-zero" because in a
+    // multi-worker fleet, a single offline worker shouldn't break a
+    // pre-session warm step.
+    if succeeded == 0 && failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Format a `WorkerConfig` slice's IDs for error messages.
+fn ctx_worker_ids(workers: &[rch_common::WorkerConfig]) -> String {
+    if workers.is_empty() {
+        return "(none)".to_string();
+    }
+    workers
+        .iter()
+        .map(|w| w.id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 async fn handle_hook(action: HookAction, ctx: &OutputContext) -> Result<()> {
     match action {
         HookAction::Install => {
@@ -2694,6 +4019,16 @@ async fn handle_hook(action: HookAction, ctx: &OutputContext) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn handle_shim(action: ShimAction, ctx: &OutputContext) -> Result<()> {
+    match action {
+        ShimAction::Install {
+            allow_local_fallback,
+        } => commands::shim_install(!allow_local_fallback, ctx),
+        ShimAction::Status => commands::shim_status(ctx),
+        ShimAction::Uninstall => commands::shim_uninstall(ctx),
+    }
 }
 
 async fn handle_agents(action: AgentsAction, ctx: &OutputContext) -> Result<()> {
@@ -2714,15 +4049,70 @@ async fn handle_agents(action: AgentsAction, ctx: &OutputContext) -> Result<()> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_doctor(
     fix: bool,
     dry_run: bool,
     install_deps: bool,
     reliability: bool,
     check_schemas: bool,
+    strict: bool,
+    lenient: bool,
+    scope: String,
+    watch: bool,
+    watch_interval: u64,
+    transitions_only: bool,
+    watch_snapshot: Option<PathBuf>,
+    runbook: Option<String>,
+    runbook_list: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    use crate::doctor::DoctorOptions;
+    use crate::doctor::{DoctorOptions, ReliabilityScopeSet};
+    // Runbook flags short-circuit before any probe gating — they're
+    // pure renderers over the static runbook registry (br-62u24.20).
+    // The clap conflicts_with_all already rejects --runbook + --fix/
+    // --watch combinations; this branch only fires when the operator
+    // asked for documentation, not diagnostics.
+    if runbook_list {
+        return handle_runbook_list(ctx);
+    }
+    if let Some(code) = runbook {
+        return handle_runbook_render(&code, ctx);
+    }
+    // Parse the scope arg (clap default = "all"). Invalid values produce
+    // a clear error via FromStr that's surfaced to the user.
+    let scope: ReliabilityScopeSet = scope
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("invalid --scope value: {e}"))?;
+    // Clamp watch interval at the CLI boundary. clap can't express an
+    // inclusive range constraint cleanly for u64, so we do it here so a
+    // pathological `--watch-interval=0` (busy loop) or `--watch-interval=
+    // 86400` (essentially-disabled) is gently corrected with a warning
+    // instead of failing or hanging.
+    let watch_interval_secs = if watch {
+        if watch_interval == 0 {
+            tracing::warn!(
+                target: "rch::doctor::watch",
+                requested = watch_interval,
+                clamped_to = 1u64,
+                "watch interval 0 would busy-loop; clamping to 1 second"
+            );
+            1
+        } else if watch_interval > 3600 {
+            tracing::warn!(
+                target: "rch::doctor::watch",
+                requested = watch_interval,
+                clamped_to = 3600u64,
+                "watch interval > 3600 is pathological; clamping to 1 hour"
+            );
+            3600
+        } else {
+            watch_interval
+        }
+    } else {
+        // Not in watch mode: the field is ignored at runtime.
+        watch_interval
+    };
     let options = DoctorOptions {
         fix,
         dry_run,
@@ -2730,8 +4120,197 @@ async fn handle_doctor(
         reliability,
         check_schemas,
         verbose: ctx.is_verbose(),
+        strict,
+        lenient,
+        scope,
+        watch,
+        watch_interval_secs,
+        transitions_only,
+        watch_snapshot,
     };
     crate::doctor::run_doctor(ctx, options).await
+}
+
+/// `rch doctor --runbook <code>` — render the authored runbook for the
+/// given RCH-Rnnn code as Markdown on stdout. Pastes cleanly into
+/// PagerDuty / Slack / wiki pages. br-62u24.20.
+fn handle_runbook_render(code_str: &str, ctx: &OutputContext) -> Result<()> {
+    let code = rch_common::ReliabilityReasonCode::from_code_str(code_str).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown reliability reason code: {code_str:?} \
+             (try `rch doctor --runbook-list` for the list of authored codes)"
+        )
+    })?;
+    let entry = code.runbook().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no authored runbook for {code_str} ({}); this is typically a \
+             Pass/Info state code that doesn't need an incident runbook. \
+             Try `rch doctor --runbook-list` for the authored set.",
+            code.name()
+        )
+    })?;
+    let markdown = render_runbook_markdown(code, &entry);
+    // Runbook is data, not diagnostics — emit to stdout so operators can
+    // pipe to `pbcopy` / `xclip` / a file.
+    println!("{markdown}");
+    tracing::info!(
+        target: "rch::doctor::runbook",
+        code = code.code(),
+        name = code.name(),
+        "doctor.runbook.rendered",
+    );
+    let _ = ctx; // ctx unused for Markdown output; reserved for --json variant
+    Ok(())
+}
+
+/// `rch doctor --runbook-list` — enumerate every code that has an
+/// authored runbook entry. One line per code on stdout (machine-friendly).
+/// br-62u24.20.
+fn handle_runbook_list(ctx: &OutputContext) -> Result<()> {
+    let codes = rch_common::ReliabilityReasonCode::authored_runbook_codes();
+    if ctx.is_json() {
+        let entries: Vec<_> = codes
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "code": c.code(),
+                    "name": c.name(),
+                    "category": c.category().as_str(),
+                })
+            })
+            .collect();
+        ctx.json(&rch_common::ApiResponse::ok(
+            "doctor.runbook.list",
+            serde_json::json!({
+                "codes": entries,
+                "count": entries.len(),
+            }),
+        ))?;
+    } else {
+        for c in &codes {
+            // Compact two-column layout. Stable enough to grep.
+            println!("{}  {}  ({})", c.code(), c.name(), c.category().as_str());
+        }
+        eprintln!();
+        eprintln!("{} authored runbook(s)", codes.len());
+    }
+    tracing::info!(
+        target: "rch::doctor::runbook",
+        count = codes.len(),
+        "doctor.runbook.listed",
+    );
+    Ok(())
+}
+
+/// Render a `RunbookEntry` as the Markdown form documented in
+/// br-62u24.20: title, at-a-glance, symptoms, diagnosis, remediation,
+/// verification, escalation, references, auto-footer. Pure function —
+/// trivially unit-testable without spinning up the doctor or daemon.
+fn render_runbook_markdown(
+    code: rch_common::ReliabilityReasonCode,
+    entry: &rch_common::RunbookEntry,
+) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(2048);
+    // Title
+    let _ = writeln!(s, "# {} — {}", code.code(), code.name());
+    // At-a-glance — three short lines so an on-call SRE can decide
+    // urgency in 5 seconds.
+    let _ = writeln!(s);
+    let _ = writeln!(s, "**Category:** `{}`  ", code.category().as_str());
+    let _ = writeln!(
+        s,
+        "**Requires restart:** `{}`  ",
+        if code.requires_restart() { "yes" } else { "no" }
+    );
+    let hint = code.remediation_hint();
+    if !hint.is_empty() {
+        let _ = writeln!(s, "**Quick hint:** {hint}");
+    }
+    let _ = writeln!(s);
+
+    // Symptoms
+    let _ = writeln!(s, "## Symptoms");
+    let _ = writeln!(s);
+    for sym in entry.symptoms {
+        let _ = writeln!(s, "- {sym}");
+    }
+    let _ = writeln!(s);
+
+    // Diagnosis
+    let _ = writeln!(s, "## Diagnosis");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Run these read-only commands to confirm the cause:");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "```bash");
+    for step in entry.diagnosis_steps {
+        let _ = writeln!(s, "{step}");
+    }
+    let _ = writeln!(s, "```");
+    let _ = writeln!(s);
+
+    // Remediation
+    let _ = writeln!(s, "## Remediation");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "```bash");
+    for step in entry.remediation_steps {
+        let _ = writeln!(s, "{step}");
+    }
+    let _ = writeln!(s, "```");
+    let _ = writeln!(s);
+
+    // Verification
+    let _ = writeln!(s, "## Verification");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "After remediation, confirm the issue resolved with:");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "```bash");
+    let _ = writeln!(s, "{}", entry.verification_command);
+    let _ = writeln!(s, "```");
+    let _ = writeln!(s);
+
+    // Escalation
+    let _ = writeln!(s, "## Escalation");
+    let _ = writeln!(s);
+    if let Some(esc) = entry.escalation {
+        let _ = writeln!(s, "{esc}");
+    } else {
+        let _ = writeln!(
+            s,
+            "If the steps above don't resolve the issue, capture full diagnostic output:"
+        );
+        let _ = writeln!(s);
+        let _ = writeln!(s, "```bash");
+        let _ = writeln!(s, "rch doctor --reliability --json > /tmp/rch-diag.json");
+        let _ = writeln!(s, "```");
+        let _ = writeln!(s);
+        let _ = writeln!(
+            s,
+            "Then open an issue at https://github.com/Dicklesworthstone/remote_compilation_helper/issues \
+             with the JSON attached."
+        );
+    }
+    let _ = writeln!(s);
+
+    // References
+    if !entry.references.is_empty() {
+        let _ = writeln!(s, "## References");
+        let _ = writeln!(s);
+        for r in entry.references {
+            let _ = writeln!(s, "- {r}");
+        }
+        let _ = writeln!(s);
+    }
+
+    // Auto-footer
+    let _ = writeln!(
+        s,
+        "---\n*Authored {} · Generated by `rch doctor --runbook {}` · {}*",
+        entry.authored_at,
+        code.code(),
+        concat!("rch ", env!("CARGO_PKG_VERSION")),
+    );
+    s
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2771,6 +4350,119 @@ async fn handle_update(
     )
     .await
     .map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+/// Handle `rch error <sub>` subcommands. Operator-facing code lookup
+/// surface — pastes a code from a log line, get description +
+/// remediation. Bridges the two namespaces (RCH-Ennn errors,
+/// RCH-Rnnn reliability) into one uniform interface.
+fn handle_error_explain(sub: ErrorSubcommand, ctx: &OutputContext) -> Result<()> {
+    use rch_common::api::ApiError;
+    use rch_common::errors::{
+        is_known_category, known_categories, list_all, list_by_category, lookup, render_human,
+    };
+    use rch_common::{ApiResponse, ErrorCode};
+
+    match sub {
+        ErrorSubcommand::Explain { code, json } => {
+            let trimmed = code.trim();
+            match lookup(trimmed) {
+                Some(explanation) => {
+                    if json || ctx.is_json() {
+                        let response = ApiResponse::ok("error.explain", &explanation);
+                        if json {
+                            ctx.json_force(&response)?;
+                        } else {
+                            ctx.json(&response)?;
+                        }
+                    } else {
+                        print!("{}", render_human(&explanation));
+                    }
+                    Ok(())
+                }
+                None => {
+                    if json || ctx.is_json() {
+                        let response: ApiResponse<()> = ApiResponse::err(
+                            "error.explain",
+                            ApiError::new(
+                                ErrorCode::ConfigValidationError,
+                                format!("Unknown code {trimmed:?}"),
+                            )
+                            .with_remediation(["Run `rch error list` to see all known codes."]),
+                        );
+                        if json {
+                            ctx.json_force(&response)?;
+                        } else {
+                            ctx.json(&response)?;
+                        }
+                    }
+                    eprintln!(
+                        "Unknown code {trimmed:?}. Try `rch error list` to see all known codes."
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+        ErrorSubcommand::List { category, json } => {
+            let requested_category = category.as_deref().map(str::trim).filter(|c| !c.is_empty());
+            let entries = match requested_category {
+                Some(c) => {
+                    let entries = list_by_category(c);
+                    if entries.is_empty() && !is_known_category(c) {
+                        let known = known_categories();
+                        let known_display = known.join(", ");
+                        if json || ctx.is_json() {
+                            let response: ApiResponse<()> = ApiResponse::err(
+                                "error.list",
+                                ApiError::new(
+                                    ErrorCode::ConfigValidationError,
+                                    format!("Unknown error category {c:?}"),
+                                )
+                                .with_context("category", c)
+                                .with_context("known_categories", known_display.as_str())
+                                .with_remediation([format!("Use one of: {known_display}")]),
+                            );
+                            if json {
+                                ctx.json_force(&response)?;
+                            } else {
+                                ctx.json(&response)?;
+                            }
+                        }
+                        eprintln!("Unknown error category {c:?}. Use one of: {known_display}.");
+                        std::process::exit(2);
+                    }
+                    entries
+                }
+                _ => list_all(),
+            };
+            if json || ctx.is_json() {
+                #[derive(serde::Serialize)]
+                struct ListPayload {
+                    count: usize,
+                    codes: Vec<rch_common::CodeExplanation>,
+                }
+                let payload = ListPayload {
+                    count: entries.len(),
+                    codes: entries,
+                };
+                let response = ApiResponse::ok("error.list", &payload);
+                if json {
+                    ctx.json_force(&response)?;
+                } else {
+                    ctx.json(&response)?;
+                }
+            } else {
+                println!("{} known code(s):", entries.len());
+                for e in &entries {
+                    println!(
+                        "  {} [{}] {} — {}",
+                        e.code, e.category, e.name, e.description
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Handle completions subcommands
@@ -2860,6 +4552,39 @@ async fn handle_fleet(action: FleetAction, ctx: &OutputContext) -> Result<()> {
             yes,
         } => fleet::drain(ctx, worker, all, timeout, yes).await,
         FleetAction::History { limit, worker } => fleet::history(ctx, limit, worker).await,
+        FleetAction::Doctor {
+            reliability,
+            scope,
+            fix,
+            fleet_confirm,
+            continue_on_failure,
+            workers,
+            worker_timeout,
+        } => {
+            // `--reliability` is the only mode today; require it explicitly so
+            // the flag space stays open for future fleet doctor modes.
+            if !reliability {
+                ctx.error("`rch fleet doctor` currently requires --reliability");
+                anyhow::bail!("fleet doctor requires --reliability");
+            }
+            let scope = if scope.is_empty() {
+                vec!["all".to_string()]
+            } else {
+                scope
+            };
+            fleet::doctor::run(
+                ctx,
+                fleet::doctor::FleetDoctorOptions {
+                    scope,
+                    fix,
+                    fleet_confirm,
+                    continue_on_failure,
+                    workers,
+                    worker_timeout_secs: worker_timeout,
+                },
+            )
+            .await
+        }
     }
 }
 
@@ -3012,17 +4737,39 @@ fn open_browser(url: &str) -> Result<()> {
 // Unit Tests
 // =============================================================================
 
-// Global test logging initialization - enables JSONL output for all unit tests
-#[cfg(test)]
-#[ctor::ctor]
-fn init_test_logging() {
-    rch_common::testing::init_global_test_logging();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[track_caller]
+    fn fail_expected(message: &str) {
+        assert!(std::hint::black_box(false), "{message}");
+    }
+
+    fn assert_golden_json(
+        actual: serde_json::Value,
+        expected: &serde_json::Value,
+        fixture_path: &str,
+    ) {
+        if &actual == expected {
+            return;
+        }
+
+        let actual_json = serde_json::to_string_pretty(&actual).expect("actual JSON renders");
+        let expected_json = serde_json::to_string_pretty(expected).expect("expected JSON renders");
+        panic!(
+            "golden mismatch in {fixture_path}\n\
+             expected_blake3={}\n\
+             actual_blake3={}\n\
+             bless path: review the semantic diff, update the fixture expected_* field, \
+             and record both hashes in the Beads closeout.\n\
+             expected:\n{expected_json}\n\
+             actual:\n{actual_json}",
+            blake3::hash(expected_json.as_bytes()),
+            blake3::hash(actual_json.as_bytes())
+        );
+    }
 
     // -------------------------------------------------------------------------
     // CLI Parsing Tests
@@ -3037,6 +4784,115 @@ mod tests {
         assert!(!cli.quiet);
         assert!(!cli.json);
         assert_eq!(cli.color, "auto");
+    }
+
+    #[test]
+    fn cli_parses_exec_clean_overlay_paths() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--base",
+            "HEAD",
+            "--clean-overlay",
+            "--overlay-path",
+            "src/lib.rs",
+            "--overlay-path",
+            "tests/slice.rs",
+            "--",
+            "cargo",
+            "test",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Exec {
+                base,
+                clean_overlay,
+                overlay_path,
+                no_overlay,
+                command,
+            }) => {
+                assert_eq!(base.as_deref(), Some("HEAD"));
+                assert!(clean_overlay);
+                assert_eq!(
+                    overlay_path,
+                    vec![PathBuf::from("src/lib.rs"), PathBuf::from("tests/slice.rs")]
+                );
+                assert!(!no_overlay);
+                assert_eq!(command, vec!["cargo", "test"]);
+            }
+            _ => fail_expected("Expected clean-overlay exec command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_exec_clean_base_without_overlay() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--base",
+            "HEAD",
+            "--clean-overlay",
+            "--no-overlay",
+            "--",
+            "cargo",
+            "check",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Exec {
+                base,
+                clean_overlay,
+                overlay_path,
+                no_overlay,
+                command,
+            }) => {
+                assert_eq!(base.as_deref(), Some("HEAD"));
+                assert!(clean_overlay);
+                assert!(overlay_path.is_empty());
+                assert!(no_overlay);
+                assert_eq!(command, vec!["cargo", "check"]);
+            }
+            _ => fail_expected("Expected base-only clean-overlay exec command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_clean_overlay_path_with_no_overlay() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--base",
+            "HEAD",
+            "--clean-overlay",
+            "--overlay-path",
+            "src/lib.rs",
+            "--no-overlay",
+            "--",
+            "cargo",
+            "check",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exec_help_declares_clean_overlay_capability_flags() {
+        let _guard = test_guard!();
+        let mut command = Cli::command();
+        let exec = command
+            .find_subcommand_mut("exec")
+            .expect("exec subcommand");
+        let help = exec.render_long_help().to_string();
+        for flag in [
+            "--base",
+            "--clean-overlay",
+            "--overlay-path",
+            "--no-overlay",
+        ] {
+            assert!(help.contains(flag), "exec help missing {flag}: {help}");
+        }
     }
 
     #[test]
@@ -3158,7 +5014,7 @@ mod tests {
             Some(Commands::Daemon {
                 action: DaemonAction::Start,
             }) => {}
-            _ => panic!("Expected daemon start command"),
+            _ => fail_expected("Expected daemon start command"),
         }
     }
 
@@ -3172,7 +5028,7 @@ mod tests {
             }) => {
                 assert!(!yes, "yes should default to false");
             }
-            _ => panic!("Expected daemon stop command"),
+            _ => fail_expected("Expected daemon stop command"),
         }
     }
 
@@ -3186,7 +5042,7 @@ mod tests {
             }) => {
                 assert!(yes, "yes should be true");
             }
-            _ => panic!("Expected daemon stop --yes command"),
+            _ => fail_expected("Expected daemon stop --yes command"),
         }
     }
 
@@ -3200,7 +5056,7 @@ mod tests {
             }) => {
                 assert!(!yes, "yes should default to false");
             }
-            _ => panic!("Expected daemon restart command"),
+            _ => fail_expected("Expected daemon restart command"),
         }
     }
 
@@ -3214,7 +5070,7 @@ mod tests {
             }) => {
                 assert!(yes, "yes should be true with -y flag");
             }
-            _ => panic!("Expected daemon restart -y command"),
+            _ => fail_expected("Expected daemon restart -y command"),
         }
     }
 
@@ -3226,7 +5082,7 @@ mod tests {
             Some(Commands::Daemon {
                 action: DaemonAction::Status,
             }) => {}
-            _ => panic!("Expected daemon status command"),
+            _ => fail_expected("Expected daemon status command"),
         }
     }
 
@@ -3240,7 +5096,7 @@ mod tests {
             }) => {
                 assert_eq!(lines, 50);
             }
-            _ => panic!("Expected daemon logs command"),
+            _ => fail_expected("Expected daemon logs command"),
         }
     }
 
@@ -3254,7 +5110,7 @@ mod tests {
             }) => {
                 assert_eq!(lines, 100);
             }
-            _ => panic!("Expected daemon logs command"),
+            _ => fail_expected("Expected daemon logs command"),
         }
     }
 
@@ -3272,7 +5128,7 @@ mod tests {
             }) => {
                 assert!(!speedscore);
             }
-            _ => panic!("Expected workers list command"),
+            _ => fail_expected("Expected workers list command"),
         }
     }
 
@@ -3287,7 +5143,7 @@ mod tests {
                 assert!(!refresh);
                 assert!(command.is_none());
             }
-            _ => panic!("Expected workers capabilities command"),
+            _ => fail_expected("Expected workers capabilities command"),
         }
     }
 
@@ -3310,7 +5166,7 @@ mod tests {
                 assert!(refresh);
                 assert_eq!(command.as_deref(), Some("bun test"));
             }
-            _ => panic!("Expected workers capabilities command"),
+            _ => fail_expected("Expected workers capabilities command"),
         }
     }
 
@@ -3325,7 +5181,7 @@ mod tests {
                 assert_eq!(worker, Some("css".to_string()));
                 assert!(!all);
             }
-            _ => panic!("Expected workers probe command"),
+            _ => fail_expected("Expected workers probe command"),
         }
     }
 
@@ -3340,7 +5196,7 @@ mod tests {
                 assert!(worker.is_none());
                 assert!(all);
             }
-            _ => panic!("Expected workers probe command"),
+            _ => fail_expected("Expected workers probe command"),
         }
     }
 
@@ -3350,10 +5206,123 @@ mod tests {
         let cli = Cli::try_parse_from(["rch", "workers", "benchmark"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
-                action: WorkersAction::Benchmark,
-            }) => {}
-            _ => panic!("Expected workers benchmark command"),
+                action:
+                    WorkersAction::Benchmark {
+                        worker_id,
+                        all,
+                        force,
+                    },
+            }) => {
+                assert!(worker_id.is_none(), "default has no worker_id");
+                assert!(!all, "default has no --all");
+                assert!(!force, "default has no --force");
+            }
+            _ => fail_expected("Expected workers benchmark command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_workers_benchmark_with_worker_id() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "workers", "benchmark", "css"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action:
+                    WorkersAction::Benchmark {
+                        worker_id,
+                        all: _,
+                        force: _,
+                    },
+            }) => assert_eq!(worker_id, Some("css".to_string())),
+            _ => fail_expected("Expected workers benchmark with worker id"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_workers_benchmark_force() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "workers", "benchmark", "css", "--force"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action:
+                    WorkersAction::Benchmark {
+                        worker_id,
+                        all: _,
+                        force,
+                    },
+            }) => {
+                assert_eq!(worker_id, Some("css".to_string()));
+                assert!(force);
+            }
+            _ => fail_expected("Expected workers benchmark --force"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_workers_benchmark_all_flag() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "workers", "benchmark", "--all"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action:
+                    WorkersAction::Benchmark {
+                        worker_id,
+                        all,
+                        force: _,
+                    },
+            }) => {
+                assert!(worker_id.is_none());
+                assert!(all);
+            }
+            _ => fail_expected("Expected workers benchmark --all"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_workers_benchmark_worker_id_and_all() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from(["rch", "workers", "benchmark", "css", "--all"]);
+        assert!(
+            result.is_err(),
+            "worker_id and --all are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn cli_parses_workers_compare() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "workers", "compare", "css", "dlx"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action: WorkersAction::Compare { worker_ids },
+            }) => assert_eq!(worker_ids, vec!["css".to_string(), "dlx".to_string()]),
+            _ => fail_expected("Expected workers compare command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_workers_compare_three_workers() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "workers", "compare", "css", "dlx", "vmi1"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action: WorkersAction::Compare { worker_ids },
+            }) => assert_eq!(
+                worker_ids,
+                vec!["css".to_string(), "dlx".to_string(), "vmi1".to_string()]
+            ),
+            _ => fail_expected("Expected workers compare with 3 workers"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_workers_compare_with_one_worker() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from(["rch", "workers", "compare", "css"]);
+        assert!(
+            result.is_err(),
+            "compare requires at least 2 worker ids (num_args = 2..)"
+        );
     }
 
     #[test]
@@ -3366,7 +5335,7 @@ mod tests {
             }) => {
                 assert_eq!(worker, "css");
             }
-            _ => panic!("Expected workers drain command"),
+            _ => fail_expected("Expected workers drain command"),
         }
     }
 
@@ -3380,7 +5349,7 @@ mod tests {
             }) => {
                 assert_eq!(worker, "css");
             }
-            _ => panic!("Expected workers enable command"),
+            _ => fail_expected("Expected workers enable command"),
         }
     }
 
@@ -3396,7 +5365,7 @@ mod tests {
                 assert!(add);
                 assert!(!yes);
             }
-            _ => panic!("Expected workers discover command"),
+            _ => fail_expected("Expected workers discover command"),
         }
     }
 
@@ -3410,7 +5379,7 @@ mod tests {
             }) => {
                 assert!(!yes);
             }
-            _ => panic!("Expected workers init command"),
+            _ => fail_expected("Expected workers init command"),
         }
     }
 
@@ -3424,7 +5393,7 @@ mod tests {
             }) => {
                 assert!(yes);
             }
-            _ => panic!("Expected workers init command with --yes"),
+            _ => fail_expected("Expected workers init command with --yes"),
         }
     }
 
@@ -3438,7 +5407,7 @@ mod tests {
             }) => {
                 assert!(yes);
             }
-            _ => panic!("Expected workers init command with -y"),
+            _ => fail_expected("Expected workers init command with -y"),
         }
     }
 
@@ -3451,11 +5420,11 @@ mod tests {
         let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "status"]).unwrap();
         match cli.command {
-            Some(Commands::Status { workers, jobs }) => {
+            Some(Commands::Status { workers, jobs, .. }) => {
                 assert!(!workers);
                 assert!(!jobs);
             }
-            _ => panic!("Expected status command"),
+            _ => fail_expected("Expected status command"),
         }
     }
 
@@ -3464,11 +5433,11 @@ mod tests {
         let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "status", "--workers"]).unwrap();
         match cli.command {
-            Some(Commands::Status { workers, jobs }) => {
+            Some(Commands::Status { workers, jobs, .. }) => {
                 assert!(workers);
                 assert!(!jobs);
             }
-            _ => panic!("Expected status command"),
+            _ => fail_expected("Expected status command"),
         }
     }
 
@@ -3477,11 +5446,11 @@ mod tests {
         let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "status", "--jobs"]).unwrap();
         match cli.command {
-            Some(Commands::Status { workers, jobs }) => {
+            Some(Commands::Status { workers, jobs, .. }) => {
                 assert!(!workers);
                 assert!(jobs);
             }
-            _ => panic!("Expected status command"),
+            _ => fail_expected("Expected status command"),
         }
     }
 
@@ -3490,11 +5459,31 @@ mod tests {
         let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "status", "--workers", "--jobs"]).unwrap();
         match cli.command {
-            Some(Commands::Status { workers, jobs }) => {
+            Some(Commands::Status { workers, jobs, .. }) => {
                 assert!(workers);
                 assert!(jobs);
             }
-            _ => panic!("Expected status command"),
+            _ => fail_expected("Expected status command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_status_with_fleet() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "status", "--fleet"]).unwrap();
+        match cli.command {
+            Some(Commands::Status {
+                workers,
+                jobs,
+                fleet,
+                remediation,
+            }) => {
+                assert!(!workers);
+                assert!(!jobs);
+                assert!(fleet);
+                assert!(!remediation);
+            }
+            _ => fail_expected("Expected status command"),
         }
     }
 
@@ -3512,7 +5501,7 @@ mod tests {
             }) => {
                 assert!(!sources);
             }
-            _ => panic!("Expected config show command"),
+            _ => fail_expected("Expected config show command"),
         }
     }
 
@@ -3526,7 +5515,7 @@ mod tests {
             }) => {
                 assert!(sources);
             }
-            _ => panic!("Expected config show command"),
+            _ => fail_expected("Expected config show command"),
         }
     }
 
@@ -3541,7 +5530,7 @@ mod tests {
                 assert_eq!(key, "general.enabled");
                 assert!(!sources);
             }
-            _ => panic!("Expected config get command"),
+            _ => fail_expected("Expected config get command"),
         }
     }
 
@@ -3557,7 +5546,7 @@ mod tests {
                 assert_eq!(key, "general.enabled");
                 assert!(sources);
             }
-            _ => panic!("Expected config get command"),
+            _ => fail_expected("Expected config get command"),
         }
     }
 
@@ -3574,7 +5563,7 @@ mod tests {
                 assert_eq!(command, vec!["cargo build --release"]);
                 assert!(!dry_run);
             }
-            _ => panic!("Expected diagnose command"),
+            _ => fail_expected("Expected diagnose command"),
         }
     }
 
@@ -3587,7 +5576,7 @@ mod tests {
                 assert_eq!(command, vec!["cargo", "build", "--release"]);
                 assert!(!dry_run);
             }
-            _ => panic!("Expected diagnose command"),
+            _ => fail_expected("Expected diagnose command"),
         }
     }
 
@@ -3600,7 +5589,7 @@ mod tests {
                 assert_eq!(command, vec!["cargo", "build"]);
                 assert!(dry_run);
             }
-            _ => panic!("Expected diagnose command"),
+            _ => fail_expected("Expected diagnose command"),
         }
     }
 
@@ -3613,7 +5602,7 @@ mod tests {
                 assert_eq!(command, vec!["cargo", "build"]);
                 assert!(dry_run);
             }
-            _ => panic!("Expected diagnose command"),
+            _ => fail_expected("Expected diagnose command"),
         }
     }
 
@@ -3632,7 +5621,7 @@ mod tests {
                 assert!(!wizard);
                 assert!(!non_interactive);
             }
-            _ => panic!("Expected config init command"),
+            _ => fail_expected("Expected config init command"),
         }
     }
 
@@ -3646,7 +5635,7 @@ mod tests {
             }) => {
                 assert!(wizard);
             }
-            _ => panic!("Expected config init command"),
+            _ => fail_expected("Expected config init command"),
         }
     }
 
@@ -3658,7 +5647,7 @@ mod tests {
             Some(Commands::Config {
                 action: ConfigAction::Validate,
             }) => {}
-            _ => panic!("Expected config validate command"),
+            _ => fail_expected("Expected config validate command"),
         }
     }
 
@@ -3673,7 +5662,7 @@ mod tests {
                 assert_eq!(key, "log_level");
                 assert_eq!(value, "debug");
             }
-            _ => panic!("Expected config set command"),
+            _ => fail_expected("Expected config set command"),
         }
     }
 
@@ -3687,7 +5676,7 @@ mod tests {
             }) => {
                 assert_eq!(key, "general.enabled");
             }
-            _ => panic!("Expected config reset command"),
+            _ => fail_expected("Expected config reset command"),
         }
     }
 
@@ -3701,7 +5690,7 @@ mod tests {
             }) => {
                 assert_eq!(format, "shell");
             }
-            _ => panic!("Expected config export command"),
+            _ => fail_expected("Expected config export command"),
         }
     }
 
@@ -3713,7 +5702,7 @@ mod tests {
             Some(Commands::Config {
                 action: ConfigAction::Lint,
             }) => {}
-            _ => panic!("Expected config lint command"),
+            _ => fail_expected("Expected config lint command"),
         }
     }
 
@@ -3725,7 +5714,7 @@ mod tests {
             Some(Commands::Config {
                 action: ConfigAction::Diff,
             }) => {}
-            _ => panic!("Expected config diff command"),
+            _ => fail_expected("Expected config diff command"),
         }
     }
 
@@ -3741,7 +5730,7 @@ mod tests {
             Some(Commands::Hook {
                 action: HookAction::Install,
             }) => {}
-            _ => panic!("Expected hook install command"),
+            _ => fail_expected("Expected hook install command"),
         }
     }
 
@@ -3753,7 +5742,7 @@ mod tests {
             Some(Commands::Hook {
                 action: HookAction::Uninstall { .. },
             }) => {}
-            _ => panic!("Expected hook uninstall command"),
+            _ => fail_expected("Expected hook uninstall command"),
         }
     }
 
@@ -3765,8 +5754,286 @@ mod tests {
             Some(Commands::Hook {
                 action: HookAction::Test,
             }) => {}
-            _ => panic!("Expected hook test command"),
+            _ => fail_expected("Expected hook test command"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Doctor Runbook Tests (br-62u24.20)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn runbook_renders_for_every_authored_code() {
+        // TEST START: every code that authored_runbook_codes() returns
+        // MUST also produce non-empty Markdown via render_runbook_markdown.
+        // Catches a future regression where a runbook entry is added to
+        // the registry but has missing required fields.
+        let _guard = test_guard!();
+        let codes = rch_common::ReliabilityReasonCode::authored_runbook_codes();
+        assert!(
+            codes.len() >= 10,
+            "MVP scope authored at least 10 high-leverage codes; got {}",
+            codes.len()
+        );
+        for code in codes {
+            let entry = code
+                .runbook()
+                .expect("authored_runbook_codes only yields Some(...)");
+            // Required-field invariants: every field must have content
+            // (no empty arrays, no empty strings on required scalars).
+            assert!(
+                !entry.symptoms.is_empty(),
+                "{} runbook has empty symptoms",
+                code.code()
+            );
+            assert!(
+                !entry.diagnosis_steps.is_empty(),
+                "{} runbook has empty diagnosis_steps",
+                code.code()
+            );
+            assert!(
+                !entry.remediation_steps.is_empty(),
+                "{} runbook has empty remediation_steps",
+                code.code()
+            );
+            assert!(
+                !entry.verification_command.is_empty(),
+                "{} runbook has empty verification_command",
+                code.code()
+            );
+            assert!(
+                !entry.authored_at.is_empty(),
+                "{} runbook has empty authored_at",
+                code.code()
+            );
+            // Markdown rendering must be non-empty and contain the code
+            // itself plus all the section headers we promise.
+            let md = render_runbook_markdown(code, &entry);
+            assert!(
+                md.contains(code.code()),
+                "rendered markdown for {} missing the code itself",
+                code.code()
+            );
+            for heading in &[
+                "## Symptoms",
+                "## Diagnosis",
+                "## Remediation",
+                "## Verification",
+            ] {
+                assert!(
+                    md.contains(heading),
+                    "rendered markdown for {} missing heading {heading:?}",
+                    code.code()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runbook_pass_state_codes_return_none() {
+        // TEST START: Pass/Info state codes don't need runbooks (operators
+        // aren't paged on them). Spot-check known Pass codes.
+        let _guard = test_guard!();
+        assert!(
+            rch_common::ReliabilityReasonCode::WorkersConfigured
+                .runbook()
+                .is_none(),
+            "Pass-state code WorkersConfigured must not have a runbook"
+        );
+        assert!(
+            rch_common::ReliabilityReasonCode::SchemaCompatible
+                .runbook()
+                .is_none(),
+            "Pass-state code SchemaCompatible must not have a runbook"
+        );
+    }
+
+    #[test]
+    fn cli_parses_doctor_runbook_with_code() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "doctor", "--runbook", "RCH-R002"]).unwrap();
+        match cli.command {
+            Some(Commands::Doctor {
+                runbook,
+                runbook_list,
+                ..
+            }) => {
+                assert_eq!(runbook, Some("RCH-R002".to_string()));
+                assert!(!runbook_list);
+            }
+            _ => fail_expected("Expected doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_doctor_runbook_list_flag() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "doctor", "--runbook-list"]).unwrap();
+        match cli.command {
+            Some(Commands::Doctor {
+                runbook,
+                runbook_list,
+                ..
+            }) => {
+                assert!(runbook.is_none());
+                assert!(runbook_list);
+            }
+            _ => fail_expected("Expected doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_doctor_runbook_with_fix() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from([
+            "rch",
+            "doctor",
+            "--reliability",
+            "--runbook",
+            "RCH-R002",
+            "--fix",
+        ]);
+        assert!(
+            result.is_err(),
+            "--runbook and --fix must be mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_doctor_runbook_with_runbook_list() {
+        let _guard = test_guard!();
+        let result =
+            Cli::try_parse_from(["rch", "doctor", "--runbook", "RCH-R002", "--runbook-list"]);
+        assert!(
+            result.is_err(),
+            "--runbook and --runbook-list must be mutually exclusive (render vs enumerate)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Cache Subcommand Tests (br-4zm6u)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_cache_warm_default() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "cache", "warm"]).unwrap();
+        match cli.command {
+            Some(Commands::Cache {
+                action: CacheAction::Warm { workers, project },
+            }) => {
+                assert!(workers.is_empty(), "default --workers must be empty");
+                assert!(project.is_none(), "default --project must be None");
+            }
+            _ => fail_expected("Expected cache warm command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_cache_warm_single_worker() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "cache", "warm", "--workers", "css"]).unwrap();
+        match cli.command {
+            Some(Commands::Cache {
+                action:
+                    CacheAction::Warm {
+                        workers,
+                        project: _,
+                    },
+            }) => assert_eq!(workers, vec!["css".to_string()]),
+            _ => fail_expected("Expected cache warm command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_cache_warm_multiple_workers() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "cache",
+            "warm",
+            "--workers",
+            "css",
+            "--workers",
+            "vmi1",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Cache {
+                action:
+                    CacheAction::Warm {
+                        workers,
+                        project: _,
+                    },
+            }) => assert_eq!(workers, vec!["css".to_string(), "vmi1".to_string()]),
+            _ => fail_expected("Expected cache warm command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_cache_warm_with_project_path() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "cache", "warm", "--project", "/tmp/some/project"])
+            .unwrap();
+        match cli.command {
+            Some(Commands::Cache {
+                action:
+                    CacheAction::Warm {
+                        workers: _,
+                        project,
+                    },
+            }) => assert_eq!(project, Some(PathBuf::from("/tmp/some/project"))),
+            _ => fail_expected("Expected cache warm command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_cache_warm_unknown_flag() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from(["rch", "cache", "warm", "--bogus"]);
+        assert!(result.is_err(), "unknown flag must error");
+    }
+
+    #[test]
+    fn cache_warm_project_root_uses_configured_topology() {
+        let _guard = test_guard!();
+        let temp = tempfile::TempDir::new().unwrap();
+        let canonical_root = temp.path().join("projects");
+        let alias_root = temp.path().join("alias");
+        let project = canonical_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let policy = rch_common::path_topology::PathTopologyPolicy::new(canonical_root, alias_root);
+
+        let resolved = resolve_cache_warm_project_root(project.clone(), &policy).unwrap();
+
+        assert_eq!(resolved, std::fs::canonicalize(&project).unwrap());
+        assert!(
+            resolve_cache_warm_project_root(
+                project,
+                &rch_common::path_topology::PathTopologyPolicy::default(),
+            )
+            .is_err(),
+            "cache warm must honor configured topology instead of the compiled-in default"
+        );
+    }
+
+    #[test]
+    fn cache_warm_project_root_rejects_file_path() {
+        let _guard = test_guard!();
+        let temp = tempfile::TempDir::new().unwrap();
+        let project_file = temp.path().join("Cargo.toml");
+        std::fs::write(&project_file, "[package]\n").unwrap();
+        let policy = rch_common::path_topology::PathTopologyPolicy::new(
+            temp.path().to_path_buf(),
+            temp.path().join("alias"),
+        );
+
+        let err = resolve_cache_warm_project_root(project_file, &policy).unwrap_err();
+
+        assert!(
+            err.to_string().contains("project root is not a directory"),
+            "unexpected error: {err}"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -3784,14 +6051,19 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
+                ..
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
                 assert!(!install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
-            _ => panic!("Expected doctor command"),
+            _ => fail_expected("Expected doctor command"),
         }
     }
 
@@ -3806,14 +6078,19 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
+                ..
             }) => {
                 assert!(fix);
                 assert!(!dry_run);
                 assert!(!install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
-            _ => panic!("Expected doctor command"),
+            _ => fail_expected("Expected doctor command"),
         }
     }
 
@@ -3828,14 +6105,19 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
+                ..
             }) => {
                 assert!(!fix);
                 assert!(dry_run);
                 assert!(!install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
-            _ => panic!("Expected doctor command"),
+            _ => fail_expected("Expected doctor command"),
         }
     }
 
@@ -3850,14 +6132,19 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
+                ..
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
                 assert!(install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
-            _ => panic!("Expected doctor command"),
+            _ => fail_expected("Expected doctor command"),
         }
     }
 
@@ -3872,14 +6159,19 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
+                ..
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
                 assert!(!install_deps);
                 assert!(reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
-            _ => panic!("Expected doctor command"),
+            _ => fail_expected("Expected doctor command"),
         }
     }
 
@@ -3895,15 +6187,66 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
+                ..
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
                 assert!(!install_deps);
                 assert!(reliability);
                 assert!(check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
-            _ => panic!("Expected doctor command"),
+            _ => fail_expected("Expected doctor command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_doctor_reliability_strict_and_lenient_modes() {
+        let _guard = test_guard!();
+        let strict_cli = Cli::try_parse_from(["rch", "doctor", "--reliability", "--strict"])
+            .expect("strict mode should parse with reliability mode");
+        assert!(
+            matches!(
+                strict_cli.command,
+                Some(Commands::Doctor {
+                    reliability: true,
+                    strict: true,
+                    lenient: false,
+                    ..
+                })
+            ),
+            "Expected doctor command with reliability strict mode"
+        );
+
+        let lenient_cli = Cli::try_parse_from(["rch", "doctor", "--reliability", "--lenient"])
+            .expect("lenient mode should parse with reliability mode");
+        assert!(
+            matches!(
+                lenient_cli.command,
+                Some(Commands::Doctor {
+                    reliability: true,
+                    strict: false,
+                    lenient: true,
+                    ..
+                })
+            ),
+            "Expected doctor command with reliability lenient mode"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_doctor_reliability_strict_and_lenient_together() {
+        let _guard = test_guard!();
+        let result =
+            Cli::try_parse_from(["rch", "doctor", "--reliability", "--strict", "--lenient"]);
+
+        assert!(
+            result.is_err(),
+            "--strict and --lenient are mutually exclusive"
+        );
     }
 
     #[test]
@@ -3920,6 +6263,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cli_parses_doctor_reliability_watch_flags() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "doctor",
+            "--reliability",
+            "--watch",
+            "--watch-interval",
+            "30",
+            "--transitions-only",
+            "--watch-snapshot",
+            "/tmp/rch-watch.json",
+        ])
+        .expect("watch mode flags should parse with reliability mode");
+
+        match cli.command {
+            Some(Commands::Doctor {
+                reliability,
+                watch,
+                watch_interval,
+                transitions_only,
+                watch_snapshot,
+                ..
+            }) => {
+                assert!(reliability);
+                assert!(watch);
+                assert_eq!(watch_interval, 30);
+                assert!(transitions_only);
+                assert_eq!(watch_snapshot, Some(PathBuf::from("/tmp/rch-watch.json")));
+            }
+            _ => fail_expected("Expected doctor command with reliability watch mode"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_doctor_watch_without_reliability() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from(["rch", "doctor", "--watch"]);
+        assert!(
+            result.is_err(),
+            "--watch is only valid with reliability mode"
+        );
+        if let Err(err) = result {
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_doctor_watch_with_fix() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from(["rch", "doctor", "--reliability", "--fix", "--watch"]);
+        assert!(result.is_err(), "--watch and --fix are mutually exclusive");
+        if let Err(err) = result {
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_doctor_watch_dependents_without_watch() {
+        let _guard = test_guard!();
+        for args in [
+            vec!["rch", "doctor", "--reliability", "--transitions-only"],
+            vec![
+                "rch",
+                "doctor",
+                "--reliability",
+                "--watch-snapshot",
+                "/tmp/rch-watch.json",
+            ],
+        ] {
+            let result = Cli::try_parse_from(args);
+            assert!(result.is_err(), "watch-only flags should require --watch");
+            if let Err(err) = result {
+                assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Init Subcommand Tests
     // -------------------------------------------------------------------------
@@ -3933,7 +6355,7 @@ mod tests {
                 assert!(!yes);
                 assert!(!skip_test);
             }
-            _ => panic!("Expected init command"),
+            _ => fail_expected("Expected init command"),
         }
     }
 
@@ -3946,7 +6368,7 @@ mod tests {
                 assert!(yes);
                 assert!(!skip_test);
             }
-            _ => panic!("Expected init command"),
+            _ => fail_expected("Expected init command"),
         }
     }
 
@@ -3959,7 +6381,7 @@ mod tests {
                 assert!(!yes);
                 assert!(skip_test);
             }
-            _ => panic!("Expected init command"),
+            _ => fail_expected("Expected init command"),
         }
     }
 
@@ -3972,7 +6394,7 @@ mod tests {
                 assert!(!yes);
                 assert!(!skip_test);
             }
-            _ => panic!("Expected init command from setup alias"),
+            _ => fail_expected("Expected init command from setup alias"),
         }
     }
 
@@ -3985,7 +6407,7 @@ mod tests {
                 assert!(yes);
                 assert!(skip_test);
             }
-            _ => panic!("Expected init command from setup alias with flags"),
+            _ => fail_expected("Expected init command from setup alias with flags"),
         }
     }
 
@@ -4010,7 +6432,7 @@ mod tests {
                 assert_eq!(channel, "stable");
                 assert!(!fleet);
             }
-            _ => panic!("Expected update command"),
+            _ => fail_expected("Expected update command"),
         }
     }
 
@@ -4022,7 +6444,19 @@ mod tests {
             Some(Commands::Update { check, .. }) => {
                 assert!(check);
             }
-            _ => panic!("Expected update command"),
+            _ => fail_expected("Expected update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_upgrade_alias_check() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "upgrade", "--check"]).unwrap();
+        match cli.command {
+            Some(Commands::Update { check, .. }) => {
+                assert!(check);
+            }
+            _ => fail_expected("Expected update command from upgrade alias"),
         }
     }
 
@@ -4034,7 +6468,7 @@ mod tests {
             Some(Commands::Update { version, .. }) => {
                 assert_eq!(version, Some("v0.2.0".to_string()));
             }
-            _ => panic!("Expected update command"),
+            _ => fail_expected("Expected update command"),
         }
     }
 
@@ -4046,7 +6480,7 @@ mod tests {
             Some(Commands::Update { channel, .. }) => {
                 assert_eq!(channel, "beta");
             }
-            _ => panic!("Expected update command"),
+            _ => fail_expected("Expected update command"),
         }
     }
 
@@ -4058,7 +6492,7 @@ mod tests {
             Some(Commands::Update { fleet, .. }) => {
                 assert!(fleet);
             }
-            _ => panic!("Expected update command"),
+            _ => fail_expected("Expected update command"),
         }
     }
 
@@ -4070,7 +6504,7 @@ mod tests {
             Some(Commands::Update { skip_verify, .. }) => {
                 assert!(skip_verify);
             }
-            _ => panic!("Expected update command"),
+            _ => fail_expected("Expected update command"),
         }
     }
 
@@ -4098,7 +6532,7 @@ mod tests {
                 assert!(canary.is_none());
                 assert!(!dry_run);
             }
-            _ => panic!("Expected fleet deploy command"),
+            _ => fail_expected("Expected fleet deploy command"),
         }
     }
 
@@ -4112,7 +6546,7 @@ mod tests {
             }) => {
                 assert_eq!(worker, Some("css".to_string()));
             }
-            _ => panic!("Expected fleet deploy command"),
+            _ => fail_expected("Expected fleet deploy command"),
         }
     }
 
@@ -4126,7 +6560,7 @@ mod tests {
             }) => {
                 assert_eq!(canary, Some(25));
             }
-            _ => panic!("Expected fleet deploy command"),
+            _ => fail_expected("Expected fleet deploy command"),
         }
     }
 
@@ -4144,7 +6578,7 @@ mod tests {
                 assert!(worker.is_none());
                 assert!(to_version.is_none());
             }
-            _ => panic!("Expected fleet rollback command"),
+            _ => fail_expected("Expected fleet rollback command"),
         }
     }
 
@@ -4159,7 +6593,7 @@ mod tests {
                 assert!(worker.is_none());
                 assert!(!watch);
             }
-            _ => panic!("Expected fleet status command"),
+            _ => fail_expected("Expected fleet status command"),
         }
     }
 
@@ -4173,7 +6607,7 @@ mod tests {
             }) => {
                 assert!(worker.is_none());
             }
-            _ => panic!("Expected fleet verify command"),
+            _ => fail_expected("Expected fleet verify command"),
         }
     }
 
@@ -4188,7 +6622,7 @@ mod tests {
                 assert_eq!(limit, 20);
                 assert!(worker.is_none());
             }
-            _ => panic!("Expected fleet history command"),
+            _ => fail_expected("Expected fleet history command"),
         }
     }
 
@@ -4218,7 +6652,7 @@ mod tests {
                 assert!(!high_contrast);
                 assert_eq!(color_blind, tui::ColorBlindMode::None);
             }
-            _ => panic!("Expected dashboard command"),
+            _ => fail_expected("Expected dashboard command"),
         }
     }
 
@@ -4230,7 +6664,7 @@ mod tests {
             Some(Commands::Dashboard { refresh, .. }) => {
                 assert_eq!(refresh, 500);
             }
-            _ => panic!("Expected dashboard command"),
+            _ => fail_expected("Expected dashboard command"),
         }
     }
 
@@ -4248,7 +6682,7 @@ mod tests {
                 assert!(!no_open);
                 assert!(!prod);
             }
-            _ => panic!("Expected web command"),
+            _ => fail_expected("Expected web command"),
         }
     }
 
@@ -4260,7 +6694,38 @@ mod tests {
             Some(Commands::Web { port, .. }) => {
                 assert_eq!(port, 3001);
             }
-            _ => panic!("Expected web command"),
+            _ => fail_expected("Expected web command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_error_explain_json() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "error", "explain", "RCH-R104", "--json"]).unwrap();
+        match cli.command {
+            Some(Commands::Error {
+                sub: ErrorSubcommand::Explain { code, json },
+            }) => {
+                assert_eq!(code, "RCH-R104");
+                assert!(json);
+            }
+            _ => fail_expected("Expected error explain command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_error_list_category() {
+        let _guard = test_guard!();
+        let cli =
+            Cli::try_parse_from(["rch", "error", "list", "--category", "disk_pressure"]).unwrap();
+        match cli.command {
+            Some(Commands::Error {
+                sub: ErrorSubcommand::List { category, json },
+            }) => {
+                assert_eq!(category.as_deref(), Some("disk_pressure"));
+                assert!(!json);
+            }
+            _ => fail_expected("Expected error list command"),
         }
     }
 
@@ -4288,7 +6753,7 @@ mod tests {
                 assert_eq!(days, 30);
                 assert_eq!(limit, 20);
             }
-            _ => panic!("Expected speedscore command"),
+            _ => fail_expected("Expected speedscore command"),
         }
     }
 
@@ -4301,7 +6766,7 @@ mod tests {
                 assert!(all);
                 assert!(worker.is_none());
             }
-            _ => panic!("Expected speedscore --all command"),
+            _ => fail_expected("Expected speedscore --all command"),
         }
     }
 
@@ -4315,7 +6780,7 @@ mod tests {
             Some(Commands::SpeedScore { worker, .. }) => {
                 assert_eq!(worker, Some("css".to_string()));
             }
-            _ => panic!("Expected speedscore --verbose command"),
+            _ => fail_expected("Expected speedscore --verbose command"),
         }
     }
 
@@ -4335,7 +6800,7 @@ mod tests {
                 assert!(history);
                 assert_eq!(days, 7);
             }
-            _ => panic!("Expected speedscore --history command"),
+            _ => fail_expected("Expected speedscore --history command"),
         }
     }
 
@@ -4347,7 +6812,7 @@ mod tests {
         assert!(cli.verbose, "Global verbose flag should be set with -v");
         match cli.command {
             Some(Commands::SpeedScore { .. }) => {}
-            _ => panic!("Expected speedscore -v command"),
+            _ => fail_expected("Expected speedscore -v command"),
         }
     }
 
@@ -4365,7 +6830,7 @@ mod tests {
             }) => {
                 assert_eq!(shell, clap_complete::Shell::Bash);
             }
-            _ => panic!("Expected completions generate command"),
+            _ => fail_expected("Expected completions generate command"),
         }
     }
 
@@ -4380,7 +6845,7 @@ mod tests {
                 assert_eq!(shell, Some(clap_complete::Shell::Zsh));
                 assert!(!dry_run);
             }
-            _ => panic!("Expected completions install command"),
+            _ => fail_expected("Expected completions install command"),
         }
     }
 
@@ -4392,7 +6857,7 @@ mod tests {
             Some(Commands::Completions {
                 action: CompletionsAction::Status,
             }) => {}
-            _ => panic!("Expected completions status command"),
+            _ => fail_expected("Expected completions status command"),
         }
     }
 
@@ -4410,7 +6875,7 @@ mod tests {
             }) => {
                 assert!(!all);
             }
-            _ => panic!("Expected agents list command"),
+            _ => fail_expected("Expected agents list command"),
         }
     }
 
@@ -4424,7 +6889,7 @@ mod tests {
             }) => {
                 assert!(all);
             }
-            _ => panic!("Expected agents list command"),
+            _ => fail_expected("Expected agents list command"),
         }
     }
 
@@ -4438,7 +6903,7 @@ mod tests {
             }) => {
                 assert!(agent.is_none());
             }
-            _ => panic!("Expected agents status command"),
+            _ => fail_expected("Expected agents status command"),
         }
     }
 
@@ -4453,7 +6918,7 @@ mod tests {
                 assert_eq!(agent, "claude-code");
                 assert!(!dry_run);
             }
-            _ => panic!("Expected agents install-hook command"),
+            _ => fail_expected("Expected agents install-hook command"),
         }
     }
 
@@ -4471,7 +6936,7 @@ mod tests {
             Some(Commands::Daemon {
                 action: DaemonAction::Status,
             }) => {}
-            _ => panic!("Expected daemon status command"),
+            _ => fail_expected("Expected daemon status command"),
         }
     }
 
@@ -4774,7 +7239,7 @@ mod tests {
                 assert!(!watch);
                 assert!(!follow);
             }
-            _ => panic!("Expected queue command"),
+            _ => fail_expected("Expected queue command"),
         }
     }
 
@@ -4786,7 +7251,7 @@ mod tests {
             Some(Commands::Queue { watch, .. }) => {
                 assert!(watch);
             }
-            _ => panic!("Expected queue command with watch"),
+            _ => fail_expected("Expected queue command with watch"),
         }
     }
 
@@ -4798,7 +7263,7 @@ mod tests {
             Some(Commands::Queue { watch, .. }) => {
                 assert!(watch);
             }
-            _ => panic!("Expected queue command with -w"),
+            _ => fail_expected("Expected queue command with -w"),
         }
     }
 
@@ -4810,7 +7275,7 @@ mod tests {
             Some(Commands::Queue { follow, .. }) => {
                 assert!(follow);
             }
-            _ => panic!("Expected queue command with follow"),
+            _ => fail_expected("Expected queue command with follow"),
         }
     }
 
@@ -4822,7 +7287,7 @@ mod tests {
             Some(Commands::Queue { follow, .. }) => {
                 assert!(follow);
             }
-            _ => panic!("Expected queue command with -f"),
+            _ => fail_expected("Expected queue command with -f"),
         }
     }
 
@@ -4835,7 +7300,7 @@ mod tests {
                 assert!(watch);
                 assert!(follow);
             }
-            _ => panic!("Expected queue command with watch and follow"),
+            _ => fail_expected("Expected queue command with watch and follow"),
         }
     }
 
@@ -4861,7 +7326,7 @@ mod tests {
                 assert!(!yes);
                 assert!(!dry_run);
             }
-            _ => panic!("Expected cancel command"),
+            _ => fail_expected("Expected cancel command"),
         }
     }
 
@@ -4873,7 +7338,7 @@ mod tests {
             Some(Commands::Cancel { all, .. }) => {
                 assert!(all);
             }
-            _ => panic!("Expected cancel --all command"),
+            _ => fail_expected("Expected cancel --all command"),
         }
     }
 
@@ -4886,7 +7351,7 @@ mod tests {
                 assert!(all);
                 assert!(yes);
             }
-            _ => panic!("Expected cancel --all --yes command"),
+            _ => fail_expected("Expected cancel --all --yes command"),
         }
     }
 
@@ -4901,7 +7366,7 @@ mod tests {
                 assert_eq!(build_id, Some(42));
                 assert!(force);
             }
-            _ => panic!("Expected cancel with --force"),
+            _ => fail_expected("Expected cancel with --force"),
         }
     }
 
@@ -4916,7 +7381,7 @@ mod tests {
                 assert_eq!(build_id, Some(42));
                 assert!(force);
             }
-            _ => panic!("Expected cancel with -f"),
+            _ => fail_expected("Expected cancel with -f"),
         }
     }
 
@@ -4928,7 +7393,7 @@ mod tests {
             Some(Commands::Cancel { yes, .. }) => {
                 assert!(yes);
             }
-            _ => panic!("Expected cancel with -y"),
+            _ => fail_expected("Expected cancel with -y"),
         }
     }
 
@@ -4940,7 +7405,7 @@ mod tests {
             Some(Commands::Cancel { dry_run, .. }) => {
                 assert!(dry_run);
             }
-            _ => panic!("Expected cancel with --dry-run"),
+            _ => fail_expected("Expected cancel with --dry-run"),
         }
     }
 
@@ -4952,7 +7417,7 @@ mod tests {
             Some(Commands::Cancel { dry_run, .. }) => {
                 assert!(dry_run);
             }
-            _ => panic!("Expected cancel with -n"),
+            _ => fail_expected("Expected cancel with -n"),
         }
     }
 
@@ -4967,7 +7432,7 @@ mod tests {
                 assert_eq!(build_id, Some(42));
                 assert!(dry_run);
             }
-            _ => panic!("Expected cancel 42 --dry-run"),
+            _ => fail_expected("Expected cancel 42 --dry-run"),
         }
     }
 
@@ -4980,7 +7445,7 @@ mod tests {
                 assert!(all);
                 assert!(dry_run);
             }
-            _ => panic!("Expected cancel -an"),
+            _ => fail_expected("Expected cancel -an"),
         }
     }
 
@@ -5001,6 +7466,10 @@ mod tests {
                 timeout,
                 debug,
                 scheduled,
+                smoke,
+                soak,
+                load,
+                dry_run,
             }) => {
                 assert!(action.is_none());
                 assert!(worker.is_none());
@@ -5009,8 +7478,12 @@ mod tests {
                 assert_eq!(timeout, 300);
                 assert!(!debug);
                 assert!(!scheduled);
+                assert!(!smoke);
+                assert!(!soak);
+                assert!(!load);
+                assert!(!dry_run);
             }
-            _ => panic!("Expected self-test command"),
+            _ => fail_expected("Expected self-test command"),
         }
     }
 
@@ -5023,7 +7496,43 @@ mod tests {
                 assert_eq!(worker.as_deref(), Some("css"));
                 assert!(!all);
             }
-            _ => panic!("Expected self-test --worker command"),
+            _ => fail_expected("Expected self-test --worker command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_self_test_smoke_dry_run() {
+        let _guard = test_guard!();
+        let cli =
+            Cli::try_parse_from(["rch", "self-test", "--smoke", "--dry-run", "--soak"]).unwrap();
+        match cli.command {
+            Some(Commands::SelfTest {
+                smoke,
+                soak,
+                dry_run,
+                ..
+            }) => {
+                assert!(smoke);
+                assert!(soak);
+                assert!(dry_run);
+            }
+            _ => fail_expected("Expected self-test --smoke command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_self_test_smoke_load() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "self-test", "--smoke", "--load", "--all"]).unwrap();
+        match cli.command {
+            Some(Commands::SelfTest {
+                smoke, load, all, ..
+            }) => {
+                assert!(smoke);
+                assert!(load);
+                assert!(all);
+            }
+            _ => fail_expected("Expected self-test --smoke --load command"),
         }
     }
 
@@ -5035,7 +7544,7 @@ mod tests {
             Some(Commands::SelfTest { all, .. }) => {
                 assert!(all);
             }
-            _ => panic!("Expected self-test --all command"),
+            _ => fail_expected("Expected self-test --all command"),
         }
     }
 
@@ -5047,7 +7556,7 @@ mod tests {
             Some(Commands::SelfTest { timeout, .. }) => {
                 assert_eq!(timeout, 600);
             }
-            _ => panic!("Expected self-test --timeout command"),
+            _ => fail_expected("Expected self-test --timeout command"),
         }
     }
 
@@ -5059,7 +7568,7 @@ mod tests {
             Some(Commands::SelfTest { debug, .. }) => {
                 assert!(debug);
             }
-            _ => panic!("Expected self-test --debug command"),
+            _ => fail_expected("Expected self-test --debug command"),
         }
     }
 
@@ -5071,7 +7580,7 @@ mod tests {
             Some(Commands::SelfTest { scheduled, .. }) => {
                 assert!(scheduled);
             }
-            _ => panic!("Expected self-test --scheduled command"),
+            _ => fail_expected("Expected self-test --scheduled command"),
         }
     }
 
@@ -5083,7 +7592,7 @@ mod tests {
             Some(Commands::SelfTest { action, .. }) => {
                 assert!(matches!(action, Some(SelfTestAction::Status)));
             }
-            _ => panic!("Expected self-test status command"),
+            _ => fail_expected("Expected self-test status command"),
         }
     }
 
@@ -5098,7 +7607,7 @@ mod tests {
                     Some(SelfTestAction::History { limit: 10 })
                 ));
             }
-            _ => panic!("Expected self-test history command"),
+            _ => fail_expected("Expected self-test history command"),
         }
     }
 
@@ -5113,7 +7622,7 @@ mod tests {
                     Some(SelfTestAction::History { limit: 20 })
                 ));
             }
-            _ => panic!("Expected self-test history --limit command"),
+            _ => fail_expected("Expected self-test history --limit command"),
         }
     }
 
@@ -5128,7 +7637,7 @@ mod tests {
                     Some("/tmp/test".to_string())
                 );
             }
-            _ => panic!("Expected self-test --project command"),
+            _ => fail_expected("Expected self-test --project command"),
         }
     }
 
@@ -5158,6 +7667,55 @@ mod tests {
     fn machine_output_requested_neither_set() {
         let _guard = test_guard!();
         assert!(!machine_output_requested(None, false));
+    }
+
+    #[test]
+    fn top_level_api_error_classifies_daemon_response_parse_as_serde() {
+        let _guard = test_guard!();
+        let error = anyhow::anyhow!(
+            "Failed to parse SpeedScore list response: invalid type: string \"healthy\""
+        );
+        let api_error = top_level_api_error(&error);
+
+        assert_eq!(api_error.code, ErrorCode::InternalSerdeError.code_string());
+        assert_eq!(
+            api_error.details.as_deref(),
+            Some("Failed to parse SpeedScore list response: invalid type: string \"healthy\"")
+        );
+    }
+
+    #[test]
+    fn golden_top_level_api_error_for_daemon_response_parse_failure() {
+        let _guard = test_guard!();
+        const FIXTURE_PATH: &str =
+            "../../tests/goldens/ft_4tp7g/top_level_daemon_parse_error_api_error.json";
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/goldens/ft_4tp7g/top_level_daemon_parse_error_api_error.json"
+        ))
+        .expect("top-level api error golden fixture parses");
+        assert_eq!(
+            fixture["schema_version"],
+            "rch.golden.top_level_api_error.v1"
+        );
+
+        let input_error = fixture["input_error"]
+            .as_str()
+            .expect("input_error is a string");
+        let api_error = top_level_api_error(&anyhow::anyhow!(input_error.to_string()));
+        assert_golden_json(
+            serde_json::to_value(&api_error).expect("api error serializes"),
+            &fixture["expected"],
+            FIXTURE_PATH,
+        );
+    }
+
+    #[test]
+    fn top_level_api_error_keeps_toml_parse_as_config() {
+        let _guard = test_guard!();
+        let error = anyhow::anyhow!("TOML parse error at line 1, column 1");
+        let api_error = top_level_api_error(&error);
+
+        assert_eq!(api_error.code, ErrorCode::ConfigParseError.code_string());
     }
 
     #[test]

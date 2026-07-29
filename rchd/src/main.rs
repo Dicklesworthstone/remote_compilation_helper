@@ -10,6 +10,8 @@ mod alerts;
 mod api;
 mod benchmark_queue;
 mod benchmark_scheduler;
+mod build_root_policy;
+mod bypass_recovery_service;
 mod cache_cleanup;
 mod cancellation;
 mod cleanup;
@@ -30,20 +32,22 @@ mod reload;
 mod repo_convergence;
 mod selection;
 mod self_test;
+mod stale_target_reap;
+mod startup_consistency;
 mod telemetry;
 mod ui;
 mod workers;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use chrono::{Duration as ChronoDuration, Local};
 use clap::Parser;
 use rch_common::{LogConfig, SelfTestConfig, init_logging};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc};
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
 use tracing::{debug, error, info, warn};
 
 #[cfg(unix)]
@@ -51,9 +55,11 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use benchmark_queue::BenchmarkQueue;
 use benchmark_scheduler::{BenchmarkScheduler, BenchmarkTriggerHandle, SchedulerConfig};
+use bypass_recovery_service::{BypassRecoveryConfig, BypassRecoveryService, SshRecoveryProber};
 use disk_pressure::{DiskPressureMonitor, DiskPressurePolicyConfig};
 use events::EventBus;
 use history::BuildHistory;
+use rch_common::bypass_record::{BypassRecordStore, default_bypass_record_path};
 use rch_telemetry::storage::TelemetryStorage;
 use selection::WorkerSelector;
 use self_test::{DEFAULT_RESULT_CAPACITY, DEFAULT_RUN_CAPACITY, SelfTestHistory, SelfTestService};
@@ -62,7 +68,11 @@ use ui::{DaemonBanner, MetricsDashboard, WorkerStatusPanel};
 
 #[derive(Parser)]
 #[command(name = "rchd")]
-#[command(author, version, about = "RCH daemon - worker fleet orchestration")]
+#[command(
+    author,
+    version = rch_common::build_version_value_static(),
+    about = "RCH daemon - worker fleet orchestration"
+)]
 struct Cli {
     /// Path to Unix socket
     #[arg(short, long, default_value_os_t = crate::config::default_socket_path())]
@@ -140,6 +150,243 @@ pub struct DaemonContext {
     pub pid: u32,
     /// Maximum time a build can wait in queue (seconds) before timing out.
     pub queue_timeout_secs: u64,
+    /// Durable bypass-record store (shared with the bypass recovery service).
+    /// `handle_worker_enable` deletes a worker's record here so an operator
+    /// re-enable is durable — otherwise `reconcile_on_start` re-quarantines the
+    /// worker from the persisted record on the next daemon restart. `None` in
+    /// test contexts that don't exercise bypass recovery.
+    pub bypass_store: Option<Arc<tokio::sync::Mutex<BypassRecordStore>>>,
+}
+
+/// Result of one bind attempt — distinguishes "socket is held by another
+/// daemon" (a normal state we wait out under systemd) from real errors.
+enum BindAttempt {
+    Bound(UnixListener),
+    SocketHeld,
+}
+
+/// Send a sd_notify(3) message to systemd if NOTIFY_SOCKET is set. Silently
+/// no-op on macOS, on hosts without systemd, and for Type=simple units
+/// (which don't set NOTIFY_SOCKET — the current rchd.service config).
+///
+/// Adding this means the daemon also works under Type=notify without
+/// TimeoutStartSec killing it: we send READY=1 once the socket is bound,
+/// and STATUS=... updates while we're in the wait-for-socket loop.
+///
+/// Path-form sockets (the default on Debian/Ubuntu/etc.) are supported.
+/// Abstract sockets (env var starts with '@') need a libc::sendto with a
+/// sockaddr_un to encode the leading NUL byte — to avoid the new dep we
+/// skip them and let the operator know via debug! log. They're rare in
+/// practice; the unit can use Type=simple as a workaround.
+fn sd_notify(message: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(raw) = std::env::var("NOTIFY_SOCKET").ok() else {
+            return;
+        };
+        if raw.is_empty() {
+            return;
+        }
+        if raw.starts_with('@') {
+            tracing::debug!(
+                "sd_notify: abstract NOTIFY_SOCKET not supported (would send {message:?})"
+            );
+            return;
+        }
+        if let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() {
+            let _ = sock.send_to(message.as_bytes(), raw);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = message;
+    }
+}
+
+/// True iff `/proc/self/cgroup` content indicates we are the rchd.service unit.
+#[allow(dead_code)] // used under cfg(linux) and in tests
+fn cgroup_contains_rchd_unit(cgroup: &str) -> bool {
+    cgroup.contains("rchd.service")
+}
+
+/// `Some(true)`/`Some(false)` once we can read our cgroup and decide whether we
+/// are the rchd.service unit's own process; `None` if the cgroup is unreadable
+/// (callers treat `None` conservatively to avoid any restart storm).
+fn cgroup_says_rchd_unit() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .map(|c| cgroup_contains_rchd_unit(&c))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(false)
+    }
+}
+
+/// Is a systemd --user `rchd.service` unit configured (enabled/static) here?
+#[cfg(target_os = "linux")]
+fn rchd_systemd_unit_present() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", "rchd"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// On systemd hosts, enforce exactly one rchd. If `rchd.service` manages the
+/// daemon here and we are NOT that unit's process (a duplicate spawned by hook
+/// auto-start, `rch daemon start/restart`, or `rch update`), make sure the unit
+/// is running and exit. systemd (Restart=always) is then the single source of
+/// truth, eliminating duplicate/orphan rchd regardless of how it was launched.
+/// No-op on macOS and on Linux hosts with no rchd.service (manual management).
+fn defer_to_systemd_if_managed() {
+    #[cfg(target_os = "linux")]
+    {
+        // Only defer when we can CONFIRM we are not the unit's own process.
+        // `Some(true)` (we ARE the unit) or `None` (cgroup unreadable) -> proceed,
+        // so we never make the real unit exit-loop under systemd Restart=always.
+        if cgroup_says_rchd_unit() != Some(false) {
+            return;
+        }
+        if !rchd_systemd_unit_present() {
+            return;
+        }
+        info!(
+            "rchd is managed by the systemd --user rchd.service unit here; starting it and exiting to avoid a duplicate daemon"
+        );
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "start", "rchd"])
+            .status();
+        std::process::exit(0);
+    }
+}
+
+async fn bind_daemon_socket(socket: &Path) -> Result<UnixListener> {
+    // "Managed by systemd" only if THIS process is the rchd.service unit's own
+    // main process (our cgroup is rchd.service) -- NOT merely because
+    // INVOCATION_ID was inherited from a parent scope (e.g. an agent's `rch`
+    // auto-spawned us). The genuine unit waits out a transiently-held socket
+    // (avoids a restart storm); any other rchd bails. A non-unit rchd on a
+    // systemd host has already exited via defer_to_systemd_if_managed().
+    let managed_by_systemd = cgroup_says_rchd_unit() == Some(true);
+    bind_daemon_socket_with_mode(socket, managed_by_systemd, Duration::from_secs(5)).await
+}
+
+/// Inner bind routine taking an explicit `managed_by_systemd` flag and
+/// `wait_backoff` (parameterized for tests).
+///
+/// If the socket is currently held by another rchd (e.g. an agent's `rch
+/// exec` auto-spawned a detached one during a momentary daemon outage),
+/// exiting with FAILURE causes systemd to restart-storm — which is what
+/// happened on css/ts2 (NRestarts in the tens of thousands). When
+/// systemd-managed, wait patiently for the other process to free the
+/// socket instead; this keeps the systemd unit Active and avoids the
+/// storm entirely.
+///
+/// We also retry on *any* error from the inner attempt when systemd-managed
+/// (probe timeouts, races on remove/bind, permission glitches): a one-shot
+/// failure must never crash-loop the unit. Standalone invocations preserve
+/// the original fail-fast behavior.
+async fn bind_daemon_socket_with_mode(
+    socket: &Path,
+    managed_by_systemd: bool,
+    wait_backoff: Duration,
+) -> Result<UnixListener> {
+    let mut waited_logged = false;
+
+    loop {
+        match try_bind_daemon_socket(socket).await {
+            Ok(BindAttempt::Bound(listener)) => return Ok(listener),
+            Ok(BindAttempt::SocketHeld) => {
+                if managed_by_systemd {
+                    if !waited_logged {
+                        warn!(
+                            "daemon socket {} already serving; waiting for it to free \
+                             (systemd-managed, will take over when the current owner exits)",
+                            socket.display()
+                        );
+                        // Visible via `systemctl --user status rchd` so
+                        // operators can tell *why* the unit looks idle.
+                        sd_notify("STATUS=waiting for another rchd to release the socket");
+                        waited_logged = true;
+                    }
+                    tokio::time::sleep(wait_backoff).await;
+                    continue;
+                }
+                bail!(
+                    "daemon socket already accepts connections at {}; refusing to start a second rchd",
+                    socket.display()
+                );
+            }
+            Err(e) if managed_by_systemd => {
+                // Don't restart-storm on transient errors. The most realistic
+                // one is the 300ms connect-probe timeout in
+                // socket_has_live_listener firing under load on the box that
+                // currently holds the socket.
+                warn!(
+                    "daemon socket bind attempt failed (systemd-managed, retrying in {}s): {e:#}",
+                    wait_backoff.as_secs()
+                );
+                tokio::time::sleep(wait_backoff).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+async fn try_bind_daemon_socket(socket: &Path) -> Result<BindAttempt> {
+    if socket.exists() {
+        if socket_has_live_listener(socket).await? {
+            return Ok(BindAttempt::SocketHeld);
+        }
+        std::fs::remove_file(socket).with_context(|| {
+            format!("failed to remove stale daemon socket {}", socket.display())
+        })?;
+    }
+
+    let listener = UnixListener::bind(socket)
+        .with_context(|| format!("failed to bind daemon socket {}", socket.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).with_context(
+            || {
+                format!(
+                    "failed to set daemon socket permissions {}",
+                    socket.display()
+                )
+            },
+        )?;
+    }
+
+    Ok(BindAttempt::Bound(listener))
+}
+
+async fn socket_has_live_listener(socket: &Path) -> Result<bool> {
+    match timeout(Duration::from_millis(300), UnixStream::connect(socket)).await {
+        Ok(Ok(_stream)) => Ok(true),
+        Ok(Err(error)) if is_stale_socket_connect_error(&error) => Ok(false),
+        Ok(Err(error)) => Err(error).with_context(|| {
+            format!(
+                "daemon socket {} exists but could not be probed safely",
+                socket.display()
+            )
+        }),
+        Err(_) => bail!(
+            "daemon socket {} exists but the connection probe timed out; refusing to start a second rchd",
+            socket.display()
+        ),
+    }
+}
+
+fn is_stale_socket_connect_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+    )
 }
 
 #[tokio::main]
@@ -161,11 +408,33 @@ async fn main() -> Result<()> {
 
     info!("Starting RCH daemon...");
 
+    // Enforce single-instance on systemd hosts before we touch the socket.
+    defer_to_systemd_if_managed();
+    let listener = bind_daemon_socket(&cli.socket).await?;
+    info!("Listening on {:?}", cli.socket);
+    // Inform systemd we're ready. No-op for Type=simple (the current unit)
+    // and on macOS; essential if anyone ever switches to Type=notify.
+    sd_notify("READY=1");
+
     // Register Prometheus metrics
     if let Err(e) = metrics::register_metrics() {
         warn!("Failed to register some metrics: {}", e);
     }
     metrics::set_daemon_info(env!("CARGO_PKG_VERSION"));
+
+    // Register remediation-state observability (bead 14.5) into the same served
+    // registry and install the process-global handle so daemon decision points
+    // can record via `rch_telemetry::remediation::record_*`. Best-effort: a
+    // construction/registration failure must never block the daemon.
+    match rch_telemetry::remediation::RemediationMetrics::new() {
+        Ok(remediation) => {
+            if let Err(e) = remediation.register(&metrics::REGISTRY) {
+                warn!("Failed to register remediation metrics: {}", e);
+            }
+            rch_telemetry::remediation::init_global(remediation);
+        }
+        Err(e) => warn!("Failed to construct remediation metrics: {}", e),
+    }
 
     // Initialize OpenTelemetry tracing (optional, configured via env vars)
     let _otel_guard = match metrics::tracing::init_otel() {
@@ -208,11 +477,21 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Startup self-consistency check (bd-...-3.2): verify the daemon's bound
+    // socket, the hook/CLI's configured socket, and the installed Claude Code
+    // hook agree, reporting any drift as structured events. Read-only — it
+    // never rewrites operator-owned config.
+    {
+        let hook_config_socket = {
+            let configured = rch_config.general.socket_path.trim();
+            (!configured.is_empty()).then(|| PathBuf::from(configured))
+        };
+        let _ = startup_consistency::gather_and_log(cli.socket.clone(), hook_config_socket);
+    }
+
     // Initialize worker selector
-    let worker_selector = Arc::new(WorkerSelector::with_config(
-        rch_config.selection.clone(),
-        rch_config.circuit.clone(),
-    ));
+    let mut worker_selector_inner =
+        WorkerSelector::with_config(rch_config.selection.clone(), rch_config.circuit.clone());
 
     // Verify and install Claude Code hook if needed (self-healing)
     if rch_config.self_healing.daemon_installs_hooks {
@@ -245,6 +524,38 @@ async fn main() -> Result<()> {
             config::DaemonConfig::default()
         }
     };
+
+    // Shared SSH connection pool for the daemon's per-worker background
+    // subsystems (health, telemetry, cache cleanup, stale-target reap, reclaim,
+    // toolchain probe). Historically each of these opened a throwaway
+    // `SshClient` per poll — a fresh ControlMaster spawned (and, with the
+    // openssh default ControlPersist, LEAKED) every ~30s per worker, flooding
+    // sshd and eventually tripping workers falsely DOWN. One warm master per
+    // worker is reused instead. Gated on the (previously dead) `connection_pooling`
+    // flag so it can be turned off if a site hits mux trouble; when `None` each
+    // subsystem falls back to its legacy throwaway path.
+    //
+    // The pool keeps a BOUNDED-idle master (ControlPersist=IdleFor(60)); the
+    // openssh crate's Forever default is deliberately avoided (see
+    // `control_persist_mode` — that default is exactly what leaked masters).
+    let ssh_pool: Option<Arc<rch_common::SshPool>> = if daemon_config.connection_pooling {
+        let pool_options = rch_common::SshOptions {
+            control_master: true,
+            control_persist_idle: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        info!("SSH connection pooling enabled (warm ControlMaster reuse)");
+        Some(Arc::new(rch_common::SshPool::new(pool_options)))
+    } else {
+        info!("SSH connection pooling disabled (per-call SSH sessions)");
+        None
+    };
+
+    // Attach the shared pool to the worker selector's toolchain preflight probe
+    // now that both the selector and the pool exist, then freeze the selector
+    // behind an Arc for the rest of the daemon.
+    worker_selector_inner.set_ssh_pool(ssh_pool.clone());
+    let worker_selector = Arc::new(worker_selector_inner);
 
     // Initialize build history
     let history = if let Some(ref path) = cli.history_file {
@@ -322,28 +633,29 @@ async fn main() -> Result<()> {
     }
 
     // Start cache cleanup scheduler
-    let cache_cleanup_scheduler = Arc::new(cache_cleanup::CacheCleanupScheduler::new(
-        worker_pool.clone(),
-        daemon_config.cache_cleanup,
-    ));
+    let cache_cleanup_scheduler = Arc::new(
+        cache_cleanup::CacheCleanupScheduler::new(worker_pool.clone(), daemon_config.cache_cleanup)
+            .with_ssh_pool(ssh_pool.clone()),
+    );
     let _cache_cleanup_handle = cache_cleanup_scheduler.start();
 
-    // Remove existing socket if present
-    if cli.socket.exists() {
-        std::fs::remove_file(&cli.socket)?;
-    }
-
-    // Create Unix socket listener
-    let listener = UnixListener::bind(&cli.socket)?;
-
-    // Set socket permissions to 600 (owner read/write only) to prevent unauthorized access
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&cli.socket, std::fs::Permissions::from_mode(0o600))?;
-    }
-
-    info!("Listening on {:?}", cli.socket);
+    // Start the worker-side stale per-job target dir reaper. The orchestrator hook
+    // only reaps the single repo being built; this periodic daemon sweep reclaims
+    // abandoned `.rch-target-*-job-*` dirs across ALL repos on each worker using
+    // the same idle predicate (shared via rch_common::stale_target_reap).
+    // Default-off for canary safety; env-overridable / opt-in via config.
+    let stale_target_reaper = Arc::new(
+        stale_target_reap::StaleTargetReaper::new(
+            worker_pool.clone(),
+            // bd-28xs5: source the reaper config from the central remediation config
+            // (remediation.pooled_target) rather than rchd-local defaults; env knobs
+            // still override on top.
+            config::StaleTargetReapConfig::from_remediation(&rch_config.remediation)
+                .with_env_overrides(),
+        )
+        .with_ssh_pool(ssh_pool.clone()),
+    );
+    let _stale_target_reaper_handle = stale_target_reaper.start();
 
     // Create daemon context
     let telemetry_storage = match telemetry::default_telemetry_db_path() {
@@ -417,14 +729,27 @@ async fn main() -> Result<()> {
     };
     let alert_manager = Arc::new(alerts::AlertManager::new(alert_config));
 
-    let repo_convergence = Arc::new(repo_convergence::RepoConvergenceService::new(
-        event_bus.clone(),
-    ));
+    // bd-28xs5: source reconciliation windows/bounds from the central remediation
+    // config (remediation.reconciliation) rather than rchd module constants.
+    let repo_convergence = Arc::new(
+        repo_convergence::RepoConvergenceService::with_reconciliation(
+            event_bus.clone(),
+            rch_config.remediation.reconciliation,
+        ),
+    );
 
     let cancellation_orchestrator = Arc::new(cancellation::CancellationOrchestrator::new(
         cancellation::CancellationConfig::default(),
         event_bus.clone(),
     ));
+
+    // The durable bypass-record store is shared between the bypass recovery
+    // service (which reads/writes records) and the DaemonContext (so
+    // `handle_worker_enable` can delete a record on operator re-enable). Create
+    // it here so both hold the same Arc.
+    let bypass_store = Arc::new(Mutex::new(BypassRecordStore::load(
+        default_bypass_record_path(),
+    )));
 
     let context = DaemonContext {
         pool: worker_pool.clone(),
@@ -443,6 +768,7 @@ async fn main() -> Result<()> {
         version: env!("CARGO_PKG_VERSION"),
         pid: std::process::id(),
         queue_timeout_secs: daemon_config.queue.timeout_secs,
+        bypass_store: Some(bypass_store.clone()),
     };
 
     // Start active build cleanup background task
@@ -457,11 +783,31 @@ async fn main() -> Result<()> {
     let metrics_interval = Duration::from_secs(cli.metrics_reset_interval.max(1));
     let metrics_dashboard = Arc::new(Mutex::new(MetricsDashboard::new(metrics_interval)));
 
+    // Health checks get their OWN dedicated ControlMaster pool, independent of
+    // the shared build/telemetry `ssh_pool`. The health probe is what opens the
+    // circuit that quarantines a worker out of scheduling; routing it through the
+    // shared pool means a single wedged/leaked ControlMaster socket false-fails
+    // EVERY health probe and can quarantine the whole fleet at once (a trigger of
+    // the 2026-07-16 offload meltdown). A separate pool (separate control sockets)
+    // keeps a build/telemetry-pool wedge from cascading into fleet-wide bypass,
+    // while still giving health checks warm-connection reuse.
+    let health_ssh_pool: Option<Arc<rch_common::SshPool>> = if daemon_config.connection_pooling {
+        let pool_options = rch_common::SshOptions {
+            control_master: true,
+            control_persist_idle: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        Some(Arc::new(rch_common::SshPool::new(pool_options)))
+    } else {
+        None
+    };
+
     // Start health monitor with alert manager integration
     let health_config = health::HealthConfig::default();
     let health_monitor = health::HealthMonitor::new(worker_pool.clone(), health_config)
         .with_status_panel(worker_status_panel.clone())
-        .with_alert_manager(alert_manager.clone());
+        .with_alert_manager(alert_manager.clone())
+        .with_ssh_pool(health_ssh_pool.clone());
     let health_handle = health_monitor.start();
     info!("Health monitor started with alerting enabled");
 
@@ -470,7 +816,8 @@ async fn main() -> Result<()> {
         worker_pool.clone(),
         telemetry_store.clone(),
         TelemetryPollerConfig::default(),
-    );
+    )
+    .with_ssh_pool(ssh_pool.clone());
     let _telemetry_handle = telemetry_poller.start();
     info!("Telemetry poller started");
 
@@ -492,6 +839,25 @@ async fn main() -> Result<()> {
     );
     let _convergence_loop_handle = convergence_loop.start();
     info!("Convergence loop started");
+
+    // Start the bypass recovery service (bd-session-history-remediation-ocv9i.1.3):
+    // quarantines plainly-unreachable workers into temporary bypass, then probes
+    // them (capabilities/disk/load/telemetry) and runs a canary before any
+    // auto-rejoin. The durable bypass records persist alongside incidents and are
+    // reconciled into live worker lifecycle on startup.
+    // bd-28xs5: source recovery knobs from the central remediation config
+    // (remediation.auto_rejoin + remediation.telemetry_freshness) rather than
+    // rchd-local defaults.
+    let bypass_config = BypassRecoveryConfig::from_remediation(&rch_config.remediation);
+    let bypass_prober = SshRecoveryProber::new(telemetry_store.clone(), bypass_config.clone());
+    let bypass_recovery = BypassRecoveryService::new(
+        worker_pool.clone(),
+        bypass_store.clone(),
+        bypass_prober,
+        bypass_config,
+    );
+    let _bypass_recovery_handle = bypass_recovery.start();
+    info!("Bypass recovery service started");
 
     let metrics_pool = worker_pool.clone();
     let metrics_history = context.history.clone();
@@ -541,11 +907,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let commit_hash = option_env!("RCH_GIT_COMMIT")
-        .or(option_env!("VERGEN_GIT_SHA"))
-        .or(option_env!("GIT_COMMIT"))
-        .or(option_env!("GITHUB_SHA"))
-        .map(|value| value.to_string());
+    let commit_hash = rch_common::build_commit().map(|value| value.to_string());
 
     let banner = DaemonBanner::new(
         env!("CARGO_PKG_VERSION"),
@@ -751,6 +1113,15 @@ async fn main() -> Result<()> {
         handle.abort();
     }
 
+    // Close the shared SSH connection pool so warm ControlMasters are torn down
+    // cleanly on shutdown rather than lingering until their idle timeout.
+    if let Some(pool) = &ssh_pool {
+        info!("Closing SSH connection pool...");
+        if let Err(e) = pool.close_all().await {
+            warn!("Error closing SSH connection pool: {}", e);
+        }
+    }
+
     // Clean up socket
     if std::path::Path::new(&context.socket_path).exists() {
         let _ = std::fs::remove_file(&context.socket_path);
@@ -758,6 +1129,12 @@ async fn main() -> Result<()> {
 
     info!("Daemon stopped");
     Ok(())
+}
+
+// Global test logging initialization - enables JSONL output for all unit tests
+#[cfg(test)]
+fn init_test_logging() {
+    rch_common::testing::init_global_test_logging();
 }
 
 #[cfg(test)]
@@ -868,6 +1245,116 @@ mod tests {
         assert!(cli.foreground);
     }
 
+    #[tokio::test]
+    async fn test_bind_daemon_socket_creates_listener() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("rch.sock");
+
+        let listener = bind_daemon_socket(&socket_path).await.unwrap();
+
+        assert!(socket_path.exists());
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn test_bind_daemon_socket_refuses_live_listener() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("rch.sock");
+        let _existing = UnixListener::bind(&socket_path).unwrap();
+
+        // Use the explicit-flag inner function (managed_by_systemd = false)
+        // so this test is deterministic regardless of whether the test
+        // runner itself happens to be inside a systemd unit (which would
+        // set INVOCATION_ID and make the public bind_daemon_socket wait
+        // forever instead of bailing — i.e. the test would hang).
+        let error = bind_daemon_socket_with_mode(&socket_path, false, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to start a second rchd"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bind_daemon_socket_replaces_stale_socket() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("rch.sock");
+        let stale_listener = UnixListener::bind(&socket_path).unwrap();
+        drop(stale_listener);
+
+        let listener = bind_daemon_socket(&socket_path).await.unwrap();
+
+        assert!(socket_path.exists());
+        drop(listener);
+    }
+
+    /// When systemd-managed and the socket is held by another process,
+    /// bind_daemon_socket must WAIT (never returning, never erroring), not
+    /// bail. This is the regression test for the css/ts2 restart-storm
+    /// (NRestarts → tens of thousands). We use the explicit-flag inner
+    /// function to avoid the test having to mutate process-global env vars.
+    #[tokio::test]
+    async fn test_bind_daemon_socket_waits_when_systemd_managed() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("rch.sock");
+        let _holder = UnixListener::bind(&socket_path).unwrap();
+
+        // 50 ms backoff (vs the 5 s production value) so the test is quick.
+        // We use timeout to assert the function is still waiting after the
+        // bail path would have returned. If the function ever returned (Ok
+        // or Err) within the timeout, the wait-loop is broken.
+        let result = tokio::time::timeout(
+            Duration::from_millis(400),
+            bind_daemon_socket_with_mode(&socket_path, true, Duration::from_millis(50)),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "bind_daemon_socket_with_mode returned within the timeout instead \
+             of waiting; that means systemd-managed mode would crash-loop. \
+             Got: {result:?}"
+        );
+    }
+
+    /// And once the holder releases the socket, the waiting bind should take
+    /// over cleanly — proving the "current owner exits → systemd rchd binds"
+    /// transition we depend on in production.
+    #[tokio::test]
+    async fn test_bind_daemon_socket_takes_over_after_holder_exits() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("rch.sock");
+        let holder = UnixListener::bind(&socket_path).unwrap();
+
+        let bind_path = socket_path.clone();
+        let bind_task = tokio::spawn(async move {
+            bind_daemon_socket_with_mode(&bind_path, true, Duration::from_millis(50)).await
+        });
+
+        // Give the waiter a couple of iterations on the held socket, then
+        // release it. The waiter should bind on its next loop iteration.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(holder);
+        // The stale-socket file may still be present — that's fine, the
+        // waiter's try_bind_daemon_socket will probe (stale) → remove → bind.
+
+        let listener = tokio::time::timeout(Duration::from_secs(2), bind_task)
+            .await
+            .expect("timed out waiting for bind takeover")
+            .expect("bind_task panicked")
+            .expect("bind_daemon_socket_with_mode returned Err");
+        drop(listener);
+    }
+
     // =========================================================================
     // test_daemon_context_creation - DaemonContext initialization tests
     // =========================================================================
@@ -900,6 +1387,7 @@ mod tests {
             version: "0.1.0-test",
             pid: std::process::id(),
             queue_timeout_secs: 300,
+            bypass_store: None,
         };
 
         assert_eq!(context.socket_path, "/tmp/test.sock");
@@ -950,6 +1438,7 @@ mod tests {
             version: env!("CARGO_PKG_VERSION"),
             pid: std::process::id(),
             queue_timeout_secs: 300,
+            bypass_store: None,
         };
 
         assert_eq!(context.pool.len(), 1);
@@ -1002,6 +1491,7 @@ mod tests {
             version: "0.1.0",
             pid: 12345,
             queue_timeout_secs: 300,
+            bypass_store: None,
         };
 
         assert_eq!(context.history.len(), 1);
@@ -1037,6 +1527,7 @@ mod tests {
             version: "0.1.0",
             pid: 1234,
             queue_timeout_secs: 300,
+            bypass_store: None,
         };
 
         // Clone the context
@@ -1091,6 +1582,7 @@ mod tests {
             version: "0.1.0",
             pid: 1234,
             queue_timeout_secs: 300,
+            bypass_store: None,
         };
 
         // Wait a small amount
@@ -1143,6 +1635,7 @@ mod tests {
             version: "0.1.0",
             pid: 1234,
             queue_timeout_secs: 300,
+            bypass_store: None,
         };
 
         assert_eq!(context.pool.len(), 5);
@@ -1228,9 +1721,24 @@ mod tests {
     }
 }
 
-// Global test logging initialization - enables JSONL output for all unit tests
 #[cfg(test)]
-#[ctor::ctor]
-fn init_test_logging() {
-    rch_common::testing::init_global_test_logging();
+mod systemd_singleton_tests {
+    use super::*;
+
+    #[test]
+    fn cgroup_detects_rchd_service_unit() {
+        assert!(cgroup_contains_rchd_unit(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/rchd.service"
+        ));
+    }
+
+    #[test]
+    fn cgroup_rejects_session_and_agent_scopes() {
+        assert!(!cgroup_contains_rchd_unit(
+            "0::/user.slice/user-1000.slice/session-18017.scope"
+        ));
+        assert!(!cgroup_contains_rchd_unit(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/some-agent.scope"
+        ));
+    }
 }

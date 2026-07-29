@@ -6,16 +6,43 @@
 // in tests and profile defaults (env::set_var/remove_var are unsafe in Rust 2024)
 #![deny(unsafe_code)]
 
+use std::sync::OnceLock;
+
+pub mod admission_recommendation;
+pub mod admission_rejection;
+pub mod admit_preflight;
 pub mod api;
+pub mod artifact_cost;
+pub mod artifact_pattern;
 pub mod artifact_verify;
 pub mod binary_hash;
+pub mod bypass_record;
+pub mod bypass_recovery;
+pub mod capability_probe;
 pub mod cargo_path_deps;
+pub mod classifier_drift;
+pub mod closure_explain;
 pub mod config;
 pub mod dependency_closure_planner;
 pub mod discovery;
+pub mod disk_pressure_report;
+pub mod disk_reclaim;
 pub mod e2e;
 pub mod errors;
+pub mod exec_misuse;
+pub mod exec_policy;
+pub mod exec_response;
+pub mod fleet_diff;
+pub mod fleet_provenance;
+pub mod fleet_smoke_profile;
+pub mod fleet_status;
+pub mod force_resync;
 pub mod hooks;
+pub mod incident;
+pub mod incident_ledger;
+pub mod job_identity;
+pub mod job_recovery;
+pub mod log_retention;
 pub mod logging;
 pub mod mock;
 pub mod mock_worker;
@@ -23,26 +50,102 @@ pub mod path_topology;
 pub mod patterns;
 #[cfg(test)]
 mod patterns_security_test;
+pub mod placement;
+pub mod pooled_target_key;
+pub mod proof_handoff;
+pub mod proof_intent;
+pub mod proof_policy;
+pub mod proof_replay;
 #[cfg(test)]
 mod proptest_tests;
 pub mod protocol;
+pub mod queue_contract;
+pub mod readiness;
+pub mod redaction;
+pub mod remediation_config;
+pub mod remediation_view;
 #[cfg(unix)]
 pub mod remote_compilation;
 #[cfg(unix)]
 pub mod remote_verification;
 pub mod repo_updater_contract;
+pub mod schema_versions;
 #[cfg(unix)]
 pub mod ssh;
 #[cfg(all(test, unix))]
 mod ssh_timeout_test;
 pub mod ssh_utils;
+pub mod stale_target_reap;
+pub mod storm_control;
+pub mod telemetry_explain;
+pub mod telemetry_freshness;
 pub mod test_change;
 pub mod testing;
 pub mod toolchain;
+pub mod transfer_hardening;
 pub mod types;
 pub mod ui;
 pub mod util;
+pub mod worker_config_validation;
+pub mod worker_facts;
 
+pub const BUILD_COMMIT_ENV_VARS: &[&str] = &[
+    "RCH_GIT_COMMIT",
+    "VERGEN_GIT_SHA",
+    "GIT_COMMIT",
+    "GITHUB_SHA",
+];
+
+pub fn build_commit() -> Option<&'static str> {
+    [
+        option_env!("RCH_GIT_COMMIT"),
+        option_env!("VERGEN_GIT_SHA"),
+        option_env!("GIT_COMMIT"),
+        option_env!("GITHUB_SHA"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+}
+
+pub fn build_version_value() -> String {
+    build_version_value_with_commit(env!("CARGO_PKG_VERSION"), build_commit())
+}
+
+pub fn build_version_value_static() -> &'static str {
+    static VERSION_VALUE: OnceLock<String> = OnceLock::new();
+
+    VERSION_VALUE.get_or_init(build_version_value).as_str()
+}
+
+pub fn build_version_value_with_commit(package_version: &str, commit: Option<&str>) -> String {
+    let mut value = package_version.to_string();
+
+    if let Some(commit) = commit.map(str::trim).filter(|value| !value.is_empty()) {
+        value.push_str(" (commit ");
+        value.push_str(short_commit(commit));
+        value.push(')');
+    }
+
+    value
+}
+
+fn short_commit(commit: &str) -> &str {
+    commit
+        .char_indices()
+        .nth(12)
+        .map_or(commit, |(index, _)| &commit[..index])
+}
+
+pub use artifact_cost::{
+    ArtifactCostReport, ArtifactPhaseTimings, GlobAdvice, RetrievalMode, assess_glob_expansion,
+    compute_artifact_cost, is_broad_recursive_glob,
+};
+pub use artifact_pattern::{
+    ARTIFACT_OUTPUT_ROOTS, ArtifactPatternRewrite, ArtifactRetrievalDiagnostics,
+    artifact_dest_is_safe, rewrite_artifact_pattern,
+};
 pub use artifact_verify::{
     ArtifactManifest, FileHash, VerificationFailure, VerificationResult, compute_file_hash,
     create_manifest, verify_artifacts,
@@ -50,16 +153,35 @@ pub use artifact_verify::{
 pub use binary_hash::{
     BinaryHashResult, binaries_equivalent, binary_contains_marker, compute_binary_hash,
 };
+pub use bypass_record::{
+    AutoRejoinCriteria, BypassBackoff, BypassFailureClass, BypassRecord, BypassRecordStore,
+    BypassState, DisabledMigration, DisabledWorkerSnapshot, MAX_DIAGNOSTIC_CHARS,
+    bypass_record_schema, bypass_record_schema_version, classify_disable_reason,
+    default_bypass_record_path, migrate_disabled_worker, truncate_diagnostic,
+};
+pub use bypass_recovery::{
+    CanaryDecision, CanaryOutcome, ProbeDecision, RecoveryProbe, decide_canary, decide_probe,
+};
 pub use cargo_path_deps::{
     CargoPathDependencyEdge, CargoPathDependencyError, CargoPathDependencyErrorKind,
-    CargoPathDependencyGraph, CargoPathDependencyPackage, resolve_cargo_path_dependency_graph,
-    resolve_cargo_path_dependency_graph_with_policy,
+    CargoPathDependencyGraph, CargoPathDependencyPackage, CargoPathMaterializationClosure,
+    resolve_cargo_path_dependency_graph, resolve_cargo_path_dependency_graph_with_policy,
+    resolve_cargo_path_materialization_closure,
+    resolve_cargo_path_materialization_closure_with_policy,
+};
+pub use closure_explain::{
+    ClosureExplainEntry, ClosureExplainReport, RootConvergence, RootSyncOutcome, derive_outcome,
+    explain_closure,
 };
 pub use dependency_closure_planner::{
     DependencyClosurePlan, DependencyClosurePlanState, DependencyPlanIssue, DependencyRiskClass,
     DependencySyncAction, DependencySyncMetadata, DependencySyncReason,
     build_dependency_closure_plan, build_dependency_closure_plan_with_policy,
     plan_dependency_closure_from_graph,
+};
+pub use force_resync::{
+    ForceResyncPlan, ForceResyncReport, InvalidationAction, RefusedInvalidation, ResyncOutcome,
+    StaleRoot, apply_force_resync, is_safe_invalidation_target, plan_force_resync,
 };
 pub use logging::{LogConfig, LogFormat, LoggingGuards, init_logging};
 pub use mock_worker::MockWorkerServer;
@@ -70,9 +192,18 @@ pub use path_topology::{
 };
 pub use patterns::{
     Classification, ClassificationDetails, ClassificationTier, CompilationKind, TierDecision,
-    classify_command, classify_command_detailed, split_shell_commands,
+    classify_command, classify_command_detailed, declined_compilation_due_to_structure,
+    split_shell_commands,
 };
 pub use protocol::{HookInput, HookOutput, ToolInput};
+pub use queue_contract::{
+    AdmissionState, QueueContractOutcome, QueueContractResponse, QueueOptions, StartState,
+    WaitResult, resolve_queue_contract,
+};
+pub use remote_compilation::{
+    RCH_CARGO_HOME_BASE_VAR, RCH_CARGO_HOME_PREFIX, remote_cargo_home_base_prelude,
+    remote_cargo_home_expr,
+};
 pub use repo_updater_contract::{
     MockRepoUpdaterAdapter, REPO_UPDATER_ALIAS_PROJECTS_ROOT, REPO_UPDATER_CANONICAL_PROJECTS_ROOT,
     REPO_UPDATER_CONTRACT_SCHEMA_VERSION, REPO_UPDATER_DEFAULT_BINARY,
@@ -95,18 +226,23 @@ pub use ssh_utils::{
 pub use ssh::{KnownHostsPolicy, SshClient, SshOptions, SshPool};
 pub use test_change::{TestChangeGuard, TestCodeChange};
 pub use toolchain::{ToolchainInfo, wrap_command_with_color, wrap_command_with_toolchain};
+pub use transfer_hardening::{
+    FirstFailure, RetryDecision, RsyncFailureClass, classify_rsync_outcome, is_ephemeral_path,
+};
 pub use types::{
     AffinityConfig, BuildCancellationMetadata, BuildCancellationWorkerHealth, BuildHeartbeatPhase,
     BuildHeartbeatRequest, BuildLocation, BuildRecord, BuildStats, CircuitBreakerConfig,
     CircuitState, CircuitStats, ColorMode, CommandPriority, CommandTimingBreakdown,
     CompilationConfig, CompilationMetrics, CompilationTimer, CompilationTimingBreakdown,
+    DoctorConfig, DoctorWebhookEndpoint, DoctorWebhookFormat, DoctorWebhooksConfig,
     EnvironmentConfig, ExecutionConfig, FairnessConfig, FleetConfig, GeneralConfig,
     MetricsAggregator, OutputConfig, OutputVisibility, PathTopologyConfig, RchConfig,
-    ReleaseRequest, RequiredRuntime, RetryConfig, SavedTimeStats, SelectedWorker, SelectionConfig,
-    SelectionReason, SelectionRequest, SelectionResponse, SelectionStrategy, SelectionWeightConfig,
+    ReleaseRequest, RequiredRuntime, RetryConfig, SELECTION_RESPONSE_PROTOCOL_VERSION,
+    SavedTimeStats, SelectedWorker, SelectionConfig, SelectionDiagnostics, SelectionReason,
+    SelectionRequest, SelectionResponse, SelectionStrategy, SelectionWeightConfig,
     SelfHealingConfig, SelfHealingLogLevel, SelfTestConfig, SelfTestFailureAction, SelfTestWorkers,
-    TransferConfig, WorkerCapabilities, WorkerConfig, WorkerId, WorkerStatus, default_socket_path,
-    validate_remote_base,
+    TransferConfig, WorkerCapabilities, WorkerConfig, WorkerId, WorkerSelectionDiagnostic,
+    WorkerSelectionDiagnosticDecision, WorkerStatus, default_socket_path, validate_remote_base,
 };
 
 // Testing module re-exports
@@ -131,8 +267,54 @@ pub use ui::{
     error_to_json, error_to_panel,
 };
 
+// Incident schema re-exports
+pub use capability_probe::{
+    CapabilityRequirement, CapabilityVerdict, EligibilityVerdict, ProbeSpec, ProbedFacts,
+    WorkerLiveness, assess_admissibility, assess_worker_eligibility, build_capability_probe_script,
+    parse_capability_probe, remote_worker_binary_path,
+};
+pub use incident::{
+    ControlState, IncidentEvent, IncidentEventType, IncidentReasonCode, IncidentSource,
+    SelectedMode, incident_schema_version,
+};
+pub use incident_ledger::{
+    IncidentFilter, IncidentLedger, IncidentLedgerConfig, LedgerReadStats, default_ledger_path,
+};
+pub use placement::{
+    ControlDiagnostic, ControlDiagnosticLevel, ControlKind, PlacementControl, PlacementPlan,
+    QueuePolicy, RequestedWorkerFacts, RequestedWorkerOutcome, RequestedWorkerStatus,
+    StrictRemotePolicy, TargetDirPolicy, VisibilityMode, evaluate_requested_worker,
+    placement_controls, resolve_placement,
+};
+pub use proof_intent::{
+    ProofIntent, ProofIntentStore, ReplayConstraints, ReplayContext, ReplayDecision,
+    SourceFingerprint, StaleSourcePolicy, derive_intent_id, proof_intent_schema,
+    proof_intent_schema_version, validate_replay,
+};
+pub use telemetry_explain::{
+    ProbeOutcome, TelemetrySignals, TelemetryUnavailabilityReason, WhyUnhealthy,
+    explain_unavailability,
+};
+pub use telemetry_freshness::{
+    FreshnessAssessment, FreshnessInputs, FreshnessVerdict, assess as assess_telemetry_freshness,
+};
+pub use worker_config_validation::{
+    ConfigDriftFinding, ConfigDriftKind, LiveHostObservation, validate_worker_config,
+};
+pub use worker_facts::{
+    DiskFacts, DiskRootFacts, HostFacts, RuntimeFacts, RustFacts, UserFacts, WorkerBinaryFacts,
+    WorkerFacts, derive_target_triple, worker_facts_schema, worker_facts_schema_version,
+};
+
 // Errors module re-exports
-pub use errors::{ErrorCategory, ErrorCode, ErrorEntry};
+pub use errors::{
+    CodeExplanation, CodeNamespace, ErrorCategory, ErrorCode, ErrorEntry, ReliabilityCategoryKind,
+    ReliabilityReasonCode, RunbookEntry,
+};
+
+// Schema-version registry re-exports
+pub use schema_versions::current_version as schema_version;
+pub use schema_versions::{ALL_COMPONENTS as SCHEMA_VERSION_COMPONENTS, SchemaComponent};
 
 // API module re-exports (unified API types for CLI and daemon)
 pub use api::{API_VERSION, ApiError, ApiResponse, ErrorContext, LegacyErrorCode};
@@ -140,9 +322,44 @@ pub use api::{API_VERSION, ApiError, ApiResponse, ErrorContext, LegacyErrorCode}
 // Hooks module re-exports (daemon self-healing)
 pub use hooks::{HookResult, is_claude_code_installed, verify_and_install_claude_code_hook};
 
-// Global test logging initialization - enables JSONL output for all unit tests
 #[cfg(test)]
-#[ctor::ctor]
-fn init_test_logging() {
-    testing::init_global_test_logging();
+mod build_version_tests {
+    use super::{BUILD_COMMIT_ENV_VARS, build_version_value_with_commit};
+
+    #[test]
+    fn build_version_value_omits_missing_commit() {
+        assert_eq!(build_version_value_with_commit("1.0.24", None), "1.0.24");
+    }
+
+    #[test]
+    fn build_version_value_trims_and_shortens_commit() {
+        assert_eq!(
+            build_version_value_with_commit(
+                "1.0.24",
+                Some(" 2fa1249a18dfd05ae5e319e8d10bfd3c9ea1af55 "),
+            ),
+            "1.0.24 (commit 2fa1249a18df)"
+        );
+    }
+
+    #[test]
+    fn build_version_value_ignores_empty_commit() {
+        assert_eq!(
+            build_version_value_with_commit("1.0.24", Some("  ")),
+            "1.0.24"
+        );
+    }
+
+    #[test]
+    fn build_commit_env_var_order_is_documented() {
+        assert_eq!(
+            BUILD_COMMIT_ENV_VARS,
+            &[
+                "RCH_GIT_COMMIT",
+                "VERGEN_GIT_SHA",
+                "GIT_COMMIT",
+                "GITHUB_SHA"
+            ]
+        );
+    }
 }

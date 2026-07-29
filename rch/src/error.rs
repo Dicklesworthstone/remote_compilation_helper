@@ -1334,6 +1334,28 @@ pub enum FleetError {
         help("The remote command returned unexpected output. Check worker compatibility.")
     )]
     UnexpectedOutput { context: String },
+
+    /// Local binary does not match the worker's platform.
+    ///
+    /// Guards against the catastrophic case where a controller pushes its own
+    /// binary (e.g. a macOS/arm64 Mach-O) onto a Linux/amd64 worker, which then
+    /// fails with `Exec format error` (exit 126) for every invocation.
+    #[error(
+        "Binary/worker platform mismatch on {worker_id}: local binary is {local}, worker is {worker}"
+    )]
+    #[diagnostic(
+        code("RCH-E705"),
+        help(
+            "The local rch-wkr binary's OS/arch does not match the worker. Deploy a binary built \
+            for the worker's target triple (for linux/amd64 workers: x86_64-unknown-linux-musl), \
+            e.g. fetch the matching release artifact instead of reusing the controller binary."
+        )
+    )]
+    BinaryPlatformMismatch {
+        worker_id: String,
+        local: String,
+        worker: String,
+    },
 }
 
 // =============================================================================

@@ -15,8 +15,9 @@ use rch_common::{SshClient, SshOptions};
 use std::path::{Path, PathBuf};
 
 use crate::status_types::{
-    DaemonFullStatusResponse, SpeedScoreListResponseFromApi, WorkerCapabilitiesFromApi,
-    WorkerCapabilitiesResponseFromApi, extract_json_body,
+    DaemonFullStatusResponse, SpeedScoreListResponseFromApi, SpeedScoreResponseFromApi,
+    SpeedScoreViewFromApi, WorkerCapabilitiesFromApi, WorkerCapabilitiesResponseFromApi,
+    extract_json_body,
 };
 use crate::ui::context::OutputContext;
 use crate::ui::progress::MultiProgressManager;
@@ -24,7 +25,7 @@ use crate::ui::theme::{StatusIndicator, Theme};
 use tracing::debug;
 
 use super::helpers::{
-    classify_ssh_error, default_socket_path, format_ssh_report, indent_lines,
+    classify_ssh_error, configured_socket_path, format_ssh_report, indent_lines,
     major_version_mismatch, runtime_label, rust_version_mismatch, send_daemon_command,
     ssh_error_code, urlencoding_encode,
 };
@@ -51,12 +52,32 @@ pub(super) fn has_any_capabilities(capabilities: &WorkerCapabilities) -> bool {
 /// Uses tokio async to spawn all 4 version checks concurrently, reducing total
 /// latency from ~200ms (sequential) to ~50ms (parallel).
 pub(super) async fn probe_local_capabilities() -> WorkerCapabilities {
-    async fn run_version(cmd: &str, args: &[&str]) -> Option<String> {
-        let output = tokio::process::Command::new(cmd)
-            .args(args)
-            .output()
-            .await
-            .ok()?;
+    fn rustc_version_command() -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("rustc");
+        command.arg("--version");
+        command
+    }
+
+    fn bun_version_command() -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("bun");
+        command.arg("--version");
+        command
+    }
+
+    fn node_version_command() -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("node");
+        command.arg("--version");
+        command
+    }
+
+    fn npm_version_command() -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("npm");
+        command.arg("--version");
+        command
+    }
+
+    async fn run_version(mut command: tokio::process::Command) -> Option<String> {
+        let output = command.output().await.ok()?;
         if !output.status.success() {
             return None;
         }
@@ -71,10 +92,10 @@ pub(super) async fn probe_local_capabilities() -> WorkerCapabilities {
 
     // Run all version checks in parallel
     let (rustc, bun, node, npm) = tokio::join!(
-        run_version("rustc", &["--version"]),
-        run_version("bun", &["--version"]),
-        run_version("node", &["--version"]),
-        run_version("npm", &["--version"]),
+        run_version(rustc_version_command()),
+        run_version(bun_version_command()),
+        run_version(node_version_command()),
+        run_version(npm_version_command()),
     );
 
     let mut caps = WorkerCapabilities::new();
@@ -228,6 +249,26 @@ pub(super) fn collect_local_capability_warnings(
     }
 
     warnings
+}
+
+pub(super) fn collect_refresh_warnings(workers: &[WorkerCapabilitiesFromApi]) -> Vec<String> {
+    workers
+        .iter()
+        .filter_map(|worker| {
+            let refresh = worker.refresh.as_ref()?;
+            if !refresh.attempted || refresh.live {
+                return None;
+            }
+            let detail = refresh
+                .message
+                .as_deref()
+                .unwrap_or("daemon returned cached capability snapshot");
+            Some(format!(
+                "Worker {} capabilities are cached after refresh attempt: {}",
+                worker.id, detail
+            ))
+        })
+        .collect()
 }
 
 fn workers_list_verbose_enabled(ctx: &OutputContext) -> bool {
@@ -560,6 +601,9 @@ pub async fn workers_capabilities(
                     RequiredRuntime::Rust => !caps.has_rust(),
                     RequiredRuntime::Bun => !caps.has_bun(),
                     RequiredRuntime::Node => !caps.has_node(),
+                    RequiredRuntime::Nix => !caps.has_nix(),
+                    RequiredRuntime::Go => !caps.has_go(),
+                    RequiredRuntime::Zig => !caps.has_zig(),
                     RequiredRuntime::None => false,
                 }
             })
@@ -581,6 +625,7 @@ pub async fn workers_capabilities(
             &local_capabilities,
         ));
     }
+    warnings.extend(collect_refresh_warnings(&workers));
 
     if ctx.is_json() {
         let report = WorkersCapabilitiesReport {
@@ -663,6 +708,23 @@ pub async fn workers_capabilities(
         render("Bun", caps.bun_version.as_ref());
         render("Node", caps.node_version.as_ref());
         render("npm", caps.npm_version.as_ref());
+        if let Some(refresh) = worker.refresh.as_ref() {
+            let (indicator, label) = if refresh.live {
+                (StatusIndicator::Success, style.value("live refresh"))
+            } else {
+                (
+                    StatusIndicator::Warning,
+                    style.warning("cached after failed refresh"),
+                )
+            };
+            println!(
+                "    {} {} {} {}",
+                indicator.display(style),
+                style.key("Refresh"),
+                style.muted(":"),
+                label
+            );
+        }
         println!();
     }
 
@@ -786,7 +848,8 @@ pub async fn workers_probe(
                 let start = std::time::Instant::now();
                 match client.health_check().await {
                     Ok(true) => {
-                        let latency = start.elapsed().as_millis() as u64;
+                        let latency =
+                            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                         results.push(WorkerProbeResult {
                             id: worker.id.as_str().to_string(),
                             host: worker.host.clone(),
@@ -932,26 +995,92 @@ fn format_probe_summary_line(
     )
 }
 
-/// Run worker benchmarks (not available on non-Unix platforms).
+/// Filtered worker benchmark (br-ifq7s): runs benchmarks against a
+/// single worker if `worker_id` is `Some`, otherwise against every
+/// configured worker. `force` is plumbed through for a future
+/// recency-check; today the underlying SSH-driven benchmark always
+/// runs regardless and `force` is informational (logged via
+/// `tracing::debug!`).
+///
+/// Non-Unix platform: unsupported (the SSH benchmark path is Unix-only).
 #[cfg(not(unix))]
-pub async fn workers_benchmark(_ctx: &OutputContext) -> Result<()> {
+pub async fn workers_benchmark_filtered(
+    _worker_id: Option<&str>,
+    _force: bool,
+    _ctx: &OutputContext,
+) -> Result<()> {
     Err(PlatformError::UnixOnly {
         feature: "worker benchmark".to_string(),
     })?
 }
 
-/// Run worker benchmarks.
+/// Filtered worker benchmark (br-ifq7s).
+///
+/// If `worker_id` is `Some`, only that worker is benchmarked; otherwise
+/// every configured worker is benchmarked sequentially. `force` is
+/// plumbed through for a future "skip if recently measured" gate; the
+/// underlying SSH benchmark always runs today regardless of the flag.
+///
+/// Errors: unknown `worker_id` returns a clear error listing every
+/// configured worker so an operator can spot a typo before any SSH
+/// round-trip.
 #[cfg(unix)]
-pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
-    let workers = load_workers_from_config()?;
+pub async fn workers_benchmark_filtered(
+    worker_id: Option<&str>,
+    force: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let all_workers = load_workers_from_config()?;
     let style = ctx.theme();
+
+    // Filter by worker_id when specified. The filter rejects unknown IDs
+    // up-front (before any SSH connect) so the operator sees a typo
+    // error in milliseconds instead of an inscrutable "0 results".
+    let workers: Vec<_> = if let Some(target) = worker_id {
+        let found: Vec<_> = all_workers
+            .iter()
+            .filter(|w| w.id.as_str() == target)
+            .cloned()
+            .collect();
+        if found.is_empty() {
+            let configured: Vec<String> = all_workers.iter().map(|w| w.id.to_string()).collect();
+            anyhow::bail!(
+                "unknown worker id: {target:?}; configured workers: {}",
+                if configured.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    configured.join(", ")
+                }
+            );
+        }
+        found
+    } else {
+        all_workers
+    };
+
+    tracing::info!(
+        target: "rch::workers::benchmark",
+        worker_filter = ?worker_id,
+        worker_count = workers.len(),
+        force,
+        "workers.benchmark.start",
+    );
+    if force {
+        // Reserved for a future recency-check; today the benchmark
+        // always runs, so --force is a no-op. We log so operators can
+        // see the flag was received.
+        tracing::debug!(
+            target: "rch::workers::benchmark",
+            "workers.benchmark.force=true (no-op today; reserved for future recency gate)",
+        );
+    }
 
     if workers.is_empty() {
         if ctx.is_json() {
-            let _ = ctx.json(&ApiResponse::<Vec<WorkerBenchmarkResult>>::ok(
+            ctx.json(&ApiResponse::<Vec<WorkerBenchmarkResult>>::ok(
                 "workers benchmark",
                 vec![],
-            ));
+            ))?;
         }
         return Ok(());
     }
@@ -1009,7 +1138,7 @@ pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
 
                 match result {
                     Ok(r) if r.success() => {
-                        let duration_ms = duration.as_millis() as u64;
+                        let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                         results.push(WorkerBenchmarkResult {
                             id: worker.id.as_str().to_string(),
                             host: worker.host.clone(),
@@ -1074,7 +1203,7 @@ pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
     }
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("workers benchmark", results));
+        ctx.json(&ApiResponse::ok("workers benchmark", results))?;
     } else {
         println!(
             "\n{} For accurate speed scores, use longer benchmark runs.",
@@ -1084,16 +1213,250 @@ pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
     Ok(())
 }
 
+/// `rch workers compare <id1> <id2> [id3..]` (br-ifq7s).
+///
+/// Fetches each named worker's latest SpeedScore from the daemon and
+/// renders a side-by-side comparison table. The leader in each metric
+/// row (SpeedScore, CPU, Memory, Disk, Network, Compile) is marked
+/// with `*` for ASCII-friendly highlighting. A one-line recommendation
+/// at the end names the worker with the highest overall SpeedScore.
+///
+/// Unknown worker IDs fail fast with a clear error. Workers without a
+/// recorded SpeedScore (never benchmarked, or expired) render dash
+/// cells but don't error, so the operator can see which of the named
+/// workers needs a benchmark run.
+pub async fn workers_compare(worker_ids: &[String], ctx: &OutputContext) -> Result<()> {
+    if worker_ids.len() < 2 {
+        anyhow::bail!(
+            "workers compare requires at least 2 worker IDs; got {}",
+            worker_ids.len()
+        );
+    }
+
+    // Validate every named worker exists in the local config BEFORE
+    // any daemon round-trip. Catches typos in the millisecond it takes
+    // to read workers.toml, not the seconds an SSH/daemon RPC would.
+    let all_workers = load_workers_from_config()?;
+    let known: std::collections::BTreeSet<&str> =
+        all_workers.iter().map(|w| w.id.as_str()).collect();
+    let unknown: Vec<&str> = worker_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !known.contains(id))
+        .collect();
+    if !unknown.is_empty() {
+        let configured: Vec<String> = all_workers.iter().map(|w| w.id.to_string()).collect();
+        anyhow::bail!(
+            "unknown worker id(s): {}; configured workers: {}",
+            unknown.join(", "),
+            if configured.is_empty() {
+                "(none)".to_string()
+            } else {
+                configured.join(", ")
+            }
+        );
+    }
+
+    // Fetch each worker's latest SpeedScore. Order in the response
+    // mirrors the operator's argument order so column 1 is the first
+    // ID they passed.
+    let mut entries: Vec<(String, Option<SpeedScoreViewFromApi>)> =
+        Vec::with_capacity(worker_ids.len());
+    for id in worker_ids {
+        let payload = format!("GET /speedscore/{}\n", id);
+        let response = send_daemon_command(&payload).await?;
+        let json = extract_json_body(&response).ok_or_else(|| {
+            anyhow::anyhow!("invalid response format from daemon for /speedscore/{id}")
+        })?;
+        let parsed: SpeedScoreResponseFromApi = serde_json::from_str(json)
+            .with_context(|| format!("failed to parse /speedscore/{id} response from daemon"))?;
+        entries.push((id.clone(), parsed.speedscore));
+    }
+
+    tracing::info!(
+        target: "rch::workers::compare",
+        worker_count = entries.len(),
+        recorded_count = entries.iter().filter(|(_, s)| s.is_some()).count(),
+        "workers.compare.fetched",
+    );
+
+    // Compute the leader for each metric row. Returns the index into
+    // `entries` of the highest score, or None if no worker has a
+    // recorded SpeedScore. Used by the renderer to mark leader cells.
+    fn finite_metric(
+        score: &SpeedScoreViewFromApi,
+        pick: fn(&SpeedScoreViewFromApi) -> f64,
+    ) -> Option<f64> {
+        let value = pick(score);
+        value.is_finite().then_some(value)
+    }
+
+    fn leader_for<F>(entries: &[(String, Option<SpeedScoreViewFromApi>)], pick: F) -> Option<usize>
+    where
+        F: Fn(&SpeedScoreViewFromApi) -> f64,
+    {
+        let mut best: Option<(usize, f64)> = None;
+        for (i, (_, sc)) in entries.iter().enumerate() {
+            if let Some(s) = sc {
+                let v = pick(s);
+                if !v.is_finite() {
+                    continue;
+                }
+                match best {
+                    None => best = Some((i, v)),
+                    Some((_, bv)) if v > bv => best = Some((i, v)),
+                    _ => {}
+                }
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    if ctx.is_json() {
+        let row = |label: &'static str, pick: fn(&SpeedScoreViewFromApi) -> f64| {
+            serde_json::json!({
+                "metric": label,
+                "leader_index": leader_for(&entries, pick),
+                "values": entries
+                    .iter()
+                    .map(|(_, s)| s.as_ref().and_then(|score| finite_metric(score, pick)))
+                    .collect::<Vec<_>>(),
+            })
+        };
+        ctx.json(&ApiResponse::ok(
+            "workers compare",
+            serde_json::json!({
+                "workers": entries.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+                "rows": [
+                    row("speedscore", |s| s.total),
+                    row("cpu",         |s| s.cpu_score),
+                    row("memory",      |s| s.memory_score),
+                    row("disk",        |s| s.disk_score),
+                    row("network",     |s| s.network_score),
+                    row("compile",     |s| s.compilation_score),
+                ],
+                "recommendation_leader_index": leader_for(&entries, |s| s.total),
+            }),
+        ))?;
+        return Ok(());
+    }
+
+    // Human-readable side-by-side table. Plain text (no fancy box
+    // drawing) so it pastes cleanly into Slack / wiki / pager view.
+    let style = ctx.theme();
+    let col_width = entries
+        .iter()
+        .map(|(id, _)| id.len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+
+    print!("  {:<12}", "Metric");
+    for (id, _) in &entries {
+        print!("  {:>width$}", id, width = col_width);
+    }
+    println!();
+    print!("  {:-<12}", "");
+    for _ in &entries {
+        print!("  {:->width$}", "", width = col_width);
+    }
+    println!();
+
+    let row = |label: &str, pick: fn(&SpeedScoreViewFromApi) -> f64| {
+        let leader = leader_for(&entries, pick);
+        print!("  {:<12}", label);
+        for (i, (_, sc)) in entries.iter().enumerate() {
+            let cell = match sc {
+                Some(s) => match finite_metric(s, pick) {
+                    Some(val) => {
+                        if Some(i) == leader {
+                            format!("*{val:>w$.1}", w = col_width - 1)
+                        } else {
+                            format!("{val:>w$.1}", w = col_width)
+                        }
+                    }
+                    None => format!("{:>w$}", "-", w = col_width),
+                },
+                None => format!("{:>w$}", "-", w = col_width),
+            };
+            print!("  {cell}");
+        }
+        println!();
+    };
+
+    row("SpeedScore", |s| s.total);
+    row("CPU", |s| s.cpu_score);
+    row("Memory", |s| s.memory_score);
+    row("Disk", |s| s.disk_score);
+    row("Network", |s| s.network_score);
+    row("Compile", |s| s.compilation_score);
+
+    println!();
+    match leader_for(&entries, |s| s.total) {
+        Some(idx) => {
+            if let Some((id, Some(score))) = entries.get(idx) {
+                println!(
+                    "{} {} leads with SpeedScore {:.1}",
+                    style.format_success("Recommendation:"),
+                    style.highlight(id),
+                    score.total
+                );
+            } else {
+                println!(
+                    "{}",
+                    style.format_warning(
+                        "No recorded SpeedScore for any named worker; \
+                         run `rch workers benchmark` first."
+                    )
+                );
+            }
+        }
+        None => {
+            println!(
+                "{}",
+                style.format_warning(
+                    "No recorded SpeedScore for any named worker; \
+                     run `rch workers benchmark` first."
+                )
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Confirm a destructive operator action, failing *legibly* when stdin is not a
+/// terminal.
+///
+/// `dialoguer::Confirm::interact()` surfaces a bare `IO error: not a terminal`
+/// when the command runs from an agent, CI job, or script — a cryptic failure for
+/// an operation whose entire remedy is one flag, and exactly the kind of
+/// illegible refusal that forces callers into folklore (same contract as the
+/// fail-closed exec refusals in rch#31/#35). Detect the non-interactive case up
+/// front and name the flag that fixes it.
+fn confirm_or_explain_non_interactive(prompt: &str) -> Result<bool> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "'{prompt}' needs an interactive confirmation but stdin is not a terminal; \
+             re-run with -y/--yes to confirm non-interactively (or --json for machine output)"
+        );
+    }
+    Ok(dialoguer::Confirm::new()
+        .with_prompt(prompt)
+        .default(false)
+        .interact()?)
+}
+
 /// Drain a worker (requires daemon).
 ///
 /// If `skip_confirm` is false, prompts for confirmation before draining.
 pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputContext) -> Result<()> {
-    use dialoguer::Confirm;
-
     let style = ctx.theme();
 
     // Check if daemon is running
-    let socket_path_str = default_socket_path();
+    let socket_path_str = configured_socket_path()?;
     if !Path::new(&socket_path_str).exists() {
         if ctx.is_json() {
             let _ = ctx.json(&ApiResponse::<()>::err(
@@ -1125,10 +1488,7 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
             "  {} Active builds will be allowed to complete.",
             StatusIndicator::Info.display(style)
         );
-        let confirmed = Confirm::new()
-            .with_prompt("Drain this worker?")
-            .default(false)
-            .interact()?;
+        let confirmed = confirm_or_explain_non_interactive("Drain this worker?")?;
         if !confirmed {
             println!("{} Aborted.", StatusIndicator::Info.display(style));
             return Ok(());
@@ -1136,7 +1496,12 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
     }
 
     // Send drain command to daemon
-    match send_daemon_command(&format!("POST /workers/{}/drain\n", worker_id)).await {
+    match send_daemon_command(&format!(
+        "POST /workers/{}/drain\n",
+        urlencoding_encode(worker_id)
+    ))
+    .await
+    {
         Ok(response) => {
             if response.contains("error") || response.contains("Error") {
                 if ctx.is_json() {
@@ -1205,7 +1570,8 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
 pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> {
     let style = ctx.theme();
 
-    if !Path::new(&default_socket_path()).exists() {
+    let socket_path_str = configured_socket_path()?;
+    if !Path::new(&socket_path_str).exists() {
         if ctx.is_json() {
             let _ = ctx.json(&ApiResponse::<()>::err(
                 "workers enable",
@@ -1221,7 +1587,12 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
         return Ok(());
     }
 
-    match send_daemon_command(&format!("POST /workers/{}/enable\n", worker_id)).await {
+    match send_daemon_command(&format!(
+        "POST /workers/{}/enable\n",
+        urlencoding_encode(worker_id)
+    ))
+    .await
+    {
         Ok(response) => {
             if response.contains("error") || response.contains("Error") {
                 if ctx.is_json() {
@@ -1288,11 +1659,10 @@ pub async fn workers_disable(
     skip_confirm: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    use dialoguer::Confirm;
-
     let style = ctx.theme();
 
-    if !Path::new(&default_socket_path()).exists() {
+    let socket_path_str = configured_socket_path()?;
+    if !Path::new(&socket_path_str).exists() {
         if ctx.is_json() {
             let _ = ctx.json(&ApiResponse::<()>::err(
                 "workers disable",
@@ -1326,10 +1696,7 @@ pub async fn workers_disable(
                 StatusIndicator::Info.display(style)
             );
         }
-        let confirmed = Confirm::new()
-            .with_prompt("Disable this worker?")
-            .default(false)
-            .interact()?;
+        let confirmed = confirm_or_explain_non_interactive("Disable this worker?")?;
         if !confirmed {
             println!("{} Aborted.", StatusIndicator::Info.display(style));
             return Ok(());
@@ -1337,7 +1704,7 @@ pub async fn workers_disable(
     }
 
     // Build the request URL with optional reason and drain flag
-    let mut url = format!("POST /workers/{}/disable", worker_id);
+    let mut url = format!("POST /workers/{}/disable", urlencoding_encode(worker_id));
     let mut query_parts = Vec::new();
     if let Some(ref r) = reason {
         query_parts.push(format!("reason={}", urlencoding_encode(r)));

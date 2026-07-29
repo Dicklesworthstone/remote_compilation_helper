@@ -103,12 +103,17 @@ test.describe('Accessibility', () => {
     console.log('[a11y:keyboard] TEST PASS: main landmark visible');
   });
 
-  test('landmarks present', async ({ page }) => {
+  test('landmarks present', async ({ page, isMobile }) => {
     console.log('[a11y:landmarks] TEST START: landmark presence');
     await mockApiResponses(page);
 
     console.log('[a11y:landmarks] NAVIGATE: /');
     await page.goto('/');
+
+    if (isMobile) {
+      console.log('[a11y:landmarks] ACTION: Open mobile navigation');
+      await page.getByTestId('hamburger-menu').click();
+    }
 
     console.log('[a11y:landmarks] VERIFY: navigation and main landmarks');
     await expect(page.getByRole('navigation')).toBeVisible();

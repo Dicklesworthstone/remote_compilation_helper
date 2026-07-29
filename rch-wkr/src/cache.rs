@@ -25,6 +25,42 @@ pub async fn cleanup(max_age_hours: u64) -> Result<()> {
     cleanup_in(&get_cache_base(), max_age_hours).await
 }
 
+/// Newest modification time of `root` or any descendant (file or subdir),
+/// starting from the already-known top-dir mtime `top`.
+///
+/// Cache eviction must not key on the top-dir mtime alone: a just-`mkdir`'d
+/// cache dir, or one rsynced in with preserved-old mtimes (`rsync -t`), can have
+/// an old top mtime while a build is actively writing deep files into it.
+/// Evicting on the top mtime would let a concurrent cleanup `remove_dir_all` a
+/// tree a build is about to use (bd-review-wkr-cache-mtime-toctou). This mirrors
+/// the `stale_target_reap` "dir OR any descendant" idle predicate. Symlinks are
+/// never followed (`DirEntry::file_type`/`metadata` do not traverse them), so a
+/// link to an unrelated tree cannot skew the result.
+fn newest_descendant_mtime(root: &Path, top: SystemTime) -> SystemTime {
+    let mut newest = top;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let Ok(meta) = entry.metadata() else { continue };
+            if let Ok(m) = meta.modified()
+                && m > newest
+            {
+                newest = m;
+            }
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    newest
+}
+
 /// Clean up old project caches under a specific base directory.
 ///
 /// This exists primarily for test isolation; production callers should prefer [`cleanup`].
@@ -108,9 +144,12 @@ pub async fn cleanup_in(cache_base: &Path, max_age_hours: u64) -> Result<()> {
                 continue;
             }
 
-            // Check modification time
+            // Check modification time using the newest mtime across the dir AND
+            // its descendants — not just the top-dir mtime, which can be stale
+            // while a build writes deep files (or preserved-old after rsync -t),
+            // risking eviction of an active tree (bd-review-wkr-cache-mtime-toctou).
             let modified = match hash_meta.modified() {
-                Ok(t) => t,
+                Ok(t) => newest_descendant_mtime(&hash_path, t),
                 Err(e) => {
                     warn!("Failed to get modified time for {:?}: {}", hash_path, e);
                     errors += 1;
@@ -400,6 +439,33 @@ mod tests {
 
         let _ = fs::remove_dir_all(&cache_base);
         println!("TEST PASS: test_cleanup_removes_old_caches");
+    }
+
+    #[test]
+    fn newest_descendant_mtime_reflects_deep_activity() {
+        // Regression (bd-review-wkr-cache-mtime-toctou): a tree whose top-dir
+        // mtime is old but which has a recent descendant must report the recent
+        // mtime, so eviction keeps an actively-written tree instead of pruning it.
+        let dir = unique_test_dir("newest-mtime");
+        fs::create_dir_all(&dir).unwrap();
+        let nested = dir.join("deep/sub");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("artifact.o"), "x").unwrap();
+
+        let fresh = fs::metadata(nested.join("artifact.o"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // Even with an ancient top-dir baseline, the deep recent file wins.
+        let newest = newest_descendant_mtime(&dir, SystemTime::UNIX_EPOCH);
+        assert!(
+            newest > SystemTime::UNIX_EPOCH,
+            "must discover a descendant mtime"
+        );
+        assert!(newest >= fresh, "must reflect the newest descendant mtime");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

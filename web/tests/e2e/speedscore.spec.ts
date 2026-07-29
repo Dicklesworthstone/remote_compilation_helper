@@ -4,26 +4,9 @@ import {
   mockWorkers,
   mockSpeedScores,
   mockSpeedScoreListResponse,
-  mockSpeedScoreHistoryResponse,
   mockDaemonStatus,
   mockStats,
 } from '../fixtures/api-mocks';
-
-const scoreLevelLabel: Record<string, string> = {
-  excellent: 'Excellent',
-  good: 'Good',
-  average: 'Average',
-  below_average: 'Below Average',
-  poor: 'Poor',
-};
-
-function getScoreLevel(score: number): string {
-  if (score >= 90) return 'excellent';
-  if (score >= 70) return 'good';
-  if (score >= 50) return 'average';
-  if (score >= 30) return 'below_average';
-  return 'poor';
-}
 
 test.describe('SpeedScore Badge Display', () => {
   test('worker cards display SpeedScore badges', async ({ page }) => {
@@ -139,13 +122,15 @@ test.describe('SpeedScore Trend Indicator', () => {
         },
         workers: workersWithPrevScore,
         active_builds: [],
+        queued_builds: [],
         recent_builds: [],
         issues: [],
         stats: {
           total_builds: 0,
-          successful_builds: 0,
-          failed_builds: 0,
-          total_duration_ms: 0,
+          success_count: 0,
+          failure_count: 0,
+          remote_count: 0,
+          local_count: 0,
           avg_duration_ms: 0,
         },
       },
@@ -331,13 +316,15 @@ test.describe('SpeedScore Dashboard Integration', () => {
         },
         workers: workersWithoutScores,
         active_builds: [],
+        queued_builds: [],
         recent_builds: [],
         issues: [],
         stats: {
           total_builds: 0,
-          successful_builds: 0,
-          failed_builds: 0,
-          total_duration_ms: 0,
+          success_count: 0,
+          failure_count: 0,
+          remote_count: 0,
+          local_count: 0,
           avg_duration_ms: 0,
         },
       },
@@ -383,13 +370,15 @@ test.describe('SpeedScore Loading and Error States', () => {
           },
           workers: mockWorkers.slice(0, 1),
           active_builds: [],
+          queued_builds: [],
           recent_builds: [],
           issues: [],
           stats: {
             total_builds: 0,
-            successful_builds: 0,
-            failed_builds: 0,
-            total_duration_ms: 0,
+            success_count: 0,
+            failure_count: 0,
+            remote_count: 0,
+            local_count: 0,
             avg_duration_ms: 0,
           },
         },
@@ -443,6 +432,7 @@ test.describe('SpeedScore Loading and Error States', () => {
           daemon: mockDaemonStatus,
           workers: mockWorkers,
           active_builds: [],
+          queued_builds: [],
           recent_builds: [],
           issues: [],
           stats: mockStats,
@@ -602,13 +592,15 @@ test.describe('SpeedScore WebSocket Updates (mocked)', () => {
           },
           workers: updatedWorkers,
           active_builds: [],
+          queued_builds: [],
           recent_builds: [],
           issues: [],
           stats: {
             total_builds: 0,
-            successful_builds: 0,
-            failed_builds: 0,
-            total_duration_ms: 0,
+            success_count: 0,
+            failure_count: 0,
+            remote_count: 0,
+            local_count: 0,
             avg_duration_ms: 0,
           },
         },

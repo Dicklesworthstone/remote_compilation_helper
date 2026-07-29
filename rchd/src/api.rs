@@ -18,9 +18,11 @@ use crate::workers::{
 use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
 use rch_common::{
-    ApiError, BuildHeartbeatRequest, BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState,
-    CommandPriority, ErrorCode, ReleaseRequest, RequiredRuntime, SavedTimeStats, SelectedWorker,
+    ApiError, BuildHeartbeatRequest, BuildRecord, BuildStats, BypassRecord, BypassRecordStore,
+    CircuitBreakerConfig, CircuitState, CommandPriority, ErrorCode, ReleaseRequest,
+    RequiredRuntime, SELECTION_RESPONSE_PROTOCOL_VERSION, SavedTimeStats, SelectedWorker,
     SelectionReason, SelectionRequest, SelectionResponse, WorkerId, WorkerStatus,
+    default_bypass_record_path,
 };
 use rch_telemetry::protocol::{TelemetrySource, TestRunRecord, TestRunStats, WorkerTelemetry};
 use rch_telemetry::speedscore::SpeedScore;
@@ -212,6 +214,12 @@ pub struct DaemonFullStatus {
     pub test_stats: TestRunStats,
     /// Saved time statistics from remote builds.
     pub saved_time: SavedTimeStats,
+    /// Operator-facing remediation view: a compact, redacted snapshot of the
+    /// remediation posture (desired/live fleet, admissibility, proof queue,
+    /// jobs, disk pressure, telemetry freshness, recent incidents) rendered by
+    /// the TUI/web dashboards (bd-session-history-remediation-ocv9i.14.4).
+    /// Assembled once here so the three surfaces cannot disagree.
+    pub remediation: rch_common::remediation_view::RemediationView,
 }
 
 /// Daemon metadata.
@@ -287,6 +295,12 @@ pub struct WorkerStatusInfo {
     pub pressure_telemetry_age_secs: Option<u64>,
     /// Whether the latest telemetry sample is fresh enough for high-confidence policy decisions.
     pub pressure_telemetry_fresh: bool,
+    /// Active temporary-bypass record for this worker, if it is currently
+    /// quarantined on the transient-eligibility axis. `None` for healthy or
+    /// admin-disabled workers. Surfaces the bypass reason, next probe, backoff,
+    /// and auto-rejoin criteria (bd-session-history-remediation-ocv9i.1.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass: Option<BypassRecord>,
 }
 
 /// Active build information (placeholder).
@@ -409,6 +423,9 @@ pub struct SelfTestRunRequest {
     pub timeout_secs: Option<u64>,
     pub release_mode: bool,
     pub scheduled: bool,
+    /// Optional per-run retry-count override (`retries` query param). A bounded
+    /// smoke canary passes `Some(0)` for one fail-fast attempt.
+    pub retries: Option<u32>,
 }
 
 /// Status response for self-test scheduler.
@@ -621,6 +638,18 @@ enum ApiResponse<T: Serialize> {
     Error(ApiError),
 }
 
+fn selection_response_json(response: &SelectionResponse) -> Result<String> {
+    let mut value = serde_json::to_value(response)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("selection response did not serialize as an object"))?;
+    object.insert(
+        "selection_protocol_version".to_string(),
+        serde_json::json!(SELECTION_RESPONSE_PROTOCOL_VERSION),
+    );
+    Ok(serde_json::to_string(&value)?)
+}
+
 /// Handle an incoming connection on the Unix socket.
 pub async fn handle_connection(
     stream: UnixStream,
@@ -650,7 +679,7 @@ pub async fn handle_connection(
             metrics::inc_requests("select-worker");
             let response =
                 handle_select_worker(&ctx, request, wait_for_worker, wait_timeout_secs).await?;
-            (serde_json::to_string(&response)?, "application/json")
+            (selection_response_json(&response)?, "application/json")
         }
         Ok(ApiRequest::ReleaseWorker(mut request)) => {
             metrics::inc_requests("release-worker");
@@ -918,6 +947,7 @@ pub async fn handle_connection(
                 options.timeout = Duration::from_secs(timeout);
             }
             options.release_mode = request.release_mode;
+            options.retry_count_override = request.retries;
 
             let report = if request.scheduled {
                 ctx.self_test.run_scheduled_now().await?
@@ -1081,7 +1111,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 let key = kv.next().unwrap_or("");
                 let value = kv.next().unwrap_or("");
                 match key {
-                    "worker" => worker_id = Some(urlencoding_decode(value)),
+                    "worker" => worker_id = Some(percent_unescape_query_value(value)),
                     "days" => days = value.parse().unwrap_or(days),
                     "limit" => limit = value.parse().unwrap_or(limit).min(10_000),
                     "offset" => offset = value.parse().unwrap_or(offset).min(1_000_000),
@@ -1127,7 +1157,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 }
 
                 return Ok(ApiRequest::SpeedScoreHistory {
-                    worker_id: WorkerId::new(urlencoding_decode(worker_part)),
+                    worker_id: WorkerId::new(percent_unescape_query_value(worker_part)),
                     days,
                     limit,
                     offset,
@@ -1135,19 +1165,19 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             }
 
             return Ok(ApiRequest::SpeedScore {
-                worker_id: WorkerId::new(urlencoding_decode(rest)),
+                worker_id: WorkerId::new(percent_unescape_query_value(rest)),
             });
         }
     }
 
-    if path.starts_with("/benchmark/trigger") {
+    if route_matches_exact_or_child(path, "/benchmark/trigger") {
         if method != "POST" {
             return Err(anyhow!("Only POST method supported for benchmark trigger"));
         }
         let (path_only, query) = split_path_query(path);
         let mut worker_id = path_only
             .strip_prefix("/benchmark/trigger/")
-            .map(urlencoding_decode);
+            .map(percent_unescape_query_value);
 
         for param in query.split('&') {
             if param.is_empty() {
@@ -1157,7 +1187,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             let key = kv.next().unwrap_or("");
             let value = kv.next().unwrap_or("");
             if key == "worker" {
-                worker_id = Some(urlencoding_decode(value));
+                worker_id = Some(percent_unescape_query_value(value));
             }
         }
 
@@ -1248,9 +1278,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         return Ok(ApiRequest::SelfTestStatus);
     }
 
-    if path.starts_with("/self-test/history") {
-        let query = path.strip_prefix("/self-test/history").unwrap_or("");
-        let query = query.strip_prefix('?').unwrap_or("");
+    if let Some(query) = query_for_exact_route(path, "/self-test/history") {
         let mut limit = 10usize;
         for param in query.split('&') {
             if param.is_empty() {
@@ -1266,18 +1294,17 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         return Ok(ApiRequest::SelfTestHistory { limit });
     }
 
-    if path.starts_with("/self-test/run") {
+    if let Some(query) = query_for_exact_route(path, "/self-test/run") {
         if method != "POST" {
             return Err(anyhow!("Only POST method supported for self-test run"));
         }
-        let query = path.strip_prefix("/self-test/run").unwrap_or("");
-        let query = query.strip_prefix('?').unwrap_or("");
 
         let mut worker_ids = Vec::new();
         let mut project = None;
         let mut timeout_secs = None;
         let mut release_mode = true;
         let mut scheduled = false;
+        let mut retries = None;
 
         for param in query.split('&') {
             if param.is_empty() {
@@ -1287,9 +1314,10 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             let key = kv.next().unwrap_or("");
             let value = kv.next().unwrap_or("");
             match key {
-                "worker" => worker_ids.push(urlencoding_decode(value)),
-                "project" => project = Some(urlencoding_decode(value)),
+                "worker" => worker_ids.push(percent_unescape_query_value(value)),
+                "project" => project = Some(percent_unescape_query_value(value)),
                 "timeout" => timeout_secs = value.parse().ok(),
+                "retries" => retries = value.parse().ok(),
                 "debug" if value == "1" || value.eq_ignore_ascii_case("true") => {
                     release_mode = false;
                 }
@@ -1309,16 +1337,14 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             timeout_secs,
             release_mode,
             scheduled,
+            retries,
         }));
     }
 
-    if path.starts_with("/release-worker") {
+    if let Some(query) = query_for_exact_route(path, "/release-worker") {
         if method != "POST" {
             return Err(anyhow!("Only POST method supported for release"));
         }
-
-        let query = path.strip_prefix("/release-worker").unwrap_or("");
-        let query = query.strip_prefix('?').unwrap_or("");
 
         let mut worker_id = None;
         let mut slots = None;
@@ -1336,7 +1362,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             let value = kv.next().unwrap_or("");
 
             match key {
-                "worker" => worker_id = Some(urlencoding_decode(value)),
+                "worker" => worker_id = Some(percent_unescape_query_value(value)),
                 "slots" => slots = value.parse().ok(),
                 "build_id" => build_id = value.parse().ok(),
                 "exit_code" => exit_code = value.parse().ok(),
@@ -1360,13 +1386,10 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         }));
     }
 
-    if path.starts_with("/record-build") {
+    if let Some(query) = query_for_exact_route(path, "/record-build") {
         if method != "POST" {
             return Err(anyhow!("Only POST method supported for record-build"));
         }
-
-        let query = path.strip_prefix("/record-build").unwrap_or("");
-        let query = query.strip_prefix('?').unwrap_or("");
 
         let mut worker_id = None;
         let mut project = None;
@@ -1381,11 +1404,11 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             let value = kv.next().unwrap_or("");
 
             match key {
-                "worker" => worker_id = Some(urlencoding_decode(value)),
-                "project" => project = Some(urlencoding_decode(value)),
+                "worker" => worker_id = Some(percent_unescape_query_value(value)),
+                "project" => project = Some(percent_unescape_query_value(value)),
                 "is_test" => {
-                    let decoded = urlencoding_decode(value);
-                    is_test = matches!(decoded.as_str(), "1" | "true" | "yes" | "y" | "on");
+                    let query_value = percent_unescape_query_value(value);
+                    is_test = matches!(query_value.as_str(), "1" | "true" | "yes" | "y" | "on");
                 }
                 _ => {}
             }
@@ -1401,14 +1424,14 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         });
     }
 
-    if path.starts_with("/build-heartbeat") {
+    if query_for_exact_route(path, "/build-heartbeat").is_some() {
         if method != "POST" {
             return Err(anyhow!("Only POST method supported for build heartbeat"));
         }
         return Ok(ApiRequest::BuildHeartbeat);
     }
 
-    if path.starts_with("/test-run") {
+    if query_for_exact_route(path, "/test-run").is_some() {
         if method != "POST" {
             return Err(anyhow!("Only POST method supported for test run"));
         }
@@ -1433,7 +1456,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     let key = kv.next().unwrap_or("");
                     let value = kv.next().unwrap_or("");
                     if key == "worker" {
-                        worker_id = Some(urlencoding_decode(value));
+                        worker_id = Some(percent_unescape_query_value(value));
                     }
                 }
 
@@ -1458,7 +1481,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     let key = kv.next().unwrap_or("");
                     let value = kv.next().unwrap_or("");
                     if key == "source" {
-                        source = parse_telemetry_source(&urlencoding_decode(value));
+                        source = parse_telemetry_source(&percent_unescape_query_value(value));
                     }
                 }
 
@@ -1477,7 +1500,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let parts: Vec<&str> = path_part.split('/').collect();
 
         if parts.len() == 2 {
-            let worker_id = urlencoding_decode(parts[0]);
+            let worker_id = percent_unescape_query_value(parts[0]);
             let action = parts[1];
 
             match action {
@@ -1504,7 +1527,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                         let value = kv.next().unwrap_or("");
 
                         match key {
-                            "reason" => reason = Some(urlencoding_decode(value)),
+                            "reason" => reason = Some(percent_unescape_query_value(value)),
                             "drain" => {
                                 drain_first = value == "1" || value.eq_ignore_ascii_case("true")
                             }
@@ -1538,7 +1561,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     let key = kv.next().unwrap_or("");
                     let value = kv.next().unwrap_or("");
                     if key == "worker" {
-                        worker_id = Some(WorkerId::new(urlencoding_decode(value)));
+                        worker_id = Some(WorkerId::new(percent_unescape_query_value(value)));
                     }
                 }
                 return Ok(ApiRequest::RepoConvergenceStatus { worker_id });
@@ -1553,7 +1576,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     let key = kv.next().unwrap_or("");
                     let value = kv.next().unwrap_or("");
                     if key == "worker" {
-                        worker_id = Some(WorkerId::new(urlencoding_decode(value)));
+                        worker_id = Some(WorkerId::new(percent_unescape_query_value(value)));
                     }
                 }
                 return match worker_id {
@@ -1574,7 +1597,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     let key = kv.next().unwrap_or("");
                     let value = kv.next().unwrap_or("");
                     if key == "worker" {
-                        worker_id = Some(WorkerId::new(urlencoding_decode(value)));
+                        worker_id = Some(WorkerId::new(percent_unescape_query_value(value)));
                     }
                 }
                 return match worker_id {
@@ -1586,13 +1609,9 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         }
     }
 
-    if !path.starts_with("/select-worker") {
+    let Some(query) = query_for_exact_route(path, "/select-worker") else {
         return Err(anyhow!("Unknown endpoint: {}", path));
-    }
-
-    // Parse query parameters for select-worker
-    let query = path.strip_prefix("/select-worker").unwrap_or("");
-    let query = query.strip_prefix('?').unwrap_or("");
+    };
 
     let mut project = None;
     let mut command = None;
@@ -1615,9 +1634,9 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let value = kv.next().unwrap_or("");
 
         match key {
-            "project" => project = Some(urlencoding_decode(value)),
-            "command" => command = Some(urlencoding_decode(value)),
-            "cores" => cores = value.parse().ok(),
+            "project" => project = Some(percent_unescape_query_value(value)),
+            "command" => command = Some(percent_unescape_query_value(value)),
+            "cores" => cores = value.parse::<u32>().ok().filter(|cores| *cores > 0),
             "wait" | "queue" => {
                 wait_for_worker = value == "1" || value.eq_ignore_ascii_case("true");
             }
@@ -1625,12 +1644,12 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 wait_timeout_secs = value.parse::<u64>().ok().filter(|secs| *secs > 0);
             }
             "toolchain" => {
-                let json = urlencoding_decode(value);
+                let json = percent_unescape_query_value(value);
                 toolchain = serde_json::from_str(&json).ok();
             }
             "runtime" => {
                 // Parse required runtime (rust, bun, node)
-                let rt_str = urlencoding_decode(value);
+                let rt_str = percent_unescape_query_value(value);
                 // Use serde_json to parse the enum variant string (e.g. "bun")
                 // We wrap in quotes to make it valid JSON string for the enum
                 required_runtime = serde_json::from_str(&format!("\"{}\"", rt_str))
@@ -1638,7 +1657,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     .unwrap_or_default();
             }
             "priority" => {
-                let pr_str = urlencoding_decode(value);
+                let pr_str = percent_unescape_query_value(value);
                 command_priority = pr_str.parse().unwrap_or(CommandPriority::Normal);
             }
             "classification_us" => {
@@ -1679,12 +1698,25 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
 }
 
 fn parse_worker_id_list(encoded_value: &str) -> Vec<WorkerId> {
-    urlencoding_decode(encoded_value)
+    percent_unescape_query_value(encoded_value)
         .split(',')
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(WorkerId::new)
         .collect()
+}
+
+fn query_for_exact_route<'a>(path: &'a str, expected_path: &str) -> Option<&'a str> {
+    let (path_only, query) = split_path_query(path);
+    (path_only == expected_path).then_some(query)
+}
+
+fn route_matches_exact_or_child(path: &str, expected_path: &str) -> bool {
+    let (path_only, _) = split_path_query(path);
+    path_only == expected_path
+        || path_only
+            .strip_prefix(expected_path)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn parse_telemetry_source(value: &str) -> Option<TelemetrySource> {
@@ -1703,11 +1735,11 @@ fn split_path_query(path: &str) -> (&str, &str) {
     }
 }
 
-/// URL percent-decoding.
+/// URL percent-unescaping for query/path segments.
 ///
-/// Decodes %XX hex sequences to their original characters.
-/// Handles UTF-8 multi-byte sequences correctly (e.g. %C3%A9 -> é).
-fn urlencoding_decode(s: &str) -> String {
+/// Converts %XX hex sequences to their original characters and treats '+'
+/// as a query-space marker.
+fn percent_unescape_query_value(s: &str) -> String {
     let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
     let mut chars = s.chars().peekable();
 
@@ -1774,7 +1806,9 @@ async fn handle_telemetry_poll(ctx: &DaemonContext, worker_id: &WorkerId) -> Tel
         };
     }
 
-    match collect_telemetry_from_worker(&worker, Duration::from_secs(5)).await {
+    // 20s (matching TelemetryPollerConfig): a fresh SSH connect+auth+exec to a
+    // trans-continental worker can approach/exceed 5s under load.
+    match collect_telemetry_from_worker(&worker, Duration::from_secs(20)).await {
         Ok(telemetry) => {
             ctx.telemetry
                 .ingest(telemetry.clone(), TelemetrySource::OnDemand);
@@ -2076,6 +2110,16 @@ async fn handle_select_worker(
                 duration_ms
             );
         }
+
+        if duration_ms > 10.0 {
+            metrics::DECISION_PANIC_THRESHOLD_VIOLATIONS
+                .with_label_values(&["compilation"])
+                .inc();
+            tracing::error!(
+                "Classification latency exceeded panic threshold: {:.3}ms (threshold: 10ms)",
+                duration_ms
+            );
+        }
     }
 
     // Mock support: RCH_MOCK_CIRCUIT_OPEN simulates all circuits open
@@ -2085,6 +2129,7 @@ async fn handle_select_worker(
             worker: None,
             reason: SelectionReason::AllCircuitsOpen,
             build_id: None,
+            diagnostics: None,
         });
     }
 
@@ -2103,13 +2148,16 @@ async fn handle_select_worker(
                 .worker_selector
                 .select_with_exclusions(&ctx.pool, request, &excluded_worker_ids)
                 .await;
+            let selection_reason = result.reason;
+            let selection_diagnostics = result.diagnostics;
 
             let Some(worker) = result.worker else {
-                debug!("No worker selected: {}", result.reason);
+                debug!("No worker selected: {}", selection_reason);
                 return Ok(SelectionResponse {
                     worker: None,
-                    reason: result.reason,
+                    reason: selection_reason,
                     build_id: None,
+                    diagnostics: selection_diagnostics,
                 });
             };
 
@@ -2193,8 +2241,9 @@ async fn handle_select_worker(
                         slots_available,
                         speed_score,
                     }),
-                    reason: SelectionReason::Success,
+                    reason: selection_reason,
                     build_id,
+                    diagnostics: selection_diagnostics,
                 });
             }
 
@@ -2209,6 +2258,7 @@ async fn handle_select_worker(
                     worker: None,
                     reason: SelectionReason::AllWorkersBusy,
                     build_id: None,
+                    diagnostics: None,
                 });
             }
             // Loop again - next selection will see reduced slot count.
@@ -2290,6 +2340,7 @@ async fn handle_select_worker(
                 worker: None,
                 reason: SelectionReason::SelectionError("queue_timeout".to_string()),
                 build_id: None,
+                diagnostics: None,
             });
         }
 
@@ -2312,6 +2363,7 @@ async fn handle_select_worker(
                 worker: None,
                 reason: SelectionReason::SelectionError("hook_exited".to_string()),
                 build_id: None,
+                diagnostics: None,
             });
         }
 
@@ -2349,59 +2401,74 @@ async fn handle_select_worker(
 
 /// Handle a release-worker request.
 async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> Result<()> {
-    debug!(
-        "Releasing {} slots on worker {}",
-        request.slots, request.worker_id
-    );
-    ctx.pool
-        .release_slots(&request.worker_id, request.slots)
-        .await;
-
-    if let Some(build_id) = request.build_id {
-        let exit_code = request.exit_code.unwrap_or(0);
-        let record = ctx.history.finish_active_build(
-            build_id,
+    let exit_code = request.exit_code.unwrap_or(0);
+    let (release_worker_id, release_slots, record) = if let Some(build_id) = request.build_id {
+        let Some(state) = ctx.history.take_active_build(build_id) else {
+            // A build-id release is canonical and idempotent. If the active
+            // record is already gone, the original release was processed; do
+            // not fall back to caller-provided slots and accidentally release
+            // capacity reserved by a later build.
+            debug!(
+                "Ignoring duplicate release for completed build {}",
+                build_id
+            );
+            return Ok(());
+        };
+        let release_worker_id = WorkerId::new(state.worker_id.clone());
+        let release_slots = state.slots;
+        let record = ctx.history.record_completed_build(
+            state,
             exit_code,
             request.duration_ms,
             request.bytes_transferred,
             request.timing,
         );
-        if let Some(ref rec) = record {
-            if !cfg!(test) {
-                metrics::dec_active_builds("remote");
-                let outcome = if exit_code == 0 { "success" } else { "failure" };
-                metrics::inc_build_total(outcome, "remote");
+        (release_worker_id, release_slots, Some(record))
+    } else {
+        (request.worker_id.clone(), request.slots, None)
+    };
+
+    debug!(
+        "Releasing {} slots on worker {}",
+        release_slots, release_worker_id
+    );
+    ctx.pool
+        .release_slots(&release_worker_id, release_slots)
+        .await;
+
+    if let Some(ref rec) = record {
+        if !cfg!(test) {
+            metrics::dec_active_builds("remote");
+            let outcome = if exit_code == 0 { "success" } else { "failure" };
+            metrics::inc_build_total(outcome, "remote");
+        }
+        ctx.events.emit(
+            "build_completed",
+            &serde_json::json!({
+                "build_id": rec.id,
+                "project_id": rec.project_id,
+                "worker_id": rec.worker_id,
+                "command": rec.command,
+                "exit_code": rec.exit_code,
+                "duration_ms": rec.duration_ms,
+                "location": format!("{:?}", rec.location),
+            }),
+        );
+
+        // Only successful command completions are positive worker-health
+        // signals. A nonzero command exit is a build/test result, not an
+        // infrastructure failure for the worker circuit.
+        if let Some(ref worker_id) = rec.worker_id {
+            if let Some(worker) = ctx.pool.get(&rch_common::WorkerId::new(worker_id)).await
+                && exit_code == 0
+            {
+                worker.record_success().await;
             }
-            ctx.events.emit(
-                "build_completed",
-                &serde_json::json!({
-                    "build_id": rec.id,
-                    "project_id": rec.project_id,
-                    "worker_id": rec.worker_id,
-                    "command": rec.command,
-                    "exit_code": rec.exit_code,
-                    "duration_ms": rec.duration_ms,
-                    "location": format!("{:?}", rec.location),
-                }),
-            );
 
-            // Record successful builds for affinity pinning
-            if let Some(ref worker_id) = rec.worker_id {
-                if let Some(worker) = ctx.pool.get(&rch_common::WorkerId::new(worker_id)).await {
-                    if exit_code == 0 {
-                        worker.record_success().await;
-                    } else {
-                        worker
-                            .record_failure(Some(format!("build exited with {exit_code}")))
-                            .await;
-                    }
-                }
-
-                if exit_code == 0 {
-                    ctx.worker_selector
-                        .record_success(worker_id, &rec.project_id)
-                        .await;
-                }
+            if exit_code == 0 {
+                ctx.worker_selector
+                    .record_success(worker_id, &rec.project_id)
+                    .await;
             }
         }
     }
@@ -2508,13 +2575,25 @@ fn handle_health(ctx: &DaemonContext) -> HealthResponse {
     }
 }
 
+fn worker_accepts_new_builds(status: WorkerStatus, circuit_state: CircuitState) -> bool {
+    matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded)
+        && circuit_state != CircuitState::Open
+}
+
 /// Handle a readiness check request.
 async fn handle_ready(ctx: &DaemonContext) -> ReadyResponse {
     let workers = ctx.pool.all_workers().await;
 
-    // Check if any workers are available
+    // Check if any assignable workers are available. Raw free slots on drained,
+    // disabled, unreachable, or open-circuit workers cannot accept new builds.
     let mut workers_available = false;
     for w in workers {
+        let Some(circuit_state) = w.circuit_state().await else {
+            continue;
+        };
+        if !worker_accepts_new_builds(w.status().await, circuit_state) {
+            continue;
+        }
         if w.available_slots().await > 0 {
             workers_available = true;
             break;
@@ -2706,8 +2785,120 @@ fn active_build_issues_from_active_builds(
 }
 
 /// Handle a status request.
+/// Assemble the operator-facing remediation view (bd-..14.4) from the live
+/// daemon state already gathered for `/status`. Single source of truth: the
+/// TUI, CLI, and web all render this struct, so the three surfaces cannot
+/// disagree on counts or posture.
+///
+/// Zero extra I/O on the (TUI-polled) status path: worker rows come from the
+/// already-built `worker_infos`, jobs from the already-fetched build history,
+/// and recent incidents from the in-memory active alerts. The deferred-proof
+/// conveyor is not daemon-resident yet (bd-..5.3 is foundation-only), so the
+/// proof-queue census is empty here; the assembler supports a populated census
+/// once the conveyor is wired.
+fn build_remediation_view(
+    worker_infos: &[WorkerStatusInfo],
+    active_builds: &[crate::history::ActiveBuildState],
+    queued_count: usize,
+    alerts: &[AlertInfo],
+    now: chrono::DateTime<Utc>,
+) -> rch_common::remediation_view::RemediationView {
+    use rch_common::bypass_record::BypassState;
+    use rch_common::fleet_diff::WorkerObservation;
+    use rch_common::fleet_status::DEFAULT_ABSENCE_THRESHOLD_SECS;
+    use rch_common::remediation_view::{
+        DiskLevel, JobsInput, MAX_VIEW_INCIDENTS, ProofQueueInput, RemediationIncidentLine,
+        RemediationWorkerRow, assemble, build_inputs,
+    };
+
+    let rows: Vec<RemediationWorkerRow> = worker_infos
+        .iter()
+        .map(|w| {
+            let facts_known = w.pressure_state != "telemetry_gap";
+            RemediationWorkerRow {
+                observation: WorkerObservation {
+                    worker_id: w.id.clone(),
+                    configured: true,
+                    in_daemon_pool: true,
+                    reachable: w.status != "unreachable",
+                    admin_disabled: w.status == "disabled",
+                    temporarily_bypassed: w.bypass.is_some(),
+                    facts_known,
+                    // The bare dashboard view is not tied to a specific command.
+                    command_admissible: true,
+                },
+                disk_level: DiskLevel::from_pressure_state(&w.pressure_state),
+                // Per-worker reclaim progress is not surfaced in the status row;
+                // critical pressure without a reclaim signal reads as operator
+                // action, which is the safe default.
+                reclaiming: false,
+                free_ratio: w.pressure_disk_free_ratio,
+                slots_used: w.used_slots,
+                slots_total: w.total_slots,
+                telemetry_known: facts_known,
+                telemetry_fresh: w.pressure_telemetry_fresh,
+                telemetry_age_secs: w.pressure_telemetry_age_secs,
+                recovered_pending_canary: w
+                    .bypass
+                    .as_ref()
+                    .is_some_and(|b| b.state == BypassState::RecoveredPendingCanary),
+                absent_secs: None,
+            }
+        })
+        .collect();
+
+    let stuck = active_builds
+        .iter()
+        .filter(|b| {
+            !b.detector_hook_alive || (b.detector_heartbeat_stale && b.detector_progress_stale)
+        })
+        .count();
+    let jobs = JobsInput {
+        active: active_builds.len(),
+        queued: queued_count,
+        stuck,
+    };
+
+    let incidents: Vec<RemediationIncidentLine> = alerts
+        .iter()
+        .filter(|a| a.state == "active")
+        .take(MAX_VIEW_INCIDENTS)
+        .map(|a| {
+            let age = chrono::DateTime::parse_from_rfc3339(&a.last_seen)
+                .ok()
+                .map(|t| {
+                    u64::try_from((now - t.with_timezone(&Utc)).num_seconds().max(0)).unwrap_or(0)
+                })
+                .unwrap_or(0);
+            RemediationIncidentLine::new(
+                a.kind.clone(),
+                "alert",
+                a.worker_id.clone(),
+                age,
+                a.message.clone(),
+            )
+        })
+        .collect();
+
+    let inputs = build_inputs(
+        &rows,
+        jobs,
+        ProofQueueInput::default(),
+        incidents,
+        DEFAULT_ABSENCE_THRESHOLD_SECS,
+    );
+    let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
+    assemble(&inputs, now_ms)
+}
+
 async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
     let workers = ctx.pool.all_workers().await;
+
+    // Current temporary-bypass records, persisted across daemon restarts. The
+    // store file is the single source of truth; a missing/corrupt file yields an
+    // empty store, so status never fails because of bypass state
+    // (bd-session-history-remediation-ocv9i.1.2).
+    let bypass_store = BypassRecordStore::load(default_bypass_record_path());
 
     let mut workers_healthy = 0;
     let mut slots_total = 0u32;
@@ -2729,6 +2920,13 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
         };
         let available_slots = worker.available_slots().await;
         let used_slots = total_slots - available_slots;
+        let circuit_stats = worker.circuit_stats().await;
+        let circuit_state = circuit_stats.state();
+        let assignable_slots = if worker_accepts_new_builds(status, circuit_state) {
+            available_slots
+        } else {
+            0
+        };
 
         // Count healthy workers
         if status == WorkerStatus::Healthy {
@@ -2736,7 +2934,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
         }
 
         slots_total = slots_total.saturating_add(total_slots);
-        slots_available = slots_available.saturating_add(available_slots);
+        slots_available = slots_available.saturating_add(assignable_slots);
 
         // Build worker status info
         let status_str = match status {
@@ -2748,9 +2946,6 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
             WorkerStatus::Disabled => "disabled",
         };
 
-        // Get circuit state and stats from worker
-        let circuit_stats = worker.circuit_stats().await;
-        let circuit_state = circuit_stats.state();
         let circuit_str = match circuit_state {
             CircuitState::Closed => "closed",
             CircuitState::Open => "open",
@@ -2786,6 +2981,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
             pressure_memory_pressure: pressure.memory_pressure,
             pressure_telemetry_age_secs: pressure.telemetry_age_secs,
             pressure_telemetry_fresh: pressure.telemetry_fresh,
+            bypass: bypass_store.get(&worker_id).cloned(),
         });
 
         // Generate issues based on worker state
@@ -2814,8 +3010,15 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
                     "Worker '{}' has stale/missing pressure telemetry ({})",
                     worker_id, pressure.reason_code
                 ),
+                // Telemetry ingest is daemon-driven: only the periodic
+                // TelemetryPoller (or worker piggyback) calls
+                // TelemetryStore::ingest(). No client-side `rch workers ...`
+                // subcommand can move a worker out of TelemetryGap; emitting
+                // one as a Fix would train agents to run confident-wrong
+                // commands (issue #16).
                 remediation: Some(
-                    "rch workers capabilities --refresh (re-probe worker metrics)".to_string(),
+                    "telemetry ingest is daemon-driven; wait for next poll (~poll-interval) or run `rch daemon restart` to force a fresh poll cycle"
+                        .to_string(),
                 ),
             });
         } else if status == WorkerStatus::Unreachable {
@@ -2870,6 +3073,16 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
     if !cfg!(test) {
         metrics::set_build_queue_depth(queue_depth);
     }
+
+    // Assemble the operator-facing remediation view from the live state above,
+    // before `active_builds`/`worker_infos` are moved into the response.
+    let remediation = build_remediation_view(
+        &worker_infos,
+        &active_builds,
+        queue_depth,
+        &alerts,
+        Utc::now(),
+    );
 
     Ok(DaemonFullStatus {
         daemon: DaemonStatusInfo {
@@ -2935,6 +3148,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
         stats,
         test_stats,
         saved_time: ctx.history.saved_time_stats(),
+        remediation,
     })
 }
 
@@ -3165,6 +3379,7 @@ async fn handle_repo_convergence_repair(
 }
 
 #[cfg(test)]
+#[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
     use crate::disk_pressure::{PressureAssessment, PressureConfidence, PressureState};
@@ -3223,6 +3438,7 @@ mod tests {
             version: "0.1.0",
             pid: 1234,
             queue_timeout_secs: 300,
+            bypass_store: None,
         }
     }
 
@@ -3259,10 +3475,22 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=test").unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
         assert_eq!(req.project, "test");
         assert_eq!(req.estimated_cores, 1); // Default
+    }
+
+    #[test]
+    fn test_parse_request_zero_cores_defaults_to_one() {
+        let _guard = test_guard!();
+        let req = parse_request("GET /select-worker?project=test&cores=0").unwrap();
+        let ApiRequest::SelectWorker { request: req, .. } = req else {
+            assert!(false, "expected select-worker request");
+            return;
+        };
+        assert_eq!(req.estimated_cores, 1);
     }
 
     #[test]
@@ -3270,7 +3498,8 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=my%20project&cores=2").unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
         assert_eq!(req.project, "my project");
         assert_eq!(req.estimated_cores, 2);
@@ -3281,7 +3510,8 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=test&cores=2&priority=high").unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
         assert_eq!(req.command_priority, rch_common::CommandPriority::High);
     }
@@ -3310,7 +3540,8 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=test&cores=2&priority=urgent").unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
         assert_eq!(req.command_priority, rch_common::CommandPriority::Normal);
     }
@@ -3350,7 +3581,7 @@ mod tests {
             ApiRequest::SpeedScore { worker_id } => {
                 assert_eq!(worker_id.as_str(), "css");
             }
-            _ => panic!("expected speedscore request"),
+            _ => assert!(false, "expected speedscore request"),
         }
     }
 
@@ -3370,7 +3601,7 @@ mod tests {
                 assert_eq!(limit, 25);
                 assert_eq!(offset, 5);
             }
-            _ => panic!("expected speedscore history request"),
+            _ => assert!(false, "expected speedscore history request"),
         }
     }
 
@@ -3392,7 +3623,7 @@ mod tests {
             ApiRequest::WorkersCapabilities { refresh } => {
                 assert!(!refresh);
             }
-            _ => panic!("expected workers capabilities request"),
+            _ => assert!(false, "expected workers capabilities request"),
         }
 
         let req = parse_request("GET /workers/capabilities?refresh=true").unwrap();
@@ -3400,7 +3631,7 @@ mod tests {
             ApiRequest::WorkersCapabilities { refresh } => {
                 assert!(refresh);
             }
-            _ => panic!("expected workers capabilities request"),
+            _ => assert!(false, "expected workers capabilities request"),
         }
     }
 
@@ -3412,7 +3643,15 @@ mod tests {
             ApiRequest::BenchmarkTrigger { worker_id } => {
                 assert_eq!(worker_id.as_str(), "css");
             }
-            _ => panic!("expected benchmark trigger request"),
+            _ => assert!(false, "expected benchmark trigger request"),
+        }
+
+        let req = parse_request("POST /benchmark/trigger?worker=css").unwrap();
+        match req {
+            ApiRequest::BenchmarkTrigger { worker_id } => {
+                assert_eq!(worker_id.as_str(), "css");
+            }
+            _ => assert!(false, "expected benchmark trigger query request"),
         }
     }
 
@@ -3446,7 +3685,7 @@ mod tests {
             ApiRequest::TelemetryPoll { worker_id } => {
                 assert_eq!(worker_id.as_str(), "css");
             }
-            _ => panic!("expected telemetry poll request"),
+            _ => assert!(false, "expected telemetry poll request"),
         }
     }
 
@@ -3466,7 +3705,7 @@ mod tests {
         let req = parse_request("GET /self-test/history?limit=5").unwrap();
         match req {
             ApiRequest::SelfTestHistory { limit } => assert_eq!(limit, 5),
-            _ => panic!("expected self-test history request"),
+            _ => assert!(false, "expected self-test history request"),
         }
     }
 
@@ -3477,7 +3716,8 @@ mod tests {
             parse_request("POST /self-test/run?worker=css&timeout=120&debug=1&scheduled=false")
                 .unwrap();
         let ApiRequest::SelfTestRun(req) = req else {
-            panic!("expected self-test run request");
+            assert!(false, "expected self-test run request");
+            return;
         };
         assert_eq!(req.worker_ids, vec!["css".to_string()]);
         assert_eq!(req.timeout_secs, Some(120));
@@ -3498,7 +3738,8 @@ mod tests {
 
         let req = parse_request(&query).unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
 
         assert_eq!(req.project, "test");
@@ -3516,14 +3757,16 @@ mod tests {
         let query = "GET /select-worker?project=test&runtime=bun";
         let req = parse_request(query).unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
         assert_eq!(req.required_runtime, RequiredRuntime::Bun);
 
         let query = "GET /select-worker?project=test&runtime=rust";
         let req = parse_request(query).unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
         assert_eq!(req.required_runtime, RequiredRuntime::Rust);
 
@@ -3531,7 +3774,8 @@ mod tests {
         let query = "GET /select-worker?project=test&runtime=invalid";
         let req = parse_request(query).unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
         assert_eq!(req.required_runtime, RequiredRuntime::None);
     }
@@ -3558,51 +3802,76 @@ mod tests {
     }
 
     #[test]
-    fn test_urlencoding_decode_basic() {
+    fn test_parse_request_rejects_route_prefix_typos() {
         let _guard = test_guard!();
-        assert_eq!(urlencoding_decode("hello%20world"), "hello world");
-        assert_eq!(urlencoding_decode("path%2Fto%2Ffile"), "path/to/file");
-        assert_eq!(urlencoding_decode("foo%3Abar"), "foo:bar");
+        let cases = [
+            "POST /benchmark/trigger-extra?worker=css",
+            "GET /self-test/history-extra?limit=5",
+            "POST /self-test/run-extra?worker=css",
+            "POST /release-worker-extra?worker=css&slots=4",
+            "POST /record-build-extra?worker=css&project=myproject",
+            "POST /build-heartbeat-extra",
+            "POST /test-run-extra",
+            "GET /select-worker-extra?project=test",
+        ];
+
+        for request in cases {
+            assert!(
+                parse_request(request).is_err(),
+                "route typo should be rejected: {request}"
+            );
+        }
     }
 
     #[test]
-    fn test_urlencoding_decode_special_chars() {
+    fn test_percent_unescape_query_value_basic() {
         let _guard = test_guard!();
-        assert_eq!(urlencoding_decode("a%26b%3Dc"), "a&b=c");
-        assert_eq!(urlencoding_decode("100%25"), "100%");
-        assert_eq!(urlencoding_decode("hello%2Bworld"), "hello+world");
-    }
-
-    #[test]
-    fn test_urlencoding_decode_plus_as_space() {
-        let _guard = test_guard!();
-        assert_eq!(urlencoding_decode("hello+world"), "hello world");
-    }
-
-    #[test]
-    fn test_urlencoding_decode_no_encoding() {
-        let _guard = test_guard!();
-        assert_eq!(urlencoding_decode("simple"), "simple");
+        assert_eq!(percent_unescape_query_value("hello%20world"), "hello world");
         assert_eq!(
-            urlencoding_decode("with-dash_underscore"),
+            percent_unescape_query_value("path%2Fto%2Ffile"),
+            "path/to/file"
+        );
+        assert_eq!(percent_unescape_query_value("foo%3Abar"), "foo:bar");
+    }
+
+    #[test]
+    fn test_percent_unescape_query_value_special_chars() {
+        let _guard = test_guard!();
+        assert_eq!(percent_unescape_query_value("a%26b%3Dc"), "a&b=c");
+        assert_eq!(percent_unescape_query_value("100%25"), "100%");
+        assert_eq!(percent_unescape_query_value("hello%2Bworld"), "hello+world");
+    }
+
+    #[test]
+    fn test_percent_unescape_query_value_plus_as_space() {
+        let _guard = test_guard!();
+        assert_eq!(percent_unescape_query_value("hello+world"), "hello world");
+    }
+
+    #[test]
+    fn test_percent_unescape_query_value_no_escapes() {
+        let _guard = test_guard!();
+        assert_eq!(percent_unescape_query_value("simple"), "simple");
+        assert_eq!(
+            percent_unescape_query_value("with-dash_underscore"),
             "with-dash_underscore"
         );
     }
 
     #[test]
-    fn test_urlencoding_decode_invalid() {
+    fn test_percent_unescape_query_value_invalid() {
         let _guard = test_guard!();
         // Invalid hex should be preserved
-        assert_eq!(urlencoding_decode("foo%GGbar"), "foo%GGbar");
+        assert_eq!(percent_unescape_query_value("foo%GGbar"), "foo%GGbar");
         // Incomplete sequence at end
-        assert_eq!(urlencoding_decode("foo%"), "foo%");
+        assert_eq!(percent_unescape_query_value("foo%"), "foo%");
     }
 
     #[test]
-    fn test_urlencoding_decode_utf8() {
+    fn test_percent_unescape_query_value_utf8() {
         let _guard = test_guard!();
         // "é" is %C3%A9 in UTF-8
-        assert_eq!(urlencoding_decode("%C3%A9"), "é");
+        assert_eq!(percent_unescape_query_value("%C3%A9"), "é");
         // "こんにちは" (Konnichiwa)
         // こ: %E3%81%93
         // ん: %E3%82%93
@@ -3610,11 +3879,14 @@ mod tests {
         // ち: %E3%81%A1
         // は: %E3%81%AF
         assert_eq!(
-            urlencoding_decode("%E3%81%93%E3%82%93%E3%81%AB%E3%81%A1%E3%81%AF"),
+            percent_unescape_query_value("%E3%81%93%E3%82%93%E3%81%AB%E3%81%A1%E3%81%AF"),
             "こんにちは"
         );
         // Mixed
-        assert_eq!(urlencoding_decode("hello%20%F0%9F%8C%8D"), "hello 🌍");
+        assert_eq!(
+            percent_unescape_query_value("hello%20%F0%9F%8C%8D"),
+            "hello 🌍"
+        );
     }
 
     // Helper for test_parse_request_with_toolchain
@@ -3721,7 +3993,7 @@ mod tests {
             project: "test".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
-            estimated_cores: 8, // Request more than total slots
+            estimated_cores: 2,
             preferred_workers: vec![],
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
@@ -3734,6 +4006,105 @@ mod tests {
             .unwrap();
         assert!(response.worker.is_none());
         assert_eq!(response.reason, SelectionReason::AllWorkersBusy);
+    }
+
+    #[tokio::test]
+    async fn test_handle_select_worker_requested_busy_does_not_use_available_alternate() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("requested", 4)).await;
+        pool.add_worker(make_test_worker("alternate", 8)).await;
+
+        let requested = pool.get(&WorkerId::new("requested")).await.unwrap();
+        assert!(requested.reserve_slots(4).await);
+
+        let ctx = make_test_context(pool);
+        let request = SelectionRequest {
+            project: "test".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("requested")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let response = handle_select_worker(&ctx, request, false, None)
+            .await
+            .unwrap();
+        assert!(response.worker.is_none());
+        assert_eq!(response.reason, SelectionReason::AllWorkersBusy);
+        assert!(response.diagnostics.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_handle_select_worker_requested_busy_queue_waits_for_requested_worker() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("requested", 4)).await;
+        pool.add_worker(make_test_worker("alternate", 8)).await;
+
+        let requested = pool.get(&WorkerId::new("requested")).await.unwrap();
+        assert!(requested.reserve_slots(4).await);
+        let release_target = requested.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            release_target.release_slots(4).await;
+        });
+
+        let ctx = make_test_context(pool);
+        let request = SelectionRequest {
+            project: "test".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("requested")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let response = handle_select_worker(&ctx, request, true, Some(2))
+            .await
+            .unwrap();
+        let selected = response
+            .worker
+            .expect("requested worker should become available");
+        assert_eq!(selected.id.as_str(), "requested");
+    }
+
+    #[tokio::test]
+    async fn test_handle_select_worker_impossible_requested_capacity_never_queues() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("requested", 1)).await;
+        pool.add_worker(make_test_worker("alternate", 8)).await;
+        let ctx = make_test_context(pool);
+        let request = SelectionRequest {
+            project: "test".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("requested")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(200),
+            handle_select_worker(&ctx, request, true, Some(2)),
+        )
+        .await
+        .expect("impossible capacity must return without entering the queue")
+        .unwrap();
+        assert!(response.worker.is_none());
+        assert!(matches!(
+            response.reason,
+            SelectionReason::NoAdmissibleWorkers(ref summary)
+                if summary.contains("insufficient_total_slots=1")
+        ));
     }
 
     #[tokio::test]
@@ -3763,6 +4134,38 @@ mod tests {
         let worker = response.worker.unwrap();
         assert_eq!(worker.id.as_str(), "worker1");
         // Should have reserved 2 slots
+        assert_eq!(worker.slots_available, 6);
+    }
+
+    #[tokio::test]
+    async fn test_handle_select_worker_preserves_affinity_pin_reason() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        pool.add_worker(make_test_worker("worker2", 8)).await;
+
+        let ctx = make_test_context(pool);
+        ctx.worker_selector
+            .record_success("worker2", "test-project")
+            .await;
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let response = handle_select_worker(&ctx, request, false, None)
+            .await
+            .unwrap();
+
+        assert_eq!(response.reason, SelectionReason::AffinityPinned);
+        let worker = response.worker.expect("affinity-pinned worker");
+        assert_eq!(worker.id.as_str(), "worker2");
         assert_eq!(worker.slots_available, 6);
     }
 
@@ -3866,7 +4269,21 @@ mod tests {
             .await
             .unwrap();
         assert!(second_response.worker.is_none());
-        assert_eq!(second_response.reason, SelectionReason::AllWorkersBusy);
+        assert_eq!(
+            second_response.reason,
+            SelectionReason::NoAdmissibleWorkers("active_project_exclusion=1".to_string())
+        );
+        let diagnostics = second_response
+            .diagnostics
+            .expect("daemon response should surface selector diagnostics");
+        assert_eq!(diagnostics.active_project_exclusion_count, 1);
+        assert_eq!(diagnostics.workers.len(), 1);
+        assert!(
+            diagnostics.workers[0]
+                .reason_codes
+                .iter()
+                .any(|code| code == "active_project_exclusion")
+        );
     }
 
     #[tokio::test]
@@ -4094,6 +4511,7 @@ mod tests {
             pressure_memory_pressure: Some(44.0),
             pressure_telemetry_age_secs: Some(7),
             pressure_telemetry_fresh: true,
+            bypass: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"id\":\"worker1\""));
@@ -4365,7 +4783,7 @@ mod tests {
                 assert_eq!(build_id, 123);
                 assert!(!force);
             }
-            _ => panic!("expected cancel build request"),
+            _ => assert!(false, "expected cancel build request"),
         }
 
         let req = parse_request("POST /builds/456/cancel?force=true").unwrap();
@@ -4374,7 +4792,7 @@ mod tests {
                 assert_eq!(build_id, 456);
                 assert!(force);
             }
-            _ => panic!("expected cancel build request with force"),
+            _ => assert!(false, "expected cancel build request with force"),
         }
     }
 
@@ -4386,7 +4804,7 @@ mod tests {
             ApiRequest::CancelAllBuilds { force } => {
                 assert!(!force);
             }
-            _ => panic!("expected cancel all builds request"),
+            _ => assert!(false, "expected cancel all builds request"),
         }
 
         let req = parse_request("POST /builds/cancel-all?force=true").unwrap();
@@ -4394,7 +4812,7 @@ mod tests {
             ApiRequest::CancelAllBuilds { force } => {
                 assert!(force);
             }
-            _ => panic!("expected cancel all builds with force"),
+            _ => assert!(false, "expected cancel all builds with force"),
         }
     }
 
@@ -4406,7 +4824,7 @@ mod tests {
             ApiRequest::WorkerDrain { worker_id } => {
                 assert_eq!(worker_id.as_str(), "css");
             }
-            _ => panic!("expected worker drain request"),
+            _ => assert!(false, "expected worker drain request"),
         }
     }
 
@@ -4418,7 +4836,7 @@ mod tests {
             ApiRequest::WorkerEnable { worker_id } => {
                 assert_eq!(worker_id.as_str(), "css");
             }
-            _ => panic!("expected worker enable request"),
+            _ => assert!(false, "expected worker enable request"),
         }
     }
 
@@ -4436,7 +4854,7 @@ mod tests {
                 assert!(reason.is_none());
                 assert!(!drain_first);
             }
-            _ => panic!("expected worker disable request"),
+            _ => assert!(false, "expected worker disable request"),
         }
 
         let req = parse_request("POST /workers/css/disable?reason=maintenance&drain=true").unwrap();
@@ -4450,7 +4868,7 @@ mod tests {
                 assert_eq!(reason, Some("maintenance".to_string()));
                 assert!(drain_first);
             }
-            _ => panic!("expected worker disable request with options"),
+            _ => assert!(false, "expected worker disable request with options"),
         }
     }
 
@@ -4463,7 +4881,7 @@ mod tests {
                 assert_eq!(req.worker_id.as_str(), "css");
                 assert_eq!(req.slots, 4);
             }
-            _ => panic!("expected release worker request"),
+            _ => assert!(false, "expected release worker request"),
         }
     }
 
@@ -4477,7 +4895,7 @@ mod tests {
                 assert_eq!(req.slots, 4);
                 assert_eq!(req.build_id, Some(123));
             }
-            _ => panic!("expected release worker request with build_id"),
+            _ => assert!(false, "expected release worker request with build_id"),
         }
     }
 
@@ -4489,7 +4907,7 @@ mod tests {
             ApiRequest::ReleaseWorker(req) => {
                 assert_eq!(req.exit_code, Some(0));
             }
-            _ => panic!("expected release worker request with exit_code"),
+            _ => assert!(false, "expected release worker request with exit_code"),
         }
     }
 
@@ -4508,7 +4926,7 @@ mod tests {
                 assert_eq!(project, "myproject");
                 assert!(is_test);
             }
-            _ => panic!("expected record build request"),
+            _ => assert!(false, "expected record build request"),
         }
     }
 
@@ -4520,7 +4938,7 @@ mod tests {
             ApiRequest::IngestTelemetry(source) => {
                 assert_eq!(source, TelemetrySource::Piggyback);
             }
-            _ => panic!("expected ingest telemetry request"),
+            _ => assert!(false, "expected ingest telemetry request"),
         }
 
         let req = parse_request("POST /telemetry/ingest?source=ssh_poll").unwrap();
@@ -4528,7 +4946,7 @@ mod tests {
             ApiRequest::IngestTelemetry(source) => {
                 assert_eq!(source, TelemetrySource::SshPoll);
             }
-            _ => panic!("expected ingest telemetry request"),
+            _ => assert!(false, "expected ingest telemetry request"),
         }
     }
 
@@ -4546,7 +4964,7 @@ mod tests {
                 assert!(wait_for_worker);
                 assert_eq!(wait_timeout_secs, Some(45));
             }
-            _ => panic!("expected select worker request"),
+            _ => assert!(false, "expected select worker request"),
         }
 
         let req = parse_request("GET /select-worker?project=test&wait=false").unwrap();
@@ -4559,7 +4977,7 @@ mod tests {
                 assert!(!wait_for_worker);
                 assert_eq!(wait_timeout_secs, None);
             }
-            _ => panic!("expected select worker request"),
+            _ => assert!(false, "expected select worker request"),
         }
 
         let req = parse_request("GET /select-worker?project=test&wait_timeout_secs=0").unwrap();
@@ -4569,7 +4987,7 @@ mod tests {
             } => {
                 assert_eq!(wait_timeout_secs, None);
             }
-            _ => panic!("expected select worker request"),
+            _ => assert!(false, "expected select worker request"),
         }
     }
 
@@ -4616,6 +5034,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_ready_ignores_non_assignable_workers_with_free_slots() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("drained", 4)).await;
+        pool.add_worker(make_test_worker("disabled", 4)).await;
+        pool.add_worker(make_test_worker("unreachable", 4)).await;
+        pool.set_status(&WorkerId::new("drained"), WorkerStatus::Drained)
+            .await;
+        pool.set_status(&WorkerId::new("disabled"), WorkerStatus::Disabled)
+            .await;
+        pool.set_status(&WorkerId::new("unreachable"), WorkerStatus::Unreachable)
+            .await;
+        let ctx = make_test_context(pool);
+
+        let response = handle_ready(&ctx).await;
+        assert_eq!(response.status, "not_ready");
+        assert!(!response.workers_available);
+        assert_eq!(response.reason.as_deref(), Some("no_workers_available"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_ready_ignores_open_circuit_workers_with_free_slots() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 4)).await;
+        let worker = pool
+            .get(&WorkerId::new("worker1"))
+            .await
+            .expect("worker should exist");
+        worker.open_circuit().await;
+        let ctx = make_test_context(pool);
+
+        let response = handle_ready(&ctx).await;
+        assert_eq!(response.status, "not_ready");
+        assert!(!response.workers_available);
+        assert_eq!(response.reason.as_deref(), Some("no_workers_available"));
+    }
+
+    #[tokio::test]
     async fn test_handle_cancel_build_not_found() {
         let pool = WorkerPool::new();
         let ctx = make_test_context(pool);
@@ -4658,7 +5113,7 @@ mod tests {
         assert_eq!(response.status, "ok");
         assert_eq!(response.worker_id, "worker1");
         assert_eq!(response.action, "drain");
-        assert_eq!(response.new_status, Some("draining".to_string()));
+        assert_eq!(response.new_status, Some("drained".to_string()));
     }
 
     #[tokio::test]
@@ -4747,6 +5202,7 @@ mod tests {
             user: "test".to_string(),
             capabilities: WorkerCapabilities::default(),
             pressure_assessment: crate::disk_pressure::PressureAssessment::default(),
+            refresh: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"id\":\"worker1\""));
@@ -4815,6 +5271,26 @@ mod tests {
         assert!(json.contains("\"has_more\":false"));
     }
 
+    #[test]
+    fn test_selection_response_json_includes_protocol_version() {
+        let _guard = test_guard!();
+        let response = SelectionResponse {
+            worker: None,
+            reason: SelectionReason::AllWorkersBusy,
+            build_id: None,
+            diagnostics: None,
+        };
+
+        let json = selection_response_json(&response).expect("selection response serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+
+        assert_eq!(
+            value["selection_protocol_version"],
+            rch_common::SELECTION_RESPONSE_PROTOCOL_VERSION
+        );
+        assert_eq!(value["reason"], "all_workers_busy");
+    }
+
     // =========================================================================
     // ApiResponse tests
     // =========================================================================
@@ -4869,7 +5345,7 @@ mod tests {
                         .contains("not found")
                 );
             }
-            _ => panic!("expected error response"),
+            _ => assert!(false, "expected error response"),
         }
     }
 
@@ -4886,7 +5362,7 @@ mod tests {
                 // No speedscore initially
                 assert!(r.speedscore.is_none());
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -4902,7 +5378,7 @@ mod tests {
             ApiResponse::Ok(r) => {
                 assert_eq!(r.workers.len(), 2);
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -4921,7 +5397,7 @@ mod tests {
                         .contains("not found")
                 );
             }
-            _ => panic!("expected error response"),
+            _ => assert!(false, "expected error response"),
         }
     }
 
@@ -4938,7 +5414,7 @@ mod tests {
                 assert_eq!(r.worker_id, "worker1");
                 assert!(!r.request_id.is_empty());
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -4962,7 +5438,7 @@ mod tests {
                 );
                 assert!(err.retry_after_secs.is_some());
             }
-            _ => panic!("expected rate-limited error response"),
+            _ => assert!(false, "expected rate-limited error response"),
         }
     }
 
@@ -4987,7 +5463,7 @@ mod tests {
                         .contains("not found")
                 );
             }
-            _ => panic!("expected error response"),
+            _ => assert!(false, "expected error response"),
         }
     }
 
@@ -5005,7 +5481,7 @@ mod tests {
                 assert!(r.history.is_empty()); // No history entries yet
                 assert!(!r.pagination.has_more);
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -5022,7 +5498,7 @@ mod tests {
             ApiResponse::Ok(r) => {
                 assert_eq!(r.worker_id, "worker1");
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
 
         // Request 1000 days - should be clamped to 365
@@ -5032,7 +5508,7 @@ mod tests {
             ApiResponse::Ok(r) => {
                 assert_eq!(r.worker_id, "worker1");
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -5049,7 +5525,7 @@ mod tests {
             ApiResponse::Ok(r) => {
                 assert_eq!(r.pagination.limit, 1);
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
 
         // Request limit of 5000 - should be clamped to 1000
@@ -5058,7 +5534,7 @@ mod tests {
             ApiResponse::Ok(r) => {
                 assert_eq!(r.pagination.limit, 1000);
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -5077,7 +5553,7 @@ mod tests {
             ApiResponse::Ok(r) => {
                 assert!(r.workers.is_empty());
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -5098,7 +5574,7 @@ mod tests {
                 assert_eq!(w1.host, "localhost");
                 assert_eq!(w1.user, "user");
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -5178,10 +5654,167 @@ mod tests {
         let completed = recent.iter().find(|b| b.id == build_id);
         assert!(completed.is_some());
         assert_eq!(completed.unwrap().exit_code, 0);
+
+        let stats = worker.circuit_stats().await;
+        assert_eq!(stats.error_rate(), 0.0);
+        assert_eq!(stats.recent_results(), &[true]);
+        assert_eq!(
+            ctx.worker_selector
+                .get_fallback_worker("test-project")
+                .await,
+            Some("worker1".to_string())
+        );
     }
 
     #[tokio::test]
-    async fn test_handle_release_worker_records_nonzero_exit_as_worker_failure() {
+    async fn test_handle_release_worker_uses_active_build_slots() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+
+        let ctx = make_test_context(pool.clone());
+        let build = ctx.history.start_active_build(
+            "test-project".to_string(),
+            "worker1".to_string(),
+            "cargo build".to_string(),
+            12345,
+            4,
+            rch_common::BuildLocation::Remote,
+        );
+        let build_id = build.id;
+
+        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+        assert!(worker.reserve_slots(4).await);
+
+        let request = ReleaseRequest {
+            worker_id: WorkerId::new("worker1"),
+            slots: 0,
+            build_id: Some(build_id),
+            exit_code: Some(0),
+            duration_ms: Some(5000),
+            bytes_transferred: Some(1024 * 1024),
+            timing: None,
+        };
+
+        handle_release_worker(&ctx, request).await.unwrap();
+
+        assert_eq!(worker.available_slots().await, 8);
+        assert!(ctx.history.active_build(build_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_release_worker_build_id_is_idempotent() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+
+        let ctx = make_test_context(pool.clone());
+        let build = ctx.history.start_active_build(
+            "test-project".to_string(),
+            "worker1".to_string(),
+            "cargo build".to_string(),
+            12345,
+            4,
+            rch_common::BuildLocation::Remote,
+        );
+        let build_id = build.id;
+        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+        assert!(worker.reserve_slots(4).await);
+
+        let release = || ReleaseRequest {
+            worker_id: WorkerId::new("worker1"),
+            slots: 4,
+            build_id: Some(build_id),
+            exit_code: Some(1),
+            duration_ms: None,
+            bytes_transferred: None,
+            timing: None,
+        };
+        handle_release_worker(&ctx, release()).await.unwrap();
+        assert_eq!(worker.available_slots().await, 8);
+
+        // Simulate a later build reserving capacity before a duplicate/late
+        // release for the completed build arrives.
+        assert!(worker.reserve_slots(2).await);
+        handle_release_worker(&ctx, release()).await.unwrap();
+        assert_eq!(worker.available_slots().await, 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_handle_release_worker_concurrent_duplicates_claim_build_once() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool.clone());
+        let build = ctx.history.start_active_build(
+            "test-project".to_string(),
+            "worker1".to_string(),
+            "cargo build".to_string(),
+            12345,
+            4,
+            rch_common::BuildLocation::Remote,
+        );
+        let build_id = build.id;
+        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+        assert!(worker.reserve_slots(4).await);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let spawn_release = |ctx: DaemonContext, barrier: Arc<tokio::sync::Barrier>| {
+            tokio::spawn(async move {
+                barrier.wait().await;
+                handle_release_worker(
+                    &ctx,
+                    ReleaseRequest {
+                        worker_id: WorkerId::new("worker1"),
+                        slots: 4,
+                        build_id: Some(build_id),
+                        exit_code: Some(1),
+                        duration_ms: None,
+                        bytes_transferred: None,
+                        timing: None,
+                    },
+                )
+                .await
+            })
+        };
+        let first = spawn_release(ctx.clone(), barrier.clone());
+        let second = spawn_release(ctx.clone(), barrier.clone());
+        barrier.wait().await;
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+
+        assert_eq!(worker.available_slots().await, 8);
+        assert!(ctx.history.active_build(build_id).is_none());
+        assert_eq!(
+            ctx.history
+                .recent(10)
+                .iter()
+                .filter(|record| record.id == build_id)
+                .count(),
+            1
+        );
+
+        // A later duplicate remains a no-op after new capacity is reserved.
+        assert!(worker.reserve_slots(2).await);
+        handle_release_worker(
+            &ctx,
+            ReleaseRequest {
+                worker_id: WorkerId::new("worker1"),
+                slots: 4,
+                build_id: Some(build_id),
+                exit_code: Some(1),
+                duration_ms: None,
+                bytes_transferred: None,
+                timing: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(worker.available_slots().await, 6);
+    }
+
+    #[tokio::test]
+    async fn test_handle_release_worker_nonzero_exit_preserves_worker_health() {
         let _guard = test_guard!();
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
@@ -5213,8 +5846,22 @@ mod tests {
         let result = handle_release_worker(&ctx, request).await;
         assert!(result.is_ok());
 
+        let recent = ctx.history.recent(10);
+        let completed = recent
+            .iter()
+            .find(|b| b.id == build_id)
+            .expect("build should be completed");
+        assert_eq!(completed.exit_code, 101);
+
         let stats = worker.circuit_stats().await;
-        assert!(stats.error_rate() > 0.0);
+        assert_eq!(stats.error_rate(), 0.0);
+        assert!(stats.recent_results().is_empty());
+        assert_eq!(
+            ctx.worker_selector
+                .get_fallback_worker("test-project")
+                .await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -5362,6 +6009,50 @@ mod tests {
         assert_eq!(status.daemon.slots_total, 12); // 8 + 4
         assert_eq!(status.daemon.version, "0.1.0");
         assert_eq!(status.daemon.pid, 1234);
+    }
+
+    #[tokio::test]
+    async fn test_handle_status_slots_available_counts_only_assignable_capacity() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("healthy", 8)).await;
+        pool.add_worker(make_test_worker("degraded", 4)).await;
+        pool.add_worker(make_test_worker("drained", 6)).await;
+        pool.add_worker(make_test_worker("disabled", 10)).await;
+        pool.add_worker(make_test_worker("open-circuit", 5)).await;
+
+        let healthy = pool
+            .get(&WorkerId::new("healthy"))
+            .await
+            .expect("healthy worker should exist");
+        assert!(healthy.reserve_slots(2).await);
+
+        let degraded = pool
+            .get(&WorkerId::new("degraded"))
+            .await
+            .expect("degraded worker should exist");
+        degraded.set_status(WorkerStatus::Degraded).await;
+        assert!(degraded.reserve_slots(1).await);
+
+        pool.set_status(&WorkerId::new("drained"), WorkerStatus::Drained)
+            .await;
+        pool.set_status(&WorkerId::new("disabled"), WorkerStatus::Disabled)
+            .await;
+
+        let open_circuit = pool
+            .get(&WorkerId::new("open-circuit"))
+            .await
+            .expect("open-circuit worker should exist");
+        open_circuit.open_circuit().await;
+
+        let ctx = make_test_context(pool);
+        let status = handle_status(&ctx).await.expect("status should succeed");
+
+        assert_eq!(status.daemon.slots_total, 33);
+        assert_eq!(
+            status.daemon.slots_available, 9,
+            "only healthy/degraded, non-open-circuit capacity should be assignable"
+        );
     }
 
     #[tokio::test]
@@ -5665,7 +6356,7 @@ mod tests {
                 assert_eq!(status.summary.total_workers, 0);
                 assert_eq!(status.status, "unknown");
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5690,7 +6381,7 @@ mod tests {
                 assert_eq!(status.summary.ready, 1);
                 assert_eq!(status.status, "healthy");
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5716,7 +6407,7 @@ mod tests {
                 assert_eq!(status.workers.len(), 1);
                 assert_eq!(status.workers[0].worker_id, "w1");
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5734,7 +6425,7 @@ mod tests {
                 assert_eq!(status.workers[0].drift_state, "stale");
                 assert!(!status.workers[0].remediation.is_empty());
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5755,7 +6446,7 @@ mod tests {
                 assert!(!dr.would_attempt, "Ready worker should not attempt sync");
                 assert_eq!(dr.current_state, "ready");
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5781,7 +6472,7 @@ mod tests {
                 assert!(!dr.missing_repos.is_empty());
                 assert!(dr.has_budget);
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5798,7 +6489,7 @@ mod tests {
                 assert!(dr.would_attempt);
                 assert_eq!(dr.current_state, "stale");
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5822,7 +6513,7 @@ mod tests {
                 assert_eq!(repair.new_state, "drifting");
                 assert_eq!(repair.action, "reset_convergence");
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5839,7 +6530,7 @@ mod tests {
                 assert_eq!(repair.status, "noop");
                 assert_eq!(repair.action, "none");
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5881,7 +6572,7 @@ mod tests {
             } => {
                 assert_eq!(wid.as_str(), "w1");
             }
-            _ => panic!("Expected RepoConvergenceStatus with worker_id"),
+            _ => assert!(false, "Expected RepoConvergenceStatus with worker_id"),
         }
     }
 
@@ -5893,7 +6584,7 @@ mod tests {
             ApiRequest::RepoConvergenceDryRun { worker_id } => {
                 assert_eq!(worker_id.as_str(), "w1");
             }
-            _ => panic!("Expected RepoConvergenceDryRun"),
+            _ => assert!(false, "Expected RepoConvergenceDryRun"),
         }
     }
 
@@ -5912,7 +6603,7 @@ mod tests {
             ApiRequest::RepoConvergenceRepair { worker_id } => {
                 assert_eq!(worker_id.as_str(), "w1");
             }
-            _ => panic!("Expected RepoConvergenceRepair"),
+            _ => assert!(false, "Expected RepoConvergenceRepair"),
         }
     }
 

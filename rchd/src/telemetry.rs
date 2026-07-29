@@ -1,11 +1,11 @@
 //! Telemetry storage and polling for worker metrics.
 
 use crate::events::EventBus;
-use crate::workers::{WorkerPool, WorkerState};
+use crate::workers::{AdminIntent, WorkerPool, WorkerState};
 use anyhow::Context;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use directories::ProjectDirs;
-use rch_common::{SshClient, SshOptions, WorkerStatus};
+use rch_common::{SshClient, SshOptions};
 use rch_telemetry::protocol::{
     ReceivedTelemetry, TelemetrySource, TestRunRecord, TestRunStats, WorkerTelemetry,
 };
@@ -17,7 +17,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::task;
 use tokio::time::interval;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// In-memory telemetry store with time-based eviction.
 pub struct TelemetryStore {
@@ -70,7 +70,7 @@ impl TelemetryStore {
         // Get summary for event emission before moving into storage
         let summary = received.telemetry.summary();
 
-        let mut recent = self.recent.write().unwrap();
+        let mut recent = self.recent.write().unwrap_or_else(|e| e.into_inner());
         let entries = recent.entry(worker_id).or_default();
         entries.push_back(received);
 
@@ -100,7 +100,7 @@ impl TelemetryStore {
 
     /// Get the most recent telemetry for a worker.
     pub fn latest(&self, worker_id: &str) -> Option<ReceivedTelemetry> {
-        let recent = self.recent.read().unwrap();
+        let recent = self.recent.read().unwrap_or_else(|e| e.into_inner());
         recent
             .get(worker_id)
             .and_then(|entries| entries.back().cloned())
@@ -108,7 +108,7 @@ impl TelemetryStore {
 
     /// Get the most recent telemetry for all workers.
     pub fn latest_all(&self) -> Vec<ReceivedTelemetry> {
-        let recent = self.recent.read().unwrap();
+        let recent = self.recent.read().unwrap_or_else(|e| e.into_inner());
         recent
             .values()
             .filter_map(|entries| entries.back().cloned())
@@ -122,7 +122,7 @@ impl TelemetryStore {
 
     /// Record a test run for telemetry and optional persistence.
     pub fn record_test_run(&self, record: TestRunRecord) {
-        let mut test_runs = self.test_runs.write().unwrap();
+        let mut test_runs = self.test_runs.write().unwrap_or_else(|e| e.into_inner());
         if test_runs.len() >= 200 {
             test_runs.pop_front();
         }
@@ -150,7 +150,7 @@ impl TelemetryStore {
             }
         }
 
-        let test_runs = self.test_runs.read().unwrap();
+        let test_runs = self.test_runs.read().unwrap_or_else(|e| e.into_inner());
         let mut stats = TestRunStats::default();
         for record in test_runs.iter() {
             stats.record(record);
@@ -213,7 +213,7 @@ pub fn default_telemetry_db_path() -> anyhow::Result<PathBuf> {
 /// Start background maintenance for the telemetry database.
 pub fn start_storage_maintenance(storage: Arc<TelemetryStorage>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(3600));
+        let mut ticker = interval(Duration::from_secs(300));
         loop {
             ticker.tick().await;
             let storage = Arc::clone(&storage);
@@ -245,17 +245,52 @@ impl Default for TelemetryPollerConfig {
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_secs(30),
-            ssh_timeout: Duration::from_secs(5),
-            skip_after: Duration::from_secs(60),
+            // Telemetry is collected via a fresh SSH connect+auth+exec each cycle.
+            // 5s was too tight for trans-continental workers (e.g. Contabo EU VPS
+            // from a US controller): connect+auth alone can approach/exceed 5s under
+            // load, causing intermittent "Command timed out after 5s" failures that
+            // flap worker freshness → flap health → spurious "no workers passed
+            // health thresholds" and offload falling back to local. 20s leaves
+            // comfortable margin while staying under the 30s poll interval.
+            ssh_timeout: Duration::from_secs(20),
+            // Re-poll cadence must stay under the pressure layer's
+            // telemetry-stale threshold (90s). With a 30s tick, a 60s skip
+            // pushed the effective re-poll to ~90s (the tick after the skip
+            // window expires) — equal to the stale threshold, so workers raced
+            // in and out of "fresh". 30s makes a worker eligible again at the
+            // *second* tick, i.e. ~60s effective re-poll: max worker age ~60s,
+            // comfortably inside the 90s window, without tripling SSH load the
+            // way a sub-tick skip (→30s re-poll) would.
+            skip_after: Duration::from_secs(30),
         }
     }
 }
 
 /// Periodic SSH poller for worker telemetry.
+/// Maximum number of worker telemetry SSH polls allowed to run concurrently.
+/// This bounds the poller's footprint on pathologically large fleets, but MUST
+/// stay comfortably above a normal fleet's worker count: a hung poll holds its
+/// permit until the hard timeout (see `poll_worker` wrapping) fires, so a cap
+/// at/below the worker count would let a few stuck workers starve the rest of
+/// the fleet of poll permits — observed as telemetry freshness collapsing to a
+/// handful of workers. 16 keeps every realistic fleet fully concurrent.
+const MAX_CONCURRENT_TELEMETRY_POLLS: usize = 16;
+
+/// Hard wall-clock bound for a single worker poll. The SSH layer is *supposed*
+/// to honor `ssh_timeout` for connect/command, but in practice a stuck
+/// connection can hang past it; without an outer timeout the spawned task (and
+/// its concurrency permit) leaks indefinitely, silently starving future polls.
+/// Sized just above `ssh_timeout` so a healthy-but-slow worker still completes.
+fn poll_hard_timeout(ssh_timeout: Duration) -> Duration {
+    ssh_timeout + Duration::from_secs(5)
+}
+
 pub struct TelemetryPoller {
     pool: WorkerPool,
     store: Arc<TelemetryStore>,
     config: TelemetryPollerConfig,
+    poll_limit: Arc<tokio::sync::Semaphore>,
+    ssh_pool: Option<Arc<rch_common::SshPool>>,
 }
 
 impl TelemetryPoller {
@@ -269,13 +304,30 @@ impl TelemetryPoller {
             pool,
             store,
             config,
+            poll_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TELEMETRY_POLLS)),
+            ssh_pool: None,
         }
+    }
+
+    /// Attach a shared SSH connection pool for warm ControlMaster reuse. The
+    /// pooled vs. throwaway branch lives in
+    /// [`collect_telemetry_from_worker_pooled`] (the poller's SSH logic is a free
+    /// function, shared with the on-demand API path), so there is no per-struct
+    /// `run_remote` helper here.
+    #[must_use]
+    pub fn with_ssh_pool(mut self, pool: Option<Arc<rch_common::SshPool>>) -> Self {
+        self.ssh_pool = pool;
+        self
     }
 
     /// Start the polling loop in the background.
     pub fn start(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = interval(self.config.poll_interval);
+            // A cycle can occasionally run long (a worker failing both attempts
+            // back-to-back). Skip missed ticks rather than firing a burst of
+            // back-to-back cycles, which would only add SSH contention.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
                 if let Err(e) = self.poll_once().await {
@@ -287,7 +339,13 @@ impl TelemetryPoller {
 
     async fn poll_once(&self) -> anyhow::Result<()> {
         let workers = self.pool.all_workers().await;
+        let total = workers.len();
 
+        // Spawn one bounded poll task per eligible worker and collect handles so
+        // we can report a per-cycle outcome summary at INFO. The summary is the
+        // single source of truth for "is telemetry actually refreshing?" in
+        // production (the daemon log is INFO-level), and avoids needing debug logs.
+        let mut handles = Vec::new();
         for worker in workers {
             if !self.should_poll_worker(&worker).await {
                 continue;
@@ -295,22 +353,54 @@ impl TelemetryPoller {
 
             let store = self.store.clone();
             let config = self.config.clone();
-            tokio::spawn(async move {
-                if let Err(e) = poll_worker(worker, store, config).await {
-                    warn!("Telemetry poll failed: {}", e);
-                }
-            });
+            let poll_limit = self.poll_limit.clone();
+            let ssh_pool = self.ssh_pool.clone();
+            handles.push(tokio::spawn(async move {
+                // Bound concurrent SSH polls (see MAX_CONCURRENT_TELEMETRY_POLLS).
+                // The semaphore is never closed, so acquire_owned cannot fail.
+                let _permit = poll_limit.acquire_owned().await;
+                poll_worker(worker, store, config, ssh_pool).await
+            }));
+        }
+
+        let attempted = handles.len();
+        let mut refreshed = 0usize;
+        for handle in handles {
+            if matches!(handle.await, Ok(true)) {
+                refreshed += 1;
+            }
+        }
+        if attempted > 0 {
+            info!(
+                "telemetry poll cycle: refreshed {}/{} polled workers ({} configured)",
+                refreshed, attempted, total
+            );
         }
 
         Ok(())
     }
 
     async fn should_poll_worker(&self, worker: &WorkerState) -> bool {
-        let status = worker.status().await;
-        if matches!(
-            status,
-            WorkerStatus::Unreachable | WorkerStatus::Drained | WorkerStatus::Disabled
-        ) {
+        // Skip ONLY workers the operator has deliberately taken out of service
+        // (admin axis). We MUST keep polling health-excluded workers —
+        // Unreachable, and especially the `TemporaryBypass` /
+        // `RecoveredPendingCanary` quarantine states — because their recovery
+        // gate requires FRESH telemetry (`telemetry_ok`).
+        //
+        // The old code keyed off the legacy `status()`, which collapses every
+        // quarantine (`TemporaryBypass`/`RecoveredPendingCanary`) down to
+        // `Unreachable` and so skipped them. That created the fleet-wide
+        // stranding deadlock of the 2026-07-16 offload meltdown: circuit trips
+        // -> worker quarantined -> poller skips it -> telemetry goes stale ->
+        // `telemetry_ok=false` -> recovery probe `StayBypassed` forever, with a
+        // persisted record that a daemon restart merely re-applies. Gating on
+        // the admin axis instead lets a quarantined-but-recovered worker keep
+        // reporting telemetry so it can actually rejoin. Polling a genuinely
+        // down worker just times out (bounded by the poll concurrency cap +
+        // per-attempt timeout), which is the same cost the health monitor
+        // already pays by checking every worker each cycle.
+        let admin = worker.lifecycle().await.admin;
+        if matches!(admin, AdminIntent::Drained | AdminIntent::Disabled) {
             return false;
         }
 
@@ -329,18 +419,41 @@ impl TelemetryPoller {
 /// Collect telemetry from a worker via SSH.
 ///
 /// Executes `rch-telemetry collect` on the remote worker and parses the result.
+/// Thin wrapper preserving the historical 2-arg signature (used by the on-demand
+/// API poll path, which has no shared pool available). Background poll cycles use
+/// [`collect_telemetry_from_worker_pooled`] to reuse a warm ControlMaster.
 pub async fn collect_telemetry_from_worker(
     worker: &WorkerState,
     ssh_timeout: Duration,
 ) -> anyhow::Result<WorkerTelemetry> {
-    let config = worker.config.read().await;
-    let worker_id = config.id.as_str();
+    collect_telemetry_from_worker_pooled(worker, ssh_timeout, None).await
+}
+
+/// Collect telemetry from a worker via SSH, optionally reusing a shared SSH
+/// connection pool (warm ControlMaster) when `ssh_pool` is `Some`.
+pub async fn collect_telemetry_from_worker_pooled(
+    worker: &WorkerState,
+    ssh_timeout: Duration,
+    ssh_pool: Option<Arc<rch_common::SshPool>>,
+) -> anyhow::Result<WorkerTelemetry> {
+    // Snapshot the worker config and RELEASE the lock before any SSH work.
+    // Holding `worker.config` across the (up to `ssh_timeout`) SSH round-trip
+    // blocks writers — and any reader queued behind a pending writer, including
+    // the in-memory worker-selection path — for the full SSH duration. Under a
+    // poll burst that surfaced as multi-second "worker_selection latency
+    // exceeded panic threshold" stalls. Cloning + dropping the guard here keeps
+    // selection lock-free while telemetry SSH is in flight.
+    let worker_config = {
+        let config = worker.config.read().await;
+        config.clone()
+    };
+    let worker_id = worker_config.id.clone();
     // Worker IDs come from operator-supplied config (workers.toml), not from
     // a trusted source — a stray quote, semicolon, or `$()` would otherwise
     // be evaluated by the remote shell. Always shell-escape before splicing
     // into the remote command. The companion path in rch/src/hook.rs already
     // uses `shell_escape::escape` for exactly this reason.
-    let escaped_worker = shell_escape::escape(worker_id.into());
+    let escaped_worker = shell_escape::escape(worker_config.id.as_str().into());
     // Use rch-wkr from PATH if available, otherwise fallback to ~/.local/bin/rch-wkr
     // This handles non-interactive SSH sessions where ~/.local/bin might not be in PATH
     let command = format!(
@@ -354,10 +467,19 @@ pub async fn collect_telemetry_from_worker(
         ..Default::default()
     };
 
-    let mut client = SshClient::new(config.clone(), options);
-    client.connect().await?;
-    let result = client.execute(&command).await;
-    client.disconnect().await?;
+    // Reuse a warm ControlMaster via the shared pool when available; otherwise
+    // fall back to a throwaway connect+exec+disconnect (mirrors the pattern in
+    // TelemetryPoller::run_remote for the on-demand / no-pool paths).
+    let result = if let Some(pool) = &ssh_pool {
+        pool.run_with_timeout(&worker_config, &command, options.command_timeout)
+            .await
+    } else {
+        let mut client = SshClient::new(worker_config, options);
+        client.connect().await?;
+        let result = client.execute(&command).await;
+        let _ = client.disconnect().await;
+        result
+    };
 
     let result = result?;
 
@@ -378,41 +500,79 @@ pub async fn collect_telemetry_from_worker(
         WorkerTelemetry::from_json(payload).context("Failed to parse telemetry JSON")?;
 
     if !telemetry.is_compatible() {
-        warn!(worker = worker_id, "Telemetry protocol version mismatch");
+        warn!(
+            worker = worker_id.as_str(),
+            "Telemetry protocol version mismatch"
+        );
     }
 
     Ok(telemetry)
 }
 
+/// Total attempts (1 initial + retries) for a single worker poll per cycle.
+const TELEMETRY_POLL_ATTEMPTS: u32 = 2;
+/// Backoff between poll attempts. Short, so a transient SSH connect failure
+/// under contention is retried after the burst clears, without dropping the
+/// worker past the stale threshold until the next cycle.
+const TELEMETRY_RETRY_BACKOFF: Duration = Duration::from_millis(1500);
+
+/// Poll one worker and ingest its telemetry. Returns `true` iff telemetry was
+/// collected and ingested this call.
+///
+/// Each attempt is bounded by a hard timeout (the SSH layer's own timeout is not
+/// always honored); a single transient failure is retried once. Without the
+/// retry, one failed re-poll under concurrent SSH load drops the worker past the
+/// stale threshold — the root cause of fluctuating fleet telemetry freshness.
 async fn poll_worker(
     worker: Arc<WorkerState>,
     store: Arc<TelemetryStore>,
     config: TelemetryPollerConfig,
-) -> anyhow::Result<()> {
+    ssh_pool: Option<Arc<rch_common::SshPool>>,
+) -> bool {
     let worker_id = worker.config.read().await.id.clone();
+    let per_attempt = poll_hard_timeout(config.ssh_timeout);
+    let mut last_err: Option<String> = None;
 
-    match collect_telemetry_from_worker(&worker, config.ssh_timeout).await {
-        Ok(telemetry) => {
-            debug!(
-                worker = worker_id.as_str(),
-                cpu = %telemetry.cpu.overall_percent,
-                memory = %telemetry.memory.used_percent,
-                "Telemetry collected via SSH"
-            );
-            store.ingest(telemetry, TelemetrySource::SshPoll);
+    for attempt in 1..=TELEMETRY_POLL_ATTEMPTS {
+        match tokio::time::timeout(
+            per_attempt,
+            collect_telemetry_from_worker_pooled(&worker, config.ssh_timeout, ssh_pool.clone()),
+        )
+        .await
+        {
+            Ok(Ok(telemetry)) => {
+                debug!(
+                    worker = worker_id.as_str(),
+                    attempt,
+                    cpu = %telemetry.cpu.overall_percent,
+                    memory = %telemetry.memory.used_percent,
+                    "Telemetry collected via SSH"
+                );
+                store.ingest(telemetry, TelemetrySource::SshPoll);
+                return true;
+            }
+            Ok(Err(e)) => last_err = Some(e.to_string()),
+            Err(_) => last_err = Some(format!("hard timeout after {per_attempt:?}")),
         }
-        Err(e) => {
-            warn!(worker = worker_id.as_str(), "Telemetry poll failed: {}", e);
+        if attempt < TELEMETRY_POLL_ATTEMPTS {
+            tokio::time::sleep(TELEMETRY_RETRY_BACKOFF).await;
         }
     }
 
-    Ok(())
+    warn!(
+        worker = worker_id.as_str(),
+        attempts = TELEMETRY_POLL_ATTEMPTS,
+        "Telemetry poll failed: {}",
+        last_err.unwrap_or_else(|| "unknown error".to_string())
+    );
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rch_common::CompilationKind;
+    use rch_common::WorkerStatus;
     use rch_common::test_guard;
     use rch_telemetry::collect::cpu::{CpuTelemetry, LoadAverage};
     use rch_telemetry::collect::memory::MemoryTelemetry;
@@ -564,8 +724,8 @@ mod tests {
         let _guard = test_guard!();
         let config = TelemetryPollerConfig::default();
         assert_eq!(config.poll_interval, Duration::from_secs(30));
-        assert_eq!(config.ssh_timeout, Duration::from_secs(5));
-        assert_eq!(config.skip_after, Duration::from_secs(60));
+        assert_eq!(config.ssh_timeout, Duration::from_secs(20));
+        assert_eq!(config.skip_after, Duration::from_secs(30));
     }
 
     #[test]
@@ -782,7 +942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_should_poll_worker_unreachable() {
+    async fn test_should_poll_worker_unreachable_is_still_polled() {
         use crate::workers::WorkerPool;
         use rch_common::WorkerId;
 
@@ -800,9 +960,40 @@ mod tests {
         let poller_config = TelemetryPollerConfig::default();
         let poller = TelemetryPoller::new(pool, store, poller_config);
 
-        // Unreachable workers should not be polled
+        // A health-excluded (Unreachable, admin=Active) worker MUST still be
+        // polled: fresh telemetry is its path back to healthy. Skipping it was
+        // the stranding deadlock (2026-07-16 offload meltdown).
         let should_poll = poller.should_poll_worker(&worker).await;
-        assert!(!should_poll);
+        assert!(should_poll);
+    }
+
+    #[tokio::test]
+    async fn test_should_poll_worker_quarantined_bypass_is_still_polled() {
+        use crate::workers::WorkerPool;
+        use rch_common::BypassFailureClass;
+        use rch_common::WorkerId;
+
+        let pool = WorkerPool::new();
+        pool.add_worker(create_worker_config("bypassed-worker"))
+            .await;
+
+        let worker = pool.get(&WorkerId::new("bypassed-worker")).await.unwrap();
+        // Quarantine it exactly as the bypass-recovery service does. Its legacy
+        // status() collapses to Unreachable, but its admin intent is still
+        // Active — the recovery gate needs telemetry_ok, so the poller MUST
+        // keep polling it. This is the specific state the old skip stranded.
+        worker.enter_bypass(BypassFailureClass::Ssh).await;
+        assert_eq!(worker.status().await, WorkerStatus::Unreachable);
+
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let poller_config = TelemetryPollerConfig::default();
+        let poller = TelemetryPoller::new(pool, store, poller_config);
+
+        let should_poll = poller.should_poll_worker(&worker).await;
+        assert!(
+            should_poll,
+            "a TemporaryBypass worker must be polled so it can recover"
+        );
     }
 
     #[tokio::test]

@@ -169,3 +169,10 @@ rch check
 | `~/.local/share/rch/fleet_history/` | Fleet deployment history |
 | `~/.cache/rch/` | Cache + default socket parent |
 | `/tmp/rch/` | Remote transfer workspace base (default) |
+| `<state>/incidents.jsonl` | Append-only reason-coded incident ledger |
+| `<state>/proofs.jsonl` | Deferred proof intents + replay state (or `[remediation.proof] store_path`) |
+
+`<state>` resolves to `$RCH_STATE_HOME`, else `$XDG_STATE_HOME/rch`, else
+`~/.local/state/rch`, else `/tmp/rch`. Read these via `rch status --remediation
+--json`, `rch diagnose "<cmd>" --json`, and `rch admit "<cmd>" --json` rather than
+parsing the files directly.

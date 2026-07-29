@@ -23,6 +23,38 @@ rch status --stats
 rch status --circuits
 ```
 
+### Fleet-wide Reliability
+
+`rch doctor --reliability` checks the **local** machine. To assess the whole
+fleet in one command, `rch fleet doctor --reliability` fans out over SSH to
+every worker, runs the per-worker reliability doctor in parallel, and
+aggregates the results. The fleet verdict is the **worst** per-worker verdict;
+an unreachable worker counts as `failing` (you cannot prove a worker you could
+not reach is healthy).
+
+```bash
+# Fleet-wide health (worst verdict wins)
+rch fleet doctor --reliability
+
+# Machine-readable envelope (per-worker drill-down under data.per_worker)
+rch fleet doctor --reliability --json
+
+# Narrow check across all workers
+rch fleet doctor --reliability --scope pressure,topology
+
+# Only specific workers
+rch fleet doctor --reliability --workers css,bil
+
+# Apply remediations fleet-wide (requires the confirmation gate)
+rch fleet doctor --reliability --fix --fleet-confirm
+```
+
+Probes run with bounded concurrency (≤16 simultaneous SSH sessions) and a
+per-worker timeout (`--worker-timeout`, default 10s); a stalled worker is
+reported as `unreachable` rather than hanging the command. `--fix` is a
+fleet-wide mutation and requires `--fleet-confirm`; without it the command
+runs check-only.
+
 ### JSON Output
 
 For programmatic monitoring:
@@ -119,6 +151,33 @@ Available metrics:
 - `rch_transfer_bytes_total{direction}` - Bytes transferred
 - `rch_circuit_state{worker, state}` - Circuit breaker states
 
+### OpenTelemetry (OTLP) Export
+
+The doctor/hook event metrics (`rch_doctor_*`, `rch_hook_*`,
+`rch_request_duration_seconds`) are mirrored to an OpenTelemetry collector
+over OTLP/gRPC when enabled. The Prometheus inventory remains the single
+source of truth — OTLP carries the *same* metric names and labels, so both
+exposition surfaces can run simultaneously.
+
+Enable it with environment variables (no config-file change needed):
+
+```bash
+export RCH_OTEL_ENABLED=1
+# Preferred RCH-specific endpoint var; falls back to the OTel standard
+# OTEL_EXPORTER_OTLP_ENDPOINT if unset.
+export RCH_OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4317"
+export OTEL_SERVICE_NAME="rch"               # resource service.name (default: rch)
+export RCH_OTEL_EXPORT_INTERVAL_SECS=30      # periodic push cadence (default: 30)
+```
+
+Behavior:
+- Export activates only when **both** `RCH_OTEL_ENABLED` is truthy **and** an
+  endpoint is set. Otherwise the pipeline stays off (Prometheus-only).
+- Fail-open: if the exporter cannot be built (bad endpoint, missing runtime),
+  RCH logs `otlp.exporter.build_failed` and continues with Prometheus only.
+- Histogram bucket boundaries match the Prometheus definitions
+  (hook hot-path buckets stay sub-millisecond).
+
 ### StatsD/DataDog
 
 ```toml
@@ -173,6 +232,58 @@ curl -X POST "http://metrics.example.com/api/v1/push" \
 webhook_url = "https://hooks.slack.com/services/..."
 alert_on = ["daemon_down", "circuit_open", "all_workers_down"]
 ```
+
+### Reliability Verdict Webhooks
+
+`rch doctor --reliability --watch` continuously re-runs the reliability
+probe suite and computes a tri-state verdict (`Healthy` / `Degraded` /
+`Failing`). Configure first-class webhooks to fire the moment the verdict
+*transitions*, so an on-call engineer is paged within ~50ms instead of
+waiting on a log-shipper pipeline.
+
+```toml
+# ~/.config/rch/config.toml
+[doctor.webhooks]
+# Bound on concurrent in-flight deliveries (shared across endpoints).
+# When exhausted, a delivery is dropped and journaled rather than queued
+# unboundedly.
+max_inflight = 16
+
+[[doctor.webhooks.endpoints]]
+name = "ops-slack"
+url = "https://hooks.slack.com/services/T0/B0/..."
+format = "slack"                 # slack | pagerduty | generic_json
+on_transitions = ["healthy_to_degraded", "any_to_failing", "failing_to_healthy"]
+retry_max = 3
+retry_backoff_ms = 200           # doubles each retry (200, 400, 800, …)
+timeout_ms = 5000
+enabled = true
+# Optional HMAC-SHA256 signing. The named env var holds the secret; the
+# signature is sent as `X-RCH-Signature: sha256=<hex>`.
+signing_secret_env = "RCH_WEBHOOK_HMAC"
+
+[[doctor.webhooks.endpoints]]
+name = "pagerduty-critical"
+url = "https://events.pagerduty.com/v2/enqueue"
+format = "pagerduty"
+on_transitions = ["any_to_failing"]   # `resolve` auto-fires on any_to_healthy
+# Secrets are NEVER stored in config — only the NAME of the env var that
+# holds them is. The runtime reads it at dispatch time.
+routing_key_env = "RCH_PAGERDUTY_ROUTING_KEY"
+enabled = true
+```
+
+**Transition predicates** (`on_transitions`): `healthy_to_degraded`,
+`degraded_to_failing`, `any_to_failing`, `any_to_degraded`,
+`failing_to_healthy`, `degraded_to_healthy`, `any_to_healthy`,
+`any_to_any`. An empty list never fires; `enabled = false` is a
+per-endpoint kill switch. The implicit baseline for the first sweep is
+`Healthy`, so a watch session that starts in a bad state still pages.
+
+Every delivery attempt (and its outcome) is journaled to the
+`rch::doctor::webhook` tracing target for post-mortem audit. Webhook
+dispatch is fail-open: a misconfigured or unreachable endpoint never
+affects the watch loop's verdict or exit code.
 
 ### Email Alerts
 

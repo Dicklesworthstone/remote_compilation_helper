@@ -114,11 +114,14 @@ impl RollbackManager {
     }
 
     /// Create a rollback manager with a custom backup directory (for testing).
+    /// The deploy/provenance history is isolated to a `history/` subdir so tests
+    /// stay hermetic — the rollback-audit emission (bd-...-7.4) never touches the
+    /// real provenance trail.
     #[cfg(test)]
     pub fn with_path(backup_dir: &std::path::Path) -> Result<Self> {
         std::fs::create_dir_all(backup_dir)?;
         Ok(Self {
-            history: HistoryManager::new()?,
+            history: HistoryManager::with_dir(backup_dir.join("history"))?,
             backup_dir: backup_dir.to_path_buf(),
         })
     }
@@ -396,12 +399,15 @@ impl RollbackManager {
         let completed = Arc::new(AtomicUsize::new(0));
         let total = workers.len();
 
-        // Phase 2: Execute rollbacks in parallel with bounded concurrency
-        let results: Vec<(usize, RollbackResult)> = stream::iter(rollback_tasks)
+        // Phase 2: Execute rollbacks in parallel with bounded concurrency. Each
+        // task is timed so the provenance audit record carries the rollback
+        // duration (bd-session-history-remediation-ocv9i.7.4).
+        let results: Vec<(usize, RollbackResult, u64)> = stream::iter(rollback_tasks)
             .map(|(idx, worker, backup_opt)| {
                 let completed = completed.clone();
 
                 async move {
+                    let started = std::time::Instant::now();
                     let result = match backup_opt {
                         Some((backup, target_version)) => {
                             execute_single_rollback(worker, &backup, &target_version, verify, ctx)
@@ -417,6 +423,8 @@ impl RollbackManager {
                             ),
                         },
                     };
+                    let duration_ms =
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
                     // Update progress
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -427,19 +435,32 @@ impl RollbackManager {
                         "Worker rollback complete"
                     );
 
-                    (idx, result)
+                    (idx, result, duration_ms)
                 }
             })
             .buffer_unordered(max_concurrent)
             .collect()
             .await;
 
-        // Sort by original index to preserve order
-        let results: Vec<RollbackResult> = {
-            let mut sorted = results;
-            sorted.sort_by_key(|(idx, _)| *idx);
-            sorted.into_iter().map(|(_, result)| result).collect()
-        };
+        // Sort by original index to preserve order.
+        let mut sorted = results;
+        sorted.sort_by_key(|(idx, _, _)| *idx);
+
+        // Append a provenance audit row per worker (bd-...-7.4): flag each
+        // worker's most recent deploy audit record rolled-back / rollback-failed
+        // and re-persist it, preserving the artifact identity, remote user/path,
+        // verification result, and trigger the rollback-history spec requires.
+        for (_, result, duration_ms) in &sorted {
+            record_rollback_audit(
+                &self.history,
+                &result.worker_id,
+                result.success,
+                *duration_ms,
+            );
+        }
+
+        let results: Vec<RollbackResult> =
+            sorted.into_iter().map(|(_, result, _)| result).collect();
 
         // Log summary
         let success_count = results.iter().filter(|r| r.success).count();
@@ -661,6 +682,60 @@ impl RollbackManager {
 // =============================================================================
 // Standalone Functions (for use in async parallel execution)
 // =============================================================================
+
+/// Append a rollback entry to the provenance audit trail
+/// (bd-session-history-remediation-ocv9i.7.4).
+///
+/// Loads the worker's most recent deploy provenance audit record, flags it
+/// rolled-back (`success`) or rollback-failed (degraded — needs operator
+/// attention), stamps the rollback duration, and re-persists it. This
+/// mutate-and-re-append design preserves the original deploy's artifact identity,
+/// remote user/path, verification result, and operator/remediation trigger — the
+/// rollback-history fields the bead requires — while recording the rollback
+/// outcome. When no prior deploy audit record exists (the deploy predates
+/// provenance auditing), the rollback still happens; it simply leaves no
+/// provenance row to flag, which is logged rather than fabricated.
+fn record_rollback_audit(
+    history: &HistoryManager,
+    worker_id: &str,
+    success: bool,
+    duration_ms: u64,
+) {
+    // Newest-first, capped at 1 -> 0 or 1 record.
+    let latest = match history.get_provenance_audit(1, Some(worker_id)) {
+        Ok(mut records) => records.pop(),
+        Err(e) => {
+            debug!(
+                worker = %worker_id,
+                error = %e,
+                "Could not read provenance audit trail to record rollback"
+            );
+            return;
+        }
+    };
+    let Some(mut record) = latest else {
+        debug!(
+            worker = %worker_id,
+            "No prior deploy audit record to flag for rollback (deploy predates provenance auditing)"
+        );
+        return;
+    };
+
+    if success {
+        record.mark_rolled_back();
+    } else {
+        record.mark_rollback_failed();
+    }
+    record.set_duration_ms(duration_ms);
+
+    if let Err(e) = history.record_provenance_audit(&record) {
+        warn!(
+            worker = %worker_id,
+            error = %e,
+            "Failed to append rollback provenance audit record"
+        );
+    }
+}
 
 /// Execute a rollback for a single worker.
 ///
@@ -1685,6 +1760,136 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(!results[0].success);
         assert!(results[0].rolled_back_to.is_none());
+    }
+
+    // bd-session-history-remediation-ocv9i.7.4 — rollback audit trail.
+
+    fn seed_deploy_audit(manager: &RollbackManager, worker: &str) -> String {
+        use rch_common::fleet_provenance::{
+            ArtifactProvenance, FleetDeployAuditRecord, ProvenancePolicy, SignatureCheck,
+            verify_artifact_provenance,
+        };
+        let triple = "x86_64-unknown-linux-gnu";
+        let p = ArtifactProvenance::dev_artifact("rch-wkr", triple);
+        let verdict = verify_artifact_provenance(
+            &p,
+            triple,
+            None,
+            SignatureCheck::Absent,
+            &ProvenancePolicy::dev_friendly(),
+        );
+        let rec = FleetDeployAuditRecord::from_verdict(
+            "run-7",
+            "bd-session-history-remediation-ocv9i.7.4",
+            worker,
+            "rch",
+            "/home/rch/.local/bin/rch-wkr",
+            &p,
+            None,
+            1000,
+            &verdict,
+            "operator",
+            "deploy",
+        );
+        manager.history.record_provenance_audit(&rec).unwrap();
+        verdict.verification_status().to_string()
+    }
+
+    #[tokio::test]
+    async fn rollback_audit_flags_record_rolled_back_on_success() {
+        use rch_common::fleet_provenance::rollback_status;
+        let temp = tempfile::tempdir().unwrap();
+        let manager = RollbackManager::with_path(temp.path()).unwrap();
+        let verification = seed_deploy_audit(&manager, "css");
+
+        // Simulate a successful rollback's audit emission.
+        record_rollback_audit(&manager.history, "css", true, 4200);
+
+        let after = manager
+            .history
+            .get_provenance_audit(10, Some("css"))
+            .unwrap();
+        let rolled = after
+            .iter()
+            .find(|r| r.rollback_status == rollback_status::ROLLED_BACK)
+            .expect("a rolled_back audit record");
+        assert_eq!(rolled.duration_ms, 4200);
+        // The mutate-and-re-append preserves the original deploy context.
+        assert_eq!(rolled.worker_id, "css");
+        assert_eq!(rolled.remote_user, "rch");
+        assert_eq!(rolled.trigger, "operator");
+        assert_eq!(rolled.verification_status, verification);
+    }
+
+    #[tokio::test]
+    async fn rollback_audit_flags_record_rollback_failed_on_failure() {
+        use rch_common::fleet_provenance::rollback_status;
+        let temp = tempfile::tempdir().unwrap();
+        let manager = RollbackManager::with_path(temp.path()).unwrap();
+        seed_deploy_audit(&manager, "css");
+
+        // A failed rollback flags the record degraded (operator attention).
+        record_rollback_audit(&manager.history, "css", false, 7);
+
+        let after = manager
+            .history
+            .get_provenance_audit(10, Some("css"))
+            .unwrap();
+        let failed = after
+            .iter()
+            .find(|r| r.rollback_status == rollback_status::ROLLBACK_FAILED)
+            .expect("a rollback_failed audit record");
+        assert_eq!(failed.duration_ms, 7);
+        assert_eq!(failed.worker_id, "css");
+    }
+
+    #[tokio::test]
+    async fn rollback_audit_noop_without_prior_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = RollbackManager::with_path(temp.path()).unwrap();
+        // No seeded deploy record -> nothing to flag, no panic, no write.
+        record_rollback_audit(&manager.history, "ghost", true, 10);
+        let after = manager
+            .history
+            .get_provenance_audit(10, Some("ghost"))
+            .unwrap();
+        assert!(after.is_empty());
+    }
+
+    // The full rollback_workers path actually emits the audit row (the wiring).
+    // Outcome-agnostic: in the test harness the mock host's SSH may succeed or
+    // fail, so we only assert the seeded record was flagged (no longer `none`) —
+    // the per-outcome rolled_back/rollback_failed mapping is covered by the two
+    // direct tests above.
+    #[tokio::test]
+    async fn rollback_workers_emits_audit_record() {
+        use crate::ui::test_utils::OutputCapture;
+        use rch_common::fleet_provenance::rollback_status;
+        let temp = tempfile::tempdir().unwrap();
+        let manager = RollbackManager::with_path(temp.path()).unwrap();
+        let worker = mock_worker("css");
+        let backup = mock_backup_with_hash("css", "1.0.0", 1000, "abc123");
+        manager.save_backup_entry(&backup).unwrap();
+        seed_deploy_audit(&manager, "css");
+
+        let capture = OutputCapture::json();
+        let ctx = capture.context();
+        let results = manager
+            .rollback_workers(&[&worker], Some("1.0.0"), 4, false, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        let after = manager
+            .history
+            .get_provenance_audit(10, Some("css"))
+            .unwrap();
+        assert!(
+            after
+                .iter()
+                .any(|r| r.rollback_status != rollback_status::NONE),
+            "rollback_workers must flag the worker's audit record"
+        );
     }
 
     #[tokio::test]

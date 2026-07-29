@@ -13,15 +13,6 @@ use crate::status_types::{DaemonFullStatusResponse, extract_json_body, format_du
 use crate::ui::theme::Theme;
 use anyhow::{Context, Result};
 use std::io::Write;
-use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::UnixStream;
-
-/// Default daemon socket path.
-fn default_socket_path() -> PathBuf {
-    PathBuf::from(rch_common::default_socket_path())
-}
 
 /// Format milliseconds as human-readable duration.
 fn format_duration_ms(ms: u64) -> String {
@@ -72,55 +63,14 @@ async fn send_status_command() -> Result<String> {
 
 #[cfg(unix)]
 async fn send_status_command() -> Result<String> {
-    let stream = UnixStream::connect(default_socket_path())
-        .await
-        .context("Failed to connect to daemon socket")?;
-
-    let (reader, mut writer) = stream.into_split();
-
-    writer.write_all(b"GET /status\n").await?;
-    writer.flush().await?;
-    writer.shutdown().await?;
-
-    let mut buf_reader = BufReader::new(reader);
-    let mut response = String::new();
-
-    loop {
-        let mut line = String::new();
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => response.push_str(&line),
-            Err(e) => return Err(e.into()),
-        }
-    }
-
-    Ok(response)
+    crate::commands::send_daemon_command("GET /status\n").await
 }
 
 /// Send a worker drain command to the daemon.
 #[cfg(unix)]
 pub async fn drain_worker(worker_id: &str) -> Result<()> {
-    let stream = UnixStream::connect(default_socket_path())
-        .await
-        .context("Failed to connect to daemon socket")?;
-
-    let (reader, mut writer) = stream.into_split();
-    let command = format!("POST /workers/{}/drain\n", worker_id);
-    writer.write_all(command.as_bytes()).await?;
-    writer.flush().await?;
-    writer.shutdown().await?;
-
-    let mut buf_reader = BufReader::new(reader);
-    let mut response = String::new();
-
-    loop {
-        let mut line = String::new();
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => response.push_str(&line),
-            Err(e) => return Err(e.into()),
-        }
-    }
+    let command = format!("POST /workers/{}/drain\n", urlencoding::encode(worker_id));
+    let response = crate::commands::send_daemon_command(&command).await?;
 
     // Check if response indicates success
     if response.contains("\"status\":\"ok\"") {
@@ -144,27 +94,8 @@ pub async fn drain_worker(_worker_id: &str) -> Result<()> {
 /// Send a worker enable command to the daemon.
 #[cfg(unix)]
 pub async fn enable_worker(worker_id: &str) -> Result<()> {
-    let stream = UnixStream::connect(default_socket_path())
-        .await
-        .context("Failed to connect to daemon socket")?;
-
-    let (reader, mut writer) = stream.into_split();
-    let command = format!("POST /workers/{}/enable\n", worker_id);
-    writer.write_all(command.as_bytes()).await?;
-    writer.flush().await?;
-    writer.shutdown().await?;
-
-    let mut buf_reader = BufReader::new(reader);
-    let mut response = String::new();
-
-    loop {
-        let mut line = String::new();
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => response.push_str(&line),
-            Err(e) => return Err(e.into()),
-        }
-    }
+    let command = format!("POST /workers/{}/enable\n", urlencoding::encode(worker_id));
+    let response = crate::commands::send_daemon_command(&command).await?;
 
     // Check if response indicates success
     if response.contains("\"status\":\"ok\"") {
@@ -188,27 +119,8 @@ pub async fn enable_worker(_worker_id: &str) -> Result<()> {
 /// Cancel a build via the daemon (SIGTERM).
 #[cfg(unix)]
 pub async fn cancel_build(build_id: &str) -> Result<()> {
-    let stream = UnixStream::connect(default_socket_path())
-        .await
-        .context("Failed to connect to daemon socket")?;
-
-    let (reader, mut writer) = stream.into_split();
     let command = format!("POST /builds/{}/cancel\n", build_id);
-    writer.write_all(command.as_bytes()).await?;
-    writer.flush().await?;
-    writer.shutdown().await?;
-
-    let mut buf_reader = BufReader::new(reader);
-    let mut response = String::new();
-
-    loop {
-        let mut line = String::new();
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => response.push_str(&line),
-            Err(e) => return Err(e.into()),
-        }
-    }
+    let response = crate::commands::send_daemon_command(&command).await?;
 
     if response.contains("\"status\":\"ok\"") {
         Ok(())
@@ -231,27 +143,8 @@ pub async fn cancel_build(_build_id: &str) -> Result<()> {
 /// Force kill a build via the daemon (SIGKILL).
 #[cfg(unix)]
 pub async fn force_kill_build(build_id: &str) -> Result<()> {
-    let stream = UnixStream::connect(default_socket_path())
-        .await
-        .context("Failed to connect to daemon socket")?;
-
-    let (reader, mut writer) = stream.into_split();
     let command = format!("POST /builds/{}/cancel?force=true\n", build_id);
-    writer.write_all(command.as_bytes()).await?;
-    writer.flush().await?;
-    writer.shutdown().await?;
-
-    let mut buf_reader = BufReader::new(reader);
-    let mut response = String::new();
-
-    loop {
-        let mut line = String::new();
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => response.push_str(&line),
-            Err(e) => return Err(e.into()),
-        }
-    }
+    let response = crate::commands::send_daemon_command(&command).await?;
 
     if response.contains("\"status\":\"ok\"") {
         Ok(())
@@ -611,6 +504,212 @@ fn render_workers_table_to<W: Write>(
             && pressure != "healthy"
         {
             render_pressure_details_to(out, worker, style)?;
+        }
+
+        // Show temporary-bypass info for transiently-quarantined workers.
+        if let Some(ref bypass) = worker.bypass {
+            render_bypass_details_to(out, bypass, style)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Render temporary-bypass details for a worker quarantined on the transient
+/// eligibility axis (bd-session-history-remediation-ocv9i.1.2).
+fn render_bypass_details_to<W: Write>(
+    out: &mut W,
+    bypass: &rch_common::BypassRecord,
+    style: &Theme,
+) -> std::io::Result<()> {
+    let state = style.warning(bypass.state.label());
+    writeln!(
+        out,
+        "    {} {} — {} ({}); consec fail {}",
+        style.muted("Bypass:"),
+        state,
+        bypass.failure_class.label(),
+        bypass.reason_code.code(),
+        bypass.consecutive_failures,
+    )?;
+    if !bypass.last_diagnostic.is_empty() {
+        writeln!(out, "      {} {}", style.muted("↳"), bypass.last_diagnostic)?;
+    }
+    Ok(())
+}
+
+/// Render the fleet-wide status report: ready count, dominant problem class,
+/// per-state worker grouping, and absence alerts
+/// (bd-session-history-remediation-ocv9i.2.2).
+pub fn render_fleet_status(report: &rch_common::fleet_status::FleetStatusReport, style: &Theme) {
+    let mut out = Vec::new();
+    // Writing to a Vec<u8> is infallible; fall back to nothing on the impossible
+    // error so a render never panics.
+    if render_fleet_status_to(&mut out, report, style).is_ok() {
+        print!("{}", String::from_utf8_lossy(&out));
+    }
+}
+
+fn render_fleet_status_to<W: Write>(
+    out: &mut W,
+    report: &rch_common::fleet_status::FleetStatusReport,
+    style: &Theme,
+) -> std::io::Result<()> {
+    use std::collections::BTreeMap;
+
+    writeln!(out, "{}", style.format_header("Fleet Status"))?;
+    writeln!(out)?;
+
+    let total = report.diff.workers.len();
+    writeln!(
+        out,
+        "  {} {}/{}",
+        style.muted("Ready:"),
+        report.diff.ready_workers,
+        total
+    )?;
+    let problem = if report.problem_class.as_str() == "healthy" {
+        style.success(report.problem_class.label())
+    } else {
+        style.warning(report.problem_class.label())
+    };
+    writeln!(out, "  {} {}", style.muted("Problem:"), problem)?;
+    writeln!(
+        out,
+        "  {} {}",
+        style.muted("Summary:"),
+        report.problem_summary
+    )?;
+
+    if !report.diff.workers.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "{}", style.format_header("Workers by state"))?;
+        // Group worker ids by diff state (BTreeMap keeps output deterministic).
+        let mut groups: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for row in &report.diff.workers {
+            groups
+                .entry(row.state.as_str())
+                .or_default()
+                .push(row.worker_id.as_str());
+        }
+        for (state, ids) in &groups {
+            writeln!(
+                out,
+                "  {} ({}): {}",
+                style.highlight(state),
+                ids.len(),
+                style.muted(&ids.join(", "))
+            )?;
+        }
+    }
+
+    if report.has_absence_warnings() {
+        writeln!(out)?;
+        writeln!(out, "{}", style.format_header("Absence alerts"))?;
+        for alert in &report.absence_alerts {
+            writeln!(
+                out,
+                "  {} {} absent {}s as {} (> {}s window)",
+                style.warning("⚠"),
+                style.highlight(&alert.worker_id),
+                alert.absent_secs,
+                alert.state.as_str(),
+                alert.threshold_secs,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Render the operator-facing remediation view: compact status bands tagged
+/// operator-action / self-healing / normal fail-open
+/// (bd-session-history-remediation-ocv9i.14.4).
+pub fn render_remediation_view(
+    view: &rch_common::remediation_view::RemediationView,
+    style: &Theme,
+) {
+    let mut out = Vec::new();
+    if render_remediation_view_to(&mut out, view, style).is_ok() {
+        print!("{}", String::from_utf8_lossy(&out));
+    }
+}
+
+fn render_remediation_view_to<W: Write>(
+    out: &mut W,
+    view: &rch_common::remediation_view::RemediationView,
+    style: &Theme,
+) -> std::io::Result<()> {
+    use rch_common::remediation_view::{BandSeverity, RemediationActionClass};
+
+    // Colorize an action-class label by severity.
+    let class_str = |class: RemediationActionClass, text: &str| match class {
+        RemediationActionClass::Healthy => style.success(text),
+        RemediationActionClass::NormalFailOpen => style.muted(text),
+        RemediationActionClass::SelfHealingInProgress => style.info(text),
+        RemediationActionClass::OperatorActionRequired => style.error(text),
+    };
+    let sev_bullet = |sev: BandSeverity| match sev {
+        BandSeverity::Ok => style.success("●"),
+        BandSeverity::Info => style.info("●"),
+        BandSeverity::Warn => style.warning("●"),
+        BandSeverity::Critical => style.error("●"),
+    };
+
+    writeln!(out, "{}", style.format_header("Remediation"))?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "  {} {}",
+        style.muted("Overall:"),
+        class_str(view.overall, view.overall.label())
+    )?;
+    writeln!(
+        out,
+        "  {}",
+        style.muted("operator-action  vs  self-healing  vs  normal fail-open")
+    )?;
+    writeln!(out)?;
+
+    for band in &view.bands {
+        let tag = match band.action_class {
+            RemediationActionClass::Healthy => "OK",
+            RemediationActionClass::NormalFailOpen => "FAIL-OPEN",
+            RemediationActionClass::SelfHealingInProgress => "HEALING",
+            RemediationActionClass::OperatorActionRequired => "ACTION",
+        };
+        writeln!(
+            out,
+            "  {} {:<20} {}  {}",
+            sev_bullet(band.severity),
+            style.value(&band.title),
+            band.headline,
+            class_str(band.action_class, &format!("[{tag}]")),
+        )?;
+        for detail in &band.detail_lines {
+            writeln!(out, "      {}", style.muted(detail))?;
+        }
+    }
+
+    writeln!(out)?;
+    if view.incidents.is_empty() {
+        writeln!(out, "  {}", style.success("Recent incidents: none"))?;
+    } else {
+        writeln!(out, "{}", style.format_header("Recent incidents"))?;
+        for inc in view.incidents.iter().take(5) {
+            let who = inc
+                .worker_id
+                .as_deref()
+                .map_or(String::new(), |w| format!(" [{w}]"));
+            writeln!(
+                out,
+                "  {} {}{} — {} ({}s ago)",
+                style.key(&inc.reason_code),
+                inc.event_type,
+                who,
+                inc.summary,
+                inc.age_secs
+            )?;
         }
     }
 
@@ -1202,6 +1301,14 @@ mod tests {
     use rch_common::test_guard;
     use tracing::info;
 
+    struct ConfigOverrideReset;
+
+    impl Drop for ConfigOverrideReset {
+        fn drop(&mut self) {
+            crate::config::set_test_config_override(None);
+        }
+    }
+
     fn sample_status() -> DaemonFullStatusResponse {
         DaemonFullStatusResponse {
             daemon: DaemonInfoFromApi {
@@ -1240,6 +1347,7 @@ mod tests {
                     pressure_memory_pressure: None,
                     pressure_telemetry_age_secs: None,
                     pressure_telemetry_fresh: None,
+                    bypass: None,
                 },
                 WorkerStatusFromApi {
                     id: "worker-b".to_string(),
@@ -1265,6 +1373,7 @@ mod tests {
                     pressure_memory_pressure: None,
                     pressure_telemetry_age_secs: None,
                     pressure_telemetry_fresh: None,
+                    bypass: None,
                 },
             ],
             active_builds: vec![ActiveBuildFromApi {
@@ -1344,7 +1453,54 @@ mod tests {
                 runs_by_kind: std::collections::HashMap::from([("cargo_test".to_string(), 3)]),
             }),
             saved_time: None,
+            remediation: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn query_daemon_full_status_uses_configured_socket_path() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp_dir.path().join("custom-rch.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind custom socket");
+
+        let mut config = rch_common::RchConfig::default();
+        config.general.socket_path = socket_path.display().to_string();
+        crate::config::set_test_config_override(Some(config));
+        let _reset = ConfigOverrideReset;
+
+        let mut expected = sample_status();
+        expected.daemon.version = "configured-socket-test".to_string();
+        let response_body = serde_json::to_string(&expected).expect("serialize status");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            assert_eq!(line, "GET /status\n");
+
+            let response = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{}\n",
+                response_body
+            );
+            writer
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let status = query_daemon_full_status()
+            .await
+            .expect("query configured daemon status");
+
+        server.await.expect("server task");
+        assert_eq!(status.daemon.version, "configured-socket-test");
     }
 
     #[test]

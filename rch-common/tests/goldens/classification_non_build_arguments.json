@@ -1,0 +1,35 @@
+{
+  "schema_version": "rch.golden.classification_non_build_arguments.v1",
+  "stability": {
+    "deterministic": true,
+    "platform_dependent": false,
+    "volatility": 1,
+    "strategy": "exact"
+  },
+  "cases": [
+    {
+      "name": "beads_comment_mentions_test_command",
+      "command": "br comments add ft-4tp7g.1 \"remote proof blocked: cargo test -p rchd --lib\"",
+      "expected_is_compilation": false,
+      "expected_reason": "no compilation keyword"
+    },
+    {
+      "name": "agent_prefixed_beads_comment_mentions_clippy",
+      "command": "AGENT_NAME=Codex br comments add ft-4tp7g.1 \"proof lane: cargo clippy --workspace\"",
+      "expected_is_compilation": false,
+      "expected_reason": "no compilation keyword"
+    },
+    {
+      "name": "printf_mentions_build_command",
+      "command": "printf \"cargo build --release\"",
+      "expected_is_compilation": false,
+      "expected_reason": "no compilation keyword"
+    },
+    {
+      "name": "grep_mentions_cmake_build",
+      "command": "grep \"cmake --build\" docs/proof-notes.md",
+      "expected_is_compilation": false,
+      "expected_reason": "no compilation keyword"
+    }
+  ]
+}

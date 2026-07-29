@@ -10,6 +10,7 @@ use rch_common::{
     ToolchainInfo, WorkerId,
 };
 use std::io::Read;
+use std::path::PathBuf;
 
 /// Run the PreToolUse hook.
 ///
@@ -27,7 +28,16 @@ pub async fn run_hook() -> anyhow::Result<()> {
 ///
 /// On non-Unix platforms we do not support daemon-based offloading, so `rch exec`
 /// simply runs the provided command via the local shell.
-pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
+pub async fn run_exec(
+    base: Option<String>,
+    clean_overlay: bool,
+    overlay_paths: Vec<PathBuf>,
+    no_overlay: bool,
+    command_parts: Vec<String>,
+) -> anyhow::Result<()> {
+    if clean_overlay || base.is_some() || !overlay_paths.is_empty() || no_overlay {
+        anyhow::bail!("clean-overlay remote execution is not supported on non-Unix clients");
+    }
     let command = command_parts.join(" ");
     if command.is_empty() {
         anyhow::bail!("No command provided to exec");
@@ -91,7 +101,31 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
             | CompilationKind::CargoBench
             | CompilationKind::Rustc => RequiredRuntime::Rust,
 
+            // Mirror the Unix hook (hook.rs): a zig cross-build needs its own
+            // runtime gate so selection requires `has_zig()` (cargo-zigbuild +
+            // zig). `RequiredRuntime::Rust` alone would admit a worker that
+            // fails with `error: no such command: 'zigbuild'`.
+            CompilationKind::CargoZigbuild => RequiredRuntime::Zig,
+
             CompilationKind::BunTest | CompilationKind::BunTypecheck => RequiredRuntime::Bun,
+
+            // Mirror the Unix hook (hook.rs): a nix build must carry the Nix
+            // runtime so worker selection gates it to a nix-capable worker via
+            // `has_nix()`. Without this, a nix build offloaded from a Windows
+            // client fell through to `None` and could be dispatched to a
+            // non-nix worker (where it would fail) instead of being gated.
+            CompilationKind::NixBuild => RequiredRuntime::Nix,
+
+            // Go builds/tests/vets must carry the Go runtime so worker selection
+            // gates them to a go-capable worker via `has_go()`. Falling through to
+            // the `_ => None` catch-all would disable capability gating entirely and
+            // dispatch `go build` to a worker with no Go toolchain.
+            CompilationKind::GoBuild | CompilationKind::GoTest | CompilationKind::GoVet => {
+                RequiredRuntime::Go
+            }
+
+            // `tsc` / `npx tsc` run under Node.
+            CompilationKind::Tsc => RequiredRuntime::Node,
 
             _ => RequiredRuntime::None,
         },

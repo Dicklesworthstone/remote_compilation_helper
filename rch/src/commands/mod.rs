@@ -17,8 +17,10 @@ mod helpers;
 mod hook;
 mod init;
 mod queue;
+mod shim;
 mod speedscore;
 mod status;
+mod sync;
 pub mod types;
 mod workers;
 mod workers_deploy;
@@ -33,22 +35,26 @@ pub use daemon::{
 // Re-export hook commands for backward compatibility
 pub use hook::{hook_install, hook_status, hook_test, hook_uninstall};
 
+// Re-export cargo-shim commands
+pub use shim::{shim_install, shim_status, shim_uninstall};
+
 // Re-export status/diagnostics commands for backward compatibility
-pub use status::{check, diagnose, self_test, status_overview};
+pub use status::{admit, check, diagnose, self_test, status_overview};
 
 // Re-export queue/cancel commands for backward compatibility
 pub use queue::{cancel_build, queue_status};
 
 // Re-export workers commands for backward compatibility
 pub use workers::{
-    workers_benchmark, workers_capabilities, workers_disable, workers_drain, workers_enable,
-    workers_list, workers_probe,
+    workers_benchmark_filtered, workers_capabilities, workers_compare, workers_disable,
+    workers_drain, workers_enable, workers_list, workers_probe,
 };
 
 // Re-export agents commands for backward compatibility
 pub use agents::{agents_install_hook, agents_list, agents_status, agents_uninstall_hook};
 
 // Re-export config commands for backward compatibility
+pub(crate) use config::{apply_config_set, default_config_path};
 pub use config::{
     config_diff, config_edit, config_export, config_get, config_lint, config_reset, config_set,
     config_show, config_validate,
@@ -58,6 +64,9 @@ pub use config_init::config_init;
 
 // Re-export speedscore command for backward compatibility
 pub use speedscore::speedscore;
+
+// Re-export force-resync sync command (bd-apg5l)
+pub use sync::sync_force;
 
 // Re-export workers init/discover commands for backward compatibility
 pub use workers_init::{workers_discover, workers_init};
@@ -145,8 +154,8 @@ async fn query_daemon_health(socket_path: &str) -> Result<DaemonHealthResponse> 
 
 // NOTE: build_dry_run_summary and diagnose moved to status.rs
 
-// Re-export send_daemon_command from helpers (single source of truth)
-pub(crate) use helpers::send_daemon_command;
+// Re-export daemon IPC helpers from helpers (single source of truth)
+pub(crate) use helpers::{configured_socket_path, send_daemon_command};
 
 // =============================================================================
 // Unit Tests
@@ -159,20 +168,52 @@ mod tests {
         major_version, major_version_mismatch, runtime_label, rust_version_mismatch,
         urlencoding_encode,
     };
-    use super::status::{build_diagnose_decision, build_dry_run_summary};
+    use super::status::{
+        build_diagnose_decision, build_diagnose_slot_estimate, build_dry_run_summary,
+    };
     use super::workers::{
-        collect_local_capability_warnings, has_any_capabilities, summarize_capabilities,
+        collect_local_capability_warnings, collect_refresh_warnings, has_any_capabilities,
+        summarize_capabilities,
     };
     use super::*;
-    use crate::status_types::{WorkerCapabilitiesFromApi, format_bytes};
+    use crate::status_types::{
+        WorkerCapabilitiesFromApi, WorkerCapabilitiesRefreshFromApi, format_bytes,
+    };
     use crate::ui::context::{OutputConfig, OutputContext, OutputMode};
     use crate::ui::writer::SharedOutputBuffer;
     use rch_common::test_guard;
     use rch_common::{ApiError, ApiResponse, ErrorCode, WorkerCapabilities, WorkerConfig};
     use rch_common::{Classification, CompilationKind, RequiredRuntime, WorkerId};
-    use rch_common::{SelectedWorker, SelectionReason};
+    use rch_common::{
+        SelectedWorker, SelectionDiagnostics, SelectionReason, WorkerSelectionDiagnostic,
+        WorkerSelectionDiagnosticDecision,
+    };
     use serde::Serialize;
     use std::path::PathBuf;
+
+    fn assert_golden_json(
+        actual: serde_json::Value,
+        expected: &serde_json::Value,
+        fixture_path: &str,
+    ) {
+        if &actual == expected {
+            return;
+        }
+
+        let actual_json = serde_json::to_string_pretty(&actual).expect("actual JSON renders");
+        let expected_json = serde_json::to_string_pretty(expected).expect("expected JSON renders");
+        panic!(
+            "golden mismatch in {fixture_path}\n\
+             expected_blake3={}\n\
+             actual_blake3={}\n\
+             bless path: review the semantic diff, update the fixture expected_* field, \
+             and record both hashes in the Beads closeout.\n\
+             expected:\n{expected_json}\n\
+             actual:\n{actual_json}",
+            blake3::hash(expected_json.as_bytes()),
+            blake3::hash(actual_json.as_bytes())
+        );
+    }
 
     struct TestConfigDirGuard;
 
@@ -590,6 +631,7 @@ mod tests {
             compilation: ConfigCompilationSection {
                 confidence_threshold: 0.85,
                 min_local_time_ms: 2000,
+                remote_speedup_threshold: 1.2,
                 build_slots: 4,
                 test_slots: 8,
                 check_slots: 2,
@@ -597,6 +639,7 @@ mod tests {
                 test_timeout_sec: 1800,
                 bun_timeout_sec: 600,
                 external_timeout_enabled: true,
+                allow_local_fallback: true,
             },
             transfer: ConfigTransferSection {
                 compression_level: 3,
@@ -780,6 +823,7 @@ mod tests {
             local_capabilities: None,
             capabilities_warnings: Vec::new(),
             worker_selection: None,
+            placement: rch_common::resolve_placement(|_| None),
             dry_run: None,
         };
 
@@ -787,6 +831,42 @@ mod tests {
         assert_eq!(json["command"], "cargo build");
         assert_eq!(json["classification"]["confidence"], 0.95);
         assert_eq!(json["threshold"]["value"], 0.85);
+    }
+
+    #[test]
+    fn diagnose_slot_estimate_honors_cargo_test_jobs() {
+        let _guard = test_guard!();
+        let config = rch_common::CompilationConfig {
+            build_slots: 6,
+            test_slots: 10,
+            check_slots: 3,
+            ..Default::default()
+        };
+
+        let (estimated_cores, cargo_jobs) = build_diagnose_slot_estimate(
+            Some(CompilationKind::CargoTest),
+            "cargo test -j 1 -p frankenterm-core-replay-types -- --nocapture",
+            &config,
+        );
+
+        assert_eq!(estimated_cores, 1);
+        assert_eq!(cargo_jobs, Some(1));
+    }
+
+    #[test]
+    fn diagnose_worker_selection_serializes_cargo_jobs() {
+        let _guard = test_guard!();
+        let worker_selection = DiagnoseWorkerSelection {
+            estimated_cores: 1,
+            cargo_jobs: Some(1),
+            worker: None,
+            reason: SelectionReason::NoAdmissibleWorkers("insufficient_slots=1".to_string()),
+            diagnostics: None,
+        };
+
+        let json = serde_json::to_value(&worker_selection).unwrap();
+        assert_eq!(json["estimated_cores"], 1);
+        assert_eq!(json["cargo_jobs"], 1);
     }
 
     #[test]
@@ -826,6 +906,7 @@ mod tests {
                 host: "host".to_string(),
                 user: "user".to_string(),
                 capabilities: WorkerCapabilities::new(),
+                refresh: None,
             },
             WorkerCapabilitiesFromApi {
                 id: "w-old".to_string(),
@@ -838,11 +919,34 @@ mod tests {
                     npm_version: None,
                     ..Default::default()
                 },
+                refresh: None,
             },
         ];
         let warnings = collect_local_capability_warnings(&workers, &local);
         assert!(warnings.iter().any(|w| w.contains("missing Rust runtime")));
         assert!(warnings.iter().any(|w| w.contains("Rust version mismatch")));
+    }
+
+    #[test]
+    fn refresh_warnings_include_cached_capability_snapshots() {
+        let _guard = test_guard!();
+        let workers = vec![WorkerCapabilitiesFromApi {
+            id: "slow-worker".to_string(),
+            host: "host".to_string(),
+            user: "user".to_string(),
+            capabilities: WorkerCapabilities::new(),
+            refresh: Some(WorkerCapabilitiesRefreshFromApi {
+                attempted: true,
+                live: false,
+                source: "cached_after_probe_failure".to_string(),
+                message: Some("probe timed out".to_string()),
+            }),
+        }];
+
+        let warnings = collect_refresh_warnings(&workers);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("slow-worker"));
+        assert!(warnings[0].contains("probe timed out"));
     }
 
     #[test]
@@ -1005,10 +1109,8 @@ mod tests {
             &None,
             false, // daemon not reachable
         );
-        // With no worker selection and daemon not reachable, would_offload is still true
-        // because the function returns optimistic summary
-        assert!(summary.would_offload);
-        assert!(summary.reason.contains("worker available"));
+        assert!(!summary.would_offload);
+        assert!(summary.reason.contains("daemon is not reachable"));
         // Intercepted commands have 6 pipeline steps
         assert_eq!(summary.pipeline_steps.len(), 6);
         // Classification step should run
@@ -1017,6 +1119,18 @@ mod tests {
         // Daemon query should be skipped (daemon not reachable)
         assert!(summary.pipeline_steps[1].skipped);
         assert_eq!(summary.pipeline_steps[1].name, "Daemon query");
+        assert!(summary.pipeline_steps[2].skipped);
+        assert!(summary.pipeline_steps[3].skipped);
+        assert!(summary.pipeline_steps[4].skipped);
+        assert!(summary.pipeline_steps[5].skipped);
+        for step in &summary.pipeline_steps[2..] {
+            assert_eq!(
+                step.skip_reason.as_deref(),
+                Some("Daemon not reachable"),
+                "skipped step {} should explain the daemon gate",
+                step.name
+            );
+        }
     }
 
     #[test]
@@ -1032,8 +1146,10 @@ mod tests {
         };
         let worker_selection = DiagnoseWorkerSelection {
             estimated_cores: 4,
+            cargo_jobs: None,
             worker: Some(worker),
             reason: SelectionReason::Success,
+            diagnostics: None,
         };
         let summary = build_dry_run_summary(
             true,
@@ -1049,6 +1165,159 @@ mod tests {
         for step in &summary.pipeline_steps {
             assert!(!step.skipped, "Step {} should not be skipped", step.name);
         }
+    }
+
+    #[test]
+    fn dry_run_summary_intercepted_without_worker_reports_no_offload() {
+        let _guard = test_guard!();
+        let worker_selection = DiagnoseWorkerSelection {
+            estimated_cores: 4,
+            cargo_jobs: None,
+            worker: None,
+            reason: SelectionReason::NoAdmissibleWorkers("critical_pressure=1".to_string()),
+            diagnostics: None,
+        };
+        let summary = build_dry_run_summary(
+            true,
+            "meets confidence threshold",
+            &Some(worker_selection),
+            true,
+        );
+
+        assert!(!summary.would_offload);
+        assert!(
+            summary
+                .reason
+                .contains("no admissible workers: critical_pressure=1")
+        );
+        assert_eq!(summary.pipeline_steps.len(), 6);
+        assert!(!summary.pipeline_steps[0].skipped);
+        assert!(!summary.pipeline_steps[1].skipped);
+        assert!(summary.pipeline_steps[2].skipped);
+        assert_eq!(
+            summary.pipeline_steps[2].skip_reason.as_deref(),
+            Some("no admissible workers: critical_pressure=1")
+        );
+        assert!(summary.pipeline_steps[3].skipped);
+        assert_eq!(
+            summary.pipeline_steps[3].skip_reason.as_deref(),
+            Some("no admissible workers: critical_pressure=1")
+        );
+        assert!(summary.pipeline_steps[4].skipped);
+        assert_eq!(
+            summary.pipeline_steps[4].skip_reason.as_deref(),
+            Some("no admissible workers: critical_pressure=1")
+        );
+        assert!(summary.pipeline_steps[5].skipped);
+        assert_eq!(
+            summary.pipeline_steps[5].skip_reason.as_deref(),
+            Some("no admissible workers: critical_pressure=1")
+        );
+
+        let fixture_path = "../../../tests/goldens/ft_4tp7g/dry_run_summary_no_worker.json";
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/goldens/ft_4tp7g/dry_run_summary_no_worker.json"
+        ))
+        .expect("dry-run summary no-worker golden fixture parses");
+        assert_eq!(fixture["schema_version"], "rch.golden.dry_run_summary.v1");
+        assert_golden_json(
+            serde_json::to_value(&summary).expect("dry-run summary serializes"),
+            fixture
+                .get("expected_summary")
+                .expect("golden fixture has expected_summary"),
+            fixture_path,
+        );
+    }
+
+    #[test]
+    fn diagnose_dry_run_response_golden_no_worker() {
+        let _guard = test_guard!();
+        let worker_selection = DiagnoseWorkerSelection {
+            estimated_cores: 4,
+            cargo_jobs: None,
+            worker: None,
+            reason: SelectionReason::NoAdmissibleWorkers("critical_pressure=1".to_string()),
+            diagnostics: Some(SelectionDiagnostics {
+                required_runtime: RequiredRuntime::Rust,
+                estimated_cores: 4,
+                min_success_rate: 0.8,
+                fallback_min_success_rate: 0.5,
+                active_project_exclusion_count: 0,
+                workers: vec![WorkerSelectionDiagnostic {
+                    worker_id: WorkerId::new("fixture-worker"),
+                    status: "healthy".to_string(),
+                    circuit_state: "closed".to_string(),
+                    pressure_state: "critical".to_string(),
+                    pressure_reason_code: "disk_ratio_below_critical".to_string(),
+                    success_rate: Some(0.95),
+                    min_success_rate: 0.8,
+                    fallback_min_success_rate: 0.5,
+                    required_runtime: RequiredRuntime::Rust,
+                    runtime_available: true,
+                    available_slots: 8,
+                    total_slots: 8,
+                    estimated_cores: 4,
+                    active_project_excluded: false,
+                    final_decision: WorkerSelectionDiagnosticDecision::Deny,
+                    final_reason: "critical pressure: disk_ratio_below_critical".to_string(),
+                    reason_codes: vec!["pressure.critical".to_string()],
+                }],
+            }),
+        };
+        let dry_run = build_dry_run_summary(
+            true,
+            "Compilation command with confidence 0.95 >= threshold 0.85",
+            &Some(worker_selection.clone()),
+            true,
+        );
+        let response = DiagnoseResponse {
+            classification: Classification::compilation(
+                CompilationKind::CargoTest,
+                0.95,
+                "cargo test",
+            ),
+            tiers: Vec::new(),
+            command: "cargo test -p frankenterm-core --lib agent_mail -- --nocapture".to_string(),
+            normalized_command: "cargo test -p frankenterm-core --lib agent_mail -- --nocapture"
+                .to_string(),
+            decision: DiagnoseDecision {
+                would_intercept: true,
+                reason: "Compilation command with confidence 0.95 >= threshold 0.85".to_string(),
+            },
+            threshold: DiagnoseThreshold {
+                value: 0.85,
+                source: "fixture".to_string(),
+            },
+            daemon: DiagnoseDaemonStatus {
+                socket_path: "/tmp/rch.sock".to_string(),
+                socket_exists: true,
+                reachable: true,
+                status: Some("healthy".to_string()),
+                version: Some("1.0.26".to_string()),
+                uptime_seconds: Some(123),
+                error: None,
+            },
+            required_runtime: RequiredRuntime::Rust,
+            local_capabilities: None,
+            capabilities_warnings: Vec::new(),
+            worker_selection: Some(worker_selection),
+            placement: rch_common::resolve_placement(|_| None),
+            dry_run: Some(dry_run),
+        };
+
+        let fixture_path = "../../../tests/goldens/ft_4tp7g/diagnose_dry_run_no_worker.json";
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/goldens/ft_4tp7g/diagnose_dry_run_no_worker.json"
+        ))
+        .expect("diagnose dry-run no-worker golden fixture parses");
+        assert_eq!(fixture["schema_version"], "rch.golden.diagnose_dry_run.v1");
+        assert_golden_json(
+            serde_json::to_value(&response).expect("diagnose response serializes"),
+            fixture
+                .get("expected_response")
+                .expect("golden fixture has expected_response"),
+            fixture_path,
+        );
     }
 
     #[test]

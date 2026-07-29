@@ -209,6 +209,15 @@ lazy_static! {
         &["decision_type"]
     ).expect("Failed to create DECISION_BUDGET_VIOLATIONS metric");
 
+    /// Decision latency panic-threshold violations.
+    pub static ref DECISION_PANIC_THRESHOLD_VIOLATIONS: CounterVec = CounterVec::new(
+        Opts::new(
+            "rch_decision_panic_threshold_violations_total",
+            "Decision latency violations exceeding panic thresholds"
+        ),
+        &["decision_type"]
+    ).expect("Failed to create DECISION_PANIC_THRESHOLD_VIOLATIONS metric");
+
     // =========================================================================
     // Reliability Metrics (bd-vvmd.6.2)
     // =========================================================================
@@ -326,6 +335,7 @@ pub fn register_metrics() -> Result<()> {
     // Decision latency metrics (CRITICAL)
     REGISTRY.register(Box::new(DECISION_LATENCY.clone()))?;
     REGISTRY.register(Box::new(DECISION_BUDGET_VIOLATIONS.clone()))?;
+    REGISTRY.register(Box::new(DECISION_PANIC_THRESHOLD_VIOLATIONS.clone()))?;
 
     // Reliability metrics
     REGISTRY.register(Box::new(RELIABILITY_DECISIONS_TOTAL.clone()))?;

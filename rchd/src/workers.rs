@@ -6,12 +6,12 @@ use crate::DaemonContext;
 use crate::disk_pressure::{
     DiskPressurePolicyConfig, PressureAssessment, evaluate_pressure_policy,
 };
-use crate::health::{HealthConfig, probe_worker_capabilities};
+use crate::health::probe_worker_capabilities;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CircuitStats, WorkerCapabilities, WorkerConfig, WorkerId,
     WorkerStatus,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -19,13 +19,378 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::debug;
 
+const CAPABILITIES_REFRESH_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+const CAPABILITIES_REFRESH_WORKER_BUDGET: Duration = Duration::from_secs(8);
+
+fn duration_millis_i64(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn duration_secs_i64(duration: Duration) -> i64 {
+    i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+}
+
+// =============================================================================
+// Worker lifecycle type model (bd-session-history-remediation-ocv9i.1.1)
+// =============================================================================
+//
+// A worker's lifecycle is modelled as **two independent axes** so that
+// permanent operator intent can never be confused with transient scheduler
+// eligibility:
+//
+//   1. [`AdminIntent`]  — the *desired inventory* axis. Changes ONLY through
+//      explicit operator actions (`rch workers disable/enable/drain`). This is
+//      what `workers.toml` encodes; it is the source of truth for what the
+//      operator wants in the fleet.
+//   2. [`EligibilityState`] — the *live scheduler eligibility* axis. Advances
+//      automatically from health probes and concrete failure classes. It NEVER
+//      writes back to `AdminIntent` / `workers.toml`.
+//
+// The cardinal safety invariant (session-history remediation): a transient
+// failure quarantines a worker on the eligibility axis (`TemporaryBypass`) but
+// must never mutate desired inventory, and a recovering worker must never
+// auto-rejoin if the operator has disabled it. Keeping the two axes as distinct
+// types makes "auto-rejoin an operator-disabled worker" unrepresentable rather
+// than merely discouraged.
+//
+// ## Serialization compatibility policy
+//
+// These types derive `serde` with `snake_case` so they are stable across the
+// daemon/status JSON boundary. They are *additive*: the legacy single-axis
+// [`WorkerStatus`] enum is untouched, and [`WorkerLifecycle::legacy_status`]
+// collapses the two axes back to a `WorkerStatus` for older status consumers
+// (both quarantine states — `TemporaryBypass` and `RecoveredPendingCanary` —
+// collapse to `Unreachable` so they stay out of legacy scheduling).
+// New variants must be appended, never reordered or renamed, so historical
+// JSONL replays continue to deserialize.
+
+/// Operator-controlled *desired* lifecycle intent for a worker.
+///
+/// This is the desired-inventory axis. It changes only through explicit
+/// operator actions and is never advanced by health probes or transient
+/// failures. A worker is only ever schedulable when its intent is
+/// [`AdminIntent::Active`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminIntent {
+    /// Operator wants this worker in service (default).
+    #[default]
+    Active,
+    /// Operator asked the worker to stop taking *new* jobs but finish current
+    /// ones (`rch workers drain`).
+    Draining,
+    /// Drain has completed (no active jobs); the operator's intent is still
+    /// "out of service" until they re-enable.
+    Drained,
+    /// Operator explicitly disabled the worker. Never eligible — and never
+    /// auto-rejoined by the recovery path — until re-enabled.
+    Disabled,
+}
+
+/// Transient *scheduler eligibility* derived from health probes and failure
+/// classes.
+///
+/// This is the live axis. It advances automatically and never writes back to
+/// [`AdminIntent`]. The quarantine lifecycle is:
+///
+/// ```text
+/// Healthy/Degraded/Unreachable --enter_bypass(class)--> TemporaryBypass
+/// TemporaryBypass              --recover_to_canary----> RecoveredPendingCanary
+/// RecoveredPendingCanary       --promote_from_canary--> Healthy
+/// RecoveredPendingCanary       --enter_bypass(class)--> TemporaryBypass   (relapse)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EligibilityState {
+    /// Healthy and accepting work.
+    #[default]
+    Healthy,
+    /// Responding but slow/partially degraded — still eligible for work.
+    Degraded,
+    /// Failed to respond to heartbeat — temporarily ineligible, but not yet
+    /// quarantined into a failure-class bypass.
+    Unreachable,
+    /// Quarantined out of scheduling because a probe hit a concrete failure
+    /// class. Distinct from [`AdminIntent::Disabled`]: this is transient and
+    /// recovers automatically via probe + canary.
+    TemporaryBypass,
+    /// A previously bypassed worker passed its recovery probe and is awaiting a
+    /// single canary build before full rejoin.
+    RecoveredPendingCanary,
+}
+
+/// Concrete failure class that quarantined a worker into
+/// [`EligibilityState::TemporaryBypass`]. Defined in `rch_common` so the shared
+/// bypass-record schema, incident ledger, and status surfaces speak one
+/// vocabulary; re-exported here as it is part of the worker lifecycle model.
+pub use rch_common::BypassFailureClass;
+
+/// An attempted lifecycle transition that the state machine rejects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IllegalLifecycleTransition {
+    /// Eligibility state the worker was in.
+    pub from: EligibilityState,
+    /// Eligibility state that was requested.
+    pub to: EligibilityState,
+    /// Why the transition is not permitted.
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for IllegalLifecycleTransition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "illegal worker lifecycle transition {:?} -> {:?}: {}",
+            self.from, self.to, self.reason
+        )
+    }
+}
+
+impl std::error::Error for IllegalLifecycleTransition {}
+
+/// The full lifecycle state of a worker: the two independent axes plus the
+/// failure class that explains a current bypass (if any).
+///
+/// Scheduling decisions combine both axes via [`WorkerLifecycle::is_schedulable`]
+/// — admin intent dominates, but neither axis ever overwrites the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WorkerLifecycle {
+    /// Operator-controlled desired intent.
+    pub admin: AdminIntent,
+    /// Health-/probe-driven live eligibility.
+    pub eligibility: EligibilityState,
+    /// Set iff `eligibility == TemporaryBypass`; explains the quarantine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass_cause: Option<BypassFailureClass>,
+}
+
+impl WorkerLifecycle {
+    /// A fresh, fully in-service worker: `Active` + `Healthy`.
+    pub fn new() -> Self {
+        Self {
+            admin: AdminIntent::Active,
+            eligibility: EligibilityState::Healthy,
+            bypass_cause: None,
+        }
+    }
+
+    /// Bridge from the legacy single-axis [`WorkerStatus`] so existing call
+    /// sites can be migrated incrementally. Admin-intent statuses populate the
+    /// admin axis with a `Healthy` eligibility; health statuses populate the
+    /// eligibility axis with an `Active` intent.
+    pub fn from_worker_status(status: WorkerStatus) -> Self {
+        match status {
+            WorkerStatus::Healthy => Self::new(),
+            WorkerStatus::Degraded => Self {
+                admin: AdminIntent::Active,
+                eligibility: EligibilityState::Degraded,
+                bypass_cause: None,
+            },
+            WorkerStatus::Unreachable => Self {
+                admin: AdminIntent::Active,
+                eligibility: EligibilityState::Unreachable,
+                bypass_cause: None,
+            },
+            WorkerStatus::Draining => Self {
+                admin: AdminIntent::Draining,
+                eligibility: EligibilityState::Healthy,
+                bypass_cause: None,
+            },
+            WorkerStatus::Drained => Self {
+                admin: AdminIntent::Drained,
+                eligibility: EligibilityState::Healthy,
+                bypass_cause: None,
+            },
+            WorkerStatus::Disabled => Self {
+                admin: AdminIntent::Disabled,
+                eligibility: EligibilityState::Healthy,
+                bypass_cause: None,
+            },
+        }
+    }
+
+    /// Collapse the two axes back to a legacy [`WorkerStatus`] for older
+    /// status/JSON consumers. Admin intent takes precedence.
+    ///
+    /// Both transient quarantine states collapse to `Unreachable` so they stay
+    /// EXCLUDED from the legacy scheduler (which treats `Degraded` as
+    /// schedulable). In particular `RecoveredPendingCanary` must NOT become
+    /// `Degraded`: the legacy scheduler would then route a normal build to a
+    /// worker that is only cleared for a single canary build, violating the
+    /// one-canary-first invariant that [`Self::is_schedulable`] enforces
+    /// (bd-review-canary-legacy-status).
+    pub fn legacy_status(&self) -> WorkerStatus {
+        match self.admin {
+            AdminIntent::Disabled => WorkerStatus::Disabled,
+            AdminIntent::Draining => WorkerStatus::Draining,
+            AdminIntent::Drained => WorkerStatus::Drained,
+            AdminIntent::Active => match self.eligibility {
+                EligibilityState::Healthy => WorkerStatus::Healthy,
+                EligibilityState::Degraded => WorkerStatus::Degraded,
+                // Unreachable, failure-class bypass, and canary-pending all stay
+                // out of normal scheduling.
+                EligibilityState::Unreachable
+                | EligibilityState::TemporaryBypass
+                | EligibilityState::RecoveredPendingCanary => WorkerStatus::Unreachable,
+            },
+        }
+    }
+
+    /// Whether the scheduler may route a *normal* build to this worker.
+    ///
+    /// True only when the operator intends it to be in service (`Active`) and
+    /// its live eligibility is `Healthy` or `Degraded`. Unreachable, bypassed,
+    /// and canary-pending workers are excluded from normal scheduling.
+    pub fn is_schedulable(&self) -> bool {
+        self.admin == AdminIntent::Active
+            && matches!(
+                self.eligibility,
+                EligibilityState::Healthy | EligibilityState::Degraded
+            )
+    }
+
+    /// Whether this worker may receive exactly one canary build (it recovered
+    /// from a bypass and the operator still wants it in service). The canary
+    /// build itself is driven by a later bead; this predicate gates it.
+    pub fn is_canary_pending(&self) -> bool {
+        self.admin == AdminIntent::Active
+            && self.eligibility == EligibilityState::RecoveredPendingCanary
+    }
+
+    /// Apply an operator intent change. This is the *only* way the desired
+    /// inventory axis moves; it never touches the eligibility axis.
+    pub fn set_admin(&mut self, intent: AdminIntent) {
+        self.admin = intent;
+    }
+
+    /// Record a plain health observation (`Healthy`/`Degraded`/`Unreachable`).
+    ///
+    /// Health observations move freely among the three plain health states but
+    /// must NOT silently clear a quarantine: if the worker is currently
+    /// `TemporaryBypass` or `RecoveredPendingCanary`, the observation is
+    /// ignored and `false` is returned. Recovery happens only through the
+    /// explicit probe/canary transitions.
+    ///
+    /// Returns `true` when the observation was applied. Passing a non-health
+    /// state (`TemporaryBypass` / `RecoveredPendingCanary`) returns `false`
+    /// without mutating; use [`Self::enter_bypass`] / [`Self::recover_to_canary`]
+    /// for those.
+    pub fn observe_health(&mut self, health: EligibilityState) -> bool {
+        let is_plain_health = matches!(
+            health,
+            EligibilityState::Healthy | EligibilityState::Degraded | EligibilityState::Unreachable
+        );
+        let currently_quarantined = matches!(
+            self.eligibility,
+            EligibilityState::TemporaryBypass | EligibilityState::RecoveredPendingCanary
+        );
+        if !is_plain_health || currently_quarantined {
+            return false;
+        }
+        self.eligibility = health;
+        true
+    }
+
+    /// Quarantine the worker on the eligibility axis because a probe hit a
+    /// concrete failure class. Legal from *any* eligibility state — a failure
+    /// is a fact, including a failed canary (`RecoveredPendingCanary` relapses
+    /// here) or an already-bypassed worker whose cause is being updated. Never
+    /// mutates the admin axis — this is the core "transient failure ≠ desired
+    /// inventory" invariant.
+    pub fn enter_bypass(&mut self, cause: BypassFailureClass) {
+        self.eligibility = EligibilityState::TemporaryBypass;
+        self.bypass_cause = Some(cause);
+    }
+
+    /// Advance a bypassed worker to `RecoveredPendingCanary` after a successful
+    /// recovery probe. Legal only from `TemporaryBypass`.
+    pub fn recover_to_canary(&mut self) -> Result<(), IllegalLifecycleTransition> {
+        if self.eligibility != EligibilityState::TemporaryBypass {
+            return Err(IllegalLifecycleTransition {
+                from: self.eligibility,
+                to: EligibilityState::RecoveredPendingCanary,
+                reason: "recovery to canary is only legal from temporary_bypass",
+            });
+        }
+        self.eligibility = EligibilityState::RecoveredPendingCanary;
+        self.bypass_cause = None;
+        Ok(())
+    }
+
+    /// Fully rejoin a worker after a successful canary build. Legal only from
+    /// `RecoveredPendingCanary`. Does not, and must not, change admin intent —
+    /// an operator-disabled worker stays disabled even after a clean canary.
+    pub fn promote_from_canary(&mut self) -> Result<(), IllegalLifecycleTransition> {
+        if self.eligibility != EligibilityState::RecoveredPendingCanary {
+            return Err(IllegalLifecycleTransition {
+                from: self.eligibility,
+                to: EligibilityState::Healthy,
+                reason: "promotion is only legal from recovered_pending_canary",
+            });
+        }
+        self.eligibility = EligibilityState::Healthy;
+        self.bypass_cause = None;
+        Ok(())
+    }
+}
+
+/// Map a legacy health [`WorkerStatus`] to the eligibility axis for
+/// [`WorkerLifecycle::observe_health`]. Administrative statuses
+/// (`Draining`/`Drained`/`Disabled`) are not health observations and return
+/// `None`, so the caller leaves the lifecycle untouched.
+fn health_status_to_eligibility(status: WorkerStatus) -> Option<EligibilityState> {
+    match status {
+        WorkerStatus::Healthy => Some(EligibilityState::Healthy),
+        WorkerStatus::Degraded => Some(EligibilityState::Degraded),
+        WorkerStatus::Unreachable => Some(EligibilityState::Unreachable),
+        WorkerStatus::Draining | WorkerStatus::Drained | WorkerStatus::Disabled => None,
+    }
+}
+
+/// Whether a worker may accept a *new* slot reservation given its lifecycle.
+///
+/// Mirrors the pre-lifecycle `reserve_slots` admin guard (refuse
+/// `Draining`/`Drained`/`Disabled`) and additionally refuses the transient
+/// quarantine states so a bypassed or canary-pending worker can never have a
+/// normal build land on it between selection and reservation. An `Unreachable`
+/// but `Active` worker is intentionally still allowed here (unchanged from the
+/// legacy guard); the selector already filters it out up front.
+fn lifecycle_accepts_new_builds(lifecycle: WorkerLifecycle) -> bool {
+    !matches!(
+        lifecycle.admin,
+        AdminIntent::Draining | AdminIntent::Drained | AdminIntent::Disabled
+    ) && !matches!(
+        lifecycle.eligibility,
+        EligibilityState::TemporaryBypass | EligibilityState::RecoveredPendingCanary
+    )
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum DrainCompletionAction {
+    #[default]
+    StayDrained,
+    RemoveFromPool,
+    Disable {
+        reason: Option<String>,
+    },
+}
+
 /// State of a single worker.
 #[derive(Debug)]
 pub struct WorkerState {
     /// Worker configuration.
     pub config: RwLock<WorkerConfig>,
-    /// Current status (uses RwLock for interior mutability).
-    status: RwLock<WorkerStatus>,
+    /// Authoritative worker lifecycle — the two-axis (admin intent + live
+    /// eligibility) model from [`WorkerLifecycle`].
+    ///
+    /// **Single source of truth.** The legacy single-axis [`WorkerStatus`] is
+    /// *derived* from this via [`WorkerLifecycle::legacy_status`] (see
+    /// [`Self::status`]); there is no separate status field that could disagree.
+    /// Both transient quarantine states (`TemporaryBypass` /
+    /// `RecoveredPendingCanary`) collapse to `Unreachable` for every legacy
+    /// consumer, so a bypassed or canary-pending worker stays out of the
+    /// scheduler automatically with no extra bookkeeping.
+    lifecycle: RwLock<WorkerLifecycle>,
     /// Number of slots currently in use.
     used_slots: Arc<AtomicU32>,
     /// Speed score from benchmarking (0-100).
@@ -67,6 +432,8 @@ pub struct WorkerState {
     pressure_assessment: RwLock<PressureAssessment>,
     /// Reason for disabling this worker (if disabled).
     disabled_reason: RwLock<Option<String>>,
+    /// Administrative intent to apply when a draining worker reaches zero slots.
+    drain_completion: RwLock<DrainCompletionAction>,
     /// Unix timestamp (seconds since epoch) when worker was disabled.
     ///
     /// **Why atomic:** Queried during worker selection to skip disabled workers.
@@ -86,7 +453,7 @@ impl WorkerState {
     pub fn new(config: WorkerConfig) -> Self {
         Self {
             config: RwLock::new(config),
-            status: RwLock::new(WorkerStatus::Healthy),
+            lifecycle: RwLock::new(WorkerLifecycle::new()),
             used_slots: Arc::new(AtomicU32::new(0)),
             speed_score: AtomicU64::new(50.0_f64.to_bits()), // Default mid-range score
             last_latency_ms: AtomicU64::new(0),
@@ -97,39 +464,114 @@ impl WorkerState {
             toolchain_preflight: RwLock::new(HashMap::new()),
             pressure_assessment: RwLock::new(PressureAssessment::default()),
             disabled_reason: RwLock::new(None),
+            drain_completion: RwLock::new(DrainCompletionAction::default()),
             disabled_at: AtomicI64::new(0),
         }
     }
 
     /// Update worker configuration.
     pub async fn update_config(&self, new_config: WorkerConfig) {
-        let mut config = self.config.write().await;
-        *config = new_config;
-    }
+        {
+            let mut config = self.config.write().await;
+            *config = new_config;
+        }
 
-    /// Get current worker status.
-    pub async fn status(&self) -> WorkerStatus {
-        *self.status.read().await
-    }
+        let cancelled_pending_removal = {
+            let mut completion = self.drain_completion.write().await;
+            let should_cancel = *completion == DrainCompletionAction::RemoveFromPool;
+            if should_cancel {
+                *completion = DrainCompletionAction::StayDrained;
+            }
+            should_cancel
+        };
 
-    /// Set worker status.
-    pub async fn set_status(&self, status: WorkerStatus) {
-        *self.status.write().await = status;
-    }
-
-    /// Apply a health-derived status without overriding administrative lifecycle states.
-    ///
-    /// Health probes may mark a worker healthy/unreachable, but they must not revive
-    /// workers that are intentionally `Draining`, `Drained`, or `Disabled`.
-    pub async fn apply_health_status(&self, health_status: WorkerStatus) -> WorkerStatus {
-        let mut status = self.status.write().await;
-        match *status {
-            WorkerStatus::Draining | WorkerStatus::Drained | WorkerStatus::Disabled => *status,
-            _ => {
-                *status = health_status;
-                health_status
+        if cancelled_pending_removal {
+            let mut lifecycle = self.lifecycle.write().await;
+            if matches!(
+                lifecycle.admin,
+                AdminIntent::Draining | AdminIntent::Drained
+            ) {
+                lifecycle.set_admin(AdminIntent::Active);
             }
         }
+    }
+
+    /// Get the current worker status as the legacy single-axis [`WorkerStatus`].
+    ///
+    /// This is a *derived* view of the authoritative [`WorkerLifecycle`]: both
+    /// quarantine states (`TemporaryBypass` / `RecoveredPendingCanary`) collapse
+    /// to [`WorkerStatus::Unreachable`], so a bypassed worker is excluded from
+    /// the legacy scheduler with no separate bookkeeping.
+    pub async fn status(&self) -> WorkerStatus {
+        self.lifecycle.read().await.legacy_status()
+    }
+
+    /// Get a copy of the authoritative two-axis [`WorkerLifecycle`].
+    pub async fn lifecycle(&self) -> WorkerLifecycle {
+        *self.lifecycle.read().await
+    }
+
+    /// Get the live scheduler-eligibility axis.
+    pub async fn eligibility(&self) -> EligibilityState {
+        self.lifecycle.read().await.eligibility
+    }
+
+    /// Set worker status from the legacy single-axis [`WorkerStatus`].
+    ///
+    /// Bridges through [`WorkerLifecycle::from_worker_status`]. This is a legacy
+    /// setter for status-API and test call sites; the lifecycle-aware paths
+    /// ([`Self::enter_bypass`], [`Self::recover_to_canary`],
+    /// [`Self::promote_from_canary`], [`Self::apply_health_status`]) move the
+    /// two axes independently and must be used for quarantine/recovery.
+    pub async fn set_status(&self, status: WorkerStatus) {
+        *self.lifecycle.write().await = WorkerLifecycle::from_worker_status(status);
+    }
+
+    /// Apply a health-derived status without overriding administrative lifecycle
+    /// states *or* an active quarantine.
+    ///
+    /// Health probes may mark a worker healthy/degraded/unreachable, but they
+    /// must not revive workers that are intentionally `Draining`, `Drained`, or
+    /// `Disabled` (admin axis), and — critically for auto-rejoin safety — they
+    /// must NOT clear a `TemporaryBypass` / `RecoveredPendingCanary` quarantine.
+    /// Only the recovery probe/canary loop may do that. The observation routes
+    /// through [`WorkerLifecycle::observe_health`], which refuses to overwrite a
+    /// quarantine, so a single lucky health check can never auto-rejoin a
+    /// bypassed worker. Returns the resulting legacy [`WorkerStatus`].
+    pub async fn apply_health_status(&self, health_status: WorkerStatus) -> WorkerStatus {
+        let mut lifecycle = self.lifecycle.write().await;
+        if let Some(eligibility) = health_status_to_eligibility(health_status) {
+            lifecycle.observe_health(eligibility);
+        }
+        lifecycle.legacy_status()
+    }
+
+    /// Quarantine this worker into [`EligibilityState::TemporaryBypass`] because
+    /// a probe hit a concrete failure `class`. Never touches the admin axis
+    /// (transient failure ≠ desired inventory). The worker immediately drops out
+    /// of scheduling — its [`Self::status`] reads `Unreachable` — and stays out
+    /// until the recovery probe/canary loop clears it.
+    pub async fn enter_bypass(&self, class: BypassFailureClass) {
+        self.lifecycle.write().await.enter_bypass(class);
+    }
+
+    /// Advance a bypassed worker to [`EligibilityState::RecoveredPendingCanary`]
+    /// after a fully-healthy recovery-probe streak. Legal only from
+    /// `TemporaryBypass`.
+    pub async fn recover_to_canary(&self) -> Result<(), IllegalLifecycleTransition> {
+        self.lifecycle.write().await.recover_to_canary()
+    }
+
+    /// Fully rejoin a worker after a passing canary build. Legal only from
+    /// `RecoveredPendingCanary`; never changes admin intent (an
+    /// operator-disabled worker stays disabled even after a clean canary).
+    pub async fn promote_from_canary(&self) -> Result<(), IllegalLifecycleTransition> {
+        self.lifecycle.write().await.promote_from_canary()
+    }
+
+    /// Whether this worker is cleared for exactly one canary build.
+    pub async fn is_canary_pending(&self) -> bool {
+        self.lifecycle.read().await.is_canary_pending()
     }
 
     /// Get the number of available slots.
@@ -151,16 +593,19 @@ impl WorkerState {
     /// otherwise let a new build land on a worker that was just asked to
     /// stop accepting work — defeating the entire drain contract.
     pub async fn reserve_slots(&self, count: u32) -> bool {
+        if count == 0 {
+            return false;
+        }
+
         let mut current = self.used_slots.load(Ordering::Relaxed);
         loop {
-            // Re-read status on each iteration so a concurrent `drain()` /
-            // `disable()` becomes authoritative as soon as it's written,
-            // not only on the next selection round.
-            match *self.status.read().await {
-                WorkerStatus::Draining | WorkerStatus::Drained | WorkerStatus::Disabled => {
-                    return false;
-                }
-                _ => {}
+            // Re-read the lifecycle on each iteration so a concurrent `drain()`
+            // / `disable()` (admin axis) or a freshly-entered `TemporaryBypass`
+            // / `RecoveredPendingCanary` quarantine (eligibility axis) becomes
+            // authoritative as soon as it's written, not only on the next
+            // selection round.
+            if !lifecycle_accepts_new_builds(*self.lifecycle.read().await) {
+                return false;
             }
             // Re-read total_slots on each iteration to handle concurrent config changes.
             // This is safe because CAS loops typically succeed in 1-2 iterations.
@@ -174,7 +619,19 @@ impl WorkerState {
                 Ordering::SeqCst,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    // TOCTOU defense: re-check the lifecycle after a successful
+                    // slot reservation. If a concurrent drain()/disable() or a
+                    // bypass quarantine landed between our initial read and the
+                    // CAS, roll the reservation back.
+                    if lifecycle_accepts_new_builds(*self.lifecycle.read().await) {
+                        return true;
+                    }
+                    // Roll back the reservation; release_slots also handles
+                    // transitioning Draining -> Drained if this was the last slot.
+                    self.release_slots(count).await;
+                    return false;
+                }
                 Err(actual) => current = actual,
             }
         }
@@ -273,6 +730,30 @@ impl WorkerState {
         circuit.record_success();
     }
 
+    /// Drive the authoritative circuit through a single health-check outcome.
+    ///
+    /// This is the ONE write path the health monitor uses to move
+    /// `WorkerState.circuit` — the circuit the scheduler actually reads — so a
+    /// worker that fails a probe short-circuits out of selection and a recovered
+    /// worker rejoins, all through the shared
+    /// [`CircuitStats::apply_health_outcome`] engine. Returns
+    /// `(previous_state, new_state)` so the caller can detect transitions for
+    /// alerting/metrics without a second lock.
+    ///
+    /// `transient` flags a retryable transport blip that survived the in-check
+    /// retries; a transient half-open failure will not reopen the circuit.
+    pub async fn record_health_check(
+        &self,
+        healthy: bool,
+        transient: bool,
+        config: &CircuitBreakerConfig,
+    ) -> (CircuitState, CircuitState) {
+        let mut circuit = self.circuit.write().await;
+        let previous = circuit.state();
+        let new = circuit.apply_health_outcome(healthy, transient, config);
+        (previous, new)
+    }
+
     /// Record a failed operation for circuit breaker.
     pub async fn record_failure(&self, error_msg: Option<String>) {
         let mut circuit = self.circuit.write().await;
@@ -337,10 +818,23 @@ impl WorkerState {
 
     /// Update worker capabilities.
     pub async fn set_capabilities(&self, capabilities: WorkerCapabilities) {
-        let pressure =
-            evaluate_pressure_policy(&capabilities, None, &DiskPressurePolicyConfig::default());
+        let pressure_config = DiskPressurePolicyConfig::default();
+        let pressure = evaluate_pressure_policy(&capabilities, None, &pressure_config);
         *self.capabilities.write().await = capabilities;
-        *self.pressure_assessment.write().await = pressure;
+
+        let now_ms = current_unix_ms();
+        let mut current = self.pressure_assessment.write().await;
+        if pressure.state != crate::disk_pressure::PressureState::Critical
+            && refresh_preserved_pressure_age(&mut current, &pressure_config, now_ms)
+        {
+            current.disk_free_gb = pressure.disk_free_gb;
+            current.disk_total_gb = pressure.disk_total_gb;
+            current.disk_free_ratio = pressure.disk_free_ratio;
+            current.evaluated_at_unix_ms = now_ms;
+            return;
+        }
+
+        *current = pressure;
     }
 
     /// Get worker capabilities.
@@ -402,62 +896,137 @@ impl WorkerState {
         self.capabilities.read().await.has_rust()
     }
 
+    /// Check if this worker has Nix installed (nix binary + `/nix/store`).
+    pub async fn has_nix(&self) -> bool {
+        self.capabilities.read().await.has_nix()
+    }
+
+    /// Whether this worker has the Go toolchain installed.
+    pub async fn has_go(&self) -> bool {
+        self.capabilities.read().await.has_go()
+    }
+
+    /// Whether this worker can run `cargo zigbuild` (cargo-zigbuild + zig).
+    pub async fn has_zig(&self) -> bool {
+        self.capabilities.read().await.has_zig()
+    }
+
     /// Disable the worker with an optional reason.
     /// Sets status to Disabled and records the timestamp and reason.
     pub async fn disable(&self, reason: Option<String>) {
-        *self.status.write().await = WorkerStatus::Disabled;
+        *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
+        self.lifecycle
+            .write()
+            .await
+            .set_admin(AdminIntent::Disabled);
         *self.disabled_reason.write().await = reason;
-        self.disabled_at.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(1), // Use 1 instead of 0 to avoid None sentinel
-            Ordering::Relaxed,
-        );
+        self.disabled_at
+            .store(current_unix_secs_for_disabled_at(), Ordering::Relaxed);
     }
 
     /// Start draining the worker (no new jobs, but finish existing).
     pub async fn drain(&self) {
-        *self.status.write().await = WorkerStatus::Draining;
+        *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
+        self.lifecycle
+            .write()
+            .await
+            .set_admin(AdminIntent::Draining);
+        self.check_drain_complete().await;
+    }
+
+    /// Start draining a worker that should be removed once active jobs finish.
+    pub async fn drain_for_removal(&self) {
+        *self.drain_completion.write().await = DrainCompletionAction::RemoveFromPool;
+        self.lifecycle
+            .write()
+            .await
+            .set_admin(AdminIntent::Draining);
+        self.check_drain_complete().await;
+    }
+
+    /// Start draining a worker that should become disabled once active jobs finish.
+    pub async fn drain_then_disable(&self, reason: Option<String>) {
+        *self.drain_completion.write().await = DrainCompletionAction::Disable { reason };
+        self.lifecycle
+            .write()
+            .await
+            .set_admin(AdminIntent::Draining);
+        self.check_drain_complete().await;
     }
 
     /// Enable a previously disabled/draining worker.
     /// Clears disabled reason and timestamp, sets status to Healthy.
     pub async fn enable(&self) {
-        *self.status.write().await = WorkerStatus::Healthy;
+        *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
+        // Operator re-enable is an authoritative override: restore both axes to
+        // fully in-service (Active + Healthy) and clear any bypass cause.
+        *self.lifecycle.write().await = WorkerLifecycle::new();
         *self.disabled_reason.write().await = None;
         self.disabled_at.store(0, Ordering::Relaxed);
+        // Also reset the circuit breaker — `WorkerState.circuit` is the single
+        // source of truth the scheduler reads, and re-enabling a worker whose
+        // circuit is still Open/HalfOpen would leave it short-circuited out of
+        // selection despite the operator explicitly bringing it back. This is a
+        // REAL reset (clears failure/success counters and error history), not a
+        // status flip. (Also clears last_error_msg, matching close_circuit.)
+        self.circuit.write().await.close();
+        *self.last_error_msg.write().await = None;
     }
 
-    /// Check if worker is disabled.
+    /// Check if worker is disabled (operator admin intent).
     pub async fn is_disabled(&self) -> bool {
-        *self.status.read().await == WorkerStatus::Disabled
+        self.lifecycle.read().await.admin == AdminIntent::Disabled
     }
 
-    /// Check if worker is draining.
+    /// Check if worker is draining (operator admin intent).
     pub async fn is_draining(&self) -> bool {
-        *self.status.read().await == WorkerStatus::Draining
+        self.lifecycle.read().await.admin == AdminIntent::Draining
     }
 
     /// Check if worker is drained (drain complete, no active jobs).
     pub async fn is_drained(&self) -> bool {
-        *self.status.read().await == WorkerStatus::Drained
+        self.lifecycle.read().await.admin == AdminIntent::Drained
     }
 
-    /// Check if draining worker has completed all jobs and should transition to Drained.
-    /// Called when a job completes; auto-transitions Draining → Drained when no jobs remain.
-    /// Uses a single write lock to avoid TOCTOU race between read and write.
+    /// Check if draining worker has completed all jobs and apply the recorded completion action.
+    ///
+    /// Plain drains transition to `Drained`, config-removal drains become pruneable, and
+    /// drain-before-disable transitions to `Disabled` while preserving the disable reason.
     pub async fn check_drain_complete(&self) {
-        let mut status = self.status.write().await;
-        if *status == WorkerStatus::Draining {
-            // Use Acquire ordering to ensure we see any concurrent reserve_slots writes.
-            // This prevents a race where we transition to Drained while another thread
-            // has just reserved slots (their SeqCst write must happen-before our read).
-            let used = self.used_slots.load(Ordering::Acquire);
-            if used == 0 {
-                *status = WorkerStatus::Drained;
-            }
+        let used = self.used_slots.load(Ordering::Acquire);
+        if used != 0 || self.lifecycle.read().await.admin != AdminIntent::Draining {
+            return;
         }
+
+        let completion = self.drain_completion.read().await.clone();
+        let mut lifecycle = self.lifecycle.write().await;
+        if lifecycle.admin != AdminIntent::Draining || self.used_slots.load(Ordering::Acquire) != 0
+        {
+            return;
+        }
+
+        let disable_reason = match completion {
+            DrainCompletionAction::StayDrained | DrainCompletionAction::RemoveFromPool => {
+                lifecycle.set_admin(AdminIntent::Drained);
+                None
+            }
+            DrainCompletionAction::Disable { reason } => {
+                lifecycle.set_admin(AdminIntent::Disabled);
+                Some(reason)
+            }
+        };
+        drop(lifecycle);
+
+        if let Some(reason) = disable_reason {
+            *self.disabled_reason.write().await = reason;
+            self.disabled_at
+                .store(current_unix_secs_for_disabled_at(), Ordering::Relaxed);
+            *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
+        }
+    }
+
+    async fn remove_after_drain_pending(&self) -> bool {
+        *self.drain_completion.read().await == DrainCompletionAction::RemoveFromPool
     }
 
     /// Get the reason this worker was disabled (if any).
@@ -492,7 +1061,7 @@ impl ToolchainPreflightStatus {
     /// Whether this verdict is fresh enough to reuse for dispatch decisions.
     pub fn is_fresh(&self, ttl: Duration) -> bool {
         let age_ms = current_unix_ms().saturating_sub(self.checked_at_unix_ms);
-        age_ms <= ttl.as_millis() as i64
+        age_ms <= duration_millis_i64(ttl)
     }
 }
 
@@ -564,27 +1133,49 @@ impl WorkerPool {
         }
     }
 
-    /// Prune workers that are in Draining or Drained state and have no active slots.
+    /// Prune workers that were removed from config and have finished draining.
     ///
     /// Returns the number of workers removed.
     pub async fn prune_drained(&self) -> usize {
-        let mut workers = self.workers.write().await;
+        let snapshot: Vec<(WorkerId, Arc<WorkerState>)> = {
+            let workers = self.workers.read().await;
+            workers
+                .iter()
+                .map(|(id, worker)| (id.clone(), Arc::clone(worker)))
+                .collect()
+        };
+
         let mut to_remove = Vec::new();
-
-        for (id, worker) in workers.iter() {
+        for (id, worker) in snapshot {
+            worker.check_drain_complete().await;
             let status = worker.status().await;
-            let is_draining_or_drained =
-                status == WorkerStatus::Draining || status == WorkerStatus::Drained;
 
-            if is_draining_or_drained && worker.used_slots() == 0 {
-                to_remove.push(id.clone());
+            if status == WorkerStatus::Drained
+                && worker.used_slots() == 0
+                && worker.remove_after_drain_pending().await
+            {
+                to_remove.push((id, worker));
             }
         }
 
-        let count = to_remove.len();
-        for id in to_remove {
-            workers.remove(&id);
-            debug!("Pruned drained worker: {}", id);
+        let mut count = 0;
+        let mut workers = self.workers.write().await;
+        for (id, worker) in to_remove {
+            let still_same_worker = workers
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(current, &worker));
+            if !still_same_worker {
+                continue;
+            }
+
+            worker.check_drain_complete().await;
+            let should_remove = worker.status().await == WorkerStatus::Drained
+                && worker.used_slots() == 0
+                && worker.remove_after_drain_pending().await;
+            if should_remove && workers.remove(&id).is_some() {
+                count += 1;
+                debug!("Pruned drained worker: {}", id);
+            }
         }
 
         if count > 0 {
@@ -652,6 +1243,14 @@ impl WorkerPool {
     }
 }
 
+fn current_unix_secs_for_disabled_at() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(duration_secs_i64)
+        .unwrap_or(1)
+        .max(1)
+}
+
 impl Default for WorkerPool {
     fn default() -> Self {
         Self::new()
@@ -661,8 +1260,31 @@ impl Default for WorkerPool {
 fn current_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
+        .map(duration_millis_i64)
         .unwrap_or_default()
+}
+
+fn refresh_preserved_pressure_age(
+    assessment: &mut PressureAssessment,
+    config: &DiskPressurePolicyConfig,
+    now_ms: i64,
+) -> bool {
+    if !assessment.telemetry_fresh {
+        return false;
+    }
+
+    let Some(previous_age_secs) = assessment.telemetry_age_secs else {
+        return false;
+    };
+
+    let elapsed_secs = now_ms
+        .saturating_sub(assessment.evaluated_at_unix_ms)
+        .max(0) as u64
+        / 1_000;
+    let age_secs = previous_age_secs.saturating_add(elapsed_secs);
+    assessment.telemetry_age_secs = Some(age_secs);
+    assessment.telemetry_fresh = age_secs <= config.telemetry_stale_after.as_secs();
+    assessment.telemetry_fresh
 }
 
 // ============================================================================
@@ -677,6 +1299,38 @@ pub struct WorkerCapabilitiesInfo {
     pub user: String,
     pub capabilities: WorkerCapabilities,
     pub pressure_assessment: PressureAssessment,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<WorkerCapabilitiesRefreshInfo>,
+}
+
+/// Freshness information for a capabilities refresh request.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerCapabilitiesRefreshInfo {
+    pub attempted: bool,
+    pub live: bool,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl WorkerCapabilitiesRefreshInfo {
+    fn live_probe() -> Self {
+        Self {
+            attempted: true,
+            live: true,
+            source: "live_probe".to_string(),
+            message: None,
+        }
+    }
+
+    fn cached_after_probe_failure(message: impl Into<String>) -> Self {
+        Self {
+            attempted: true,
+            live: false,
+            source: "cached_after_probe_failure".to_string(),
+            message: Some(message.into()),
+        }
+    }
 }
 
 /// Worker capabilities response.
@@ -712,13 +1366,13 @@ pub async fn get_workers_capabilities(
 ) -> WorkerCapabilitiesResponse {
     let workers = ctx.pool.all_workers().await;
     let mut entries = Vec::with_capacity(workers.len());
-    let timeout = HealthConfig::default().check_timeout;
+    let mut refresh_results = if refresh {
+        refresh_worker_capabilities_concurrently(&workers).await
+    } else {
+        HashMap::new()
+    };
 
     for worker in workers {
-        if refresh && let Some(capabilities) = probe_worker_capabilities(&worker, timeout).await {
-            worker.set_capabilities(capabilities).await;
-        }
-
         let (id, host, user) = {
             let config = worker.config.read().await;
             (
@@ -729,6 +1383,7 @@ pub async fn get_workers_capabilities(
         };
         let capabilities = worker.capabilities().await;
         let pressure_assessment = worker.pressure_assessment().await;
+        let refresh = refresh_results.remove(&id);
 
         entries.push(WorkerCapabilitiesInfo {
             id,
@@ -736,10 +1391,69 @@ pub async fn get_workers_capabilities(
             user,
             capabilities,
             pressure_assessment,
+            refresh,
         });
     }
 
     WorkerCapabilitiesResponse { workers: entries }
+}
+
+async fn refresh_worker_capabilities_concurrently(
+    workers: &[Arc<WorkerState>],
+) -> HashMap<String, WorkerCapabilitiesRefreshInfo> {
+    let mut handles = Vec::with_capacity(workers.len());
+
+    for worker in workers {
+        let id = {
+            let config = worker.config.read().await;
+            config.id.to_string()
+        };
+        let worker = Arc::clone(worker);
+        handles.push((
+            id,
+            tokio::spawn(async move { refresh_worker_capabilities_for_worker(worker).await }),
+        ));
+    }
+
+    let mut results = HashMap::with_capacity(handles.len());
+    for (id, handle) in handles {
+        let refresh = match handle.await {
+            Ok(refresh) => refresh,
+            Err(err) => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(format!(
+                "capabilities refresh task failed: {err}; returning cached capability snapshot"
+            )),
+        };
+        results.insert(id, refresh);
+    }
+
+    results
+}
+
+async fn refresh_worker_capabilities_for_worker(
+    worker: Arc<WorkerState>,
+) -> WorkerCapabilitiesRefreshInfo {
+    let probe = tokio::time::timeout(
+        CAPABILITIES_REFRESH_WORKER_BUDGET,
+        // On-demand capability refresh (the `rch workers capabilities` API path)
+        // uses a throwaway SSH session — it is a low-frequency operator query, not
+        // one of the ~30s periodic poll loops the shared pool exists to de-flood.
+        probe_worker_capabilities(&worker, CAPABILITIES_REFRESH_PROBE_TIMEOUT, None),
+    )
+    .await;
+
+    match probe {
+        Ok(Some(capabilities)) => {
+            worker.set_capabilities(capabilities).await;
+            WorkerCapabilitiesRefreshInfo::live_probe()
+        }
+        Ok(None) => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(
+            "capabilities probe failed; returning cached capability snapshot",
+        ),
+        Err(_) => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(format!(
+            "capabilities probe exceeded {}s response budget; returning cached capability snapshot",
+            CAPABILITIES_REFRESH_WORKER_BUDGET.as_secs()
+        )),
+    }
 }
 
 /// Handle a worker drain request.
@@ -748,15 +1462,17 @@ pub async fn handle_worker_drain(ctx: &DaemonContext, worker_id: &WorkerId) -> W
         Some(worker) => {
             let active_slots = worker.used_slots();
             worker.drain().await;
+            let new_status = worker.status().await;
             WorkerStateResponse {
                 status: "ok".to_string(),
                 worker_id: worker_id.to_string(),
                 action: "drain".to_string(),
-                new_status: Some("draining".to_string()),
+                new_status: Some(worker_status_label(new_status).to_string()),
                 reason: None,
                 message: Some(format!(
-                    "Worker is draining. {} slot(s) currently in use.",
-                    active_slots
+                    "Worker is {}. {} slot(s) currently in use.",
+                    worker_status_label(new_status),
+                    active_slots,
                 )),
                 active_slots: Some(active_slots),
             }
@@ -782,6 +1498,15 @@ pub async fn handle_worker_enable(
         Some(worker) => {
             let old_status = worker.status().await;
             worker.enable().await;
+            // Operator re-enable must be DURABLE: delete the worker's persisted
+            // bypass record too. `worker.enable()` only resets the in-memory
+            // lifecycle/circuit; if the record survives, `reconcile_on_start`
+            // re-quarantines the worker from it on the next daemon restart (and
+            // the live recovery loop can re-touch it). Mirrors `rejoin`'s
+            // `store.remove(worker_id)`. (2026-07-16 offload meltdown follow-up.)
+            if let Some(store) = &ctx.bypass_store {
+                let _ = store.lock().await.remove(worker_id.as_str());
+            }
             WorkerStateResponse {
                 status: "ok".to_string(),
                 worker_id: worker_id.to_string(),
@@ -816,16 +1541,17 @@ pub async fn handle_worker_disable(
             let active_slots = worker.used_slots();
 
             if drain_first && active_slots > 0 {
-                // Start draining - will be fully disabled when slots reach 0
-                worker.drain().await;
+                worker.drain_then_disable(reason.clone()).await;
+                let new_status = worker.status().await;
                 WorkerStateResponse {
                     status: "ok".to_string(),
                     worker_id: worker_id.to_string(),
                     action: "disable".to_string(),
-                    new_status: Some("draining".to_string()),
+                    new_status: Some(worker_status_label(new_status).to_string()),
                     reason: reason.clone(),
                     message: Some(format!(
-                        "Worker is draining before disable. {} slot(s) in use. Reason: {}",
+                        "Worker is {} before disable. {} slot(s) in use. Reason: {}",
+                        worker_status_label(new_status),
                         active_slots,
                         reason.as_deref().unwrap_or("none provided")
                     )),
@@ -860,9 +1586,374 @@ pub async fn handle_worker_disable(
     }
 }
 
+fn worker_status_label(status: WorkerStatus) -> &'static str {
+    match status {
+        WorkerStatus::Healthy => "healthy",
+        WorkerStatus::Degraded => "degraded",
+        WorkerStatus::Unreachable => "unreachable",
+        WorkerStatus::Draining => "draining",
+        WorkerStatus::Drained => "drained",
+        WorkerStatus::Disabled => "disabled",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // Worker lifecycle type model (bd-session-history-remediation-ocv9i.1.1)
+    // =========================================================================
+
+    /// Every concrete failure class, for exhaustive bypass-attribution tests.
+    const ALL_FAILURE_CLASSES: &[BypassFailureClass] = &[
+        BypassFailureClass::Ssh,
+        BypassFailureClass::WorkerBinary,
+        BypassFailureClass::RuntimeToolchain,
+        BypassFailureClass::DiskInodePressure,
+        BypassFailureClass::StaleTelemetry,
+        BypassFailureClass::PathSync,
+        BypassFailureClass::ArtifactRetrieval,
+        BypassFailureClass::CircuitBreaker,
+        BypassFailureClass::OsArchMismatch,
+    ];
+
+    #[test]
+    fn lifecycle_new_is_active_healthy_and_schedulable() {
+        let lc = WorkerLifecycle::new();
+        assert_eq!(lc.admin, AdminIntent::Active);
+        assert_eq!(lc.eligibility, EligibilityState::Healthy);
+        assert_eq!(lc.bypass_cause, None);
+        assert!(lc.is_schedulable());
+        assert!(!lc.is_canary_pending());
+        // Default must match new().
+        assert_eq!(WorkerLifecycle::default(), lc);
+    }
+
+    #[test]
+    fn lifecycle_from_worker_status_maps_both_axes() {
+        let cases = [
+            (
+                WorkerStatus::Healthy,
+                AdminIntent::Active,
+                EligibilityState::Healthy,
+            ),
+            (
+                WorkerStatus::Degraded,
+                AdminIntent::Active,
+                EligibilityState::Degraded,
+            ),
+            (
+                WorkerStatus::Unreachable,
+                AdminIntent::Active,
+                EligibilityState::Unreachable,
+            ),
+            (
+                WorkerStatus::Draining,
+                AdminIntent::Draining,
+                EligibilityState::Healthy,
+            ),
+            (
+                WorkerStatus::Drained,
+                AdminIntent::Drained,
+                EligibilityState::Healthy,
+            ),
+            (
+                WorkerStatus::Disabled,
+                AdminIntent::Disabled,
+                EligibilityState::Healthy,
+            ),
+        ];
+        for (status, admin, eligibility) in cases {
+            let lc = WorkerLifecycle::from_worker_status(status);
+            assert_eq!(lc.admin, admin, "admin axis for {status:?}");
+            assert_eq!(
+                lc.eligibility, eligibility,
+                "eligibility axis for {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_legacy_status_collapses_two_axes() {
+        // Admin intent dominates.
+        let disabled = WorkerLifecycle {
+            admin: AdminIntent::Disabled,
+            eligibility: EligibilityState::Healthy,
+            bypass_cause: None,
+        };
+        assert_eq!(disabled.legacy_status(), WorkerStatus::Disabled);
+        // New transient states map to their closest legacy equivalent.
+        let bypassed = WorkerLifecycle {
+            admin: AdminIntent::Active,
+            eligibility: EligibilityState::TemporaryBypass,
+            bypass_cause: Some(BypassFailureClass::Ssh),
+        };
+        assert_eq!(bypassed.legacy_status(), WorkerStatus::Unreachable);
+        let canary = WorkerLifecycle {
+            admin: AdminIntent::Active,
+            eligibility: EligibilityState::RecoveredPendingCanary,
+            bypass_cause: None,
+        };
+        // Canary-pending must collapse to Unreachable (NOT Degraded), so the
+        // legacy scheduler keeps it out of normal builds (one-canary-first).
+        assert_eq!(canary.legacy_status(), WorkerStatus::Unreachable);
+        // Round-trip the unambiguous health states.
+        for status in [
+            WorkerStatus::Healthy,
+            WorkerStatus::Degraded,
+            WorkerStatus::Disabled,
+        ] {
+            assert_eq!(
+                WorkerLifecycle::from_worker_status(status).legacy_status(),
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_is_schedulable_matrix() {
+        // Active + Healthy/Degraded => schedulable.
+        for elig in [EligibilityState::Healthy, EligibilityState::Degraded] {
+            let lc = WorkerLifecycle {
+                admin: AdminIntent::Active,
+                eligibility: elig,
+                bypass_cause: None,
+            };
+            assert!(lc.is_schedulable(), "Active+{elig:?} must schedule");
+        }
+        // Active + non-eligible => not schedulable.
+        for elig in [
+            EligibilityState::Unreachable,
+            EligibilityState::TemporaryBypass,
+            EligibilityState::RecoveredPendingCanary,
+        ] {
+            let lc = WorkerLifecycle {
+                admin: AdminIntent::Active,
+                eligibility: elig,
+                bypass_cause: None,
+            };
+            assert!(!lc.is_schedulable(), "Active+{elig:?} must NOT schedule");
+        }
+        // Any non-Active admin intent => never schedulable, even when Healthy.
+        for admin in [
+            AdminIntent::Draining,
+            AdminIntent::Drained,
+            AdminIntent::Disabled,
+        ] {
+            let lc = WorkerLifecycle {
+                admin,
+                eligibility: EligibilityState::Healthy,
+                bypass_cause: None,
+            };
+            assert!(!lc.is_schedulable(), "{admin:?}+Healthy must NOT schedule");
+        }
+    }
+
+    #[test]
+    fn lifecycle_enter_bypass_quarantines_for_every_failure_class_without_touching_admin() {
+        for &cause in ALL_FAILURE_CLASSES {
+            let mut lc = WorkerLifecycle::new();
+            let admin_before = lc.admin;
+            lc.enter_bypass(cause);
+            assert_eq!(lc.eligibility, EligibilityState::TemporaryBypass);
+            assert_eq!(lc.bypass_cause, Some(cause), "cause recorded for {cause:?}");
+            // The cardinal invariant: transient failure never mutates desired
+            // inventory.
+            assert_eq!(lc.admin, admin_before, "admin axis must be untouched");
+            assert!(!lc.is_schedulable());
+        }
+    }
+
+    #[test]
+    fn lifecycle_legal_recovery_path_healthy_again() {
+        let mut lc = WorkerLifecycle::new();
+        lc.enter_bypass(BypassFailureClass::DiskInodePressure);
+        lc.recover_to_canary().expect("probe success -> canary");
+        assert_eq!(lc.eligibility, EligibilityState::RecoveredPendingCanary);
+        assert_eq!(lc.bypass_cause, None, "cause cleared on recovery");
+        assert!(lc.is_canary_pending());
+        assert!(
+            !lc.is_schedulable(),
+            "canary-pending is not normal scheduling"
+        );
+        lc.promote_from_canary().expect("canary success -> healthy");
+        assert_eq!(lc.eligibility, EligibilityState::Healthy);
+        assert!(lc.is_schedulable());
+    }
+
+    #[test]
+    fn lifecycle_canary_relapse_via_enter_bypass_is_legal() {
+        let mut lc = WorkerLifecycle::new();
+        lc.enter_bypass(BypassFailureClass::Ssh);
+        lc.recover_to_canary().unwrap();
+        // Canary build fails -> relapse back to bypass with the new cause.
+        lc.enter_bypass(BypassFailureClass::PathSync);
+        assert_eq!(lc.eligibility, EligibilityState::TemporaryBypass);
+        assert_eq!(lc.bypass_cause, Some(BypassFailureClass::PathSync));
+    }
+
+    #[test]
+    fn lifecycle_illegal_recover_to_canary_from_non_bypass() {
+        for elig in [
+            EligibilityState::Healthy,
+            EligibilityState::Degraded,
+            EligibilityState::Unreachable,
+            EligibilityState::RecoveredPendingCanary,
+        ] {
+            let mut lc = WorkerLifecycle {
+                admin: AdminIntent::Active,
+                eligibility: elig,
+                bypass_cause: None,
+            };
+            let err = lc
+                .recover_to_canary()
+                .expect_err("recover_to_canary must be illegal from non-bypass");
+            assert_eq!(err.from, elig);
+            assert_eq!(err.to, EligibilityState::RecoveredPendingCanary);
+            // State unchanged on illegal transition.
+            assert_eq!(lc.eligibility, elig);
+        }
+    }
+
+    #[test]
+    fn lifecycle_illegal_promote_from_non_canary() {
+        for elig in [
+            EligibilityState::Healthy,
+            EligibilityState::Degraded,
+            EligibilityState::Unreachable,
+            EligibilityState::TemporaryBypass,
+        ] {
+            let mut lc = WorkerLifecycle {
+                admin: AdminIntent::Active,
+                eligibility: elig,
+                bypass_cause: None,
+            };
+            let err = lc
+                .promote_from_canary()
+                .expect_err("promote must be illegal from non-canary");
+            assert_eq!(err.from, elig);
+            assert_eq!(lc.eligibility, elig, "state unchanged on illegal promote");
+        }
+    }
+
+    #[test]
+    fn lifecycle_observe_health_never_clears_quarantine() {
+        let mut lc = WorkerLifecycle::new();
+        lc.enter_bypass(BypassFailureClass::StaleTelemetry);
+        // A "healthy" heartbeat must NOT auto-clear a failure-class bypass.
+        assert!(!lc.observe_health(EligibilityState::Healthy));
+        assert_eq!(lc.eligibility, EligibilityState::TemporaryBypass);
+        assert_eq!(lc.bypass_cause, Some(BypassFailureClass::StaleTelemetry));
+        // Same protection while awaiting canary.
+        lc.recover_to_canary().unwrap();
+        assert!(!lc.observe_health(EligibilityState::Healthy));
+        assert_eq!(lc.eligibility, EligibilityState::RecoveredPendingCanary);
+    }
+
+    #[test]
+    fn lifecycle_observe_health_moves_among_plain_states() {
+        let mut lc = WorkerLifecycle::new();
+        assert!(lc.observe_health(EligibilityState::Degraded));
+        assert_eq!(lc.eligibility, EligibilityState::Degraded);
+        assert!(lc.observe_health(EligibilityState::Unreachable));
+        assert_eq!(lc.eligibility, EligibilityState::Unreachable);
+        assert!(lc.observe_health(EligibilityState::Healthy));
+        assert_eq!(lc.eligibility, EligibilityState::Healthy);
+        // Passing a non-health state is rejected without mutation.
+        assert!(!lc.observe_health(EligibilityState::TemporaryBypass));
+        assert_eq!(lc.eligibility, EligibilityState::Healthy);
+    }
+
+    #[test]
+    fn lifecycle_operator_disabled_worker_never_auto_rejoins() {
+        // A worker the operator disabled must stay out of service even if it
+        // walks the full recovery path on the eligibility axis.
+        let mut lc = WorkerLifecycle::new();
+        lc.set_admin(AdminIntent::Disabled);
+        lc.enter_bypass(BypassFailureClass::CircuitBreaker);
+        lc.recover_to_canary().unwrap();
+        lc.promote_from_canary().unwrap();
+        assert_eq!(lc.eligibility, EligibilityState::Healthy);
+        // Admin intent is the gate: still disabled => never schedulable.
+        assert_eq!(lc.admin, AdminIntent::Disabled);
+        assert!(!lc.is_schedulable());
+        assert!(!lc.is_canary_pending());
+    }
+
+    #[test]
+    fn lifecycle_admin_axis_is_invariant_across_eligibility_transitions() {
+        for admin in [
+            AdminIntent::Active,
+            AdminIntent::Draining,
+            AdminIntent::Drained,
+            AdminIntent::Disabled,
+        ] {
+            let mut lc = WorkerLifecycle {
+                admin,
+                eligibility: EligibilityState::Healthy,
+                bypass_cause: None,
+            };
+            lc.enter_bypass(BypassFailureClass::OsArchMismatch);
+            lc.recover_to_canary().unwrap();
+            lc.promote_from_canary().unwrap();
+            lc.observe_health(EligibilityState::Degraded);
+            assert_eq!(
+                lc.admin, admin,
+                "eligibility transitions must not move admin"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_serde_round_trips_full_state() {
+        let lc = WorkerLifecycle {
+            admin: AdminIntent::Draining,
+            eligibility: EligibilityState::TemporaryBypass,
+            bypass_cause: Some(BypassFailureClass::ArtifactRetrieval),
+        };
+        let json = serde_json::to_string(&lc).expect("serialize");
+        assert!(json.contains("temporary_bypass"));
+        assert!(json.contains("artifact_retrieval"));
+        let back: WorkerLifecycle = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, lc);
+        // bypass_cause omitted when None.
+        let healthy = WorkerLifecycle::new();
+        let json = serde_json::to_string(&healthy).expect("serialize");
+        assert!(!json.contains("bypass_cause"), "None cause must be omitted");
+    }
+
+    #[test]
+    fn lifecycle_every_failure_class_serializes_to_distinct_snake_case_token() {
+        let mut seen = std::collections::BTreeSet::new();
+        for &cause in ALL_FAILURE_CLASSES {
+            let token = serde_json::to_string(&cause).expect("serialize cause");
+            assert!(seen.insert(token.clone()), "duplicate token {token}");
+            // Round-trips.
+            let back: BypassFailureClass = serde_json::from_str(&token).expect("deserialize cause");
+            assert_eq!(back, cause);
+        }
+        assert_eq!(seen.len(), ALL_FAILURE_CLASSES.len());
+    }
+
+    #[test]
+    fn test_duration_millis_i64_saturates() {
+        assert_eq!(
+            duration_millis_i64(Duration::from_millis(u64::MAX)),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn test_toolchain_preflight_freshness_saturates_extreme_ttl() {
+        let status = ToolchainPreflightStatus {
+            usable: true,
+            reason: None,
+            checked_at_unix_ms: 0,
+        };
+
+        assert!(status.is_fresh(Duration::from_millis(u64::MAX)));
+    }
 
     /// Helper to create a test worker config with given id.
     fn test_config(id: &str) -> WorkerConfig {
@@ -875,6 +1966,29 @@ mod tests {
             priority: 100,
             tags: vec![],
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_refresh_worker_capabilities_marks_live_probe() {
+        let _guard = rch_common::test_guard!();
+        struct MockOverrideGuard;
+        impl Drop for MockOverrideGuard {
+            fn drop(&mut self) {
+                rch_common::mock::clear_mock_overrides();
+            }
+        }
+
+        rch_common::mock::set_mock_enabled_override(Some(true));
+        let _mock_guard = MockOverrideGuard;
+        let state = std::sync::Arc::new(WorkerState::new(test_config("test-worker")));
+
+        let refresh = refresh_worker_capabilities_for_worker(std::sync::Arc::clone(&state)).await;
+
+        assert!(refresh.attempted);
+        assert!(refresh.live);
+        assert_eq!(refresh.source, "live_probe");
+        assert!(state.has_rust().await);
     }
 
     // ============== WorkerState Tests ==============
@@ -1070,6 +2184,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_record_health_check_drives_authoritative_circuit() {
+        // The health monitor's ONLY circuit write path is record_health_check;
+        // this is the circuit the scheduler reads via circuit_state(). Failures
+        // must open it, and a healthy streak must recover it — all through the
+        // shared apply_health_outcome engine.
+        let state = WorkerState::new(test_config("test"));
+        let cfg = CircuitBreakerConfig {
+            failure_threshold: 3,
+            success_threshold: 2,
+            open_cooldown_secs: 0,
+            ..Default::default()
+        };
+
+        // Starts Closed.
+        assert_eq!(state.circuit_state().await, Some(CircuitState::Closed));
+
+        // Three failures open the authoritative circuit.
+        for _ in 0..3 {
+            state.record_health_check(false, false, &cfg).await;
+        }
+        // With a 0s cooldown the engine immediately re-arms half-open after
+        // opening; the point is the circuit is no longer Closed, so selection
+        // sees it as non-healthy.
+        assert_ne!(state.circuit_state().await, Some(CircuitState::Closed));
+
+        // Two clean probes recover it to Closed.
+        state.record_health_check(true, false, &cfg).await;
+        let (_, new) = state.record_health_check(true, false, &cfg).await;
+        assert_eq!(new, CircuitState::Closed);
+        assert_eq!(state.circuit_state().await, Some(CircuitState::Closed));
+    }
+
+    #[tokio::test]
+    async fn test_enable_resets_authoritative_circuit() {
+        // enable() must REALLY reset the circuit the scheduler reads, not just
+        // flip lifecycle status — otherwise a re-enabled worker stays
+        // short-circuited out of selection.
+        let state = WorkerState::new(test_config("test"));
+
+        // Force the circuit Open, then record an error message.
+        state.open_circuit().await;
+        state.set_error("boom".to_string()).await;
+        assert_eq!(state.circuit_state().await, Some(CircuitState::Open));
+
+        // Operator re-enable must close the circuit and clear the error.
+        state.enable().await;
+        assert_eq!(
+            state.circuit_state().await,
+            Some(CircuitState::Closed),
+            "enable() must reset the authoritative circuit to Closed"
+        );
+        assert_eq!(state.last_error().await, None);
+    }
+
     // --- Concurrent access tests ---
 
     #[tokio::test]
@@ -1188,6 +2357,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_zero_slot_reservation_is_rejected() {
+        let state = WorkerState::new(test_config("test"));
+
+        assert!(!state.reserve_slots(0).await);
+        assert_eq!(state.used_slots(), 0);
+        assert_eq!(state.available_slots().await, 8);
+    }
+
+    #[tokio::test]
     async fn test_slot_reservation_exact_boundary() {
         let state = WorkerState::new(test_config("test"));
 
@@ -1294,6 +2472,7 @@ mod tests {
     async fn test_apply_health_status_preserves_administrative_states() {
         let state = WorkerState::new(test_config("test"));
 
+        assert!(state.reserve_slots(1).await);
         state.drain().await;
         assert_eq!(
             state.apply_health_status(WorkerStatus::Healthy).await,
@@ -1301,7 +2480,7 @@ mod tests {
         );
         assert_eq!(state.status().await, WorkerStatus::Draining);
 
-        state.check_drain_complete().await;
+        state.release_slots(1).await;
         assert_eq!(state.status().await, WorkerStatus::Drained);
         assert_eq!(
             state.apply_health_status(WorkerStatus::Healthy).await,
@@ -1315,6 +2494,131 @@ mod tests {
             WorkerStatus::Disabled
         );
         assert_eq!(state.status().await, WorkerStatus::Disabled);
+    }
+
+    #[tokio::test]
+    async fn test_enter_bypass_excludes_from_scheduling() {
+        // A worker quarantined into TemporaryBypass must look `Unreachable` to
+        // every legacy consumer, report not-schedulable, and refuse new slot
+        // reservations — all derived from the single lifecycle source of truth.
+        let state = WorkerState::new(test_config("bypassed"));
+        assert!(state.reserve_slots(1).await);
+        state.release_slots(1).await;
+
+        state.enter_bypass(BypassFailureClass::Ssh).await;
+
+        assert_eq!(state.eligibility().await, EligibilityState::TemporaryBypass);
+        assert_eq!(state.status().await, WorkerStatus::Unreachable);
+        assert!(!state.lifecycle().await.is_schedulable());
+        assert_eq!(
+            state.lifecycle().await.bypass_cause,
+            Some(BypassFailureClass::Ssh)
+        );
+        assert!(
+            !state.reserve_slots(1).await,
+            "a bypassed worker must refuse new reservations"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_probe_never_clears_bypass() {
+        // The cardinal safety invariant: lucky health observations routed
+        // through the health monitor must NOT auto-rejoin a bypassed worker.
+        // Only the recovery probe/canary loop may clear a quarantine.
+        let state = WorkerState::new(test_config("flapper"));
+        state
+            .enter_bypass(BypassFailureClass::DiskInodePressure)
+            .await;
+
+        for _ in 0..5 {
+            let effective = state.apply_health_status(WorkerStatus::Healthy).await;
+            assert_eq!(effective, WorkerStatus::Unreachable);
+            assert_eq!(state.eligibility().await, EligibilityState::TemporaryBypass);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_recover_to_canary_then_promote() {
+        // The full recovery path: bypass -> canary-pending -> healthy. The
+        // canary-pending worker is still excluded from *normal* scheduling
+        // (status reads Unreachable, reservations refused) while
+        // is_canary_pending gates the single allowed canary build.
+        let state = WorkerState::new(test_config("recoverer"));
+        state.enter_bypass(BypassFailureClass::CircuitBreaker).await;
+
+        state
+            .recover_to_canary()
+            .await
+            .expect("bypass -> canary is legal");
+        assert!(state.is_canary_pending().await);
+        assert_eq!(
+            state.eligibility().await,
+            EligibilityState::RecoveredPendingCanary
+        );
+        assert_eq!(state.status().await, WorkerStatus::Unreachable);
+        assert!(
+            !state.reserve_slots(1).await,
+            "canary-pending worker must not take normal builds"
+        );
+
+        state
+            .promote_from_canary()
+            .await
+            .expect("canary-pending -> healthy is legal");
+        assert_eq!(state.status().await, WorkerStatus::Healthy);
+        assert!(state.lifecycle().await.is_schedulable());
+        assert!(!state.is_canary_pending().await);
+        assert!(state.reserve_slots(1).await, "rejoined worker accepts work");
+    }
+
+    #[tokio::test]
+    async fn test_recover_to_canary_illegal_from_healthy() {
+        // recover_to_canary is only legal from TemporaryBypass; a healthy worker
+        // can never shortcut into the canary gate.
+        let state = WorkerState::new(test_config("healthy"));
+        let err = state.recover_to_canary().await.unwrap_err();
+        assert_eq!(err.from, EligibilityState::Healthy);
+        assert_eq!(err.to, EligibilityState::RecoveredPendingCanary);
+    }
+
+    #[tokio::test]
+    async fn test_enable_clears_bypass() {
+        // Operator re-enable is an authoritative override that clears a
+        // quarantine (both axes back to Active + Healthy).
+        let state = WorkerState::new(test_config("reenabled"));
+        state
+            .enter_bypass(BypassFailureClass::RuntimeToolchain)
+            .await;
+        assert_eq!(state.status().await, WorkerStatus::Unreachable);
+
+        state.enable().await;
+        assert_eq!(state.status().await, WorkerStatus::Healthy);
+        assert!(state.lifecycle().await.is_schedulable());
+        assert_eq!(state.lifecycle().await.bypass_cause, None);
+    }
+
+    #[tokio::test]
+    async fn test_pool_healthy_workers_excludes_bypassed() {
+        // The pool's healthy_workers() filter (the selector's candidate source)
+        // must drop TemporaryBypass and RecoveredPendingCanary workers just like
+        // an Unreachable one.
+        let pool = WorkerPool::new();
+        pool.add_worker(test_config("healthy")).await;
+        pool.add_worker(test_config("bypassed")).await;
+        pool.add_worker(test_config("canary")).await;
+
+        pool.get(&WorkerId::new("bypassed"))
+            .await
+            .unwrap()
+            .enter_bypass(BypassFailureClass::Ssh)
+            .await;
+        let canary = pool.get(&WorkerId::new("canary")).await.unwrap();
+        canary.enter_bypass(BypassFailureClass::Ssh).await;
+        canary.recover_to_canary().await.unwrap();
+
+        let healthy = pool.healthy_workers().await;
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(healthy[0].config.read().await.id, WorkerId::new("healthy"));
     }
 
     #[tokio::test]
@@ -1353,6 +2657,7 @@ mod tests {
     async fn test_drain_state() {
         let state = WorkerState::new(test_config("test"));
 
+        assert!(state.reserve_slots(1).await);
         state.drain().await;
         assert!(state.is_draining().await);
         assert_eq!(state.status().await, WorkerStatus::Draining);
@@ -1368,13 +2673,8 @@ mod tests {
     async fn test_drained_state() {
         let state = WorkerState::new(test_config("test"));
 
-        // Drained is set automatically via check_drain_complete()
+        // No slots are in use, so drain completes immediately.
         state.drain().await;
-        assert!(state.is_draining().await);
-        assert!(!state.is_drained().await);
-
-        // When no slots are used, draining should auto-transition to drained
-        state.check_drain_complete().await;
         assert!(!state.is_draining().await);
         assert!(state.is_drained().await);
         assert_eq!(state.status().await, WorkerStatus::Drained);
@@ -1410,6 +2710,29 @@ mod tests {
         assert!(!state.is_draining().await);
         assert!(state.is_drained().await);
         assert_eq!(state.status().await, WorkerStatus::Drained);
+    }
+
+    #[tokio::test]
+    async fn test_drain_then_disable_disables_after_active_jobs_finish() {
+        let state = WorkerState::new(test_config("test"));
+
+        assert!(state.reserve_slots(1).await);
+        state
+            .drain_then_disable(Some("maintenance".to_string()))
+            .await;
+        assert_eq!(state.status().await, WorkerStatus::Draining);
+        assert!(state.disabled_reason().await.is_none());
+        assert!(state.disabled_at().is_none());
+
+        state.release_slots(1).await;
+
+        assert_eq!(state.status().await, WorkerStatus::Disabled);
+        assert_eq!(
+            state.disabled_reason().await,
+            Some("maintenance".to_string())
+        );
+        assert!(state.disabled_at().is_some());
+        assert!(!state.remove_after_drain_pending().await);
     }
 
     #[tokio::test]
@@ -1522,6 +2845,7 @@ mod tests {
         assert!(!state.has_bun().await);
         assert!(!state.has_node().await);
         assert!(!state.has_rust().await);
+        assert!(!state.has_nix().await);
 
         // Set capabilities with Rust
         let mut caps = WorkerCapabilities::new();
@@ -1558,6 +2882,83 @@ mod tests {
         let retrieved = state.capabilities().await;
         assert_eq!(retrieved.rustc_version, Some("1.87.0".to_string()));
         assert_eq!(retrieved.bun_version, Some("1.2.0".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_capability_refresh_preserves_fresh_pressure_telemetry() {
+        let state = WorkerState::new(test_config("test"));
+        state
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                state: crate::disk_pressure::PressureState::Healthy,
+                confidence: crate::disk_pressure::PressureConfidence::High,
+                reason_code: "all_pressure_rules_within_threshold".to_string(),
+                policy_rule: "fresh_telemetry".to_string(),
+                disk_free_gb: Some(50.0),
+                disk_total_gb: Some(100.0),
+                disk_free_ratio: Some(0.5),
+                disk_io_util_pct: Some(0.0),
+                memory_pressure: Some(10.0),
+                telemetry_age_secs: Some(10),
+                telemetry_fresh: true,
+                evaluated_at_unix_ms: current_unix_ms(),
+            })
+            .await;
+
+        let mut caps = WorkerCapabilities::new();
+        caps.rustc_version = Some("1.87.0-nightly".to_string());
+        caps.disk_free_gb = Some(90.0);
+        caps.disk_total_gb = Some(120.0);
+        state.set_capabilities(caps).await;
+
+        let pressure = state.pressure_assessment().await;
+        assert_eq!(pressure.state, crate::disk_pressure::PressureState::Healthy);
+        assert_eq!(pressure.reason_code, "all_pressure_rules_within_threshold");
+        assert_eq!(pressure.disk_free_gb, Some(90.0));
+        assert_eq!(pressure.disk_total_gb, Some(120.0));
+        assert_eq!(pressure.disk_free_ratio, Some(0.75));
+        assert_eq!(pressure.disk_io_util_pct, Some(0.0));
+        assert_eq!(pressure.memory_pressure, Some(10.0));
+        assert!(pressure.telemetry_fresh);
+        assert!(pressure.telemetry_age_secs.unwrap_or(u64::MAX) <= 11);
+    }
+
+    #[tokio::test]
+    async fn test_capability_refresh_critical_disk_overrides_fresh_pressure() {
+        let state = WorkerState::new(test_config("test"));
+        state
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                state: crate::disk_pressure::PressureState::Healthy,
+                confidence: crate::disk_pressure::PressureConfidence::High,
+                reason_code: "all_pressure_rules_within_threshold".to_string(),
+                policy_rule: "fresh_telemetry".to_string(),
+                disk_free_gb: Some(50.0),
+                disk_total_gb: Some(100.0),
+                disk_free_ratio: Some(0.5),
+                disk_io_util_pct: Some(0.0),
+                memory_pressure: Some(10.0),
+                telemetry_age_secs: Some(10),
+                telemetry_fresh: true,
+                evaluated_at_unix_ms: current_unix_ms(),
+            })
+            .await;
+
+        let mut caps = WorkerCapabilities::new();
+        caps.rustc_version = Some("1.87.0-nightly".to_string());
+        caps.disk_free_gb = Some(2.0);
+        caps.disk_total_gb = Some(120.0);
+        state.set_capabilities(caps).await;
+
+        let pressure = state.pressure_assessment().await;
+        assert_eq!(
+            pressure.state,
+            crate::disk_pressure::PressureState::Critical
+        );
+        assert_eq!(
+            pressure.reason_code,
+            "disk_critical_without_fresh_telemetry"
+        );
+        assert_eq!(pressure.disk_free_gb, Some(2.0));
+        assert!(!pressure.telemetry_fresh);
     }
 
     #[tokio::test]
@@ -1604,6 +3005,25 @@ mod tests {
         let config = state.config.read().await;
         assert_eq!(config.total_slots, 16);
         assert_eq!(config.priority, 200);
+    }
+
+    #[tokio::test]
+    async fn test_update_config_cancels_pending_removal_drain() {
+        let state = WorkerState::new(test_config("test"));
+
+        assert!(state.reserve_slots(1).await);
+        state.drain_for_removal().await;
+        assert_eq!(state.status().await, WorkerStatus::Draining);
+        assert!(state.remove_after_drain_pending().await);
+
+        let mut new_config = test_config("test");
+        new_config.priority = 250;
+        state.update_config(new_config).await;
+
+        assert_eq!(state.status().await, WorkerStatus::Healthy);
+        assert!(!state.remove_after_drain_pending().await);
+        state.release_slots(1).await;
+        assert_eq!(state.status().await, WorkerStatus::Healthy);
     }
 
     // ============== WorkerPool Tests ==============
@@ -1782,9 +3202,10 @@ mod tests {
         });
         pool.add_worker_state(active).await;
 
-        // Drained worker with 0 slots used
-        let drained_empty = WorkerState::new(WorkerConfig {
-            id: WorkerId::new("drained_empty"),
+        // User-drained worker with 0 slots used. This must remain in the pool
+        // so `rch workers enable <id>` can bring it back.
+        let user_drained_empty = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("user_drained_empty"),
             host: "localhost".to_string(),
             user: "u".to_string(),
             identity_file: "i".to_string(),
@@ -1792,18 +3213,32 @@ mod tests {
             priority: 100,
             tags: vec![],
         });
-        drained_empty.drain().await;
-        pool.add_worker_state(drained_empty).await;
+        user_drained_empty.drain().await;
+        pool.add_worker_state(user_drained_empty).await;
 
-        // Drained worker with slots in use (should NOT be pruned).
+        // Config-removal drain with 0 slots used. This is the only kind of
+        // drained worker the background cleanup should prune.
+        let removed_empty = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("removed_empty"),
+            host: "localhost".to_string(),
+            user: "u".to_string(),
+            identity_file: "i".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        });
+        removed_empty.drain_for_removal().await;
+        pool.add_worker_state(removed_empty).await;
+
+        // Config-removal drain with slots in use (should NOT be pruned yet).
         //
         // In production, slot reservation happens while the worker is
-        // still healthy (selection path) and a subsequent drain() just
+        // still healthy (selection path) and a subsequent removal drain just
         // stops new reservations without releasing the in-flight ones.
         // `reserve_slots` (correctly) refuses after drain, so the test
         // must mirror that ordering.
-        let drained_busy = WorkerState::new(WorkerConfig {
-            id: WorkerId::new("drained_busy"),
+        let removed_busy = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("removed_busy"),
             host: "localhost".to_string(),
             user: "u".to_string(),
             identity_file: "i".to_string(),
@@ -1811,19 +3246,29 @@ mod tests {
             priority: 100,
             tags: vec![],
         });
-        assert!(drained_busy.reserve_slots(1).await);
-        drained_busy.drain().await;
-        pool.add_worker_state(drained_busy).await;
+        assert!(removed_busy.reserve_slots(1).await);
+        removed_busy.drain_for_removal().await;
+        pool.add_worker_state(removed_busy).await;
 
-        assert_eq!(pool.len(), 3);
+        assert_eq!(pool.len(), 4);
 
         let pruned = pool.prune_drained().await;
         assert_eq!(pruned, 1);
-        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.len(), 3);
 
         assert!(pool.get(&WorkerId::new("active")).await.is_some());
-        assert!(pool.get(&WorkerId::new("drained_busy")).await.is_some());
-        assert!(pool.get(&WorkerId::new("drained_empty")).await.is_none());
+        assert!(
+            pool.get(&WorkerId::new("user_drained_empty"))
+                .await
+                .is_some()
+        );
+        assert!(pool.get(&WorkerId::new("removed_busy")).await.is_some());
+        assert!(pool.get(&WorkerId::new("removed_empty")).await.is_none());
+
+        let removed_busy = pool.get(&WorkerId::new("removed_busy")).await.unwrap();
+        removed_busy.release_slots(1).await;
+        assert_eq!(pool.prune_drained().await, 1);
+        assert!(pool.get(&WorkerId::new("removed_busy")).await.is_none());
     }
 
     #[tokio::test]
