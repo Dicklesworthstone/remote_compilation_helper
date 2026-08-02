@@ -83,6 +83,24 @@ fn is_windows_drive_abs_path(path: &str) -> bool {
         && (bytes[2] == b'/' || bytes[2] == b'\\')
 }
 
+/// Top-level members `retrieve_artifacts_windows` archives from the remote root.
+///
+/// A project ROOT (it has a `Cargo.toml`) yields only `./target`, so a
+/// project-root retrieval (`rustc`/`clang --target *-windows-msvc`, whose build
+/// dir is not forwarded) can never tar the synced remote source back over the
+/// local source tree — this mirrors the unix retrieval's source-integrity guard
+/// (rch bug d7xc3). A bare CARGO_TARGET_DIR (no `Cargo.toml`) yields `.`: it holds
+/// only build outputs, including the cross-target `<triple>/` subdir that a
+/// pattern-based root filter would miss, so archiving everything is both correct
+/// and safe.
+fn windows_retrieve_members(project_root: &Path) -> Vec<&'static str> {
+    if project_root.join("Cargo.toml").exists() {
+        vec!["./target"]
+    } else {
+        vec!["."]
+    }
+}
+
 const PROJECT_HASH_CONTENT_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
 const PROJECT_HASH_KEY_FILES: &[&str] = &[
     // Rust project files
@@ -1454,9 +1472,13 @@ impl TransferPipeline {
         // SSH channel's stdio open there, so sshd never sees EOF and every
         // *successful* build hangs until the command timeout (the #20 failure
         // mode, re-triggered on Windows). Windows workers therefore run the
-        // command directly (the `else` branch); the SSH ConnectTimeout, the
-        // in-loop `command_timeout`, and the daemon stuck-detector still bound
-        // runaways.
+        // command directly (the `else` branch). The tradeoff: the daemon's
+        // stuck-detector reaps a runaway by SIGKILLing the remote process GROUP
+        // via the `.pgid` file the watchdog writes, so it does NOT cover Windows
+        // builds (no pgid file, no process groups). Bounding there is only the
+        // SSH ConnectTimeout and the in-loop `command_timeout`, which kill the
+        // local `ssh` on expiry; a detached `cargo.exe`/`rustc.exe` can still
+        // outlive the channel close. Acceptable for v1 single-Windows-worker use.
         let execution_command = if let Some(build_id) =
             self.build_id.filter(|_| !self.worker_platform.is_windows())
         {
@@ -1576,9 +1598,10 @@ fi",
     fn wrap_with_external_timeout(&self, command: &str) -> String {
         // On a Windows worker, `timeout` under Git's sh resolves to Windows
         // `timeout.exe` (a pause utility), NOT GNU coreutils timeout — wrapping
-        // with it would corrupt the command. Skip it; hook builds carry a
-        // `build_id` and use the in-session pgid watchdog instead, and the SSH
-        // ConnectTimeout plus the daemon stuck-detector still bound runaways.
+        // with it would corrupt the command. Skip it. Note the Windows path also
+        // skips the pgid watchdog (see `build_remote_command`), so runaways are
+        // bounded only by the SSH ConnectTimeout / `command_timeout` killing the
+        // local ssh — not by the daemon's process-group stuck-detector.
         if self.worker_platform.is_windows() {
             return command.to_string();
         }
@@ -2070,6 +2093,10 @@ fi",
         for a in remote_args {
             cmd.arg(a);
         }
+        // Kill the local ssh (and thus close the channel) if this Command's
+        // Child is dropped — e.g. when a dispatch-level timeout drops the
+        // transfer future. Harmless for the awaited-to-completion callers.
+        cmd.kill_on_drop(true);
         cmd
     }
 
@@ -2133,7 +2160,9 @@ fi",
             tar.arg(format!("--exclude={ex}"));
         }
         tar.arg(".");
-        tar.stdout(Stdio::piped()).stderr(Stdio::piped());
+        tar.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         let mut ssh = self.worker_ssh_command(worker, &["tar", "xzf", "-", "-C", remote_path]);
         ssh.stdin(Stdio::piped())
@@ -2220,7 +2249,9 @@ fi",
         for e in junk {
             remote_args.push(format!("--exclude={e}"));
         }
-        remote_args.push(".".into());
+        for member in windows_retrieve_members(&self.project_root) {
+            remote_args.push(member.to_string());
+        }
         let remote_args_ref: Vec<&str> = remote_args.iter().map(String::as_str).collect();
 
         let mut ssh = self.worker_ssh_command(worker, &remote_args_ref);
@@ -2231,7 +2262,10 @@ fi",
             .arg("-")
             .arg("-C")
             .arg(&self.project_root);
-        local_tar.stdin(Stdio::piped()).stderr(Stdio::piped());
+        local_tar
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         let mut ssh_child = ssh.spawn().context("spawn ssh tar c (windows retrieve)")?;
         let mut tar_child = local_tar
@@ -2313,11 +2347,25 @@ fi",
         }
 
         // A Windows worker has no rsync; use tar-over-ssh instead. Gated on the
-        // worker platform, so this branch is unreachable for linux/darwin.
+        // worker platform, so this branch is unreachable for linux/darwin. Bounded
+        // by `command_timeout` because — unlike the rsync path — the tar transport
+        // has no retry/timeout of its own; on expiry the transfer future drops and
+        // the `kill_on_drop` children are reaped.
         if self.worker_platform.is_windows() {
-            return self
-                .sync_to_remote_windows(worker, &remote_path, &effective_excludes)
-                .await;
+            let timeout = self.ssh_options.command_timeout;
+            return match tokio::time::timeout(
+                timeout,
+                self.sync_to_remote_windows(worker, &remote_path, &effective_excludes),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "windows tar sync to {} timed out after {:?}",
+                    worker.id,
+                    timeout
+                )),
+            };
         }
 
         info!(
@@ -3039,9 +3087,24 @@ fi",
         }
 
         // Windows worker: pull artifacts via tar-over-ssh (no rsync). Gated on
-        // platform, so linux/darwin never reach this.
+        // platform, so linux/darwin never reach this. Bounded by `command_timeout`
+        // (the tar transport has no timeout of its own); on expiry the future
+        // drops and the `kill_on_drop` children are reaped.
         if self.worker_platform.is_windows() {
-            return self.retrieve_artifacts_windows(worker, &remote_path).await;
+            let timeout = self.ssh_options.command_timeout;
+            return match tokio::time::timeout(
+                timeout,
+                self.retrieve_artifacts_windows(worker, &remote_path),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "windows tar artifact retrieve from {} timed out after {:?}",
+                    worker.id,
+                    timeout
+                )),
+            };
         }
 
         info!("Retrieving artifacts from {} on {}", remote_path, worker.id);
@@ -5901,6 +5964,19 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
         assert!(!is_windows_drive_abs_path("relative/path"));
         assert!(!is_windows_drive_abs_path("C:")); // no separator
         assert!(!is_windows_drive_abs_path("1:/rch")); // non-alpha drive
+    }
+
+    #[test]
+    fn windows_retrieve_members_protects_project_root_source() {
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("temp dir");
+        // A bare target dir (no Cargo.toml) → archive everything, so the
+        // cross-target `<triple>/` outputs come back.
+        assert_eq!(windows_retrieve_members(temp.path()), vec!["."]);
+        // A project root (has Cargo.toml) → archive only `target/`, so remote
+        // source can't be tarred back over the local source tree.
+        std::fs::write(temp.path().join("Cargo.toml"), b"[package]").expect("write");
+        assert_eq!(windows_retrieve_members(temp.path()), vec!["./target"]);
     }
 
     #[test]
