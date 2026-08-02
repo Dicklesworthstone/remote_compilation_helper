@@ -172,12 +172,6 @@ pub(super) fn build_dry_run_summary(
         estimated_duration_ms: Some(2),
     });
 
-    let blocked_by_worker_selection = || {
-        worker_selection_skip_reason
-            .clone()
-            .unwrap_or_else(|| "worker selection did not choose a worker".to_string())
-    };
-
     // Step 4: Transfer
     steps.push(DryRunPipelineStep {
         step: 4,
@@ -3351,7 +3345,6 @@ mod tests {
     use super::*;
     use crate::ui::context::OutputConfig;
     use crate::ui::writer::SharedOutputBuffer;
-    use rch_common::{SelectedWorker, SelectionReason, WorkerId};
 
     fn make_context(config: OutputConfig) -> OutputContext {
         let stdout = SharedOutputBuffer::new().as_writer(true);

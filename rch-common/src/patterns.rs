@@ -2274,9 +2274,11 @@ fn classify_cargo_zigbuild(cmd: &str) -> Classification {
     };
 
     match subcommand {
-        "zigbuild" | "build" | "b" => {
-            Classification::compilation(CompilationKind::CargoZigbuild, 0.95, "cargo-zigbuild build")
-        }
+        "zigbuild" | "build" | "b" => Classification::compilation(
+            CompilationKind::CargoZigbuild,
+            0.95,
+            "cargo-zigbuild build",
+        ),
         _ => Classification::not_compilation("cargo-zigbuild subcommand not interceptable"),
     }
 }

@@ -538,6 +538,9 @@ impl ErrorCode {
             Self::BuildEnvError => "Build environment setup failed",
             Self::BuildIncrementalError => "Incremental build state is corrupted",
             Self::BuildArtifactMissing => "Build artifact not found",
+            Self::BuildCargoWorkspaceInheritance => {
+                "Cargo workspace inheritance failed under remote topology"
+            }
 
             // Process Triage
             Self::ProcessTriageAdapterUnavailable => {
@@ -1269,9 +1272,9 @@ impl ErrorCode {
             Self::BuildToolchainError,
             Self::BuildEnvError,
             Self::BuildIncrementalError,
-                        Self::BuildArtifactMissing,
+            Self::BuildArtifactMissing,
             Self::BuildCargoWorkspaceInheritance,
-// Process Triage
+            // Process Triage
             Self::ProcessTriageAdapterUnavailable,
             Self::ProcessTriageDetectorUncertain,
             Self::ProcessTriagePolicyViolation,
