@@ -625,6 +625,7 @@ mod tests {
                     total_slots: 8,
                     priority: 100,
                     tags: vec![],
+                    os: None,
                     enabled: true,
                 },
                 config::WorkerEntry {
@@ -635,6 +636,7 @@ mod tests {
                     total_slots: 4,
                     priority: 50,
                     tags: vec![],
+                    os: None,
                     enabled: true,
                 },
             ],
@@ -658,6 +660,7 @@ mod tests {
                 total_slots: 0,
                 priority: 100,
                 tags: vec![],
+                os: None,
                 enabled: true,
             }],
         };
@@ -891,6 +894,7 @@ enabled = true
                 total_slots: 8,
                 priority: 100,
                 tags: vec![],
+                os: None,
                 enabled: false,
             }],
         };
@@ -914,6 +918,7 @@ enabled = true
                 total_slots: 8,
                 priority: 100,
                 tags: vec![],
+                os: None,
                 enabled: true,
             }],
         };
@@ -983,6 +988,7 @@ enabled = true
         let config = WorkersConfig {
             workers: vec![crate::config::WorkerEntry {
                 id: "worker;rm -rf /".to_string(),
+                os: None,
                 enabled: true,
                 host: "1.2.3.4".to_string(),
                 user: "ubuntu".to_string(),

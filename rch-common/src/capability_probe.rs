@@ -175,6 +175,7 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
 /// the corresponding probe produced no line (i.e. the capability is absent).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbedFacts {
+    /// Probed host OS, normalized by [`normalize_probed_os`].
     pub os: Option<String>,
     pub arch: Option<String>,
     pub probed_user: Option<String>,
@@ -201,6 +202,25 @@ impl ProbedFacts {
     }
 }
 
+/// Collapse the many shapes `uname -s` takes on Windows into plain `windows`.
+///
+/// The probe is a POSIX script, so on a Windows worker it runs under MSYS2,
+/// Git-Bash or Cygwin, each of which reports a versioned kernel name —
+/// `mingw64_nt-10.0-26100`, `msys_nt-10.0-26100`, `cygwin_nt-10.0`. Left raw,
+/// none of them compare equal to the `windows` an operator writes in config or
+/// a `*-pc-windows-msvc` triple implies. Everything else passes through
+/// untouched.
+#[must_use]
+pub fn normalize_probed_os(raw: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    for prefix in ["mingw32_nt", "mingw64_nt", "msys_nt", "cygwin_nt"] {
+        if lower.starts_with(prefix) {
+            return "windows".to_string();
+        }
+    }
+    lower
+}
+
 /// Parse `RCH_FACT k=v` probe output into [`ProbedFacts`]. Lines without the
 /// prefix are ignored, so incidental stdout never corrupts the parse.
 #[must_use]
@@ -215,7 +235,7 @@ pub fn parse_capability_probe(stdout: &str) -> ProbedFacts {
         };
         let value = value.trim();
         match key {
-            "os" => f.os = Some(value.to_string()),
+            "os" => f.os = Some(normalize_probed_os(value)),
             "arch" => f.arch = Some(value.to_string()),
             "user" => f.probed_user = Some(value.to_string()),
             "rch_wkr_path" => f.rch_wkr_path = Some(value.to_string()),
@@ -244,9 +264,7 @@ pub fn parse_capability_probe(stdout: &str) -> ProbedFacts {
             "nix_version" => f.runtimes.nix_version = Some(value.to_string()),
             "go_version" => f.runtimes.go_version = Some(value.to_string()),
             "zig_version" => f.runtimes.zig_version = Some(value.to_string()),
-            "cargo_zigbuild_version" => {
-                f.runtimes.cargo_zigbuild_version = Some(value.to_string())
-            }
+            "cargo_zigbuild_version" => f.runtimes.cargo_zigbuild_version = Some(value.to_string()),
             "disk" => {
                 // path;total_kb;avail_kb;avail_inodes
                 let parts: Vec<&str> = value.split(';').collect();
@@ -525,8 +543,7 @@ pub fn assess_admissibility(facts: &ProbedFacts, req: &CapabilityRequirement) ->
     // this worker can't run it; if every candidate is rejected the build falls
     // back to local, exactly like a missing rustup target.
     if req.needs_zig
-        && (facts.runtimes.zig_version.is_none()
-            || facts.runtimes.cargo_zigbuild_version.is_none())
+        && (facts.runtimes.zig_version.is_none() || facts.runtimes.cargo_zigbuild_version.is_none())
     {
         return CapabilityVerdict::Rejected {
             reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
@@ -635,6 +652,34 @@ pub fn assess_worker_eligibility(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalize_probed_os_collapses_windows_shells() {
+        // The probe is a POSIX script, so on Windows it runs under MSYS2 /
+        // Git-Bash / Cygwin and `uname -s` names the emulation layer, not the OS.
+        for raw in [
+            "MINGW64_NT-10.0-26100",
+            "mingw32_nt-10.0-22631",
+            "MSYS_NT-10.0-26100",
+            "CYGWIN_NT-10.0",
+        ] {
+            assert_eq!(normalize_probed_os(raw), "windows", "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn test_normalize_probed_os_passes_through_unix() {
+        assert_eq!(normalize_probed_os("Linux"), "linux");
+        assert_eq!(normalize_probed_os("Darwin"), "darwin");
+        assert_eq!(normalize_probed_os(" linux "), "linux");
+    }
+
+    #[test]
+    fn test_parse_normalizes_windows_os_fact() {
+        let facts =
+            parse_capability_probe("RCH_FACT os=MINGW64_NT-10.0-26100\nRCH_FACT arch=x86_64\n");
+        assert_eq!(facts.os.as_deref(), Some("windows"));
+    }
 
     fn spec() -> ProbeSpec {
         let mut s = ProbeSpec::new("rch", "/home/rch/.local/bin/rch-wkr");

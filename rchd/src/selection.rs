@@ -1059,6 +1059,22 @@ impl WorkerSelector {
         let worker_id = WorkerId::new(&fallback_id);
         let worker = pool.get(&worker_id).await?;
 
+        // The OS gate is a correctness constraint, not a health heuristic, so the
+        // affinity fallback must honour it too. It fires precisely when the main
+        // path found nothing eligible — exactly when a cached last-success worker
+        // would otherwise be resurrected and hand back wrong-platform artifacts.
+        let declared_os = rch_common::declared_os(&worker.config.read().await.tags);
+        if !os_gate_admits(
+            declared_os.as_deref(),
+            required_os_for_request(request).as_deref(),
+        ) {
+            debug!(
+                "Affinity fallback worker {} skipped: OS gate (declared={:?})",
+                fallback_id, declared_os
+            );
+            return None;
+        }
+
         // Mirror the main selection path / healthy_workers(): never fall back onto
         // a worker that is not assignable (operator-Drained/Disabled, Unreachable,
         // …). Without this, an admin-Drained worker is returned as the affinity
@@ -1291,10 +1307,13 @@ impl WorkerSelector {
         let mut diagnostics = Vec::with_capacity(all_workers.len());
         let mut active_project_exclusion_count = 0usize;
 
+        let required_os = required_os_for_request(request);
+
         for worker in all_workers {
             let config = worker.config.read().await;
             let worker_id = config.id.clone();
             let total_slots = config.total_slots;
+            let declared_os = rch_common::declared_os(&config.tags);
             drop(config);
 
             let status = worker.status().await;
@@ -1366,6 +1385,32 @@ impl WorkerSelector {
                     (
                         WorkerSelectionDiagnosticDecision::Deny,
                         "worker already has an active build for this project".to_string(),
+                    )
+                } else if !os_gate_admits(declared_os.as_deref(), required_os.as_deref()) {
+                    // Must mirror the gate in `get_eligible_workers`, and sit at
+                    // the same point in the ladder (before runtime). Without it
+                    // diagnostics report a worker as eligible that selection
+                    // denies, which is worse than no diagnostic at all.
+                    push_reason_code(&mut reason_codes, "os.declared_mismatch");
+                    (
+                        WorkerSelectionDiagnosticDecision::Deny,
+                        match (declared_os.as_deref(), required_os.as_deref()) {
+                            (Some(declared), Some(required)) => format!(
+                                "worker declares os={declared}, command requires os={required}"
+                            ),
+                            (Some(declared), None) => format!(
+                                "worker declares os={declared}, so it takes only commands \
+                                 targeting that OS"
+                            ),
+                            (None, Some(required)) => {
+                                format!("command requires os={required}, worker declares no os")
+                            }
+                            // `os_gate_admits` admits (None, None), so this arm
+                            // is unreachable today. Describe it rather than
+                            // `unreachable!()`: a future edit to the gate must
+                            // not be able to panic the daemon from here.
+                            (None, None) => "OS gate denied with no OS on either side".to_string(),
+                        },
                     )
                 } else if !runtime_available {
                     push_reason_code(&mut reason_codes, "runtime.unavailable");
@@ -1714,16 +1759,23 @@ impl WorkerSelector {
         let mut filtered_by_hard_preflight = 0usize;
         let mut filtered_by_convergence = 0usize;
         let mut filtered_by_pressure = 0usize;
+        let mut filtered_by_os_gate = 0usize;
         let mut filtered_by_slots = 0usize;
         let mut filtered_by_capacity = 0usize;
         let mut filtered_by_active_project = 0usize;
         let mut any_has_runtime = false;
 
+        let required_os = required_os_for_request(request);
+
         for worker in workers {
             let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
-            let (worker_id, total_slots) = {
+            let (worker_id, total_slots, declared_os) = {
                 let config = worker.config.read().await;
-                (config.id.clone(), config.total_slots)
+                (
+                    config.id.clone(),
+                    config.total_slots,
+                    rch_common::declared_os(&config.tags),
+                )
             };
 
             // An explicit worker request is an allow-set, not a scoring hint.
@@ -1734,6 +1786,18 @@ impl WorkerSelector {
                 continue;
             }
             matched_preferred_worker = true;
+
+            // Applied after the allow-set check so `matched_preferred_worker`
+            // keeps meaning "the requested worker exists" — an OS-incompatible
+            // pin should report an empty eligible set, not a missing worker.
+            if !os_gate_admits(declared_os.as_deref(), required_os.as_deref()) {
+                debug!(
+                    "Worker {} excluded by OS gate: declared={:?} required={:?}",
+                    worker_id, declared_os, required_os
+                );
+                filtered_by_os_gate += 1;
+                continue;
+            }
 
             // Filter by circuit state
             match circuit_state {
@@ -2098,6 +2162,34 @@ impl WorkerSelector {
 
         if has_preferred && !matched_preferred_worker {
             return Err(SelectionReason::NoMatchingWorkers);
+        }
+
+        // When the OS gate is the *only* thing that emptied the pool, say so.
+        // Otherwise this surfaces as a generic "all workers busy", and an agent
+        // debugging `--target x86_64-pc-windows-msvc` against an all-Linux fleet
+        // has nothing to go on.
+        if filtered_by_os_gate > 0
+            && eligible.is_empty()
+            && preferred.is_empty()
+            && eligible_without_health.is_empty()
+            && preferred_without_health.is_empty()
+        {
+            // The two directions need opposite advice: either nothing declares
+            // the OS the command needs, or everything declares one and so
+            // refuses an unqualified command.
+            let detail = match required_os.as_deref() {
+                Some(os) => format!(
+                    "os_gate_excluded={filtered_by_os_gate} required_os={os} \
+                     (no worker declares `os = \"{os}\"` in workers.toml)"
+                ),
+                None => format!(
+                    "os_gate_excluded={filtered_by_os_gate} required_os=none \
+                     (every candidate declares an `os`, which restricts it to \
+                      commands targeting that OS; an unqualified build needs at \
+                      least one worker with no `os` set)"
+                ),
+            };
+            return Err(SelectionReason::NoAdmissibleWorkers(detail));
         }
 
         if !any_has_runtime && !matches!(request.required_runtime, RequiredRuntime::None) {
@@ -2658,6 +2750,36 @@ pub async fn select_worker(
         .worker
 }
 
+/// The host OS a request's command demands of a worker, if any.
+///
+/// Derived from the command string the request already carries rather than a new
+/// wire field, so the gate holds even while `rch` and `rchd` sit at different
+/// versions across the fleet.
+fn required_os_for_request(request: &SelectionRequest) -> Option<String> {
+    request
+        .command
+        .as_deref()
+        .and_then(rch_common::admit_preflight::required_os_for_command)
+}
+
+/// Whether a worker may run a command, given the OS each declares.
+///
+/// A worker that declares an OS is **exclusive** to commands requiring exactly
+/// that OS: without this a Windows worker would sit in the same undifferentiated
+/// pool as the Linux fleet and quietly accept an ordinary `cargo check`, since
+/// `tags` do not gate admission. Symmetrically, a worker declaring nothing
+/// cannot satisfy a command that names an OS — there is no evidence it runs one.
+///
+/// Both `None` — every historical worker, every ordinary native build — admits,
+/// which is what keeps the existing macOS→Linux offload path working.
+fn os_gate_admits(declared_os: Option<&str>, required_os: Option<&str>) -> bool {
+    match (declared_os, required_os) {
+        (None, None) => true,
+        (Some(declared), Some(required)) => declared.eq_ignore_ascii_case(required),
+        _ => false,
+    }
+}
+
 /// Select the best worker with explicit circuit breaker config.
 ///
 /// Returns both the selected worker and the reason for selection result.
@@ -2735,6 +2857,8 @@ pub async fn select_worker_with_config(
     let has_preferred = !preferred_set.is_empty();
     let mut matched_preferred_worker = false;
 
+    let required_os = required_os_for_request(request);
+
     // Filter workers by circuit state and slot availability
     let mut eligible: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
     let mut preferred: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
@@ -2746,15 +2870,29 @@ pub async fn select_worker_with_config(
 
     for worker in workers {
         let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
-        let (worker_id, total_slots) = {
+        let (worker_id, total_slots, declared_os) = {
             let config = worker.config.read().await;
-            (config.id.clone(), config.total_slots)
+            (
+                config.id.clone(),
+                config.total_slots,
+                rch_common::declared_os(&config.tags),
+            )
         };
 
         if has_preferred && !preferred_set.contains(worker_id.as_str()) {
             continue;
         }
         matched_preferred_worker = true;
+
+        // See `get_eligible_workers`: applied after the allow-set check so an
+        // OS-incompatible pin does not masquerade as a missing worker.
+        if !os_gate_admits(declared_os.as_deref(), required_os.as_deref()) {
+            debug!(
+                "Worker {} excluded by OS gate: declared={:?} required={:?}",
+                worker_id, declared_os, required_os
+            );
+            continue;
+        }
 
         match circuit_state {
             CircuitState::Open => {
@@ -3380,6 +3518,15 @@ mod tests {
     }
 
     fn make_worker(id: &str, total_slots: u32, speed: f64) -> WorkerState {
+        make_worker_with_os(id, total_slots, speed, None)
+    }
+
+    fn make_worker_with_os(
+        id: &str,
+        total_slots: u32,
+        speed: f64,
+        os: Option<&str>,
+    ) -> WorkerState {
         let config = WorkerConfig {
             id: WorkerId::new(id),
             host: "localhost".to_string(),
@@ -3387,7 +3534,7 @@ mod tests {
             identity_file: "~/.ssh/id_rsa".to_string(),
             total_slots,
             priority: 100,
-            tags: vec![],
+            tags: os.map(rch_common::os_tag).into_iter().collect(),
         };
         let state = WorkerState::new(config);
         state.set_speed_score(speed);
@@ -4165,6 +4312,155 @@ mod tests {
         let selected = result.worker.expect("Expected a worker");
         // Should select by priority, not speed
         assert_eq!(selected.config.read().await.id.as_str(), "high-priority");
+    }
+
+    /// Pool of one plain worker and one `os = "windows"` worker, plus a request
+    /// carrying `command`. Shared by the OS-gate tests below.
+    async fn os_gate_fixture(command: &str) -> (WorkerPool, WorkerSelector, SelectionRequest) {
+        let pool = WorkerPool::new();
+        pool.add_worker_state(make_worker("linux-worker", 8, 50.0))
+            .await;
+        pool.add_worker_state(make_worker_with_os(
+            "windows-worker",
+            8,
+            50.0,
+            Some("windows"),
+        ))
+        .await;
+
+        let selector = WorkerSelector::with_config(
+            SelectionConfig::default(),
+            CircuitBreakerConfig::default(),
+        );
+
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: Some(command.to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        (pool, selector, request)
+    }
+
+    #[tokio::test]
+    async fn test_os_declared_worker_excluded_from_unqualified_command() {
+        // The regression this gate exists for: a Windows worker must not absorb
+        // an ordinary build dispatched from a Linux or macOS box and hand back
+        // wrong-platform artifacts.
+        let (pool, selector, request) = os_gate_fixture("cargo check --workspace").await;
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result.worker.expect("Expected a worker");
+        assert_eq!(selected.config.read().await.id.as_str(), "linux-worker");
+    }
+
+    #[tokio::test]
+    async fn test_os_declared_worker_selected_for_matching_target() {
+        let (pool, selector, request) =
+            os_gate_fixture("cargo build --target x86_64-pc-windows-msvc").await;
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result.worker.expect("Expected a worker");
+        assert_eq!(selected.config.read().await.id.as_str(), "windows-worker");
+    }
+
+    #[tokio::test]
+    async fn test_undeclared_worker_cannot_satisfy_os_requirement() {
+        // Only the windows worker can claim the MSVC target, so removing it must
+        // leave nothing selectable rather than falling back to a Linux box.
+        let pool = WorkerPool::new();
+        pool.add_worker_state(make_worker("linux-worker", 8, 50.0))
+            .await;
+
+        let selector = WorkerSelector::with_config(
+            SelectionConfig::default(),
+            CircuitBreakerConfig::default(),
+        );
+
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: Some("cargo build --target x86_64-pc-windows-msvc".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(
+            result.worker.is_none(),
+            "a worker with no declared OS must not satisfy an OS requirement"
+        );
+    }
+
+    #[test]
+    fn test_os_gate_admits_truth_table() {
+        // Undeclared worker + unqualified command: every worker in the fleet
+        // today. Must stay admissible or the whole pool stops taking work.
+        assert!(os_gate_admits(None, None));
+        // Declared worker only takes commands naming its OS.
+        assert!(os_gate_admits(Some("windows"), Some("windows")));
+        assert!(!os_gate_admits(Some("windows"), Some("darwin")));
+        assert!(!os_gate_admits(Some("windows"), None));
+        // And an undeclared worker cannot claim to satisfy one.
+        assert!(!os_gate_admits(None, Some("windows")));
+        // Case is not significant on either side.
+        assert!(os_gate_admits(Some("Windows"), Some("windows")));
+        assert!(os_gate_admits(Some("windows"), Some("WINDOWS")));
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics_report_os_gate_exclusion() {
+        // Diagnostics re-derive admissibility independently of the selection
+        // loop. If they disagree, `rch status` shows a worker as eligible that
+        // the scheduler refuses — worse than reporting nothing at all.
+        let (pool, selector, request) = os_gate_fixture("cargo check --workspace").await;
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result.worker.expect("linux worker should still be chosen");
+        assert_eq!(selected.config.read().await.id.as_str(), "linux-worker");
+
+        let diagnostics = selector
+            .build_selection_diagnostics(&pool, &request, &HashSet::new())
+            .await;
+        let windows = diagnostics
+            .workers
+            .iter()
+            .find(|w| w.worker_id.as_str() == "windows-worker")
+            .expect("windows worker present in diagnostics");
+
+        assert_eq!(
+            windows.final_decision,
+            WorkerSelectionDiagnosticDecision::Deny
+        );
+        assert!(
+            windows
+                .reason_codes
+                .iter()
+                .any(|code| code == "os.declared_mismatch"),
+            "expected os.declared_mismatch, got {:?}",
+            windows.reason_codes
+        );
+    }
+
+    #[tokio::test]
+    async fn test_windows_gnu_target_does_not_require_windows_host() {
+        // mingw cross-compiles fine from Linux, so it must stay unconstrained.
+        let (pool, selector, request) =
+            os_gate_fixture("cargo build --target x86_64-pc-windows-gnu").await;
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result.worker.expect("Expected a worker");
+        assert_eq!(selected.config.read().await.id.as_str(), "linux-worker");
     }
 
     #[tokio::test]

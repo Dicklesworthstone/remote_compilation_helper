@@ -621,6 +621,9 @@ fn generate_workers_toml(workers: &[WizardWorker]) -> Result<String> {
                 total_slots: u32::from(worker.total_slots),
                 priority: u32::from(worker.priority),
                 tags: Vec::new(),
+                // The wizard has no OS question; leaving it unset keeps the new
+                // worker a candidate for any job, which is the safe default.
+                os: None,
                 enabled: true,
             })
             .collect(),

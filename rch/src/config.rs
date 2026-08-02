@@ -2397,6 +2397,15 @@ pub struct WorkerEntry {
     /// Optional tags for filtering.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Operator-declared host OS (`linux`, `darwin`, `windows`), gating which
+    /// commands may run here — see `rch_common::declared_os`.
+    ///
+    /// Must be carried by every `workers.toml` model, not just the daemon's:
+    /// `rch workers init` and `rch config init` re-serialize the whole file from
+    /// this struct, so a missing field here silently DELETES the declaration and
+    /// un-fences the worker on the next write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
     /// Whether this worker is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -2570,6 +2579,61 @@ mod tests {
     use rch_common::test_guard;
     use tempfile::NamedTempFile;
     use tracing::info;
+
+    /// `rch workers init` and `rch config init` rewrite the WHOLE workers.toml
+    /// by deserializing into this struct and re-serializing it. A field missing
+    /// here is silently deleted from the operator's file — and deleting
+    /// `os = "windows"` un-fences a Windows worker, letting it start accepting
+    /// Linux builds. Guard the round-trip.
+    #[test]
+    fn test_workers_toml_roundtrip_preserves_declared_os() {
+        let _guard = test_guard!();
+
+        let original = r#"
+[[workers]]
+id = "wsurf"
+host = "100.68.2.11"
+user = "jeffr"
+priority = 60
+tags = ["rust"]
+os = "windows"
+"#;
+
+        let parsed: WorkersConfig = toml::from_str(original).expect("parse");
+        assert_eq!(parsed.workers[0].os.as_deref(), Some("windows"));
+
+        let rewritten = toml::to_string_pretty(&parsed).expect("serialize");
+        assert!(
+            rewritten.contains(r#"os = "windows""#),
+            "declared OS lost on rewrite:\n{rewritten}"
+        );
+
+        let reparsed: WorkersConfig = toml::from_str(&rewritten).expect("reparse");
+        assert_eq!(reparsed.workers[0].os.as_deref(), Some("windows"));
+    }
+
+    /// The inverse: an ordinary worker must not gain an `os` key on rewrite,
+    /// which would fence it off from the jobs it handles today.
+    #[test]
+    fn test_workers_toml_roundtrip_omits_absent_declared_os() {
+        let _guard = test_guard!();
+
+        let original = r#"
+[[workers]]
+id = "vmi1149989"
+host = "212.90.121.76"
+tags = ["rust"]
+"#;
+
+        let parsed: WorkersConfig = toml::from_str(original).expect("parse");
+        assert_eq!(parsed.workers[0].os, None);
+
+        let rewritten = toml::to_string_pretty(&parsed).expect("serialize");
+        assert!(
+            !rewritten.contains("os ="),
+            "unexpected os key added on rewrite:\n{rewritten}"
+        );
+    }
 
     #[test]
     fn test_config_dir_env_value_override() {

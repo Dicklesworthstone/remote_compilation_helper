@@ -69,6 +69,11 @@ pub struct RequiredCapabilities {
     pub needs_targets: Vec<String>,
     /// Explicit toolchain overrides (`cargo +nightly-…`).
     pub needs_toolchains: Vec<String>,
+    /// Host OS the worker must run, when a requested `--target` triple implies
+    /// one (e.g. `*-pc-windows-msvc` → `windows`). `None` for the ordinary
+    /// native build, which stays schedulable on any worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_os: Option<String>,
 }
 
 impl RequiredCapabilities {
@@ -86,6 +91,7 @@ impl RequiredCapabilities {
             needs_node: self.needs_node,
             needs_zig: self.needs_zig,
             needs_toolchains: self.needs_toolchains.clone(),
+            needs_os: self.needs_os.clone(),
             ..CapabilityRequirement::default()
         }
     }
@@ -208,7 +214,57 @@ fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> Required
     req.needs_targets.dedup();
     req.needs_toolchains.sort();
     req.needs_toolchains.dedup();
+    req.needs_os = os_from_target_triples(&req.needs_targets);
     req
+}
+
+/// The host OS a command demands of a worker, if any.
+///
+/// Exposed for the daemon's selection path, which gates on the command string it
+/// already carries rather than on a new wire field — keeping this usable across
+/// a fleet whose `rch` and `rchd` binaries are at mixed versions.
+#[must_use]
+pub fn required_os_for_command(command: &str) -> Option<String> {
+    let mut triples: Vec<String> = Vec::new();
+    for part in split_shell_commands(command) {
+        let detail = classify_command_detailed(part);
+        if detail.classification.is_compilation {
+            triples.extend(derive_capabilities(part, detail.classification.kind).needs_targets);
+        }
+    }
+    os_from_target_triples(&triples)
+}
+
+/// The host OS a set of `--target` triples demands, when they agree on one.
+///
+/// Only a triple naming an OS the worker must *be* counts. `x86_64-pc-windows-msvc`
+/// links against the MSVC toolchain and needs a real Windows host, so it yields
+/// `windows`; every `*-apple-*` target (darwin, ios, tvos, watchos, visionos)
+/// needs the macOS SDK, so it yields `darwin`. `x86_64-pc-windows-gnu` and
+/// `wasm32-unknown-unknown` cross-compile happily from Linux and yield nothing.
+///
+/// Mixed or absent requirements yield `None`, leaving the command schedulable
+/// anywhere — the historical behaviour. A compound command spanning two host
+/// OSes cannot succeed on any single worker regardless, and returning `None`
+/// keeps that no worse than it is today rather than inventing a new refusal.
+fn os_from_target_triples(triples: &[String]) -> Option<String> {
+    let mut required: Option<String> = None;
+    for triple in triples {
+        let lower = triple.to_ascii_lowercase();
+        let os = if lower.contains("-windows-msvc") {
+            "windows"
+        } else if lower.contains("-apple-") {
+            "darwin"
+        } else {
+            continue;
+        };
+        match &required {
+            Some(existing) if existing != os => return None,
+            Some(_) => {}
+            None => required = Some(os.to_string()),
+        }
+    }
+    required
 }
 
 /// Run the read-only preflight for a command. `proof_policy` reflects the
@@ -255,6 +311,9 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
     required.needs_targets.dedup();
     required.needs_toolchains.sort();
     required.needs_toolchains.dedup();
+    // Recomputed over the merged target set: a compound command whose parts
+    // disagree on the required OS must not inherit one part's answer.
+    required.needs_os = os_from_target_triples(&required.needs_targets);
 
     let base_recommendation = if is_compilation {
         AdmitRecommendation::Offload
@@ -329,6 +388,80 @@ mod tests {
     use crate::admission_rejection::{
         AdmissionRejectionCategory, CandidateRejection, aggregate_rejections,
     };
+
+    #[test]
+    fn msvc_target_requires_a_windows_host() {
+        // MSVC links against the Microsoft toolchain: it cannot be produced
+        // anywhere but a real Windows box.
+        assert_eq!(
+            required_os_for_command("cargo build --target x86_64-pc-windows-msvc"),
+            Some("windows".to_string())
+        );
+        assert_eq!(
+            required_os_for_command("cargo build --target=aarch64-pc-windows-msvc --release"),
+            Some("windows".to_string())
+        );
+    }
+
+    #[test]
+    fn cross_compilable_targets_stay_unconstrained() {
+        // mingw and wasm cross-compile from Linux, so constraining them would
+        // strand work that the existing fleet handles today.
+        assert_eq!(
+            required_os_for_command("cargo build --target x86_64-pc-windows-gnu"),
+            None
+        );
+        assert_eq!(
+            required_os_for_command("cargo build --target wasm32-unknown-unknown"),
+            None
+        );
+        assert_eq!(required_os_for_command("cargo check --workspace"), None);
+        assert_eq!(required_os_for_command("cargo test"), None);
+    }
+
+    #[test]
+    fn apple_target_requires_a_darwin_host() {
+        // Every Apple target needs the macOS SDK, not just apple-darwin.
+        for triple in [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "aarch64-apple-ios",
+            "aarch64-apple-tvos",
+            "arm64_32-apple-watchos",
+        ] {
+            assert_eq!(
+                required_os_for_command(&format!("cargo build --target {triple}")),
+                Some("darwin".to_string()),
+                "triple={triple}"
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_targets_constrain_nothing() {
+        // A compound command spanning two host OSes has no single answer; it must
+        // stay schedulable rather than inherit one half's requirement.
+        assert_eq!(
+            required_os_for_command(
+                "cargo build --target x86_64-pc-windows-msvc && cargo build --target aarch64-apple-darwin"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn preflight_surfaces_the_required_os() {
+        let p = preflight("cargo build --target x86_64-pc-windows-msvc", false);
+        assert_eq!(p.required.needs_os.as_deref(), Some("windows"));
+        assert_eq!(
+            p.required.to_requirement(0).needs_os.as_deref(),
+            Some("windows")
+        );
+
+        let plain = preflight("cargo build --release", false);
+        assert_eq!(plain.required.needs_os, None);
+        assert_eq!(plain.required.to_requirement(0).needs_os, None);
+    }
 
     #[test]
     fn common_cargo_build_offloads_needing_cargo() {
