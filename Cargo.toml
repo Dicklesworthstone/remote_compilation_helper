@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.54"
+version = "1.0.55"
 edition = "2024"
 license = "MIT"
 authors = ["Remote Compilation Helper Contributors"]

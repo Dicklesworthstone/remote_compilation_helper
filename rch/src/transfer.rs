@@ -2143,10 +2143,21 @@ fi",
         let mut tar_child = tar.spawn().context("spawn local tar (windows sync)")?;
         let mut ssh_child = ssh.spawn().context("spawn ssh tar x (windows sync)")?;
         let mut tar_out = tar_child.stdout.take().context("local tar stdout")?;
+        let mut tar_err = tar_child.stderr.take();
         let mut ssh_in = ssh_child.stdin.take().context("ssh stdin")?;
         let pump = tokio::spawn(async move {
             let _ = tokio::io::copy(&mut tar_out, &mut ssh_in).await;
             drop(ssh_in);
+        });
+        // Drain the local tar's stderr concurrently. `ssh_child.wait_with_output`
+        // blocks until the remote extract finishes; if a chatty tar (many
+        // per-file warnings) fills its undrained stderr pipe in the meantime it
+        // stops writing stdout, the pump starves the ssh stdin, and the whole
+        // transfer deadlocks. We only need the exit status, so discard the text.
+        let tar_err_drain = tokio::spawn(async move {
+            if let Some(err) = tar_err.as_mut() {
+                let _ = tokio::io::copy(err, &mut tokio::io::sink()).await;
+            }
         });
         let ssh_out = ssh_child
             .wait_with_output()
@@ -2154,6 +2165,7 @@ fi",
             .context("ssh tar x wait")?;
         let tar_status = tar_child.wait().await.context("local tar wait")?;
         let _ = pump.await;
+        let _ = tar_err_drain.await;
 
         if !tar_status.success() {
             return Err(anyhow::anyhow!("local tar failed during windows sync"));
@@ -2226,10 +2238,20 @@ fi",
             .spawn()
             .context("spawn local tar x (windows retrieve)")?;
         let mut ssh_out = ssh_child.stdout.take().context("ssh stdout")?;
+        let mut ssh_err = ssh_child.stderr.take();
         let mut tar_in = tar_child.stdin.take().context("local tar stdin")?;
         let pump = tokio::spawn(async move {
             let _ = tokio::io::copy(&mut ssh_out, &mut tar_in).await;
             drop(tar_in);
+        });
+        // Drain the remote tar's stderr (forwarded over ssh) concurrently. Without
+        // this a chatty remote tar (e.g. "file changed as we read it" on a live
+        // target dir) fills the undrained ssh stderr pipe, blocks ssh, starves the
+        // pump, and hangs the local extract. Exit status is all we need here.
+        let ssh_err_drain = tokio::spawn(async move {
+            if let Some(err) = ssh_err.as_mut() {
+                let _ = tokio::io::copy(err, &mut tokio::io::sink()).await;
+            }
         });
         let tar_res = tar_child
             .wait_with_output()
@@ -2237,6 +2259,7 @@ fi",
             .context("local tar x wait")?;
         let ssh_status = ssh_child.wait().await.context("ssh tar c wait")?;
         let _ = pump.await;
+        let _ = ssh_err_drain.await;
 
         if !tar_res.status.success() {
             return Err(anyhow::anyhow!(
