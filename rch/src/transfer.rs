@@ -5869,6 +5869,86 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
         assert_eq!(pipeline.remote_path(), "/data/tmp/rch/project/def456");
     }
 
+    #[test]
+    fn test_is_windows_drive_abs_path_matches_drive_letter_forms() {
+        assert!(is_windows_drive_abs_path("C:/rch"));
+        assert!(is_windows_drive_abs_path("C:\\rch"));
+        assert!(is_windows_drive_abs_path("d:/x/y"));
+        assert!(!is_windows_drive_abs_path("/data/projects"));
+        assert!(!is_windows_drive_abs_path("relative/path"));
+        assert!(!is_windows_drive_abs_path("C:")); // no separator
+        assert!(!is_windows_drive_abs_path("1:/rch")); // non-alpha drive
+    }
+
+    #[test]
+    fn test_remote_path_override_accepts_windows_drive_path() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/workspace/project"),
+            "project".to_string(),
+            "def456".to_string(),
+            TransferConfig::default(),
+        )
+        .with_worker_platform(WorkerPlatform::Windows)
+        .with_remote_path_override("C:/rch/project/def456");
+
+        // The drive-letter override is accepted verbatim, not rejected as
+        // "not absolute" (which would fall back to the default remote path and
+        // send the target retrieval to the wrong directory).
+        assert_eq!(pipeline.remote_path(), "C:/rch/project/def456");
+    }
+
+    #[test]
+    fn test_build_remote_command_windows_skips_pgid_watchdog() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/workspace/project"),
+            "project".to_string(),
+            "def456".to_string(),
+            TransferConfig::default(),
+        )
+        .with_worker_platform(WorkerPlatform::Windows)
+        .with_build_id(Some(42));
+
+        let cmd = pipeline.build_remote_command("cargo build", None);
+        // Windows must NOT get the Unix pgid/setsid watchdog: its backgrounded
+        // timer subshell keeps the SSH channel open so a successful build hangs
+        // until timeout (the #20 failure mode re-triggered on Windows).
+        assert!(!cmd.contains("setsid"), "windows cmd must not use setsid: {cmd}");
+        assert!(
+            !cmd.contains("kill -KILL"),
+            "windows cmd must not arm a group-kill watchdog: {cmd}"
+        );
+        assert!(
+            cmd.contains("cargo build"),
+            "windows cmd must still run the command: {cmd}"
+        );
+        assert!(
+            cmd.contains("C:/rch/project/def456"),
+            "windows cmd must cd into the C:/rch build root: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_build_remote_command_posix_keeps_pgid_watchdog() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/workspace/project"),
+            "project".to_string(),
+            "def456".to_string(),
+            TransferConfig::default(),
+        )
+        .with_build_id(Some(42)); // default platform = Posix
+
+        let cmd = pipeline.build_remote_command("cargo build", None);
+        // Posix keeps the in-session pgid watchdog (setsid + group kill) so
+        // this change is Windows-only and leaves the fleet path untouched.
+        assert!(
+            cmd.contains("setsid"),
+            "posix cmd should still arm the pgid watchdog: {cmd}"
+        );
+    }
+
     // ==========================================================================
     // .rchignore Parser Tests
     // ==========================================================================
