@@ -2166,13 +2166,14 @@ async fn handle_select_worker(
             // Reserve the slots.
             reservation_attempts += 1;
             if worker.reserve_slots(request.estimated_cores).await {
-                let (id, host, user, identity_file) = {
+                let (id, host, user, identity_file, declared_os) = {
                     let config = worker.config.read().await;
                     (
                         config.id.clone(),
                         config.host.clone(),
                         config.user.clone(),
                         config.identity_file.clone(),
+                        rch_common::declared_os(&config.tags),
                     )
                 };
 
@@ -2240,6 +2241,7 @@ async fn handle_select_worker(
                         identity_file,
                         slots_available,
                         speed_score,
+                        declared_os,
                     }),
                     reason: selection_reason,
                     build_id,

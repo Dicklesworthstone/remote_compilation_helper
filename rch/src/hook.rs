@@ -8,7 +8,7 @@ use crate::error::{ArtifactRetrievalWarning, DaemonError, TransferError};
 use crate::status_types::format_bytes;
 use crate::toolchain::{detect_toolchain, parse_channel_string};
 use crate::transfer::{
-    SyncResult, TransferPipeline, clean_overlay_include_patterns,
+    SyncResult, TransferPipeline, WorkerPlatform, clean_overlay_include_patterns,
     compute_project_hash_with_dependency_roots_and_policy, configure_clean_git_command,
     default_bun_artifact_patterns, default_c_cpp_artifact_patterns, default_rust_artifact_patterns,
     default_rust_test_artifact_patterns, default_zigbuild_artifact_patterns, project_id_from_path,
@@ -3083,6 +3083,14 @@ fn command_priority_from_env(reporter: &HookReporter) -> CommandPriority {
 
 /// Convert a SelectedWorker to a WorkerConfig.
 fn selected_worker_to_config(worker: &SelectedWorker) -> WorkerConfig {
+    // Rebuild the reserved `os:<os>` tag from the daemon-propagated declared OS
+    // so `WorkerPlatform::from_worker` can pick the Windows transport. Historical
+    // workers report no OS and keep the empty (Posix) tag set.
+    let tags = worker
+        .declared_os
+        .as_deref()
+        .map(|os| vec![rch_common::os_tag(os)])
+        .unwrap_or_default();
     WorkerConfig {
         id: worker.id.clone(),
         host: worker.host.clone(),
@@ -3090,7 +3098,7 @@ fn selected_worker_to_config(worker: &SelectedWorker) -> WorkerConfig {
         identity_file: worker.identity_file.clone(),
         total_slots: worker.slots_available,
         priority: 100,
-        tags: vec![],
+        tags,
     }
 }
 

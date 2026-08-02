@@ -3441,6 +3441,7 @@ mod tests {
                 identity_file: "~/.ssh/id_rsa".to_string(),
                 slots_available: 6,
                 speed_score: 90.0,
+                declared_os: None,
             }),
             reason: rch_common::SelectionReason::Success,
             diagnostics: Some(diagnostics),

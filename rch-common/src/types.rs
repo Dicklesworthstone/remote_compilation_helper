@@ -503,6 +503,13 @@ pub struct SelectedWorker {
     pub slots_available: u32,
     /// Worker's speed score (0-100).
     pub speed_score: f64,
+    /// Operator-declared host OS (e.g. `windows`), if any. Propagated so the
+    /// hook can pick the right transport (Windows workers use `C:/rch` +
+    /// tar-over-ssh instead of the Unix rsync path). `None` for the historical
+    /// unlabelled workers. `#[serde(default)]` keeps old daemons/hooks
+    /// wire-compatible.
+    #[serde(default)]
+    pub declared_os: Option<String>,
 }
 
 /// Worker selection response from daemon to hook.

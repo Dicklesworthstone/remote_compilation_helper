@@ -1441,6 +1441,7 @@ fn test_selected_worker_to_config() {
         identity_file: "~/.ssh/id_rsa".to_string(),
         slots_available: 8,
         speed_score: 75.5,
+        declared_os: None,
     };
 
     let config = selected_worker_to_config(&worker);
@@ -1594,6 +1595,7 @@ async fn test_daemon_query_protocol() {
                 identity_file: "~/.ssh/mock_key".to_string(),
                 slots_available: 16,
                 speed_score: 95.0,
+                declared_os: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -1677,6 +1679,7 @@ async fn test_daemon_query_sends_preferred_workers() {
                 identity_file: "~/.ssh/mock_key".to_string(),
                 slots_available: 16,
                 speed_score: 95.0,
+                declared_os: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -1758,6 +1761,7 @@ async fn test_daemon_query_releases_worker_outside_requested_set() {
                     identity_file: "~/.ssh/mock_key".to_string(),
                     slots_available: 6,
                     speed_score: 90.0,
+                    declared_os: None,
                 }),
                 reason: SelectionReason::Success,
                 build_id: Some(42),
@@ -1856,6 +1860,7 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
                     identity_file: "~/.ssh/mock_key".to_string(),
                     slots_available: 6,
                     speed_score: 90.0,
+                    declared_os: None,
                 }),
                 reason: SelectionReason::Success,
                 build_id: Some(43),
@@ -1961,6 +1966,7 @@ async fn test_daemon_query_wait_parameters() {
                 identity_file: "~/.ssh/mock_key".to_string(),
                 slots_available: 16,
                 speed_score: 95.0,
+                declared_os: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -2037,6 +2043,7 @@ async fn test_daemon_query_url_encoding() {
                 identity_file: "i".to_string(),
                 slots_available: 1,
                 speed_score: 1.0,
+                declared_os: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -2157,6 +2164,7 @@ async fn test_process_hook_remote_success_mocked() {
             identity_file: "~/.ssh/mock_key".to_string(),
             slots_available: 8,
             speed_score: 90.0,
+            declared_os: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -2236,6 +2244,7 @@ async fn test_force_local_allows_even_when_remote_available() {
             identity_file: "~/.ssh/mock_key".to_string(),
             slots_available: 8,
             speed_score: 90.0,
+            declared_os: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -2303,6 +2312,7 @@ async fn test_force_remote_bypasses_confidence_threshold() {
             identity_file: "~/.ssh/mock_key".to_string(),
             slots_available: 8,
             speed_score: 90.0,
+            declared_os: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -2489,6 +2499,7 @@ async fn test_process_hook_remote_nonzero_exit_uses_transparent_interception() {
             identity_file: "~/.ssh/mock_key".to_string(),
             slots_available: 8,
             speed_score: 90.0,
+            declared_os: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -2539,6 +2550,7 @@ fn test_worker_config_from_selected_worker() {
         identity_file: "/keys/deploy.pem".to_string(),
         slots_available: 32,
         speed_score: 88.8,
+        declared_os: None,
     };
 
     let config = selected_worker_to_config(&worker);
@@ -5487,6 +5499,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         identity_file: "~/.ssh/mock_key".to_string(),
         slots_available: 8,
         speed_score: 90.0,
+        declared_os: None,
     };
 
     let reporter = HookReporter::new(OutputVisibility::None);
@@ -5596,6 +5609,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         identity_file: "~/.ssh/mock_key".to_string(),
         slots_available: 8,
         speed_score: 90.0,
+        declared_os: None,
     };
     let reporter = HookReporter::new(OutputVisibility::None);
 
@@ -5762,6 +5776,7 @@ async fn test_cargo_test_remote_build_failure() {
             identity_file: "~/.ssh/test_key".to_string(),
             slots_available: 8,
             speed_score: 85.0,
+            declared_os: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -5823,6 +5838,7 @@ async fn test_cargo_test_with_filter() {
             identity_file: "~/.ssh/test_key".to_string(),
             slots_available: 8,
             speed_score: 85.0,
+            declared_os: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -5884,6 +5900,7 @@ async fn test_cargo_test_with_test_threads() {
             identity_file: "~/.ssh/test_key".to_string(),
             slots_available: 8,
             speed_score: 85.0,
+            declared_os: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -5950,6 +5967,7 @@ async fn test_cargo_test_signal_killed() {
             identity_file: "~/.ssh/test_key".to_string(),
             slots_available: 8,
             speed_score: 85.0,
+            declared_os: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -6016,6 +6034,7 @@ async fn test_cargo_test_signal_killed_with_toolchain_path_does_not_fallback_loc
             identity_file: "~/.ssh/test_key".to_string(),
             slots_available: 8,
             speed_score: 85.0,
+            declared_os: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,
@@ -6076,6 +6095,7 @@ async fn test_cargo_test_toolchain_fallback() {
             identity_file: "~/.ssh/test_key".to_string(),
             slots_available: 8,
             speed_score: 85.0,
+            declared_os: None,
         }),
         reason: SelectionReason::Success,
         build_id: None,

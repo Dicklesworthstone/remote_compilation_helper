@@ -160,6 +160,11 @@ pub(super) async fn execute_remote_compilation(
     }
     let normalized_project_root = normalized_project.canonical_path().to_path_buf();
 
+    // Windows workers have no Unix canonical/alias projects topology and cargo
+    // needs drive-letter paths, so their whole remote layout lives under the
+    // Windows build base and syncs via tar-over-ssh (no rsync/streaming).
+    let worker_is_windows = WorkerPlatform::from_worker(&worker_config).is_windows();
+
     let exact_dependency_closure_sync =
         clean_overlay.is_none() && command_uses_cargo_dependency_graph(kind);
     let raw_sync_roots = if clean_overlay.is_some() {
@@ -246,6 +251,20 @@ pub(super) async fn execute_remote_compilation(
         sync_plan[0].remote_root = format!("{remote_base}/{project_id}/{project_hash}");
         sync_plan[0].root_hash.clone_from(&project_hash);
     }
+    // Relocate every closure root under the Windows build base so all downstream
+    // remote paths (sync target, build cwd, CARGO_TARGET_DIR, manifest
+    // verification) use drive-letter paths. Mirrors the clean-overlay remote_root
+    // override above but applies to the whole plan. See rch#<NN>.
+    if worker_is_windows {
+        for entry in sync_plan.iter_mut() {
+            entry.remote_root = format!(
+                "{}/{}/{}",
+                crate::transfer::WINDOWS_DEFAULT_REMOTE_BASE,
+                entry.project_id,
+                entry.root_hash
+            );
+        }
+    }
     let sync_roots = sync_plan
         .iter()
         .map(|entry| entry.local_root.clone())
@@ -255,8 +274,12 @@ pub(super) async fn execute_remote_compilation(
     let output_ctx = OutputContext::detect();
     let console = RchConsole::with_context(output_ctx);
     let feedback_visible = reporter.visibility != OutputVisibility::None && !console.is_machine();
-    let progress_enabled =
-        output_ctx.supports_rich() && reporter.visibility != OutputVisibility::None;
+    // The Windows tar-over-ssh transport has no streaming (rsync-style) progress
+    // variant, so disable progress there to force the Windows-aware
+    // non-streaming sync/retrieve paths.
+    let progress_enabled = output_ctx.supports_rich()
+        && reporter.visibility != OutputVisibility::None
+        && !worker_is_windows;
     let remote_pgid_file = build_id.and_then(|id| {
         sync_plan
             .iter()
@@ -384,6 +407,7 @@ pub(super) async fn execute_remote_compilation(
         .with_compilation_config(compilation_config.clone())
         .with_compilation_kind(kind)
         .with_remote_path_override(entry.remote_root.clone())
+        .with_worker_platform(WorkerPlatform::from_worker(&worker_config))
         .with_build_id(build_id);
         if let Some(spec) = clean_overlay {
             root_pipeline = root_pipeline
@@ -913,7 +937,8 @@ pub(super) async fn execute_remote_compilation(
                 .with_command_timeout(command_timeout)
                 .with_compilation_config(compilation_config.clone())
                 .with_compilation_kind(kind)
-                .with_remote_path_override(remote_target_path.clone());
+                .with_remote_path_override(remote_target_path.clone())
+                .with_worker_platform(WorkerPlatform::from_worker(&worker_config));
 
                 let mut target_progress = if progress_enabled {
                     Some(TransferProgress::download(

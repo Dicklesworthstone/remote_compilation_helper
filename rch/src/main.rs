@@ -3876,7 +3876,8 @@ async fn handle_cache_warm(
             project_id.clone(),
             project_hash.clone(),
             transfer_config.clone(),
-        );
+        )
+        .with_worker_platform(transfer::WorkerPlatform::from_worker(worker));
         let started = std::time::Instant::now();
         match pipeline.sync_to_remote(worker).await {
             Ok(sync_result) => {
