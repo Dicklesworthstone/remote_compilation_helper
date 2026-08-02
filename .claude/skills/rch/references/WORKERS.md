@@ -10,7 +10,8 @@ user = "ubuntu"              # Required: SSH user
 identity_file = "~/.ssh/key" # Required: SSH key path
 total_slots = 16             # Required: max concurrent jobs (≈ CPU cores - 2)
 priority = 100               # Optional: selection weight (default: 50, higher = preferred)
-tags = ["rust", "fast"]      # Optional: capability tags
+tags = ["rust", "fast"]      # Optional: descriptive labels (NOT a scheduling gate)
+os = "windows"               # Optional: hard gate — see "Cross-Platform Workers"
 enabled = true               # Optional: set false to disable (default: true)
 ```
 
@@ -23,7 +24,12 @@ score = available_slots × priority × locality_bonus
 1. **Available slots**: `total_slots - active_jobs`
 2. **Priority**: tiebreaker when slots equal
 3. **Locality**: bonus for workers with cached project data
-4. **Tags**: project can require specific tags via `.rch/config.toml`
+4. **Runtime capability**: probed per worker (rust/go/bun/node/nix/zig); a
+   command is only scheduled onto a worker that has the runtime it needs
+5. **Host OS**: a worker declaring `os` is admissible *only* for commands
+   requiring that OS — see below
+
+Tags take no part in selection.
 
 ## Multi-Worker Example
 
@@ -92,20 +98,56 @@ watch -n 5 'rch workers status'      # Continuous monitoring
 
 Probe output shows: SSH connectivity, detected toolchains (rustc, cargo, bun, gcc), disk space, load.
 
+## Cross-Platform Workers (`os =`)
+
+A worker whose host OS differs from the rest of the fleet declares it:
+
+```toml
+[[workers]]
+id = "windows-builder"
+host = "192.168.1.127"
+user = "builder"
+identity_file = "~/.ssh/windows_key"
+total_slots = 4
+os = "windows"      # linux | darwin | windows
+```
+
+`os` is a **hard admission gate** and makes the worker **exclusive**: it accepts
+only commands that require that OS. A plain `cargo check` dispatched from a Linux
+or macOS machine will never be scheduled there, so it cannot hand back
+wrong-platform artifacts. A worker with no `os` set remains a candidate for
+anything — the default, and the behaviour of every worker that predates this.
+
+The requirement comes from the command's `--target` triple:
+
+| Triple | Requires | Why |
+|---|---|---|
+| `*-pc-windows-msvc` | `os = "windows"` | links against the MSVC toolchain |
+| `*-apple-*` (darwin/ios/tvos/watchos) | `os = "darwin"` | needs the macOS SDK |
+| `*-pc-windows-gnu`, `wasm32-*`, others | nothing | cross-compiles fine from Linux |
+
+If a command requires an OS no worker declares, nothing is admissible and the
+build **falls back to local** — which is correct, and better than shipping it to
+a host that cannot produce the artifact. `rch status` diagnostics report the
+exclusion with reason code `os.declared_mismatch`.
+
+> **Upgrade before you configure.** `WorkerEntry` does not set
+> `#[serde(deny_unknown_fields)]`, so an rchd predating this feature parses
+> `os = "windows"`, discards it, and treats the worker as unfenced. Roll out the
+> daemon first, then add the worker.
+
 ## Tags
 
-Workers declare capabilities:
+Workers may carry descriptive labels:
 ```toml
 [[workers]]
 id = "polyglot"
 tags = ["rust", "bun", "cpp"]
 ```
 
-Projects require tags:
-```toml
-# .rch/config.toml in project root
-required_tags = ["rust", "fast"]
-```
+**Tags do not affect scheduling.** Nothing in rch matches on them — they exist
+for operator bookkeeping (`rch workers list`). Runtime capability is *probed*
+per worker rather than declared, and host OS is gated by `os` above.
 
 ## Slot Sizing
 
