@@ -866,27 +866,40 @@ async fn run_benchmark(format: OutputFormat) -> Result<()> {
     let elapsed = start.elapsed();
     let cores = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
 
+    // serde_json maps NaN/Infinity to `null`, and rchd parses the score with
+    // `json.get("score").and_then(Value::as_f64)`. A single non-finite value
+    // would therefore emit `"score": null`, the daemon would fail to parse it,
+    // and the worker would silently fall back into the "never benchmarked"
+    // re-queue loop. A NaN is reachable if any benchmark divides 0/0, so clamp
+    // every float we emit.
+    fn finite(v: f64) -> f64 {
+        if v.is_finite() { v } else { 0.0 }
+    }
+    fn round1(v: f64) -> f64 {
+        (finite(v) * 10.0).round() / 10.0
+    }
+
     match format {
         OutputFormat::Json => {
             // `score` stays a top-level f64 for backward compatibility: rchd's
             // `execute_benchmark_on_worker` parses exactly that field.
             let payload = serde_json::json!({
-                "score": (score.total * 10.0).round() / 10.0,
+                "score": round1(score.total),
                 "elapsed_secs": (elapsed.as_secs_f64() * 100.0).round() / 100.0,
                 "cores": cores,
                 "components": {
-                    "cpu": score.cpu_score,
-                    "memory": score.memory_score,
-                    "disk": score.disk_score,
-                    "network": score.network_score,
-                    "compilation": score.compilation_score,
+                    "cpu": finite(score.cpu_score),
+                    "memory": finite(score.memory_score),
+                    "disk": finite(score.disk_score),
+                    "network": finite(score.network_score),
+                    "compilation": finite(score.compilation_score),
                 },
                 "raw": {
-                    "cpu_ops_per_second": cpu.ops_per_second,
-                    "memory_seq_bandwidth_gbps": memory.seq_bandwidth_gbps,
-                    "disk_seq_read_mbps": disk.seq_read_mbps,
-                    "disk_seq_write_mbps": disk.seq_write_mbps,
-                    "disk_random_read_iops": disk.random_read_iops,
+                    "cpu_ops_per_second": finite(cpu.ops_per_second),
+                    "memory_seq_bandwidth_gbps": finite(memory.seq_bandwidth_gbps),
+                    "disk_seq_read_mbps": finite(disk.seq_read_mbps),
+                    "disk_seq_write_mbps": finite(disk.seq_write_mbps),
+                    "disk_random_read_iops": finite(disk.random_read_iops),
                     "compilation_release_build_ms": compilation.as_ref().map(|c| c.release_build_ms),
                 },
             });
@@ -894,12 +907,18 @@ async fn run_benchmark(format: OutputFormat) -> Result<()> {
         }
         OutputFormat::Pretty => {
             println!("Benchmark completed in {:.2}s", elapsed.as_secs_f64());
-            println!("Score: {:.1} ({})", score.total, score.rating());
+            // Keep `Score: <float>` alone on its line and nothing else on it.
+            // rchd's `parse_benchmark_score` fallback does
+            // `strip_prefix("score:").trim().parse::<f64>()`, so appending the
+            // rating here (e.g. "Score: 75.6 (excellent)") would make that
+            // fallback fail to parse. Rating goes on its own line.
+            println!("Score: {:.1}", finite(score.total));
+            println!("Rating: {}", score.rating());
             println!("  cores       : {cores}");
-            println!("  cpu         : {:.1}", score.cpu_score);
-            println!("  memory      : {:.1}", score.memory_score);
-            println!("  disk        : {:.1}", score.disk_score);
-            println!("  compilation : {:.1}", score.compilation_score);
+            println!("  cpu         : {:.1}", finite(score.cpu_score));
+            println!("  memory      : {:.1}", finite(score.memory_score));
+            println!("  disk        : {:.1}", finite(score.disk_score));
+            println!("  compilation : {:.1}", finite(score.compilation_score));
         }
     }
 
