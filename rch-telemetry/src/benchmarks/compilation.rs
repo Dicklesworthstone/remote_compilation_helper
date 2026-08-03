@@ -76,7 +76,27 @@ impl std::fmt::Display for CompilationBenchmarkError {
             f,
             "Compilation benchmark failed in {}: {}",
             self.phase, self.message
-        )
+        )?;
+        // Include the captured stderr. Without it the caller only ever logged
+        // "cargo build failed", which is unactionable — this component silently
+        // dropped out of every SpeedScore and nobody could see why. Bounded so a
+        // wall of rustc diagnostics can't flood the log.
+        if let Some(stderr) = self.stderr.as_deref() {
+            let stderr = stderr.trim();
+            if !stderr.is_empty() {
+                const MAX: usize = 1200;
+                if stderr.len() <= MAX {
+                    write!(f, " — stderr: {stderr}")?;
+                } else {
+                    let mut end = MAX;
+                    while !stderr.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    write!(f, " — stderr (truncated): {}…", &stderr[..end])?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -417,6 +437,18 @@ impl CompilationBenchmark {
 
         // Suppress color output for cleaner logs
         cmd.env("CARGO_TERM_COLOR", "never");
+
+        // Bypass RCH's own cargo shim.
+        //
+        // On a worker, `cargo` on PATH is usually the RCH wrapper. Left alone it
+        // tries to *offload* this build to another worker and — under the
+        // remote-required policy — refuses to fall back to local, so the build
+        // fails and the compilation component (20% of the SpeedScore) is silently
+        // dropped from every score. That is self-defeating: the tool's benchmark
+        // is broken by the tool's own hook. This benchmark must always measure
+        // *local* compilation on the machine it is running on.
+        cmd.env("RCH_CARGO_WRAPPER_BYPASS", "1");
+        cmd.env("RCH_ENABLED", "0");
 
         let start = Instant::now();
         let output = cmd.output().map_err(|e| CompilationBenchmarkError {
@@ -1001,7 +1033,12 @@ pub fn product<T: Numeric>(values: &[T]) -> T {
 }
 
 /// Associated type trait.
-pub trait Container {
+// Renamed from `Container` to `Collection`: `generics.rs` also exports a
+// `Container<T>` struct, and `main.rs` glob-imports both modules, so the two
+// names collided with `error[E0659]: 'Container' is ambiguous`. The reference
+// project therefore never compiled, which silently removed the compilation
+// component (20% of the SpeedScore) from every worker's score.
+pub trait Collection {
     type Item;
     fn get(&self) -> Option<&Self::Item>;
     fn put(&mut self, item: Self::Item);
@@ -1024,7 +1061,7 @@ impl<T> Default for Stack<T> {
     }
 }
 
-impl<T> Container for Stack<T> {
+impl<T> Collection for Stack<T> {
     type Item = T;
 
     fn get(&self) -> Option<&Self::Item> {
