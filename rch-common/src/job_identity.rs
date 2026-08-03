@@ -23,6 +23,7 @@
 //! the client and daemon correlate against.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 /// Locally-generated wrapper id, minted by `rch exec` before any daemon
@@ -35,6 +36,26 @@ pub type RemoteBuildId = u64;
 
 /// Prefix of every local wrapper id, so logs and cleanup can recognise them.
 pub const LOCAL_WRAPPER_ID_PREFIX: &str = "rchw-";
+
+/// Resolve the durable client-lease directory using RCH's shared state-home
+/// policy.  Both the hook and restart remediator use this function so they
+/// cannot accidentally inspect different state roots.
+#[must_use]
+pub fn default_job_lease_directory() -> PathBuf {
+    let state_dir = std::env::var_os("RCH_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| {
+            std::env::var_os("XDG_STATE_HOME")
+                .map(|path| PathBuf::from(path).join("rch"))
+                .filter(|path| !path.as_os_str().is_empty())
+        })
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state/rch"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/tmp/rch"));
+    state_dir.join("job-leases")
+}
 
 /// Mint a fresh, unique local wrapper id.
 #[must_use]
@@ -305,6 +326,16 @@ mod tests {
         let b = new_local_wrapper_id();
         assert!(a.starts_with(LOCAL_WRAPPER_ID_PREFIX));
         assert_ne!(a, b, "wrapper ids must be unique");
+    }
+
+    #[test]
+    fn default_job_lease_directory_has_the_stable_leaf() {
+        assert_eq!(
+            default_job_lease_directory()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("job-leases")
+        );
     }
 
     #[test]

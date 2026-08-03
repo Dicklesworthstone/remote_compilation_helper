@@ -17,7 +17,7 @@ use crate::transfer::{
 use crate::ui::console::RchConsole;
 use anyhow::Context;
 use rch_common::errors::catalog::ErrorCode;
-use rch_common::job_identity::{DurableJobLease, JobIdentity};
+use rch_common::job_identity::{DurableJobLease, JobIdentity, default_job_lease_directory};
 use rch_common::repo_updater_contract::{
     REPO_UPDATER_ALLOW_OVERRIDE_ENV, REPO_UPDATER_ALLOWED_HOSTS_ENV, REPO_UPDATER_ALLOWLIST_ENV,
     REPO_UPDATER_AUTH_CREDENTIAL_ID_ENV, REPO_UPDATER_AUTH_EXPIRES_AT_MS_ENV,
@@ -67,7 +67,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::sync::oneshot;
@@ -1077,21 +1077,7 @@ impl DurableLeaseWriter {
 }
 
 fn durable_lease_path(local_wrapper_id: &str) -> PathBuf {
-    let state_dir = std::env::var_os("RCH_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .or_else(|| {
-            std::env::var_os("XDG_STATE_HOME")
-                .map(|path| PathBuf::from(path).join("rch"))
-                .filter(|path| !path.as_os_str().is_empty())
-        })
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state/rch"))
-        })
-        .unwrap_or_else(|| PathBuf::from("/tmp/rch"));
-    state_dir
-        .join("job-leases")
-        .join(format!("{local_wrapper_id}.json"))
+    default_job_lease_directory().join(format!("{local_wrapper_id}.json"))
 }
 
 fn current_process_start_ticks() -> Option<u64> {
@@ -1951,6 +1937,16 @@ pub async fn run_exec(
     )?;
     let wrapper_id = durable_lease.wrapper_id();
 
+    if restart_admission_is_closed(&config.general.socket_path)
+        .await
+        .unwrap_or(false)
+    {
+        durable_lease.heartbeat("restart_admission_blocked")?;
+        return Err(anyhow::anyhow!(
+            "remote build admission is paused while daemon restart remediation is active"
+        ));
+    }
+
     // Query daemon for worker selection
     let response = match query_daemon(
         &config.general.socket_path,
@@ -2725,7 +2721,7 @@ use timing_history::record_build_timing;
 // `record_build` / `queue_when_busy_enabled` are re-exported for the hook hot
 // path. The timeout helpers and `urlencoding_encode` stay `pub(super)` for tests.
 mod daemon_ipc;
-pub(crate) use daemon_ipc::{query_daemon, release_worker};
+pub(crate) use daemon_ipc::{query_daemon, release_worker, restart_admission_is_closed};
 use daemon_ipc::{queue_when_busy_enabled, record_build};
 
 // Command-string parsing utilities (tokenization + cargo flag/env analyzers +

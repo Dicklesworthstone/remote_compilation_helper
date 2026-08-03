@@ -17,7 +17,9 @@ use crate::workers::{
 };
 use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
-use rch_common::job_identity::LOCAL_WRAPPER_ID_PREFIX;
+use rch_common::job_identity::{
+    DurableJobLease, LOCAL_WRAPPER_ID_PREFIX, default_job_lease_directory,
+};
 use rch_common::{
     ApiError, BuildHeartbeatRequest, BuildRecord, BuildStats, BypassRecord, BypassRecordStore,
     CircuitBreakerConfig, CircuitState, CommandPriority, ErrorCode, ReleaseRequest,
@@ -150,6 +152,12 @@ enum ApiRequest {
     },
     SelfTestRun(SelfTestRunRequest),
     Shutdown,
+    /// Atomically close or reopen daemon worker admission for restart safety.
+    RestartAdmission {
+        close: bool,
+    },
+    /// Read the restart barrier without changing daemon state.
+    RestartAdmissionStatus,
     /// Reload configuration (workers.toml) without restart.
     Reload,
     CancelBuild {
@@ -462,6 +470,21 @@ pub struct BuildHeartbeatResponse {
     pub build_id: u64,
     pub worker_id: String,
     pub phase: String,
+}
+
+/// Result of atomically closing admission and proving daemon quiescence.
+#[derive(Debug, Serialize)]
+pub struct RestartAdmissionResponse {
+    pub admission_closed: bool,
+    pub restart_permitted: bool,
+    pub active_build_ids: Vec<u64>,
+    pub queued_build_ids: Vec<u64>,
+    /// Nonterminal or unacknowledged client-side durable job leases.
+    pub client_lease_ids: Vec<String>,
+    /// A lease scan failure must fail closed because it makes the zero-state
+    /// proof unprovable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_lease_scan_error: Option<String>,
 }
 
 // ============================================================================
@@ -972,11 +995,47 @@ pub async fn handle_connection(
         }
         Ok(ApiRequest::Shutdown) => {
             metrics::inc_requests("shutdown");
-            let _ = shutdown_tx.send(()).await;
-            (
-                "{\"status\":\"shutting_down\"}".to_string(),
-                "application/json",
-            )
+            let admission = ctx.admission_barrier.read().await;
+            let active_build_ids: Vec<_> = ctx
+                .history
+                .active_builds()
+                .into_iter()
+                .map(|build| build.id)
+                .collect();
+            let queued_build_ids: Vec<_> = ctx
+                .history
+                .queued_builds()
+                .into_iter()
+                .map(|build| build.id)
+                .collect();
+            if !*admission || !active_build_ids.is_empty() || !queued_build_ids.is_empty() {
+                (
+                    serde_json::json!({
+                        "status": "shutdown_blocked",
+                        "admission_closed": *admission,
+                        "active_build_ids": active_build_ids,
+                        "queued_build_ids": queued_build_ids,
+                    })
+                    .to_string(),
+                    "application/json",
+                )
+            } else {
+                let _ = shutdown_tx.send(()).await;
+                (
+                    "{\"status\":\"shutting_down\"}".to_string(),
+                    "application/json",
+                )
+            }
+        }
+        Ok(ApiRequest::RestartAdmission { close }) => {
+            metrics::inc_requests("restart-admission");
+            let response = handle_restart_admission(&ctx, close).await;
+            (serde_json::to_string(&response)?, "application/json")
+        }
+        Ok(ApiRequest::RestartAdmissionStatus) => {
+            metrics::inc_requests("restart-admission-status");
+            let response = restart_admission_status(&ctx).await;
+            (serde_json::to_string(&response)?, "application/json")
         }
         Ok(ApiRequest::Reload) => {
             metrics::inc_requests("reload");
@@ -1212,6 +1271,18 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
 
     if path == "/shutdown" && method == "POST" {
         return Ok(ApiRequest::Shutdown);
+    }
+
+    if path == "/restart-admission" && method == "POST" {
+        return Ok(ApiRequest::RestartAdmission { close: true });
+    }
+
+    if path == "/restart-admission" && method == "GET" {
+        return Ok(ApiRequest::RestartAdmissionStatus);
+    }
+
+    if path == "/restart-admission/release" && method == "POST" {
+        return Ok(ApiRequest::RestartAdmission { close: false });
     }
 
     if path == "/reload" && method == "POST" {
@@ -2115,6 +2186,14 @@ async fn handle_select_worker_with_wrapper(
     wait_timeout_secs: Option<u64>,
     local_wrapper_id: Option<String>,
 ) -> Result<SelectionResponse> {
+    if *ctx.admission_barrier.read().await {
+        return Ok(SelectionResponse {
+            worker: None,
+            reason: SelectionReason::SelectionError("restart_admission_barrier_active".to_string()),
+            build_id: None,
+            diagnostics: None,
+        });
+    }
     debug!(
         "Selecting worker for project '{}' with {} cores",
         request.project, request.estimated_cores
@@ -2167,6 +2246,18 @@ async fn handle_select_worker_with_wrapper(
         request: &SelectionRequest,
         local_wrapper_id: Option<String>,
     ) -> Result<SelectionResponse> {
+        let admission = ctx.admission_barrier.read().await;
+        if *admission {
+            return Ok(SelectionResponse {
+                worker: None,
+                reason: SelectionReason::SelectionError(
+                    "restart_admission_barrier_active".to_string(),
+                ),
+                build_id: None,
+                diagnostics: None,
+            });
+        }
+        let response = async {
         // Retry loop to handle race conditions where slots are taken between selection and reservation.
         let mut reservation_attempts = 0;
         const MAX_ATTEMPTS: u32 = 3;
@@ -2297,6 +2388,10 @@ async fn handle_select_worker_with_wrapper(
             }
             // Loop again - next selection will see reduced slot count.
         }
+        }
+        .await;
+        drop(admission);
+        response
     }
 
     let initial = attempt_select_and_reserve(ctx, &request, local_wrapper_id.clone()).await?;
@@ -2314,12 +2409,23 @@ async fn handle_select_worker_with_wrapper(
         .clone()
         .unwrap_or_else(|| "<unknown>".to_string());
 
-    let Some(queued) = ctx.history.enqueue_build(
+    let admission = ctx.admission_barrier.read().await;
+    if *admission {
+        return Ok(SelectionResponse {
+            worker: None,
+            reason: SelectionReason::SelectionError("restart_admission_barrier_active".to_string()),
+            build_id: None,
+            diagnostics: None,
+        });
+    }
+    let queued_result = ctx.history.enqueue_build(
         request.project.clone(),
         command.clone(),
         hook_pid,
         request.estimated_cores,
-    ) else {
+    );
+    drop(admission);
+    let Some(queued) = queued_result else {
         // Queue full - fall back to the normal busy response.
         return Ok(initial);
     };
@@ -2431,6 +2537,115 @@ async fn handle_select_worker_with_wrapper(
 
         tokio::time::sleep(QUEUE_POLL_INTERVAL).await;
     }
+}
+
+/// Close admission before a restart and report the daemon-owned build/queue
+/// snapshot.  The caller must treat any nonempty list as a hard no-action and
+/// leave the barrier raised; only a fresh daemon instance may reopen it after
+/// a successful restart.  A failed restart can explicitly reopen the barrier
+/// with `close=false`.
+async fn handle_restart_admission(ctx: &DaemonContext, close: bool) -> RestartAdmissionResponse {
+    let mut admission = ctx.admission_barrier.write().await;
+    let was_closed = *admission;
+    *admission = close;
+    let active_build_ids: Vec<u64> = ctx
+        .history
+        .active_builds()
+        .into_iter()
+        .map(|build| build.id)
+        .collect();
+    let queued_build_ids: Vec<u64> = ctx
+        .history
+        .queued_builds()
+        .into_iter()
+        .map(|build| build.id)
+        .collect();
+    let client_lease_scan = nonterminal_client_lease_ids();
+    let (client_lease_ids, client_lease_scan_error) = match client_lease_scan {
+        Ok(ids) => (ids, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+    let restart_permitted = close
+        && !was_closed
+        && active_build_ids.is_empty()
+        && queued_build_ids.is_empty()
+        && client_lease_ids.is_empty()
+        && client_lease_scan_error.is_none();
+    RestartAdmissionResponse {
+        admission_closed: close,
+        restart_permitted,
+        active_build_ids,
+        queued_build_ids,
+        client_lease_ids,
+        client_lease_scan_error,
+    }
+}
+
+/// Snapshot restart admission without changing the barrier.  The hook calls
+/// this after it writes its durable lease and before worker selection, so an
+/// established remediator can refuse new work without a selection race.
+async fn restart_admission_status(ctx: &DaemonContext) -> RestartAdmissionResponse {
+    let admission = ctx.admission_barrier.read().await;
+    let active_build_ids: Vec<u64> = ctx
+        .history
+        .active_builds()
+        .into_iter()
+        .map(|build| build.id)
+        .collect();
+    let queued_build_ids: Vec<u64> = ctx
+        .history
+        .queued_builds()
+        .into_iter()
+        .map(|build| build.id)
+        .collect();
+    let client_lease_scan = nonterminal_client_lease_ids();
+    let (client_lease_ids, client_lease_scan_error) = match client_lease_scan {
+        Ok(ids) => (ids, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+    RestartAdmissionResponse {
+        admission_closed: *admission,
+        restart_permitted: false,
+        active_build_ids,
+        queued_build_ids,
+        client_lease_ids,
+        client_lease_scan_error,
+    }
+}
+
+/// Return every client lease that is not both terminal and explicitly
+/// acknowledged by the daemon.  A malformed directory entry fails closed: a
+/// restart cannot claim a zero-state snapshot when durable evidence is
+/// unreadable.
+fn nonterminal_client_lease_ids() -> Result<Vec<String>> {
+    let lease_dir = default_job_lease_directory();
+    let entries = match std::fs::read_dir(&lease_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(anyhow!("cannot inspect {}: {error}", lease_dir.display())),
+    };
+
+    let mut blocked = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| anyhow!("cannot enumerate {}: {error}", lease_dir.display()))?;
+        if entry
+            .path()
+            .extension()
+            .is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path())
+            .map_err(|error| anyhow!("cannot read {}: {error}", entry.path().display()))?;
+        let lease: DurableJobLease = serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow!("cannot parse {}: {error}", entry.path().display()))?;
+        if !lease.state.is_terminal() || !lease.terminal_acknowledged {
+            blocked.push(lease.identity.local_wrapper_id);
+        }
+    }
+    blocked.sort();
+    Ok(blocked)
 }
 
 /// Handle a release-worker request.
@@ -3473,6 +3688,7 @@ mod tests {
             pid: 1234,
             queue_timeout_secs: 300,
             bypass_store: None,
+            admission_barrier: Arc::new(tokio::sync::RwLock::new(false)),
         }
     }
 
@@ -4191,6 +4407,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_admission_barrier_refuses_new_worker_selection() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+        *ctx.admission_barrier.write().await = true;
+        let request = SelectionRequest {
+            project: "restart-guard".to_string(),
+            command: Some("cargo test".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: Some(1234),
+        };
+
+        let response = handle_select_worker(&ctx, request, false, None)
+            .await
+            .expect("barrier returns a structured refusal");
+
+        assert!(response.worker.is_none());
+        assert_eq!(
+            response.reason,
+            SelectionReason::SelectionError("restart_admission_barrier_active".to_string())
+        );
+        assert!(ctx.history.active_builds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_restart_admission_reports_active_build_and_keeps_barrier_closed() {
+        let ctx = make_test_context(WorkerPool::new());
+        let active = ctx.history.start_active_build(
+            "restart-proof".to_string(),
+            "worker-a".to_string(),
+            "cargo test -p rchd".to_string(),
+            4242,
+            1,
+            rch_common::BuildLocation::Remote,
+        );
+
+        let response = handle_restart_admission(&ctx, true).await;
+
+        assert!(!response.restart_permitted);
+        assert_eq!(response.active_build_ids, vec![active.id]);
+        assert!(response.queued_build_ids.is_empty());
+        assert!(*ctx.admission_barrier.read().await);
+    }
+
+    #[tokio::test]
     async fn test_handle_select_worker_preserves_affinity_pin_reason() {
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
@@ -4835,6 +5101,23 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("POST /shutdown").unwrap();
         assert!(matches!(req, ApiRequest::Shutdown));
+    }
+
+    #[test]
+    fn test_parse_request_restart_admission_routes() {
+        let _guard = test_guard!();
+        assert!(matches!(
+            parse_request("POST /restart-admission").unwrap(),
+            ApiRequest::RestartAdmission { close: true }
+        ));
+        assert!(matches!(
+            parse_request("POST /restart-admission/release").unwrap(),
+            ApiRequest::RestartAdmission { close: false }
+        ));
+        assert!(matches!(
+            parse_request("GET /restart-admission").unwrap(),
+            ApiRequest::RestartAdmissionStatus
+        ));
     }
 
     #[test]
