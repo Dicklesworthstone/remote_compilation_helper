@@ -5,6 +5,7 @@
 
 use crate::config::load_config;
 use crate::error::{ArtifactRetrievalWarning, DaemonError, TransferError};
+use crate::state::primitives::atomic_write;
 use crate::status_types::format_bytes;
 use crate::toolchain::{detect_toolchain, parse_channel_string};
 use crate::transfer::{
@@ -16,6 +17,7 @@ use crate::transfer::{
 use crate::ui::console::RchConsole;
 use anyhow::Context;
 use rch_common::errors::catalog::ErrorCode;
+use rch_common::job_identity::{DurableJobLease, JobIdentity};
 use rch_common::repo_updater_contract::{
     REPO_UPDATER_ALLOW_OVERRIDE_ENV, REPO_UPDATER_ALLOWED_HOSTS_ENV, REPO_UPDATER_ALLOWLIST_ENV,
     REPO_UPDATER_AUTH_CREDENTIAL_ID_ENV, REPO_UPDATER_AUTH_EXPIRES_AT_MS_ENV,
@@ -774,6 +776,7 @@ async fn try_retry_on_bigger_worker(
     command_priority: CommandPriority,
     tried_workers: &[WorkerId],
     worker_pin: &[WorkerId],
+    local_wrapper_id: Option<&str>,
     reporter: &HookReporter,
 ) -> Option<(SelectionResponse, WorkerId)> {
     let status = match crate::status_display::query_daemon_full_status().await {
@@ -798,6 +801,7 @@ async fn try_retry_on_bigger_worker(
         command_priority,
         0,
         Some(std::process::id()),
+        local_wrapper_id,
         false, // do not block waiting on one specific worker during a retry
         &preferred,
     )
@@ -975,6 +979,132 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+/// Write one crash-safe lease file for the lifetime of an `rch exec` wrapper.
+/// The file is intentionally retained after completion so a later recovery
+/// scan can distinguish an acknowledged terminal command from an uncertain
+/// dead wrapper.
+#[derive(Clone)]
+struct DurableLeaseWriter {
+    path: PathBuf,
+    lease: Arc<Mutex<DurableJobLease>>,
+}
+
+impl DurableLeaseWriter {
+    fn create(
+        command: &str,
+        strict_remote: bool,
+        self_healing_enabled: bool,
+    ) -> anyhow::Result<Self> {
+        let identity = JobIdentity::new_local();
+        let path = durable_lease_path(&identity.local_wrapper_id);
+        let command_fingerprint = format!("blake3:{}", blake3::hash(command.as_bytes()).to_hex());
+        let lease = DurableJobLease::new(
+            identity,
+            std::process::id(),
+            current_process_start_ticks(),
+            current_boot_id(),
+            now_unix_ms(),
+            strict_remote,
+            self_healing_enabled,
+            command_fingerprint,
+        );
+        let writer = Self {
+            path,
+            lease: Arc::new(Mutex::new(lease)),
+        };
+        writer.persist()?;
+        Ok(writer)
+    }
+
+    fn wrapper_id(&self) -> String {
+        self.lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .identity
+            .local_wrapper_id
+            .clone()
+    }
+
+    fn admit(&self, remote_build_id: u64, worker_id: &WorkerId) -> anyhow::Result<()> {
+        {
+            let mut lease = self
+                .lease
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lease.admit(
+                remote_build_id,
+                worker_id.as_str().to_string(),
+                now_unix_ms(),
+            );
+        }
+        self.persist()
+    }
+
+    fn heartbeat(&self, phase: &str) -> anyhow::Result<()> {
+        {
+            let mut lease = self
+                .lease
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lease.heartbeat(phase, now_unix_ms());
+        }
+        self.persist()
+    }
+
+    fn acknowledge_terminal(&self) -> anyhow::Result<()> {
+        {
+            let mut lease = self
+                .lease
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lease.acknowledge_terminal(now_unix_ms());
+        }
+        self.persist()
+    }
+
+    fn persist(&self) -> anyhow::Result<()> {
+        let bytes = {
+            let lease = self
+                .lease
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            serde_json::to_vec_pretty(&*lease)?
+        };
+        atomic_write(&self.path, &bytes)
+    }
+}
+
+fn durable_lease_path(local_wrapper_id: &str) -> PathBuf {
+    let state_dir = std::env::var_os("RCH_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| {
+            std::env::var_os("XDG_STATE_HOME")
+                .map(|path| PathBuf::from(path).join("rch"))
+                .filter(|path| !path.as_os_str().is_empty())
+        })
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state/rch"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/tmp/rch"));
+    state_dir
+        .join("job-leases")
+        .join(format!("{local_wrapper_id}.json"))
+}
+
+fn current_process_start_ticks() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn current_boot_id() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Build the structured incident for a daemon-socket failure (RCH-I010). The
@@ -1814,6 +1944,12 @@ pub async fn run_exec(
     let command_priority = command_priority_from_env(&reporter);
     let wait_for_worker = queue_when_busy_enabled();
     let preferred_workers = preferred_workers_from_env();
+    let durable_lease = DurableLeaseWriter::create(
+        &command,
+        require_remote,
+        config.self_healing.hook_starts_daemon,
+    )?;
+    let wrapper_id = durable_lease.wrapper_id();
 
     // Query daemon for worker selection
     let response = match query_daemon(
@@ -1826,6 +1962,7 @@ pub async fn run_exec(
         command_priority,
         0, // classification duration not relevant here
         Some(std::process::id()),
+        Some(&wrapper_id),
         wait_for_worker,
         &preferred_workers,
     )
@@ -1874,6 +2011,7 @@ pub async fn run_exec(
                         command_priority,
                         0,
                         Some(std::process::id()),
+                        Some(&wrapper_id),
                         wait_for_worker,
                         &preferred_workers,
                     )
@@ -1984,6 +2122,37 @@ pub async fn run_exec(
             );
         };
 
+        let Some(remote_build_id) = response.build_id else {
+            // A worker reservation without a daemon build identity cannot be
+            // correlated to this durable wrapper lease.  Release it rather
+            // than executing an untrackable build; the lease intentionally
+            // remains nonterminal because release evidence was not obtained.
+            let release = release_worker(
+                &config.general.socket_path,
+                &worker.id,
+                estimated_cores,
+                None,
+                Some(EXIT_BUILD_ERROR),
+                None,
+                None,
+                None,
+            )
+            .await;
+            if let Err(error) = release {
+                warn!(
+                    "Worker {} selected without build id and release was not acknowledged: {}",
+                    worker.id, error
+                );
+            }
+            anyhow::bail!(
+                "daemon selected worker {} without a durable build id; refusing untrackable execution",
+                worker.id
+            );
+        };
+        durable_lease
+            .admit(remote_build_id, &worker.id)
+            .context("persist admitted durable job lease")?;
+
         if !selected_worker_is_requested(&worker.id, &current_query_preferred) {
             let requested = current_query_preferred
                 .iter()
@@ -2014,6 +2183,11 @@ pub async fn run_exec(
                 warn!(
                     "Failed to release unrequested worker {} after selection refusal: {}",
                     worker.id, error
+                );
+            } else if let Err(error) = durable_lease.acknowledge_terminal() {
+                warn!(
+                    "Failed to persist acknowledged durable lease terminal state: {}",
+                    error
                 );
             }
             let reason = if let Some(error) = release_error {
@@ -2058,12 +2232,20 @@ pub async fn run_exec(
             &reporter,
             &config.general.socket_path,
             config.output.color_mode,
-            response.build_id,
+            Some(remote_build_id),
+            Some(&wrapper_id),
+            Some(&durable_lease),
             &topology_policy,
             clean_overlay_spec.as_ref(),
         )
         .await;
         let remote_elapsed = remote_start.elapsed();
+        if let Err(error) = durable_lease.heartbeat("finalize") {
+            warn!(
+                "Failed to persist durable lease finalize heartbeat: {}",
+                error
+            );
+        }
 
         // Release worker slots
         let release_exit_code = result
@@ -2075,11 +2257,11 @@ pub async fn run_exec(
             timing.total = Some(remote_elapsed);
             timing
         });
-        if let Err(e) = release_worker(
+        let release_acknowledged = match release_worker(
             &config.general.socket_path,
             &worker.id,
             estimated_cores,
-            response.build_id,
+            Some(remote_build_id),
             Some(release_exit_code),
             None,
             None,
@@ -2087,8 +2269,12 @@ pub async fn run_exec(
         )
         .await
         {
-            warn!("Failed to release worker slots: {}", e);
-        }
+            Ok(()) => true,
+            Err(error) => {
+                warn!("Failed to release worker slots: {}", error);
+                false
+            }
+        };
 
         // Classify the outcome. Terminal cases (success, real build/test failure,
         // preflight/transfer-skip decisions, SSH-timeout fail-closed) exit here;
@@ -2111,6 +2297,13 @@ pub async fn run_exec(
                             .await
                     {
                         warn!("Failed to record build: {}", e);
+                    }
+                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
+                    {
+                        warn!(
+                            "Failed to persist acknowledged durable lease terminal state: {}",
+                            error
+                        );
                     }
                     std::process::exit(0);
                 } else if is_toolchain_failure(&result.stderr, result.exit_code) {
@@ -2192,6 +2385,13 @@ pub async fn run_exec(
                         "[RCH] remote {} failed (exit {})",
                         worker.id, result.exit_code
                     ));
+                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
+                    {
+                        warn!(
+                            "Failed to persist acknowledged durable lease terminal state: {}",
+                            error
+                        );
+                    }
                     std::process::exit(result.exit_code);
                 }
             }
@@ -2213,6 +2413,13 @@ pub async fn run_exec(
                     ));
                     let fallback_reason =
                         format!("dependency preflight failed: {evidence_summary}");
+                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
+                    {
+                        warn!(
+                            "Failed to persist acknowledged durable lease terminal state: {}",
+                            error
+                        );
+                    }
                     exit_with_local_fallback(&command, &reporter, &fallback_reason, require_remote);
                 }
 
@@ -2221,6 +2428,13 @@ pub async fn run_exec(
                     && let TransferError::TransferSkipped { reason } = skip_err
                 {
                     reporter.summary(&format!("[RCH] local ({})", reason));
+                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
+                    {
+                        warn!(
+                            "Failed to persist acknowledged durable lease terminal state: {}",
+                            error
+                        );
+                    }
                     exit_with_local_fallback(
                         &command,
                         &reporter,
@@ -2239,6 +2453,13 @@ pub async fn run_exec(
                     // Fail-closed refusal: the line explaining the non-zero exit must
                     // reach the agent even at stock visibility (rch#31).
                     reporter.summary_critical(&remote_pipeline_failure_summary(&worker.id));
+                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
+                    {
+                        warn!(
+                            "Failed to persist acknowledged durable lease terminal state: {}",
+                            error
+                        );
+                    }
                     std::process::exit(EXIT_BUILD_ERROR);
                 }
 
@@ -2269,6 +2490,7 @@ pub async fn run_exec(
                 command_priority,
                 &tried_workers,
                 &preferred_workers,
+                Some(&wrapper_id),
                 &reporter,
             )
             .await
@@ -2298,6 +2520,12 @@ pub async fn run_exec(
                 // Terminal non-zero exit: the line explaining it must reach the
                 // agent even at stock visibility (rch#31).
                 reporter.summary_critical(&summary);
+                if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal() {
+                    warn!(
+                        "Failed to persist acknowledged durable lease terminal state: {}",
+                        error
+                    );
+                }
                 std::process::exit(code);
             }
             RemoteFaultExhaustAction::ExitWithEnvRemediation {
@@ -2314,6 +2542,12 @@ pub async fn run_exec(
                 // agent even at stock visibility (rch#31).
                 reporter.summary_critical(&summary);
                 reporter.verbose(&remediation);
+                if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal() {
+                    warn!(
+                        "Failed to persist acknowledged durable lease terminal state: {}",
+                        error
+                    );
+                }
                 std::process::exit(code);
             }
             RemoteFaultExhaustAction::GatedLocalFallback { reason } => {
@@ -2327,6 +2561,12 @@ pub async fn run_exec(
                     }
                 );
                 let reason = format!("{reason}; remote retries exhausted");
+                if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal() {
+                    warn!(
+                        "Failed to persist acknowledged durable lease terminal state: {}",
+                        error
+                    );
+                }
                 exit_with_gated_local_fallback(
                     &command,
                     &reporter,
@@ -2790,6 +3030,8 @@ async fn handle_selection_response(
         &config.general.socket_path,
         config.output.color_mode,
         response.build_id,
+        None,
+        None,
         &topology_policy,
         None,
     )

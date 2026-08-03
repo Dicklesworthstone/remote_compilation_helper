@@ -139,6 +139,8 @@ pub(super) async fn execute_remote_compilation(
     socket_path: &str,
     color_mode: ColorMode,
     build_id: Option<u64>,
+    local_wrapper_id: Option<&str>,
+    durable_lease: Option<&DurableLeaseWriter>,
     topology_policy: &PathTopologyPolicy,
     clean_overlay: Option<&CleanOverlaySpec>,
 ) -> anyhow::Result<RemoteExecutionResult> {
@@ -286,8 +288,15 @@ pub(super) async fn execute_remote_compilation(
             .find(|entry| entry.is_primary)
             .map(|entry| TransferPipeline::remote_pgid_file_path_for_root(&entry.remote_root, id))
     });
-    let mut heartbeat_loop =
-        build_id.map(|id| BuildHeartbeatLoop::start(socket_path, id, &worker_config.id));
+    let mut heartbeat_loop = build_id.map(|id| {
+        BuildHeartbeatLoop::start(
+            socket_path,
+            id,
+            &worker_config.id,
+            local_wrapper_id,
+            durable_lease,
+        )
+    });
     if let Some(loop_ref) = heartbeat_loop.as_ref() {
         loop_ref.set_remote_pgid_file(remote_pgid_file);
         loop_ref.update_phase(BuildHeartbeatPhase::SyncUp, Some("sync_start".to_string()));

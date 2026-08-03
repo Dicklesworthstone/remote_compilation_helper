@@ -646,6 +646,9 @@ pub struct BuildHeartbeatRequest {
     /// Hook process ID sending the heartbeat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_pid: Option<u32>,
+    /// Client-minted wrapper identity for local durable-lease correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_wrapper_id: Option<String>,
     /// Remote file containing the process-group leader PID for cancellation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_pgid_file: Option<String>,

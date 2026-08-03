@@ -64,6 +64,9 @@ pub struct ActiveBuildState {
     pub started_at: String,
     pub started_at_mono: Instant,
     pub hook_pid: u32,
+    /// Client wrapper identity, allowing the daemon's active build to be
+    /// joined with the client-side durable lease without relying on a reusable PID.
+    pub local_wrapper_id: Option<String>,
     pub remote_pgid_file: Option<String>,
     pub slots: u32,
     pub location: BuildLocation,
@@ -239,6 +242,23 @@ impl BuildHistory {
         slots: u32,
         location: BuildLocation,
     ) -> ActiveBuildState {
+        self.start_active_build_with_wrapper(
+            project_id, worker_id, command, hook_pid, None, slots, location,
+        )
+    }
+
+    /// Register an active build while preserving the client durable-lease id.
+    #[allow(clippy::too_many_arguments)] // Mirrors the existing explicit active-build registration contract plus correlation id.
+    pub fn start_active_build_with_wrapper(
+        &self,
+        project_id: String,
+        worker_id: String,
+        command: String,
+        hook_pid: u32,
+        local_wrapper_id: Option<String>,
+        slots: u32,
+        location: BuildLocation,
+    ) -> ActiveBuildState {
         let id = self.next_id();
         let started_at = Utc::now().to_rfc3339();
         let started_at_mono = Instant::now();
@@ -250,6 +270,7 @@ impl BuildHistory {
             started_at: started_at.clone(),
             started_at_mono,
             hook_pid,
+            local_wrapper_id,
             remote_pgid_file: None,
             slots,
             location,
@@ -287,6 +308,23 @@ impl BuildHistory {
         slots: u32,
         location: BuildLocation,
     ) -> Option<ActiveBuildState> {
+        self.try_start_active_build_with_wrapper(
+            project_id, worker_id, command, hook_pid, None, slots, location,
+        )
+    }
+
+    /// Try to register an active build with a client durable-lease id.
+    #[allow(clippy::too_many_arguments)] // Mirrors the existing explicit active-build registration contract plus correlation id.
+    pub fn try_start_active_build_with_wrapper(
+        &self,
+        project_id: String,
+        worker_id: String,
+        command: String,
+        hook_pid: u32,
+        local_wrapper_id: Option<String>,
+        slots: u32,
+        location: BuildLocation,
+    ) -> Option<ActiveBuildState> {
         let id = self.next_id();
         let started_at = Utc::now().to_rfc3339();
         let started_at_mono = Instant::now();
@@ -298,6 +336,7 @@ impl BuildHistory {
             started_at: started_at.clone(),
             started_at_mono,
             hook_pid,
+            local_wrapper_id,
             remote_pgid_file: None,
             slots,
             location,
@@ -350,6 +389,16 @@ impl BuildHistory {
         // Keep hook PID in sync if the heartbeat carries it.
         if let Some(pid) = heartbeat.hook_pid.filter(|pid| *pid > 0) {
             state.hook_pid = pid;
+        }
+        if let Some(local_wrapper_id) = heartbeat.local_wrapper_id {
+            if state
+                .local_wrapper_id
+                .as_ref()
+                .is_some_and(|recorded| recorded != &local_wrapper_id)
+            {
+                return None;
+            }
+            state.local_wrapper_id = Some(local_wrapper_id);
         }
         if let Some(remote_pgid_file) = heartbeat
             .remote_pgid_file
@@ -1383,6 +1432,7 @@ mod tests {
                 build_id: build.id,
                 worker_id: rch_common::WorkerId::new("worker-a"),
                 hook_pid: Some(1234),
+                local_wrapper_id: Some("rchw-test".to_string()),
                 remote_pgid_file: Some("/tmp/rch/proj/hash/.rch-run/1.pgid".to_string()),
                 phase: BuildHeartbeatPhase::Execute,
                 detail: Some("Compiling".to_string()),
@@ -1419,6 +1469,7 @@ mod tests {
             build_id: build.id,
             worker_id: rch_common::WorkerId::new("worker-b"),
             hook_pid: Some(9999),
+            local_wrapper_id: None,
             remote_pgid_file: None,
             phase: BuildHeartbeatPhase::Execute,
             detail: Some("Unexpected".to_string()),

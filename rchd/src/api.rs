@@ -17,6 +17,7 @@ use crate::workers::{
 };
 use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
+use rch_common::job_identity::LOCAL_WRAPPER_ID_PREFIX;
 use rch_common::{
     ApiError, BuildHeartbeatRequest, BuildRecord, BuildStats, BypassRecord, BypassRecordStore,
     CircuitBreakerConfig, CircuitState, CommandPriority, ErrorCode, ReleaseRequest,
@@ -101,6 +102,8 @@ fn format_wait_time(secs: u64) -> String {
 enum ApiRequest {
     SelectWorker {
         request: SelectionRequest,
+        /// Client-minted identity supplied before daemon contact.
+        local_wrapper_id: Option<String>,
         /// If true and all workers are busy, enqueue and wait for a worker.
         wait_for_worker: bool,
         /// Optional client-provided max queue wait timeout (seconds).
@@ -673,12 +676,19 @@ pub async fn handle_connection(
     let (response_json, content_type) = match parse_request(line) {
         Ok(ApiRequest::SelectWorker {
             request,
+            local_wrapper_id,
             wait_for_worker,
             wait_timeout_secs,
         }) => {
             metrics::inc_requests("select-worker");
-            let response =
-                handle_select_worker(&ctx, request, wait_for_worker, wait_timeout_secs).await?;
+            let response = handle_select_worker_with_wrapper(
+                &ctx,
+                request,
+                wait_for_worker,
+                wait_timeout_secs,
+                local_wrapper_id,
+            )
+            .await?;
             (selection_response_json(&response)?, "application/json")
         }
         Ok(ApiRequest::ReleaseWorker(mut request)) => {
@@ -1623,6 +1633,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     let mut command_priority = CommandPriority::Normal;
     let mut classification_duration_us = None;
     let mut hook_pid = None;
+    let mut local_wrapper_id = None;
     let mut preferred_workers = Vec::new();
 
     for param in query.split('&') {
@@ -1667,6 +1678,12 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             "hook_pid" => {
                 hook_pid = value.parse().ok();
             }
+            "local_wrapper_id" => {
+                let candidate = percent_unescape_query_value(value);
+                if candidate.starts_with(LOCAL_WRAPPER_ID_PREFIX) {
+                    local_wrapper_id = Some(candidate);
+                }
+            }
             "worker" | "preferred_worker" | "preferred" => {
                 preferred_workers.extend(parse_worker_id_list(value));
             }
@@ -1694,6 +1711,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         },
         wait_for_worker,
         wait_timeout_secs,
+        local_wrapper_id,
     })
 }
 
@@ -2080,11 +2098,22 @@ async fn handle_event_stream(
 }
 
 /// Handle a select-worker request.
+#[cfg(test)]
 async fn handle_select_worker(
     ctx: &DaemonContext,
     request: SelectionRequest,
     wait_for_worker: bool,
     wait_timeout_secs: Option<u64>,
+) -> Result<SelectionResponse> {
+    handle_select_worker_with_wrapper(ctx, request, wait_for_worker, wait_timeout_secs, None).await
+}
+
+async fn handle_select_worker_with_wrapper(
+    ctx: &DaemonContext,
+    request: SelectionRequest,
+    wait_for_worker: bool,
+    wait_timeout_secs: Option<u64>,
+    local_wrapper_id: Option<String>,
 ) -> Result<SelectionResponse> {
     debug!(
         "Selecting worker for project '{}' with {} cores",
@@ -2136,6 +2165,7 @@ async fn handle_select_worker(
     async fn attempt_select_and_reserve(
         ctx: &DaemonContext,
         request: &SelectionRequest,
+        local_wrapper_id: Option<String>,
     ) -> Result<SelectionResponse> {
         // Retry loop to handle race conditions where slots are taken between selection and reservation.
         let mut reservation_attempts = 0;
@@ -2183,11 +2213,12 @@ async fn handle_select_worker(
                     .unwrap_or_else(|| "<unknown>".to_string());
 
                 let build_id = if let Some(hook_pid) = request.hook_pid.filter(|pid| *pid > 0) {
-                    let Some(state) = ctx.history.try_start_active_build(
+                    let Some(state) = ctx.history.try_start_active_build_with_wrapper(
                         request.project.clone(),
                         id.as_str().to_string(),
                         command.clone(),
                         hook_pid,
+                        local_wrapper_id.clone(),
                         request.estimated_cores,
                         rch_common::BuildLocation::Remote,
                     ) else {
@@ -2209,6 +2240,7 @@ async fn handle_select_worker(
                             "project_id": request.project.clone(),
                             "worker_id": id.as_str(),
                             "command": command,
+                            "local_wrapper_id": local_wrapper_id.clone(),
                             "slots": request.estimated_cores,
                         }),
                     );
@@ -2267,7 +2299,7 @@ async fn handle_select_worker(
         }
     }
 
-    let initial = attempt_select_and_reserve(ctx, &request).await?;
+    let initial = attempt_select_and_reserve(ctx, &request, local_wrapper_id.clone()).await?;
     if initial.worker.is_some()
         || !wait_for_worker
         || initial.reason != SelectionReason::AllWorkersBusy
@@ -2369,7 +2401,7 @@ async fn handle_select_worker(
             });
         }
 
-        let response = attempt_select_and_reserve(ctx, &request).await?;
+        let response = attempt_select_and_reserve(ctx, &request, local_wrapper_id.clone()).await?;
         if response.worker.is_some() {
             let _ = ctx.history.remove_queued_build(queued.id);
             ctx.history.update_queue_estimates();
@@ -3508,6 +3540,25 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_request_carries_valid_local_wrapper_id_separately_from_command() {
+        let _guard = test_guard!();
+        let request = parse_request(
+            "GET /select-worker?project=test&command=cargo%20build&local_wrapper_id=rchw-lease-1",
+        )
+        .unwrap();
+        let ApiRequest::SelectWorker {
+            request,
+            local_wrapper_id,
+            ..
+        } = request
+        else {
+            panic!("expected select-worker request");
+        };
+        assert_eq!(request.command.as_deref(), Some("cargo build"));
+        assert_eq!(local_wrapper_id.as_deref(), Some("rchw-lease-1"));
+    }
+
+    #[test]
     fn test_parse_request_with_priority_hint() {
         let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=test&cores=2&priority=high").unwrap();
@@ -4189,9 +4240,15 @@ mod tests {
             hook_pid: Some(4242),
         };
 
-        let response = handle_select_worker(&ctx, request, false, None)
-            .await
-            .unwrap();
+        let response = handle_select_worker_with_wrapper(
+            &ctx,
+            request,
+            false,
+            None,
+            Some("rchw-daemon-correlation".to_string()),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.reason, SelectionReason::Success);
         let build_id = response.build_id.expect("build_id should be assigned");
 
@@ -4200,6 +4257,10 @@ mod tests {
         assert_eq!(active.worker_id, "worker1");
         assert_eq!(active.command, "cargo build --release");
         assert_eq!(active.hook_pid, 4242);
+        assert_eq!(
+            active.local_wrapper_id.as_deref(),
+            Some("rchw-daemon-correlation")
+        );
         assert_eq!(active.slots, 2);
 
         // Release should finalize the active build and move it into history
@@ -5888,6 +5949,7 @@ mod tests {
                 build_id: build.id,
                 worker_id: WorkerId::new("worker1"),
                 hook_pid: Some(43210),
+                local_wrapper_id: Some("rchw-test".to_string()),
                 remote_pgid_file: Some("/tmp/rch/test-project/hash/.rch-run/99.pgid".to_string()),
                 phase: rch_common::BuildHeartbeatPhase::Execute,
                 detail: Some("Compiling".to_string()),
@@ -5933,6 +5995,7 @@ mod tests {
                 build_id: build.id,
                 worker_id: WorkerId::new("worker-x"),
                 hook_pid: Some(5555),
+                local_wrapper_id: None,
                 remote_pgid_file: None,
                 phase: rch_common::BuildHeartbeatPhase::Execute,
                 detail: Some("Mismatch".to_string()),

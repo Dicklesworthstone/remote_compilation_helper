@@ -1543,6 +1543,7 @@ async fn test_daemon_query_missing_socket() {
         CommandPriority::Normal,
         100, // 100µs classification time
         None,
+        None,
         false,
         &[],
     )
@@ -1627,6 +1628,7 @@ async fn test_daemon_query_protocol() {
         RequiredRuntime::None,
         CommandPriority::Normal,
         100,
+        None,
         None,
         false,
         &[],
@@ -1713,6 +1715,7 @@ async fn test_daemon_query_sends_preferred_workers() {
         RequiredRuntime::None,
         CommandPriority::Normal,
         100,
+        None,
         None,
         false,
         &preferred,
@@ -1814,6 +1817,7 @@ async fn test_daemon_query_releases_worker_outside_requested_set() {
         CommandPriority::Normal,
         0,
         Some(1234),
+        None,
         false,
         &[WorkerId::new("requested")],
     )
@@ -1910,6 +1914,7 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
         CommandPriority::Normal,
         0,
         Some(1234),
+        None,
         false,
         &[WorkerId::new("requested")],
     )
@@ -1997,6 +2002,7 @@ async fn test_daemon_query_wait_parameters() {
         CommandPriority::Normal,
         100,
         None,
+        None,
         true,
         &[],
     )
@@ -2065,6 +2071,7 @@ async fn test_daemon_query_url_encoding() {
         RequiredRuntime::None,
         CommandPriority::Normal,
         150, // 150µs classification time
+        None,
         None,
         false,
         &[],
@@ -5516,6 +5523,8 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         &socket_path,
         ColorMode::Auto,
         None,
+        None,
+        None,
         &policy,
         None,
     )
@@ -5627,6 +5636,8 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &socket_path,
         ColorMode::Auto,
         None,
+        None,
+        None,
         &policy,
         None,
     )
@@ -5647,6 +5658,8 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &reporter,
         &socket_path,
         ColorMode::Auto,
+        None,
+        None,
         None,
         &policy,
         None,
@@ -6861,6 +6874,7 @@ async fn test_daemon_query_connect_timeout_fail_open() {
         CommandPriority::Normal,
         100,
         None,
+        None,
         false,
         &[],
     )
@@ -6975,6 +6989,7 @@ async fn test_daemon_query_partial_response_timeout() {
         RequiredRuntime::None,
         CommandPriority::Normal,
         100,
+        None,
         None,
         false,
         &[],

@@ -21,6 +21,7 @@ pub(crate) async fn query_daemon(
     command_priority: CommandPriority,
     classification_duration_us: u64,
     hook_pid: Option<u32>,
+    local_wrapper_id: Option<&str>,
     wait_for_worker: bool,
     preferred_workers: &[WorkerId],
 ) -> anyhow::Result<SelectionResponse> {
@@ -83,6 +84,12 @@ pub(crate) async fn query_daemon(
 
     if let Some(pid) = hook_pid {
         query.push_str(&format!("&hook_pid={}", pid));
+    }
+    if let Some(local_wrapper_id) = local_wrapper_id {
+        query.push_str(&format!(
+            "&local_wrapper_id={}",
+            urlencoding_encode(local_wrapper_id)
+        ));
     }
 
     for worker in preferred_workers {

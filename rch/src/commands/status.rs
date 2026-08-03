@@ -454,6 +454,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             CommandPriority::Normal,
             0,
             None,
+            None,
             false,
             &preferred_workers,
         )
