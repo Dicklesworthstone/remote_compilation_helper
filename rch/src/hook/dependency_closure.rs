@@ -112,7 +112,7 @@ pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING: &str = "Ensure every 
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_STALE: &str = "One or more dependency roots were not refreshed; rerun after successful sync of skipped roots.";
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN: &str =
     "Dependency verification could not determine remote state; inspect sync/SSH logs and retry.";
-pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY: &str = "Path dependency topology policy failed; move dependencies under /data/projects (or /dp) and retry.";
+pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY: &str = "Path dependency topology policy failed; move dependencies under the canonical project root (path_topology.canonical_root, default /data/projects, alias /dp) and retry.";
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_TIMEOUT: &str = "Dependency planner timed out; rerun after system load decreases or investigate cargo metadata latency.";
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_MATERIALIZATION: &str = "Cargo path materialization is incomplete; repair the reported repository manifest/path dependency before retrying remote Cargo execution.";
 pub(super) const DEPENDENCY_PREFLIGHT_PROBE_BATCH_SIZE: usize = 128;

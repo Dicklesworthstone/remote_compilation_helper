@@ -18,7 +18,7 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs";
+const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root";
 
 fn print_file_validation(
     label: &str,
@@ -1163,6 +1163,14 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
         "self_healing.auto_start_timeout_secs" => {
             config.self_healing.auto_start_timeout_secs = parse_u64(value, key)?;
         }
+        // GH #38: the canonical project root must be settable via the CLI, not
+        // just via a hand-edited [path_topology] TOML block or env vars.
+        "path_topology.canonical_root" => {
+            config.path_topology.canonical_root = Some(parse_topology_root(value, key)?);
+        }
+        "path_topology.alias_root" => {
+            config.path_topology.alias_root = Some(parse_topology_root(value, key)?);
+        }
         _ => {
             return Err(ConfigError::InvalidValue {
                 field: key.to_string(),
@@ -1295,6 +1303,15 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
         "output.first_run_complete" | "first_run_complete" => {
             config.output.first_run_complete = defaults.output.first_run_complete;
             config.output.first_run_complete.to_string()
+        }
+        // GH #38: resetting returns to the compiled-in default root.
+        "path_topology.canonical_root" => {
+            config.path_topology.canonical_root = None;
+            rch_common::path_topology::DEFAULT_CANONICAL_PROJECT_ROOT.to_string()
+        }
+        "path_topology.alias_root" => {
+            config.path_topology.alias_root = None;
+            rch_common::path_topology::DEFAULT_ALIAS_PROJECT_ROOT.to_string()
         }
         _ => {
             return Err(ConfigError::InvalidValue {
@@ -2208,6 +2225,34 @@ fn parse_bool(value: &str, key: &str) -> Result<bool> {
     })
 }
 
+/// Parse a `[path_topology]` root value: an absolute directory path.
+///
+/// Empty strings are rejected here (use `config reset <key>` to return to the
+/// compiled-in default) and relative paths are rejected because the topology
+/// policy compares absolute canonical prefixes (GH #38).
+fn parse_topology_root(value: &str, key: &str) -> Result<String> {
+    let trimmed = value.trim().trim_matches('"').trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field: key.to_string(),
+            reason: "value is empty".to_string(),
+            suggestion: format!(
+                "Provide an absolute path, or run 'rch config reset {key}' to restore the default"
+            ),
+        }
+        .into());
+    }
+    if !std::path::Path::new(trimmed).is_absolute() {
+        return Err(ConfigError::InvalidValue {
+            field: key.to_string(),
+            reason: format!("'{trimmed}' is not an absolute path"),
+            suggestion: "Use an absolute path such as /home/me/code".to_string(),
+        }
+        .into());
+    }
+    Ok(trimmed.to_string())
+}
+
 fn parse_u32(value: &str, key: &str) -> Result<u32> {
     value.trim().parse::<u32>().map_err(|_| {
         ConfigError::InvalidValue {
@@ -2532,6 +2577,89 @@ mod tests {
         let contents = std::fs::read_to_string(&config_path).expect("read config");
         let config: RchConfig = toml::from_str(&contents).expect("parse config");
         assert!(config.self_healing.hook_starts_daemon);
+    }
+
+    /// GH #38 regression: `rch config set path_topology.canonical_root <path>`
+    /// used to hit the unknown-key arm even though the TOML section, env vars,
+    /// and `config get` all understood the key — leaving the canonical project
+    /// root effectively non-configurable from the CLI.
+    #[test]
+    fn config_set_and_reset_path_topology_roots() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let ctx = plain_context();
+
+        config_set_at(
+            &config_path,
+            "path_topology.canonical_root",
+            "/home/me/code",
+            &ctx,
+        )
+        .expect("set canonical_root");
+        config_set_at(
+            &config_path,
+            "path_topology.alias_root",
+            "/home/me/code",
+            &ctx,
+        )
+        .expect("set alias_root");
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        assert_eq!(
+            config.path_topology.canonical_root.as_deref(),
+            Some("/home/me/code")
+        );
+        assert_eq!(
+            config.path_topology.alias_root.as_deref(),
+            Some("/home/me/code")
+        );
+        let policy = config.path_topology.to_policy();
+        assert_eq!(
+            policy.canonical_root(),
+            std::path::Path::new("/home/me/code")
+        );
+
+        // Reset returns both keys to the compiled-in defaults (unset in TOML).
+        config_reset_at(&config_path, "path_topology.canonical_root", &ctx)
+            .expect("reset canonical_root");
+        config_reset_at(&config_path, "path_topology.alias_root", &ctx).expect("reset alias_root");
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        assert!(config.path_topology.canonical_root.is_none());
+        assert!(config.path_topology.alias_root.is_none());
+        let policy = config.path_topology.to_policy();
+        assert_eq!(
+            policy.canonical_root(),
+            std::path::Path::new(rch_common::path_topology::DEFAULT_CANONICAL_PROJECT_ROOT)
+        );
+    }
+
+    /// GH #38: relative and empty roots are rejected with actionable errors.
+    #[test]
+    fn config_set_path_topology_rejects_relative_and_empty() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        let err = apply_config_set(
+            &config_path,
+            "path_topology.canonical_root",
+            "relative/path",
+        )
+        .expect_err("relative path must be rejected");
+        assert!(
+            err.to_string().contains("not an absolute path"),
+            "unexpected error: {err}"
+        );
+
+        let err = apply_config_set(&config_path, "path_topology.canonical_root", "  ")
+            .expect_err("empty value must be rejected");
+        assert!(err.to_string().contains("empty"), "unexpected error: {err}");
+        assert!(
+            !config_path.exists(),
+            "rejected values must not create/modify the config file"
+        );
     }
 
     #[test]

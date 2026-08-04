@@ -3970,6 +3970,7 @@ retry_max = 2
             build_id: 42,
             worker_id: WorkerId::new("worker-a"),
             hook_pid: Some(12345),
+            local_wrapper_id: Some("wrapper-abc123".to_string()),
             remote_pgid_file: Some("/tmp/rch/project/hash/.rch-run/42.pgid".to_string()),
             phase: BuildHeartbeatPhase::Execute,
             detail: Some("Compiling crates".to_string()),

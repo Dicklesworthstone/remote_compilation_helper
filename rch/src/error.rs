@@ -957,7 +957,9 @@ pub enum PathDepError {
     #[error("Path dependency at {dep_path} violates canonical-root policy: {reason}")]
     #[diagnostic(
         code("RCH-E016"),
-        help("Ensure all path dependencies are under the canonical root (/data/projects)")
+        help(
+            "Ensure all path dependencies are under the configured canonical root (path_topology.canonical_root, default /data/projects)"
+        )
     )]
     PolicyViolation { dep_path: String, reason: String },
 

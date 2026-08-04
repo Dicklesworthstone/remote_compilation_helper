@@ -6013,7 +6013,10 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
         // Windows must NOT get the Unix pgid/setsid watchdog: its backgrounded
         // timer subshell keeps the SSH channel open so a successful build hangs
         // until timeout (the #20 failure mode re-triggered on Windows).
-        assert!(!cmd.contains("setsid"), "windows cmd must not use setsid: {cmd}");
+        assert!(
+            !cmd.contains("setsid"),
+            "windows cmd must not use setsid: {cmd}"
+        );
         assert!(
             !cmd.contains("kill -KILL"),
             "windows cmd must not arm a group-kill watchdog: {cmd}"

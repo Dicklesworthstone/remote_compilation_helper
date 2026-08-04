@@ -302,6 +302,31 @@ Precedence (highest first):
 6. User config
 7. Built-in defaults
 
+### Canonical Project Root
+
+By default rch expects projects to live under `/data/projects` (with the `/dp`
+alias symlink). Both roots are configurable, so repos under `~/code`,
+`/workspace`, etc. work without relocating anything:
+
+```toml
+[path_topology]
+canonical_root = "/home/me/code"   # default: /data/projects
+alias_root = "/home/me/code"       # default: /dp (set equal to canonical_root if you have no alias)
+```
+
+Or via the CLI / environment (env wins over TOML):
+
+```bash
+rch config set path_topology.canonical_root /home/me/code
+rch config set path_topology.alias_root /home/me/code
+# or
+export RCH_CANONICAL_PROJECT_ROOT=/home/me/code
+export RCH_ALIAS_PROJECT_ROOT=/home/me/code
+```
+
+Empty strings are treated as unset (defaults apply). See
+`docs/guides/configuration.md` (`[path_topology]`) for details.
+
 ### Minimal Example
 
 ```toml

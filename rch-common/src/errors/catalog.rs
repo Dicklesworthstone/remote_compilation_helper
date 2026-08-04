@@ -684,7 +684,7 @@ impl ErrorCode {
                 "Break the cycle by restructuring crate boundaries",
             ],
             Self::PathDepPolicyViolation => &[
-                "Ensure all path dependencies are under the canonical root (/data/projects)",
+                "Ensure all path dependencies are under the configured canonical root (path_topology.canonical_root, default /data/projects)",
                 "Check that paths resolve within allowed topology prefixes",
                 "Review the PathTopologyPolicy configuration",
             ],
