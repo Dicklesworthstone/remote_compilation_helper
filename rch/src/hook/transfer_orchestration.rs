@@ -1194,5 +1194,25 @@ mod tests {
             first_root, second_root,
             "concurrent clean-overlay jobs must never share a remote root"
         );
+
+        let fixed_nonce = uuid::Uuid::from_u128(3);
+        assert_ne!(
+            clean_overlay_remote_project_hash(base, "first-dirty-overlay-fingerprint", fixed_nonce,),
+            clean_overlay_remote_project_hash(
+                "fedcba9876543210fedcba9876543210fedcba98",
+                "first-dirty-overlay-fingerprint",
+                fixed_nonce,
+            ),
+            "the immutable base must be part of the remote-root identity"
+        );
+        assert_ne!(
+            clean_overlay_remote_project_hash(base, "first-dirty-overlay-fingerprint", fixed_nonce,),
+            clean_overlay_remote_project_hash(
+                base,
+                "second-conflicting-overlay-fingerprint",
+                fixed_nonce,
+            ),
+            "the dirty overlay fingerprint must be part of the remote-root identity"
+        );
     }
 }
