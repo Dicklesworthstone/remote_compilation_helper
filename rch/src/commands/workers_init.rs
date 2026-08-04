@@ -342,7 +342,16 @@ fn serialize_workers_config(workers: &[WorkerConfig]) -> Result<String> {
                 identity_file: worker.identity_file.clone(),
                 total_slots: worker.total_slots,
                 priority: worker.priority,
-                tags: worker.tags.clone(),
+                // Lift the declaration back out of the reserved tag so the
+                // rewritten file keeps the `os = "..."` key an operator wrote,
+                // and does not leak `os:windows` into the visible tag list.
+                os: rch_common::declared_os(&worker.tags),
+                tags: worker
+                    .tags
+                    .iter()
+                    .filter(|tag| !tag.starts_with(rch_common::OS_TAG_PREFIX))
+                    .cloned()
+                    .collect(),
                 enabled: true,
             })
             .collect(),

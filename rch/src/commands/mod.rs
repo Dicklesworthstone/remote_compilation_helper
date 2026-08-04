@@ -1143,6 +1143,7 @@ mod tests {
             identity_file: "~/.ssh/id_rsa".to_string(),
             slots_available: 4,
             speed_score: 1.5,
+            declared_os: None,
         };
         let worker_selection = DiagnoseWorkerSelection {
             estimated_cores: 4,

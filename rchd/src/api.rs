@@ -17,6 +17,9 @@ use crate::workers::{
 };
 use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
+use rch_common::job_identity::{
+    DurableJobLease, LOCAL_WRAPPER_ID_PREFIX, default_job_lease_directory,
+};
 use rch_common::{
     ApiError, BuildHeartbeatRequest, BuildRecord, BuildStats, BypassRecord, BypassRecordStore,
     CircuitBreakerConfig, CircuitState, CommandPriority, ErrorCode, ReleaseRequest,
@@ -101,6 +104,8 @@ fn format_wait_time(secs: u64) -> String {
 enum ApiRequest {
     SelectWorker {
         request: SelectionRequest,
+        /// Client-minted identity supplied before daemon contact.
+        local_wrapper_id: Option<String>,
         /// If true and all workers are busy, enqueue and wait for a worker.
         wait_for_worker: bool,
         /// Optional client-provided max queue wait timeout (seconds).
@@ -147,6 +152,12 @@ enum ApiRequest {
     },
     SelfTestRun(SelfTestRunRequest),
     Shutdown,
+    /// Atomically close or reopen daemon worker admission for restart safety.
+    RestartAdmission {
+        close: bool,
+    },
+    /// Read the restart barrier without changing daemon state.
+    RestartAdmissionStatus,
     /// Reload configuration (workers.toml) without restart.
     Reload,
     CancelBuild {
@@ -461,6 +472,21 @@ pub struct BuildHeartbeatResponse {
     pub phase: String,
 }
 
+/// Result of atomically closing admission and proving daemon quiescence.
+#[derive(Debug, Serialize)]
+pub struct RestartAdmissionResponse {
+    pub admission_closed: bool,
+    pub restart_permitted: bool,
+    pub active_build_ids: Vec<u64>,
+    pub queued_build_ids: Vec<u64>,
+    /// Nonterminal or unacknowledged client-side durable job leases.
+    pub client_lease_ids: Vec<String>,
+    /// A lease scan failure must fail closed because it makes the zero-state
+    /// proof unprovable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_lease_scan_error: Option<String>,
+}
+
 // ============================================================================
 // Build Cancellation Response Types (per bead remote_compilation_helper-scs)
 // ============================================================================
@@ -673,12 +699,19 @@ pub async fn handle_connection(
     let (response_json, content_type) = match parse_request(line) {
         Ok(ApiRequest::SelectWorker {
             request,
+            local_wrapper_id,
             wait_for_worker,
             wait_timeout_secs,
         }) => {
             metrics::inc_requests("select-worker");
-            let response =
-                handle_select_worker(&ctx, request, wait_for_worker, wait_timeout_secs).await?;
+            let response = handle_select_worker_with_wrapper(
+                &ctx,
+                request,
+                wait_for_worker,
+                wait_timeout_secs,
+                local_wrapper_id,
+            )
+            .await?;
             (selection_response_json(&response)?, "application/json")
         }
         Ok(ApiRequest::ReleaseWorker(mut request)) => {
@@ -962,11 +995,47 @@ pub async fn handle_connection(
         }
         Ok(ApiRequest::Shutdown) => {
             metrics::inc_requests("shutdown");
-            let _ = shutdown_tx.send(()).await;
-            (
-                "{\"status\":\"shutting_down\"}".to_string(),
-                "application/json",
-            )
+            let admission = ctx.admission_barrier.read().await;
+            let active_build_ids: Vec<_> = ctx
+                .history
+                .active_builds()
+                .into_iter()
+                .map(|build| build.id)
+                .collect();
+            let queued_build_ids: Vec<_> = ctx
+                .history
+                .queued_builds()
+                .into_iter()
+                .map(|build| build.id)
+                .collect();
+            if !*admission || !active_build_ids.is_empty() || !queued_build_ids.is_empty() {
+                (
+                    serde_json::json!({
+                        "status": "shutdown_blocked",
+                        "admission_closed": *admission,
+                        "active_build_ids": active_build_ids,
+                        "queued_build_ids": queued_build_ids,
+                    })
+                    .to_string(),
+                    "application/json",
+                )
+            } else {
+                let _ = shutdown_tx.send(()).await;
+                (
+                    "{\"status\":\"shutting_down\"}".to_string(),
+                    "application/json",
+                )
+            }
+        }
+        Ok(ApiRequest::RestartAdmission { close }) => {
+            metrics::inc_requests("restart-admission");
+            let response = handle_restart_admission(&ctx, close).await;
+            (serde_json::to_string(&response)?, "application/json")
+        }
+        Ok(ApiRequest::RestartAdmissionStatus) => {
+            metrics::inc_requests("restart-admission-status");
+            let response = restart_admission_status(&ctx).await;
+            (serde_json::to_string(&response)?, "application/json")
         }
         Ok(ApiRequest::Reload) => {
             metrics::inc_requests("reload");
@@ -1202,6 +1271,18 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
 
     if path == "/shutdown" && method == "POST" {
         return Ok(ApiRequest::Shutdown);
+    }
+
+    if path == "/restart-admission" && method == "POST" {
+        return Ok(ApiRequest::RestartAdmission { close: true });
+    }
+
+    if path == "/restart-admission" && method == "GET" {
+        return Ok(ApiRequest::RestartAdmissionStatus);
+    }
+
+    if path == "/restart-admission/release" && method == "POST" {
+        return Ok(ApiRequest::RestartAdmission { close: false });
     }
 
     if path == "/reload" && method == "POST" {
@@ -1623,6 +1704,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     let mut command_priority = CommandPriority::Normal;
     let mut classification_duration_us = None;
     let mut hook_pid = None;
+    let mut local_wrapper_id = None;
     let mut preferred_workers = Vec::new();
 
     for param in query.split('&') {
@@ -1667,6 +1749,12 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             "hook_pid" => {
                 hook_pid = value.parse().ok();
             }
+            "local_wrapper_id" => {
+                let candidate = percent_unescape_query_value(value);
+                if candidate.starts_with(LOCAL_WRAPPER_ID_PREFIX) {
+                    local_wrapper_id = Some(candidate);
+                }
+            }
             "worker" | "preferred_worker" | "preferred" => {
                 preferred_workers.extend(parse_worker_id_list(value));
             }
@@ -1694,6 +1782,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         },
         wait_for_worker,
         wait_timeout_secs,
+        local_wrapper_id,
     })
 }
 
@@ -2080,12 +2169,31 @@ async fn handle_event_stream(
 }
 
 /// Handle a select-worker request.
+#[cfg(test)]
 async fn handle_select_worker(
     ctx: &DaemonContext,
     request: SelectionRequest,
     wait_for_worker: bool,
     wait_timeout_secs: Option<u64>,
 ) -> Result<SelectionResponse> {
+    handle_select_worker_with_wrapper(ctx, request, wait_for_worker, wait_timeout_secs, None).await
+}
+
+async fn handle_select_worker_with_wrapper(
+    ctx: &DaemonContext,
+    request: SelectionRequest,
+    wait_for_worker: bool,
+    wait_timeout_secs: Option<u64>,
+    local_wrapper_id: Option<String>,
+) -> Result<SelectionResponse> {
+    if *ctx.admission_barrier.read().await {
+        return Ok(SelectionResponse {
+            worker: None,
+            reason: SelectionReason::SelectionError("restart_admission_barrier_active".to_string()),
+            build_id: None,
+            diagnostics: None,
+        });
+    }
     debug!(
         "Selecting worker for project '{}' with {} cores",
         request.project, request.estimated_cores
@@ -2136,7 +2244,20 @@ async fn handle_select_worker(
     async fn attempt_select_and_reserve(
         ctx: &DaemonContext,
         request: &SelectionRequest,
+        local_wrapper_id: Option<String>,
     ) -> Result<SelectionResponse> {
+        let admission = ctx.admission_barrier.read().await;
+        if *admission {
+            return Ok(SelectionResponse {
+                worker: None,
+                reason: SelectionReason::SelectionError(
+                    "restart_admission_barrier_active".to_string(),
+                ),
+                build_id: None,
+                diagnostics: None,
+            });
+        }
+        let response = async {
         // Retry loop to handle race conditions where slots are taken between selection and reservation.
         let mut reservation_attempts = 0;
         const MAX_ATTEMPTS: u32 = 3;
@@ -2166,13 +2287,14 @@ async fn handle_select_worker(
             // Reserve the slots.
             reservation_attempts += 1;
             if worker.reserve_slots(request.estimated_cores).await {
-                let (id, host, user, identity_file) = {
+                let (id, host, user, identity_file, declared_os) = {
                     let config = worker.config.read().await;
                     (
                         config.id.clone(),
                         config.host.clone(),
                         config.user.clone(),
                         config.identity_file.clone(),
+                        rch_common::declared_os(&config.tags),
                     )
                 };
 
@@ -2182,11 +2304,12 @@ async fn handle_select_worker(
                     .unwrap_or_else(|| "<unknown>".to_string());
 
                 let build_id = if let Some(hook_pid) = request.hook_pid.filter(|pid| *pid > 0) {
-                    let Some(state) = ctx.history.try_start_active_build(
+                    let Some(state) = ctx.history.try_start_active_build_with_wrapper(
                         request.project.clone(),
                         id.as_str().to_string(),
                         command.clone(),
                         hook_pid,
+                        local_wrapper_id.clone(),
                         request.estimated_cores,
                         rch_common::BuildLocation::Remote,
                     ) else {
@@ -2208,6 +2331,7 @@ async fn handle_select_worker(
                             "project_id": request.project.clone(),
                             "worker_id": id.as_str(),
                             "command": command,
+                            "local_wrapper_id": local_wrapper_id.clone(),
                             "slots": request.estimated_cores,
                         }),
                     );
@@ -2240,6 +2364,7 @@ async fn handle_select_worker(
                         identity_file,
                         slots_available,
                         speed_score,
+                        declared_os,
                     }),
                     reason: selection_reason,
                     build_id,
@@ -2263,9 +2388,13 @@ async fn handle_select_worker(
             }
             // Loop again - next selection will see reduced slot count.
         }
+        }
+        .await;
+        drop(admission);
+        response
     }
 
-    let initial = attempt_select_and_reserve(ctx, &request).await?;
+    let initial = attempt_select_and_reserve(ctx, &request, local_wrapper_id.clone()).await?;
     if initial.worker.is_some()
         || !wait_for_worker
         || initial.reason != SelectionReason::AllWorkersBusy
@@ -2280,12 +2409,23 @@ async fn handle_select_worker(
         .clone()
         .unwrap_or_else(|| "<unknown>".to_string());
 
-    let Some(queued) = ctx.history.enqueue_build(
+    let admission = ctx.admission_barrier.read().await;
+    if *admission {
+        return Ok(SelectionResponse {
+            worker: None,
+            reason: SelectionReason::SelectionError("restart_admission_barrier_active".to_string()),
+            build_id: None,
+            diagnostics: None,
+        });
+    }
+    let queued_result = ctx.history.enqueue_build(
         request.project.clone(),
         command.clone(),
         hook_pid,
         request.estimated_cores,
-    ) else {
+    );
+    drop(admission);
+    let Some(queued) = queued_result else {
         // Queue full - fall back to the normal busy response.
         return Ok(initial);
     };
@@ -2367,7 +2507,7 @@ async fn handle_select_worker(
             });
         }
 
-        let response = attempt_select_and_reserve(ctx, &request).await?;
+        let response = attempt_select_and_reserve(ctx, &request, local_wrapper_id.clone()).await?;
         if response.worker.is_some() {
             let _ = ctx.history.remove_queued_build(queued.id);
             ctx.history.update_queue_estimates();
@@ -2397,6 +2537,115 @@ async fn handle_select_worker(
 
         tokio::time::sleep(QUEUE_POLL_INTERVAL).await;
     }
+}
+
+/// Close admission before a restart and report the daemon-owned build/queue
+/// snapshot.  The caller must treat any nonempty list as a hard no-action and
+/// leave the barrier raised; only a fresh daemon instance may reopen it after
+/// a successful restart.  A failed restart can explicitly reopen the barrier
+/// with `close=false`.
+async fn handle_restart_admission(ctx: &DaemonContext, close: bool) -> RestartAdmissionResponse {
+    let mut admission = ctx.admission_barrier.write().await;
+    let was_closed = *admission;
+    *admission = close;
+    let active_build_ids: Vec<u64> = ctx
+        .history
+        .active_builds()
+        .into_iter()
+        .map(|build| build.id)
+        .collect();
+    let queued_build_ids: Vec<u64> = ctx
+        .history
+        .queued_builds()
+        .into_iter()
+        .map(|build| build.id)
+        .collect();
+    let client_lease_scan = nonterminal_client_lease_ids();
+    let (client_lease_ids, client_lease_scan_error) = match client_lease_scan {
+        Ok(ids) => (ids, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+    let restart_permitted = close
+        && !was_closed
+        && active_build_ids.is_empty()
+        && queued_build_ids.is_empty()
+        && client_lease_ids.is_empty()
+        && client_lease_scan_error.is_none();
+    RestartAdmissionResponse {
+        admission_closed: close,
+        restart_permitted,
+        active_build_ids,
+        queued_build_ids,
+        client_lease_ids,
+        client_lease_scan_error,
+    }
+}
+
+/// Snapshot restart admission without changing the barrier.  The hook calls
+/// this after it writes its durable lease and before worker selection, so an
+/// established remediator can refuse new work without a selection race.
+async fn restart_admission_status(ctx: &DaemonContext) -> RestartAdmissionResponse {
+    let admission = ctx.admission_barrier.read().await;
+    let active_build_ids: Vec<u64> = ctx
+        .history
+        .active_builds()
+        .into_iter()
+        .map(|build| build.id)
+        .collect();
+    let queued_build_ids: Vec<u64> = ctx
+        .history
+        .queued_builds()
+        .into_iter()
+        .map(|build| build.id)
+        .collect();
+    let client_lease_scan = nonterminal_client_lease_ids();
+    let (client_lease_ids, client_lease_scan_error) = match client_lease_scan {
+        Ok(ids) => (ids, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+    RestartAdmissionResponse {
+        admission_closed: *admission,
+        restart_permitted: false,
+        active_build_ids,
+        queued_build_ids,
+        client_lease_ids,
+        client_lease_scan_error,
+    }
+}
+
+/// Return every client lease that is not both terminal and explicitly
+/// acknowledged by the daemon.  A malformed directory entry fails closed: a
+/// restart cannot claim a zero-state snapshot when durable evidence is
+/// unreadable.
+fn nonterminal_client_lease_ids() -> Result<Vec<String>> {
+    let lease_dir = default_job_lease_directory();
+    let entries = match std::fs::read_dir(&lease_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(anyhow!("cannot inspect {}: {error}", lease_dir.display())),
+    };
+
+    let mut blocked = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| anyhow!("cannot enumerate {}: {error}", lease_dir.display()))?;
+        if entry
+            .path()
+            .extension()
+            .is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path())
+            .map_err(|error| anyhow!("cannot read {}: {error}", entry.path().display()))?;
+        let lease: DurableJobLease = serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow!("cannot parse {}: {error}", entry.path().display()))?;
+        if !lease.state.is_terminal() || !lease.terminal_acknowledged {
+            blocked.push(lease.identity.local_wrapper_id);
+        }
+    }
+    blocked.sort();
+    Ok(blocked)
 }
 
 /// Handle a release-worker request.
@@ -3439,6 +3688,7 @@ mod tests {
             pid: 1234,
             queue_timeout_secs: 300,
             bypass_store: None,
+            admission_barrier: Arc::new(tokio::sync::RwLock::new(false)),
         }
     }
 
@@ -3503,6 +3753,25 @@ mod tests {
         };
         assert_eq!(req.project, "my project");
         assert_eq!(req.estimated_cores, 2);
+    }
+
+    #[test]
+    fn test_parse_request_carries_valid_local_wrapper_id_separately_from_command() {
+        let _guard = test_guard!();
+        let request = parse_request(
+            "GET /select-worker?project=test&command=cargo%20build&local_wrapper_id=rchw-lease-1",
+        )
+        .unwrap();
+        let ApiRequest::SelectWorker {
+            request,
+            local_wrapper_id,
+            ..
+        } = request
+        else {
+            panic!("expected select-worker request");
+        };
+        assert_eq!(request.command.as_deref(), Some("cargo build"));
+        assert_eq!(local_wrapper_id.as_deref(), Some("rchw-lease-1"));
     }
 
     #[test]
@@ -4138,6 +4407,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_admission_barrier_refuses_new_worker_selection() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+        *ctx.admission_barrier.write().await = true;
+        let request = SelectionRequest {
+            project: "restart-guard".to_string(),
+            command: Some("cargo test".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: Some(1234),
+        };
+
+        let response = handle_select_worker(&ctx, request, false, None)
+            .await
+            .expect("barrier returns a structured refusal");
+
+        assert!(response.worker.is_none());
+        assert_eq!(
+            response.reason,
+            SelectionReason::SelectionError("restart_admission_barrier_active".to_string())
+        );
+        assert!(ctx.history.active_builds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_restart_admission_reports_active_build_and_keeps_barrier_closed() {
+        let ctx = make_test_context(WorkerPool::new());
+        let active = ctx.history.start_active_build(
+            "restart-proof".to_string(),
+            "worker-a".to_string(),
+            "cargo test -p rchd".to_string(),
+            4242,
+            1,
+            rch_common::BuildLocation::Remote,
+        );
+
+        let response = handle_restart_admission(&ctx, true).await;
+
+        assert!(!response.restart_permitted);
+        assert_eq!(response.active_build_ids, vec![active.id]);
+        assert!(response.queued_build_ids.is_empty());
+        assert!(*ctx.admission_barrier.read().await);
+    }
+
+    #[tokio::test]
     async fn test_handle_select_worker_preserves_affinity_pin_reason() {
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
@@ -4187,9 +4506,15 @@ mod tests {
             hook_pid: Some(4242),
         };
 
-        let response = handle_select_worker(&ctx, request, false, None)
-            .await
-            .unwrap();
+        let response = handle_select_worker_with_wrapper(
+            &ctx,
+            request,
+            false,
+            None,
+            Some("rchw-daemon-correlation".to_string()),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.reason, SelectionReason::Success);
         let build_id = response.build_id.expect("build_id should be assigned");
 
@@ -4198,6 +4523,10 @@ mod tests {
         assert_eq!(active.worker_id, "worker1");
         assert_eq!(active.command, "cargo build --release");
         assert_eq!(active.hook_pid, 4242);
+        assert_eq!(
+            active.local_wrapper_id.as_deref(),
+            Some("rchw-daemon-correlation")
+        );
         assert_eq!(active.slots, 2);
 
         // Release should finalize the active build and move it into history
@@ -4772,6 +5101,23 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("POST /shutdown").unwrap();
         assert!(matches!(req, ApiRequest::Shutdown));
+    }
+
+    #[test]
+    fn test_parse_request_restart_admission_routes() {
+        let _guard = test_guard!();
+        assert!(matches!(
+            parse_request("POST /restart-admission").unwrap(),
+            ApiRequest::RestartAdmission { close: true }
+        ));
+        assert!(matches!(
+            parse_request("POST /restart-admission/release").unwrap(),
+            ApiRequest::RestartAdmission { close: false }
+        ));
+        assert!(matches!(
+            parse_request("GET /restart-admission").unwrap(),
+            ApiRequest::RestartAdmissionStatus
+        ));
     }
 
     #[test]
@@ -5886,6 +6232,7 @@ mod tests {
                 build_id: build.id,
                 worker_id: WorkerId::new("worker1"),
                 hook_pid: Some(43210),
+                local_wrapper_id: Some("rchw-test".to_string()),
                 remote_pgid_file: Some("/tmp/rch/test-project/hash/.rch-run/99.pgid".to_string()),
                 phase: rch_common::BuildHeartbeatPhase::Execute,
                 detail: Some("Compiling".to_string()),
@@ -5931,6 +6278,7 @@ mod tests {
                 build_id: build.id,
                 worker_id: WorkerId::new("worker-x"),
                 hook_pid: Some(5555),
+                local_wrapper_id: None,
                 remote_pgid_file: None,
                 phase: rch_common::BuildHeartbeatPhase::Execute,
                 detail: Some("Mismatch".to_string()),

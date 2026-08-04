@@ -357,6 +357,15 @@ pub struct WorkerEntry {
     #[serde(default)]
     pub tags: Vec<String>,
 
+    /// Host OS this worker builds on (`linux`, `darwin`, `windows`).
+    ///
+    /// Unlike [`Self::tags`], which are descriptive, this **gates** admission:
+    /// declaring it makes the worker exclusive to commands that require that OS
+    /// (a `--target *-pc-windows-msvc` build, say). Omit it for an ordinary
+    /// worker that should remain a candidate for any job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+
     /// Whether this worker is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -364,6 +373,21 @@ pub struct WorkerEntry {
 
 impl From<WorkerEntry> for WorkerConfig {
     fn from(entry: WorkerEntry) -> Self {
+        // `os = "windows"` is normalized into the reserved `os:windows` tag so
+        // the declaration rides the tag vector every downstream path already
+        // carries, instead of a parallel field.
+        let mut tags = entry.tags;
+        if let Some(os) = entry
+            .os
+            .as_deref()
+            .map(str::trim)
+            .filter(|os| !os.is_empty())
+        {
+            let tag = rch_common::os_tag(os);
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
         WorkerConfig {
             id: rch_common::WorkerId::new(entry.id),
             host: entry.host,
@@ -371,7 +395,7 @@ impl From<WorkerEntry> for WorkerConfig {
             identity_file: entry.identity_file,
             total_slots: entry.total_slots,
             priority: entry.priority,
-            tags: entry.tags,
+            tags,
         }
     }
 }
@@ -692,6 +716,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec!["rust".to_string()],
+            os: None,
             enabled: true,
         };
 
@@ -1047,6 +1072,62 @@ tags = ["rust", "go", "python", "fast", "production"]
     }
 
     #[test]
+    fn test_declared_os_becomes_reserved_tag() {
+        let _guard = test_guard!();
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+
+        std::fs::write(
+            &workers_path,
+            r#"
+[[workers]]
+id = "wsurf"
+host = "100.68.2.11"
+os = "Windows"
+tags = ["rust"]
+"#,
+        )
+        .unwrap();
+
+        let workers = load_workers(Some(&workers_path)).unwrap();
+
+        // Normalized to lowercase and carried as the reserved tag, which is what
+        // the selection gate reads.
+        assert_eq!(
+            rch_common::declared_os(&workers[0].tags),
+            Some("windows".to_string())
+        );
+        assert!(workers[0].tags.contains(&"rust".to_string()));
+    }
+
+    #[test]
+    fn test_worker_without_declared_os_is_unfenced() {
+        let _guard = test_guard!();
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+
+        // Every worker in the existing fleet looks like this. None may gain an
+        // OS constraint, or the whole pool stops accepting ordinary builds.
+        std::fs::write(
+            &workers_path,
+            r#"
+[[workers]]
+id = "vmi1149989"
+host = "212.90.121.76"
+tags = ["rust"]
+"#,
+        )
+        .unwrap();
+
+        let workers = load_workers(Some(&workers_path)).unwrap();
+        assert_eq!(rch_common::declared_os(&workers[0].tags), None);
+    }
+
+    #[test]
     fn test_worker_entry_conversion_preserves_all_fields() {
         let _guard = test_guard!();
         init_test_logging();
@@ -1059,6 +1140,7 @@ tags = ["rust", "go", "python", "fast", "production"]
             total_slots: 32,
             priority: 200,
             tags: vec!["tag1".to_string(), "tag2".to_string()],
+            os: None,
             enabled: true,
         };
 

@@ -215,3 +215,63 @@ pub(super) fn signal_name(signal: i32) -> &'static str {
         _ => "UNKNOWN",
     }
 }
+
+/// Topology-specific Cargo workspace inheritance failure under remote roots.
+#[derive(Debug, Clone)]
+pub(super) struct CargoWorkspaceInheritanceFailure {
+    inherited_field: Option<String>,
+}
+
+impl CargoWorkspaceInheritanceFailure {
+    pub(super) fn summary(&self) -> String {
+        match &self.inherited_field {
+            Some(field) => format!("cargo workspace inheritance blocked for {field}"),
+            None => "cargo workspace inheritance blocked by remote topology".to_string(),
+        }
+    }
+
+    pub(super) fn remediation(&self) -> &'static str {
+        "Sync dependency workspace metadata roots or isolate remote sync roots from unrelated outer Cargo workspaces before retrying."
+    }
+
+    pub(super) fn log_detail(&self) -> String {
+        match &self.inherited_field {
+            Some(field) => format!("workspace_package_field={field}"),
+            None => "workspace package inheritance failure matched".to_string(),
+        }
+    }
+}
+
+/// Detect Cargo workspace-inheritance failures caused by remote topology isolation.
+pub(super) fn detect_cargo_workspace_inheritance_failure(
+    stderr: &str,
+    exit_code: i32,
+) -> Option<CargoWorkspaceInheritanceFailure> {
+    if exit_code == 0 {
+        return None;
+    }
+
+    let lower = stderr.to_ascii_lowercase();
+    let inherits_from_workspace =
+        lower.contains("error inheriting") && lower.contains("from workspace root manifest");
+    let missing_workspace_package =
+        lower.contains("workspace.package.") && lower.contains("was not defined");
+    if !inherits_from_workspace || !missing_workspace_package {
+        return None;
+    }
+
+    let inherited_field = stderr.lines().find_map(extract_workspace_package_field);
+    Some(CargoWorkspaceInheritanceFailure { inherited_field })
+}
+
+fn extract_workspace_package_field(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let prefix = "workspace.package.";
+    let start = lower.find(prefix)? + prefix.len();
+    let original_tail = line.get(start..)?.trim_start();
+    let field = original_tail
+        .split_whitespace()
+        .next()?
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
+    (!field.is_empty()).then(|| field.to_string())
+}

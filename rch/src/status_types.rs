@@ -339,16 +339,21 @@ pub enum SystemPosture {
     RemoteReady,
     /// Some workers degraded; partial remote capability.
     Degraded,
-    /// No workers available; all builds run locally (fail-open).
+    /// No workers are configured, healthy, or admissible for remote work.
     LocalOnly,
 }
 
 impl SystemPosture {
     /// Compute posture from daemon status response.
     pub fn from_status(status: &DaemonFullStatusResponse) -> Self {
-        if status.daemon.workers_total == 0 || status.daemon.workers_healthy == 0 {
+        if status.daemon.workers_total == 0
+            || status.daemon.workers_healthy == 0
+            || (!status.workers.is_empty() && remote_admissible_worker_count(&status.workers) == 0)
+        {
             Self::LocalOnly
-        } else if status.daemon.workers_healthy < status.daemon.workers_total {
+        } else if status.daemon.workers_healthy < status.daemon.workers_total
+            || critical_pressure_worker_count(&status.workers) > 0
+        {
             Self::Degraded
         } else {
             Self::RemoteReady
@@ -367,10 +372,34 @@ impl SystemPosture {
     pub fn description(&self) -> &'static str {
         match self {
             Self::RemoteReady => "All workers healthy, remote compilation available",
-            Self::Degraded => "Some workers unhealthy, partial remote capability",
-            Self::LocalOnly => "No workers available, builds run locally (fail-open)",
+            Self::Degraded => {
+                "Some workers unavailable or pressure-blocked, partial remote capability"
+            }
+            Self::LocalOnly => "No admissible remote workers available; builds cannot run remotely",
         }
     }
+}
+
+/// Whether a worker can currently accept remote work according to status-level
+/// signals that mirror the daemon's hard admission blockers.
+pub fn worker_has_remote_admission_capacity(worker: &WorkerStatusFromApi) -> bool {
+    worker.status == "healthy" && worker.pressure_state.as_deref() != Some("critical")
+}
+
+/// Count workers that should be eligible for remote admission from the status surface.
+pub fn remote_admissible_worker_count(workers: &[WorkerStatusFromApi]) -> usize {
+    workers
+        .iter()
+        .filter(|worker| worker_has_remote_admission_capacity(worker))
+        .count()
+}
+
+/// Count workers blocked by critical storage pressure.
+pub fn critical_pressure_worker_count(workers: &[WorkerStatusFromApi]) -> usize {
+    workers
+        .iter()
+        .filter(|worker| worker.pressure_state.as_deref() == Some("critical"))
+        .count()
 }
 
 /// Structured remediation hint with reason code and actionable guidance.
@@ -441,7 +470,7 @@ pub fn generate_worker_remediations(workers: &[WorkerStatusFromApi]) -> Vec<Reme
                             w.id, disk_info
                         ),
                         suggested_action: format!(
-                            "ssh {}@{} 'df -h / /tmp && du -sh /tmp/rch-* /tmp/rch_target_* /data/projects/*/target* 2>/dev/null'",
+                            "ssh {}@{} 'df -h / /tmp && du -sh /tmp/rch-* /tmp/rch_target_* /data/projects/*/.rch-target-* /data/projects/*/target* 2>/dev/null'",
                             w.user, w.host
                         ),
                         worker_id: Some(w.id.clone()),
@@ -457,7 +486,7 @@ pub fn generate_worker_remediations(workers: &[WorkerStatusFromApi]) -> Vec<Reme
                         severity: "warning".into(),
                         message: format!("Worker {} storage pressure elevated{}", w.id, disk_info),
                         suggested_action: format!(
-                            "ssh {}@{} 'df -h / /tmp && du -sh /tmp/rch-* /tmp/rch_target_* 2>/dev/null'",
+                            "ssh {}@{} 'df -h / /tmp && du -sh /tmp/rch-* /tmp/rch_target_* /data/projects/*/.rch-target-* 2>/dev/null'",
                             w.user, w.host
                         ),
                         worker_id: Some(w.id.clone()),
@@ -1567,6 +1596,38 @@ mod tests {
     }
 
     #[test]
+    fn test_system_posture_local_only_when_all_healthy_workers_pressure_critical() {
+        let _guard = test_guard!();
+        let mut status = make_daemon_status(2, 2);
+        let mut first = make_worker("w1", "healthy", "closed");
+        first.pressure_state = Some("critical".to_string());
+        let mut second = make_worker("w2", "healthy", "closed");
+        second.pressure_state = Some("critical".to_string());
+        status.workers = vec![first, second];
+
+        assert_eq!(critical_pressure_worker_count(&status.workers), 2);
+        assert_eq!(remote_admissible_worker_count(&status.workers), 0);
+        assert_eq!(
+            SystemPosture::from_status(&status),
+            SystemPosture::LocalOnly
+        );
+    }
+
+    #[test]
+    fn test_system_posture_degraded_when_some_workers_pressure_critical() {
+        let _guard = test_guard!();
+        let mut status = make_daemon_status(2, 2);
+        let ready = make_worker("w1", "healthy", "closed");
+        let mut blocked = make_worker("w2", "healthy", "closed");
+        blocked.pressure_state = Some("critical".to_string());
+        status.workers = vec![ready, blocked];
+
+        assert_eq!(critical_pressure_worker_count(&status.workers), 1);
+        assert_eq!(remote_admissible_worker_count(&status.workers), 1);
+        assert_eq!(SystemPosture::from_status(&status), SystemPosture::Degraded);
+    }
+
+    #[test]
     fn test_remediation_circuit_open() {
         let _guard = test_guard!();
         let mut w = make_worker("w1", "unhealthy", "open");
@@ -1614,6 +1675,7 @@ mod tests {
         assert_eq!(pressure[0].severity, "critical");
         assert!(pressure[0].message.contains("1.2 GB free"));
         assert!(pressure[0].suggested_action.contains("df -h / /tmp"));
+        assert!(pressure[0].suggested_action.contains(".rch-target-*"));
     }
 
     #[test]
@@ -1630,6 +1692,7 @@ mod tests {
         assert_eq!(pressure.len(), 1);
         assert_eq!(pressure[0].severity, "warning");
         assert!(pressure[0].suggested_action.contains("df -h / /tmp"));
+        assert!(pressure[0].suggested_action.contains(".rch-target-*"));
     }
 
     #[test]

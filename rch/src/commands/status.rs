@@ -454,6 +454,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             CommandPriority::Normal,
             0,
             None,
+            None,
             false,
             &preferred_workers,
         )
@@ -2549,7 +2550,8 @@ pub async fn status_overview(
 ) -> Result<()> {
     use crate::status_types::{
         CliStatusResponse, RemediationHint, RepoConvergenceStatusFromApi, STATUS_SCHEMA_VERSION,
-        SystemPosture, generate_convergence_remediations, generate_worker_remediations,
+        SystemPosture, critical_pressure_worker_count, generate_convergence_remediations,
+        generate_worker_remediations, remote_admissible_worker_count,
     };
 
     // Query daemon for full status.
@@ -2617,6 +2619,21 @@ pub async fn status_overview(
                         .into(),
                     worker_id: None,
                 });
+            } else if critical_pressure_worker_count(&status.workers) > 0
+                && remote_admissible_worker_count(&status.workers) == 0
+            {
+                remediation_hints.push(RemediationHint {
+                    reason_code: "all_workers_pressure_critical".into(),
+                    severity: "critical".into(),
+                    message: format!(
+                        "No admissible remote workers; {} worker(s) are blocked by critical storage pressure",
+                        critical_pressure_worker_count(&status.workers)
+                    ),
+                    suggested_action:
+                        "Use the pressure_critical worker hints for read-only df/du attribution; free space only with explicit operator approval, then run rch workers capabilities --refresh"
+                            .into(),
+                    worker_id: None,
+                });
             } else {
                 remediation_hints.push(RemediationHint {
                     reason_code: "all_workers_down".into(),
@@ -2628,14 +2645,29 @@ pub async fn status_overview(
             }
         }
         SystemPosture::Degraded => {
+            let pressure_blocked = critical_pressure_worker_count(&status.workers);
             remediation_hints.push(RemediationHint {
                 reason_code: "partial_capacity".into(),
                 severity: "warning".into(),
-                message: format!(
-                    "Operating at reduced capacity: {}/{} workers healthy",
-                    status.daemon.workers_healthy, status.daemon.workers_total
-                ),
-                suggested_action: "rch workers probe --all".into(),
+                message: if pressure_blocked > 0 {
+                    format!(
+                        "Operating at reduced capacity: {}/{} workers healthy, {} pressure-blocked",
+                        status.daemon.workers_healthy,
+                        status.daemon.workers_total,
+                        pressure_blocked
+                    )
+                } else {
+                    format!(
+                        "Operating at reduced capacity: {}/{} workers healthy",
+                        status.daemon.workers_healthy, status.daemon.workers_total
+                    )
+                },
+                suggested_action: if pressure_blocked > 0 {
+                    "Use rch status --workers --json pressure hints before retrying heavy builds"
+                        .into()
+                } else {
+                    "rch workers probe --all".into()
+                },
                 worker_id: None,
             });
         }
@@ -3410,6 +3442,7 @@ mod tests {
                 identity_file: "~/.ssh/id_rsa".to_string(),
                 slots_available: 6,
                 speed_score: 90.0,
+                declared_os: None,
             }),
             reason: rch_common::SelectionReason::Success,
             diagnostics: Some(diagnostics),

@@ -671,7 +671,7 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
             .unwrap_or("~/.ssh/id_rsa");
         let total_slots = toml_u32_field_or(entry, "total_slots", 8);
         let priority = toml_u32_field_or(entry, "priority", 100);
-        let tags: Vec<String> = entry
+        let mut tags: Vec<String> = entry
             .get("tags")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -680,6 +680,19 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
                     .collect()
             })
             .unwrap_or_default();
+        // Mirrors `WorkerEntry -> WorkerConfig` in the daemon: `os = "windows"`
+        // becomes the reserved `os:windows` tag.
+        if let Some(os) = entry
+            .get("os")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            let tag = rch_common::os_tag(os);
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
 
         workers.push(WorkerConfig {
             id: WorkerId::new(id),

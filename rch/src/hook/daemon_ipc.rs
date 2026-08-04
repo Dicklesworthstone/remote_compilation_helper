@@ -8,6 +8,43 @@
 //! the parent's re-exported `parse_selection_response`; the timeout helpers
 //! and `urlencoding_encode` stay `pub(super)` for the test suite.
 use super::*;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct RestartAdmissionStatus {
+    admission_closed: bool,
+}
+
+/// Return whether a daemon restart remediator has closed new-worker admission.
+/// This is intentionally a read-only preflight: the hook has already written
+/// its durable lease, but must not change restart state itself.
+pub(crate) async fn restart_admission_is_closed(socket_path: &str) -> anyhow::Result<bool> {
+    if !Path::new(socket_path).exists() {
+        return Err(DaemonError::SocketNotFound {
+            socket_path: socket_path.to_string(),
+        }
+        .into());
+    }
+    let stream = timeout(Duration::from_secs(5), UnixStream::connect(socket_path))
+        .await
+        .map_err(|_| anyhow::anyhow!("Daemon connect timed out after 5s"))??;
+    let (mut reader, mut writer) = stream.into_split();
+    writer.write_all(b"GET /restart-admission\n").await?;
+    writer.flush().await?;
+
+    let mut response = String::new();
+    timeout(Duration::from_secs(5), reader.read_to_string(&mut response))
+        .await
+        .map_err(|_| anyhow::anyhow!("Restart-admission response timed out after 5s"))??;
+    let body = response
+        .split_once("\r\n\r\n")
+        .or_else(|| response.split_once("\n\n"))
+        .map_or(response.as_str(), |(_, body)| body)
+        .trim();
+    let status: RestartAdmissionStatus = serde_json::from_str(body)
+        .map_err(|error| anyhow::anyhow!("Malformed restart-admission response: {error}"))?;
+    Ok(status.admission_closed)
+}
 
 /// Query the daemon for a worker.
 #[allow(clippy::too_many_arguments)] // Command routing query wires many independent fields.
@@ -21,6 +58,7 @@ pub(crate) async fn query_daemon(
     command_priority: CommandPriority,
     classification_duration_us: u64,
     hook_pid: Option<u32>,
+    local_wrapper_id: Option<&str>,
     wait_for_worker: bool,
     preferred_workers: &[WorkerId],
 ) -> anyhow::Result<SelectionResponse> {
@@ -83,6 +121,12 @@ pub(crate) async fn query_daemon(
 
     if let Some(pid) = hook_pid {
         query.push_str(&format!("&hook_pid={}", pid));
+    }
+    if let Some(local_wrapper_id) = local_wrapper_id {
+        query.push_str(&format!(
+            "&local_wrapper_id={}",
+            urlencoding_encode(local_wrapper_id)
+        ));
     }
 
     for worker in preferred_workers {

@@ -14,7 +14,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rch_common::{DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT, WorkerCapabilities};
 use rch_common::{LogConfig, init_logging};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser)]
 #[command(name = "rch-wkr")]
@@ -590,6 +590,19 @@ fn probe_projects_topology(
         return (false, Some("canonical_not_directory".to_string()));
     }
 
+    // The canonical↔alias dual-root symlink convention is Unix-only (rch#15).
+    // Windows workers use a single build base (e.g. C:/rch) with no alias, so
+    // requiring an alias symlink there would fail every Windows worker's
+    // preflight. `validate_alias_symlink` enforces the symlink on Unix and is a
+    // no-op on other platforms (the caller's canonical dir check is sufficient).
+    validate_alias_symlink(canonical_root, alias_root)
+}
+
+#[cfg(unix)]
+fn validate_alias_symlink(
+    canonical_root: &std::path::Path,
+    alias_root: &std::path::Path,
+) -> (bool, Option<String>) {
     let alias_meta = match std::fs::symlink_metadata(alias_root) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -625,6 +638,16 @@ fn probe_projects_topology(
         );
     }
 
+    (true, None)
+}
+
+#[cfg(not(unix))]
+fn validate_alias_symlink(
+    _canonical_root: &std::path::Path,
+    _alias_root: &std::path::Path,
+) -> (bool, Option<String>) {
+    // Non-Unix workers (Windows) have no canonical↔alias symlink topology; the
+    // single build base already verified by the caller is sufficient. See rch#15.
     (true, None)
 }
 
@@ -795,91 +818,118 @@ fn parse_df_posix_kb(stdout: &str) -> Option<(u64, u64)> {
 async fn run_benchmark(format: OutputFormat) -> Result<()> {
     info!("Running benchmark...");
 
-    let temp_dir = tempfile::Builder::new()
-        .prefix("rch-benchmark-")
-        .tempdir()?;
-    let temp_path = temp_dir.path();
-
-    // Write a simple Rust project
-    let cargo_toml = r#"
-[package]
-name = "benchmark"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-"#;
-    std::fs::write(temp_path.join("Cargo.toml"), cargo_toml)?;
-
-    let main_rs = r#"
-fn main() {
-    let sum: u64 = (1..1000000).sum();
-    println!("Sum: {}", sum);
-}
-"#;
-    std::fs::create_dir_all(temp_path.join("src"))?;
-    std::fs::write(temp_path.join("src/main.rs"), main_rs)?;
-
-    // Time the build
+    // Run the real multi-dimensional benchmark suite from `rch-telemetry` and
+    // score it with the weighted SpeedScore engine (CPU 30 / disk 20 /
+    // compilation 20 / memory 15 / network 15).
+    //
+    // History (bd-speedscore-saturation): this used to build a single
+    // zero-dependency crate and report `100.0 / elapsed_secs`, clamped to 100.
+    // Every modern worker builds that in well under a second, so the clamp
+    // pinned essentially the whole fleet at exactly 100.0 — the score could not
+    // discriminate at all, and the only workers scoring below 100 were the ones
+    // that happened to be *busy*, which inverted the ranking. It was also
+    // single-threaded, so a 16-core box scored no better than a 4-core box.
+    //
+    // The component benchmarks are CPU-count aware (see `run_stable` variants,
+    // which take the median of several runs to damp load noise), so a busy
+    // worker no longer masquerades as a slow one.
     let start = std::time::Instant::now();
-    let output = std::process::Command::new("cargo")
-        .args(["build", "--release"])
-        .current_dir(temp_path)
-        .output()?;
 
-    let elapsed = start.elapsed();
+    let cpu = rch_telemetry::benchmarks::cpu::run_cpu_benchmark_stable();
+    let memory = rch_telemetry::benchmarks::memory::run_memory_benchmark_stable();
+    let disk = rch_telemetry::benchmarks::disk::run_disk_benchmark_stable();
 
-    if output.status.success() {
-        let score = 100.0 / elapsed.as_secs_f64();
-        match format {
-            OutputFormat::Json => {
-                println!(
-                    "{{\"score\":{:.1},\"elapsed_secs\":{:.2}}}",
-                    score.min(100.0),
-                    elapsed.as_secs_f64()
-                );
-            }
-            OutputFormat::Pretty => {
-                println!("Benchmark completed in {:.2}s", elapsed.as_secs_f64());
-                println!("Score: {:.1}", score.min(100.0));
-            }
+    // Compilation is the one component that can legitimately fail (no cargo,
+    // no toolchain, read-only tmp). Treat that as "component absent" rather
+    // than failing the whole benchmark: `calculate_speedscore` re-weights
+    // across the components it actually has.
+    let compilation = match rch_telemetry::benchmarks::compilation::run_compilation_benchmark_stable(
+    ) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warn!("compilation benchmark unavailable, scoring without it: {e}");
+            None
         }
-    } else {
-        anyhow::bail!(
-            "Benchmark failed: {}",
-            benchmark_failure_summary(&output.stdout, &output.stderr)
-        );
+    };
+
+    // Network is deliberately omitted here: it measures the controller↔worker
+    // path, which is only meaningful when measured from the controller side.
+    let mut results = rch_telemetry::speedscore::BenchmarkResults::new()
+        .with_cpu(cpu.clone())
+        .with_memory(memory.clone())
+        .with_disk(disk.clone());
+    if let Some(ref c) = compilation {
+        results = results.with_compilation(c.clone());
+    }
+
+    let score = rch_telemetry::speedscore::calculate_speedscore(&results);
+    let elapsed = start.elapsed();
+    let cores = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
+
+    // serde_json maps NaN/Infinity to `null`, and rchd parses the score with
+    // `json.get("score").and_then(Value::as_f64)`. A single non-finite value
+    // would therefore emit `"score": null`, the daemon would fail to parse it,
+    // and the worker would silently fall back into the "never benchmarked"
+    // re-queue loop. A NaN is reachable if any benchmark divides 0/0, so clamp
+    // every float we emit.
+    fn finite(v: f64) -> f64 {
+        if v.is_finite() { v } else { 0.0 }
+    }
+    fn round1(v: f64) -> f64 {
+        (finite(v) * 10.0).round() / 10.0
+    }
+
+    match format {
+        OutputFormat::Json => {
+            // `score` stays a top-level f64 for backward compatibility: rchd's
+            // `execute_benchmark_on_worker` parses exactly that field.
+            let payload = serde_json::json!({
+                "score": round1(score.total),
+                "elapsed_secs": (elapsed.as_secs_f64() * 100.0).round() / 100.0,
+                "cores": cores,
+                "components": {
+                    "cpu": finite(score.cpu_score),
+                    "memory": finite(score.memory_score),
+                    "disk": finite(score.disk_score),
+                    "network": finite(score.network_score),
+                    "compilation": finite(score.compilation_score),
+                },
+                "raw": {
+                    "cpu_ops_per_second": finite(cpu.ops_per_second),
+                    "memory_seq_bandwidth_gbps": finite(memory.seq_bandwidth_gbps),
+                    "disk_seq_read_mbps": finite(disk.seq_read_mbps),
+                    "disk_seq_write_mbps": finite(disk.seq_write_mbps),
+                    "disk_random_read_iops": finite(disk.random_read_iops),
+                    "compilation_release_build_ms": compilation.as_ref().map(|c| c.release_build_ms),
+                },
+            });
+            println!("{payload}");
+        }
+        OutputFormat::Pretty => {
+            println!("Benchmark completed in {:.2}s", elapsed.as_secs_f64());
+            // Keep `Score: <float>` alone on its line and nothing else on it.
+            // rchd's `parse_benchmark_score` fallback does
+            // `strip_prefix("score:").trim().parse::<f64>()`, so appending the
+            // rating here (e.g. "Score: 75.6 (excellent)") would make that
+            // fallback fail to parse. Rating goes on its own line.
+            println!("Score: {:.1}", finite(score.total));
+            println!("Rating: {}", score.rating());
+            println!("  cores       : {cores}");
+            println!("  cpu         : {:.1}", finite(score.cpu_score));
+            println!("  memory      : {:.1}", finite(score.memory_score));
+            println!("  disk        : {:.1}", finite(score.disk_score));
+            println!("  compilation : {:.1}", finite(score.compilation_score));
+        }
     }
 
     Ok(())
 }
 
-fn benchmark_failure_summary(stdout: &[u8], stderr: &[u8]) -> String {
-    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
-    if !stderr.is_empty() {
-        return truncate_for_error(&stderr);
-    }
-
-    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
-    if !stdout.is_empty() {
-        return truncate_for_error(&stdout);
-    }
-
-    "cargo build exited unsuccessfully without output".to_string()
-}
-
-fn truncate_for_error(message: &str) -> String {
-    const MAX_LEN: usize = 2048;
-    if message.len() <= MAX_LEN {
-        return message.to_string();
-    }
-
-    let mut end = MAX_LEN;
-    while !message.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &message[..end])
-}
+// `benchmark_failure_summary` / `truncate_for_error` lived here to summarize raw
+// stdout/stderr from the hand-rolled `cargo build` the old benchmark shelled out
+// to. The benchmark now runs the typed `rch-telemetry` suite, which reports
+// structured errors, so both helpers (and their tests) were removed with the
+// code path they served.
 
 #[cfg(test)]
 mod tests {
@@ -1009,27 +1059,6 @@ mod tests {
         assert_eq!(total_kb, 1_048_576);
         assert_eq!(avail_kb, 524_288);
         println!("TEST PASS: test_parse_df_posix_kb_parses_total_and_available");
-    }
-
-    #[test]
-    fn test_benchmark_failure_summary_prefers_stderr() {
-        let _guard = test_guard!();
-        let summary = benchmark_failure_summary(b"stdout detail", b"stderr detail");
-        assert_eq!(summary, "stderr detail");
-    }
-
-    #[test]
-    fn test_benchmark_failure_summary_falls_back_to_stdout() {
-        let _guard = test_guard!();
-        let summary = benchmark_failure_summary(b"stdout detail", b"");
-        assert_eq!(summary, "stdout detail");
-    }
-
-    #[test]
-    fn test_benchmark_failure_summary_handles_empty_output() {
-        let _guard = test_guard!();
-        let summary = benchmark_failure_summary(b"", b"");
-        assert_eq!(summary, "cargo build exited unsuccessfully without output");
     }
 
     fn make_temp_topology_paths(

@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::time::{interval, timeout};
 use tracing::{debug, error, info, warn};
 
@@ -156,6 +156,10 @@ pub struct DaemonContext {
     /// worker from the persisted record on the next daemon restart. `None` in
     /// test contexts that don't exercise bypass recovery.
     pub bypass_store: Option<Arc<tokio::sync::Mutex<BypassRecordStore>>>,
+    /// Stops new worker selection while a restart remediator proves quiescence.
+    /// This is shared with the socket API so check-and-close admission occurs
+    /// in the daemon rather than in a racy CLI preflight.
+    pub admission_barrier: Arc<RwLock<bool>>,
 }
 
 /// Result of one bind attempt — distinguishes "socket is held by another
@@ -769,6 +773,7 @@ async fn main() -> Result<()> {
         pid: std::process::id(),
         queue_timeout_secs: daemon_config.queue.timeout_secs,
         bypass_store: Some(bypass_store.clone()),
+        admission_barrier: Arc::new(RwLock::new(false)),
     };
 
     // Start active build cleanup background task
@@ -1388,6 +1393,7 @@ mod tests {
             pid: std::process::id(),
             queue_timeout_secs: 300,
             bypass_store: None,
+            admission_barrier: Arc::new(RwLock::new(false)),
         };
 
         assert_eq!(context.socket_path, "/tmp/test.sock");
@@ -1439,6 +1445,7 @@ mod tests {
             pid: std::process::id(),
             queue_timeout_secs: 300,
             bypass_store: None,
+            admission_barrier: Arc::new(RwLock::new(false)),
         };
 
         assert_eq!(context.pool.len(), 1);
@@ -1492,6 +1499,7 @@ mod tests {
             pid: 12345,
             queue_timeout_secs: 300,
             bypass_store: None,
+            admission_barrier: Arc::new(RwLock::new(false)),
         };
 
         assert_eq!(context.history.len(), 1);
@@ -1528,6 +1536,7 @@ mod tests {
             pid: 1234,
             queue_timeout_secs: 300,
             bypass_store: None,
+            admission_barrier: Arc::new(RwLock::new(false)),
         };
 
         // Clone the context
@@ -1583,6 +1592,7 @@ mod tests {
             pid: 1234,
             queue_timeout_secs: 300,
             bypass_store: None,
+            admission_barrier: Arc::new(RwLock::new(false)),
         };
 
         // Wait a small amount
@@ -1636,6 +1646,7 @@ mod tests {
             pid: 1234,
             queue_timeout_secs: 300,
             bypass_store: None,
+            admission_barrier: Arc::new(RwLock::new(false)),
         };
 
         assert_eq!(context.pool.len(), 5);

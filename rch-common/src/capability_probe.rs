@@ -112,6 +112,27 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
     s.push_str(&format!(
         "{rustup} target list --installed 2>/dev/null | awk -v p=\"$P\" '{{print p\"target=\"$1}}'; "
     ));
+    // Installed components, reported PER TOOLCHAIN as `component=<toolchain>:<name>`.
+    //
+    // Per-toolchain is the whole point, not extra precision: components are
+    // installed against a specific toolchain, and consuming projects pin their
+    // own via `rust-toolchain.toml`. A worker can hold `clippy` for `stable` and
+    // still be unable to run `cargo clippy` for a pinned nightly, which is
+    // exactly the state that let 4 of 12 workers report healthy while silently
+    // voiding a mandated lint gate (bd-vc61a). Probing only the default
+    // toolchain would have reported OK for every one of them.
+    //
+    // `rustup toolchain list` prints the active toolchain with a ` (default)` /
+    // ` (override)` suffix, so `$1` is taken as the name. Each inner listing is
+    // best-effort: a toolchain that cannot be queried simply contributes no
+    // component facts, which reads downstream as "not known to have it" rather
+    // than as "known to lack it".
+    s.push_str(&format!(
+        "for tc in $({rustup} toolchain list 2>/dev/null | awk '{{print $1}}'); do \
+           {rustup} component list --installed --toolchain \"$tc\" 2>/dev/null \
+             | awk -v p=\"$P\" -v t=\"$tc\" '{{print p\"component=\"t\":\"$1}}'; \
+         done; "
+    ));
     // JS runtimes (PATH-resolved is acceptable for these advisory facts).
     s.push_str("bv=$(bun --version 2>/dev/null) && printf '%sbun_version=%s\\n' \"$P\" \"$bv\"; ");
     s.push_str(
@@ -154,6 +175,7 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
 /// the corresponding probe produced no line (i.e. the capability is absent).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbedFacts {
+    /// Probed host OS, normalized by [`normalize_probed_os`].
     pub os: Option<String>,
     pub arch: Option<String>,
     pub probed_user: Option<String>,
@@ -180,6 +202,25 @@ impl ProbedFacts {
     }
 }
 
+/// Collapse the many shapes `uname -s` takes on Windows into plain `windows`.
+///
+/// The probe is a POSIX script, so on a Windows worker it runs under MSYS2,
+/// Git-Bash or Cygwin, each of which reports a versioned kernel name —
+/// `mingw64_nt-10.0-26100`, `msys_nt-10.0-26100`, `cygwin_nt-10.0`. Left raw,
+/// none of them compare equal to the `windows` an operator writes in config or
+/// a `*-pc-windows-msvc` triple implies. Everything else passes through
+/// untouched.
+#[must_use]
+pub fn normalize_probed_os(raw: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    for prefix in ["mingw32_nt", "mingw64_nt", "msys_nt", "cygwin_nt"] {
+        if lower.starts_with(prefix) {
+            return "windows".to_string();
+        }
+    }
+    lower
+}
+
 /// Parse `RCH_FACT k=v` probe output into [`ProbedFacts`]. Lines without the
 /// prefix are ignored, so incidental stdout never corrupts the parse.
 #[must_use]
@@ -194,7 +235,7 @@ pub fn parse_capability_probe(stdout: &str) -> ProbedFacts {
         };
         let value = value.trim();
         match key {
-            "os" => f.os = Some(value.to_string()),
+            "os" => f.os = Some(normalize_probed_os(value)),
             "arch" => f.arch = Some(value.to_string()),
             "user" => f.probed_user = Some(value.to_string()),
             "rch_wkr_path" => f.rch_wkr_path = Some(value.to_string()),
@@ -203,15 +244,27 @@ pub fn parse_capability_probe(stdout: &str) -> ProbedFacts {
             "cargo_version" => f.rust.rustc_version = Some(value.to_string()),
             "toolchain" => f.rust.toolchains.push(value.to_string()),
             "target" => f.rust.targets.push(value.to_string()),
+            // `component=<toolchain>:<name>`. A value without a separator is
+            // dropped rather than stored under an empty toolchain: an entry that
+            // cannot say WHICH toolchain owns the component would answer
+            // `has_component` for every toolchain, which is the fail-open
+            // direction this fact exists to close.
+            "component" => {
+                if let Some((toolchain, component)) = value.split_once(':') {
+                    let toolchain = toolchain.trim();
+                    let component = component.trim();
+                    if !toolchain.is_empty() && !component.is_empty() {
+                        f.rust.components.push(format!("{toolchain}:{component}"));
+                    }
+                }
+            }
             "bun_version" => f.runtimes.bun_version = Some(value.to_string()),
             "node_version" => f.runtimes.node_version = Some(value.to_string()),
             "npm_version" => f.runtimes.npm_version = Some(value.to_string()),
             "nix_version" => f.runtimes.nix_version = Some(value.to_string()),
             "go_version" => f.runtimes.go_version = Some(value.to_string()),
             "zig_version" => f.runtimes.zig_version = Some(value.to_string()),
-            "cargo_zigbuild_version" => {
-                f.runtimes.cargo_zigbuild_version = Some(value.to_string())
-            }
+            "cargo_zigbuild_version" => f.runtimes.cargo_zigbuild_version = Some(value.to_string()),
             "disk" => {
                 // path;total_kb;avail_kb;avail_inodes
                 let parts: Vec<&str> = value.split(';').collect();
@@ -269,6 +322,18 @@ pub struct CapabilityRequirement {
     /// worker's installed toolchains, e.g. `nightly-2025-11-01` matches
     /// `nightly-2025-11-01-x86_64-unknown-linux-gnu`).
     pub needs_toolchains: Vec<String>,
+    /// Rustup components the build needs, each as `"<toolchain>:<component>"`
+    /// (e.g. `"nightly:clippy"`). The toolchain half is prefix-matched exactly
+    /// like [`Self::needs_toolchains`]; the component half must match exactly.
+    ///
+    /// Components are toolchain-scoped on purpose: a worker holding `clippy`
+    /// for `stable` cannot lint a project that pins a nightly, and without this
+    /// the scheduler routed lint work to such a worker and surfaced
+    /// `error: 'cargo-clippy' is not installed for the toolchain '...'` as a
+    /// plain exit 1 — indistinguishable from a real lint failure (bd-vc61a).
+    ///
+    /// Empty by default, so this constrains nothing until a caller opts in.
+    pub needs_components: Vec<String>,
 }
 
 impl CapabilityRequirement {
@@ -422,6 +487,33 @@ pub fn assess_admissibility(facts: &ProbedFacts, req: &CapabilityRequirement) ->
             };
         }
     }
+    // Toolchain-scoped components. Rejecting here turns "this worker cannot run
+    // the command" into a routing decision, so the caller sees a capability
+    // rejection (and, if every candidate is rejected, the same local fallback a
+    // missing target produces) instead of a 2-second exit 1 that reads like a
+    // lint failure (bd-vc61a).
+    for needed in &req.needs_components {
+        let Some((toolchain, component)) = needed.split_once(':') else {
+            return CapabilityVerdict::Rejected {
+                reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
+                detail: format!(
+                    "malformed component requirement {needed}; expected <toolchain>:<component>"
+                ),
+            };
+        };
+        let prefix = format!("{toolchain}-");
+        let present = facts.rust.components.iter().any(|entry| {
+            entry.split_once(':').is_some_and(|(owner, name)| {
+                name == component && (owner == toolchain || owner.starts_with(&prefix))
+            })
+        });
+        if !present {
+            return CapabilityVerdict::Rejected {
+                reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
+                detail: format!("missing rustup component {component} for toolchain {toolchain}"),
+            };
+        }
+    }
     if req.needs_bun && facts.runtimes.bun_version.is_none() {
         return CapabilityVerdict::Rejected {
             reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
@@ -451,8 +543,7 @@ pub fn assess_admissibility(facts: &ProbedFacts, req: &CapabilityRequirement) ->
     // this worker can't run it; if every candidate is rejected the build falls
     // back to local, exactly like a missing rustup target.
     if req.needs_zig
-        && (facts.runtimes.zig_version.is_none()
-            || facts.runtimes.cargo_zigbuild_version.is_none())
+        && (facts.runtimes.zig_version.is_none() || facts.runtimes.cargo_zigbuild_version.is_none())
     {
         return CapabilityVerdict::Rejected {
             reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
@@ -562,6 +653,34 @@ pub fn assess_worker_eligibility(
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_normalize_probed_os_collapses_windows_shells() {
+        // The probe is a POSIX script, so on Windows it runs under MSYS2 /
+        // Git-Bash / Cygwin and `uname -s` names the emulation layer, not the OS.
+        for raw in [
+            "MINGW64_NT-10.0-26100",
+            "mingw32_nt-10.0-22631",
+            "MSYS_NT-10.0-26100",
+            "CYGWIN_NT-10.0",
+        ] {
+            assert_eq!(normalize_probed_os(raw), "windows", "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn test_normalize_probed_os_passes_through_unix() {
+        assert_eq!(normalize_probed_os("Linux"), "linux");
+        assert_eq!(normalize_probed_os("Darwin"), "darwin");
+        assert_eq!(normalize_probed_os(" linux "), "linux");
+    }
+
+    #[test]
+    fn test_parse_normalizes_windows_os_fact() {
+        let facts =
+            parse_capability_probe("RCH_FACT os=MINGW64_NT-10.0-26100\nRCH_FACT arch=x86_64\n");
+        assert_eq!(facts.os.as_deref(), Some("windows"));
+    }
+
     fn spec() -> ProbeSpec {
         let mut s = ProbeSpec::new("rch", "/home/rch/.local/bin/rch-wkr");
         s.cargo_path = Some("/home/rch/.cargo/bin/cargo".to_string());
@@ -580,6 +699,15 @@ mod tests {
         assert!(script.contains("--protocol-version"));
         assert!(script.contains("toolchain list"));
         assert!(script.contains("target list --installed"));
+        // Components must be enumerated PER toolchain, not for the default one:
+        // a worker holding clippy for `stable` still cannot lint a pinned
+        // nightly, and probing only the default would report it healthy
+        // (bd-vc61a).
+        assert!(script.contains("component list --installed --toolchain"));
+        assert!(
+            script.contains("for tc in"),
+            "component probe must loop over every installed toolchain"
+        );
         assert!(script.contains("bun --version"));
         assert!(script.contains("df -Pk"));
         assert!(script.contains("df -Pi"));
@@ -599,6 +727,10 @@ mod tests {
          RCH_FACT toolchain=nightly-2026-05-22\n\
          RCH_FACT target=x86_64-unknown-linux-gnu\n\
          RCH_FACT target=wasm32-unknown-unknown\n\
+         RCH_FACT component=stable:clippy\n\
+         RCH_FACT component=stable:rustfmt\n\
+         RCH_FACT component=nightly-2026-05-22:rustfmt\n\
+         RCH_FACT component=malformed-without-separator\n\
          RCH_FACT bun_version=1.1.0\n\
          RCH_FACT disk=/data/tmp;1048576;524288;900000\n\
          incidental noise line that must be ignored\n"
@@ -616,6 +748,18 @@ mod tests {
         assert_eq!(w.rch_wkr_path, "/home/rch/.local/bin/rch-wkr");
         assert_eq!(f.rust.toolchains, vec!["stable", "nightly-2026-05-22"]);
         assert!(f.rust.targets.iter().any(|t| t == "wasm32-unknown-unknown"));
+        // Components stay toolchain-qualified, and the malformed line carrying
+        // no `<toolchain>:<name>` separator is dropped rather than stored under
+        // an empty owner -- an unqualified entry would answer `has_component`
+        // for EVERY toolchain, which is the fail-open direction.
+        assert_eq!(
+            f.rust.components,
+            vec![
+                "stable:clippy",
+                "stable:rustfmt",
+                "nightly-2026-05-22:rustfmt"
+            ]
+        );
         assert_eq!(f.runtimes.bun_version.as_deref(), Some("1.1.0"));
         assert_eq!(f.disk_roots.len(), 1);
         assert_eq!(f.disk_roots[0].path, "/data/tmp");
@@ -639,6 +783,65 @@ mod tests {
     #[test]
     fn admissible_when_all_capabilities_present() {
         let f = parse_capability_probe(good_output());
+        assert_eq!(
+            assess_admissibility(&f, &req_wasm()),
+            CapabilityVerdict::Admissible
+        );
+    }
+
+    #[test]
+    fn component_requirement_is_toolchain_scoped() {
+        let f = parse_capability_probe(good_output());
+        let with_components = |needed: &[&str]| CapabilityRequirement {
+            needs_components: needed.iter().map(|s| (*s).to_string()).collect(),
+            ..req_wasm()
+        };
+
+        // Present for the toolchain that actually owns it, including the
+        // `-`-suffixed pinned form.
+        assert_eq!(
+            assess_admissibility(&f, &with_components(&["stable:clippy"])),
+            CapabilityVerdict::Admissible
+        );
+        assert_eq!(
+            assess_admissibility(&f, &with_components(&["nightly:rustfmt"])),
+            CapabilityVerdict::Admissible
+        );
+
+        // The regression this exists to catch: the worker HAS clippy, but for
+        // `stable` only. A pinned-nightly lint must not be routed here.
+        match assess_admissibility(&f, &with_components(&["nightly:clippy"])) {
+            CapabilityVerdict::Rejected { reason, detail } => {
+                assert_eq!(reason, IncidentReasonCode::MissingRuntimeToolchainTarget);
+                assert!(
+                    detail.contains("clippy") && detail.contains("nightly"),
+                    "rejection must name the component and toolchain: {detail}"
+                );
+            }
+            other => panic!("expected rejection, got {other:?}"),
+        }
+
+        // A requirement that cannot say which toolchain it means is rejected
+        // rather than matched loosely.
+        match assess_admissibility(&f, &with_components(&["clippy"])) {
+            CapabilityVerdict::Rejected { detail, .. } => {
+                assert!(detail.contains("malformed"), "got {detail}");
+            }
+            other => panic!("expected rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_component_requirement_constrains_nothing() {
+        // Default is empty, so every existing caller keeps its current routing.
+        // A worker reporting no components at all stays admissible.
+        let out = "RCH_FACT os=linux\nRCH_FACT arch=x86_64\nRCH_FACT user=rch\n\
+                   RCH_FACT rch_wkr_path=/home/rch/.local/bin/rch-wkr\n\
+                   RCH_FACT worker_version=1.0.41\nRCH_FACT worker_protocol=3\n\
+                   RCH_FACT cargo_version=cargo 1.98.0-nightly\n\
+                   RCH_FACT target=wasm32-unknown-unknown\n";
+        let f = parse_capability_probe(out);
+        assert!(f.rust.components.is_empty());
         assert_eq!(
             assess_admissibility(&f, &req_wasm()),
             CapabilityVerdict::Admissible

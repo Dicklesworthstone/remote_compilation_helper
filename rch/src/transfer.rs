@@ -30,6 +30,77 @@ use tokio::time::Instant as TokioInstant;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
+/// The remote worker's OS family, which selects the transport and path
+/// conventions the pipeline uses. Derived from the worker's declared `os`
+/// (`os = "windows"` in workers.toml). Defaults to `Posix`, so every existing
+/// worker — and every code path that does not thread a platform — behaves
+/// exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkerPlatform {
+    /// Linux/macOS: rsync transport, POSIX paths, `/data/tmp/rch` base. The
+    /// only behaviour that has ever existed.
+    #[default]
+    Posix,
+    /// Windows worker reached through Git's POSIX `sh`: tar-over-ssh transport,
+    /// `C:/rch` base, no `timeout(1)` wrapper (Windows `timeout.exe` is unrelated).
+    Windows,
+}
+
+impl WorkerPlatform {
+    /// Derive the platform from a worker's declared OS. Only `windows` selects
+    /// the Windows path; everything else — including an undeclared OS — is
+    /// `Posix`, so linux/darwin workers are untouched.
+    #[must_use]
+    pub fn from_worker(worker: &WorkerConfig) -> Self {
+        match rch_common::declared_os(&worker.tags).as_deref() {
+            Some("windows") => Self::Windows,
+            _ => Self::Posix,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn is_windows(self) -> bool {
+        matches!(self, Self::Windows)
+    }
+}
+
+/// Remote build root for Windows workers. Drive letter + forward slashes: Git's
+/// POSIX `sh` (`mkdir`/`cd`) and `cargo.exe` (`CARGO_TARGET_DIR`) both accept
+/// this form, and it sidesteps rsync's `C:`-as-host parsing (Windows uses the
+/// tar transport instead). Empirically validated on a real Surface build host.
+pub(crate) const WINDOWS_DEFAULT_REMOTE_BASE: &str = "C:/rch";
+
+/// Whether `path` is a Windows drive-letter absolute path like `C:/rch` or
+/// `C:\rch`. Windows workers use these as remote build roots, so a remote-path
+/// override must accept them as absolute even though a leading-`/` check (Unix
+/// `Path::is_absolute` semantics) would reject them. A relative path — the case
+/// the override guard exists to reject — matches neither form.
+fn is_windows_drive_abs_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+}
+
+/// Top-level members `retrieve_artifacts_windows` archives from the remote root.
+///
+/// A project ROOT (it has a `Cargo.toml`) yields only `./target`, so a
+/// project-root retrieval (`rustc`/`clang --target *-windows-msvc`, whose build
+/// dir is not forwarded) can never tar the synced remote source back over the
+/// local source tree — this mirrors the unix retrieval's source-integrity guard
+/// (rch bug d7xc3). A bare CARGO_TARGET_DIR (no `Cargo.toml`) yields `.`: it holds
+/// only build outputs, including the cross-target `<triple>/` subdir that a
+/// pattern-based root filter would miss, so archiving everything is both correct
+/// and safe.
+fn windows_retrieve_members(project_root: &Path) -> Vec<&'static str> {
+    if project_root.join("Cargo.toml").exists() {
+        vec!["./target"]
+    } else {
+        vec!["."]
+    }
+}
+
 const PROJECT_HASH_CONTENT_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
 const PROJECT_HASH_KEY_FILES: &[&str] = &[
     // Rust project files
@@ -668,6 +739,11 @@ pub struct TransferPipeline {
     sync_checksum: bool,
     /// Build ID for tracking and cancellation.
     build_id: Option<u64>,
+    /// Remote worker OS family. Selects transport (rsync vs tar) and path
+    /// conventions. Defaults to `Posix`; set per-worker at construction via
+    /// [`Self::with_worker_platform`]. Left at the default, behaviour is
+    /// identical to before this field existed.
+    worker_platform: WorkerPlatform,
 }
 
 /// Validate a project hash for safe use in file paths.
@@ -760,12 +836,22 @@ impl TransferPipeline {
             sync_delete: true,
             sync_checksum: false,
             build_id: None,
+            worker_platform: WorkerPlatform::Posix,
         }
     }
 
     /// Set build id for remote execution.
     pub fn with_build_id(mut self, build_id: Option<u64>) -> Self {
         self.build_id = build_id;
+        self
+    }
+
+    /// Set the remote worker's OS platform. Callers that know the selected
+    /// worker pass `WorkerPlatform::from_worker(worker)` so transport and path
+    /// construction match the worker. Omitting it keeps the Posix default.
+    #[must_use]
+    pub fn with_worker_platform(mut self, platform: WorkerPlatform) -> Self {
+        self.worker_platform = platform;
         self
     }
 
@@ -870,7 +956,7 @@ impl TransferPipeline {
             warn!("Ignoring empty remote path override");
             return self;
         }
-        if !trimmed.starts_with('/') {
+        if !trimmed.starts_with('/') && !is_windows_drive_abs_path(trimmed) {
             warn!(
                 "Ignoring remote path override that is not absolute: {}",
                 trimmed
@@ -1288,7 +1374,14 @@ impl TransferPipeline {
         if let Some(remote_path) = &self.remote_path_override {
             return remote_path.clone();
         }
-        let base = self.transfer_config.remote_base.trim_end_matches('/');
+        // A Windows worker uses `C:/rch` regardless of the (Unix) global
+        // `remote_base`, since `/data/tmp/rch` does not exist there and cargo
+        // needs a drive-letter path. Everything else uses the configured base.
+        let base = if self.worker_platform.is_windows() {
+            WINDOWS_DEFAULT_REMOTE_BASE
+        } else {
+            self.transfer_config.remote_base.trim_end_matches('/')
+        };
         format!("{}/{}/{}", base, self.project_id, self.project_hash)
     }
 
@@ -1372,7 +1465,23 @@ impl TransferPipeline {
         // Touching the remote root refreshes directory mtime so age-based cleanup
         // treats actively used caches as hot.
         // Wrap command to run in project directory.
-        let execution_command = if let Some(build_id) = self.build_id {
+        //
+        // The pgid-watchdog path is Unix-only: it relies on `setsid`, process
+        // groups, and `kill -KILL -$pgid`, none of which exist under Git's `sh`
+        // on a Windows worker. Worse, its backgrounded timer subshell keeps the
+        // SSH channel's stdio open there, so sshd never sees EOF and every
+        // *successful* build hangs until the command timeout (the #20 failure
+        // mode, re-triggered on Windows). Windows workers therefore run the
+        // command directly (the `else` branch). The tradeoff: the daemon's
+        // stuck-detector reaps a runaway by SIGKILLing the remote process GROUP
+        // via the `.pgid` file the watchdog writes, so it does NOT cover Windows
+        // builds (no pgid file, no process groups). Bounding there is only the
+        // SSH ConnectTimeout and the in-loop `command_timeout`, which kill the
+        // local `ssh` on expiry; a detached `cargo.exe`/`rustc.exe` can still
+        // outlive the channel close. Acceptable for v1 single-Windows-worker use.
+        let execution_command = if let Some(build_id) =
+            self.build_id.filter(|_| !self.worker_platform.is_windows())
+        {
             let remote_pgid_file = Self::remote_pgid_file_path_for_root(&remote_path, build_id);
             let remote_run_dir = Self::remote_run_dir_for_root(&remote_path);
             let escaped_pgid_file = escape(Cow::from(remote_pgid_file));
@@ -1487,6 +1596,16 @@ fi",
     ///
     /// Returns the original command unchanged if timeout wrapping is disabled.
     fn wrap_with_external_timeout(&self, command: &str) -> String {
+        // On a Windows worker, `timeout` under Git's sh resolves to Windows
+        // `timeout.exe` (a pause utility), NOT GNU coreutils timeout — wrapping
+        // with it would corrupt the command. Skip it. Note the Windows path also
+        // skips the pgid watchdog (see `build_remote_command`), so runaways are
+        // bounded only by the SSH ConnectTimeout / `command_timeout` killing the
+        // local ssh — not by the daemon's process-group stuck-detector.
+        if self.worker_platform.is_windows() {
+            return command.to_string();
+        }
+
         // Check if external timeout protection is enabled
         if !self.compilation_config.external_timeout_enabled() {
             debug!("External timeout protection disabled by config");
@@ -1951,6 +2070,253 @@ fi",
     /// Synchronize local project to remote worker.
     ///
     /// Uses retry logic with exponential backoff for transient network errors.
+    /// Build an `ssh` command carrying this pipeline's connection options and
+    /// ready to run `remote_args` on the worker. The Windows tar transport uses
+    /// this instead of rsync.
+    fn worker_ssh_command(&self, worker: &WorkerConfig, remote_args: &[&str]) -> Command {
+        let identity_file = shellexpand::tilde(&worker.identity_file);
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-o").arg("BatchMode=yes");
+        cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+        cmd.arg("-o").arg(format!(
+            "ConnectTimeout={}",
+            self.ssh_options.connect_timeout.as_secs().max(1)
+        ));
+        cmd.arg("-i").arg(identity_file.as_ref());
+        if let Some(interval) = self.ssh_options.server_alive_interval {
+            let secs = interval.as_secs();
+            if secs > 0 {
+                cmd.arg("-o").arg(format!("ServerAliveInterval={secs}"));
+            }
+        }
+        cmd.arg(format!("{}@{}", worker.user, worker.host));
+        for a in remote_args {
+            cmd.arg(a);
+        }
+        // Kill the local ssh (and thus close the channel) if this Command's
+        // Child is dropped — e.g. when a dispatch-level timeout drops the
+        // transfer future. Harmless for the awaited-to-completion callers.
+        cmd.kill_on_drop(true);
+        cmd
+    }
+
+    /// Run a POSIX script on the worker via `ssh <host> sh -s` (script on stdin).
+    ///
+    /// Deliberately NOT `ssh <host> sh -c '<script>'`: a Windows worker's sshd
+    /// default shell is `cmd.exe`, which re-parses and mangles quoted arguments
+    /// (`mkdir: missing operand`). Feeding the script on stdin to `sh -s` — Git's
+    /// POSIX shell — sidesteps that entirely, exactly as the exec path does.
+    async fn run_remote_sh(&self, worker: &WorkerConfig, script: &str) -> Result<()> {
+        let mut cmd = self.worker_ssh_command(worker, &["sh", "-s"]);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().context("spawn ssh sh -s")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(script.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+            drop(stdin);
+        }
+        let out = child.wait_with_output().await.context("ssh sh -s wait")?;
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "remote sh script failed (exit {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Windows source sync: create the remote dir, then `tar czf -` the project
+    /// locally (honouring excludes) and pipe it into `tar xzf -` on the worker.
+    /// Native `tar` on both ends — no rsync, no `C:`-colon path ambiguity.
+    async fn sync_to_remote_windows(
+        &self,
+        worker: &WorkerConfig,
+        remote_path: &str,
+        excludes: &[String],
+    ) -> Result<SyncResult> {
+        let start = std::time::Instant::now();
+        info!(
+            "Syncing (windows/tar) {} -> {} on {}",
+            self.project_root.display(),
+            remote_path,
+            worker.id
+        );
+
+        // 1. Ensure the remote dir exists. `mkdir -p` under Git's sh accepts the
+        //    C:/ form. Escape defensively even though our paths have no metachars.
+        self.run_remote_sh(
+            worker,
+            &format!("mkdir -p {}", escape(Cow::from(remote_path))),
+        )
+        .await?;
+
+        // 2. local `tar c` | remote `tar x`.
+        let mut tar = Command::new("tar");
+        tar.arg("czf").arg("-").arg("-C").arg(&self.project_root);
+        for ex in excludes {
+            tar.arg(format!("--exclude={ex}"));
+        }
+        tar.arg(".");
+        tar.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut ssh = self.worker_ssh_command(worker, &["tar", "xzf", "-", "-C", remote_path]);
+        ssh.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut tar_child = tar.spawn().context("spawn local tar (windows sync)")?;
+        let mut ssh_child = ssh.spawn().context("spawn ssh tar x (windows sync)")?;
+        let mut tar_out = tar_child.stdout.take().context("local tar stdout")?;
+        let mut tar_err = tar_child.stderr.take();
+        let mut ssh_in = ssh_child.stdin.take().context("ssh stdin")?;
+        let pump = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut tar_out, &mut ssh_in).await;
+            drop(ssh_in);
+        });
+        // Drain the local tar's stderr concurrently. `ssh_child.wait_with_output`
+        // blocks until the remote extract finishes; if a chatty tar (many
+        // per-file warnings) fills its undrained stderr pipe in the meantime it
+        // stops writing stdout, the pump starves the ssh stdin, and the whole
+        // transfer deadlocks. We only need the exit status, so discard the text.
+        let tar_err_drain = tokio::spawn(async move {
+            if let Some(err) = tar_err.as_mut() {
+                let _ = tokio::io::copy(err, &mut tokio::io::sink()).await;
+            }
+        });
+        let ssh_out = ssh_child
+            .wait_with_output()
+            .await
+            .context("ssh tar x wait")?;
+        let tar_status = tar_child.wait().await.context("local tar wait")?;
+        let _ = pump.await;
+        let _ = tar_err_drain.await;
+
+        if !tar_status.success() {
+            return Err(anyhow::anyhow!("local tar failed during windows sync"));
+        }
+        if !ssh_out.status.success() {
+            return Err(anyhow::anyhow!(
+                "remote tar extract failed (exit {:?}): {}",
+                ssh_out.status.code(),
+                String::from_utf8_lossy(&ssh_out.stderr)
+            ));
+        }
+        Ok(SyncResult {
+            // tar does not report per-file byte/count stats the way rsync does;
+            // these are used only for logging, so 0 is acceptable here.
+            bytes_transferred: 0,
+            files_transferred: 0,
+            duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
+    }
+
+    /// Windows artifact retrieval: `tar c` the remote build dir (skipping the
+    /// incremental/fingerprint/build junk) and pipe it into `tar x` locally.
+    async fn retrieve_artifacts_windows(
+        &self,
+        worker: &WorkerConfig,
+        remote_path: &str,
+    ) -> Result<SyncResult> {
+        let start = std::time::Instant::now();
+        info!(
+            "Retrieving (windows/tar) artifacts from {} on {}",
+            remote_path, worker.id
+        );
+        std::fs::create_dir_all(&self.project_root).ok();
+
+        // Skip the same non-artifact subtrees rsync's retrieval filters drop.
+        // `deps/` and the final binaries are kept.
+        let junk = [
+            "*/incremental",
+            "*/incremental/*",
+            "*/.fingerprint",
+            "*/.fingerprint/*",
+            "*/build",
+            "*/build/*",
+        ];
+        let mut remote_args: Vec<String> = vec![
+            "tar".into(),
+            "czf".into(),
+            "-".into(),
+            "-C".into(),
+            remote_path.into(),
+        ];
+        for e in junk {
+            remote_args.push(format!("--exclude={e}"));
+        }
+        for member in windows_retrieve_members(&self.project_root) {
+            remote_args.push(member.to_string());
+        }
+        let remote_args_ref: Vec<&str> = remote_args.iter().map(String::as_str).collect();
+
+        let mut ssh = self.worker_ssh_command(worker, &remote_args_ref);
+        ssh.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut local_tar = Command::new("tar");
+        local_tar
+            .arg("xzf")
+            .arg("-")
+            .arg("-C")
+            .arg(&self.project_root);
+        local_tar
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut ssh_child = ssh.spawn().context("spawn ssh tar c (windows retrieve)")?;
+        let mut tar_child = local_tar
+            .spawn()
+            .context("spawn local tar x (windows retrieve)")?;
+        let mut ssh_out = ssh_child.stdout.take().context("ssh stdout")?;
+        let mut ssh_err = ssh_child.stderr.take();
+        let mut tar_in = tar_child.stdin.take().context("local tar stdin")?;
+        let pump = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut ssh_out, &mut tar_in).await;
+            drop(tar_in);
+        });
+        // Drain the remote tar's stderr (forwarded over ssh) concurrently. Without
+        // this a chatty remote tar (e.g. "file changed as we read it" on a live
+        // target dir) fills the undrained ssh stderr pipe, blocks ssh, starves the
+        // pump, and hangs the local extract. Exit status is all we need here.
+        let ssh_err_drain = tokio::spawn(async move {
+            if let Some(err) = ssh_err.as_mut() {
+                let _ = tokio::io::copy(err, &mut tokio::io::sink()).await;
+            }
+        });
+        let tar_res = tar_child
+            .wait_with_output()
+            .await
+            .context("local tar x wait")?;
+        let ssh_status = ssh_child.wait().await.context("ssh tar c wait")?;
+        let _ = pump.await;
+        let _ = ssh_err_drain.await;
+
+        if !tar_res.status.success() {
+            return Err(anyhow::anyhow!(
+                "local tar extract failed (exit {:?}): {}",
+                tar_res.status.code(),
+                String::from_utf8_lossy(&tar_res.stderr)
+            ));
+        }
+        // The remote tar can exit non-zero when the tree is empty or a file
+        // changed mid-read; the authority is whether local extraction succeeded.
+        if !ssh_status.success() {
+            warn!(
+                "remote tar reported exit {:?} during windows retrieve (local extract ok)",
+                ssh_status.code()
+            );
+        }
+        Ok(SyncResult {
+            bytes_transferred: 0,
+            files_transferred: 0,
+            duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
+    }
+
     pub async fn sync_to_remote(&self, worker: &WorkerConfig) -> Result<SyncResult> {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
@@ -1978,6 +2344,28 @@ fi",
                 files_transferred: result.files_transferred,
                 duration_ms: result.duration_ms,
             });
+        }
+
+        // A Windows worker has no rsync; use tar-over-ssh instead. Gated on the
+        // worker platform, so this branch is unreachable for linux/darwin. Bounded
+        // by `command_timeout` because — unlike the rsync path — the tar transport
+        // has no retry/timeout of its own; on expiry the transfer future drops and
+        // the `kill_on_drop` children are reaped.
+        if self.worker_platform.is_windows() {
+            let timeout = self.ssh_options.command_timeout;
+            return match tokio::time::timeout(
+                timeout,
+                self.sync_to_remote_windows(worker, &remote_path, &effective_excludes),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "windows tar sync to {} timed out after {:?}",
+                    worker.id,
+                    timeout
+                )),
+            };
         }
 
         info!(
@@ -2696,6 +3084,27 @@ fi",
                 files_transferred: result.files_transferred,
                 duration_ms: result.duration_ms,
             });
+        }
+
+        // Windows worker: pull artifacts via tar-over-ssh (no rsync). Gated on
+        // platform, so linux/darwin never reach this. Bounded by `command_timeout`
+        // (the tar transport has no timeout of its own); on expiry the future
+        // drops and the `kill_on_drop` children are reaped.
+        if self.worker_platform.is_windows() {
+            let timeout = self.ssh_options.command_timeout;
+            return match tokio::time::timeout(
+                timeout,
+                self.retrieve_artifacts_windows(worker, &remote_path),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "windows tar artifact retrieve from {} timed out after {:?}",
+                    worker.id,
+                    timeout
+                )),
+            };
         }
 
         info!("Retrieving artifacts from {} on {}", remote_path, worker.id);
@@ -3657,6 +4066,92 @@ mod tests {
             matches!(window, [observed_flag, observed_value]
                 if observed_flag.as_str() == flag && observed_value.as_str() == value)
         })
+    }
+
+    fn worker_with_os(os: Option<&str>) -> WorkerConfig {
+        WorkerConfig {
+            id: WorkerId::new("w"),
+            host: "h".to_string(),
+            user: "u".to_string(),
+            identity_file: "~/.ssh/id".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: os.map(rch_common::os_tag).into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn worker_platform_only_windows_selects_windows() {
+        assert_eq!(
+            WorkerPlatform::from_worker(&worker_with_os(Some("windows"))),
+            WorkerPlatform::Windows
+        );
+        // Everything else — including an undeclared OS — is Posix, so the
+        // linux/darwin fleet is untouched.
+        assert_eq!(
+            WorkerPlatform::from_worker(&worker_with_os(None)),
+            WorkerPlatform::Posix
+        );
+        assert_eq!(
+            WorkerPlatform::from_worker(&worker_with_os(Some("linux"))),
+            WorkerPlatform::Posix
+        );
+        assert_eq!(
+            WorkerPlatform::from_worker(&worker_with_os(Some("darwin"))),
+            WorkerPlatform::Posix
+        );
+    }
+
+    #[test]
+    fn windows_platform_uses_c_drive_remote_base() {
+        let base = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        // Default (Posix) is unchanged.
+        assert_eq!(base.remote_path(), "/data/tmp/rch/myproject/abc123");
+
+        // Windows worker gets the C:/ base cargo.exe + Git sh both accept.
+        let win = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_worker_platform(WorkerPlatform::Windows);
+        assert_eq!(win.remote_path(), "C:/rch/myproject/abc123");
+    }
+
+    #[test]
+    fn windows_platform_skips_external_timeout_wrapper() {
+        // Windows `timeout.exe` is a pause utility, not GNU timeout; wrapping
+        // with it would corrupt the command, so the wrapper must be a no-op.
+        let win = TransferPipeline::new(
+            PathBuf::from("/p"),
+            "p".to_string(),
+            "abc".to_string(),
+            TransferConfig::default(),
+        )
+        .with_compilation_kind(Some(CompilationKind::CargoBuild))
+        .with_worker_platform(WorkerPlatform::Windows);
+        assert_eq!(win.wrap_with_external_timeout("cargo build"), "cargo build");
+
+        // A Posix worker still gets wrapped (sanity that the guard is platform-
+        // specific, not a blanket disable).
+        let posix = TransferPipeline::new(
+            PathBuf::from("/p"),
+            "p".to_string(),
+            "abc".to_string(),
+            TransferConfig::default(),
+        )
+        .with_compilation_kind(Some(CompilationKind::CargoBuild));
+        assert!(
+            posix
+                .wrap_with_external_timeout("cargo build")
+                .contains("timeout")
+        );
     }
 
     fn command_args(cmd: &Command) -> Vec<String> {
@@ -5458,6 +5953,99 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
         .with_remote_path_override("relative/path");
 
         assert_eq!(pipeline.remote_path(), "/data/tmp/rch/project/def456");
+    }
+
+    #[test]
+    fn test_is_windows_drive_abs_path_matches_drive_letter_forms() {
+        assert!(is_windows_drive_abs_path("C:/rch"));
+        assert!(is_windows_drive_abs_path("C:\\rch"));
+        assert!(is_windows_drive_abs_path("d:/x/y"));
+        assert!(!is_windows_drive_abs_path("/data/projects"));
+        assert!(!is_windows_drive_abs_path("relative/path"));
+        assert!(!is_windows_drive_abs_path("C:")); // no separator
+        assert!(!is_windows_drive_abs_path("1:/rch")); // non-alpha drive
+    }
+
+    #[test]
+    fn windows_retrieve_members_protects_project_root_source() {
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("temp dir");
+        // A bare target dir (no Cargo.toml) → archive everything, so the
+        // cross-target `<triple>/` outputs come back.
+        assert_eq!(windows_retrieve_members(temp.path()), vec!["."]);
+        // A project root (has Cargo.toml) → archive only `target/`, so remote
+        // source can't be tarred back over the local source tree.
+        std::fs::write(temp.path().join("Cargo.toml"), b"[package]").expect("write");
+        assert_eq!(windows_retrieve_members(temp.path()), vec!["./target"]);
+    }
+
+    #[test]
+    fn test_remote_path_override_accepts_windows_drive_path() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/workspace/project"),
+            "project".to_string(),
+            "def456".to_string(),
+            TransferConfig::default(),
+        )
+        .with_worker_platform(WorkerPlatform::Windows)
+        .with_remote_path_override("C:/rch/project/def456");
+
+        // The drive-letter override is accepted verbatim, not rejected as
+        // "not absolute" (which would fall back to the default remote path and
+        // send the target retrieval to the wrong directory).
+        assert_eq!(pipeline.remote_path(), "C:/rch/project/def456");
+    }
+
+    #[test]
+    fn test_build_remote_command_windows_skips_pgid_watchdog() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/workspace/project"),
+            "project".to_string(),
+            "def456".to_string(),
+            TransferConfig::default(),
+        )
+        .with_worker_platform(WorkerPlatform::Windows)
+        .with_build_id(Some(42));
+
+        let cmd = pipeline.build_remote_command("cargo build", None);
+        // Windows must NOT get the Unix pgid/setsid watchdog: its backgrounded
+        // timer subshell keeps the SSH channel open so a successful build hangs
+        // until timeout (the #20 failure mode re-triggered on Windows).
+        assert!(!cmd.contains("setsid"), "windows cmd must not use setsid: {cmd}");
+        assert!(
+            !cmd.contains("kill -KILL"),
+            "windows cmd must not arm a group-kill watchdog: {cmd}"
+        );
+        assert!(
+            cmd.contains("cargo build"),
+            "windows cmd must still run the command: {cmd}"
+        );
+        assert!(
+            cmd.contains("C:/rch/project/def456"),
+            "windows cmd must cd into the C:/rch build root: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_build_remote_command_posix_keeps_pgid_watchdog() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/workspace/project"),
+            "project".to_string(),
+            "def456".to_string(),
+            TransferConfig::default(),
+        )
+        .with_build_id(Some(42)); // default platform = Posix
+
+        let cmd = pipeline.build_remote_command("cargo build", None);
+        // Posix keeps the in-session pgid watchdog (setsid + group kill) so
+        // this change is Windows-only and leaves the fleet path untouched.
+        assert!(
+            cmd.contains("setsid"),
+            "posix cmd should still arm the pgid watchdog: {cmd}"
+        );
     }
 
     // ==========================================================================

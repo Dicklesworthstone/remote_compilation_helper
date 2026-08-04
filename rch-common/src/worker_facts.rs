@@ -81,6 +81,15 @@ pub struct RustFacts {
     /// Installed rustup targets, e.g. `wasm32-unknown-unknown`.
     #[serde(default)]
     pub targets: Vec<String>,
+    /// Installed rustup components, qualified by the toolchain that owns them:
+    /// `"<toolchain>:<component>"`, e.g.
+    /// `"nightly-2026-07-05-x86_64-unknown-linux-gnu:clippy"`.
+    ///
+    /// Qualified rather than bare because components are installed against a
+    /// specific toolchain: a worker holding `clippy` for `stable` still cannot
+    /// run `cargo clippy` under a project's pinned nightly (bd-vc61a).
+    #[serde(default)]
+    pub components: Vec<String>,
 }
 
 /// JS-runtime facts.
@@ -195,6 +204,31 @@ impl WorkerFacts {
     #[must_use]
     pub fn has_target(&self, target: &str) -> bool {
         self.rust.targets.iter().any(|t| t == target)
+    }
+
+    /// Whether `component` is installed for `toolchain` (e.g. `clippy` for
+    /// `nightly`).
+    ///
+    /// The toolchain half is matched with the same `-` boundary rule as
+    /// [`WorkerFacts::has_toolchain`], so `nightly` matches a pinned
+    /// `nightly-2026-07-05-x86_64-unknown-linux-gnu` but never a hypothetical
+    /// `nightlyfoo`. The component half must match exactly: `clippy` must not be
+    /// satisfied by `clippy-preview`, because the two are not interchangeable at
+    /// the `cargo clippy` call site.
+    ///
+    /// Absence means "not known to be installed", never "known to be absent".
+    /// A worker whose component listing could not be read reports nothing here,
+    /// so callers must treat `false` as a reason to avoid routing, not as
+    /// evidence about the host (bd-vc61a).
+    #[must_use]
+    pub fn has_component(&self, toolchain: &str, component: &str) -> bool {
+        let prefix = format!("{toolchain}-");
+        self.rust.components.iter().any(|entry| {
+            let Some((owner, name)) = entry.split_once(':') else {
+                return false;
+            };
+            name == component && (owner == toolchain || owner.starts_with(&prefix))
+        })
     }
 }
 
@@ -330,6 +364,39 @@ mod tests {
         assert!(!f.has_toolchain("beta"));
         assert!(f.has_target("wasm32-unknown-unknown"));
         assert!(!f.has_target("wasm32-wasi"));
+    }
+
+    #[test]
+    fn has_component_is_toolchain_scoped_and_component_exact() {
+        let mut f = sample();
+        f.rust.components = vec![
+            "stable:clippy".to_string(),
+            "nightly-2026-07-05-x86_64-unknown-linux-gnu:rustfmt".to_string(),
+            "nightlyfoo:clippy".to_string(),
+            "beta:clippy-preview".to_string(),
+        ];
+
+        // Exact toolchain, and the `-` boundary form a pinned nightly takes.
+        assert!(f.has_component("stable", "clippy"));
+        assert!(f.has_component("nightly", "rustfmt"));
+        assert!(f.has_component("nightly-2026-07-05-x86_64-unknown-linux-gnu", "rustfmt"));
+
+        // The exact failure this fact exists to catch: clippy installed for
+        // SOME toolchain must not answer for a different pinned one. This is the
+        // state that let workers report healthy while voiding a lint gate.
+        assert!(!f.has_component("nightly", "clippy"));
+
+        // Same `-` boundary discipline as `has_toolchain`: `nightly` must not be
+        // satisfied by a toolchain merely starting with those letters.
+        assert!(!f.has_component("nightl", "clippy"));
+
+        // Component half is exact: `clippy-preview` is not `clippy` at the
+        // `cargo clippy` call site.
+        assert!(!f.has_component("beta", "clippy"));
+
+        // Unknown toolchain/component answers false rather than panicking.
+        assert!(!f.has_component("stable", "rust-analyzer"));
+        assert!(!f.has_component("does-not-exist", "clippy"));
     }
 
     #[test]

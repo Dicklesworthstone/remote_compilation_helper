@@ -166,6 +166,14 @@ pub(super) async fn ensure_worker_projects_topology(
         return Ok(());
     }
 
+    if crate::transfer::WorkerPlatform::from_worker(worker).is_windows() {
+        // Windows workers have no Unix canonical/alias projects topology — they
+        // build under `C:/rch` via tar-over-ssh — so the `/dp`→canonical symlink
+        // enforcement does not apply and would fail (no POSIX symlink there).
+        reporter.verbose("[RCH] topology preflight skipped for Windows worker");
+        return Ok(());
+    }
+
     let canonical_display = topology_policy.canonical_root().display().to_string();
     let alias_display = topology_policy.alias_root().display().to_string();
     let topology_cmd = build_worker_projects_topology_cmd(topology_policy);

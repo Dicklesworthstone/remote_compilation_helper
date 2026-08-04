@@ -503,6 +503,13 @@ pub struct SelectedWorker {
     pub slots_available: u32,
     /// Worker's speed score (0-100).
     pub speed_score: f64,
+    /// Operator-declared host OS (e.g. `windows`), if any. Propagated so the
+    /// hook can pick the right transport (Windows workers use `C:/rch` +
+    /// tar-over-ssh instead of the Unix rsync path). `None` for the historical
+    /// unlabelled workers. `#[serde(default)]` keeps old daemons/hooks
+    /// wire-compatible.
+    #[serde(default)]
+    pub declared_os: Option<String>,
 }
 
 /// Worker selection response from daemon to hook.
@@ -639,6 +646,9 @@ pub struct BuildHeartbeatRequest {
     /// Hook process ID sending the heartbeat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_pid: Option<u32>,
+    /// Client-minted wrapper identity for local durable-lease correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_wrapper_id: Option<String>,
     /// Remote file containing the process-group leader PID for cancellation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_pgid_file: Option<String>,
@@ -675,12 +685,47 @@ pub struct WorkerConfig {
     #[serde(default = "default_priority")]
     pub priority: u32,
     /// Optional tags for filtering.
+    ///
+    /// Mostly descriptive, with one reserved form: `os:<name>` (see
+    /// [`crate::declared_os`]) is a hard admission gate, written in
+    /// `workers.toml` as `os = "<name>"`.
     #[serde(default)]
     pub tags: Vec<String>,
 }
 
 fn default_priority() -> u32 {
     100
+}
+
+/// Tag prefix reserved for the operator-declared host OS.
+pub const OS_TAG_PREFIX: &str = "os:";
+
+/// The host OS an operator declared for a worker, from its tags.
+///
+/// Written in `workers.toml` as `os = "windows"` and normalized into the
+/// reserved `os:windows` tag on load, so it rides the existing tag vector
+/// through every path that already carries a [`WorkerConfig`].
+///
+/// Declaring it makes the worker **exclusive**: selection admits it only for
+/// commands that require that OS, so a Windows box cannot quietly absorb a
+/// `cargo check` dispatched from Linux and return wrong-platform artifacts.
+/// Workers without the tag — every historical worker — keep taking anything.
+#[must_use]
+pub fn declared_os(tags: &[String]) -> Option<String> {
+    // `find` over the mapped values, not `find_map` over the tags: a malformed
+    // `os:` entry must not mask a valid declaration later in the list, because
+    // failing open here is precisely the "Windows worker silently takes Linux
+    // jobs" outcome the gate exists to prevent.
+    tags.iter()
+        .filter_map(|tag| tag.strip_prefix(OS_TAG_PREFIX))
+        .map(|os| os.trim().to_ascii_lowercase())
+        .find(|os| !os.is_empty())
+}
+
+/// Build the reserved tag for a declared OS.
+#[must_use]
+pub fn os_tag(os: &str) -> String {
+    format!("{OS_TAG_PREFIX}{}", os.trim().to_ascii_lowercase())
 }
 
 impl Default for WorkerConfig {
@@ -3231,6 +3276,43 @@ mod tests {
     use super::*;
     use crate::test_guard;
 
+    #[test]
+    fn test_declared_os_reads_reserved_tag() {
+        assert_eq!(
+            declared_os(&["rust".to_string(), "os:windows".to_string()]),
+            Some("windows".to_string())
+        );
+        assert_eq!(
+            declared_os(&["os:WINDOWS".to_string()]),
+            Some("windows".to_string())
+        );
+    }
+
+    #[test]
+    fn test_declared_os_absent_for_ordinary_tags() {
+        // Every historical worker: no reserved tag, so no exclusivity and the
+        // worker stays a candidate for any job.
+        assert_eq!(declared_os(&[]), None);
+        assert_eq!(
+            declared_os(&["rust".to_string(), "bun".to_string(), "go".to_string()]),
+            None
+        );
+        // A malformed declaration must not silently fence the worker off.
+        assert_eq!(declared_os(&["os:".to_string()]), None);
+        assert_eq!(declared_os(&["os:  ".to_string()]), None);
+    }
+
+    #[test]
+    fn test_os_tag_roundtrips_through_declared_os() {
+        for os in ["windows", "Darwin", " linux "] {
+            let tag = os_tag(os);
+            assert_eq!(
+                declared_os(std::slice::from_ref(&tag)).as_deref(),
+                Some(os.trim().to_ascii_lowercase().as_str())
+            );
+        }
+    }
+
     /// Verdict-webhook config must NEVER carry an inline secret. Operators
     /// reference secrets by env-var name (`*_env`); the resolved value is
     /// read at dispatch time and never persisted to the cache or config TOML.
@@ -3760,6 +3842,7 @@ retry_max = 2
                 identity_file: "~/.ssh/id_rsa".to_string(),
                 slots_available: 8,
                 speed_score: 75.0,
+                declared_os: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,
@@ -3853,6 +3936,7 @@ retry_max = 2
                 identity_file: "/path/to/key".to_string(),
                 slots_available: 16,
                 speed_score: 90.5,
+                declared_os: None,
             }),
             reason: SelectionReason::Success,
             build_id: None,

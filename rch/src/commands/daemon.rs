@@ -35,8 +35,39 @@ struct ReloadApiResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RestartAdmissionResponse {
+    restart_permitted: bool,
+    active_build_ids: Vec<u64>,
+    queued_build_ids: Vec<u64>,
+    #[serde(default)]
+    client_lease_ids: Vec<String>,
+    #[serde(default)]
+    client_lease_scan_error: Option<String>,
+}
+
 fn reload_success_default() -> bool {
     true
+}
+
+async fn require_restart_admission() -> Result<()> {
+    let response = send_daemon_command("POST /restart-admission\n")
+        .await
+        .context("daemon did not acknowledge restart admission barrier")?;
+    let body =
+        extract_json_body(&response).context("restart admission response was missing JSON")?;
+    let admission: RestartAdmissionResponse =
+        serde_json::from_str(body).context("restart admission response was malformed")?;
+    if admission.restart_permitted {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "restart blocked by daemon admission barrier: active builds {:?}, queued builds {:?}, client leases {:?}, lease scan {:?}",
+        admission.active_build_ids,
+        admission.queued_build_ids,
+        admission.client_lease_ids,
+        admission.client_lease_scan_error,
+    );
 }
 
 // =============================================================================
@@ -615,6 +646,10 @@ pub async fn daemon_restart(skip_confirm: bool, ctx: &OutputContext) -> Result<(
                 return Ok(());
             }
         }
+    }
+
+    if socket_path.exists() {
+        require_restart_admission().await?;
     }
 
     if !ctx.is_json() {

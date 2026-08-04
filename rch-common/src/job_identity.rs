@@ -23,6 +23,7 @@
 //! the client and daemon correlate against.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 /// Locally-generated wrapper id, minted by `rch exec` before any daemon
@@ -35,6 +36,26 @@ pub type RemoteBuildId = u64;
 
 /// Prefix of every local wrapper id, so logs and cleanup can recognise them.
 pub const LOCAL_WRAPPER_ID_PREFIX: &str = "rchw-";
+
+/// Resolve the durable client-lease directory using RCH's shared state-home
+/// policy.  Both the hook and restart remediator use this function so they
+/// cannot accidentally inspect different state roots.
+#[must_use]
+pub fn default_job_lease_directory() -> PathBuf {
+    let state_dir = std::env::var_os("RCH_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| {
+            std::env::var_os("XDG_STATE_HOME")
+                .map(|path| PathBuf::from(path).join("rch"))
+                .filter(|path| !path.as_os_str().is_empty())
+        })
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state/rch"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/tmp/rch"));
+    state_dir.join("job-leases")
+}
 
 /// Mint a fresh, unique local wrapper id.
 #[must_use]
@@ -172,6 +193,102 @@ pub struct JobRecord {
     pub exit_code: Option<i32>,
 }
 
+/// Atomically persisted local evidence for one `rch exec` wrapper.
+///
+/// The client creates this record before contacting the daemon and rewrites the
+/// same file as admission, progress, and completion are observed.  It is
+/// deliberately an evidence record rather than a replay recipe: it contains a
+/// one-way command fingerprint, never an argv string or environment values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableJobLease {
+    /// Format version for forward-compatible on-disk readers.
+    pub schema_version: u32,
+    /// Stable local/remote correlation identity.
+    pub identity: JobIdentity,
+    /// PID of the wrapper process which owns this lease.
+    pub wrapper_pid: u32,
+    /// Linux `/proc/<pid>/stat` start tick, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_ticks: Option<u64>,
+    /// Linux boot identifier, when available, to disambiguate PID reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    /// Current operator-facing lifecycle state.
+    pub state: JobLifecycleState,
+    /// Current remote pipeline phase or `admission` before a worker is selected.
+    pub phase: String,
+    /// Selected worker after daemon admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    /// Wall-clock heartbeat observation time in Unix milliseconds.
+    pub heartbeat_unix_ms: u64,
+    /// Whether this wrapper is in a strict remote-only proof lane.
+    pub strict_remote: bool,
+    /// Whether the wrapper may attempt the bounded daemon self-healing path.
+    pub self_healing_enabled: bool,
+    /// Irreversible fingerprint of the command; raw argv is never persisted.
+    pub command_fingerprint: String,
+    /// A terminal state is valid only after the daemon acknowledges release or
+    /// completion.  A dead wrapper with this false must remain uncertain.
+    pub terminal_acknowledged: bool,
+}
+
+impl DurableJobLease {
+    /// Create the pre-admission lease.  It stays nonterminal until the caller
+    /// has concrete daemon evidence for the final transition.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // Lease evidence is intentionally explicit so callers cannot omit an identity component.
+    pub fn new(
+        identity: JobIdentity,
+        wrapper_pid: u32,
+        process_start_ticks: Option<u64>,
+        boot_id: Option<String>,
+        heartbeat_unix_ms: u64,
+        strict_remote: bool,
+        self_healing_enabled: bool,
+        command_fingerprint: String,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            identity,
+            wrapper_pid,
+            process_start_ticks,
+            boot_id,
+            state: JobLifecycleState::Queued,
+            phase: "admission".to_string(),
+            worker_id: None,
+            heartbeat_unix_ms,
+            strict_remote,
+            self_healing_enabled,
+            command_fingerprint,
+            terminal_acknowledged: false,
+        }
+    }
+
+    /// Record an admission from the daemon.
+    pub fn admit(&mut self, remote_build_id: u64, worker_id: String, heartbeat_unix_ms: u64) {
+        self.identity.admit(remote_build_id);
+        self.worker_id = Some(worker_id);
+        self.state = JobLifecycleState::Running;
+        self.phase = "sync_up".to_string();
+        self.heartbeat_unix_ms = heartbeat_unix_ms;
+    }
+
+    /// Record an observed nonterminal phase transition.
+    pub fn heartbeat(&mut self, phase: impl Into<String>, heartbeat_unix_ms: u64) {
+        self.phase = phase.into();
+        self.heartbeat_unix_ms = heartbeat_unix_ms;
+    }
+
+    /// Mark completion only after a daemon acknowledgement.
+    pub fn acknowledge_terminal(&mut self, heartbeat_unix_ms: u64) {
+        self.state = JobLifecycleState::Finished;
+        self.phase = "finished".to_string();
+        self.heartbeat_unix_ms = heartbeat_unix_ms;
+        self.terminal_acknowledged = true;
+    }
+}
+
 impl JobRecord {
     /// Build a record, deriving the lifecycle state from the identity +
     /// signals. `admitted` is taken from the identity so callers cannot pass a
@@ -209,6 +326,16 @@ mod tests {
         let b = new_local_wrapper_id();
         assert!(a.starts_with(LOCAL_WRAPPER_ID_PREFIX));
         assert_ne!(a, b, "wrapper ids must be unique");
+    }
+
+    #[test]
+    fn default_job_lease_directory_has_the_stable_leaf() {
+        assert_eq!(
+            default_job_lease_directory()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("job-leases")
+        );
     }
 
     #[test]
@@ -343,5 +470,48 @@ mod tests {
         let json = serde_json::to_string(&rec).expect("serialize");
         assert!(json.contains("\"state\":\"queued\""));
         assert!(json.contains("rchw-"));
+    }
+
+    #[test]
+    fn durable_lease_requires_acknowledgement_for_terminal_state() {
+        let mut lease = DurableJobLease::new(
+            JobIdentity::new_local(),
+            42,
+            Some(99),
+            Some("boot-a".to_string()),
+            1,
+            true,
+            false,
+            "blake3:abc".to_string(),
+        );
+        assert_eq!(lease.state, JobLifecycleState::Queued);
+        assert!(!lease.terminal_acknowledged);
+
+        lease.admit(7, "worker-a".to_string(), 2);
+        lease.heartbeat("execute", 3);
+        assert_eq!(lease.identity.remote_build_id, Some(7));
+        assert_eq!(lease.phase, "execute");
+        assert!(!lease.terminal_acknowledged);
+
+        lease.acknowledge_terminal(4);
+        assert_eq!(lease.state, JobLifecycleState::Finished);
+        assert!(lease.terminal_acknowledged);
+    }
+
+    #[test]
+    fn durable_lease_serialization_has_fingerprint_not_command() {
+        let lease = DurableJobLease::new(
+            JobIdentity::new_local(),
+            42,
+            None,
+            None,
+            1,
+            false,
+            true,
+            "blake3:abc".to_string(),
+        );
+        let json = serde_json::to_string(&lease).expect("serialize");
+        assert!(json.contains("command_fingerprint"));
+        assert!(!json.contains("command\":"));
     }
 }

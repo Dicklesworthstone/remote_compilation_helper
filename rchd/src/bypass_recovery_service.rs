@@ -526,8 +526,16 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
     async fn evaluate_record(&self, record: BypassRecord, now_ms: u64) {
         let worker_id = record.worker_id.clone();
         let Some(worker) = self.pool.get(&WorkerId::new(&worker_id)).await else {
-            // Worker was removed from the pool; drop the stale record.
-            let _ = self.store.lock().await.remove(&worker_id);
+            // A fresh or partial daemon pool cannot prove that an absent worker
+            // recovered. Retain its durable quarantine for a later reconciliation
+            // instead of silently clearing backoff and canary requirements.
+            warn!(
+                worker = %worker_id,
+                event = "reduced_capacity",
+                reason = "quarantine_record_missing_live_worker",
+                "retaining durable bypass record until its worker is observable"
+            );
+            remediation::record_bypass_transition(BypassTransition::StayBypassed);
             return;
         };
         // An operator-disabled worker is NEVER probed for auto-rejoin: that is an
@@ -946,6 +954,28 @@ mod tests {
             "record untouched for disabled worker"
         );
         assert_eq!(worker.status().await, rch_common::WorkerStatus::Disabled);
+    }
+
+    #[tokio::test]
+    async fn missing_live_worker_retains_durable_quarantine_record() {
+        let pool = pool_with(&[]).await;
+        let store = store();
+        let record = BypassRecord::new("missing", "h", "u", BypassFailureClass::Ssh, T0);
+        store.lock().await.upsert(record.clone()).unwrap();
+
+        let svc = BypassRecoveryService::new(
+            pool,
+            store.clone(),
+            FakeProber::new(vec![], RecoveryProbe::all_ok(), CanaryOutcome::Passed),
+            BypassRecoveryConfig::default(),
+        );
+        svc.evaluate_once(T0 + 60_000).await;
+
+        assert_eq!(
+            store.lock().await.get("missing"),
+            Some(&record),
+            "a fresh daemon pool must not erase a durable quarantine record"
+        );
     }
 
     #[tokio::test]
