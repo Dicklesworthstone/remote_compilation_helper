@@ -57,6 +57,26 @@ pub(super) fn wrap_command_with_telemetry(command: &str, worker_id: &WorkerId) -
     )
 }
 
+/// Derive the remote-root component for one clean-overlay execution.
+///
+/// The job nonce deliberately keeps even identical source snapshots in
+/// separate directories: overlapping jobs must never synchronize into the
+/// same remote project root.
+fn clean_overlay_remote_project_hash(
+    base_commit: &str,
+    overlay_fingerprint: &str,
+    job_nonce: uuid::Uuid,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rch-clean-overlay-remote-root-v1\0");
+    hasher.update(base_commit.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(overlay_fingerprint.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(job_nonce.as_bytes());
+    hasher.finalize().to_hex()[..16].to_string()
+}
+
 async fn send_telemetry(
     socket_path: &str,
     source: TelemetrySource,
@@ -221,14 +241,11 @@ pub(super) async fn execute_remote_compilation(
     };
     let project_id = project_id_from_path(&normalized_project_root);
     let project_hash = if let Some(spec) = clean_overlay {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"rch-clean-overlay-remote-root-v1\0");
-        hasher.update(spec.base_commit().as_bytes());
-        hasher.update(b"\0");
-        hasher.update(spec.overlay_fingerprint().as_bytes());
-        hasher.update(b"\0");
-        hasher.update(uuid::Uuid::new_v4().as_bytes());
-        hasher.finalize().to_hex()[..16].to_string()
+        clean_overlay_remote_project_hash(
+            spec.base_commit(),
+            spec.overlay_fingerprint(),
+            uuid::Uuid::new_v4(),
+        )
     } else {
         compute_project_hash_with_dependency_roots_and_policy(
             &normalized_project_root,
@@ -1147,4 +1164,35 @@ pub(super) async fn execute_remote_compilation(
         duration_ms: result.duration_ms,
         timing,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_overlay_remote_project_hash;
+
+    #[test]
+    fn clean_overlay_concurrent_jobs_use_distinct_remote_roots() {
+        let base = "0123456789abcdef0123456789abcdef01234567";
+        let first = std::thread::spawn(move || {
+            clean_overlay_remote_project_hash(
+                base,
+                "first-dirty-overlay-fingerprint",
+                uuid::Uuid::from_u128(1),
+            )
+        });
+        let second = std::thread::spawn(move || {
+            clean_overlay_remote_project_hash(
+                base,
+                "second-conflicting-overlay-fingerprint",
+                uuid::Uuid::from_u128(2),
+            )
+        });
+
+        let first_root = first.join().expect("first clean-overlay job panicked");
+        let second_root = second.join().expect("second clean-overlay job panicked");
+        assert_ne!(
+            first_root, second_root,
+            "concurrent clean-overlay jobs must never share a remote root"
+        );
+    }
 }
