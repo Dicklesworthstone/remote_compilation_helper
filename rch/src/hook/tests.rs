@@ -125,6 +125,42 @@ async fn clean_overlay_spec_accepts_base_only_and_resolves_commit() {
 }
 
 #[tokio::test]
+async fn clean_overlay_execution_receipt_names_the_resolved_base_and_content_fingerprint() {
+    let _guard = test_guard!();
+    let repo = init_clean_overlay_test_repo();
+    let first = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".to_string()),
+        true,
+        vec![PathBuf::from("src/lib.rs")],
+        false,
+    )
+    .await
+    .expect("prepare first clean-overlay spec")
+    .expect("first clean-overlay spec");
+    let first_receipt = first.execution_receipt();
+    assert!(first_receipt.contains(&format!("base={}", first.base_commit())));
+    assert!(first_receipt.contains(&format!(
+        "overlay-fingerprint={}",
+        first.overlay_fingerprint()
+    )));
+
+    std::fs::write(repo.path().join("src/lib.rs"), "pub fn changed() {}\n")
+        .expect("change selected overlay");
+    let second = prepare_clean_overlay_spec(
+        repo.path(),
+        Some("HEAD".to_string()),
+        true,
+        vec![PathBuf::from("src/lib.rs")],
+        false,
+    )
+    .await
+    .expect("prepare second clean-overlay spec")
+    .expect("second clean-overlay spec");
+    assert_ne!(first.execution_receipt(), second.execution_receipt());
+}
+
+#[tokio::test]
 async fn clean_overlay_spec_requires_exactly_one_overlay_scope() {
     let _guard = test_guard!();
     let repo = init_clean_overlay_test_repo();

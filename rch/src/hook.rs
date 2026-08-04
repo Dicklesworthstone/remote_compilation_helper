@@ -171,6 +171,15 @@ impl CleanOverlaySpec {
         &self.overlay_fingerprint
     }
 
+    /// Receipt emitted only after the worker has successfully executed this
+    /// immutable base plus verified overlay.
+    pub(super) fn execution_receipt(&self) -> String {
+        format!(
+            "[RCH] clean-overlay receipt: base={} overlay-fingerprint={}",
+            self.base_commit, self.overlay_fingerprint
+        )
+    }
+
     pub(super) async fn verify_archive_attributes(
         &self,
         project_root: &Path,
@@ -2283,6 +2292,13 @@ pub async fn run_exec(
                         worker.id,
                         format_duration_ms(remote_elapsed)
                     ));
+                    if let Some(spec) = clean_overlay_spec.as_ref() {
+                        // A clean-overlay caller opted into a content-bound
+                        // execution. Keep the receipt visible even when normal
+                        // progress output is suppressed, so a successful remote
+                        // run remains attributable to the exact bytes executed.
+                        reporter.summary_critical(&spec.execution_receipt());
+                    }
                     // Record successful build
                     let is_test = classification
                         .kind
