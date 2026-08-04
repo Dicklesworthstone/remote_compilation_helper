@@ -200,6 +200,35 @@ impl CleanOverlaySpec {
     }
 }
 
+/// Return the daemon-history identity for one execution.
+///
+/// Ordinary syncs retain their project-wide exclusion because they share a
+/// mutable remote root. A clean-overlay job instead owns a fresh remote root,
+/// so its daemon identity includes the verified source inputs and a job nonce.
+/// This permits two isolated snapshots of the same project to consume separate
+/// worker slots without making default-mode syncs concurrent.
+fn selection_project_for_execution(
+    project: &str,
+    clean_overlay: Option<&CleanOverlaySpec>,
+    job_nonce: uuid::Uuid,
+) -> String {
+    let Some(spec) = clean_overlay else {
+        return project.to_string();
+    };
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rch-clean-overlay-selection-project-v1\0");
+    hasher.update(project.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(spec.base_commit().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(spec.overlay_fingerprint().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(job_nonce.as_bytes());
+    let suffix = hasher.finalize().to_hex();
+    format!("{project}::clean-overlay::{}", &suffix[..16])
+}
+
 static HOOK_MODE_PANIC_FAIL_OPEN: AtomicBool = AtomicBool::new(false);
 static AUTOSTART_LOCK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1901,6 +1930,11 @@ pub async fn run_exec(
         no_overlay,
     )
     .await?;
+    let selection_project = selection_project_for_execution(
+        &project,
+        clean_overlay_spec.as_ref(),
+        uuid::Uuid::new_v4(),
+    );
     let needs_rust_toolchain = clean_overlay_fmt_check
         || matches!(
             required_runtime_for_kind(classification.kind),
@@ -1959,7 +1993,7 @@ pub async fn run_exec(
     // Query daemon for worker selection
     let response = match query_daemon(
         &config.general.socket_path,
-        &project,
+        &selection_project,
         estimated_cores,
         &remote_command,
         toolchain.as_ref(),
@@ -2008,7 +2042,7 @@ pub async fn run_exec(
                 {
                     query_daemon(
                         &socket_path,
-                        &project,
+                        &selection_project,
                         estimated_cores,
                         &remote_command,
                         toolchain.as_ref(),
@@ -2494,7 +2528,7 @@ pub async fn run_exec(
         if attempt < max_attempts
             && let Some((next_response, next_worker)) = try_retry_on_bigger_worker(
                 &config.general.socket_path,
-                &project,
+                &selection_project,
                 estimated_cores,
                 &remote_command,
                 toolchain.as_ref(),

@@ -160,6 +160,54 @@ async fn clean_overlay_execution_receipt_names_the_resolved_base_and_content_fin
     assert_ne!(first.execution_receipt(), second.execution_receipt());
 }
 
+#[test]
+fn clean_overlay_selection_identity_is_source_bound_and_per_job() {
+    let _guard = test_guard!();
+    let spec = CleanOverlaySpec {
+        base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        overlay_paths: vec![PathBuf::from("src/lib.rs")],
+        overlay_fingerprint: "first-overlay-fingerprint".to_string(),
+    };
+    let plain = selection_project_for_execution("fixture-project", None, uuid::Uuid::from_u128(1));
+    assert_eq!(plain, "fixture-project");
+
+    let first =
+        selection_project_for_execution("fixture-project", Some(&spec), uuid::Uuid::from_u128(2));
+    let second_job =
+        selection_project_for_execution("fixture-project", Some(&spec), uuid::Uuid::from_u128(3));
+    let different_base = CleanOverlaySpec {
+        base_commit: "fedcba9876543210fedcba9876543210fedcba98".to_string(),
+        ..spec.clone()
+    };
+    let different_overlay = CleanOverlaySpec {
+        overlay_fingerprint: "second-overlay-fingerprint".to_string(),
+        ..spec.clone()
+    };
+
+    assert_ne!(
+        first, second_job,
+        "each clean-overlay job needs a new identity"
+    );
+    assert_ne!(
+        first,
+        selection_project_for_execution(
+            "fixture-project",
+            Some(&different_base),
+            uuid::Uuid::from_u128(2),
+        ),
+        "the immutable base must bind the selection identity"
+    );
+    assert_ne!(
+        first,
+        selection_project_for_execution(
+            "fixture-project",
+            Some(&different_overlay),
+            uuid::Uuid::from_u128(2),
+        ),
+        "the dirty overlay fingerprint must bind the selection identity"
+    );
+}
+
 #[tokio::test]
 async fn clean_overlay_spec_requires_exactly_one_overlay_scope() {
     let _guard = test_guard!();
