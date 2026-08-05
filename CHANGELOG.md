@@ -8,9 +8,40 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ---
 
-## [Unreleased] (since v1.0.52)
+## [Unreleased] (since v1.0.56)
 
 No unreleased changes yet.
+
+---
+
+## [v1.0.56] -- 2026-08-04 (release)
+
+First published release since v1.0.53; v1.0.54 and v1.0.55 were git-tag-only
+(GitHub Actions could not run the release pipeline), so their changes ship
+here as binaries for the first time.
+
+### Added
+
+- **GH #38 — the canonical project root is configurable.** `path_topology`
+  roots (`canonical_project_root`, `extra_project_roots`) are wired into the
+  `rch config set` / `rch config reset` arms with validation, so fleets that
+  do not keep code under `/data/projects` can point rch at their real layout
+  without hand-editing config files.
+- **Clean-overlay execution receipts and admission.** Successful clean-overlay
+  runs emit receipts; concurrent overlay roots are guarded, root identity is
+  bound, and isolated clean-overlay jobs are admitted correctly.
+- **Durable client job leases and daemon restart admission guards**
+  (bd-6xhh9.2/.3/.4), including retention of missing-worker bypass records.
+
+### Fixed
+
+- **SpeedScore benchmarks compile and emit finite, parseable output**: the
+  compilation benchmark actually compiles, JSON scores are finite, and pretty
+  `Score` lines parse; worker probes no longer report NaN/garbage SpeedScores.
+- **Windows worker transfers** (v1.0.54/v1.0.55 content): tar/ssh stderr is
+  drained concurrently (no more deadlocked transfers), retrieval can no longer
+  clobber the source, and transfers are bounded by a timeout.
+- Lockfile pruned of unused entries; benchmark/test formatting cleaned up.
 
 ---
 

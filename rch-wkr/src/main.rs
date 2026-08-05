@@ -843,14 +843,14 @@ async fn run_benchmark(format: OutputFormat) -> Result<()> {
     // no toolchain, read-only tmp). Treat that as "component absent" rather
     // than failing the whole benchmark: `calculate_speedscore` re-weights
     // across the components it actually has.
-    let compilation = match rch_telemetry::benchmarks::compilation::run_compilation_benchmark_stable(
-    ) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            warn!("compilation benchmark unavailable, scoring without it: {e}");
-            None
-        }
-    };
+    let compilation =
+        match rch_telemetry::benchmarks::compilation::run_compilation_benchmark_stable() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!("compilation benchmark unavailable, scoring without it: {e}");
+                None
+            }
+        };
 
     // Network is deliberately omitted here: it measures the controller↔worker
     // path, which is only meaningful when measured from the controller side.
