@@ -3944,10 +3944,20 @@ pub fn project_id_from_path(path: &Path) -> String {
 }
 
 /// Default artifact patterns for Rust projects.
+///
+/// Includes the triple-aware `target/*/<profile>/**` globs: an ordinary
+/// `cargo build --target <triple>` (not just zigbuild) writes its outputs
+/// under `target/<triple>/<profile>/`, and the anchored `target/<profile>/**`
+/// patterns alone silently exclude every final binary from artifact
+/// sync-down. Found 2026-08-05 when an HFDT release leg completed remotely
+/// but synced back 92 metadata files (2.1 KB) and no binaries (hfdt-elh1t).
 pub fn default_rust_artifact_patterns() -> Vec<String> {
     vec![
         "target/debug/**".to_string(),
         "target/release/**".to_string(),
+        // Explicit --target outputs: target/<triple>/<profile>/**
+        "target/*/debug/**".to_string(),
+        "target/*/release/**".to_string(),
         "target/doc/**".to_string(),
         "target/.rustc_info.json".to_string(),
         "target/CACHEDIR.TAG".to_string(),

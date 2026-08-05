@@ -200,6 +200,24 @@ pub(super) fn get_custom_target_artifact_patterns(kind: Option<CompilationKind>)
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect();
+            // Ordinary `cargo build --target <triple>` writes outputs one level
+            // deeper (`<triple>/<profile>/`), exactly like zigbuild. The output
+            // globs gained their triple-aware forms (hfdt-elh1t: a release leg
+            // completed remotely but synced back zero binaries), so the cache
+            // excludes must gain the triple-nested forms too or the new
+            // `*/<profile>/**` includes would drag the remote cache trees home.
+            patterns.extend(
+                [
+                    "- */release/incremental/",
+                    "- */release/.fingerprint/",
+                    "- */release/build/",
+                    "- */debug/incremental/",
+                    "- */debug/.fingerprint/",
+                    "- */debug/build/",
+                ]
+                .iter()
+                .map(|s| (*s).to_string()),
+            );
             patterns.extend(get_artifact_patterns(kind).into_iter().map(|pattern| {
                 pattern
                     .strip_prefix("target/")

@@ -6444,6 +6444,17 @@ fn test_custom_target_artifact_patterns_for_build_commands_capture_outputs_only(
             patterns.iter().any(|p| p == "release/**"),
             "{kind:?}: must retain release profile outputs (incl. the binary): {patterns:?}"
         );
+        // Explicit `--target <triple>` outputs live one level deeper; the
+        // sync-back must include them (hfdt-elh1t) and must exclude their
+        // nested cache trees.
+        assert!(
+            patterns.iter().any(|p| p == "*/release/**"),
+            "{kind:?}: must retain triple-nested release outputs: {patterns:?}"
+        );
+        assert!(
+            patterns.iter().any(|p| p == "- */release/incremental/"),
+            "{kind:?}: must exclude triple-nested release cache trees: {patterns:?}"
+        );
 
         // Cache trees are EXCLUDED via `- <pat>` rules (emitted as rsync
         // `--exclude` before the includes).
