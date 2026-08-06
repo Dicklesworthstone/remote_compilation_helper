@@ -346,11 +346,15 @@ fn top_level_artifact_pattern_matches_entry(pattern: &str, entry_name: &str) -> 
     if first.is_empty() {
         return false;
     }
-    if first == "*" {
-        // `*` is used by the C/C++ defaults as a best-effort way to fetch
-        // newly-created root-level outputs. It is too broad to prove that an
-        // existing local top-level entry is an artifact, so it must not disable
-        // the source-integrity exclude guard for source files/directories.
+    if first == "*" && after_slash == "*" {
+        // A bare `*` (the C/C++ defaults' best-effort root-level fetch) is too
+        // broad to prove that an existing local top-level entry is an artifact,
+        // so it must not disable the source-integrity exclude guard. A deeper
+        // `*/...` prefix (e.g. `*/release/**` for cargo --target triple dirs)
+        // is a directory-scoped artifact pattern and MUST allow descent: with
+        // the old blanket `first == "*"` refusal, a pre-existing local triple
+        // dir got excluded at the transfer root and every cross-target binary
+        // silently vanished from sync-down (hfdt release leg, 2026-08-06).
         return false;
     }
     if first == entry_name {
