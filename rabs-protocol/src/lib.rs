@@ -44,6 +44,7 @@
 //! human/JSON displays use escaped presentation forms without changing the
 //! keyed bytes.
 
+pub mod authority;
 pub mod authority_matrix;
 pub mod raw_bytes;
 pub mod reason_codes;
