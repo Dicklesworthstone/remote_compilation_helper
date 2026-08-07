@@ -139,6 +139,14 @@ pub const REGISTRY: &[SchemaEntry] = &[
         notes: "Stable machine-readable reason-code registry; append-only \
                 within a protocol major version (bead A006).",
     },
+    SchemaEntry {
+        domain: SchemaDomain::Protocol,
+        name: "rabs.invocation-record",
+        version: 1,
+        notes: "Record/replay corpus entry: tool kind, raw-byte correlation \
+                digests + redacted presentation argv/env/cwd, signal-vs-exit \
+                outcome, timing (bead B001; privacy rules B004/A007).",
+    },
     // ---- Database domain ------------------------------------------------
     SchemaEntry {
         domain: SchemaDomain::Database,
