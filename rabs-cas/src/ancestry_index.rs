@@ -53,6 +53,12 @@ impl CommitGraph {
         self.parents.insert(commit, parents.to_vec());
     }
 
+    /// The recorded parents of a commit (empty when unknown).
+    #[must_use]
+    pub fn parents_of(&self, commit: CommitId) -> Vec<CommitId> {
+        self.parents.get(&commit).cloned().unwrap_or_default()
+    }
+
     /// Whether `ancestor` is reachable from `from` (inclusive).
     #[must_use]
     pub fn reachable(&self, from: CommitId, ancestor: CommitId) -> bool {

@@ -36,6 +36,7 @@
 //!   happens in `rabs-asupersync`.
 //! - Filesystem effects are this crate's business; network effects are not.
 
+pub mod ancestor_selection;
 pub mod ancestry_index;
 pub mod chunking;
 pub mod closure_validation;
