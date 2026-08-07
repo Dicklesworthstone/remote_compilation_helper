@@ -1,0 +1,25 @@
+[package]
+name = "rabs-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "RABS coherent snapshot capture, canonical execroot construction, kernel isolation, environment policy, input observation, and output harvesting"
+publish = false
+
+[lib]
+doctest = false
+
+# Filesystem/namespace/process effects are this crate's business (it OWNS
+# sandbox construction). No Tokio; async orchestration goes through
+# rabs-asupersync. Privileged helpers are separate audited binaries recorded
+# in the unsafe-boundary ledger (bead A011).
+[dependencies]
+rabs-protocol = { path = "../rabs-protocol" }
+
+[lints.rust]
+unsafe_code = "forbid"
