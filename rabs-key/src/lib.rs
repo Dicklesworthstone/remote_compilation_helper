@@ -37,3 +37,4 @@
 //! - No Tokio, no Asupersync.
 
 pub mod canonical;
+pub mod epochs;
