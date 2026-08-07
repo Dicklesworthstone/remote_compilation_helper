@@ -336,6 +336,23 @@ pub struct LeaseState {
     pub renewal_seq: u64,
 }
 
+/// One pin row as the lease layer sees it (H041).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinRow {
+    /// Pin root digest key.
+    pub root_key: String,
+    /// Owner identity string.
+    pub owner: String,
+    /// Pin class (e.g. `"action-publication"`).
+    pub class: String,
+    /// Expiry sequence, if any.
+    pub expires_at_seq: Option<u64>,
+    /// Whether the pin has been released.
+    pub released: bool,
+    /// Last accepted renewal sequence.
+    pub renewal_seq: u64,
+}
+
 /// One tombstoned location awaiting (or past) its grace window (H022).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcTombstoneRow {
@@ -546,6 +563,9 @@ pub trait RabsMetadataStore {
     /// Renew a pin's lease: `renewal_seq` must be strictly greater than
     /// the stored one; released pins refuse renewal.
     fn renew_pin(&mut self, id: u128, renewal_seq: u64) -> Result<(), StoreError>;
+
+    /// Full pin row by id (H041 lease judgments).
+    fn pin_row(&mut self, id: u128) -> Result<Option<PinRow>, StoreError>;
 
     /// Release a pin; the owner must match.
     fn release_pin(&mut self, id: u128, owner: &str) -> Result<(), StoreError>;
@@ -2011,6 +2031,37 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 _ => Err(StoreError::Corruption("publication list shape".into())),
             })
             .collect()
+    }
+
+    fn pin_row(&mut self, id: u128) -> Result<Option<PinRow>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT root_key, owner, class, expires_at_seq, released, renewal_seq \
+             FROM pins WHERE id_hex = ?1",
+            &[SqlValue::Text(u128_hex(id))],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let [root_key, owner, class, expires, released, renewal] = row.as_slice() else {
+            return Err(StoreError::Corruption("pin row shape".into()));
+        };
+        let (SqlValue::Text(root_key), SqlValue::Text(owner), SqlValue::Text(class)) =
+            (root_key, owner, class)
+        else {
+            return Err(StoreError::Corruption("pin column shape".into()));
+        };
+        let expires_at_seq = match expires {
+            SqlValue::Null => None,
+            other => Some(expect_u64(other, "expires_at_seq")?),
+        };
+        Ok(Some(PinRow {
+            root_key: root_key.clone(),
+            owner: owner.clone(),
+            class: class.clone(),
+            expires_at_seq,
+            released: expect_u64(released, "released")? != 0,
+            renewal_seq: expect_u64(renewal, "renewal_seq")?,
+        }))
     }
 
     fn pin_released_by_hex(&mut self, pin_hex: &str) -> Result<Option<bool>, StoreError> {
