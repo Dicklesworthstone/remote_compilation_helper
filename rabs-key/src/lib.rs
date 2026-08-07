@@ -62,6 +62,7 @@ pub mod filesystem_class;
 pub mod fragmentation;
 pub mod fragmentation_analyzer;
 pub mod fragmentation_dashboard;
+pub mod full_suite_verification;
 pub mod hit_verification;
 pub mod inspect;
 pub mod invocation;
