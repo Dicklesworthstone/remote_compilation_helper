@@ -37,6 +37,7 @@
 //! - No Tokio, no Asupersync.
 
 pub mod action_class_detection;
+pub mod action_dag;
 pub mod action_key;
 pub mod authority_binding;
 pub mod binary_dep_info;
