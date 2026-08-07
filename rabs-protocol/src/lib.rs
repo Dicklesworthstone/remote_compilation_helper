@@ -46,6 +46,7 @@
 
 pub mod authority;
 pub mod authority_matrix;
+pub mod class_policy;
 pub mod descriptor;
 pub mod framing;
 pub mod generation;
