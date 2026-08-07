@@ -190,6 +190,50 @@ const fn eviction_layer(class: PolicyClass) -> u8 {
 ///
 /// # Errors
 /// Store errors from taking the snapshot or the reconciliation scan.
+/// The single protection judgment shared by plan-time evaluation and the
+/// H022 pre-unlink RECHECK — one implementation, so the two can never
+/// drift apart.
+fn protection_for(
+    preserved: &BTreeSet<String>,
+    world: &GcWorld,
+    mode: GcMode,
+    object_key: &str,
+    policy: ObjectPolicy,
+) -> Option<ProtectionReason> {
+    if preserved.contains(object_key) {
+        Some(ProtectionReason::PinnedOrReachable)
+    } else if world.protections.active_builds.contains(object_key) {
+        Some(ProtectionReason::ActiveBuild)
+    } else if world.protections.materializations.contains(object_key) {
+        Some(ProtectionReason::Materialization)
+    } else if world.protections.transfers.contains(object_key) {
+        Some(ProtectionReason::Transfer)
+    } else if world.protections.open_readers.contains(object_key) {
+        Some(ProtectionReason::OpenReader)
+    } else {
+        match policy.class {
+            // NEVER deleted, no mode exempts it.
+            PolicyClass::AuthoritativeEvidence => Some(ProtectionReason::AuthoritativeEvidence),
+            PolicyClass::ProvisionalStaging if !world.reconciliation_complete => {
+                Some(ProtectionReason::AwaitingReconciliation)
+            }
+            PolicyClass::HotDependency | PolicyClass::Toolchain if mode == GcMode::Normal => {
+                Some(ProtectionReason::RetainedByPolicy)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn preserved_set(snapshot: &crate::metadata_store::GcSnapshot) -> BTreeSet<String> {
+    snapshot
+        .pinned_roots
+        .iter()
+        .chain(snapshot.reachable_from_pins.iter())
+        .cloned()
+        .collect()
+}
+
 pub fn plan_gc(
     store: &mut dyn RabsMetadataStore,
     world: &GcWorld,
@@ -198,11 +242,7 @@ pub fn plan_gc(
 ) -> Result<GcPlan, StoreError> {
     let snapshot = store.gc_snapshot(seq)?;
     let scan = store.reconciliation_scan()?;
-    let preserved: BTreeSet<&String> = snapshot
-        .pinned_roots
-        .iter()
-        .chain(snapshot.reachable_from_pins.iter())
-        .collect();
+    let preserved = preserved_set(&snapshot);
 
     let mut candidates: Vec<(LocationRef, ObjectPolicy)> = Vec::new();
     let mut protected: Vec<(LocationRef, ProtectionReason)> = Vec::new();
@@ -216,30 +256,7 @@ pub fn plan_gc(
             .get(&row.object_key)
             .copied()
             .unwrap_or_else(default_policy);
-        let protection = if preserved.contains(&row.object_key) {
-            Some(ProtectionReason::PinnedOrReachable)
-        } else if world.protections.active_builds.contains(&row.object_key) {
-            Some(ProtectionReason::ActiveBuild)
-        } else if world.protections.materializations.contains(&row.object_key) {
-            Some(ProtectionReason::Materialization)
-        } else if world.protections.transfers.contains(&row.object_key) {
-            Some(ProtectionReason::Transfer)
-        } else if world.protections.open_readers.contains(&row.object_key) {
-            Some(ProtectionReason::OpenReader)
-        } else {
-            match policy.class {
-                // NEVER deleted, no mode exempts it.
-                PolicyClass::AuthoritativeEvidence => Some(ProtectionReason::AuthoritativeEvidence),
-                PolicyClass::ProvisionalStaging if !world.reconciliation_complete => {
-                    Some(ProtectionReason::AwaitingReconciliation)
-                }
-                PolicyClass::HotDependency | PolicyClass::Toolchain if mode == GcMode::Normal => {
-                    Some(ProtectionReason::RetainedByPolicy)
-                }
-                _ => None,
-            }
-        };
-        match protection {
+        match protection_for(&preserved, world, mode, &row.object_key, policy) {
             Some(reason) => protected.push((location, reason)),
             None => candidates.push((location, policy)),
         }
@@ -306,6 +323,93 @@ pub fn execute_gc(
         reclaimed,
         skipped,
     })
+}
+
+/// One unlink pass's outcome (H022): what was unlinked after the final
+/// recheck, and what the recheck RESCUED.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlinkReceipt {
+    /// Tombstoned locations whose grace elapsed and whose final recheck
+    /// confirmed no protection: unlinked.
+    pub unlinked: Vec<LocationRef>,
+    /// Tombstoned locations the final recheck found protected again (a
+    /// reader, pin, or edge appeared during grace): tombstone cancelled,
+    /// location kept.
+    pub rescued: Vec<(LocationRef, ProtectionReason)>,
+}
+
+/// H022 phase 1 — MARK: tombstone every planned location. Nothing is
+/// deleted here; the tombstone only starts the grace clock
+/// (`plan.seq + grace_windows`). Re-marking is idempotent and keeps the
+/// original deadline.
+///
+/// # Errors
+/// Store errors from tombstone insertion.
+pub fn mark_plan(
+    store: &mut dyn RabsMetadataStore,
+    plan: &GcPlan,
+    grace_windows: u64,
+) -> Result<usize, StoreError> {
+    for location in &plan.reclaim {
+        store.add_gc_tombstone(
+            &location.object_key,
+            &location.store_path,
+            plan.seq,
+            plan.seq.saturating_add(grace_windows),
+        )?;
+    }
+    Ok(plan.reclaim.len())
+}
+
+/// H022 phases 2–4 — GRACE, RECHECK, UNLINK: take the tombstones whose
+/// grace window has elapsed at `now_seq`, re-evaluate protection against
+/// a FRESH snapshot and the CURRENT live protections, and only then
+/// unlink. The recheck defeats the race where a new read,
+/// materialization, pin, or reachability edge appeared between mark and
+/// unlink: such a location is rescued (tombstone cancelled), never
+/// deleted.
+///
+/// # Errors
+/// Store errors; rescues and unlinks already performed stand.
+pub fn unlink_due(
+    store: &mut dyn RabsMetadataStore,
+    world: &GcWorld,
+    mode: GcMode,
+    now_seq: u64,
+) -> Result<UnlinkReceipt, StoreError> {
+    let due = store.due_gc_tombstones(now_seq)?;
+    let mut unlinked = Vec::new();
+    let mut rescued = Vec::new();
+    if due.is_empty() {
+        return Ok(UnlinkReceipt { unlinked, rescued });
+    }
+    // The FINAL recheck runs on a fresh consistent snapshot, not the one
+    // the plan was computed from.
+    let snapshot = store.gc_snapshot(now_seq)?;
+    let preserved = preserved_set(&snapshot);
+    for tombstone in due {
+        let location = LocationRef {
+            object_key: tombstone.object_key.clone(),
+            store_path: tombstone.store_path.clone(),
+        };
+        let policy = world
+            .policies
+            .get(&tombstone.object_key)
+            .copied()
+            .unwrap_or_else(default_policy);
+        match protection_for(&preserved, world, mode, &tombstone.object_key, policy) {
+            Some(reason) => {
+                store.remove_gc_tombstone(&tombstone.object_key, &tombstone.store_path)?;
+                rescued.push((location, reason));
+            }
+            None => {
+                store.remove_location_by_key(&tombstone.object_key, &tombstone.store_path)?;
+                store.remove_gc_tombstone(&tombstone.object_key, &tombstone.store_path)?;
+                unlinked.push(location);
+            }
+        }
+    }
+    Ok(UnlinkReceipt { unlinked, rescued })
 }
 
 #[cfg(test)]
@@ -599,6 +703,314 @@ mod tests {
             SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("ref")).unwrap()).unwrap();
         let mut candidate =
             SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("fsq")).unwrap()).unwrap();
+        assert_eq!(scenario(&mut reference), scenario(&mut candidate));
+    }
+
+    #[test]
+    fn h022_mark_never_deletes_and_unlink_waits_for_grace() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        install_world(&mut store);
+        let mut w = world();
+        w.reconciliation_complete = true;
+        let plan = plan_gc(&mut store, &w, GcMode::Normal, 100).unwrap();
+        assert_eq!(plan.reclaim.len(), 4); // 6, 7, 8, 9
+
+        // MARK: nothing deleted.
+        assert_eq!(mark_plan(&mut store, &plan, 10).unwrap(), 4);
+        let located: Vec<String> = store
+            .reconciliation_scan()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.object_key)
+            .collect();
+        for tag in [6u8, 7, 8, 9] {
+            assert!(located.contains(&key(tag)), "mark must not delete");
+        }
+
+        // During grace: unlink is a no-op.
+        let early = unlink_due(&mut store, &w, GcMode::Normal, 105).unwrap();
+        assert!(early.unlinked.is_empty());
+        assert!(early.rescued.is_empty());
+
+        // Re-mark is idempotent and keeps the ORIGINAL deadline.
+        assert_eq!(mark_plan(&mut store, &plan, 10_000).unwrap(), 4);
+        let due = store.due_gc_tombstones(110).unwrap();
+        assert_eq!(due.len(), 4, "original grace deadline survives re-mark");
+
+        // Grace elapsed: unlink proceeds for all four.
+        let receipt = unlink_due(&mut store, &w, GcMode::Normal, 110).unwrap();
+        assert_eq!(receipt.unlinked.len(), 4);
+        assert!(receipt.rescued.is_empty());
+        let located: Vec<String> = store
+            .reconciliation_scan()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.object_key)
+            .collect();
+        for tag in [6u8, 7, 8, 9] {
+            assert!(!located.contains(&key(tag)));
+        }
+        // Tombstones are consumed.
+        assert!(store.due_gc_tombstones(u64::MAX).unwrap().is_empty());
+    }
+
+    #[test]
+    fn h022_final_recheck_rescues_the_mark_to_unlink_race() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        install_world(&mut store);
+        let mut w = world();
+        w.reconciliation_complete = true;
+        let plan = plan_gc(&mut store, &w, GcMode::Normal, 100).unwrap();
+        mark_plan(&mut store, &plan, 10).unwrap();
+
+        // THE RACE: between mark and unlink, a reader opens object 8, a
+        // new pin lands on object 9, and object 6 becomes reachable from
+        // the pinned root via a new edge.
+        w.protections.open_readers.insert(key(8));
+        store
+            .create_pin(
+                77,
+                &digest(9),
+                "reader-service",
+                "materialization",
+                None,
+                None,
+                false,
+                "late pin",
+            )
+            .unwrap();
+        store
+            .add_object_edge(&digest(1), &digest(6), "late-edge")
+            .unwrap();
+
+        let receipt = unlink_due(&mut store, &w, GcMode::Normal, 110).unwrap();
+        // Only object 7 is still unprotected.
+        assert_eq!(
+            receipt
+                .unlinked
+                .iter()
+                .map(|l| l.object_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![key(7).as_str()]
+        );
+        let rescued_reasons: BTreeMap<&str, ProtectionReason> = receipt
+            .rescued
+            .iter()
+            .map(|(l, r)| (l.object_key.as_str(), *r))
+            .collect();
+        assert_eq!(
+            rescued_reasons.get(key(6).as_str()),
+            Some(&ProtectionReason::PinnedOrReachable)
+        );
+        assert_eq!(
+            rescued_reasons.get(key(8).as_str()),
+            Some(&ProtectionReason::OpenReader)
+        );
+        assert_eq!(
+            rescued_reasons.get(key(9).as_str()),
+            Some(&ProtectionReason::PinnedOrReachable)
+        );
+        // Rescued locations survive with their tombstones cancelled.
+        let located: Vec<String> = store
+            .reconciliation_scan()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.object_key)
+            .collect();
+        for tag in [6u8, 8, 9] {
+            assert!(located.contains(&key(tag)), "rescued object kept its copy");
+        }
+        assert!(store.due_gc_tombstones(u64::MAX).unwrap().is_empty());
+    }
+
+    /// Deterministic splitmix-style generator: the property suite must
+    /// reproduce exactly from a seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+    }
+
+    /// H016 (R26): under seeded-random object graphs, pins, and
+    /// interleaved concurrent operations (new objects/locations standing
+    /// in for `put_if_absent` uploads, seeding edges, materialization and
+    /// reader churn), the full mark → grace → recheck → unlink pipeline
+    /// NEVER deletes an object that is pinned, pin-reachable, or held by
+    /// a live protection at unlink time. Interleaving is simulated
+    /// deterministically (single-threaded op schedule), not with OS
+    /// threads.
+    #[test]
+    fn h016_property_gc_preserves_pinned_and_reachable_objects() {
+        for seed in 0..30u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x1234_5678_9abc_def1) + 1);
+            let mut store =
+                SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+
+            // Random world: objects, locations, edges (cycles allowed),
+            // pins, policies.
+            let object_count = 12 + rng.below(12) as u8;
+            let mut next_tag = object_count;
+            let mut pin_id = 1u128;
+            for tag in 0..object_count {
+                store.record_object(&digest(tag), 64).unwrap();
+                store
+                    .add_location(&digest(tag), &format!("/cas/{tag}"), Some(1), "raw")
+                    .unwrap();
+            }
+            for _ in 0..(object_count as u64 * 2) {
+                let a = rng.below(u64::from(object_count)) as u8;
+                let b = rng.below(u64::from(object_count)) as u8;
+                store.add_object_edge(&digest(a), &digest(b), "edge").unwrap();
+            }
+            for tag in 0..object_count {
+                if rng.chance(25) {
+                    store
+                        .create_pin(
+                            pin_id,
+                            &digest(tag),
+                            "prop",
+                            "root",
+                            None,
+                            None,
+                            true,
+                            "property pin",
+                        )
+                        .unwrap();
+                    pin_id += 1;
+                }
+            }
+            let mut w = GcWorld {
+                reconciliation_complete: true,
+                reclaim_budget: 1000,
+                ..GcWorld::default()
+            };
+            for tag in 0..object_count {
+                let class = match rng.below(5) {
+                    0 => PolicyClass::ProvisionalStaging,
+                    1 => PolicyClass::HotDependency,
+                    2 => PolicyClass::Toolchain,
+                    3 => PolicyClass::AuthoritativeEvidence,
+                    _ => PolicyClass::CommittedResult,
+                };
+                w.policies.insert(
+                    key(tag),
+                    ObjectPolicy {
+                        class,
+                        last_use_seq: rng.below(100),
+                    },
+                );
+            }
+
+            let mut seq = 100u64;
+            for _round in 0..8 {
+                // Concurrent-operation churn interleaved with GC phases.
+                for tag in 0..object_count {
+                    if rng.chance(15) {
+                        w.protections.open_readers.insert(key(tag));
+                    } else if rng.chance(15) {
+                        w.protections.open_readers.remove(&key(tag));
+                    }
+                    if rng.chance(10) {
+                        w.protections.materializations.insert(key(tag));
+                    } else if rng.chance(10) {
+                        w.protections.materializations.remove(&key(tag));
+                    }
+                }
+                // put_if_absent-style upload of a brand-new object +
+                // seeding edge from an existing object.
+                if rng.chance(60) {
+                    let fresh = next_tag;
+                    next_tag = next_tag.wrapping_add(1);
+                    store.record_object(&digest(fresh), 64).unwrap();
+                    store
+                        .add_location(&digest(fresh), &format!("/cas/{fresh}"), Some(1), "raw")
+                        .unwrap();
+                    let from = rng.below(u64::from(object_count)) as u8;
+                    store
+                        .add_object_edge(&digest(from), &digest(fresh), "seeded")
+                        .unwrap();
+                }
+                let mode = if rng.chance(30) {
+                    GcMode::Emergency
+                } else {
+                    GcMode::Normal
+                };
+
+                let plan = plan_gc(&mut store, &w, mode, seq).unwrap();
+                mark_plan(&mut store, &plan, 3).unwrap();
+                // More churn DURING grace (the race the recheck defeats).
+                for tag in 0..object_count {
+                    if rng.chance(10) {
+                        w.protections.open_readers.insert(key(tag));
+                    }
+                }
+                if rng.chance(50) {
+                    let a = rng.below(u64::from(object_count)) as u8;
+                    let b = rng.below(u64::from(object_count)) as u8;
+                    store.add_object_edge(&digest(a), &digest(b), "late").unwrap();
+                }
+                seq += 5;
+                unlink_due(&mut store, &w, mode, seq).unwrap();
+
+                // THE INVARIANT (R26): every pinned or pin-reachable
+                // object, every live-protection holder, and every
+                // authoritative-evidence object still has its location.
+                let snapshot = store.gc_snapshot(seq).unwrap();
+                let located: BTreeSet<String> = store
+                    .reconciliation_scan()
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.object_key)
+                    .collect();
+                let mut must_survive: BTreeSet<String> = preserved_set(&snapshot);
+                must_survive.extend(w.protections.open_readers.iter().cloned());
+                must_survive.extend(w.protections.materializations.iter().cloned());
+                for (object_key, policy) in &w.policies {
+                    if policy.class == PolicyClass::AuthoritativeEvidence {
+                        must_survive.insert(object_key.clone());
+                    }
+                }
+                for object_key in &must_survive {
+                    assert!(
+                        located.contains(object_key),
+                        "seed {seed}: protected object {object_key} lost its location"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn h022_differential_mark_grace_unlink_reference_vs_frankensqlite() {
+        fn scenario(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+            install_world(store);
+            let mut w = world();
+            w.reconciliation_complete = true;
+            let plan = plan_gc(store, &w, GcMode::Normal, 100).unwrap();
+            mark_plan(store, &plan, 10).unwrap();
+            w.protections.open_readers.insert(key(8));
+            let receipt = unlink_due(store, &w, GcMode::Normal, 110).unwrap();
+            assert_eq!(receipt.rescued.len(), 1);
+            store.differential_snapshot().unwrap()
+        }
+        let mut reference =
+            SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("ref22")).unwrap()).unwrap();
+        let mut candidate =
+            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("fsq22")).unwrap()).unwrap();
         assert_eq!(scenario(&mut reference), scenario(&mut candidate));
     }
 }
