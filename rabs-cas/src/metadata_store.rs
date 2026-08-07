@@ -38,7 +38,7 @@ use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 
 /// Current schema version (the single v1 epoch; H010/H038 add tables in
 /// later epochs).
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -139,6 +139,17 @@ pub const MIGRATIONS: &[Migration] = &[
             "CREATE TABLE gc_receipts (id INTEGER PRIMARY KEY, seq INTEGER NOT NULL, \
          mode TEXT NOT NULL, planned INTEGER NOT NULL, reclaimed INTEGER NOT NULL, \
          skipped INTEGER NOT NULL, truncated INTEGER NOT NULL)",
+        ],
+    },
+    Migration {
+        // H022: mark → tombstone → grace → recheck → unlink. A tombstone
+        // is a marked location awaiting its grace window; deletion is
+        // NEVER immediate.
+        version: 5,
+        statements: &[
+            "CREATE TABLE gc_tombstones (object_key TEXT NOT NULL, \
+         store_path TEXT NOT NULL, marked_seq INTEGER NOT NULL, \
+         grace_until_seq INTEGER NOT NULL, PRIMARY KEY (object_key, store_path))",
         ],
     },
 ];
@@ -300,6 +311,19 @@ pub struct LeaseState {
     pub released: bool,
     /// Last accepted renewal sequence.
     pub renewal_seq: u64,
+}
+
+/// One tombstoned location awaiting (or past) its grace window (H022).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcTombstoneRow {
+    /// Object digest key.
+    pub object_key: String,
+    /// Store path of the marked copy.
+    pub store_path: String,
+    /// Sequence at marking.
+    pub marked_seq: u64,
+    /// First sequence at which unlink may proceed.
+    pub grace_until_seq: u64,
 }
 
 /// One planned-vs-actual GC reclaim receipt (H014).
@@ -556,6 +580,27 @@ pub trait RabsMetadataStore {
 
     /// Record a planned-vs-actual GC reclaim receipt (H014).
     fn record_gc_receipt(&mut self, receipt: &GcReceiptRow) -> Result<(), StoreError>;
+
+    /// Mark a location with a tombstone (H022 phase 1): idempotent —
+    /// re-marking keeps the ORIGINAL grace deadline.
+    fn add_gc_tombstone(
+        &mut self,
+        object_key: &str,
+        store_path: &str,
+        marked_seq: u64,
+        grace_until_seq: u64,
+    ) -> Result<(), StoreError>;
+
+    /// Tombstones whose grace window has elapsed at `now_seq`.
+    fn due_gc_tombstones(&mut self, now_seq: u64) -> Result<Vec<GcTombstoneRow>, StoreError>;
+
+    /// Remove a tombstone (after unlink, or as a rescue). Returns whether
+    /// a row was removed.
+    fn remove_gc_tombstone(
+        &mut self,
+        object_key: &str,
+        store_path: &str,
+    ) -> Result<bool, StoreError>;
 
     /// Deterministic dump of every table for differential comparison.
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError>;
@@ -1781,6 +1826,87 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         })
     }
 
+    fn add_gc_tombstone(
+        &mut self,
+        object_key: &str,
+        store_path: &str,
+        marked_seq: u64,
+        grace_until_seq: u64,
+    ) -> Result<(), StoreError> {
+        let object_key = object_key.to_owned();
+        let store_path = store_path.to_owned();
+        let marked = i64::try_from(marked_seq)
+            .map_err(|_| StoreError::Corruption("marked_seq out of range".into()))?;
+        let grace = i64::try_from(grace_until_seq)
+            .map_err(|_| StoreError::Corruption("grace_until_seq out of range".into()))?;
+        self.in_txn(move |engine| {
+            let existing = engine.query(
+                "SELECT object_key FROM gc_tombstones WHERE object_key = ?1 AND store_path = ?2",
+                &[
+                    SqlValue::Text(object_key.clone()),
+                    SqlValue::Text(store_path.clone()),
+                ],
+            )?;
+            if !existing.is_empty() {
+                // Idempotent re-mark keeps the ORIGINAL deadline.
+                return Ok(());
+            }
+            engine.execute(
+                "INSERT INTO gc_tombstones (object_key, store_path, marked_seq, grace_until_seq) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    SqlValue::Text(object_key),
+                    SqlValue::Text(store_path),
+                    SqlValue::Int(marked),
+                    SqlValue::Int(grace),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn due_gc_tombstones(&mut self, now_seq: u64) -> Result<Vec<GcTombstoneRow>, StoreError> {
+        let now = i64::try_from(now_seq)
+            .map_err(|_| StoreError::Corruption("now_seq out of range".into()))?;
+        let rows = self.engine.query(
+            "SELECT object_key, store_path, marked_seq, grace_until_seq FROM gc_tombstones \
+             WHERE grace_until_seq <= ?1 ORDER BY object_key, store_path",
+            &[SqlValue::Int(now)],
+        )?;
+        rows.into_iter()
+            .map(|row| {
+                let [key, path, marked, grace] = row.as_slice() else {
+                    return Err(StoreError::Corruption("tombstone row shape".into()));
+                };
+                let (SqlValue::Text(key), SqlValue::Text(path)) = (key, path) else {
+                    return Err(StoreError::Corruption("tombstone column shape".into()));
+                };
+                Ok(GcTombstoneRow {
+                    object_key: key.clone(),
+                    store_path: path.clone(),
+                    marked_seq: expect_u64(marked, "marked_seq")?,
+                    grace_until_seq: expect_u64(grace, "grace_until_seq")?,
+                })
+            })
+            .collect()
+    }
+
+    fn remove_gc_tombstone(
+        &mut self,
+        object_key: &str,
+        store_path: &str,
+    ) -> Result<bool, StoreError> {
+        let object_key = object_key.to_owned();
+        let store_path = store_path.to_owned();
+        self.in_txn(move |engine| {
+            let removed = engine.execute(
+                "DELETE FROM gc_tombstones WHERE object_key = ?1 AND store_path = ?2",
+                &[SqlValue::Text(object_key), SqlValue::Text(store_path)],
+            )?;
+            Ok(removed > 0)
+        })
+    }
+
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError> {
         // Deterministic dump: every table, every column, ordered rows.
         const DUMPS: &[(&str, &str)] = &[
@@ -1875,6 +2001,11 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 "gc_runs",
                 "SELECT id, seq, pinned_roots, located_objects, reachable_objects \
                  FROM gc_runs ORDER BY id",
+            ),
+            (
+                "gc_tombstones",
+                "SELECT object_key, store_path, marked_seq, grace_until_seq \
+                 FROM gc_tombstones ORDER BY object_key, store_path",
             ),
             (
                 "gc_receipts",
