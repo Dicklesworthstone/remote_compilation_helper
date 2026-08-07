@@ -36,3 +36,4 @@ pub mod layout;
 pub mod leak_scanner;
 pub mod runtime_path_scanner;
 pub mod source_capture;
+pub mod upload_policy;
