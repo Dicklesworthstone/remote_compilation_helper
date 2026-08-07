@@ -49,6 +49,7 @@ pub mod authority_matrix;
 pub mod class_policy;
 pub mod descriptor;
 pub mod durable_ids;
+pub mod envelope;
 pub mod frame_extensions;
 pub mod framing;
 pub mod generation;
