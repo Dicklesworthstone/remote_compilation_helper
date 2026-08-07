@@ -38,7 +38,7 @@ use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 
 /// Current schema version (the single v1 epoch; H010/H038 add tables in
 /// later epochs).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -51,56 +51,70 @@ pub struct Migration {
 /// The versioned migration set. Digest columns are always the triple
 /// `*_algo TEXT, *_domain TEXT, *_bytes BLOB` plus a derived `*_key TEXT`
 /// (domain:hex) used for keys/joins; object bytes NEVER appear here.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    statements: &[
-        "CREATE TABLE schema_epochs (version INTEGER PRIMARY KEY, applied_seq INTEGER NOT NULL)",
-        "CREATE TABLE coordinator_authorities (key TEXT PRIMARY KEY, algo TEXT NOT NULL, \
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        statements: &[
+            "CREATE TABLE schema_epochs (version INTEGER PRIMARY KEY, applied_seq INTEGER NOT NULL)",
+            "CREATE TABLE coordinator_authorities (key TEXT PRIMARY KEY, algo TEXT NOT NULL, \
          domain TEXT NOT NULL, bytes BLOB NOT NULL, cluster_id TEXT NOT NULL, \
          incarnation BLOB NOT NULL, term INTEGER NOT NULL, acquired_seq INTEGER NOT NULL, \
          released INTEGER NOT NULL)",
-        "CREATE TABLE action_entries (key TEXT PRIMARY KEY, algo TEXT NOT NULL, \
+            "CREATE TABLE action_entries (key TEXT PRIMARY KEY, algo TEXT NOT NULL, \
          domain TEXT NOT NULL, bytes BLOB NOT NULL, key_epoch INTEGER NOT NULL, \
          projection_epoch INTEGER NOT NULL)",
-        "CREATE TABLE action_generations (id_hex TEXT PRIMARY KEY, id BLOB NOT NULL, \
+            "CREATE TABLE action_generations (id_hex TEXT PRIMARY KEY, id BLOB NOT NULL, \
          action_key TEXT NOT NULL, authority_key TEXT NOT NULL, tombstoned INTEGER NOT NULL)",
-        "CREATE TABLE generation_high_water (kind TEXT PRIMARY KEY, value BLOB NOT NULL)",
-        "CREATE TABLE action_attempts (id_hex TEXT PRIMARY KEY, id BLOB NOT NULL, \
+            "CREATE TABLE generation_high_water (kind TEXT PRIMARY KEY, value BLOB NOT NULL)",
+            "CREATE TABLE action_attempts (id_hex TEXT PRIMARY KEY, id BLOB NOT NULL, \
          generation_hex TEXT NOT NULL, worker TEXT NOT NULL, seq INTEGER NOT NULL)",
-        "CREATE TABLE execution_leases (id_hex TEXT PRIMARY KEY, id BLOB NOT NULL, \
+            "CREATE TABLE execution_leases (id_hex TEXT PRIMARY KEY, id BLOB NOT NULL, \
          attempt_hex TEXT NOT NULL, renewal_seq INTEGER NOT NULL, \
          expires_at_seq INTEGER NOT NULL, released INTEGER NOT NULL)",
-        "CREATE TABLE action_publications (action_key TEXT PRIMARY KEY, \
+            "CREATE TABLE action_publications (action_key TEXT PRIMARY KEY, \
          descriptor_algo TEXT NOT NULL, descriptor_domain TEXT NOT NULL, \
          descriptor_bytes BLOB NOT NULL, manifest_algo TEXT NOT NULL, \
          manifest_domain TEXT NOT NULL, manifest_bytes BLOB NOT NULL, \
          winner_generation_hex TEXT NOT NULL, winner_attempt_hex TEXT NOT NULL, \
          result_kind TEXT NOT NULL, pin_hex TEXT NOT NULL)",
-        "CREATE TABLE action_serving_states (action_key TEXT PRIMARY KEY, \
+            "CREATE TABLE action_serving_states (action_key TEXT PRIMARY KEY, \
          disposition TEXT NOT NULL, version INTEGER NOT NULL)",
-        "CREATE TABLE objects (key TEXT PRIMARY KEY, algo TEXT NOT NULL, \
+            "CREATE TABLE objects (key TEXT PRIMARY KEY, algo TEXT NOT NULL, \
          domain TEXT NOT NULL, bytes BLOB NOT NULL, logical_size INTEGER NOT NULL)",
-        "CREATE TABLE object_locations (object_key TEXT NOT NULL, store_path TEXT NOT NULL, \
+            "CREATE TABLE object_locations (object_key TEXT NOT NULL, store_path TEXT NOT NULL, \
          verified_seq INTEGER, PRIMARY KEY (object_key, store_path))",
-        "CREATE TABLE pins (id_hex TEXT PRIMARY KEY, id BLOB NOT NULL, root_key TEXT NOT NULL, \
+            "CREATE TABLE pins (id_hex TEXT PRIMARY KEY, id BLOB NOT NULL, root_key TEXT NOT NULL, \
          owner TEXT NOT NULL, class TEXT NOT NULL, expires_at_seq INTEGER, \
          released INTEGER NOT NULL)",
-        "CREATE TABLE observed_input_recipes (action_key TEXT PRIMARY KEY, \
+            "CREATE TABLE observed_input_recipes (action_key TEXT PRIMARY KEY, \
          recipe_algo TEXT NOT NULL, recipe_domain TEXT NOT NULL, recipe_bytes BLOB NOT NULL)",
-        "CREATE TABLE key_breakdowns (action_key TEXT NOT NULL, component TEXT NOT NULL, \
+            "CREATE TABLE key_breakdowns (action_key TEXT NOT NULL, component TEXT NOT NULL, \
          algo TEXT NOT NULL, domain TEXT NOT NULL, bytes BLOB NOT NULL, \
          PRIMARY KEY (action_key, component))",
-        "CREATE TABLE trust_states (action_key TEXT PRIMARY KEY, state TEXT NOT NULL, \
+            "CREATE TABLE trust_states (action_key TEXT PRIMARY KEY, state TEXT NOT NULL, \
          reason TEXT NOT NULL)",
-        "CREATE TABLE quarantines (scope TEXT NOT NULL, subject TEXT NOT NULL, \
+            "CREATE TABLE quarantines (scope TEXT NOT NULL, subject TEXT NOT NULL, \
          reason TEXT NOT NULL, PRIMARY KEY (scope, subject))",
-        "CREATE TABLE verification_samples (action_key TEXT NOT NULL, attempt_hex TEXT NOT NULL, \
+            "CREATE TABLE verification_samples (action_key TEXT NOT NULL, attempt_hex TEXT NOT NULL, \
          passed INTEGER NOT NULL, seq INTEGER NOT NULL, \
          PRIMARY KEY (action_key, attempt_hex, seq))",
-        "CREATE TABLE gc_runs (id INTEGER PRIMARY KEY, seq INTEGER NOT NULL, \
+            "CREATE TABLE gc_runs (id INTEGER PRIMARY KEY, seq INTEGER NOT NULL, \
          pinned_roots INTEGER NOT NULL, located_objects INTEGER NOT NULL)",
-    ],
-}];
+        ],
+    },
+    Migration {
+        // H011: attempts' evidence bundles are append-only associations; the
+        // winner's evidence row is written in the SAME transaction as the
+        // publication pointer + pin.
+        version: 2,
+        statements: &[
+            "CREATE TABLE action_evidence_index (action_key TEXT NOT NULL, \
+         evidence_algo TEXT NOT NULL, evidence_domain TEXT NOT NULL, \
+         evidence_bytes BLOB NOT NULL, generation_hex TEXT NOT NULL, \
+         attempt_hex TEXT NOT NULL, PRIMARY KEY (action_key, evidence_domain, evidence_bytes))",
+        ],
+    },
+];
 
 /// Typed store errors (comparable so the differential harness can assert
 /// both backends fail IDENTICALLY).
@@ -186,6 +200,9 @@ pub struct PublicationRow {
     pub descriptor_digest: TypedDigest,
     /// Canonical result-manifest digest.
     pub manifest_digest: TypedDigest,
+    /// Winning attempt's evidence-bundle digest (recorded in the SAME
+    /// transaction as the publication pointer; H011).
+    pub evidence_digest: TypedDigest,
     /// Winning generation id.
     pub winner_generation: u128,
     /// Winning attempt id.
@@ -236,6 +253,22 @@ impl QuarantineScope {
             Self::ActionEntry => "action-entry",
         }
     }
+}
+
+/// Existence + tombstone state of a generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationState {
+    /// Whether the generation is tombstoned.
+    pub tombstoned: bool,
+}
+
+/// Observable lease state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseState {
+    /// Whether the lease has been released.
+    pub released: bool,
+    /// Last accepted renewal sequence.
+    pub renewal_seq: u64,
 }
 
 /// GC snapshot: what the collector must preserve.
@@ -323,12 +356,44 @@ pub trait RabsMetadataStore {
     fn release_lease(&mut self, id: u128) -> Result<(), StoreError>;
 
     /// Coordinator-only atomic publication commit (row + serving state +
-    /// reachability pin in ONE transaction; conflicts quarantine).
+    /// winner evidence row + reachability pin in ONE transaction;
+    /// conflicts quarantine).
     fn commit_publication(
         &mut self,
         authority: &TypedDigest,
         row: &PublicationRow,
     ) -> Result<CommitOutcome, StoreError>;
+
+    /// Append an evidence-bundle association for an action (append-only;
+    /// re-appending the same evidence digest is an idempotent no-op).
+    fn append_evidence(
+        &mut self,
+        action: &TypedDigest,
+        evidence: &TypedDigest,
+        generation: u128,
+        attempt: u128,
+    ) -> Result<(), StoreError>;
+
+    /// Whether a publication row exists for an action key.
+    fn has_publication(&mut self, action: &TypedDigest) -> Result<bool, StoreError>;
+
+    /// The committed manifest digest key for an action, if published.
+    fn published_manifest_key(
+        &mut self,
+        action: &TypedDigest,
+    ) -> Result<Option<String>, StoreError>;
+
+    /// Whether a generation exists, and whether it is tombstoned.
+    fn generation_state(&mut self, id: u128) -> Result<Option<GenerationState>, StoreError>;
+
+    /// Whether an attempt exists under the given generation.
+    fn attempt_exists(&mut self, id: u128, generation: u128) -> Result<bool, StoreError>;
+
+    /// Lease state (released flag + last renewal), if the lease exists.
+    fn lease_state(&mut self, id: u128) -> Result<Option<LeaseState>, StoreError>;
+
+    /// Whether an object has at least one recorded location.
+    fn object_located(&mut self, object: &TypedDigest) -> Result<bool, StoreError>;
 
     /// Record object metadata (digest + logical size; never bytes).
     fn record_object(&mut self, id: &TypedDigest, logical_size: u64) -> Result<(), StoreError>;
@@ -443,7 +508,9 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-fn digest_key(d: &TypedDigest) -> String {
+/// Canonical `domain:hex` key for a typed digest (table keys/joins).
+#[must_use]
+pub fn digest_key(d: &TypedDigest) -> String {
     format!("{}:{}", d.domain, hex(&d.bytes))
 }
 
@@ -958,6 +1025,7 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         self.intern(row.action_key.domain);
         self.intern(row.descriptor_digest.domain);
         self.intern(row.manifest_digest.domain);
+        self.intern(row.evidence_digest.domain);
         let authority = authority.clone();
         let row = row.clone();
         self.in_txn(move |engine| {
@@ -1016,7 +1084,23 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             engine.execute(
                 "INSERT OR REPLACE INTO action_serving_states (action_key, disposition, version) \
                  VALUES (?1, 'servable', 1)",
-                &[SqlValue::Text(action)],
+                &[SqlValue::Text(action.clone())],
+            )?;
+            // The winner's evidence association, SAME transaction (H011).
+            let [e_algo, e_domain, e_bytes] =
+                SqlMetadataStore::<E>::digest_params(&row.evidence_digest);
+            engine.execute(
+                "INSERT OR REPLACE INTO action_evidence_index \
+                 (action_key, evidence_algo, evidence_domain, evidence_bytes, \
+                  generation_hex, attempt_hex) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[
+                    SqlValue::Text(action),
+                    e_algo,
+                    e_domain,
+                    e_bytes,
+                    SqlValue::Text(u128_hex(row.winner_generation)),
+                    SqlValue::Text(u128_hex(row.winner_attempt)),
+                ],
             )?;
             // The durable publication reachability pin, SAME transaction.
             engine.execute(
@@ -1031,6 +1115,108 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             )?;
             Ok(CommitOutcome::Committed)
         })
+    }
+
+    fn append_evidence(
+        &mut self,
+        action: &TypedDigest,
+        evidence: &TypedDigest,
+        generation: u128,
+        attempt: u128,
+    ) -> Result<(), StoreError> {
+        self.intern(evidence.domain);
+        let action = digest_key(action);
+        let [algo, domain, bytes] = SqlMetadataStore::<E>::digest_params(evidence);
+        self.in_txn(move |engine| {
+            engine.execute(
+                "INSERT OR REPLACE INTO action_evidence_index \
+                 (action_key, evidence_algo, evidence_domain, evidence_bytes, \
+                  generation_hex, attempt_hex) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[
+                    SqlValue::Text(action),
+                    algo,
+                    domain,
+                    bytes,
+                    SqlValue::Text(u128_hex(generation)),
+                    SqlValue::Text(u128_hex(attempt)),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn has_publication(&mut self, action: &TypedDigest) -> Result<bool, StoreError> {
+        let rows = self.engine.query(
+            "SELECT action_key FROM action_publications WHERE action_key = ?1",
+            &[SqlValue::Text(digest_key(action))],
+        )?;
+        Ok(!rows.is_empty())
+    }
+
+    fn published_manifest_key(
+        &mut self,
+        action: &TypedDigest,
+    ) -> Result<Option<String>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT manifest_domain, manifest_bytes FROM action_publications WHERE action_key = ?1",
+            &[SqlValue::Text(digest_key(action))],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let [SqlValue::Text(domain), SqlValue::Blob(bytes)] = row.as_slice() else {
+            return Err(StoreError::Corruption("publication manifest shape".into()));
+        };
+        Ok(Some(format!("{}:{}", domain, hex(bytes))))
+    }
+
+    fn generation_state(&mut self, id: u128) -> Result<Option<GenerationState>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT tombstoned FROM action_generations WHERE id_hex = ?1",
+            &[SqlValue::Text(u128_hex(id))],
+        )?;
+        match rows.first().and_then(|r| r.first()) {
+            None => Ok(None),
+            Some(v) => Ok(Some(GenerationState {
+                tombstoned: expect_u64(v, "tombstoned")? != 0,
+            })),
+        }
+    }
+
+    fn attempt_exists(&mut self, id: u128, generation: u128) -> Result<bool, StoreError> {
+        let rows = self.engine.query(
+            "SELECT id_hex FROM action_attempts WHERE id_hex = ?1 AND generation_hex = ?2",
+            &[
+                SqlValue::Text(u128_hex(id)),
+                SqlValue::Text(u128_hex(generation)),
+            ],
+        )?;
+        Ok(!rows.is_empty())
+    }
+
+    fn lease_state(&mut self, id: u128) -> Result<Option<LeaseState>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT released, renewal_seq FROM execution_leases WHERE id_hex = ?1",
+            &[SqlValue::Text(u128_hex(id))],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let [released, renewal_seq] = row.as_slice() else {
+            return Err(StoreError::Corruption("lease state shape".into()));
+        };
+        Ok(Some(LeaseState {
+            released: expect_u64(released, "released")? != 0,
+            renewal_seq: expect_u64(renewal_seq, "renewal_seq")?,
+        }))
+    }
+
+    fn object_located(&mut self, object: &TypedDigest) -> Result<bool, StoreError> {
+        let rows = self.engine.query(
+            "SELECT object_key FROM object_locations WHERE object_key = ?1 LIMIT 1",
+            &[SqlValue::Text(digest_key(object))],
+        )?;
+        Ok(!rows.is_empty())
     }
 
     fn record_object(&mut self, id: &TypedDigest, logical_size: u64) -> Result<(), StoreError> {
@@ -1405,6 +1591,12 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 "gc_runs",
                 "SELECT id, seq, pinned_roots, located_objects FROM gc_runs ORDER BY id",
             ),
+            (
+                "action_evidence_index",
+                "SELECT action_key, evidence_algo, evidence_domain, evidence_bytes, \
+                 generation_hex, attempt_hex FROM action_evidence_index \
+                 ORDER BY action_key, evidence_domain, evidence_bytes",
+            ),
         ];
         let mut lines = Vec::new();
         for (table, sql) in DUMPS {
@@ -1618,6 +1810,7 @@ mod tests {
             action_key: digest("rabs.action-key.sha256.v1", action_tag),
             descriptor_digest: digest("rabs.descriptor.sha256.v1", descriptor_tag),
             manifest_digest: digest("rabs.result-manifest.sha256.v1", descriptor_tag),
+            evidence_digest: digest("rabs.evidence-bundle.sha256.v1", descriptor_tag),
             winner_generation: 10,
             winner_attempt: 20,
             result_kind: ResultKindTag::Success,
@@ -1733,6 +1926,20 @@ mod tests {
                 .unwrap(),
             CommitOutcome::ConflictQuarantined
         );
+        assert!(store.has_publication(&publication_row.action_key).unwrap());
+        assert!(
+            !store
+                .has_publication(&digest("rabs.action-key.sha256.v1", 99))
+                .unwrap()
+        );
+        // Evidence is append-only and idempotent per digest.
+        let extra_evidence = digest("rabs.evidence-bundle.sha256.v1", 90);
+        store
+            .append_evidence(&publication_row.action_key, &extra_evidence, 11, 20)
+            .unwrap();
+        store
+            .append_evidence(&publication_row.action_key, &extra_evidence, 11, 20)
+            .unwrap();
 
         // Objects, locations, pins.
         let object = digest("rabs.object.sha256.v1", 50);

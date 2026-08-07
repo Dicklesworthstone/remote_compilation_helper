@@ -46,4 +46,5 @@ pub mod link_bundle;
 pub mod manifest_validation;
 pub mod materialization;
 pub mod metadata_store;
+pub mod publication;
 pub mod tree_manifest;

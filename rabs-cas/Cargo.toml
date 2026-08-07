@@ -26,6 +26,9 @@ rabs-protocol = { path = "../rabs-protocol" }
 # is the dogfood candidate gated by the identical suite (H024).
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 fsqlite = { version = "0.1.19", default-features = false, features = ["native"] }
+# Reviewed pure digest crate (F034 pattern): independent recompute of
+# result-projection digests during publication admission (H011).
+sha2 = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"
