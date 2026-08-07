@@ -34,6 +34,7 @@
 
 pub mod acquisition_order;
 pub mod break_even;
+pub mod critical_path;
 pub mod fairness;
 pub mod hard_exclusions;
 pub mod health_policy;
