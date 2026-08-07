@@ -75,6 +75,7 @@ pub mod redaction;
 pub mod resource_envelope;
 pub mod result_identity;
 pub mod schema_registry;
+pub mod secret_redaction;
 pub mod sequence_domains;
 pub mod serving;
 pub mod snapshot_lineage;
