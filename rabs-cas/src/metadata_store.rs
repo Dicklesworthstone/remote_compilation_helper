@@ -38,7 +38,7 @@ use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 
 /// Current schema version (the single v1 epoch; H010/H038 add tables in
 /// later epochs).
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -114,6 +114,24 @@ pub const MIGRATIONS: &[Migration] = &[
          attempt_hex TEXT NOT NULL, PRIMARY KEY (action_key, evidence_domain, evidence_bytes))",
         ],
     },
+    Migration {
+        // H010: object edges (reachability), location EVIDENCE columns
+        // (encoding + quarantine status — never identity), and full pin
+        // semantics (evidence, renewal lease, durable-vs-ephemeral,
+        // reason).
+        version: 3,
+        statements: &[
+            "CREATE TABLE object_edges (parent_key TEXT NOT NULL, child_key TEXT NOT NULL, \
+         kind TEXT NOT NULL, PRIMARY KEY (parent_key, child_key, kind))",
+            "ALTER TABLE object_locations ADD COLUMN encoding TEXT NOT NULL DEFAULT 'raw'",
+            "ALTER TABLE object_locations ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE pins ADD COLUMN evidence TEXT",
+            "ALTER TABLE pins ADD COLUMN renewal_seq INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE pins ADD COLUMN durable INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE pins ADD COLUMN reason TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE gc_runs ADD COLUMN reachable_objects INTEGER NOT NULL DEFAULT 0",
+        ],
+    },
 ];
 
 /// Typed store errors (comparable so the differential harness can assert
@@ -146,6 +164,10 @@ pub enum StoreError {
     UnknownPin,
     /// Pin release attempted by a non-owner.
     PinOwnerMismatch,
+    /// Pin already released.
+    PinReleased,
+    /// Pin renewal sequence not strictly greater than the stored one.
+    NonMonotonicPinRenewal,
     /// A digest domain was read back that this process never wrote —
     /// fail-closed (R121), never silently re-typed.
     DomainNotInterned(String),
@@ -278,6 +300,9 @@ pub struct GcSnapshot {
     pub pinned_roots: Vec<String>,
     /// Objects with at least one recorded location (digest keys).
     pub located_objects: Vec<String>,
+    /// Closure of the unreleased pin roots over `object_edges` (digest
+    /// keys, sorted): what GC must preserve beyond the roots themselves.
+    pub reachable_from_pins: Vec<String>,
 }
 
 /// One row of a reconciliation scan (checked against filesystem reality).
@@ -289,6 +314,10 @@ pub struct ReconciliationRow {
     pub store_path: String,
     /// Last verification sequence, if any.
     pub verified_seq: Option<u64>,
+    /// Storage encoding of this copy (location EVIDENCE, never identity).
+    pub encoding: String,
+    /// Whether this location (this COPY, not the object) is quarantined.
+    pub quarantined: bool,
 }
 
 /// The narrow transactional metadata interface (plan §62). Every method
@@ -398,15 +427,37 @@ pub trait RabsMetadataStore {
     /// Record object metadata (digest + logical size; never bytes).
     fn record_object(&mut self, id: &TypedDigest, logical_size: u64) -> Result<(), StoreError>;
 
-    /// Record a stored location for an object.
+    /// Record a stored location for an object. `encoding` names the
+    /// stored representation of this COPY (location evidence — it never
+    /// changes the object's logical identity).
     fn add_location(
         &mut self,
         object: &TypedDigest,
         store_path: &str,
         verified_seq: Option<u64>,
+        encoding: &str,
     ) -> Result<(), StoreError>;
 
-    /// Create a pin.
+    /// Quarantine (or clear quarantine on) one location. Location
+    /// quarantine is evidence about a COPY: the object row and its edges
+    /// are untouched by construction.
+    fn set_location_quarantined(
+        &mut self,
+        object: &TypedDigest,
+        store_path: &str,
+        quarantined: bool,
+    ) -> Result<(), StoreError>;
+
+    /// Record a reachability edge between two objects.
+    fn add_object_edge(
+        &mut self,
+        parent: &TypedDigest,
+        child: &TypedDigest,
+        kind: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Create a pin with full H010 semantics.
+    #[allow(clippy::too_many_arguments)]
     fn create_pin(
         &mut self,
         id: u128,
@@ -414,7 +465,14 @@ pub trait RabsMetadataStore {
         owner: &str,
         class: &str,
         expires_at_seq: Option<u64>,
+        evidence: Option<&str>,
+        durable: bool,
+        reason: &str,
     ) -> Result<(), StoreError>;
+
+    /// Renew a pin's lease: `renewal_seq` must be strictly greater than
+    /// the stored one; released pins refuse renewal.
+    fn renew_pin(&mut self, id: u128, renewal_seq: u64) -> Result<(), StoreError>;
 
     /// Release a pin; the owner must match.
     fn release_pin(&mut self, id: u128, owner: &str) -> Result<(), StoreError>;
@@ -1104,13 +1162,16 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             )?;
             // The durable publication reachability pin, SAME transaction.
             engine.execute(
-                "INSERT INTO pins (id_hex, id, root_key, owner, class, expires_at_seq, released) \
-                 VALUES (?1, ?2, ?3, ?4, 'action-publication', NULL, 0)",
+                "INSERT INTO pins (id_hex, id, root_key, owner, class, expires_at_seq, released, \
+                 evidence, renewal_seq, durable, reason) \
+                 VALUES (?1, ?2, ?3, ?4, 'action-publication', NULL, 0, ?5, 0, 1, \
+                 'publication reachability root')",
                 &[
                     SqlValue::Text(u128_hex(row.pin_id)),
                     SqlValue::Blob(u128_blob(row.pin_id)),
                     SqlValue::Text(digest_key(&row.manifest_digest)),
                     SqlValue::Text(row.pin_owner.clone()),
+                    SqlValue::Text(digest_key(&row.action_key)),
                 ],
             )?;
             Ok(CommitOutcome::Committed)
@@ -1212,8 +1273,11 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
     }
 
     fn object_located(&mut self, object: &TypedDigest) -> Result<bool, StoreError> {
+        // A quarantined location is suspect COPY evidence: it does not
+        // count as availability (the object's identity is untouched).
         let rows = self.engine.query(
-            "SELECT object_key FROM object_locations WHERE object_key = ?1 LIMIT 1",
+            "SELECT object_key FROM object_locations \
+             WHERE object_key = ?1 AND quarantined = 0 LIMIT 1",
             &[SqlValue::Text(digest_key(object))],
         )?;
         Ok(!rows.is_empty())
@@ -1246,9 +1310,11 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         object: &TypedDigest,
         store_path: &str,
         verified_seq: Option<u64>,
+        encoding: &str,
     ) -> Result<(), StoreError> {
         let key = digest_key(object);
         let path = store_path.to_owned();
+        let encoding = encoding.to_owned();
         let verified = match verified_seq {
             None => SqlValue::Null,
             Some(v) => SqlValue::Int(
@@ -1258,9 +1324,63 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         };
         self.in_txn(move |engine| {
             engine.execute(
-                "INSERT OR REPLACE INTO object_locations (object_key, store_path, verified_seq) \
+                "INSERT OR REPLACE INTO object_locations \
+                 (object_key, store_path, verified_seq, encoding, quarantined) \
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                &[
+                    SqlValue::Text(key),
+                    SqlValue::Text(path),
+                    verified,
+                    SqlValue::Text(encoding),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn set_location_quarantined(
+        &mut self,
+        object: &TypedDigest,
+        store_path: &str,
+        quarantined: bool,
+    ) -> Result<(), StoreError> {
+        let key = digest_key(object);
+        let path = store_path.to_owned();
+        self.in_txn(move |engine| {
+            let changed = engine.execute(
+                "UPDATE object_locations SET quarantined = ?1 \
+                 WHERE object_key = ?2 AND store_path = ?3",
+                &[
+                    SqlValue::Int(i64::from(quarantined)),
+                    SqlValue::Text(key),
+                    SqlValue::Text(path),
+                ],
+            )?;
+            if changed == 0 {
+                return Err(StoreError::Corruption("unknown location".into()));
+            }
+            Ok(())
+        })
+    }
+
+    fn add_object_edge(
+        &mut self,
+        parent: &TypedDigest,
+        child: &TypedDigest,
+        kind: &str,
+    ) -> Result<(), StoreError> {
+        let parent = digest_key(parent);
+        let child = digest_key(child);
+        let kind = kind.to_owned();
+        self.in_txn(move |engine| {
+            engine.execute(
+                "INSERT OR REPLACE INTO object_edges (parent_key, child_key, kind) \
                  VALUES (?1, ?2, ?3)",
-                &[SqlValue::Text(key), SqlValue::Text(path), verified],
+                &[
+                    SqlValue::Text(parent),
+                    SqlValue::Text(child),
+                    SqlValue::Text(kind),
+                ],
             )?;
             Ok(())
         })
@@ -1273,10 +1393,18 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         owner: &str,
         class: &str,
         expires_at_seq: Option<u64>,
+        evidence: Option<&str>,
+        durable: bool,
+        reason: &str,
     ) -> Result<(), StoreError> {
         let root = digest_key(root);
         let owner = owner.to_owned();
         let class = class.to_owned();
+        let evidence = match evidence {
+            None => SqlValue::Null,
+            Some(e) => SqlValue::Text(e.to_owned()),
+        };
+        let reason = reason.to_owned();
         let expires = match expires_at_seq {
             None => SqlValue::Null,
             Some(v) => SqlValue::Int(
@@ -1286,8 +1414,9 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         };
         self.in_txn(move |engine| {
             engine.execute(
-                "INSERT INTO pins (id_hex, id, root_key, owner, class, expires_at_seq, released) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                "INSERT INTO pins (id_hex, id, root_key, owner, class, expires_at_seq, released, \
+                 evidence, renewal_seq, durable, reason) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, 0, ?8, ?9)",
                 &[
                     SqlValue::Text(u128_hex(id)),
                     SqlValue::Blob(u128_blob(id)),
@@ -1295,7 +1424,38 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     SqlValue::Text(owner),
                     SqlValue::Text(class),
                     expires,
+                    evidence,
+                    SqlValue::Int(i64::from(durable)),
+                    SqlValue::Text(reason),
                 ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn renew_pin(&mut self, id: u128, renewal_seq: u64) -> Result<(), StoreError> {
+        self.in_txn(move |engine| {
+            let rows = engine.query(
+                "SELECT renewal_seq, released FROM pins WHERE id_hex = ?1",
+                &[SqlValue::Text(u128_hex(id))],
+            )?;
+            let Some(row) = rows.first() else {
+                return Err(StoreError::UnknownPin);
+            };
+            let [stored_seq, released] = row.as_slice() else {
+                return Err(StoreError::Corruption("pin row shape".into()));
+            };
+            if expect_u64(released, "released")? != 0 {
+                return Err(StoreError::PinReleased);
+            }
+            if renewal_seq <= expect_u64(stored_seq, "renewal_seq")? {
+                return Err(StoreError::NonMonotonicPinRenewal);
+            }
+            let renewal = i64::try_from(renewal_seq)
+                .map_err(|_| StoreError::Corruption("renewal_seq out of range".into()))?;
+            engine.execute(
+                "UPDATE pins SET renewal_seq = ?1 WHERE id_hex = ?2",
+                &[SqlValue::Int(renewal), SqlValue::Text(u128_hex(id))],
             )?;
             Ok(())
         })
@@ -1456,37 +1616,73 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             };
             let pinned_roots = text_col(pinned)?;
             let located_objects = text_col(located)?;
+            // Reachability closure over object_edges from the unreleased
+            // pin roots (cycle-safe via the visited set).
+            let edges = engine.query(
+                "SELECT parent_key, child_key FROM object_edges ORDER BY parent_key, child_key",
+                &[],
+            )?;
+            let mut children: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for row in edges {
+                let [SqlValue::Text(parent), SqlValue::Text(child)] = row.as_slice() else {
+                    return Err(StoreError::Corruption("edge row shape".into()));
+                };
+                children
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(child.clone());
+            }
+            let mut reachable: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            let mut frontier: Vec<String> = pinned_roots.clone();
+            while let Some(key) = frontier.pop() {
+                if !reachable.insert(key.clone()) {
+                    continue;
+                }
+                if let Some(next) = children.get(&key) {
+                    frontier.extend(next.iter().cloned());
+                }
+            }
+            let reachable_from_pins: Vec<String> = reachable.into_iter().collect();
             let pinned_count = i64::try_from(pinned_roots.len())
                 .map_err(|_| StoreError::Corruption("pin count".into()))?;
             let located_count = i64::try_from(located_objects.len())
                 .map_err(|_| StoreError::Corruption("location count".into()))?;
+            let reachable_count = i64::try_from(reachable_from_pins.len())
+                .map_err(|_| StoreError::Corruption("reachable count".into()))?;
             engine.execute(
-                "INSERT INTO gc_runs (seq, pinned_roots, located_objects) VALUES (?1, ?2, ?3)",
+                "INSERT INTO gc_runs (seq, pinned_roots, located_objects, reachable_objects) \
+                 VALUES (?1, ?2, ?3, ?4)",
                 &[
                     SqlValue::Int(seq),
                     SqlValue::Int(pinned_count),
                     SqlValue::Int(located_count),
+                    SqlValue::Int(reachable_count),
                 ],
             )?;
             Ok(GcSnapshot {
                 pinned_roots,
                 located_objects,
+                reachable_from_pins,
             })
         })
     }
 
     fn reconciliation_scan(&mut self) -> Result<Vec<ReconciliationRow>, StoreError> {
         let rows = self.engine.query(
-            "SELECT object_key, store_path, verified_seq FROM object_locations \
-             ORDER BY object_key, store_path",
+            "SELECT object_key, store_path, verified_seq, encoding, quarantined \
+             FROM object_locations ORDER BY object_key, store_path",
             &[],
         )?;
         rows.into_iter()
             .map(|row| {
-                let [key, path, verified] = row.as_slice() else {
+                let [key, path, verified, encoding, quarantined] = row.as_slice() else {
                     return Err(StoreError::Corruption("location row shape".into()));
                 };
-                let (SqlValue::Text(key), SqlValue::Text(path)) = (key, path) else {
+                let (SqlValue::Text(key), SqlValue::Text(path), SqlValue::Text(encoding)) =
+                    (key, path, encoding)
+                else {
                     return Err(StoreError::Corruption("location column shape".into()));
                 };
                 let verified_seq = match verified {
@@ -1497,6 +1693,8 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     object_key: key.clone(),
                     store_path: path.clone(),
                     verified_seq,
+                    encoding: encoding.clone(),
+                    quarantined: expect_u64(quarantined, "quarantined")? != 0,
                 })
             })
             .collect()
@@ -1556,13 +1754,18 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             ),
             (
                 "object_locations",
-                "SELECT object_key, store_path, verified_seq FROM object_locations \
-                 ORDER BY object_key, store_path",
+                "SELECT object_key, store_path, verified_seq, encoding, quarantined \
+                 FROM object_locations ORDER BY object_key, store_path",
+            ),
+            (
+                "object_edges",
+                "SELECT parent_key, child_key, kind FROM object_edges \
+                 ORDER BY parent_key, child_key, kind",
             ),
             (
                 "pins",
-                "SELECT id_hex, id, root_key, owner, class, expires_at_seq, released \
-                 FROM pins ORDER BY id_hex",
+                "SELECT id_hex, id, root_key, owner, class, expires_at_seq, released, \
+                 evidence, renewal_seq, durable, reason FROM pins ORDER BY id_hex",
             ),
             (
                 "observed_input_recipes",
@@ -1589,7 +1792,8 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             ),
             (
                 "gc_runs",
-                "SELECT id, seq, pinned_roots, located_objects FROM gc_runs ORDER BY id",
+                "SELECT id, seq, pinned_roots, located_objects, reachable_objects \
+                 FROM gc_runs ORDER BY id",
             ),
             (
                 "action_evidence_index",
@@ -1944,10 +2148,23 @@ mod tests {
         // Objects, locations, pins.
         let object = digest("rabs.object.sha256.v1", 50);
         store.record_object(&object, 4096).unwrap();
-        store.add_location(&object, "/cas/aa/bb", Some(7)).unwrap();
-        store.add_location(&object, "/cas/cc/dd", None).unwrap();
         store
-            .create_pin(60, &object, "operator", "administrative", Some(500))
+            .add_location(&object, "/cas/aa/bb", Some(7), "raw")
+            .unwrap();
+        store
+            .add_location(&object, "/cas/cc/dd", None, "zstd")
+            .unwrap();
+        store
+            .create_pin(
+                60,
+                &object,
+                "operator",
+                "administrative",
+                Some(500),
+                Some("manual hold"),
+                false,
+                "operator investigation",
+            )
             .unwrap();
         assert_eq!(
             store.release_pin(60, "someone-else"),
@@ -1957,6 +2174,50 @@ mod tests {
             store.release_pin(61, "operator"),
             Err(StoreError::UnknownPin)
         );
+        // H010: pin lease renewal is strictly monotonic.
+        store.renew_pin(60, 2).unwrap();
+        assert_eq!(
+            store.renew_pin(60, 2),
+            Err(StoreError::NonMonotonicPinRenewal)
+        );
+        assert_eq!(store.renew_pin(62, 1), Err(StoreError::UnknownPin));
+
+        // H010: reachability edges from the pinned root.
+        let child = digest("rabs.object.sha256.v1", 51);
+        let grandchild = digest("rabs.object.sha256.v1", 52);
+        let orphan = digest("rabs.object.sha256.v1", 53);
+        store.record_object(&child, 16).unwrap();
+        store.record_object(&grandchild, 16).unwrap();
+        store.record_object(&orphan, 16).unwrap();
+        store
+            .add_object_edge(&object, &child, "manifest-entry")
+            .unwrap();
+        store.add_object_edge(&child, &grandchild, "chunk").unwrap();
+        // Cycle back to the root must not loop the traversal.
+        store
+            .add_object_edge(&grandchild, &object, "back-ref")
+            .unwrap();
+
+        // H010: location quarantine is COPY evidence, never identity.
+        store
+            .set_location_quarantined(&object, "/cas/aa/bb", true)
+            .unwrap();
+        assert!(
+            store.object_located(&object).unwrap(),
+            "second clean copy remains"
+        );
+        store
+            .set_location_quarantined(&object, "/cas/cc/dd", true)
+            .unwrap();
+        assert!(
+            !store.object_located(&object).unwrap(),
+            "all copies quarantined: object unavailable"
+        );
+        // The object row and its edges are untouched by construction.
+        store
+            .set_location_quarantined(&object, "/cas/aa/bb", false)
+            .unwrap();
+        assert!(store.object_located(&object).unwrap());
 
         // Recipes, breakdowns, trust, quarantine, verification.
         store
@@ -1984,10 +2245,26 @@ mod tests {
         // Publication pin (40) + administrative pin (60) both unreleased.
         assert_eq!(snapshot.pinned_roots.len(), 2);
         assert_eq!(snapshot.located_objects, vec![digest_key(&object)]);
+        // H010 reachability: both pin roots plus the object→child→
+        // grandchild closure (the cycle edge terminates via the visited
+        // set); the orphan is NOT reachable.
+        assert_eq!(snapshot.reachable_from_pins.len(), 4);
+        assert!(snapshot.reachable_from_pins.contains(&digest_key(&object)));
+        assert!(snapshot.reachable_from_pins.contains(&digest_key(&child)));
+        assert!(
+            snapshot
+                .reachable_from_pins
+                .contains(&digest_key(&grandchild))
+        );
+        assert!(!snapshot.reachable_from_pins.contains(&digest_key(&orphan)));
         let scan = store.reconciliation_scan().unwrap();
         assert_eq!(scan.len(), 2);
         assert_eq!(scan[0].verified_seq, Some(7));
+        assert_eq!(scan[0].encoding, "raw");
+        assert!(!scan[0].quarantined);
         assert_eq!(scan[1].verified_seq, None);
+        assert_eq!(scan[1].encoding, "zstd");
+        assert!(scan[1].quarantined);
 
         // Authority release + handover.
         store.release_authority(&active).unwrap();

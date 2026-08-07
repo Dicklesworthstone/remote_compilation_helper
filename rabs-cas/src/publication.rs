@@ -656,7 +656,7 @@ mod tests {
             let id = object(tag);
             store.record_object(&id.0, 64).unwrap();
             store
-                .add_location(&id.0, &format!("/cas/{tag}"), Some(1))
+                .add_location(&id.0, &format!("/cas/{tag}"), Some(1), "raw")
                 .unwrap();
         }
     }
@@ -1022,11 +1022,11 @@ mod tests {
         let divergent_id = object(52);
         store.record_object(&object(42).0, 64).unwrap();
         store
-            .add_location(&object(42).0, "/cas/42", Some(1))
+            .add_location(&object(42).0, "/cas/42", Some(1), "raw")
             .unwrap();
         store.record_object(&divergent_id.0, 64).unwrap();
         store
-            .add_location(&divergent_id.0, "/cas/52", Some(1))
+            .add_location(&divergent_id.0, "/cas/52", Some(1), "raw")
             .unwrap();
         let divergent = OfferPreparedActionResult::build(
             attempt_authority(),
