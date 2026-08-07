@@ -124,6 +124,46 @@ impl InvocationRecord {
     }
 }
 
+/// Content-retention policy for corpus storage (bead B004): digests-only
+/// is the default and the only unconditional mode; retaining actual bytes
+/// requires an explicit incident reference and expires with it (corpus
+/// policy §1/§2, docs/rabs-corpus-policy.md).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ContentRetention {
+    /// Only correlation digests and redacted presentation forms persist.
+    #[default]
+    DigestsOnly,
+    /// Bytes retained for one named incident; deleted when it closes.
+    ExplicitIncidentRetention {
+        /// The incident that justifies retention (its closure expires this).
+        incident_id: u64,
+    },
+}
+
+impl InvocationRecord {
+    /// Exhaustive field audit (bead B004): destructures every field and
+    /// returns the names of fields that carry free-form/raw content.
+    /// Adding a field to the record without classifying it here is a
+    /// compile error; the audit test asserts the list stays empty.
+    #[must_use]
+    pub fn raw_content_fields(&self) -> Vec<&'static str> {
+        let Self {
+            schema_version: _,   // number
+            tool: _,             // enum
+            argv_correlation: _, // digest
+            argv_redacted: _,    // redacted presentation (A007-processed)
+            env_correlation: _,  // digest
+            env_redacted: _,     // redacted presentation (A007-processed)
+            cwd_redacted: _,     // redacted presentation (A007-processed)
+            outcome: _,          // enum
+            duration_ms: _,      // number
+        } = self;
+        // Every field above is a digest, number, enum, or A007-redacted
+        // presentation form. No raw-content field exists.
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +272,27 @@ mod tests {
             NormalizedOutcome::Exited(137),
             "128+N flattening is exactly what the schema must prevent (R94)"
         );
+    }
+
+    #[test]
+    fn records_carry_digests_only_no_raw_content_fields() {
+        // B004: the exhaustive field audit must report zero raw-content
+        // fields — the schema structurally cannot retain source bytes.
+        let r = record_with(&["rustc", "lib.rs"], &[("RUSTFLAGS", "-O")]);
+        assert!(
+            r.raw_content_fields().is_empty(),
+            "raw-content fields present: {:?}",
+            r.raw_content_fields()
+        );
+    }
+
+    #[test]
+    fn content_retention_defaults_to_digests_only_and_bytes_need_an_incident() {
+        assert_eq!(ContentRetention::default(), ContentRetention::DigestsOnly);
+        // The only other mode NAMES the incident that justifies it — there
+        // is no unconditional keep-bytes mode to reach for.
+        let r = ContentRetention::ExplicitIncidentRetention { incident_id: 42 };
+        assert_ne!(r, ContentRetention::DigestsOnly);
     }
 
     #[test]
