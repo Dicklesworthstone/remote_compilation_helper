@@ -47,5 +47,6 @@ pub mod invocation;
 pub mod key_diff;
 pub mod output_declarations;
 pub mod output_platform;
+pub mod response_files;
 pub mod toolchain;
 pub mod typed_digest;
