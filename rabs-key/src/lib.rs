@@ -77,6 +77,7 @@ pub mod response_files;
 pub mod test_config_keys;
 pub mod test_keys;
 pub mod test_observation;
+pub mod test_pass_cache;
 pub mod toolchain;
 pub mod typed_digest;
 pub mod workspace_api_hash;
