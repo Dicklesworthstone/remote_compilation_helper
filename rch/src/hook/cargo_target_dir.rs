@@ -61,7 +61,14 @@ fn cargo_kind_uses_target_dir(kind: Option<CompilationKind>) -> bool {
                 | CompilationKind::CargoDoc
                 | CompilationKind::CargoTest
                 | CompilationKind::CargoNextest
-                | CompilationKind::CargoBench,
+                | CompilationKind::CargoBench
+                // Zigbuild writes into CARGO_TARGET_DIR exactly like a plain
+                // build; omitting it here left the forwarded target dir (and
+                // its sync-back) disengaged, so cross-built binaries stayed in
+                // the worker's default .rch-target and never came home (hfdt
+                // aarch64 release leg, 2026-08-06 — same class as the
+                // command_uses_cargo_dependency_graph omission).
+                | CompilationKind::CargoZigbuild,
         )
     )
 }
