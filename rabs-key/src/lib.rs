@@ -39,6 +39,7 @@
 pub mod action_key;
 pub mod authority_binding;
 pub mod canonical;
+pub mod dep_info;
 pub mod dependency_identity;
 pub mod dependency_projection;
 pub mod environment;
