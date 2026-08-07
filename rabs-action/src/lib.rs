@@ -38,6 +38,7 @@
 //!   `rabs-protocol` causal/budget values.
 
 pub mod generation_fence;
+pub mod incremental_gate;
 pub mod serving_transitions;
 pub mod snapshot_capture;
 pub mod state_machines;
