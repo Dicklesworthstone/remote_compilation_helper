@@ -61,6 +61,7 @@ pub mod filesystem_class;
 pub mod fragmentation;
 pub mod fragmentation_analyzer;
 pub mod hit_verification;
+pub mod inspect;
 pub mod invocation;
 pub mod key_diff;
 pub mod link_invocation;
