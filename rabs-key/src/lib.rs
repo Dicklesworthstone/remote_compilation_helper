@@ -59,6 +59,7 @@ pub mod hit_verification;
 pub mod invocation;
 pub mod key_diff;
 pub mod link_invocation;
+pub mod linker_profiles;
 pub mod logical_output_map;
 pub mod output_declarations;
 pub mod output_platform;
