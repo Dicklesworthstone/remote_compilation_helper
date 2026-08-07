@@ -52,4 +52,5 @@ pub mod redaction;
 pub mod result_identity;
 pub mod schema_registry;
 pub mod serving;
+pub mod snapshot_lineage;
 pub mod wire_time;
