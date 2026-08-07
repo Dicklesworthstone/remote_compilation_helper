@@ -38,7 +38,7 @@ use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 
 /// Current schema version (the single v1 epoch; H010/H038 add tables in
 /// later epochs).
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -130,6 +130,15 @@ pub const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE pins ADD COLUMN durable INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE pins ADD COLUMN reason TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE gc_runs ADD COLUMN reachable_objects INTEGER NOT NULL DEFAULT 0",
+        ],
+    },
+    Migration {
+        // H014: planned + actual reclaim receipts, one row per GC run.
+        version: 4,
+        statements: &[
+            "CREATE TABLE gc_receipts (id INTEGER PRIMARY KEY, seq INTEGER NOT NULL, \
+         mode TEXT NOT NULL, planned INTEGER NOT NULL, reclaimed INTEGER NOT NULL, \
+         skipped INTEGER NOT NULL, truncated INTEGER NOT NULL)",
         ],
     },
 ];
@@ -291,6 +300,23 @@ pub struct LeaseState {
     pub released: bool,
     /// Last accepted renewal sequence.
     pub renewal_seq: u64,
+}
+
+/// One planned-vs-actual GC reclaim receipt (H014).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcReceiptRow {
+    /// Logical sequence of the run.
+    pub seq: u64,
+    /// `"normal"` or `"emergency"`.
+    pub mode: String,
+    /// Locations the plan intended to reclaim.
+    pub planned: u64,
+    /// Locations actually reclaimed.
+    pub reclaimed: u64,
+    /// Planned locations skipped at execution time.
+    pub skipped: u64,
+    /// Whether the plan was truncated by the reclaim budget.
+    pub truncated: bool,
 }
 
 /// GC snapshot: what the collector must preserve.
@@ -518,6 +544,18 @@ pub trait RabsMetadataStore {
 
     /// List location rows for reconciliation against the filesystem.
     fn reconciliation_scan(&mut self) -> Result<Vec<ReconciliationRow>, StoreError>;
+
+    /// Remove one location row (GC reclaim). Works on digest KEYS because
+    /// GC plans over snapshot keys, never typed digests. Returns whether
+    /// a row was removed.
+    fn remove_location_by_key(
+        &mut self,
+        object_key: &str,
+        store_path: &str,
+    ) -> Result<bool, StoreError>;
+
+    /// Record a planned-vs-actual GC reclaim receipt (H014).
+    fn record_gc_receipt(&mut self, receipt: &GcReceiptRow) -> Result<(), StoreError>;
 
     /// Deterministic dump of every table for differential comparison.
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError>;
@@ -1700,6 +1738,49 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             .collect()
     }
 
+    fn remove_location_by_key(
+        &mut self,
+        object_key: &str,
+        store_path: &str,
+    ) -> Result<bool, StoreError> {
+        let object_key = object_key.to_owned();
+        let store_path = store_path.to_owned();
+        self.in_txn(move |engine| {
+            let removed = engine.execute(
+                "DELETE FROM object_locations WHERE object_key = ?1 AND store_path = ?2",
+                &[SqlValue::Text(object_key), SqlValue::Text(store_path)],
+            )?;
+            Ok(removed > 0)
+        })
+    }
+
+    fn record_gc_receipt(&mut self, receipt: &GcReceiptRow) -> Result<(), StoreError> {
+        let to_int = |v: u64, what: &str| -> Result<i64, StoreError> {
+            i64::try_from(v).map_err(|_| StoreError::Corruption(format!("{what} out of range")))
+        };
+        let seq = to_int(receipt.seq, "seq")?;
+        let planned = to_int(receipt.planned, "planned")?;
+        let reclaimed = to_int(receipt.reclaimed, "reclaimed")?;
+        let skipped = to_int(receipt.skipped, "skipped")?;
+        let mode = receipt.mode.clone();
+        let truncated = i64::from(receipt.truncated);
+        self.in_txn(move |engine| {
+            engine.execute(
+                "INSERT INTO gc_receipts (seq, mode, planned, reclaimed, skipped, truncated) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[
+                    SqlValue::Int(seq),
+                    SqlValue::Text(mode),
+                    SqlValue::Int(planned),
+                    SqlValue::Int(reclaimed),
+                    SqlValue::Int(skipped),
+                    SqlValue::Int(truncated),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError> {
         // Deterministic dump: every table, every column, ordered rows.
         const DUMPS: &[(&str, &str)] = &[
@@ -1794,6 +1875,11 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 "gc_runs",
                 "SELECT id, seq, pinned_roots, located_objects, reachable_objects \
                  FROM gc_runs ORDER BY id",
+            ),
+            (
+                "gc_receipts",
+                "SELECT id, seq, mode, planned, reclaimed, skipped, truncated \
+                 FROM gc_receipts ORDER BY id",
             ),
             (
                 "action_evidence_index",
