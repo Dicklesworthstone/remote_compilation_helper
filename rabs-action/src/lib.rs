@@ -37,4 +37,5 @@
 //! - No Tokio, no Asupersync, no clocks: time enters as explicit
 //!   `rabs-protocol` causal/budget values.
 
+pub mod generation_fence;
 pub mod state_machines;
