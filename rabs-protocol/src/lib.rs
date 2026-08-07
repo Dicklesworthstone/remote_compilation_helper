@@ -68,6 +68,7 @@ pub mod nextest_runner;
 pub mod nextest_serving_gate;
 pub mod object_model;
 pub mod object_transfer;
+pub mod peer_limits;
 pub mod peer_queues;
 pub mod portability;
 pub mod pressure;
