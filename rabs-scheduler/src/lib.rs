@@ -37,4 +37,5 @@ pub mod break_even;
 pub mod fairness;
 pub mod hard_exclusions;
 pub mod health_policy;
+pub mod pool_sizing;
 pub mod priority_classes;
