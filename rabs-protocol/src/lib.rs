@@ -50,3 +50,4 @@ pub mod raw_bytes;
 pub mod reason_codes;
 pub mod redaction;
 pub mod schema_registry;
+pub mod wire_time;
