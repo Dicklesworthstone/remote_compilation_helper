@@ -1,0 +1,25 @@
+[package]
+name = "rabs-asupersync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "The ONLY broad adapter between RABS domain types and Asupersync/ATP implementation types"
+publish = false
+
+[lib]
+doctest = false
+
+# The asupersync dependency is added by bead A003 (exact revision pin + ADR).
+# This crate is the sole place Asupersync types may appear; no durable or
+# public RABS schema may contain a type from this crate (invariant I14,
+# boundary tests in bead A008).
+[dependencies]
+rabs-protocol = { path = "../rabs-protocol" }
+
+[lints.rust]
+unsafe_code = "forbid"
