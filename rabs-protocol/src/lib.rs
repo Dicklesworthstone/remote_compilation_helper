@@ -45,4 +45,5 @@
 //! keyed bytes.
 
 pub mod reason_codes;
+pub mod redaction;
 pub mod schema_registry;
