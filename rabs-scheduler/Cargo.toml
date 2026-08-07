@@ -1,0 +1,24 @@
+[package]
+name = "rabs-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "RABS build-action admission and placement: root permits, jobserver policy, worker scoring, break-even, fairness"
+publish = false
+
+[lib]
+doctest = false
+
+# Pure policy core: decisions are deterministic functions of typed evidence
+# (worker snapshots, resource envelopes) so receipts replay. No Tokio, no
+# Asupersync, no I/O. Dependency-direction CI (bead A002) enforces this.
+[dependencies]
+rabs-protocol = { path = "../rabs-protocol" }
+
+[lints.rust]
+unsafe_code = "forbid"
