@@ -33,6 +33,7 @@
 //!   + receipt out. The daemon hosting loop lives in `rabs-coord`.
 
 pub mod break_even;
+pub mod fairness;
 pub mod hard_exclusions;
 pub mod health_policy;
 pub mod priority_classes;
