@@ -37,6 +37,7 @@
 //! - No Tokio, no Asupersync.
 
 pub mod action_key;
+pub mod authority_binding;
 pub mod canonical;
 pub mod epochs;
 pub mod family_key;
