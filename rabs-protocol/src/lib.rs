@@ -51,4 +51,5 @@ pub mod reason_codes;
 pub mod redaction;
 pub mod result_identity;
 pub mod schema_registry;
+pub mod serving;
 pub mod wire_time;
