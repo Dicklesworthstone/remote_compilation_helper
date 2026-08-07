@@ -44,6 +44,7 @@ pub mod epochs;
 pub mod family_key;
 pub mod invocation;
 pub mod key_diff;
+pub mod output_declarations;
 pub mod output_platform;
 pub mod toolchain;
 pub mod typed_digest;
