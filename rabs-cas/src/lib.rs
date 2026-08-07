@@ -38,6 +38,7 @@
 
 pub mod chunking;
 pub mod closure_validation;
+pub mod collision_policy;
 pub mod dependency_snapshot;
 pub mod link_bundle;
 pub mod manifest_validation;
