@@ -43,3 +43,5 @@
 //! targets are canonical **byte strings**, never assumed UTF-8 (bead A019);
 //! human/JSON displays use escaped presentation forms without changing the
 //! keyed bytes.
+
+pub mod schema_registry;
