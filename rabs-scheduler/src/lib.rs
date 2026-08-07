@@ -35,3 +35,4 @@
 pub mod break_even;
 pub mod hard_exclusions;
 pub mod health_policy;
+pub mod priority_classes;
