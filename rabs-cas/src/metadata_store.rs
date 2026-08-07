@@ -600,6 +600,28 @@ pub trait RabsMetadataStore {
         store_path: &str,
     ) -> Result<bool, StoreError>;
 
+    /// All publications as (action key, pin hex) pairs (H013 integrity
+    /// sweep input).
+    fn list_publications(&mut self) -> Result<Vec<(String, String)>, StoreError>;
+
+    /// Released flag of a pin addressed by hex id, if it exists.
+    fn pin_released_by_hex(&mut self, pin_hex: &str) -> Result<Option<bool>, StoreError>;
+
+    /// Whether a serving-state row exists for an action key.
+    fn has_serving_state_key(&mut self, action_key: &str) -> Result<bool, StoreError>;
+
+    /// Whether at least one evidence row exists for an action key.
+    fn has_evidence_key(&mut self, action_key: &str) -> Result<bool, StoreError>;
+
+    /// Total authority rows ever recorded (released or not).
+    fn authority_count(&mut self) -> Result<u64, StoreError>;
+
+    /// Total generation rows.
+    fn generation_count(&mut self) -> Result<u64, StoreError>;
+
+    /// Whether the generation never-reuse high-water mark exists.
+    fn has_generation_high_water(&mut self) -> Result<bool, StoreError>;
+
     /// Deterministic dump of every table for differential comparison.
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError>;
 }
@@ -677,6 +699,13 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
         };
         store.apply_migrations()?;
         Ok(store)
+    }
+
+    /// Direct engine access for diagnostic/repair tooling and for test
+    /// fixtures that must SEED corrupted or torn states the public API
+    /// refuses to produce (H013 drift fixtures).
+    pub fn engine_mut(&mut self) -> &mut E {
+        &mut self.engine
     }
 
     fn apply_migrations(&mut self) -> Result<(), StoreError> {
@@ -1904,6 +1933,74 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             )?;
             Ok(removed > 0)
         })
+    }
+
+    fn list_publications(&mut self) -> Result<Vec<(String, String)>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT action_key, pin_hex FROM action_publications ORDER BY action_key",
+            &[],
+        )?;
+        rows.into_iter()
+            .map(|row| match row.as_slice() {
+                [SqlValue::Text(action), SqlValue::Text(pin)] => Ok((action.clone(), pin.clone())),
+                _ => Err(StoreError::Corruption("publication list shape".into())),
+            })
+            .collect()
+    }
+
+    fn pin_released_by_hex(&mut self, pin_hex: &str) -> Result<Option<bool>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT released FROM pins WHERE id_hex = ?1",
+            &[SqlValue::Text(pin_hex.to_owned())],
+        )?;
+        match rows.first().and_then(|r| r.first()) {
+            None => Ok(None),
+            Some(v) => Ok(Some(expect_u64(v, "released")? != 0)),
+        }
+    }
+
+    fn has_serving_state_key(&mut self, action_key: &str) -> Result<bool, StoreError> {
+        let rows = self.engine.query(
+            "SELECT action_key FROM action_serving_states WHERE action_key = ?1",
+            &[SqlValue::Text(action_key.to_owned())],
+        )?;
+        Ok(!rows.is_empty())
+    }
+
+    fn has_evidence_key(&mut self, action_key: &str) -> Result<bool, StoreError> {
+        let rows = self.engine.query(
+            "SELECT action_key FROM action_evidence_index WHERE action_key = ?1 LIMIT 1",
+            &[SqlValue::Text(action_key.to_owned())],
+        )?;
+        Ok(!rows.is_empty())
+    }
+
+    fn authority_count(&mut self) -> Result<u64, StoreError> {
+        let rows = self
+            .engine
+            .query("SELECT COUNT(*) FROM coordinator_authorities", &[])?;
+        match rows.first().and_then(|r| r.first()) {
+            Some(v) => expect_u64(v, "authority count"),
+            None => Err(StoreError::Corruption("count shape".into())),
+        }
+    }
+
+    fn generation_count(&mut self) -> Result<u64, StoreError> {
+        let rows = self
+            .engine
+            .query("SELECT COUNT(*) FROM action_generations", &[])?;
+        match rows.first().and_then(|r| r.first()) {
+            Some(v) => expect_u64(v, "generation count"),
+            None => Err(StoreError::Corruption("count shape".into())),
+        }
+    }
+
+    fn has_generation_high_water(&mut self) -> Result<bool, StoreError> {
+        let rows = self.engine.query(
+            "SELECT kind FROM generation_high_water WHERE kind = 'action-generation'",
+            &[],
+        )?;
+        Ok(!rows.is_empty())
     }
 
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError> {

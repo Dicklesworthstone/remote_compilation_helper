@@ -48,4 +48,5 @@ pub mod manifest_validation;
 pub mod materialization;
 pub mod metadata_store;
 pub mod publication;
+pub mod startup_reconciliation;
 pub mod tree_manifest;
