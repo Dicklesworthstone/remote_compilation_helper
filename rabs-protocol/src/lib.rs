@@ -78,6 +78,7 @@ pub mod reason_codes;
 pub mod redaction;
 pub mod resource_envelope;
 pub mod result_identity;
+pub mod rolling_upgrade;
 pub mod schema_registry;
 pub mod secret_redaction;
 pub mod sequence_domains;
