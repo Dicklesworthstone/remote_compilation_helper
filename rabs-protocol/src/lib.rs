@@ -46,6 +46,7 @@
 
 pub mod authority;
 pub mod authority_matrix;
+pub mod descriptor;
 pub mod raw_bytes;
 pub mod reason_codes;
 pub mod redaction;
