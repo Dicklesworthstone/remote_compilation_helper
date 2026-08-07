@@ -39,6 +39,7 @@
 pub mod action_key;
 pub mod authority_binding;
 pub mod canonical;
+pub mod environment;
 pub mod epochs;
 pub mod family_key;
 pub mod invocation;
