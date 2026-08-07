@@ -32,4 +32,5 @@
 //!   binary listed in the unsafe-boundary ledger — never in this library.
 
 pub mod layout;
+pub mod leak_scanner;
 pub mod source_capture;
