@@ -38,6 +38,7 @@ pub mod critical_path;
 pub mod fairness;
 pub mod hard_exclusions;
 pub mod health_policy;
+pub mod managed_pool;
 pub mod pool_sizing;
 pub mod priority_classes;
 pub mod speculation_brownout;
