@@ -39,6 +39,7 @@
 pub mod action_class_detection;
 pub mod action_dag;
 pub mod action_key;
+pub mod advise;
 pub mod affected_tests;
 pub mod authority_binding;
 pub mod binary_dep_info;
