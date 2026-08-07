@@ -82,4 +82,5 @@ pub mod test_observation;
 pub mod test_pass_cache;
 pub mod toolchain;
 pub mod typed_digest;
+pub mod why;
 pub mod workspace_api_hash;
