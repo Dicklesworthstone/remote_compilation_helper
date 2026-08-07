@@ -38,7 +38,7 @@ use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 
 /// Current schema version (the single v1 epoch; H010/H038 add tables in
 /// later epochs).
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -163,6 +163,15 @@ pub const MIGRATIONS: &[Migration] = &[
          evicted_seq INTEGER NOT NULL)",
         ],
     },
+    Migration {
+        // H037: consumed operator-reset generations — the ONLY path that
+        // resumes serving over lost/rolled-back authoritative state.
+        version: 7,
+        statements: &[
+            "CREATE TABLE operator_resets (generation INTEGER PRIMARY KEY, \
+         applied_seq INTEGER NOT NULL)",
+        ],
+    },
 ];
 
 /// Typed store errors (comparable so the differential harness can assert
@@ -199,6 +208,9 @@ pub enum StoreError {
     PinReleased,
     /// Pin renewal sequence not strictly greater than the stored one.
     NonMonotonicPinRenewal,
+    /// Operator-reset generation not strictly greater than every
+    /// recorded one (replayed or stale proof).
+    StaleOperatorReset,
     /// A digest domain was read back that this process never wrote —
     /// fail-closed (R121), never silently re-typed.
     DomainNotInterned(String),
@@ -655,6 +667,25 @@ pub trait RabsMetadataStore {
     /// Consume (remove) an eviction tombstone. Returns whether one
     /// existed.
     fn consume_eviction_tombstone(&mut self, action: &TypedDigest) -> Result<bool, StoreError>;
+
+    /// Record a consumed operator-reset generation (H037). The
+    /// generation must be strictly greater than every recorded one —
+    /// replayed or stale proofs are refused.
+    fn record_operator_reset(&mut self, generation: u64, seq: u64) -> Result<(), StoreError>;
+
+    /// Highest consumed operator-reset generation, if any.
+    fn highest_operator_reset(&mut self) -> Result<Option<u64>, StoreError>;
+
+    /// Serving disposition for an action key, if a row exists.
+    fn serving_disposition_key(&mut self, action_key: &str) -> Result<Option<String>, StoreError>;
+
+    /// Set (insert or overwrite) the serving disposition for an action
+    /// key.
+    fn set_serving_disposition_key(
+        &mut self,
+        action_key: &str,
+        disposition: &str,
+    ) -> Result<(), StoreError>;
 
     /// Deterministic dump of every table for differential comparison.
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError>;
@@ -2104,6 +2135,69 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         })
     }
 
+    fn record_operator_reset(&mut self, generation: u64, seq: u64) -> Result<(), StoreError> {
+        let generation_int = i64::try_from(generation)
+            .map_err(|_| StoreError::Corruption("reset generation out of range".into()))?;
+        let seq =
+            i64::try_from(seq).map_err(|_| StoreError::Corruption("seq out of range".into()))?;
+        self.in_txn(move |engine| {
+            let rows = engine.query("SELECT MAX(generation) FROM operator_resets", &[])?;
+            if let Some(SqlValue::Int(highest)) = rows.first().and_then(|r| r.first())
+                && generation_int <= *highest
+            {
+                return Err(StoreError::StaleOperatorReset);
+            }
+            engine.execute(
+                "INSERT INTO operator_resets (generation, applied_seq) VALUES (?1, ?2)",
+                &[SqlValue::Int(generation_int), SqlValue::Int(seq)],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn highest_operator_reset(&mut self) -> Result<Option<u64>, StoreError> {
+        let rows = self
+            .engine
+            .query("SELECT MAX(generation) FROM operator_resets", &[])?;
+        match rows.first().and_then(|r| r.first()) {
+            Some(SqlValue::Int(v)) => {
+                Ok(Some(u64::try_from(*v).map_err(|_| {
+                    StoreError::Corruption("negative reset generation".into())
+                })?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn serving_disposition_key(&mut self, action_key: &str) -> Result<Option<String>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT disposition FROM action_serving_states WHERE action_key = ?1",
+            &[SqlValue::Text(action_key.to_owned())],
+        )?;
+        match rows.first().and_then(|r| r.first()) {
+            None => Ok(None),
+            Some(SqlValue::Text(d)) => Ok(Some(d.clone())),
+            Some(_) => Err(StoreError::Corruption("disposition shape".into())),
+        }
+    }
+
+    fn set_serving_disposition_key(
+        &mut self,
+        action_key: &str,
+        disposition: &str,
+    ) -> Result<(), StoreError> {
+        let action_key = action_key.to_owned();
+        let disposition = disposition.to_owned();
+        self.in_txn(move |engine| {
+            engine.execute(
+                "INSERT OR REPLACE INTO action_serving_states (action_key, disposition, version) \
+                 VALUES (?1, ?2, 1)",
+                &[SqlValue::Text(action_key), SqlValue::Text(disposition)],
+            )?;
+            Ok(())
+        })
+    }
+
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError> {
         // Deterministic dump: every table, every column, ordered rows.
         const DUMPS: &[(&str, &str)] = &[
@@ -2198,6 +2292,10 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 "gc_runs",
                 "SELECT id, seq, pinned_roots, located_objects, reachable_objects \
                  FROM gc_runs ORDER BY id",
+            ),
+            (
+                "operator_resets",
+                "SELECT generation, applied_seq FROM operator_resets ORDER BY generation",
             ),
             (
                 "eviction_tombstones",

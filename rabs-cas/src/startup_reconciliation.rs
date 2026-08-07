@@ -25,7 +25,7 @@
 //! publication, or fence state must never be treated as an ordinary
 //! cold cache (plan §62).
 
-use crate::metadata_store::{RabsMetadataStore, StoreError};
+use crate::metadata_store::{QuarantineScope, RabsMetadataStore, StoreError};
 
 /// Filesystem reality as the reconciler sees it. The production adapter
 /// wraps real IO; tests use a set-backed view.
@@ -183,9 +183,36 @@ pub fn reconcile_startup(
     }
 
     // 4. Authoritative completeness — fail-closed (R119).
+    let incomplete = authoritative_incompleteness(store)?;
+
+    Ok(StartupReport {
+        repaired,
+        reported,
+        serving: if incomplete.is_empty() {
+            ServingDecision::Allowed
+        } else {
+            ServingDecision::Refused(incomplete)
+        },
+    })
+}
+
+/// Evaluate authoritative completeness (shared by startup and by the
+/// H037 reset path). A publication whose serving disposition is
+/// `"quarantined"` has already been adjudicated — its torn rows no
+/// longer refuse serving. The history-wide gaps (empty authority
+/// history, missing generation high-water) refuse serving only until an
+/// operator reset has been consumed: the reset opens a NEW authority
+/// lineage in which the old lineage's guarantees are void by
+/// declaration, not by accident.
+fn authoritative_incompleteness(
+    store: &mut dyn RabsMetadataStore,
+) -> Result<Vec<IncompleteState>, StoreError> {
     let mut incomplete = Vec::new();
     let publications = store.list_publications()?;
     for (action_key, pin_hex) in &publications {
+        if store.serving_disposition_key(action_key)?.as_deref() == Some("quarantined") {
+            continue;
+        }
         match store.pin_released_by_hex(pin_hex)? {
             None => incomplete.push(IncompleteState::PublicationPinMissing {
                 action_key: action_key.clone(),
@@ -206,22 +233,73 @@ pub fn reconcile_startup(
             });
         }
     }
+    let reset_consumed = store.highest_operator_reset()?.is_some();
     let generations = store.generation_count()?;
-    if (!publications.is_empty() || generations > 0) && store.authority_count()? == 0 {
+    if (!publications.is_empty() || generations > 0)
+        && store.authority_count()? == 0
+        && !reset_consumed
+    {
         incomplete.push(IncompleteState::AuthorityHistoryMissing);
     }
-    if generations > 0 && !store.has_generation_high_water()? {
+    if generations > 0 && !store.has_generation_high_water()? && !reset_consumed {
         incomplete.push(IncompleteState::GenerationHighWaterMissing);
     }
+    Ok(incomplete)
+}
 
-    Ok(StartupReport {
-        repaired,
-        reported,
-        serving: if incomplete.is_empty() {
-            ServingDecision::Allowed
-        } else {
-            ServingDecision::Refused(incomplete)
-        },
+/// Outcome of consuming an operator reset (H037).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetOutcome {
+    /// The consumed reset generation.
+    pub generation: u64,
+    /// Action keys whose torn publications were quarantined under the
+    /// reset (they will never serve as cache hits from the old lineage).
+    pub quarantined_actions: Vec<String>,
+}
+
+/// H037: consume an explicit operator-reset generation over a store
+/// whose authoritative state is torn. Every publication that is
+/// currently incomplete is quarantined (serving disposition
+/// `"quarantined"` + a scoped quarantine row — adjudicated, never
+/// silently trusted), and the reset generation is recorded monotonically
+/// (a replayed or stale proof is `StoreError::StaleOperatorReset`).
+/// After a successful reset, `reconcile_startup` allows serving under
+/// the new lineage.
+///
+/// # Errors
+/// `StaleOperatorReset` for replayed proofs; store errors otherwise.
+pub fn apply_operator_reset(
+    store: &mut dyn RabsMetadataStore,
+    generation: u64,
+    seq: u64,
+) -> Result<ResetOutcome, StoreError> {
+    // Record FIRST: a stale proof must not quarantine anything.
+    store.record_operator_reset(generation, seq)?;
+    let incomplete = authoritative_incompleteness(store)?;
+    let mut quarantined_actions = Vec::new();
+    for state in incomplete {
+        let action_key = match state {
+            IncompleteState::PublicationPinMissing { action_key }
+            | IncompleteState::PublicationPinReleased { action_key }
+            | IncompleteState::ServingStateMissing { action_key }
+            | IncompleteState::EvidenceMissing { action_key } => action_key,
+            IncompleteState::AuthorityHistoryMissing
+            | IncompleteState::GenerationHighWaterMissing => continue,
+        };
+        if quarantined_actions.contains(&action_key) {
+            continue;
+        }
+        store.set_serving_disposition_key(&action_key, "quarantined")?;
+        store.add_quarantine(
+            QuarantineScope::ActionEntry,
+            &action_key,
+            "operator reset: pre-reset publication state incomplete",
+        )?;
+        quarantined_actions.push(action_key);
+    }
+    Ok(ResetOutcome {
+        generation,
+        quarantined_actions,
     })
 }
 
@@ -433,6 +511,115 @@ mod tests {
             SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("ref")).unwrap()).unwrap();
         let mut candidate =
             SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("fsq")).unwrap()).unwrap();
+        assert_eq!(scenario(&mut reference), scenario(&mut candidate));
+    }
+
+    /// Seed the T039-style rolled-back database: authoritative rows
+    /// survive but their authority history, pins, serving states,
+    /// evidence, and generation high-water are gone.
+    fn roll_back<E: SqlEngine>(store: &mut SqlMetadataStore<E>) {
+        for sql in [
+            "DELETE FROM pins",
+            "DELETE FROM action_serving_states",
+            "DELETE FROM action_evidence_index",
+            "DELETE FROM coordinator_authorities",
+            "DELETE FROM generation_high_water",
+        ] {
+            store.engine_mut().execute(sql, &[]).unwrap();
+        }
+    }
+
+    #[test]
+    fn h037_rolled_back_db_refuses_until_reset_then_serves_quarantined() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        healthy(&mut store);
+        roll_back(&mut store);
+        let action_key = digest_key(&digest("rabs.action-key.sha256.v1", 7));
+
+        // NEVER an ordinary cold cache: startup refuses.
+        let before = reconcile_startup(&mut store, &full_filesystem()).unwrap();
+        assert!(matches!(before.serving, ServingDecision::Refused(_)));
+
+        // Operator reset: torn publication quarantined, reset recorded.
+        let outcome = apply_operator_reset(&mut store, 1, 500).unwrap();
+        assert_eq!(outcome.generation, 1);
+        assert_eq!(outcome.quarantined_actions, vec![action_key.clone()]);
+        assert_eq!(
+            store
+                .serving_disposition_key(&action_key)
+                .unwrap()
+                .as_deref(),
+            Some("quarantined")
+        );
+
+        // Serving resumes under the new lineage; the quarantined action
+        // never counts as incomplete again.
+        let after = reconcile_startup(&mut store, &full_filesystem()).unwrap();
+        assert_eq!(after.serving, ServingDecision::Allowed);
+
+        // A replayed or stale reset proof is refused, and quarantines
+        // nothing further.
+        assert_eq!(
+            apply_operator_reset(&mut store, 1, 501),
+            Err(crate::metadata_store::StoreError::StaleOperatorReset)
+        );
+        assert_eq!(store.highest_operator_reset().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn h037_reset_covers_history_gaps_without_publications() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        healthy(&mut store);
+        // Drop the publication too: only generations remain, with the
+        // authority history and high-water gone.
+        for sql in [
+            "DELETE FROM action_publications",
+            "DELETE FROM pins",
+            "DELETE FROM action_serving_states",
+            "DELETE FROM action_evidence_index",
+            "DELETE FROM coordinator_authorities",
+            "DELETE FROM generation_high_water",
+        ] {
+            store.engine_mut().execute(sql, &[]).unwrap();
+        }
+        let before = reconcile_startup(&mut store, &full_filesystem()).unwrap();
+        assert_eq!(
+            before.serving,
+            ServingDecision::Refused(vec![
+                IncompleteState::AuthorityHistoryMissing,
+                IncompleteState::GenerationHighWaterMissing,
+            ])
+        );
+        let outcome = apply_operator_reset(&mut store, 3, 600).unwrap();
+        assert!(outcome.quarantined_actions.is_empty());
+        let after = reconcile_startup(&mut store, &full_filesystem()).unwrap();
+        assert_eq!(after.serving, ServingDecision::Allowed);
+    }
+
+    #[test]
+    fn h037_differential_reference_vs_frankensqlite() {
+        fn scenario<E: SqlEngine>(store: &mut SqlMetadataStore<E>) -> Vec<String> {
+            healthy(store);
+            roll_back(store);
+            assert!(matches!(
+                reconcile_startup(store, &full_filesystem())
+                    .unwrap()
+                    .serving,
+                ServingDecision::Refused(_)
+            ));
+            apply_operator_reset(store, 2, 700).unwrap();
+            assert_eq!(
+                reconcile_startup(store, &full_filesystem())
+                    .unwrap()
+                    .serving,
+                ServingDecision::Allowed
+            );
+            store.differential_snapshot().unwrap()
+        }
+        let mut reference =
+            SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("ref37")).unwrap()).unwrap();
+        let mut candidate =
+            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("fsq37")).unwrap()).unwrap();
         assert_eq!(scenario(&mut reference), scenario(&mut candidate));
     }
 }
