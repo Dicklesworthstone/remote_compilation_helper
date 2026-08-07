@@ -20,6 +20,9 @@ doctest = false
 # enforces this.
 [dependencies]
 rabs-protocol = { path = "../rabs-protocol" }
+# The reviewed pure digest crate (bead F034): SHA-256 for typed
+# authoritative digests. no-default-features; pure computation only.
+sha2 = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

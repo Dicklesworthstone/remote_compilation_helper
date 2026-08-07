@@ -37,7 +37,9 @@ const DOMAIN_CRATES: &[&str] = &[
 const PURE_CRATES: &[&str] = &["rabs-protocol", "rabs-action", "rabs-key", "rabs-scheduler"];
 
 /// The only dependencies a pure crate may declare.
-const PURE_ALLOWLIST: &[&str] = &["rabs-protocol"];
+/// `sha2` is the reviewed pure digest crate for typed authoritative
+/// digests (bead F034): no-default-features, pure computation, no I/O.
+const PURE_ALLOWLIST: &[&str] = &["rabs-protocol", "sha2"];
 
 /// Forbidden anywhere in a domain crate's `[dependencies]`.
 const FORBIDDEN_IN_DOMAIN: &[&str] = &[

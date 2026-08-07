@@ -4288,6 +4288,7 @@ name = "rabs-key"
 version = "1.0.56"
 dependencies = [
  "rabs-protocol",
+ "sha2 0.10.9",
 ]
 
 [[package]]

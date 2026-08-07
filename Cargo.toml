@@ -64,6 +64,9 @@ regex = "1.12.3"
 
 # Fast hashing
 blake3 = "1.8.3"
+# SHA-256 for RABS typed authoritative digests (bead F034; pure, no-default
+# features; reviewed addition to the rabs-key pure-crate allowlist)
+sha2 = { version = "0.10", default-features = false }
 
 # Binary/object file parsing (ELF, Mach-O, etc.)
 object = { version = "0.38.1", default-features = false, features = ["read", "elf", "macho"] }

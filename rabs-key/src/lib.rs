@@ -38,3 +38,4 @@
 
 pub mod canonical;
 pub mod epochs;
+pub mod typed_digest;
