@@ -41,6 +41,7 @@ pub mod authority_binding;
 pub mod build_script_directives;
 pub mod canonical;
 pub mod canonical_layout;
+pub mod capability_policy;
 pub mod dep_info;
 pub mod dependency_identity;
 pub mod dependency_lane;
