@@ -1,0 +1,28 @@
+[package]
+name = "rabs-wkr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "RABS trusted worker daemon: sandboxed execution, staging, prepared-result offers (never commits)"
+publish = false
+
+[lib]
+doctest = false
+
+# Specialized trusted worker — deliberately NOT a mode added to a broad
+# generic daemon (plan rejects extending atpd). Composes the domain crates
+# and (via rabs-asupersync) the runtime.
+[dependencies]
+rabs-protocol = { path = "../rabs-protocol" }
+rabs-action = { path = "../rabs-action" }
+rabs-cas = { path = "../rabs-cas" }
+rabs-sandbox = { path = "../rabs-sandbox" }
+rabs-asupersync = { path = "../rabs-asupersync" }
+
+[lints.rust]
+unsafe_code = "forbid"

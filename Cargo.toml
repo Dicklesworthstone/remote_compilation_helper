@@ -6,6 +6,20 @@ members = [
     "rch-wkr",
     "rch-common",
     "rch-telemetry",
+    # RABS (Asupersync-native Accelerated Build Sidecar) crates — see the
+    # RABS bead graph (remote_compilation_helper-rabs-root-4pidu) and
+    # COMPREHENSIVE_MASTER_PLAN_FOR_RABS_ASUPERSYNC_NATIVE.md.
+    # Dependency rules per crate are stated in each crate's lib.rs doc
+    # header and enforced by dependency-direction CI (bead A002).
+    "rabs-protocol",
+    "rabs-action",
+    "rabs-key",
+    "rabs-cas",
+    "rabs-sandbox",
+    "rabs-scheduler",
+    "rabs-asupersync",
+    "rabsd",
+    "rabs-wkr",
 ]
 
 [workspace.package]
