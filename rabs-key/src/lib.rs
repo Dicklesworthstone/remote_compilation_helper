@@ -68,6 +68,7 @@ pub mod presentation;
 pub mod projection_differential;
 pub mod public_api_hash;
 pub mod response_files;
+pub mod test_config_keys;
 pub mod test_keys;
 pub mod toolchain;
 pub mod typed_digest;
