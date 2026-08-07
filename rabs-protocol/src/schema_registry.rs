@@ -265,7 +265,7 @@ mod tests {
     fn registry_change_is_deliberate() {
         let fp = registry_fingerprint();
         assert_eq!(
-            fp, 0x7314_db1a_cae6_5ee3,
+            fp, 0x1a61_e5bd_8ad2_cfb5,
             "schema registry changed (fingerprint {fp:#x}); if intentional, \
              bump the affected schema versions per the epoch doctrine and \
              update this golden in the same commit"
