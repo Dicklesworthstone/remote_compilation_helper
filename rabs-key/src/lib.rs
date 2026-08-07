@@ -69,3 +69,4 @@ pub mod public_api_hash;
 pub mod response_files;
 pub mod toolchain;
 pub mod typed_digest;
+pub mod workspace_api_hash;
