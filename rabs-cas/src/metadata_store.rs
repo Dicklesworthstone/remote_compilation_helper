@@ -38,7 +38,7 @@ use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 
 /// Current schema version (the single v1 epoch; H010/H038 add tables in
 /// later epochs).
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -149,6 +149,19 @@ pub const MIGRATIONS: &[Migration] = &[
         statements: &["CREATE TABLE gc_tombstones (object_key TEXT NOT NULL, \
          store_path TEXT NOT NULL, marked_seq INTEGER NOT NULL, \
          grace_until_seq INTEGER NOT NULL, PRIMARY KEY (object_key, store_path))"],
+    },
+    Migration {
+        // H034: result digests survive blob eviction so a post-eviction
+        // recomputation can be compared — mismatch is a divergence
+        // incident, never a silent replacement.
+        version: 6,
+        statements: &[
+            "CREATE TABLE eviction_tombstones (action_key TEXT PRIMARY KEY, \
+         semantic_algo TEXT NOT NULL, semantic_domain TEXT NOT NULL, \
+         semantic_bytes BLOB NOT NULL, observable_algo TEXT NOT NULL, \
+         observable_domain TEXT NOT NULL, observable_bytes BLOB NOT NULL, \
+         evicted_seq INTEGER NOT NULL)",
+        ],
     },
 ];
 
@@ -621,6 +634,27 @@ pub trait RabsMetadataStore {
 
     /// Whether the generation never-reuse high-water mark exists.
     fn has_generation_high_water(&mut self) -> Result<bool, StoreError>;
+
+    /// Retain a published result's projection digests across blob
+    /// eviction (H034). Overwrites an existing tombstone for the key.
+    fn record_eviction_tombstone(
+        &mut self,
+        action: &TypedDigest,
+        semantic: &TypedDigest,
+        observable: &TypedDigest,
+        evicted_seq: u64,
+    ) -> Result<(), StoreError>;
+
+    /// The retained (semantic, observable) digests for an action, if a
+    /// tombstone exists.
+    fn eviction_tombstone(
+        &mut self,
+        action: &TypedDigest,
+    ) -> Result<Option<(TypedDigest, TypedDigest)>, StoreError>;
+
+    /// Consume (remove) an eviction tombstone. Returns whether one
+    /// existed.
+    fn consume_eviction_tombstone(&mut self, action: &TypedDigest) -> Result<bool, StoreError>;
 
     /// Deterministic dump of every table for differential comparison.
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError>;
@@ -2003,6 +2037,73 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         Ok(!rows.is_empty())
     }
 
+    fn record_eviction_tombstone(
+        &mut self,
+        action: &TypedDigest,
+        semantic: &TypedDigest,
+        observable: &TypedDigest,
+        evicted_seq: u64,
+    ) -> Result<(), StoreError> {
+        self.intern(semantic.domain);
+        self.intern(observable.domain);
+        let action = digest_key(action);
+        let [s_algo, s_domain, s_bytes] = SqlMetadataStore::<E>::digest_params(semantic);
+        let [o_algo, o_domain, o_bytes] = SqlMetadataStore::<E>::digest_params(observable);
+        let seq = i64::try_from(evicted_seq)
+            .map_err(|_| StoreError::Corruption("evicted_seq out of range".into()))?;
+        self.in_txn(move |engine| {
+            engine.execute(
+                "INSERT OR REPLACE INTO eviction_tombstones \
+                 (action_key, semantic_algo, semantic_domain, semantic_bytes, \
+                  observable_algo, observable_domain, observable_bytes, evicted_seq) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    SqlValue::Text(action),
+                    s_algo,
+                    s_domain,
+                    s_bytes,
+                    o_algo,
+                    o_domain,
+                    o_bytes,
+                    SqlValue::Int(seq),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn eviction_tombstone(
+        &mut self,
+        action: &TypedDigest,
+    ) -> Result<Option<(TypedDigest, TypedDigest)>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT semantic_algo, semantic_domain, semantic_bytes, \
+             observable_algo, observable_domain, observable_bytes \
+             FROM eviction_tombstones WHERE action_key = ?1",
+            &[SqlValue::Text(digest_key(action))],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let [s_algo, s_domain, s_bytes, o_algo, o_domain, o_bytes] = row.as_slice() else {
+            return Err(StoreError::Corruption("eviction tombstone shape".into()));
+        };
+        let semantic = self.restore_digest(s_algo, s_domain, s_bytes)?;
+        let observable = self.restore_digest(o_algo, o_domain, o_bytes)?;
+        Ok(Some((semantic, observable)))
+    }
+
+    fn consume_eviction_tombstone(&mut self, action: &TypedDigest) -> Result<bool, StoreError> {
+        let action = digest_key(action);
+        self.in_txn(move |engine| {
+            let removed = engine.execute(
+                "DELETE FROM eviction_tombstones WHERE action_key = ?1",
+                &[SqlValue::Text(action)],
+            )?;
+            Ok(removed > 0)
+        })
+    }
+
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError> {
         // Deterministic dump: every table, every column, ordered rows.
         const DUMPS: &[(&str, &str)] = &[
@@ -2097,6 +2198,12 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 "gc_runs",
                 "SELECT id, seq, pinned_roots, located_objects, reachable_objects \
                  FROM gc_runs ORDER BY id",
+            ),
+            (
+                "eviction_tombstones",
+                "SELECT action_key, semantic_algo, semantic_domain, semantic_bytes, \
+                 observable_algo, observable_domain, observable_bytes, evicted_seq \
+                 FROM eviction_tombstones ORDER BY action_key",
             ),
             (
                 "gc_tombstones",

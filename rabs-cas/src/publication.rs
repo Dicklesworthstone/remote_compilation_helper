@@ -510,6 +510,73 @@ pub fn process_offer(
     }))
 }
 
+/// Outcome of comparing a post-eviction recomputation against the
+/// retained eviction tombstone (bead H034).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecomputationCheck {
+    /// No tombstone exists for the key: nothing to compare.
+    NoTombstone,
+    /// Both digests match the retained values: the recomputation
+    /// reproduces the evicted result; the tombstone is consumed.
+    Reproduced,
+    /// The recomputation DIVERGES from the evicted result: an incident —
+    /// the action is quarantined, never silently replaced.
+    Divergence(DivergenceClass),
+}
+
+/// H034: retain a published result's projection digests before its blobs
+/// are evicted, so a later recomputation of the same key has something
+/// to answer to.
+///
+/// # Errors
+/// Store errors from the tombstone write.
+pub fn retain_eviction_tombstone(
+    store: &mut dyn RabsMetadataStore,
+    manifest: &CanonicalActionResultManifest,
+    evicted_seq: u64,
+) -> Result<(), StoreError> {
+    store.record_eviction_tombstone(
+        &manifest.action_key,
+        &manifest.semantic_result_digest,
+        &manifest.observable_result_digest,
+        evicted_seq,
+    )
+}
+
+/// H034: compare a re-executed result's digests against the eviction
+/// tombstone. A match consumes the tombstone (the result is reproduced
+/// and may republish); a mismatch quarantines the ACTION with the A018
+/// divergence class and LEAVES the tombstone in place as incident
+/// evidence.
+///
+/// # Errors
+/// Store errors from the lookup/quarantine writes.
+pub fn check_recomputation_against_tombstone(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+    new_semantic: &TypedDigest,
+    new_observable: &TypedDigest,
+) -> Result<RecomputationCheck, StoreError> {
+    let Some((retained_semantic, retained_observable)) = store.eviction_tombstone(action)? else {
+        return Ok(RecomputationCheck::NoTombstone);
+    };
+    if retained_semantic == *new_semantic && retained_observable == *new_observable {
+        store.consume_eviction_tombstone(action)?;
+        return Ok(RecomputationCheck::Reproduced);
+    }
+    let class = if retained_semantic == *new_semantic {
+        DivergenceClass::ObservableOnlyDivergence
+    } else {
+        DivergenceClass::SemanticDivergence
+    };
+    store.add_quarantine(
+        QuarantineScope::ActionEntry,
+        &digest_key(action),
+        "post-eviction recomputation divergence",
+    )?;
+    Ok(RecomputationCheck::Divergence(class))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,6 +1162,125 @@ mod tests {
             SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("ref")).unwrap()).unwrap();
         let mut candidate =
             SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("fsq")).unwrap()).unwrap();
+        assert_eq!(scenario(&mut reference), scenario(&mut candidate));
+    }
+
+    #[test]
+    fn h034_evict_then_recompute_divergence_is_detected() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        ready_store(&mut store);
+        let first = offer();
+        assert!(matches!(
+            process_offer(
+                &mut store,
+                &first,
+                &expected_descriptor(),
+                no_committed,
+                900,
+                1
+            )
+            .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+
+        // Blobs get evicted; the digests are RETAINED first.
+        retain_eviction_tombstone(&mut store, &first.manifest, 50).unwrap();
+        for tag in [40u8, 41, 50] {
+            store
+                .remove_location_by_key(&digest_key(&object(tag).0), &format!("/cas/{tag}"))
+                .unwrap();
+        }
+
+        let action = digest("rabs.action-key.sha256.v1", 7);
+        // Re-execution produces a DIFFERENT semantic result: divergence
+        // incident, quarantined, tombstone preserved as evidence.
+        let outcome = check_recomputation_against_tombstone(
+            &mut store,
+            &action,
+            &digest(SEMANTIC_PROJECTION_DOMAIN, 99),
+            &first.manifest.observable_result_digest,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            RecomputationCheck::Divergence(DivergenceClass::SemanticDivergence)
+        );
+        assert!(
+            store
+                .differential_snapshot()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("quarantines|")
+                    && l.contains("post-eviction recomputation divergence"))
+        );
+        assert!(
+            store.eviction_tombstone(&action).unwrap().is_some(),
+            "divergence keeps the tombstone as incident evidence"
+        );
+
+        // Same semantic, different observable: the narrower class.
+        assert_eq!(
+            check_recomputation_against_tombstone(
+                &mut store,
+                &action,
+                &first.manifest.semantic_result_digest,
+                &digest(OBSERVABLE_PROJECTION_DOMAIN, 99),
+            )
+            .unwrap(),
+            RecomputationCheck::Divergence(DivergenceClass::ObservableOnlyDivergence)
+        );
+
+        // A faithful reproduction matches and CONSUMES the tombstone.
+        assert_eq!(
+            check_recomputation_against_tombstone(
+                &mut store,
+                &action,
+                &first.manifest.semantic_result_digest,
+                &first.manifest.observable_result_digest,
+            )
+            .unwrap(),
+            RecomputationCheck::Reproduced
+        );
+        assert!(store.eviction_tombstone(&action).unwrap().is_none());
+        assert_eq!(
+            check_recomputation_against_tombstone(
+                &mut store,
+                &action,
+                &first.manifest.semantic_result_digest,
+                &first.manifest.observable_result_digest,
+            )
+            .unwrap(),
+            RecomputationCheck::NoTombstone
+        );
+    }
+
+    #[test]
+    fn h034_differential_reference_vs_frankensqlite() {
+        fn scenario(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+            ready_store(store);
+            let first = offer();
+            assert!(matches!(
+                process_offer(store, &first, &expected_descriptor(), no_committed, 900, 1).unwrap(),
+                PublicationOutcome::Committed(_)
+            ));
+            retain_eviction_tombstone(store, &first.manifest, 50).unwrap();
+            let action = digest("rabs.action-key.sha256.v1", 7);
+            assert_eq!(
+                check_recomputation_against_tombstone(
+                    store,
+                    &action,
+                    &digest(SEMANTIC_PROJECTION_DOMAIN, 99),
+                    &first.manifest.observable_result_digest,
+                )
+                .unwrap(),
+                RecomputationCheck::Divergence(DivergenceClass::SemanticDivergence)
+            );
+            store.differential_snapshot().unwrap()
+        }
+        let mut reference =
+            SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("ref34")).unwrap()).unwrap();
+        let mut candidate =
+            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("fsq34")).unwrap()).unwrap();
         assert_eq!(scenario(&mut reference), scenario(&mut candidate));
     }
 }
