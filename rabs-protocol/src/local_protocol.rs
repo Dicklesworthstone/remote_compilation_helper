@@ -86,9 +86,90 @@ pub const fn negotiate(wrapper: VersionRange, edge: VersionRange) -> Negotiation
     }
 }
 
+/// What kind of fallback the edge tells the wrapper is still permitted,
+/// derived from that subscriber's two exposure frontiers (bead C005;
+/// plan §85's three-band table; I11/I43/I46). Wire-layer mirror of
+/// `rabs-action`'s `FallbackClass` — consistency between the two is
+/// proven by a cross-crate test in `rabs-action`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackPermission {
+    /// Nothing exposed: seamless nonpublishing local fallback is safe.
+    SeamlessNonpublishing,
+    /// Transcript-only exposure: reconnect or fail coherently by default;
+    /// explicitly configured LABELED transcript recovery only.
+    LabeledTranscriptRecoveryOnly,
+    /// Stateful intent/commit exists: no uncoordinated fallback, ever.
+    NoUncoordinatedFallback,
+}
+
+/// Per-subscriber frontier state as carried on the wire — the edge
+/// includes this in responses and the wrapper reports it back on
+/// reconnect (C014/C023 resume flow). Uncertainty flags are sticky until
+/// reconciliation resolves them; an uncertain frontier is conservatively
+/// treated as exposed (R97/R116).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SubscriberFrontierReport {
+    /// A transcript frame was fully exposed (or conservatively assumed so).
+    pub transcript_exposed: bool,
+    /// A complete transcript frame MAY have reached the wrapper without
+    /// full acknowledgement.
+    pub transcript_uncertain: bool,
+    /// A stateful commit intent was durably recorded.
+    pub stateful_intent_recorded: bool,
+    /// A stateful item's delivery is in the uncertain window.
+    pub stateful_uncertain: bool,
+    /// Last fully delivered subscriber-delivery sequence number.
+    pub last_fully_delivered_seq: u64,
+}
+
+impl SubscriberFrontierReport {
+    /// The fallback the edge may permit given these frontiers. Dominance
+    /// order: any stateful signal > any transcript signal > clean.
+    /// Uncertainty counts as exposure (fail closed).
+    #[must_use]
+    pub const fn permitted_fallback(self) -> FallbackPermission {
+        if self.stateful_intent_recorded || self.stateful_uncertain {
+            FallbackPermission::NoUncoordinatedFallback
+        } else if self.transcript_exposed || self.transcript_uncertain {
+            FallbackPermission::LabeledTranscriptRecoveryOnly
+        } else {
+            FallbackPermission::SeamlessNonpublishing
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncertainty_counts_as_exposure_in_the_wire_report() {
+        // Clean: seamless.
+        let clean = SubscriberFrontierReport::default();
+        assert_eq!(
+            clean.permitted_fallback(),
+            FallbackPermission::SeamlessNonpublishing
+        );
+        // Transcript UNCERTAIN (never acked): already labeled-only.
+        let t_unc = SubscriberFrontierReport {
+            transcript_uncertain: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            t_unc.permitted_fallback(),
+            FallbackPermission::LabeledTranscriptRecoveryOnly
+        );
+        // Stateful UNCERTAIN dominates everything (fail closed, R97).
+        let s_unc = SubscriberFrontierReport {
+            transcript_exposed: true,
+            stateful_uncertain: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            s_unc.permitted_fallback(),
+            FallbackPermission::NoUncoordinatedFallback
+        );
+    }
 
     #[test]
     fn matching_versions_select_that_version() {
