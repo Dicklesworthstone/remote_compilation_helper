@@ -39,6 +39,7 @@
 pub mod action_key;
 pub mod authority_binding;
 pub mod canonical;
+pub mod dependency_identity;
 pub mod environment;
 pub mod epochs;
 pub mod extern_resolution;
