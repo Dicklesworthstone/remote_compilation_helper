@@ -3531,6 +3531,12 @@ fn command_uses_cargo_dependency_graph(kind: Option<CompilationKind>) -> bool {
                 | CompilationKind::CargoTest
                 | CompilationKind::CargoNextest
                 | CompilationKind::CargoBench
+                // A zig cross-build consumes the same cargo dependency graph as
+                // a plain build; omitting it here skipped sibling path-dep root
+                // sync entirely, so every zigbuild of a workspace with external
+                // path deps died with "failed to read <sibling>/Cargo.toml"
+                // (hfdt aarch64 release leg, 2026-08-06).
+                | CompilationKind::CargoZigbuild
         )
     )
 }
