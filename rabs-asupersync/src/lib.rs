@@ -30,3 +30,5 @@
 //!   always two-way through `rabs-protocol` owned types.
 //! - Domain crates (`rabs-protocol`, `rabs-action`, `rabs-key`,
 //!   `rabs-scheduler`, core `rabs-cas`) must never depend on this crate.
+
+pub mod region_tree;
