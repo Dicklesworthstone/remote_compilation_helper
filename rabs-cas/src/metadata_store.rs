@@ -36,9 +36,8 @@ use std::collections::HashMap;
 
 use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 
-/// Current schema version (the single v1 epoch; H010/H038 add tables in
-/// later epochs).
-pub const SCHEMA_VERSION: u32 = 7;
+/// Current schema version (v8 = the full H038 authoritative table set).
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -172,6 +171,55 @@ pub const MIGRATIONS: &[Migration] = &[
          applied_seq INTEGER NOT NULL)",
         ],
     },
+    Migration {
+        // H038: the remainder of the full authoritative table set.
+        // Incarnations and peer terms fence stale writers; edge handoffs
+        // model at most ONE active row with exactly one NAMED
+        // predecessor; trust evaluations are the append-only versioned
+        // ledger behind the mutable `trust_states` row. Deterministic
+        // failures remain `ResultKind` publications — there is
+        // deliberately NO failure table in this set.
+        version: 8,
+        statements: &[
+            "CREATE TABLE peer_authority_high_water (peer_id TEXT PRIMARY KEY, \
+         term INTEGER NOT NULL, observed_seq INTEGER NOT NULL)",
+            "CREATE TABLE worker_incarnation_fences (worker TEXT PRIMARY KEY, \
+         incarnation BLOB NOT NULL)",
+            "CREATE TABLE edge_incarnation_fences (edge_id TEXT PRIMARY KEY, \
+         incarnation BLOB NOT NULL)",
+            "CREATE TABLE edge_handoffs (edge_id TEXT PRIMARY KEY, \
+         active_incarnation BLOB NOT NULL, predecessor_incarnation BLOB NOT NULL, \
+         begun_seq INTEGER NOT NULL, resolved INTEGER NOT NULL)",
+            "CREATE TABLE action_trust_evaluations (action_key TEXT NOT NULL, \
+         version INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT NOT NULL, \
+         evaluated_seq INTEGER NOT NULL, PRIMARY KEY (action_key, version))",
+            "CREATE TABLE operations (id_hex TEXT PRIMARY KEY, id BLOB NOT NULL, \
+         kind TEXT NOT NULL, state TEXT NOT NULL, updated_seq INTEGER NOT NULL)",
+            "CREATE TABLE edge_subscribers (edge_id TEXT NOT NULL, subscriber TEXT NOT NULL, \
+         registered_seq INTEGER NOT NULL, PRIMARY KEY (edge_id, subscriber))",
+            "CREATE TABLE manifests (key TEXT PRIMARY KEY, algo TEXT NOT NULL, \
+         domain TEXT NOT NULL, bytes BLOB NOT NULL, kind TEXT NOT NULL, \
+         entry_count INTEGER NOT NULL)",
+            "CREATE TABLE worker_sessions (worker TEXT NOT NULL, incarnation BLOB NOT NULL, \
+         started_seq INTEGER NOT NULL, ended_seq INTEGER, \
+         PRIMARY KEY (worker, started_seq))",
+            "CREATE TABLE worker_capabilities (worker TEXT NOT NULL, capability TEXT NOT NULL, \
+         PRIMARY KEY (worker, capability))",
+            "CREATE TABLE worker_health_samples (worker TEXT NOT NULL, seq INTEGER NOT NULL, \
+         healthy INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY (worker, seq))",
+            "CREATE TABLE decision_receipts (kind TEXT NOT NULL, subject TEXT NOT NULL, \
+         seq INTEGER NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL, \
+         PRIMARY KEY (kind, subject, seq))",
+            "CREATE TABLE provenance_edges (from_key TEXT NOT NULL, to_key TEXT NOT NULL, \
+         kind TEXT NOT NULL, PRIMARY KEY (from_key, to_key, kind))",
+            "CREATE TABLE determinism_audits (action_key TEXT NOT NULL, \
+         attempt_hex TEXT NOT NULL, seq INTEGER NOT NULL, verdict TEXT NOT NULL, \
+         PRIMARY KEY (action_key, attempt_hex, seq))",
+            "CREATE TABLE materialization_records (id_hex TEXT PRIMARY KEY, id BLOB NOT NULL, \
+         root_key TEXT NOT NULL, dest_path TEXT NOT NULL, state TEXT NOT NULL, \
+         updated_seq INTEGER NOT NULL)",
+        ],
+    },
 ];
 
 /// Typed store errors (comparable so the differential harness can assert
@@ -211,6 +259,38 @@ pub enum StoreError {
     /// Operator-reset generation not strictly greater than every
     /// recorded one (replayed or stale proof).
     StaleOperatorReset,
+    /// Peer authority term below the recorded per-peer high-water
+    /// (a stale view of that peer; H038).
+    StalePeerAuthority,
+    /// Worker incarnation below the recorded fence.
+    StaleWorkerIncarnation,
+    /// Edge incarnation below the recorded fence, or a handoff whose
+    /// active incarnation does not exceed its named predecessor.
+    StaleEdgeIncarnation,
+    /// An unresolved handoff with different content already exists for
+    /// this edge (at most ONE active handoff per edge).
+    EdgeHandoffActive,
+    /// The handoff's named predecessor is not the edge's fenced
+    /// incarnation.
+    EdgeHandoffPredecessorMismatch,
+    /// No unresolved handoff row matches (edge, active incarnation).
+    UnknownEdgeHandoff,
+    /// Trust-evaluation version not strictly greater than the stored
+    /// maximum for the action (evaluations are append-only history).
+    NonMonotonicTrustEvaluation,
+    /// Operation id already recorded.
+    DuplicateOperation,
+    /// Referenced operation does not exist.
+    UnknownOperation,
+    /// A manifest row exists under this digest with different metadata
+    /// (same-digest/different-content is an incident, never an
+    /// overwrite).
+    ManifestDivergence,
+    /// An append-only row exists under this key with different content;
+    /// carries the table name for diagnosis.
+    AppendConflict(String),
+    /// Referenced materialization record does not exist.
+    UnknownMaterialization,
     /// A digest domain was read back that this process never wrote —
     /// fail-closed (R121), never silently re-typed.
     DomainNotInterned(String),
@@ -408,6 +488,32 @@ pub struct ReconciliationRow {
     pub encoding: String,
     /// Whether this location (this COPY, not the object) is quarantined.
     pub quarantined: bool,
+}
+
+/// One versioned trust evaluation (H038). The mutable `trust_states`
+/// row is the CURRENT state; this is the append-only ledger behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustEvaluationRow {
+    /// Strictly increasing evaluation version for the action.
+    pub version: u32,
+    /// Evaluated trust state.
+    pub state: String,
+    /// Why this evaluation was reached.
+    pub reason: String,
+    /// Logical sequence of the evaluation.
+    pub evaluated_seq: u64,
+}
+
+/// The unresolved handoff for an edge: exactly one active incarnation
+/// and exactly one NAMED predecessor (H038).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeHandoffRow {
+    /// Incarnation taking over the edge.
+    pub active_incarnation: u128,
+    /// The named predecessor incarnation being replaced.
+    pub predecessor_incarnation: u128,
+    /// Logical sequence when the handoff began.
+    pub begun_seq: u64,
 }
 
 /// The narrow transactional metadata interface (plan §62). Every method
@@ -707,6 +813,243 @@ pub trait RabsMetadataStore {
         disposition: &str,
     ) -> Result<(), StoreError>;
 
+    // --- H038: fences, peer high-water, handoffs (authoritative
+    // coordination state; writes require the ACTIVE authority) ---
+
+    /// Record the highest authority term observed from a peer. The
+    /// high-water is monotone: a lower term is refused as stale, an
+    /// equal term is an idempotent no-op.
+    fn record_peer_authority_high_water(
+        &mut self,
+        authority: &TypedDigest,
+        peer_id: &str,
+        term: u64,
+        observed_seq: u64,
+    ) -> Result<(), StoreError>;
+
+    /// The recorded (term, `observed_seq`) high-water for a peer, if any.
+    fn peer_authority_high_water(
+        &mut self,
+        peer_id: &str,
+    ) -> Result<Option<(u64, u64)>, StoreError>;
+
+    /// Advance a worker's incarnation fence. Strictly monotone: a lower
+    /// incarnation is refused as stale, an equal one is an idempotent
+    /// no-op.
+    fn advance_worker_fence(
+        &mut self,
+        authority: &TypedDigest,
+        worker: &str,
+        incarnation: u128,
+    ) -> Result<(), StoreError>;
+
+    /// The fenced incarnation for a worker, if any.
+    fn worker_fence(&mut self, worker: &str) -> Result<Option<u128>, StoreError>;
+
+    /// Advance an edge's incarnation fence (same monotonicity contract
+    /// as [`Self::advance_worker_fence`]).
+    fn advance_edge_fence(
+        &mut self,
+        authority: &TypedDigest,
+        edge_id: &str,
+        incarnation: u128,
+    ) -> Result<(), StoreError>;
+
+    /// The fenced incarnation for an edge, if any.
+    fn edge_fence(&mut self, edge_id: &str) -> Result<Option<u128>, StoreError>;
+
+    /// Begin an edge handoff: at most ONE unresolved handoff per edge;
+    /// the predecessor must be NAMED and must match the edge's fenced
+    /// incarnation when a fence exists; the active incarnation must
+    /// exceed the predecessor. Identical re-begin is idempotent.
+    fn begin_edge_handoff(
+        &mut self,
+        authority: &TypedDigest,
+        edge_id: &str,
+        active_incarnation: u128,
+        predecessor_incarnation: u128,
+        begun_seq: u64,
+    ) -> Result<(), StoreError>;
+
+    /// Resolve the unresolved handoff matching (edge, active) and
+    /// advance the edge fence to the active incarnation in the SAME
+    /// transaction.
+    fn resolve_edge_handoff(
+        &mut self,
+        authority: &TypedDigest,
+        edge_id: &str,
+        active_incarnation: u128,
+    ) -> Result<(), StoreError>;
+
+    /// The unresolved handoff for an edge, if any.
+    fn active_edge_handoff(&mut self, edge_id: &str) -> Result<Option<EdgeHandoffRow>, StoreError>;
+
+    // --- H038: versioned trust evaluations (authority-gated ledger) ---
+
+    /// Append a trust evaluation; the version must be strictly greater
+    /// than the stored maximum for the action.
+    fn append_trust_evaluation(
+        &mut self,
+        authority: &TypedDigest,
+        action: &TypedDigest,
+        row: &TrustEvaluationRow,
+    ) -> Result<(), StoreError>;
+
+    /// The highest-version trust evaluation for an action, if any.
+    fn latest_trust_evaluation(
+        &mut self,
+        action: &TypedDigest,
+    ) -> Result<Option<TrustEvaluationRow>, StoreError>;
+
+    // --- H038: operations (creation is the authoritative admission) ---
+
+    /// Create an operation lifecycle record (coordinator-only;
+    /// duplicate ids refused).
+    fn create_operation(
+        &mut self,
+        authority: &TypedDigest,
+        id: u128,
+        kind: &str,
+        state: &str,
+        seq: u64,
+    ) -> Result<(), StoreError>;
+
+    /// Update an existing operation's state.
+    fn update_operation_state(&mut self, id: u128, state: &str, seq: u64)
+    -> Result<(), StoreError>;
+
+    /// Current state of an operation, if it exists.
+    fn operation_state(&mut self, id: u128) -> Result<Option<String>, StoreError>;
+
+    // --- H038: edge subscribers, manifests, worker records,
+    // receipts/audits/provenance, materializations (observational
+    // lifecycle; conflicting rewrites are typed refusals, never silent
+    // overwrites) ---
+
+    /// Register an edge subscriber. Idempotent: the FIRST registration
+    /// sequence wins; re-registration is a no-op.
+    fn register_edge_subscriber(
+        &mut self,
+        edge_id: &str,
+        subscriber: &str,
+        registered_seq: u64,
+    ) -> Result<(), StoreError>;
+
+    /// Remove an edge subscriber. Returns whether a row was removed.
+    fn remove_edge_subscriber(
+        &mut self,
+        edge_id: &str,
+        subscriber: &str,
+    ) -> Result<bool, StoreError>;
+
+    /// Subscribers registered for an edge, ordered.
+    fn list_edge_subscribers(&mut self, edge_id: &str) -> Result<Vec<String>, StoreError>;
+
+    /// Record manifest metadata (digest + kind + entry count; never
+    /// manifest bytes). Identical re-record is idempotent; different
+    /// content under the same digest is a divergence incident.
+    fn record_manifest(
+        &mut self,
+        manifest: &TypedDigest,
+        kind: &str,
+        entry_count: u64,
+    ) -> Result<(), StoreError>;
+
+    /// Recorded (kind, entry count) for a manifest digest, if any.
+    fn manifest_meta(
+        &mut self,
+        manifest: &TypedDigest,
+    ) -> Result<Option<(String, u64)>, StoreError>;
+
+    /// Record the start of a worker session (append-only; a conflicting
+    /// rewrite of the same (worker, start) is refused).
+    fn record_worker_session(
+        &mut self,
+        worker: &str,
+        incarnation: u128,
+        started_seq: u64,
+    ) -> Result<(), StoreError>;
+
+    /// Mark a worker session ended. Returns whether an open session row
+    /// was updated.
+    fn end_worker_session(
+        &mut self,
+        worker: &str,
+        started_seq: u64,
+        ended_seq: u64,
+    ) -> Result<bool, StoreError>;
+
+    /// Record a worker capability (idempotent).
+    fn record_worker_capability(
+        &mut self,
+        worker: &str,
+        capability: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Capabilities recorded for a worker, ordered.
+    fn list_worker_capabilities(&mut self, worker: &str) -> Result<Vec<String>, StoreError>;
+
+    /// Record a worker health sample (append-only; conflicting rewrite
+    /// refused).
+    fn record_worker_health_sample(
+        &mut self,
+        worker: &str,
+        seq: u64,
+        healthy: bool,
+        detail: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Record a decision receipt (append-only; conflicting rewrite
+    /// refused).
+    fn record_decision_receipt(
+        &mut self,
+        kind: &str,
+        subject: &str,
+        seq: u64,
+        decision: &str,
+        reason: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Record a provenance edge between two digests (idempotent).
+    fn add_provenance_edge(
+        &mut self,
+        from: &TypedDigest,
+        to: &TypedDigest,
+        kind: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Record a determinism-audit verdict (append-only; conflicting
+    /// rewrite refused).
+    fn record_determinism_audit(
+        &mut self,
+        action: &TypedDigest,
+        attempt: u128,
+        seq: u64,
+        verdict: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Create a materialization record. Identical re-create is
+    /// idempotent; a different-content duplicate id is refused.
+    fn create_materialization(
+        &mut self,
+        id: u128,
+        root: &TypedDigest,
+        dest_path: &str,
+        state: &str,
+        seq: u64,
+    ) -> Result<(), StoreError>;
+
+    /// Update an existing materialization's state.
+    fn update_materialization_state(
+        &mut self,
+        id: u128,
+        state: &str,
+        seq: u64,
+    ) -> Result<(), StoreError>;
+
+    /// Current state of a materialization record, if it exists.
+    fn materialization_state(&mut self, id: u128) -> Result<Option<String>, StoreError>;
+
     /// Deterministic dump of every table for differential comparison.
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError>;
 }
@@ -958,6 +1301,30 @@ fn expect_u64(v: &SqlValue, what: &str) -> Result<u64, StoreError> {
         }
         _ => Err(StoreError::Corruption(format!("{what} shape"))),
     }
+}
+
+fn expect_u128(v: &SqlValue, what: &str) -> Result<u128, StoreError> {
+    match v {
+        SqlValue::Blob(b) => {
+            let bytes: [u8; 16] = b
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Corruption(format!("{what} not 16 bytes")))?;
+            Ok(u128::from_be_bytes(bytes))
+        }
+        _ => Err(StoreError::Corruption(format!("{what} shape"))),
+    }
+}
+
+fn expect_text(v: &SqlValue, what: &str) -> Result<String, StoreError> {
+    match v {
+        SqlValue::Text(t) => Ok(t.clone()),
+        _ => Err(StoreError::Corruption(format!("{what} shape"))),
+    }
+}
+
+fn to_seq(v: u64, what: &str) -> Result<i64, StoreError> {
+    i64::try_from(v).map_err(|_| StoreError::Corruption(format!("{what} out of range")))
 }
 
 impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
@@ -2249,6 +2616,874 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         })
     }
 
+    fn record_peer_authority_high_water(
+        &mut self,
+        authority: &TypedDigest,
+        peer_id: &str,
+        term: u64,
+        observed_seq: u64,
+    ) -> Result<(), StoreError> {
+        let authority = authority.clone();
+        let peer = peer_id.to_owned();
+        let term_int = to_seq(term, "term")?;
+        let observed = to_seq(observed_seq, "observed_seq")?;
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let rows = engine.query(
+                "SELECT term FROM peer_authority_high_water WHERE peer_id = ?1",
+                &[SqlValue::Text(peer.clone())],
+            )?;
+            if let Some(row) = rows.first() {
+                let stored = expect_u64(
+                    row.first()
+                        .ok_or_else(|| StoreError::Corruption("peer high-water shape".into()))?,
+                    "peer term",
+                )?;
+                if term < stored {
+                    return Err(StoreError::StalePeerAuthority);
+                }
+                if term == stored {
+                    return Ok(()); // idempotent
+                }
+            }
+            engine.execute(
+                "INSERT OR REPLACE INTO peer_authority_high_water \
+                 (peer_id, term, observed_seq) VALUES (?1, ?2, ?3)",
+                &[
+                    SqlValue::Text(peer),
+                    SqlValue::Int(term_int),
+                    SqlValue::Int(observed),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn peer_authority_high_water(
+        &mut self,
+        peer_id: &str,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT term, observed_seq FROM peer_authority_high_water WHERE peer_id = ?1",
+            &[SqlValue::Text(peer_id.to_owned())],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let [term, observed] = row.as_slice() else {
+            return Err(StoreError::Corruption("peer high-water shape".into()));
+        };
+        Ok(Some((
+            expect_u64(term, "peer term")?,
+            expect_u64(observed, "observed_seq")?,
+        )))
+    }
+
+    fn advance_worker_fence(
+        &mut self,
+        authority: &TypedDigest,
+        worker: &str,
+        incarnation: u128,
+    ) -> Result<(), StoreError> {
+        let authority = authority.clone();
+        let worker = worker.to_owned();
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let rows = engine.query(
+                "SELECT incarnation FROM worker_incarnation_fences WHERE worker = ?1",
+                &[SqlValue::Text(worker.clone())],
+            )?;
+            if let Some(row) = rows.first() {
+                let stored = expect_u128(
+                    row.first()
+                        .ok_or_else(|| StoreError::Corruption("worker fence shape".into()))?,
+                    "worker fence",
+                )?;
+                if incarnation < stored {
+                    return Err(StoreError::StaleWorkerIncarnation);
+                }
+                if incarnation == stored {
+                    return Ok(()); // idempotent
+                }
+            }
+            engine.execute(
+                "INSERT OR REPLACE INTO worker_incarnation_fences (worker, incarnation) \
+                 VALUES (?1, ?2)",
+                &[
+                    SqlValue::Text(worker),
+                    SqlValue::Blob(u128_blob(incarnation)),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn worker_fence(&mut self, worker: &str) -> Result<Option<u128>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT incarnation FROM worker_incarnation_fences WHERE worker = ?1",
+            &[SqlValue::Text(worker.to_owned())],
+        )?;
+        match rows.first().and_then(|r| r.first()) {
+            None => Ok(None),
+            Some(v) => Ok(Some(expect_u128(v, "worker fence")?)),
+        }
+    }
+
+    fn advance_edge_fence(
+        &mut self,
+        authority: &TypedDigest,
+        edge_id: &str,
+        incarnation: u128,
+    ) -> Result<(), StoreError> {
+        let authority = authority.clone();
+        let edge = edge_id.to_owned();
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let rows = engine.query(
+                "SELECT incarnation FROM edge_incarnation_fences WHERE edge_id = ?1",
+                &[SqlValue::Text(edge.clone())],
+            )?;
+            if let Some(row) = rows.first() {
+                let stored = expect_u128(
+                    row.first()
+                        .ok_or_else(|| StoreError::Corruption("edge fence shape".into()))?,
+                    "edge fence",
+                )?;
+                if incarnation < stored {
+                    return Err(StoreError::StaleEdgeIncarnation);
+                }
+                if incarnation == stored {
+                    return Ok(()); // idempotent
+                }
+            }
+            engine.execute(
+                "INSERT OR REPLACE INTO edge_incarnation_fences (edge_id, incarnation) \
+                 VALUES (?1, ?2)",
+                &[SqlValue::Text(edge), SqlValue::Blob(u128_blob(incarnation))],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn edge_fence(&mut self, edge_id: &str) -> Result<Option<u128>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT incarnation FROM edge_incarnation_fences WHERE edge_id = ?1",
+            &[SqlValue::Text(edge_id.to_owned())],
+        )?;
+        match rows.first().and_then(|r| r.first()) {
+            None => Ok(None),
+            Some(v) => Ok(Some(expect_u128(v, "edge fence")?)),
+        }
+    }
+
+    fn begin_edge_handoff(
+        &mut self,
+        authority: &TypedDigest,
+        edge_id: &str,
+        active_incarnation: u128,
+        predecessor_incarnation: u128,
+        begun_seq: u64,
+    ) -> Result<(), StoreError> {
+        let authority = authority.clone();
+        let edge = edge_id.to_owned();
+        let begun = to_seq(begun_seq, "begun_seq")?;
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            // At most one handoff row per edge; only a RESOLVED row may
+            // be replaced.
+            let rows = engine.query(
+                "SELECT active_incarnation, predecessor_incarnation, resolved \
+                 FROM edge_handoffs WHERE edge_id = ?1",
+                &[SqlValue::Text(edge.clone())],
+            )?;
+            if let Some(row) = rows.first() {
+                let [active, predecessor, resolved] = row.as_slice() else {
+                    return Err(StoreError::Corruption("edge handoff shape".into()));
+                };
+                if expect_u64(resolved, "resolved")? == 0 {
+                    if expect_u128(active, "active incarnation")? == active_incarnation
+                        && expect_u128(predecessor, "predecessor incarnation")?
+                            == predecessor_incarnation
+                    {
+                        return Ok(()); // idempotent re-begin
+                    }
+                    return Err(StoreError::EdgeHandoffActive);
+                }
+            }
+            // The NAMED predecessor must be the fenced incarnation when
+            // a fence exists.
+            let fence = engine.query(
+                "SELECT incarnation FROM edge_incarnation_fences WHERE edge_id = ?1",
+                &[SqlValue::Text(edge.clone())],
+            )?;
+            if let Some(v) = fence.first().and_then(|r| r.first())
+                && expect_u128(v, "edge fence")? != predecessor_incarnation
+            {
+                return Err(StoreError::EdgeHandoffPredecessorMismatch);
+            }
+            if active_incarnation <= predecessor_incarnation {
+                return Err(StoreError::StaleEdgeIncarnation);
+            }
+            engine.execute(
+                "INSERT OR REPLACE INTO edge_handoffs \
+                 (edge_id, active_incarnation, predecessor_incarnation, begun_seq, resolved) \
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                &[
+                    SqlValue::Text(edge),
+                    SqlValue::Blob(u128_blob(active_incarnation)),
+                    SqlValue::Blob(u128_blob(predecessor_incarnation)),
+                    SqlValue::Int(begun),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn resolve_edge_handoff(
+        &mut self,
+        authority: &TypedDigest,
+        edge_id: &str,
+        active_incarnation: u128,
+    ) -> Result<(), StoreError> {
+        let authority = authority.clone();
+        let edge = edge_id.to_owned();
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let rows = engine.query(
+                "SELECT active_incarnation, resolved FROM edge_handoffs WHERE edge_id = ?1",
+                &[SqlValue::Text(edge.clone())],
+            )?;
+            let Some(row) = rows.first() else {
+                return Err(StoreError::UnknownEdgeHandoff);
+            };
+            let [active, resolved] = row.as_slice() else {
+                return Err(StoreError::Corruption("edge handoff shape".into()));
+            };
+            if expect_u64(resolved, "resolved")? != 0
+                || expect_u128(active, "active incarnation")? != active_incarnation
+            {
+                return Err(StoreError::UnknownEdgeHandoff);
+            }
+            engine.execute(
+                "UPDATE edge_handoffs SET resolved = 1 WHERE edge_id = ?1",
+                &[SqlValue::Text(edge.clone())],
+            )?;
+            // Fence advance in the SAME transaction: the handoff is not
+            // resolved unless the edge is fenced at the new incarnation.
+            engine.execute(
+                "INSERT OR REPLACE INTO edge_incarnation_fences (edge_id, incarnation) \
+                 VALUES (?1, ?2)",
+                &[
+                    SqlValue::Text(edge),
+                    SqlValue::Blob(u128_blob(active_incarnation)),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn active_edge_handoff(&mut self, edge_id: &str) -> Result<Option<EdgeHandoffRow>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT active_incarnation, predecessor_incarnation, begun_seq \
+             FROM edge_handoffs WHERE edge_id = ?1 AND resolved = 0",
+            &[SqlValue::Text(edge_id.to_owned())],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let [active, predecessor, begun] = row.as_slice() else {
+            return Err(StoreError::Corruption("edge handoff shape".into()));
+        };
+        Ok(Some(EdgeHandoffRow {
+            active_incarnation: expect_u128(active, "active incarnation")?,
+            predecessor_incarnation: expect_u128(predecessor, "predecessor incarnation")?,
+            begun_seq: expect_u64(begun, "begun_seq")?,
+        }))
+    }
+
+    fn append_trust_evaluation(
+        &mut self,
+        authority: &TypedDigest,
+        action: &TypedDigest,
+        row: &TrustEvaluationRow,
+    ) -> Result<(), StoreError> {
+        let authority = authority.clone();
+        let action = digest_key(action);
+        let row = row.clone();
+        let evaluated = to_seq(row.evaluated_seq, "evaluated_seq")?;
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let stored = engine.query(
+                "SELECT MAX(version) FROM action_trust_evaluations WHERE action_key = ?1",
+                &[SqlValue::Text(action.clone())],
+            )?;
+            if let Some(SqlValue::Int(max)) = stored.first().and_then(|r| r.first())
+                && u64::from(row.version) <= u64::try_from(*max).unwrap_or(0)
+            {
+                return Err(StoreError::NonMonotonicTrustEvaluation);
+            }
+            engine.execute(
+                "INSERT INTO action_trust_evaluations \
+                 (action_key, version, state, reason, evaluated_seq) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    SqlValue::Text(action),
+                    SqlValue::Int(i64::from(row.version)),
+                    SqlValue::Text(row.state),
+                    SqlValue::Text(row.reason),
+                    SqlValue::Int(evaluated),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn latest_trust_evaluation(
+        &mut self,
+        action: &TypedDigest,
+    ) -> Result<Option<TrustEvaluationRow>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT version, state, reason, evaluated_seq FROM action_trust_evaluations \
+             WHERE action_key = ?1 ORDER BY version DESC LIMIT 1",
+            &[SqlValue::Text(digest_key(action))],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let [version, state, reason, evaluated] = row.as_slice() else {
+            return Err(StoreError::Corruption("trust evaluation shape".into()));
+        };
+        Ok(Some(TrustEvaluationRow {
+            version: u32::try_from(expect_u64(version, "version")?)
+                .map_err(|_| StoreError::Corruption("version out of range".into()))?,
+            state: expect_text(state, "state")?,
+            reason: expect_text(reason, "reason")?,
+            evaluated_seq: expect_u64(evaluated, "evaluated_seq")?,
+        }))
+    }
+
+    fn create_operation(
+        &mut self,
+        authority: &TypedDigest,
+        id: u128,
+        kind: &str,
+        state: &str,
+        seq: u64,
+    ) -> Result<(), StoreError> {
+        let authority = authority.clone();
+        let kind = kind.to_owned();
+        let state = state.to_owned();
+        let seq = to_seq(seq, "seq")?;
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let existing = engine.query(
+                "SELECT id_hex FROM operations WHERE id_hex = ?1",
+                &[SqlValue::Text(u128_hex(id))],
+            )?;
+            if !existing.is_empty() {
+                return Err(StoreError::DuplicateOperation);
+            }
+            engine.execute(
+                "INSERT INTO operations (id_hex, id, kind, state, updated_seq) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    SqlValue::Text(u128_hex(id)),
+                    SqlValue::Blob(u128_blob(id)),
+                    SqlValue::Text(kind),
+                    SqlValue::Text(state),
+                    SqlValue::Int(seq),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn update_operation_state(
+        &mut self,
+        id: u128,
+        state: &str,
+        seq: u64,
+    ) -> Result<(), StoreError> {
+        let state = state.to_owned();
+        let seq = to_seq(seq, "seq")?;
+        self.in_txn(move |engine| {
+            let changed = engine.execute(
+                "UPDATE operations SET state = ?1, updated_seq = ?2 WHERE id_hex = ?3",
+                &[
+                    SqlValue::Text(state),
+                    SqlValue::Int(seq),
+                    SqlValue::Text(u128_hex(id)),
+                ],
+            )?;
+            if changed == 0 {
+                return Err(StoreError::UnknownOperation);
+            }
+            Ok(())
+        })
+    }
+
+    fn operation_state(&mut self, id: u128) -> Result<Option<String>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT state FROM operations WHERE id_hex = ?1",
+            &[SqlValue::Text(u128_hex(id))],
+        )?;
+        match rows.first().and_then(|r| r.first()) {
+            None => Ok(None),
+            Some(v) => Ok(Some(expect_text(v, "operation state")?)),
+        }
+    }
+
+    fn register_edge_subscriber(
+        &mut self,
+        edge_id: &str,
+        subscriber: &str,
+        registered_seq: u64,
+    ) -> Result<(), StoreError> {
+        let edge = edge_id.to_owned();
+        let subscriber = subscriber.to_owned();
+        let seq = to_seq(registered_seq, "registered_seq")?;
+        self.in_txn(move |engine| {
+            engine.execute(
+                "INSERT OR IGNORE INTO edge_subscribers (edge_id, subscriber, registered_seq) \
+                 VALUES (?1, ?2, ?3)",
+                &[
+                    SqlValue::Text(edge),
+                    SqlValue::Text(subscriber),
+                    SqlValue::Int(seq),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn remove_edge_subscriber(
+        &mut self,
+        edge_id: &str,
+        subscriber: &str,
+    ) -> Result<bool, StoreError> {
+        let edge = edge_id.to_owned();
+        let subscriber = subscriber.to_owned();
+        self.in_txn(move |engine| {
+            let changed = engine.execute(
+                "DELETE FROM edge_subscribers WHERE edge_id = ?1 AND subscriber = ?2",
+                &[SqlValue::Text(edge), SqlValue::Text(subscriber)],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    fn list_edge_subscribers(&mut self, edge_id: &str) -> Result<Vec<String>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT subscriber FROM edge_subscribers WHERE edge_id = ?1 ORDER BY subscriber",
+            &[SqlValue::Text(edge_id.to_owned())],
+        )?;
+        rows.iter()
+            .map(|row| {
+                expect_text(
+                    row.first()
+                        .ok_or_else(|| StoreError::Corruption("subscriber shape".into()))?,
+                    "subscriber",
+                )
+            })
+            .collect()
+    }
+
+    fn record_manifest(
+        &mut self,
+        manifest: &TypedDigest,
+        kind: &str,
+        entry_count: u64,
+    ) -> Result<(), StoreError> {
+        self.intern(manifest.domain);
+        let key = digest_key(manifest);
+        let [algo, domain, bytes] = SqlMetadataStore::<E>::digest_params(manifest);
+        let kind = kind.to_owned();
+        let count = to_seq(entry_count, "entry_count")?;
+        self.in_txn(move |engine| {
+            let existing = engine.query(
+                "SELECT kind, entry_count FROM manifests WHERE key = ?1",
+                &[SqlValue::Text(key.clone())],
+            )?;
+            if let Some(row) = existing.first() {
+                let [stored_kind, stored_count] = row.as_slice() else {
+                    return Err(StoreError::Corruption("manifest row shape".into()));
+                };
+                if expect_text(stored_kind, "manifest kind")? == kind
+                    && expect_u64(stored_count, "entry_count")? == entry_count
+                {
+                    return Ok(()); // idempotent
+                }
+                return Err(StoreError::ManifestDivergence);
+            }
+            engine.execute(
+                "INSERT INTO manifests (key, algo, domain, bytes, kind, entry_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[
+                    SqlValue::Text(key),
+                    algo,
+                    domain,
+                    bytes,
+                    SqlValue::Text(kind),
+                    SqlValue::Int(count),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn manifest_meta(
+        &mut self,
+        manifest: &TypedDigest,
+    ) -> Result<Option<(String, u64)>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT kind, entry_count FROM manifests WHERE key = ?1",
+            &[SqlValue::Text(digest_key(manifest))],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let [kind, count] = row.as_slice() else {
+            return Err(StoreError::Corruption("manifest row shape".into()));
+        };
+        Ok(Some((
+            expect_text(kind, "manifest kind")?,
+            expect_u64(count, "entry_count")?,
+        )))
+    }
+
+    fn record_worker_session(
+        &mut self,
+        worker: &str,
+        incarnation: u128,
+        started_seq: u64,
+    ) -> Result<(), StoreError> {
+        let worker = worker.to_owned();
+        let started = to_seq(started_seq, "started_seq")?;
+        self.in_txn(move |engine| {
+            let existing = engine.query(
+                "SELECT incarnation FROM worker_sessions WHERE worker = ?1 AND started_seq = ?2",
+                &[SqlValue::Text(worker.clone()), SqlValue::Int(started)],
+            )?;
+            if let Some(row) = existing.first() {
+                let stored = expect_u128(
+                    row.first()
+                        .ok_or_else(|| StoreError::Corruption("worker session shape".into()))?,
+                    "session incarnation",
+                )?;
+                if stored == incarnation {
+                    return Ok(()); // idempotent
+                }
+                return Err(StoreError::AppendConflict("worker_sessions".into()));
+            }
+            engine.execute(
+                "INSERT INTO worker_sessions (worker, incarnation, started_seq, ended_seq) \
+                 VALUES (?1, ?2, ?3, NULL)",
+                &[
+                    SqlValue::Text(worker),
+                    SqlValue::Blob(u128_blob(incarnation)),
+                    SqlValue::Int(started),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn end_worker_session(
+        &mut self,
+        worker: &str,
+        started_seq: u64,
+        ended_seq: u64,
+    ) -> Result<bool, StoreError> {
+        let worker = worker.to_owned();
+        let started = to_seq(started_seq, "started_seq")?;
+        let ended = to_seq(ended_seq, "ended_seq")?;
+        self.in_txn(move |engine| {
+            let changed = engine.execute(
+                "UPDATE worker_sessions SET ended_seq = ?1 \
+                 WHERE worker = ?2 AND started_seq = ?3 AND ended_seq IS NULL",
+                &[
+                    SqlValue::Int(ended),
+                    SqlValue::Text(worker),
+                    SqlValue::Int(started),
+                ],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    fn record_worker_capability(
+        &mut self,
+        worker: &str,
+        capability: &str,
+    ) -> Result<(), StoreError> {
+        let worker = worker.to_owned();
+        let capability = capability.to_owned();
+        self.in_txn(move |engine| {
+            engine.execute(
+                "INSERT OR IGNORE INTO worker_capabilities (worker, capability) \
+                 VALUES (?1, ?2)",
+                &[SqlValue::Text(worker), SqlValue::Text(capability)],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_worker_capabilities(&mut self, worker: &str) -> Result<Vec<String>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT capability FROM worker_capabilities WHERE worker = ?1 ORDER BY capability",
+            &[SqlValue::Text(worker.to_owned())],
+        )?;
+        rows.iter()
+            .map(|row| {
+                expect_text(
+                    row.first()
+                        .ok_or_else(|| StoreError::Corruption("capability shape".into()))?,
+                    "capability",
+                )
+            })
+            .collect()
+    }
+
+    fn record_worker_health_sample(
+        &mut self,
+        worker: &str,
+        seq: u64,
+        healthy: bool,
+        detail: &str,
+    ) -> Result<(), StoreError> {
+        let worker = worker.to_owned();
+        let seq = to_seq(seq, "seq")?;
+        let detail = detail.to_owned();
+        let healthy_int = i64::from(healthy);
+        self.in_txn(move |engine| {
+            let existing = engine.query(
+                "SELECT healthy, detail FROM worker_health_samples \
+                 WHERE worker = ?1 AND seq = ?2",
+                &[SqlValue::Text(worker.clone()), SqlValue::Int(seq)],
+            )?;
+            if let Some(row) = existing.first() {
+                let [stored_healthy, stored_detail] = row.as_slice() else {
+                    return Err(StoreError::Corruption("health sample shape".into()));
+                };
+                if expect_u64(stored_healthy, "healthy")? == u64::from(healthy)
+                    && expect_text(stored_detail, "detail")? == detail
+                {
+                    return Ok(()); // idempotent
+                }
+                return Err(StoreError::AppendConflict("worker_health_samples".into()));
+            }
+            engine.execute(
+                "INSERT INTO worker_health_samples (worker, seq, healthy, detail) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    SqlValue::Text(worker),
+                    SqlValue::Int(seq),
+                    SqlValue::Int(healthy_int),
+                    SqlValue::Text(detail),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn record_decision_receipt(
+        &mut self,
+        kind: &str,
+        subject: &str,
+        seq: u64,
+        decision: &str,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let kind = kind.to_owned();
+        let subject = subject.to_owned();
+        let seq = to_seq(seq, "seq")?;
+        let decision = decision.to_owned();
+        let reason = reason.to_owned();
+        self.in_txn(move |engine| {
+            let existing = engine.query(
+                "SELECT decision, reason FROM decision_receipts \
+                 WHERE kind = ?1 AND subject = ?2 AND seq = ?3",
+                &[
+                    SqlValue::Text(kind.clone()),
+                    SqlValue::Text(subject.clone()),
+                    SqlValue::Int(seq),
+                ],
+            )?;
+            if let Some(row) = existing.first() {
+                let [stored_decision, stored_reason] = row.as_slice() else {
+                    return Err(StoreError::Corruption("decision receipt shape".into()));
+                };
+                if expect_text(stored_decision, "decision")? == decision
+                    && expect_text(stored_reason, "reason")? == reason
+                {
+                    return Ok(()); // idempotent
+                }
+                return Err(StoreError::AppendConflict("decision_receipts".into()));
+            }
+            engine.execute(
+                "INSERT INTO decision_receipts (kind, subject, seq, decision, reason) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    SqlValue::Text(kind),
+                    SqlValue::Text(subject),
+                    SqlValue::Int(seq),
+                    SqlValue::Text(decision),
+                    SqlValue::Text(reason),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn add_provenance_edge(
+        &mut self,
+        from: &TypedDigest,
+        to: &TypedDigest,
+        kind: &str,
+    ) -> Result<(), StoreError> {
+        let from = digest_key(from);
+        let to = digest_key(to);
+        let kind = kind.to_owned();
+        self.in_txn(move |engine| {
+            engine.execute(
+                "INSERT OR IGNORE INTO provenance_edges (from_key, to_key, kind) \
+                 VALUES (?1, ?2, ?3)",
+                &[
+                    SqlValue::Text(from),
+                    SqlValue::Text(to),
+                    SqlValue::Text(kind),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn record_determinism_audit(
+        &mut self,
+        action: &TypedDigest,
+        attempt: u128,
+        seq: u64,
+        verdict: &str,
+    ) -> Result<(), StoreError> {
+        let action = digest_key(action);
+        let seq = to_seq(seq, "seq")?;
+        let verdict = verdict.to_owned();
+        self.in_txn(move |engine| {
+            let existing = engine.query(
+                "SELECT verdict FROM determinism_audits \
+                 WHERE action_key = ?1 AND attempt_hex = ?2 AND seq = ?3",
+                &[
+                    SqlValue::Text(action.clone()),
+                    SqlValue::Text(u128_hex(attempt)),
+                    SqlValue::Int(seq),
+                ],
+            )?;
+            if let Some(row) = existing.first() {
+                let stored = expect_text(
+                    row.first()
+                        .ok_or_else(|| StoreError::Corruption("determinism audit shape".into()))?,
+                    "verdict",
+                )?;
+                if stored == verdict {
+                    return Ok(()); // idempotent
+                }
+                return Err(StoreError::AppendConflict("determinism_audits".into()));
+            }
+            engine.execute(
+                "INSERT INTO determinism_audits (action_key, attempt_hex, seq, verdict) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    SqlValue::Text(action),
+                    SqlValue::Text(u128_hex(attempt)),
+                    SqlValue::Int(seq),
+                    SqlValue::Text(verdict),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn create_materialization(
+        &mut self,
+        id: u128,
+        root: &TypedDigest,
+        dest_path: &str,
+        state: &str,
+        seq: u64,
+    ) -> Result<(), StoreError> {
+        let root = digest_key(root);
+        let dest = dest_path.to_owned();
+        let state = state.to_owned();
+        let seq = to_seq(seq, "seq")?;
+        self.in_txn(move |engine| {
+            let existing = engine.query(
+                "SELECT root_key, dest_path FROM materialization_records WHERE id_hex = ?1",
+                &[SqlValue::Text(u128_hex(id))],
+            )?;
+            if let Some(row) = existing.first() {
+                let [stored_root, stored_dest] = row.as_slice() else {
+                    return Err(StoreError::Corruption("materialization shape".into()));
+                };
+                if expect_text(stored_root, "root_key")? == root
+                    && expect_text(stored_dest, "dest_path")? == dest
+                {
+                    return Ok(()); // idempotent
+                }
+                return Err(StoreError::AppendConflict("materialization_records".into()));
+            }
+            engine.execute(
+                "INSERT INTO materialization_records \
+                 (id_hex, id, root_key, dest_path, state, updated_seq) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[
+                    SqlValue::Text(u128_hex(id)),
+                    SqlValue::Blob(u128_blob(id)),
+                    SqlValue::Text(root),
+                    SqlValue::Text(dest),
+                    SqlValue::Text(state),
+                    SqlValue::Int(seq),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn update_materialization_state(
+        &mut self,
+        id: u128,
+        state: &str,
+        seq: u64,
+    ) -> Result<(), StoreError> {
+        let state = state.to_owned();
+        let seq = to_seq(seq, "seq")?;
+        self.in_txn(move |engine| {
+            let changed = engine.execute(
+                "UPDATE materialization_records SET state = ?1, updated_seq = ?2 \
+                 WHERE id_hex = ?3",
+                &[
+                    SqlValue::Text(state),
+                    SqlValue::Int(seq),
+                    SqlValue::Text(u128_hex(id)),
+                ],
+            )?;
+            if changed == 0 {
+                return Err(StoreError::UnknownMaterialization);
+            }
+            Ok(())
+        })
+    }
+
+    fn materialization_state(&mut self, id: u128) -> Result<Option<String>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT state FROM materialization_records WHERE id_hex = ?1",
+            &[SqlValue::Text(u128_hex(id))],
+        )?;
+        match rows.first().and_then(|r| r.first()) {
+            None => Ok(None),
+            Some(v) => Ok(Some(expect_text(v, "materialization state")?)),
+        }
+    }
+
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError> {
         // Deterministic dump: every table, every column, ordered rows.
         const DUMPS: &[(&str, &str)] = &[
@@ -2369,6 +3604,78 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 "SELECT action_key, evidence_algo, evidence_domain, evidence_bytes, \
                  generation_hex, attempt_hex FROM action_evidence_index \
                  ORDER BY action_key, evidence_domain, evidence_bytes",
+            ),
+            (
+                "peer_authority_high_water",
+                "SELECT peer_id, term, observed_seq FROM peer_authority_high_water \
+                 ORDER BY peer_id",
+            ),
+            (
+                "worker_incarnation_fences",
+                "SELECT worker, incarnation FROM worker_incarnation_fences ORDER BY worker",
+            ),
+            (
+                "edge_incarnation_fences",
+                "SELECT edge_id, incarnation FROM edge_incarnation_fences ORDER BY edge_id",
+            ),
+            (
+                "edge_handoffs",
+                "SELECT edge_id, active_incarnation, predecessor_incarnation, begun_seq, \
+                 resolved FROM edge_handoffs ORDER BY edge_id",
+            ),
+            (
+                "action_trust_evaluations",
+                "SELECT action_key, version, state, reason, evaluated_seq \
+                 FROM action_trust_evaluations ORDER BY action_key, version",
+            ),
+            (
+                "operations",
+                "SELECT id_hex, id, kind, state, updated_seq FROM operations ORDER BY id_hex",
+            ),
+            (
+                "edge_subscribers",
+                "SELECT edge_id, subscriber, registered_seq FROM edge_subscribers \
+                 ORDER BY edge_id, subscriber",
+            ),
+            (
+                "manifests",
+                "SELECT key, algo, domain, bytes, kind, entry_count FROM manifests \
+                 ORDER BY key",
+            ),
+            (
+                "worker_sessions",
+                "SELECT worker, incarnation, started_seq, ended_seq FROM worker_sessions \
+                 ORDER BY worker, started_seq",
+            ),
+            (
+                "worker_capabilities",
+                "SELECT worker, capability FROM worker_capabilities \
+                 ORDER BY worker, capability",
+            ),
+            (
+                "worker_health_samples",
+                "SELECT worker, seq, healthy, detail FROM worker_health_samples \
+                 ORDER BY worker, seq",
+            ),
+            (
+                "decision_receipts",
+                "SELECT kind, subject, seq, decision, reason FROM decision_receipts \
+                 ORDER BY kind, subject, seq",
+            ),
+            (
+                "provenance_edges",
+                "SELECT from_key, to_key, kind FROM provenance_edges \
+                 ORDER BY from_key, to_key, kind",
+            ),
+            (
+                "determinism_audits",
+                "SELECT action_key, attempt_hex, seq, verdict FROM determinism_audits \
+                 ORDER BY action_key, attempt_hex, seq",
+            ),
+            (
+                "materialization_records",
+                "SELECT id_hex, id, root_key, dest_path, state, updated_seq \
+                 FROM materialization_records ORDER BY id_hex",
             ),
         ];
         let mut lines = Vec::new();
@@ -2835,6 +4142,257 @@ mod tests {
         assert_eq!(scan[1].encoding, "zstd");
         assert!(scan[1].quarantined);
 
+        // H038: peer authority high-water is monotone in term.
+        assert_eq!(
+            store.record_peer_authority_high_water(&wrong, "peer-1", 5, 100),
+            Err(StoreError::NotActiveAuthority)
+        );
+        store
+            .record_peer_authority_high_water(&active, "peer-1", 5, 100)
+            .unwrap();
+        store
+            .record_peer_authority_high_water(&active, "peer-1", 5, 101)
+            .unwrap(); // equal term: idempotent no-op
+        assert_eq!(
+            store.record_peer_authority_high_water(&active, "peer-1", 4, 102),
+            Err(StoreError::StalePeerAuthority)
+        );
+        store
+            .record_peer_authority_high_water(&active, "peer-1", 6, 103)
+            .unwrap();
+        assert_eq!(
+            store.peer_authority_high_water("peer-1").unwrap(),
+            Some((6, 103))
+        );
+        assert_eq!(store.peer_authority_high_water("peer-2").unwrap(), None);
+
+        // H038: worker fences are strictly monotone, idempotent at
+        // equality.
+        store.advance_worker_fence(&active, "worker-a", 3).unwrap();
+        store.advance_worker_fence(&active, "worker-a", 3).unwrap();
+        assert_eq!(
+            store.advance_worker_fence(&active, "worker-a", 2),
+            Err(StoreError::StaleWorkerIncarnation)
+        );
+        store.advance_worker_fence(&active, "worker-a", 4).unwrap();
+        assert_eq!(store.worker_fence("worker-a").unwrap(), Some(4));
+        assert_eq!(store.worker_fence("worker-b").unwrap(), None);
+
+        // H038: edge handoff — at most one active row, predecessor NAMED
+        // and matching the fence, fence advances only at resolve.
+        store.advance_edge_fence(&active, "edge-1", 10).unwrap();
+        assert_eq!(
+            store.advance_edge_fence(&active, "edge-1", 9),
+            Err(StoreError::StaleEdgeIncarnation)
+        );
+        assert_eq!(
+            store.begin_edge_handoff(&active, "edge-1", 11, 9, 200),
+            Err(StoreError::EdgeHandoffPredecessorMismatch)
+        );
+        assert_eq!(
+            store.begin_edge_handoff(&active, "edge-1", 10, 10, 200),
+            Err(StoreError::StaleEdgeIncarnation)
+        );
+        store
+            .begin_edge_handoff(&active, "edge-1", 11, 10, 200)
+            .unwrap();
+        store
+            .begin_edge_handoff(&active, "edge-1", 11, 10, 200)
+            .unwrap(); // idempotent re-begin
+        assert_eq!(
+            store.begin_edge_handoff(&active, "edge-1", 12, 10, 201),
+            Err(StoreError::EdgeHandoffActive)
+        );
+        assert_eq!(
+            store.active_edge_handoff("edge-1").unwrap(),
+            Some(EdgeHandoffRow {
+                active_incarnation: 11,
+                predecessor_incarnation: 10,
+                begun_seq: 200,
+            })
+        );
+        assert_eq!(
+            store.edge_fence("edge-1").unwrap(),
+            Some(10),
+            "fence advances only at resolve"
+        );
+        assert_eq!(
+            store.resolve_edge_handoff(&active, "edge-1", 12),
+            Err(StoreError::UnknownEdgeHandoff)
+        );
+        store.resolve_edge_handoff(&active, "edge-1", 11).unwrap();
+        assert_eq!(store.edge_fence("edge-1").unwrap(), Some(11));
+        assert_eq!(store.active_edge_handoff("edge-1").unwrap(), None);
+        // The NEXT handoff must name the NEW fence as predecessor.
+        assert_eq!(
+            store.begin_edge_handoff(&active, "edge-1", 12, 10, 202),
+            Err(StoreError::EdgeHandoffPredecessorMismatch)
+        );
+        store
+            .begin_edge_handoff(&active, "edge-1", 12, 11, 202)
+            .unwrap();
+
+        // H038: trust evaluations are an authority-gated append-only
+        // versioned ledger.
+        let evaluation = TrustEvaluationRow {
+            version: 1,
+            state: "trusted".to_owned(),
+            reason: "verified once".to_owned(),
+            evaluated_seq: 300,
+        };
+        assert_eq!(
+            store.append_trust_evaluation(&wrong, &action.action_key, &evaluation),
+            Err(StoreError::NotActiveAuthority)
+        );
+        store
+            .append_trust_evaluation(&active, &action.action_key, &evaluation)
+            .unwrap();
+        assert_eq!(
+            store.append_trust_evaluation(&active, &action.action_key, &evaluation),
+            Err(StoreError::NonMonotonicTrustEvaluation)
+        );
+        let demotion = TrustEvaluationRow {
+            version: 2,
+            state: "suspect".to_owned(),
+            reason: "divergent recompute".to_owned(),
+            evaluated_seq: 301,
+        };
+        store
+            .append_trust_evaluation(&active, &action.action_key, &demotion)
+            .unwrap();
+        assert_eq!(
+            store.latest_trust_evaluation(&action.action_key).unwrap(),
+            Some(demotion)
+        );
+
+        // H038: operations — coordinator-only creation, duplicates
+        // refused.
+        assert_eq!(
+            store.create_operation(&wrong, 400, "transfer", "running", 310),
+            Err(StoreError::NotActiveAuthority)
+        );
+        store
+            .create_operation(&active, 400, "transfer", "running", 310)
+            .unwrap();
+        assert_eq!(
+            store.create_operation(&active, 400, "transfer", "running", 311),
+            Err(StoreError::DuplicateOperation)
+        );
+        store.update_operation_state(400, "done", 312).unwrap();
+        assert_eq!(
+            store.update_operation_state(401, "done", 312),
+            Err(StoreError::UnknownOperation)
+        );
+        assert_eq!(store.operation_state(400).unwrap(), Some("done".to_owned()));
+
+        // H038: edge subscribers — first registration wins.
+        store
+            .register_edge_subscriber("edge-1", "sub-a", 320)
+            .unwrap();
+        store
+            .register_edge_subscriber("edge-1", "sub-a", 999)
+            .unwrap(); // no-op; seq 320 retained
+        store
+            .register_edge_subscriber("edge-1", "sub-b", 321)
+            .unwrap();
+        assert_eq!(
+            store.list_edge_subscribers("edge-1").unwrap(),
+            vec!["sub-a".to_owned(), "sub-b".to_owned()]
+        );
+        assert!(store.remove_edge_subscriber("edge-1", "sub-b").unwrap());
+        assert!(!store.remove_edge_subscriber("edge-1", "sub-b").unwrap());
+
+        // H038: manifest metadata — divergence under one digest refused.
+        let manifest = digest("rabs.result-manifest.sha256.v1", 80);
+        store.record_manifest(&manifest, "tree", 12).unwrap();
+        store.record_manifest(&manifest, "tree", 12).unwrap();
+        assert_eq!(
+            store.record_manifest(&manifest, "tree", 13),
+            Err(StoreError::ManifestDivergence)
+        );
+        assert_eq!(
+            store.manifest_meta(&manifest).unwrap(),
+            Some(("tree".to_owned(), 12))
+        );
+
+        // H038: worker sessions / capabilities / health samples.
+        store.record_worker_session("worker-a", 3, 330).unwrap();
+        store.record_worker_session("worker-a", 3, 330).unwrap();
+        assert_eq!(
+            store.record_worker_session("worker-a", 4, 330),
+            Err(StoreError::AppendConflict("worker_sessions".into()))
+        );
+        assert!(store.end_worker_session("worker-a", 330, 340).unwrap());
+        assert!(!store.end_worker_session("worker-a", 330, 341).unwrap());
+        store.record_worker_capability("worker-a", "nix").unwrap();
+        store.record_worker_capability("worker-a", "nix").unwrap();
+        store.record_worker_capability("worker-a", "cargo").unwrap();
+        assert_eq!(
+            store.list_worker_capabilities("worker-a").unwrap(),
+            vec!["cargo".to_owned(), "nix".to_owned()]
+        );
+        store
+            .record_worker_health_sample("worker-a", 350, true, "ok")
+            .unwrap();
+        store
+            .record_worker_health_sample("worker-a", 350, true, "ok")
+            .unwrap();
+        assert_eq!(
+            store.record_worker_health_sample("worker-a", 350, false, "ok"),
+            Err(StoreError::AppendConflict("worker_health_samples".into()))
+        );
+
+        // H038: decision receipts, provenance edges, determinism audits.
+        store
+            .record_decision_receipt("gc", "run-1", 360, "reclaim", "under pressure")
+            .unwrap();
+        store
+            .record_decision_receipt("gc", "run-1", 360, "reclaim", "under pressure")
+            .unwrap();
+        assert_eq!(
+            store.record_decision_receipt("gc", "run-1", 360, "skip", "under pressure"),
+            Err(StoreError::AppendConflict("decision_receipts".into()))
+        );
+        store
+            .add_provenance_edge(&object, &child, "derived-from")
+            .unwrap();
+        store
+            .add_provenance_edge(&object, &child, "derived-from")
+            .unwrap();
+        store
+            .record_determinism_audit(&action.action_key, 20, 370, "deterministic")
+            .unwrap();
+        store
+            .record_determinism_audit(&action.action_key, 20, 370, "deterministic")
+            .unwrap();
+        assert_eq!(
+            store.record_determinism_audit(&action.action_key, 20, 370, "divergent"),
+            Err(StoreError::AppendConflict("determinism_audits".into()))
+        );
+
+        // H038: materialization records.
+        store
+            .create_materialization(500, &object, "/work/out", "staging", 380)
+            .unwrap();
+        store
+            .create_materialization(500, &object, "/work/out", "staging", 380)
+            .unwrap();
+        assert_eq!(
+            store.create_materialization(500, &object, "/work/other", "staging", 381),
+            Err(StoreError::AppendConflict("materialization_records".into()))
+        );
+        store
+            .update_materialization_state(500, "complete", 382)
+            .unwrap();
+        assert_eq!(
+            store.update_materialization_state(501, "complete", 382),
+            Err(StoreError::UnknownMaterialization)
+        );
+        assert_eq!(
+            store.materialization_state(500).unwrap(),
+            Some("complete".to_owned())
+        );
+
         // Authority release + handover.
         store.release_authority(&active).unwrap();
         assert_eq!(store.active_authority().unwrap(), None);
@@ -2929,6 +4487,161 @@ mod tests {
             Err(StoreError::DomainNotInterned(
                 "rabs.authority.sha256.v1".to_owned()
             ))
+        );
+    }
+
+    fn h038_fence_seed(store: &mut dyn RabsMetadataStore) {
+        store.acquire_authority(&authority(1)).unwrap();
+        let active = digest("rabs.authority.sha256.v1", 1);
+        store.advance_worker_fence(&active, "worker-a", 7).unwrap();
+        store.advance_edge_fence(&active, "edge-1", 9).unwrap();
+    }
+
+    fn h038_fence_check_after_reopen(store: &mut dyn RabsMetadataStore) {
+        // Fences must survive restart: the stale incarnations refused
+        // before the reopen stay refused after it.
+        store.acquire_authority(&authority(1)).unwrap();
+        let active = digest("rabs.authority.sha256.v1", 1);
+        assert_eq!(store.worker_fence("worker-a").unwrap(), Some(7));
+        assert_eq!(store.edge_fence("edge-1").unwrap(), Some(9));
+        assert_eq!(
+            store.advance_worker_fence(&active, "worker-a", 6),
+            Err(StoreError::StaleWorkerIncarnation)
+        );
+        assert_eq!(
+            store.advance_edge_fence(&active, "edge-1", 8),
+            Err(StoreError::StaleEdgeIncarnation)
+        );
+        store.advance_worker_fence(&active, "worker-a", 8).unwrap();
+    }
+
+    #[test]
+    fn h038_fences_survive_reopen_reference() {
+        let path = fresh_path("h038-fence-ref");
+        {
+            let engine = RusqliteEngine::open(&path).unwrap();
+            let mut store = SqlMetadataStore::open(engine).unwrap();
+            h038_fence_seed(&mut store);
+        }
+        let engine = RusqliteEngine::open(&path).unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        h038_fence_check_after_reopen(&mut store);
+    }
+
+    #[test]
+    fn h038_fences_survive_reopen_frankensqlite() {
+        let path = fresh_path("h038-fence-fsq");
+        {
+            let engine = FsqliteEngine::open(&path).unwrap();
+            let mut store = SqlMetadataStore::open(engine).unwrap();
+            h038_fence_seed(&mut store);
+        }
+        let engine = FsqliteEngine::open(&path).unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        h038_fence_check_after_reopen(&mut store);
+    }
+
+    fn table_names<E: SqlEngine>(store: &mut SqlMetadataStore<E>) -> Vec<String> {
+        store
+            .engine_mut()
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+                &[],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| match row.into_iter().next() {
+                Some(SqlValue::Text(t)) => t,
+                other => panic!("table name shape: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn h038_full_authoritative_table_set_no_failure_table() {
+        // The COMPLETE Epic-H table surface, pinned exactly: a table
+        // appearing or disappearing without this list changing is a
+        // schema regression. Deterministic failures are ResultKind
+        // publications — the absence of any failure table is asserted
+        // below, not just assumed.
+        let expected: Vec<String> = [
+            "action_attempts",
+            "action_entries",
+            "action_evidence_index",
+            "action_generations",
+            "action_publications",
+            "action_serving_states",
+            "action_trust_evaluations",
+            "coordinator_authorities",
+            "decision_receipts",
+            "determinism_audits",
+            "edge_handoffs",
+            "edge_incarnation_fences",
+            "edge_subscribers",
+            "eviction_tombstones",
+            "execution_leases",
+            "gc_receipts",
+            "gc_runs",
+            "gc_tombstones",
+            "generation_high_water",
+            "key_breakdowns",
+            "manifests",
+            "materialization_records",
+            "object_edges",
+            "object_locations",
+            "objects",
+            "observed_input_recipes",
+            "operations",
+            "operator_resets",
+            "peer_authority_high_water",
+            "pins",
+            "provenance_edges",
+            "quarantines",
+            "schema_epochs",
+            "trust_states",
+            "verification_samples",
+            "worker_capabilities",
+            "worker_health_samples",
+            "worker_incarnation_fences",
+            "worker_sessions",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        assert!(
+            expected.iter().all(|name| !name.contains("failure")),
+            "deterministic failures are ResultKind publications; no failure table may exist"
+        );
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        assert_eq!(table_names(&mut store), expected);
+        let engine = FsqliteEngine::open(&fresh_path("h038-tables")).unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        assert_eq!(table_names(&mut store), expected);
+    }
+
+    #[test]
+    fn h038_deterministic_failure_publishes_as_result_kind() {
+        // One publication path for success AND deterministic failure
+        // (I16): the failure lands in action_publications carrying its
+        // result kind — there is no separate failure table to receive
+        // it (asserted structurally in the table-set test above).
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        store.acquire_authority(&authority(1)).unwrap();
+        let active = digest("rabs.authority.sha256.v1", 1);
+        let mut row = publication(9, 3, 90);
+        row.result_kind = ResultKindTag::DeterministicFailure;
+        assert_eq!(
+            store.commit_publication(&active, &row).unwrap(),
+            CommitOutcome::Committed
+        );
+        let dump = store.differential_snapshot().unwrap();
+        assert!(
+            dump.iter().any(|line| {
+                line.starts_with("action_publications|") && line.contains("|deterministic-failure|")
+            }),
+            "failure publication must appear in action_publications with its result kind"
         );
     }
 }
