@@ -54,6 +54,7 @@ pub mod logical_output_map;
 pub mod output_declarations;
 pub mod output_platform;
 pub mod presentation;
+pub mod public_api_hash;
 pub mod response_files;
 pub mod toolchain;
 pub mod typed_digest;
