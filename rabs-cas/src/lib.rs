@@ -38,6 +38,7 @@
 
 pub mod ancestor_selection;
 pub mod ancestry_index;
+pub mod authority_gate;
 pub mod chunking;
 pub mod closure_validation;
 pub mod collision_policy;
