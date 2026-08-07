@@ -35,3 +35,5 @@
 //! - **No Tokio, no Asupersync** in the core storage path; async adaptation
 //!   happens in `rabs-asupersync`.
 //! - Filesystem effects are this crate's business; network effects are not.
+
+pub mod manifest_validation;
