@@ -44,6 +44,7 @@ pub mod environment;
 pub mod epochs;
 pub mod extern_resolution;
 pub mod family_key;
+pub mod fragmentation;
 pub mod hit_verification;
 pub mod invocation;
 pub mod key_diff;
