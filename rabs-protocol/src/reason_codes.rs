@@ -329,7 +329,7 @@ mod tests {
     fn registry_change_is_deliberate() {
         let fp = registry_fingerprint();
         assert_eq!(
-            fp, 0x0000_0000_0000_0000,
+            fp, 0x0fc5_0136_d95b_0ec6,
             "reason-code registry changed (fingerprint {fp:#x}); codes are \
              append-only within a protocol major — if this change only adds \
              codes, update this golden in the same commit"
