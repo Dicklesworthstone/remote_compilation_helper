@@ -57,6 +57,7 @@ pub mod object_model;
 pub mod raw_bytes;
 pub mod reason_codes;
 pub mod redaction;
+pub mod resource_envelope;
 pub mod result_identity;
 pub mod schema_registry;
 pub mod serving;
