@@ -82,6 +82,7 @@ pub mod secret_redaction;
 pub mod sequence_domains;
 pub mod serving;
 pub mod snapshot_lineage;
+pub mod trust_domain;
 pub mod version_negotiation;
 pub mod volatility;
 pub mod wire_time;
