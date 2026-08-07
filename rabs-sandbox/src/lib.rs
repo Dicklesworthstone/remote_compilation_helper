@@ -30,3 +30,5 @@
 //!   `rabs-asupersync`.
 //! - Any privileged operation lives in a separate, audited, bounded helper
 //!   binary listed in the unsafe-boundary ledger — never in this library.
+
+pub mod layout;
