@@ -32,6 +32,7 @@
 //! - **Zero I/O, zero clocks, zero Tokio/Asupersync**: evidence in, decision
 //!   + receipt out. The daemon hosting loop lives in `rabs-coord`.
 
+pub mod acquisition_order;
 pub mod break_even;
 pub mod fairness;
 pub mod hard_exclusions;
