@@ -31,6 +31,7 @@
 //! - Domain crates (`rabs-protocol`, `rabs-action`, `rabs-key`,
 //!   `rabs-scheduler`, core `rabs-cas`) must never depend on this crate.
 
+pub mod crashpack;
 pub mod obligations;
 pub mod region_tree;
 pub mod supervision;
