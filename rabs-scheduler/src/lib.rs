@@ -31,3 +31,5 @@
 //! - May depend on `rabs-protocol` only.
 //! - **Zero I/O, zero clocks, zero Tokio/Asupersync**: evidence in, decision
 //!   + receipt out. The daemon hosting loop lives in `rabs-coord`.
+
+pub mod health_policy;
