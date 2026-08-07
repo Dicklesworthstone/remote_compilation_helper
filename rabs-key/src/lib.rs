@@ -88,3 +88,4 @@ pub mod toolchain;
 pub mod typed_digest;
 pub mod why;
 pub mod workspace_api_hash;
+pub mod zero_incorrect_pass;
