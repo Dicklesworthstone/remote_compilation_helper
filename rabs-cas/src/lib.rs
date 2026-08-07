@@ -40,4 +40,5 @@ pub mod chunking;
 pub mod closure_validation;
 pub mod dependency_snapshot;
 pub mod manifest_validation;
+pub mod materialization;
 pub mod tree_manifest;
