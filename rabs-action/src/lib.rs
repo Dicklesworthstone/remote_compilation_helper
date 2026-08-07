@@ -39,4 +39,5 @@
 
 pub mod generation_fence;
 pub mod serving_transitions;
+pub mod snapshot_capture;
 pub mod state_machines;
