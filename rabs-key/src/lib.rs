@@ -43,6 +43,7 @@ pub mod dependency_identity;
 pub mod dependency_projection;
 pub mod environment;
 pub mod epochs;
+pub mod event_contracts;
 pub mod extern_resolution;
 pub mod family_key;
 pub mod fragmentation;
