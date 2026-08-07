@@ -59,6 +59,7 @@ pub mod envelope;
 pub mod frame_extensions;
 pub mod framing;
 pub mod generation;
+pub mod incident_bundle;
 pub mod incremental_snapshot;
 pub mod input_evidence;
 pub mod invocation_record;
