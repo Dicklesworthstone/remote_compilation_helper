@@ -4273,6 +4273,7 @@ name = "rabs-asupersync"
 version = "1.0.56"
 dependencies = [
  "asupersync",
+ "rabs-action",
  "rabs-protocol",
 ]
 
