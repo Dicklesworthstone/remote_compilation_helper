@@ -55,6 +55,7 @@ pub mod envelope;
 pub mod frame_extensions;
 pub mod framing;
 pub mod generation;
+pub mod incremental_snapshot;
 pub mod input_evidence;
 pub mod invocation_record;
 pub mod local_protocol;
