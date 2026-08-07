@@ -39,5 +39,6 @@
 pub mod action_key;
 pub mod canonical;
 pub mod epochs;
+pub mod family_key;
 pub mod key_diff;
 pub mod typed_digest;
