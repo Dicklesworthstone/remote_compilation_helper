@@ -968,13 +968,23 @@ mod tests {
                         .unwrap();
                 }
                 seq += 5;
+                let located_before: BTreeSet<String> = store
+                    .reconciliation_scan()
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.object_key)
+                    .collect();
                 unlink_due(&mut store, &w, mode, seq).unwrap();
 
-                // THE INVARIANT (R26): every pinned or pin-reachable
-                // object, every live-protection holder, and every
-                // authoritative-evidence object still has its location.
+                // THE INVARIANT (R26): GC never DELETES a protected copy.
+                // Every object that is pinned/pin-reachable, held by a
+                // live protection, or authoritative evidence at unlink
+                // time, and that HAD a location going in, still has one.
+                // (An object whose only copy was legitimately collected
+                // in an earlier round and only later gained a protection
+                // is not GC's to resurrect.)
                 let snapshot = store.gc_snapshot(seq).unwrap();
-                let located: BTreeSet<String> = store
+                let located_after: BTreeSet<String> = store
                     .reconciliation_scan()
                     .unwrap()
                     .into_iter()
@@ -988,9 +998,9 @@ mod tests {
                         must_survive.insert(object_key.clone());
                     }
                 }
-                for object_key in &must_survive {
+                for object_key in must_survive.intersection(&located_before) {
                     assert!(
-                        located.contains(object_key),
+                        located_after.contains(object_key),
                         "seed {seed}: protected object {object_key} lost its location"
                     );
                 }

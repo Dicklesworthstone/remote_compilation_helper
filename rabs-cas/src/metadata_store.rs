@@ -1864,8 +1864,9 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
     }
 
     fn due_gc_tombstones(&mut self, now_seq: u64) -> Result<Vec<GcTombstoneRow>, StoreError> {
-        let now = i64::try_from(now_seq)
-            .map_err(|_| StoreError::Corruption("now_seq out of range".into()))?;
+        // Clamp: any u64 beyond i64::MAX is later than every storable
+        // deadline, so the clamp is semantically exact.
+        let now = i64::try_from(now_seq).unwrap_or(i64::MAX);
         let rows = self.engine.query(
             "SELECT object_key, store_path, marked_seq, grace_until_seq FROM gc_tombstones \
              WHERE grace_until_seq <= ?1 ORDER BY object_key, store_path",
