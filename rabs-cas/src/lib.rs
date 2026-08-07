@@ -38,3 +38,4 @@
 
 pub mod chunking;
 pub mod manifest_validation;
+pub mod tree_manifest;
