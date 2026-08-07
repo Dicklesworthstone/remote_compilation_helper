@@ -151,6 +151,16 @@ pub const REGISTRY: &[ReasonCode] = &[
         summary: "No prior entry for this action key.",
     },
     ReasonCode {
+        family: ReasonFamily::Key,
+        code: "KEY_RECOMPUTATION_MISMATCH",
+        summary: "Hit refused: action key recomputed from the descriptor differs from the index key.",
+    },
+    ReasonCode {
+        family: ReasonFamily::Storage,
+        code: "STORAGE_DESCRIPTOR_BYTES_MISMATCH",
+        summary: "Hit refused: stored canonical descriptor bytes or independent digest failed verification.",
+    },
+    ReasonCode {
         family: ReasonFamily::Cache,
         code: "CACHE_HIT_VALIDATED",
         summary: "Committed result served after descriptor byte-verification.",
@@ -329,7 +339,7 @@ mod tests {
     fn registry_change_is_deliberate() {
         let fp = registry_fingerprint();
         assert_eq!(
-            fp, 0x0fc5_0136_d95b_0ec6,
+            fp, 0x179c_dad8_0ffc_0675,
             "reason-code registry changed (fingerprint {fp:#x}); codes are \
              append-only within a protocol major — if this change only adds \
              codes, update this golden in the same commit"
