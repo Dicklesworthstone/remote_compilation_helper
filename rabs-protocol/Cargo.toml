@@ -1,0 +1,23 @@
+[package]
+name = "rabs-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Stable RABS domain and wire schemas shared by wrappers, edge, coordinator, workers, gateways, and test harnesses"
+publish = false
+
+[lib]
+doctest = false
+
+# INTENTIONALLY EMPTY: rabs-protocol must never depend on Asupersync, Tokio,
+# network servers, daemon crates, or anything with filesystem/process effects.
+# Dependency-direction CI (bead A002) enforces this.
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"

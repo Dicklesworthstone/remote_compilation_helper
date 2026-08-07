@@ -1,0 +1,24 @@
+[package]
+name = "rabs-action"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Pure RABS action semantics and state machines (build operation, publication, attempt, subscriber delivery)"
+publish = false
+
+[lib]
+doctest = false
+
+# rabs-protocol is the ONLY permitted dependency. No Tokio, no Asupersync,
+# no network/filesystem/process crates. Dependency-direction CI (bead A002)
+# enforces this.
+[dependencies]
+rabs-protocol = { path = "../rabs-protocol" }
+
+[lints.rust]
+unsafe_code = "forbid"

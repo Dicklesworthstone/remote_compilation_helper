@@ -1,0 +1,26 @@
+[package]
+name = "rabs-cas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Durable RABS content-addressed storage, action-cache indexing, object lifecycle, and publication transactions"
+publish = false
+
+[lib]
+doctest = false
+
+# Core storage semantics stay Tokio-free and Asupersync-free; filesystem
+# effects are permitted here (this crate OWNS durable storage). The metadata
+# store abstraction gains a reference-SQLite backend and a gated FrankenSQLite
+# backend in Epic H. Dependency-direction CI (bead A002) forbids Tokio and
+# rabs-asupersync from the core.
+[dependencies]
+rabs-protocol = { path = "../rabs-protocol" }
+
+[lints.rust]
+unsafe_code = "forbid"

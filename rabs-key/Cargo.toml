@@ -1,0 +1,25 @@
+[package]
+name = "rabs-key"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Canonical RABS action-key construction, discovery recipes, presentation variants, and key explainability"
+publish = false
+
+[lib]
+doctest = false
+
+# rabs-protocol is the ONLY permitted dependency (hashing enters later via an
+# explicitly reviewed pure digest crate). No Tokio, no Asupersync, no
+# network/filesystem/process crates. Dependency-direction CI (bead A002)
+# enforces this.
+[dependencies]
+rabs-protocol = { path = "../rabs-protocol" }
+
+[lints.rust]
+unsafe_code = "forbid"
