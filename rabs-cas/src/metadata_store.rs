@@ -146,11 +146,9 @@ pub const MIGRATIONS: &[Migration] = &[
         // is a marked location awaiting its grace window; deletion is
         // NEVER immediate.
         version: 5,
-        statements: &[
-            "CREATE TABLE gc_tombstones (object_key TEXT NOT NULL, \
+        statements: &["CREATE TABLE gc_tombstones (object_key TEXT NOT NULL, \
          store_path TEXT NOT NULL, marked_seq INTEGER NOT NULL, \
-         grace_until_seq INTEGER NOT NULL, PRIMARY KEY (object_key, store_path))",
-        ],
+         grace_until_seq INTEGER NOT NULL, PRIMARY KEY (object_key, store_path))"],
     },
 ];
 

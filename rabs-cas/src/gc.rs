@@ -184,12 +184,6 @@ const fn eviction_layer(class: PolicyClass) -> u8 {
     }
 }
 
-/// Compute a GC plan from one consistent store snapshot. PURE given the
-/// snapshot: calling it twice on an unchanged store yields the identical
-/// plan (the dry-run parity guarantee).
-///
-/// # Errors
-/// Store errors from taking the snapshot or the reconciliation scan.
 /// The single protection judgment shared by plan-time evaluation and the
 /// H022 pre-unlink RECHECK — one implementation, so the two can never
 /// drift apart.
@@ -234,6 +228,12 @@ fn preserved_set(snapshot: &crate::metadata_store::GcSnapshot) -> BTreeSet<Strin
         .collect()
 }
 
+/// Compute a GC plan from one consistent store snapshot. PURE given the
+/// snapshot: calling it twice on an unchanged store yields the identical
+/// plan (the dry-run parity guarantee).
+///
+/// # Errors
+/// Store errors from taking the snapshot or the reconciliation scan.
 pub fn plan_gc(
     store: &mut dyn RabsMetadataStore,
     world: &GcWorld,
@@ -874,7 +874,9 @@ mod tests {
             for _ in 0..(object_count as u64 * 2) {
                 let a = rng.below(u64::from(object_count)) as u8;
                 let b = rng.below(u64::from(object_count)) as u8;
-                store.add_object_edge(&digest(a), &digest(b), "edge").unwrap();
+                store
+                    .add_object_edge(&digest(a), &digest(b), "edge")
+                    .unwrap();
             }
             for tag in 0..object_count {
                 if rng.chance(25) {
@@ -961,7 +963,9 @@ mod tests {
                 if rng.chance(50) {
                     let a = rng.below(u64::from(object_count)) as u8;
                     let b = rng.below(u64::from(object_count)) as u8;
-                    store.add_object_edge(&digest(a), &digest(b), "late").unwrap();
+                    store
+                        .add_object_edge(&digest(a), &digest(b), "late")
+                        .unwrap();
                 }
                 seq += 5;
                 unlink_due(&mut store, &w, mode, seq).unwrap();
