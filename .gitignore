@@ -103,3 +103,7 @@ docs/evidence/fleet_deploy_audit_*.json
 
 # Isolated per-session build dirs (deploy/perf/version target dirs) — never commit
 /target_*/
+
+# === multi-repo ephemeral hygiene 2026-08-06 ===
+# Local agent salvage/scratch (patches, WIP notes) — never source of truth
+/scratchpad/
