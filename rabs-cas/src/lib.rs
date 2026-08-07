@@ -37,5 +37,6 @@
 //! - Filesystem effects are this crate's business; network effects are not.
 
 pub mod chunking;
+pub mod dependency_snapshot;
 pub mod manifest_validation;
 pub mod tree_manifest;
