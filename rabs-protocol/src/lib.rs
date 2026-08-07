@@ -62,6 +62,7 @@ pub mod invocation_record;
 pub mod local_protocol;
 pub mod messages;
 pub mod nextest_runner;
+pub mod nextest_serving_gate;
 pub mod object_model;
 pub mod object_transfer;
 pub mod peer_queues;
