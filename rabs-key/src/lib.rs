@@ -38,6 +38,7 @@
 
 pub mod action_key;
 pub mod authority_binding;
+pub mod build_script_directives;
 pub mod canonical;
 pub mod canonical_layout;
 pub mod dep_info;
