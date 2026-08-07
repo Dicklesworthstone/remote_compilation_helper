@@ -45,4 +45,5 @@ pub mod dependency_snapshot;
 pub mod link_bundle;
 pub mod manifest_validation;
 pub mod materialization;
+pub mod metadata_store;
 pub mod tree_manifest;

@@ -21,6 +21,11 @@ doctest = false
 # rabs-asupersync from the core.
 [dependencies]
 rabs-protocol = { path = "../rabs-protocol" }
+# H009 metadata-store backends: rusqlite (bundled C SQLite) is the
+# reference/differential TRUTH engine; fsqlite (FrankenSQLite, pure Rust)
+# is the dogfood candidate gated by the identical suite (H024).
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+fsqlite = { version = "0.1.19", default-features = false, features = ["native"] }
 
 [lints.rust]
 unsafe_code = "forbid"
