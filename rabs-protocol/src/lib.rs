@@ -57,6 +57,7 @@ pub mod input_evidence;
 pub mod invocation_record;
 pub mod local_protocol;
 pub mod object_model;
+pub mod peer_queues;
 pub mod portability;
 pub mod pressure;
 pub mod raw_bytes;
