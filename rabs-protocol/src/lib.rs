@@ -48,6 +48,7 @@ pub mod authority;
 pub mod authority_matrix;
 pub mod descriptor;
 pub mod framing;
+pub mod generation;
 pub mod invocation_record;
 pub mod local_protocol;
 pub mod raw_bytes;
