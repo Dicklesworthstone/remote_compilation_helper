@@ -51,6 +51,7 @@ pub mod class_policy;
 pub mod compat_doctor;
 pub mod computation_registry;
 pub mod control_reserve;
+pub mod dashboards;
 pub mod decision_receipt;
 pub mod descriptor;
 pub mod domain_plumbing;
