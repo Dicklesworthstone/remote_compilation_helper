@@ -41,5 +41,6 @@ pub mod authority_binding;
 pub mod canonical;
 pub mod epochs;
 pub mod family_key;
+pub mod invocation;
 pub mod key_diff;
 pub mod typed_digest;
