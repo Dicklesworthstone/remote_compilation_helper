@@ -50,6 +50,7 @@ pub mod capability_tokens;
 pub mod class_policy;
 pub mod computation_registry;
 pub mod control_reserve;
+pub mod decision_receipt;
 pub mod descriptor;
 pub mod domain_plumbing;
 pub mod durable_ids;
