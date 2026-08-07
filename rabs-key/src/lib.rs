@@ -36,6 +36,7 @@
 //!   observed bytes; this crate only normalizes, serializes, and hashes.
 //! - No Tokio, no Asupersync.
 
+pub mod action_key;
 pub mod canonical;
 pub mod epochs;
 pub mod typed_digest;
