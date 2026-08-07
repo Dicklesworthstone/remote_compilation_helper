@@ -47,6 +47,7 @@
 pub mod authority;
 pub mod authority_matrix;
 pub mod class_policy;
+pub mod computation_registry;
 pub mod descriptor;
 pub mod durable_ids;
 pub mod envelope;
