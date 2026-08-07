@@ -44,4 +44,5 @@
 //! human/JSON displays use escaped presentation forms without changing the
 //! keyed bytes.
 
+pub mod reason_codes;
 pub mod schema_registry;
