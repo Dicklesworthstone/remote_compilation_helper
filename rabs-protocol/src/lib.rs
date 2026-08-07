@@ -57,6 +57,7 @@ pub mod invocation_record;
 pub mod local_protocol;
 pub mod object_model;
 pub mod portability;
+pub mod pressure;
 pub mod raw_bytes;
 pub mod reason_codes;
 pub mod redaction;
