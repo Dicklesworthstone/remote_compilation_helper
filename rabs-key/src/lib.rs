@@ -35,3 +35,5 @@
 //! - **Zero filesystem, network, or process effects**: callers supply all
 //!   observed bytes; this crate only normalizes, serializes, and hashes.
 //! - No Tokio, no Asupersync.
+
+pub mod canonical;
