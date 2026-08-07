@@ -45,6 +45,7 @@
 //! keyed bytes.
 
 pub mod authority_matrix;
+pub mod raw_bytes;
 pub mod reason_codes;
 pub mod redaction;
 pub mod schema_registry;
