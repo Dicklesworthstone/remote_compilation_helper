@@ -94,6 +94,7 @@ pub mod serving;
 pub mod snapshot_lineage;
 pub mod socket_admission;
 pub mod stateful_delivery;
+pub mod stream_chunker;
 pub mod subscriber_interest;
 pub mod subscriber_queue;
 pub mod transcript_sequencing;
