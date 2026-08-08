@@ -86,6 +86,7 @@ pub mod result_identity;
 pub mod rolling_upgrade;
 pub mod schema_registry;
 pub mod secret_redaction;
+pub mod self_host_bypass;
 pub mod sequence_domains;
 pub mod serving;
 pub mod snapshot_lineage;
