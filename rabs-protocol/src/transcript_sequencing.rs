@@ -199,6 +199,221 @@ impl TranscriptSequencer {
     }
 }
 
+// ---------------------------------------------------------------------
+// Wrapper side (bead C023): complete-frame acceptance, partial-write
+// recovery, and the both-died rule.
+// ---------------------------------------------------------------------
+
+/// Typed refusals from the wrapper-side frame reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameReadError {
+    /// A frame began while another is still partially written — the
+    /// wire is strictly one frame at a time.
+    FrameAlreadyInProgress {
+        /// The partially written sequence.
+        partial_seq: u64,
+    },
+    /// Frame sequence is not the next expected one (duplicate or skip).
+    UnexpectedSequence {
+        /// The sequence the reader expects next.
+        expected: u64,
+    },
+    /// Declared length exceeds the negotiated bound: refused before a
+    /// single payload byte is read (length-bounded frames, R116).
+    FrameTooLarge {
+        /// The declared length.
+        declared: u32,
+        /// The negotiated maximum.
+        max: u32,
+    },
+    /// More payload bytes arrived than the frame declared.
+    Overrun {
+        /// The frame being overrun.
+        seq: u64,
+    },
+    /// Completion was claimed before all declared bytes arrived.
+    Incomplete {
+        /// Bytes received so far.
+        received: u32,
+        /// Bytes the frame declared.
+        declared: u32,
+    },
+    /// No frame is in progress.
+    NoFrameInProgress,
+}
+
+/// A frame whose write began but has not completed — the R116
+/// uncertainty carrier on the wrapper side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialFrame {
+    /// Sequence of the partially written frame.
+    pub seq: u64,
+    /// Declared payload length.
+    pub declared_len: u32,
+    /// Payload bytes received so far (NEVER exposed).
+    pub received: Vec<u8>,
+}
+
+/// The wrapper-side frame reader: accepts ONLY complete length-bounded
+/// frames into the exposed transcript; a partial frame is held privately
+/// and reported as possibly-in-flight on reconnect, never shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameReader {
+    /// Negotiated maximum frame payload length.
+    max_frame_len: u32,
+    /// Frames `1..=exposed` were received complete and shown.
+    exposed: u64,
+    /// Complete frames' payloads, in exposure order (the ONLY bytes the
+    /// user ever sees).
+    exposed_payloads: Vec<Vec<u8>>,
+    /// The one frame whose write may have begun.
+    partial: Option<PartialFrame>,
+}
+
+impl FrameReader {
+    /// A fresh reader with the negotiated frame bound.
+    #[must_use]
+    pub const fn new(max_frame_len: u32) -> Self {
+        Self {
+            max_frame_len,
+            exposed: 0,
+            exposed_payloads: Vec::new(),
+            partial: None,
+        }
+    }
+
+    /// Last fully exposed sequence.
+    #[must_use]
+    pub const fn exposed(&self) -> u64 {
+        self.exposed
+    }
+
+    /// Payloads of fully exposed frames (fixture visibility).
+    #[must_use]
+    pub fn exposed_payloads(&self) -> &[Vec<u8>] {
+        &self.exposed_payloads
+    }
+
+    /// Begin receiving the next frame's payload.
+    ///
+    /// # Errors
+    /// Typed [`FrameReadError`]; nothing is buffered on refusal.
+    pub fn begin_frame(&mut self, seq: u64, declared_len: u32) -> Result<(), FrameReadError> {
+        if let Some(partial) = &self.partial {
+            return Err(FrameReadError::FrameAlreadyInProgress {
+                partial_seq: partial.seq,
+            });
+        }
+        if seq != self.exposed + 1 {
+            return Err(FrameReadError::UnexpectedSequence {
+                expected: self.exposed + 1,
+            });
+        }
+        if declared_len > self.max_frame_len {
+            return Err(FrameReadError::FrameTooLarge {
+                declared: declared_len,
+                max: self.max_frame_len,
+            });
+        }
+        self.partial = Some(PartialFrame {
+            seq,
+            declared_len,
+            received: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// Feed payload bytes for the in-progress frame.
+    ///
+    /// # Errors
+    /// Typed [`FrameReadError`].
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), FrameReadError> {
+        let Some(partial) = &mut self.partial else {
+            return Err(FrameReadError::NoFrameInProgress);
+        };
+        if partial.received.len() + bytes.len() > partial.declared_len as usize {
+            return Err(FrameReadError::Overrun { seq: partial.seq });
+        }
+        partial.received.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Complete the in-progress frame: ONLY a byte-complete frame is
+    /// exposed; anything less stays partial and unexposed.
+    ///
+    /// # Errors
+    /// Typed [`FrameReadError`]; the partial frame is retained on
+    /// refusal (it is still the uncertainty carrier).
+    pub fn complete_frame(&mut self) -> Result<u64, FrameReadError> {
+        let Some(partial) = &self.partial else {
+            return Err(FrameReadError::NoFrameInProgress);
+        };
+        let received = u32::try_from(partial.received.len())
+            .map_err(|_| FrameReadError::Overrun { seq: partial.seq })?;
+        if received != partial.declared_len {
+            return Err(FrameReadError::Incomplete {
+                received,
+                declared: partial.declared_len,
+            });
+        }
+        let complete = self.partial.take().expect("checked above");
+        self.exposed = complete.seq;
+        self.exposed_payloads.push(complete.received);
+        Ok(self.exposed)
+    }
+
+    /// The wrapper's truthful reconnect report (C014): last fully
+    /// exposed sequence AND any frame whose write may have begun. The
+    /// partial frame's bytes are NOT in the report — a partial frame
+    /// was never exposed, so replaying it whole duplicates nothing.
+    #[must_use]
+    pub fn resume_report(&self) -> crate::reconnect::WrapperResumeReport {
+        crate::reconnect::WrapperResumeReport {
+            last_fully_exposed_seq: self.exposed,
+            possibly_in_flight_seq: self.partial.as_ref().map(|p| p.seq),
+            frontier: SubscriberFrontierReport {
+                transcript_exposed: self.exposed > 0,
+                transcript_uncertain: self.partial.is_some(),
+                stateful_intent_recorded: false,
+                stateful_uncertain: false,
+                last_fully_delivered_seq: self.exposed,
+            },
+        }
+    }
+}
+
+/// Where a later invocation goes after a crash (C023's both-died rule).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostCrashPath {
+    /// The wrapper survived with its reader state and token: reconnect
+    /// and reconcile (C014) against the edge or its named successor.
+    ReconnectAndResume,
+    /// The wrapper's exposure state is GONE (wrapper died — with or
+    /// without the edge): what reached the user's terminal is
+    /// unknowable, so the Cargo command has simply failed; a later
+    /// invocation starts a NEW BuildOperation instead of replaying an
+    /// unknowable partial transcript.
+    NewBuildOperation {
+        /// Why no resume exists.
+        reason: &'static str,
+    },
+}
+
+/// Decide the post-crash path. Resume requires the WRAPPER's state:
+/// the edge's retention can replay frames, but only the wrapper knows
+/// what was exposed — without it, uncertainty is unresolvable and the
+/// only honest continuation is a fresh operation.
+#[must_use]
+pub const fn post_crash_path(wrapper_state_intact: bool) -> PostCrashPath {
+    if wrapper_state_intact {
+        PostCrashPath::ReconnectAndResume
+    } else {
+        PostCrashPath::NewBuildOperation {
+            reason: "wrapper exposure state lost: partial transcript is unknowable (R116)",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +578,128 @@ mod tests {
             }
             other => panic!("expected labeled recovery, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn c023_partial_frame_crash_fixtures_resolve_to_correct_uncertainty() {
+        // THE C023 acceptance: a 4-frame stream with distinct payloads;
+        // kill the connection at EVERY byte offset of every frame. The
+        // reader must report exposed = complete frames only, the
+        // partial frame as possibly-in-flight, and C014 reconcile must
+        // resume exactly there with the in-flight flag — while the
+        // exposed transcript contains no partial bytes at any kill
+        // point.
+        let payloads: [&[u8]; 4] = [b"one", b"two2", b"three33", b"x"];
+        // Edge lane with the full stream (the replay source).
+        let mut edge = TranscriptSequencer::new(64);
+        for p in payloads {
+            edge.assign(p.to_vec());
+        }
+        for frame in 0..payloads.len() {
+            for cut in 0..=payloads[frame].len() {
+                let complete_before = frame as u64;
+                let mut reader = FrameReader::new(64);
+                // Frames before the kill frame arrive complete.
+                for (i, p) in payloads.iter().take(frame).enumerate() {
+                    reader
+                        .begin_frame(i as u64 + 1, u32::try_from(p.len()).unwrap())
+                        .unwrap();
+                    reader.feed(p).unwrap();
+                    reader.complete_frame().unwrap();
+                }
+                // The kill frame: header + `cut` payload bytes arrive.
+                reader
+                    .begin_frame(
+                        complete_before + 1,
+                        u32::try_from(payloads[frame].len()).unwrap(),
+                    )
+                    .unwrap();
+                reader.feed(&payloads[frame][..cut]).unwrap();
+                // A cut mid-frame can NEVER expose it.
+                if cut < payloads[frame].len() {
+                    assert!(matches!(
+                        reader.complete_frame(),
+                        Err(FrameReadError::Incomplete { .. })
+                    ));
+                }
+                let report = reader.resume_report();
+                assert_eq!(report.last_fully_exposed_seq, complete_before);
+                assert_eq!(
+                    report.possibly_in_flight_seq,
+                    Some(complete_before + 1),
+                    "frame={frame} cut={cut}: the begun frame is the uncertainty"
+                );
+                assert!(report.frontier.transcript_uncertain);
+                // No partial bytes ever reached the exposed transcript.
+                assert_eq!(
+                    reader.exposed_payloads(),
+                    payloads[..frame]
+                        .iter()
+                        .map(|p| p.to_vec())
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    "frame={frame} cut={cut}"
+                );
+                // C014 reconcile: resume at the begun frame, flagged
+                // in-flight; replayable from edge retention.
+                let plan = reconcile(
+                    &token(),
+                    BuildOperationId(10),
+                    SubscriberId(20),
+                    &SECRET,
+                    &edge.resume_view(5, None),
+                    &report,
+                )
+                .unwrap();
+                assert_eq!(plan.resume_from_seq, complete_before + 1);
+                assert!(plan.first_frame_was_in_flight);
+                assert!(edge.retained(plan.resume_from_seq).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn c023_only_complete_length_bounded_frames_are_accepted() {
+        let mut reader = FrameReader::new(8);
+        // Oversized declaration refuses before any payload byte.
+        assert_eq!(
+            reader.begin_frame(1, 9),
+            Err(FrameReadError::FrameTooLarge {
+                declared: 9,
+                max: 8
+            })
+        );
+        // In-order, bounded frame accepted; overrun refuses.
+        reader.begin_frame(1, 3).unwrap();
+        reader.feed(b"ab").unwrap();
+        assert_eq!(reader.feed(b"cd"), Err(FrameReadError::Overrun { seq: 1 }));
+        reader.feed(b"c").unwrap();
+        assert_eq!(reader.complete_frame().unwrap(), 1);
+        // A second frame cannot begin while one is partial.
+        reader.begin_frame(2, 2).unwrap();
+        assert_eq!(
+            reader.begin_frame(3, 2),
+            Err(FrameReadError::FrameAlreadyInProgress { partial_seq: 2 })
+        );
+        // Duplicate/skipped sequences refuse.
+        let mut fresh = FrameReader::new(8);
+        assert_eq!(
+            fresh.begin_frame(2, 1),
+            Err(FrameReadError::UnexpectedSequence { expected: 1 })
+        );
+    }
+
+    #[test]
+    fn c023_both_died_starts_a_new_build_operation() {
+        // Wrapper state intact: reconnect + reconcile.
+        assert_eq!(post_crash_path(true), PostCrashPath::ReconnectAndResume);
+        // Wrapper state gone (both died, or wrapper alone): the command
+        // has failed; a later invocation is a NEW BuildOperation — no
+        // replay of an unknowable partial transcript.
+        let PostCrashPath::NewBuildOperation { reason } = post_crash_path(false) else {
+            panic!("lost wrapper state must not resume");
+        };
+        assert!(reason.contains("unknowable"));
     }
 
     #[test]
