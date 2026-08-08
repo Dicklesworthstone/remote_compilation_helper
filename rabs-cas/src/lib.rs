@@ -51,6 +51,7 @@ pub mod link_bundle;
 pub mod manifest_validation;
 pub mod materialization;
 pub mod metadata_store;
+pub mod pack;
 pub mod pin_leases;
 pub mod publication;
 pub mod serving_state;
