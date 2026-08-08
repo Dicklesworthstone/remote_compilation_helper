@@ -539,7 +539,9 @@ mod tests {
         // once it acks, the wrapper's final act is the C024 relay —
         // which preserves the status EXACTLY. Composed here: run a
         // delivery to completion, then relay each child termination.
-        use crate::stateful_delivery::{DeliveryEngine, DeliveryItemKind, DeliveryPlan, VisibleWorld};
+        use crate::stateful_delivery::{
+            DeliveryEngine, DeliveryItemKind, DeliveryPlan, VisibleWorld,
+        };
         let plan = DeliveryPlan::new(vec![
             DeliveryItemKind::StatefulWrite,
             DeliveryItemKind::Terminal,
@@ -574,10 +576,7 @@ mod tests {
         // no-resignal fallback, and exits are bit-exact everywhere.
         for signal_number in 1..=31 {
             assert_eq!(
-                relay_child_termination(
-                    ChildTermination::Signaled { signal_number },
-                    true
-                ),
+                relay_child_termination(ChildTermination::Signaled { signal_number }, true),
                 RelayAction::RestoreDefaultAndResignal { signal_number },
                 "signal {signal_number} must never translate on a resignal platform"
             );
