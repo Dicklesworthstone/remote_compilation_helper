@@ -41,8 +41,9 @@ use rabs_protocol::serving::ServingValidity;
 /// v9 = H040 revisioned authority-bound serving state; v10 = H026
 /// append-only divergence incidents; v11 = H029 evidence rows name the
 /// canonical result manifest they support; v12 = H032 location rows
-/// carry their durability state).
-pub const SCHEMA_VERSION: u32 = 12;
+/// carry their durability state; v13 = H028 provisional-ancestor
+/// lineage + adoption edges).
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -287,6 +288,29 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 12,
         statements: &["ALTER TABLE object_locations ADD COLUMN durable INTEGER NOT NULL DEFAULT 0"],
     },
+    Migration {
+        // H028: provisional-ancestor lineage (I32; risk R64). A committed
+        // consumer NAMES every producer whose provisional output it
+        // consumed — rows are written in the SAME transaction as the
+        // publication pointer, so the transitive closure walk at a later
+        // dependent's commit reads durable truth, never offer-time
+        // claims. Adoption edges are the coordinator's explicit,
+        // authority-gated declaration that a consumed losing-attempt
+        // object is compatible with the winning attempt's committed
+        // object for the same logical output.
+        version: 13,
+        statements: &[
+            "CREATE TABLE provisional_ancestry (consumer_action_key TEXT NOT NULL, \
+         producer_action_key TEXT NOT NULL, role TEXT NOT NULL, \
+         virtual_path BLOB NOT NULL, object_key TEXT NOT NULL, \
+         adopted INTEGER NOT NULL, \
+         PRIMARY KEY (consumer_action_key, producer_action_key, role, virtual_path))",
+            "CREATE TABLE adoption_edges (producer_action_key TEXT NOT NULL, \
+         role TEXT NOT NULL, virtual_path BLOB NOT NULL, \
+         from_object_key TEXT NOT NULL, to_object_key TEXT NOT NULL, \
+         PRIMARY KEY (producer_action_key, role, virtual_path, from_object_key))",
+        ],
+    },
 ];
 
 /// Typed store errors (comparable so the differential harness can assert
@@ -432,6 +456,29 @@ pub struct PublicationRow {
     pub pin_id: u128,
     /// Pin owner recorded for the publication reachability root.
     pub pin_owner: String,
+    /// Verified provisional-ancestor lineage, written in the SAME
+    /// transaction as the publication pointer (H028; I32). Empty when
+    /// the result consumed no provisional outputs.
+    pub provisional_ancestors: Vec<ProvisionalAncestorRow>,
+}
+
+/// One verified provisional-ancestor lineage row (H028): the consumer
+/// consumed `object_key` as the producer's `(role, virtual_path)`
+/// provisional output; `adopted` records that compatibility went through
+/// an explicit adoption edge rather than exact-object identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionalAncestorRow {
+    /// Digest key of the producer action.
+    pub producer_action_key: String,
+    /// Role tag of the consumed logical output.
+    pub role: String,
+    /// Canonical virtual path bytes of the consumed logical output.
+    pub virtual_path: Vec<u8>,
+    /// Digest key of the exact object the consumer consumed.
+    pub object_key: String,
+    /// Whether an explicit adoption edge (not exact-object identity)
+    /// established compatibility.
+    pub adopted: bool,
 }
 
 /// Result kind tag persisted with a publication.
