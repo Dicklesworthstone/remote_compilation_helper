@@ -4856,6 +4856,7 @@ dependencies = [
 name = "rabs-cas"
 version = "1.0.56"
 dependencies = [
+ "blake3",
  "fsqlite",
  "rabs-protocol",
  "rusqlite",

@@ -29,6 +29,10 @@ fsqlite = { version = "0.1.19", default-features = false, features = ["native"] 
 # Reviewed pure digest crate (F034 pattern): independent recompute of
 # result-projection digests during publication admission (H011).
 sha2 = { workspace = true }
+# Reviewed pure digest crate: fast LOCAL fingerprints only (H002) —
+# structurally kept out of TypedDigest so a BLAKE3 value can never enter
+# authoritative metadata as an identity digest.
+blake3 = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

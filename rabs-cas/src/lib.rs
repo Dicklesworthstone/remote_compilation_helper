@@ -44,6 +44,7 @@ pub mod closure_validation;
 pub mod collision_policy;
 pub mod crash_matrix;
 pub mod dependency_snapshot;
+pub mod digest_set;
 pub mod gc;
 pub mod link_bundle;
 pub mod manifest_validation;
