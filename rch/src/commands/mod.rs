@@ -647,6 +647,7 @@ mod tests {
                 remote_base: "/tmp/rch".to_string(),
                 max_transfer_mb: None,
                 max_transfer_time_ms: None,
+                sync_timeout_ms: None,
                 bwlimit_kbps: None,
                 estimated_bandwidth_bps: None,
                 adaptive_compression: false,

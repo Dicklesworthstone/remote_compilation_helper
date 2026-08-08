@@ -28,7 +28,6 @@
 //!   AGENT after the hook allows them — the hook never observes their
 //!   outcome, so they cannot be recorded here.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use rabs_protocol::invocation_record::{
@@ -120,7 +119,11 @@ pub(super) fn record_to_ndjson(record: &InvocationRecord) -> String {
 
 /// Spool file path.
 fn spool_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|dir| dir.join("rch").join("rabs-corpus").join("invocations.ndjsonl"))
+    dirs::cache_dir().map(|dir| {
+        dir.join("rch")
+            .join("rabs-corpus")
+            .join("invocations.ndjsonl")
+    })
 }
 
 /// Append one line with single-file rotation at `max_bytes`. Fail-open:
@@ -207,7 +210,10 @@ mod tests {
             Some(ToolKind::Nextest)
         );
         assert_eq!(tool_kind_for(CompilationKind::Rustc), Some(ToolKind::Rustc));
-        assert_eq!(tool_kind_for(CompilationKind::Gcc), Some(ToolKind::NativeCc));
+        assert_eq!(
+            tool_kind_for(CompilationKind::Gcc),
+            Some(ToolKind::NativeCc)
+        );
         assert_eq!(
             tool_kind_for(CompilationKind::Clangpp),
             Some(ToolKind::NativeCxx)
@@ -228,9 +234,7 @@ mod tests {
 
     #[test]
     fn b002_ndjson_lines_validate_against_the_schema_and_carry_no_secrets() {
-        let argv = [RawBytes::from(
-            "cargo publish --token=tok_live_supersecret",
-        )];
+        let argv = [RawBytes::from("cargo publish --token=tok_live_supersecret")];
         let env = [(
             RawBytes::from("CARGO_REGISTRY_TOKEN"),
             RawBytes::from("tok_live_supersecret"),
@@ -248,7 +252,10 @@ mod tests {
         // Validates as one JSON object with the schema fields.
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(parsed["schema"], "rabs.invocation-record");
-        assert_eq!(parsed["schema_version"], u64::from(INVOCATION_RECORD_VERSION));
+        assert_eq!(
+            parsed["schema_version"],
+            u64::from(INVOCATION_RECORD_VERSION)
+        );
         assert_eq!(parsed["tool"], "CargoWholeCommand");
         assert_eq!(parsed["outcome_kind"], "exited");
         assert_eq!(parsed["outcome_value"], 0);

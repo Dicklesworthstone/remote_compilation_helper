@@ -15,6 +15,10 @@ rch-telemetry = { path = "../rch-telemetry" }
 # RABS B002: the invocation recorder emits B001 corpus records from the
 # live hook path. Zero-dependency schema crate.
 rabs-protocol = { path = "../rabs-protocol" }
+# Clean-overlay archive materialization (transfer.rs) uses tempfile at
+# RUNTIME since bd-glivu's per-attempt retry fix; dev-dependencies alone
+# left `cargo check -p rch` broken.
+tempfile = "3.25.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
