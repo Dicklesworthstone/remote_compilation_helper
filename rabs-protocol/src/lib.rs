@@ -93,6 +93,7 @@ pub mod serving;
 pub mod snapshot_lineage;
 pub mod stateful_delivery;
 pub mod subscriber_interest;
+pub mod subscriber_queue;
 pub mod transcript_sequencing;
 pub mod trust_domain;
 pub mod version_negotiation;
