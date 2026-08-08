@@ -516,6 +516,17 @@ pub struct EdgeHandoffRow {
     pub begun_seq: u64,
 }
 
+/// One recorded verification sample (H033 trust-evaluation input).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationSampleRow {
+    /// Attempt id, hex.
+    pub attempt_hex: String,
+    /// Whether the verification passed.
+    pub passed: bool,
+    /// Logical sequence of the sample.
+    pub seq: u64,
+}
+
 /// The narrow transactional metadata interface (plan §62). Every method
 /// is one transaction in the backing engine.
 pub trait RabsMetadataStore {
@@ -711,6 +722,23 @@ pub trait RabsMetadataStore {
         passed: bool,
         seq: u64,
     ) -> Result<(), StoreError>;
+
+    /// Canonical evidence-ID keys (`domain:hex`) recorded for an action,
+    /// sorted (H033 evidence-set input). Keys, not typed digests, so a
+    /// fresh process can enumerate history without re-typing domains it
+    /// never wrote (R121).
+    fn list_evidence_keys(&mut self, action: &TypedDigest) -> Result<Vec<String>, StoreError>;
+
+    /// All verification samples recorded for an action, ordered by
+    /// (attempt, seq).
+    fn list_verification_samples(
+        &mut self,
+        action: &TypedDigest,
+    ) -> Result<Vec<VerificationSampleRow>, StoreError>;
+
+    /// The worker that ran an attempt (addressed by hex id), if the
+    /// attempt exists.
+    fn attempt_worker_by_hex(&mut self, attempt_hex: &str) -> Result<Option<String>, StoreError>;
 
     /// Take a GC snapshot (and record the run).
     fn gc_snapshot(&mut self, seq: u64) -> Result<GcSnapshot, StoreError>;
@@ -2154,6 +2182,63 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             )?;
             Ok(())
         })
+    }
+
+    fn list_evidence_keys(&mut self, action: &TypedDigest) -> Result<Vec<String>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT evidence_domain, evidence_bytes FROM action_evidence_index \
+             WHERE action_key = ?1 ORDER BY evidence_domain, evidence_bytes",
+            &[SqlValue::Text(digest_key(action))],
+        )?;
+        rows.iter()
+            .map(|row| {
+                let [domain, bytes] = row.as_slice() else {
+                    return Err(StoreError::Corruption("evidence row shape".into()));
+                };
+                let SqlValue::Blob(bytes) = bytes else {
+                    return Err(StoreError::Corruption("evidence bytes shape".into()));
+                };
+                Ok(format!(
+                    "{}:{}",
+                    expect_text(domain, "evidence domain")?,
+                    hex(bytes)
+                ))
+            })
+            .collect()
+    }
+
+    fn list_verification_samples(
+        &mut self,
+        action: &TypedDigest,
+    ) -> Result<Vec<VerificationSampleRow>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT attempt_hex, passed, seq FROM verification_samples \
+             WHERE action_key = ?1 ORDER BY attempt_hex, seq",
+            &[SqlValue::Text(digest_key(action))],
+        )?;
+        rows.iter()
+            .map(|row| {
+                let [attempt_hex, passed, seq] = row.as_slice() else {
+                    return Err(StoreError::Corruption("verification sample shape".into()));
+                };
+                Ok(VerificationSampleRow {
+                    attempt_hex: expect_text(attempt_hex, "attempt_hex")?,
+                    passed: expect_u64(passed, "passed")? != 0,
+                    seq: expect_u64(seq, "seq")?,
+                })
+            })
+            .collect()
+    }
+
+    fn attempt_worker_by_hex(&mut self, attempt_hex: &str) -> Result<Option<String>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT worker FROM action_attempts WHERE id_hex = ?1",
+            &[SqlValue::Text(attempt_hex.to_owned())],
+        )?;
+        match rows.first().and_then(|r| r.first()) {
+            None => Ok(None),
+            Some(v) => Ok(Some(expect_text(v, "worker")?)),
+        }
     }
 
     fn gc_snapshot(&mut self, seq: u64) -> Result<GcSnapshot, StoreError> {

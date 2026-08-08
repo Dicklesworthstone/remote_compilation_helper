@@ -52,3 +52,4 @@ pub mod pin_leases;
 pub mod publication;
 pub mod startup_reconciliation;
 pub mod tree_manifest;
+pub mod trust_evidence;
