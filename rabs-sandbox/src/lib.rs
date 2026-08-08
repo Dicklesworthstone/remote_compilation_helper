@@ -32,6 +32,7 @@
 //!   binary listed in the unsafe-boundary ledger — never in this library.
 
 pub mod edit_watcher;
+pub mod env_builder;
 pub mod external_inputs;
 pub mod layout;
 pub mod leak_scanner;
