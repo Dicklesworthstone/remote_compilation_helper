@@ -50,6 +50,7 @@ pub mod materialization;
 pub mod metadata_store;
 pub mod pin_leases;
 pub mod publication;
+pub mod serving_state;
 pub mod startup_reconciliation;
 pub mod tree_manifest;
 pub mod trust_evidence;

@@ -35,9 +35,11 @@
 use std::collections::HashMap;
 
 use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
+use rabs_protocol::serving::ServingValidity;
 
-/// Current schema version (v8 = the full H038 authoritative table set).
-pub const SCHEMA_VERSION: u32 = 8;
+/// Current schema version (v8 = the full H038 authoritative table set;
+/// v9 = H040 revisioned authority-bound serving state).
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -220,6 +222,29 @@ pub const MIGRATIONS: &[Migration] = &[
          updated_seq INTEGER NOT NULL)",
         ],
     },
+    Migration {
+        // H040: revisioned authority-bound serving state with a durable
+        // conservative validity window (R126). Blocking quarantines are
+        // NAMED rows in a junction table — a reason string is never the
+        // gate. Legacy rows carry state_revision 0, so every H040 write
+        // (revision >= 1) supersedes them.
+        version: 9,
+        statements: &[
+            "ALTER TABLE action_serving_states ADD COLUMN state_revision INTEGER NOT NULL \
+         DEFAULT 0",
+            "ALTER TABLE action_serving_states ADD COLUMN authority_key TEXT NOT NULL \
+         DEFAULT ''",
+            "ALTER TABLE action_serving_states ADD COLUMN evaluated_at_micros INTEGER NOT NULL \
+         DEFAULT 0",
+            "ALTER TABLE action_serving_states ADD COLUMN max_age_micros INTEGER",
+            "ALTER TABLE action_serving_states ADD COLUMN clock_uncertainty_micros INTEGER \
+         NOT NULL DEFAULT 0",
+            "ALTER TABLE action_serving_states ADD COLUMN clock_epoch INTEGER NOT NULL \
+         DEFAULT 0",
+            "CREATE TABLE serving_blocking_quarantines (action_key TEXT NOT NULL, \
+         scope TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY (action_key, scope, subject))",
+        ],
+    },
 ];
 
 /// Typed store errors (comparable so the differential harness can assert
@@ -291,6 +316,12 @@ pub enum StoreError {
     AppendConflict(String),
     /// Referenced materialization record does not exist.
     UnknownMaterialization,
+    /// Serving-state revision not strictly greater than the stored one
+    /// (replayed or stale evaluation; H040).
+    StaleServingRevision,
+    /// A named blocking quarantine row does not exist — references are
+    /// the authority, so dangling ones are refused at write.
+    UnknownQuarantineReference,
     /// A digest domain was read back that this process never wrote —
     /// fail-closed (R121), never silently re-typed.
     DomainNotInterned(String),
@@ -514,6 +545,25 @@ pub struct EdgeHandoffRow {
     pub predecessor_incarnation: u128,
     /// Logical sequence when the handoff began.
     pub begun_seq: u64,
+}
+
+/// One revisioned, authority-bound serving-state record (H040). The
+/// legacy `disposition`-only rows read back with `state_revision` 0 and
+/// an empty authority key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServingRecordRow {
+    /// Serving disposition string (`"servable"`, `"evidence-pending"`,
+    /// `"quarantined"`, ...).
+    pub disposition: String,
+    /// Monotonic revision; replays are refused, never overwritten.
+    pub state_revision: u64,
+    /// Digest key of the authority that evaluated this state.
+    pub authority_key: String,
+    /// Conservative durable validity window (R126).
+    pub validity: ServingValidity,
+    /// NAMED blocking quarantine rows (scope tag, subject), sorted. The
+    /// references are the gate — a reason string never is.
+    pub blocking: Vec<(String, String)>,
 }
 
 /// One recorded verification sample (H033 trust-evaluation input).
@@ -1077,6 +1127,28 @@ pub trait RabsMetadataStore {
 
     /// Current state of a materialization record, if it exists.
     fn materialization_state(&mut self, id: u128) -> Result<Option<String>, StoreError>;
+
+    // --- H040: revisioned authority-bound serving state ---
+
+    /// Write a serving-state record in ONE transaction: the revision
+    /// must be strictly greater than the stored one (legacy rows are
+    /// revision 0, so H040 records start at 1); every named blocking
+    /// quarantine must exist; the record is stamped with the ACTIVE
+    /// authority's digest key. The junction reference set is replaced
+    /// atomically with the row.
+    fn put_serving_record(
+        &mut self,
+        authority: &TypedDigest,
+        action_key: &str,
+        disposition: &str,
+        state_revision: u64,
+        validity: &ServingValidity,
+        blocking: &[(QuarantineScope, String)],
+    ) -> Result<(), StoreError>;
+
+    /// The full serving record for an action key, if a row exists
+    /// (legacy rows read back at revision 0 with defaults).
+    fn serving_record(&mut self, action_key: &str) -> Result<Option<ServingRecordRow>, StoreError>;
 
     /// Deterministic dump of every table for differential comparison.
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError>;
@@ -1729,11 +1801,20 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     SqlValue::Text(u128_hex(row.pin_id)),
                 ],
             )?;
-            engine.execute(
-                "INSERT OR REPLACE INTO action_serving_states (action_key, disposition, version) \
-                 VALUES (?1, 'servable', 1)",
+            // Disposition-only write: UPDATE first so the H040 revision
+            // and validity columns are never silently reset by a legacy
+            // path.
+            let serving_changed = engine.execute(
+                "UPDATE action_serving_states SET disposition = 'servable' WHERE action_key = ?1",
                 &[SqlValue::Text(action.clone())],
             )?;
+            if serving_changed == 0 {
+                engine.execute(
+                    "INSERT INTO action_serving_states (action_key, disposition, version) \
+                     VALUES (?1, 'servable', 1)",
+                    &[SqlValue::Text(action.clone())],
+                )?;
+            }
             // The winner's evidence association, SAME transaction (H011).
             let [e_algo, e_domain, e_bytes] =
                 SqlMetadataStore::<E>::digest_params(&row.evidence_digest);
@@ -2692,11 +2773,22 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         let action_key = action_key.to_owned();
         let disposition = disposition.to_owned();
         self.in_txn(move |engine| {
-            engine.execute(
-                "INSERT OR REPLACE INTO action_serving_states (action_key, disposition, version) \
-                 VALUES (?1, ?2, 1)",
-                &[SqlValue::Text(action_key), SqlValue::Text(disposition)],
+            // UPDATE first: a disposition-only write must never reset
+            // the H040 revision/validity columns to their defaults.
+            let changed = engine.execute(
+                "UPDATE action_serving_states SET disposition = ?2 WHERE action_key = ?1",
+                &[
+                    SqlValue::Text(action_key.clone()),
+                    SqlValue::Text(disposition.clone()),
+                ],
             )?;
+            if changed == 0 {
+                engine.execute(
+                    "INSERT INTO action_serving_states (action_key, disposition, version) \
+                     VALUES (?1, ?2, 1)",
+                    &[SqlValue::Text(action_key), SqlValue::Text(disposition)],
+                )?;
+            }
             Ok(())
         })
     }
@@ -3569,6 +3661,159 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         }
     }
 
+    fn put_serving_record(
+        &mut self,
+        authority: &TypedDigest,
+        action_key: &str,
+        disposition: &str,
+        state_revision: u64,
+        validity: &ServingValidity,
+        blocking: &[(QuarantineScope, String)],
+    ) -> Result<(), StoreError> {
+        let authority = authority.clone();
+        let action_key = action_key.to_owned();
+        let disposition = disposition.to_owned();
+        let revision = to_seq(state_revision, "state_revision")?;
+        let evaluated_at = validity.evaluated_at_unix_micros;
+        let max_age = validity
+            .maximum_age_micros
+            .map(|v| to_seq(v, "max_age_micros"))
+            .transpose()?;
+        let uncertainty = to_seq(
+            validity.clock_uncertainty_micros,
+            "clock_uncertainty_micros",
+        )?;
+        let epoch = to_seq(validity.coordinator_clock_epoch, "clock_epoch")?;
+        let blocking: Vec<(String, String)> = blocking
+            .iter()
+            .map(|(scope, subject)| (scope.as_str().to_owned(), subject.clone()))
+            .collect();
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let stored = engine.query(
+                "SELECT state_revision FROM action_serving_states WHERE action_key = ?1",
+                &[SqlValue::Text(action_key.clone())],
+            )?;
+            let stored_revision = match stored.first().and_then(|r| r.first()) {
+                None => None,
+                Some(v) => Some(expect_u64(v, "state_revision")?),
+            };
+            // Legacy rows are revision 0; H040 records start at 1.
+            if state_revision == 0 || stored_revision.is_some_and(|s| state_revision <= s) {
+                return Err(StoreError::StaleServingRevision);
+            }
+            // Every NAMED blocking quarantine must exist (references are
+            // the authority; dangling ones are refused at write).
+            for (scope, subject) in &blocking {
+                let exists = engine.query(
+                    "SELECT scope FROM quarantines WHERE scope = ?1 AND subject = ?2",
+                    &[
+                        SqlValue::Text(scope.clone()),
+                        SqlValue::Text(subject.clone()),
+                    ],
+                )?;
+                if exists.is_empty() {
+                    return Err(StoreError::UnknownQuarantineReference);
+                }
+            }
+            engine.execute(
+                "INSERT OR REPLACE INTO action_serving_states \
+                 (action_key, disposition, version, state_revision, authority_key, \
+                  evaluated_at_micros, max_age_micros, clock_uncertainty_micros, clock_epoch) \
+                 VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    SqlValue::Text(action_key.clone()),
+                    SqlValue::Text(disposition),
+                    SqlValue::Int(revision),
+                    SqlValue::Text(digest_key(&authority)),
+                    SqlValue::Int(evaluated_at),
+                    max_age.map_or(SqlValue::Null, SqlValue::Int),
+                    SqlValue::Int(uncertainty),
+                    SqlValue::Int(epoch),
+                ],
+            )?;
+            // Replace the reference set atomically with the row.
+            engine.execute(
+                "DELETE FROM serving_blocking_quarantines WHERE action_key = ?1",
+                &[SqlValue::Text(action_key.clone())],
+            )?;
+            for (scope, subject) in &blocking {
+                engine.execute(
+                    "INSERT OR IGNORE INTO serving_blocking_quarantines \
+                     (action_key, scope, subject) VALUES (?1, ?2, ?3)",
+                    &[
+                        SqlValue::Text(action_key.clone()),
+                        SqlValue::Text(scope.clone()),
+                        SqlValue::Text(subject.clone()),
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    fn serving_record(&mut self, action_key: &str) -> Result<Option<ServingRecordRow>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT disposition, state_revision, authority_key, evaluated_at_micros, \
+             max_age_micros, clock_uncertainty_micros, clock_epoch \
+             FROM action_serving_states WHERE action_key = ?1",
+            &[SqlValue::Text(action_key.to_owned())],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let [
+            disposition,
+            revision,
+            authority_key,
+            evaluated_at,
+            max_age,
+            uncertainty,
+            epoch,
+        ] = row.as_slice()
+        else {
+            return Err(StoreError::Corruption("serving record shape".into()));
+        };
+        let evaluated_at = match evaluated_at {
+            SqlValue::Int(v) => *v,
+            _ => return Err(StoreError::Corruption("evaluated_at_micros shape".into())),
+        };
+        let max_age = match max_age {
+            SqlValue::Null => None,
+            SqlValue::Int(_) => Some(expect_u64(max_age, "max_age_micros")?),
+            _ => return Err(StoreError::Corruption("max_age_micros shape".into())),
+        };
+        let blocking_rows = self.engine.query(
+            "SELECT scope, subject FROM serving_blocking_quarantines \
+             WHERE action_key = ?1 ORDER BY scope, subject",
+            &[SqlValue::Text(action_key.to_owned())],
+        )?;
+        let blocking = blocking_rows
+            .iter()
+            .map(|row| {
+                let [scope, subject] = row.as_slice() else {
+                    return Err(StoreError::Corruption("blocking reference shape".into()));
+                };
+                Ok((
+                    expect_text(scope, "scope")?,
+                    expect_text(subject, "subject")?,
+                ))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        Ok(Some(ServingRecordRow {
+            disposition: expect_text(disposition, "disposition")?,
+            state_revision: expect_u64(revision, "state_revision")?,
+            authority_key: expect_text(authority_key, "authority_key")?,
+            validity: ServingValidity {
+                evaluated_at_unix_micros: evaluated_at,
+                maximum_age_micros: max_age,
+                clock_uncertainty_micros: expect_u64(uncertainty, "clock_uncertainty_micros")?,
+                coordinator_clock_epoch: expect_u64(epoch, "clock_epoch")?,
+            },
+            blocking,
+        }))
+    }
+
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError> {
         // Deterministic dump: every table, every column, ordered rows.
         const DUMPS: &[(&str, &str)] = &[
@@ -3614,8 +3859,14 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             ),
             (
                 "action_serving_states",
-                "SELECT action_key, disposition, version FROM action_serving_states \
-                 ORDER BY action_key",
+                "SELECT action_key, disposition, version, state_revision, authority_key, \
+                 evaluated_at_micros, max_age_micros, clock_uncertainty_micros, clock_epoch \
+                 FROM action_serving_states ORDER BY action_key",
+            ),
+            (
+                "serving_blocking_quarantines",
+                "SELECT action_key, scope, subject FROM serving_blocking_quarantines \
+                 ORDER BY action_key, scope, subject",
             ),
             (
                 "objects",
@@ -4683,6 +4934,7 @@ mod tests {
             "provenance_edges",
             "quarantines",
             "schema_epochs",
+            "serving_blocking_quarantines",
             "trust_states",
             "verification_samples",
             "worker_capabilities",
