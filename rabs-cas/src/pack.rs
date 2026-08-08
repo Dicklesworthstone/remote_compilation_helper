@@ -302,7 +302,9 @@ impl PackIndex {
 /// Record every pack member as an H010 location row pointing into the
 /// pack (`<pack_path>#<offset>`, encoding `pack-v1`): pack membership
 /// stays location EVIDENCE — logical identity and action keys are
-/// untouched.
+/// untouched. `pack_durable` states whether the pack FILE was published
+/// under the full durability profile; every member location inherits
+/// exactly that claim (H032).
 ///
 /// # Errors
 /// Store errors from the location writes.
@@ -311,6 +313,7 @@ pub fn record_pack_member_locations(
     pack_path: &str,
     index: &PackIndex,
     member_digests: &[TypedDigest],
+    pack_durable: bool,
 ) -> Result<(), StoreError> {
     for digest in member_digests {
         let key = digest_key(digest);
@@ -325,6 +328,7 @@ pub fn record_pack_member_locations(
                 &format!("{pack_path}#{}", member.offset),
                 None,
                 PACK_PROFILE_V1,
+                pack_durable,
             )?;
         }
     }
@@ -479,7 +483,7 @@ mod tests {
             .into_iter()
             .filter(|l| l.starts_with("action_"))
             .collect();
-        record_pack_member_locations(&mut store, "/cas/pack/aa", &index, &digests).unwrap();
+        record_pack_member_locations(&mut store, "/cas/pack/aa", &index, &digests, true).unwrap();
 
         // Members keep their OWN logical ids, now with pack-resident
         // location evidence.

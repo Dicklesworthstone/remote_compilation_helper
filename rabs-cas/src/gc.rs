@@ -448,7 +448,7 @@ mod tests {
         for tag in 1..=11u8 {
             store.record_object(&digest(tag), 64).unwrap();
             store
-                .add_location(&digest(tag), &format!("/cas/{tag}"), Some(1), "raw")
+                .add_location(&digest(tag), &format!("/cas/{tag}"), Some(1), "raw", true)
                 .unwrap();
         }
         store
@@ -868,7 +868,7 @@ mod tests {
             for tag in 0..object_count {
                 store.record_object(&digest(tag), 64).unwrap();
                 store
-                    .add_location(&digest(tag), &format!("/cas/{tag}"), Some(1), "raw")
+                    .add_location(&digest(tag), &format!("/cas/{tag}"), Some(1), "raw", true)
                     .unwrap();
             }
             for _ in 0..(object_count as u64 * 2) {
@@ -939,7 +939,13 @@ mod tests {
                     next_tag = next_tag.wrapping_add(1);
                     store.record_object(&digest(fresh), 64).unwrap();
                     store
-                        .add_location(&digest(fresh), &format!("/cas/{fresh}"), Some(1), "raw")
+                        .add_location(
+                            &digest(fresh),
+                            &format!("/cas/{fresh}"),
+                            Some(1),
+                            "raw",
+                            true,
+                        )
                         .unwrap();
                     let from = rng.below(u64::from(object_count)) as u8;
                     store

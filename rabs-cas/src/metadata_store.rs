@@ -40,8 +40,9 @@ use rabs_protocol::serving::ServingValidity;
 /// Current schema version (v8 = the full H038 authoritative table set;
 /// v9 = H040 revisioned authority-bound serving state; v10 = H026
 /// append-only divergence incidents; v11 = H029 evidence rows name the
-/// canonical result manifest they support).
-pub const SCHEMA_VERSION: u32 = 11;
+/// canonical result manifest they support; v12 = H032 location rows
+/// carry their durability state).
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -275,6 +276,16 @@ pub const MIGRATIONS: &[Migration] = &[
         statements: &[
             "ALTER TABLE action_evidence_index ADD COLUMN manifest_key TEXT NOT NULL DEFAULT ''",
         ],
+    },
+    Migration {
+        // H032: a location row states whether its copy satisfied the FULL
+        // durability policy (file + directory fsync) when recorded.
+        // Commit acknowledgement gates on durable locations, so a
+        // committed pointer can never name an object that only exists in
+        // volatile page cache. Legacy rows default to 0: durability is
+        // never assumed retroactively.
+        version: 12,
+        statements: &["ALTER TABLE object_locations ADD COLUMN durable INTEGER NOT NULL DEFAULT 0"],
     },
 ];
 
@@ -749,14 +760,22 @@ pub trait RabsMetadataStore {
 
     /// Record a stored location for an object. `encoding` names the
     /// stored representation of this COPY (location evidence — it never
-    /// changes the object's logical identity).
+    /// changes the object's logical identity). `durable` states whether
+    /// this copy satisfied the FULL durability policy (file + directory
+    /// fsync) when recorded (H032) — a claim about THIS copy, never
+    /// inferred.
     fn add_location(
         &mut self,
         object: &TypedDigest,
         store_path: &str,
         verified_seq: Option<u64>,
         encoding: &str,
+        durable: bool,
     ) -> Result<(), StoreError>;
+
+    /// Whether the object has at least one durable, non-quarantined
+    /// location (H032: the commit-gate durability check).
+    fn object_durably_located(&mut self, object: &TypedDigest) -> Result<bool, StoreError>;
 
     /// Quarantine (or clear quarantine on) one location. Location
     /// quarantine is evidence about a COPY: the object row and its edges
@@ -2121,6 +2140,7 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         store_path: &str,
         verified_seq: Option<u64>,
         encoding: &str,
+        durable: bool,
     ) -> Result<(), StoreError> {
         let key = digest_key(object);
         let path = store_path.to_owned();
@@ -2135,17 +2155,30 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         self.in_txn(move |engine| {
             engine.execute(
                 "INSERT OR REPLACE INTO object_locations \
-                 (object_key, store_path, verified_seq, encoding, quarantined) \
-                 VALUES (?1, ?2, ?3, ?4, 0)",
+                 (object_key, store_path, verified_seq, encoding, quarantined, durable) \
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
                 &[
                     SqlValue::Text(key),
                     SqlValue::Text(path),
                     verified,
                     SqlValue::Text(encoding),
+                    SqlValue::Int(i64::from(durable)),
                 ],
             )?;
             Ok(())
         })
+    }
+
+    fn object_durably_located(&mut self, object: &TypedDigest) -> Result<bool, StoreError> {
+        // Same quarantine rule as `object_located`, plus the H032 gate:
+        // only a copy recorded as satisfying the FULL durability policy
+        // counts.
+        let rows = self.engine.query(
+            "SELECT object_key FROM object_locations \
+             WHERE object_key = ?1 AND quarantined = 0 AND durable = 1 LIMIT 1",
+            &[SqlValue::Text(digest_key(object))],
+        )?;
+        Ok(!rows.is_empty())
     }
 
     fn set_location_quarantined(
@@ -4143,7 +4176,7 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             ),
             (
                 "object_locations",
-                "SELECT object_key, store_path, verified_seq, encoding, quarantined \
+                "SELECT object_key, store_path, verified_seq, encoding, quarantined, durable \
                  FROM object_locations ORDER BY object_key, store_path",
             ),
             (
@@ -4678,10 +4711,10 @@ mod tests {
         let object = digest("rabs.object.sha256.v1", 50);
         store.record_object(&object, 4096).unwrap();
         store
-            .add_location(&object, "/cas/aa/bb", Some(7), "raw")
+            .add_location(&object, "/cas/aa/bb", Some(7), "raw", true)
             .unwrap();
         store
-            .add_location(&object, "/cas/cc/dd", None, "zstd")
+            .add_location(&object, "/cas/cc/dd", None, "zstd", false)
             .unwrap();
         store
             .create_pin(

@@ -307,6 +307,14 @@ pub enum OfferRefusal {
         /// Digest key of the first missing object.
         missing: String,
     },
+    /// A referenced object is located but no copy satisfies the FULL
+    /// durability profile the commit is configured to require (H032):
+    /// acknowledging would create a committed pointer to bytes that may
+    /// only exist in volatile page cache.
+    ObjectNotDurable {
+        /// Digest key of the first non-durable object.
+        missing: String,
+    },
     /// The committed manifest for a same-key offer could not be loaded
     /// for divergence classification.
     CommittedManifestUnavailable,
@@ -366,6 +374,24 @@ pub enum PublicationOutcome {
     Quarantined(DivergenceQuarantine),
 }
 
+/// The configured CAS durability profile a commit acknowledgement gates
+/// on (H032): what "the objects exist" must mean BEFORE the metadata
+/// transaction may commit. `ActionResultCommitted` (the
+/// [`PublicationOutcome::Committed`] receipt) exists only after both the
+/// CAS side satisfies this profile and the store transaction reported
+/// durable success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitDurabilityProfile {
+    /// Authoritative default: every object in the offer's closure must
+    /// have a durable (full fsync profile), non-quarantined location. A
+    /// power failure after commit can then never orphan the committed
+    /// pointer.
+    RequireDurableClosure,
+    /// Explicitly volatile deployment (throwaway scratch cache): any
+    /// non-quarantined location admits. Named, never the silent default.
+    AcceptVolatileLocations,
+}
+
 const fn result_kind_to_tag(kind: ResultKind) -> ResultKindTag {
     match kind {
         ResultKind::Success => ResultKindTag::Success,
@@ -381,7 +407,12 @@ const fn result_kind_to_tag(kind: ResultKind) -> ResultKindTag {
 /// allocated durable pin id — the publication reachability pin on
 /// commit, or the candidate-preservation pin when the offer diverges
 /// (H026); `seq` is the causal commit sequence stamped into the receipt
-/// (and into the incident row on divergence).
+/// (and into the incident row on divergence); `durability` is the
+/// configured H032 commit profile — under
+/// [`CommitDurabilityProfile::RequireDurableClosure`] every closure
+/// object must have a durable location BEFORE the metadata transaction
+/// runs, so the committed pointer can never name bytes a power failure
+/// may still lose.
 ///
 /// # Errors
 /// A typed [`OfferRefusal`]; refusals write nothing.
@@ -392,6 +423,7 @@ pub fn process_offer(
     committed_manifest: impl FnOnce(&str) -> Option<CanonicalActionResultManifest>,
     pin_id: u128,
     seq: u64,
+    durability: CommitDurabilityProfile,
 ) -> Result<PublicationOutcome, OfferRefusal> {
     // 1. Authority fence: active authority + F033 digest equality.
     let offered_authority = authority_digest(&offer.authority.coordinator);
@@ -475,6 +507,16 @@ pub fn process_offer(
     for object in closure {
         if !store.object_located(object)? {
             return Err(OfferRefusal::IncompleteObjectClosure {
+                missing: digest_key(object),
+            });
+        }
+        // H032: under the authoritative profile the metadata transaction
+        // may not even begin until every closure object has a durable
+        // copy — located-but-volatile is a typed refusal, not a commit.
+        if durability == CommitDurabilityProfile::RequireDurableClosure
+            && !store.object_durably_located(object)?
+        {
+            return Err(OfferRefusal::ObjectNotDurable {
                 missing: digest_key(object),
             });
         }
@@ -937,7 +979,7 @@ mod tests {
             let id = object(tag);
             store.record_object(&id.0, 64).unwrap();
             store
-                .add_location(&id.0, &format!("/cas/{tag}"), Some(1), "raw")
+                .add_location(&id.0, &format!("/cas/{tag}"), Some(1), "raw", true)
                 .unwrap();
         }
     }
@@ -948,6 +990,94 @@ mod tests {
 
     fn no_committed(_: &str) -> Option<CanonicalActionResultManifest> {
         None
+    }
+
+    #[test]
+    fn h032_commit_ack_gates_on_the_configured_durability_profile() {
+        // A located-but-volatile closure object refuses the commit under
+        // the authoritative profile with a typed refusal naming it.
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        ready_store(&mut store);
+        store
+            .add_location(&object(61).0, "/cas/61", Some(1), "raw", false)
+            .unwrap();
+        assert_eq!(
+            process_offer(
+                &mut store,
+                &offer(),
+                &expected_descriptor(),
+                no_committed,
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            ),
+            Err(OfferRefusal::ObjectNotDurable {
+                missing: digest_key(&object(61).0),
+            })
+        );
+        // The refusal wrote nothing: no publication, no ack.
+        let action = digest("rabs.action-key.sha256.v1", 7);
+        assert!(!store.has_publication(&action).unwrap());
+
+        // POWER-FAIL SIMULATION over the refused state: the volatile
+        // copy is lost (quarantined as suspect on reopen). There is no
+        // committed pointer to the lost object — the gate held.
+        store
+            .set_location_quarantined(&object(61).0, "/cas/61", true)
+            .unwrap();
+        assert!(!store.has_publication(&action).unwrap());
+
+        // An explicitly volatile deployment admits the same offer — the
+        // relaxation is NAMED, never the silent default.
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut volatile_store = SqlMetadataStore::open(engine).unwrap();
+        ready_store(&mut volatile_store);
+        volatile_store
+            .add_location(&object(61).0, "/cas/61", Some(1), "raw", false)
+            .unwrap();
+        assert!(matches!(
+            process_offer(
+                &mut volatile_store,
+                &offer(),
+                &expected_descriptor(),
+                no_committed,
+                900,
+                1,
+                CommitDurabilityProfile::AcceptVolatileLocations,
+            )
+            .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+
+        // Durable closure commits under the authoritative profile, and a
+        // power failure afterward cannot orphan the pointer: every
+        // closure object still has a durable location.
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut durable_store = SqlMetadataStore::open(engine).unwrap();
+        ready_store(&mut durable_store);
+        assert!(matches!(
+            process_offer(
+                &mut durable_store,
+                &offer(),
+                &expected_descriptor(),
+                no_committed,
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            )
+            .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+        assert!(durable_store.has_publication(&action).unwrap());
+        for tag in [40, 41, 50, 51, 60, 61, 62, 63] {
+            assert!(
+                durable_store
+                    .object_durably_located(&object(tag).0)
+                    .unwrap(),
+                "committed closure object {tag} must be durable"
+            );
+        }
     }
 
     #[test]
@@ -1025,6 +1155,7 @@ mod tests {
             no_committed,
             900,
             42,
+            CommitDurabilityProfile::RequireDurableClosure,
         )
         .unwrap();
         let PublicationOutcome::Committed(receipt) = outcome else {
@@ -1063,7 +1194,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             ),
             Err(OfferRefusal::NotActiveAuthority)
         );
@@ -1083,7 +1215,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             ),
             Err(OfferRefusal::GenerationAuthorityMismatch)
         );
@@ -1098,7 +1231,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             ),
             Err(OfferRefusal::UnknownGeneration)
         );
@@ -1113,7 +1247,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             ),
             Err(OfferRefusal::UnknownAttempt)
         );
@@ -1127,7 +1262,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             ),
             Err(OfferRefusal::LeaseReleased)
         );
@@ -1152,7 +1288,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             ),
             Err(OfferRefusal::GenerationTombstoned)
         );
@@ -1172,7 +1309,8 @@ mod tests {
                 &digest("rabs.descriptor.sha256.v1", 99),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             ),
             Err(OfferRefusal::DescriptorMismatch)
         );
@@ -1190,7 +1328,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             ),
             Err(OfferRefusal::EpochMismatch)
         );
@@ -1205,7 +1344,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             ),
             Err(OfferRefusal::SemanticDigestMismatch)
         );
@@ -1220,7 +1360,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             ),
             Err(OfferRefusal::ObservableDigestMismatch)
         );
@@ -1253,7 +1394,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             ),
             Err(OfferRefusal::IncompleteObjectClosure {
                 missing: digest_key(&object(200).0)
@@ -1274,7 +1416,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -1289,7 +1432,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 901,
-                2
+                2,
+                CommitDurabilityProfile::RequireDurableClosure,
             )
             .unwrap(),
             PublicationOutcome::IdempotentEvidenceAppended
@@ -1303,11 +1447,11 @@ mod tests {
         let divergent_id = object(52);
         store.record_object(&object(42).0, 64).unwrap();
         store
-            .add_location(&object(42).0, "/cas/42", Some(1), "raw")
+            .add_location(&object(42).0, "/cas/42", Some(1), "raw", true)
             .unwrap();
         store.record_object(&divergent_id.0, 64).unwrap();
         store
-            .add_location(&divergent_id.0, "/cas/52", Some(1), "raw")
+            .add_location(&divergent_id.0, "/cas/52", Some(1), "raw", true)
             .unwrap();
         let divergent = OfferPreparedActionResult::build(
             attempt_authority(),
@@ -1327,6 +1471,7 @@ mod tests {
             move |_| Some(committed),
             902,
             3,
+            CommitDurabilityProfile::RequireDurableClosure,
         )
         .unwrap();
         let PublicationOutcome::Quarantined(quarantine) = outcome else {
@@ -1368,7 +1513,7 @@ mod tests {
         {
             store.record_object(&object(tag).0, 64).unwrap();
             store
-                .add_location(&object(tag).0, &format!("/cas/{tag}"), Some(1), "raw")
+                .add_location(&object(tag).0, &format!("/cas/{tag}"), Some(1), "raw", true)
                 .unwrap();
         }
         OfferPreparedActionResult::build(
@@ -1399,7 +1544,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -1441,6 +1587,7 @@ mod tests {
             move |_| Some(committed),
             902,
             3,
+            CommitDurabilityProfile::RequireDurableClosure,
         )
         .unwrap();
         let PublicationOutcome::Quarantined(quarantine) = outcome else {
@@ -1543,7 +1690,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -1573,6 +1721,7 @@ mod tests {
             move |_| Some(committed),
             903,
             4,
+            CommitDurabilityProfile::RequireDurableClosure,
         )
         .unwrap();
         let PublicationOutcome::Quarantined(quarantine) = outcome else {
@@ -1617,7 +1766,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -1631,7 +1781,7 @@ mod tests {
         other_evidence.provenance_receipt = object(64);
         store.record_object(&object(64).0, 64).unwrap();
         store
-            .add_location(&object(64).0, "/cas/64", Some(1), "raw")
+            .add_location(&object(64).0, "/cas/64", Some(1), "raw", true)
             .unwrap();
         let reoffer = OfferPreparedActionResult::build(
             attempt_authority(),
@@ -1645,7 +1795,7 @@ mod tests {
         .unwrap();
         store.record_object(&object(54).0, 64).unwrap();
         store
-            .add_location(&object(54).0, "/cas/54", Some(1), "raw")
+            .add_location(&object(54).0, "/cas/54", Some(1), "raw", true)
             .unwrap();
         assert_eq!(
             process_offer(
@@ -1654,7 +1804,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 904,
-                5
+                5,
+                CommitDurabilityProfile::RequireDurableClosure,
             )
             .unwrap(),
             PublicationOutcome::IdempotentEvidenceAppended
@@ -1736,7 +1887,16 @@ mod tests {
             let action_key = digest_key(&action);
             let first = offer();
             assert!(matches!(
-                process_offer(store, &first, &expected_descriptor(), no_committed, 900, 1).unwrap(),
+                process_offer(
+                    store,
+                    &first,
+                    &expected_descriptor(),
+                    no_committed,
+                    900,
+                    1,
+                    CommitDurabilityProfile::RequireDurableClosure,
+                )
+                .unwrap(),
                 PublicationOutcome::Committed(_)
             ));
             store
@@ -1757,6 +1917,7 @@ mod tests {
                 move |_| Some(committed),
                 902,
                 3,
+                CommitDurabilityProfile::RequireDurableClosure,
             )
             .unwrap();
             assert!(matches!(outcome, PublicationOutcome::Quarantined(_)));
@@ -1778,11 +1939,29 @@ mod tests {
             ready_store(store);
             let first = offer();
             assert!(matches!(
-                process_offer(store, &first, &expected_descriptor(), no_committed, 900, 1).unwrap(),
+                process_offer(
+                    store,
+                    &first,
+                    &expected_descriptor(),
+                    no_committed,
+                    900,
+                    1,
+                    CommitDurabilityProfile::RequireDurableClosure,
+                )
+                .unwrap(),
                 PublicationOutcome::Committed(_)
             ));
             assert_eq!(
-                process_offer(store, &first, &expected_descriptor(), no_committed, 901, 2).unwrap(),
+                process_offer(
+                    store,
+                    &first,
+                    &expected_descriptor(),
+                    no_committed,
+                    901,
+                    2,
+                    CommitDurabilityProfile::RequireDurableClosure,
+                )
+                .unwrap(),
                 PublicationOutcome::IdempotentEvidenceAppended
             );
             assert_eq!(
@@ -1792,7 +1971,8 @@ mod tests {
                     &digest("rabs.descriptor.sha256.v1", 99),
                     no_committed,
                     902,
-                    3
+                    3,
+                    CommitDurabilityProfile::RequireDurableClosure,
                 ),
                 Err(OfferRefusal::DescriptorMismatch)
             );
@@ -1817,7 +1997,8 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 900,
-                1
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -1900,7 +2081,16 @@ mod tests {
             ready_store(store);
             let first = offer();
             assert!(matches!(
-                process_offer(store, &first, &expected_descriptor(), no_committed, 900, 1).unwrap(),
+                process_offer(
+                    store,
+                    &first,
+                    &expected_descriptor(),
+                    no_committed,
+                    900,
+                    1,
+                    CommitDurabilityProfile::RequireDurableClosure,
+                )
+                .unwrap(),
                 PublicationOutcome::Committed(_)
             ));
             retain_eviction_tombstone(store, &first.manifest, 50).unwrap();

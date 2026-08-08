@@ -56,7 +56,8 @@ use crate::metadata_store::{
     StoreError, digest_key,
 };
 use crate::publication::{
-    OfferPreparedActionResult, OfferRefusal, PublicationOutcome, authority_digest, process_offer,
+    CommitDurabilityProfile, OfferPreparedActionResult, OfferRefusal, PublicationOutcome,
+    authority_digest, process_offer,
 };
 use crate::startup_reconciliation::{ServingDecision, SetFilesystem, reconcile_startup};
 
@@ -277,7 +278,7 @@ fn upload(store: &mut dyn RabsMetadataStore, tags: &[u8]) -> Result<(), StoreErr
     for &tag in tags {
         let id = object(tag);
         store.record_object(&id.0, 64)?;
-        store.add_location(&id.0, &format!("/cas/{tag}"), Some(1), "raw")?;
+        store.add_location(&id.0, &format!("/cas/{tag}"), Some(1), "raw", true)?;
     }
     Ok(())
 }
@@ -316,6 +317,7 @@ fn run_phase(
                 |_| None,
                 900 + u128::from(attempt),
                 1 + attempt,
+                CommitDurabilityProfile::RequireDurableClosure,
             )
             .map_err(refusal_to_error)
         }
@@ -331,6 +333,7 @@ fn run_phase(
                 |_| Some(winner_manifest_as_committed()),
                 950 + u128::from(attempt),
                 10 + attempt,
+                CommitDurabilityProfile::RequireDurableClosure,
             )
             .map_err(refusal_to_error)
         }
@@ -403,6 +406,21 @@ fn check_recovery(
     let disposition = store.serving_disposition_key(&action_key_str())?;
     if disposition.as_deref() == Some("servable") && publications.is_empty() {
         violations.push(ctx("servable disposition without a publication row"));
+    }
+
+    // H032: a committed pointer may NEVER name a non-durable object. At
+    // every kill point, if the publication row survived the crash, its
+    // full winner closure must have durable locations — a commit that
+    // slipped past the durability gate would trip this at the boundary
+    // where the volatile copy is gone.
+    if !publications.is_empty() {
+        for tag in WINNER_UPLOAD_TAGS {
+            if !store.object_durably_located(&object(tag).0)? {
+                violations.push(ctx(&format!(
+                    "committed pointer to non-durable object /cas/{tag}"
+                )));
+            }
+        }
     }
 
     if phase == MatrixPhase::Divergence {

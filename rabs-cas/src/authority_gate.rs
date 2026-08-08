@@ -325,7 +325,7 @@ fn operation_script(
     outcome(
         &mut t,
         "location",
-        &store.add_location(&object, "/cas/aa/bb", Some(7), "raw"),
+        &store.add_location(&object, "/cas/aa/bb", Some(7), "raw", true),
     );
     outcome(
         &mut t,

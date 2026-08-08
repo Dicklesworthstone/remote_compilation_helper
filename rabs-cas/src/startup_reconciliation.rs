@@ -358,7 +358,7 @@ mod tests {
         for tag in [50u8, 51] {
             store.record_object(&object(tag), 64).unwrap();
             store
-                .add_location(&object(tag), &format!("/cas/{tag}"), Some(1), "raw")
+                .add_location(&object(tag), &format!("/cas/{tag}"), Some(1), "raw", true)
                 .unwrap();
         }
         store
@@ -405,7 +405,7 @@ mod tests {
         // Extra object with a location AND a tombstone; its path vanishes.
         store.record_object(&object(60), 64).unwrap();
         store
-            .add_location(&object(60), "/cas/60", None, "raw")
+            .add_location(&object(60), "/cas/60", None, "raw", true)
             .unwrap();
         store
             .add_gc_tombstone(&digest_key(&object(60)), "/cas/60", 1, 2)
@@ -500,7 +500,7 @@ mod tests {
             healthy(store);
             store.record_object(&object(60), 64).unwrap();
             store
-                .add_location(&object(60), "/cas/60", None, "raw")
+                .add_location(&object(60), "/cas/60", None, "raw", true)
                 .unwrap();
             let report = reconcile_startup(store, &full_filesystem()).unwrap();
             assert_eq!(report.repaired.len(), 1); // /cas/60 vanished

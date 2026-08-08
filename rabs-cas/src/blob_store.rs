@@ -97,6 +97,13 @@ impl DurabilityPolicy {
         fsync_file: true,
         fsync_directory: true,
     };
+
+    /// Whether this policy satisfies the FULL profile — the only state a
+    /// location row may record as `durable` (H032).
+    #[must_use]
+    pub const fn is_full(self) -> bool {
+        self.fsync_file && self.fsync_directory
+    }
 }
 
 /// Streaming limits enforced while bytes arrive.
@@ -498,6 +505,7 @@ fn publish_staged_inner(
                 file_digest,
                 staging,
                 &target,
+                durability,
             );
         }
         Err(e) => {
@@ -518,9 +526,17 @@ fn publish_staged_inner(
         return Err(PutError::CrashInjected(FaultPoint::DirectorySynced));
     }
 
-    // 5. Record object + location; encoding tag is the profile.
+    // 5. Record object + location; encoding tag is the profile. The
+    // location claims durability only when the policy actually was the
+    // full profile (H032).
     store.record_object(declared, logical_size)?;
-    store.add_location(declared, &target.to_string_lossy(), None, profile)?;
+    store.add_location(
+        declared,
+        &target.to_string_lossy(),
+        None,
+        profile,
+        durability.is_full(),
+    )?;
     if fault == Some(FaultPoint::MetadataRecorded) {
         return Err(PutError::CrashInjected(FaultPoint::MetadataRecorded));
     }
@@ -703,15 +719,33 @@ fn handle_existing(
     file_digest: &TypedDigest,
     staging: &Path,
     target: &Path,
+    durability: DurabilityPolicy,
 ) -> Result<PutOutcome, PutError> {
     let existing_digest = hash_file_under_domain(target, file_digest.domain)?;
     if existing_digest == *file_digest {
         // Identical representation already published. Make sure the
         // metadata rows exist (the original writer may have died
         // between link and record), then clean OUR temp — the race
-        // loser's duty.
+        // loser's duty. The original writer's fsync state is UNKNOWN
+        // (it may have died before the directory sync), so under the
+        // full profile the loser fsyncs the published copy itself
+        // before this location may claim durability (H032).
+        if durability.is_full() {
+            let file = fs::File::open(target).map_err(io_err("fsync-existing"))?;
+            file.sync_all().map_err(io_err("fsync-existing"))?;
+            if let Some(dir) = target.parent() {
+                let dir = fs::File::open(dir).map_err(io_err("fsync-existing-dir"))?;
+                dir.sync_all().map_err(io_err("fsync-existing-dir"))?;
+            }
+        }
         store.record_object(declared, logical_size)?;
-        store.add_location(declared, &target.to_string_lossy(), None, profile)?;
+        store.add_location(
+            declared,
+            &target.to_string_lossy(),
+            None,
+            profile,
+            durability.is_full(),
+        )?;
         let _ = fs::remove_file(staging);
         return Ok(PutOutcome::IdempotentDuplicate {
             path: target.to_string_lossy().into_owned(),
