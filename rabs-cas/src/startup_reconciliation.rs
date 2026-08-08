@@ -374,6 +374,7 @@ mod tests {
                     result_kind: ResultKindTag::Success,
                     pin_id: 40,
                     pin_owner: "coordinator".to_owned(),
+                    provisional_ancestors: Vec::new(),
                 },
             )
             .unwrap();

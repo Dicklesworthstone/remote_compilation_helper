@@ -233,6 +233,7 @@ fn build_offer(
             OutputRole::Materializable,
             RawBytes::new(b"out/lib.rlib".to_vec()),
         )],
+        Vec::new(),
     )
     .map_err(|e| StoreError::Corruption(format!("offer construction failed: {e:?}")))
 }

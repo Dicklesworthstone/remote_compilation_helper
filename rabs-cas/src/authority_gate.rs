@@ -166,6 +166,7 @@ fn publication(action_tag: u8, descriptor_tag: u8, pin: u128) -> PublicationRow 
         result_kind: ResultKindTag::Success,
         pin_id: pin,
         pin_owner: "coordinator".to_owned(),
+        provisional_ancestors: Vec::new(),
     }
 }
 

@@ -45,8 +45,8 @@ use rabs_protocol::result_identity::{
 use sha2::{Digest, Sha256};
 
 use crate::metadata_store::{
-    CommitOutcome, DivergenceIncidentRow, PublicationRow, QuarantineScope, RabsMetadataStore,
-    ResultKindTag, StoreError, digest_key,
+    CommitOutcome, DivergenceIncidentRow, ProvisionalAncestorRow, PublicationRow, QuarantineScope,
+    RabsMetadataStore, ResultKindTag, StoreError, digest_key,
 };
 use crate::trust_evidence::DISPOSITION_QUARANTINED;
 
@@ -195,6 +195,44 @@ pub enum OfferBuildError {
         /// Escaped virtual path of the offending output.
         path: String,
     },
+    /// Two provisional-ancestor references name the same
+    /// (producer, role, path) — the canonical set admits no duplicates.
+    DuplicateAncestorRef {
+        /// Escaped virtual path of the duplicated reference.
+        path: String,
+    },
+    /// A provisional-ancestor reference names the offering action itself.
+    SelfAncestorRef,
+}
+
+/// One provisional-ancestor reference carried by a prepared result
+/// (H028; I32): the offering attempt consumed `consumed_object` as the
+/// producer action's `(role, virtual_path)` provisional output before
+/// that producer had committed. Commit verifies the producer is now
+/// committed and resolves that logical output to the EXACT consumed
+/// object (or an explicit adoption edge).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionalAncestorRef {
+    /// Action key of the producer whose provisional output was consumed.
+    pub producer_action_key: TypedDigest,
+    /// Role of the consumed logical output.
+    pub role: OutputRole,
+    /// Canonical virtual path of the consumed logical output.
+    pub virtual_path: RawBytes,
+    /// The exact object the attempt consumed.
+    pub consumed_object: ObjectId,
+}
+
+/// Stable string tag for an output role (persisted in lineage and
+/// adoption rows; the numeric `output_role_tag` above is framing-only).
+const fn output_role_name(role: OutputRole) -> &'static str {
+    match role {
+        OutputRole::Materializable => "materializable",
+        OutputRole::DepInfo => "dep-info",
+        OutputRole::ProvisionalMetadata => "provisional-metadata",
+        OutputRole::BuildScriptMetadata => "build-script-metadata",
+        OutputRole::TestSideEffect => "test-side-effect",
+    }
 }
 
 /// A prepared result offered for publication, carrying FULL authority
@@ -215,6 +253,9 @@ pub struct OfferPreparedActionResult {
     /// Digest of the canonical observation stream (input to the
     /// observable projection recompute).
     pub canonical_observations: TypedDigest,
+    /// Canonical (sorted, duplicate-free) provisional-ancestor set
+    /// (H028; I32). Empty when no provisional outputs were consumed.
+    pub provisional_ancestors: Vec<ProvisionalAncestorRef>,
 }
 
 impl OfferPreparedActionResult {
@@ -226,6 +267,7 @@ impl OfferPreparedActionResult {
     ///
     /// # Errors
     /// A typed [`OfferBuildError`] naming the violated rule.
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         authority: AttemptAuthority,
         mut manifest: CanonicalActionResultManifest,
@@ -234,10 +276,41 @@ impl OfferPreparedActionResult {
         evidence_id: ObjectId,
         canonical_observations: TypedDigest,
         declared_outputs: &[(OutputRole, RawBytes)],
+        mut provisional_ancestors: Vec<ProvisionalAncestorRef>,
     ) -> Result<Self, OfferBuildError> {
         manifest
             .validate()
             .map_err(OfferBuildError::ManifestInvalid)?;
+        // Canonical sorted ancestor set: order-independent identity,
+        // duplicates refused, self-reference refused (H028).
+        provisional_ancestors.sort_by(|a, b| {
+            (
+                digest_key(&a.producer_action_key),
+                output_role_name(a.role),
+                a.virtual_path.as_bytes(),
+            )
+                .cmp(&(
+                    digest_key(&b.producer_action_key),
+                    output_role_name(b.role),
+                    b.virtual_path.as_bytes(),
+                ))
+        });
+        for pair in provisional_ancestors.windows(2) {
+            if pair[0].producer_action_key == pair[1].producer_action_key
+                && pair[0].role == pair[1].role
+                && pair[0].virtual_path == pair[1].virtual_path
+            {
+                return Err(OfferBuildError::DuplicateAncestorRef {
+                    path: pair[1].virtual_path.escaped(),
+                });
+            }
+        }
+        if provisional_ancestors
+            .iter()
+            .any(|a| a.producer_action_key == manifest.action_key)
+        {
+            return Err(OfferBuildError::SelfAncestorRef);
+        }
         if evidence.canonical_result_manifest_id != manifest_id {
             return Err(OfferBuildError::EvidenceManifestMismatch);
         }
@@ -265,6 +338,7 @@ impl OfferPreparedActionResult {
             evidence,
             evidence_id,
             canonical_observations,
+            provisional_ancestors,
         })
     }
 }
@@ -318,6 +392,37 @@ pub enum OfferRefusal {
     /// The committed manifest for a same-key offer could not be loaded
     /// for divergence classification.
     CommittedManifestUnavailable,
+    /// A referenced provisional-ancestor producer (direct or transitive)
+    /// has no committed publication (H028; I32: no dependent commit
+    /// before producer finalization).
+    ProvisionalProducerNotCommitted {
+        /// Digest key of the uncommitted producer action.
+        producer: String,
+    },
+    /// A committed ancestor's manifest bytes could not be loaded for the
+    /// exact-object check.
+    AncestorManifestUnavailable {
+        /// Digest key of the producer action.
+        producer: String,
+    },
+    /// The producer committed, but its canonical manifest has no logical
+    /// output at the referenced (role, path).
+    AncestorOutputMissing {
+        /// Digest key of the producer action.
+        producer: String,
+        /// Escaped virtual path of the missing output.
+        path: String,
+    },
+    /// The producer committed a DIFFERENT object at the referenced
+    /// logical output and no adoption edge covers the consumed object
+    /// (risk R64: the consumed provisional bytes are not what the
+    /// winning attempt published).
+    DivergentProvisionalAncestor {
+        /// Digest key of the producer action.
+        producer: String,
+        /// Escaped virtual path of the divergent output.
+        path: String,
+    },
     /// The store refused or failed.
     Store(StoreError),
 }
@@ -420,7 +525,7 @@ pub fn process_offer(
     store: &mut dyn RabsMetadataStore,
     offer: &OfferPreparedActionResult,
     expected_descriptor: &TypedDigest,
-    committed_manifest: impl FnOnce(&str) -> Option<CanonicalActionResultManifest>,
+    manifest_resolver: impl Fn(&str) -> Option<CanonicalActionResultManifest>,
     pin_id: u128,
     seq: u64,
     durability: CommitDurabilityProfile,
@@ -522,6 +627,14 @@ pub fn process_offer(
         }
     }
 
+    // 7.5. Provisional-ancestor closure (H028; I32): EVERY referenced
+    // producer — direct AND transitive through each committed producer's
+    // recorded lineage — must be committed and resolve the referenced
+    // logical output to the exact consumed object (or an explicit
+    // adoption edge). Direct-only checking would let an A→B→C chain
+    // commit C over a hole at A.
+    let ancestor_rows = verify_provisional_ancestry(store, offer, &manifest_resolver)?;
+
     // 8. Same-key candidates: divergence taxonomy, never overwrite.
     if let Some(committed_key) = store.published_manifest_key(&offer.manifest.action_key)? {
         let candidate_key = digest_key(&offer.manifest_id.0);
@@ -538,7 +651,7 @@ pub fn process_offer(
             return Ok(PublicationOutcome::IdempotentEvidenceAppended);
         }
         let committed =
-            committed_manifest(&committed_key).ok_or(OfferRefusal::CommittedManifestUnavailable)?;
+            manifest_resolver(&committed_key).ok_or(OfferRefusal::CommittedManifestUnavailable)?;
         // A018 taxonomy with the manifest-id inequality already
         // established above (committed_key != candidate_key), so the
         // idempotent branch is unreachable here by construction.
@@ -575,6 +688,7 @@ pub fn process_offer(
         result_kind: result_kind_to_tag(offer.manifest.result_kind),
         pin_id,
         pin_owner: "coordinator".to_owned(),
+        provisional_ancestors: ancestor_rows,
     };
     match store.commit_publication(&offered_authority, &row)? {
         CommitOutcome::Committed => {}
@@ -594,6 +708,119 @@ pub fn process_offer(
         winner_evidence_bundle_id: offer.evidence_id.clone(),
         committed_causal_sequence: seq,
     }))
+}
+
+/// One lineage reference to verify: producer/role/path/consumed-object,
+/// all in digest-key/tag form so direct refs (typed) and recorded rows
+/// (strings) share one code path.
+struct PendingAncestorCheck {
+    producer_key: String,
+    role_tag: String,
+    path: Vec<u8>,
+    consumed_key: String,
+    /// Direct refs are recorded on the consumer's own publication row;
+    /// transitive ones are already recorded on their consumer.
+    direct: bool,
+}
+
+/// The H028 transitive provisional-ancestor verification (I32; R64).
+///
+/// Walks the offer's direct references plus, for every committed
+/// producer, the lineage rows recorded at THAT producer's commit —
+/// breadth-first with a visited set, so diamond graphs verify once and
+/// cycles terminate. Every reference (at every depth) must satisfy:
+/// producer committed, its canonical manifest resolves the (role, path)
+/// logical output, and that output is the EXACT consumed object or an
+/// explicit adoption edge from consumed to committed exists.
+///
+/// Returns the verified direct rows for the consumer's own publication.
+fn verify_provisional_ancestry(
+    store: &mut dyn RabsMetadataStore,
+    offer: &OfferPreparedActionResult,
+    manifest_resolver: &impl Fn(&str) -> Option<CanonicalActionResultManifest>,
+) -> Result<Vec<ProvisionalAncestorRow>, OfferRefusal> {
+    let mut direct_rows = Vec::new();
+    let mut queue: std::collections::VecDeque<PendingAncestorCheck> = offer
+        .provisional_ancestors
+        .iter()
+        .map(|a| PendingAncestorCheck {
+            producer_key: digest_key(&a.producer_action_key),
+            role_tag: output_role_name(a.role).to_owned(),
+            path: a.virtual_path.as_bytes().to_vec(),
+            consumed_key: digest_key(&a.consumed_object.0),
+            direct: true,
+        })
+        .collect();
+    let mut walked_producers = std::collections::BTreeSet::new();
+
+    while let Some(check) = queue.pop_front() {
+        // Producer committed? (Direct-only shortcuts are exactly the
+        // R64 hole; this fires at every depth.)
+        let manifest_key = store
+            .published_manifest_key_str(&check.producer_key)?
+            .ok_or_else(|| OfferRefusal::ProvisionalProducerNotCommitted {
+                producer: check.producer_key.clone(),
+            })?;
+        let manifest = manifest_resolver(&manifest_key).ok_or_else(|| {
+            OfferRefusal::AncestorManifestUnavailable {
+                producer: check.producer_key.clone(),
+            }
+        })?;
+        // Exact-object resolution at the referenced logical output.
+        let output = manifest
+            .logical_outputs
+            .iter()
+            .find(|o| {
+                output_role_name(o.role) == check.role_tag
+                    && o.virtual_path.as_bytes() == check.path.as_slice()
+            })
+            .ok_or_else(|| OfferRefusal::AncestorOutputMissing {
+                producer: check.producer_key.clone(),
+                path: RawBytes::new(check.path.clone()).escaped(),
+            })?;
+        let committed_key = digest_key(&output.object.0);
+        let adopted = if committed_key == check.consumed_key {
+            false
+        } else if store.has_adoption_edge(
+            &check.producer_key,
+            &check.role_tag,
+            &check.path,
+            &check.consumed_key,
+            &committed_key,
+        )? {
+            true
+        } else {
+            return Err(OfferRefusal::DivergentProvisionalAncestor {
+                producer: check.producer_key.clone(),
+                path: RawBytes::new(check.path.clone()).escaped(),
+            });
+        };
+        if check.direct {
+            direct_rows.push(ProvisionalAncestorRow {
+                producer_action_key: check.producer_key.clone(),
+                role: check.role_tag.clone(),
+                virtual_path: check.path.clone(),
+                object_key: check.consumed_key.clone(),
+                adopted,
+            });
+        }
+        // Transitive expansion: the producer's own recorded lineage.
+        if walked_producers.insert(check.producer_key.clone()) {
+            for row in store.list_provisional_ancestors(&check.producer_key)? {
+                if walked_producers.contains(&row.producer_action_key) {
+                    continue;
+                }
+                queue.push_back(PendingAncestorCheck {
+                    producer_key: row.producer_action_key,
+                    role_tag: row.role,
+                    path: row.virtual_path,
+                    consumed_key: row.object_key,
+                    direct: false,
+                });
+            }
+        }
+    }
+    Ok(direct_rows)
 }
 
 const fn divergence_class_tag(class: DivergenceClass) -> &'static str {
@@ -945,6 +1172,7 @@ mod tests {
             object(51),
             digest("rabs.observation-stream.sha256.v1", 9),
             &declared(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -990,6 +1218,349 @@ mod tests {
 
     fn no_committed(_: &str) -> Option<CanonicalActionResultManifest> {
         None
+    }
+
+    /// A committed producer world for the H028 scenarios: `key_tag`
+    /// names the producer action, its canonical manifest (id
+    /// `manifest_tag`) resolves one ProvisionalMetadata output at `path`
+    /// to `output_tag`, and its publication row carries `ancestors`.
+    #[allow(clippy::too_many_arguments)]
+    fn plant_producer(
+        store: &mut dyn RabsMetadataStore,
+        resolver_map: &mut std::collections::BTreeMap<String, CanonicalActionResultManifest>,
+        key_tag: u8,
+        manifest_tag: u8,
+        path: &str,
+        output_tag: u8,
+        pin: u128,
+        ancestors: Vec<ProvisionalAncestorRow>,
+    ) {
+        let action = digest("rabs.action-key.sha256.v1", key_tag);
+        let mut producer_manifest = manifest();
+        producer_manifest.action_key = action.clone();
+        producer_manifest.logical_outputs = vec![LogicalOutput {
+            role: OutputRole::ProvisionalMetadata,
+            virtual_path: RawBytes::from(path),
+            object: object(output_tag),
+        }];
+        resolver_map.insert(digest_key(&object(manifest_tag).0), producer_manifest);
+        let auth = authority_digest(&coordinator_authority());
+        assert_eq!(
+            store
+                .commit_publication(
+                    &auth,
+                    &PublicationRow {
+                        action_key: action,
+                        descriptor_digest: expected_descriptor(),
+                        manifest_digest: object(manifest_tag).0,
+                        evidence_digest: object(manifest_tag).0.clone(),
+                        winner_generation: 11,
+                        winner_attempt: 20,
+                        result_kind: ResultKindTag::Success,
+                        pin_id: pin,
+                        pin_owner: "coordinator".to_owned(),
+                        provisional_ancestors: ancestors,
+                    },
+                )
+                .unwrap(),
+            CommitOutcome::Committed
+        );
+    }
+
+    fn ancestor_ref(producer_tag: u8, path: &str, consumed_tag: u8) -> ProvisionalAncestorRef {
+        ProvisionalAncestorRef {
+            producer_action_key: digest("rabs.action-key.sha256.v1", producer_tag),
+            role: OutputRole::ProvisionalMetadata,
+            virtual_path: RawBytes::from(path),
+            consumed_object: object(consumed_tag),
+        }
+    }
+
+    fn offer_with_ancestors(ancestors: Vec<ProvisionalAncestorRef>) -> OfferPreparedActionResult {
+        let manifest_id = object(50);
+        OfferPreparedActionResult::build(
+            attempt_authority(),
+            manifest(),
+            manifest_id.clone(),
+            evidence(&manifest_id),
+            object(51),
+            digest("rabs.observation-stream.sha256.v1", 9),
+            &declared(),
+            ancestors,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn h028_transitive_ancestor_closure_adoption_and_divergence() {
+        // World: A (key 100) committed ProvisionalMetadata "out/a.rmeta"
+        // -> object 110; B (key 101) committed "out/b.rmeta" -> object
+        // 111 and RECORDS having consumed A's object 110; C offers,
+        // naming only B (consumed object 111). T020.
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        ready_store(&mut store);
+        let mut manifests = std::collections::BTreeMap::new();
+        plant_producer(
+            &mut store,
+            &mut manifests,
+            100,
+            120,
+            "out/a.rmeta",
+            110,
+            800,
+            vec![],
+        );
+        plant_producer(
+            &mut store,
+            &mut manifests,
+            101,
+            121,
+            "out/b.rmeta",
+            111,
+            801,
+            vec![ProvisionalAncestorRow {
+                producer_action_key: digest_key(&digest("rabs.action-key.sha256.v1", 100)),
+                role: "provisional-metadata".to_owned(),
+                virtual_path: b"out/a.rmeta".to_vec(),
+                object_key: digest_key(&object(110).0),
+                adopted: false,
+            }],
+        );
+        let resolver = {
+            let manifests = manifests.clone();
+            move |key: &str| manifests.get(key).cloned()
+        };
+
+        // Happy path: full A->B->C chain verified; C commits and its
+        // publication records the direct lineage row.
+        let c_offer = offer_with_ancestors(vec![ancestor_ref(101, "out/b.rmeta", 111)]);
+        assert!(matches!(
+            process_offer(
+                &mut store,
+                &c_offer,
+                &expected_descriptor(),
+                resolver.clone(),
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            )
+            .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+        let c_key = digest_key(&digest("rabs.action-key.sha256.v1", 7));
+        let recorded = store.list_provisional_ancestors(&c_key).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].producer_action_key,
+            digest_key(&digest("rabs.action-key.sha256.v1", 101))
+        );
+        assert_eq!(recorded[0].object_key, digest_key(&object(111).0));
+        assert!(!recorded[0].adopted);
+    }
+
+    #[test]
+    fn h028_transitive_hole_refuses_where_direct_only_would_commit() {
+        // B is committed, but B's recorded lineage names producer 102
+        // which never committed: C's direct check on B alone would pass
+        // — the transitive walk must refuse (I32).
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        ready_store(&mut store);
+        let mut manifests = std::collections::BTreeMap::new();
+        plant_producer(
+            &mut store,
+            &mut manifests,
+            101,
+            121,
+            "out/b.rmeta",
+            111,
+            801,
+            vec![ProvisionalAncestorRow {
+                producer_action_key: digest_key(&digest("rabs.action-key.sha256.v1", 102)),
+                role: "provisional-metadata".to_owned(),
+                virtual_path: b"out/x.rmeta".to_vec(),
+                object_key: digest_key(&object(112).0),
+                adopted: false,
+            }],
+        );
+        let resolver = move |key: &str| manifests.get(key).cloned();
+        let c_offer = offer_with_ancestors(vec![ancestor_ref(101, "out/b.rmeta", 111)]);
+        assert_eq!(
+            process_offer(
+                &mut store,
+                &c_offer,
+                &expected_descriptor(),
+                resolver,
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            ),
+            Err(OfferRefusal::ProvisionalProducerNotCommitted {
+                producer: digest_key(&digest("rabs.action-key.sha256.v1", 102)),
+            })
+        );
+        // Nothing committed for C.
+        assert!(
+            !store
+                .has_publication(&digest("rabs.action-key.sha256.v1", 7))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn h028_divergent_consumed_object_refuses_until_adoption_edge() {
+        // C consumed object 119 from B's losing attempt, but B's winning
+        // attempt committed object 111 at the same logical output: typed
+        // refusal (R64) — until the coordinator records the explicit
+        // adoption edge 119 -> 111, after which the re-offer commits
+        // with adopted=true lineage.
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        ready_store(&mut store);
+        let mut manifests = std::collections::BTreeMap::new();
+        plant_producer(
+            &mut store,
+            &mut manifests,
+            101,
+            121,
+            "out/b.rmeta",
+            111,
+            801,
+            vec![],
+        );
+        let resolver = {
+            let manifests = manifests.clone();
+            move |key: &str| manifests.get(key).cloned()
+        };
+        let b_key = digest_key(&digest("rabs.action-key.sha256.v1", 101));
+        let c_offer = offer_with_ancestors(vec![ancestor_ref(101, "out/b.rmeta", 119)]);
+        assert_eq!(
+            process_offer(
+                &mut store,
+                &c_offer,
+                &expected_descriptor(),
+                resolver.clone(),
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            ),
+            Err(OfferRefusal::DivergentProvisionalAncestor {
+                producer: b_key.clone(),
+                path: "out/b.rmeta".to_owned(),
+            })
+        );
+
+        // Authority-gated adoption edge; conflicting rewrite refused.
+        let auth = authority_digest(&coordinator_authority());
+        store
+            .record_adoption_edge(
+                &auth,
+                &b_key,
+                "provisional-metadata",
+                b"out/b.rmeta",
+                &digest_key(&object(119).0),
+                &digest_key(&object(111).0),
+            )
+            .unwrap();
+        assert_eq!(
+            store.record_adoption_edge(
+                &auth,
+                &b_key,
+                "provisional-metadata",
+                b"out/b.rmeta",
+                &digest_key(&object(119).0),
+                &digest_key(&object(112).0),
+            ),
+            Err(StoreError::AdoptionEdgeConflict)
+        );
+
+        assert!(matches!(
+            process_offer(
+                &mut store,
+                &c_offer,
+                &expected_descriptor(),
+                resolver,
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            )
+            .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+        let c_key = digest_key(&digest("rabs.action-key.sha256.v1", 7));
+        let recorded = store.list_provisional_ancestors(&c_key).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            recorded[0].adopted,
+            "adoption edge must be recorded as such"
+        );
+    }
+
+    #[test]
+    fn h028_canonical_ancestor_set_refuses_duplicates_and_self() {
+        let manifest_id = object(50);
+        assert_eq!(
+            OfferPreparedActionResult::build(
+                attempt_authority(),
+                manifest(),
+                manifest_id.clone(),
+                evidence(&manifest_id),
+                object(51),
+                digest("rabs.observation-stream.sha256.v1", 9),
+                &declared(),
+                vec![
+                    ancestor_ref(101, "out/b.rmeta", 111),
+                    ancestor_ref(101, "out/b.rmeta", 119),
+                ],
+            ),
+            Err(OfferBuildError::DuplicateAncestorRef {
+                path: "out/b.rmeta".to_owned()
+            })
+        );
+        assert_eq!(
+            OfferPreparedActionResult::build(
+                attempt_authority(),
+                manifest(),
+                manifest_id.clone(),
+                evidence(&manifest_id),
+                object(51),
+                digest("rabs.observation-stream.sha256.v1", 9),
+                &declared(),
+                vec![ancestor_ref(7, "out/self.rmeta", 111)],
+            ),
+            Err(OfferBuildError::SelfAncestorRef)
+        );
+        // The canonical set is SORTED regardless of input order.
+        let shuffled = OfferPreparedActionResult::build(
+            attempt_authority(),
+            manifest(),
+            manifest_id.clone(),
+            evidence(&manifest_id),
+            object(51),
+            digest("rabs.observation-stream.sha256.v1", 9),
+            &declared(),
+            vec![
+                ancestor_ref(102, "out/x.rmeta", 112),
+                ancestor_ref(101, "out/b.rmeta", 111),
+            ],
+        )
+        .unwrap();
+        let ordered = OfferPreparedActionResult::build(
+            attempt_authority(),
+            manifest(),
+            manifest_id.clone(),
+            evidence(&manifest_id),
+            object(51),
+            digest("rabs.observation-stream.sha256.v1", 9),
+            &declared(),
+            vec![
+                ancestor_ref(101, "out/b.rmeta", 111),
+                ancestor_ref(102, "out/x.rmeta", 112),
+            ],
+        )
+        .unwrap();
+        assert_eq!(shuffled, ordered, "ancestor order never changes identity");
     }
 
     #[test]
@@ -1104,6 +1675,7 @@ mod tests {
                 object(51),
                 digest("rabs.observation-stream.sha256.v1", 9),
                 &[],
+                Vec::new(),
             ),
             Err(OfferBuildError::UndeclaredOutput {
                 path: "out/lib.rlib".to_owned()
@@ -1120,6 +1692,7 @@ mod tests {
                 object(51),
                 digest("rabs.observation-stream.sha256.v1", 9),
                 &declared(),
+                Vec::new(),
             ),
             Err(OfferBuildError::EvidenceManifestMismatch)
         );
@@ -1138,6 +1711,7 @@ mod tests {
                 object(51),
                 digest("rabs.observation-stream.sha256.v1", 9),
                 &declared(),
+                Vec::new(),
             ),
             Err(OfferBuildError::ManifestInvalid(_))
         ));
@@ -1385,6 +1959,7 @@ mod tests {
             object(51),
             digest("rabs.observation-stream.sha256.v1", 9),
             &declared(),
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1461,6 +2036,7 @@ mod tests {
             object(51),
             digest("rabs.observation-stream.sha256.v1", 9),
             &declared(),
+            Vec::new(),
         )
         .unwrap();
         let committed = first.manifest.clone();
@@ -1468,7 +2044,7 @@ mod tests {
             &mut store,
             &divergent,
             &expected_descriptor(),
-            move |_| Some(committed),
+            move |_| Some(committed.clone()),
             902,
             3,
             CommitDurabilityProfile::RequireDurableClosure,
@@ -1524,6 +2100,7 @@ mod tests {
             object(evidence_tag),
             observations,
             &declared(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -1584,7 +2161,7 @@ mod tests {
             &mut store,
             &divergent,
             &expected_descriptor(),
-            move |_| Some(committed),
+            move |_| Some(committed.clone()),
             902,
             3,
             CommitDurabilityProfile::RequireDurableClosure,
@@ -1718,7 +2295,7 @@ mod tests {
             &mut store,
             &divergent,
             &expected_descriptor(),
-            move |_| Some(committed),
+            move |_| Some(committed.clone()),
             903,
             4,
             CommitDurabilityProfile::RequireDurableClosure,
@@ -1791,6 +2368,7 @@ mod tests {
             object(54),
             digest("rabs.observation-stream.sha256.v1", 9),
             &declared(),
+            Vec::new(),
         )
         .unwrap();
         store.record_object(&object(54).0, 64).unwrap();
@@ -1914,7 +2492,7 @@ mod tests {
                 store,
                 &divergent,
                 &expected_descriptor(),
-                move |_| Some(committed),
+                move |_| Some(committed.clone()),
                 902,
                 3,
                 CommitDurabilityProfile::RequireDurableClosure,

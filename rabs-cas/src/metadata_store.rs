@@ -361,6 +361,10 @@ pub enum StoreError {
     /// An unresolved handoff with different content already exists for
     /// this edge (at most ONE active handoff per edge).
     EdgeHandoffActive,
+    /// An adoption edge for this (producer, role, path, from-object)
+    /// already exists with a DIFFERENT target object (H028; edges are
+    /// never patched).
+    AdoptionEdgeConflict,
     /// The handoff's named predecessor is not the edge's fenced
     /// incarnation.
     EdgeHandoffPredecessorMismatch,
@@ -788,6 +792,14 @@ pub trait RabsMetadataStore {
     fn published_manifest_key(
         &mut self,
         action: &TypedDigest,
+    ) -> Result<Option<String>, StoreError>;
+
+    /// [`Self::published_manifest_key`] addressed by the action's digest
+    /// KEY string (H028 transitive walk: recorded lineage rows carry
+    /// keys, not typed digests — R121).
+    fn published_manifest_key_str(
+        &mut self,
+        action_key: &str,
     ) -> Result<Option<String>, StoreError>;
 
     /// Whether a generation exists, and whether it is tombstoned.
@@ -2077,6 +2089,24 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     SqlValue::Text(digest_key(&row.action_key)),
                 ],
             )?;
+            // The verified provisional-ancestor lineage, SAME transaction
+            // (H028; I32): a dependent's later commit walks these rows as
+            // durable truth.
+            for ancestor in &row.provisional_ancestors {
+                engine.execute(
+                    "INSERT OR IGNORE INTO provisional_ancestry \
+                     (consumer_action_key, producer_action_key, role, virtual_path, \
+                      object_key, adopted) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    &[
+                        SqlValue::Text(digest_key(&row.action_key)),
+                        SqlValue::Text(ancestor.producer_action_key.clone()),
+                        SqlValue::Text(ancestor.role.clone()),
+                        SqlValue::Blob(ancestor.virtual_path.clone()),
+                        SqlValue::Text(ancestor.object_key.clone()),
+                        SqlValue::Int(i64::from(ancestor.adopted)),
+                    ],
+                )?;
+            }
             Ok(CommitOutcome::Committed)
         })
     }
@@ -2130,9 +2160,16 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         &mut self,
         action: &TypedDigest,
     ) -> Result<Option<String>, StoreError> {
+        self.published_manifest_key_str(&digest_key(action))
+    }
+
+    fn published_manifest_key_str(
+        &mut self,
+        action_key: &str,
+    ) -> Result<Option<String>, StoreError> {
         let rows = self.engine.query(
             "SELECT manifest_domain, manifest_bytes FROM action_publications WHERE action_key = ?1",
-            &[SqlValue::Text(digest_key(action))],
+            &[SqlValue::Text(action_key.to_owned())],
         )?;
         let Some(row) = rows.first() else {
             return Ok(None);
@@ -4165,6 +4202,113 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             .collect()
     }
 
+    fn record_adoption_edge(
+        &mut self,
+        authority: &TypedDigest,
+        producer_action_key: &str,
+        role: &str,
+        virtual_path: &[u8],
+        from_object_key: &str,
+        to_object_key: &str,
+    ) -> Result<(), StoreError> {
+        let authority = authority.clone();
+        let producer = producer_action_key.to_owned();
+        let role = role.to_owned();
+        let path = virtual_path.to_vec();
+        let from = from_object_key.to_owned();
+        let to = to_object_key.to_owned();
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let existing = engine.query(
+                "SELECT to_object_key FROM adoption_edges \
+                 WHERE producer_action_key = ?1 AND role = ?2 AND virtual_path = ?3 \
+                 AND from_object_key = ?4",
+                &[
+                    SqlValue::Text(producer.clone()),
+                    SqlValue::Text(role.clone()),
+                    SqlValue::Blob(path.clone()),
+                    SqlValue::Text(from.clone()),
+                ],
+            )?;
+            if let Some(row) = existing.first() {
+                let [existing_to] = row.as_slice() else {
+                    return Err(StoreError::Corruption("adoption edge shape".into()));
+                };
+                // Idempotent re-record; a rewrite to a DIFFERENT target
+                // is a typed refusal — edges are never patched.
+                return if expect_text(existing_to, "adoption target")? == to {
+                    Ok(())
+                } else {
+                    Err(StoreError::AdoptionEdgeConflict)
+                };
+            }
+            engine.execute(
+                "INSERT INTO adoption_edges (producer_action_key, role, virtual_path, \
+                 from_object_key, to_object_key) VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    SqlValue::Text(producer),
+                    SqlValue::Text(role),
+                    SqlValue::Blob(path),
+                    SqlValue::Text(from),
+                    SqlValue::Text(to),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn has_adoption_edge(
+        &mut self,
+        producer_action_key: &str,
+        role: &str,
+        virtual_path: &[u8],
+        from_object_key: &str,
+        to_object_key: &str,
+    ) -> Result<bool, StoreError> {
+        let rows = self.engine.query(
+            "SELECT producer_action_key FROM adoption_edges \
+             WHERE producer_action_key = ?1 AND role = ?2 AND virtual_path = ?3 \
+             AND from_object_key = ?4 AND to_object_key = ?5 LIMIT 1",
+            &[
+                SqlValue::Text(producer_action_key.to_owned()),
+                SqlValue::Text(role.to_owned()),
+                SqlValue::Blob(virtual_path.to_vec()),
+                SqlValue::Text(from_object_key.to_owned()),
+                SqlValue::Text(to_object_key.to_owned()),
+            ],
+        )?;
+        Ok(!rows.is_empty())
+    }
+
+    fn list_provisional_ancestors(
+        &mut self,
+        consumer_action_key: &str,
+    ) -> Result<Vec<ProvisionalAncestorRow>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT producer_action_key, role, virtual_path, object_key, adopted \
+             FROM provisional_ancestry WHERE consumer_action_key = ?1 \
+             ORDER BY producer_action_key, role, virtual_path",
+            &[SqlValue::Text(consumer_action_key.to_owned())],
+        )?;
+        rows.iter()
+            .map(|row| {
+                let [producer, role, path, object, adopted] = row.as_slice() else {
+                    return Err(StoreError::Corruption("provisional ancestry shape".into()));
+                };
+                let SqlValue::Blob(path) = path else {
+                    return Err(StoreError::Corruption("ancestry path shape".into()));
+                };
+                Ok(ProvisionalAncestorRow {
+                    producer_action_key: expect_text(producer, "ancestry producer")?,
+                    role: expect_text(role, "ancestry role")?,
+                    virtual_path: path.clone(),
+                    object_key: expect_text(object, "ancestry object")?,
+                    adopted: expect_u64(adopted, "ancestry adopted")? != 0,
+                })
+            })
+            .collect()
+    }
+
     fn record_served_consumer(
         &mut self,
         action_key: &str,
@@ -4405,6 +4549,18 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                  generation_hex, attempt_hex, detail FROM divergence_incidents \
                  ORDER BY action_key, seq",
             ),
+            (
+                "provisional_ancestry",
+                "SELECT consumer_action_key, producer_action_key, role, virtual_path, \
+                 object_key, adopted FROM provisional_ancestry \
+                 ORDER BY consumer_action_key, producer_action_key, role, virtual_path",
+            ),
+            (
+                "adoption_edges",
+                "SELECT producer_action_key, role, virtual_path, from_object_key, \
+                 to_object_key FROM adoption_edges \
+                 ORDER BY producer_action_key, role, virtual_path, from_object_key",
+            ),
         ];
         let mut lines = Vec::new();
         for (table, sql) in DUMPS {
@@ -4624,6 +4780,7 @@ mod tests {
             result_kind: ResultKindTag::Success,
             pin_id: pin,
             pin_owner: "coordinator".to_owned(),
+            provisional_ancestors: Vec::new(),
         }
     }
 
@@ -5341,6 +5498,7 @@ mod tests {
             "action_publications",
             "action_serving_states",
             "action_trust_evaluations",
+            "adoption_edges",
             "coordinator_authorities",
             "decision_receipts",
             "determinism_audits",
@@ -5366,6 +5524,7 @@ mod tests {
             "peer_authority_high_water",
             "pins",
             "provenance_edges",
+            "provisional_ancestry",
             "quarantines",
             "schema_epochs",
             "serving_blocking_quarantines",
