@@ -28,6 +28,140 @@ pub enum DisconnectCause {
     ProcessDead,
     /// The wrapper explicitly released its interest.
     ExplicitRelease,
+    /// The wrapper received a catchable termination signal and
+    /// forwarded its own cancellation before dying by it (C016).
+    Signal(WrapperSignal),
+    /// The wrapper's parent died (PDEATHSIG or platform equivalent).
+    ParentDeath,
+}
+
+/// The catchable termination signals the wrapper maps exactly (C016).
+/// SIGKILL is uncatchable by definition — it arrives here as
+/// [`DisconnectCause::ProcessDead`] via the liveness sweep instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapperSignal {
+    /// SIGINT (Ctrl-C).
+    Interrupt,
+    /// SIGTERM.
+    Terminate,
+    /// SIGHUP (controlling terminal gone).
+    Hangup,
+}
+
+impl WrapperSignal {
+    /// The POSIX signal number — the EXACT number stock Cargo would
+    /// die by, so observers cannot tell the wrapper from the real
+    /// thing.
+    #[must_use]
+    pub const fn number(self) -> i32 {
+        match self {
+            Self::Hangup => 1,
+            Self::Interrupt => 2,
+            Self::Terminate => 15,
+        }
+    }
+
+    /// The wait-status exit code an observing shell reports
+    /// (`128 + N`) — the signal-vs-exit classification the wrapper
+    /// must preserve.
+    #[must_use]
+    pub const fn observed_exit_code(self) -> i32 {
+        128 + self.number()
+    }
+}
+
+/// What ends a wrapper's participation, as observed at the wrapper
+/// (signals, parent death) or at the edge (disconnect, liveness).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancellationTrigger {
+    /// A catchable termination signal was delivered to the wrapper.
+    Signal(WrapperSignal),
+    /// The wrapper's parent died (delivered as the configured
+    /// PDEATHSIG, conventionally SIGTERM, or the platform equivalent).
+    ParentDeath,
+    /// The edge observed the wrapper's UDS connection close.
+    UdsDisconnect,
+    /// The edge's liveness sweep found the wrapper's PID gone
+    /// (SIGKILL — nothing was catchable).
+    ProcessDead,
+    /// The wrapper completed normally and released its interest.
+    ExplicitRelease,
+}
+
+/// How the wrapper process itself must end after forwarding its
+/// cancellation — the EXACT stock classification (I6/C016): a signal
+/// death stays a signal death, an exit stays an exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapperFate {
+    /// Re-raise the SAME signal with the default disposition restored,
+    /// so the parent observes death-by-signal (`128 + N`), exactly as
+    /// stock Cargo would have died.
+    DieBySignal(WrapperSignal),
+    /// Exit normally with the build's own exit code.
+    ExitWithBuildCode,
+    /// The wrapper process is not ours to end (the trigger was
+    /// observed at the edge; the process is already gone or detached).
+    NotOurProcess,
+}
+
+/// The C016 exact mapping: trigger → (registry release cause, wrapper
+/// fate). One table, no per-call judgment.
+#[must_use]
+pub const fn map_cancellation(trigger: CancellationTrigger) -> (DisconnectCause, WrapperFate) {
+    match trigger {
+        CancellationTrigger::Signal(signal) => (
+            DisconnectCause::Signal(signal),
+            // Forward cancellation FIRST, then die by the same signal:
+            // the observer's signal-vs-exit view is byte-identical to
+            // stock.
+            WrapperFate::DieBySignal(signal),
+        ),
+        CancellationTrigger::ParentDeath => (
+            DisconnectCause::ParentDeath,
+            // PDEATHSIG delivers SIGTERM (the configured convention):
+            // the orphaned wrapper dies by it after forwarding.
+            WrapperFate::DieBySignal(WrapperSignal::Terminate),
+        ),
+        CancellationTrigger::UdsDisconnect => {
+            (DisconnectCause::UdsDisconnect, WrapperFate::NotOurProcess)
+        }
+        CancellationTrigger::ProcessDead => {
+            (DisconnectCause::ProcessDead, WrapperFate::NotOurProcess)
+        }
+        CancellationTrigger::ExplicitRelease => (
+            DisconnectCause::ExplicitRelease,
+            WrapperFate::ExitWithBuildCode,
+        ),
+    }
+}
+
+/// Whether the SHARED attempt may be cancelled after a release — the
+/// reference-counted policy (I6): never because one subscriber left,
+/// only when NO retained interest remains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptCancellation {
+    /// Retained interest remains: the shared attempt keeps running.
+    NotPermitted {
+        /// Interests still retained.
+        retained: usize,
+    },
+    /// The last interest released: cancelling the shared attempt is
+    /// now permitted.
+    PermittedNow,
+}
+
+impl ReleaseOutcome {
+    /// The refcounted shared-attempt cancellation decision this
+    /// release yields.
+    #[must_use]
+    pub const fn attempt_cancellation(&self) -> AttemptCancellation {
+        match self.disposition {
+            ActionDisposition::SurvivesWithRemaining { retained } => {
+                AttemptCancellation::NotPermitted { retained }
+            }
+            ActionDisposition::LastInterestReleased => AttemptCancellation::PermittedNow,
+        }
+    }
 }
 
 /// What the shared action looks like after one interest ended.
@@ -241,6 +375,107 @@ mod tests {
 
         // A sweep with everyone alive reaps nobody.
         assert!(action.sweep_dead(|_| true).is_empty());
+    }
+
+    #[test]
+    fn c016_exact_signal_mapping_matches_stock() {
+        // The differential-vs-stock table: for each catchable signal,
+        // stock Cargo dies BY that signal and the shell observes
+        // 128+N. The wrapper's mapping must be indistinguishable:
+        // cancellation forwarded with the signal recorded, then death
+        // by the SAME signal — never a plain exit code.
+        let stock: [(WrapperSignal, i32, i32); 3] = [
+            (WrapperSignal::Hangup, 1, 129),
+            (WrapperSignal::Interrupt, 2, 130),
+            (WrapperSignal::Terminate, 15, 143),
+        ];
+        for (signal, number, observed) in stock {
+            assert_eq!(signal.number(), number);
+            assert_eq!(signal.observed_exit_code(), observed);
+            let (cause, fate) = map_cancellation(CancellationTrigger::Signal(signal));
+            assert_eq!(cause, DisconnectCause::Signal(signal));
+            assert_eq!(
+                fate,
+                WrapperFate::DieBySignal(signal),
+                "signal-vs-exit classification must be preserved exactly"
+            );
+        }
+        // Normal completion exits with the build's code — an exit
+        // stays an exit.
+        assert_eq!(
+            map_cancellation(CancellationTrigger::ExplicitRelease),
+            (
+                DisconnectCause::ExplicitRelease,
+                WrapperFate::ExitWithBuildCode
+            )
+        );
+    }
+
+    #[test]
+    fn c016_parent_death_forwards_then_dies_by_sigterm() {
+        // PDEATHSIG (or platform equivalent) → the orphaned wrapper
+        // cancels ITS OWN subscription and dies by SIGTERM, exactly as
+        // an unwrapped child with the same PDEATHSIG would.
+        let (cause, fate) = map_cancellation(CancellationTrigger::ParentDeath);
+        assert_eq!(cause, DisconnectCause::ParentDeath);
+        assert_eq!(fate, WrapperFate::DieBySignal(WrapperSignal::Terminate));
+
+        // And the release touches only that subscriber.
+        let mut action = SharedActionInterest::new();
+        action.register(1, 1001).unwrap();
+        action.register(2, 1002).unwrap();
+        let outcome = action.release(1, cause);
+        assert!(outcome.released);
+        assert_eq!(
+            outcome.disposition,
+            ActionDisposition::SurvivesWithRemaining { retained: 1 }
+        );
+        assert_eq!(action.obligation_open(2), Ok(true));
+    }
+
+    #[test]
+    fn c016_shared_attempt_cancels_only_through_the_refcount_policy() {
+        // Three subscribers; SIGINT one, SIGTERM another: the shared
+        // attempt is NOT cancellable while interest remains. Only the
+        // LAST release (parent death here) permits attempt
+        // cancellation.
+        let mut action = SharedActionInterest::new();
+        action.register(1, 1001).unwrap();
+        action.register(2, 1002).unwrap();
+        action.register(3, 1003).unwrap();
+
+        let (cause1, _) =
+            map_cancellation(CancellationTrigger::Signal(WrapperSignal::Interrupt));
+        assert_eq!(
+            action.release(1, cause1).attempt_cancellation(),
+            AttemptCancellation::NotPermitted { retained: 2 }
+        );
+        let (cause2, _) =
+            map_cancellation(CancellationTrigger::Signal(WrapperSignal::Terminate));
+        assert_eq!(
+            action.release(2, cause2).attempt_cancellation(),
+            AttemptCancellation::NotPermitted { retained: 1 }
+        );
+        let (cause3, _) = map_cancellation(CancellationTrigger::ParentDeath);
+        assert_eq!(
+            action.release(3, cause3).attempt_cancellation(),
+            AttemptCancellation::PermittedNow
+        );
+    }
+
+    #[test]
+    fn c016_edge_observed_triggers_have_no_wrapper_fate() {
+        // UDS disconnect and liveness-detected SIGKILL are observed at
+        // the EDGE: the wrapper process is not ours to end (it is gone
+        // or detached) — the mapping must never invent a signal death.
+        assert_eq!(
+            map_cancellation(CancellationTrigger::UdsDisconnect),
+            (DisconnectCause::UdsDisconnect, WrapperFate::NotOurProcess)
+        );
+        assert_eq!(
+            map_cancellation(CancellationTrigger::ProcessDead),
+            (DisconnectCause::ProcessDead, WrapperFate::NotOurProcess)
+        );
     }
 
     #[test]
