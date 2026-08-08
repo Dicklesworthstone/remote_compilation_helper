@@ -328,7 +328,10 @@ mod tests {
             gate.commit_staged(2, &mut tree),
             Err(RightsRefusal::RightsRevoked)
         );
-        assert_eq!(tree.written, vec![(1, WriteSource::Remote { rights_epoch: 1 })]);
+        assert_eq!(
+            tree.written,
+            vec![(1, WriteSource::Remote { rights_epoch: 1 })]
+        );
     }
 
     #[test]
