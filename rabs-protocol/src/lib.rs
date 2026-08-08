@@ -56,6 +56,7 @@ pub mod decision_receipt;
 pub mod descriptor;
 pub mod domain_plumbing;
 pub mod durable_ids;
+pub mod edge_fence;
 pub mod envelope;
 pub mod frame_extensions;
 pub mod framing;
