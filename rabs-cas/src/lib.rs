@@ -43,6 +43,7 @@ pub mod blob_store;
 pub mod chunking;
 pub mod closure_validation;
 pub mod collision_policy;
+pub mod compression_policy;
 pub mod crash_matrix;
 pub mod dependency_snapshot;
 pub mod digest_set;
