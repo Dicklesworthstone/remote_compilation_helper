@@ -4858,6 +4858,7 @@ version = "1.0.56"
 dependencies = [
  "blake3",
  "fsqlite",
+ "rabs-key",
  "rabs-protocol",
  "rusqlite",
  "sha2 0.10.9",

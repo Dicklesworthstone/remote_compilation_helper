@@ -284,6 +284,20 @@ fn upload(store: &mut dyn RabsMetadataStore, tags: &[u8]) -> Result<(), StoreErr
     Ok(())
 }
 
+/// Locate the offer's derived bundle root (H039: build() stamps the
+/// F035 derivation, and the closure check requires it located like
+/// any other object). Idempotent, recovery-aware like `upload`.
+fn upload_bundle_root(
+    store: &mut dyn RabsMetadataStore,
+    offer: &OfferPreparedActionResult,
+) -> Result<(), StoreError> {
+    if let Some(root) = &offer.manifest.artifact_bundle_root {
+        store.record_object(&root.0, 0)?;
+        store.add_location(&root.0, "/cas/bundle-root", Some(1), "raw", true)?;
+    }
+    Ok(())
+}
+
 fn expected_descriptor() -> TypedDigest {
     digest("rabs.descriptor.sha256.v1", 8)
 }
@@ -311,6 +325,7 @@ fn run_phase(
         MatrixPhase::Commit => {
             upload(store, &WINNER_UPLOAD_TAGS)?;
             let offer = build_offer(winner_manifest(), 50, 51)?;
+            upload_bundle_root(store, &offer)?;
             process_offer(
                 store,
                 &offer,
@@ -327,6 +342,7 @@ fn run_phase(
             let mut divergent = winner_manifest();
             divergent.logical_outputs[0].object = object(42);
             let offer = build_offer(divergent, 52, 55)?;
+            upload_bundle_root(store, &offer)?;
             process_offer(
                 store,
                 &offer,

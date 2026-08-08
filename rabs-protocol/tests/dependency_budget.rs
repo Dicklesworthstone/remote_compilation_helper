@@ -33,10 +33,12 @@ const BUDGETS: &[(&str, usize, &str)] = &[
     ("rabs-scheduler", 1, "rabs-protocol only (pure policy)"),
     (
         "rabs-cas",
-        5,
+        6,
         "protocol + rusqlite/fsqlite differential store pair + sha2 \
          (authoritative digests) + blake3 (H002 LOCAL fingerprints only, \
-         workspace-reviewed, structurally excluded from TypedDigest)",
+         workspace-reviewed, structurally excluded from TypedDigest) + \
+         rabs-key (H039: publication admission reuses F035's one \
+         bundle-root implementation; pure sibling, protocol-only deps)",
     ),
     ("rabs-sandbox", 4, "protocol + reviewed namespace/fs crates"),
     ("rabs-asupersync", 3, "asupersync + protocol (+1 headroom)"),

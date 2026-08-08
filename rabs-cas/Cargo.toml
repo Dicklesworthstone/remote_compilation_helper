@@ -33,6 +33,11 @@ sha2 = { workspace = true }
 # structurally kept out of TypedDigest so a BLAKE3 value can never enter
 # authoritative metadata as an identity digest.
 blake3 = { workspace = true }
+# H039: publication admission reuses F035's ONE bundle-root/derived-index
+# implementation instead of duplicating the canonical framing here (two
+# implementations of the root computation could silently drift). Pure
+# sibling crate; depends only on rabs-protocol.
+rabs-key = { path = "../rabs-key" }
 
 [lints.rust]
 unsafe_code = "forbid"

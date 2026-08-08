@@ -203,6 +203,10 @@ pub enum OfferBuildError {
     },
     /// A provisional-ancestor reference names the offering action itself.
     SelfAncestorRef,
+    /// The manifest's declared artifact bundle root does not match the
+    /// deterministic derivation from the output map, or is present or
+    /// absent when it must not be (H039; risk R125).
+    BundleRoot(rabs_key::logical_output_map::BundleRootError),
 }
 
 /// One provisional-ancestor reference carried by a prepared result
@@ -328,6 +332,14 @@ impl OfferPreparedActionResult {
                 });
             }
         }
+        // H039: STAMP the deterministic bundle root from the single
+        // role-tagged map (F035's one implementation), THEN verify —
+        // so a worker can neither omit nor contradict it, and the
+        // digests below cover the derived root.
+        manifest.artifact_bundle_root =
+            rabs_key::logical_output_map::compute_bundle_root(&manifest.logical_outputs);
+        rabs_key::logical_output_map::verify_manifest_bundle_root(&manifest)
+            .map_err(OfferBuildError::BundleRoot)?;
         manifest.semantic_result_digest = semantic_result_digest_v1(&manifest);
         manifest.observable_result_digest =
             observable_result_digest_v1(&manifest, &canonical_observations);
@@ -370,6 +382,14 @@ pub enum OfferRefusal {
     UnknownActionEntry,
     /// Manifest epochs disagree with the action entry.
     EpochMismatch,
+    /// Independent recompute of the artifact bundle root from the
+    /// output map disagrees with the declared root, or the map itself
+    /// is structurally invalid (duplicate roles, failure with outputs)
+    /// — the H039/R125 admission gate.
+    BundleRootMismatch {
+        /// The F035 rule that failed, rendered.
+        rule: String,
+    },
     /// Independent recompute of `semantic_result_digest` disagrees with
     /// the declared value.
     SemanticDigestMismatch,
@@ -581,6 +601,17 @@ pub fn process_offer(
         || entry.projection_epoch != offer.manifest.projection_epoch
     {
         return Err(OfferRefusal::EpochMismatch);
+    }
+
+    // 5.5. Independent bundle-root recompute (H039; R125): the
+    // coordinator re-derives the root from the single role-tagged map
+    // with F035's one implementation and refuses any manifest whose
+    // declared root is absent, contradictory, or whose map is
+    // structurally invalid — a worker-stamped root is never trusted.
+    if let Err(rule) = rabs_key::logical_output_map::verify_manifest_bundle_root(&offer.manifest) {
+        return Err(OfferRefusal::BundleRootMismatch {
+            rule: format!("{rule:?}"),
+        });
     }
 
     // 6. Independent digest recompute from the versioned projections.
@@ -1210,6 +1241,19 @@ mod tests {
                 .add_location(&id.0, &format!("/cas/{tag}"), Some(1), "raw", true)
                 .unwrap();
         }
+        // H039: build() stamps the F035-derived bundle root, and the
+        // closure check requires it located like any other object.
+        locate_bundle_root(store, &offer());
+    }
+
+    /// Record + locate an offer's derived bundle root (idempotent).
+    fn locate_bundle_root(store: &mut dyn RabsMetadataStore, offer: &OfferPreparedActionResult) {
+        if let Some(root) = &offer.manifest.artifact_bundle_root {
+            store.record_object(&root.0, 0).unwrap();
+            store
+                .add_location(&root.0, "/cas/bundle-root", Some(1), "raw", true)
+                .unwrap();
+        }
     }
 
     fn expected_descriptor() -> TypedDigest {
@@ -1561,6 +1605,112 @@ mod tests {
         )
         .unwrap();
         assert_eq!(shuffled, ordered, "ancestor order never changes identity");
+    }
+
+    #[test]
+    fn h039_bundle_root_and_role_uniqueness_are_enforced_at_both_gates() {
+        // T047 rejection fixtures (R125).
+        // Gate 1 — worker build(): a duplicate (role, path) row is a
+        // typed structural refusal (the A031 validate runs before the
+        // F035 root check; the BundleRoot(Structural) arm guards
+        // against the two validators drifting); the offer never
+        // exists either way.
+        let manifest_id = object(50);
+        let mut duplicated = manifest();
+        duplicated
+            .logical_outputs
+            .push(duplicated.logical_outputs[0].clone());
+        assert!(matches!(
+            OfferPreparedActionResult::build(
+                attempt_authority(),
+                duplicated,
+                manifest_id.clone(),
+                evidence(&manifest_id),
+                object(51),
+                digest("rabs.observation-stream.sha256.v1", 9),
+                &[declared()[0].clone(), declared()[0].clone()],
+                Vec::new(),
+            ),
+            Err(OfferBuildError::ManifestInvalid(_))
+        ));
+
+        // build() STAMPS the derived root: whatever garbage the
+        // fixture manifest carried, the built offer's root is the
+        // F035 derivation.
+        let built = offer();
+        assert_eq!(
+            built.manifest.artifact_bundle_root,
+            rabs_key::logical_output_map::compute_bundle_root(&built.manifest.logical_outputs),
+            "worker cannot ship a contradictory root"
+        );
+
+        // Gate 2 — coordinator admission: a tampered root (re-stamped
+        // digests, so digest recompute alone would PASS) is refused by
+        // the independent bundle-root recompute, before any write.
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        ready_store(&mut store);
+        let mut tampered = offer();
+        tampered.manifest.artifact_bundle_root = Some(object(99));
+        tampered.manifest.semantic_result_digest = semantic_result_digest_v1(&tampered.manifest);
+        tampered.manifest.observable_result_digest = observable_result_digest_v1(
+            &tampered.manifest,
+            &digest("rabs.observation-stream.sha256.v1", 9),
+        );
+        assert!(matches!(
+            process_offer(
+                &mut store,
+                &tampered,
+                &expected_descriptor(),
+                no_committed,
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            ),
+            Err(OfferRefusal::BundleRootMismatch { .. })
+        ));
+        let action = digest("rabs.action-key.sha256.v1", 7);
+        assert!(
+            !store.has_publication(&action).unwrap(),
+            "refusals write nothing"
+        );
+
+        // A root MISSING where outputs exist refuses the same way.
+        let mut rootless = offer();
+        rootless.manifest.artifact_bundle_root = None;
+        rootless.manifest.semantic_result_digest = semantic_result_digest_v1(&rootless.manifest);
+        rootless.manifest.observable_result_digest = observable_result_digest_v1(
+            &rootless.manifest,
+            &digest("rabs.observation-stream.sha256.v1", 9),
+        );
+        assert!(matches!(
+            process_offer(
+                &mut store,
+                &rootless,
+                &expected_descriptor(),
+                no_committed,
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            ),
+            Err(OfferRefusal::BundleRootMismatch { .. })
+        ));
+
+        // The untampered offer commits: the gates reject exactly the
+        // contradictions, not the happy path.
+        assert!(matches!(
+            process_offer(
+                &mut store,
+                &offer(),
+                &expected_descriptor(),
+                no_committed,
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            )
+            .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
     }
 
     #[test]
@@ -2039,6 +2189,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
+        locate_bundle_root(&mut store, &divergent);
         let committed = first.manifest.clone();
         let outcome = process_offer(
             &mut store,
@@ -2092,7 +2243,7 @@ mod tests {
                 .add_location(&object(tag).0, &format!("/cas/{tag}"), Some(1), "raw", true)
                 .unwrap();
         }
-        OfferPreparedActionResult::build(
+        let built = OfferPreparedActionResult::build(
             attempt_authority(),
             m,
             id.clone(),
@@ -2102,7 +2253,9 @@ mod tests {
             &declared(),
             Vec::new(),
         )
-        .unwrap()
+        .unwrap();
+        locate_bundle_root(store, &built);
+        built
     }
 
     #[test]
