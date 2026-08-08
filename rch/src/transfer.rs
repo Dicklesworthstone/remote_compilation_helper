@@ -474,6 +474,72 @@ fn retrieval_exclude_can_block_artifacts(pattern: &str, artifact_patterns: &[Str
     })
 }
 
+fn path_matches_transfer_exclude(relative: &Path, is_dir: bool, excludes: &[String]) -> bool {
+    let relative_text = relative.to_string_lossy().replace('\\', "/");
+    let basename = relative
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+
+    excludes.iter().any(|raw_pattern| {
+        let normalized = normalize_config_exclude_pattern(raw_pattern);
+        let directory_only = normalized.ends_with('/');
+        if directory_only && !is_dir {
+            return false;
+        }
+        let pattern_text = normalized.trim_start_matches('/').trim_end_matches('/');
+        if pattern_text.is_empty() {
+            return false;
+        }
+        Pattern::new(pattern_text)
+            .is_ok_and(|pattern| pattern.matches(&relative_text) || pattern.matches(&basename))
+    })
+}
+
+/// Conservative local upper bound for an ordinary rsync payload.
+///
+/// This intentionally counts sparse files by logical length and stops at the
+/// amount needed to reach the one-hour timeout cap. It skips configured rsync
+/// exclusions and never follows symlinks. An unreadable entry is ignored; the
+/// resulting 30-second floor remains the fail-open fallback.
+fn local_sync_payload_upper_bound(project_root: &Path, excludes: &[String]) -> u64 {
+    const PAYLOAD_BYTES_AT_TIMEOUT_CAP: u64 = (TransferConfig::MAX_SYNC_TIMEOUT_MS
+        - TransferConfig::DEFAULT_SYNC_TIMEOUT_FLOOR_MS)
+        / 1_000
+        * 1024
+        * 1024;
+
+    let mut total = 0_u64;
+    let mut pending = vec![project_root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(relative) = path.strip_prefix(project_root) else {
+                continue;
+            };
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let file_type = metadata.file_type();
+            if path_matches_transfer_exclude(relative, file_type.is_dir(), excludes) {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file() {
+                total = total.saturating_add(metadata.len());
+                if total >= PAYLOAD_BYTES_AT_TIMEOUT_CAP {
+                    return PAYLOAD_BYTES_AT_TIMEOUT_CAP;
+                }
+            }
+        }
+    }
+    total
+}
+
 /// One deterministic source-transfer attempt retained for hook diagnostics.
 ///
 /// These records are unit-observable evidence about the retry state machine;
@@ -557,11 +623,12 @@ where
             }
             Err(error) => {
                 let retryable = is_retryable_transport_error(&error);
+                let detail = source_transfer_error_detail(&error);
                 attempts.push(TransferAttemptDiagnostic {
                     attempt,
                     max_attempts,
                     outcome: if retryable { "retryable" } else { "fatal" },
-                    detail: error.to_string(),
+                    detail: detail.clone(),
                 });
                 warn!(
                     "{}: {} error on attempt {}/{}: {}",
@@ -575,7 +642,7 @@ where
                 if !retryable || attempt == max_attempts {
                     return Err(TransferAttemptsExhausted {
                         attempts,
-                        last_error: error.to_string(),
+                        last_error: detail,
                     });
                 }
             }
@@ -700,41 +767,53 @@ async fn execute_rsync_with_retry(
     operation_name: &str,
     build_command: impl Fn() -> Command,
 ) -> Result<std::process::Output> {
-    retry_with_backoff(config, operation_name, || async {
-        let mut cmd = build_command();
-        cmd.kill_on_drop(true);
-        let child = cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("rsync I/O error: {}", e))?;
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|e| anyhow::anyhow!("rsync I/O error: {}", e))?;
-        // A process that RAN but exited non-zero on a *transient transport*
-        // error must surface as Err so retry_with_backoff classifies and
-        // retries it. `wait_with_output` returns Ok for any exit status, so
-        // without this the retry subsystem was inert for the exact failure
-        // (flaky SSH → rsync exit 12/30/10, "connection unexpectedly closed")
-        // it exists to handle. The full stderr is embedded so the retry layer's
-        // re-classification agrees. Non-retryable non-zero exits return
-        // Ok(output) unchanged, so the caller's existing failure handling
-        // (exit-code/stderr reporting, partial-transfer checks) is preserved.
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if is_retryable_transport_error_text(&stderr) {
-                return Err(anyhow::anyhow!(
-                    "rsync transport error (exit {}): {}",
-                    output
-                        .status
-                        .code()
-                        .map_or_else(|| "signal".to_string(), |c| c.to_string()),
-                    stderr
-                ));
-            }
-        }
-        Ok(output)
+    retry_with_backoff(config, operation_name, || {
+        execute_rsync_attempt(build_command())
     })
     .await
+}
+
+async fn execute_rsync_attempt(mut cmd: Command) -> Result<std::process::Output> {
+    cmd.kill_on_drop(true);
+    let child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("rsync I/O error: {}", e))?;
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| anyhow::anyhow!("rsync I/O error: {}", e))?;
+    // A process that RAN but exited non-zero on a transient transport error
+    // must surface as Err so the retry layer can classify it. Non-transport
+    // exits stay as Output for the caller's structured rsync failure handling.
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_retryable_transport_error_text(&stderr) {
+            return Err(anyhow::anyhow!(
+                "rsync transport error (exit {}): {}",
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+                stderr
+            ));
+        }
+    }
+    Ok(output)
+}
+
+async fn execute_source_rsync_attempt(cmd: Command) -> Result<std::process::Output> {
+    let output = execute_rsync_attempt(cmd).await?;
+    if output.status.success() {
+        return Ok(output);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    Err(TransferError::SyncFailed {
+        reason: "rsync failed".to_string(),
+        exit_code: output.status.code(),
+        stderr,
+    }
+    .into())
 }
 
 fn use_mock_transport(worker: &WorkerConfig) -> bool {
@@ -1058,6 +1137,16 @@ impl TransferPipeline {
             retry.total_timeout_ms = max_transfer_time_ms;
         }
         retry
+    }
+
+    fn source_sync_attempt_timeout(&self, effective_excludes: &[String]) -> std::time::Duration {
+        if self.transfer_config.sync_timeout_ms.is_some() {
+            return self.transfer_config.sync_timeout_for_payload(0);
+        }
+        let payload_bytes = self.estimated_transfer_bytes.unwrap_or_else(|| {
+            local_sync_payload_upper_bound(&self.project_root, effective_excludes)
+        });
+        self.transfer_config.sync_timeout_for_payload(payload_bytes)
     }
 
     /// Override the remote project path used for sync and command execution.
@@ -1933,7 +2022,9 @@ fi",
 
         cmd.arg("-az"); // Archive mode + compression
         add_portable_rsync_archive_args(&mut cmd);
-        cmd.arg("--stats") // Structured output for parse_rsync_bytes/files
+        cmd.arg("--partial")
+            .arg("--partial-dir=.rch-partial")
+            .arg("--stats") // Structured output for parse_rsync_bytes/files
             .arg("-e")
             .arg(ssh_command);
 
@@ -2002,7 +2093,9 @@ fi",
 
         cmd.arg("-az"); // Archive mode + compression
         add_portable_rsync_archive_args(&mut cmd);
-        cmd.arg("--info=progress2")
+        cmd.arg("--partial")
+            .arg("--partial-dir=.rch-partial")
+            .arg("--info=progress2")
             .arg("--info=stats2")
             .arg("-e")
             .arg(ssh_command);
@@ -2152,6 +2245,7 @@ fi",
                     let ssh_command = ssh_command.clone();
                     let extraction_script = extraction_script.clone();
                     let archive_path = archive_path.clone();
+                    let escaped_remote_path = escaped_remote_path.clone();
                     async move {
                         let mut rsync = Command::new("rsync");
                         rsync
@@ -2162,6 +2256,8 @@ fi",
                             .arg("--append-verify")
                             .arg("-e")
                             .arg(ssh_command)
+                            .arg("--rsync-path")
+                            .arg(format!("mkdir -p {escaped_remote_path} && rsync"))
                             .arg(archive_path)
                             .arg(destination)
                             .stdout(Stdio::piped())
@@ -2473,14 +2569,21 @@ fi",
             let rsync = std::sync::Arc::new(MockRsync::new(MockRsyncConfig::from_env()));
             let project_root_str = self.project_root.display().to_string();
             let retry_config = self.transfer_config.retry.clone();
-            let result = retry_with_backoff(&retry_config, "mock_sync_to_remote", || {
-                let rsync = rsync.clone();
-                let project_root = project_root_str.clone();
-                let dest = destination.clone();
-                let excludes = effective_excludes.clone();
-                async move { rsync.sync_to_remote(&project_root, &dest, &excludes).await }
-            })
-            .await?;
+            let attempt_timeout = self.source_sync_attempt_timeout(&effective_excludes);
+            let (result, _attempts) = run_source_transfer_attempts(
+                &retry_config,
+                attempt_timeout,
+                "mock_sync_to_remote",
+                |_attempt| {
+                    let rsync = rsync.clone();
+                    let project_root = project_root_str.clone();
+                    let dest = destination.clone();
+                    let excludes = effective_excludes.clone();
+                    async move { rsync.sync_to_remote(&project_root, &dest, &excludes).await }
+                },
+            )
+            .await
+            .map_err(anyhow::Error::new)?;
             return Ok(SyncResult {
                 bytes_transferred: result.bytes_transferred,
                 files_transferred: result.files_transferred,
@@ -2521,17 +2624,26 @@ fi",
 
         let start = std::time::Instant::now();
 
-        // Execute rsync with retry logic for transient errors
-        let retry_config = self.effective_rsync_retry_config();
-        let output = execute_rsync_with_retry(&retry_config, "sync_to_remote", || {
-            self.build_sync_command(
-                worker,
-                &destination,
-                &escaped_remote_path,
-                &effective_excludes,
-            )
-        })
-        .await?;
+        // Source uploads receive a full payload-aware timeout on every attempt.
+        // This is intentionally independent of the remote Cargo command timeout
+        // and artifact-return retry budget.
+        let retry_config = self.transfer_config.retry.clone();
+        let attempt_timeout = self.source_sync_attempt_timeout(&effective_excludes);
+        let (output, _attempts) = run_source_transfer_attempts(
+            &retry_config,
+            attempt_timeout,
+            "sync_to_remote",
+            |_attempt| {
+                execute_source_rsync_attempt(self.build_sync_command(
+                    worker,
+                    &destination,
+                    &escaped_remote_path,
+                    &effective_excludes,
+                ))
+            },
+        )
+        .await
+        .map_err(anyhow::Error::new)?;
 
         let duration = start.elapsed();
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -2644,9 +2756,11 @@ fi",
         );
 
         let retry_config = self.effective_rsync_retry_config();
+        let attempt_timeout = self.source_sync_attempt_timeout(&effective_excludes);
         let (output, duration_ms) = run_command_streaming_with_retry(
             &retry_config,
             "sync_to_remote_streaming",
+            Some(attempt_timeout),
             build_cmd,
             |line| {
                 on_line(line);
@@ -3368,6 +3482,7 @@ fi",
         let (output, duration_ms) = run_command_streaming_with_retry(
             &retry_config,
             "retrieve_artifacts_streaming",
+            None,
             build_cmd,
             |line| {
                 on_line(line);
@@ -3830,15 +3945,26 @@ fn streaming_error_is_retryable(err: &anyhow::Error) -> bool {
     is_retryable_transport_error(err)
 }
 
+fn source_transfer_error_detail(err: &anyhow::Error) -> String {
+    if let Some(TransferError::SyncFailed { stderr, .. }) = err.downcast_ref::<TransferError>()
+        && !stderr.is_empty()
+    {
+        format!("{err}: {stderr}")
+    } else {
+        err.to_string()
+    }
+}
+
 /// Streaming counterpart of [`execute_rsync_with_retry`].
 ///
 /// `run_command_streaming` consumes its `Command` (so it cannot be retried in
 /// place) and surfaces transport failures inside a `TransferError::SyncFailed`
 /// whose `Display` omits the stderr — which is why this loop is hand-rolled
 /// rather than delegating to `retry_with_backoff`. Each attempt rebuilds the
-/// command via `build_command`, runs it under the *remaining* total budget
-/// (mirroring `retry_with_backoff`'s per-attempt timeout accounting), and on a
-/// transient transport failure backs off and retries up to `max_attempts`.
+/// command via `build_command`, and retries transient transport failures up to
+/// `max_attempts`. Source uploads pass `Some(timeout)` so every attempt receives
+/// the full payload-aware source-sync timeout. Artifact retrieval passes `None`
+/// and retains the existing shared `RetryConfig::total_timeout_ms` budget.
 ///
 /// `on_line` is re-invoked from scratch on every attempt (rsync restarts from
 /// the beginning). All call sites use it purely for progress/heartbeat display,
@@ -3846,6 +3972,7 @@ fn streaming_error_is_retryable(err: &anyhow::Error) -> bool {
 async fn run_command_streaming_with_retry<F>(
     config: &RetryConfig,
     operation_name: &str,
+    source_attempt_timeout: Option<std::time::Duration>,
     build_command: impl Fn() -> Command,
     mut on_line: F,
 ) -> Result<(String, u64)>
@@ -3854,10 +3981,16 @@ where
 {
     let start = std::time::Instant::now();
     let mut last_error: Option<anyhow::Error> = None;
+    let max_attempts = config.max_attempts.max(1);
+    let mut source_attempts = Vec::with_capacity(max_attempts as usize);
 
-    for attempt in 0..config.max_attempts {
-        // Stop before a retry once the total budget is spent.
-        if attempt > 0 && !config.should_retry(attempt, start.elapsed()) {
+    for attempt in 0..max_attempts {
+        // Artifact retrieval retains the shared total budget. Source uploads
+        // deliberately do not: each configured attempt gets its full timeout.
+        if source_attempt_timeout.is_none()
+            && attempt > 0
+            && !config.should_retry(attempt, start.elapsed())
+        {
             debug!(
                 "{}: total timeout exceeded after {} attempts",
                 operation_name, attempt
@@ -3878,20 +4011,27 @@ where
             sleep(delay).await;
         }
 
-        // The per-attempt timeout is the remaining total budget, so the sum of
-        // all attempts stays bounded by `total_timeout_ms` exactly as the
-        // non-streaming retry path does.
-        let elapsed_ms = start.elapsed().as_millis();
-        let remaining_ms = if elapsed_ms >= config.total_timeout_ms as u128 {
-            1
-        } else {
-            (config.total_timeout_ms - elapsed_ms as u64).max(1)
-        };
-        let attempt_timeout = std::time::Duration::from_millis(remaining_ms);
+        let attempt_timeout = source_attempt_timeout.unwrap_or_else(|| {
+            let elapsed_ms = start.elapsed().as_millis();
+            let remaining_ms = if elapsed_ms >= config.total_timeout_ms as u128 {
+                1
+            } else {
+                (config.total_timeout_ms - elapsed_ms as u64).max(1)
+            };
+            std::time::Duration::from_millis(remaining_ms)
+        });
 
         let cmd = build_command();
         match run_command_streaming(cmd, operation_name, attempt_timeout, &mut on_line).await {
             Ok(result) => {
+                if source_attempt_timeout.is_some() {
+                    source_attempts.push(TransferAttemptDiagnostic {
+                        attempt: attempt + 1,
+                        max_attempts,
+                        outcome: "succeeded",
+                        detail: format!("{operation_name} completed"),
+                    });
+                }
                 if attempt > 0 {
                     info!(
                         "{}: succeeded on attempt {}/{}",
@@ -3903,13 +4043,29 @@ where
                 return Ok(result);
             }
             Err(err) => {
-                if !streaming_error_is_retryable(&err) {
+                let retryable = streaming_error_is_retryable(&err);
+                let detail = source_transfer_error_detail(&err);
+                if source_attempt_timeout.is_some() {
+                    source_attempts.push(TransferAttemptDiagnostic {
+                        attempt: attempt + 1,
+                        max_attempts,
+                        outcome: if retryable { "retryable" } else { "fatal" },
+                        detail: detail.clone(),
+                    });
+                }
+                if !retryable {
                     debug!(
                         "{}: non-retryable error on attempt {}: {}",
                         operation_name,
                         attempt + 1,
                         err
                     );
+                    if source_attempt_timeout.is_some() {
+                        return Err(anyhow::Error::new(TransferAttemptsExhausted {
+                            attempts: source_attempts,
+                            last_error: detail,
+                        }));
+                    }
                     return Err(err);
                 }
                 warn!(
@@ -3922,6 +4078,17 @@ where
                 last_error = Some(err);
             }
         }
+    }
+
+    if source_attempt_timeout.is_some() {
+        let last_error = source_attempts
+            .last()
+            .map(|attempt| attempt.detail.clone())
+            .unwrap_or_else(|| format!("{operation_name}: all retries exhausted"));
+        return Err(anyhow::Error::new(TransferAttemptsExhausted {
+            attempts: source_attempts,
+            last_error,
+        }));
     }
 
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{}: all retries exhausted", operation_name)))
@@ -6679,7 +6846,7 @@ Total file size: 123 bytes";
 
         let (value, attempts) = run_source_transfer_attempts(
             &retry,
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(10),
             "cold_pinned_tree",
             move |_attempt| {
                 let call = calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -6689,7 +6856,8 @@ Total file size: 123 bytes";
                     .push("worker:/remote/job/.rch-clean-overlay-base.tar");
                 async move {
                     if call == 0 {
-                        Err(anyhow::anyhow!("cold_pinned_tree: timed out"))
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        Ok("completed too late")
                     } else {
                         Ok("continued")
                     }
@@ -6703,6 +6871,7 @@ Total file size: 123 bytes";
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].outcome, "retryable");
         assert_eq!(attempts[1].outcome, "succeeded");
+        assert!(attempts[0].detail.contains("timed out after 10ms"));
         assert_eq!(
             observed_bases
                 .lock()
@@ -6815,8 +6984,122 @@ Total file size: 123 bytes";
 
         assert!(args.iter().any(|arg| arg == "--delete"));
         assert!(!args.iter().any(|arg| arg == "--append-verify"));
-        assert!(!args.iter().any(|arg| arg == "--partial"));
+        assert_eq!(args.iter().filter(|arg| *arg == "--partial").count(), 1);
+        assert_eq!(
+            args.iter()
+                .filter(|arg| *arg == "--partial-dir=.rch-partial")
+                .count(),
+            1
+        );
         assert_eq!(args.last(), Some(&destination));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ordinary_source_retry_rebuilds_same_resumable_rsync_command() {
+        // Deterministic production-command spying boundary, not live-network
+        // evidence: the real command builder is inspected on both attempts while
+        // the injected operation makes attempt 1 exceed the real timeout future.
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/pinned-materialized-tree"),
+            "pinned-tree".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = worker_with_os(Some("linux"));
+        let excludes = pipeline.get_effective_excludes();
+        let remote_path = pipeline.remote_path();
+        let escaped_remote_path = escape(Cow::from(remote_path.as_str()));
+        let destination = format!("{}@{}:{}", worker.user, worker.host, escaped_remote_path);
+        let expected_destination = destination.clone();
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_in = std::sync::Arc::clone(&observed);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        let retry = RetryConfig {
+            max_attempts: 2,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            jitter_factor: 0.0,
+            // Deliberately smaller than one attempt. The source path must ignore
+            // this old shared budget and still launch attempt 2 with a fresh cap.
+            total_timeout_ms: 1,
+        };
+
+        let (_, attempts) = run_source_transfer_attempts(
+            &retry,
+            std::time::Duration::from_millis(200),
+            "ordinary_source_sync",
+            move |_attempt| {
+                let command = pipeline.build_sync_command(
+                    &worker,
+                    &destination,
+                    &escaped_remote_path,
+                    &excludes,
+                );
+                observed_in
+                    .lock()
+                    .expect("record production rsync argv")
+                    .push(
+                        command
+                            .as_std()
+                            .get_args()
+                            .map(|arg| arg.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>(),
+                    );
+                let call = calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if call == 0 {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    } else {
+                        // This exceeds the obsolete 1ms shared budget, but fits
+                        // comfortably inside the fresh 200ms attempt budget.
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("attempt 2 should launch with a fresh source-sync budget");
+
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].outcome, "retryable");
+        assert_eq!(attempts[1].outcome, "succeeded");
+        assert!(attempts[0].detail.contains("timed out after 200ms"));
+        let observed = observed.lock().expect("read production rsync argv");
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0], observed[1]);
+        assert_eq!(
+            observed[0].iter().filter(|arg| *arg == "--partial").count(),
+            1
+        );
+        assert_eq!(
+            observed[0]
+                .iter()
+                .filter(|arg| *arg == "--partial-dir=.rch-partial")
+                .count(),
+            1
+        );
+        assert_eq!(observed[0].last(), Some(&expected_destination));
+    }
+
+    #[test]
+    fn test_ordinary_source_sync_large_payload_gets_larger_per_attempt_budget() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/large-materialized-tree"),
+            "large-tree".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_estimated_transfer_bytes(Some(512 * 1024 * 1024));
+
+        assert_eq!(
+            pipeline.source_sync_attempt_timeout(&[]),
+            std::time::Duration::from_secs(30 + 512)
+        );
     }
 
     #[cfg(unix)]
@@ -7011,6 +7294,7 @@ Total file size: 123 bytes";
         let err = run_command_streaming_with_retry(
             &retry_config,
             "transient_streaming_rsync",
+            None,
             move || {
                 calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut cmd = Command::new("sh");
@@ -7058,6 +7342,7 @@ Total file size: 123 bytes";
         run_command_streaming_with_retry(
             &retry_config,
             "fatal_streaming_rsync",
+            None,
             move || {
                 calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut cmd = Command::new("sh");
@@ -7096,6 +7381,7 @@ Total file size: 123 bytes";
         let (out, _ms) = run_command_streaming_with_retry(
             &retry_config,
             "recovering_streaming_rsync",
+            None,
             move || {
                 let n = calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut cmd = Command::new("sh");
@@ -7119,6 +7405,92 @@ Total file size: 123 bytes";
             calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "should succeed on the second attempt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_source_streaming_timeout_still_launches_attempt_two_with_full_budget() {
+        let _guard = test_guard!();
+        let retry_config = RetryConfig {
+            max_attempts: 2,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            jitter_factor: 0.0,
+            total_timeout_ms: 1,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        let (output, _) = run_command_streaming_with_retry(
+            &retry_config,
+            "ordinary_source_streaming",
+            Some(std::time::Duration::from_millis(200)),
+            move || {
+                let call = calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut command = Command::new("sh");
+                if call == 0 {
+                    command.arg("-c").arg("sleep 1");
+                } else {
+                    command.arg("-c").arg("sleep 0.025; echo attempt-two");
+                }
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+                command
+            },
+            |_| {},
+        )
+        .await
+        .expect("attempt 2 should receive a fresh 200ms source-sync budget");
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(output, "attempt-two\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_source_streaming_exhaustion_retains_every_attempt() {
+        let _guard = test_guard!();
+        let retry_config = RetryConfig {
+            max_attempts: 2,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            jitter_factor: 0.0,
+            total_timeout_ms: 1,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        let error = run_command_streaming_with_retry(
+            &retry_config,
+            "ordinary_source_streaming",
+            Some(std::time::Duration::from_millis(100)),
+            move || {
+                calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut command = Command::new("sh");
+                command
+                    .arg("-c")
+                    .arg("echo 'rsync: connection unexpectedly closed' >&2; exit 12")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                command
+            },
+            |_| {},
+        )
+        .await
+        .expect_err("source streaming retries must exhaust exactly");
+
+        let history = error
+            .downcast_ref::<TransferAttemptsExhausted>()
+            .expect("typed source streaming attempt history");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(history.attempts.len(), 2);
+        assert_eq!(history.attempts[0].attempt, 1);
+        assert_eq!(history.attempts[1].attempt, 2);
+        assert_eq!(history.attempts[0].outcome, "retryable");
+        assert_eq!(history.attempts[1].outcome, "retryable");
+        assert!(
+            history
+                .attempts
+                .iter()
+                .all(|attempt| attempt.detail.contains("connection unexpectedly closed"))
         );
     }
 
