@@ -532,6 +532,70 @@ mod tests {
     }
 
     #[test]
+    fn c008_terminal_item_delivers_the_exact_tool_status_end_to_end() {
+        // C008's composition property (R94): the TERMINAL delivered
+        // item is the exact tool exit status. The C019 delivery plan
+        // puts the terminal item last (behind every owned output), and
+        // once it acks, the wrapper's final act is the C024 relay —
+        // which preserves the status EXACTLY. Composed here: run a
+        // delivery to completion, then relay each child termination.
+        use crate::stateful_delivery::{DeliveryEngine, DeliveryItemKind, DeliveryPlan, VisibleWorld};
+        let plan = DeliveryPlan::new(vec![
+            DeliveryItemKind::StatefulWrite,
+            DeliveryItemKind::Terminal,
+        ])
+        .unwrap();
+        let mut engine = DeliveryEngine::new(plan);
+        let mut world = VisibleWorld::default();
+        engine.record_intent(1).unwrap();
+        engine.begin_expose(1, &mut world).unwrap();
+        engine.ack(1).unwrap();
+        assert!(!engine.delivery_complete(), "status is never early");
+        engine.begin_expose(2, &mut world).unwrap();
+        engine.ack(2).unwrap();
+        assert!(engine.delivery_complete());
+        // Now — and only now — the wrapper ends with the exact status.
+        assert_eq!(
+            relay_child_termination(ChildTermination::Exited(101), true),
+            RelayAction::ExitWith(101),
+            "cargo-test's 101 arrives untranslated"
+        );
+        assert_eq!(
+            relay_child_termination(ChildTermination::Signaled { signal_number: 11 }, true),
+            RelayAction::RestoreDefaultAndResignal { signal_number: 11 }
+        );
+    }
+
+    #[test]
+    fn c008_resignal_platforms_never_translate_to_128_plus_n() {
+        // THE R94 property, exhaustively: on a platform with re-signal
+        // support, NO signal number ever degrades to the 128+N exit
+        // translation — the conventional-code arm is exclusively the
+        // no-resignal fallback, and exits are bit-exact everywhere.
+        for signal_number in 1..=31 {
+            assert_eq!(
+                relay_child_termination(
+                    ChildTermination::Signaled { signal_number },
+                    true
+                ),
+                RelayAction::RestoreDefaultAndResignal { signal_number },
+                "signal {signal_number} must never translate on a resignal platform"
+            );
+        }
+        for code in 0..=255 {
+            assert_eq!(
+                relay_child_termination(ChildTermination::Exited(code), true),
+                RelayAction::ExitWith(code)
+            );
+            assert_eq!(
+                relay_child_termination(ChildTermination::Exited(code), false),
+                RelayAction::ExitWith(code),
+                "exit codes are exact even without resignal support"
+            );
+        }
+    }
+
+    #[test]
     fn c024_child_signal_termination_relays_identically_to_stock() {
         // THE differential table vs stock: when the wrapped tool is
         // signal-terminated — SIGINT, SIGTERM, SIGKILL(child), SIGSEGV
