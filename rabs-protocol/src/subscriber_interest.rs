@@ -444,14 +444,12 @@ mod tests {
         action.register(2, 1002).unwrap();
         action.register(3, 1003).unwrap();
 
-        let (cause1, _) =
-            map_cancellation(CancellationTrigger::Signal(WrapperSignal::Interrupt));
+        let (cause1, _) = map_cancellation(CancellationTrigger::Signal(WrapperSignal::Interrupt));
         assert_eq!(
             action.release(1, cause1).attempt_cancellation(),
             AttemptCancellation::NotPermitted { retained: 2 }
         );
-        let (cause2, _) =
-            map_cancellation(CancellationTrigger::Signal(WrapperSignal::Terminate));
+        let (cause2, _) = map_cancellation(CancellationTrigger::Signal(WrapperSignal::Terminate));
         assert_eq!(
             action.release(2, cause2).attempt_cancellation(),
             AttemptCancellation::NotPermitted { retained: 1 }
