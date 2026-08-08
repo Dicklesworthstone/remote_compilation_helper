@@ -138,9 +138,152 @@ impl SubscriberFrontierReport {
     }
 }
 
+/// Explicit operator configuration for post-transcript recovery
+/// (C006). The default is OFF: after transcript exposure the wrapper
+/// reconnects or fails coherently unless labeled recovery was
+/// explicitly chosen — a silent restart after partial transcript would
+/// duplicate or mix output (R104).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FallbackConfig {
+    /// Whether the operator explicitly enabled labeled transcript
+    /// recovery for post-transcript disconnects.
+    pub labeled_transcript_recovery: bool,
+}
+
+/// The wrapper's typed fallback action for one disconnect (C006).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FallbackAction {
+    /// Nothing was exposed: run the original chain immediately and
+    /// seamlessly.
+    RunOriginalSeamless,
+    /// Transcript was exposed and labeled recovery is configured:
+    /// detach the subscription and run the original chain AFTER
+    /// emitting the unmistakable boundary marker.
+    DetachAndRunLabeled {
+        /// The marker to emit before any rerun output.
+        boundary_marker: String,
+    },
+    /// Reconnect (C014) or fail coherently; no local rerun is
+    /// permitted.
+    ReconnectOrFailCoherently {
+        /// Why no local rerun is permitted.
+        reason: &'static str,
+    },
+}
+
+/// The unmistakable boundary marker emitted before a labeled rerun's
+/// output: it names the build and the last delivered sequence, and
+/// states plainly that following output is a local rerun.
+#[must_use]
+pub fn render_boundary_marker(request_id: u128, last_delivered_seq: u64) -> String {
+    format!(
+        "================ RABS LABELED TRANSCRIPT RECOVERY ================\n\
+         build {request_id:032x}: detached after delivered seq {last_delivered_seq}.\n\
+         Output below is a LOCAL RERUN of the original command and may\n\
+         repeat or reorder lines shown above this marker.\n\
+         =================================================================="
+    )
+}
+
+/// Decide the fallback action from the subscriber's frontiers and the
+/// operator configuration. Configuration can only choose BETWEEN
+/// permitted actions — it can never widen what the frontiers permit:
+/// after stateful commit intent no configuration yields a local rerun.
+#[must_use]
+pub fn decide_fallback(
+    report: &SubscriberFrontierReport,
+    config: &FallbackConfig,
+    request_id: u128,
+) -> FallbackAction {
+    match report.permitted_fallback() {
+        FallbackPermission::SeamlessNonpublishing => FallbackAction::RunOriginalSeamless,
+        FallbackPermission::LabeledTranscriptRecoveryOnly => {
+            if config.labeled_transcript_recovery {
+                FallbackAction::DetachAndRunLabeled {
+                    boundary_marker: render_boundary_marker(
+                        request_id,
+                        report.last_fully_delivered_seq,
+                    ),
+                }
+            } else {
+                FallbackAction::ReconnectOrFailCoherently {
+                    reason: "transcript exposed and labeled recovery not configured (R104)",
+                }
+            }
+        }
+        FallbackPermission::NoUncoordinatedFallback => FallbackAction::ReconnectOrFailCoherently {
+            reason: "stateful commit intent or commit exposed (R97)",
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c006_all_three_frontier_classes_decide_correctly() {
+        let config_off = FallbackConfig::default();
+        let config_on = FallbackConfig {
+            labeled_transcript_recovery: true,
+        };
+        // Clean frontier: seamless, regardless of configuration.
+        let clean = SubscriberFrontierReport::default();
+        assert_eq!(
+            decide_fallback(&clean, &config_off, 7),
+            FallbackAction::RunOriginalSeamless
+        );
+        assert_eq!(
+            decide_fallback(&clean, &config_on, 7),
+            FallbackAction::RunOriginalSeamless
+        );
+        // Transcript exposed: default is reconnect-or-fail; labeled
+        // rerun ONLY when explicitly configured, and always behind the
+        // boundary marker.
+        let transcript = SubscriberFrontierReport {
+            transcript_exposed: true,
+            last_fully_delivered_seq: 42,
+            ..Default::default()
+        };
+        assert!(matches!(
+            decide_fallback(&transcript, &config_off, 7),
+            FallbackAction::ReconnectOrFailCoherently { .. }
+        ));
+        match decide_fallback(&transcript, &config_on, 7) {
+            FallbackAction::DetachAndRunLabeled { boundary_marker } => {
+                assert!(boundary_marker.contains("RABS LABELED TRANSCRIPT RECOVERY"));
+                assert!(boundary_marker.contains("delivered seq 42"));
+                assert!(boundary_marker.contains(&format!("{:032x}", 7)));
+                assert!(boundary_marker.contains("LOCAL RERUN"));
+            }
+            other => panic!("expected labeled recovery, got {other:?}"),
+        }
+        // Stateful commit intent: configuration CANNOT widen the
+        // permission — no local rerun exists, configured or not.
+        let stateful = SubscriberFrontierReport {
+            transcript_exposed: true,
+            stateful_intent_recorded: true,
+            ..Default::default()
+        };
+        for config in [&config_off, &config_on] {
+            assert_eq!(
+                decide_fallback(&stateful, config, 7),
+                FallbackAction::ReconnectOrFailCoherently {
+                    reason: "stateful commit intent or commit exposed (R97)",
+                }
+            );
+        }
+        // Uncertainty is exposure: an unacked in-flight transcript frame
+        // already forbids seamless fallback (R116).
+        let uncertain = SubscriberFrontierReport {
+            transcript_uncertain: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            decide_fallback(&uncertain, &config_off, 7),
+            FallbackAction::ReconnectOrFailCoherently { .. }
+        ));
+    }
 
     #[test]
     fn uncertainty_counts_as_exposure_in_the_wire_report() {
