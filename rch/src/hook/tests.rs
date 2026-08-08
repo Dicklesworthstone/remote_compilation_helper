@@ -43,7 +43,7 @@ use super::timing_history::{
     MAX_TIMING_SAMPLES, ProjectTimingData, TimingEstimate, TimingHistory, TimingRecord,
     estimate_timing_for_build, record_build_timing, timing_cache,
 };
-use super::transfer_orchestration::wrap_command_with_telemetry;
+use super::transfer_orchestration::{source_sync_terminal_summary, wrap_command_with_telemetry};
 use proptest::prelude::*;
 use rch_common::mock::{
     self, MockConfig, MockRsyncConfig, clear_mock_overrides, set_mock_enabled_override,
@@ -5656,6 +5656,105 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         execute_command.contains("CARGO_TARGET_DIR=")
             && execute_command.contains(".rch-target-mock-worker-"),
         "expected remote Cargo execution to force per-job worker CARGO_TARGET_DIR, got {execute_command}"
+    );
+}
+
+#[tokio::test]
+#[serial(mock_global)]
+async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
+    let _lock = test_lock().lock().await;
+    let _guard = test_guard!();
+    let socket_path = format!(
+        "/tmp/rch_test_pre_cargo_sync_failure_{}_{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos()
+    );
+    let rsync_config = MockRsyncConfig {
+        fail_sync_attempts: 3,
+        ..MockRsyncConfig::success()
+    };
+    let _overrides = TestOverridesGuard::set(&socket_path, MockConfig::default(), rsync_config);
+    mock::clear_global_invocations();
+
+    let (temp_dir, policy) = topology_tempdir();
+    let project_dir = temp_dir.path().join("remote_compilation_helper");
+    std::fs::create_dir_all(&project_dir).expect("create project dir");
+    let prev_cwd = std::env::current_dir().ok();
+    std::env::set_current_dir(&project_dir).expect("cd into project dir");
+    let worker = SelectedWorker {
+        id: rch_common::WorkerId::new("mock-worker"),
+        host: "mock.host.local".to_string(),
+        user: "mockuser".to_string(),
+        identity_file: "~/.ssh/mock_key".to_string(),
+        slots_available: 8,
+        speed_score: 90.0,
+        declared_os: None,
+    };
+    let transfer_config = TransferConfig {
+        sync_timeout_ms: Some(1_000),
+        retry: rch_common::RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            jitter_factor: 0.0,
+            total_timeout_ms: 1,
+        },
+        ..TransferConfig::default()
+    };
+    let reporter = HookReporter::new(OutputVisibility::Summary);
+
+    let result = execute_remote_compilation(
+        &worker,
+        "cargo check",
+        transfer_config,
+        Vec::new(),
+        None,
+        &rch_common::CompilationConfig::default(),
+        None,
+        Some(CompilationKind::CargoCheck),
+        &reporter,
+        &socket_path,
+        ColorMode::Auto,
+        None,
+        None,
+        None,
+        &policy,
+        None,
+    )
+    .await;
+
+    if let Some(prev) = prev_cwd {
+        let _ = std::env::set_current_dir(prev);
+    }
+
+    let error = result.expect_err("source sync exhaustion must stop before Cargo");
+    let history = error
+        .downcast_ref::<crate::transfer::TransferAttemptsExhausted>()
+        .expect("typed source-transfer history");
+    assert_eq!(history.attempts.len(), 3);
+    assert_eq!(
+        mock::global_rsync_invocations_snapshot()
+            .iter()
+            .filter(|entry| entry.phase == mock::Phase::Sync)
+            .count(),
+        3
+    );
+    assert_eq!(
+        mock::global_ssh_invocations_snapshot()
+            .iter()
+            .filter(|entry| entry.phase == mock::Phase::Execute)
+            .count(),
+        0,
+        "terminal source-transfer failure must launch remote Cargo exactly zero times"
+    );
+    assert_eq!(
+        source_sync_terminal_summary(&history.attempts, false).as_deref(),
+        Some(
+            "[RCH] source sync failed before remote Cargo execution after 3/3 attempts; remote Cargo was not started: Mock: Sync failed (transient) - Connection timed out"
+        )
     );
 }
 

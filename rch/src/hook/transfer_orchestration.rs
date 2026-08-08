@@ -42,6 +42,24 @@ use super::repo_updater::maybe_sync_repo_set_with_repo_updater;
 use super::ssh::ensure_worker_projects_topology;
 use super::*;
 
+pub(super) fn source_sync_terminal_summary(
+    attempts: &[crate::transfer::TransferAttemptDiagnostic],
+    clean_overlay: bool,
+) -> Option<String> {
+    let last = attempts.last()?;
+    let label = if clean_overlay {
+        "clean-overlay source sync"
+    } else {
+        "source sync"
+    };
+    Some(format!(
+        "[RCH] {label} failed before remote Cargo execution after {}/{} attempts; remote Cargo was not started: {}",
+        attempts.len(),
+        last.max_attempts,
+        last.detail
+    ))
+}
+
 pub(super) fn wrap_command_with_telemetry(command: &str, worker_id: &WorkerId) -> String {
     let escaped_worker = shell_escape::escape(worker_id.as_str().into());
     // Use newline instead of semicolon to ensure trailing comments in command
@@ -523,6 +541,10 @@ pub(super) async fn execute_remote_compilation(
                                 attempt.detail
                             ));
                         }
+                        if let Some(summary) = source_sync_terminal_summary(&history.attempts, true)
+                        {
+                            reporter.summary(&summary);
+                        }
                     }
                     return Err(error.context(
                         "clean-overlay base transfer failed before remote Cargo execution",
@@ -577,6 +599,28 @@ pub(super) async fn execute_remote_compilation(
                 if entry.is_primary || exact_dependency_closure_sync {
                     // Cargo dependency-closure builds must not continue against
                     // stale sibling repositories on the worker.
+                    if let Some(history) =
+                        e.downcast_ref::<crate::transfer::TransferAttemptsExhausted>()
+                    {
+                        for attempt in &history.attempts {
+                            reporter.verbose(&format!(
+                                "[RCH] source sync attempt {}/{} {} before remote Cargo execution: {}",
+                                attempt.attempt,
+                                attempt.max_attempts,
+                                attempt.outcome,
+                                attempt.detail
+                            ));
+                        }
+                        if let Some(summary) =
+                            source_sync_terminal_summary(&history.attempts, false)
+                        {
+                            reporter.summary(&summary);
+                        }
+                    } else {
+                        reporter.summary(&format!(
+                            "[RCH] source sync failed before remote Cargo execution; remote Cargo was not started: {e}"
+                        ));
+                    }
                     return Err(e);
                 }
                 // Dependency root failure is non-fatal (fail-open for deps).
