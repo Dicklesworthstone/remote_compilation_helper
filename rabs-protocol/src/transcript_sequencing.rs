@@ -362,6 +362,14 @@ impl FrameReader {
         Ok(self.exposed)
     }
 
+    /// Discard the torn partial frame on reconnect (C026 resume path):
+    /// its bytes were never exposed, so dropping them loses nothing and
+    /// the replayed WHOLE frame can begin cleanly. Returns the
+    /// discarded sequence, if any.
+    pub fn discard_partial(&mut self) -> Option<u64> {
+        self.partial.take().map(|p| p.seq)
+    }
+
     /// The wrapper's truthful reconnect report (C014): last fully
     /// exposed sequence AND any frame whose write may have begun. The
     /// partial frame's bytes are NOT in the report — a partial frame
@@ -411,6 +419,97 @@ pub const fn post_crash_path(wrapper_state_intact: bool) -> PostCrashPath {
         PostCrashPath::NewBuildOperation {
             reason: "wrapper exposure state lost: partial transcript is unknowable (R116)",
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Wire realization (bead C026): the local-protocol message mirror of
+// the C021 edge lane and C023 wrapper reader.
+// ---------------------------------------------------------------------
+
+/// Local-protocol messages for the transcript lane (C026): the
+/// concrete wire mirror of `SubscriberTranscriptIntent` /
+/// `Acknowledged` / `DeliveryUncertain`. Complete-frame delivery rides
+/// an intent header followed by payload bytes; acknowledgement and the
+/// reconnect uncertainty report ride back. No message carries — or
+/// needs — a durability side effect (R104: the lane stays
+/// fsync-free on the wire too).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptLaneMessage {
+    /// Edge → wrapper: the framed-sequence intent header for the next
+    /// frame (sequence + exact declared payload length).
+    SubscriberTranscriptIntent {
+        /// Assigned delivery sequence.
+        seq: u64,
+        /// Exact payload length that will follow.
+        declared_len: u32,
+    },
+    /// Edge → wrapper: payload bytes following the intent header (a
+    /// torn connection may truncate these — that is exactly the C023
+    /// partial-frame case).
+    TranscriptPayload {
+        /// The frame the bytes belong to.
+        seq: u64,
+        /// Payload bytes.
+        bytes: Vec<u8>,
+    },
+    /// Wrapper → edge: complete-frame acknowledgement (full-write ack;
+    /// nothing less than a byte-complete frame is ever acknowledged).
+    SubscriberTranscriptAcknowledged {
+        /// The fully accepted sequence.
+        seq: u64,
+    },
+    /// Wrapper → edge on reconnect: last fully accepted sequence plus
+    /// the one frame whose write may have begun — the wire carrier of
+    /// the C023 uncertainty state.
+    SubscriberTranscriptDeliveryUncertain {
+        /// Last fully accepted (exposed) sequence.
+        last_accepted_seq: u64,
+        /// The frame possibly in flight at disconnect, if any.
+        possibly_in_flight_seq: Option<u64>,
+    },
+}
+
+/// Edge-side outcome of applying a wrapper acknowledgement — the
+/// J012 idempotency doctrine mirrored onto this lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckOutcome {
+    /// The next unacknowledged frame was acknowledged.
+    Acknowledged,
+    /// A duplicate ack for an already-acknowledged frame: no-op.
+    AlreadyAcknowledged,
+    /// An ack for a frame never sent (or skipping ahead): refused,
+    /// nothing changes.
+    RefusedFutureAck {
+        /// The sequence the lane expected.
+        expected: u64,
+    },
+}
+
+/// Apply a wrapper `SubscriberTranscriptAcknowledged` to the edge lane
+/// with idempotent-repeat semantics: duplicates are harmless no-ops,
+/// future acks are typed refusals, and only the exact next frame
+/// advances the exposure frontier.
+pub fn edge_apply_ack(lane: &mut TranscriptSequencer, seq: u64) -> AckOutcome {
+    if seq <= lane.exposed {
+        return AckOutcome::AlreadyAcknowledged;
+    }
+    match lane.ack(seq) {
+        Ok(()) => AckOutcome::Acknowledged,
+        Err(_) => AckOutcome::RefusedFutureAck {
+            expected: lane.exposed + 1,
+        },
+    }
+}
+
+/// Build the wrapper's reconnect message from its reader state (the
+/// wire form of [`FrameReader::resume_report`]).
+#[must_use]
+pub fn wrapper_uncertainty_message(reader: &FrameReader) -> TranscriptLaneMessage {
+    let report = reader.resume_report();
+    TranscriptLaneMessage::SubscriberTranscriptDeliveryUncertain {
+        last_accepted_seq: report.last_fully_exposed_seq,
+        possibly_in_flight_seq: report.possibly_in_flight_seq,
     }
 }
 
@@ -700,6 +799,216 @@ mod tests {
             panic!("lost wrapper state must not resume");
         };
         assert!(reason.contains("unknowable"));
+    }
+
+    /// Where the edge daemon dies during frame `k`'s delivery.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DeathPhase {
+        /// Before the intent header for frame k went out.
+        BeforeIntent,
+        /// After the header, with only `usize` payload bytes delivered.
+        MidPayload(usize),
+        /// Frame fully delivered and accepted, ack lost with the edge.
+        BeforeAck,
+        /// Frame delivered and acknowledged; death after the ack.
+        AfterAck,
+    }
+
+    /// A restarted edge daemon: fresh incarnation, canonical stream
+    /// rebuilt deterministically from the action layer (frame content
+    /// is the ACTION's truth, not the dead edge's memory).
+    fn restarted_edge(lines: &[&[u8]]) -> TranscriptSequencer {
+        let mut lane = TranscriptSequencer::new(64);
+        for line in lines {
+            lane.assign(line.to_vec());
+        }
+        lane
+    }
+
+    /// Deliver frame `seq` to the reader over the wire messages,
+    /// optionally truncating the payload (returns false when the frame
+    /// could not complete).
+    fn deliver_frame(
+        reader: &mut FrameReader,
+        lane: &TranscriptSequencer,
+        seq: u64,
+        truncate_at: Option<usize>,
+    ) -> bool {
+        let frame = lane.retained(seq).expect("frame replayable");
+        let header = TranscriptLaneMessage::SubscriberTranscriptIntent {
+            seq,
+            declared_len: u32::try_from(frame.bytes.len()).unwrap(),
+        };
+        let TranscriptLaneMessage::SubscriberTranscriptIntent { seq, declared_len } = header else {
+            unreachable!()
+        };
+        reader.begin_frame(seq, declared_len).unwrap();
+        let cut = truncate_at.unwrap_or(frame.bytes.len());
+        let payload = TranscriptLaneMessage::TranscriptPayload {
+            seq,
+            bytes: frame.bytes[..cut].to_vec(),
+        };
+        let TranscriptLaneMessage::TranscriptPayload { bytes, .. } = payload else {
+            unreachable!()
+        };
+        reader.feed(&bytes).unwrap();
+        reader.complete_frame().is_ok()
+    }
+
+    #[test]
+    fn c026_daemon_death_matrix_completes_without_duplication_or_loss() {
+        // THE C026 acceptance (M0/T046 seed): a 4-frame exchange over
+        // the wire messages, with the edge daemon killed at every
+        // (frame, phase) point — before the intent, at every payload
+        // byte, before the ack landed, and after it. The wrapper
+        // survives with its reader, reports uncertainty over the wire,
+        // the successor incarnation reconciles (C014) and replays.
+        // Every death point ends with the full transcript exposed
+        // exactly once.
+        let lines: [&[u8]; 4] = [b"alpha", b"bb", b"c3", b"delta4"];
+        let mut deaths: Vec<(u64, DeathPhase)> = Vec::new();
+        for k in 1..=lines.len() as u64 {
+            deaths.push((k, DeathPhase::BeforeIntent));
+            for cut in 0..lines[k as usize - 1].len() {
+                deaths.push((k, DeathPhase::MidPayload(cut)));
+            }
+            deaths.push((k, DeathPhase::BeforeAck));
+            deaths.push((k, DeathPhase::AfterAck));
+        }
+        for (kill_frame, phase) in deaths {
+            let mut edge = restarted_edge(&lines);
+            let mut reader = FrameReader::new(64);
+            // Normal exchange until the death point.
+            for seq in 1..kill_frame {
+                edge.send(seq).unwrap();
+                assert!(deliver_frame(&mut reader, &edge, seq, None));
+                assert_eq!(edge_apply_ack(&mut edge, seq), AckOutcome::Acknowledged);
+            }
+            match phase {
+                DeathPhase::BeforeIntent => {}
+                DeathPhase::MidPayload(cut) => {
+                    edge.send(kill_frame).unwrap();
+                    assert!(!deliver_frame(&mut reader, &edge, kill_frame, Some(cut)));
+                }
+                DeathPhase::BeforeAck => {
+                    edge.send(kill_frame).unwrap();
+                    assert!(deliver_frame(&mut reader, &edge, kill_frame, None));
+                }
+                DeathPhase::AfterAck => {
+                    edge.send(kill_frame).unwrap();
+                    assert!(deliver_frame(&mut reader, &edge, kill_frame, None));
+                    assert_eq!(
+                        edge_apply_ack(&mut edge, kill_frame),
+                        AckOutcome::Acknowledged
+                    );
+                }
+            }
+            // EDGE DAEMON DIES. The wrapper survives with its reader:
+            // post-crash path is reconnect-and-resume.
+            assert_eq!(post_crash_path(true), PostCrashPath::ReconnectAndResume);
+            let successor = restarted_edge(&lines);
+            let mut edge = successor;
+
+            // The wrapper's uncertainty message → C014 reconcile
+            // against the successor (incarnation 6, predecessor 5).
+            let message = wrapper_uncertainty_message(&reader);
+            let TranscriptLaneMessage::SubscriberTranscriptDeliveryUncertain {
+                last_accepted_seq,
+                possibly_in_flight_seq,
+            } = message
+            else {
+                panic!("wrong reconnect message");
+            };
+            let plan = reconcile(
+                &token(),
+                BuildOperationId(10),
+                SubscriberId(20),
+                &SECRET,
+                &edge.resume_view(6, Some(5)),
+                &crate::reconnect::WrapperResumeReport {
+                    last_fully_exposed_seq: last_accepted_seq,
+                    possibly_in_flight_seq,
+                    frontier: reader.resume_report().frontier,
+                },
+            )
+            .unwrap();
+            assert_eq!(plan.resume_from_seq, last_accepted_seq + 1);
+
+            // A torn frame stays partial in the reader: discard it on
+            // resume (its bytes were never exposed, so nothing is
+            // lost) and the replayed WHOLE frame begins cleanly.
+            let discarded = reader.discard_partial();
+            if plan.first_frame_was_in_flight {
+                assert_eq!(discarded, Some(plan.resume_from_seq));
+            } else {
+                assert_eq!(discarded, None);
+            }
+            // Successor replays from the plan; exchange completes.
+            for seq in 1..plan.resume_from_seq {
+                // Frames at or below the exposed frontier are NEVER
+                // re-sent (C014); mark them acknowledged edge-side.
+                edge.send(seq).unwrap();
+                assert_eq!(edge_apply_ack(&mut edge, seq), AckOutcome::Acknowledged);
+            }
+            for seq in plan.resume_from_seq..=lines.len() as u64 {
+                edge.send(seq).unwrap();
+                assert!(deliver_frame(&mut reader, &edge, seq, None));
+                assert_eq!(edge_apply_ack(&mut edge, seq), AckOutcome::Acknowledged);
+            }
+            // The full transcript, exactly once, in order.
+            assert_eq!(
+                reader.exposed_payloads(),
+                lines
+                    .iter()
+                    .map(|l| l.to_vec())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                "kill_frame={kill_frame} phase={phase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn c026_ack_idempotency_follows_the_doctrine() {
+        let mut lane = TranscriptSequencer::new(8);
+        lane.assign(b"a".to_vec());
+        lane.assign(b"b".to_vec());
+        lane.send(1).unwrap();
+        assert_eq!(edge_apply_ack(&mut lane, 1), AckOutcome::Acknowledged);
+        // Duplicate ack: harmless no-op, frontier unchanged.
+        assert_eq!(
+            edge_apply_ack(&mut lane, 1),
+            AckOutcome::AlreadyAcknowledged
+        );
+        assert_eq!(lane.frontier_report().last_fully_delivered_seq, 1);
+        // Future ack (frame 2 not yet sent): typed refusal, no change.
+        assert_eq!(
+            edge_apply_ack(&mut lane, 2),
+            AckOutcome::RefusedFutureAck { expected: 2 }
+        );
+        assert_eq!(lane.frontier_report().last_fully_delivered_seq, 1);
+    }
+
+    #[test]
+    fn c026_version_negotiation_gates_the_exchange() {
+        use crate::local_protocol::{Negotiation, VersionRange, negotiate};
+        // Same version and N/N-1 both select a version — the exchange
+        // proceeds identically (the lane is version-independent at v1).
+        for (wrapper, edge) in [
+            (VersionRange::exactly(1), VersionRange::exactly(1)),
+            (
+                VersionRange::new(1, 1).unwrap(),
+                VersionRange::new(1, 2).unwrap(),
+            ),
+        ] {
+            assert!(matches!(negotiate(wrapper, edge), Negotiation::Selected(_)));
+        }
+        // Disjoint ranges refuse BEFORE any transcript message flows:
+        // the wrapper falls open to the original chain (C001/C004).
+        assert!(matches!(
+            negotiate(VersionRange::exactly(1), VersionRange::new(2, 3).unwrap()),
+            Negotiation::Refused { .. }
+        ));
     }
 
     #[test]
