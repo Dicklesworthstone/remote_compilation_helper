@@ -135,6 +135,61 @@ pub const fn map_cancellation(trigger: CancellationTrigger) -> (DisconnectCause,
     }
 }
 
+/// How the wrapped tool ended, read from its wait status — locally, or
+/// relayed over the protocol when the tool ran on a worker (C024).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildTermination {
+    /// Normal exit with a code.
+    Exited(i32),
+    /// Killed by a signal (ANY signal — including SIGKILL and SIGSEGV,
+    /// which the wrapper only ever observes in the CHILD's status).
+    Signaled {
+        /// The terminating signal number.
+        signal_number: i32,
+    },
+}
+
+/// What the wrapper does to relay the child's termination so Cargo
+/// observes semantics IDENTICAL to stock (C024): an exit stays an
+/// exit with the same code; a signal death stays a signal death by
+/// the same signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayAction {
+    /// Exit with the child's own code, unchanged.
+    ExitWith(i32),
+    /// Restore the DEFAULT disposition for the signal, then raise it
+    /// on the wrapper itself — the wrapper dies by the same signal and
+    /// Cargo's wait status is byte-identical to stock.
+    RestoreDefaultAndResignal {
+        /// The signal to die by.
+        signal_number: i32,
+    },
+    /// Platform without re-signal support: the DOCUMENTED
+    /// approximation — exit with the shell-conventional `128 + N`.
+    /// Cargo sees the right number but an exit, not a signal; the
+    /// approximation is named, never silent.
+    ExitWithConventionalCode(i32),
+}
+
+/// The C024 relay decision. `resignal_supported` is the platform
+/// capability (true on Unix).
+#[must_use]
+pub const fn relay_child_termination(
+    termination: ChildTermination,
+    resignal_supported: bool,
+) -> RelayAction {
+    match termination {
+        ChildTermination::Exited(code) => RelayAction::ExitWith(code),
+        ChildTermination::Signaled { signal_number } => {
+            if resignal_supported {
+                RelayAction::RestoreDefaultAndResignal { signal_number }
+            } else {
+                RelayAction::ExitWithConventionalCode(128 + signal_number)
+            }
+        }
+    }
+}
+
 /// Whether the SHARED attempt may be cancelled after a release — the
 /// reference-counted policy (I6): never because one subscriber left,
 /// only when NO retained interest remains.
@@ -473,6 +528,52 @@ mod tests {
         assert_eq!(
             map_cancellation(CancellationTrigger::ProcessDead),
             (DisconnectCause::ProcessDead, WrapperFate::NotOurProcess)
+        );
+    }
+
+    #[test]
+    fn c024_child_signal_termination_relays_identically_to_stock() {
+        // THE differential table vs stock: when the wrapped tool is
+        // signal-terminated — SIGINT, SIGTERM, SIGKILL(child), SIGSEGV
+        // — stock Cargo observes a wait status of "signaled N". The
+        // wrapper must present EXACTLY that: restore the default
+        // disposition and die by the same signal. Exits relay
+        // unchanged (including cargo-test's 101).
+        for signal_number in [2, 15, 9, 11] {
+            assert_eq!(
+                relay_child_termination(
+                    ChildTermination::Signaled { signal_number },
+                    true
+                ),
+                RelayAction::RestoreDefaultAndResignal { signal_number },
+                "signal {signal_number}: classification must never flip to exit"
+            );
+        }
+        for code in [0, 1, 101] {
+            assert_eq!(
+                relay_child_termination(ChildTermination::Exited(code), true),
+                RelayAction::ExitWith(code)
+            );
+        }
+    }
+
+    #[test]
+    fn c024_unsupported_platform_uses_the_named_conventional_code() {
+        // Where re-signalling is unsupported, the approximation is the
+        // shell-conventional 128+N — DOCUMENTED and typed, never a
+        // silent 1.
+        assert_eq!(
+            relay_child_termination(ChildTermination::Signaled { signal_number: 11 }, false),
+            RelayAction::ExitWithConventionalCode(139)
+        );
+        assert_eq!(
+            relay_child_termination(ChildTermination::Signaled { signal_number: 9 }, false),
+            RelayAction::ExitWithConventionalCode(137)
+        );
+        // Plain exits are exact on every platform.
+        assert_eq!(
+            relay_child_termination(ChildTermination::Exited(101), false),
+            RelayAction::ExitWith(101)
         );
     }
 
