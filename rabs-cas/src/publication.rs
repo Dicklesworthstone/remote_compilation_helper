@@ -1608,6 +1608,132 @@ mod tests {
     }
 
     #[test]
+    fn h035_equal_digests_different_manifest_opens_projection_completeness_incident() {
+        // THE T035 fixture (I48; R103): two candidates whose semantic
+        // AND observable digests are IDENTICAL — the manifest content
+        // is byte-for-byte the same logical projection — but whose
+        // canonical manifest OBJECTS differ (a serializer emitted
+        // different bytes for the same content, or the projection
+        // omitted a field that differs). That is never "evidence-only
+        // variation": it is a serializer/projection-completeness
+        // incident and the action quarantines.
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        ready_store(&mut store);
+        let first = offer();
+        assert!(matches!(
+            process_offer(
+                &mut store,
+                &first,
+                &expected_descriptor(),
+                no_committed,
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            )
+            .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+
+        // Same manifest CONTENT (identical projections → identical
+        // recomputed digests), different manifest OBJECT id.
+        let doppel_id = object(52);
+        store.record_object(&doppel_id.0, 64).unwrap();
+        store
+            .add_location(&doppel_id.0, "/cas/52", Some(1), "raw", true)
+            .unwrap();
+        let doppel = OfferPreparedActionResult::build(
+            attempt_authority(),
+            manifest(),
+            doppel_id.clone(),
+            evidence(&doppel_id),
+            object(54),
+            digest("rabs.observation-stream.sha256.v1", 9),
+            &declared(),
+            Vec::new(),
+        )
+        .unwrap();
+        store.record_object(&object(54).0, 64).unwrap();
+        store
+            .add_location(&object(54).0, "/cas/54", Some(1), "raw", true)
+            .unwrap();
+        assert_eq!(
+            doppel.manifest.semantic_result_digest, first.manifest.semantic_result_digest,
+            "fixture precondition: equal semantic digests"
+        );
+        assert_eq!(
+            doppel.manifest.observable_result_digest, first.manifest.observable_result_digest,
+            "fixture precondition: equal observable digests"
+        );
+        assert_ne!(doppel.manifest_id, first.manifest_id);
+
+        let committed = first.manifest.clone();
+        let outcome = process_offer(
+            &mut store,
+            &doppel,
+            &expected_descriptor(),
+            move |_| Some(committed.clone()),
+            905,
+            6,
+            CommitDurabilityProfile::RequireDurableClosure,
+        )
+        .unwrap();
+        // The RIGHT incident class — and specifically NOT the
+        // idempotent/evidence-append path (R103's mislabel) and NOT
+        // the narrower presentation quarantine.
+        let PublicationOutcome::Quarantined(quarantine) = outcome else {
+            panic!("equal-digests/different-manifest must quarantine, got {outcome:?}");
+        };
+        assert_eq!(
+            quarantine.class,
+            DivergenceClass::ProjectionCompletenessIncident
+        );
+        assert!(
+            quarantine.escalations.is_empty(),
+            "consumer escalation is the semantic-divergence arm only"
+        );
+        let action = digest("rabs.action-key.sha256.v1", 7);
+        let action_key = digest_key(&action);
+        // FULL serving disable (not presentation-quarantined).
+        assert_eq!(
+            store.serving_disposition_key(&action_key).unwrap().unwrap(),
+            DISPOSITION_QUARANTINED
+        );
+        // The incident row records the class and BOTH manifests.
+        let incidents = store.list_divergence_incidents(&action_key).unwrap();
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].class, "projection-completeness");
+        assert_eq!(
+            incidents[0].committed_manifest_key,
+            digest_key(&first.manifest_id.0)
+        );
+        assert_eq!(
+            incidents[0].candidate_manifest_key,
+            digest_key(&doppel_id.0)
+        );
+        // Committed row preserved untouched; candidate preserved under
+        // the divergence-evidence pin.
+        assert_eq!(
+            store.published_manifest_key(&action).unwrap().unwrap(),
+            digest_key(&first.manifest_id.0)
+        );
+        let pin = store.pin_row(905).unwrap().unwrap();
+        assert_eq!(pin.class, DIVERGENCE_EVIDENCE_PIN_CLASS);
+        assert_eq!(pin.root_key, digest_key(&doppel_id.0));
+        // The candidate's evidence is preserved, bound to the
+        // CANDIDATE manifest (H029) — recorded, but never presented
+        // as ordinary evidence-only variation for the committed one.
+        let candidate_view = store
+            .list_evidence_keys_for_manifest(&digest_key(&doppel_id.0))
+            .unwrap();
+        assert!(candidate_view.contains(&digest_key(&object(54).0)));
+        let committed_view = store
+            .list_evidence_keys_for_manifest(&digest_key(&first.manifest_id.0))
+            .unwrap();
+        assert!(!committed_view.contains(&digest_key(&object(54).0)));
+    }
+
+    #[test]
     fn h039_bundle_root_and_role_uniqueness_are_enforced_at_both_gates() {
         // T047 rejection fixtures (R125).
         // Gate 1 — worker build(): a duplicate (role, path) row is a
