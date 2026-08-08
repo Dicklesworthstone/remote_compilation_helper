@@ -93,4 +93,5 @@ pub mod version_negotiation;
 pub mod volatility;
 pub mod wire_time;
 pub mod worker_fence;
+pub mod wrapper_breaker;
 pub mod zero_rtt_policy;
