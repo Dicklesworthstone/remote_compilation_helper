@@ -2320,6 +2320,25 @@ pub async fn run_exec(
         // worker-fault cases yield a `RetryableRemoteFault` handled below.
         let fault: RetryableRemoteFault = match result {
             Ok(result) => {
+                // RABS B002: completed exec-path invocations join the
+                // corpus too (off the latency path; fail-open inside).
+                {
+                    let command_for_corpus = command.to_string();
+                    let cwd_for_corpus =
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    let kind_for_corpus = classification.kind;
+                    let exit_code = result.exit_code;
+                    let duration_ms = result.duration_ms;
+                    tokio::task::spawn_blocking(move || {
+                        record_invocation(
+                            &command_for_corpus,
+                            &cwd_for_corpus,
+                            kind_for_corpus,
+                            exit_code,
+                            duration_ms,
+                        );
+                    });
+                }
                 if result.exit_code == 0 {
                     reporter.summary(&format!(
                         "[RCH] remote {} ({})",
@@ -2764,6 +2783,11 @@ use selection_response::parse_selection_response;
 mod timing_history;
 use timing_history::record_build_timing;
 
+// RABS B002: redacted invocation recorder — every completed offloaded
+// build emits one B001 corpus record, off the SLO path, fail-open.
+mod rabs_recorder;
+use rabs_recorder::record_invocation;
+
 // The daemon IPC client (worker-selection / release / build-record requests
 // over the `rchd` Unix socket, plus request-timeout + queue-when-busy policy
 // helpers) lives in the `daemon_ipc` submodule. `query_daemon` / `release_worker`
@@ -3112,6 +3136,24 @@ async fn handle_selection_response(
 
     match result {
         Ok(result) => {
+            // RABS B002: every COMPLETED offloaded invocation (success,
+            // test failure, build error alike) joins the corpus. Off the
+            // SLO path via spawn_blocking; fail-open inside.
+            {
+                let command_for_corpus = command.to_string();
+                let cwd_for_corpus = invocation_cwd.clone();
+                let exit_code = result.exit_code;
+                let duration_ms = result.duration_ms;
+                tokio::task::spawn_blocking(move || {
+                    record_invocation(
+                        &command_for_corpus,
+                        &cwd_for_corpus,
+                        classification_kind,
+                        exit_code,
+                        duration_ms,
+                    );
+                });
+            }
             if result.exit_code == 0 {
                 // Command succeeded remotely - replace with no-op for transparency
                 // The agent already saw output via stderr, artifacts are local
