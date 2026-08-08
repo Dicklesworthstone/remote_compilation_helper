@@ -42,6 +42,7 @@ pub mod authority_gate;
 pub mod chunking;
 pub mod closure_validation;
 pub mod collision_policy;
+pub mod crash_matrix;
 pub mod dependency_snapshot;
 pub mod gc;
 pub mod link_bundle;
