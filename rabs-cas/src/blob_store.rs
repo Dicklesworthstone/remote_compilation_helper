@@ -200,6 +200,12 @@ impl BlobStoreLayout {
         Ok(layout)
     }
 
+    /// The store root (H007 journals/op-staging live under it too).
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn objects_dir(&self) -> PathBuf {
         self.root.join("objects")
     }
@@ -254,16 +260,17 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-fn io_err(step: &'static str) -> impl FnOnce(std::io::Error) -> PutError {
+pub(crate) fn io_err(step: &'static str) -> impl FnOnce(std::io::Error) -> PutError {
     move |e| PutError::Io {
         step,
         error: e.to_string(),
     }
 }
 
-/// Recompute the logical content id of an existing published file
-/// (used to verify a representation found under the target path).
-fn recompute_file_digest(path: &Path) -> Result<TypedDigest, PutError> {
+/// Recompute the logical content id of an existing file (used to
+/// verify a representation found under the target path, and by H007
+/// recovery to decide resume-vs-clean for a staged write).
+pub(crate) fn recompute_file_digest(path: &Path) -> Result<TypedDigest, PutError> {
     let mut file = fs::File::open(path).map_err(io_err("open-existing"))?;
     let mut writer = StreamingObjectWriter::new(DigestRequest::default(), None);
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -337,9 +344,49 @@ pub fn put_if_absent_with_fault(
         return Err(PutError::CrashInjected(FaultPoint::StagingWritten));
     }
 
+    publish_staged_inner(
+        layout,
+        store,
+        declared,
+        &staging,
+        digests.logical_size,
+        durability,
+        fault,
+    )
+}
+
+/// Publish an ALREADY-VERIFIED staged file (steps 3–5 of the
+/// pipeline): fsync per durability policy, atomic create-exclusive
+/// link, directory fsync, metadata record, staging cleanup. Used by
+/// the put path and by H007 journal recovery when it RESUMES a staged
+/// write whose bytes verify against the declared identity — the
+/// caller vouches for that verification.
+///
+/// # Errors
+/// As [`put_if_absent`].
+pub fn publish_staged(
+    layout: &BlobStoreLayout,
+    store: &mut dyn RabsMetadataStore,
+    declared: &TypedDigest,
+    staging: &Path,
+    durability: DurabilityPolicy,
+) -> Result<PutOutcome, PutError> {
+    let logical_size = fs::metadata(staging).map_err(io_err("stat-staging"))?.len();
+    publish_staged_inner(layout, store, declared, staging, logical_size, durability, None)
+}
+
+fn publish_staged_inner(
+    layout: &BlobStoreLayout,
+    store: &mut dyn RabsMetadataStore,
+    declared: &TypedDigest,
+    staging: &Path,
+    logical_size: u64,
+    durability: DurabilityPolicy,
+    fault: Option<FaultPoint>,
+) -> Result<PutOutcome, PutError> {
     // 3. fsync file data per durability policy.
     if durability.fsync_file {
-        let file = fs::File::open(&staging).map_err(io_err("open-for-sync"))?;
+        let file = fs::File::open(staging).map_err(io_err("open-for-sync"))?;
         file.sync_all().map_err(io_err("fsync-staging"))?;
     }
     if fault == Some(FaultPoint::StagingSynced) {
@@ -357,15 +404,15 @@ pub fn put_if_absent_with_fault(
         })?
         .to_path_buf();
     fs::create_dir_all(&target_dir).map_err(io_err("create-fanout"))?;
-    match fs::hard_link(&staging, &target) {
+    match fs::hard_link(staging, &target) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // Race loser or re-put: VERIFY the existing representation
             // before conceding idempotency.
-            return handle_existing(layout, store, declared, &staging, &target);
+            return handle_existing(layout, store, declared, staging, &target);
         }
         Err(e) => {
-            let _ = fs::remove_file(&staging);
+            let _ = fs::remove_file(staging);
             return Err(io_err("publish-link")(e));
         }
     }
@@ -383,19 +430,19 @@ pub fn put_if_absent_with_fault(
     }
 
     // 5. Record object + location; encoding tag is the profile.
-    store.record_object(declared, digests.logical_size)?;
+    store.record_object(declared, logical_size)?;
     store.add_location(declared, &target.to_string_lossy(), None, RAW_PROFILE_V1)?;
     if fault == Some(FaultPoint::MetadataRecorded) {
         return Err(PutError::CrashInjected(FaultPoint::MetadataRecorded));
     }
 
-    let _ = fs::remove_file(&staging);
+    let _ = fs::remove_file(staging);
     Ok(PutOutcome::Stored {
         path: target.to_string_lossy().into_owned(),
     })
 }
 
-fn stream_to_staging(
+pub(crate) fn stream_to_staging(
     staging: &Path,
     reader: &mut dyn Read,
     limits: PutLimits,
