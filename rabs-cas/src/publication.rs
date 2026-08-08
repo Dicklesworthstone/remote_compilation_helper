@@ -484,9 +484,11 @@ pub fn process_offer(
     if let Some(committed_key) = store.published_manifest_key(&offer.manifest.action_key)? {
         let candidate_key = digest_key(&offer.manifest_id.0);
         if committed_key == candidate_key {
-            // Idempotent re-offer: append evidence only.
+            // Idempotent re-offer: append evidence only, bound to the
+            // committed canonical manifest it supports (H029; I37).
             store.append_evidence(
                 &offer.manifest.action_key,
+                &committed_key,
                 &offer.evidence_id.0,
                 generation_id,
                 attempt_id,
@@ -661,9 +663,13 @@ fn quarantine_divergence(
     )?;
 
     // 4. The candidate's evidence bundle joins the append-only index —
-    // attempt evidence is preserved for BOTH candidates (I34).
+    // attempt evidence is preserved for BOTH candidates (I34) — bound to
+    // the CANDIDATE manifest, so the committed canonical result's
+    // evidence view never absorbs a divergent candidate's evidence
+    // (H029; I37).
     store.append_evidence(
         &offer.manifest.action_key,
+        &candidate_key,
         &offer.evidence_id.0,
         generation_id,
         attempt_id,
@@ -1472,6 +1478,17 @@ mod tests {
                 .unwrap()
                 .contains(&digest_key(&object(55).0))
         );
+        // H029/I37: the candidate's evidence is bound to the CANDIDATE
+        // manifest — the committed canonical result's evidence view never
+        // absorbs a divergent candidate's evidence.
+        let candidate_view = store
+            .list_evidence_keys_for_manifest(&digest_key(&object(52).0))
+            .unwrap();
+        assert!(candidate_view.contains(&digest_key(&object(55).0)));
+        let committed_view = store
+            .list_evidence_keys_for_manifest(&digest_key(&object(50).0))
+            .unwrap();
+        assert!(!committed_view.contains(&digest_key(&object(55).0)));
 
         // The incident row names class, both manifests, and the pin.
         let incidents = store.list_divergence_incidents(&action_key).unwrap();
@@ -1645,6 +1662,14 @@ mod tests {
         let evidence_keys = store.list_evidence_keys(&action).unwrap();
         assert!(evidence_keys.contains(&digest_key(&object(51).0)));
         assert!(evidence_keys.contains(&digest_key(&object(54).0)));
+        // H029: both equivalent attempts' evidence bundles bind to the ONE
+        // committed canonical manifest, and the per-manifest view shows
+        // the appended set.
+        let manifest_view = store
+            .list_evidence_keys_for_manifest(&digest_key(&object(50).0))
+            .unwrap();
+        assert!(manifest_view.contains(&digest_key(&object(51).0)));
+        assert!(manifest_view.contains(&digest_key(&object(54).0)));
         assert_eq!(
             store.serving_disposition_key(&action_key).unwrap().unwrap(),
             "servable"

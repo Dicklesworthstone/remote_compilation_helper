@@ -44,7 +44,7 @@ use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use crate::metadata_store::{
     ActionEntryRow, AuthorityRow, FsqliteEngine, GcReceiptRow, PublicationRow, RabsMetadataStore,
     ResultKindTag, RusqliteEngine, SCHEMA_VERSION, SqlEngine, SqlMetadataStore, SqlValue,
-    StoreError, TrustEvaluationRow,
+    StoreError, TrustEvaluationRow, digest_key,
 };
 
 impl SqlEngine for Box<dyn SqlEngine> {
@@ -294,15 +294,28 @@ fn operation_script(
         &store.commit_publication(&active, &failure_row),
     );
     let extra_evidence = digest("rabs.evidence-bundle.sha256.v1", 90);
+    let manifest_key = digest_key(&publication_row.manifest_digest);
     outcome(
         &mut t,
         "evidence",
-        &store.append_evidence(&publication_row.action_key, &extra_evidence, 11, 20),
+        &store.append_evidence(
+            &publication_row.action_key,
+            &manifest_key,
+            &extra_evidence,
+            11,
+            20,
+        ),
     );
     outcome(
         &mut t,
         "evidence-idempotent",
-        &store.append_evidence(&publication_row.action_key, &extra_evidence, 11, 20),
+        &store.append_evidence(
+            &publication_row.action_key,
+            &manifest_key,
+            &extra_evidence,
+            11,
+            20,
+        ),
     );
 
     let object = digest("rabs.object.sha256.v1", 50);

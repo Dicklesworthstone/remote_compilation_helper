@@ -39,8 +39,9 @@ use rabs_protocol::serving::ServingValidity;
 
 /// Current schema version (v8 = the full H038 authoritative table set;
 /// v9 = H040 revisioned authority-bound serving state; v10 = H026
-/// append-only divergence incidents).
-pub const SCHEMA_VERSION: u32 = 10;
+/// append-only divergence incidents; v11 = H029 evidence rows name the
+/// canonical result manifest they support).
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -261,6 +262,18 @@ pub const MIGRATIONS: &[Migration] = &[
          candidate_evidence_key TEXT NOT NULL, candidate_pin_hex TEXT NOT NULL, \
          generation_hex TEXT NOT NULL, attempt_hex TEXT NOT NULL, detail TEXT NOT NULL, \
          PRIMARY KEY (action_key, seq))",
+        ],
+    },
+    Migration {
+        // H029: every evidence row NAMES the canonical result manifest it
+        // supports (I37; risks R80/R115). Evidence for a divergence
+        // candidate binds to the CANDIDATE manifest, so listing evidence
+        // for the committed canonical result can never conflate the two.
+        // Legacy rows carry '' (pre-H029 attribution is unknown, never
+        // guessed).
+        version: 11,
+        statements: &[
+            "ALTER TABLE action_evidence_index ADD COLUMN manifest_key TEXT NOT NULL DEFAULT ''",
         ],
     },
 ];
@@ -696,11 +709,15 @@ pub trait RabsMetadataStore {
         row: &PublicationRow,
     ) -> Result<CommitOutcome, StoreError>;
 
-    /// Append an evidence-bundle association for an action (append-only;
-    /// re-appending the same evidence digest is an idempotent no-op).
+    /// Append an evidence-bundle association for an action, bound to the
+    /// canonical result manifest (digest key) the evidence supports
+    /// (H029; I37). Append-only and first-writer-wins: re-appending the
+    /// same evidence digest is an idempotent no-op that NEVER rewrites
+    /// the original (manifest, generation, attempt) attribution.
     fn append_evidence(
         &mut self,
         action: &TypedDigest,
+        manifest_key: &str,
         evidence: &TypedDigest,
         generation: u128,
         attempt: u128,
@@ -824,6 +841,15 @@ pub trait RabsMetadataStore {
     /// fresh process can enumerate history without re-typing domains it
     /// never wrote (R121).
     fn list_evidence_keys(&mut self, action: &TypedDigest) -> Result<Vec<String>, StoreError>;
+
+    /// Canonical evidence-ID keys (`domain:hex`) bound to ONE canonical
+    /// result manifest (digest key), sorted (H029; I37). Divergence
+    /// candidates' evidence binds to the candidate manifest, so this view
+    /// never conflates evidence across same-key candidates.
+    fn list_evidence_keys_for_manifest(
+        &mut self,
+        manifest_key: &str,
+    ) -> Result<Vec<String>, StoreError>;
 
     /// All verification samples recorded for an action, ordered by
     /// (attempt, seq).
@@ -1507,6 +1533,26 @@ fn to_seq(v: u64, what: &str) -> Result<i64, StoreError> {
     i64::try_from(v).map_err(|_| StoreError::Corruption(format!("{what} out of range")))
 }
 
+/// Decode `(evidence_domain, evidence_bytes)` rows into sorted
+/// `domain:hex` keys (shared by the per-action and per-manifest listings).
+fn evidence_key_rows(rows: &[Vec<SqlValue>]) -> Result<Vec<String>, StoreError> {
+    rows.iter()
+        .map(|row| {
+            let [domain, bytes] = row.as_slice() else {
+                return Err(StoreError::Corruption("evidence row shape".into()));
+            };
+            let SqlValue::Blob(bytes) = bytes else {
+                return Err(StoreError::Corruption("evidence bytes shape".into()));
+            };
+            Ok(format!(
+                "{}:{}",
+                expect_text(domain, "evidence domain")?,
+                hex(bytes)
+            ))
+        })
+        .collect()
+}
+
 impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
     fn schema_version(&mut self) -> Result<u32, StoreError> {
         let rows = self
@@ -1895,13 +1941,16 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     &[SqlValue::Text(action.clone())],
                 )?;
             }
-            // The winner's evidence association, SAME transaction (H011).
+            // The winner's evidence association, SAME transaction (H011),
+            // bound to the committed canonical manifest (H029; I37) and
+            // append-only (OR IGNORE: never rewrite prior attribution).
             let [e_algo, e_domain, e_bytes] =
                 SqlMetadataStore::<E>::digest_params(&row.evidence_digest);
             engine.execute(
-                "INSERT OR REPLACE INTO action_evidence_index \
+                "INSERT OR IGNORE INTO action_evidence_index \
                  (action_key, evidence_algo, evidence_domain, evidence_bytes, \
-                  generation_hex, attempt_hex) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                  generation_hex, attempt_hex, manifest_key) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 &[
                     SqlValue::Text(action),
                     e_algo,
@@ -1909,6 +1958,7 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     e_bytes,
                     SqlValue::Text(u128_hex(row.winner_generation)),
                     SqlValue::Text(u128_hex(row.winner_attempt)),
+                    SqlValue::Text(digest_key(&row.manifest_digest)),
                 ],
             )?;
             // The durable publication reachability pin, SAME transaction.
@@ -1932,18 +1982,26 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
     fn append_evidence(
         &mut self,
         action: &TypedDigest,
+        manifest_key: &str,
         evidence: &TypedDigest,
         generation: u128,
         attempt: u128,
     ) -> Result<(), StoreError> {
         self.intern(evidence.domain);
         let action = digest_key(action);
+        let manifest_key = manifest_key.to_owned();
         let [algo, domain, bytes] = SqlMetadataStore::<E>::digest_params(evidence);
         self.in_txn(move |engine| {
+            // OR IGNORE, not OR REPLACE: append-only, first-writer-wins.
+            // A re-append of the same evidence digest under a different
+            // (manifest, generation, attempt) is an idempotent no-op —
+            // the original attribution is history and never rewritten
+            // (H029; I37).
             engine.execute(
-                "INSERT OR REPLACE INTO action_evidence_index \
+                "INSERT OR IGNORE INTO action_evidence_index \
                  (action_key, evidence_algo, evidence_domain, evidence_bytes, \
-                  generation_hex, attempt_hex) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                  generation_hex, attempt_hex, manifest_key) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 &[
                     SqlValue::Text(action),
                     algo,
@@ -1951,6 +2009,7 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     bytes,
                     SqlValue::Text(u128_hex(generation)),
                     SqlValue::Text(u128_hex(attempt)),
+                    SqlValue::Text(manifest_key),
                 ],
             )?;
             Ok(())
@@ -2351,21 +2410,19 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
              WHERE action_key = ?1 ORDER BY evidence_domain, evidence_bytes",
             &[SqlValue::Text(digest_key(action))],
         )?;
-        rows.iter()
-            .map(|row| {
-                let [domain, bytes] = row.as_slice() else {
-                    return Err(StoreError::Corruption("evidence row shape".into()));
-                };
-                let SqlValue::Blob(bytes) = bytes else {
-                    return Err(StoreError::Corruption("evidence bytes shape".into()));
-                };
-                Ok(format!(
-                    "{}:{}",
-                    expect_text(domain, "evidence domain")?,
-                    hex(bytes)
-                ))
-            })
-            .collect()
+        evidence_key_rows(&rows)
+    }
+
+    fn list_evidence_keys_for_manifest(
+        &mut self,
+        manifest_key: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT evidence_domain, evidence_bytes FROM action_evidence_index \
+             WHERE manifest_key = ?1 ORDER BY evidence_domain, evidence_bytes",
+            &[SqlValue::Text(manifest_key.to_owned())],
+        )?;
+        evidence_key_rows(&rows)
     }
 
     fn list_verification_samples(
@@ -4150,7 +4207,7 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             (
                 "action_evidence_index",
                 "SELECT action_key, evidence_algo, evidence_domain, evidence_bytes, \
-                 generation_hex, attempt_hex FROM action_evidence_index \
+                 generation_hex, attempt_hex, manifest_key FROM action_evidence_index \
                  ORDER BY action_key, evidence_domain, evidence_bytes",
             ),
             (
@@ -4569,12 +4626,53 @@ mod tests {
         );
         // Evidence is append-only and idempotent per digest.
         let extra_evidence = digest("rabs.evidence-bundle.sha256.v1", 90);
+        let manifest_key = digest_key(&publication_row.manifest_digest);
         store
-            .append_evidence(&publication_row.action_key, &extra_evidence, 11, 20)
+            .append_evidence(
+                &publication_row.action_key,
+                &manifest_key,
+                &extra_evidence,
+                11,
+                20,
+            )
             .unwrap();
+        // Re-append under a DIFFERENT attribution: idempotent no-op, the
+        // original (manifest, generation, attempt) row is never rewritten
+        // (H029).
         store
-            .append_evidence(&publication_row.action_key, &extra_evidence, 11, 20)
+            .append_evidence(
+                &publication_row.action_key,
+                "rabs.canonical-result-manifest.sha256.v1:ff",
+                &extra_evidence,
+                99,
+                98,
+            )
             .unwrap();
+        let evidence_line = store
+            .differential_snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|l| l.starts_with("action_evidence_index|") && l.contains("|5a5a"))
+            .expect("extra evidence row present");
+        assert!(
+            evidence_line.contains(&u128_hex(11)) && evidence_line.contains(&u128_hex(20)),
+            "first-writer attribution preserved: {evidence_line}"
+        );
+        assert!(
+            !evidence_line.ends_with(":ff"),
+            "re-append must not rebind the manifest: {evidence_line}"
+        );
+        // Per-manifest listing binds evidence to the canonical result.
+        let for_manifest = store
+            .list_evidence_keys_for_manifest(&manifest_key)
+            .unwrap();
+        assert!(for_manifest.contains(&digest_key(&extra_evidence)));
+        assert!(
+            store
+                .list_evidence_keys_for_manifest("rabs.canonical-result-manifest.sha256.v1:ff")
+                .unwrap()
+                .is_empty()
+        );
 
         // Objects, locations, pins.
         let object = digest("rabs.object.sha256.v1", 50);

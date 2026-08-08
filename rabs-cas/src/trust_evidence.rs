@@ -305,10 +305,12 @@ pub fn report_compromise(
             presented: report.domain.to_owned(),
         });
     }
-    if !store.has_publication(action)? {
-        return Err(TrustEvidenceError::NotPublished);
-    }
-    store.append_evidence(action, report, generation, attempt)?;
+    // The report is evidence about the COMMITTED canonical result, so it
+    // binds to the published manifest key (H029; I37).
+    let manifest_key = store
+        .published_manifest_key(action)?
+        .ok_or(TrustEvidenceError::NotPublished)?;
+    store.append_evidence(action, &manifest_key, report, generation, attempt)?;
     reevaluate_action(store, authority, action, policies, seq)
 }
 
@@ -613,10 +615,12 @@ mod tests {
         let mut store = SqlMetadataStore::open(engine).unwrap();
         let (_, action) = published_fixture(&mut store);
         let before = store.list_evidence_keys(&action).unwrap();
+        let manifest_key = store.published_manifest_key(&action).unwrap().unwrap();
         // Re-append the winner's evidence digest (idempotent per H011).
         store
             .append_evidence(
                 &action,
+                &manifest_key,
                 &digest("rabs.evidence-bundle.sha256.v1", 1),
                 10,
                 20,
