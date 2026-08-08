@@ -54,6 +54,7 @@ pub mod metadata_store;
 pub mod pin_leases;
 pub mod publication;
 pub mod serving_state;
+pub mod sparse_writer;
 pub mod staging_journal;
 pub mod startup_reconciliation;
 pub mod tree_manifest;

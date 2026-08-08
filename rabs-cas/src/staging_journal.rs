@@ -123,6 +123,59 @@ fn record_checksum(payload: &[u8]) -> [u8; 4] {
     out
 }
 
+/// Append one length-framed, checksummed record to an append-only
+/// journal file and fsync it (shared by the H007 lifecycle journal and
+/// the H008 range journal).
+pub(crate) fn append_framed(path: &Path, payload: &[u8]) -> Result<(), PutError> {
+    let mut framed = Vec::with_capacity(payload.len() + 8);
+    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    framed.extend_from_slice(payload);
+    framed.extend_from_slice(&record_checksum(payload));
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(io_err("open-journal"))?;
+    file.write_all(&framed).map_err(io_err("append-journal"))?;
+    file.sync_all().map_err(io_err("fsync-journal"))?;
+    Ok(())
+}
+
+/// Replay a framed journal, tolerating a torn/corrupt tail: returns
+/// the intact payloads in order plus whether a tear was found.
+pub(crate) fn replay_framed(path: &Path) -> Result<(Vec<Vec<u8>>, bool), PutError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
+        Err(e) => return Err(io_err("read-journal")(e)),
+    };
+    let mut payloads = Vec::new();
+    let mut cursor = 0_usize;
+    let mut torn_tail = false;
+    while cursor < bytes.len() {
+        let Some(header) = bytes.get(cursor..cursor + 4) else {
+            torn_tail = true;
+            break;
+        };
+        let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let Some(payload) = bytes.get(cursor + 4..cursor + 4 + len) else {
+            torn_tail = true;
+            break;
+        };
+        let Some(stored_sum) = bytes.get(cursor + 4 + len..cursor + 8 + len) else {
+            torn_tail = true;
+            break;
+        };
+        if stored_sum != record_checksum(payload) {
+            torn_tail = true;
+            break;
+        }
+        payloads.push(payload.to_vec());
+        cursor += 8 + len;
+    }
+    Ok((payloads, torn_tail))
+}
+
 fn journals_dir(layout: &BlobStoreLayout) -> PathBuf {
     layout.root().join("journals")
 }
@@ -171,20 +224,10 @@ impl StagingJournal {
     /// # Errors
     /// [`PutError::Io`] on append/sync failure.
     pub fn append(&self, record: &JournalRecord) -> Result<(), PutError> {
-        let payload = record.encode();
-        let payload = payload.as_bytes();
-        let mut framed = Vec::with_capacity(payload.len() + 8);
-        framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        framed.extend_from_slice(payload);
-        framed.extend_from_slice(&record_checksum(payload));
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(journal_path(&self.layout, &self.op_hex))
-            .map_err(io_err("open-journal"))?;
-        file.write_all(&framed).map_err(io_err("append-journal"))?;
-        file.sync_all().map_err(io_err("fsync-journal"))?;
-        Ok(())
+        append_framed(
+            &journal_path(&self.layout, &self.op_hex),
+            record.encode().as_bytes(),
+        )
     }
 
     /// Replay the journal, tolerating a torn tail.
@@ -197,46 +240,20 @@ impl StagingJournal {
 }
 
 fn replay_file(path: &Path) -> Result<JournalReplay, PutError> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(JournalReplay {
-                records: Vec::new(),
-                torn_tail: false,
-            });
-        }
-        Err(e) => return Err(io_err("read-journal")(e)),
-    };
+    let (payloads, mut torn_tail) = replay_framed(path)?;
     let mut records = Vec::new();
-    let mut cursor = 0_usize;
-    let mut torn_tail = false;
-    while cursor < bytes.len() {
-        let Some(header) = bytes.get(cursor..cursor + 4) else {
-            torn_tail = true;
-            break;
-        };
-        let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        let Some(payload) = bytes.get(cursor + 4..cursor + 4 + len) else {
-            torn_tail = true;
-            break;
-        };
-        let Some(stored_sum) = bytes.get(cursor + 4 + len..cursor + 8 + len) else {
-            torn_tail = true;
-            break;
-        };
-        if stored_sum != record_checksum(payload) {
-            torn_tail = true;
-            break;
-        }
-        let Some(record) = std::str::from_utf8(payload)
+    for payload in payloads {
+        let Some(record) = std::str::from_utf8(&payload)
             .ok()
             .and_then(JournalRecord::decode)
         else {
+            // An intact frame that does not decode is corruption at the
+            // record layer: treated exactly like a torn tail — trust
+            // nothing from here on.
             torn_tail = true;
             break;
         };
         records.push(record);
-        cursor += 8 + len;
     }
     Ok(JournalReplay { records, torn_tail })
 }
