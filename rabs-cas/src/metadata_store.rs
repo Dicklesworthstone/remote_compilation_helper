@@ -5130,6 +5130,7 @@ mod tests {
             "coordinator_authorities",
             "decision_receipts",
             "determinism_audits",
+            "divergence_incidents",
             "edge_handoffs",
             "edge_incarnation_fences",
             "edge_subscribers",

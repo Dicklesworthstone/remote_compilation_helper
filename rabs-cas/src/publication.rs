@@ -634,12 +634,20 @@ fn quarantine_divergence(
     // 3. Preserve the losing candidate: reachability edges from its
     // manifest to everything it references, then a durable pin rooted at
     // the manifest so GC preserves the whole candidate closure.
-    store.add_object_edge(&offer.manifest_id.0, &offer.evidence_id.0, "divergence-candidate")?;
+    store.add_object_edge(
+        &offer.manifest_id.0,
+        &offer.evidence_id.0,
+        "divergence-candidate",
+    )?;
     if let Some(root) = &offer.manifest.artifact_bundle_root {
         store.add_object_edge(&offer.manifest_id.0, &root.0, "divergence-candidate")?;
     }
     for output in &offer.manifest.logical_outputs {
-        store.add_object_edge(&offer.manifest_id.0, &output.object.0, "divergence-candidate")?;
+        store.add_object_edge(
+            &offer.manifest_id.0,
+            &output.object.0,
+            "divergence-candidate",
+        )?;
     }
     store.create_pin(
         pin_id,
@@ -1329,6 +1337,411 @@ mod tests {
                 .unwrap(),
             digest_key(&object(50).0)
         );
+    }
+
+    /// A second offer for the same key whose manifest object differs.
+    /// `output_tag`/`manifest_tag`/`evidence_tag` pick the divergent
+    /// output object, manifest id, and evidence id; `observations` picks
+    /// the observation stream.
+    fn divergent_offer(
+        store: &mut dyn RabsMetadataStore,
+        output_tag: Option<u8>,
+        manifest_tag: u8,
+        evidence_tag: u8,
+        observations: TypedDigest,
+    ) -> OfferPreparedActionResult {
+        let mut m = manifest();
+        if let Some(tag) = output_tag {
+            m.logical_outputs[0].object = object(tag);
+        }
+        let id = object(manifest_tag);
+        for tag in output_tag
+            .iter()
+            .copied()
+            .chain([manifest_tag, evidence_tag])
+        {
+            store.record_object(&object(tag).0, 64).unwrap();
+            store
+                .add_location(&object(tag).0, &format!("/cas/{tag}"), Some(1), "raw")
+                .unwrap();
+        }
+        OfferPreparedActionResult::build(
+            attempt_authority(),
+            m,
+            id.clone(),
+            evidence(&id),
+            object(evidence_tag),
+            observations,
+            &declared(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn h026_semantic_divergence_quarantines_preserves_and_escalates() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        ready_store(&mut store);
+        let action = digest("rabs.action-key.sha256.v1", 7);
+        let action_key = digest_key(&action);
+        let auth = authority_digest(&coordinator_authority());
+
+        let first = offer();
+        assert!(matches!(
+            process_offer(
+                &mut store,
+                &first,
+                &expected_descriptor(),
+                no_committed,
+                900,
+                1
+            )
+            .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+
+        // Two consumers were served this result under a RELEASE tier.
+        store
+            .record_served_consumer(&action_key, "consumer-b")
+            .unwrap();
+        store
+            .record_served_consumer(&action_key, "consumer-a")
+            .unwrap();
+        store
+            .append_trust_evaluation(
+                &auth,
+                &action,
+                &crate::metadata_store::TrustEvaluationRow {
+                    version: 1,
+                    state: "project-release-eligible".to_owned(),
+                    reason: "release gate".to_owned(),
+                    evaluated_seq: 2,
+                },
+            )
+            .unwrap();
+
+        // Semantic divergence: different output object under the same key.
+        let divergent = divergent_offer(
+            &mut store,
+            Some(42),
+            52,
+            55,
+            digest("rabs.observation-stream.sha256.v1", 9),
+        );
+        let committed = first.manifest.clone();
+        let outcome = process_offer(
+            &mut store,
+            &divergent,
+            &expected_descriptor(),
+            move |_| Some(committed),
+            902,
+            3,
+        )
+        .unwrap();
+        let PublicationOutcome::Quarantined(quarantine) = outcome else {
+            panic!("expected quarantine, got {outcome:?}");
+        };
+        assert_eq!(quarantine.class, DivergenceClass::SemanticDivergence);
+
+        // Serving is DISABLED with the full quarantine disposition.
+        assert_eq!(
+            store.serving_disposition_key(&action_key).unwrap().unwrap(),
+            DISPOSITION_QUARANTINED
+        );
+
+        // BOTH candidates preserved: the committed row is untouched...
+        assert_eq!(
+            store.published_manifest_key(&action).unwrap().unwrap(),
+            digest_key(&object(50).0)
+        );
+        // ...and the losing candidate sits under a durable
+        // divergence-evidence pin with reachability edges.
+        let pin = store.pin_row(902).unwrap().unwrap();
+        assert_eq!(pin.class, DIVERGENCE_EVIDENCE_PIN_CLASS);
+        assert_eq!(pin.root_key, digest_key(&object(52).0));
+        assert!(!pin.released);
+        let snapshot = store.differential_snapshot().unwrap();
+        assert!(
+            snapshot
+                .iter()
+                .any(|l| l.starts_with("object_edges|") && l.contains("divergence-candidate"))
+        );
+        // The candidate's evidence bundle joined the append-only index.
+        assert!(
+            store
+                .list_evidence_keys(&action)
+                .unwrap()
+                .contains(&digest_key(&object(55).0))
+        );
+
+        // The incident row names class, both manifests, and the pin.
+        let incidents = store.list_divergence_incidents(&action_key).unwrap();
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].seq, 3);
+        assert_eq!(incidents[0].class, "semantic");
+        assert_eq!(
+            incidents[0].committed_manifest_key,
+            digest_key(&object(50).0)
+        );
+        assert_eq!(
+            incidents[0].candidate_manifest_key,
+            digest_key(&object(52).0)
+        );
+        assert_eq!(incidents[0].candidate_pin_hex, format!("{:032x}", 902));
+
+        // Previously served consumers escalated by RELEASE tier: recall.
+        assert_eq!(
+            quarantine.escalations,
+            vec![
+                ConsumerEscalation {
+                    consumer: "consumer-a".to_owned(),
+                    trust_state: "project-release-eligible".to_owned(),
+                    decision: "recall-and-reverify".to_owned(),
+                },
+                ConsumerEscalation {
+                    consumer: "consumer-b".to_owned(),
+                    trust_state: "project-release-eligible".to_owned(),
+                    decision: "recall-and-reverify".to_owned(),
+                },
+            ]
+        );
+        assert!(snapshot.iter().any(|l| {
+            l.starts_with(
+                "decision_receipts|divergence-escalation|consumer-a|3|recall-and-reverify",
+            )
+        }));
+    }
+
+    #[test]
+    fn h026_observable_only_divergence_gets_presentation_quarantine() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        ready_store(&mut store);
+        let action = digest("rabs.action-key.sha256.v1", 7);
+        let action_key = digest_key(&action);
+
+        let first = offer();
+        assert!(matches!(
+            process_offer(
+                &mut store,
+                &first,
+                &expected_descriptor(),
+                no_committed,
+                900,
+                1
+            )
+            .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+        store
+            .record_served_consumer(&action_key, "consumer-a")
+            .unwrap();
+
+        // Same semantic result, different observation stream, offered as
+        // a different manifest object: observable-only divergence.
+        let divergent = divergent_offer(
+            &mut store,
+            None,
+            53,
+            56,
+            digest("rabs.observation-stream.sha256.v1", 10),
+        );
+        assert_eq!(
+            divergent.manifest.semantic_result_digest,
+            first.manifest.semantic_result_digest
+        );
+        let committed = first.manifest.clone();
+        let outcome = process_offer(
+            &mut store,
+            &divergent,
+            &expected_descriptor(),
+            move |_| Some(committed),
+            903,
+            4,
+        )
+        .unwrap();
+        let PublicationOutcome::Quarantined(quarantine) = outcome else {
+            panic!("expected quarantine, got {outcome:?}");
+        };
+        assert_eq!(quarantine.class, DivergenceClass::ObservableOnlyDivergence);
+
+        // The NARROWER disposition: ordinary replay disabled, tagged as
+        // presentation-only.
+        assert_eq!(
+            store.serving_disposition_key(&action_key).unwrap().unwrap(),
+            DISPOSITION_PRESENTATION_QUARANTINED
+        );
+        // Candidate still preserved; incident recorded with the narrower
+        // class; NO consumer escalation for observable-only.
+        assert!(store.pin_row(903).unwrap().is_some());
+        let incidents = store.list_divergence_incidents(&action_key).unwrap();
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].class, "observable-only");
+        assert!(quarantine.escalations.is_empty());
+        assert!(
+            !store
+                .differential_snapshot()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("decision_receipts|divergence-escalation|"))
+        );
+    }
+
+    #[test]
+    fn h026_attempt_evidence_difference_appends_normally() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        ready_store(&mut store);
+        let action = digest("rabs.action-key.sha256.v1", 7);
+        let action_key = digest_key(&action);
+
+        let first = offer();
+        assert!(matches!(
+            process_offer(
+                &mut store,
+                &first,
+                &expected_descriptor(),
+                no_committed,
+                900,
+                1
+            )
+            .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+
+        // Same manifest, DIFFERENT evidence bundle: the third H026 class
+        // — attempt-evidence variation appends normally, no quarantine,
+        // no incident, serving untouched.
+        let manifest_id = object(50);
+        let mut other_evidence = evidence(&manifest_id);
+        other_evidence.provenance_receipt = object(64);
+        store.record_object(&object(64).0, 64).unwrap();
+        store
+            .add_location(&object(64).0, "/cas/64", Some(1), "raw")
+            .unwrap();
+        let reoffer = OfferPreparedActionResult::build(
+            attempt_authority(),
+            manifest(),
+            manifest_id,
+            other_evidence,
+            object(54),
+            digest("rabs.observation-stream.sha256.v1", 9),
+            &declared(),
+        )
+        .unwrap();
+        store.record_object(&object(54).0, 64).unwrap();
+        store
+            .add_location(&object(54).0, "/cas/54", Some(1), "raw")
+            .unwrap();
+        assert_eq!(
+            process_offer(
+                &mut store,
+                &reoffer,
+                &expected_descriptor(),
+                no_committed,
+                904,
+                5
+            )
+            .unwrap(),
+            PublicationOutcome::IdempotentEvidenceAppended
+        );
+        let evidence_keys = store.list_evidence_keys(&action).unwrap();
+        assert!(evidence_keys.contains(&digest_key(&object(51).0)));
+        assert!(evidence_keys.contains(&digest_key(&object(54).0)));
+        assert_eq!(
+            store.serving_disposition_key(&action_key).unwrap().unwrap(),
+            "servable"
+        );
+        assert!(
+            store
+                .list_divergence_incidents(&action_key)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !store
+                .differential_snapshot()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("quarantines|"))
+        );
+    }
+
+    #[test]
+    fn h026_incident_rows_are_append_only_and_authority_gated() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        let auth = authority_digest(&coordinator_authority());
+        let row = DivergenceIncidentRow {
+            action_key: "k".to_owned(),
+            seq: 1,
+            class: "semantic".to_owned(),
+            committed_manifest_key: "m1".to_owned(),
+            candidate_manifest_key: "m2".to_owned(),
+            candidate_evidence_key: "e2".to_owned(),
+            candidate_pin_hex: format!("{:032x}", 7),
+            generation_hex: format!("{:032x}", 11),
+            attempt_hex: format!("{:032x}", 20),
+            detail: "detail".to_owned(),
+        };
+        // No active authority: refused, nothing written.
+        assert_eq!(
+            store.record_divergence_incident(&auth, &row),
+            Err(StoreError::NotActiveAuthority)
+        );
+        ready_store(&mut store);
+        store.record_divergence_incident(&auth, &row).unwrap();
+        // Identical re-record: idempotent.
+        store.record_divergence_incident(&auth, &row).unwrap();
+        // Conflicting rewrite: typed refusal; the stored row survives.
+        let mut tampered = row.clone();
+        tampered.detail = "rewritten".to_owned();
+        assert_eq!(
+            store.record_divergence_incident(&auth, &tampered),
+            Err(StoreError::AppendConflict("divergence_incidents".into()))
+        );
+        let incidents = store.list_divergence_incidents("k").unwrap();
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0], row);
+    }
+
+    #[test]
+    fn h026_differential_reference_vs_frankensqlite() {
+        // Semantic divergence with escalation AND observable-only
+        // divergence must leave both engines byte-identical.
+        fn scenario(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+            ready_store(store);
+            let action = digest("rabs.action-key.sha256.v1", 7);
+            let action_key = digest_key(&action);
+            let first = offer();
+            assert!(matches!(
+                process_offer(store, &first, &expected_descriptor(), no_committed, 900, 1).unwrap(),
+                PublicationOutcome::Committed(_)
+            ));
+            store
+                .record_served_consumer(&action_key, "consumer-a")
+                .unwrap();
+            let divergent = divergent_offer(
+                store,
+                Some(42),
+                52,
+                55,
+                digest("rabs.observation-stream.sha256.v1", 9),
+            );
+            let committed = first.manifest.clone();
+            let outcome = process_offer(
+                store,
+                &divergent,
+                &expected_descriptor(),
+                move |_| Some(committed),
+                902,
+                3,
+            )
+            .unwrap();
+            assert!(matches!(outcome, PublicationOutcome::Quarantined(_)));
+            store.differential_snapshot().unwrap()
+        }
+        let mut reference =
+            SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("ref26")).unwrap()).unwrap();
+        let mut candidate =
+            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("fsq26")).unwrap()).unwrap();
+        assert_eq!(scenario(&mut reference), scenario(&mut candidate));
     }
 
     #[test]
