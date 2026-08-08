@@ -83,6 +83,7 @@ ENVIRONMENT VARIABLES:
     RCH_SSH_SERVER_ALIVE_INTERVAL_SECS  SSH keepalive interval (ServerAliveInterval)
     RCH_SSH_CONTROL_PERSIST_SECS        SSH ControlPersist idle seconds (0 disables persistence)
     RCH_COMPRESSION_LEVEL Compression level 1-22 (default: 3)
+    RCH_SYNC_TIMEOUT_MS   Per-attempt source-sync timeout (default: payload-aware)
     RCH_ENV_ALLOWLIST     Comma-separated env vars to forward (e.g., RUSTFLAGS,CARGO_TARGET_DIR)
     RCH_MIN_LOCAL_TIME_MS Minimum local runtime estimate required before offload
     RCH_REMOTE_SPEEDUP_THRESHOLD Minimum predicted remote speedup ratio before offload
@@ -2920,6 +2921,10 @@ fn env_var_capabilities() -> Vec<EnvVarCapability> {
         EnvVarCapability {
             name: "RCH_COMPRESSION_LEVEL".to_string(),
             effect: "Override transfer compression level.".to_string(),
+        },
+        EnvVarCapability {
+            name: "RCH_SYNC_TIMEOUT_MS".to_string(),
+            effect: "Override the per-attempt source-sync timeout in milliseconds; distinct from remote build and artifact-return timeouts.".to_string(),
         },
         EnvVarCapability {
             name: "RCH_MIN_LOCAL_TIME_MS".to_string(),

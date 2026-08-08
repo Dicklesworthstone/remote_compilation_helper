@@ -2118,6 +2118,7 @@ fi",
             );
         }
 
+        let archive_path = archive_file.path().to_path_buf();
         let payload_bytes = archive_file
             .as_file()
             .metadata()
@@ -2155,6 +2156,7 @@ fi",
                     let destination = destination.clone();
                     let ssh_command = ssh_command.clone();
                     let extraction_script = extraction_script.clone();
+                    let archive_path = archive_path.clone();
                     async move {
                         let mut rsync = Command::new("rsync");
                         rsync
@@ -2165,7 +2167,7 @@ fi",
                             .arg("--append-verify")
                             .arg("-e")
                             .arg(ssh_command)
-                            .arg(archive_file.path())
+                            .arg(archive_path)
                             .arg(destination)
                             .stdout(Stdio::piped())
                             .stderr(Stdio::piped())
@@ -6660,6 +6662,163 @@ Total file size: 123 bytes";
             pipeline.effective_rsync_retry_config().total_timeout_ms,
             5000
         );
+    }
+
+    #[tokio::test]
+    async fn test_source_transfer_retry_unit_timeout_then_success_reuses_partial_base() {
+        // Deterministic injected-runner unit proof only; this is not a live
+        // network capture. The stable base string models the production rsync
+        // destination retained across attempts.
+        let _guard = test_guard!();
+        let retry = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            jitter_factor: 0.0,
+            total_timeout_ms: 1,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_bases = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_in = std::sync::Arc::clone(&calls);
+        let bases_in = std::sync::Arc::clone(&observed_bases);
+
+        let (value, attempts) = run_source_transfer_attempts(
+            &retry,
+            std::time::Duration::from_secs(1),
+            "cold_pinned_tree",
+            move |_attempt| {
+                let call = calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                bases_in
+                    .lock()
+                    .expect("record partial base")
+                    .push("worker:/remote/job/.rch-clean-overlay-base.tar");
+                async move {
+                    if call == 0 {
+                        Err(anyhow::anyhow!("cold_pinned_tree: timed out"))
+                    } else {
+                        Ok("continued")
+                    }
+                }
+            },
+        )
+        .await
+        .expect("second attempt should continue the partial base");
+
+        assert_eq!(value, "continued");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].outcome, "retryable");
+        assert_eq!(attempts[1].outcome, "succeeded");
+        assert_eq!(
+            observed_bases.lock().expect("read partial bases").as_slice(),
+            [
+                "worker:/remote/job/.rch-clean-overlay-base.tar",
+                "worker:/remote/job/.rch-clean-overlay-base.tar"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_source_transfer_retry_unit_exhausts_exact_attempt_count() {
+        // Deterministic injected-runner unit proof only; no live network claim.
+        let _guard = test_guard!();
+        let retry = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            jitter_factor: 0.0,
+            total_timeout_ms: 1,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        let error = run_source_transfer_attempts(
+            &retry,
+            std::time::Duration::from_secs(1),
+            "cold_pinned_tree",
+            move |_attempt| {
+                calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err::<(), _>(anyhow::anyhow!("source sync timed out")) }
+            },
+        )
+        .await
+        .expect_err("all configured attempts should be exhausted");
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(error.attempts.len(), 3);
+        assert_eq!(
+            error
+                .attempts
+                .iter()
+                .map(|attempt| attempt.attempt)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("before remote Cargo execution after 3 attempt(s)")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_source_transfer_retry_unit_fatal_error_does_not_spin() {
+        // Deterministic injected-runner unit proof only; no live network claim.
+        let _guard = test_guard!();
+        let retry = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            jitter_factor: 0.0,
+            total_timeout_ms: 1,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        let error = run_source_transfer_attempts(
+            &retry,
+            std::time::Duration::from_secs(1),
+            "cold_pinned_tree",
+            move |_attempt| {
+                calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err::<(), _>(anyhow::anyhow!("Permission denied")) }
+            },
+        )
+        .await
+        .expect_err("fatal error should fail immediately");
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(error.attempts.len(), 1);
+        assert_eq!(error.attempts[0].outcome, "fatal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ordinary_warm_base_rsync_fast_path_is_unchanged() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/warm-project"),
+            "warm-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = worker_with_os(Some("linux"));
+        let remote_path = pipeline.remote_path();
+        let escaped_remote_path = escape(Cow::from(remote_path.as_str()));
+        let destination = format!("{}@{}:{}", worker.user, worker.host, escaped_remote_path);
+        let command = pipeline.build_sync_command(
+            &worker,
+            &destination,
+            &escaped_remote_path,
+            &pipeline.get_effective_excludes(),
+        );
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(args.iter().any(|arg| arg == "--delete"));
+        assert!(!args.iter().any(|arg| arg == "--append-verify"));
+        assert!(!args.iter().any(|arg| arg == "--partial"));
+        assert_eq!(args.last(), Some(&destination));
     }
 
     #[cfg(unix)]

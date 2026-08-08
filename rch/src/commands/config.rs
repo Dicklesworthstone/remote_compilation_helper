@@ -136,6 +136,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 compression_level: config.transfer.compression_level,
                 exclude_patterns: config.transfer.exclude_patterns.clone(),
                 remote_base: config.transfer.remote_base.clone(),
+                sync_timeout_ms: config.transfer.sync_timeout_ms,
                 // Transfer optimization (bd-3hho)
                 max_transfer_mb: config.transfer.max_transfer_mb,
                 max_transfer_time_ms: config.transfer.max_transfer_time_ms,
@@ -1398,6 +1399,9 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                 "export RCH_COMPRESSION_LEVEL={}",
                 config.transfer.compression_level
             );
+            if let Some(sync_timeout_ms) = config.transfer.sync_timeout_ms {
+                println!("export RCH_SYNC_TIMEOUT_MS={sync_timeout_ms}");
+            }
             println!(
                 "export RCH_ENV_ALLOWLIST=\"{}\"",
                 config.environment.allowlist.join(",")
@@ -1441,6 +1445,9 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                 "RCH_COMPRESSION_LEVEL={}",
                 config.transfer.compression_level
             );
+            if let Some(sync_timeout_ms) = config.transfer.sync_timeout_ms {
+                println!("RCH_SYNC_TIMEOUT_MS={sync_timeout_ms}");
+            }
             println!(
                 "RCH_ENV_ALLOWLIST={}",
                 config.environment.allowlist.join(",")

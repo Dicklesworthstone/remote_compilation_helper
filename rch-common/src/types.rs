@@ -4995,6 +4995,43 @@ retry_max = 2
         assert_eq!(config.remote_base, "/data/tmp/rch");
     }
 
+    #[test]
+    fn test_source_sync_timeout_validation_boundaries() {
+        let _guard = test_guard!();
+        assert!(!TransferConfig::valid_sync_timeout_ms(0));
+        assert!(!TransferConfig::valid_sync_timeout_ms(999));
+        assert!(TransferConfig::valid_sync_timeout_ms(1_000));
+        assert!(TransferConfig::valid_sync_timeout_ms(3_600_000));
+        assert!(!TransferConfig::valid_sync_timeout_ms(3_600_001));
+    }
+
+    #[test]
+    fn test_source_sync_timeout_is_explicit_or_payload_aware() {
+        let _guard = test_guard!();
+        let default = TransferConfig::default();
+        assert_eq!(
+            default.sync_timeout_for_payload(0),
+            std::time::Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            default.sync_timeout_for_payload(10 * 1024 * 1024),
+            std::time::Duration::from_millis(40_000)
+        );
+        assert_eq!(
+            default.sync_timeout_for_payload(u64::MAX),
+            std::time::Duration::from_millis(3_600_000)
+        );
+
+        let explicit = TransferConfig {
+            sync_timeout_ms: Some(120_000),
+            ..TransferConfig::default()
+        };
+        assert_eq!(
+            explicit.sync_timeout_for_payload(u64::MAX),
+            std::time::Duration::from_millis(120_000)
+        );
+    }
+
     // ========================================================================
     // RetryConfig Tests (bd-x1ek)
     // ========================================================================

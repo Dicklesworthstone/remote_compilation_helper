@@ -260,6 +260,8 @@ pub struct ConfigTransferSection {
     pub compression_level: u32,
     pub exclude_patterns: Vec<String>,
     pub remote_base: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_timeout_ms: Option<u64>,
     // Transfer optimization (bd-3hho)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_transfer_mb: Option<u64>,

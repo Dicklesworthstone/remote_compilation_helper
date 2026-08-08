@@ -902,6 +902,15 @@ pub fn validate_rch_config_file(path: &Path) -> FileValidation {
     if let Err(e) = validate_remote_base(&config.transfer.remote_base) {
         validation.error(format!("transfer.remote_base invalid: {}", e));
     }
+    if let Some(sync_timeout_ms) = config.transfer.sync_timeout_ms
+        && !TransferConfig::valid_sync_timeout_ms(sync_timeout_ms)
+    {
+        validation.error(format!(
+            "transfer.sync_timeout_ms must be between {} and {} milliseconds",
+            TransferConfig::MIN_SYNC_TIMEOUT_MS,
+            TransferConfig::MAX_SYNC_TIMEOUT_MS
+        ));
+    }
 
     for entry in &config.environment.allowlist {
         let trimmed = entry.trim();
@@ -1201,6 +1210,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "compilation.allow_local_fallback",
         "transfer.compression_level",
         "transfer.exclude_patterns",
+        "transfer.sync_timeout_ms",
         "environment.allowlist",
         "circuit.failure_threshold",
         "circuit.success_threshold",
@@ -2537,6 +2547,9 @@ check_slots = 2
 [transfer]
 # zstd compression level (1-19)
 compression_level = 3
+# Optional per-attempt source-sync timeout in milliseconds.
+# Unset uses the payload-aware default (30s + 1s/MiB, capped at 1h).
+# sync_timeout_ms = 120000
 # Patterns to exclude from transfer (replaces defaults if modified)
 exclude_patterns = [
 {exclude_lines}]
@@ -4444,6 +4457,47 @@ extra_field = 123
             &ConfigValueSource::EnvVar("RCH_COMPRESSION_LEVEL".to_string())
         );
         info!("PASS: RCH_COMPRESSION_LEVEL override applied");
+    }
+
+    #[test]
+    fn test_apply_env_overrides_source_sync_timeout_boundaries() {
+        let _guard = test_guard!();
+        for accepted in [
+            TransferConfig::MIN_SYNC_TIMEOUT_MS,
+            TransferConfig::MAX_SYNC_TIMEOUT_MS,
+        ] {
+            let mut config = RchConfig::default();
+            let mut sources = default_sources_map();
+            let env_overrides = HashMap::from([(
+                "RCH_SYNC_TIMEOUT_MS".to_string(),
+                accepted.to_string(),
+            )]);
+            apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+            assert_eq!(config.transfer.sync_timeout_ms, Some(accepted));
+            assert_eq!(
+                sources
+                    .get("transfer.sync_timeout_ms")
+                    .expect("sync timeout source present"),
+                &ConfigValueSource::EnvVar("RCH_SYNC_TIMEOUT_MS".to_string())
+            );
+        }
+
+        for rejected in ["0", "999", "3600001", "not-a-number"] {
+            let mut config = RchConfig::default();
+            let mut sources = default_sources_map();
+            let env_overrides = HashMap::from([(
+                "RCH_SYNC_TIMEOUT_MS".to_string(),
+                rejected.to_string(),
+            )]);
+            apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+            assert_eq!(config.transfer.sync_timeout_ms, None);
+            assert_eq!(
+                sources
+                    .get("transfer.sync_timeout_ms")
+                    .expect("default sync timeout source present"),
+                &ConfigValueSource::Default
+            );
+        }
     }
 
     #[test]

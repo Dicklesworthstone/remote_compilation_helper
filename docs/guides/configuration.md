@@ -64,6 +64,12 @@ Sections and fields:
   for remote execution and rsync transfers to reduce dropped connections on flaky networks.
 - `ssh_control_persist_secs` (u64, optional) — Sets `ssh -o ControlPersist=<N>s` for
   remote execution (ControlMaster). Use `0` to disable persistence (`ControlPersist=no`).
+- `sync_timeout_ms` (u64, optional; `1000..=3600000`) — Per-attempt timeout for
+  uploading source to the worker. When unset, RCH uses a payload-aware default:
+  30 seconds plus one second per MiB at a conservative 1 MiB/s floor, capped at
+  one hour. Each retry receives this full timeout and resumes the same partial
+  immutable-base upload. This setting does not affect remote Cargo execution or
+  artifact-return timeouts.
 
 ### `[circuit]`
 - `failure_threshold` (u32, default `3`) — Consecutive failures to open.
@@ -178,6 +184,7 @@ These are read by the hook configuration loader:
 - `RCH_REMOTE_SPEEDUP_THRESHOLD`
 - `RCH_COMPRESSION_LEVEL`
 - `RCH_COMPRESSION` (legacy alias for `RCH_COMPRESSION_LEVEL`)
+- `RCH_SYNC_TIMEOUT_MS` (per-attempt source-upload timeout; `1000..=3600000`)
 - `RCH_CANONICAL_PROJECT_ROOT`
 - `RCH_ALIAS_PROJECT_ROOT`
 

@@ -505,9 +505,37 @@ pub(super) async fn execute_remote_compilation(
         let sync_attempt = if let Some(spec) = clean_overlay {
             spec.verify_archive_attributes(&entry.local_root).await?;
             spec.verify_overlay_unchanged(&entry.local_root)?;
-            let base_result = root_pipeline
+            let base_materialization = match root_pipeline
                 .materialize_git_archive(&worker_config, &entry.local_root, spec.base_commit())
-                .await?;
+                .await
+            {
+                Ok(materialization) => materialization,
+                Err(error) => {
+                    if let Some(history) =
+                        error.downcast_ref::<crate::transfer::TransferAttemptsExhausted>()
+                    {
+                        for attempt in &history.attempts {
+                            reporter.verbose(&format!(
+                                "[RCH] clean-overlay base transfer attempt {}/{} {} before remote Cargo execution: {}",
+                                attempt.attempt,
+                                attempt.max_attempts,
+                                attempt.outcome,
+                                attempt.detail
+                            ));
+                        }
+                    }
+                    return Err(error.context(
+                        "clean-overlay base transfer failed before remote Cargo execution",
+                    ));
+                }
+            };
+            for attempt in &base_materialization.attempts {
+                reporter.verbose(&format!(
+                    "[RCH] clean-overlay base transfer attempt {}/{} {} before remote Cargo execution: {}",
+                    attempt.attempt, attempt.max_attempts, attempt.outcome, attempt.detail
+                ));
+            }
+            let base_result = base_materialization.sync_result;
             spec.verify_archive_attributes(&entry.local_root).await?;
             let result = if spec.is_base_only() {
                 base_result

@@ -352,6 +352,9 @@ external_timeout_enabled = true
 [transfer]
 compression_level = 3
 remote_base = "/tmp/rch"
+# Optional per-attempt source-sync cap. When unset, the default is payload-aware:
+# 30 seconds plus one second per MiB, capped at one hour.
+# sync_timeout_ms = 120000
 adaptive_compression = true
 verify_artifacts = false
 max_transfer_mb = 2048
@@ -425,6 +428,7 @@ plan for any command is shown by `rch diagnose <command> --json` under
 | Wait timeout | `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (`RCH_DAEMON_RESPONSE_TIMEOUT_SECS`) | Max seconds to wait for a queued worker. |
 | Visibility | `RCH_VISIBILITY=none\|summary\|verbose` (`RCH_QUIET`, `RCH_VERBOSE`) | Hook output verbosity. |
 | Target dir | `RCH_DISABLE_TARGET_REUSE` | Legacy unique-per-job remote target dir instead of the pooled, reuse-friendly dir. |
+| Source-sync timeout | `RCH_SYNC_TIMEOUT_MS` | Per-attempt source-upload timeout in milliseconds (1000..=3600000). Unset uses the payload-aware default. This does not change remote Cargo or artifact-return timeouts. |
 
 The resolved plan reports `requested_worker`, `requested_profile`,
 `effective_worker`, `strict_remote_policy`, `queue_policy`, `visibility_mode`,
