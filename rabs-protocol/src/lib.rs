@@ -79,6 +79,7 @@ pub mod portability;
 pub mod pressure;
 pub mod raw_bytes;
 pub mod reason_codes;
+pub mod reconnect;
 pub mod redaction;
 pub mod resource_envelope;
 pub mod result_identity;
