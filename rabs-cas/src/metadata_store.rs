@@ -38,8 +38,9 @@ use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use rabs_protocol::serving::ServingValidity;
 
 /// Current schema version (v8 = the full H038 authoritative table set;
-/// v9 = H040 revisioned authority-bound serving state).
-pub const SCHEMA_VERSION: u32 = 9;
+/// v9 = H040 revisioned authority-bound serving state; v10 = H026
+/// append-only divergence incidents).
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -243,6 +244,23 @@ pub const MIGRATIONS: &[Migration] = &[
          DEFAULT 0",
             "CREATE TABLE serving_blocking_quarantines (action_key TEXT NOT NULL, \
          scope TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY (action_key, scope, subject))",
+        ],
+    },
+    Migration {
+        // H026: same-key divergence incidents (I34; risk R63). Append-only:
+        // one row per admitted divergence observation, keyed by
+        // (action_key, seq); a conflicting rewrite of an existing key is a
+        // typed refusal. Both candidates' manifest/evidence keys and the
+        // candidate-preservation pin are NAMED in the row, so the incident
+        // is auditable after the offer path returns.
+        version: 10,
+        statements: &[
+            "CREATE TABLE divergence_incidents (action_key TEXT NOT NULL, \
+         seq INTEGER NOT NULL, class TEXT NOT NULL, \
+         committed_manifest_key TEXT NOT NULL, candidate_manifest_key TEXT NOT NULL, \
+         candidate_evidence_key TEXT NOT NULL, candidate_pin_hex TEXT NOT NULL, \
+         generation_hex TEXT NOT NULL, attempt_hex TEXT NOT NULL, detail TEXT NOT NULL, \
+         PRIMARY KEY (action_key, seq))",
         ],
     },
 ];
@@ -564,6 +582,34 @@ pub struct ServingRecordRow {
     /// NAMED blocking quarantine rows (scope tag, subject), sorted. The
     /// references are the gate — a reason string never is.
     pub blocking: Vec<(String, String)>,
+}
+
+/// One append-only same-key divergence incident (H026; I34/R63). The
+/// committed candidate stays the published row; the offered candidate is
+/// preserved under the named pin — neither is ever patched in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DivergenceIncidentRow {
+    /// Action key (digest key form) the divergence was observed on.
+    pub action_key: String,
+    /// Logical sequence of the observation (part of the primary key).
+    pub seq: u64,
+    /// Divergence class tag (`"semantic"`, `"observable-only"`,
+    /// `"projection-completeness"`).
+    pub class: String,
+    /// Manifest digest key of the already-committed candidate.
+    pub committed_manifest_key: String,
+    /// Manifest digest key of the offered (losing) candidate.
+    pub candidate_manifest_key: String,
+    /// Evidence-bundle digest key of the offered candidate.
+    pub candidate_evidence_key: String,
+    /// Hex id of the durable candidate-preservation pin.
+    pub candidate_pin_hex: String,
+    /// Offering generation id, hex.
+    pub generation_hex: String,
+    /// Offering attempt id, hex.
+    pub attempt_hex: String,
+    /// Human-readable incident detail.
+    pub detail: String,
 }
 
 /// One recorded verification sample (H033 trust-evaluation input).
@@ -1149,6 +1195,40 @@ pub trait RabsMetadataStore {
     /// The full serving record for an action key, if a row exists
     /// (legacy rows read back at revision 0 with defaults).
     fn serving_record(&mut self, action_key: &str) -> Result<Option<ServingRecordRow>, StoreError>;
+
+    // --- H026: same-key divergence incidents + served-consumer
+    // provenance (append-only; coordinator-authority-gated writes) ---
+
+    /// Append a divergence incident (H026). Requires the ACTIVE
+    /// authority. Identical re-record of an existing (action, seq) row is
+    /// idempotent; a conflicting rewrite is a typed refusal — incidents
+    /// are never patched.
+    fn record_divergence_incident(
+        &mut self,
+        authority: &TypedDigest,
+        row: &DivergenceIncidentRow,
+    ) -> Result<(), StoreError>;
+
+    /// All divergence incidents recorded for an action key, ordered by
+    /// sequence.
+    fn list_divergence_incidents(
+        &mut self,
+        action_key: &str,
+    ) -> Result<Vec<DivergenceIncidentRow>, StoreError>;
+
+    /// Record that a consumer was served this action's published result
+    /// (a `served-to` provenance edge; idempotent). This is what H026
+    /// escalation later enumerates — serving paths must call it when they
+    /// hand a result to a consumer.
+    fn record_served_consumer(
+        &mut self,
+        action_key: &str,
+        consumer: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Consumers previously served this action's result, from `served-to`
+    /// provenance edges, ordered.
+    fn list_served_consumers(&mut self, action_key: &str) -> Result<Vec<String>, StoreError>;
 
     /// Deterministic dump of every table for differential comparison.
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError>;
@@ -3814,6 +3894,138 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         }))
     }
 
+    fn record_divergence_incident(
+        &mut self,
+        authority: &TypedDigest,
+        row: &DivergenceIncidentRow,
+    ) -> Result<(), StoreError> {
+        let authority = authority.clone();
+        let row = row.clone();
+        let seq = to_seq(row.seq, "seq")?;
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let existing = engine.query(
+                "SELECT class, committed_manifest_key, candidate_manifest_key, \
+                 candidate_evidence_key, candidate_pin_hex, generation_hex, attempt_hex, \
+                 detail FROM divergence_incidents WHERE action_key = ?1 AND seq = ?2",
+                &[SqlValue::Text(row.action_key.clone()), SqlValue::Int(seq)],
+            )?;
+            if let Some(stored) = existing.first() {
+                let same = stored.len() == 8
+                    && expect_text(&stored[0], "class")? == row.class
+                    && expect_text(&stored[1], "committed_manifest_key")?
+                        == row.committed_manifest_key
+                    && expect_text(&stored[2], "candidate_manifest_key")?
+                        == row.candidate_manifest_key
+                    && expect_text(&stored[3], "candidate_evidence_key")?
+                        == row.candidate_evidence_key
+                    && expect_text(&stored[4], "candidate_pin_hex")? == row.candidate_pin_hex
+                    && expect_text(&stored[5], "generation_hex")? == row.generation_hex
+                    && expect_text(&stored[6], "attempt_hex")? == row.attempt_hex
+                    && expect_text(&stored[7], "detail")? == row.detail;
+                if same {
+                    return Ok(()); // idempotent
+                }
+                return Err(StoreError::AppendConflict("divergence_incidents".into()));
+            }
+            engine.execute(
+                "INSERT INTO divergence_incidents (action_key, seq, class, \
+                 committed_manifest_key, candidate_manifest_key, candidate_evidence_key, \
+                 candidate_pin_hex, generation_hex, attempt_hex, detail) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                &[
+                    SqlValue::Text(row.action_key),
+                    SqlValue::Int(seq),
+                    SqlValue::Text(row.class),
+                    SqlValue::Text(row.committed_manifest_key),
+                    SqlValue::Text(row.candidate_manifest_key),
+                    SqlValue::Text(row.candidate_evidence_key),
+                    SqlValue::Text(row.candidate_pin_hex),
+                    SqlValue::Text(row.generation_hex),
+                    SqlValue::Text(row.attempt_hex),
+                    SqlValue::Text(row.detail),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_divergence_incidents(
+        &mut self,
+        action_key: &str,
+    ) -> Result<Vec<DivergenceIncidentRow>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT seq, class, committed_manifest_key, candidate_manifest_key, \
+             candidate_evidence_key, candidate_pin_hex, generation_hex, attempt_hex, detail \
+             FROM divergence_incidents WHERE action_key = ?1 ORDER BY seq",
+            &[SqlValue::Text(action_key.to_owned())],
+        )?;
+        rows.iter()
+            .map(|row| {
+                let [
+                    seq,
+                    class,
+                    committed,
+                    candidate,
+                    evidence,
+                    pin,
+                    generation,
+                    attempt,
+                    detail,
+                ] = row.as_slice()
+                else {
+                    return Err(StoreError::Corruption("divergence incident shape".into()));
+                };
+                Ok(DivergenceIncidentRow {
+                    action_key: action_key.to_owned(),
+                    seq: expect_u64(seq, "seq")?,
+                    class: expect_text(class, "class")?,
+                    committed_manifest_key: expect_text(committed, "committed_manifest_key")?,
+                    candidate_manifest_key: expect_text(candidate, "candidate_manifest_key")?,
+                    candidate_evidence_key: expect_text(evidence, "candidate_evidence_key")?,
+                    candidate_pin_hex: expect_text(pin, "candidate_pin_hex")?,
+                    generation_hex: expect_text(generation, "generation_hex")?,
+                    attempt_hex: expect_text(attempt, "attempt_hex")?,
+                    detail: expect_text(detail, "detail")?,
+                })
+            })
+            .collect()
+    }
+
+    fn record_served_consumer(
+        &mut self,
+        action_key: &str,
+        consumer: &str,
+    ) -> Result<(), StoreError> {
+        let action_key = action_key.to_owned();
+        let consumer = consumer.to_owned();
+        self.in_txn(move |engine| {
+            engine.execute(
+                "INSERT OR IGNORE INTO provenance_edges (from_key, to_key, kind) \
+                 VALUES (?1, ?2, 'served-to')",
+                &[SqlValue::Text(action_key), SqlValue::Text(consumer)],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_served_consumers(&mut self, action_key: &str) -> Result<Vec<String>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT to_key FROM provenance_edges \
+             WHERE from_key = ?1 AND kind = 'served-to' ORDER BY to_key",
+            &[SqlValue::Text(action_key.to_owned())],
+        )?;
+        rows.iter()
+            .map(|row| {
+                expect_text(
+                    row.first()
+                        .ok_or_else(|| StoreError::Corruption("served consumer shape".into()))?,
+                    "consumer",
+                )
+            })
+            .collect()
+    }
+
     fn differential_snapshot(&mut self) -> Result<Vec<String>, StoreError> {
         // Deterministic dump: every table, every column, ordered rows.
         const DUMPS: &[(&str, &str)] = &[
@@ -4012,6 +4224,13 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 "materialization_records",
                 "SELECT id_hex, id, root_key, dest_path, state, updated_seq \
                  FROM materialization_records ORDER BY id_hex",
+            ),
+            (
+                "divergence_incidents",
+                "SELECT action_key, seq, class, committed_manifest_key, \
+                 candidate_manifest_key, candidate_evidence_key, candidate_pin_hex, \
+                 generation_hex, attempt_hex, detail FROM divergence_incidents \
+                 ORDER BY action_key, seq",
             ),
         ];
         let mut lines = Vec::new();

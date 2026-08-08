@@ -45,9 +45,10 @@ use rabs_protocol::result_identity::{
 use sha2::{Digest, Sha256};
 
 use crate::metadata_store::{
-    CommitOutcome, PublicationRow, QuarantineScope, RabsMetadataStore, ResultKindTag, StoreError,
-    digest_key,
+    CommitOutcome, DivergenceIncidentRow, PublicationRow, QuarantineScope, RabsMetadataStore,
+    ResultKindTag, StoreError, digest_key,
 };
+use crate::trust_evidence::DISPOSITION_QUARANTINED;
 
 /// Domain separator for the canonical coordinator-authority digest.
 pub const AUTHORITY_DIGEST_DOMAIN: &str = "rabs.coordinator-authority.sha256.v1";
@@ -55,6 +56,18 @@ pub const AUTHORITY_DIGEST_DOMAIN: &str = "rabs.coordinator-authority.sha256.v1"
 pub const SEMANTIC_PROJECTION_DOMAIN: &str = "rabs.semantic-result-projection.sha256.v1";
 /// Domain separator for the v1 observable result projection.
 pub const OBSERVABLE_PROJECTION_DOMAIN: &str = "rabs.observable-result-projection.sha256.v1";
+
+/// Serving disposition for observable-only divergence (H026): ordinary
+/// replay is disabled (any disposition other than `"servable"` refuses
+/// the serving gate), but the narrower tag records that the semantic
+/// result itself was reproduced — only presentation/observability
+/// differed.
+pub const DISPOSITION_PRESENTATION_QUARANTINED: &str = "presentation-quarantined";
+
+/// Pin class preserving the LOSING candidate of a divergence incident
+/// (H026; I34): both candidates outlive GC until the incident is
+/// resolved.
+pub const DIVERGENCE_EVIDENCE_PIN_CLASS: &str = "divergence-evidence";
 
 /// Length-delimited canonical framing (the F034 pattern): every field is
 /// `len(u64 be) || bytes`, so no concatenation ambiguity exists.
@@ -307,6 +320,37 @@ impl From<StoreError> for OfferRefusal {
     }
 }
 
+/// One consumer escalated after a semantic divergence (H026): the
+/// consumer was previously served this action's result, so it must be
+/// told the result's determinism is now in question. The decision is
+/// tiered by the action's latest trust/release evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerEscalation {
+    /// The served consumer (as recorded in `served-to` provenance).
+    pub consumer: String,
+    /// The action's latest trust-evaluation state at escalation time
+    /// (`"unevaluated"` when no evaluation exists).
+    pub trust_state: String,
+    /// The tiered escalation decision recorded in the receipt.
+    pub decision: String,
+}
+
+/// The full H026 quarantine outcome for a same-key divergence: what was
+/// quarantined, which incident row records it, which pin preserves the
+/// losing candidate, and who was escalated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DivergenceQuarantine {
+    /// The A018 divergence class.
+    pub class: DivergenceClass,
+    /// Sequence of the append-only incident row.
+    pub incident_seq: u64,
+    /// Id of the durable candidate-preservation pin.
+    pub candidate_pin_id: u128,
+    /// Consumers escalated from `served-to` provenance (semantic
+    /// divergence only; empty for the other classes).
+    pub escalations: Vec<ConsumerEscalation>,
+}
+
 /// Admitted outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicationOutcome {
@@ -317,8 +361,9 @@ pub enum PublicationOutcome {
     /// changed.
     IdempotentEvidenceAppended,
     /// Same key, different result: the action is quarantined with the
-    /// A018 divergence class; the committed row is preserved untouched.
-    Quarantined(DivergenceClass),
+    /// A018 divergence class; the committed row is preserved untouched
+    /// and BOTH candidates survive (H026).
+    Quarantined(DivergenceQuarantine),
 }
 
 const fn result_kind_to_tag(kind: ResultKind) -> ResultKindTag {
@@ -458,23 +503,18 @@ pub fn process_offer(
         } else {
             DivergenceClass::ProjectionCompletenessIncident
         };
-        store.add_quarantine(
-            QuarantineScope::ActionEntry,
-            &digest_key(&offer.manifest.action_key),
-            match class {
-                DivergenceClass::IdempotentSameResult => "same-key re-offer",
-                DivergenceClass::SemanticDivergence => {
-                    "semantic divergence: determinism/key-soundness incident"
-                }
-                DivergenceClass::ObservableOnlyDivergence => {
-                    "observable-only divergence: presentation quarantine"
-                }
-                DivergenceClass::ProjectionCompletenessIncident => {
-                    "projection completeness incident: equal digests, different manifests"
-                }
-            },
+        let quarantine = quarantine_divergence(
+            store,
+            &offered_authority,
+            offer,
+            class,
+            &committed_key,
+            generation_id,
+            attempt_id,
+            pin_id,
+            seq,
         )?;
-        return Ok(PublicationOutcome::Quarantined(class));
+        return Ok(PublicationOutcome::Quarantined(quarantine));
     }
 
     // 9. Compare-and-set commit: publication pointer + serving state +
