@@ -378,8 +378,10 @@ const fn result_kind_to_tag(kind: ResultKind) -> ResultKindTag {
 /// digest; `committed_manifest` resolves a manifest digest key to the
 /// manifest bytes the coordinator holds in its CAS (used only for
 /// same-key divergence classification); `pin_id` is the coordinator-
-/// allocated durable reachability pin; `seq` is the causal commit
-/// sequence stamped into the receipt.
+/// allocated durable pin id — the publication reachability pin on
+/// commit, or the candidate-preservation pin when the offer diverges
+/// (H026); `seq` is the causal commit sequence stamped into the receipt
+/// (and into the incident row on divergence).
 ///
 /// # Errors
 /// A typed [`OfferRefusal`]; refusals write nothing.
@@ -548,6 +550,164 @@ pub fn process_offer(
         winner_evidence_bundle_id: offer.evidence_id.clone(),
         committed_causal_sequence: seq,
     }))
+}
+
+const fn divergence_class_tag(class: DivergenceClass) -> &'static str {
+    match class {
+        DivergenceClass::IdempotentSameResult => "idempotent",
+        DivergenceClass::SemanticDivergence => "semantic",
+        DivergenceClass::ObservableOnlyDivergence => "observable-only",
+        DivergenceClass::ProjectionCompletenessIncident => "projection-completeness",
+    }
+}
+
+const fn divergence_quarantine_reason(class: DivergenceClass) -> &'static str {
+    match class {
+        DivergenceClass::IdempotentSameResult => "same-key re-offer",
+        DivergenceClass::SemanticDivergence => {
+            "semantic divergence: determinism/key-soundness incident"
+        }
+        DivergenceClass::ObservableOnlyDivergence => {
+            "observable-only divergence: presentation quarantine"
+        }
+        DivergenceClass::ProjectionCompletenessIncident => {
+            "projection completeness incident: equal digests, different manifests"
+        }
+    }
+}
+
+/// Tiered escalation decision for a served consumer (H026): a consumer
+/// served under a RELEASE tier may have shipped artifacts built on the
+/// now-suspect result, so it gets a recall; everything below release
+/// tier is notified for re-verification.
+fn escalation_decision(trust_state: &str) -> &'static str {
+    match trust_state {
+        "ci-policy-approved" | "project-release-eligible" => "recall-and-reverify",
+        _ => "notify-and-reverify",
+    }
+}
+
+/// The H026 divergence quarantine: quarantine the ACTION, disable
+/// serving with a per-class disposition, preserve BOTH candidates (the
+/// committed row is untouched; the losing candidate gets a durable
+/// `divergence-evidence` pin plus reachability edges and its evidence is
+/// appended to the index), open an append-only incident row, and — for
+/// semantic divergence — escalate every consumer previously served this
+/// result, tiered by the action's latest trust/release evaluation.
+///
+/// Write order is stricter-state-first: a crash mid-sequence can leave
+/// the action quarantined with partial bookkeeping, never bookkept but
+/// unquarantined.
+#[allow(clippy::too_many_arguments)]
+fn quarantine_divergence(
+    store: &mut dyn RabsMetadataStore,
+    authority: &TypedDigest,
+    offer: &OfferPreparedActionResult,
+    class: DivergenceClass,
+    committed_key: &str,
+    generation_id: u128,
+    attempt_id: u128,
+    pin_id: u128,
+    seq: u64,
+) -> Result<DivergenceQuarantine, OfferRefusal> {
+    let action_key = digest_key(&offer.manifest.action_key);
+    let candidate_key = digest_key(&offer.manifest_id.0);
+
+    // 1. Quarantine first (strictest state lands before anything else).
+    store.add_quarantine(
+        QuarantineScope::ActionEntry,
+        &action_key,
+        divergence_quarantine_reason(class),
+    )?;
+
+    // 2. Per-class serving disposition: semantic and
+    // projection-completeness fully disable serving; observable-only is
+    // the narrower presentation quarantine. Either way ordinary replay
+    // is disabled — the serving gate refuses any non-"servable"
+    // disposition.
+    let disposition = match class {
+        DivergenceClass::ObservableOnlyDivergence => DISPOSITION_PRESENTATION_QUARANTINED,
+        _ => DISPOSITION_QUARANTINED,
+    };
+    store.set_serving_disposition_key(&action_key, disposition)?;
+
+    // 3. Preserve the losing candidate: reachability edges from its
+    // manifest to everything it references, then a durable pin rooted at
+    // the manifest so GC preserves the whole candidate closure.
+    store.add_object_edge(&offer.manifest_id.0, &offer.evidence_id.0, "divergence-candidate")?;
+    if let Some(root) = &offer.manifest.artifact_bundle_root {
+        store.add_object_edge(&offer.manifest_id.0, &root.0, "divergence-candidate")?;
+    }
+    for output in &offer.manifest.logical_outputs {
+        store.add_object_edge(&offer.manifest_id.0, &output.object.0, "divergence-candidate")?;
+    }
+    store.create_pin(
+        pin_id,
+        &offer.manifest_id.0,
+        "coordinator",
+        DIVERGENCE_EVIDENCE_PIN_CLASS,
+        None,
+        Some(&format!("divergence-incident:{action_key}:{seq}")),
+        true,
+        divergence_quarantine_reason(class),
+    )?;
+
+    // 4. The candidate's evidence bundle joins the append-only index —
+    // attempt evidence is preserved for BOTH candidates (I34).
+    store.append_evidence(
+        &offer.manifest.action_key,
+        &offer.evidence_id.0,
+        generation_id,
+        attempt_id,
+    )?;
+
+    // 5. Open the incident (append-only; authority-gated).
+    store.record_divergence_incident(
+        authority,
+        &DivergenceIncidentRow {
+            action_key: action_key.clone(),
+            seq,
+            class: divergence_class_tag(class).to_owned(),
+            committed_manifest_key: committed_key.to_owned(),
+            candidate_manifest_key: candidate_key,
+            candidate_evidence_key: digest_key(&offer.evidence_id.0),
+            candidate_pin_hex: format!("{pin_id:032x}"),
+            generation_hex: format!("{generation_id:032x}"),
+            attempt_hex: format!("{attempt_id:032x}"),
+            detail: divergence_quarantine_reason(class).to_owned(),
+        },
+    )?;
+
+    // 6. Semantic divergence escalates previously served consumers from
+    // provenance, tiered by the latest trust/release evaluation.
+    let mut escalations = Vec::new();
+    if class == DivergenceClass::SemanticDivergence {
+        let trust_state = store
+            .latest_trust_evaluation(&offer.manifest.action_key)?
+            .map_or_else(|| "unevaluated".to_owned(), |row| row.state);
+        for consumer in store.list_served_consumers(&action_key)? {
+            let decision = escalation_decision(&trust_state);
+            store.record_decision_receipt(
+                "divergence-escalation",
+                &consumer,
+                seq,
+                decision,
+                &format!("semantic divergence on {action_key}; trust {trust_state}"),
+            )?;
+            escalations.push(ConsumerEscalation {
+                consumer,
+                trust_state: trust_state.clone(),
+                decision: decision.to_owned(),
+            });
+        }
+    }
+
+    Ok(DivergenceQuarantine {
+        class,
+        incident_seq: seq,
+        candidate_pin_id: pin_id,
+        escalations,
+    })
 }
 
 /// Outcome of comparing a post-eviction recomputation against the
@@ -1155,10 +1315,12 @@ mod tests {
             3,
         )
         .unwrap();
-        assert_eq!(
-            outcome,
-            PublicationOutcome::Quarantined(DivergenceClass::SemanticDivergence)
-        );
+        let PublicationOutcome::Quarantined(quarantine) = outcome else {
+            panic!("expected quarantine, got {outcome:?}");
+        };
+        assert_eq!(quarantine.class, DivergenceClass::SemanticDivergence);
+        assert_eq!(quarantine.incident_seq, 3);
+        assert_eq!(quarantine.candidate_pin_id, 902);
         // Committed manifest pointer unchanged.
         assert_eq!(
             store
