@@ -1308,6 +1308,42 @@ pub trait RabsMetadataStore {
         action_key: &str,
     ) -> Result<Vec<DivergenceIncidentRow>, StoreError>;
 
+    /// Record an explicit adoption edge (H028): the coordinator's
+    /// authority-gated declaration that `from_object_key` (a consumed
+    /// losing-attempt output) is compatible with `to_object_key` (the
+    /// winning attempt's committed object) for the producer's
+    /// `(role, virtual_path)` logical output. Idempotent per
+    /// (producer, role, path, from) — a conflicting rewrite to a
+    /// DIFFERENT target is a typed refusal.
+    fn record_adoption_edge(
+        &mut self,
+        authority: &TypedDigest,
+        producer_action_key: &str,
+        role: &str,
+        virtual_path: &[u8],
+        from_object_key: &str,
+        to_object_key: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Whether an adoption edge exists for exactly this
+    /// (producer, role, path, from → to) tuple (H028 commit check).
+    fn has_adoption_edge(
+        &mut self,
+        producer_action_key: &str,
+        role: &str,
+        virtual_path: &[u8],
+        from_object_key: &str,
+        to_object_key: &str,
+    ) -> Result<bool, StoreError>;
+
+    /// The recorded provisional-ancestor lineage of a committed consumer
+    /// (H028), ordered by (producer, role, path) — input to the
+    /// transitive closure walk at a dependent's commit.
+    fn list_provisional_ancestors(
+        &mut self,
+        consumer_action_key: &str,
+    ) -> Result<Vec<ProvisionalAncestorRow>, StoreError>;
+
     /// Record that a consumer was served this action's published result
     /// (a `served-to` provenance edge; idempotent). This is what H026
     /// escalation later enumerates — serving paths must call it when they
