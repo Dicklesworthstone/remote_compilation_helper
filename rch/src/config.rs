@@ -608,6 +608,7 @@ struct PartialTransferConfig {
     compression_level: Option<u32>,
     exclude_patterns: Option<Vec<String>>,
     remote_base: Option<String>,
+    sync_timeout_ms: Option<u64>,
     ssh_server_alive_interval_secs: Option<u64>,
     ssh_control_persist_secs: Option<u64>,
     // Transfer optimization (bd-3hho)
@@ -1329,6 +1330,20 @@ fn apply_layer(
         }
     }
 
+    if let Some(sync_timeout_ms) = layer.transfer.sync_timeout_ms {
+        if TransferConfig::valid_sync_timeout_ms(sync_timeout_ms) {
+            config.transfer.sync_timeout_ms = Some(sync_timeout_ms);
+            set_source(sources, "transfer.sync_timeout_ms", source.clone());
+        } else {
+            warn!(
+                "Invalid transfer.sync_timeout_ms in {}: expected {}..={}",
+                source,
+                TransferConfig::MIN_SYNC_TIMEOUT_MS,
+                TransferConfig::MAX_SYNC_TIMEOUT_MS
+            );
+        }
+    }
+
     if let Some(interval) = layer.transfer.ssh_server_alive_interval_secs {
         config.transfer.ssh_server_alive_interval_secs = Some(interval);
         set_source(
@@ -1688,6 +1703,11 @@ fn merge_transfer(
                 warn!("Ignoring invalid remote_base in overlay config: {}", e);
             }
         }
+    }
+    if overlay.sync_timeout_ms != default.sync_timeout_ms {
+        base.sync_timeout_ms = overlay
+            .sync_timeout_ms
+            .filter(|value| rch_common::TransferConfig::valid_sync_timeout_ms(*value));
     }
     // Transfer optimization (bd-3hho)
     if overlay.max_transfer_mb != default.max_transfer_mb {
@@ -2098,6 +2118,20 @@ fn apply_env_overrides_inner(
                 sources,
                 "transfer.compression_level",
                 ConfigValueSource::EnvVar("RCH_COMPRESSION".to_string()),
+            );
+        }
+    }
+
+    if let Some(val) = get_env("RCH_SYNC_TIMEOUT_MS")
+        && let Ok(sync_timeout_ms) = val.parse::<u64>()
+        && TransferConfig::valid_sync_timeout_ms(sync_timeout_ms)
+    {
+        config.transfer.sync_timeout_ms = Some(sync_timeout_ms);
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "transfer.sync_timeout_ms",
+                ConfigValueSource::EnvVar("RCH_SYNC_TIMEOUT_MS".to_string()),
             );
         }
     }

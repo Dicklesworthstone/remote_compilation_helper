@@ -2217,6 +2217,13 @@ pub struct TransferConfig {
     /// Must be an absolute path. Defaults to /tmp/rch.
     #[serde(default = "default_remote_base")]
     pub remote_base: String,
+    /// Per-attempt timeout for source synchronization, in milliseconds.
+    ///
+    /// This is deliberately separate from remote compilation and artifact-return
+    /// timeouts. When unset, RCH derives a conservative timeout from the source
+    /// payload size (30 seconds plus one second per MiB, capped at one hour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_timeout_ms: Option<u64>,
     /// Retry policy for transient network errors during transfer.
     #[serde(default)]
     pub retry: RetryConfig,
@@ -2305,6 +2312,7 @@ impl Default for TransferConfig {
             ssh_server_alive_interval_secs: None,
             ssh_control_persist_secs: None,
             remote_base: default_remote_base(),
+            sync_timeout_ms: None,
             retry: RetryConfig::default(),
             verify_artifacts: false,
             verify_max_size_bytes: default_verify_max_size(),
@@ -2322,6 +2330,42 @@ impl Default for TransferConfig {
 }
 
 impl TransferConfig {
+    /// Smallest accepted explicit source-sync timeout (one second).
+    pub const MIN_SYNC_TIMEOUT_MS: u64 = 1_000;
+    /// Largest accepted explicit or derived source-sync timeout (one hour).
+    pub const MAX_SYNC_TIMEOUT_MS: u64 = 3_600_000;
+    /// Fixed floor used by the payload-aware default policy.
+    pub const DEFAULT_SYNC_TIMEOUT_FLOOR_MS: u64 = 30_000;
+    const DEFAULT_SYNC_BYTES_PER_SECOND: u64 = 1024 * 1024;
+
+    /// Whether an explicit source-sync timeout is within the supported range.
+    #[must_use]
+    pub fn valid_sync_timeout_ms(value: u64) -> bool {
+        (Self::MIN_SYNC_TIMEOUT_MS..=Self::MAX_SYNC_TIMEOUT_MS).contains(&value)
+    }
+
+    /// Resolve the per-attempt source-sync timeout for an exact payload size.
+    ///
+    /// Explicit configuration wins. Otherwise the default grants 30 seconds of
+    /// setup time plus one second per MiB at a conservative 1 MiB/s floor. This
+    /// prevents a cold, large pinned tree from inheriting the old fixed 30-second
+    /// ceiling while still bounding every individual attempt.
+    #[must_use]
+    pub fn sync_timeout_for_payload(&self, payload_bytes: u64) -> std::time::Duration {
+        let timeout_ms = self
+            .sync_timeout_ms
+            .filter(|value| Self::valid_sync_timeout_ms(*value))
+            .unwrap_or_else(|| {
+                let transfer_seconds = payload_bytes
+                    .saturating_add(Self::DEFAULT_SYNC_BYTES_PER_SECOND - 1)
+                    / Self::DEFAULT_SYNC_BYTES_PER_SECOND;
+                Self::DEFAULT_SYNC_TIMEOUT_FLOOR_MS
+                    .saturating_add(transfer_seconds.saturating_mul(1_000))
+                    .min(Self::MAX_SYNC_TIMEOUT_MS)
+            });
+        std::time::Duration::from_millis(timeout_ms)
+    }
+
     /// Select compression level based on estimated transfer size (bd-243w).
     ///
     /// When adaptive compression is enabled, selects an appropriate level

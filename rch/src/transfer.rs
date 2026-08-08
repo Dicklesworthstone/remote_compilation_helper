@@ -474,6 +474,117 @@ fn retrieval_exclude_can_block_artifacts(pattern: &str, artifact_patterns: &[Str
     })
 }
 
+/// One deterministic source-transfer attempt retained for hook diagnostics.
+///
+/// These records are unit-observable evidence about the retry state machine;
+/// they are not represented as live-network proof by tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransferAttemptDiagnostic {
+    pub(crate) attempt: u32,
+    pub(crate) max_attempts: u32,
+    pub(crate) outcome: &'static str,
+    pub(crate) detail: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct CleanOverlayMaterialization {
+    pub(crate) sync_result: SyncResult,
+    pub(crate) attempts: Vec<TransferAttemptDiagnostic>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TransferAttemptsExhausted {
+    pub(crate) attempts: Vec<TransferAttemptDiagnostic>,
+    last_error: String,
+}
+
+impl std::fmt::Display for TransferAttemptsExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "source transfer failed before remote Cargo execution after {} attempt(s): {}",
+            self.attempts.len(),
+            self.last_error
+        )
+    }
+}
+
+impl std::error::Error for TransferAttemptsExhausted {}
+
+/// Run a source-transfer operation with a full timeout budget for each attempt.
+///
+/// The older generic transfer retry path treats `total_timeout_ms` as one shared
+/// wall-clock budget, so an attempt that consumes the whole timeout necessarily
+/// prevents attempt two. Cold pinned trees need different semantics: each
+/// retry gets the configured source-sync timeout and reuses the same partial
+/// remote base. The injected operation makes the state machine deterministic in
+/// unit tests without presenting the injection as live network evidence.
+async fn run_source_transfer_attempts<T, F, Fut>(
+    retry: &RetryConfig,
+    attempt_timeout: std::time::Duration,
+    operation_name: &str,
+    mut operation: F,
+) -> std::result::Result<(T, Vec<TransferAttemptDiagnostic>), TransferAttemptsExhausted>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let max_attempts = retry.max_attempts.max(1);
+    let mut attempts = Vec::with_capacity(max_attempts as usize);
+
+    for attempt in 1..=max_attempts {
+        if attempt > 1 {
+            sleep(retry.delay_for_attempt(attempt - 1)).await;
+        }
+
+        let result = match tokio::time::timeout(attempt_timeout, operation(attempt)).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "{operation_name}: timed out after {}ms",
+                attempt_timeout.as_millis()
+            )),
+        };
+
+        match result {
+            Ok(value) => {
+                attempts.push(TransferAttemptDiagnostic {
+                    attempt,
+                    max_attempts,
+                    outcome: "succeeded",
+                    detail: format!("{operation_name} completed"),
+                });
+                return Ok((value, attempts));
+            }
+            Err(error) => {
+                let retryable = is_retryable_transport_error(&error);
+                attempts.push(TransferAttemptDiagnostic {
+                    attempt,
+                    max_attempts,
+                    outcome: if retryable { "retryable" } else { "fatal" },
+                    detail: error.to_string(),
+                });
+                warn!(
+                    "{}: {} error on attempt {}/{}: {}",
+                    operation_name,
+                    if retryable { "retryable" } else { "fatal" },
+                    attempt,
+                    max_attempts,
+                    error
+                );
+
+                if !retryable || attempt == max_attempts {
+                    return Err(TransferAttemptsExhausted {
+                        attempts,
+                        last_error: error.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    unreachable!("source transfer loop always executes at least once")
+}
+
 // =============================================================================
 // Retry Logic (bd-x1ek)
 // =============================================================================
@@ -1952,12 +2063,21 @@ fi",
         worker: &WorkerConfig,
         git_root: &Path,
         base_commit: &str,
-    ) -> Result<SyncResult> {
+    ) -> Result<CleanOverlayMaterialization> {
         if use_mock_transport(worker) {
-            return Ok(SyncResult {
-                bytes_transferred: 0,
-                files_transferred: 0,
-                duration_ms: 0,
+            return Ok(CleanOverlayMaterialization {
+                sync_result: SyncResult {
+                    bytes_transferred: 0,
+                    files_transferred: 0,
+                    duration_ms: 0,
+                },
+                attempts: vec![TransferAttemptDiagnostic {
+                    attempt: 1,
+                    max_attempts: self.transfer_config.retry.max_attempts.max(1),
+                    outcome: "succeeded",
+                    detail: "mock clean-overlay source transfer completed (unit transport)"
+                        .to_string(),
+                }],
             });
         }
         if !matches!(base_commit.len(), 40 | 64)
@@ -1966,108 +2086,129 @@ fi",
             anyhow::bail!("clean-overlay base must be a full hexadecimal commit object ID");
         }
 
-        let remote_path = self.remote_path();
-        let escaped_remote_path = escape(Cow::from(remote_path.as_str()));
-        let remote_script = format!(
-            "if [ -e {path} ]; then echo 'clean-overlay destination already exists' >&2; exit 73; fi\n\
-             umask 0022\n\
-             mkdir -p {path}\n\
-             TAR_OPTIONS='' tar -xf - -C {path}",
-            path = escaped_remote_path
-        );
-
+        // Materialize the immutable archive once locally. Retrying the network
+        // transfer then uses the exact same byte sequence and lets rsync resume
+        // the stable remote partial file with --append-verify.
+        let archive_file = tempfile::Builder::new()
+            .prefix("rch-clean-overlay-")
+            .suffix(".tar")
+            .tempfile()
+            .context("create clean-overlay archive file")?;
         let mut archive = Command::new("git");
         configure_clean_git_command(&mut archive);
         archive
             .current_dir(git_root)
             .arg("archive")
             .arg("--format=tar")
+            .arg("--output")
+            .arg(archive_file.path())
             .arg(base_commit)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut archive_child = archive
-            .spawn()
-            .with_context(|| format!("spawn git archive for {base_commit}"))?;
-        let mut archive_stdout = archive_child
-            .stdout
-            .take()
-            .context("git archive stdout unavailable")?;
-
-        let destination = format!("{}@{}", worker.user, worker.host);
-        let identity_file = shellexpand::tilde(&worker.identity_file);
-        let mut ssh = Command::new("ssh");
-        ssh.arg("-o").arg("BatchMode=yes");
-        ssh.arg("-o").arg("StrictHostKeyChecking=accept-new");
-        ssh.arg("-o").arg(format!(
-            "ConnectTimeout={}",
-            self.ssh_options.connect_timeout.as_secs().max(1)
-        ));
-        ssh.arg("-i").arg(identity_file.as_ref());
-        if let Some(interval) = self.ssh_options.server_alive_interval {
-            let secs = interval.as_secs();
-            if secs > 0 {
-                ssh.arg("-o").arg(format!("ServerAliveInterval={secs}"));
-            }
-        }
-        let escaped_script = escape(Cow::from(remote_script.as_str()));
-        ssh.arg(&destination)
-            .arg(format!("sh -c {escaped_script}"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut ssh_child = ssh
-            .spawn()
-            .with_context(|| format!("spawn clean-overlay archive SSH to {destination}"))?;
-        let mut ssh_stdin = ssh_child
-            .stdin
-            .take()
-            .context("clean-overlay SSH stdin unavailable")?;
-
-        let start = std::time::Instant::now();
-        let transfer = async move {
-            let copy_archive = async move {
-                let bytes = tokio::io::copy(&mut archive_stdout, &mut ssh_stdin).await?;
-                ssh_stdin.shutdown().await?;
-                Ok::<u64, std::io::Error>(bytes)
-            };
-            let (copied, archive_output, ssh_output) = tokio::join!(
-                copy_archive,
-                archive_child.wait_with_output(),
-                ssh_child.wait_with_output()
-            );
-            Ok::<_, anyhow::Error>((copied?, archive_output?, ssh_output?))
-        };
-        let (bytes_transferred, archive_output, ssh_output) =
-            tokio::time::timeout(self.ssh_options.command_timeout, transfer)
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "clean-overlay archive transfer timed out after {:?}",
-                        self.ssh_options.command_timeout
-                    )
-                })??;
-
+        let archive_output = archive
+            .output()
+            .await
+            .with_context(|| format!("run git archive for {base_commit}"))?;
         if !archive_output.status.success() {
             anyhow::bail!(
                 "git archive failed for {base_commit}: {}",
                 String::from_utf8_lossy(&archive_output.stderr).trim()
             );
         }
-        if !ssh_output.status.success() {
-            anyhow::bail!(
-                "remote clean-overlay archive extraction failed (exit {:?}): {}",
-                ssh_output.status.code(),
-                String::from_utf8_lossy(&ssh_output.stderr).trim()
-            );
-        }
 
-        Ok(SyncResult {
-            bytes_transferred,
-            files_transferred: 0,
-            duration_ms: start.elapsed().as_millis() as u64,
+        let payload_bytes = archive_file
+            .as_file()
+            .metadata()
+            .context("stat clean-overlay archive")?
+            .len();
+        let attempt_timeout = self
+            .transfer_config
+            .sync_timeout_for_payload(payload_bytes);
+        let remote_path = self.remote_path();
+        let escaped_remote_path = escape(Cow::from(remote_path.as_str()));
+        // The remote root includes the clean-overlay job nonce, so it is unique
+        // to this execution. Keeping this filename stable across attempts is
+        // what allows rsync to validate and continue the partial payload.
+        let remote_archive_path = format!("{remote_path}/.rch-clean-overlay-base.tar");
+        let escaped_remote_archive = escape(Cow::from(remote_archive_path.as_str()));
+        let destination = format!(
+            "{}@{}:{}",
+            worker.user, worker.host, escaped_remote_archive
+        );
+        let identity_file = shellexpand::tilde(&worker.identity_file);
+        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
+        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let extraction_script = format!(
+            "umask 0022\nmkdir -p {path}\nTAR_OPTIONS='' tar -xf {archive} -C {path}",
+            path = escaped_remote_path,
+            archive = escaped_remote_archive
+        );
+        let start = std::time::Instant::now();
+        let (((), attempts), duration_ms) = {
+            let result = run_source_transfer_attempts(
+                &self.transfer_config.retry,
+                attempt_timeout,
+                "clean_overlay_base_sync",
+                |_attempt| {
+                    let destination = destination.clone();
+                    let ssh_command = ssh_command.clone();
+                    let extraction_script = extraction_script.clone();
+                    async move {
+                        let mut rsync = Command::new("rsync");
+                        rsync
+                            .arg("-a")
+                            .arg("--no-owner")
+                            .arg("--no-group")
+                            .arg("--partial")
+                            .arg("--append-verify")
+                            .arg("-e")
+                            .arg(ssh_command)
+                            .arg(archive_file.path())
+                            .arg(destination)
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .kill_on_drop(true);
+                        let output = rsync
+                            .output()
+                            .await
+                            .context("run resumable clean-overlay base rsync")?;
+                        if !output.status.success() {
+                            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                            if is_retryable_transport_error_text(&stderr) {
+                                anyhow::bail!(
+                                    "rsync transport error (exit {:?}): {}",
+                                    output.status.code(),
+                                    stderr.trim()
+                                );
+                            }
+                            return Err(TransferError::SyncFailed {
+                                reason: "clean-overlay base rsync failed".to_string(),
+                                exit_code: output.status.code(),
+                                stderr,
+                            }
+                            .into());
+                        }
+                        self.run_remote_sh(worker, &extraction_script)
+                            .await
+                            .context("extract clean-overlay base archive")?;
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .map_err(anyhow::Error::new)?;
+            (result, start.elapsed().as_millis() as u64)
+        };
+
+        Ok(CleanOverlayMaterialization {
+            sync_result: SyncResult {
+                bytes_transferred: payload_bytes,
+                files_transferred: 0,
+                duration_ms,
+            },
+            attempts,
         })
     }
 
