@@ -270,7 +270,9 @@ pub fn put_if_absent_journaled(
     })?;
 
     let staging = dir.join("object");
-    let outcome = stage_verify_publish(layout, store, declared, reader, limits, durability, &staging);
+    let outcome = stage_verify_publish(
+        layout, store, declared, reader, limits, durability, &staging,
+    );
     match &outcome {
         Ok(_) => {
             journal.append(&JournalRecord::Published {
@@ -406,7 +408,9 @@ pub fn recover_operations(
             let staged = attempt_dir.join("object");
             let action = resolve_open_attempt(layout, store, declared_key, &staged, durability)?;
             let _ = fs::remove_dir_all(&attempt_dir);
-            report.resolved.push((op_hex.clone(), attempt_hex.clone(), action));
+            report
+                .resolved
+                .push((op_hex.clone(), attempt_hex.clone(), action));
         }
 
         // Every attempt is now terminal: retire the journal and the
@@ -463,8 +467,7 @@ mod tests {
 
     fn fresh_layout(tag: &str) -> BlobStoreLayout {
         let n = DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let root =
-            std::env::temp_dir().join(format!("rabs-h007-{}-{tag}-{n}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("rabs-h007-{}-{tag}-{n}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         BlobStoreLayout::open(&root).unwrap()
     }
@@ -528,7 +531,10 @@ mod tests {
             PutLimits::default(),
             DurabilityPolicy::FULL,
         );
-        assert!(matches!(refused, Err(PutError::DeclaredDigestMismatch { .. })));
+        assert!(matches!(
+            refused,
+            Err(PutError::DeclaredDigestMismatch { .. })
+        ));
         let replay = journal.replay().unwrap();
         assert!(matches!(
             replay.records.last(),
@@ -623,7 +629,7 @@ mod tests {
         let path = journals_dir(&layout).join(format!("{:032x}.journal", 3));
         let intact = fs::read(&path).unwrap();
         for tail in [
-            vec![0, 0, 0, 42, b'p', b'a', b'r'],                  // truncated payload
+            vec![0, 0, 0, 42, b'p', b'a', b'r'], // truncated payload
             {
                 let payload = b"aborted|deadbeef|x".to_vec();
                 let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
@@ -694,8 +700,7 @@ mod tests {
                 fs::write(dir.join("object"), staged).unwrap();
             }
 
-            let report =
-                recover_operations(&layout, &mut store, DurabilityPolicy::FULL).unwrap();
+            let report = recover_operations(&layout, &mut store, DurabilityPolicy::FULL).unwrap();
             assert_eq!(report.resolved.len(), 1, "{}", boundary.name);
             match &report.resolved[0].2 {
                 RecoveryAction::Resumed { path } => {

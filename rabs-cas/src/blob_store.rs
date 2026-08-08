@@ -372,7 +372,15 @@ pub fn publish_staged(
     durability: DurabilityPolicy,
 ) -> Result<PutOutcome, PutError> {
     let logical_size = fs::metadata(staging).map_err(io_err("stat-staging"))?.len();
-    publish_staged_inner(layout, store, declared, staging, logical_size, durability, None)
+    publish_staged_inner(
+        layout,
+        store,
+        declared,
+        staging,
+        logical_size,
+        durability,
+        None,
+    )
 }
 
 fn publish_staged_inner(
