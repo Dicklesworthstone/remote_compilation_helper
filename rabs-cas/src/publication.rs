@@ -1608,6 +1608,66 @@ mod tests {
     }
 
     #[test]
+    fn h036_publication_pin_is_coordinator_owned_and_worker_release_refuses() {
+        // T039/T049 seed at this layer (R111/R127). The H015 crash
+        // matrix already proves publication ⟺ pin atomicity at every
+        // kill point; this fixture pins the pin's POSTURE and the
+        // release-attempt surface.
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        ready_store(&mut store);
+        assert!(matches!(
+            process_offer(
+                &mut store,
+                &offer(),
+                &expected_descriptor(),
+                no_committed,
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            )
+            .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+        // The pin exists, unreleased, coordinator-owned, rooted at the
+        // committed manifest, in the action-publication class, with NO
+        // expiry (durable — never lease-decayed).
+        let pin = store.pin_row(900).unwrap().unwrap();
+        assert_eq!(pin.owner, "coordinator");
+        assert_eq!(pin.class, "action-publication");
+        assert_eq!(pin.root_key, digest_key(&object(50).0));
+        assert!(!pin.released);
+        assert_eq!(pin.expires_at_seq, None, "publication pins never expire");
+
+        // R127: WORKERS can never release it — any non-coordinator
+        // identity refuses with a typed owner mismatch, and repeated
+        // attempts change nothing.
+        for intruder in ["worker-a", "worker-b", "rabs-wkr:22", ""] {
+            assert_eq!(
+                store.release_pin(900, intruder),
+                Err(StoreError::PinOwnerMismatch),
+                "worker identity {intruder:?} must be refused"
+            );
+        }
+        let after = store.pin_row(900).unwrap().unwrap();
+        assert!(!after.released, "refused releases must not release");
+        assert_eq!(after, pin, "refused releases must change nothing");
+
+        // Releasing a pin that does not exist is UnknownPin, not a
+        // silent no-op — a worker cannot even probe usefully.
+        assert_eq!(
+            store.release_pin(999, "coordinator"),
+            Err(StoreError::UnknownPin)
+        );
+
+        // The coordinator CAN release (decommission path exists and is
+        // owner-gated, proving the refusals above are about ownership,
+        // not a frozen table).
+        store.release_pin(900, "coordinator").unwrap();
+        assert!(store.pin_row(900).unwrap().unwrap().released);
+    }
+
+    #[test]
     fn h035_equal_digests_different_manifest_opens_projection_completeness_incident() {
         // THE T035 fixture (I48; R103): two candidates whose semantic
         // AND observable digests are IDENTICAL — the manifest content
