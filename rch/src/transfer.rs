@@ -2124,9 +2124,7 @@ fi",
             .metadata()
             .context("stat clean-overlay archive")?
             .len();
-        let attempt_timeout = self
-            .transfer_config
-            .sync_timeout_for_payload(payload_bytes);
+        let attempt_timeout = self.transfer_config.sync_timeout_for_payload(payload_bytes);
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(remote_path.as_str()));
         // The remote root includes the clean-overlay job nonce, so it is unique
@@ -2134,10 +2132,7 @@ fi",
         // what allows rsync to validate and continue the partial payload.
         let remote_archive_path = format!("{remote_path}/.rch-clean-overlay-base.tar");
         let escaped_remote_archive = escape(Cow::from(remote_archive_path.as_str()));
-        let destination = format!(
-            "{}@{}:{}",
-            worker.user, worker.host, escaped_remote_archive
-        );
+        let destination = format!("{}@{}:{}", worker.user, worker.host, escaped_remote_archive);
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
         let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
@@ -6709,7 +6704,10 @@ Total file size: 123 bytes";
         assert_eq!(attempts[0].outcome, "retryable");
         assert_eq!(attempts[1].outcome, "succeeded");
         assert_eq!(
-            observed_bases.lock().expect("read partial bases").as_slice(),
+            observed_bases
+                .lock()
+                .expect("read partial bases")
+                .as_slice(),
             [
                 "worker:/remote/job/.rch-clean-overlay-base.tar",
                 "worker:/remote/job/.rch-clean-overlay-base.tar"

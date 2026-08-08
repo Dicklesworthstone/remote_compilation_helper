@@ -4468,10 +4468,8 @@ extra_field = 123
         ] {
             let mut config = RchConfig::default();
             let mut sources = default_sources_map();
-            let env_overrides = HashMap::from([(
-                "RCH_SYNC_TIMEOUT_MS".to_string(),
-                accepted.to_string(),
-            )]);
+            let env_overrides =
+                HashMap::from([("RCH_SYNC_TIMEOUT_MS".to_string(), accepted.to_string())]);
             apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
             assert_eq!(config.transfer.sync_timeout_ms, Some(accepted));
             assert_eq!(
@@ -4485,10 +4483,8 @@ extra_field = 123
         for rejected in ["0", "999", "3600001", "not-a-number"] {
             let mut config = RchConfig::default();
             let mut sources = default_sources_map();
-            let env_overrides = HashMap::from([(
-                "RCH_SYNC_TIMEOUT_MS".to_string(),
-                rejected.to_string(),
-            )]);
+            let env_overrides =
+                HashMap::from([("RCH_SYNC_TIMEOUT_MS".to_string(), rejected.to_string())]);
             apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
             assert_eq!(config.transfer.sync_timeout_ms, None);
             assert_eq!(
