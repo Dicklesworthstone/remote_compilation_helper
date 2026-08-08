@@ -55,6 +55,31 @@ use crate::metadata_store::{QuarantineScope, RabsMetadataStore, StoreError, dige
 /// logical object (encoded digest == logical digest).
 pub const RAW_PROFILE_V1: &str = "raw-v1";
 
+/// Domain of encoded-representation digests (H030): the digest of the
+/// ENCODED bytes, distinct by construction from the logical content
+/// domain so an encoded digest can never pose as object identity.
+pub const ENCODED_REPRESENTATION_DOMAIN: &str = "rabs.encoded-representation.sha256.v1";
+
+/// A profile's decoder: encoded bytes → logical bytes (H030
+/// verification input; errors are the profile's own diagnostics).
+pub type RepresentationDecoder<'a> = &'a dyn Fn(&[u8]) -> Result<Vec<u8>, String>;
+
+/// One verified stored representation of a logical object (H030;
+/// risk R81): raw/zstd/packed representations coexist, each under its
+/// own unambiguous pathname; NONE of them changes the logical
+/// identity or any action key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRepresentationId {
+    /// The logical object this represents.
+    pub logical: TypedDigest,
+    /// The storage profile (encoding) of this representation.
+    pub storage_profile: String,
+    /// Digest of the encoded bytes (equals `logical` for raw).
+    pub encoded_digest: TypedDigest,
+    /// Size of the encoded bytes.
+    pub encoded_size: u64,
+}
+
 /// How hard the store pushes bytes to the platter before reporting
 /// durable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +137,14 @@ pub enum PutError {
         existing_path: String,
         /// Quarantine path preserving the refused incoming bytes.
         preserved_incoming_path: String,
+    },
+    /// The encoded representation failed to decode back to logical
+    /// bytes (H030 verification).
+    EncodingDecodeFailed {
+        /// The storage profile whose decoder refused.
+        profile: String,
+        /// Decoder error text.
+        error: String,
     },
     /// Metadata-store failure.
     Store(StoreError),
@@ -267,6 +300,31 @@ pub(crate) fn io_err(step: &'static str) -> impl FnOnce(std::io::Error) -> PutEr
     }
 }
 
+/// Hash a file's bytes under an arbitrary digest domain (the same
+/// length-framed prefix rule as [`crate::digest_set`]): used to verify
+/// existing representations whose expected digest may live under the
+/// logical OR the encoded domain (H030).
+fn hash_file_under_domain(path: &Path, domain: &'static str) -> Result<TypedDigest, PutError> {
+    use sha2::{Digest as _, Sha256};
+    let mut file = fs::File::open(path).map_err(io_err("open-existing"))?;
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_be_bytes());
+    hasher.update(domain.as_bytes());
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer).map_err(io_err("read-existing"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(TypedDigest {
+        algorithm: rabs_protocol::result_identity::DigestAlgorithm::Sha256V1,
+        domain,
+        bytes: hasher.finalize().into(),
+    })
+}
+
 /// Recompute the logical content id of an existing file (used to
 /// verify a representation found under the target path, and by H007
 /// recovery to decide resume-vs-clean for a staged write).
@@ -352,6 +410,8 @@ pub fn put_if_absent_with_fault(
         digests.logical_size,
         durability,
         fault,
+        RAW_PROFILE_V1,
+        declared,
     )
 }
 
@@ -380,9 +440,17 @@ pub fn publish_staged(
         logical_size,
         durability,
         None,
+        RAW_PROFILE_V1,
+        declared,
     )
 }
 
+/// Steps 3–5 for ANY representation (H030): `profile` + `file_digest`
+/// name the representation — for raw the file digest IS the logical
+/// identity, for encoded profiles it is the encoded digest — while
+/// `declared`/`logical_size` remain the LOGICAL object recorded in
+/// metadata. Representation selection never changes logical identity.
+#[allow(clippy::too_many_arguments)]
 fn publish_staged_inner(
     layout: &BlobStoreLayout,
     store: &mut dyn RabsMetadataStore,
@@ -391,6 +459,8 @@ fn publish_staged_inner(
     logical_size: u64,
     durability: DurabilityPolicy,
     fault: Option<FaultPoint>,
+    profile: &str,
+    file_digest: &TypedDigest,
 ) -> Result<PutOutcome, PutError> {
     // 3. fsync file data per durability policy.
     if durability.fsync_file {
@@ -402,8 +472,10 @@ fn publish_staged_inner(
     }
 
     // 4. Atomic create-exclusive publish: hard_link never overwrites,
-    // so a concurrent writer's representation is never clobbered.
-    let target = layout.published_path(declared, RAW_PROFILE_V1, declared);
+    // so a concurrent writer's representation is never clobbered —
+    // and different profiles publish DIFFERENT pathnames, so they
+    // never race one ambiguous name (H030/R81).
+    let target = layout.published_path(declared, profile, file_digest);
     let target_dir = target
         .parent()
         .ok_or_else(|| PutError::Io {
@@ -417,7 +489,16 @@ fn publish_staged_inner(
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // Race loser or re-put: VERIFY the existing representation
             // before conceding idempotency.
-            return handle_existing(layout, store, declared, staging, &target);
+            return handle_existing(
+                layout,
+                store,
+                declared,
+                logical_size,
+                profile,
+                file_digest,
+                staging,
+                &target,
+            );
         }
         Err(e) => {
             let _ = fs::remove_file(staging);
@@ -439,7 +520,7 @@ fn publish_staged_inner(
 
     // 5. Record object + location; encoding tag is the profile.
     store.record_object(declared, logical_size)?;
-    store.add_location(declared, &target.to_string_lossy(), None, RAW_PROFILE_V1)?;
+    store.add_location(declared, &target.to_string_lossy(), None, profile)?;
     if fault == Some(FaultPoint::MetadataRecorded) {
         return Err(PutError::CrashInjected(FaultPoint::MetadataRecorded));
     }
@@ -448,6 +529,135 @@ fn publish_staged_inner(
     Ok(PutOutcome::Stored {
         path: target.to_string_lossy().into_owned(),
     })
+}
+
+/// H030: publish one ENCODED representation of an already-known
+/// logical object. The encoded bytes stream to staging while their
+/// digest (under [`ENCODED_REPRESENTATION_DOMAIN`]) is computed; the
+/// representation is then VERIFIED — `decoder` must reproduce bytes
+/// that digest to `declared_logical` (raw callers use
+/// [`put_if_absent`] instead) — before the standard atomic publish at
+/// the representation's own `(logical, profile, encoded)` pathname.
+/// `limits.max_logical_bytes` caps the DECODED size (bomb guard);
+/// `limits.expected_size` verifies the ENCODED byte count.
+///
+/// # Errors
+/// Typed [`PutError`]; refusals publish nothing and clean staging.
+#[allow(clippy::too_many_arguments)]
+pub fn put_encoded_representation(
+    layout: &BlobStoreLayout,
+    store: &mut dyn RabsMetadataStore,
+    declared_logical: &TypedDigest,
+    profile: &str,
+    encoded: &mut dyn Read,
+    decoder: RepresentationDecoder<'_>,
+    limits: PutLimits,
+    durability: DurabilityPolicy,
+) -> Result<(StoredRepresentationId, PutOutcome), PutError> {
+    let staging = layout.fresh_staging_path();
+
+    // Stream encoded bytes to staging, hashing under the ENCODED
+    // domain and counting encoded size.
+    let stream = (|| -> Result<(TypedDigest, u64), PutError> {
+        use sha2::{Digest as _, Sha256};
+        let mut file = fs::File::create(&staging).map_err(io_err("create-staging"))?;
+        let mut hasher = Sha256::new();
+        hasher.update((ENCODED_REPRESENTATION_DOMAIN.len() as u64).to_be_bytes());
+        hasher.update(ENCODED_REPRESENTATION_DOMAIN.as_bytes());
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = encoded.read(&mut buffer).map_err(io_err("read-encoded"))?;
+            if n == 0 {
+                break;
+            }
+            total = total.saturating_add(n as u64);
+            hasher.update(&buffer[..n]);
+            file.write_all(&buffer[..n])
+                .map_err(io_err("write-staging"))?;
+        }
+        if let Some(expected) = limits.expected_size
+            && expected != total
+        {
+            return Err(PutError::Digest(DigestError::LogicalSizeMismatch {
+                expected,
+                actual: total,
+            }));
+        }
+        Ok((
+            TypedDigest {
+                algorithm: rabs_protocol::result_identity::DigestAlgorithm::Sha256V1,
+                domain: ENCODED_REPRESENTATION_DOMAIN,
+                bytes: hasher.finalize().into(),
+            },
+            total,
+        ))
+    })();
+    let (encoded_digest, encoded_size) = match stream {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = fs::remove_file(&staging);
+            return Err(e);
+        }
+    };
+
+    // VERIFY: the representation must decode to the declared logical
+    // object; the decoded size honors the bomb guard.
+    let verify = (|| -> Result<u64, PutError> {
+        let encoded_bytes = fs::read(&staging).map_err(io_err("read-staged"))?;
+        let logical_bytes =
+            decoder(&encoded_bytes).map_err(|error| PutError::EncodingDecodeFailed {
+                profile: profile.to_owned(),
+                error,
+            })?;
+        if let Some(limit) = limits.max_logical_bytes
+            && logical_bytes.len() as u64 > limit
+        {
+            return Err(PutError::LogicalLimitExceeded { limit });
+        }
+        let computed = crate::digest_set::digest_set(
+            &logical_bytes,
+            crate::digest_set::DigestRequest::default(),
+            None,
+        )
+        .map_err(PutError::Digest)?
+        .atp_content_id;
+        if computed != *declared_logical {
+            return Err(PutError::DeclaredDigestMismatch {
+                declared: digest_key(declared_logical),
+                computed: digest_key(&computed),
+            });
+        }
+        Ok(logical_bytes.len() as u64)
+    })();
+    let logical_size = match verify {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = fs::remove_file(&staging);
+            return Err(e);
+        }
+    };
+
+    let outcome = publish_staged_inner(
+        layout,
+        store,
+        declared_logical,
+        &staging,
+        logical_size,
+        durability,
+        None,
+        profile,
+        &encoded_digest,
+    )?;
+    Ok((
+        StoredRepresentationId {
+            logical: declared_logical.clone(),
+            storage_profile: profile.to_owned(),
+            encoded_digest,
+            encoded_size,
+        },
+        outcome,
+    ))
 }
 
 pub(crate) fn stream_to_staging(
@@ -477,26 +687,31 @@ pub(crate) fn stream_to_staging(
     writer.finish().map_err(PutError::Digest)
 }
 
-/// The target path already exists: verify it. Identical → idempotent
-/// (clean own temp). Different → collision/corruption incident:
-/// preserve the incoming candidate, quarantine every implicated
-/// location, open the logical-object quarantine, REFUSE.
+/// The target path already exists: verify it against the EXPECTED
+/// file digest (logical id for raw, encoded digest for encoded
+/// profiles). Identical → idempotent (clean own temp). Different →
+/// collision/corruption incident: preserve the incoming candidate,
+/// quarantine every implicated location, open the logical-object
+/// quarantine, REFUSE.
+#[allow(clippy::too_many_arguments)]
 fn handle_existing(
     layout: &BlobStoreLayout,
     store: &mut dyn RabsMetadataStore,
     declared: &TypedDigest,
+    logical_size: u64,
+    profile: &str,
+    file_digest: &TypedDigest,
     staging: &Path,
     target: &Path,
 ) -> Result<PutOutcome, PutError> {
-    let existing_digest = recompute_file_digest(target)?;
-    if existing_digest == *declared {
+    let existing_digest = hash_file_under_domain(target, file_digest.domain)?;
+    if existing_digest == *file_digest {
         // Identical representation already published. Make sure the
         // metadata rows exist (the original writer may have died
         // between link and record), then clean OUR temp — the race
         // loser's duty.
-        let size = fs::metadata(target).map_err(io_err("stat-existing"))?.len();
-        store.record_object(declared, size)?;
-        store.add_location(declared, &target.to_string_lossy(), None, RAW_PROFILE_V1)?;
+        store.record_object(declared, logical_size)?;
+        store.add_location(declared, &target.to_string_lossy(), None, profile)?;
         let _ = fs::remove_file(staging);
         return Ok(PutOutcome::IdempotentDuplicate {
             path: target.to_string_lossy().into_owned(),
@@ -565,12 +780,23 @@ mod tests {
                     continue;
                 }
                 let name = path.file_name().unwrap().to_string_lossy().into_owned();
-                let claimed_hex = name.split('.').next().unwrap().to_owned();
-                let recomputed = recompute_file_digest(&path).unwrap();
+                let segments: Vec<&str> = name.split('.').collect();
+                let [logical_hex, profile, encoded_hex] = segments.as_slice() else {
+                    panic!("unexpected published name {name}");
+                };
+                // Raw files re-digest to the logical id; encoded files
+                // to their encoded digest — either way, only COMPLETE
+                // correct representations may be visible.
+                let (domain, claimed) = if *profile == RAW_PROFILE_V1 {
+                    (crate::digest_set::ATP_OBJECT_CONTENT_DOMAIN, *logical_hex)
+                } else {
+                    (ENCODED_REPRESENTATION_DOMAIN, *encoded_hex)
+                };
+                let recomputed = hash_file_under_domain(&path, domain).unwrap();
                 assert_eq!(
                     hex(&recomputed.bytes),
-                    claimed_hex,
-                    "partial or corrupt object exposed at {}",
+                    claimed,
+                    "partial or corrupt representation exposed at {}",
                     path.display()
                 );
             }
@@ -803,6 +1029,258 @@ mod tests {
             );
             assert_no_partial_published(&layout);
         }
+    }
+
+    /// Test profile: bytes stored reversed.
+    fn rev_encode(bytes: &[u8]) -> Vec<u8> {
+        bytes.iter().rev().copied().collect()
+    }
+
+    fn rev_decoder(encoded: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(encoded.iter().rev().copied().collect())
+    }
+
+    #[test]
+    fn h030_encoded_and_raw_representations_coexist_without_ambiguity() {
+        let layout = BlobStoreLayout::open(&fresh_root("h030")).unwrap();
+        let mut store = store();
+        let bytes = b"multi-representation object".to_vec();
+        let declared = id_of(&bytes);
+
+        let PutOutcome::Stored { path: raw_path } = put_if_absent(
+            &layout,
+            &mut store,
+            &declared,
+            &mut bytes.as_slice(),
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .unwrap() else {
+            panic!("raw put must store");
+        };
+        let encoded = rev_encode(&bytes);
+        let (representation, outcome) = put_encoded_representation(
+            &layout,
+            &mut store,
+            &declared,
+            "rev-v1",
+            &mut encoded.as_slice(),
+            &rev_decoder,
+            PutLimits {
+                max_logical_bytes: Some(1024),
+                expected_size: Some(encoded.len() as u64),
+            },
+            DurabilityPolicy::FULL,
+        )
+        .unwrap();
+        let PutOutcome::Stored { path: rev_path } = outcome else {
+            panic!("encoded put must store");
+        };
+
+        // Distinct unambiguous pathnames; encoded bytes live at the
+        // encoded path; the representation names everything.
+        assert_ne!(raw_path, rev_path);
+        assert_eq!(fs::read(&rev_path).unwrap(), encoded);
+        assert_eq!(representation.storage_profile, "rev-v1");
+        assert_eq!(representation.encoded_size, encoded.len() as u64);
+        assert_eq!(
+            representation.encoded_digest.domain,
+            ENCODED_REPRESENTATION_DOMAIN
+        );
+        assert_eq!(representation.logical, declared);
+
+        // Both representations are location rows of ONE logical
+        // object, tagged by profile.
+        let encodings: Vec<String> = store
+            .reconciliation_scan()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.encoding)
+            .collect();
+        assert!(encodings.contains(&"raw-v1".to_owned()));
+        assert!(encodings.contains(&"rev-v1".to_owned()));
+
+        // Re-put of the same encoded representation: verified
+        // idempotent against the ENCODED digest.
+        let (_, again) = put_encoded_representation(
+            &layout,
+            &mut store,
+            &declared,
+            "rev-v1",
+            &mut encoded.as_slice(),
+            &rev_decoder,
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .unwrap();
+        assert_eq!(again, PutOutcome::IdempotentDuplicate { path: rev_path });
+        assert_eq!(fs::read_dir(layout.staging_dir()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn h030_decode_verification_refuses_wrong_and_bombing_representations() {
+        let layout = BlobStoreLayout::open(&fresh_root("h030-verify")).unwrap();
+        let mut store = store();
+        let bytes = b"verified object".to_vec();
+        let declared = id_of(&bytes);
+        let encoded = rev_encode(&bytes);
+
+        // Decoder that produces the WRONG logical bytes: refused, and
+        // nothing published anywhere.
+        let bad_decoder = |_: &[u8]| -> Result<Vec<u8>, String> { Ok(b"other bytes".to_vec()) };
+        assert!(matches!(
+            put_encoded_representation(
+                &layout,
+                &mut store,
+                &declared,
+                "rev-v1",
+                &mut encoded.as_slice(),
+                &bad_decoder,
+                PutLimits::default(),
+                DurabilityPolicy::FULL,
+            ),
+            Err(PutError::DeclaredDigestMismatch { .. })
+        ));
+
+        // Decoder failure is typed.
+        let failing = |_: &[u8]| -> Result<Vec<u8>, String> { Err("truncated frame".to_owned()) };
+        assert!(matches!(
+            put_encoded_representation(
+                &layout,
+                &mut store,
+                &declared,
+                "rev-v1",
+                &mut encoded.as_slice(),
+                &failing,
+                PutLimits::default(),
+                DurabilityPolicy::FULL,
+            ),
+            Err(PutError::EncodingDecodeFailed { .. })
+        ));
+
+        // Decompression bomb: decoded bytes exceed the logical cap.
+        let bomb = |_: &[u8]| -> Result<Vec<u8>, String> { Ok(vec![0_u8; 4096]) };
+        assert_eq!(
+            put_encoded_representation(
+                &layout,
+                &mut store,
+                &declared,
+                "bomb-v1",
+                &mut encoded.as_slice(),
+                &bomb,
+                PutLimits {
+                    max_logical_bytes: Some(64),
+                    expected_size: None,
+                },
+                DurabilityPolicy::FULL,
+            ),
+            Err(PutError::LogicalLimitExceeded { limit: 64 })
+        );
+
+        assert!(!store.object_located(&declared).unwrap());
+        assert_eq!(fs::read_dir(layout.staging_dir()).unwrap().count(), 0);
+        assert_no_partial_published(&layout);
+    }
+
+    #[test]
+    fn h030_concurrent_profiles_publish_distinct_records_not_one_race() {
+        let layout = BlobStoreLayout::open(&fresh_root("h030-race")).unwrap();
+        let bytes = b"contended multi-encoding object".to_vec();
+        let declared = id_of(&bytes);
+
+        let workers: Vec<_> = (0..8)
+            .map(|i| {
+                let layout = layout.clone();
+                let bytes = bytes.clone();
+                let declared = declared.clone();
+                std::thread::spawn(move || {
+                    let mut store = store();
+                    if i % 2 == 0 {
+                        put_if_absent(
+                            &layout,
+                            &mut store,
+                            &declared,
+                            &mut bytes.as_slice(),
+                            PutLimits::default(),
+                            DurabilityPolicy::FULL,
+                        )
+                        .map(|outcome| ("raw-v1", outcome))
+                    } else {
+                        let encoded = rev_encode(&bytes);
+                        put_encoded_representation(
+                            &layout,
+                            &mut store,
+                            &declared,
+                            "rev-v1",
+                            &mut encoded.as_slice(),
+                            &rev_decoder,
+                            PutLimits::default(),
+                            DurabilityPolicy::FULL,
+                        )
+                        .map(|(_, outcome)| ("rev-v1", outcome))
+                    }
+                })
+            })
+            .collect();
+        let outcomes: Vec<(&str, PutOutcome)> = workers
+            .into_iter()
+            .map(|t| t.join().unwrap().unwrap())
+            .collect();
+
+        // Exactly one Stored PER PROFILE: different profiles never
+        // contend on one ambiguous pathname.
+        for profile in ["raw-v1", "rev-v1"] {
+            let stored = outcomes
+                .iter()
+                .filter(|(p, o)| *p == profile && matches!(o, PutOutcome::Stored { .. }))
+                .count();
+            assert_eq!(stored, 1, "profile {profile}");
+        }
+        assert_eq!(fs::read_dir(layout.staging_dir()).unwrap().count(), 0);
+        assert_no_partial_published(&layout);
+    }
+
+    #[test]
+    fn h030_representation_ops_never_touch_action_keys() {
+        let layout = BlobStoreLayout::open(&fresh_root("h030-keys")).unwrap();
+        let mut store = store();
+        let bytes = b"identity-stable object".to_vec();
+        let declared = id_of(&bytes);
+        let before: Vec<String> = store
+            .differential_snapshot()
+            .unwrap()
+            .into_iter()
+            .filter(|l| l.starts_with("action_"))
+            .collect();
+        put_if_absent(
+            &layout,
+            &mut store,
+            &declared,
+            &mut bytes.as_slice(),
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .unwrap();
+        let encoded = rev_encode(&bytes);
+        put_encoded_representation(
+            &layout,
+            &mut store,
+            &declared,
+            "rev-v1",
+            &mut encoded.as_slice(),
+            &rev_decoder,
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .unwrap();
+        let after: Vec<String> = store
+            .differential_snapshot()
+            .unwrap()
+            .into_iter()
+            .filter(|l| l.starts_with("action_"))
+            .collect();
+        // Representation selection never changes action keys (H030).
+        assert_eq!(before, after);
     }
 
     #[test]
