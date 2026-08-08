@@ -91,6 +91,7 @@ pub mod self_host_bypass;
 pub mod sequence_domains;
 pub mod serving;
 pub mod snapshot_lineage;
+pub mod socket_admission;
 pub mod stateful_delivery;
 pub mod subscriber_interest;
 pub mod subscriber_queue;
