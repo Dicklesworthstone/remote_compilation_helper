@@ -67,6 +67,7 @@ pub mod input_evidence;
 pub mod invocation_record;
 pub mod lease_semantics;
 pub mod local_protocol;
+pub mod materialization_rights;
 pub mod messages;
 pub mod nextest_runner;
 pub mod nextest_serving_gate;
