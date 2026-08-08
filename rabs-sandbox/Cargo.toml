@@ -20,6 +20,7 @@ doctest = false
 # in the unsafe-boundary ledger (bead A011).
 [dependencies]
 rabs-protocol = { path = "../rabs-protocol" }
+sha2 = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

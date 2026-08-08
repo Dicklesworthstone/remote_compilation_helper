@@ -25,7 +25,7 @@ members = [
 [workspace.package]
 version = "1.0.56"
 edition = "2024"
-license = "MIT"
+license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 authors = ["Remote Compilation Helper Contributors"]
 repository = "https://github.com/Dicklesworthstone/remote_compilation_helper"
 homepage = "https://github.com/Dicklesworthstone/remote_compilation_helper"

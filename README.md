@@ -22,7 +22,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilati
 
 **Transparent remote compilation for multi-agent development**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT + OpenAI/Anthropic Rider](https://img.shields.io/badge/License-MIT%20%2B%20OpenAI%2FAnthropic%20Rider-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-nightly%202024-orange.svg)](https://www.rust-lang.org/)
 [![codecov](https://codecov.io/gh/Dicklesworthstone/remote_compilation_helper/graph/badge.svg)](https://codecov.io/gh/Dicklesworthstone/remote_compilation_helper)
 
@@ -594,4 +594,7 @@ Please don't take this the wrong way, but I do not accept outside contributions 
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT License **with an OpenAI/Anthropic rider** — this is not ordinary
+OSI MIT: no rights are granted to the restricted parties named in the
+rider. See [LICENSE](LICENSE) for the exact, controlling terms
+(SPDX: `LicenseRef-MIT-OpenAI-Anthropic-Rider`).
