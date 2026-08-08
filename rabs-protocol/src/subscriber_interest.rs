@@ -541,10 +541,7 @@ mod tests {
         // unchanged (including cargo-test's 101).
         for signal_number in [2, 15, 9, 11] {
             assert_eq!(
-                relay_child_termination(
-                    ChildTermination::Signaled { signal_number },
-                    true
-                ),
+                relay_child_termination(ChildTermination::Signaled { signal_number }, true),
                 RelayAction::RestoreDefaultAndResignal { signal_number },
                 "signal {signal_number}: classification must never flip to exit"
             );
