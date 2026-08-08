@@ -435,7 +435,8 @@ mod tests {
         }
         assert_eq!(ZSTD_BALANCED.name, "zstd-3");
         assert_eq!(ZSTD_FAST.name, "zstd-1");
-        assert!(ZSTD_FAST.level < ZSTD_BALANCED.level);
+        assert_eq!(ZSTD_FAST.level, 1);
+        assert_eq!(ZSTD_BALANCED.level, 3);
     }
 
     #[test]
