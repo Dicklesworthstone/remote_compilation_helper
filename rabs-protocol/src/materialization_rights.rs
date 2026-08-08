@@ -69,16 +69,18 @@ pub struct OperationTree {
 }
 
 /// Proof that fallback preconditions ran: subscription detached, rights
-/// revoked, staging discarded. Unforgeable outside this module (private
-/// field), and the ONLY token [`run_original_chain`] accepts — so the
-/// original chain cannot start while remote rights are live.
+/// revoked, staging discarded. Non-exhaustive, so code outside this
+/// crate (the edge daemon, the wrapper) cannot construct one — the ONLY
+/// source is [`MaterializationGate::revoke_for_fallback`], and it is
+/// the only token [`run_original_chain`] accepts: the original chain
+/// cannot start while remote rights are live.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FallbackClearance {
     /// Rights epoch fenced by the revocation.
     pub fenced_epoch: u64,
     /// How many staged-but-uncommitted remote writes were discarded.
     pub staged_discarded: usize,
-    _private: (),
 }
 
 /// Per-(operation, subscriber) materialization gate: the single
@@ -186,7 +188,6 @@ impl MaterializationGate {
         Ok(FallbackClearance {
             fenced_epoch: self.epoch,
             staged_discarded,
-            _private: (),
         })
     }
 }
