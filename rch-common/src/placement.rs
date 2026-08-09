@@ -1121,6 +1121,57 @@ mod tests {
         assert!(!plan.strict_remote_policy.fail_closed());
     }
 
+    // --- box role (bd-wywsj) ----------------------------------------------
+
+    #[test]
+    fn dispatcher_role_defaults_fail_closed_with_env_override() {
+        use crate::BoxRole;
+        // Bare dispatcher: fail-closed + queue by default, with the
+        // role default named in a diagnostic.
+        let plan = resolve_placement_with_role(env(&[]), BoxRole::Dispatcher);
+        assert_eq!(
+            plan.strict_remote_policy,
+            StrictRemotePolicy::RequireRemote,
+            "dispatcher must never repopulate local rustc by default"
+        );
+        assert_eq!(plan.queue_policy, QueuePolicy::QueueWhenBusy);
+        assert!(
+            plan.diagnostics.iter().any(|d| d.control == "general.role"),
+            "the role default must be visible in diagnostics"
+        );
+        // Env presence — even FALSY — is an explicit per-call override.
+        let opted_out =
+            resolve_placement_with_role(env(&[("RCH_REQUIRE_REMOTE", "0")]), BoxRole::Dispatcher);
+        assert_eq!(opted_out.strict_remote_policy, StrictRemotePolicy::Off);
+        // Explicit fail-open force wins over the role default too.
+        let forced =
+            resolve_placement_with_role(env(&[("RCH_FORCE_REMOTE", "1")]), BoxRole::Dispatcher);
+        assert_eq!(forced.strict_remote_policy, StrictRemotePolicy::ForceRemote);
+        // And explicit fail-closed is unchanged.
+        let required =
+            resolve_placement_with_role(env(&[("RCH_REQUIRE_REMOTE", "1")]), BoxRole::Dispatcher);
+        assert_eq!(
+            required.strict_remote_policy,
+            StrictRemotePolicy::RequireRemote
+        );
+    }
+
+    #[test]
+    fn worker_and_hybrid_roles_change_nothing() {
+        use crate::BoxRole;
+        for role in [BoxRole::Worker, BoxRole::Hybrid] {
+            let plan = resolve_placement_with_role(env(&[]), role);
+            let baseline = resolve_placement(env(&[]));
+            assert_eq!(plan.strict_remote_policy, baseline.strict_remote_policy);
+            assert_eq!(plan.queue_policy, baseline.queue_policy);
+            assert_eq!(
+                plan.diagnostics.len(),
+                baseline.diagnostics.len(),
+                "{role:?} must add no diagnostics"
+            );
+        }
+    }
+
     #[test]
     fn require_remote_is_fail_closed() {
         let plan = resolve_placement(env(&[("RCH_REQUIRE_REMOTE", "true")]));
