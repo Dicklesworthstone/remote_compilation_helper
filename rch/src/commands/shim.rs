@@ -161,6 +161,17 @@ struct ShimStatus {
 
 /// `rch shim install` — write (or refresh) the canonical cargo shim.
 pub fn shim_install(require_remote: bool, ctx: &OutputContext) -> Result<()> {
+    // bd-wywsj: a WORKER box is the compute — shimming cargo to
+    // offload from it is a configuration error, refused loudly.
+    if let Ok(config) = crate::config::load_config()
+        && config.general.role == rch_common::BoxRole::Worker
+    {
+        anyhow::bail!(
+            "refusing to install the cargo shim: general.role = \"worker\" — this box IS \
+             the compute. Set role = \"dispatcher\" or \"hybrid\" in config.toml if this \
+             machine should offload builds."
+        );
+    }
     let style = ctx.theme();
     let path = cargo_shim_path()?;
     let body = cargo_shim_body(require_remote);
