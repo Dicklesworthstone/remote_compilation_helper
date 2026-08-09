@@ -453,6 +453,16 @@ fn exec_requires_remote() -> bool {
     std::env::var(RCH_REQUIRE_REMOTE_ENV).is_ok_and(|value| env_flag_enabled(&value))
 }
 
+/// Box-role default for strict-remote (bd-wywsj): on a DISPATCHER box,
+/// offloadable builds are fail-closed by default — env stays the
+/// per-call override (presence of RCH_REQUIRE_REMOTE or
+/// RCH_FORCE_REMOTE, even falsy, is an explicit decision that wins).
+fn role_requires_remote(role: rch_common::BoxRole) -> bool {
+    role == rch_common::BoxRole::Dispatcher
+        && std::env::var(RCH_REQUIRE_REMOTE_ENV).is_err()
+        && std::env::var("RCH_FORCE_REMOTE").is_err()
+}
+
 pub(crate) fn preferred_workers_from_env() -> Vec<WorkerId> {
     let mut preferred = Vec::new();
     if let Ok(value) = std::env::var(RCH_WORKER_ENV) {
@@ -1896,6 +1906,14 @@ pub async fn run_exec(
             exit_with_local_fallback(&command, &reporter, "config unavailable", require_remote);
         }
     };
+
+    // bd-wywsj: a dispatcher box defaults offloadable builds to
+    // fail-closed + queue — box policy, not a per-call env. Explicit
+    // env (even RCH_REQUIRE_REMOTE=0) remains the per-call override.
+    let require_remote = require_remote || role_requires_remote(config.general.role);
+    if role_requires_remote(config.general.role) {
+        info!("role=dispatcher: offloadable build defaults to fail-closed + queue");
+    }
 
     let reporter = HookReporter::new(config.output.visibility);
 
