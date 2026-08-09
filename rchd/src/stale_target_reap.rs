@@ -554,6 +554,61 @@ mod tests {
     }
 
     #[test]
+    fn sweep_script_cap_pass_evicts_oldest_until_under_budget() {
+        use std::fs;
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("create tmp root");
+        let base = tmp.path().join("projects");
+        fs::create_dir_all(&base).unwrap();
+
+        // Three ~200KB pooled dirs with staggered ages (all idle beyond the
+        // short window, all within the pooled TTL since we pass None), plus a
+        // fresh oversized one that the safety floor must protect.
+        let aged = |path: &std::path::Path, stamp: &str| {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("blob.bin"), vec![0u8; 200 * 1024]).unwrap();
+            let ok = Command::new("find")
+                .arg(path)
+                .args(["-exec", "touch", "-t", stamp, "{}", ";"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "aging {path:?} should succeed");
+        };
+        let oldest = base.join("repoA").join(".rch-target-w-pool-oldest");
+        let middle = base.join("repoB").join(".rch-target-w-pool-middle");
+        let newest = base.join("repoC").join(".rch-target-w-pool-newest");
+        aged(&oldest, "202601010000");
+        aged(&middle, "202602010000");
+        aged(&newest, "202603010000");
+        let fresh_big = base.join("repoD").join(".rch-target-w-pool-freshbig");
+        fs::create_dir_all(&fresh_big).unwrap();
+        fs::write(fresh_big.join("blob.bin"), vec![0u8; 400 * 1024]).unwrap();
+
+        // Budget 700KB. Total is ~1020KB (3×~204 + ~404), so eviction fires;
+        // the fresh dir is protected by the -mmin floor; evicting the two
+        // oldest aged dirs (~408KB) brings the total to ~612KB ≤ 700 and the
+        // loop stops before the newest aged dir.
+        let cmd = build_sweep_command(base.to_str().unwrap(), 720, None, Some(700));
+        let out = Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        assert!(!oldest.exists(), "oldest aged pool must be evicted: {stdout}");
+        assert!(!middle.exists(), "middle aged pool must be evicted: {stdout}");
+        assert!(
+            newest.exists(),
+            "newest aged pool must survive once under budget: {stdout}"
+        );
+        assert!(fresh_big.exists(), "fresh dir is protected by the -mmin floor");
+        let m = parse_reap_metrics(&stdout).expect("metrics line present");
+        assert_eq!(m.removed, 2, "exactly the two oldest are counted: {stdout}");
+        assert!(m.freed_bytes >= 300 * 1024, "freed reflects evictions: {stdout}");
+    }
+
+    #[test]
     fn parse_metrics_reads_values() {
         let out = "noise\nRCH_WORKER_REAP_METRICS removed=3 freed_kb=2048\n";
         let m = parse_reap_metrics(out).expect("parse");

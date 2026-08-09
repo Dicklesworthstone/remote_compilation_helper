@@ -226,15 +226,18 @@ pub fn worker_sweep_command(
         None => String::new(),
     };
     // Byte-cap eviction (bead 6dj11): after the TTL passes, when the TOTAL of
-    // every remaining reap-class dir exceeds the budget, evict oldest-idle
-    // first — but NEVER a dir with activity within the short idle window (the
-    // same active-build safety floor as the TTL pass) — until back under.
-    // Oldest-first makes this a warm-LRU by construction: the newest warm
-    // pools survive, the coldest go first. Candidate list is re-discovered
-    // because the TTL passes just removed entries; sizes come from the same
-    // single find+awk stat pass as the enumeration surface; `sort -n` orders
-    // by newest-mtime ascending; the eviction loop reads from a FILE so the
-    // counter mutations survive (no pipe subshell).
+    // every remaining reap-class dir exceeds the budget, evict oldest first —
+    // but NEVER a dir with activity within the short idle window (the same
+    // whole-tree `find -mmin` active-build safety floor as the TTL pass) —
+    // until back under. Oldest-first makes this a warm-LRU by construction:
+    // the newest warm pools survive, the coldest go first. Ordering uses the
+    // dir's own mtime via `date -r` (portable across GNU/BSD, and cargo
+    // touches the target root constantly during builds, so it is a good
+    // recency proxy — the `-mmin` tree walk remains the safety authority);
+    // sizes come from `du -sk`. The candidate list is re-discovered because
+    // the TTL passes just removed entries; `sort -n` orders oldest-mtime
+    // first; the eviction loop reads from a FILE so the counter mutations
+    // survive (no pipe subshell).
     let cap_pass = match max_cache_kb {
         Some(cap_kb) => format!(
             "if [ {cap_kb} -gt 0 ] \
@@ -245,8 +248,8 @@ pub fn worker_sweep_command(
                : > \"$__lst\"; total_kb=0; \
                while IFS= read -r d; do \
                  [ -d \"$d\" ] || continue; \
-                 set -- $(find \"$d\" -printf '%T@ %s\\n' 2>/dev/null | awk '{{ t=int($1); if (t>n) n=t; s+=$2 }} END {{ printf \"%d %d\", n, int(s/1024) }}'); \
-                 __n=${{1:-0}}; __k=${{2:-0}}; \
+                 __n=$(date -r \"$d\" +%s 2>/dev/null); [ -n \"$__n\" ] || __n=0; \
+                 __k=$(du -sk \"$d\" 2>/dev/null | awk '{{print $1}}'); [ -n \"$__k\" ] || __k=0; \
                  total_kb=$((total_kb + __k)); \
                  printf '%s %s %s\\n' \"$__n\" \"$__k\" \"$d\" >> \"$__lst\"; \
                done < \"$__tmpf3\"; \
