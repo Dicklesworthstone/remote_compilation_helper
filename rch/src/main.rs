@@ -3843,7 +3843,7 @@ fn selected_reap_workers(worker_filter: &[String]) -> Result<Vec<rch_common::Wor
 /// periodic sweep uses, so status/gc and the sweep can never disagree. The
 /// third element is the LONG pooled-dir window in hours (0 = pooled dirs are
 /// never reaped).
-fn reap_surface_config() -> Result<(String, u32, u32)> {
+fn reap_surface_config() -> Result<(String, u32, u32, u32)> {
     let rch_config = config::load_config().map_err(|e| anyhow::anyhow!("load config: {e}"))?;
     let base = rch_config.remediation.pooled_target.remote_base.clone();
     if !rch_common::stale_target_reap::is_safe_reap_base(&base) {
@@ -3859,6 +3859,7 @@ fn reap_surface_config() -> Result<(String, u32, u32)> {
             .remediation
             .pooled_target
             .reaper_pooled_idle_hours,
+        rch_config.remediation.pooled_target.reaper_max_cache_gb,
     ))
 }
 
@@ -3892,7 +3893,7 @@ async fn handle_cache_status(worker_filter: Vec<String>, ctx: &OutputContext) ->
     use rch_common::stale_target_reap as reap;
 
     let style = ctx.theme();
-    let (base, idle_hours, pooled_idle_hours) = reap_surface_config()?;
+    let (base, idle_hours, pooled_idle_hours, _max_cache_gb) = reap_surface_config()?;
     let workers = selected_reap_workers(&worker_filter)?;
     let idle_secs = u64::from(idle_hours.max(reap::MIN_IDLE_HOURS)) * 3600;
     // Pooled dirs reap only under the LONG window; 0 = never (floored at 24h
@@ -4030,13 +4031,17 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
     use rch_common::stale_target_reap as reap;
 
     let style = ctx.theme();
-    let (base, idle_hours, pooled_idle_hours) = reap_surface_config()?;
+    let (base, idle_hours, pooled_idle_hours, max_cache_gb) = reap_surface_config()?;
     let workers = selected_reap_workers(&worker_filter)?;
     let idle_minutes = reap::idle_minutes_from_hours(idle_hours);
     let idle_secs = idle_minutes * 60;
     let pooled_idle_minutes = (pooled_idle_hours != 0)
         .then(|| (u64::from(pooled_idle_hours) * 60).max(reap::MIN_POOLED_IDLE_MINUTES));
     let pooled_idle_secs = pooled_idle_minutes.map(|m| m * 60);
+    // Byte-cap eviction runs only in the REAL sweep; the dry-run reports TTL
+    // verdicts and does not simulate cap eviction (it depends on live totals
+    // at sweep time).
+    let max_cache_kb = (max_cache_gb != 0).then(|| u64::from(max_cache_gb) * 1024 * 1024);
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -4083,7 +4088,8 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
                 }),
             }
         } else {
-            let command = reap::worker_sweep_command(&base, idle_minutes, pooled_idle_minutes);
+            let command =
+                reap::worker_sweep_command(&base, idle_minutes, pooled_idle_minutes, max_cache_kb);
             match run_reap_surface_command(worker, &command).await {
                 Ok(result) if result.success() => {
                     match reap::parse_worker_reap_metrics(&result.stdout) {

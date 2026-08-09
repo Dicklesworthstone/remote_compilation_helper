@@ -206,6 +206,7 @@ pub fn worker_sweep_command(
     escaped_base: &str,
     idle_minutes: u64,
     pooled_idle_minutes: Option<u64>,
+    max_cache_kb: Option<u64>,
 ) -> String {
     let loop_body = reap_loop_body(idle_minutes, None, "removed", "freed_kb");
     let guard = "printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; ";
@@ -224,12 +225,54 @@ pub fn worker_sweep_command(
         }
         None => String::new(),
     };
+    // Byte-cap eviction (bead 6dj11): after the TTL passes, when the TOTAL of
+    // every remaining reap-class dir exceeds the budget, evict oldest-idle
+    // first — but NEVER a dir with activity within the short idle window (the
+    // same active-build safety floor as the TTL pass) — until back under.
+    // Oldest-first makes this a warm-LRU by construction: the newest warm
+    // pools survive, the coldest go first. Candidate list is re-discovered
+    // because the TTL passes just removed entries; sizes come from the same
+    // single find+awk stat pass as the enumeration surface; `sort -n` orders
+    // by newest-mtime ascending; the eviction loop reads from a FILE so the
+    // counter mutations survive (no pipe subshell).
+    let cap_pass = match max_cache_kb {
+        Some(cap_kb) => format!(
+            "if [ {cap_kb} -gt 0 ] \
+               && __lst=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) \
+               && __tmpf3=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
+               find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" \\) -prune 2>/dev/null > \"$__tmpf3\"; \
+               case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf3\";; esac; \
+               : > \"$__lst\"; total_kb=0; \
+               while IFS= read -r d; do \
+                 [ -d \"$d\" ] || continue; \
+                 set -- $(find \"$d\" -printf '%T@ %s\\n' 2>/dev/null | awk '{{ t=int($1); if (t>n) n=t; s+=$2 }} END {{ printf \"%d %d\", n, int(s/1024) }}'); \
+                 __n=${{1:-0}}; __k=${{2:-0}}; \
+                 total_kb=$((total_kb + __k)); \
+                 printf '%s %s %s\\n' \"$__n\" \"$__k\" \"$d\" >> \"$__lst\"; \
+               done < \"$__tmpf3\"; \
+               if [ \"$total_kb\" -gt {cap_kb} ]; then \
+                 sort -n \"$__lst\" > \"$__tmpf3\"; \
+                 while IFS=' ' read -r __n __k d; do \
+                   [ \"$total_kb\" -le {cap_kb} ] && break; \
+                   [ -d \"$d\" ] || continue; \
+                   if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then continue; fi; \
+                   if rm -rf -- \"$d\" 2>/dev/null; then \
+                     removed=$((removed + 1)); freed_kb=$((freed_kb + __k)); total_kb=$((total_kb - __k)); \
+                   fi; \
+                 done < \"$__tmpf3\"; \
+               fi; \
+               rm -f \"$__lst\" \"$__tmpf3\"; \
+             fi; "
+        ),
+        None => String::new(),
+    };
     format!(
         "{preamble}\
          removed=0; freed_kb=0; \
          while IFS= read -r d; do {loop_body} done < \"$__tmpf\"; \
          rm -f \"$__tmpf\"; \
          {pooled_pass}\
+         {cap_pass}\
          printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\""
     )
 }
@@ -463,12 +506,12 @@ mod tests {
     #[test]
     fn worker_sweep_pooled_pass_is_optional_and_floored() {
         // Without a pooled window, pool dirs are never touched.
-        let cmd = worker_sweep_command("/data/projects", 720, None);
+        let cmd = worker_sweep_command("/data/projects", 720, None, None);
         assert!(!cmd.contains("-pool-"));
 
         // With one, a second pass targets exactly the pool glob under its own
         // (floored) window, feeding the same counters.
-        let cmd = worker_sweep_command("/data/projects", 720, Some(168 * 60));
+        let cmd = worker_sweep_command("/data/projects", 720, Some(168 * 60), None);
         assert!(cmd.contains("-name \".rch-target-*-pool-*\" -prune"));
         assert!(
             cmd.contains("-mmin -10080"),
@@ -478,13 +521,32 @@ mod tests {
         assert!(!cmd.contains("| while"));
 
         // A dangerously small non-zero window is floored to 24h.
-        let cmd = worker_sweep_command("/data/projects", 720, Some(60));
+        let cmd = worker_sweep_command("/data/projects", 720, Some(60), None);
         assert!(cmd.contains("-mmin -1440"));
     }
 
     #[test]
+    fn worker_sweep_cap_pass_is_optional_and_shaped() {
+        // Without a cap there is no accounting pass at all.
+        let cmd = worker_sweep_command("/data/projects", 720, None, None);
+        assert!(!cmd.contains("total_kb"));
+
+        let cmd = worker_sweep_command("/data/projects", 720, None, Some(100 * 1024 * 1024));
+        // The budget (KiB) reaches the comparison verbatim.
+        assert!(cmd.contains("104857600"));
+        // Oldest-first eviction order via numeric sort on newest-mtime.
+        assert!(cmd.contains("sort -n"));
+        // The active-build safety floor uses the SHORT idle window: once for
+        // the TTL pass, once inside the eviction loop.
+        assert!(cmd.matches("-mmin -720").count() >= 2);
+        // Counter mutations survive: eviction loop reads from a file.
+        assert!(cmd.contains("done < \"$__tmpf3\""));
+        assert!(!cmd.contains("| while"));
+    }
+
+    #[test]
     fn worker_sweep_command_keeps_the_load_bearing_shape() {
-        let cmd = worker_sweep_command("/data/projects", 720, None);
+        let cmd = worker_sweep_command("/data/projects", 720, None, None);
         // Per-job discovery is depth-bounded, pruned, and job/pid-only (pooled
         // dirs are reused and never swept).
         assert!(cmd.contains(

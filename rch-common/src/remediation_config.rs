@@ -110,6 +110,15 @@ pub const DEFAULT_POOLED_REAPER_INTERVAL_MINS: u64 = 120;
 /// 2026-08-09: ~670h-idle pooled dirs accumulating forever, bead 6dj11).
 /// `0` disables pooled reaping entirely.
 pub const DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS: u32 = 168;
+/// Default per-worker byte budget (GiB) across ALL reap-class target dirs
+/// (per-job + pooled + legacy). `0` disables the cap. When the total exceeds
+/// the budget after the TTL passes, the sweep evicts oldest-idle-first among
+/// dirs past the SHORT idle window — never an actively-written dir — until
+/// back under budget (bead 6dj11: the css incident was ~300 GB of target
+/// trees; a TTL alone cannot bound a burst of still-fresh dirs). Ships 0
+/// (off): the cap pass re-stats every candidate tree, and an autonomous
+/// eviction budget is an operator decision.
+pub const DEFAULT_POOLED_REAPER_MAX_CACHE_GB: u32 = 0;
 /// Default remote base under which pooled target dirs live.
 pub const DEFAULT_POOLED_REMOTE_BASE: &str = "/data/projects";
 
@@ -372,6 +381,10 @@ pub struct PooledTargetConfig {
     /// `0` disables pooled reaping. Floored at 24h when non-zero — pooled
     /// dirs are warm caches, never short-TTL targets (bead 6dj11).
     pub reaper_pooled_idle_hours: u32,
+    /// Per-worker byte budget (GiB) across all reap-class target dirs; `0`
+    /// disables. Over budget, the sweep evicts oldest-idle-first among dirs
+    /// past the short idle window until back under (bead 6dj11).
+    pub reaper_max_cache_gb: u32,
 }
 
 impl Default for PooledTargetConfig {
@@ -383,6 +396,7 @@ impl Default for PooledTargetConfig {
             reaper_interval_mins: DEFAULT_POOLED_REAPER_INTERVAL_MINS,
             remote_base: DEFAULT_POOLED_REMOTE_BASE.to_string(),
             reaper_pooled_idle_hours: DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
+            reaper_max_cache_gb: DEFAULT_POOLED_REAPER_MAX_CACHE_GB,
         }
     }
 }

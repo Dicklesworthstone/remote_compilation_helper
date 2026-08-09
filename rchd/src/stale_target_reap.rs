@@ -109,20 +109,33 @@ fn build_sweep_command(
     escaped_base: &str,
     idle_minutes: u64,
     pooled_idle_minutes: Option<u64>,
+    max_cache_kb: Option<u64>,
 ) -> String {
     // Delegates to the shared builder (moved to `rch_common::stale_target_reap`
     // for 6dj11's `rch gc`, which must sweep EXACTLY what this periodic sweep
     // sweeps — one builder so the two can never drift). The legacy
     // `/data/tmp/rch_target_*` pass, the optional long-window pooled pass, the
-    // depth guards, and the metrics-survive-the-loop file-redirect shape all
-    // live there now; the shape tests below still pin the emitted script.
-    stale_target_reap::worker_sweep_command(escaped_base, idle_minutes, pooled_idle_minutes)
+    // optional byte-cap LRU eviction, the depth guards, and the
+    // metrics-survive-the-loop file-redirect shape all live there now; the
+    // shape tests below still pin the emitted script.
+    stale_target_reap::worker_sweep_command(
+        escaped_base,
+        idle_minutes,
+        pooled_idle_minutes,
+        max_cache_kb,
+    )
 }
 
 /// Convert the configured pooled idle window (hours; 0 = disabled) into the
 /// builder's `Option<minutes>`.
 fn pooled_idle_minutes_from_hours(pooled_idle_hours: u32) -> Option<u64> {
     (pooled_idle_hours != 0).then(|| u64::from(pooled_idle_hours) * 60)
+}
+
+/// Convert the configured byte budget (GiB; 0 = disabled) into the builder's
+/// `Option<KiB>`.
+fn max_cache_kb_from_gb(max_cache_gb: u32) -> Option<u64> {
+    (max_cache_gb != 0).then(|| u64::from(max_cache_gb) * 1024 * 1024)
 }
 
 fn parse_reap_metrics(stdout: &str) -> Option<ReapMetrics> {
@@ -320,6 +333,7 @@ impl StaleTargetReaper {
             &self.config.remote_base,
             idle_minutes,
             pooled_idle_minutes_from_hours(self.config.pooled_idle_hours),
+            max_cache_kb_from_gb(self.config.max_cache_gb),
         );
 
         debug!(worker = %worker_id, idle_minutes, "Starting stale-target sweep");
@@ -347,7 +361,7 @@ mod tests {
 
     #[test]
     fn sweep_command_confines_to_base_and_per_job_globs() {
-        let cmd = build_sweep_command("/data/projects", 720, None);
+        let cmd = build_sweep_command("/data/projects", 720, None, None);
         // Depth-robust find at ANY depth under the canonicalized base — NOT a
         // fixed depth-2 `for proj in "$base"/*` glob (which would miss nested
         // workspace-member per-job dirs).
@@ -455,7 +469,7 @@ mod tests {
         fs::create_dir_all(&bystander).unwrap();
         make_idle(&bystander); // even idle, the glob must not match it
 
-        let cmd = build_sweep_command(base.to_str().unwrap(), 720, None);
+        let cmd = build_sweep_command(base.to_str().unwrap(), 720, None, None);
         let out = Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
 
@@ -526,7 +540,7 @@ mod tests {
         );
 
         // With the pooled pass on, only the long-idle pool is reaped.
-        let cmd = build_sweep_command(base.to_str().unwrap(), 720, Some(7 * 24 * 60));
+        let cmd = build_sweep_command(base.to_str().unwrap(), 720, Some(7 * 24 * 60), None);
         let out = Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);

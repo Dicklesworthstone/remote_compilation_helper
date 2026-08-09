@@ -164,10 +164,21 @@ pub struct StaleTargetReapConfig {
     /// 168h (7 days), floored at 24h when non-zero.
     #[serde(default = "default_worker_reap_pooled_idle_hours")]
     pub pooled_idle_hours: u32,
+
+    /// Per-worker byte budget (GiB) across all reap-class target dirs; 0
+    /// disables (the ship default). Over budget after the TTL passes, the
+    /// sweep evicts oldest-idle-first among dirs past the short idle window
+    /// until back under (bead 6dj11).
+    #[serde(default = "default_worker_reap_max_cache_gb")]
+    pub max_cache_gb: u32,
 }
 
 fn default_worker_reap_pooled_idle_hours() -> u32 {
     rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS
+}
+
+fn default_worker_reap_max_cache_gb() -> u32 {
+    rch_common::remediation_config::DEFAULT_POOLED_REAPER_MAX_CACHE_GB
 }
 
 fn default_worker_reap_enabled() -> bool {
@@ -205,6 +216,7 @@ impl Default for StaleTargetReapConfig {
             idle_hours: default_worker_reap_idle_hours(),
             remote_base: default_reaper_remote_base(),
             pooled_idle_hours: default_worker_reap_pooled_idle_hours(),
+            max_cache_gb: default_worker_reap_max_cache_gb(),
         }
     }
 }
@@ -258,6 +270,7 @@ impl StaleTargetReapConfig {
             idle_hours: rem.pooled_target.reaper_idle_hours,
             remote_base: rem.pooled_target.remote_base.clone(),
             pooled_idle_hours: rem.pooled_target.reaper_pooled_idle_hours,
+            max_cache_gb: rem.pooled_target.reaper_max_cache_gb,
         }
     }
 }
