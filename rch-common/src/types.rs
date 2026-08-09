@@ -1269,11 +1269,45 @@ impl FleetConfig {
     }
 }
 
+/// Box-level role (bd-wywsj): what this MACHINE is for, so "never
+/// build locally" is configuration rather than a per-call env var.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BoxRole {
+    /// Orchestrator box: offloadable builds default FAIL-CLOSED +
+    /// queue (RCH_REQUIRE_REMOTE semantics) — a saturated fleet waits
+    /// for a worker instead of repopulating local rustc. Explicit
+    /// per-call env still overrides.
+    Dispatcher,
+    /// The box IS the compute: fail-open/local; `rch shim install`
+    /// refuses here.
+    Worker,
+    /// Today's behavior (fully backward compatible).
+    #[default]
+    Hybrid,
+}
+
+impl BoxRole {
+    /// Stable lowercase token.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BoxRole::Dispatcher => "dispatcher",
+            BoxRole::Worker => "worker",
+            BoxRole::Hybrid => "hybrid",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneralConfig {
     /// Whether RCH is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Box-level role (bd-wywsj): dispatcher boxes default fail-closed
+    /// + queue for offloadable builds; worker boxes are the compute.
+    #[serde(default)]
+    pub role: BoxRole,
     /// Force local execution for this project (never offload), even if the command is classified.
     ///
     /// Intended for sensitive projects or cases where local state must be authoritative.
@@ -1305,6 +1339,7 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            role: BoxRole::default(),
             force_local: false,
             force_remote: false,
             log_level: "info".to_string(),
