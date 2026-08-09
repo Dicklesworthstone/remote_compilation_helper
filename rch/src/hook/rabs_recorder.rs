@@ -93,10 +93,35 @@ fn relevant_env() -> Vec<(RawBytes, RawBytes)> {
     pairs
 }
 
+/// Spool-level metadata accompanying one B001 record (B006): arrival
+/// time (scenario stratification needs overlap detection — storm
+/// labels are validated from interval overlap) and the CI-environment
+/// flag (a boolean, never the env value).
+pub(super) struct SpoolMeta {
+    /// Wall-clock arrival, Unix milliseconds.
+    pub(super) recorded_at_unix_ms: u64,
+    /// Whether a CI environment marker (`CI`/`GITHUB_ACTIONS`) was set.
+    pub(super) ci_env: bool,
+}
+
+impl SpoolMeta {
+    fn now() -> Self {
+        Self {
+            recorded_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0),
+            ci_env: std::env::var_os("CI").is_some()
+                || std::env::var_os("GITHUB_ACTIONS").is_some(),
+        }
+    }
+}
+
 /// Serialize one record as its NDJSON line. The encoding is owned HERE
 /// (rabs-protocol stays serde-free); field names mirror the B001 struct
-/// so the replay tooling reads them stably.
-pub(super) fn record_to_ndjson(record: &InvocationRecord) -> String {
+/// so the replay tooling reads them stably. `meta` carries the
+/// spool-level fields (B006 stratification evidence).
+pub(super) fn record_to_ndjson(record: &InvocationRecord, meta: &SpoolMeta) -> String {
     let (outcome_kind, outcome_value) = match record.outcome {
         NormalizedOutcome::Exited(code) => ("exited", code),
         NormalizedOutcome::Signaled(signal) => ("signaled", signal),
@@ -113,6 +138,8 @@ pub(super) fn record_to_ndjson(record: &InvocationRecord) -> String {
         "outcome_kind": outcome_kind,
         "outcome_value": outcome_value,
         "duration_ms": record.duration_ms,
+        "recorded_at_unix_ms": meta.recorded_at_unix_ms,
+        "ci_env": meta.ci_env,
     })
     .to_string()
 }
@@ -188,7 +215,7 @@ pub(super) fn record_invocation(
         debug!("rabs-recorder: no cache dir, dropping record");
         return;
     };
-    let line = record_to_ndjson(&record);
+    let line = record_to_ndjson(&record, &SpoolMeta::now());
     if let Err(e) = append_line(&path, &line, MAX_SPOOL_BYTES) {
         debug!("rabs-recorder: append failed (fail-open): {e}");
     }
@@ -248,10 +275,18 @@ mod tests {
             NormalizedOutcome::Exited(0),
             2500,
         );
-        let line = record_to_ndjson(&record);
+        let line = record_to_ndjson(
+            &record,
+            &SpoolMeta {
+                recorded_at_unix_ms: 1_700_000_000_000,
+                ci_env: true,
+            },
+        );
         // Validates as one JSON object with the schema fields.
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(parsed["schema"], "rabs.invocation-record");
+        assert_eq!(parsed["recorded_at_unix_ms"], 1_700_000_000_000_u64);
+        assert_eq!(parsed["ci_env"], true);
         assert_eq!(
             parsed["schema_version"],
             u64::from(INVOCATION_RECORD_VERSION)
