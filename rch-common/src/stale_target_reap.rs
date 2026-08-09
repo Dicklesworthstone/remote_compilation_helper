@@ -149,6 +149,160 @@ pub fn reap_loop_body(
     )
 }
 
+/// The shared candidate-discovery preamble for worker-wide sweeps: canonicalize
+/// `$base` (already validated by [`is_safe_reap_base`]), refuse shallow roots,
+/// and write every candidate dir path into `$__tmpf` — the per-job/per-pid
+/// `.rch-target-*` dirs at any depth under `$base`, plus the LEGACY
+/// `rch_target_*` trees directly under the worker's tmp base (bead 6dj11: the
+/// 2026-07-10 css incident class, which nothing else reaps). The tmp base is
+/// `$TMPDIR` when set, else `/data/tmp`, else `/tmp`, and the legacy pass is
+/// gated on it being at least two segments deep so a bare `/tmp` fallback is
+/// deliberately never scanned (mirrors the `$base` depth guard).
+///
+/// `on_guard_exit` is the `sh` fragment run before `exit 0` on every guard
+/// bail-out (e.g. printing an empty metrics line so callers always parse a
+/// result). The `find … > file` + `while read … < file` shape (instead of a
+/// pipe) keeps the caller's loop in the parent shell so counters survive.
+fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str) -> String {
+    format!(
+        "set -u; \
+         base=\"{escaped_base}\"; \
+         if [ ! -d \"$base\" ]; then {on_guard_exit}exit 0; fi; \
+         __rt=$(cd \"$base\" 2>/dev/null && pwd -P) || {{ {on_guard_exit}exit 0; }}; \
+         [ -n \"$__rt\" ] || {{ {on_guard_exit}exit 0; }}; \
+         case \"$__rt\" in */*/*) ;; *) {on_guard_exit}exit 0;; esac; \
+         __tmpbase=\"${{TMPDIR:-}}\"; \
+         [ -n \"$__tmpbase\" ] && [ -d \"$__tmpbase\" ] || __tmpbase=/data/tmp; \
+         [ -d \"$__tmpbase\" ] || __tmpbase=/tmp; \
+         __tmpf=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) || {{ {on_guard_exit}exit 0; }}; \
+         find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null > \"$__tmpf\"; \
+         case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf\";; esac; "
+    )
+}
+
+/// Build the worker-wide sweep script shared by the daemon's periodic reaper
+/// (`rchd::stale_target_reap`) and the on-demand `rch gc` — one builder so the
+/// two can never drift (bead 6dj11). Applies [`reap_loop_body`] to every
+/// candidate from [`candidate_discovery_preamble`] and always prints a final
+/// `RCH_WORKER_REAP_METRICS removed=<n> freed_kb=<kb>` line.
+///
+/// `escaped_base` MUST already be validated with [`is_safe_reap_base`]; it is
+/// embedded inside double quotes.
+#[must_use]
+pub fn worker_sweep_command(escaped_base: &str, idle_minutes: u64) -> String {
+    let loop_body = reap_loop_body(idle_minutes, None, "removed", "freed_kb");
+    let guard = "printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; ";
+    let preamble = candidate_discovery_preamble(escaped_base, guard);
+    format!(
+        "{preamble}\
+         removed=0; freed_kb=0; \
+         while IFS= read -r d; do {loop_body} done < \"$__tmpf\"; \
+         rm -f \"$__tmpf\"; \
+         printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\""
+    )
+}
+
+/// Parse the `RCH_WORKER_REAP_METRICS removed=<n> freed_kb=<kb>` line a
+/// [`worker_sweep_command`] run prints. Returns `(removed, freed_kb)`.
+#[must_use]
+pub fn parse_worker_reap_metrics(stdout: &str) -> Option<(u64, u64)> {
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("RCH_WORKER_REAP_METRICS"))?;
+    let mut removed = None;
+    let mut freed_kb = None;
+    for token in line.split_whitespace().skip(1) {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        match key {
+            "removed" => removed = value.parse::<u64>().ok(),
+            "freed_kb" => freed_kb = value.parse::<u64>().ok(),
+            _ => {}
+        }
+    }
+    Some((removed.unwrap_or(0), freed_kb.unwrap_or(0)))
+}
+
+/// Build the READ-ONLY enumeration script behind `rch cache status` and
+/// `rch gc --dry-run`: identical candidate discovery to
+/// [`worker_sweep_command`] (so what status shows is exactly what gc would
+/// consider), plus the POOLED `.rch-target-*-pool-*` dirs — deliberately NOT
+/// swept (they are reused across jobs) but usually the largest disk consumers,
+/// so observability must include them. Nothing is removed. One line per
+/// candidate:
+///
+/// `RCH_TARGET_ENTRY <newest_mtime_unix> <kb> <path>`
+///
+/// `newest_mtime_unix` is the newest mtime of the dir or any descendant (the
+/// exact signal the idle predicate tests), via GNU `find -printf` — workers
+/// are Linux by contract. `escaped_base` MUST already be validated with
+/// [`is_safe_reap_base`].
+#[must_use]
+pub fn enumerate_targets_command(escaped_base: &str) -> String {
+    let preamble = candidate_discovery_preamble(escaped_base, "");
+    format!(
+        "{preamble}\
+         find \"$__rt\" -maxdepth 8 -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf\"; \
+         while IFS= read -r d; do \
+           [ -d \"$d\" ] || continue; \
+           newest=$(find \"$d\" -printf '%T@\\n' 2>/dev/null | sort -rn | head -1 | cut -d. -f1); \
+           [ -n \"$newest\" ] || newest=0; \
+           kb=$(du -sk \"$d\" 2>/dev/null | awk '{{print $1}}'); \
+           [ -n \"$kb\" ] || kb=0; \
+           printf 'RCH_TARGET_ENTRY %s %s %s\\n' \"$newest\" \"$kb\" \"$d\"; \
+         done < \"$__tmpf\"; \
+         rm -f \"$__tmpf\""
+    )
+}
+
+/// One enumerated remote target dir from [`enumerate_targets_command`] output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTargetEntry {
+    /// Newest mtime (Unix seconds) of the dir or any descendant.
+    pub newest_mtime_unix: u64,
+    /// Disk usage in KiB (`du -sk`).
+    pub kb: u64,
+    /// Absolute path on the worker.
+    pub path: String,
+}
+
+impl RemoteTargetEntry {
+    /// Whether this is a pooled (`-pool-`) dir — reused across jobs, shown for
+    /// observability but never swept by gc.
+    #[must_use]
+    pub fn is_pooled(&self) -> bool {
+        self.path
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.starts_with(".rch-target-") && name.contains("-pool-"))
+    }
+}
+
+/// Parse the `RCH_TARGET_ENTRY` lines an [`enumerate_targets_command`] run
+/// prints. Unparseable lines are skipped (fail-open observability).
+#[must_use]
+pub fn parse_target_entries(stdout: &str) -> Vec<RemoteTargetEntry> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("RCH_TARGET_ENTRY ")?;
+            let mut parts = rest.splitn(3, ' ');
+            let newest_mtime_unix = parts.next()?.parse::<u64>().ok()?;
+            let kb = parts.next()?.parse::<u64>().ok()?;
+            let path = parts.next()?.trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(RemoteTargetEntry {
+                newest_mtime_unix,
+                kb,
+                path: path.to_string(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +424,58 @@ mod tests {
         // A bare `target` (or non-rch dir) is NEVER matched.
         assert!(!REAP_GLOBS.iter().any(|g| glob_matches(g, "target")));
         assert!(!REAP_GLOBS.iter().any(|g| glob_matches(g, ".rch-target")));
+    }
+
+    #[test]
+    fn worker_sweep_command_keeps_the_load_bearing_shape() {
+        let cmd = worker_sweep_command("/data/projects", 720);
+        // Per-job discovery is depth-bounded, pruned, and job/pid-only (pooled
+        // dirs are reused and never swept).
+        assert!(cmd.contains(
+            "find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune"
+        ));
+        assert!(!cmd.contains("sweep-pool"));
+        // 6dj11: the legacy tmp-base pass, depth-guarded so /tmp is never swept.
+        assert!(cmd.contains(
+            "case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune"
+        ));
+        // Metrics survive the loop: no `find | while` pipe subshell.
+        assert!(cmd.contains("done < \"$__tmpf\""));
+        assert!(!cmd.contains("| while"));
+        assert!(cmd.contains("RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s"));
+        // The idle window (already minutes) reaches the predicate verbatim.
+        assert!(cmd.contains("-mmin -720"));
+    }
+
+    #[test]
+    fn enumerate_command_is_read_only_and_includes_pooled_dirs() {
+        let cmd = enumerate_targets_command("/data/projects");
+        assert!(cmd.contains("-name \".rch-target-*-pool-*\" -prune"));
+        assert!(cmd.contains("RCH_TARGET_ENTRY"));
+        assert!(cmd.contains("done < \"$__tmpf\""));
+        // Read-only: the only removal is the tempfile bookkeeping.
+        assert!(!cmd.contains("rm -rf"));
+        assert!(cmd.matches("rm -f").count() == 1 && cmd.contains("rm -f \"$__tmpf\""));
+    }
+
+    #[test]
+    fn parse_worker_reap_metrics_roundtrips() {
+        let out = "noise\nRCH_WORKER_REAP_METRICS removed=3 freed_kb=204800\n";
+        assert_eq!(parse_worker_reap_metrics(out), Some((3, 204_800)));
+        assert!(parse_worker_reap_metrics("no metrics here").is_none());
+    }
+
+    #[test]
+    fn parse_target_entries_parses_and_skips_garbage() {
+        let out = "RCH_TARGET_ENTRY 1754700000 1024 /data/tmp/rch_target_old\n\
+                   garbage line\n\
+                   RCH_TARGET_ENTRY notanum 5 /x\n\
+                   RCH_TARGET_ENTRY 1754700001 2048 /data/projects/repo/.rch-target-css-pool-abc\n";
+        let entries = parse_target_entries(out);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "/data/tmp/rch_target_old");
+        assert_eq!(entries[0].kb, 1024);
+        assert!(!entries[0].is_pooled());
+        assert!(entries[1].is_pooled());
     }
 }

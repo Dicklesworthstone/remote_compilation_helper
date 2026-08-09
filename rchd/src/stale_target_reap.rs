@@ -106,59 +106,20 @@ pub struct ReapCycleStats {
 /// inside double quotes. The `find -name` globs are double-quoted so they survive
 /// the single-quoted `sh -c '…'` dispatch unchanged.
 fn build_sweep_command(escaped_base: &str, idle_minutes: u64) -> String {
-    // No exclude token (the daemon has no "current job" of its own); accumulate
-    // metrics into `removed` / `freed_kb` via the shared per-dir predicate.
-    //
-    // Besides the `.rch-target-*` dirs under `remote_base`, the sweep also
-    // covers the LEGACY `rch_target_*` per-job trees directly under the
-    // worker's tmp base (bead 6dj11: the 2026-07-10 css incident was ~300 GB
-    // of exactly these at /data/tmp — no rch version reaps them, and sbh's
-    // heuristics score them zero). Same idle predicate, same per-dir loop;
-    // the scan is -maxdepth 1 and gated on the tmp base being at least two
-    // path segments deep (e.g. /data/tmp), mirroring the remote_base depth
-    // guard — a bare /tmp fallback is deliberately NOT swept.
-    let loop_body = stale_target_reap::reap_loop_body(idle_minutes, None, "removed", "freed_kb");
-    format!(
-        "set -u; \
-         base=\"{escaped_base}\"; \
-         removed=0; freed_kb=0; \
-         if [ ! -d \"$base\" ]; then \
-           printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; exit 0; \
-         fi; \
-         __rt=$(cd \"$base\" 2>/dev/null && pwd -P) || {{ printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; exit 0; }}; \
-         [ -n \"$__rt\" ] || {{ printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; exit 0; }}; \
-         case \"$__rt\" in */*/*) ;; *) printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; exit 0;; esac; \
-         __tmpbase=\"${{TMPDIR:-}}\"; \
-         [ -n \"$__tmpbase\" ] && [ -d \"$__tmpbase\" ] || __tmpbase=/data/tmp; \
-         [ -d \"$__tmpbase\" ] || __tmpbase=/tmp; \
-         __tmpf=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) || {{ printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; exit 0; }}; \
-         find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null > \"$__tmpf\"; \
-         case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf\";; esac; \
-         while IFS= read -r d; do {loop_body} done < \"$__tmpf\"; \
-         rm -f \"$__tmpf\"; \
-         printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\""
-    )
+    // Delegates to the shared builder (moved to `rch_common::stale_target_reap`
+    // for 6dj11's `rch gc`, which must sweep EXACTLY what this periodic sweep
+    // sweeps — one builder so the two can never drift). The legacy
+    // `/data/tmp/rch_target_*` pass, the depth guards, and the
+    // metrics-survive-the-loop file-redirect shape all live there now; the
+    // shape tests below still pin the emitted script.
+    stale_target_reap::worker_sweep_command(escaped_base, idle_minutes)
 }
 
 fn parse_reap_metrics(stdout: &str) -> Option<ReapMetrics> {
-    let line = stdout
-        .lines()
-        .find(|l| l.contains("RCH_WORKER_REAP_METRICS"))?;
-    let mut removed = None;
-    let mut freed_kb = None;
-    for token in line.split_whitespace().skip(1) {
-        let Some((key, value)) = token.split_once('=') else {
-            continue;
-        };
-        match key {
-            "removed" => removed = value.parse::<u64>().ok(),
-            "freed_kb" => freed_kb = value.parse::<u64>().ok(),
-            _ => {}
-        }
-    }
+    let (removed, freed_kb) = stale_target_reap::parse_worker_reap_metrics(stdout)?;
     Some(ReapMetrics {
-        removed: removed.unwrap_or(0),
-        freed_bytes: freed_kb.unwrap_or(0).saturating_mul(1024),
+        removed,
+        freed_bytes: freed_kb.saturating_mul(1024),
     })
 }
 
