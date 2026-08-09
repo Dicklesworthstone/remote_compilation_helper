@@ -602,6 +602,12 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
+    /// Process env is GLOBAL: every test that touches
+    /// `ENV_WORKERS_CONFIG` / `ENV_TIMEOUT_SECS` /
+    /// `ENV_SKIP_WORKER_CHECK` must hold this lock, or parallel test
+    /// threads clobber each other's config resolution (bead tzk2s).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_config_parses_valid_toml() {
         let config_str = r#"
@@ -682,10 +688,11 @@ identity_file = "~/.ssh/id_ed25519"
 
     #[test]
     fn test_config_from_env_override() {
+        let _env = ENV_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let custom_path = temp_dir.path().join("custom_workers.toml");
 
-        // SAFETY: Test isolation - env var is set and removed in same test
+        // SAFETY: serialized by ENV_LOCK; set and removed in this test.
         unsafe {
             std::env::set_var(ENV_WORKERS_CONFIG, custom_path.to_string_lossy().as_ref());
         }
@@ -805,6 +812,7 @@ host = "test.example.com"
 
     #[test]
     fn test_effective_timeout_from_env() {
+        let _env = ENV_LOCK.lock().unwrap();
         let config_str = r#"
 [settings]
 default_timeout_secs = 300
@@ -856,6 +864,7 @@ total_slots = 16
 
     #[test]
     fn test_should_skip_worker_check() {
+        let _env = ENV_LOCK.lock().unwrap();
         // Default is false
         unsafe {
             std::env::remove_var(ENV_SKIP_WORKER_CHECK);

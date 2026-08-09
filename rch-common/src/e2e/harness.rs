@@ -1283,14 +1283,26 @@ impl TestHarness {
         S: AsRef<OsStr>,
     {
         let mut cmd = Command::new(program);
-        // Use Stdio::null() to prevent pipe buffer blocking. Long-running
-        // daemon processes can fill the 64KB pipe buffer on Linux, blocking
-        // on write and becoming unresponsive to socket requests. Since no
-        // test reads from the daemon's piped stdout/stderr, null is correct.
+        // Capture stdout/stderr to FILES under <test_dir>/logs — not pipes
+        // (a long-running daemon can fill the 64KB pipe buffer and block),
+        // and not Stdio::null() (which discarded the only evidence when a
+        // daemon died during startup: every such failure surfaced as an
+        // undiagnosable 10s socket timeout — bead tzk2s). File-backed
+        // stdio keeps the no-pipe-blocking property AND the diagnostics;
+        // wait_for_socket appends the file tails to its timeout error.
+        let logs_dir = self.test_dir.join("logs");
+        let _ = std::fs::create_dir_all(&logs_dir);
+        let stdio_for = |suffix: &str| -> Stdio {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(logs_dir.join(format!("{name}.{suffix}")))
+                .map_or_else(|_| Stdio::null(), Stdio::from)
+        };
         cmd.args(args)
             .current_dir(&self.test_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(stdio_for("out"))
+            .stderr(stdio_for("err"));
 
         // Set default environment variables
         for (k, v) in &self.config.env_vars {
@@ -1795,9 +1807,33 @@ impl TestHarness {
             delay = (delay * 2).min(max_delay);
         }
 
+        // The timeout is the SYMPTOM; the captured spawned-process
+        // stdio is the evidence (bead tzk2s: Stdio::null made every
+        // startup death an undiagnosable timeout). Dump the tails.
+        let mut evidence = String::new();
+        if let Ok(entries) = std::fs::read_dir(self.test_dir.join("logs")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_stdio = path
+                    .extension()
+                    .is_some_and(|e| e == "out" || e == "err");
+                if !is_stdio {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let tail: Vec<&str> = content.lines().rev().take(20).collect();
+                    if !tail.is_empty() {
+                        evidence.push_str(&format!("\n--- tail of {} ---\n", path.display()));
+                        for line in tail.iter().rev() {
+                            evidence.push_str(line);
+                            evidence.push('\n');
+                        }
+                    }
+                }
+            }
+        }
         self.logger.error(format!(
-            "Socket timeout after {:?}: {socket_display}",
-            max_wait
+            "Socket timeout after {max_wait:?}: {socket_display}{evidence}"
         ));
         Err(HarnessError::Timeout(max_wait))
     }
