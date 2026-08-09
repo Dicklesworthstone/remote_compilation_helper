@@ -31,6 +31,7 @@
 pub mod benchmark_report;
 pub mod minimizer;
 pub mod scenario_labels;
+pub mod stratified_selection;
 
 use std::process::Command;
 use std::time::Instant;
