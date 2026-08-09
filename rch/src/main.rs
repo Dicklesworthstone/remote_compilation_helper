@@ -3838,10 +3838,12 @@ fn selected_reap_workers(worker_filter: &[String]) -> Result<Vec<rch_common::Wor
         .collect())
 }
 
-/// The validated remote sync-root + idle window the reap surfaces operate on,
+/// The validated remote sync-root + idle windows the reap surfaces operate on,
 /// sourced from `[remediation.pooled_target]` — the same knobs the daemon's
-/// periodic sweep uses, so status/gc and the sweep can never disagree.
-fn reap_surface_config() -> Result<(String, u32)> {
+/// periodic sweep uses, so status/gc and the sweep can never disagree. The
+/// third element is the LONG pooled-dir window in hours (0 = pooled dirs are
+/// never reaped).
+fn reap_surface_config() -> Result<(String, u32, u32)> {
     let rch_config = config::load_config().map_err(|e| anyhow::anyhow!("load config: {e}"))?;
     let base = rch_config.remediation.pooled_target.remote_base.clone();
     if !rch_common::stale_target_reap::is_safe_reap_base(&base) {
@@ -3850,7 +3852,11 @@ fn reap_surface_config() -> Result<(String, u32)> {
              validation; refusing to embed it in a remote shell command"
         );
     }
-    Ok((base, rch_config.remediation.pooled_target.reaper_idle_hours))
+    Ok((
+        base,
+        rch_config.remediation.pooled_target.reaper_idle_hours,
+        rch_config.remediation.pooled_target.reaper_pooled_idle_hours,
+    ))
 }
 
 /// Run one remote command on a worker over a throwaway SSH session.
@@ -3883,9 +3889,13 @@ async fn handle_cache_status(worker_filter: Vec<String>, ctx: &OutputContext) ->
     use rch_common::stale_target_reap as reap;
 
     let style = ctx.theme();
-    let (base, idle_hours) = reap_surface_config()?;
+    let (base, idle_hours, pooled_idle_hours) = reap_surface_config()?;
     let workers = selected_reap_workers(&worker_filter)?;
     let idle_secs = u64::from(idle_hours.max(reap::MIN_IDLE_HOURS)) * 3600;
+    // Pooled dirs reap only under the LONG window; 0 = never (floored at 24h
+    // to match the sweep builder's defense).
+    let pooled_idle_secs = (pooled_idle_hours != 0)
+        .then(|| (u64::from(pooled_idle_hours) * 60).max(reap::MIN_POOLED_IDLE_MINUTES) * 60);
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -3903,13 +3913,19 @@ async fn handle_cache_status(worker_filter: Vec<String>, ctx: &OutputContext) ->
                     .map(|e| {
                         let age_secs = now_unix.saturating_sub(e.newest_mtime_unix);
                         let pooled = e.is_pooled();
+                        // Per-job dirs reap at the short window; pooled dirs
+                        // only at the LONG window (never, when disabled).
+                        let reapable = if pooled {
+                            pooled_idle_secs.is_some_and(|w| age_secs >= w)
+                        } else {
+                            age_secs >= idle_secs
+                        };
                         serde_json::json!({
                             "path": e.path,
                             "kb": e.kb,
                             "age_secs": age_secs,
                             "pooled": pooled,
-                            // Pooled dirs are kept by policy; others reap once idle.
-                            "reapable": !pooled && age_secs >= idle_secs,
+                            "reapable": reapable,
                         })
                     })
                     .collect();
@@ -3944,13 +3960,21 @@ async fn handle_cache_status(worker_filter: Vec<String>, ctx: &OutputContext) ->
     let data = serde_json::json!({
         "remote_base": base,
         "idle_hours": idle_hours,
+        "pooled_idle_hours": pooled_idle_hours,
         "workers": worker_reports,
     });
 
     if ctx.is_json() {
         ctx.json(&ApiResponse::ok("cache status", data))?;
     } else {
-        println!("Remote target dirs (idle window: {idle_hours}h, base: {base})\n");
+        println!(
+            "Remote target dirs (idle window: {idle_hours}h, pooled: {}, base: {base})\n",
+            if pooled_idle_hours == 0 {
+                "never".to_string()
+            } else {
+                format!("{pooled_idle_hours}h")
+            }
+        );
         for report in data["workers"].as_array().into_iter().flatten() {
             let id = report["id"].as_str().unwrap_or("?");
             if report["ok"].as_bool() != Some(true) {
@@ -4003,10 +4027,13 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
     use rch_common::stale_target_reap as reap;
 
     let style = ctx.theme();
-    let (base, idle_hours) = reap_surface_config()?;
+    let (base, idle_hours, pooled_idle_hours) = reap_surface_config()?;
     let workers = selected_reap_workers(&worker_filter)?;
     let idle_minutes = reap::idle_minutes_from_hours(idle_hours);
     let idle_secs = idle_minutes * 60;
+    let pooled_idle_minutes = (pooled_idle_hours != 0)
+        .then(|| (u64::from(pooled_idle_hours) * 60).max(reap::MIN_POOLED_IDLE_MINUTES));
+    let pooled_idle_secs = pooled_idle_minutes.map(|m| m * 60);
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -4024,8 +4051,12 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
                         reap::parse_target_entries(&result.stdout)
                             .into_iter()
                             .filter(|e| {
-                                !e.is_pooled()
-                                    && now_unix.saturating_sub(e.newest_mtime_unix) >= idle_secs
+                                let age = now_unix.saturating_sub(e.newest_mtime_unix);
+                                if e.is_pooled() {
+                                    pooled_idle_secs.is_some_and(|w| age >= w)
+                                } else {
+                                    age >= idle_secs
+                                }
                             })
                             .map(|e| serde_json::json!({ "path": e.path, "kb": e.kb }))
                             .collect();
@@ -4049,7 +4080,7 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
                 }),
             }
         } else {
-            let command = reap::worker_sweep_command(&base, idle_minutes);
+            let command = reap::worker_sweep_command(&base, idle_minutes, pooled_idle_minutes);
             match run_reap_surface_command(worker, &command).await {
                 Ok(result) if result.success() => {
                     match reap::parse_worker_reap_metrics(&result.stdout) {
@@ -4086,6 +4117,7 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
         "dry_run": dry_run,
         "remote_base": base,
         "idle_hours": idle_hours,
+        "pooled_idle_hours": pooled_idle_hours,
         "workers": worker_reports,
     });
 

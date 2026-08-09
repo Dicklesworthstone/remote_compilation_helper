@@ -105,14 +105,24 @@ pub struct ReapCycleStats {
 /// [`stale_target_reap::is_safe_reap_base`] in the Rust caller; it is embedded
 /// inside double quotes. The `find -name` globs are double-quoted so they survive
 /// the single-quoted `sh -c '…'` dispatch unchanged.
-fn build_sweep_command(escaped_base: &str, idle_minutes: u64) -> String {
+fn build_sweep_command(
+    escaped_base: &str,
+    idle_minutes: u64,
+    pooled_idle_minutes: Option<u64>,
+) -> String {
     // Delegates to the shared builder (moved to `rch_common::stale_target_reap`
     // for 6dj11's `rch gc`, which must sweep EXACTLY what this periodic sweep
     // sweeps — one builder so the two can never drift). The legacy
-    // `/data/tmp/rch_target_*` pass, the depth guards, and the
-    // metrics-survive-the-loop file-redirect shape all live there now; the
-    // shape tests below still pin the emitted script.
-    stale_target_reap::worker_sweep_command(escaped_base, idle_minutes)
+    // `/data/tmp/rch_target_*` pass, the optional long-window pooled pass, the
+    // depth guards, and the metrics-survive-the-loop file-redirect shape all
+    // live there now; the shape tests below still pin the emitted script.
+    stale_target_reap::worker_sweep_command(escaped_base, idle_minutes, pooled_idle_minutes)
+}
+
+/// Convert the configured pooled idle window (hours; 0 = disabled) into the
+/// builder's `Option<minutes>`.
+fn pooled_idle_minutes_from_hours(pooled_idle_hours: u32) -> Option<u64> {
+    (pooled_idle_hours != 0).then(|| u64::from(pooled_idle_hours) * 60)
 }
 
 fn parse_reap_metrics(stdout: &str) -> Option<ReapMetrics> {
@@ -306,7 +316,11 @@ impl StaleTargetReaper {
         if !stale_target_reap::is_safe_reap_base(&self.config.remote_base) {
             anyhow::bail!("unsafe remote_base {:?}", self.config.remote_base);
         }
-        let cmd = build_sweep_command(&self.config.remote_base, idle_minutes);
+        let cmd = build_sweep_command(
+            &self.config.remote_base,
+            idle_minutes,
+            pooled_idle_minutes_from_hours(self.config.pooled_idle_hours),
+        );
 
         debug!(worker = %worker_id, idle_minutes, "Starting stale-target sweep");
 
@@ -333,7 +347,7 @@ mod tests {
 
     #[test]
     fn sweep_command_confines_to_base_and_per_job_globs() {
-        let cmd = build_sweep_command("/data/projects", 720);
+        let cmd = build_sweep_command("/data/projects", 720, None);
         // Depth-robust find at ANY depth under the canonicalized base — NOT a
         // fixed depth-2 `for proj in "$base"/*` glob (which would miss nested
         // workspace-member per-job dirs).
@@ -441,7 +455,7 @@ mod tests {
         fs::create_dir_all(&bystander).unwrap();
         make_idle(&bystander); // even idle, the glob must not match it
 
-        let cmd = build_sweep_command(base.to_str().unwrap(), 720);
+        let cmd = build_sweep_command(base.to_str().unwrap(), 720, None);
         let out = Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
 
@@ -467,6 +481,52 @@ mod tests {
             m.freed_bytes > 0,
             "freed bytes must be > 0 when dirs were removed: {stdout}"
         );
+    }
+
+    #[test]
+    fn sweep_script_pooled_pass_reaps_long_idle_pools_and_keeps_active_ones() {
+        use std::fs;
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("create tmp root");
+        let base = tmp.path().join("projects");
+        fs::create_dir_all(&base).unwrap();
+
+        let make_aged = |path: &std::path::Path| {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("artifact.o"), b"x").unwrap();
+            let ok = Command::new("find")
+                .arg(path)
+                .args(["-exec", "touch", "-t", "202601010000", "{}", ";"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "aging {path:?} should succeed");
+        };
+
+        // A pooled dir idle far beyond the 7-day pooled window: corpse, reap.
+        let dead_pool = base.join("repoA").join(".rch-target-w-pool-deadbeef");
+        make_aged(&dead_pool);
+        // A freshly-written pooled dir: warm cache, keep.
+        let live_pool = base.join("repoB").join(".rch-target-w-pool-cafef00d");
+        fs::create_dir_all(&live_pool).unwrap();
+        fs::write(live_pool.join("artifact.o"), b"x").unwrap();
+        // An aged pooled dir with the pooled pass DISABLED must survive.
+        let cmd_no_pool = build_sweep_command(base.to_str().unwrap(), 720, None);
+        let out = Command::new("sh").arg("-c").arg(&cmd_no_pool).output().unwrap();
+        assert!(out.status.success());
+        assert!(dead_pool.exists(), "pooled dirs untouched without the pooled pass");
+
+        // With the pooled pass on, only the long-idle pool is reaped.
+        let cmd = build_sweep_command(base.to_str().unwrap(), 720, Some(7 * 24 * 60));
+        let out = Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!dead_pool.exists(), "long-idle pooled dir must be reaped: {stdout}");
+        assert!(live_pool.exists(), "active pooled dir must be kept");
+        let m = parse_reap_metrics(&stdout).expect("metrics line present");
+        assert_eq!(m.removed, 1, "exactly the dead pool is counted: {stdout}");
     }
 
     #[test]

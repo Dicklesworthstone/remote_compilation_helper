@@ -102,6 +102,14 @@ pub const DEFAULT_BUILD_ROOT_MIN_FREE_INODES: u64 = 50_000;
 pub const DEFAULT_POOLED_REAPER_IDLE_HOURS: u32 = 12;
 /// Default sweep cadence for the pooled-target stale reaper (minutes).
 pub const DEFAULT_POOLED_REAPER_INTERVAL_MINS: u64 = 120;
+/// Default LONG idle window before a POOLED (`-pool-`) target dir is reaped
+/// (hours). Pooled dirs are reused across jobs — the warm cache is the point —
+/// so they get a much longer window than per-job dirs: seven days of zero file
+/// activity means the pool key's build dimensions are gone (toolchain bumped,
+/// project retired) and the dir is a corpse, not a cache (observed live
+/// 2026-08-09: ~670h-idle pooled dirs accumulating forever, bead 6dj11).
+/// `0` disables pooled reaping entirely.
+pub const DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS: u32 = 168;
 /// Default remote base under which pooled target dirs live.
 pub const DEFAULT_POOLED_REMOTE_BASE: &str = "/data/projects";
 
@@ -360,6 +368,10 @@ pub struct PooledTargetConfig {
     pub reaper_interval_mins: u64,
     /// Remote base under which pooled target dirs live.
     pub remote_base: String,
+    /// LONG idle window before a POOLED (`-pool-`) dir is reaped (hours);
+    /// `0` disables pooled reaping. Floored at 24h when non-zero — pooled
+    /// dirs are warm caches, never short-TTL targets (bead 6dj11).
+    pub reaper_pooled_idle_hours: u32,
 }
 
 impl Default for PooledTargetConfig {
@@ -370,6 +382,7 @@ impl Default for PooledTargetConfig {
             reaper_idle_hours: DEFAULT_POOLED_REAPER_IDLE_HOURS,
             reaper_interval_mins: DEFAULT_POOLED_REAPER_INTERVAL_MINS,
             remote_base: DEFAULT_POOLED_REMOTE_BASE.to_string(),
+            reaper_pooled_idle_hours: DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         }
     }
 }
@@ -679,6 +692,14 @@ impl RemediationConfig {
             &self.pooled_target.remote_base,
             &mut issues,
         );
+        if self.pooled_target.reaper_pooled_idle_hours != 0
+            && self.pooled_target.reaper_pooled_idle_hours < 24
+        {
+            issues.push(RemediationIssue::error(
+                "remediation.pooled_target.reaper_pooled_idle_hours",
+                "reaper_pooled_idle_hours must be 0 (disabled) or >= 24 — pooled dirs are warm caches, not short-TTL targets",
+            ));
+        }
 
         // Telemetry freshness.
         if self.telemetry_freshness.max_age_secs == 0 {

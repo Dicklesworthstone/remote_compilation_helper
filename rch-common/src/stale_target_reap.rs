@@ -180,24 +180,56 @@ fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str) -> Stri
     )
 }
 
+/// Minimum non-zero pooled idle window in minutes (24h). Pooled dirs are warm
+/// caches; the builder floors any smaller non-zero window to this as a last
+/// defense behind the config-level validation.
+pub const MIN_POOLED_IDLE_MINUTES: u64 = 24 * 60;
+
 /// Build the worker-wide sweep script shared by the daemon's periodic reaper
 /// (`rchd::stale_target_reap`) and the on-demand `rch gc` — one builder so the
 /// two can never drift (bead 6dj11). Applies [`reap_loop_body`] to every
 /// candidate from [`candidate_discovery_preamble`] and always prints a final
 /// `RCH_WORKER_REAP_METRICS removed=<n> freed_kb=<kb>` line.
 ///
+/// `pooled_idle_minutes` adds a SECOND pass over the pooled
+/// `.rch-target-*-pool-*` dirs with its own (much longer) idle window —
+/// `None` skips pooled dirs entirely. Pooled dirs are reused warm caches, so
+/// they only reap after e.g. seven idle days (a pool key nobody has built for
+/// a week is a corpse, not a cache); non-zero windows are floored at
+/// [`MIN_POOLED_IDLE_MINUTES`]. Same counters, same predicate, one metrics
+/// line covering both passes.
+///
 /// `escaped_base` MUST already be validated with [`is_safe_reap_base`]; it is
 /// embedded inside double quotes.
 #[must_use]
-pub fn worker_sweep_command(escaped_base: &str, idle_minutes: u64) -> String {
+pub fn worker_sweep_command(
+    escaped_base: &str,
+    idle_minutes: u64,
+    pooled_idle_minutes: Option<u64>,
+) -> String {
     let loop_body = reap_loop_body(idle_minutes, None, "removed", "freed_kb");
     let guard = "printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; ";
     let preamble = candidate_discovery_preamble(escaped_base, guard);
+    let pooled_pass = match pooled_idle_minutes {
+        Some(window) => {
+            let window = window.max(MIN_POOLED_IDLE_MINUTES);
+            let pooled_body = reap_loop_body(window, None, "removed", "freed_kb");
+            format!(
+                "if __tmpf2=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
+                   find \"$__rt\" -maxdepth 8 -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null > \"$__tmpf2\"; \
+                   while IFS= read -r d; do {pooled_body} done < \"$__tmpf2\"; \
+                   rm -f \"$__tmpf2\"; \
+                 fi; "
+            )
+        }
+        None => String::new(),
+    };
     format!(
         "{preamble}\
          removed=0; freed_kb=0; \
          while IFS= read -r d; do {loop_body} done < \"$__tmpf\"; \
          rm -f \"$__tmpf\"; \
+         {pooled_pass}\
          printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\""
     )
 }
@@ -429,8 +461,27 @@ mod tests {
     }
 
     #[test]
+    fn worker_sweep_pooled_pass_is_optional_and_floored() {
+        // Without a pooled window, pool dirs are never touched.
+        let cmd = worker_sweep_command("/data/projects", 720, None);
+        assert!(!cmd.contains("-pool-"));
+
+        // With one, a second pass targets exactly the pool glob under its own
+        // (floored) window, feeding the same counters.
+        let cmd = worker_sweep_command("/data/projects", 720, Some(168 * 60));
+        assert!(cmd.contains("-name \".rch-target-*-pool-*\" -prune"));
+        assert!(cmd.contains("-mmin -10080"), "pooled window must reach the predicate");
+        assert!(cmd.contains("done < \"$__tmpf2\""));
+        assert!(!cmd.contains("| while"));
+
+        // A dangerously small non-zero window is floored to 24h.
+        let cmd = worker_sweep_command("/data/projects", 720, Some(60));
+        assert!(cmd.contains("-mmin -1440"));
+    }
+
+    #[test]
     fn worker_sweep_command_keeps_the_load_bearing_shape() {
-        let cmd = worker_sweep_command("/data/projects", 720);
+        let cmd = worker_sweep_command("/data/projects", 720, None);
         // Per-job discovery is depth-bounded, pruned, and job/pid-only (pooled
         // dirs are reused and never swept).
         assert!(cmd.contains(

@@ -158,6 +158,16 @@ pub struct StaleTargetReapConfig {
     /// `canonical_root` differs on the workers.
     #[serde(default = "default_reaper_remote_base")]
     pub remote_base: String,
+
+    /// LONG idle window for POOLED (`-pool-`) dirs in hours; 0 disables the
+    /// pooled pass (bead 6dj11). Pooled dirs are reused warm caches — default
+    /// 168h (7 days), floored at 24h when non-zero.
+    #[serde(default = "default_worker_reap_pooled_idle_hours")]
+    pub pooled_idle_hours: u32,
+}
+
+fn default_worker_reap_pooled_idle_hours() -> u32 {
+    rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS
 }
 
 fn default_worker_reap_enabled() -> bool {
@@ -194,6 +204,7 @@ impl Default for StaleTargetReapConfig {
             interval_mins: default_worker_reap_interval_mins(),
             idle_hours: default_worker_reap_idle_hours(),
             remote_base: default_reaper_remote_base(),
+            pooled_idle_hours: default_worker_reap_pooled_idle_hours(),
         }
     }
 }
@@ -246,6 +257,7 @@ impl StaleTargetReapConfig {
             interval_mins: rem.pooled_target.reaper_interval_mins,
             idle_hours: rem.pooled_target.reaper_idle_hours,
             remote_base: rem.pooled_target.remote_base.clone(),
+            pooled_idle_hours: rem.pooled_target.reaper_pooled_idle_hours,
         }
     }
 }
