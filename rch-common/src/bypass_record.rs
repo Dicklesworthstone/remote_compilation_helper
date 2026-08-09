@@ -596,6 +596,153 @@ impl BypassRecordStore {
 }
 
 // ---------------------------------------------------------------------------
+// Durable admin disables (bd-8zxz7)
+// ---------------------------------------------------------------------------
+
+/// A durable record of an admin/system worker disable.
+///
+/// `handle_worker_disable` only flips in-memory lifecycle state, so every
+/// disable — an operator's `rch workers disable`, or the automatic
+/// cpu-capability-fault quarantine — silently evaporated on daemon restart
+/// (observed live 2026-08-09: ovh-b, quarantined for SIGILL-ing AVX2 build
+/// scripts, rejoined the pool after a `launchctl kickstart` and would have
+/// served one false build failure per restart). Unlike a [`BypassRecord`],
+/// an admin disable has NO recovery probing or auto-rejoin: hardware does not
+/// heal on restart, and an operator's explicit disable stands until an
+/// explicit enable removes the record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminDisableRecord {
+    /// Worker id (the store's key).
+    pub worker_id: String,
+    /// Disable reason as given by the operator or fault path, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Unix epoch milliseconds when the disable was recorded.
+    pub disabled_unix_ms: u64,
+}
+
+/// On-disk document for [`AdminDisableStore`].
+#[derive(Debug, Serialize, Deserialize)]
+struct AdminDisableFile {
+    schema_version: u32,
+    records: Vec<AdminDisableRecord>,
+}
+
+const ADMIN_DISABLE_SCHEMA_VERSION: u32 = 1;
+
+/// Resolve the default store path: `${RCH_STATE_HOME}/admin_disables.json`,
+/// beside [`default_bypass_record_path`]'s `bypass_records.json`.
+#[must_use]
+pub fn default_admin_disable_path() -> PathBuf {
+    default_bypass_record_path().with_file_name("admin_disables.json")
+}
+
+/// A single-document, atomically-persisted store of current
+/// [`AdminDisableRecord`]s keyed by worker id. Same corruption tolerance as
+/// [`BypassRecordStore`]: a missing or unreadable file yields an empty store
+/// and never blocks daemon startup (the failure mode is "worker rejoins until
+/// re-disabled", the pre-existing behavior).
+#[derive(Debug)]
+pub struct AdminDisableStore {
+    path: PathBuf,
+    records: BTreeMap<String, AdminDisableRecord>,
+}
+
+impl AdminDisableStore {
+    /// An empty store bound to `path` (nothing read from disk).
+    #[must_use]
+    pub fn with_path(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            records: BTreeMap::new(),
+        }
+    }
+
+    /// Load the store from `path`; missing/corrupt files yield an empty store.
+    #[must_use]
+    pub fn load(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let mut records = BTreeMap::new();
+        if let Ok(bytes) = fs::read(&path)
+            && let Ok(file) = serde_json::from_slice::<AdminDisableFile>(&bytes)
+        {
+            for record in file.records {
+                records.insert(record.worker_id.clone(), record);
+            }
+        }
+        Self { path, records }
+    }
+
+    /// The store file path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The current record for a worker, if disabled.
+    #[must_use]
+    pub fn get(&self, worker_id: &str) -> Option<&AdminDisableRecord> {
+        self.records.get(worker_id)
+    }
+
+    /// All current records, ordered by worker id.
+    #[must_use]
+    pub fn all(&self) -> Vec<&AdminDisableRecord> {
+        self.records.values().collect()
+    }
+
+    /// Record a worker disable and persist the store.
+    pub fn upsert(&mut self, record: AdminDisableRecord) -> std::io::Result<()> {
+        self.records.insert(record.worker_id.clone(), record);
+        self.persist()
+    }
+
+    /// Remove a worker's record (operator enable) and persist. Returns the
+    /// removed record, if any.
+    pub fn remove(&mut self, worker_id: &str) -> std::io::Result<Option<AdminDisableRecord>> {
+        let removed = self.records.remove(worker_id);
+        if removed.is_some() {
+            self.persist()?;
+        }
+        Ok(removed)
+    }
+
+    /// Atomically write the current records to disk (temp-file + rename).
+    fn persist(&self) -> std::io::Result<()> {
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let doc = AdminDisableFile {
+            schema_version: ADMIN_DISABLE_SCHEMA_VERSION,
+            records: self.records.values().cloned().collect(),
+        };
+        let body = serde_json::to_vec_pretty(&doc)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let tmp = parent.join(format!(".admin_disables.{}.tmp", std::process::id()));
+        {
+            let mut tmp_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            tmp_file.write_all(&body)?;
+            tmp_file.flush()?;
+        }
+        match fs::rename(&tmp, &self.path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Migration: admin-disabled (for transient illness) -> temporary bypass
 // ---------------------------------------------------------------------------
 
@@ -1074,5 +1221,61 @@ mod tests {
             migrate_disabled_worker(&deliberate, TS),
             DisabledMigration::KeepDisabled { .. }
         ));
+    }
+
+    #[test]
+    fn admin_disable_store_roundtrips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin_disables.json");
+        let mut store = AdminDisableStore::with_path(&path);
+        store
+            .upsert(AdminDisableRecord {
+                worker_id: "ovh-b".to_string(),
+                reason: Some("cpu-capability-fault (SIGILL)".to_string()),
+                disabled_unix_ms: 1_700_000_000_000,
+            })
+            .unwrap();
+
+        let reloaded = AdminDisableStore::load(&path);
+        let record = reloaded.get("ovh-b").expect("record survives reload");
+        assert_eq!(record.reason.as_deref(), Some("cpu-capability-fault (SIGILL)"));
+        assert_eq!(record.disabled_unix_ms, 1_700_000_000_000);
+        assert_eq!(reloaded.all().len(), 1);
+    }
+
+    #[test]
+    fn admin_disable_store_remove_persists_and_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin_disables.json");
+        let mut store = AdminDisableStore::with_path(&path);
+        store
+            .upsert(AdminDisableRecord {
+                worker_id: "w1".to_string(),
+                reason: None,
+                disabled_unix_ms: 1,
+            })
+            .unwrap();
+        assert!(store.remove("w1").unwrap().is_some());
+        assert!(store.remove("w1").unwrap().is_none());
+        assert!(AdminDisableStore::load(&path).get("w1").is_none());
+    }
+
+    #[test]
+    fn admin_disable_store_tolerates_missing_and_corrupt_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = AdminDisableStore::load(dir.path().join("nope.json"));
+        assert!(missing.all().is_empty());
+
+        let corrupt_path = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt_path, b"{ not json").unwrap();
+        let corrupt = AdminDisableStore::load(&corrupt_path);
+        assert!(corrupt.all().is_empty());
+    }
+
+    #[test]
+    fn admin_disable_default_path_is_beside_bypass_records() {
+        let path = default_admin_disable_path();
+        assert!(path.ends_with("admin_disables.json"));
+        assert_eq!(path.parent(), default_bypass_record_path().parent());
     }
 }
