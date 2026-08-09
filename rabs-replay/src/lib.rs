@@ -29,6 +29,7 @@
 //!   downstream gates consume.
 
 pub mod benchmark_report;
+pub mod intent_to_green;
 pub mod minimizer;
 pub mod scenario_labels;
 pub mod stratified_selection;
