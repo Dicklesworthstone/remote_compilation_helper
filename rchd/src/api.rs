@@ -3729,6 +3729,7 @@ mod tests {
             pid: 1234,
             queue_timeout_secs: 300,
             bypass_store: None,
+            admin_disable_store: None,
             admission_barrier: Arc::new(tokio::sync::RwLock::new(false)),
         }
     }
