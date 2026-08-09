@@ -385,7 +385,28 @@ total_slots = 4
         "Daemon should be healthy before shutdown",
     )?;
 
-    // Send shutdown request
+    // The graceful-shutdown CONTRACT: /shutdown refuses while
+    // admission is open (shutdown_blocked), and proceeds only after
+    // the admission barrier is raised and no builds are active. Pin
+    // both halves.
+    let premature = send_request(&socket_path, "POST /shutdown")
+        .map_err(rch_common::e2e::harness::HarnessError::Io)?;
+    harness
+        .logger
+        .info(format!("Premature shutdown response: {}", premature));
+    harness.assert(
+        premature.contains("shutdown_blocked"),
+        "Shutdown with open admission must be refused as shutdown_blocked",
+    )?;
+
+    // Raise the admission barrier (the restart/shutdown precondition).
+    let admission = send_request(&socket_path, "POST /restart-admission")
+        .map_err(rch_common::e2e::harness::HarnessError::Io)?;
+    harness
+        .logger
+        .info(format!("Admission-close response: {}", admission));
+
+    // Send shutdown request (now permitted: admission closed, idle).
     let shutdown_response = send_request(&socket_path, "POST /shutdown")
         .map_err(rch_common::e2e::harness::HarnessError::Io)?;
 
