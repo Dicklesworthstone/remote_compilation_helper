@@ -929,7 +929,9 @@ pub fn x86_64_microarch_level_from_flags(flags: &str) -> u8 {
     // x86-64-v2: CMPXCHG16B, LAHF/SAHF, POPCNT, SSE3/SSSE3/SSE4.x.
     const V2: &[&str] = &["cx16", "lahf_lm", "popcnt", "sse4_1", "sse4_2", "ssse3"];
     // x86-64-v3: AVX/AVX2, BMI1/2, F16C, FMA, MOVBE, XSAVE (LZCNT is `abm`).
-    const V3: &[&str] = &["abm", "avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "movbe", "xsave"];
+    const V3: &[&str] = &[
+        "abm", "avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "movbe", "xsave",
+    ];
     // x86-64-v4: the AVX-512 F/BW/CD/DQ/VL baseline.
     const V4: &[&str] = &["avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl"];
     if !has_all(V2) {
