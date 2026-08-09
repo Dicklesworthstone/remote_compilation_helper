@@ -40,6 +40,11 @@ const TEST_CACHE_BOOST: f64 = 1.5;
 const TEST_BUILD_FALLBACK_FACTOR: f64 = 0.4;
 const TOOLCHAIN_PREFLIGHT_TTL: Duration = Duration::from_secs(600);
 const TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Balanced-score multiplier penalty for known pre-x86-64-v3 workers
+/// (bd-6qchz): strong enough that any v3-capable worker wins when one is
+/// available, soft enough that a pre-v3 worker still serves when it is the
+/// only candidate (the reactive SIGILL quarantine handles actual faults).
+const PRE_V3_MICROARCH_PENALTY: f64 = 0.5;
 const TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Weights for the selection scoring algorithm (legacy compatibility).
@@ -2571,6 +2576,17 @@ impl WorkerSelector {
             0.0
         };
 
+        // Proactive pre-v3 microarch deprioritization (bd-6qchz): a worker
+        // whose CPU lacks AVX2 (x86-64-v1/v2, e.g. Ivy Bridge) SIGILLs any
+        // build-script/proc-macro compiled for v3, so prefer other workers
+        // when they exist. Soft penalty only — builds do not declare ISA needs
+        // ahead of time, and the reactive SIGILL quarantine (bd-68hon) remains
+        // the primary mechanism. Unknown/non-x86 microarch is never penalized.
+        let capabilities = worker.capabilities().await;
+        if capabilities.is_pre_v3_x86() {
+            final_score *= 1.0 - PRE_V3_MICROARCH_PENALTY;
+        }
+
         debug!(
             "Worker {} balanced score: {:.3} (speed={:.2}, load={:.2}, slots={:.2}, health={:.2}, cache={:.2}, network={:.2}, priority={:.2}, half_open={:?}, admission_penalty={:.2}, reliability_penalty={:.2}, cache_use={:?})",
             config.id,
@@ -4925,6 +4941,67 @@ mod tests {
             "Expected AllWorkersBusy, got {:?}",
             result.reason
         );
+    }
+
+    #[tokio::test]
+    async fn test_pre_v3_microarch_worker_deprioritized_but_still_selectable() {
+        // bd-6qchz: with an otherwise-equal v3-capable worker available, the
+        // pre-v3 (no AVX2) worker must lose; alone, it must still be selected.
+        let pool = WorkerPool::new();
+
+        let pre_v3 = make_worker("ivy-bridge", 8, 80.0);
+        pre_v3
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.75.0".to_string()),
+                cpu_microarch_level: Some(2),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(pre_v3).await;
+
+        let v3 = make_worker("modern", 8, 80.0);
+        v3.set_capabilities(rch_common::WorkerCapabilities {
+            rustc_version: Some("1.75.0".to_string()),
+            cpu_microarch_level: Some(3),
+            ..Default::default()
+        })
+        .await;
+        pool.add_worker_state(v3).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "test".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result.worker.expect("a worker is selected");
+        assert_eq!(
+            selected.config.read().await.id.as_str(),
+            "modern",
+            "v3-capable worker must beat the equal pre-v3 worker"
+        );
+
+        // Alone, the pre-v3 worker still serves (soft penalty, not exclusion).
+        let solo_pool = WorkerPool::new();
+        let solo = make_worker("ivy-bridge", 8, 80.0);
+        solo.set_capabilities(rch_common::WorkerCapabilities {
+            rustc_version: Some("1.75.0".to_string()),
+            cpu_microarch_level: Some(2),
+            ..Default::default()
+        })
+        .await;
+        solo_pool.add_worker_state(solo).await;
+        let result = selector.select(&solo_pool, &request).await;
+        let selected = result.worker.expect("solo pre-v3 worker still selected");
+        assert_eq!(selected.config.read().await.id.as_str(), "ivy-bridge");
     }
 
     #[tokio::test]

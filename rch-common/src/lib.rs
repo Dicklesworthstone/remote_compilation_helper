@@ -247,6 +247,7 @@ pub use types::{
     SelfTestFailureAction, SelfTestWorkers, TransferConfig, WorkerCapabilities, WorkerConfig,
     WorkerId, WorkerSelectionDiagnostic, WorkerSelectionDiagnosticDecision, WorkerStatus,
     declared_os, default_socket_path, os_tag, validate_remote_base,
+    x86_64_microarch_level_from_flags,
 };
 
 // Testing module re-exports
