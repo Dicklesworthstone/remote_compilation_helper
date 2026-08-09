@@ -59,7 +59,9 @@ use bypass_recovery_service::{BypassRecoveryConfig, BypassRecoveryService, SshRe
 use disk_pressure::{DiskPressureMonitor, DiskPressurePolicyConfig};
 use events::EventBus;
 use history::BuildHistory;
-use rch_common::bypass_record::{BypassRecordStore, default_bypass_record_path};
+use rch_common::bypass_record::{
+    AdminDisableStore, BypassRecordStore, default_admin_disable_path, default_bypass_record_path,
+};
 use rch_telemetry::storage::TelemetryStorage;
 use selection::WorkerSelector;
 use self_test::{DEFAULT_RESULT_CAPACITY, DEFAULT_RUN_CAPACITY, SelfTestHistory, SelfTestService};
@@ -156,6 +158,11 @@ pub struct DaemonContext {
     /// worker from the persisted record on the next daemon restart. `None` in
     /// test contexts that don't exercise bypass recovery.
     pub bypass_store: Option<Arc<tokio::sync::Mutex<BypassRecordStore>>>,
+    /// Durable admin-disable store (bd-8zxz7). `handle_worker_disable` writes a
+    /// record and `handle_worker_enable` removes it, so both operator disables
+    /// and the cpu-capability-fault quarantine survive daemon restarts (startup
+    /// re-applies surviving records to the pool). `None` in test contexts.
+    pub admin_disable_store: Option<Arc<tokio::sync::Mutex<AdminDisableStore>>>,
     /// Stops new worker selection while a restart remediator proves quiescence.
     /// This is shared with the socket API so check-and-close admission occurs
     /// in the daemon rather than in a racy CLI preflight.
@@ -755,6 +762,29 @@ async fn main() -> Result<()> {
         default_bypass_record_path(),
     )));
 
+    // Durable admin disables (bd-8zxz7): re-apply persisted disables to the
+    // freshly-loaded pool BEFORE serving, so an operator disable or a
+    // cpu-capability-fault quarantine survives daemon restarts. A record for a
+    // worker no longer in workers.toml is inert (kept until an enable removes
+    // it, harmless meanwhile).
+    let admin_disable_store = Arc::new(Mutex::new(AdminDisableStore::load(
+        default_admin_disable_path(),
+    )));
+    {
+        let store = admin_disable_store.lock().await;
+        for record in store.all() {
+            let worker_id = rch_common::WorkerId::new(&record.worker_id);
+            if let Some(worker) = worker_pool.get(&worker_id).await {
+                worker.disable(record.reason.clone()).await;
+                info!(
+                    "Re-applied durable admin disable for worker {} (reason: {})",
+                    record.worker_id,
+                    record.reason.as_deref().unwrap_or("none recorded"),
+                );
+            }
+        }
+    }
+
     let context = DaemonContext {
         pool: worker_pool.clone(),
         worker_selector: worker_selector.clone(),
@@ -773,6 +803,7 @@ async fn main() -> Result<()> {
         pid: std::process::id(),
         queue_timeout_secs: daemon_config.queue.timeout_secs,
         bypass_store: Some(bypass_store.clone()),
+        admin_disable_store: Some(admin_disable_store.clone()),
         admission_barrier: Arc::new(RwLock::new(false)),
     };
 
@@ -1393,6 +1424,7 @@ mod tests {
             pid: std::process::id(),
             queue_timeout_secs: 300,
             bypass_store: None,
+            admin_disable_store: None,
             admission_barrier: Arc::new(RwLock::new(false)),
         };
 
@@ -1445,6 +1477,7 @@ mod tests {
             pid: std::process::id(),
             queue_timeout_secs: 300,
             bypass_store: None,
+            admin_disable_store: None,
             admission_barrier: Arc::new(RwLock::new(false)),
         };
 
@@ -1499,6 +1532,7 @@ mod tests {
             pid: 12345,
             queue_timeout_secs: 300,
             bypass_store: None,
+            admin_disable_store: None,
             admission_barrier: Arc::new(RwLock::new(false)),
         };
 
@@ -1536,6 +1570,7 @@ mod tests {
             pid: 1234,
             queue_timeout_secs: 300,
             bypass_store: None,
+            admin_disable_store: None,
             admission_barrier: Arc::new(RwLock::new(false)),
         };
 
@@ -1592,6 +1627,7 @@ mod tests {
             pid: 1234,
             queue_timeout_secs: 300,
             bypass_store: None,
+            admin_disable_store: None,
             admission_barrier: Arc::new(RwLock::new(false)),
         };
 
@@ -1646,6 +1682,7 @@ mod tests {
             pid: 1234,
             queue_timeout_secs: 300,
             bypass_store: None,
+            admin_disable_store: None,
             admission_barrier: Arc::new(RwLock::new(false)),
         };
 

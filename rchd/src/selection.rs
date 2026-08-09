@@ -40,6 +40,11 @@ const TEST_CACHE_BOOST: f64 = 1.5;
 const TEST_BUILD_FALLBACK_FACTOR: f64 = 0.4;
 const TOOLCHAIN_PREFLIGHT_TTL: Duration = Duration::from_secs(600);
 const TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Balanced-score multiplier penalty for known pre-x86-64-v3 workers
+/// (bd-6qchz): strong enough that any v3-capable worker wins when one is
+/// available, soft enough that a pre-v3 worker still serves when it is the
+/// only candidate (the reactive SIGILL quarantine handles actual faults).
+const PRE_V3_MICROARCH_PENALTY: f64 = 0.5;
 const TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Weights for the selection scoring algorithm (legacy compatibility).
@@ -2208,20 +2213,27 @@ impl WorkerSelector {
         if has_preferred && !preferred_without_health.is_empty() {
             return Ok(preferred_without_health);
         }
-        if has_preferred {
-            return Err(SelectionReason::NoMatchingWorkers);
-        }
-        if !eligible.is_empty() {
-            return Ok(eligible);
-        }
-
         if has_preferred && filtered_by_slots > 0 {
             // Returning an empty eligible set maps to AllWorkersBusy in
             // select_with_exclusions. That keeps RCH_QUEUE_WHEN_BUSY polling
             // the same requested allow-set instead of selecting an unrelated
             // worker. If several workers were requested, one busy requested
             // worker is enough to make waiting useful.
+            //
+            // bd-uw4d8: this branch MUST come before the unconditional
+            // NoMatchingWorkers return below — the bd-iupei allow-set
+            // enforcement landed above it and made it unreachable, so a pinned
+            // busy worker refused no_free_slots and fell local even with
+            // RCH_QUEUE_WHEN_BUSY=1 explicitly set (observed live 2026-08-09:
+            // vmi1227854 saturated 8/8, second pinned build told to set the
+            // env it already had).
             return Ok(Vec::new());
+        }
+        if has_preferred {
+            return Err(SelectionReason::NoMatchingWorkers);
+        }
+        if !eligible.is_empty() {
+            return Ok(eligible);
         }
 
         if (filtered_by_active_project > 0 || (filtered_by_capacity > 0 && filtered_by_slots == 0))
@@ -2563,6 +2575,17 @@ impl WorkerSelector {
         } else {
             0.0
         };
+
+        // Proactive pre-v3 microarch deprioritization (bd-6qchz): a worker
+        // whose CPU lacks AVX2 (x86-64-v1/v2, e.g. Ivy Bridge) SIGILLs any
+        // build-script/proc-macro compiled for v3, so prefer other workers
+        // when they exist. Soft penalty only — builds do not declare ISA needs
+        // ahead of time, and the reactive SIGILL quarantine (bd-68hon) remains
+        // the primary mechanism. Unknown/non-x86 microarch is never penalized.
+        let capabilities = worker.capabilities().await;
+        if capabilities.is_pre_v3_x86() {
+            final_score *= 1.0 - PRE_V3_MICROARCH_PENALTY;
+        }
 
         debug!(
             "Worker {} balanced score: {:.3} (speed={:.2}, load={:.2}, slots={:.2}, health={:.2}, cache={:.2}, network={:.2}, priority={:.2}, half_open={:?}, admission_penalty={:.2}, reliability_penalty={:.2}, cache_use={:?})",
@@ -4918,6 +4941,131 @@ mod tests {
             "Expected AllWorkersBusy, got {:?}",
             result.reason
         );
+    }
+
+    #[tokio::test]
+    async fn test_pre_v3_microarch_worker_deprioritized_but_still_selectable() {
+        // bd-6qchz: with an otherwise-equal v3-capable worker available, the
+        // pre-v3 (no AVX2) worker must lose; alone, it must still be selected.
+        let pool = WorkerPool::new();
+
+        let pre_v3 = make_worker("ivy-bridge", 8, 80.0);
+        pre_v3
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.75.0".to_string()),
+                cpu_microarch_level: Some(2),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(pre_v3).await;
+
+        let v3 = make_worker("modern", 8, 80.0);
+        v3.set_capabilities(rch_common::WorkerCapabilities {
+            rustc_version: Some("1.75.0".to_string()),
+            cpu_microarch_level: Some(3),
+            ..Default::default()
+        })
+        .await;
+        pool.add_worker_state(v3).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "test".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result.worker.expect("a worker is selected");
+        assert_eq!(
+            selected.config.read().await.id.as_str(),
+            "modern",
+            "v3-capable worker must beat the equal pre-v3 worker"
+        );
+
+        // Alone, the pre-v3 worker still serves (soft penalty, not exclusion).
+        let solo_pool = WorkerPool::new();
+        let solo = make_worker("ivy-bridge", 8, 80.0);
+        solo.set_capabilities(rch_common::WorkerCapabilities {
+            rustc_version: Some("1.75.0".to_string()),
+            cpu_microarch_level: Some(2),
+            ..Default::default()
+        })
+        .await;
+        solo_pool.add_worker_state(solo).await;
+        let result = selector.select(&solo_pool, &request).await;
+        let selected = result.worker.expect("solo pre-v3 worker still selected");
+        assert_eq!(selected.config.read().await.id.as_str(), "ivy-bridge");
+    }
+
+    #[tokio::test]
+    async fn test_pinned_busy_worker_maps_to_all_workers_busy_for_queueing() {
+        // bd-uw4d8: a REQUESTED worker that exists, is healthy, and merely has
+        // no free slots must surface AllWorkersBusy — the reason the daemon's
+        // RCH_QUEUE_WHEN_BUSY wait path keys on — not NoMatchingWorkers (which
+        // refuses and falls local). The queue branch existed but sat below the
+        // unconditional allow-set NoMatchingWorkers return, i.e. dead code.
+        let pool = WorkerPool::new();
+
+        let busy = make_worker("pinned-busy", 4, 80.0);
+        busy.set_capabilities(rch_common::WorkerCapabilities {
+            rustc_version: Some("1.75.0".to_string()),
+            ..Default::default()
+        })
+        .await;
+        assert!(busy.reserve_slots(4).await);
+        pool.add_worker_state(busy).await;
+
+        // A second, FREE worker outside the allow-set proves the pin is
+        // honored: waiting on the requested worker, not selecting another.
+        let free = make_worker("free-other", 8, 90.0);
+        free.set_capabilities(rch_common::WorkerCapabilities {
+            rustc_version: Some("1.75.0".to_string()),
+            ..Default::default()
+        })
+        .await;
+        pool.add_worker_state(free).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "test".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![rch_common::WorkerId::new("pinned-busy")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(
+            result.worker.is_none(),
+            "pin must not select another worker"
+        );
+        assert_eq!(
+            result.reason,
+            SelectionReason::AllWorkersBusy,
+            "pinned-busy must be queueable (AllWorkersBusy), got {:?}",
+            result.reason
+        );
+
+        // Once the pinned worker frees up, the same request selects it.
+        let worker = pool
+            .get(&rch_common::WorkerId::new("pinned-busy"))
+            .await
+            .unwrap();
+        worker.release_slots(4).await;
+        let result = selector.select(&pool, &request).await;
+        let selected = result.worker.expect("freed pinned worker is selected");
+        assert_eq!(selected.config.read().await.id.as_str(), "pinned-busy");
     }
 
     #[tokio::test]

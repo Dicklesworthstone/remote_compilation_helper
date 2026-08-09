@@ -1507,6 +1507,18 @@ pub async fn handle_worker_enable(
             if let Some(store) = &ctx.bypass_store {
                 let _ = store.lock().await.remove(worker_id.as_str());
             }
+            // Same durability rule for the admin-disable record (bd-8zxz7):
+            // an enable that leaves the record behind would be undone by the
+            // next daemon restart's re-apply pass.
+            if let Some(store) = &ctx.admin_disable_store
+                && let Err(e) = store.lock().await.remove(worker_id.as_str())
+            {
+                tracing::warn!(
+                    "Failed to remove durable admin-disable record for {}: {}",
+                    worker_id,
+                    e
+                );
+            }
             WorkerStateResponse {
                 status: "ok".to_string(),
                 worker_id: worker_id.to_string(),
@@ -1539,6 +1551,28 @@ pub async fn handle_worker_disable(
     match ctx.pool.get(worker_id).await {
         Some(worker) => {
             let active_slots = worker.used_slots();
+
+            // Durable admin disable (bd-8zxz7): persist the intent BEFORE the
+            // in-memory flip, for both the drain and immediate branches — a
+            // disable that only lives in memory evaporates on daemon restart
+            // (observed live: the ovh-b cpu-capability quarantine rejoined the
+            // pool after a kickstart). Persist failure is logged but does not
+            // block the in-memory disable (fail-open, matches bypass_store).
+            if let Some(store) = &ctx.admin_disable_store {
+                let record = rch_common::bypass_record::AdminDisableRecord {
+                    worker_id: worker_id.to_string(),
+                    reason: reason.clone(),
+                    disabled_unix_ms: u64::try_from(chrono::Utc::now().timestamp_millis())
+                        .unwrap_or(0),
+                };
+                if let Err(e) = store.lock().await.upsert(record) {
+                    tracing::warn!(
+                        "Failed to persist durable admin-disable record for {}: {}",
+                        worker_id,
+                        e
+                    );
+                }
+            }
 
             if drain_first && active_slots > 0 {
                 worker.drain_then_disable(reason.clone()).await;

@@ -2625,6 +2625,7 @@ fn nonterminal_client_lease_ids() -> Result<Vec<String>> {
         Err(error) => return Err(anyhow!("cannot inspect {}: {error}", lease_dir.display())),
     };
 
+    let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
     let mut blocked = Vec::new();
     for entry in entries {
         let entry =
@@ -2640,12 +2641,52 @@ fn nonterminal_client_lease_ids() -> Result<Vec<String>> {
             .map_err(|error| anyhow!("cannot read {}: {error}", entry.path().display()))?;
         let lease: DurableJobLease = serde_json::from_slice(&bytes)
             .map_err(|error| anyhow!("cannot parse {}: {error}", entry.path().display()))?;
-        if !lease.state.is_terminal() || !lease.terminal_acknowledged {
+        if lease_blocks_restart(&lease, now_unix_ms, || is_process_alive(lease.wrapper_pid)) {
             blocked.push(lease.identity.local_wrapper_id);
         }
     }
     blocked.sort();
     Ok(blocked)
+}
+
+/// Heartbeat age past which a lease whose wrapper PID is provably dead is
+/// treated as abandoned for restart-admission purposes. Wrappers heartbeat
+/// every few seconds while alive, so fifteen minutes of silence combined with
+/// a dead PID is affirmative evidence the client is gone — not a pause.
+const DEAD_WRAPPER_HEARTBEAT_STALE_MS: u64 = 15 * 60 * 1000;
+
+/// Whether one durable client lease blocks the restart-admission barrier.
+///
+/// A lease only stops blocking on affirmative evidence: either the wrapper
+/// acknowledged a terminal state, or the wrapper is provably dead (its PID no
+/// longer exists AND its heartbeat is stale past
+/// [`DEAD_WRAPPER_HEARTBEAT_STALE_MS`]). Everything else — fresh heartbeat, a
+/// PID that still exists (possibly recycled — conservative direction), a
+/// zero/unknown PID — stays blocking. Without the dead-wrapper arm, leases
+/// orphaned by killed wrappers accumulate forever and permanently wedge
+/// `rch daemon restart` (observed live 2026-08-09: ~450 dead `running` leases,
+/// heartbeats days old, no restart possible).
+///
+/// `wrapper_alive` is a thunk so the (subprocess-spawning) liveness probe only
+/// runs for leases that already passed the cheap heartbeat-staleness filter.
+fn lease_blocks_restart(
+    lease: &DurableJobLease,
+    now_unix_ms: u64,
+    wrapper_alive: impl FnOnce() -> bool,
+) -> bool {
+    if lease.state.is_terminal() && lease.terminal_acknowledged {
+        return false;
+    }
+    let heartbeat_stale =
+        now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+    if !heartbeat_stale {
+        return true;
+    }
+    if lease.wrapper_pid == 0 {
+        // No PID to check — death cannot be proven, so fail closed.
+        return true;
+    }
+    wrapper_alive()
 }
 
 /// Handle a release-worker request.
@@ -3688,6 +3729,7 @@ mod tests {
             pid: 1234,
             queue_timeout_secs: 300,
             bypass_store: None,
+            admin_disable_store: None,
             admission_barrier: Arc::new(tokio::sync::RwLock::new(false)),
         }
     }
@@ -4434,6 +4476,77 @@ mod tests {
             SelectionReason::SelectionError("restart_admission_barrier_active".to_string())
         );
         assert!(ctx.history.active_builds().is_empty());
+    }
+
+    fn make_test_lease(heartbeat_unix_ms: u64, wrapper_pid: u32) -> DurableJobLease {
+        let mut identity = rch_common::job_identity::JobIdentity::new_local();
+        identity.admit(42);
+        let mut lease = DurableJobLease::new(
+            identity,
+            wrapper_pid,
+            None,
+            None,
+            heartbeat_unix_ms,
+            false,
+            true,
+            "blake3:test".to_string(),
+        );
+        lease.admit(42, "worker1".to_string(), heartbeat_unix_ms);
+        lease
+    }
+
+    #[test]
+    fn test_lease_blocks_restart_acknowledged_terminal_never_blocks() {
+        let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+        let mut lease = make_test_lease(1, 1);
+        lease.acknowledge_terminal(now);
+        assert!(!lease_blocks_restart(&lease, now, || unreachable!(
+            "terminal+acknowledged must not probe liveness"
+        )));
+    }
+
+    #[test]
+    fn test_lease_blocks_restart_fresh_heartbeat_blocks_without_liveness_probe() {
+        let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+        let lease = make_test_lease(now - DEAD_WRAPPER_HEARTBEAT_STALE_MS + 1, 1);
+        assert!(lease_blocks_restart(&lease, now, || unreachable!(
+            "a fresh heartbeat must not probe liveness"
+        )));
+    }
+
+    #[test]
+    fn test_lease_blocks_restart_stale_heartbeat_alive_pid_blocks() {
+        let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+        let lease = make_test_lease(now - DEAD_WRAPPER_HEARTBEAT_STALE_MS, 1);
+        assert!(lease_blocks_restart(&lease, now, || true));
+    }
+
+    #[test]
+    fn test_lease_blocks_restart_stale_heartbeat_dead_pid_unblocks() {
+        let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+        let lease = make_test_lease(now - DEAD_WRAPPER_HEARTBEAT_STALE_MS, 1);
+        assert!(!lease_blocks_restart(&lease, now, || false));
+    }
+
+    #[test]
+    fn test_lease_blocks_restart_zero_pid_stays_blocking_even_when_stale() {
+        let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+        let lease = make_test_lease(1, 0);
+        assert!(lease_blocks_restart(&lease, now, || unreachable!(
+            "a zero pid must not probe liveness"
+        )));
+    }
+
+    #[test]
+    fn test_lease_blocks_restart_unacknowledged_terminal_dead_wrapper_unblocks() {
+        // A wrapper that died after reaching a terminal state but before the
+        // daemon acknowledged it: same dead-wrapper evidence rule applies.
+        let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+        let mut lease = make_test_lease(1, 1);
+        lease.state = rch_common::job_identity::JobLifecycleState::Finished;
+        assert!(!lease.terminal_acknowledged);
+        assert!(!lease_blocks_restart(&lease, now, || false));
+        assert!(lease_blocks_restart(&lease, now, || true));
     }
 
     #[tokio::test]
@@ -5533,6 +5646,74 @@ mod tests {
         assert_eq!(response.action, "disable");
         // When drain_first is true, should set to draining first
         assert_eq!(response.new_status, Some("draining".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_worker_disable_persists_durable_record_and_enable_removes_it() {
+        use rch_common::bypass_record::AdminDisableStore;
+
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let mut ctx = make_test_context(pool);
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("admin_disables.json");
+        ctx.admin_disable_store = Some(Arc::new(tokio::sync::Mutex::new(
+            AdminDisableStore::with_path(&store_path),
+        )));
+
+        let response = handle_worker_disable(
+            &ctx,
+            &WorkerId::new("worker1"),
+            Some("cpu-capability-fault (SIGILL)".to_string()),
+            false,
+        )
+        .await;
+        assert_eq!(response.status, "ok");
+
+        // A fresh load from disk is the restart-survival property under test.
+        let reloaded = AdminDisableStore::load(&store_path);
+        assert_eq!(
+            reloaded
+                .get("worker1")
+                .expect("record persisted")
+                .reason
+                .as_deref(),
+            Some("cpu-capability-fault (SIGILL)"),
+        );
+
+        let response = handle_worker_enable(&ctx, &WorkerId::new("worker1")).await;
+        assert_eq!(response.status, "ok");
+        assert!(
+            AdminDisableStore::load(&store_path)
+                .get("worker1")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_worker_disable_with_drain_also_persists_durable_record() {
+        use rch_common::bypass_record::AdminDisableStore;
+
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let mut ctx = make_test_context(pool);
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("admin_disables.json");
+        ctx.admin_disable_store = Some(Arc::new(tokio::sync::Mutex::new(
+            AdminDisableStore::with_path(&store_path),
+        )));
+
+        let worker = ctx.pool.get(&WorkerId::new("worker1")).await.unwrap();
+        assert!(worker.reserve_slots(1).await);
+        let response = handle_worker_disable(&ctx, &WorkerId::new("worker1"), None, true).await;
+        assert_eq!(response.new_status, Some("draining".to_string()));
+
+        // The intent is durable even while the worker is still draining.
+        assert!(
+            AdminDisableStore::load(&store_path)
+                .get("worker1")
+                .is_some()
+        );
     }
 
     // =========================================================================

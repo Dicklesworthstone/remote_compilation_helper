@@ -230,6 +230,36 @@ pub(super) const fn is_cpu_capability_signal(signal: i32) -> bool {
     signal == 4
 }
 
+/// Detect a build-tool-WRAPPED CPU-capability signal death.
+///
+/// Live verification against ovh-b (2026-08-09) showed the incident-class
+/// fault never reaches the exit-code arm: when a build script or proc-macro
+/// dies by SIGILL, cargo does NOT propagate 128+N — it prints
+/// `process didn't exit successfully: `…` (signal: 4, SIGILL: illegal
+/// instruction)` and exits 101, so the CPU-capability fault masquerades as
+/// an ordinary build failure and the worker is never quarantined.
+///
+/// Sniff cargo's diagnostic line instead. Both markers must appear on the
+/// SAME line so incidental strings in test output cannot spoof a quarantine,
+/// and a zero exit never classifies.
+pub(super) fn wrapped_cpu_capability_signal(exit_code: i32, output: &str) -> Option<i32> {
+    if exit_code == 0 {
+        return None;
+    }
+    for line in output.lines() {
+        if !line.contains("didn't exit successfully") {
+            continue;
+        }
+        if line.contains("(signal: 4, SIGILL") {
+            return Some(4);
+        }
+        if line.contains("(signal: 7, SIGBUS") {
+            return Some(7);
+        }
+    }
+    None
+}
+
 /// Topology-specific Cargo workspace inheritance failure under remote roots.
 #[derive(Debug, Clone)]
 pub(super) struct CargoWorkspaceInheritanceFailure {
@@ -288,4 +318,52 @@ fn extract_workspace_package_field(line: &str) -> Option<String> {
         .next()?
         .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
     (!field.is_empty()).then(|| field.to_string())
+}
+
+#[cfg(test)]
+mod wrapped_signal_tests {
+    use super::wrapped_cpu_capability_signal;
+
+    const CARGO_SIGILL_LINE: &str = "  process didn't exit successfully: `/data/projects/avx2probe/.rch-target-ovh-b-pool-75509f/debug/build/avx2probe/b03d/out/build_script_build` (signal: 4, SIGILL: illegal instruction)";
+
+    #[test]
+    fn detects_cargo_wrapped_build_script_sigill_at_exit_101() {
+        assert_eq!(
+            wrapped_cpu_capability_signal(101, CARGO_SIGILL_LINE),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn detects_cargo_wrapped_sigbus() {
+        let line = "process didn't exit successfully: `rustc …` (signal: 7, SIGBUS: access to undefined memory)";
+        assert_eq!(wrapped_cpu_capability_signal(101, line), Some(7));
+    }
+
+    #[test]
+    fn zero_exit_never_classifies_even_with_marker() {
+        assert_eq!(wrapped_cpu_capability_signal(0, CARGO_SIGILL_LINE), None);
+    }
+
+    #[test]
+    fn markers_on_separate_lines_do_not_classify() {
+        // e.g. test output that PRINTS a sample cargo error across lines, or
+        // mentions the signal marker without cargo's process-death prefix.
+        let output =
+            "left: `didn't exit successfully`\nright: `(signal: 4, SIGILL: illegal instruction)`";
+        assert_eq!(wrapped_cpu_capability_signal(101, output), None);
+    }
+
+    #[test]
+    fn other_signals_in_marker_do_not_classify() {
+        // SIGKILL (OOM) stays with the resource-exhaustion handling.
+        let line = "process didn't exit successfully: `rustc …` (signal: 9, SIGKILL: kill)";
+        assert_eq!(wrapped_cpu_capability_signal(101, line), None);
+    }
+
+    #[test]
+    fn ordinary_build_error_output_does_not_classify() {
+        let output = "error[E0308]: mismatched types\n --> src/main.rs:1:1";
+        assert_eq!(wrapped_cpu_capability_signal(101, output), None);
+    }
 }

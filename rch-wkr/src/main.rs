@@ -477,6 +477,13 @@ fn probe_capabilities() -> WorkerCapabilities {
         }
     }
 
+    // Probe the x86-64 microarchitecture level (bd-6qchz / bd-68hon item 4):
+    // a pre-v3 CPU (e.g. Ivy Bridge — AVX but no AVX2) SIGILLs any
+    // build-script/proc-macro binary compiled for x86-64-v3, so the dispatcher
+    // deprioritizes such workers proactively. None on non-x86 or when
+    // /proc/cpuinfo is unavailable (macOS test runs).
+    capabilities.cpu_microarch_level = probe_cpu_microarch_level();
+
     // Probe system health metrics (bd-3eaa)
     capabilities.num_cpus = probe_num_cpus();
     if let Some((load1, load5, load15)) = probe_load_average() {
@@ -649,6 +656,22 @@ fn validate_alias_symlink(
     // Non-Unix workers (Windows) have no canonical↔alias symlink topology; the
     // single build base already verified by the caller is sufficient. See rch#15.
     (true, None)
+}
+
+/// Probe the x86-64 microarchitecture level (1..=4) from `/proc/cpuinfo`.
+///
+/// Returns `None` when cpuinfo is unreadable or carries no x86 `flags` line
+/// (non-x86 CPUs, macOS). Classification lives in
+/// [`rch_common::x86_64_microarch_level_from_flags`] so the dispatcher-side
+/// interpretation can never drift from the probe.
+fn probe_cpu_microarch_level() -> Option<u8> {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    let flags = cpuinfo
+        .lines()
+        .find(|line| line.starts_with("flags") && line.contains(':'))?
+        .split_once(':')?
+        .1;
+    Some(rch_common::x86_64_microarch_level_from_flags(flags))
 }
 
 /// Probe number of CPU cores.

@@ -780,6 +780,14 @@ pub struct WorkerCapabilities {
     /// subcommand's own parser rejects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cargo_zigbuild_version: Option<String>,
+    /// x86-64 microarchitecture level (1..=4) parsed from `/proc/cpuinfo`
+    /// flags on the worker (bd-6qchz / bd-68hon item 4). `Some(2)` marks a
+    /// pre-AVX2 box (e.g. ovh-b's Ivy Bridge) whose build scripts SIGILL on
+    /// x86-64-v3 codegen; selection deprioritizes such workers proactively
+    /// while the reactive SIGILL quarantine remains the primary mechanism.
+    /// `None` on non-x86 workers or when the probe cannot read cpuinfo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_microarch_level: Option<u8>,
 
     // Health metrics (bd-3eaa)
     /// Number of CPU cores on the worker.
@@ -829,6 +837,14 @@ impl WorkerCapabilities {
             projects_root_ok: Some(true),
             ..Self::default()
         }
+    }
+
+    /// Whether this is a known pre-x86-64-v3 (no AVX2) x86 worker — the class
+    /// whose build-script/proc-macro binaries SIGILL on v3 codegen (bd-68hon).
+    /// `None` (unknown/non-x86) is NOT pre-v3: only affirmative evidence
+    /// deprioritizes a worker.
+    pub fn is_pre_v3_x86(&self) -> bool {
+        matches!(self.cpu_microarch_level, Some(1 | 2))
     }
 
     /// Check if this worker has Bun installed.
@@ -896,6 +912,38 @@ impl WorkerCapabilities {
     pub fn is_topology_healthy(&self) -> Option<bool> {
         self.projects_root_ok
     }
+}
+
+/// Classify an x86-64 microarchitecture level (1..=4) from a `/proc/cpuinfo`
+/// `flags` line (bd-6qchz).
+///
+/// Levels follow the psABI x86-64-v2/v3/v4 feature baselines, restricted to
+/// flags as they appear in Linux cpuinfo. A CPU missing any flag of a level is
+/// classified at the level below — e.g. ovh-b's Ivy Bridge E3-1245 V2 has AVX
+/// but no `avx2`/`bmi2`/`fma`, so it classifies as 2 and its v3-codegen build
+/// scripts SIGILL (the bd-68hon incident class).
+#[must_use]
+pub fn x86_64_microarch_level_from_flags(flags: &str) -> u8 {
+    let set: std::collections::HashSet<&str> = flags.split_whitespace().collect();
+    let has_all = |required: &[&str]| required.iter().all(|flag| set.contains(flag));
+    // x86-64-v2: CMPXCHG16B, LAHF/SAHF, POPCNT, SSE3/SSSE3/SSE4.x.
+    const V2: &[&str] = &["cx16", "lahf_lm", "popcnt", "sse4_1", "sse4_2", "ssse3"];
+    // x86-64-v3: AVX/AVX2, BMI1/2, F16C, FMA, MOVBE, XSAVE (LZCNT is `abm`).
+    const V3: &[&str] = &[
+        "abm", "avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "movbe", "xsave",
+    ];
+    // x86-64-v4: the AVX-512 F/BW/CD/DQ/VL baseline.
+    const V4: &[&str] = &["avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl"];
+    if !has_all(V2) {
+        return 1;
+    }
+    if !has_all(V3) {
+        return 2;
+    }
+    if !has_all(V4) {
+        return 3;
+    }
+    4
 }
 
 /// Path topology configuration.
@@ -5769,5 +5817,42 @@ retry_max = 2
         assert_eq!(parsed.num_cpus, Some(8));
         assert_eq!(parsed.load_avg_1, Some(1.5));
         assert_eq!(parsed.disk_free_gb, Some(50.5));
+    }
+
+    #[test]
+    fn microarch_level_classifies_ivy_bridge_as_v2() {
+        // Abbreviated real flag set from ovh-b (Xeon E3-1245 V2, Ivy Bridge):
+        // AVX present, but no avx2/bmi/fma — the bd-68hon SIGILL class.
+        let ivy = "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov \
+                   pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx rdtscp lm \
+                   constant_tsc pni pclmulqdq ssse3 cx16 sse4_1 sse4_2 x2apic \
+                   popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm";
+        assert_eq!(x86_64_microarch_level_from_flags(ivy), 2);
+    }
+
+    #[test]
+    fn microarch_level_classifies_v3_and_v4() {
+        let v3 = "cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3 abm avx avx2 bmi1 bmi2 \
+                  f16c fma movbe xsave";
+        assert_eq!(x86_64_microarch_level_from_flags(v3), 3);
+
+        let v4 = format!("{v3} avx512f avx512bw avx512cd avx512dq avx512vl");
+        assert_eq!(x86_64_microarch_level_from_flags(&v4), 4);
+    }
+
+    #[test]
+    fn microarch_level_v1_for_ancient_or_empty_flags() {
+        assert_eq!(x86_64_microarch_level_from_flags(""), 1);
+        assert_eq!(x86_64_microarch_level_from_flags("fpu mmx sse sse2"), 1);
+    }
+
+    #[test]
+    fn pre_v3_predicate_only_fires_on_affirmative_evidence() {
+        let mut caps = WorkerCapabilities::new();
+        assert!(!caps.is_pre_v3_x86(), "unknown must not deprioritize");
+        caps.cpu_microarch_level = Some(2);
+        assert!(caps.is_pre_v3_x86());
+        caps.cpu_microarch_level = Some(3);
+        assert!(!caps.is_pre_v3_x86());
     }
 }

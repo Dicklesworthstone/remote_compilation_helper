@@ -442,13 +442,51 @@ fn default_priority() -> u32 {
 }
 
 /// Get the configuration directory path.
+///
+/// Resolution order (bd-9fgeu, kept identical to `rch::config::config_dir`):
+/// 1. `RCH_CONFIG_DIR` env override.
+/// 2. The docs-canonical XDG location (`$XDG_CONFIG_HOME/rch`, else
+///    `~/.config/rch`) when it EXISTS — on macOS `ProjectDirs` diverges to
+///    `~/Library/Application Support/com.rch.rch`, silently orphaning the
+///    documented config location the Linux fleet uses.
+/// 3. An EXISTING platform-native `ProjectDirs` dir (legacy installs).
+/// 4. Fresh install: the XDG location, matching the docs.
 pub fn config_dir() -> Option<PathBuf> {
     if let Some(path) = config_dir_from_env_value(std::env::var_os(RCH_CONFIG_DIR_ENV).as_deref()) {
         return Some(path);
     }
 
-    directories::ProjectDirs::from("com", "rch", CONFIG_DIR_NAME)
-        .map(|dirs| dirs.config_dir().to_path_buf())
+    let xdg_style = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|home| PathBuf::from(home).join(".config"))
+        })
+        .map(|base| base.join(CONFIG_DIR_NAME));
+    let native = directories::ProjectDirs::from("com", "rch", CONFIG_DIR_NAME)
+        .map(|dirs| dirs.config_dir().to_path_buf());
+    let xdg_exists = xdg_style.as_deref().is_some_and(Path::is_dir);
+    let native_exists = native.as_deref().is_some_and(Path::is_dir);
+    resolve_config_dir_preference(xdg_style, xdg_exists, native, native_exists)
+}
+
+/// Pure preference rule behind [`config_dir`]: existing XDG dir > existing
+/// platform-native dir > XDG (fresh installs follow the docs) > native.
+fn resolve_config_dir_preference(
+    xdg_style: Option<PathBuf>,
+    xdg_exists: bool,
+    native: Option<PathBuf>,
+    native_exists: bool,
+) -> Option<PathBuf> {
+    if xdg_exists && let Some(dir) = xdg_style {
+        return Some(dir);
+    }
+    if native_exists && let Some(dir) = native {
+        return Some(dir);
+    }
+    xdg_style.or(native)
 }
 
 fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
@@ -1195,5 +1233,32 @@ priority = 999999
 
         let config = load_workers_config(Some(&workers_path)).unwrap();
         assert_eq!(config.workers[0].priority, 999999);
+    }
+
+    #[test]
+    fn config_dir_preference_matrix_matches_rch_cli() {
+        // bd-9fgeu: identical rule to rch::config — existing XDG wins, legacy
+        // native kept when it is the only one, fresh installs follow the docs.
+        let xdg = Some(PathBuf::from("/home/u/.config/rch"));
+        let native = Some(PathBuf::from(
+            "/home/u/Library/Application Support/com.rch.rch",
+        ));
+
+        assert_eq!(
+            resolve_config_dir_preference(xdg.clone(), true, native.clone(), true),
+            xdg
+        );
+        assert_eq!(
+            resolve_config_dir_preference(xdg.clone(), false, native.clone(), true),
+            native
+        );
+        assert_eq!(
+            resolve_config_dir_preference(xdg.clone(), false, native.clone(), false),
+            xdg
+        );
+        assert_eq!(
+            resolve_config_dir_preference(None, false, native.clone(), false),
+            native
+        );
     }
 }

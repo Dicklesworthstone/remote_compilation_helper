@@ -2471,6 +2471,45 @@ pub async fn run_exec(
                             ),
                         },
                     }
+                } else if let Some(signal) =
+                    wrapped_cpu_capability_signal(result.exit_code, &result.stderr)
+                {
+                    // bd-68hon (wrapped shape): a build-script/proc-macro
+                    // SIGILL is reported by cargo as exit 101 with the signal
+                    // named only in its diagnostics — the exit-code arm above
+                    // never sees it. Same fault, same handling: quarantine
+                    // the worker, retry this build on any other worker.
+                    warn!(
+                        "Remote build's build-script/proc-macro killed by {} on {} (cargo exit {}) — worker CPU cannot execute build (likely missing ISA, e.g. AVX2); quarantining worker and retrying elsewhere",
+                        signal_name(signal),
+                        worker.id,
+                        result.exit_code
+                    );
+                    if let Err(e) = disable_worker_for_fault(
+                        &config.general.socket_path,
+                        &worker.id,
+                        "cpu-capability-fault (build-script SIGILL) — likely missing ISA (e.g. AVX2)",
+                    )
+                    .await
+                    {
+                        warn!("Failed to quarantine SIGILL worker {}: {}", worker.id, e);
+                    }
+                    RetryableRemoteFault {
+                        log_reason: format!(
+                            "worker CPU cannot execute build ({} in build script, cargo exit {}) — quarantined",
+                            signal_name(signal),
+                            result.exit_code
+                        ),
+                        failed_worker: worker.id.clone(),
+                        on_exhaust: RemoteFaultExhaustAction::ExitWithCode {
+                            code: result.exit_code,
+                            summary: format!(
+                                "[RCH] remote {} build script killed ({} — CPU capability)",
+                                worker.id,
+                                signal_name(signal)
+                            ),
+                        },
+                    }
                 } else if let Some(signal) = is_signal_killed(result.exit_code) {
                     // Signal kill (137/SIGKILL == OOM, etc.): the small worker
                     // could not hold the build. Retry on a BIGGER worker; if all
@@ -2796,6 +2835,7 @@ mod remote_result;
 use remote_result::{
     detect_cargo_workspace_inheritance_failure, detect_worker_system_dependency_failure,
     is_cpu_capability_signal, is_signal_killed, is_toolchain_failure, signal_name,
+    wrapped_cpu_capability_signal,
 };
 
 // The remote cargo target-dir resolution / naming / command-rewrite cluster
@@ -3319,6 +3359,36 @@ async fn handle_selection_response(
                     }
                     reporter.summary(&format!(
                         "[RCH] remote {} killed ({})",
+                        worker.id,
+                        signal_name(signal)
+                    ));
+                } else if let Some(signal) =
+                    wrapped_cpu_capability_signal(exit_code, &result.stderr)
+                {
+                    // bd-68hon (wrapped shape): a build-script/proc-macro
+                    // SIGILL surfaces from cargo as exit 101 with the signal
+                    // named only in the diagnostics, so it must be sniffed
+                    // BEFORE the generic exit-101 arm below. Quarantine the
+                    // worker so later builds route around it; exit-code
+                    // transparency for THIS build is preserved (no retry loop
+                    // on the hook path).
+                    warn!(
+                        "Remote command's build-script/proc-macro killed by {} on {} (cargo exit {}) — worker CPU cannot execute build (likely missing ISA, e.g. AVX2); quarantining worker",
+                        signal_name(signal),
+                        worker.id,
+                        exit_code
+                    );
+                    if let Err(e) = disable_worker_for_fault(
+                        &config.general.socket_path,
+                        &worker.id,
+                        "cpu-capability-fault (build-script SIGILL) — likely missing ISA (e.g. AVX2)",
+                    )
+                    .await
+                    {
+                        warn!("Failed to quarantine SIGILL worker {}: {}", worker.id, e);
+                    }
+                    reporter.summary(&format!(
+                        "[RCH] remote {} build script killed ({} — CPU capability)",
                         worker.id,
                         signal_name(signal)
                     ));

@@ -108,6 +108,15 @@ pub struct ReapCycleStats {
 fn build_sweep_command(escaped_base: &str, idle_minutes: u64) -> String {
     // No exclude token (the daemon has no "current job" of its own); accumulate
     // metrics into `removed` / `freed_kb` via the shared per-dir predicate.
+    //
+    // Besides the `.rch-target-*` dirs under `remote_base`, the sweep also
+    // covers the LEGACY `rch_target_*` per-job trees directly under the
+    // worker's tmp base (bead 6dj11: the 2026-07-10 css incident was ~300 GB
+    // of exactly these at /data/tmp — no rch version reaps them, and sbh's
+    // heuristics score them zero). Same idle predicate, same per-dir loop;
+    // the scan is -maxdepth 1 and gated on the tmp base being at least two
+    // path segments deep (e.g. /data/tmp), mirroring the remote_base depth
+    // guard — a bare /tmp fallback is deliberately NOT swept.
     let loop_body = stale_target_reap::reap_loop_body(idle_minutes, None, "removed", "freed_kb");
     format!(
         "set -u; \
@@ -124,6 +133,7 @@ fn build_sweep_command(escaped_base: &str, idle_minutes: u64) -> String {
          [ -d \"$__tmpbase\" ] || __tmpbase=/tmp; \
          __tmpf=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) || {{ printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; exit 0; }}; \
          find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null > \"$__tmpf\"; \
+         case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf\";; esac; \
          while IFS= read -r d; do {loop_body} done < \"$__tmpf\"; \
          rm -f \"$__tmpf\"; \
          printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\""
@@ -395,6 +405,13 @@ mod tests {
         assert!(cmd.contains("[ -d \"$__tmpbase\" ] || __tmpbase=/tmp"));
         assert!(cmd.contains("mktemp -p \"$__tmpbase\""));
         assert!(!cmd.contains("mktemp -p \"${TMPDIR:-/data/tmp}\""));
+        // 6dj11: the legacy /data/tmp/rch_target_* trees (the css
+        // incident class) are swept too — -maxdepth 1, name-anchored,
+        // depth-guarded so a bare /tmp fallback is never scanned.
+        assert!(cmd.contains(
+            "case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune"
+        ));
+        assert!(!cmd.contains("-name \"rch_target_*\" -prune 2>/dev/null | "));
         assert!(cmd.contains("done < \"$__tmpf\""));
         assert!(!cmd.contains("-prune 2>/dev/null | \\\n"));
         assert!(!cmd.contains("-prune 2>/dev/null | while"));

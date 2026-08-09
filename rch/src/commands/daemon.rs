@@ -61,6 +61,17 @@ async fn require_restart_admission() -> Result<()> {
     if admission.restart_permitted {
         return Ok(());
     }
+    // The POST above CLOSED the barrier as a side effect; a refused restart
+    // must reopen it, otherwise this failed attempt leaves the daemon
+    // refusing every subsequent worker selection (restart_admission_barrier_active)
+    // until someone manually hits the release endpoint. Best-effort: if the
+    // release itself fails we still surface the refusal below.
+    if let Err(release_error) = send_daemon_command("POST /restart-admission/release\n").await {
+        tracing::warn!(
+            "failed to release the restart-admission barrier after a refused restart: {release_error}; \
+             worker selection may refuse builds until `POST /restart-admission/release` succeeds"
+        );
+    }
     anyhow::bail!(
         "restart blocked by daemon admission barrier: active builds {:?}, queued builds {:?}, client leases {:?}, lease scan {:?}",
         admission.active_build_ids,

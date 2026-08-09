@@ -31,12 +31,53 @@ pub fn set_test_config_override(config: Option<RchConfig>) {
 }
 
 /// Get the user config directory.
+///
+/// Resolution order (bd-9fgeu):
+/// 1. `RCH_CONFIG_DIR` env override.
+/// 2. The docs-canonical XDG location: `$XDG_CONFIG_HOME/rch`, else
+///    `~/.config/rch`, when that directory EXISTS. On Linux this is the same
+///    answer `ProjectDirs` gives; on macOS `ProjectDirs` instead points at
+///    `~/Library/Application Support/com.rch.rch` — a location no doc mentions
+///    — which silently orphaned the operator's real `~/.config/rch/config.toml`
+///    (path_topology, remediation, everything).
+/// 3. An EXISTING platform-native `ProjectDirs` dir (keeps legacy macOS
+///    installs working).
+/// 4. Fresh install (neither exists): the XDG location, matching the docs.
 pub fn config_dir() -> Option<PathBuf> {
     if let Some(path) = config_dir_from_env_value(std::env::var_os(RCH_CONFIG_DIR_ENV).as_deref()) {
         return Some(path);
     }
 
-    ProjectDirs::from("com", "rch", "rch").map(|dirs| dirs.config_dir().to_path_buf())
+    let xdg_style = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|home| PathBuf::from(home).join(".config"))
+        })
+        .map(|base| base.join("rch"));
+    let native = ProjectDirs::from("com", "rch", "rch").map(|dirs| dirs.config_dir().to_path_buf());
+    let xdg_exists = xdg_style.as_deref().is_some_and(Path::is_dir);
+    let native_exists = native.as_deref().is_some_and(Path::is_dir);
+    resolve_config_dir_preference(xdg_style, xdg_exists, native, native_exists)
+}
+
+/// Pure preference rule behind [`config_dir`]: existing XDG dir > existing
+/// platform-native dir > XDG (fresh installs follow the docs) > native.
+fn resolve_config_dir_preference(
+    xdg_style: Option<PathBuf>,
+    xdg_exists: bool,
+    native: Option<PathBuf>,
+    native_exists: bool,
+) -> Option<PathBuf> {
+    if xdg_exists && let Some(dir) = xdg_style {
+        return Some(dir);
+    }
+    if native_exists && let Some(dir) = native {
+        return Some(dir);
+    }
+    xdg_style.or(native)
 }
 
 fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
@@ -2695,6 +2736,41 @@ tags = ["rust"]
             None
         );
         assert_eq!(super::config_dir_from_env_value(None), None);
+    }
+
+    #[test]
+    fn test_config_dir_prefers_existing_xdg_over_native() {
+        // bd-9fgeu matrix: the docs-canonical ~/.config/rch must win whenever
+        // it exists, even when the platform-native dir also exists (the macOS
+        // stale-parallel-universe case).
+        let xdg = Some(PathBuf::from("/home/u/.config/rch"));
+        let native = Some(PathBuf::from(
+            "/home/u/Library/Application Support/com.rch.rch",
+        ));
+
+        assert_eq!(
+            super::resolve_config_dir_preference(xdg.clone(), true, native.clone(), true),
+            xdg
+        );
+        assert_eq!(
+            super::resolve_config_dir_preference(xdg.clone(), true, native.clone(), false),
+            xdg
+        );
+        // Only the legacy native dir exists: keep it working.
+        assert_eq!(
+            super::resolve_config_dir_preference(xdg.clone(), false, native.clone(), true),
+            native
+        );
+        // Fresh install: neither exists — follow the docs (XDG).
+        assert_eq!(
+            super::resolve_config_dir_preference(xdg.clone(), false, native.clone(), false),
+            xdg
+        );
+        // Degenerate: no XDG candidate (no HOME) — fall through to native.
+        assert_eq!(
+            super::resolve_config_dir_preference(None, false, native.clone(), false),
+            native
+        );
     }
 
     #[test]
