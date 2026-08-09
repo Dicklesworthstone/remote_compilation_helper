@@ -17,6 +17,7 @@ members = [
     "rabs-cas",
     "rabs-sandbox",
     "rabs-scheduler",
+    "rabs-replay",
     "rabs-asupersync",
     "rabsd",
     "rabs-wkr",

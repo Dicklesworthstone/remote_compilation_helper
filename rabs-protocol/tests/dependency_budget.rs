@@ -41,6 +41,13 @@ const BUDGETS: &[(&str, usize, &str)] = &[
          bundle-root implementation; pure sibling, protocol-only deps)",
     ),
     ("rabs-sandbox", 4, "protocol + reviewed namespace/fs crates"),
+    (
+        "rabs-replay",
+        2,
+        "protocol + serde_json (B005 harness: reads the B002 NDJSON \
+         corpus and emits the divergence corpus; process effects are \
+         its purpose)",
+    ),
     ("rabs-asupersync", 3, "asupersync + protocol (+1 headroom)"),
     ("rabsd", 10, "composes the domain crates + runtime adapter"),
     ("rabs-wkr", 8, "composes execution-relevant domain crates"),

@@ -4877,6 +4877,14 @@ name = "rabs-protocol"
 version = "1.0.56"
 
 [[package]]
+name = "rabs-replay"
+version = "1.0.56"
+dependencies = [
+ "rabs-protocol",
+ "serde_json",
+]
+
+[[package]]
 name = "rabs-sandbox"
 version = "1.0.56"
 dependencies = [

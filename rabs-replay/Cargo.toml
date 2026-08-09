@@ -1,0 +1,26 @@
+[package]
+name = "rabs-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "RABS replay runner: executes recorded invocations under stock and candidate paths and emits the divergence corpus"
+publish = false
+
+[lib]
+doctest = false
+
+# The trust-ladder engine (bead B005): reads the B002 corpus, replays
+# under pluggable execution paths (the stock path REALLY executes), and
+# compares. Process effects are this crate's PURPOSE; no Tokio, no
+# Asupersync (dependency-direction CI, bead A002).
+[dependencies]
+rabs-protocol = { path = "../rabs-protocol" }
+serde_json = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
