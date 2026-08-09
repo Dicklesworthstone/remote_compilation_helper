@@ -523,6 +523,35 @@ const TELEMETRY_RETRY_BACKOFF: Duration = Duration::from_millis(1500);
 /// always honored); a single transient failure is retried once. Without the
 /// retry, one failed re-poll under concurrent SSH load drops the worker past the
 /// stale threshold — the root cause of fluctuating fleet telemetry freshness.
+/// One failed poll attempt's evidence (bead pn1xb: a worker used to be
+/// able to sit telemetry-dark indefinitely with ZERO log lines while a
+/// no-fresh-telemetry verdict gated scheduling — the failure log must
+/// carry enough to diagnose from journalctl alone).
+struct PollAttemptFailure {
+    attempt: u32,
+    transport: &'static str,
+    elapsed: Duration,
+    error: String,
+}
+
+/// Render every attempt's evidence into one warn line.
+fn render_poll_failures(failures: &[PollAttemptFailure]) -> String {
+    failures
+        .iter()
+        .map(|f| {
+            format!(
+                "attempt {} [{} {:.1}s]: {}",
+                f.attempt,
+                f.transport,
+                f.elapsed.as_secs_f64(),
+                // First bytes only: SSH/stderr noise can be huge.
+                f.error.chars().take(200).collect::<String>()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 async fn poll_worker(
     worker: Arc<WorkerState>,
     store: Arc<TelemetryStore>,
@@ -531,9 +560,15 @@ async fn poll_worker(
 ) -> bool {
     let worker_id = worker.config.read().await.id.clone();
     let per_attempt = poll_hard_timeout(config.ssh_timeout);
-    let mut last_err: Option<String> = None;
+    let transport: &'static str = if ssh_pool.is_some() {
+        "pooled-ssh"
+    } else {
+        "throwaway-ssh"
+    };
+    let mut failures: Vec<PollAttemptFailure> = Vec::new();
 
     for attempt in 1..=TELEMETRY_POLL_ATTEMPTS {
+        let started = std::time::Instant::now();
         match tokio::time::timeout(
             per_attempt,
             collect_telemetry_from_worker_pooled(&worker, config.ssh_timeout, ssh_pool.clone()),
@@ -551,8 +586,20 @@ async fn poll_worker(
                 store.ingest(telemetry, TelemetrySource::SshPoll);
                 return true;
             }
-            Ok(Err(e)) => last_err = Some(e.to_string()),
-            Err(_) => last_err = Some(format!("hard timeout after {per_attempt:?}")),
+            Ok(Err(e)) => failures.push(PollAttemptFailure {
+                attempt,
+                transport,
+                elapsed: started.elapsed(),
+                // The collector's errors carry exit code + stderr for
+                // command failures (see collect_telemetry_from_worker_pooled).
+                error: format!("{e:#}"),
+            }),
+            Err(_) => failures.push(PollAttemptFailure {
+                attempt,
+                transport,
+                elapsed: started.elapsed(),
+                error: format!("hard timeout after {per_attempt:?}"),
+            }),
         }
         if attempt < TELEMETRY_POLL_ATTEMPTS {
             tokio::time::sleep(TELEMETRY_RETRY_BACKOFF).await;
@@ -563,7 +610,7 @@ async fn poll_worker(
         worker = worker_id.as_str(),
         attempts = TELEMETRY_POLL_ATTEMPTS,
         "Telemetry poll failed: {}",
-        last_err.unwrap_or_else(|| "unknown error".to_string())
+        render_poll_failures(&failures)
     );
     false
 }
@@ -576,6 +623,39 @@ mod tests {
     use rch_common::test_guard;
     use rch_telemetry::collect::cpu::{CpuTelemetry, LoadAverage};
     use rch_telemetry::collect::memory::MemoryTelemetry;
+
+    #[test]
+    fn poll_failure_rendering_carries_transport_elapsed_and_bounded_error() {
+        // pn1xb: the warn line must be diagnosable from journalctl
+        // alone — every attempt, its transport, elapsed seconds, and
+        // the (bounded) error including exit/stderr detail.
+        let failures = vec![
+            PollAttemptFailure {
+                attempt: 1,
+                transport: "pooled-ssh",
+                elapsed: Duration::from_millis(24_900),
+                error: "hard timeout after 25s".to_owned(),
+            },
+            PollAttemptFailure {
+                attempt: 2,
+                transport: "pooled-ssh",
+                elapsed: Duration::from_millis(1_200),
+                error: format!("Telemetry command failed (exit 1): {}", "x".repeat(500)),
+            },
+        ];
+        let rendered = render_poll_failures(&failures);
+        assert!(rendered.contains("attempt 1 [pooled-ssh 24.9s]: hard timeout"));
+        assert!(
+            rendered.contains("attempt 2 [pooled-ssh 1.2s]: Telemetry command failed (exit 1)")
+        );
+        // Bounded: a 500-char stderr is clipped to the first 200 chars
+        // per attempt, so one noisy worker cannot flood the journal.
+        assert!(
+            rendered.len() < 500,
+            "unbounded error leaked: {} chars",
+            rendered.len()
+        );
+    }
 
     fn make_telemetry(worker_id: &str, cpu_pct: f64, mem_pct: f64) -> WorkerTelemetry {
         let cpu = CpuTelemetry {
