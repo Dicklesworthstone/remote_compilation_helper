@@ -5648,6 +5648,63 @@ mod tests {
         assert_eq!(response.new_status, Some("draining".to_string()));
     }
 
+    #[tokio::test]
+    async fn test_worker_disable_persists_durable_record_and_enable_removes_it() {
+        use rch_common::bypass_record::AdminDisableStore;
+
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let mut ctx = make_test_context(pool);
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("admin_disables.json");
+        ctx.admin_disable_store = Some(Arc::new(tokio::sync::Mutex::new(
+            AdminDisableStore::with_path(&store_path),
+        )));
+
+        let response = handle_worker_disable(
+            &ctx,
+            &WorkerId::new("worker1"),
+            Some("cpu-capability-fault (SIGILL)".to_string()),
+            false,
+        )
+        .await;
+        assert_eq!(response.status, "ok");
+
+        // A fresh load from disk is the restart-survival property under test.
+        let reloaded = AdminDisableStore::load(&store_path);
+        assert_eq!(
+            reloaded.get("worker1").expect("record persisted").reason.as_deref(),
+            Some("cpu-capability-fault (SIGILL)"),
+        );
+
+        let response = handle_worker_enable(&ctx, &WorkerId::new("worker1")).await;
+        assert_eq!(response.status, "ok");
+        assert!(AdminDisableStore::load(&store_path).get("worker1").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_worker_disable_with_drain_also_persists_durable_record() {
+        use rch_common::bypass_record::AdminDisableStore;
+
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let mut ctx = make_test_context(pool);
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("admin_disables.json");
+        ctx.admin_disable_store = Some(Arc::new(tokio::sync::Mutex::new(
+            AdminDisableStore::with_path(&store_path),
+        )));
+
+        let worker = ctx.pool.get(&WorkerId::new("worker1")).await.unwrap();
+        assert!(worker.reserve_slots(1).await);
+        let response =
+            handle_worker_disable(&ctx, &WorkerId::new("worker1"), None, true).await;
+        assert_eq!(response.new_status, Some("draining".to_string()));
+
+        // The intent is durable even while the worker is still draining.
+        assert!(AdminDisableStore::load(&store_path).get("worker1").is_some());
+    }
+
     // =========================================================================
     // Worker capabilities info tests
     // =========================================================================
