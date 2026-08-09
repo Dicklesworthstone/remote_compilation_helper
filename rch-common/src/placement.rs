@@ -949,6 +949,39 @@ where
     }
 }
 
+/// Resolve placement with the box-level role applied BENEATH the
+/// per-call environment (bd-wywsj): role sets the DEFAULT posture,
+/// explicit env always wins.
+///
+/// * `Dispatcher`: when NEITHER `RCH_REQUIRE_REMOTE` nor
+///   `RCH_FORCE_REMOTE` is present (presence — even with a falsy
+///   value — is an explicit per-call decision), the strict-remote
+///   policy defaults to fail-closed [`StrictRemotePolicy::RequireRemote`]
+///   so a saturated fleet QUEUES instead of repopulating local rustc
+///   on the orchestrator. A diagnostic records the role default.
+/// * `Worker` / `Hybrid`: identical to [`resolve_placement`] — the
+///   box is (or may be) the compute; fail-open stays the default.
+pub fn resolve_placement_with_role<F>(get: F, role: crate::BoxRole) -> PlacementPlan
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let strict_env_present =
+        get("RCH_REQUIRE_REMOTE").is_some() || get("RCH_FORCE_REMOTE").is_some();
+    let mut plan = resolve_placement(get);
+    if role == crate::BoxRole::Dispatcher
+        && !strict_env_present
+        && plan.strict_remote_policy == StrictRemotePolicy::Off
+    {
+        plan.strict_remote_policy = StrictRemotePolicy::RequireRemote;
+        plan.diagnostics.push(ControlDiagnostic::info(
+            "general.role",
+            "role=dispatcher defaults offloadable builds to fail-closed + queue \
+             (set RCH_REQUIRE_REMOTE=0 or RCH_FORCE_REMOTE=1 per call to override)",
+        ));
+    }
+    plan
+}
+
 /// Merge two comma-separated worker lists, trimming and de-duplicating while
 /// preserving first-seen order.
 fn merge_worker_lists(primary: &str, alias: &str) -> String {
