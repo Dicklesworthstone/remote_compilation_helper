@@ -28,6 +28,7 @@
 //!   [`divergence_to_ndjson`] is the divergence-corpus line format
 //!   downstream gates consume.
 
+pub mod minimizer;
 pub mod scenario_labels;
 
 use std::process::Command;
