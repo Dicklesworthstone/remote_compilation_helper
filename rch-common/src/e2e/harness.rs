@@ -1814,9 +1814,7 @@ impl TestHarness {
         if let Ok(entries) = std::fs::read_dir(self.test_dir.join("logs")) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                let is_stdio = path
-                    .extension()
-                    .is_some_and(|e| e == "out" || e == "err");
+                let is_stdio = path.extension().is_some_and(|e| e == "out" || e == "err");
                 if !is_stdio {
                     continue;
                 }
@@ -2121,6 +2119,42 @@ mod tests {
 
         assert!(harness.test_dir().exists());
         // Will cleanup on drop
+    }
+
+    /// tzk2s acceptance (evidence half): a spawned process that dies
+    /// during startup leaves its stderr in <test_dir>/logs, and a
+    /// socket wait that times out is diagnosable from the captured
+    /// files instead of being a bare 10s timeout.
+    #[test]
+    #[cfg(unix)]
+    fn test_dead_daemon_startup_stderr_is_captured_not_discarded() {
+        let harness = TestHarnessBuilder::new("dead_daemon_evidence")
+            .cleanup_on_success(true)
+            .cleanup_on_failure(true)
+            .build()
+            .unwrap();
+        // A "daemon" that prints its dying words and exits before any
+        // socket can appear — the exact shape Stdio::null() used to
+        // erase.
+        harness
+            .spawn_process(
+                "daemon",
+                Path::new("/bin/sh"),
+                ["-c", "echo doomed-by-config >&2; exit 3"],
+                None,
+            )
+            .unwrap();
+        let socket = harness.test_dir().join("never.sock");
+        let result = harness.wait_for_socket(&socket, Duration::from_millis(300));
+        assert!(result.is_err(), "no socket ever appears");
+        // The dying words are ON DISK under logs/ — the evidence the
+        // timeout error also tails into the harness log.
+        let captured = std::fs::read_to_string(harness.test_dir().join("logs").join("daemon.err"))
+            .expect("stderr capture file must exist");
+        assert!(
+            captured.contains("doomed-by-config"),
+            "captured stderr must hold the dying words: {captured:?}"
+        );
     }
 
     #[test]
