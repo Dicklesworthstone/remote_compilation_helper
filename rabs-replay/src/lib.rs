@@ -79,9 +79,11 @@ pub fn parse_corpus_line(line: &str) -> Result<ReplayCommand, ReplaySkip> {
         })?;
     let mut parts = Vec::new();
     for element in argv {
-        let text = element.as_str().ok_or_else(|| ReplaySkip::MalformedRecord {
-            detail: "argv element not a string".to_owned(),
-        })?;
+        let text = element
+            .as_str()
+            .ok_or_else(|| ReplaySkip::MalformedRecord {
+                detail: "argv element not a string".to_owned(),
+            })?;
         if text.contains(REDACTED) {
             return Err(ReplaySkip::RedactedArgv);
         }
@@ -94,7 +96,10 @@ pub fn parse_corpus_line(line: &str) -> Result<ReplayCommand, ReplaySkip> {
             detail: "cwd_redacted missing".to_owned(),
         })?
         .to_owned();
-    let outcome = match (value["outcome_kind"].as_str(), value["outcome_value"].as_i64()) {
+    let outcome = match (
+        value["outcome_kind"].as_str(),
+        value["outcome_value"].as_i64(),
+    ) {
         (Some("exited"), Some(code)) => NormalizedOutcome::Exited(code as i32),
         (Some("signaled"), Some(signal)) => NormalizedOutcome::Signaled(signal as i32),
         _ => {
@@ -451,7 +456,10 @@ mod tests {
 
     #[test]
     fn b005_outcomes_replay_with_signal_vs_exit_preserved() {
-        let lines = [record_line("sh -c 'kill -9 $$'", NormalizedOutcome::Signaled(9))];
+        let lines = [record_line(
+            "sh -c 'kill -9 $$'",
+            NormalizedOutcome::Signaled(9),
+        )];
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let mut baseline = StockPath;
         let invocation = parse_corpus_line(refs[0]).unwrap();
