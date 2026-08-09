@@ -235,9 +235,13 @@ pub fn parse_worker_reap_metrics(stdout: &str) -> Option<(u64, u64)> {
 /// `RCH_TARGET_ENTRY <newest_mtime_unix> <kb> <path>`
 ///
 /// `newest_mtime_unix` is the newest mtime of the dir or any descendant (the
-/// exact signal the idle predicate tests), via GNU `find -printf` — workers
-/// are Linux by contract. `escaped_base` MUST already be validated with
-/// [`is_safe_reap_base`].
+/// exact signal the idle predicate tests) and `<kb>` the apparent-size sum,
+/// both from ONE `find -printf '%T@ %s'` + awk pass per dir (GNU find —
+/// workers are Linux by contract). A du-based variant needed three stat walks
+/// and exceeded 15 minutes live on a loaded worker whose pooled dirs held
+/// millions of inodes; apparent size instead of block usage is an acceptable
+/// trade for an observability surface. `escaped_base` MUST already be
+/// validated with [`is_safe_reap_base`].
 #[must_use]
 pub fn enumerate_targets_command(escaped_base: &str) -> String {
     let preamble = candidate_discovery_preamble(escaped_base, "");
@@ -246,10 +250,8 @@ pub fn enumerate_targets_command(escaped_base: &str) -> String {
          find \"$__rt\" -maxdepth 8 -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf\"; \
          while IFS= read -r d; do \
            [ -d \"$d\" ] || continue; \
-           newest=$(find \"$d\" -printf '%T@\\n' 2>/dev/null | sort -rn | head -1 | cut -d. -f1); \
-           [ -n \"$newest\" ] || newest=0; \
-           kb=$(du -sk \"$d\" 2>/dev/null | awk '{{print $1}}'); \
-           [ -n \"$kb\" ] || kb=0; \
+           set -- $(find \"$d\" -printf '%T@ %s\\n' 2>/dev/null | awk '{{ t=int($1); if (t>n) n=t; s+=$2 }} END {{ printf \"%d %d\", n, int(s/1024) }}'); \
+           newest=${{1:-0}}; kb=${{2:-0}}; \
            printf 'RCH_TARGET_ENTRY %s %s %s\\n' \"$newest\" \"$kb\" \"$d\"; \
          done < \"$__tmpf\"; \
          rm -f \"$__tmpf\""
