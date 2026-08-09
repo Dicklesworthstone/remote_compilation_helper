@@ -104,5 +104,6 @@ pub mod volatility;
 pub mod wire_time;
 pub mod worker_fence;
 pub mod wrapper_breaker;
+pub mod wrapper_diagnostics;
 pub mod wrapper_panic;
 pub mod zero_rtt_policy;
