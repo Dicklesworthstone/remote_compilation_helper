@@ -1238,7 +1238,10 @@ mod tests {
 
         let reloaded = AdminDisableStore::load(&path);
         let record = reloaded.get("ovh-b").expect("record survives reload");
-        assert_eq!(record.reason.as_deref(), Some("cpu-capability-fault (SIGILL)"));
+        assert_eq!(
+            record.reason.as_deref(),
+            Some("cpu-capability-fault (SIGILL)")
+        );
         assert_eq!(record.disabled_unix_ms, 1_700_000_000_000);
         assert_eq!(reloaded.all().len(), 1);
     }

@@ -2744,7 +2744,9 @@ tags = ["rust"]
         // it exists, even when the platform-native dir also exists (the macOS
         // stale-parallel-universe case).
         let xdg = Some(PathBuf::from("/home/u/.config/rch"));
-        let native = Some(PathBuf::from("/home/u/Library/Application Support/com.rch.rch"));
+        let native = Some(PathBuf::from(
+            "/home/u/Library/Application Support/com.rch.rch",
+        ));
 
         assert_eq!(
             super::resolve_config_dir_preference(xdg.clone(), true, native.clone(), true),

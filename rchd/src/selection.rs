@@ -4969,7 +4969,10 @@ mod tests {
         };
 
         let result = selector.select(&pool, &request).await;
-        assert!(result.worker.is_none(), "pin must not select another worker");
+        assert!(
+            result.worker.is_none(),
+            "pin must not select another worker"
+        );
         assert_eq!(
             result.reason,
             SelectionReason::AllWorkersBusy,

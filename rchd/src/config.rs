@@ -1240,7 +1240,9 @@ priority = 999999
         // bd-9fgeu: identical rule to rch::config — existing XDG wins, legacy
         // native kept when it is the only one, fresh installs follow the docs.
         let xdg = Some(PathBuf::from("/home/u/.config/rch"));
-        let native = Some(PathBuf::from("/home/u/Library/Application Support/com.rch.rch"));
+        let native = Some(PathBuf::from(
+            "/home/u/Library/Application Support/com.rch.rch",
+        ));
 
         assert_eq!(
             resolve_config_dir_preference(xdg.clone(), true, native.clone(), true),

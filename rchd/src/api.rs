@@ -5673,13 +5673,21 @@ mod tests {
         // A fresh load from disk is the restart-survival property under test.
         let reloaded = AdminDisableStore::load(&store_path);
         assert_eq!(
-            reloaded.get("worker1").expect("record persisted").reason.as_deref(),
+            reloaded
+                .get("worker1")
+                .expect("record persisted")
+                .reason
+                .as_deref(),
             Some("cpu-capability-fault (SIGILL)"),
         );
 
         let response = handle_worker_enable(&ctx, &WorkerId::new("worker1")).await;
         assert_eq!(response.status, "ok");
-        assert!(AdminDisableStore::load(&store_path).get("worker1").is_none());
+        assert!(
+            AdminDisableStore::load(&store_path)
+                .get("worker1")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -5697,12 +5705,15 @@ mod tests {
 
         let worker = ctx.pool.get(&WorkerId::new("worker1")).await.unwrap();
         assert!(worker.reserve_slots(1).await);
-        let response =
-            handle_worker_disable(&ctx, &WorkerId::new("worker1"), None, true).await;
+        let response = handle_worker_disable(&ctx, &WorkerId::new("worker1"), None, true).await;
         assert_eq!(response.new_status, Some("draining".to_string()));
 
         // The intent is durable even while the worker is still draining.
-        assert!(AdminDisableStore::load(&store_path).get("worker1").is_some());
+        assert!(
+            AdminDisableStore::load(&store_path)
+                .get("worker1")
+                .is_some()
+        );
     }
 
     // =========================================================================
