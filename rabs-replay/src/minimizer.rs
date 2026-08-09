@@ -193,7 +193,7 @@ pub fn lab_case_to_ndjson(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Availability, NormalizedOutcome, PathObservation, StockPath};
+    use crate::{NormalizedOutcome, PathObservation, StockPath};
 
     /// The seeded synthetic divergence: a candidate that diverges IFF
     /// the command contains BOTH trigger tokens (a conjunction, so the
@@ -245,7 +245,7 @@ mod tests {
         assert!(case.elements.contains(&"--trigger-b".to_owned()));
         // 1-minimality, proven exhaustively: removing ANY single
         // remaining element loses the reproduction.
-        let mut probe = |subset: &[String]| {
+        let probe = |subset: &[String]| {
             let shrunk = ReplayCommand {
                 command: subset.join(" "),
                 ..noisy.clone()
@@ -273,12 +273,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(parsed["schema"], "rabs.minimized-lab-case");
         assert_eq!(parsed["verified_minimal"], true);
-        assert!(
-            parsed["command"]
-                .as_str()
-                .unwrap()
-                .contains("--trigger-a")
-        );
+        assert!(parsed["command"].as_str().unwrap().contains("--trigger-a"));
     }
 
     #[test]
