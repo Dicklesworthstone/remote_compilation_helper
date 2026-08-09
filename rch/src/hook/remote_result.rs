@@ -206,7 +206,12 @@ pub(super) fn signal_name(signal: i32) -> &'static str {
         1 => "SIGHUP",
         2 => "SIGINT",
         3 => "SIGQUIT",
+        // 4/7: CPU-capability faults (bd-68hon) — an Ivy-Bridge-class
+        // worker executing x86-64-v3 codegen dies by SIGILL; logging
+        // it as UNKNOWN hid the real cause behind "exit 132".
+        4 => "SIGILL",
         6 => "SIGABRT",
+        7 => "SIGBUS",
         9 => "SIGKILL",
         11 => "SIGSEGV",
         13 => "SIGPIPE",
@@ -214,6 +219,15 @@ pub(super) fn signal_name(signal: i32) -> &'static str {
         15 => "SIGTERM",
         _ => "UNKNOWN",
     }
+}
+
+/// Whether a signal indicates a WORKER CPU-CAPABILITY fault rather than
+/// resource exhaustion (bd-68hon): SIGILL means the worker's CPU cannot
+/// execute the build's codegen (e.g. AVX2 on a pre-v3 microarch). The
+/// build is fine; the WORKER is incompatible — quarantine it and retry
+/// on any other worker, instead of the OOM heuristic of "retry bigger".
+pub(super) const fn is_cpu_capability_signal(signal: i32) -> bool {
+    signal == 4
 }
 
 /// Topology-specific Cargo workspace inheritance failure under remote roots.

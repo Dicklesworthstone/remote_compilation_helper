@@ -3058,10 +3058,35 @@ fn test_signal_name() {
     let _guard = test_guard!();
     assert_eq!(signal_name(1), "SIGHUP");
     assert_eq!(signal_name(2), "SIGINT");
+    // bd-68hon: 4/7 used to log as UNKNOWN, hiding CPU-capability
+    // faults behind "killed by UNKNOWN (exit 132)".
+    assert_eq!(signal_name(4), "SIGILL");
+    assert_eq!(signal_name(7), "SIGBUS");
     assert_eq!(signal_name(9), "SIGKILL");
     assert_eq!(signal_name(11), "SIGSEGV");
     assert_eq!(signal_name(15), "SIGTERM");
     assert_eq!(signal_name(99), "UNKNOWN");
+}
+
+#[test]
+fn test_sigill_classifies_as_cpu_capability_fault_not_oom() {
+    let _guard = test_guard!();
+    // bd-68hon: exit 132 (128+4) is a WORKER capability fault — the
+    // quarantine-and-retry-anywhere arm — never the OOM
+    // retry-on-bigger heuristic. SIGKILL/SIGSEGV stay in the generic
+    // signal arm.
+    use super::remote_result::is_cpu_capability_signal;
+    assert_eq!(is_signal_killed(132), Some(4));
+    assert!(is_cpu_capability_signal(4));
+    assert!(
+        !is_cpu_capability_signal(9),
+        "OOM is not a capability fault"
+    );
+    assert!(!is_cpu_capability_signal(11));
+    assert!(
+        !is_cpu_capability_signal(7),
+        "SIGBUS is named but not auto-quarantined"
+    );
 }
 
 #[test]

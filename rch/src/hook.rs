@@ -2416,6 +2416,43 @@ pub async fn run_exec(
                             ),
                         },
                     }
+                } else if let Some(signal) = is_signal_killed(result.exit_code)
+                    && is_cpu_capability_signal(signal)
+                {
+                    // SIGILL = worker CPU-capability fault (bd-68hon), NOT
+                    // resource exhaustion: the worker's CPU cannot execute
+                    // the build's codegen (e.g. AVX2 on a pre-x86-64-v3
+                    // box). The build is fine; the WORKER is incompatible.
+                    // Quarantine it at the daemon so the first SIGILL
+                    // auto-routes every later build around it, then retry
+                    // this build on any other worker.
+                    warn!(
+                        "Remote build killed by SIGILL (exit {}) on {} — worker CPU cannot execute build (likely missing ISA, e.g. AVX2); quarantining worker and retrying elsewhere",
+                        result.exit_code, worker.id
+                    );
+                    if let Err(e) = disable_worker_for_fault(
+                        &config.general.socket_path,
+                        &worker.id,
+                        "cpu-capability-fault (SIGILL) — likely missing ISA (e.g. AVX2)",
+                    )
+                    .await
+                    {
+                        warn!("Failed to quarantine SIGILL worker {}: {}", worker.id, e);
+                    }
+                    RetryableRemoteFault {
+                        log_reason: format!(
+                            "worker CPU cannot execute build (SIGILL, exit {}) — quarantined",
+                            result.exit_code
+                        ),
+                        failed_worker: worker.id.clone(),
+                        on_exhaust: RemoteFaultExhaustAction::ExitWithCode {
+                            code: result.exit_code,
+                            summary: format!(
+                                "[RCH] remote {} killed (SIGILL — CPU capability)",
+                                worker.id
+                            ),
+                        },
+                    }
                 } else if let Some(signal) = is_signal_killed(result.exit_code) {
                     // Signal kill (137/SIGKILL == OOM, etc.): the small worker
                     // could not hold the build. Retry on a BIGGER worker; if all
@@ -2740,7 +2777,7 @@ use dependency_closure::{
 mod remote_result;
 use remote_result::{
     detect_cargo_workspace_inheritance_failure, detect_worker_system_dependency_failure,
-    is_signal_killed, is_toolchain_failure, signal_name,
+    is_cpu_capability_signal, is_signal_killed, is_toolchain_failure, signal_name,
 };
 
 // The remote cargo target-dir resolution / naming / command-rewrite cluster
@@ -2795,8 +2832,8 @@ use rabs_recorder::record_invocation;
 // `record_build` / `queue_when_busy_enabled` are re-exported for the hook hot
 // path. The timeout helpers and `urlencoding_encode` stay `pub(super)` for tests.
 mod daemon_ipc;
+use daemon_ipc::{disable_worker_for_fault, queue_when_busy_enabled, record_build};
 pub(crate) use daemon_ipc::{query_daemon, release_worker, restart_admission_is_closed};
-use daemon_ipc::{queue_when_busy_enabled, record_build};
 
 // Command-string parsing utilities (tokenization + cargo flag/env analyzers +
 // offload core estimation) live in the `command_parsing` submodule.
@@ -3235,12 +3272,33 @@ async fn handle_selection_response(
                         workspace_failure.remediation()
                     ));
                 } else if let Some(signal) = is_signal_killed(exit_code) {
-                    warn!(
-                        "Remote command killed by signal {} ({}) on {}, replacing with exit code for transparency",
-                        signal,
-                        signal_name(signal),
-                        worker.id
-                    );
+                    if is_cpu_capability_signal(signal) {
+                        // bd-68hon: SIGILL on the hook path — the worker's
+                        // CPU cannot execute this build's codegen. Quarantine
+                        // it so later builds auto-route around it (the hook
+                        // path has no retry loop; transparency still returns
+                        // the exit code to the agent for THIS build).
+                        warn!(
+                            "Remote command killed by SIGILL on {} — worker CPU cannot execute build (likely missing ISA, e.g. AVX2); quarantining worker",
+                            worker.id
+                        );
+                        if let Err(e) = disable_worker_for_fault(
+                            &config.general.socket_path,
+                            &worker.id,
+                            "cpu-capability-fault (SIGILL) — likely missing ISA (e.g. AVX2)",
+                        )
+                        .await
+                        {
+                            warn!("Failed to quarantine SIGILL worker {}: {}", worker.id, e);
+                        }
+                    } else {
+                        warn!(
+                            "Remote command killed by signal {} ({}) on {}, replacing with exit code for transparency",
+                            signal,
+                            signal_name(signal),
+                            worker.id
+                        );
+                    }
                     reporter.summary(&format!(
                         "[RCH] remote {} killed ({})",
                         worker.id,

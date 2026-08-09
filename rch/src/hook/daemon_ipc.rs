@@ -365,6 +365,41 @@ pub(crate) async fn record_build(
     Ok(())
 }
 
+/// Quarantine a worker by reporting a fault to the daemon (bd-68hon):
+/// `POST /workers/{id}/disable?reason=…`. Fire-and-forget with the same
+/// fail-open discipline as `record_build` — a missing/busy daemon never
+/// blocks the hook, and the caller's retry logic proceeds either way.
+pub(crate) async fn disable_worker_for_fault(
+    socket_path: &str,
+    worker_id: &WorkerId,
+    reason: &str,
+) -> anyhow::Result<()> {
+    if !Path::new(socket_path).exists() {
+        return Ok(()); // Ignore if daemon gone
+    }
+
+    let stream = match timeout(Duration::from_secs(2), UnixStream::connect(socket_path)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Ok(()), // Daemon busy — don't block the hook
+    };
+    let (reader, mut writer) = stream.into_split();
+
+    let request = format!(
+        "POST /workers/{}/disable?reason={}\n",
+        urlencoding_encode(worker_id.as_str()),
+        urlencoding_encode(reason)
+    );
+    writer.write_all(request.as_bytes()).await?;
+    writer.flush().await?;
+
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    let _ = timeout(Duration::from_secs(5), reader.read_line(&mut line)).await;
+
+    Ok(())
+}
+
 /// URL percent-encoding for query parameters.
 ///
 /// Encodes characters that are not URL-safe (RFC 3986 unreserved characters).
