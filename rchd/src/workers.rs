@@ -1510,14 +1510,14 @@ pub async fn handle_worker_enable(
             // Same durability rule for the admin-disable record (bd-8zxz7):
             // an enable that leaves the record behind would be undone by the
             // next daemon restart's re-apply pass.
-            if let Some(store) = &ctx.admin_disable_store {
-                if let Err(e) = store.lock().await.remove(worker_id.as_str()) {
-                    tracing::warn!(
-                        "Failed to remove durable admin-disable record for {}: {}",
-                        worker_id,
-                        e
-                    );
-                }
+            if let Some(store) = &ctx.admin_disable_store
+                && let Err(e) = store.lock().await.remove(worker_id.as_str())
+            {
+                tracing::warn!(
+                    "Failed to remove durable admin-disable record for {}: {}",
+                    worker_id,
+                    e
+                );
             }
             WorkerStateResponse {
                 status: "ok".to_string(),

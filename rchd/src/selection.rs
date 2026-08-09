@@ -2208,20 +2208,27 @@ impl WorkerSelector {
         if has_preferred && !preferred_without_health.is_empty() {
             return Ok(preferred_without_health);
         }
-        if has_preferred {
-            return Err(SelectionReason::NoMatchingWorkers);
-        }
-        if !eligible.is_empty() {
-            return Ok(eligible);
-        }
-
         if has_preferred && filtered_by_slots > 0 {
             // Returning an empty eligible set maps to AllWorkersBusy in
             // select_with_exclusions. That keeps RCH_QUEUE_WHEN_BUSY polling
             // the same requested allow-set instead of selecting an unrelated
             // worker. If several workers were requested, one busy requested
             // worker is enough to make waiting useful.
+            //
+            // bd-uw4d8: this branch MUST come before the unconditional
+            // NoMatchingWorkers return below — the bd-iupei allow-set
+            // enforcement landed above it and made it unreachable, so a pinned
+            // busy worker refused no_free_slots and fell local even with
+            // RCH_QUEUE_WHEN_BUSY=1 explicitly set (observed live 2026-08-09:
+            // vmi1227854 saturated 8/8, second pinned build told to set the
+            // env it already had).
             return Ok(Vec::new());
+        }
+        if has_preferred {
+            return Err(SelectionReason::NoMatchingWorkers);
+        }
+        if !eligible.is_empty() {
+            return Ok(eligible);
         }
 
         if (filtered_by_active_project > 0 || (filtered_by_capacity > 0 && filtered_by_slots == 0))
@@ -4918,6 +4925,67 @@ mod tests {
             "Expected AllWorkersBusy, got {:?}",
             result.reason
         );
+    }
+
+    #[tokio::test]
+    async fn test_pinned_busy_worker_maps_to_all_workers_busy_for_queueing() {
+        // bd-uw4d8: a REQUESTED worker that exists, is healthy, and merely has
+        // no free slots must surface AllWorkersBusy — the reason the daemon's
+        // RCH_QUEUE_WHEN_BUSY wait path keys on — not NoMatchingWorkers (which
+        // refuses and falls local). The queue branch existed but sat below the
+        // unconditional allow-set NoMatchingWorkers return, i.e. dead code.
+        let pool = WorkerPool::new();
+
+        let busy = make_worker("pinned-busy", 4, 80.0);
+        busy.set_capabilities(rch_common::WorkerCapabilities {
+            rustc_version: Some("1.75.0".to_string()),
+            ..Default::default()
+        })
+        .await;
+        assert!(busy.reserve_slots(4).await);
+        pool.add_worker_state(busy).await;
+
+        // A second, FREE worker outside the allow-set proves the pin is
+        // honored: waiting on the requested worker, not selecting another.
+        let free = make_worker("free-other", 8, 90.0);
+        free.set_capabilities(rch_common::WorkerCapabilities {
+            rustc_version: Some("1.75.0".to_string()),
+            ..Default::default()
+        })
+        .await;
+        pool.add_worker_state(free).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "test".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![rch_common::WorkerId::new("pinned-busy")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none(), "pin must not select another worker");
+        assert_eq!(
+            result.reason,
+            SelectionReason::AllWorkersBusy,
+            "pinned-busy must be queueable (AllWorkersBusy), got {:?}",
+            result.reason
+        );
+
+        // Once the pinned worker frees up, the same request selects it.
+        let worker = pool
+            .get(&rch_common::WorkerId::new("pinned-busy"))
+            .await
+            .unwrap();
+        worker.release_slots(4).await;
+        let result = selector.select(&pool, &request).await;
+        let selected = result.worker.expect("freed pinned worker is selected");
+        assert_eq!(selected.config.read().await.id.as_str(), "pinned-busy");
     }
 
     #[tokio::test]
