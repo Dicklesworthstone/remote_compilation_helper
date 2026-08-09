@@ -514,16 +514,26 @@ mod tests {
         fs::write(live_pool.join("artifact.o"), b"x").unwrap();
         // An aged pooled dir with the pooled pass DISABLED must survive.
         let cmd_no_pool = build_sweep_command(base.to_str().unwrap(), 720, None);
-        let out = Command::new("sh").arg("-c").arg(&cmd_no_pool).output().unwrap();
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd_no_pool)
+            .output()
+            .unwrap();
         assert!(out.status.success());
-        assert!(dead_pool.exists(), "pooled dirs untouched without the pooled pass");
+        assert!(
+            dead_pool.exists(),
+            "pooled dirs untouched without the pooled pass"
+        );
 
         // With the pooled pass on, only the long-idle pool is reaped.
         let cmd = build_sweep_command(base.to_str().unwrap(), 720, Some(7 * 24 * 60));
         let out = Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(!dead_pool.exists(), "long-idle pooled dir must be reaped: {stdout}");
+        assert!(
+            !dead_pool.exists(),
+            "long-idle pooled dir must be reaped: {stdout}"
+        );
         assert!(live_pool.exists(), "active pooled dir must be kept");
         let m = parse_reap_metrics(&stdout).expect("metrics line present");
         assert_eq!(m.removed, 1, "exactly the dead pool is counted: {stdout}");

@@ -470,7 +470,10 @@ mod tests {
         // (floored) window, feeding the same counters.
         let cmd = worker_sweep_command("/data/projects", 720, Some(168 * 60));
         assert!(cmd.contains("-name \".rch-target-*-pool-*\" -prune"));
-        assert!(cmd.contains("-mmin -10080"), "pooled window must reach the predicate");
+        assert!(
+            cmd.contains("-mmin -10080"),
+            "pooled window must reach the predicate"
+        );
         assert!(cmd.contains("done < \"$__tmpf2\""));
         assert!(!cmd.contains("| while"));
 

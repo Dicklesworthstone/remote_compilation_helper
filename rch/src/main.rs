@@ -3855,7 +3855,10 @@ fn reap_surface_config() -> Result<(String, u32, u32)> {
     Ok((
         base,
         rch_config.remediation.pooled_target.reaper_idle_hours,
-        rch_config.remediation.pooled_target.reaper_pooled_idle_hours,
+        rch_config
+            .remediation
+            .pooled_target
+            .reaper_pooled_idle_hours,
     ))
 }
 
