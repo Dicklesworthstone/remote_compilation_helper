@@ -3854,11 +3854,21 @@ fn reap_surface_config() -> Result<(String, u32)> {
 }
 
 /// Run one remote command on a worker over a throwaway SSH session.
+///
+/// Uses a 15-minute command timeout instead of the 300s default: the
+/// enumeration walks every candidate with `du -sk`, and pooled target dirs on
+/// a loaded worker run to tens of GB (observed live: vmi1152480's enumeration
+/// exceeded 300s while hz2's took ~4min). These are explicit operator
+/// commands, not hook-path work, so a long ceiling is the right trade.
 async fn run_reap_surface_command(
     worker: &rch_common::WorkerConfig,
     command: &str,
 ) -> Result<rch_common::CommandResult> {
-    let mut client = rch_common::SshClient::new(worker.clone(), rch_common::SshOptions::default());
+    let options = rch_common::SshOptions {
+        command_timeout: std::time::Duration::from_secs(900),
+        ..rch_common::SshOptions::default()
+    };
+    let mut client = rch_common::SshClient::new(worker.clone(), options);
     client.connect().await?;
     let result = client.execute(command).await;
     let _ = client.disconnect().await;
