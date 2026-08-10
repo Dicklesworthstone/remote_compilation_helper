@@ -17,3 +17,5 @@
 //! prior-authority active generation before issuing new publication-eligible
 //! leases; prior-authority prepared candidates may contribute verified
 //! immutable blobs and evidence but can never publish (risk R120).
+
+pub mod target_lease;
