@@ -538,7 +538,14 @@ mod tests {
     impl TestFixture {
         fn new(prefix: &str, create_alias: bool, alias_target: Option<&Path>) -> Self {
             let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let root = std::env::temp_dir().join(format!(
+            // Canonicalize the temp root (yw6mn): on macOS `/var` is a symlink
+            // to `/private/var`, and `temp_dir()` returns the `/var` spelling.
+            // Expected values are built by joining onto this root while the
+            // code under test canonicalizes, so an un-canonicalized root makes
+            // every comparison differ by a prefix that is the same directory.
+            let temp_root = std::env::temp_dir();
+            let temp_root = temp_root.canonicalize().unwrap_or(temp_root);
+            let root = temp_root.join(format!(
                 "rch-path-topology-{}-{}-{}",
                 prefix,
                 std::process::id(),
