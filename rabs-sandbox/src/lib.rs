@@ -42,6 +42,7 @@ pub mod leak_scanner;
 pub mod metadata_policy;
 pub mod path_remap;
 pub mod process_context;
+pub mod pseudo_files;
 pub mod runtime_path_scanner;
 pub mod snapshot_capture;
 pub mod source_capture;

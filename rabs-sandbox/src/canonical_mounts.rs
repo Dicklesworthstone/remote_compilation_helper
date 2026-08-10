@@ -203,6 +203,12 @@ impl CanonicalMountPlan {
                 "RUSTUP_TOOLCHAIN".to_string(),
                 "/nonexistent-rustup".to_string(),
             ),
+            // D017: deterministic locale and timezone — build scripts and
+            // compilers must never observe the host's language or clock
+            // zone (sort orders, message text, embedded timestamps).
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+            ("TZ".to_string(), "UTC".to_string()),
         ]
     }
 
