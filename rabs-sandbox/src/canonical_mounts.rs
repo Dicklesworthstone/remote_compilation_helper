@@ -30,6 +30,7 @@
 
 use crate::canonical_namespace::{Bind, CanonicalNamespaceSpec};
 use crate::layout;
+use crate::snapshot_capture::SnapshotProvenance;
 use std::path::PathBuf;
 
 /// A checksum-addressed immutable content mount (registry unpack or git
@@ -129,6 +130,12 @@ pub struct CanonicalMountPlan {
     pub extra_env: Vec<(String, String)>,
     /// Network default-deny unless a fetch lane explicitly opts in.
     pub allow_network: bool,
+    /// Immutable-source mode (D004): when a coherent D018 snapshot backs
+    /// the workspace, its provenance is bound here and the workspace
+    /// mounts READ-ONLY — the build cannot mutate source, and a mutation
+    /// attempt surfaces as an error inside the sandbox, never as silent
+    /// divergence from the captured manifest.
+    pub immutable_source: Option<SnapshotProvenance>,
 }
 
 impl CanonicalMountPlan {
@@ -152,7 +159,21 @@ impl CanonicalMountPlan {
             incremental_units: Vec::new(),
             extra_env: Vec::new(),
             allow_network: false,
+            immutable_source: None,
         }
+    }
+
+    /// Switch the workspace to an immutable D018 snapshot (D004): the
+    /// backing directory is the materialized coherent snapshot, mounted
+    /// read-only, with its identity bound into the plan's provenance.
+    pub fn with_immutable_source(
+        mut self,
+        snapshot_backing: impl Into<PathBuf>,
+        provenance: SnapshotProvenance,
+    ) -> Self {
+        self.workspace_backing = snapshot_backing.into();
+        self.immutable_source = Some(provenance);
+        self
     }
 
     /// The canonical environment the plan implies, before `extra_env` is
@@ -191,8 +212,15 @@ impl CanonicalMountPlan {
         // Toolchain: STABLE path, read-only immutable dataset.
         ro.push(Bind::new(&self.toolchain_backing, layout::TOOLCHAIN));
 
+        // Workspace: read-only when an immutable D018 snapshot backs it
+        // (D004 — the build cannot mutate source), writable otherwise.
+        if self.immutable_source.is_some() {
+            ro.push(Bind::new(&self.workspace_backing, layout::WORKSPACE));
+        } else {
+            rw.push(Bind::new(&self.workspace_backing, layout::WORKSPACE));
+        }
+
         // Writable core surfaces.
-        rw.push(Bind::new(&self.workspace_backing, layout::WORKSPACE));
         rw.push(Bind::new(&self.cargo_home_backing, layout::CARGO_HOME));
         rw.push(Bind::new(&self.home_backing, layout::HOME));
 
@@ -437,6 +465,39 @@ mod tests {
             plan.git.push(ChecksumMount::new(bad, "/backing/x"));
             assert!(plan.to_spec().is_err(), "token {bad:?} must be refused");
         }
+    }
+
+    #[test]
+    fn immutable_snapshot_source_mounts_read_only_with_provenance_bound() {
+        use crate::snapshot_capture::{FsSemanticClass, SnapshotProvenance};
+        let provenance = SnapshotProvenance {
+            snapshot_root: "workspace".into(),
+            fs_class: FsSemanticClass::GenerationScan,
+            manifest_sha256: [7u8; 32],
+        };
+        let plan = base_plan().with_immutable_source("/backing/snapshots/m-7", provenance.clone());
+        let spec = plan.to_spec().unwrap();
+        let ws = std::path::Path::new(layout::WORKSPACE);
+        assert!(
+            spec.ro_binds
+                .iter()
+                .any(|b| b.visible == ws
+                    && b.backing == std::path::Path::new("/backing/snapshots/m-7")),
+            "snapshot workspace must be a READ-ONLY bind of the snapshot backing"
+        );
+        assert!(
+            !spec.rw_binds.iter().any(|b| b.visible == ws),
+            "no writable workspace bind may coexist with an immutable source"
+        );
+        assert_eq!(plan.immutable_source, Some(provenance));
+    }
+
+    #[test]
+    fn default_workspace_without_snapshot_stays_writable() {
+        let spec = base_plan().to_spec().unwrap();
+        let ws = std::path::Path::new(layout::WORKSPACE);
+        assert!(spec.rw_binds.iter().any(|b| b.visible == ws));
+        assert!(!spec.ro_binds.iter().any(|b| b.visible == ws));
     }
 
     #[test]
