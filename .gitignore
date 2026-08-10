@@ -107,3 +107,21 @@ docs/evidence/fleet_deploy_audit_*.json
 # === multi-repo ephemeral hygiene 2026-08-06 ===
 # Local agent salvage/scratch (patches, WIP notes) — never source of truth
 /scratchpad/
+
+# === multi-repo ephemeral patterns 2026-08-10 ===
+# Eidetic Engine local runtime memory
+.ee/
+# Full NTM runtime dir (logs/pids already ignored; cover rate_limits etc.)
+.ntm/
+# macOS Finder metadata (was missing; flooded status)
+.DS_Store
+**/.DS_Store
+# br fsqlite-ns + stale write locks
+.beads/beads.db-fsqlite-ns-*
+.beads/.write.lock.stale-*
+# Skill-loop / repo-janitor scratch
+.skill-loop-progress.md
+.skill-loop-progress-*.md
+.repo_janitor_workspace/
+# Wrangler local state
+.wrangler/
