@@ -29,8 +29,9 @@ TOOLCHAIN=$(rustc -V 2>/dev/null | tr -d '"')
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/rabs-l0-bench.XXXXXX")
 trap 'rm -rf "$SCRATCH"' EXIT
 
-# A source file to touch for the incremental scenario.
-TOUCH_FILE=$(find "$REPO_DIR/src" "$REPO_DIR" -maxdepth 3 -name '*.rs' 2>/dev/null | head -1)
+# A source file to touch for the incremental scenario. (find must not
+# kill the script under `set -eo pipefail` when probing paths.)
+TOUCH_FILE=$( (find "$REPO_DIR" -maxdepth 3 -name '*.rs' 2>/dev/null || true) | head -1)
 [ -n "$TOUCH_FILE" ] || { echo "no .rs file to touch in $REPO_DIR" >&2; exit 2; }
 
 now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
