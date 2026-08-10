@@ -35,6 +35,7 @@ pub mod canonical_mounts;
 pub mod canonical_namespace;
 pub mod edit_watcher;
 pub mod env_builder;
+pub mod equality_suite;
 pub mod external_inputs;
 pub mod layout;
 pub mod leak_scanner;
