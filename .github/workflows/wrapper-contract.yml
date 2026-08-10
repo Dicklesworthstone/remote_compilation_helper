@@ -1,0 +1,50 @@
+# C009 (bead rabs-root-4pidu.21.9): stable/beta/nightly wrapper-contract
+# matrix. Cargo/rustc contract drift (R29) — argv shapes, wrapper env,
+# JSON diagnostics framing, artifact notifications — turns red HERE
+# instead of breaking production. Each job captures the live contract of
+# its channel and compares it against the recorded fixture in
+# rabsd/tests/fixtures/. To refresh a fixture intentionally, run:
+#   RABS_RECORD_CONTRACT=1 rustup run <channel> cargo test -p rabsd --test wrapper_contract
+name: Wrapper Contract Matrix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rabsd/tests/wrapper_contract.rs'
+      - 'rabsd/tests/fixtures/wrapper_contract_*.json'
+      - '.github/workflows/wrapper-contract.yml'
+  pull_request:
+  schedule:
+    - cron: '0 7 * * *' # daily: channels move under us; that is the point
+  workflow_dispatch:
+
+concurrency:
+  group: wrapper-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  contract:
+    name: contract (${{ matrix.channel }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [stable, beta, nightly]
+    steps:
+      - uses: actions/checkout@v4
+      # The channel under test (the harness itself builds under the
+      # workspace's pinned nightly from rust-toolchain.toml).
+      - name: Install channel under test
+        run: rustup toolchain install ${{ matrix.channel }} --profile minimal
+      - name: Compare live wrapper contract against the recorded fixture
+        env:
+          RABS_CONTRACT_CHANNELS: ${{ matrix.channel }}
+        run: cargo test -p rabsd --test wrapper_contract -- --nocapture

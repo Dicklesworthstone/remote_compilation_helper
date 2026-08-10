@@ -20,6 +20,7 @@ doctest = false
 # and protocol interfaces stay distinct from day one.
 [dependencies]
 rabs-protocol = { path = "../rabs-protocol" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 rabs-action = { path = "../rabs-action" }
