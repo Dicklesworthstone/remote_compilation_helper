@@ -50,8 +50,11 @@ pub fn parse_wrapper_log(log: &str) -> Vec<RustcInvocation> {
             .map(str::to_string)
             .collect();
         let Some(crate_name) = value_after(&argv, "--crate-name") else {
-            continue; // -vV / --print probes carry no crate name
+            continue; // -vV probes carry no crate name
         };
+        if crate_name == "___" {
+            continue; // cargo's target-info probe (--print=file-names)
+        }
         let mut metadata = Vec::new();
         let mut extra_filename = Vec::new();
         let mut iter = argv.iter().peekable();
@@ -229,7 +232,14 @@ mod tests {
     }
 
     fn sample_log(metadata: &str, order_swapped: bool) -> String {
-        let probe = line(&["/tc/bin/rustc", "-vV"]);
+        let probe = line(&[
+            "/tc/bin/rustc",
+            "-vV",
+            "\n/tc/bin/rustc",
+            "--crate-name",
+            "___",
+            "--print=file-names",
+        ]);
         let build_script = line(&[
             "/tc/bin/rustc",
             "--crate-name",
