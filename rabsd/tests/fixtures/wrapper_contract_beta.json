@@ -1,0 +1,64 @@
+{
+  "units": {
+    "build-script": {
+      "flags": [
+        "--check-cfg",
+        "--crate-name",
+        "--crate-type",
+        "--edition",
+        "--emit",
+        "--error-format",
+        "--json",
+        "--out-dir",
+        "-C embed-bitcode",
+        "-C extra-filename",
+        "-C metadata",
+        "-L"
+      ],
+      "error_format": "json",
+      "json": [
+        "artifacts",
+        "diagnostic-rendered-ansi",
+        "future-incompat"
+      ]
+    },
+    "crate": {
+      "flags": [
+        "--check-cfg",
+        "--crate-name",
+        "--crate-type",
+        "--edition",
+        "--emit",
+        "--error-format",
+        "--json",
+        "--out-dir",
+        "-C debuginfo",
+        "-C embed-bitcode",
+        "-C extra-filename",
+        "-C metadata",
+        "-C split-debuginfo",
+        "-L"
+      ],
+      "error_format": "json",
+      "json": [
+        "artifacts",
+        "diagnostic-rendered-ansi",
+        "future-incompat"
+      ]
+    }
+  },
+  "env_keys": [
+    "CARGO",
+    "CARGO_BIN_EXE_rabs_noop_bench",
+    "CARGO_BIN_NAME",
+    "CARGO_CRATE_NAME",
+    "CARGO_HOME",
+    "CARGO_INCREMENTAL",
+    "CARGO_MAKEFLAGS",
+    "CARGO_MANIFEST_DIR",
+    "CARGO_MANIFEST_PATH",
+    "CARGO_PRIMARY_PACKAGE",
+    "CARGO_TARGET_DIR",
+    "RUSTC_WRAPPER"
+  ]
+}

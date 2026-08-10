@@ -271,15 +271,47 @@ pub fn assemble(evidence: &PackEvidence) -> Layer0Pack {
 }
 
 impl Layer0Pack {
-    /// Render the enabled knobs' fragments, in inventory order, under
-    /// a versioned header. Disabled knobs contribute NOTHING to the
-    /// config (their reasons live in the inventory, not the output).
+    /// Render the enabled knobs' fragments under a versioned header,
+    /// MERGED BY SECTION: fragments naming the same `[table]` fold into
+    /// one table body (TOML rejects duplicate table headers — found
+    /// live when B015 fed the rendered config to `cargo --config`).
+    /// Section first-appearance order and in-section knob order both
+    /// follow inventory order. Disabled knobs contribute NOTHING (their
+    /// reasons live in the inventory, not the output).
     #[must_use]
     pub fn render_config(&self) -> String {
-        let mut out = format!("# rabs layer0 pack v{}\n", self.version);
+        let mut section_order: Vec<String> = Vec::new();
+        let mut sections: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
         for knob in self.knobs.iter().filter(|k| k.enabled) {
-            out.push_str(&format!("\n# knob: {}\n", knob.id));
-            out.push_str(&knob.fragment);
+            let mut current = String::new(); // "" = preamble (comments)
+            for line in knob.fragment.lines() {
+                if line.starts_with('[') {
+                    current = line.to_string();
+                    if !sections.contains_key(&current) {
+                        section_order.push(current.clone());
+                        sections.insert(current.clone(), String::new());
+                    }
+                    let body = sections.get_mut(&current).expect("just inserted");
+                    body.push_str(&format!("# knob: {}\n", knob.id));
+                } else {
+                    let body = sections.entry(current.clone()).or_insert_with(|| {
+                        section_order.push(current.clone());
+                        String::new()
+                    });
+                    body.push_str(line);
+                    body.push('\n');
+                }
+            }
+        }
+        let mut out = format!("# rabs layer0 pack v{}\n", self.version);
+        for section in &section_order {
+            out.push('\n');
+            if !section.is_empty() {
+                out.push_str(section);
+                out.push('\n');
+            }
+            out.push_str(&sections[section]);
         }
         out
     }
@@ -303,6 +335,25 @@ impl Layer0Pack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_config_has_no_duplicate_table_headers() {
+        // TOML rejects duplicate [table] headers; multiple knobs share
+        // [profile.dev], so render must merge (found live in B015 when
+        // cargo --config refused the rendered pack).
+        let pack = assemble(&evidence("release: 1.99.0-nightly", &["LLD 18.0"]));
+        let rendered = pack.render_config();
+        let mut seen = std::collections::BTreeSet::new();
+        for line in rendered.lines() {
+            if line.starts_with('[') {
+                assert!(
+                    seen.insert(line.to_string()),
+                    "duplicate table header {line} in:\n{rendered}"
+                );
+            }
+        }
+        assert!(rendered.contains("[profile.dev]"));
+    }
 
     fn evidence(rustc: &str, linkers: &[&str]) -> PackEvidence {
         PackEvidence {
