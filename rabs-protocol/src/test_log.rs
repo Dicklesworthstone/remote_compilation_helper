@@ -315,7 +315,10 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(buffer).unwrap();
         let hostile_line = text.lines().nth(1).unwrap();
-        assert!(hostile_line.contains(r#"quote\" backslash\\ newline\n tab\t bell"#));
+        assert!(
+            hostile_line.contains(r#"quote\" backslash\\ newline\n tab\t bell"#),
+            "line: {hostile_line}"
+        );
         // Still one record per line: no raw newline broke the framing.
         assert_eq!(text.lines().count(), 3);
     }
