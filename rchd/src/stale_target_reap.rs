@@ -343,6 +343,18 @@ impl StaleTargetReaper {
         ensure_sweep_command_success(&result)?;
 
         let metrics = parse_reap_metrics(&result.stdout).unwrap_or_default();
+        // Per-removal audit trail (bead 6dj11): one info line per reaped dir
+        // with size and the policy that removed it, so any deletion can be
+        // reconstructed from the daemon log alone.
+        for event in stale_target_reap::parse_reap_events(&result.stdout) {
+            info!(
+                worker = %worker_id,
+                kb = event.kb,
+                trigger = %event.trigger,
+                path = %event.path,
+                "Reaped remote target dir"
+            );
+        }
         debug!(
             worker = %worker_id,
             removed = metrics.removed,
@@ -527,7 +539,7 @@ mod tests {
         fs::create_dir_all(&live_pool).unwrap();
         fs::write(live_pool.join("artifact.o"), b"x").unwrap();
         // An aged pooled dir with the pooled pass DISABLED must survive.
-        let cmd_no_pool = build_sweep_command(base.to_str().unwrap(), 720, None);
+        let cmd_no_pool = build_sweep_command(base.to_str().unwrap(), 720, None, None);
         let out = Command::new("sh")
             .arg("-c")
             .arg(&cmd_no_pool)
@@ -596,16 +608,28 @@ mod tests {
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
 
-        assert!(!oldest.exists(), "oldest aged pool must be evicted: {stdout}");
-        assert!(!middle.exists(), "middle aged pool must be evicted: {stdout}");
+        assert!(
+            !oldest.exists(),
+            "oldest aged pool must be evicted: {stdout}"
+        );
+        assert!(
+            !middle.exists(),
+            "middle aged pool must be evicted: {stdout}"
+        );
         assert!(
             newest.exists(),
             "newest aged pool must survive once under budget: {stdout}"
         );
-        assert!(fresh_big.exists(), "fresh dir is protected by the -mmin floor");
+        assert!(
+            fresh_big.exists(),
+            "fresh dir is protected by the -mmin floor"
+        );
         let m = parse_reap_metrics(&stdout).expect("metrics line present");
         assert_eq!(m.removed, 2, "exactly the two oldest are counted: {stdout}");
-        assert!(m.freed_bytes >= 300 * 1024, "freed reflects evictions: {stdout}");
+        assert!(
+            m.freed_bytes >= 300 * 1024,
+            "freed reflects evictions: {stdout}"
+        );
     }
 
     #[test]

@@ -125,6 +125,22 @@ pub fn reap_loop_body(
     removed_counter: &str,
     freed_kb: &str,
 ) -> String {
+    reap_loop_body_with_event(idle_minutes, exclude_token, removed_counter, freed_kb, None)
+}
+
+/// [`reap_loop_body`] with an optional per-removal EVENT line: when `trigger`
+/// is `Some` (and counters are enabled), every successful removal prints
+/// `RCH_REAP_RM <kb> <trigger> <path>` so a reviewer can reconstruct any
+/// deletion — which dir, how big, which policy removed it — from the sweep
+/// output alone (bead 6dj11's observability requirement; also the
+/// diagnosability gap named in bd-kwvy8).
+pub fn reap_loop_body_with_event(
+    idle_minutes: u64,
+    exclude_token: Option<&str>,
+    removed_counter: &str,
+    freed_kb: &str,
+    trigger: Option<&str>,
+) -> String {
     let exclude = match exclude_token {
         Some(tok) => format!("[ \"$d\" = \"{tok}\" ] && continue; "),
         None => String::new(),
@@ -133,11 +149,15 @@ pub fn reap_loop_body(
     let (size_capture, removal) = if removed_counter.is_empty() || freed_kb.is_empty() {
         (String::new(), "rm -rf -- \"$d\" 2>/dev/null;".to_string())
     } else {
+        let event = match trigger {
+            Some(tag) => format!("printf 'RCH_REAP_RM %s {tag} %s\\n' \"$sz\" \"$d\"; "),
+            None => String::new(),
+        };
         (
             "sz=$(du -sk \"$d\" 2>/dev/null | awk '{print $1}'); [ -z \"$sz\" ] && sz=0; "
                 .to_string(),
             format!(
-                "if rm -rf -- \"$d\" 2>/dev/null; then {removed_counter}=$(({removed_counter} + 1)); {freed_kb}=$(({freed_kb} + sz)); fi;"
+                "if rm -rf -- \"$d\" 2>/dev/null; then {removed_counter}=$(({removed_counter} + 1)); {freed_kb}=$(({freed_kb} + sz)); {event}fi;"
             ),
         )
     };
@@ -208,13 +228,15 @@ pub fn worker_sweep_command(
     pooled_idle_minutes: Option<u64>,
     max_cache_kb: Option<u64>,
 ) -> String {
-    let loop_body = reap_loop_body(idle_minutes, None, "removed", "freed_kb");
+    let loop_body =
+        reap_loop_body_with_event(idle_minutes, None, "removed", "freed_kb", Some("ttl"));
     let guard = "printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; ";
     let preamble = candidate_discovery_preamble(escaped_base, guard);
     let pooled_pass = match pooled_idle_minutes {
         Some(window) => {
             let window = window.max(MIN_POOLED_IDLE_MINUTES);
-            let pooled_body = reap_loop_body(window, None, "removed", "freed_kb");
+            let pooled_body =
+                reap_loop_body_with_event(window, None, "removed", "freed_kb", Some("pooled-ttl"));
             format!(
                 "if __tmpf2=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
                    find \"$__rt\" -maxdepth 8 -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null > \"$__tmpf2\"; \
@@ -261,6 +283,7 @@ pub fn worker_sweep_command(
                    if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then continue; fi; \
                    if rm -rf -- \"$d\" 2>/dev/null; then \
                      removed=$((removed + 1)); freed_kb=$((freed_kb + __k)); total_kb=$((total_kb - __k)); \
+                     printf 'RCH_REAP_RM %s cap %s\\n' \"$__k\" \"$d\"; \
                    fi; \
                  done < \"$__tmpf3\"; \
                fi; \
@@ -300,6 +323,43 @@ pub fn parse_worker_reap_metrics(stdout: &str) -> Option<(u64, u64)> {
         }
     }
     Some((removed.unwrap_or(0), freed_kb.unwrap_or(0)))
+}
+
+/// One per-removal event from a [`worker_sweep_command`] run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReapEvent {
+    /// Disk usage of the removed dir in KiB.
+    pub kb: u64,
+    /// Which policy removed it: `ttl`, `pooled-ttl`, or `cap`.
+    pub trigger: String,
+    /// Absolute path removed.
+    pub path: String,
+}
+
+/// Parse the `RCH_REAP_RM <kb> <trigger> <path>` event lines a
+/// [`worker_sweep_command`] run prints — one per successful removal, so any
+/// deletion can be reconstructed from the output alone. Unparseable lines are
+/// skipped.
+#[must_use]
+pub fn parse_reap_events(stdout: &str) -> Vec<ReapEvent> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("RCH_REAP_RM ")?;
+            let mut parts = rest.splitn(3, ' ');
+            let kb = parts.next()?.parse::<u64>().ok()?;
+            let trigger = parts.next()?.to_string();
+            let path = parts.next()?.trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(ReapEvent {
+                kb,
+                trigger,
+                path: path.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Build the READ-ONLY enumeration script behind `rch cache status` and
@@ -598,5 +658,26 @@ mod tests {
         assert_eq!(entries[0].kb, 1024);
         assert!(!entries[0].is_pooled());
         assert!(entries[1].is_pooled());
+    }
+
+    #[test]
+    fn reap_events_are_emitted_per_pass_and_parse_back() {
+        // Each pass tags its removals so any deletion is attributable.
+        let cmd = worker_sweep_command("/data/projects", 720, Some(168 * 60), Some(1024));
+        assert!(cmd.contains("RCH_REAP_RM %s ttl %s"));
+        assert!(cmd.contains("RCH_REAP_RM %s pooled-ttl %s"));
+        assert!(cmd.contains("RCH_REAP_RM %s cap %s"));
+
+        let out = "RCH_REAP_RM 2048 ttl /data/projects/r/.rch-target-w-job-1\n\
+                   RCH_REAP_RM 512 cap /data/projects/r/.rch-target-w-pool-x\n\
+                   RCH_WORKER_REAP_METRICS removed=2 freed_kb=2560\n";
+        let events = parse_reap_events(out);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].trigger, "ttl");
+        assert_eq!(events[1].kb, 512);
+        assert_eq!(events[1].trigger, "cap");
+        // Untagged bodies (the orchestrator hook path) emit no events.
+        let hook_body = reap_loop_body(720, None, "", "");
+        assert!(!hook_body.contains("RCH_REAP_RM"));
     }
 }

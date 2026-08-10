@@ -4095,11 +4095,24 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
                     match reap::parse_worker_reap_metrics(&result.stdout) {
                         Some((removed, freed_kb)) => {
                             any_ok = true;
+                            // Per-removal audit entries (RCH_REAP_RM lines).
+                            let events: Vec<serde_json::Value> =
+                                reap::parse_reap_events(&result.stdout)
+                                    .into_iter()
+                                    .map(|e| {
+                                        serde_json::json!({
+                                            "path": e.path,
+                                            "kb": e.kb,
+                                            "trigger": e.trigger,
+                                        })
+                                    })
+                                    .collect();
                             serde_json::json!({
                                 "id": worker.id.as_str(),
                                 "ok": true,
                                 "removed": removed,
                                 "freed_kb": freed_kb,
+                                "entries": events,
                             })
                         }
                         None => serde_json::json!({
@@ -4167,6 +4180,14 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
                     report["removed"].as_u64().unwrap_or(0),
                     report["freed_kb"].as_u64().unwrap_or(0) / 1024,
                 );
+                for e in report["entries"].as_array().into_iter().flatten() {
+                    println!(
+                        "    {:>8} MB  [{}]  {}",
+                        e["kb"].as_u64().unwrap_or(0) / 1024,
+                        e["trigger"].as_str().unwrap_or("?"),
+                        e["path"].as_str().unwrap_or("?"),
+                    );
+                }
             }
         }
     }
