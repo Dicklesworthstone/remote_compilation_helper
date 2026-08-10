@@ -242,10 +242,10 @@ impl CanonicalMountPlan {
         // Env: canonical base, then explicit extras (extras never override a
         // canonical key — mounts and env must stay consistent).
         let mut env = self.canonical_env();
-        let canonical_keys: std::collections::BTreeSet<&str> =
-            env.iter().map(|(k, _)| k.as_str()).collect();
+        let canonical_keys: std::collections::BTreeSet<String> =
+            env.iter().map(|(k, _)| k.clone()).collect();
         for (k, v) in &self.extra_env {
-            if !canonical_keys.contains(k.as_str()) {
+            if !canonical_keys.contains(k) {
                 env.push((k.clone(), v.clone()));
             }
         }
