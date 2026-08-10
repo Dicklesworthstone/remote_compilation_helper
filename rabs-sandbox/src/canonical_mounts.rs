@@ -123,8 +123,15 @@ pub struct CanonicalMountPlan {
     pub repos: Vec<RepoMount>,
     /// Primary output units → `/__rabs/out/<unit>` (writable).
     pub out_units: Vec<UnitMount>,
+    /// Build-script out units → `/__rabs/build/<unit>/out` (writable;
+    /// D006 — valid only when the driver configured Cargo to request
+    /// exactly this path before planning).
+    pub build_units: Vec<UnitMount>,
     /// Incremental units → `/__rabs/incremental/<unit>` (writable).
     pub incremental_units: Vec<UnitMount>,
+    /// Secret slots → `/run/rabs-secrets/<slot>` (read-only; outside
+    /// `/__rabs` so a secret never looks like a build input).
+    pub secret_slots: Vec<UnitMount>,
     /// Extra explicitly-declared env pairs (merged over the canonical base;
     /// the plan's own keys win to keep mounts and env consistent).
     pub extra_env: Vec<(String, String)>,
@@ -156,7 +163,9 @@ impl CanonicalMountPlan {
             git: Vec::new(),
             repos: Vec::new(),
             out_units: Vec::new(),
+            build_units: Vec::new(),
             incremental_units: Vec::new(),
+            secret_slots: Vec::new(),
             extra_env: Vec::new(),
             allow_network: false,
             immutable_source: None,
@@ -259,11 +268,26 @@ impl CanonicalMountPlan {
                 format!("{}/{}", layout::OUT, unit.unit),
             ));
         }
+        for unit in &self.build_units {
+            validate_token("build_units.unit", &unit.unit)?;
+            rw.push(Bind::new(
+                &unit.backing,
+                format!("{}/{}/out", layout::BUILD, unit.unit),
+            ));
+        }
         for unit in &self.incremental_units {
             validate_token("incremental_units.unit", &unit.unit)?;
             rw.push(Bind::new(
                 &unit.backing,
                 format!("{}/{}", layout::INCREMENTAL, unit.unit),
+            ));
+        }
+        // Secret slots: read-only, outside /__rabs (never build-input-shaped).
+        for slot in &self.secret_slots {
+            validate_token("secret_slots.unit", &slot.unit)?;
+            ro.push(Bind::new(
+                &slot.backing,
+                format!("{}/{}", layout::SECRETS, slot.unit),
             ));
         }
 
@@ -465,6 +489,31 @@ mod tests {
             plan.git.push(ChecksumMount::new(bad, "/backing/x"));
             assert!(plan.to_spec().is_err(), "token {bad:?} must be refused");
         }
+    }
+
+    #[test]
+    fn build_units_and_secret_slots_mount_at_their_d006_paths() {
+        let mut plan = base_plan();
+        plan.build_units.push(UnitMount {
+            unit: "fx-1.0-build-script-build-debug".into(),
+            backing: "/b/bs-out".into(),
+        });
+        plan.secret_slots.push(UnitMount {
+            unit: "signing-key".into(),
+            backing: "/b/secrets/sk".into(),
+        });
+        let spec = plan.to_spec().unwrap();
+        assert!(
+            spec.rw_binds.iter().any(|b| b.visible
+                == std::path::Path::new("/__rabs/build/fx-1.0-build-script-build-debug/out")),
+            "build-script out dir is writable at its canonical path"
+        );
+        assert!(
+            spec.ro_binds
+                .iter()
+                .any(|b| b.visible == std::path::Path::new("/run/rabs-secrets/signing-key")),
+            "secret slot is READ-ONLY and outside /__rabs"
+        );
     }
 
     #[test]
