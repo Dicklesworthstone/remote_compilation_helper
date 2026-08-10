@@ -66,6 +66,43 @@ pub fn materialization_step(cas_mtime_ns: u128, floor_ns: u128) -> Materializati
     }
 }
 
+/// The deterministic mtime for snapshot-materialized SOURCE files:
+/// 2000-01-01T00:00:00Z, far in the past so every real output clears it.
+///
+/// Why it exists (observed live on hz2 during D009 bring-up): Cargo's
+/// package fingerprint hashes source file MTIMES, so two worktrees of
+/// byte-identical content whose files were written at different moments
+/// fingerprint differently — `cargo build -vv` reports "the
+/// precalculated components changed" and spuriously rebuilds. Snapshot
+/// materialization therefore stamps every source with this constant:
+/// same content ⇒ same mtimes ⇒ the fingerprint converges across
+/// worktrees. Outputs keep real mtimes (≥ the D009 floor), so
+/// input-older-than-output always holds.
+#[must_use]
+pub fn snapshot_source_epoch() -> std::time::SystemTime {
+    // 946_684_800 seconds after the Unix epoch = 2000-01-01T00:00:00Z.
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800)
+}
+
+/// Stamp every regular file under `root` with the snapshot source
+/// epoch (the materializer's mtime choreography; symlinks untouched).
+pub fn apply_snapshot_source_epoch(root: &std::path::Path) -> std::io::Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                let file = std::fs::File::options().write(true).open(entry.path())?;
+                file.set_modified(snapshot_source_epoch())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::diagnostic_rewrite::MappingEntry;

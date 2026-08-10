@@ -100,6 +100,13 @@ fn served_target_state_is_fresh_across_worktrees() {
     let worktree_b = tempfile::tempdir().unwrap();
     fixture(worktree_a.path());
     fixture(worktree_b.path());
+    // The materializer's mtime choreography (D009): snapshot sources
+    // are stamped with the deterministic epoch, so Cargo's
+    // mtime-hashing package fingerprint converges across worktrees.
+    // Without this, the second build reports "the precalculated
+    // components changed" and spuriously recompiles (observed live).
+    rabsd::edge::dep_info::apply_snapshot_source_epoch(worktree_a.path()).unwrap();
+    rabsd::edge::dep_info::apply_snapshot_source_epoch(worktree_b.path()).unwrap();
     let out_backing = tempfile::tempdir().unwrap();
 
     // The "served hit": worktree A populates the canonical target state
