@@ -106,6 +106,50 @@ pub fn normalize_dep_info(content: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Normalize an `.rlib` before comparison: rustc names its per-invocation
+/// temp codegen objects with RANDOM tokens (`{crate}.{rand}.{rand}.rcgu.o`)
+/// that embed in the archive's extended-name table AND each object's
+/// string table — two builds of the SAME worktree already differ there,
+/// so it is time-noise, not a path leak (verified empirically on hz2:
+/// same-worktree double build diverges only at these tokens). Masking is
+/// LENGTH-PRESERVING and scoped: every `[0-9a-z.]` run ending in
+/// `.rcgu.o` has its alphanumerics overwritten with `x`; nothing else in
+/// the archive is touched, so any real content difference still
+/// surfaces. (The crate metadata hash inside such a token is masked with
+/// it — that hash is independently compared via file names, argv, and
+/// the standalone `.rmeta`.)
+#[must_use]
+pub fn normalize_rlib(bytes: &[u8]) -> Vec<u8> {
+    const SUFFIX: &[u8] = b".rcgu.o";
+    let mut out = bytes.to_vec();
+    let mut search_from = 0;
+    while let Some(pos) = find(&out[search_from..], SUFFIX) {
+        let suffix_start = search_from + pos;
+        let mut token_start = suffix_start;
+        while token_start > 0 {
+            let byte = out[token_start - 1];
+            if byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' {
+                token_start -= 1;
+            } else {
+                break;
+            }
+        }
+        for byte in &mut out[token_start..suffix_start] {
+            if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
+                *byte = b'x';
+            }
+        }
+        search_from = suffix_start + SUFFIX.len();
+    }
+    out
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -125,10 +169,10 @@ pub fn collect_run_artifacts(deps_dir: &std::path::Path) -> std::io::Result<RunA
             continue;
         };
         let raw = std::fs::read(entry.path())?;
-        let content = if class == ArtifactClass::DepInfo {
-            normalize_dep_info(&raw)
-        } else {
-            raw
+        let content = match class {
+            ArtifactClass::DepInfo => normalize_dep_info(&raw),
+            ArtifactClass::Rlib => normalize_rlib(&raw),
+            ArtifactClass::Rmeta | ArtifactClass::Binary => raw,
         };
         run.artifacts.insert(
             name,
@@ -275,6 +319,24 @@ mod tests {
         assert_eq!(classify_artifact("libfx.rmeta"), Some(ArtifactClass::Rmeta));
         let empty = RunArtifacts::default();
         assert!(!classes_covered(&empty, &[ArtifactClass::Rmeta]));
+    }
+
+    #[test]
+    fn rlib_normalization_masks_rcgu_tokens_and_nothing_else() {
+        // Two runs' worth of the same archive region, differing only in
+        // the random rcgu temp tokens (as observed on hz2): equal after
+        // normalization.
+        let run1 = b"!<arch>\n90uhkulp1gxeqtrr.0kgwkth.rcgu.o/\nlib.rmeta/ CODE\
+                     \x01?probe-4080c224e33b8777.2d15jdor4.rcgu.o\xc1\x00rust-end-file";
+        let run2 = b"!<arch>\nzz9hkulp1gxeqtrr.abcdefg.rcgu.o/\nlib.rmeta/ CODE\
+                     \x01?probe-4080c224e33b8777.99z8xy0w7.rcgu.o\xc1\x00rust-end-file";
+        assert_eq!(normalize_rlib(run1), normalize_rlib(run2));
+        // A REAL content difference (the code bytes) still surfaces.
+        let run3 = b"!<arch>\n90uhkulp1gxeqtrr.0kgwkth.rcgu.o/\nlib.rmeta/ EVIL\
+                     \x01?probe-4080c224e33b8777.2d15jdor4.rcgu.o\xc1\x00rust-end-file";
+        assert_ne!(normalize_rlib(run1), normalize_rlib(run3));
+        // And an archive with no rcgu tokens is untouched.
+        assert_eq!(normalize_rlib(b"!<arch>\nplain"), b"!<arch>\nplain");
     }
 
     #[test]
