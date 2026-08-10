@@ -198,13 +198,20 @@ async fn commit_benchmark_score(
     worker: &WorkerState,
     worker_id: &WorkerId,
     score: SpeedScore,
-) -> anyhow::Result<SpeedScore> {
-    telemetry
-        .record_speedscore(worker_id.as_str(), score.clone())
-        .await?;
+) -> SpeedScore {
     worker.set_speed_score(score.total);
     worker.record_success().await;
-    Ok(score)
+    if let Err(error) = telemetry
+        .record_speedscore(worker_id.as_str(), score.clone())
+        .await
+    {
+        warn!(
+            worker_id = %worker_id,
+            error = %error,
+            "Benchmark succeeded but SpeedScore persistence failed"
+        );
+    }
+    score
 }
 
 fn benchmark_queued_event_data(request: &ScheduledBenchmarkRequest) -> serde_json::Value {
@@ -741,11 +748,10 @@ impl BenchmarkScheduler {
         tokio::spawn(async move {
             let start_time = std::time::Instant::now();
             let result = match execute_benchmark_on_worker(&worker_config, timeout).await {
-                Ok((score, exec_duration)) => {
-                    commit_benchmark_score(&telemetry, &worker_state, &worker_id, score)
-                        .await
-                        .map(|score| (score, exec_duration))
-                }
+                Ok((score, exec_duration)) => Ok((
+                    commit_benchmark_score(&telemetry, &worker_state, &worker_id, score).await,
+                    exec_duration,
+                )),
                 Err(error) => Err(error),
             };
             let duration = start_time.elapsed();
@@ -857,23 +863,19 @@ impl BenchmarkScheduler {
 
         if let Some(running) = running {
             let score = benchmark_speedscore(score, Utc::now());
-            let result = match self.pool.get(worker_id).await {
+            let score = match self.pool.get(worker_id).await {
                 Some(worker) => {
                     commit_benchmark_score(&self.telemetry, &worker, worker_id, score).await
                 }
-                None => Err(anyhow::anyhow!(
-                    "Worker {} disappeared while completing benchmark",
-                    worker_id
-                )),
-            };
-            let score = match result {
-                Ok(score) => score,
-                Err(error) => {
+                None => {
                     self.running
                         .write()
                         .await
                         .insert(worker_id.clone(), running);
-                    return Err(error);
+                    return Err(anyhow::anyhow!(
+                        "Worker {} disappeared while completing benchmark",
+                        worker_id
+                    ));
                 }
             };
             info!(
@@ -1139,6 +1141,7 @@ fn parse_benchmark_speedscore(output: &str, measured_at: DateTime<Utc>) -> Optio
         score.disk_score = normalized_event_score(score.disk_score);
         score.network_score = normalized_event_score(score.network_score);
         score.compilation_score = normalized_event_score(score.compilation_score);
+        score.calculated_at = measured_at;
         return Some(score);
     }
 
@@ -1443,9 +1446,7 @@ mod tests {
         let mut completed_score = benchmark_speedscore(75.0, Utc::now());
         completed_score.cpu_score = 81.0;
         completed_score.memory_score = 72.0;
-        commit_benchmark_score(&telemetry, &worker, &worker_id, completed_score)
-            .await
-            .expect("successful benchmark score should persist");
+        commit_benchmark_score(&telemetry, &worker, &worker_id, completed_score).await;
 
         assert!(scheduler.should_benchmark(&worker).await.is_none());
         let persisted = telemetry
@@ -1623,7 +1624,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mark_completed_releases_slot() {
+    async fn test_mark_completed_releases_slot_when_persistence_unavailable() {
         let pool = WorkerPool::new();
         pool.add_worker(make_worker_config("complete-test")).await;
 
@@ -1632,7 +1633,7 @@ mod tests {
         let mut rx = events.subscribe();
 
         let (scheduler, _handle) =
-            BenchmarkScheduler::new(make_test_config(), pool.clone(), telemetry, events);
+            BenchmarkScheduler::new(make_test_config(), pool.clone(), telemetry.clone(), events);
 
         let worker_id = WorkerId::new("complete-test");
 
@@ -1670,7 +1671,15 @@ mod tests {
         // Check slot was released
         if let Some(worker) = pool.get(&worker_id).await {
             assert_eq!(worker.available_slots().await, 4);
+            assert_eq!(worker.get_speed_score(), 75.0);
         }
+
+        let cached = telemetry
+            .latest_speedscore(worker_id.as_str())
+            .await
+            .expect("cached score lookup should succeed")
+            .expect("successful benchmark should update the live cache");
+        assert_eq!(cached.total, 75.0);
 
         let msg = tokio::time::timeout(Duration::from_millis(50), rx.recv())
             .await
@@ -2465,8 +2474,9 @@ mod tests {
 
     #[test]
     fn test_parse_benchmark_speedscore_preserves_components() {
-        let measured_at = Utc::now();
-        let mut expected = benchmark_speedscore(62.5, measured_at);
+        let daemon_measured_at = Utc::now();
+        let worker_measured_at = daemon_measured_at - ChronoDuration::days(30);
+        let mut expected = benchmark_speedscore(62.5, worker_measured_at);
         expected.cpu_score = 71.0;
         expected.memory_score = 66.0;
         expected.disk_score = 58.0;
@@ -2478,7 +2488,7 @@ mod tests {
         })
         .to_string();
 
-        let parsed = parse_benchmark_speedscore(&output, Utc::now())
+        let parsed = parse_benchmark_speedscore(&output, daemon_measured_at)
             .expect("typed benchmark score should parse");
         assert_eq!(parsed.total, 62.5);
         assert_eq!(parsed.cpu_score, 71.0);
@@ -2486,7 +2496,7 @@ mod tests {
         assert_eq!(parsed.disk_score, 58.0);
         assert_eq!(parsed.network_score, 0.0);
         assert_eq!(parsed.compilation_score, 55.0);
-        assert_eq!(parsed.calculated_at, measured_at);
+        assert_eq!(parsed.calculated_at, daemon_measured_at);
     }
 
     #[test]

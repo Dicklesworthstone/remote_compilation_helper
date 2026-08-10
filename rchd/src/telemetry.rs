@@ -182,13 +182,25 @@ impl TelemetryStore {
             move || storage.latest_speedscore(&worker_id)
         })
         .await??;
-        if let Some(score) = score.as_ref() {
-            self.speed_scores
-                .write()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert(worker_id, score.clone());
+        Ok(self.cache_loaded_speedscore(&worker_id, score))
+    }
+
+    fn cache_loaded_speedscore(
+        &self,
+        worker_id: &str,
+        loaded: Option<SpeedScore>,
+    ) -> Option<SpeedScore> {
+        let mut speed_scores = self
+            .speed_scores
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(score) = speed_scores.get(worker_id) {
+            return Some(score.clone());
         }
-        Ok(score)
+        if let Some(score) = loaded.as_ref() {
+            speed_scores.insert(worker_id.to_string(), score.clone());
+        }
+        loaded
     }
 
     /// Persist a newly calculated SpeedScore for a worker.
@@ -934,6 +946,41 @@ mod tests {
             .expect("cached score lookup should succeed")
             .expect("failed persistence should still suppress immediate re-benchmarking");
         assert_eq!(cached.total, 73.0);
+    }
+
+    #[tokio::test]
+    async fn test_cache_fill_preserves_score_recorded_after_cache_miss() {
+        let _guard = test_guard!();
+        let store = TelemetryStore::new(Duration::from_secs(300), None);
+        let older = SpeedScore {
+            total: 40.0,
+            calculated_at: Utc::now() - ChronoDuration::hours(1),
+            ..SpeedScore::default()
+        };
+        let newer = SpeedScore {
+            total: 90.0,
+            calculated_at: Utc::now(),
+            ..SpeedScore::default()
+        };
+
+        store
+            .record_speedscore("w1", newer)
+            .await
+            .expect_err("test store intentionally has no durable storage");
+
+        let published = store
+            .cache_loaded_speedscore("w1", Some(older))
+            .expect("concurrently recorded score should remain cached");
+        assert_eq!(published.total, 90.0);
+        assert_eq!(
+            store
+                .latest_speedscore("w1")
+                .await
+                .expect("cached score lookup should succeed")
+                .expect("newer score should remain cached")
+                .total,
+            90.0
+        );
     }
 
     #[tokio::test]
