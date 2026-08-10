@@ -58,7 +58,7 @@ fn fixture(root: &std::path::Path) {
         root,
         "log-rustc.sh",
         "#!/bin/sh\n\
-         line=$(printf '%s\\x1f' \"$@\")\n\
+         line=$(printf '%s\\037' \"$@\")\n\
          printf '%s\\n' \"$line\" >> \"$RABS_ARGV_LOG\"\n\
          exec \"$@\"\n",
     );
