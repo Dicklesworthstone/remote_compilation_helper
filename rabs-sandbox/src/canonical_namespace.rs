@@ -16,7 +16,7 @@
 //! (A011 ledger). The preferred stack from the bead — user/mount/pid/uts/
 //! network namespaces via unprivileged userns — is therefore driven through
 //! **bubblewrap** as a subprocess: [`HostIsolationSupport::probe`] measures
-//! what the host actually provides, [`build_bwrap_argv`] deterministically
+//! what the host actually provides, [`build_canonical_argv`] deterministically
 //! compiles a namespace spec into a `bwrap` argv, and a host that cannot
 //! satisfy the request yields a typed [`IsolationError::UnsupportedHost`]
 //! refusal — never a silently weaker sandbox.
