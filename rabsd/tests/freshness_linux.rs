@@ -1,0 +1,120 @@
+//! D009 acceptance (Linux): after a build's outputs exist (the served
+//! hit), a `cargo build` from a DIFFERENT host worktree over the same
+//! canonical target state reports full freshness — zero `Compiling`
+//! lines, no spurious rebuild — because dep-info and fingerprints carry
+//! only canonical paths that both worktrees share.
+//!
+//! Executes real `bwrap` namespaces; skips loudly on any host whose
+//! probe fails rather than fake a pass.
+#![cfg(target_os = "linux")]
+
+use rabs_sandbox::canonical_mounts::{CanonicalMountPlan, UnitMount};
+use rabs_sandbox::canonical_namespace::{HostIsolationSupport, build_canonical_argv, command_for};
+use rabs_sandbox::layout;
+
+fn supported() -> Option<HostIsolationSupport> {
+    let support = HostIsolationSupport::probe();
+    if support.missing_for_canonical().is_empty() {
+        Some(support)
+    } else {
+        eprintln!(
+            "SKIP: host cannot run D009 acceptance; missing {:?}",
+            support.missing_for_canonical()
+        );
+        None
+    }
+}
+
+fn toolchain_dir() -> std::path::PathBuf {
+    let cargo_path = std::env::var("CARGO").expect("cargo sets $CARGO for tests");
+    std::path::Path::new(&cargo_path)
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("<root>/bin/cargo")
+        .to_path_buf()
+}
+
+fn write(root: &std::path::Path, rel: &str, contents: &str) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, contents).unwrap();
+}
+
+fn fixture(root: &std::path::Path) {
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"rabs-d009\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    );
+    write(root, "build.rs", "fn main() {}\n");
+    write(root, "src/main.rs", "fn main() {}\n");
+}
+
+/// Run `cargo build` from `source_backing` against a SHARED out
+/// backing; return cargo's stderr.
+fn build(
+    support: &HostIsolationSupport,
+    source_backing: &std::path::Path,
+    out_backing: &std::path::Path,
+) -> String {
+    let cargo_home = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut plan = CanonicalMountPlan::new(
+        toolchain_dir(),
+        source_backing,
+        cargo_home.path(),
+        home.path(),
+    );
+    plan.out_units.push(UnitMount {
+        unit: "fixture".into(),
+        backing: out_backing.to_path_buf(),
+    });
+    plan.extra_env.push((
+        "CARGO_TARGET_DIR".into(),
+        format!("{}/fixture", layout::OUT),
+    ));
+    let spec = plan.to_spec().unwrap();
+    let launch = build_canonical_argv(
+        &spec,
+        support,
+        "cargo",
+        &["build".to_string(), "--offline".to_string()],
+    )
+    .unwrap();
+    let out = command_for(&launch).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "build failed:\n{stderr}");
+    stderr
+}
+
+/// ACCEPTANCE: worktree B over worktree A's target state = fully fresh.
+#[test]
+fn served_target_state_is_fresh_across_worktrees() {
+    let Some(support) = supported() else { return };
+
+    let worktree_a = tempfile::tempdir().unwrap();
+    let worktree_b = tempfile::tempdir().unwrap();
+    fixture(worktree_a.path());
+    fixture(worktree_b.path());
+    let out_backing = tempfile::tempdir().unwrap();
+
+    // The "served hit": worktree A populates the canonical target state
+    // (dep-info, fingerprints, artifacts — all under /__rabs paths).
+    let first = build(&support, worktree_a.path(), out_backing.path());
+    assert!(
+        first.contains("Compiling rabs-d009"),
+        "control arm must actually compile:\n{first}"
+    );
+
+    // Worktree B (different host path, same content) over the same
+    // state: Cargo must report freshness — ZERO compile steps.
+    let second = build(&support, worktree_b.path(), out_backing.path());
+    assert!(
+        !second.contains("Compiling"),
+        "spurious rebuild across worktrees:\n{second}"
+    );
+    assert!(
+        second.contains("Finished"),
+        "second build must still complete:\n{second}"
+    );
+}

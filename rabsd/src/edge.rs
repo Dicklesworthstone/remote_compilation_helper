@@ -16,4 +16,5 @@
 //! subscriber/materialization rights per boot generation outside an
 //! explicit bounded handoff (risk R118).
 
+pub mod dep_info;
 pub mod diagnostic_rewrite;
