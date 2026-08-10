@@ -18,3 +18,4 @@
 
 pub mod dep_info;
 pub mod diagnostic_rewrite;
+pub mod mtime_choreography;

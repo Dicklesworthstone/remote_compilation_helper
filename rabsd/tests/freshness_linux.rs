@@ -143,3 +143,34 @@ fn served_target_state_is_fresh_across_worktrees() {
         "second build must still complete:\n{second}"
     );
 }
+
+/// D010 acceptance arm: hit → immediate rebuild, repeatedly — three
+/// consecutive builds over served state show ZERO recompilation (no
+/// rebuild storm), alternating worktrees to keep the cross-worktree
+/// property in the loop.
+#[test]
+fn repeated_hits_do_not_induce_rebuild_storms() {
+    let Some(support) = supported() else { return };
+
+    let worktree_a = tempfile::tempdir().unwrap();
+    let worktree_b = tempfile::tempdir().unwrap();
+    fixture(worktree_a.path());
+    fixture(worktree_b.path());
+    rabsd::edge::dep_info::apply_snapshot_source_epoch(worktree_a.path()).unwrap();
+    rabsd::edge::dep_info::apply_snapshot_source_epoch(worktree_b.path()).unwrap();
+    let out_backing = tempfile::tempdir().unwrap();
+
+    let first = build(&support, worktree_a.path(), out_backing.path());
+    assert!(first.contains("Compiling rabs-d009"), "{first}");
+
+    for (round, worktree) in [&worktree_b, &worktree_a, &worktree_b]
+        .into_iter()
+        .enumerate()
+    {
+        let rebuild = build(&support, worktree.path(), out_backing.path());
+        assert!(
+            !rebuild.contains("Compiling"),
+            "rebuild storm on repeated hit round {round}:\n{rebuild}"
+        );
+    }
+}
