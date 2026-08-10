@@ -149,16 +149,27 @@ pub fn reap_loop_body_with_event(
     let (size_capture, removal) = if removed_counter.is_empty() || freed_kb.is_empty() {
         (String::new(), "rm -rf -- \"$d\" 2>/dev/null;".to_string())
     } else {
-        let event = match trigger {
-            Some(tag) => format!("printf 'RCH_REAP_RM %s {tag} %s\\n' \"$sz\" \"$d\"; "),
-            None => String::new(),
+        // Tagged (sweep) contexts capture rm's stderr instead of silencing it
+        // (bd-kwvy8: a half-removed dir with removed=0 was undiagnosable
+        // because the failing rm was 2>/dev/null'd) — a failed removal emits
+        // `RCH_REAP_ERR <trigger> <path> :: <first stderr line>`.
+        let removal_body = match trigger {
+            Some(tag) => format!(
+                "if __rmerr=$(rm -rf -- \"$d\" 2>&1); then \
+                   {removed_counter}=$(({removed_counter} + 1)); {freed_kb}=$(({freed_kb} + sz)); \
+                   printf 'RCH_REAP_RM %s {tag} %s\\n' \"$sz\" \"$d\"; \
+                 else \
+                   printf 'RCH_REAP_ERR {tag} %s :: %s\\n' \"$d\" \"$(printf '%s' \"$__rmerr\" | head -1)\"; \
+                 fi;"
+            ),
+            None => format!(
+                "if rm -rf -- \"$d\" 2>/dev/null; then {removed_counter}=$(({removed_counter} + 1)); {freed_kb}=$(({freed_kb} + sz)); fi;"
+            ),
         };
         (
             "sz=$(du -sk \"$d\" 2>/dev/null | awk '{print $1}'); [ -z \"$sz\" ] && sz=0; "
                 .to_string(),
-            format!(
-                "if rm -rf -- \"$d\" 2>/dev/null; then {removed_counter}=$(({removed_counter} + 1)); {freed_kb}=$(({freed_kb} + sz)); {event}fi;"
-            ),
+            removal_body,
         )
     };
     format!(
@@ -276,16 +287,22 @@ pub fn worker_sweep_command(
                  printf '%s %s %s\\n' \"$__n\" \"$__k\" \"$d\" >> \"$__lst\"; \
                done < \"$__tmpf3\"; \
                if [ \"$total_kb\" -gt {cap_kb} ]; then \
+                 printf 'RCH_REAP_CAP initial_kb=%s cap_kb={cap_kb}\\n' \"$total_kb\"; \
                  sort -n \"$__lst\" > \"$__tmpf3\"; \
                  while IFS=' ' read -r __n __k d; do \
                    [ \"$total_kb\" -le {cap_kb} ] && break; \
                    [ -d \"$d\" ] || continue; \
-                   if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then continue; fi; \
-                   if rm -rf -- \"$d\" 2>/dev/null; then \
+                   if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then \
+                     printf 'RCH_REAP_SKIP cap %s active %s\\n' \"$__k\" \"$d\"; continue; \
+                   fi; \
+                   if __rmerr=$(rm -rf -- \"$d\" 2>&1); then \
                      removed=$((removed + 1)); freed_kb=$((freed_kb + __k)); total_kb=$((total_kb - __k)); \
                      printf 'RCH_REAP_RM %s cap %s\\n' \"$__k\" \"$d\"; \
+                   else \
+                     printf 'RCH_REAP_ERR cap %s :: %s\\n' \"$d\" \"$(printf '%s' \"$__rmerr\" | head -1)\"; \
                    fi; \
                  done < \"$__tmpf3\"; \
+                 printf 'RCH_REAP_CAP final_kb=%s\\n' \"$total_kb\"; \
                fi; \
                rm -f \"$__lst\" \"$__tmpf3\"; \
              fi; "
@@ -357,6 +374,41 @@ pub fn parse_reap_events(stdout: &str) -> Vec<ReapEvent> {
                 kb,
                 trigger,
                 path: path.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// One failed-removal diagnostic from a [`worker_sweep_command`] run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReapError {
+    /// Which pass hit the failure: `ttl`, `pooled-ttl`, or `cap`.
+    pub trigger: String,
+    /// Path whose removal failed.
+    pub path: String,
+    /// First line of `rm`'s stderr.
+    pub message: String,
+}
+
+/// Parse the `RCH_REAP_ERR <trigger> <path> :: <message>` lines a
+/// [`worker_sweep_command`] run prints — one per FAILED removal (bd-kwvy8:
+/// silenced rm failures made a half-removed dir undiagnosable). Unparseable
+/// lines are skipped.
+#[must_use]
+pub fn parse_reap_errors(stdout: &str) -> Vec<ReapError> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("RCH_REAP_ERR ")?;
+            let (trigger, rest) = rest.split_once(' ')?;
+            let (path, message) = rest.split_once(" :: ")?;
+            if path.is_empty() {
+                return None;
+            }
+            Some(ReapError {
+                trigger: trigger.to_string(),
+                path: path.to_string(),
+                message: message.trim().to_string(),
             })
         })
         .collect()
@@ -679,5 +731,36 @@ mod tests {
         // Untagged bodies (the orchestrator hook path) emit no events.
         let hook_body = reap_loop_body(720, None, "", "");
         assert!(!hook_body.contains("RCH_REAP_RM"));
+    }
+
+    #[test]
+    fn rm_failures_are_captured_in_tagged_contexts_only() {
+        // Tagged sweep bodies capture rm stderr into an ERR event…
+        let tagged = reap_loop_body_with_event(720, None, "removed", "freed_kb", Some("ttl"));
+        assert!(tagged.contains("RCH_REAP_ERR ttl"));
+        assert!(!tagged.contains("rm -rf -- \"$d\" 2>/dev/null"));
+        // …while the untagged hook body keeps its historical silent shape.
+        let untagged = reap_loop_body(720, None, "removed", "freed_kb");
+        assert!(!untagged.contains("RCH_REAP_ERR"));
+        assert!(untagged.contains("rm -rf -- \"$d\" 2>/dev/null"));
+
+        // The cap pass captures failures and accounts totals.
+        let cmd = worker_sweep_command("/data/projects", 720, None, Some(1024));
+        assert!(cmd.contains("RCH_REAP_ERR cap"));
+        assert!(cmd.contains("RCH_REAP_CAP initial_kb=%s cap_kb=1024"));
+        assert!(cmd.contains("RCH_REAP_CAP final_kb=%s"));
+        assert!(cmd.contains("RCH_REAP_SKIP cap %s active %s"));
+    }
+
+    #[test]
+    fn parse_reap_errors_reads_trigger_path_and_message() {
+        let out = "RCH_REAP_RM 5 ttl /data/projects/r/.rch-target-w-job-1\n\
+                   RCH_REAP_ERR cap /data/projects/r/.rch-target-w-pool-x :: rm: cannot remove 'x': Permission denied\n\
+                   garbage\n";
+        let errors = parse_reap_errors(out);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].trigger, "cap");
+        assert_eq!(errors[0].path, "/data/projects/r/.rch-target-w-pool-x");
+        assert!(errors[0].message.contains("Permission denied"));
     }
 }

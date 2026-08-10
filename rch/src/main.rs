@@ -4095,7 +4095,8 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
                     match reap::parse_worker_reap_metrics(&result.stdout) {
                         Some((removed, freed_kb)) => {
                             any_ok = true;
-                            // Per-removal audit entries (RCH_REAP_RM lines).
+                            // Per-removal audit entries (RCH_REAP_RM lines)
+                            // and failed removals (RCH_REAP_ERR, bd-kwvy8).
                             let events: Vec<serde_json::Value> =
                                 reap::parse_reap_events(&result.stdout)
                                     .into_iter()
@@ -4107,12 +4108,24 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
                                         })
                                     })
                                     .collect();
+                            let rm_errors: Vec<serde_json::Value> =
+                                reap::parse_reap_errors(&result.stdout)
+                                    .into_iter()
+                                    .map(|e| {
+                                        serde_json::json!({
+                                            "path": e.path,
+                                            "trigger": e.trigger,
+                                            "message": e.message,
+                                        })
+                                    })
+                                    .collect();
                             serde_json::json!({
                                 "id": worker.id.as_str(),
                                 "ok": true,
                                 "removed": removed,
                                 "freed_kb": freed_kb,
                                 "entries": events,
+                                "rm_errors": rm_errors,
                             })
                         }
                         None => serde_json::json!({
@@ -4186,6 +4199,15 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
                         e["kb"].as_u64().unwrap_or(0) / 1024,
                         e["trigger"].as_str().unwrap_or("?"),
                         e["path"].as_str().unwrap_or("?"),
+                    );
+                }
+                for e in report["rm_errors"].as_array().into_iter().flatten() {
+                    println!(
+                        "    {} rm FAILED [{}] {} — {}",
+                        style.muted("✗"),
+                        e["trigger"].as_str().unwrap_or("?"),
+                        e["path"].as_str().unwrap_or("?"),
+                        e["message"].as_str().unwrap_or("?"),
                     );
                 }
             }

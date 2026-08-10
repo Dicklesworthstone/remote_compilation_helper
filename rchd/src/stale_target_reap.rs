@@ -355,6 +355,17 @@ impl StaleTargetReaper {
                 "Reaped remote target dir"
             );
         }
+        // Failed removals surface at warn (bd-kwvy8): a half-removed dir with
+        // an unincremented counter was undiagnosable while rm was silenced.
+        for error in stale_target_reap::parse_reap_errors(&result.stdout) {
+            warn!(
+                worker = %worker_id,
+                trigger = %error.trigger,
+                path = %error.path,
+                "Remote target dir removal FAILED: {}",
+                error.message
+            );
+        }
         debug!(
             worker = %worker_id,
             removed = metrics.removed,
@@ -629,6 +640,48 @@ mod tests {
         assert!(
             m.freed_bytes >= 300 * 1024,
             "freed reflects evictions: {stdout}"
+        );
+    }
+
+    #[test]
+    fn sweep_script_reports_failed_removals_instead_of_silence() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("create tmp root");
+        let base = tmp.path().join("projects");
+        let parent = base.join("repoA");
+        let victim = parent.join(".rch-target-w-job-err-1-0");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("artifact.o"), b"x").unwrap();
+        let ok = Command::new("find")
+            .arg(&victim)
+            .args(["-exec", "touch", "-t", "202601010000", "{}", ";"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "aging should succeed");
+
+        // A read-only parent makes the unlink fail (as non-root).
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let cmd = build_sweep_command(base.to_str().unwrap(), 720, None, None);
+        let out = Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
+        // Restore before asserting so tempdir cleanup works even on failure.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(victim.exists(), "read-only parent must defeat the rm");
+        let errors = stale_target_reap::parse_reap_errors(&stdout);
+        assert_eq!(errors.len(), 1, "the failed rm must be reported: {stdout}");
+        assert_eq!(errors[0].trigger, "ttl");
+        assert!(errors[0].path.ends_with(".rch-target-w-job-err-1-0"));
+        let m = parse_reap_metrics(&stdout).expect("metrics line present");
+        assert_eq!(
+            m.removed, 0,
+            "failed removals must not be counted: {stdout}"
         );
     }
 
