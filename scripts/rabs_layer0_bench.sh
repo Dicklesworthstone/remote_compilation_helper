@@ -53,24 +53,38 @@ run_timed() { # variant scenario iteration -- cmd...
 
 cargo_for() { # variant target_dir -- subcmd...
   local variant=$1 target=$2; shift 3
+  local -a wrapper=()
+  if [ "$variant" = sccache ]; then
+    wrapper=(env "RUSTC_WRAPPER=sccache" "SCCACHE_DIR=$SCRATCH/sccache-cache")
+  fi
   if [ "$variant" = layer0 ] && [ -n "$LAYER0_CONFIG" ]; then
     # Apply the pack as a config OVERLAY (file path form of --config)
     # without touching the repo tree.
     CARGO_TARGET_DIR=$target CARGO_INCREMENTAL=0 \
-      cargo --config "$LAYER0_CONFIG" "$@" --manifest-path "$REPO_DIR/Cargo.toml"
+      "${wrapper[@]}" cargo --config "$LAYER0_CONFIG" "$@" --manifest-path "$REPO_DIR/Cargo.toml"
   else
     CARGO_TARGET_DIR=$target CARGO_INCREMENTAL=0 \
-      cargo "$@" --manifest-path "$REPO_DIR/Cargo.toml"
+      "${wrapper[@]}" cargo "$@" --manifest-path "$REPO_DIR/Cargo.toml"
   fi
 }
 
-for VARIANT in stock layer0; do
+VARIANTS=${RABS_BENCH_VARIANTS:-"stock layer0"}
+for VARIANT in $VARIANTS; do
   if [ "$VARIANT" = layer0 ] && [ -z "$LAYER0_CONFIG" ]; then
     echo "layer0 config not provided; skipping layer0 variant (recorded)" >&2
     emit layer0 skipped 0 0 -1
     continue
   fi
+  if [ "$VARIANT" = sccache ] && ! command -v sccache >/dev/null; then
+    echo "sccache not on PATH; skipping sccache variant (recorded)" >&2
+    emit sccache skipped 0 0 -1
+    continue
+  fi
   TARGET="$SCRATCH/target-$VARIANT"
+  if [ "$VARIANT" = sccache ]; then
+    rm -rf "$SCRATCH/sccache-cache"
+    SCCACHE_DIR="$SCRATCH/sccache-cache" sccache --stop-server >/dev/null 2>&1 || true
+  fi
 
   for i in $(seq 1 "$COLD_ITERS"); do
     rm -rf "$TARGET"
@@ -86,6 +100,15 @@ for VARIANT in stock layer0; do
     rm -rf "$TARGET"
     run_timed "$VARIANT" cold-build "$i" -- cargo_for "$VARIANT" "$TARGET" -- build --workspace || true
   done
+
+  # sccache's value scenario: target wiped, COMPILE CACHE kept — the
+  # repeated-cold-build a shared cache accelerates.
+  if [ "$VARIANT" = sccache ]; then
+    for i in $(seq 1 "$COLD_ITERS"); do
+      rm -rf "$TARGET"
+      run_timed "$VARIANT" cold-build-cached "$i" -- cargo_for "$VARIANT" "$TARGET" -- build --workspace || true
+    done
+  fi
 done
 
 echo "baseline records appended to $OUT" >&2
