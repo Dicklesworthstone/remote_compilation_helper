@@ -11,9 +11,11 @@
 //! surface changes embedded times, a host-identity surface splits
 //! caches across machines, and a storage device is an escape hatch.
 
-/// The approved device allowlist (bwrap `--dev` minimal tmpfs).
-pub const APPROVED_DEVICES: [&str; 8] = [
-    "null", "zero", "full", "random", "urandom", "tty", "console", "ptmx",
+/// The approved device allowlist (bwrap `--dev` minimal tmpfs; `core`
+/// is bwrap's `/proc/kcore` symlink, unreadable inside the userns —
+/// observed live on hz2 as part of the audited minimal set).
+pub const APPROVED_DEVICES: [&str; 9] = [
+    "null", "zero", "full", "random", "urandom", "tty", "console", "ptmx", "core",
 ];
 
 /// Approved device DIRECTORIES in the minimal /dev.
