@@ -38,6 +38,7 @@ pub mod env_builder;
 pub mod external_inputs;
 pub mod layout;
 pub mod leak_scanner;
+pub mod metadata_policy;
 pub mod path_remap;
 pub mod runtime_path_scanner;
 pub mod snapshot_capture;
