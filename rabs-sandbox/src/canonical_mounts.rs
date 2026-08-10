@@ -30,6 +30,7 @@
 
 use crate::canonical_namespace::{Bind, CanonicalNamespaceSpec};
 use crate::layout;
+use crate::snapshot_capture::SnapshotProvenance;
 use std::path::PathBuf;
 
 /// A checksum-addressed immutable content mount (registry unpack or git
@@ -122,13 +123,26 @@ pub struct CanonicalMountPlan {
     pub repos: Vec<RepoMount>,
     /// Primary output units → `/__rabs/out/<unit>` (writable).
     pub out_units: Vec<UnitMount>,
+    /// Build-script out units → `/__rabs/build/<unit>/out` (writable;
+    /// D006 — valid only when the driver configured Cargo to request
+    /// exactly this path before planning).
+    pub build_units: Vec<UnitMount>,
     /// Incremental units → `/__rabs/incremental/<unit>` (writable).
     pub incremental_units: Vec<UnitMount>,
+    /// Secret slots → `/run/rabs-secrets/<slot>` (read-only; outside
+    /// `/__rabs` so a secret never looks like a build input).
+    pub secret_slots: Vec<UnitMount>,
     /// Extra explicitly-declared env pairs (merged over the canonical base;
     /// the plan's own keys win to keep mounts and env consistent).
     pub extra_env: Vec<(String, String)>,
     /// Network default-deny unless a fetch lane explicitly opts in.
     pub allow_network: bool,
+    /// Immutable-source mode (D004): when a coherent D018 snapshot backs
+    /// the workspace, its provenance is bound here and the workspace
+    /// mounts READ-ONLY — the build cannot mutate source, and a mutation
+    /// attempt surfaces as an error inside the sandbox, never as silent
+    /// divergence from the captured manifest.
+    pub immutable_source: Option<SnapshotProvenance>,
 }
 
 impl CanonicalMountPlan {
@@ -149,10 +163,26 @@ impl CanonicalMountPlan {
             git: Vec::new(),
             repos: Vec::new(),
             out_units: Vec::new(),
+            build_units: Vec::new(),
             incremental_units: Vec::new(),
+            secret_slots: Vec::new(),
             extra_env: Vec::new(),
             allow_network: false,
+            immutable_source: None,
         }
+    }
+
+    /// Switch the workspace to an immutable D018 snapshot (D004): the
+    /// backing directory is the materialized coherent snapshot, mounted
+    /// read-only, with its identity bound into the plan's provenance.
+    pub fn with_immutable_source(
+        mut self,
+        snapshot_backing: impl Into<PathBuf>,
+        provenance: SnapshotProvenance,
+    ) -> Self {
+        self.workspace_backing = snapshot_backing.into();
+        self.immutable_source = Some(provenance);
+        self
     }
 
     /// The canonical environment the plan implies, before `extra_env` is
@@ -173,6 +203,12 @@ impl CanonicalMountPlan {
                 "RUSTUP_TOOLCHAIN".to_string(),
                 "/nonexistent-rustup".to_string(),
             ),
+            // D017: deterministic locale and timezone — build scripts and
+            // compilers must never observe the host's language or clock
+            // zone (sort orders, message text, embedded timestamps).
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+            ("TZ".to_string(), "UTC".to_string()),
         ]
     }
 
@@ -191,8 +227,15 @@ impl CanonicalMountPlan {
         // Toolchain: STABLE path, read-only immutable dataset.
         ro.push(Bind::new(&self.toolchain_backing, layout::TOOLCHAIN));
 
+        // Workspace: read-only when an immutable D018 snapshot backs it
+        // (D004 — the build cannot mutate source), writable otherwise.
+        if self.immutable_source.is_some() {
+            ro.push(Bind::new(&self.workspace_backing, layout::WORKSPACE));
+        } else {
+            rw.push(Bind::new(&self.workspace_backing, layout::WORKSPACE));
+        }
+
         // Writable core surfaces.
-        rw.push(Bind::new(&self.workspace_backing, layout::WORKSPACE));
         rw.push(Bind::new(&self.cargo_home_backing, layout::CARGO_HOME));
         rw.push(Bind::new(&self.home_backing, layout::HOME));
 
@@ -231,6 +274,13 @@ impl CanonicalMountPlan {
                 format!("{}/{}", layout::OUT, unit.unit),
             ));
         }
+        for unit in &self.build_units {
+            validate_token("build_units.unit", &unit.unit)?;
+            rw.push(Bind::new(
+                &unit.backing,
+                format!("{}/{}/out", layout::BUILD, unit.unit),
+            ));
+        }
         for unit in &self.incremental_units {
             validate_token("incremental_units.unit", &unit.unit)?;
             rw.push(Bind::new(
@@ -238,14 +288,22 @@ impl CanonicalMountPlan {
                 format!("{}/{}", layout::INCREMENTAL, unit.unit),
             ));
         }
+        // Secret slots: read-only, outside /__rabs (never build-input-shaped).
+        for slot in &self.secret_slots {
+            validate_token("secret_slots.unit", &slot.unit)?;
+            ro.push(Bind::new(
+                &slot.backing,
+                format!("{}/{}", layout::SECRETS, slot.unit),
+            ));
+        }
 
         // Env: canonical base, then explicit extras (extras never override a
         // canonical key — mounts and env must stay consistent).
         let mut env = self.canonical_env();
-        let canonical_keys: std::collections::BTreeSet<&str> =
-            env.iter().map(|(k, _)| k.as_str()).collect();
+        let canonical_keys: std::collections::BTreeSet<String> =
+            env.iter().map(|(k, _)| k.clone()).collect();
         for (k, v) in &self.extra_env {
-            if !canonical_keys.contains(k.as_str()) {
+            if !canonical_keys.contains(k) {
                 env.push((k.clone(), v.clone()));
             }
         }
@@ -308,10 +366,13 @@ mod tests {
         let tc: Vec<_> = spec
             .ro_binds
             .iter()
-            .filter(|b| b.visible == PathBuf::from(layout::TOOLCHAIN))
+            .filter(|b| b.visible == std::path::Path::new(layout::TOOLCHAIN))
             .collect();
         assert_eq!(tc.len(), 1, "toolchain is a single read-only bind");
-        assert_eq!(tc[0].backing, PathBuf::from("/backing/toolchains/nightly-2026"));
+        assert_eq!(
+            tc[0].backing,
+            PathBuf::from("/backing/toolchains/nightly-2026")
+        );
         // The visible path carries NO digest.
         assert_eq!(tc[0].visible.to_string_lossy(), "/__rabs/toolchain");
     }
@@ -348,14 +409,18 @@ mod tests {
     #[test]
     fn extra_env_cannot_override_canonical_keys() {
         let mut plan = base_plan();
-        plan.extra_env
-            .push(("CARGO_HOME".into(), "/evil".into()));
-        plan.extra_env
-            .push(("RUST_LOG".into(), "debug".into()));
+        plan.extra_env.push(("CARGO_HOME".into(), "/evil".into()));
+        plan.extra_env.push(("RUST_LOG".into(), "debug".into()));
         let spec = plan.to_spec().unwrap();
         let env: std::collections::BTreeMap<_, _> = spec.env.into_iter().collect();
-        assert_eq!(env["CARGO_HOME"], "/__rabs/cargo-home", "canonical key wins");
-        assert_eq!(env["RUST_LOG"], "debug", "non-canonical extra passes through");
+        assert_eq!(
+            env["CARGO_HOME"], "/__rabs/cargo-home",
+            "canonical key wins"
+        );
+        assert_eq!(
+            env["RUST_LOG"], "debug",
+            "non-canonical extra passes through"
+        );
     }
 
     #[test]
@@ -375,32 +440,36 @@ mod tests {
         assert!(
             spec.rw_binds
                 .iter()
-                .any(|b| b.visible == PathBuf::from("/__rabs/repos/member-a"))
+                .any(|b| b.visible == std::path::Path::new("/__rabs/repos/member-a"))
         );
         assert!(
             spec.ro_binds
                 .iter()
-                .any(|b| b.visible == PathBuf::from("/__rabs/repos/dep-b"))
+                .any(|b| b.visible == std::path::Path::new("/__rabs/repos/dep-b"))
         );
     }
 
     #[test]
     fn output_and_incremental_units_are_writable_under_their_roots() {
         let mut plan = base_plan();
-        plan.out_units
-            .push(UnitMount { unit: "u1".into(), backing: "/b/out1".into() });
-        plan.incremental_units
-            .push(UnitMount { unit: "u1".into(), backing: "/b/inc1".into() });
+        plan.out_units.push(UnitMount {
+            unit: "u1".into(),
+            backing: "/b/out1".into(),
+        });
+        plan.incremental_units.push(UnitMount {
+            unit: "u1".into(),
+            backing: "/b/inc1".into(),
+        });
         let spec = plan.to_spec().unwrap();
         assert!(
             spec.rw_binds
                 .iter()
-                .any(|b| b.visible == PathBuf::from("/__rabs/out/u1"))
+                .any(|b| b.visible == std::path::Path::new("/__rabs/out/u1"))
         );
         assert!(
             spec.rw_binds
                 .iter()
-                .any(|b| b.visible == PathBuf::from("/__rabs/incremental/u1"))
+                .any(|b| b.visible == std::path::Path::new("/__rabs/incremental/u1"))
         );
     }
 
@@ -429,6 +498,64 @@ mod tests {
     }
 
     #[test]
+    fn build_units_and_secret_slots_mount_at_their_d006_paths() {
+        let mut plan = base_plan();
+        plan.build_units.push(UnitMount {
+            unit: "fx-1.0-build-script-build-debug".into(),
+            backing: "/b/bs-out".into(),
+        });
+        plan.secret_slots.push(UnitMount {
+            unit: "signing-key".into(),
+            backing: "/b/secrets/sk".into(),
+        });
+        let spec = plan.to_spec().unwrap();
+        assert!(
+            spec.rw_binds.iter().any(|b| b.visible
+                == std::path::Path::new("/__rabs/build/fx-1.0-build-script-build-debug/out")),
+            "build-script out dir is writable at its canonical path"
+        );
+        assert!(
+            spec.ro_binds
+                .iter()
+                .any(|b| b.visible == std::path::Path::new("/run/rabs-secrets/signing-key")),
+            "secret slot is READ-ONLY and outside /__rabs"
+        );
+    }
+
+    #[test]
+    fn immutable_snapshot_source_mounts_read_only_with_provenance_bound() {
+        use crate::snapshot_capture::{FsSemanticClass, SnapshotProvenance};
+        let provenance = SnapshotProvenance {
+            snapshot_root: "workspace".into(),
+            fs_class: FsSemanticClass::GenerationScan,
+            manifest_sha256: [7u8; 32],
+        };
+        let plan = base_plan().with_immutable_source("/backing/snapshots/m-7", provenance.clone());
+        let spec = plan.to_spec().unwrap();
+        let ws = std::path::Path::new(layout::WORKSPACE);
+        assert!(
+            spec.ro_binds
+                .iter()
+                .any(|b| b.visible == ws
+                    && b.backing == std::path::Path::new("/backing/snapshots/m-7")),
+            "snapshot workspace must be a READ-ONLY bind of the snapshot backing"
+        );
+        assert!(
+            !spec.rw_binds.iter().any(|b| b.visible == ws),
+            "no writable workspace bind may coexist with an immutable source"
+        );
+        assert_eq!(plan.immutable_source, Some(provenance));
+    }
+
+    #[test]
+    fn default_workspace_without_snapshot_stays_writable() {
+        let spec = base_plan().to_spec().unwrap();
+        let ws = std::path::Path::new(layout::WORKSPACE);
+        assert!(spec.rw_binds.iter().any(|b| b.visible == ws));
+        assert!(!spec.ro_binds.iter().any(|b| b.visible == ws));
+    }
+
+    #[test]
     fn plan_compiles_through_d003_builder_to_a_strict_argv() {
         use crate::canonical_namespace::{HostIsolationSupport, build_canonical_argv};
         let support = HostIsolationSupport {
@@ -439,8 +566,7 @@ mod tests {
             landlock: true,
         };
         let spec = base_plan().to_spec().unwrap();
-        let launch =
-            build_canonical_argv(&spec, &support, "cargo", &["build".into()]).unwrap();
+        let launch = build_canonical_argv(&spec, &support, "cargo", &["build".into()]).unwrap();
         assert!(launch.boundary.satisfies_strict_hermetic_linux());
     }
 }

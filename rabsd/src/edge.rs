@@ -15,3 +15,8 @@
 //! boot generation + fresh incarnation ID; exactly one incarnation owns
 //! subscriber/materialization rights per boot generation outside an
 //! explicit bounded handoff (risk R118).
+
+pub mod build_script_state;
+pub mod dep_info;
+pub mod diagnostic_rewrite;
+pub mod mtime_choreography;
