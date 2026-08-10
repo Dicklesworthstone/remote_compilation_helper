@@ -97,6 +97,7 @@ pub mod stateful_delivery;
 pub mod stream_chunker;
 pub mod subscriber_interest;
 pub mod subscriber_queue;
+pub mod test_log;
 pub mod transcript_sequencing;
 pub mod trust_domain;
 pub mod version_negotiation;
