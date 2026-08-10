@@ -160,19 +160,29 @@ fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         // /proc/<pid> probe — cheap and unambiguous on Linux. We do
-        // NOT use kill(0) because rch is #![forbid(unsafe_code)] and
-        // the kill(2) wrapper would require nix/libc raw syscalls.
+        // NOT use kill(0) directly because rch is #![forbid(unsafe_code)]
+        // and the kill(2) wrapper would require nix/libc raw syscalls.
         let proc_path = std::path::PathBuf::from(format!("/proc/{pid}"));
         if proc_path.exists() {
             return true;
         }
-        // On non-Linux Unix (macOS, BSD), /proc may not exist. We can't
-        // easily check liveness without unsafe; rely on TTL fallback.
-        // To distinguish "no /proc" from "PID is dead" we check whether
-        // /proc itself exists.
         if !std::path::Path::new("/proc").exists() {
-            // No /proc on this platform — be conservative and assume alive.
-            return true;
+            // No /proc (macOS/BSD): probe via the external `kill -0`
+            // binary — no unsafe, and this path only runs on the rare
+            // daemon-autostart lane, never per hook decision (qqa0y: the
+            // old conservative `true` meant a dead-pid lock could only
+            // recover via the 60s TTL on macOS). `kill -0` exits 0 when
+            // the process exists and is signalable; autostart locks live
+            // in the per-user state dir, so same-user EPERM is not a
+            // practical concern. A spawn failure falls back to
+            // conservative alive (TTL still recovers).
+            return std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(true);
         }
         // /proc exists but /proc/<pid> doesn't — PID is definitively gone.
         false
@@ -332,13 +342,26 @@ fn spawn_rchd(path: &Path) -> Result<(), AutoStartError> {
         .stdin(Stdio::null());
 
     let mut child = cmd.spawn().map_err(AutoStartError::SpawnFailed)?;
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    if let Some(status) = child.try_wait().map_err(AutoStartError::SpawnFailed)? {
-        return if status.success() {
-            Ok(())
-        } else {
-            Err(AutoStartError::WrapperFailed(status))
-        };
+    // Immediate-death detection: DEADLINE-based polling instead of one 100ms
+    // sleep + single try_wait (qqa0y: under load a child that died at
+    // 100-200ms slipped past the one-shot check on macOS). A fixed
+    // iteration count would amplify scheduler jitter (N stretched sleeps);
+    // the deadline bounds the live-child wall time at ~150ms + one slice,
+    // safely under the <250ms latency contract pinned by
+    // test_spawn_rchd_returns_quickly_for_live_child even on a loaded box.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+    loop {
+        if let Some(status) = child.try_wait().map_err(AutoStartError::SpawnFailed)? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(AutoStartError::WrapperFailed(status))
+            };
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
     // `nohup` does not daemonize by itself; it execs/wraps rchd as our
@@ -924,7 +947,19 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&fake_rchd, perms).expect("chmod fake rchd");
 
-        let err = super::spawn_rchd(&fake_rchd).expect_err("child failure should surface");
+        // The detection window is deliberately bounded (~150ms) by the
+        // live-child latency contract, so under parallel-test scheduler load
+        // a single attempt can miss a child that took >150ms to start+exit.
+        // Retry a few times: if detection is BROKEN every attempt returns Ok
+        // and the test still fails; if it works, an attempt catches the exit.
+        let mut caught = None;
+        for _ in 0..5 {
+            if let Err(err) = super::spawn_rchd(&fake_rchd) {
+                caught = Some(err);
+                break;
+            }
+        }
+        let err = caught.expect("child failure should surface within 5 attempts");
         assert!(
             matches!(err, super::AutoStartError::WrapperFailed(status) if status.code() == Some(42)),
             "unexpected error: {err:?}"

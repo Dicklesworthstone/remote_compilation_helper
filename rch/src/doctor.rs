@@ -4276,15 +4276,27 @@ fn spawn_rchd(rchd_path: &Path, socket_path: &Path) -> Result<(), String> {
         _ => e.to_string(),
     })?;
 
-    std::thread::sleep(Duration::from_millis(100));
-    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-        return if status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "rchd launch wrapper exited unsuccessfully: {status}"
-            ))
-        };
+    // Immediate-death detection: deadline-based polling instead of a one-shot
+    // 100ms sleep + try_wait (qqa0y: under load a wrapper that exited at
+    // 100-500ms slipped past the single check, and the caller then reported a
+    // misleading "did not accept connections" instead of the real exit
+    // status). Doctor is an interactive path with no tight latency contract,
+    // so a 500ms window is a fine trade for reliable attribution.
+    let spawn_deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "rchd launch wrapper exited unsuccessfully: {status}"
+                ))
+            };
+        }
+        if Instant::now() >= spawn_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 
     // `nohup` does not daemonize by itself; it execs/wraps rchd as our
@@ -7359,6 +7371,13 @@ exit 0\n"
         let error = start_daemon_with_binary(&socket_path, &fake_rchd, Duration::from_millis(50))
             .unwrap_err();
         assert!(error.contains("did not accept connections"));
+        // Under load the fake may still be finishing its `: > "$sock"` when
+        // the (short, deliberate) 50ms socket wait gives up — poll briefly
+        // rather than flake on scheduler timing.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !socket_path.is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(
             socket_path.is_file(),
             "fake must receive the -s socket path"

@@ -423,11 +423,23 @@ fn lock_info_is_stale(info: &LockInfo) -> bool {
         }
     }
 
-    // On non-Linux Unix systems, we rely solely on lock age
+    // On non-Linux Unix (macOS/BSD): probe via the external `kill -0`
+    // binary — no unsafe needed (qqa0y: relying solely on the 1h age
+    // meant a dead holder wedged the lock for an hour on macOS). Exit 0
+    // means the process exists; a spawn failure stays conservative and
+    // falls through to the age check.
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        // Can't safely check process existence without unsafe code.
-        let _ = &info;
+        let probe = std::process::Command::new("kill")
+            .args(["-0", &info.pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Ok(status) = probe
+            && !status.success()
+        {
+            return true;
+        }
     }
 
     lock_timestamp_is_too_old(&info.created_at)
