@@ -31,6 +31,7 @@
 //! - Any privileged operation lives in a separate, audited, bounded helper
 //!   binary listed in the unsafe-boundary ledger — never in this library.
 
+pub mod canonical_mounts;
 pub mod canonical_namespace;
 pub mod edit_watcher;
 pub mod env_builder;
