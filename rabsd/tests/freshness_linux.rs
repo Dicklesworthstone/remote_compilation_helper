@@ -73,6 +73,10 @@ fn build(
         "CARGO_TARGET_DIR".into(),
         format!("{}/fixture", layout::OUT),
     ));
+    plan.extra_env.push((
+        "CARGO_LOG".into(),
+        "cargo::core::compiler::fingerprint=debug".into(),
+    ));
     let spec = plan.to_spec().unwrap();
     let launch = build_canonical_argv(
         &spec,
