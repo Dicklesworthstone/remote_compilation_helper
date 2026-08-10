@@ -192,10 +192,7 @@ impl<W: Write> TestLogger<W> {
         home: &str,
     ) -> std::io::Result<()> {
         let mut fields = BTreeMap::new();
-        fields.insert(
-            key.to_string(),
-            crate::redaction::redact_path(path, home),
-        );
+        fields.insert(key.to_string(), crate::redaction::redact_path(path, home));
         self.emit(step, &fields)
     }
 
@@ -270,10 +267,19 @@ mod tests {
         let mut buffer = Vec::new();
         let mut logger = logger_into(&mut buffer);
         logger
-            .env_field("observe-env", "AWS_SECRET_ACCESS_KEY", "hunter2-actual-secret")
+            .env_field(
+                "observe-env",
+                "AWS_SECRET_ACCESS_KEY",
+                "hunter2-actual-secret",
+            )
             .unwrap();
         logger
-            .path_field("observe-path", "workspace", "/home/alice/secret-proj/src", "/home/alice")
+            .path_field(
+                "observe-path",
+                "workspace",
+                "/home/alice/secret-proj/src",
+                "/home/alice",
+            )
             .unwrap();
         logger
             .finish(&TestOutcome::Fail {
@@ -297,7 +303,10 @@ mod tests {
         let mut buffer = Vec::new();
         let mut logger = logger_into(&mut buffer);
         logger
-            .step("hostile", &[("payload", "quote\" backslash\\ newline\n tab\t bell\u{7}")])
+            .step(
+                "hostile",
+                &[("payload", "quote\" backslash\\ newline\n tab\t bell\u{7}")],
+            )
             .unwrap();
         logger
             .finish(&TestOutcome::Pass {

@@ -89,12 +89,28 @@ fn real_mid_scan_mutation_forces_retry_and_only_the_new_world_survives() {
     // engine must discard attempt 0 wholesale; the manifest must be
     // exactly the post-mutation world — a mixed manifest (old lib.rs
     // hash, or missing new file) is the I2 violation this test exists
-    // to catch.
+    // to catch. Emits T053 structured logs (the standard's first
+    // adopted suite).
+    use rabs_protocol::test_log::{CausalAttribution, TestLogger, TestOutcome};
+    let mut logger = TestLogger::start(
+        std::io::stderr(),
+        "unit/snapshot",
+        "real_mid_scan_mutation_forces_retry",
+        "unit-snapshot-mutation-0",
+        None,
+        CausalAttribution {
+            region: Some("edge".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let dir = tempfile::tempdir().unwrap();
     fixture_tree(dir.path());
 
     let mut mutated = false;
+    let mut scans = 0u32;
     let manifest = capture_coherent(CaptureConfig::generation_scan(), "workspace", |_a, pass| {
+        scans += 1;
         let scan = scan_directory(dir.path(), false);
         if pass == 0 && !mutated {
             mutated = true;
@@ -104,6 +120,10 @@ fn real_mid_scan_mutation_forces_retry_and_only_the_new_world_survives() {
         scan
     })
     .unwrap();
+    logger
+        .step("captured", &[("scan_passes", &scans.to_string())])
+        .unwrap();
+    assert!(scans > 2, "attempt 0 must have been discarded and retried");
 
     match &manifest.members["src/lib.rs"] {
         MemberKind::Regular { content_sha256, .. } => assert_eq!(
@@ -117,6 +137,14 @@ fn real_mid_scan_mutation_forces_retry_and_only_the_new_world_survives() {
         manifest.members.contains_key("src/new_module.rs"),
         "the file added mid-capture must be present in the coherent retry"
     );
+    logger
+        .finish(&TestOutcome::Pass {
+            evidence: format!(
+                "mid-scan mutation forced retry ({scans} scan passes); manifest \
+                 carries only the post-mutation world (edited hash + added file)"
+            ),
+        })
+        .unwrap();
 }
 
 #[test]
