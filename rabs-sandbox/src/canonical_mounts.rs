@@ -308,10 +308,13 @@ mod tests {
         let tc: Vec<_> = spec
             .ro_binds
             .iter()
-            .filter(|b| b.visible == PathBuf::from(layout::TOOLCHAIN))
+            .filter(|b| b.visible == std::path::Path::new(layout::TOOLCHAIN))
             .collect();
         assert_eq!(tc.len(), 1, "toolchain is a single read-only bind");
-        assert_eq!(tc[0].backing, PathBuf::from("/backing/toolchains/nightly-2026"));
+        assert_eq!(
+            tc[0].backing,
+            PathBuf::from("/backing/toolchains/nightly-2026")
+        );
         // The visible path carries NO digest.
         assert_eq!(tc[0].visible.to_string_lossy(), "/__rabs/toolchain");
     }
@@ -348,14 +351,18 @@ mod tests {
     #[test]
     fn extra_env_cannot_override_canonical_keys() {
         let mut plan = base_plan();
-        plan.extra_env
-            .push(("CARGO_HOME".into(), "/evil".into()));
-        plan.extra_env
-            .push(("RUST_LOG".into(), "debug".into()));
+        plan.extra_env.push(("CARGO_HOME".into(), "/evil".into()));
+        plan.extra_env.push(("RUST_LOG".into(), "debug".into()));
         let spec = plan.to_spec().unwrap();
         let env: std::collections::BTreeMap<_, _> = spec.env.into_iter().collect();
-        assert_eq!(env["CARGO_HOME"], "/__rabs/cargo-home", "canonical key wins");
-        assert_eq!(env["RUST_LOG"], "debug", "non-canonical extra passes through");
+        assert_eq!(
+            env["CARGO_HOME"], "/__rabs/cargo-home",
+            "canonical key wins"
+        );
+        assert_eq!(
+            env["RUST_LOG"], "debug",
+            "non-canonical extra passes through"
+        );
     }
 
     #[test]
@@ -375,32 +382,36 @@ mod tests {
         assert!(
             spec.rw_binds
                 .iter()
-                .any(|b| b.visible == PathBuf::from("/__rabs/repos/member-a"))
+                .any(|b| b.visible == std::path::Path::new("/__rabs/repos/member-a"))
         );
         assert!(
             spec.ro_binds
                 .iter()
-                .any(|b| b.visible == PathBuf::from("/__rabs/repos/dep-b"))
+                .any(|b| b.visible == std::path::Path::new("/__rabs/repos/dep-b"))
         );
     }
 
     #[test]
     fn output_and_incremental_units_are_writable_under_their_roots() {
         let mut plan = base_plan();
-        plan.out_units
-            .push(UnitMount { unit: "u1".into(), backing: "/b/out1".into() });
-        plan.incremental_units
-            .push(UnitMount { unit: "u1".into(), backing: "/b/inc1".into() });
+        plan.out_units.push(UnitMount {
+            unit: "u1".into(),
+            backing: "/b/out1".into(),
+        });
+        plan.incremental_units.push(UnitMount {
+            unit: "u1".into(),
+            backing: "/b/inc1".into(),
+        });
         let spec = plan.to_spec().unwrap();
         assert!(
             spec.rw_binds
                 .iter()
-                .any(|b| b.visible == PathBuf::from("/__rabs/out/u1"))
+                .any(|b| b.visible == std::path::Path::new("/__rabs/out/u1"))
         );
         assert!(
             spec.rw_binds
                 .iter()
-                .any(|b| b.visible == PathBuf::from("/__rabs/incremental/u1"))
+                .any(|b| b.visible == std::path::Path::new("/__rabs/incremental/u1"))
         );
     }
 
@@ -439,8 +450,7 @@ mod tests {
             landlock: true,
         };
         let spec = base_plan().to_spec().unwrap();
-        let launch =
-            build_canonical_argv(&spec, &support, "cargo", &["build".into()]).unwrap();
+        let launch = build_canonical_argv(&spec, &support, "cargo", &["build".into()]).unwrap();
         assert!(launch.boundary.satisfies_strict_hermetic_linux());
     }
 }

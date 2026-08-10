@@ -66,7 +66,10 @@ fn rustc_reports_canonical_sysroot_and_no_host_path_leak() {
     let out = command_for(&launch).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "rustc --print sysroot failed: {stderr}");
+    assert!(
+        out.status.success(),
+        "rustc --print sysroot failed: {stderr}"
+    );
     assert_eq!(
         stdout.trim(),
         layout::TOOLCHAIN,
@@ -110,13 +113,8 @@ fn registry_source_resolves_at_checksum_path() {
         "test -f /__rabs/registry/{checksum}/Cargo.toml && echo registry_ok; \
          test -x /__rabs/toolchain/bin/rustc && echo toolchain_ok"
     );
-    let launch = build_canonical_argv(
-        &spec,
-        &support,
-        "/bin/sh",
-        &["-c".to_string(), script],
-    )
-    .unwrap();
+    let launch =
+        build_canonical_argv(&spec, &support, "/bin/sh", &["-c".to_string(), script]).unwrap();
     let out = command_for(&launch).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "resolve script failed: {stdout}");
@@ -140,10 +138,11 @@ fn full_plan_builds_cargo_fixture() {
     std::fs::write(ws.path().join("src/main.rs"), "fn main() {}\n").unwrap();
 
     let out_backing = tempfile::tempdir().unwrap();
-    plan.out_units.push(rabs_sandbox::canonical_mounts::UnitMount {
-        unit: "fixture".into(),
-        backing: out_backing.path().to_path_buf(),
-    });
+    plan.out_units
+        .push(rabs_sandbox::canonical_mounts::UnitMount {
+            unit: "fixture".into(),
+            backing: out_backing.path().to_path_buf(),
+        });
     plan.extra_env.push((
         "CARGO_TARGET_DIR".into(),
         format!("{}/fixture", layout::OUT),
@@ -159,6 +158,9 @@ fn full_plan_builds_cargo_fixture() {
     .unwrap();
     let out = command_for(&launch).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "cargo build via mount plan failed:\n{stderr}");
+    assert!(
+        out.status.success(),
+        "cargo build via mount plan failed:\n{stderr}"
+    );
     assert!(out_backing.path().join("debug/rabs-d005").exists());
 }
