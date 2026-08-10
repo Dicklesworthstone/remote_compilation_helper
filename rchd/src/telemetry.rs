@@ -24,6 +24,7 @@ pub struct TelemetryStore {
     retention: ChronoDuration,
     recent: RwLock<HashMap<String, VecDeque<ReceivedTelemetry>>>,
     test_runs: RwLock<VecDeque<TestRunRecord>>,
+    speed_scores: RwLock<HashMap<String, SpeedScore>>,
     storage: Option<Arc<TelemetryStorage>>,
     event_bus: Option<EventBus>,
 }
@@ -37,6 +38,7 @@ impl TelemetryStore {
             retention,
             recent: RwLock::new(HashMap::new()),
             test_runs: RwLock::new(VecDeque::new()),
+            speed_scores: RwLock::new(HashMap::new()),
             storage,
             event_bus: None,
         }
@@ -54,6 +56,7 @@ impl TelemetryStore {
             retention,
             recent: RwLock::new(HashMap::new()),
             test_runs: RwLock::new(VecDeque::new()),
+            speed_scores: RwLock::new(HashMap::new()),
             storage,
             event_bus: Some(event_bus),
         }
@@ -158,13 +161,51 @@ impl TelemetryStore {
         stats
     }
 
-    /// Fetch latest SpeedScore for a worker from persistent storage.
+    /// Fetch the latest in-memory or persisted SpeedScore for a worker.
     pub async fn latest_speedscore(&self, worker_id: &str) -> anyhow::Result<Option<SpeedScore>> {
+        if let Some(score) = self
+            .speed_scores
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(worker_id)
+            .cloned()
+        {
+            return Ok(Some(score));
+        }
+
         let Some(storage) = self.storage.clone() else {
             return Ok(None);
         };
         let worker_id = worker_id.to_string();
-        tokio::task::spawn_blocking(move || storage.latest_speedscore(&worker_id)).await?
+        let score = tokio::task::spawn_blocking({
+            let worker_id = worker_id.clone();
+            move || storage.latest_speedscore(&worker_id)
+        })
+        .await??;
+        if let Some(score) = score.as_ref() {
+            self.speed_scores
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(worker_id, score.clone());
+        }
+        Ok(score)
+    }
+
+    /// Persist a newly calculated SpeedScore for a worker.
+    pub async fn record_speedscore(
+        &self,
+        worker_id: &str,
+        score: SpeedScore,
+    ) -> anyhow::Result<()> {
+        self.speed_scores
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(worker_id.to_string(), score.clone());
+        let Some(storage) = self.storage.clone() else {
+            anyhow::bail!("SpeedScore persistence is unavailable");
+        };
+        let worker_id = worker_id.to_string();
+        tokio::task::spawn_blocking(move || storage.insert_speedscore(&worker_id, &score)).await?
     }
 
     /// Fetch SpeedScore history for a worker from persistent storage.
@@ -870,6 +911,29 @@ mod tests {
         let result = store.latest_speedscore("w1").await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_record_speedscore_without_storage_is_cached_but_not_durable() {
+        let _guard = test_guard!();
+        let store = TelemetryStore::new(Duration::from_secs(300), None);
+        let score = SpeedScore {
+            total: 73.0,
+            ..SpeedScore::default()
+        };
+
+        let error = store
+            .record_speedscore("w1", score)
+            .await
+            .expect_err("missing persistence must not report durable success");
+        assert!(error.to_string().contains("persistence is unavailable"));
+
+        let cached = store
+            .latest_speedscore("w1")
+            .await
+            .expect("cached score lookup should succeed")
+            .expect("failed persistence should still suppress immediate re-benchmarking");
+        assert_eq!(cached.total, 73.0);
     }
 
     #[tokio::test]

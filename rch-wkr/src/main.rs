@@ -904,10 +904,19 @@ async fn run_benchmark(format: OutputFormat) -> Result<()> {
 
     match format {
         OutputFormat::Json => {
+            let mut persisted_score = score.clone();
+            persisted_score.total = round1(score.total);
+            persisted_score.cpu_score = finite(score.cpu_score);
+            persisted_score.memory_score = finite(score.memory_score);
+            persisted_score.disk_score = finite(score.disk_score);
+            persisted_score.network_score = finite(score.network_score);
+            persisted_score.compilation_score = finite(score.compilation_score);
+
             // `score` stays a top-level f64 for backward compatibility: rchd's
-            // `execute_benchmark_on_worker` parses exactly that field.
+            // `execute_benchmark_on_worker` previously parsed exactly that field.
             let payload = serde_json::json!({
                 "score": round1(score.total),
+                "speedscore": persisted_score,
                 "elapsed_secs": (elapsed.as_secs_f64() * 100.0).round() / 100.0,
                 "cores": cores,
                 "components": {

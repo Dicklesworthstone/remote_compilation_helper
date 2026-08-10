@@ -13,6 +13,7 @@
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rch_common::WorkerId;
+use rch_telemetry::speedscore::SpeedScore;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -169,18 +170,41 @@ fn normalized_event_score(score: f64) -> f64 {
     }
 }
 
-fn benchmark_score_view(score: f64, measured_at: DateTime<Utc>) -> serde_json::Value {
-    let score = normalized_event_score(score);
+fn benchmark_score_view(score: &SpeedScore) -> serde_json::Value {
     serde_json::json!({
-        "total": score,
-        "cpu_score": 0.0,
-        "memory_score": 0.0,
-        "disk_score": 0.0,
-        "network_score": 0.0,
-        "compilation_score": score,
-        "measured_at": measured_at.to_rfc3339(),
-        "version": rch_telemetry::speedscore::SPEEDSCORE_VERSION,
+        "total": score.total,
+        "cpu_score": score.cpu_score,
+        "memory_score": score.memory_score,
+        "disk_score": score.disk_score,
+        "network_score": score.network_score,
+        "compilation_score": score.compilation_score,
+        "measured_at": score.calculated_at.to_rfc3339(),
+        "version": score.version,
     })
+}
+
+fn benchmark_speedscore(score: f64, measured_at: DateTime<Utc>) -> SpeedScore {
+    let score = normalized_event_score(score);
+    SpeedScore {
+        total: score,
+        compilation_score: score,
+        calculated_at: measured_at,
+        ..SpeedScore::default()
+    }
+}
+
+async fn commit_benchmark_score(
+    telemetry: &TelemetryStore,
+    worker: &WorkerState,
+    worker_id: &WorkerId,
+    score: SpeedScore,
+) -> anyhow::Result<SpeedScore> {
+    telemetry
+        .record_speedscore(worker_id.as_str(), score.clone())
+        .await?;
+    worker.set_speed_score(score.total);
+    worker.record_success().await;
+    Ok(score)
 }
 
 fn benchmark_queued_event_data(request: &ScheduledBenchmarkRequest) -> serde_json::Value {
@@ -205,14 +229,14 @@ fn benchmark_started_event_data(request: &ScheduledBenchmarkRequest) -> serde_js
 fn benchmark_completed_event_data(
     request_id: &str,
     worker_id: &WorkerId,
-    score: f64,
+    score: &SpeedScore,
     duration: Duration,
 ) -> serde_json::Value {
     serde_json::json!({
         "request_id": request_id,
         "job_id": request_id,
         "worker_id": worker_id.as_str(),
-        "speedscore": benchmark_score_view(score, Utc::now()),
+        "speedscore": benchmark_score_view(score),
         "duration_secs": duration.as_secs_f64(),
         "success": true,
     })
@@ -421,6 +445,10 @@ impl BenchmarkScheduler {
                 BenchmarkReason::NewWorker,
             ));
         };
+
+        // The persisted score is authoritative across daemon restarts. Keep
+        // the live WorkerState used by selection hydrated from that value.
+        worker.set_speed_score(score.total);
 
         let age = Utc::now() - score.calculated_at;
         let age_duration = age.to_std().unwrap_or_default();
@@ -707,10 +735,19 @@ impl BenchmarkScheduler {
         let running_map = self.running.clone();
         let pending_queue = self.pending_queue.clone();
         let alert_threshold = self.config.consecutive_failure_alert_threshold;
+        let telemetry = self.telemetry.clone();
+        let worker_state = worker.clone();
 
         tokio::spawn(async move {
             let start_time = std::time::Instant::now();
-            let result = execute_benchmark_on_worker(&worker_config, timeout).await;
+            let result = match execute_benchmark_on_worker(&worker_config, timeout).await {
+                Ok((score, exec_duration)) => {
+                    commit_benchmark_score(&telemetry, &worker_state, &worker_id, score)
+                        .await
+                        .map(|score| (score, exec_duration))
+                }
+                Err(error) => Err(error),
+            };
             let duration = start_time.elapsed();
 
             match result {
@@ -718,7 +755,7 @@ impl BenchmarkScheduler {
                     info!(
                         worker_id = %worker_id,
                         request_id = %request_id,
-                        score = score,
+                        score = score.total,
                         duration_ms = duration.as_millis(),
                         "Benchmark completed successfully"
                     );
@@ -735,7 +772,7 @@ impl BenchmarkScheduler {
                     // Emit completed event
                     events.emit(
                         "benchmark_completed",
-                        &benchmark_completed_event_data(&request_id, &worker_id, score, duration),
+                        &benchmark_completed_event_data(&request_id, &worker_id, &score, duration),
                     );
                 }
                 Err(e) => {
@@ -810,30 +847,45 @@ impl BenchmarkScheduler {
     }
 
     /// Mark a benchmark as completed.
-    pub async fn mark_completed(&self, worker_id: &WorkerId, score: f64, duration: Duration) {
+    pub async fn mark_completed(
+        &self,
+        worker_id: &WorkerId,
+        score: f64,
+        duration: Duration,
+    ) -> anyhow::Result<()> {
         let running = self.running.write().await.remove(worker_id);
 
         if let Some(running) = running {
+            let score = benchmark_speedscore(score, Utc::now());
+            let result = match self.pool.get(worker_id).await {
+                Some(worker) => {
+                    commit_benchmark_score(&self.telemetry, &worker, worker_id, score).await
+                }
+                None => Err(anyhow::anyhow!(
+                    "Worker {} disappeared while completing benchmark",
+                    worker_id
+                )),
+            };
+            let score = match result {
+                Ok(score) => score,
+                Err(error) => {
+                    self.running
+                        .write()
+                        .await
+                        .insert(worker_id.clone(), running);
+                    return Err(error);
+                }
+            };
             info!(
                 worker_id = %worker_id,
                 request_id = %running.request.request_id,
-                score = score,
+                score = score.total,
                 duration_ms = duration.as_millis(),
                 "Benchmark completed"
             );
 
             // Release slot
             self.pool.release_slots(worker_id, 1).await;
-
-            // Credit the worker's circuit breaker: a completed benchmark is a
-            // successful round-trip to the worker, so it should count toward
-            // closing/keeping-closed the authoritative WorkerState.circuit that
-            // selection reads (the circuit is otherwise only advanced by the
-            // health monitor). Without this, benchmark success touched neither
-            // circuit store — a documented gap in the unification.
-            if let Some(worker) = self.pool.get(worker_id).await {
-                worker.record_success().await;
-            }
 
             // Reset consecutive failure counter on success
             self.consecutive_failures.write().await.remove(worker_id);
@@ -844,11 +896,13 @@ impl BenchmarkScheduler {
                 &benchmark_completed_event_data(
                     &running.request.request_id,
                     worker_id,
-                    score,
+                    &score,
                     duration,
                 ),
             );
         }
+
+        Ok(())
     }
 
     /// Mark a benchmark as failed.
@@ -945,7 +999,7 @@ impl BenchmarkScheduler {
 async fn execute_benchmark_on_worker(
     worker: &rch_common::WorkerConfig,
     timeout: Duration,
-) -> anyhow::Result<(f64, Duration)> {
+) -> anyhow::Result<(SpeedScore, Duration)> {
     use tokio::process::Command;
 
     // Expand tilde in identity file path
@@ -1057,22 +1111,40 @@ async fn execute_benchmark_on_worker(
 
     let stdout_str = String::from_utf8_lossy(&stdout_buf);
 
-    // Try to parse JSON output first
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout_str)
-        && let Some(score) = json.get("score").and_then(|s| s.as_f64())
-    {
+    // Try to parse the full typed result first, with scalar compatibility for
+    // workers that predate the typed payload.
+    if let Some(score) = parse_benchmark_speedscore(&stdout_str, Utc::now()) {
         return Ok((score, exec_duration));
     }
 
     // Fall back to line-based parsing for non-JSON output
     if let Some(score) = parse_benchmark_score(&stdout_str) {
-        return Ok((score, exec_duration));
+        return Ok((benchmark_speedscore(score, Utc::now()), exec_duration));
     }
 
     Err(anyhow::anyhow!(
         "Failed to parse benchmark score from output: {}",
         stdout_str.chars().take(200).collect::<String>()
     ))
+}
+
+fn parse_benchmark_speedscore(output: &str, measured_at: DateTime<Utc>) -> Option<SpeedScore> {
+    let json = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    if let Some(value) = json.get("speedscore")
+        && let Ok(mut score) = serde_json::from_value::<SpeedScore>(value.clone())
+    {
+        score.total = normalized_event_score(score.total);
+        score.cpu_score = normalized_event_score(score.cpu_score);
+        score.memory_score = normalized_event_score(score.memory_score);
+        score.disk_score = normalized_event_score(score.disk_score);
+        score.network_score = normalized_event_score(score.network_score);
+        score.compilation_score = normalized_event_score(score.compilation_score);
+        return Some(score);
+    }
+
+    json.get("score")
+        .and_then(serde_json::Value::as_f64)
+        .map(|score| benchmark_speedscore(score, measured_at))
 }
 
 /// Parse benchmark score from text output.
@@ -1147,6 +1219,7 @@ mod tests {
     use super::*;
     use crate::events::EventBus;
     use rch_common::WorkerConfig;
+    use rch_telemetry::storage::TelemetryStorage;
 
     fn make_test_config() -> SchedulerConfig {
         SchedulerConfig {
@@ -1176,8 +1249,13 @@ mod tests {
     #[test]
     fn test_benchmark_completed_event_matches_web_contract() {
         let worker_id = WorkerId::new("worker-1");
-        let event =
-            benchmark_completed_event_data("req-1", &worker_id, 87.5, Duration::from_millis(1500));
+        let score = benchmark_speedscore(87.5, Utc::now());
+        let event = benchmark_completed_event_data(
+            "req-1",
+            &worker_id,
+            &score,
+            Duration::from_millis(1500),
+        );
         let event = event.as_object().expect("event data should be an object");
         let speedscore = event
             .get("speedscore")
@@ -1339,6 +1417,84 @@ mod tests {
 
         // Now it's pending
         assert!(scheduler.is_pending_or_running(&worker_id).await);
+    }
+
+    #[tokio::test]
+    async fn successful_benchmark_persistence_stops_new_worker_rescheduling() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_worker_config("new-worker")).await;
+        let storage = Arc::new(TelemetryStorage::new_in_memory().expect("telemetry storage"));
+        let telemetry = Arc::new(TelemetryStore::new(
+            Duration::from_secs(300),
+            Some(storage.clone()),
+        ));
+        let events = EventBus::new(16);
+        let (scheduler, _handle) =
+            BenchmarkScheduler::new(make_test_config(), pool.clone(), telemetry.clone(), events);
+        let worker_id = WorkerId::new("new-worker");
+        let worker = pool.get(&worker_id).await.expect("worker should exist");
+
+        let first_request = scheduler
+            .should_benchmark(&worker)
+            .await
+            .expect("worker without a score should be benchmarked");
+        assert!(matches!(first_request.reason, BenchmarkReason::NewWorker));
+
+        let mut completed_score = benchmark_speedscore(75.0, Utc::now());
+        completed_score.cpu_score = 81.0;
+        completed_score.memory_score = 72.0;
+        commit_benchmark_score(&telemetry, &worker, &worker_id, completed_score)
+            .await
+            .expect("successful benchmark score should persist");
+
+        assert!(scheduler.should_benchmark(&worker).await.is_none());
+        let persisted = telemetry
+            .latest_speedscore(worker_id.as_str())
+            .await
+            .expect("persisted score should be readable")
+            .expect("persisted score should exist");
+        assert_eq!(persisted.total, 75.0);
+        assert_eq!(persisted.compilation_score, 75.0);
+        assert_eq!(persisted.cpu_score, 81.0);
+        assert_eq!(persisted.memory_score, 72.0);
+        assert_eq!(worker.get_speed_score(), 75.0);
+
+        let history = telemetry
+            .speedscore_history(
+                worker_id.as_str(),
+                Utc::now() - ChronoDuration::days(1),
+                10,
+                0,
+            )
+            .await
+            .expect("persisted history should be readable");
+        assert_eq!(history.total, 1);
+        assert_eq!(history.entries.len(), 1);
+
+        let restarted_pool = WorkerPool::new();
+        restarted_pool
+            .add_worker(make_worker_config("new-worker"))
+            .await;
+        let restarted_telemetry =
+            Arc::new(TelemetryStore::new(Duration::from_secs(300), Some(storage)));
+        let restarted_events = EventBus::new(16);
+        let (restarted_scheduler, _handle) = BenchmarkScheduler::new(
+            make_test_config(),
+            restarted_pool.clone(),
+            restarted_telemetry,
+            restarted_events,
+        );
+        let restarted_worker = restarted_pool
+            .get(&worker_id)
+            .await
+            .expect("restarted worker should exist");
+        assert!(
+            restarted_scheduler
+                .should_benchmark(&restarted_worker)
+                .await
+                .is_none()
+        );
+        assert_eq!(restarted_worker.get_speed_score(), 75.0);
     }
 
     #[tokio::test]
@@ -1505,7 +1661,8 @@ mod tests {
         // Mark completed
         scheduler
             .mark_completed(&worker_id, 75.0, Duration::from_secs(30))
-            .await;
+            .await
+            .expect("completion should succeed");
 
         // Check running is empty
         assert_eq!(scheduler.running_count().await, 0);
@@ -1692,7 +1849,8 @@ mod tests {
         simulate_running_benchmark(&scheduler, &pool, &worker_id).await;
         scheduler
             .mark_completed(&worker_id, 75.0, Duration::from_secs(30))
-            .await;
+            .await
+            .expect("completion should succeed");
 
         // Check counter is reset (removed)
         {
@@ -2233,7 +2391,8 @@ mod tests {
         // This should be a no-op, not panic
         scheduler
             .mark_completed(&WorkerId::new("ghost"), 50.0, Duration::from_secs(10))
-            .await;
+            .await
+            .expect("missing running benchmark should be a no-op");
 
         assert_eq!(scheduler.running_count().await, 0);
     }
@@ -2302,6 +2461,32 @@ mod tests {
             super::parse_benchmark_score(r#"  "score": 42.0,  "#),
             Some(42.0)
         );
+    }
+
+    #[test]
+    fn test_parse_benchmark_speedscore_preserves_components() {
+        let measured_at = Utc::now();
+        let mut expected = benchmark_speedscore(62.5, measured_at);
+        expected.cpu_score = 71.0;
+        expected.memory_score = 66.0;
+        expected.disk_score = 58.0;
+        expected.network_score = 0.0;
+        expected.compilation_score = 55.0;
+        let output = serde_json::json!({
+            "score": expected.total,
+            "speedscore": expected,
+        })
+        .to_string();
+
+        let parsed = parse_benchmark_speedscore(&output, Utc::now())
+            .expect("typed benchmark score should parse");
+        assert_eq!(parsed.total, 62.5);
+        assert_eq!(parsed.cpu_score, 71.0);
+        assert_eq!(parsed.memory_score, 66.0);
+        assert_eq!(parsed.disk_score, 58.0);
+        assert_eq!(parsed.network_score, 0.0);
+        assert_eq!(parsed.compilation_score, 55.0);
+        assert_eq!(parsed.calculated_at, measured_at);
     }
 
     #[test]
