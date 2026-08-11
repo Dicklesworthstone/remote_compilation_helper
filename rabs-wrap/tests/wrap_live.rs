@@ -5,7 +5,6 @@
 //! byte-identical with and without the wrapper.
 #![cfg(unix)]
 
-use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

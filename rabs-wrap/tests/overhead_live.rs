@@ -86,7 +86,11 @@ fn wrapper_end_to_end_p95_under_10ms_against_live_daemon() {
         "{{\"v\":1,\"suite\":\"perf/wrapper\",\"test\":\"rabs_wrap_end_to_end\",\
          \"p95_us\":{p95_us},\"SLO_ms\":{SLO_MS},\"profile\":\"{}\",\"gate\":\"{}\"}}",
         if enforcing { "release" } else { "debug" },
-        if enforcing { "enforcing" } else { "measurement-only" },
+        if enforcing {
+            "enforcing"
+        } else {
+            "measurement-only"
+        },
     );
     eprintln!("{evidence}");
     assert!(
