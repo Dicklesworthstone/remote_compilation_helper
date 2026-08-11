@@ -155,7 +155,8 @@ async fn session_loop(
     report: &rabs_wkr::session::CapabilityReport,
     once: bool,
 ) -> Result<(), String> {
-    let mut stream = TcpStream::connect(coordinator)
+    let addr = coordinator.to_string();
+    let mut stream = TcpStream::connect(addr)
         .await
         .map_err(|e| format!("connect {coordinator}: {e}"))?;
     cx.trace("rabs-wkr connected to coordinator");
