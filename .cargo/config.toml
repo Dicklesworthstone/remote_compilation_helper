@@ -4,3 +4,6 @@ exclude = [
     "*/benches/*",
     "*/examples/*",
 ]
+
+[build]
+rustflags = ["-Z", "threads=4"]
