@@ -29,7 +29,10 @@ const SEED: u64 = 0x5EED_C0DE_1234_5678;
 struct Lcg(u64);
 impl Lcg {
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0
     }
     fn in_range(&mut self, lo: u64, hi: u64) -> u64 {
@@ -170,7 +173,10 @@ fn breaker_opens_under_sustained_death_and_recovers_on_live_daemon() {
     )
     .unwrap();
     assert!(
-        matches!(opened, rabs_protocol::wrapper_breaker::BreakerState::Open { .. }),
+        matches!(
+            opened,
+            rabs_protocol::wrapper_breaker::BreakerState::Open { .. }
+        ),
         "breaker must open under sustained death (seed {SEED:#x}): {opened:?}"
     );
 
@@ -186,7 +192,10 @@ fn breaker_opens_under_sustained_death_and_recovers_on_live_daemon() {
             &std::fs::read(dir.path().join("breaker")).unwrap(),
         )
         .unwrap();
-        if matches!(state, rabs_protocol::wrapper_breaker::BreakerState::Closed { .. }) {
+        if matches!(
+            state,
+            rabs_protocol::wrapper_breaker::BreakerState::Closed { .. }
+        ) {
             break true;
         }
         if Instant::now() > deadline {
@@ -199,7 +208,10 @@ fn breaker_opens_under_sustained_death_and_recovers_on_live_daemon() {
         .status()
         .unwrap();
     let _ = daemon.wait();
-    assert!(recovered, "breaker never recovered against a live daemon (seed {SEED:#x})");
+    assert!(
+        recovered,
+        "breaker never recovered against a live daemon (seed {SEED:#x})"
+    );
 }
 
 #[test]
@@ -217,7 +229,10 @@ fn compressed_soak_no_receipt_gaps_or_build_failures() {
     for _ in 0..200 {
         let (ok, elapsed) = run_wrapper(dir.path(), &fake);
         assert!(ok, "soak build failed (seed {SEED:#x})");
-        assert!(elapsed < Duration::from_secs(2), "soak wrapper slow: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "soak wrapper slow: {elapsed:?}"
+        );
         builds += 1;
     }
 
