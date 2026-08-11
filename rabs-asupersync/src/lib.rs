@@ -32,6 +32,7 @@
 //!   `rabs-scheduler`, core `rabs-cas`) must never depend on this crate.
 
 pub mod crashpack;
+pub mod daemon_runtime;
 pub mod delivery_obligations;
 pub mod obligation_dashboard;
 pub mod obligations;

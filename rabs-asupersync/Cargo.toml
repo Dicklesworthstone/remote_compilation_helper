@@ -30,5 +30,8 @@ asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev 
 rabs-action = { path = "../rabs-action" }
 rabs-protocol = { path = "../rabs-protocol" }
 
+[dev-dependencies]
+tempfile = "3.25.0"
+
 [lints.rust]
 unsafe_code = "forbid"
