@@ -413,6 +413,7 @@ mod tests {
             behavior: [SubsystemBehavior::Clean; 4],
             edge_work: None,
             coord_work: None,
+            janitor_work: None,
         }
     }
 

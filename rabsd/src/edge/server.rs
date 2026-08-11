@@ -69,7 +69,6 @@ fn log_line(kind: &str, fields: &[(&str, &str)]) {
 /// Build the edge [`SubsystemWork`] for [`DaemonRunOptions`].
 ///
 /// [`DaemonRunOptions`]: rabs_asupersync::daemon_runtime::DaemonRunOptions
-#[must_use]
 pub fn edge_work(config: EdgeServerConfig) -> SubsystemWork {
     Box::new(move |cx, shutdown| Box::pin(serve(cx, shutdown, config)))
 }

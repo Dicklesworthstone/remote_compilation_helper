@@ -83,9 +83,10 @@ pub struct MountedCas {
 /// abandoned-obligation reason in the shutdown receipt, builds still pass
 /// through locally), but the store itself reconciles fail-*closed*.
 pub fn mount_and_reconcile(cas_root: &Path) -> Result<MountedCas, String> {
-    std::fs::create_dir_all(cas_root).map_err(|e| format!("cas root {}: {e}", cas_root.display()))?;
-    let layout =
-        BlobStoreLayout::open(&cas_root.join("blobs")).map_err(|e| format!("blob layout: {e:?}"))?;
+    std::fs::create_dir_all(cas_root)
+        .map_err(|e| format!("cas root {}: {e}", cas_root.display()))?;
+    let layout = BlobStoreLayout::open(&cas_root.join("blobs"))
+        .map_err(|e| format!("blob layout: {e:?}"))?;
     let engine = RusqliteEngine::open(&cas_root.join("meta.sqlite"))
         .map_err(|e| format!("metadata engine: {e:?}"))?;
     let mut store = SqlMetadataStore::open(engine).map_err(|e| format!("metadata store: {e:?}"))?;
@@ -105,7 +106,6 @@ pub fn mount_and_reconcile(cas_root: &Path) -> Result<MountedCas, String> {
 
 /// Build the janitor region work: mount the store, reconcile fail-closed,
 /// hold it for the daemon lifetime, release on shutdown.
-#[must_use]
 pub fn janitor_work(cas_root: PathBuf) -> SubsystemWork {
     Box::new(move |cx, mut shutdown| {
         Box::pin(async move {
