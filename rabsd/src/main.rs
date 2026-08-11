@@ -119,6 +119,33 @@ fn main() {
             );
             return;
         }
+        Some("--coord-status") => {
+            // Live query over the real socket: connect, hello, status.
+            use std::io::{BufRead, BufReader, Write};
+            let config = load_config().unwrap_or_default();
+            let stream = std::os::unix::net::UnixStream::connect(&config.socket_path);
+            let Ok(mut stream) = stream else {
+                eprintln!("rabsd: no daemon at {}", config.socket_path);
+                std::process::exit(1);
+            };
+            let hello = "{\"kind\":\"hello\",\
+                \"transport\":{\"minimum_compatible\":1,\"current\":1},\
+                \"application\":{\"minimum_compatible\":1,\"current\":1}}";
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut line = String::new();
+            let ok = stream.write_all(hello.as_bytes()).is_ok()
+                && stream.write_all(b"\n").is_ok()
+                && reader.read_line(&mut line).is_ok()
+                && line.contains("hello-ok")
+                && stream.write_all(b"{\"kind\":\"status\"}\n").is_ok();
+            line.clear();
+            if !ok || reader.read_line(&mut line).is_err() {
+                eprintln!("rabsd: status query failed");
+                std::process::exit(1);
+            }
+            print!("{line}");
+            return;
+        }
         Some("--shadow-report") => {
             let state_dir = std::env::var("RABS_STATE_DIR")
                 .unwrap_or_else(|_| default_under_home(".cache/rch/rabs-state"));
@@ -182,6 +209,27 @@ fn main() {
 
     let marker = std::env::var("RABS_BOOT_MARKER")
         .unwrap_or_else(|_| default_under_home(".cache/rch/rabsd.boot"));
+    // The live coordinator (S6): shared edge<->coord in-process, with
+    // the structural authority split intact — the coord region owns its
+    // availability; the edge only consults it.
+    let coord = std::sync::Arc::new(rabsd::coord::live::CoordLive::new());
+    let coord_for_region = std::sync::Arc::clone(&coord);
+    let coord_work: rabs_asupersync::daemon_runtime::SubsystemWork =
+        Box::new(move |cx, mut shutdown| {
+            Box::pin(async move {
+                if std::env::var("RABS_LAB_COORD_DOWN").is_ok() {
+                    // Lab fault injection: the coord region dies at boot;
+                    // edge consults must survive in degraded mode and the
+                    // receipt must show this region abandoned.
+                    return Err("lab: coord region down (RABS_LAB_COORD_DOWN)".to_string());
+                }
+                coord_for_region.mark_up();
+                cx.trace("coord region up: leases + arbiter + singleflight mounted");
+                shutdown.wait().await;
+                coord_for_region.mark_down();
+                Ok(())
+            })
+        });
     let options = DaemonRunOptions {
         run_for,
         boot_marker: Some(std::path::PathBuf::from(marker)),
@@ -192,8 +240,10 @@ fn main() {
                     std::env::var("RABS_STATE_DIR")
                         .unwrap_or_else(|_| default_under_home(".cache/rch/rabs-state")),
                 ),
+                coord,
             },
         )),
+        coord_work: Some(coord_work),
         ..DaemonRunOptions::default()
     };
     match run_daemon(options) {

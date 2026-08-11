@@ -53,6 +53,8 @@ pub struct EdgeServerConfig {
     pub socket_path: PathBuf,
     /// Shadow-plane state directory (index + receipts).
     pub state_dir: PathBuf,
+    /// The live coordinator (S6: consults route through it in-process).
+    pub coord: std::sync::Arc<crate::coord::live::CoordLive>,
 }
 
 fn log_line(kind: &str, fields: &[(&str, &str)]) {
@@ -132,8 +134,9 @@ async fn serve(
     // Acceptor as a region-owned child task; aborted at shutdown so a
     // blocked accept (or a hung connection it spawned) cannot wedge us.
     let acceptor_cx = cx.clone();
+    let coord = std::sync::Arc::clone(&config.coord);
     let acceptor = cx
-        .spawn(move |cx| accept_loop(cx, listener, policy, socket_evidence, shadow))
+        .spawn(move |cx| accept_loop(cx, listener, policy, socket_evidence, shadow, coord))
         .map_err(|e| format!("acceptor spawn: {e:?}"))?;
     let _ = acceptor_cx.checkpoint();
 
@@ -151,6 +154,7 @@ async fn accept_loop(
     policy: AdmissionPolicy,
     socket_evidence: SocketMetadata,
     shadow: std::sync::Arc<std::sync::Mutex<crate::edge::shadow::ShadowPlane>>,
+    coord: std::sync::Arc<crate::coord::live::CoordLive>,
 ) {
     let mut connection_id: u64 = 0;
     loop {
@@ -159,9 +163,10 @@ async fn accept_loop(
                 connection_id += 1;
                 let id = connection_id;
                 let shadow = std::sync::Arc::clone(&shadow);
+                let coord = std::sync::Arc::clone(&coord);
                 let spawned = cx.spawn(move |cx| async move {
                     let _ = cx.checkpoint();
-                    handle_connection(id, stream, policy, socket_evidence, shadow).await;
+                    handle_connection(id, stream, policy, socket_evidence, shadow, coord).await;
                 });
                 match spawned {
                     // Dropping the handle detaches WITHOUT aborting
@@ -223,6 +228,7 @@ async fn handle_connection(
     policy: AdmissionPolicy,
     socket_evidence: SocketMetadata,
     shadow: std::sync::Arc<std::sync::Mutex<crate::edge::shadow::ShadowPlane>>,
+    coord: std::sync::Arc<crate::coord::live::CoordLive>,
 ) {
     let trace = format!("edge-conn-{id}");
     // Admission: kernel peer credentials against the policy.
@@ -292,23 +298,48 @@ async fn handle_connection(
         }
     }
 
-    // Consult loop: the S4 shadow decision plane. Every consult with a
-    // full observation computes a REAL Epic F key, records a receipt,
-    // and answers pass-through; consults without argv (legacy/summary
-    // frames) pass through unshadowed, loudly labeled.
+    // Consult loop: the S4 shadow decision plane routed through the S6
+    // live coordinator. Every consult computes its REAL Epic F key,
+    // joins that key's singleflight (window = this connection's life),
+    // records a receipt carrying its flight role, and passes through.
+    let mut open_flights: Vec<String> = Vec::new();
     while let Some(frame) = read_frame(&mut stream).await {
         let reply = match serde_json::from_slice::<serde_json::Value>(&frame) {
+            Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("status") => {
+                coord.status_json()
+            }
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("consult") => {
                 match parse_observation(&value) {
                     Some(observation) => {
+                        let coord_for_flight = std::sync::Arc::clone(&coord);
+                        let mut joined: Option<(String, &'static str)> = None;
                         let decision = shadow.lock().map_err(|_| ()).and_then(|mut plane| {
-                            plane.on_consult(&trace, &observation).map_err(|_| ())
+                            plane
+                                .on_consult(&trace, &observation, |key| {
+                                    let role = coord_for_flight.begin_flight(key);
+                                    joined = Some((key.to_string(), role.label()));
+                                    role.label()
+                                })
+                                .map_err(|_| ())
                         });
+                        let flight_label = match &joined {
+                            Some((key, label)) => {
+                                open_flights.push(key.clone());
+                                label
+                            }
+                            None => "degraded",
+                        };
                         match decision {
                             Ok(decision) => format!(
                                 "{{\"kind\":\"decision\",\"decision\":\"pass-through\",\
-                                 \"mode\":\"shadow\",\"key\":\"{}\",\
-                                 \"hit_upper_bound\":{},\"class\":\"{}\"}}",
+                                 \"mode\":\"{}\",\"key\":\"{}\",\
+                                 \"hit_upper_bound\":{},\"class\":\"{}\",\
+                                 \"flight\":\"{flight_label}\"}}",
+                                if coord.available() {
+                                    "shadow"
+                                } else {
+                                    "shadow-coord-degraded"
+                                },
                                 decision.key_hex,
                                 decision.would_have_hit_upper_bound,
                                 decision.class,
@@ -336,8 +367,13 @@ async fn handle_connection(
             }
         };
         if !write_frame(&mut stream, &reply).await {
-            return;
+            break;
         }
+    }
+    // Connection closed: every flight this connection joined ends now
+    // (the shadow-tier singleflight window is connection-scoped).
+    for key in open_flights {
+        coord.end_flight(&key);
     }
 }
 

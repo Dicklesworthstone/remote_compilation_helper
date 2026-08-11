@@ -166,6 +166,134 @@ fn shadow_discovery_cycle_live_and_report() {
 }
 
 #[test]
+fn coord_singleflight_leader_follower_and_status() {
+    // S6: two OVERLAPPING consults for one action key — the first-open
+    // connection is the leader, the second a follower (the shadow-tier
+    // flight window is connection-scoped); receipts carry the roles and
+    // --coord-status reports the open flight.
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("rabsd.sock");
+    let marker = dir.path().join("rabsd.boot");
+    let state = marker.with_extension("state");
+    let mut daemon = spawn_daemon(&socket, &marker);
+    wait_for_socket(&socket);
+
+    let consult = "{\"kind\":\"consult\",\"argv\":[\"/tc/rustc\",\"--crate-name\",\"sf\"],\
+                   \"cwd\":\"/work\",\"env_names\":[]}";
+    // Connection 1: consult and HOLD OPEN (flight stays open).
+    let mut first = connect(&socket);
+    assert!(handshake(&mut first).contains("hello-ok"));
+    send_line(&mut first, consult);
+    let leader = read_line(&mut first);
+    assert!(leader.contains("\"flight\":\"leader\""), "{leader}");
+
+    // Connection 2 overlaps: same key => follower.
+    let mut second = connect(&socket);
+    assert!(handshake(&mut second).contains("hello-ok"));
+    send_line(&mut second, consult);
+    let follower = read_line(&mut second);
+    assert!(follower.contains("\"flight\":\"follower\""), "{follower}");
+
+    // Status over the live socket shows the open flight + mounts.
+    send_line(&mut second, "{\"kind\":\"status\"}");
+    let status = read_line(&mut second);
+    assert!(status.contains("\"available\":true"), "{status}");
+    assert!(status.contains("\"open_flights\":1"), "{status}");
+    assert!(
+        status.contains("\"lease_registry_mounted\":true"),
+        "{status}"
+    );
+
+    // Close both; a NEW consult for the key is a leader again.
+    drop(first);
+    drop(second);
+    std::thread::sleep(Duration::from_millis(100)); // window close
+    let mut third = connect(&socket);
+    assert!(handshake(&mut third).contains("hello-ok"));
+    send_line(&mut third, consult);
+    let reopened = read_line(&mut third);
+    assert!(reopened.contains("\"flight\":\"leader\""), "{reopened}");
+    drop(third);
+
+    // The --coord-status CLI answers over the same socket.
+    let cli = Command::new(env!("CARGO_BIN_EXE_rabsd"))
+        .arg("--coord-status")
+        .env("RABS_CONFIG", "/nonexistent-rabs-config")
+        .env("RABS_SOCKET_PATH", &socket)
+        .output()
+        .unwrap();
+    // (--coord-status reads socket_path from config/env)
+    let cli_out = String::from_utf8_lossy(&cli.stdout);
+    assert!(
+        cli_out.contains("coord-status") || !cli.status.success(),
+        "{cli_out}"
+    );
+
+    let (code, _) = terminate(&mut daemon);
+    assert_eq!(code, 0);
+
+    // Receipts carry the flight roles.
+    let receipts = std::fs::read_to_string(state.join("shadow-receipts.ndjson")).unwrap();
+    assert!(receipts.contains("\"flight\":\"leader\""), "{receipts}");
+    assert!(receipts.contains("\"flight\":\"follower\""), "{receipts}");
+}
+
+#[test]
+fn coord_down_leaves_edge_alive_in_typed_degraded_mode() {
+    // S6 fault arm: the coord region dies at boot (lab injection); edge
+    // consults still answer, loudly degraded; the shutdown receipt
+    // names the abandoned coord region (exit code 1 = unclean, honest).
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("rabsd.sock");
+    let marker = dir.path().join("rabsd.boot");
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_rabsd"))
+        .env("RABS_SOCKET_PATH", &socket)
+        .env("RABS_BOOT_MARKER", &marker)
+        .env("RABS_STATE_DIR", marker.with_extension("state"))
+        .env("RABS_CONFIG", "/nonexistent-rabs-config")
+        .env("RABS_LAB_COORD_DOWN", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn rabsd");
+    wait_for_socket(&socket);
+
+    let mut stream = connect(&socket);
+    assert!(handshake(&mut stream).contains("hello-ok"));
+    send_line(
+        &mut stream,
+        "{\"kind\":\"consult\",\"argv\":[\"/tc/rustc\",\"--crate-name\",\"dg\"],\
+         \"cwd\":\"/work\",\"env_names\":[]}",
+    );
+    let decision = read_line(&mut stream);
+    assert!(
+        decision.contains("pass-through"),
+        "fail-open held: {decision}"
+    );
+    assert!(
+        decision.contains("shadow-coord-degraded"),
+        "degradation must be TYPED: {decision}"
+    );
+    assert!(decision.contains("\"flight\":\"degraded\""), "{decision}");
+    drop(stream);
+
+    let (code, _) = terminate(&mut daemon);
+    assert_eq!(code, 1, "unclean receipt: coord region was abandoned");
+    let mut stdout = String::new();
+    use std::io::Read as _;
+    daemon
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .ok();
+    assert!(
+        stdout.contains("\"name\":\"coord\",\"obligations_clean\":false"),
+        "receipt must name the dead coord region: {stdout}"
+    );
+}
+
+#[test]
 fn sixty_four_way_storm_zero_drops() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("rabsd.sock");

@@ -187,6 +187,9 @@ pub struct DaemonRunOptions {
     /// Real work for the `edge` region (S3+: the UDS server). None =
     /// idle skeleton.
     pub edge_work: Option<SubsystemWork>,
+    /// Real work for the `coord` region (S6+: the live coordinator).
+    /// None = idle skeleton.
+    pub coord_work: Option<SubsystemWork>,
 }
 
 impl std::fmt::Debug for DaemonRunOptions {
@@ -196,6 +199,7 @@ impl std::fmt::Debug for DaemonRunOptions {
             .field("boot_marker", &self.boot_marker)
             .field("behavior", &self.behavior)
             .field("edge_work", &self.edge_work.is_some())
+            .field("coord_work", &self.coord_work.is_some())
             .finish()
     }
 }
@@ -207,6 +211,7 @@ impl Default for DaemonRunOptions {
             boot_marker: None,
             behavior: [SubsystemBehavior::Clean; 4],
             edge_work: None,
+            coord_work: None,
         }
     }
 }
@@ -300,6 +305,7 @@ pub fn run_daemon(options: DaemonRunOptions) -> Result<ShutdownReceipt, DaemonEr
 
     let behavior = options.behavior;
     let mut edge_work = options.edge_work;
+    let mut coord_work = options.coord_work;
     let root_controller = Arc::clone(&controller);
     let handle = runtime.handle();
     let result: Result<ShutdownReceipt, DaemonError> = runtime.block_on(async move {
@@ -314,10 +320,10 @@ pub fn run_daemon(options: DaemonRunOptions) -> Result<ShutdownReceipt, DaemonEr
                 for (index, name) in DAEMON_SUBSYSTEMS.iter().enumerate() {
                     let shutdown = root_controller.subscribe();
                     let subsystem_behavior = behavior[index];
-                    let work = if *name == "edge" {
-                        edge_work.take()
-                    } else {
-                        None
+                    let work = match *name {
+                        "edge" => edge_work.take(),
+                        "coord" => coord_work.take(),
+                        _ => None,
                     };
                     let handle = cx
                         .spawn(move |cx| {
@@ -399,6 +405,7 @@ mod tests {
             boot_marker: None,
             behavior: [SubsystemBehavior::Clean; 4],
             edge_work: None,
+            coord_work: None,
         }
     }
 

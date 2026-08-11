@@ -166,11 +166,13 @@ impl ShadowPlane {
         &mut self,
         trace: &str,
         observation: &ConsultObservation,
+        flight_of: impl FnOnce(&str) -> &'static str,
     ) -> std::io::Result<ShadowDecision> {
         self.consults += 1;
         let descriptor = shadow_descriptor(observation);
         let breakdown = compute_action_key(&descriptor);
         let key_hex = hex(&breakdown.final_key.bytes);
+        let flight = flight_of(&key_hex);
         let would_have_hit_upper_bound = self.index.contains_key(&key_hex);
         let class = format!("{:?}", descriptor.action_class);
 
@@ -181,6 +183,7 @@ impl ShadowPlane {
             "{{\"v\":1,\"kind\":\"shadow-receipt\",\"trace\":\"{trace}\",\
              \"class\":\"{class}\",\"key\":\"{key_hex}\",\
              \"hit_upper_bound\":{would_have_hit_upper_bound},\
+             \"flight\":\"{flight}\",\
              \"grade\":\"shadow-upper-bound\",\"decision\":\"pass-through\",\
              \"argv0\":\"{}\",\"argc\":{}}}",
             argv_redacted.first().map(String::as_str).unwrap_or(""),
@@ -276,9 +279,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut plane = ShadowPlane::open(dir.path()).unwrap();
         let invocation = observation(&["/tc/rustc", "--crate-name", "fx"]);
-        let first = plane.on_consult("t1", &invocation).unwrap();
+        let first = plane.on_consult("t1", &invocation, |_| "leader").unwrap();
         assert!(!first.would_have_hit_upper_bound, "first sight = miss");
-        let second = plane.on_consult("t2", &invocation).unwrap();
+        let second = plane.on_consult("t2", &invocation, |_| "leader").unwrap();
         assert!(
             second.would_have_hit_upper_bound,
             "repeat = upper-bound hit"
@@ -286,7 +289,11 @@ mod tests {
         assert_eq!(first.key_hex, second.key_hex);
         // Different argv MUST NOT smear into a hit.
         let other = plane
-            .on_consult("t3", &observation(&["/tc/rustc", "--crate-name", "other"]))
+            .on_consult(
+                "t3",
+                &observation(&["/tc/rustc", "--crate-name", "other"]),
+                |_| "leader",
+            )
             .unwrap();
         assert!(!other.would_have_hit_upper_bound);
         assert_ne!(other.key_hex, first.key_hex);
@@ -298,11 +305,11 @@ mod tests {
         let invocation = observation(&["/tc/rustc", "--crate-name", "fx"]);
         {
             let mut plane = ShadowPlane::open(dir.path()).unwrap();
-            plane.on_consult("t1", &invocation).unwrap();
+            plane.on_consult("t1", &invocation, |_| "leader").unwrap();
         }
         // A NEW instance (daemon restart) still knows the completion.
         let mut plane = ShadowPlane::open(dir.path()).unwrap();
-        let decision = plane.on_consult("t2", &invocation).unwrap();
+        let decision = plane.on_consult("t2", &invocation, |_| "leader").unwrap();
         assert!(decision.would_have_hit_upper_bound, "index persisted");
         // Receipts: exactly one line per consult.
         let receipts = std::fs::read_to_string(dir.path().join("shadow-receipts.ndjson")).unwrap();
@@ -343,8 +350,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut plane = ShadowPlane::open(dir.path()).unwrap();
         let invocation = observation(&["/tc/rustc", "--crate-name", "fx"]);
-        plane.on_consult("t1", &invocation).unwrap();
-        plane.on_consult("t2", &invocation).unwrap();
+        plane.on_consult("t1", &invocation, |_| "leader").unwrap();
+        plane.on_consult("t2", &invocation, |_| "leader").unwrap();
         let report = shadow_report(dir.path()).unwrap();
         assert!(report.contains("\"total_consults\":2"), "{report}");
         assert!(
@@ -367,7 +374,7 @@ mod tests {
             cwd: "/work".to_string(),
             env_names: vec![],
         };
-        plane.on_consult("t1", &invocation).unwrap();
+        plane.on_consult("t1", &invocation, |_| "leader").unwrap();
         let receipts = std::fs::read_to_string(dir.path().join("shadow-receipts.ndjson")).unwrap();
         // argv0 is recorded; argv payload beyond argv0 stays OUT of the
         // receipt entirely (only the key digest carries it).
