@@ -1,0 +1,50 @@
+# S7 (bead bd-n8qt3): release builds of the three RABS spine binaries.
+# The tiny wrapper (rabs-wrap) and the daemons (rabsd, rabs-wkr) must
+# always build in release — the A021 split-profile discipline and the
+# C010 overhead gate both assume the shipped artifact is release-built.
+# This workflow proves they compile, and runs the doctor + wrapper
+# overhead gates that only mean anything in release.
+name: RABS Binaries
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rabsd/**'
+      - 'rabs-wrap/**'
+      - 'rabs-wkr/**'
+      - 'rabs-asupersync/**'
+      - '.github/workflows/rabs-binaries.yml'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: rabs-binaries-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: release build + gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bubblewrap (worker capability + sandbox tests)
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Release build the three spine binaries
+        run: cargo build --release -p rabsd -p rabs-wrap -p rabs-wkr
+      - name: Binary size budget (rabs-wrap < 2 MiB, A021)
+        run: |
+          size=$(stat -c%s target/release/rabs-wrap)
+          echo "rabs-wrap release size: $size bytes"
+          test "$size" -lt 2097152
+      - name: Doctor + wrapper overhead gate (release, enforcing)
+        run: |
+          cargo test --release -p rabsd --test doctor_live
+          cargo test --release -p rabs-wrap --test overhead_live -- --nocapture

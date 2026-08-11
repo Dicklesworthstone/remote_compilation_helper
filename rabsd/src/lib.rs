@@ -15,4 +15,5 @@
 //! - workers (`rabs-wkr`) prepare and offer results but never commit.
 
 pub mod coord;
+pub mod doctor;
 pub mod edge;

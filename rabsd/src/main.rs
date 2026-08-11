@@ -99,6 +99,90 @@ fn log_line(kind: &str, fields: &[(&str, &str)]) {
     eprintln!("{line}");
 }
 
+/// Gather installation facts and run the doctor. Exit code: 0 ok/warn
+/// (fail-open — a warn must never fail a CI gate that only cares whether
+/// RABS is catastrophically misconfigured), 1 on any Fail check.
+fn run_doctor() -> i32 {
+    use rabsd::doctor::{DoctorFacts, Severity, diagnose, overall, to_ndjson};
+    let config = load_config().unwrap_or_default();
+    let socket = std::path::Path::new(&config.socket_path);
+
+    let socket_present = socket.exists();
+    let socket_mode = if socket_present {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(socket)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o777)
+    } else {
+        None
+    };
+    // Liveness probe: connect + hello + status.
+    let daemon_responsive = socket_present && probe_daemon(&config.socket_path);
+
+    let breaker_path =
+        std::env::var("RABS_BREAKER_FILE").unwrap_or_else(|_| default_under_home(".cache/rch/rabs-breaker"));
+    let breaker_bytes = std::fs::read(&breaker_path).ok();
+    let breaker_present = breaker_bytes.is_some();
+    let breaker_open = breaker_bytes
+        .and_then(|b| rabs_protocol::wrapper_breaker::decode_state(&b))
+        .is_some_and(|s| matches!(s, rabs_protocol::wrapper_breaker::BreakerState::Open { .. }));
+
+    let state_dir =
+        std::env::var("RABS_STATE_DIR").unwrap_or_else(|_| default_under_home(".cache/rch/rabs-state"));
+    let state_dir_writable = {
+        let dir = std::path::Path::new(&state_dir);
+        std::fs::create_dir_all(dir).is_ok()
+            && std::fs::write(dir.join(".doctor-probe"), b"ok").is_ok()
+            && std::fs::remove_file(dir.join(".doctor-probe")).is_ok()
+    };
+
+    let support = rabs_sandbox::canonical_namespace::HostIsolationSupport::probe();
+    let missing_facets: Vec<String> = support
+        .missing_for_canonical()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    let facts = DoctorFacts {
+        socket_present,
+        socket_mode,
+        daemon_responsive,
+        breaker_present,
+        breaker_open,
+        state_dir_writable,
+        canonical_capable: missing_facets.is_empty(),
+        missing_facets,
+    };
+    let checks = diagnose(&facts);
+    println!("{}", to_ndjson(&checks));
+    i32::from(overall(&checks) == Severity::Fail)
+}
+
+/// Liveness probe: hello + status over the socket. True iff a daemon
+/// answered a status frame.
+fn probe_daemon(socket_path: &str) -> bool {
+    use std::io::{BufRead, BufReader, Write};
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket_path) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let hello = "{\"kind\":\"hello\",\
+        \"transport\":{\"minimum_compatible\":1,\"current\":1},\
+        \"application\":{\"minimum_compatible\":1,\"current\":1}}";
+    let mut reader = BufReader::new(match stream.try_clone() {
+        Ok(clone) => clone,
+        Err(_) => return false,
+    });
+    let mut line = String::new();
+    let ok = stream.write_all(hello.as_bytes()).is_ok()
+        && stream.write_all(b"\n").is_ok()
+        && reader.read_line(&mut line).is_ok()
+        && line.contains("hello-ok")
+        && stream.write_all(b"{\"kind\":\"status\"}\n").is_ok();
+    line.clear();
+    ok && reader.read_line(&mut line).is_ok() && line.contains("coord-status")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -118,6 +202,10 @@ fn main() {
                  env: RABS_SOCKET_PATH, RABS_LOG_LEVEL."
             );
             return;
+        }
+        Some("--doctor") => {
+            let code = run_doctor();
+            std::process::exit(code);
         }
         Some("--coord-status") => {
             // Live query over the real socket: connect, hello, status.

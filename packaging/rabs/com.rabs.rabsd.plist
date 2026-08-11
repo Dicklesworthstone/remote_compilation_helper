@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- S7 (bead bd-n8qt3): launchd unit for rabsd on macOS edge hosts (csd).
+     rabsd is the edge+coordinator daemon; it fails open, so a crash
+     never blocks builds. KeepAlive restarts it; the shutdown receipt
+     (its final stdout line) lands in the log for post-mortems. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.rabs.rabsd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/rabsd</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/rabsd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/rabsd.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RABS_STATE_DIR</key>
+    <string>/tmp/rabs-state</string>
+  </dict>
+</dict>
+</plist>
