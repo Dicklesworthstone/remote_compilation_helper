@@ -171,6 +171,11 @@ fn main() {
     let options = DaemonRunOptions {
         run_for,
         boot_marker: Some(std::path::PathBuf::from(marker)),
+        edge_work: Some(rabsd::edge::server::edge_work(
+            rabsd::edge::server::EdgeServerConfig {
+                socket_path: std::path::PathBuf::from(&config.socket_path),
+            },
+        )),
         ..DaemonRunOptions::default()
     };
     match run_daemon(options) {

@@ -163,8 +163,19 @@ pub enum SubsystemBehavior {
     HoldObligationOpen,
 }
 
+/// Real work mounted into a subsystem region: receives the region's Cx
+/// and a shutdown receiver, MUST return when shutdown fires, and its
+/// Err string becomes an abandoned-obligation reason in the receipt.
+pub type SubsystemWork = Box<
+    dyn FnOnce(
+            Cx,
+            asupersync::signal::ShutdownReceiver,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send,
+>;
+
 /// Options for one daemon run.
-#[derive(Debug, Clone)]
 pub struct DaemonRunOptions {
     /// Auto-trigger shutdown after this duration (None = wait for
     /// SIGTERM/SIGINT via the asupersync signal listener).
@@ -173,6 +184,20 @@ pub struct DaemonRunOptions {
     pub boot_marker: Option<std::path::PathBuf>,
     /// Per-subsystem behavior override (lab); defaults to Clean.
     pub behavior: [SubsystemBehavior; 4],
+    /// Real work for the `edge` region (S3+: the UDS server). None =
+    /// idle skeleton.
+    pub edge_work: Option<SubsystemWork>,
+}
+
+impl std::fmt::Debug for DaemonRunOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonRunOptions")
+            .field("run_for", &self.run_for)
+            .field("boot_marker", &self.boot_marker)
+            .field("behavior", &self.behavior)
+            .field("edge_work", &self.edge_work.is_some())
+            .finish()
+    }
 }
 
 impl Default for DaemonRunOptions {
@@ -181,6 +206,7 @@ impl Default for DaemonRunOptions {
             run_for: None,
             boot_marker: None,
             behavior: [SubsystemBehavior::Clean; 4],
+            edge_work: None,
         }
     }
 }
@@ -198,20 +224,31 @@ async fn subsystem_body(
     cx: Cx,
     mut shutdown: asupersync::signal::ShutdownReceiver,
     behavior: SubsystemBehavior,
+    work: Option<SubsystemWork>,
 ) -> SubsystemOutcome {
     cx.trace(&format!("rabsd subsystem {name} ready"));
     let mut obligations = ObligationSet::default();
     obligations.open(lifetime_obligation(name));
 
-    shutdown.wait().await;
+    // Real work owns the shutdown wait; idle subsystems wait directly.
+    let work_result = match work {
+        Some(work) => work(cx.clone(), shutdown).await,
+        None => {
+            shutdown.wait().await;
+            Ok(())
+        }
+    };
 
     let _ = cx.checkpoint();
-    let (obligations_clean, abandoned) = match behavior {
-        SubsystemBehavior::Clean => match obligations.resolve(lifetime_obligation(name)) {
-            Ok(()) => (true, vec![]),
-            Err(e) => (false, vec![format!("resolve failed: {e:?}")]),
-        },
-        SubsystemBehavior::HoldObligationOpen => (
+    let (obligations_clean, abandoned) = match (behavior, work_result) {
+        (SubsystemBehavior::Clean, Ok(())) => {
+            match obligations.resolve(lifetime_obligation(name)) {
+                Ok(()) => (true, vec![]),
+                Err(e) => (false, vec![format!("resolve failed: {e:?}")]),
+            }
+        }
+        (SubsystemBehavior::Clean, Err(reason)) => (false, vec![format!("work failed: {reason}")]),
+        (SubsystemBehavior::HoldObligationOpen, _) => (
             false,
             vec![format!(
                 "abandoned {:?}: subsystem held it open past shutdown (lab)",
@@ -262,6 +299,7 @@ pub fn run_daemon(options: DaemonRunOptions) -> Result<ShutdownReceipt, DaemonEr
     }
 
     let behavior = options.behavior;
+    let mut edge_work = options.edge_work;
     let root_controller = Arc::clone(&controller);
     let handle = runtime.handle();
     let result: Result<ShutdownReceipt, DaemonError> = runtime.block_on(async move {
@@ -276,8 +314,15 @@ pub fn run_daemon(options: DaemonRunOptions) -> Result<ShutdownReceipt, DaemonEr
                 for (index, name) in DAEMON_SUBSYSTEMS.iter().enumerate() {
                     let shutdown = root_controller.subscribe();
                     let subsystem_behavior = behavior[index];
+                    let work = if *name == "edge" {
+                        edge_work.take()
+                    } else {
+                        None
+                    };
                     let handle = cx
-                        .spawn(move |cx| subsystem_body(name, cx, shutdown, subsystem_behavior))
+                        .spawn(move |cx| {
+                            subsystem_body(name, cx, shutdown, subsystem_behavior, work)
+                        })
                         .map_err(|e| DaemonError::SubsystemSpawn {
                             name,
                             error: format!("{e:?}"),
@@ -353,6 +398,7 @@ mod tests {
             run_for: Some(Duration::from_millis(run_for_ms)),
             boot_marker: None,
             behavior: [SubsystemBehavior::Clean; 4],
+            edge_work: None,
         }
     }
 
@@ -393,11 +439,13 @@ mod tests {
         // First clean run: marker created then removed.
         let mut opts = options(20);
         opts.boot_marker = Some(marker.clone());
-        let receipt = run_daemon(opts.clone()).expect("run 1");
+        let receipt = run_daemon(opts).expect("run 1");
         assert!(!receipt.recovered_from_unclean);
         assert!(!marker.exists(), "clean shutdown removes the marker");
         // Simulate kill -9: marker left behind by a dead incarnation.
         std::fs::write(&marker, "pid=99999\n").unwrap();
+        let mut opts = options(20);
+        opts.boot_marker = Some(marker.clone());
         let receipt = run_daemon(opts).expect("run 2");
         assert!(
             receipt.recovered_from_unclean,
