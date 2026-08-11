@@ -51,6 +51,8 @@ pub fn our_hello() -> VersionHello {
 pub struct EdgeServerConfig {
     /// Socket path.
     pub socket_path: PathBuf,
+    /// Shadow-plane state directory (index + receipts).
+    pub state_dir: PathBuf,
 }
 
 fn log_line(kind: &str, fields: &[(&str, &str)]) {
@@ -121,11 +123,17 @@ async fn serve(
         &[("socket", &config.socket_path.display().to_string())],
     );
 
+    // The shadow decision plane (S4): persisted index + receipts.
+    let shadow = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::edge::shadow::ShadowPlane::open(&config.state_dir)
+            .map_err(|e| format!("shadow plane open: {e}"))?,
+    ));
+
     // Acceptor as a region-owned child task; aborted at shutdown so a
     // blocked accept (or a hung connection it spawned) cannot wedge us.
     let acceptor_cx = cx.clone();
     let acceptor = cx
-        .spawn(move |cx| accept_loop(cx, listener, policy, socket_evidence))
+        .spawn(move |cx| accept_loop(cx, listener, policy, socket_evidence, shadow))
         .map_err(|e| format!("acceptor spawn: {e:?}"))?;
     let _ = acceptor_cx.checkpoint();
 
@@ -142,6 +150,7 @@ async fn accept_loop(
     listener: UnixListener,
     policy: AdmissionPolicy,
     socket_evidence: SocketMetadata,
+    shadow: std::sync::Arc<std::sync::Mutex<crate::edge::shadow::ShadowPlane>>,
 ) {
     let mut connection_id: u64 = 0;
     loop {
@@ -149,14 +158,10 @@ async fn accept_loop(
             Ok((stream, _addr)) => {
                 connection_id += 1;
                 let id = connection_id;
-                // One region-owned task per connection; handle dropped
-                // immediately => abort-on-drop is DEFUSED only via join,
-                // so keep it detached-by-abort-semantics: we deliberately
-                // hold no handle — the task aborts with the acceptor's
-                // region at shutdown.
+                let shadow = std::sync::Arc::clone(&shadow);
                 let spawned = cx.spawn(move |cx| async move {
                     let _ = cx.checkpoint();
-                    handle_connection(id, stream, policy, socket_evidence).await;
+                    handle_connection(id, stream, policy, socket_evidence, shadow).await;
                 });
                 match spawned {
                     // Dropping the handle detaches WITHOUT aborting
@@ -217,6 +222,7 @@ async fn handle_connection(
     mut stream: UnixStream,
     policy: AdmissionPolicy,
     socket_evidence: SocketMetadata,
+    shadow: std::sync::Arc<std::sync::Mutex<crate::edge::shadow::ShadowPlane>>,
 ) {
     let trace = format!("edge-conn-{id}");
     // Admission: kernel peer credentials against the policy.
@@ -286,13 +292,41 @@ async fn handle_connection(
         }
     }
 
-    // Consult loop (S3 skeleton: every consult passes through; S4
-    // mounts the shadow decision plane here).
+    // Consult loop: the S4 shadow decision plane. Every consult with a
+    // full observation computes a REAL Epic F key, records a receipt,
+    // and answers pass-through; consults without argv (legacy/summary
+    // frames) pass through unshadowed, loudly labeled.
     while let Some(frame) = read_frame(&mut stream).await {
         let reply = match serde_json::from_slice::<serde_json::Value>(&frame) {
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("consult") => {
-                "{\"kind\":\"decision\",\"decision\":\"pass-through\",\"mode\":\"shadow-skeleton\"}"
-                    .to_string()
+                match parse_observation(&value) {
+                    Some(observation) => {
+                        let decision = shadow
+                            .lock()
+                            .map_err(|_| ())
+                            .and_then(|mut plane| plane.on_consult(&trace, &observation).map_err(|_| ()));
+                        match decision {
+                            Ok(decision) => format!(
+                                "{{\"kind\":\"decision\",\"decision\":\"pass-through\",\
+                                 \"mode\":\"shadow\",\"key\":\"{}\",\
+                                 \"hit_upper_bound\":{},\"class\":\"{}\"}}",
+                                decision.key_hex,
+                                decision.would_have_hit_upper_bound,
+                                decision.class,
+                            ),
+                            Err(()) => {
+                                "{\"kind\":\"decision\",\"decision\":\"pass-through\",\
+                                 \"mode\":\"shadow-error\"}"
+                                    .to_string()
+                            }
+                        }
+                    }
+                    None => {
+                        "{\"kind\":\"decision\",\"decision\":\"pass-through\",\
+                         \"mode\":\"unshadowed\"}"
+                            .to_string()
+                    }
+                }
             }
             Ok(other) => refusal(
                 "unknown-frame",
@@ -310,6 +344,40 @@ async fn handle_connection(
             return;
         }
     }
+}
+
+/// Parse the full consult observation (argv + cwd + env names); None
+/// when the frame carries only the legacy summary.
+fn parse_observation(
+    value: &serde_json::Value,
+) -> Option<crate::edge::shadow::ConsultObservation> {
+    let argv: Vec<String> = value
+        .get("argv")?
+        .as_array()?
+        .iter()
+        .filter_map(|item| item.as_str().map(str::to_string))
+        .collect();
+    if argv.is_empty() {
+        return None;
+    }
+    Some(crate::edge::shadow::ConsultObservation {
+        argv,
+        cwd: value
+            .get("cwd")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string(),
+        env_names: value
+            .get("env_names")
+            .and_then(|e| e.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
 }
 
 fn parse_hello(frame: &[u8]) -> Result<VersionHello, String> {

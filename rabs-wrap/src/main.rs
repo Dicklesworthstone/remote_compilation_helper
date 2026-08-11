@@ -29,6 +29,25 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::time::Duration;
 
+/// Minimal JSON string encoder (quotes + escapes; no serde by design).
+fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -112,12 +131,22 @@ fn consult(
         return Err(());
     }
 
-    // B001-shaped consult summary (S4 enriches this to the full
-    // invocation record; the frame kind and shape are stable).
+    // The full S4 observation: real argv, cwd, CARGO_*/RUSTC_* env
+    // NAMES (values never leave the process in shadow tier). The
+    // daemon computes the Epic F key and redacts before persisting.
+    let argv_json: Vec<String> = args.iter().map(|a| json_string(a)).collect();
+    let env_names: Vec<String> = std::env::vars()
+        .filter(|(name, _)| name.starts_with("CARGO") || name.starts_with("RUSTC"))
+        .map(|(name, _)| json_string(&name))
+        .collect();
+    let cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
     let consult_frame = format!(
-        "{{\"kind\":\"consult\",\"argv0\":\"{}\",\"arg_count\":{}}}",
-        args.first().map(String::as_str).unwrap_or(""),
-        args.len()
+        "{{\"kind\":\"consult\",\"argv\":[{}],\"cwd\":{},\"env_names\":[{}]}}",
+        argv_json.join(","),
+        json_string(&cwd),
+        env_names.join(","),
     );
     writer.write_all(consult_frame.as_bytes()).map_err(|_| ())?;
     writer.write_all(b"\n").map_err(|_| ())?;

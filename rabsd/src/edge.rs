@@ -24,4 +24,5 @@ pub mod destination_arbiter;
 pub mod diagnostic_rewrite;
 pub mod mtime_choreography;
 pub mod server;
+pub mod shadow;
 pub mod snapshot_lineage;

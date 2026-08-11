@@ -119,6 +119,20 @@ fn main() {
             );
             return;
         }
+        Some("--shadow-report") => {
+            let state_dir = std::env::var("RABS_STATE_DIR")
+                .unwrap_or_else(|_| default_under_home(".cache/rch/rabs-state"));
+            match rabsd::edge::shadow::shadow_report(std::path::Path::new(&state_dir)) {
+                Ok(report) => {
+                    println!("{report}");
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("rabsd: shadow report: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("--check-config") => match load_config() {
             Ok(config) => {
                 println!(
@@ -174,6 +188,10 @@ fn main() {
         edge_work: Some(rabsd::edge::server::edge_work(
             rabsd::edge::server::EdgeServerConfig {
                 socket_path: std::path::PathBuf::from(&config.socket_path),
+                state_dir: std::path::PathBuf::from(
+                    std::env::var("RABS_STATE_DIR")
+                        .unwrap_or_else(|_| default_under_home(".cache/rch/rabs-state")),
+                ),
             },
         )),
         ..DaemonRunOptions::default()
