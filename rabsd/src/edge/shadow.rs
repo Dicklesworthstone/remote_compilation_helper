@@ -82,16 +82,14 @@ fn constant_component(domain: &'static str) -> rabs_protocol::result_identity::T
 #[must_use]
 pub fn shadow_descriptor(observation: &ConsultObservation) -> ActionDescriptor {
     let argv_joined = observation.argv.join("\u{1f}");
-    let toolchain_identity = observation.argv.first().map_or_else(String::new, |tool| {
-        match std::fs::metadata(tool) {
-            Ok(meta) => format!(
-                "{tool}|len={}|mtime={:?}",
-                meta.len(),
-                meta.modified().ok()
-            ),
-            Err(_) => format!("{tool}|unstat"),
-        }
-    });
+    let toolchain_identity =
+        observation
+            .argv
+            .first()
+            .map_or_else(String::new, |tool| match std::fs::metadata(tool) {
+                Ok(meta) => format!("{tool}|len={}|mtime={:?}", meta.len(), meta.modified().ok()),
+                Err(_) => format!("{tool}|unstat"),
+            });
     ActionDescriptor {
         key_epoch: 1,
         projection_epoch: 0, // 0 = shadow projection (upper bound)
@@ -223,8 +221,8 @@ fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
 /// straight from the receipt stream (the audit trail is the input —
 /// not in-memory state).
 pub fn shadow_report(state_dir: &std::path::Path) -> std::io::Result<String> {
-    let receipts = std::fs::read_to_string(state_dir.join("shadow-receipts.ndjson"))
-        .unwrap_or_default();
+    let receipts =
+        std::fs::read_to_string(state_dir.join("shadow-receipts.ndjson")).unwrap_or_default();
     let mut per_class: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut total = 0u64;
     for line in receipts.lines() {
@@ -281,7 +279,10 @@ mod tests {
         let first = plane.on_consult("t1", &invocation).unwrap();
         assert!(!first.would_have_hit_upper_bound, "first sight = miss");
         let second = plane.on_consult("t2", &invocation).unwrap();
-        assert!(second.would_have_hit_upper_bound, "repeat = upper-bound hit");
+        assert!(
+            second.would_have_hit_upper_bound,
+            "repeat = upper-bound hit"
+        );
         assert_eq!(first.key_hex, second.key_hex);
         // Different argv MUST NOT smear into a hit.
         let other = plane
@@ -304,8 +305,7 @@ mod tests {
         let decision = plane.on_consult("t2", &invocation).unwrap();
         assert!(decision.would_have_hit_upper_bound, "index persisted");
         // Receipts: exactly one line per consult.
-        let receipts =
-            std::fs::read_to_string(dir.path().join("shadow-receipts.ndjson")).unwrap();
+        let receipts = std::fs::read_to_string(dir.path().join("shadow-receipts.ndjson")).unwrap();
         assert_eq!(receipts.lines().count(), 2);
         for line in receipts.lines() {
             let value: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -348,7 +348,9 @@ mod tests {
         let report = shadow_report(dir.path()).unwrap();
         assert!(report.contains("\"total_consults\":2"), "{report}");
         assert!(
-            report.contains("\"class\":\"RustcWorkspaceCompile\",\"consults\":2,\"hit_upper_bound\":1"),
+            report.contains(
+                "\"class\":\"RustcWorkspaceCompile\",\"consults\":2,\"hit_upper_bound\":1"
+            ),
             "{report}"
         );
     }
@@ -366,8 +368,7 @@ mod tests {
             env_names: vec![],
         };
         plane.on_consult("t1", &invocation).unwrap();
-        let receipts =
-            std::fs::read_to_string(dir.path().join("shadow-receipts.ndjson")).unwrap();
+        let receipts = std::fs::read_to_string(dir.path().join("shadow-receipts.ndjson")).unwrap();
         // argv0 is recorded; argv payload beyond argv0 stays OUT of the
         // receipt entirely (only the key digest carries it).
         assert!(!receipts.contains("hunter2"), "{receipts}");

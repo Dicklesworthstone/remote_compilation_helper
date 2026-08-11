@@ -301,10 +301,9 @@ async fn handle_connection(
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("consult") => {
                 match parse_observation(&value) {
                     Some(observation) => {
-                        let decision = shadow
-                            .lock()
-                            .map_err(|_| ())
-                            .and_then(|mut plane| plane.on_consult(&trace, &observation).map_err(|_| ()));
+                        let decision = shadow.lock().map_err(|_| ()).and_then(|mut plane| {
+                            plane.on_consult(&trace, &observation).map_err(|_| ())
+                        });
                         match decision {
                             Ok(decision) => format!(
                                 "{{\"kind\":\"decision\",\"decision\":\"pass-through\",\
@@ -314,18 +313,14 @@ async fn handle_connection(
                                 decision.would_have_hit_upper_bound,
                                 decision.class,
                             ),
-                            Err(()) => {
-                                "{\"kind\":\"decision\",\"decision\":\"pass-through\",\
+                            Err(()) => "{\"kind\":\"decision\",\"decision\":\"pass-through\",\
                                  \"mode\":\"shadow-error\"}"
-                                    .to_string()
-                            }
+                                .to_string(),
                         }
                     }
-                    None => {
-                        "{\"kind\":\"decision\",\"decision\":\"pass-through\",\
+                    None => "{\"kind\":\"decision\",\"decision\":\"pass-through\",\
                          \"mode\":\"unshadowed\"}"
-                            .to_string()
-                    }
+                        .to_string(),
                 }
             }
             Ok(other) => refusal(
@@ -348,9 +343,7 @@ async fn handle_connection(
 
 /// Parse the full consult observation (argv + cwd + env names); None
 /// when the frame carries only the legacy summary.
-fn parse_observation(
-    value: &serde_json::Value,
-) -> Option<crate::edge::shadow::ConsultObservation> {
+fn parse_observation(value: &serde_json::Value) -> Option<crate::edge::shadow::ConsultObservation> {
     let argv: Vec<String> = value
         .get("argv")?
         .as_array()?
