@@ -71,14 +71,18 @@ fn unknown_config_keys_refuse_loudly() {
 #[test]
 fn hundred_boot_shutdown_cycles_all_obligation_clean() {
     // THE S1 acceptance loop: 100 real boot/shutdown cycles, every
-    // receipt clean, every marker removed.
+    // receipt clean, every marker removed. Unique socket per test —
+    // the default path collides across concurrent daemons (found live
+    // on hz2 when S3 landed the edge server).
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("rabsd.boot");
+    let socket = dir.path().join("rabsd.sock");
     for cycle in 0..100 {
         let (stdout, stderr, code, _) = run_capture(
             &["--run-for-ms", "5"],
             &[
                 ("RABS_BOOT_MARKER", marker.to_str().unwrap()),
+                ("RABS_SOCKET_PATH", socket.to_str().unwrap()),
                 ("RABS_CONFIG", "/nonexistent-rabs-config"),
             ],
         );
@@ -96,8 +100,12 @@ fn hundred_boot_shutdown_cycles_all_obligation_clean() {
 }
 
 fn spawn_daemon(marker: &std::path::Path) -> Child {
+    // Unique socket beside the marker: concurrent daemons on one host
+    // must never share the default socket path.
+    let socket = marker.with_extension("sock");
     rabsd()
         .env("RABS_BOOT_MARKER", marker)
+        .env("RABS_SOCKET_PATH", &socket)
         .env("RABS_CONFIG", "/nonexistent-rabs-config")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -147,10 +155,14 @@ fn kill_nine_leaves_evidence_and_next_boot_reports_recovery() {
     child.wait().expect("reaped");
     assert!(marker.exists(), "kill -9 must leave the crash evidence");
 
+    // Same socket as the killed daemon: the recovery boot also
+    // exercises stale-socket takeover (liveness probe on a dead peer).
+    let socket = marker.with_extension("sock");
     let (stdout, stderr, code, _) = run_capture(
         &["--run-for-ms", "10"],
         &[
             ("RABS_BOOT_MARKER", marker.to_str().unwrap()),
+            ("RABS_SOCKET_PATH", socket.to_str().unwrap()),
             ("RABS_CONFIG", "/nonexistent-rabs-config"),
         ],
     );
