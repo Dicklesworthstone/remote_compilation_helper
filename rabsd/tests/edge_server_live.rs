@@ -14,6 +14,7 @@ fn spawn_daemon(socket: &std::path::Path, marker: &std::path::Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_rabsd"))
         .env("RABS_SOCKET_PATH", socket)
         .env("RABS_BOOT_MARKER", marker)
+        .env("RABS_STATE_DIR", marker.with_extension("state"))
         .env("RABS_CONFIG", "/nonexistent-rabs-config")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -99,11 +100,69 @@ fn handshake_consult_roundtrip_and_socket_permissions() {
     send_line(&mut stream, "{\"kind\":\"consult\",\"argv\":[\"rustc\"]}");
     let decision = read_line(&mut stream);
     assert!(decision.contains("pass-through"), "{decision}");
-    assert!(decision.contains("shadow-skeleton"), "{decision}");
+    assert!(decision.contains("\"mode\":\"shadow\""), "{decision}");
+    assert!(
+        decision.contains("\"key\":\""),
+        "shadow key present: {decision}"
+    );
+    assert!(decision.contains("hit_upper_bound"), "{decision}");
 
     let (code, _) = terminate(&mut daemon);
     assert_eq!(code, 0, "clean exit");
     assert!(!socket.exists(), "clean shutdown removes the socket");
+}
+
+#[test]
+fn shadow_discovery_cycle_live_and_report() {
+    // S4 end to end on the real socket: identical consults collide in
+    // the shadow index (miss -> upper-bound hit), receipts land 1:1,
+    // and --shadow-report aggregates from the receipt stream.
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("rabsd.sock");
+    let marker = dir.path().join("rabsd.boot");
+    let state = marker.with_extension("state");
+    let mut daemon = spawn_daemon(&socket, &marker);
+    wait_for_socket(&socket);
+
+    let consult = "{\"kind\":\"consult\",\"argv\":[\"/tc/rustc\",\"--crate-name\",\"fx\"],\
+                   \"cwd\":\"/work\",\"env_names\":[\"CARGO_HOME\"]}";
+    let mut stream = connect(&socket);
+    assert!(handshake(&mut stream).contains("hello-ok"));
+    send_line(&mut stream, consult);
+    let first = read_line(&mut stream);
+    assert!(first.contains("\"hit_upper_bound\":false"), "{first}");
+    send_line(&mut stream, consult);
+    let second = read_line(&mut stream);
+    assert!(second.contains("\"hit_upper_bound\":true"), "{second}");
+    // A different invocation must NOT smear into a hit.
+    send_line(
+        &mut stream,
+        "{\"kind\":\"consult\",\"argv\":[\"/tc/rustc\",\"--crate-name\",\"other\"],\
+         \"cwd\":\"/work\",\"env_names\":[]}",
+    );
+    let third = read_line(&mut stream);
+    assert!(third.contains("\"hit_upper_bound\":false"), "{third}");
+
+    let (code, _) = terminate(&mut daemon);
+    assert_eq!(code, 0);
+
+    // Receipts 1:1 with consults, all shadow-graded.
+    let receipts = std::fs::read_to_string(state.join("shadow-receipts.ndjson")).unwrap();
+    assert_eq!(receipts.lines().count(), 3, "{receipts}");
+    assert!(receipts.lines().all(|l| l.contains("shadow-upper-bound")));
+
+    // The report CLI aggregates from the same stream.
+    let report = Command::new(env!("CARGO_BIN_EXE_rabsd"))
+        .arg("--shadow-report")
+        .env("RABS_STATE_DIR", &state)
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&report.stdout);
+    assert!(report.contains("\"total_consults\":3"), "{report}");
+    assert!(
+        report.contains("\"consults\":3,\"hit_upper_bound\":1"),
+        "{report}"
+    );
 }
 
 #[test]
@@ -229,6 +288,7 @@ fn stale_socket_takeover_and_live_daemon_refusal() {
         .args(["--run-for-ms", "2000"])
         .env("RABS_SOCKET_PATH", &socket)
         .env("RABS_BOOT_MARKER", dir.path().join("second.boot"))
+        .env("RABS_STATE_DIR", dir.path().join("second.state"))
         .env("RABS_CONFIG", "/nonexistent-rabs-config")
         .output()
         .expect("second daemon");

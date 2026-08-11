@@ -32,6 +32,7 @@ fn wrapper_end_to_end_p95_under_10ms_against_live_daemon() {
     let mut daemon = Command::new(rabsd_bin())
         .env("RABS_SOCKET_PATH", &socket)
         .env("RABS_BOOT_MARKER", &marker)
+        .env("RABS_STATE_DIR", dir.path().join("state"))
         .env("RABS_CONFIG", "/nonexistent-rabs-config")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
