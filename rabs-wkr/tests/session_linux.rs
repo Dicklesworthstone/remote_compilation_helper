@@ -158,3 +158,48 @@ fn handshake_carries_real_capability_and_worker_exits_on_close() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn malformed_exec_request_does_not_tear_down_the_session() {
+    // A single bad canonical-exec frame is a per-request error, not a
+    // session kill: the worker replies with an error and stays alive to
+    // serve the next request. (No canonical capability needed — a
+    // malformed request never reaches the sandbox.)
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut worker = Command::new(worker_bin())
+        .args(["--coordinator", &addr, "--worker-id", "robust-test"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let (stream, _peer) = listener.accept().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert!(read_line(&mut reader).contains("worker-hello"));
+    writeln!(writer, "{{\"kind\":\"session-ok\"}}").unwrap();
+
+    // A canonical-exec missing `program` => error frame, session lives.
+    writeln!(writer, "{{\"kind\":\"canonical-exec\",\"request_id\":1}}").unwrap();
+    let err = read_line(&mut reader);
+    assert!(err.contains("\"kind\":\"error\""), "expected error frame: {err}");
+
+    // The worker is still serving: a ping gets a heartbeat.
+    writeln!(writer, "{{\"kind\":\"ping\"}}").unwrap();
+    let heartbeat = read_line(&mut reader);
+    assert!(
+        heartbeat.contains("heartbeat"),
+        "worker died after a bad request: {heartbeat}"
+    );
+
+    drop(writer);
+    drop(reader);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while worker.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "worker did not exit on close");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

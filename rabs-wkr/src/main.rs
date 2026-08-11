@@ -207,7 +207,24 @@ async fn session_loop(
                 }
             }
             Some("canonical-exec") => {
-                let request = parse_exec_request(&value)?;
+                // A malformed request is a per-request error, NOT a
+                // session teardown — one bad frame must never drop a
+                // healthy worker (matches the malformed-JSON handling
+                // above).
+                let request = match parse_exec_request(&value) {
+                    Ok(request) => request,
+                    Err(reason) => {
+                        let _ = write_frame(
+                            &mut stream,
+                            &format!(
+                                "{{\"kind\":\"error\",\"reason\":{}}}",
+                                json_string(&reason)
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
                 let result = execute_canonical(&request, &cargo_home, &home);
                 let reply = format!(
                     "{{\"kind\":\"exec-result\",\"request_id\":{},\"exit_code\":{},\
