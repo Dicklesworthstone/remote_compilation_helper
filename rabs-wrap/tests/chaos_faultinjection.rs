@@ -38,7 +38,17 @@ impl Lcg {
 }
 
 fn rabsd() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_BIN_EXE_rabs-wrap")).with_file_name("rabsd")
+    // The rabsd binary lives beside ours in the target dir; build it
+    // once if a chaos-only test run hasn't produced it yet.
+    let path = std::path::Path::new(env!("CARGO_BIN_EXE_rabs-wrap")).with_file_name("rabsd");
+    if !path.exists() {
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "-p", "rabsd", "--bin", "rabsd"])
+            .status()
+            .expect("build rabsd");
+        assert!(status.success(), "rabsd build failed");
+    }
+    path
 }
 
 fn spawn_daemon(dir: &std::path::Path) -> Child {
