@@ -58,9 +58,7 @@ fn orchestrated_canonical_exec_reports_d005_sysroot() {
     let addr = listener.local_addr().unwrap().to_string();
     let mut worker = spawn_worker(&addr);
 
-    listener
-        .set_nonblocking(false)
-        .expect("blocking accept");
+    listener.set_nonblocking(false).expect("blocking accept");
     let (stream, _peer) = {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -185,7 +183,10 @@ fn malformed_exec_request_does_not_tear_down_the_session() {
     // A canonical-exec missing `program` => error frame, session lives.
     writeln!(writer, "{{\"kind\":\"canonical-exec\",\"request_id\":1}}").unwrap();
     let err = read_line(&mut reader);
-    assert!(err.contains("\"kind\":\"error\""), "expected error frame: {err}");
+    assert!(
+        err.contains("\"kind\":\"error\""),
+        "expected error frame: {err}"
+    );
 
     // The worker is still serving: a ping gets a heartbeat.
     writeln!(writer, "{{\"kind\":\"ping\"}}").unwrap();

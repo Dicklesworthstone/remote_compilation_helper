@@ -136,7 +136,10 @@ pub fn diagnose(facts: &DoctorFacts) -> Vec<Check> {
 
     // Worker capability (advisory: an edge-only host needs no bwrap).
     if facts.canonical_capable {
-        checks.push(Check::ok("canonical", "host can run the canonical namespace"));
+        checks.push(Check::ok(
+            "canonical",
+            "host can run the canonical namespace",
+        ));
     } else {
         checks.push(Check::warn(
             "canonical",
@@ -238,11 +241,19 @@ mod tests {
         let checks = diagnose(&facts);
         assert_eq!(overall(&checks), Severity::Fail);
         assert_eq!(
-            checks.iter().find(|c| c.id == "socket-perms").unwrap().severity,
+            checks
+                .iter()
+                .find(|c| c.id == "socket-perms")
+                .unwrap()
+                .severity,
             Severity::Fail
         );
         assert_eq!(
-            checks.iter().find(|c| c.id == "state-dir").unwrap().severity,
+            checks
+                .iter()
+                .find(|c| c.id == "state-dir")
+                .unwrap()
+                .severity,
             Severity::Fail
         );
     }

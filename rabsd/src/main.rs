@@ -119,16 +119,16 @@ fn run_doctor() -> i32 {
     // Liveness probe: connect + hello + status.
     let daemon_responsive = socket_present && probe_daemon(&config.socket_path);
 
-    let breaker_path =
-        std::env::var("RABS_BREAKER_FILE").unwrap_or_else(|_| default_under_home(".cache/rch/rabs-breaker"));
+    let breaker_path = std::env::var("RABS_BREAKER_FILE")
+        .unwrap_or_else(|_| default_under_home(".cache/rch/rabs-breaker"));
     let breaker_bytes = std::fs::read(&breaker_path).ok();
     let breaker_present = breaker_bytes.is_some();
     let breaker_open = breaker_bytes
         .and_then(|b| rabs_protocol::wrapper_breaker::decode_state(&b))
         .is_some_and(|s| matches!(s, rabs_protocol::wrapper_breaker::BreakerState::Open { .. }));
 
-    let state_dir =
-        std::env::var("RABS_STATE_DIR").unwrap_or_else(|_| default_under_home(".cache/rch/rabs-state"));
+    let state_dir = std::env::var("RABS_STATE_DIR")
+        .unwrap_or_else(|_| default_under_home(".cache/rch/rabs-state"));
     let state_dir_writable = {
         let dir = std::path::Path::new(&state_dir);
         std::fs::create_dir_all(dir).is_ok()

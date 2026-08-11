@@ -216,10 +216,7 @@ async fn session_loop(
                     Err(reason) => {
                         let _ = write_frame(
                             &mut stream,
-                            &format!(
-                                "{{\"kind\":\"error\",\"reason\":{}}}",
-                                json_string(&reason)
-                            ),
+                            &format!("{{\"kind\":\"error\",\"reason\":{}}}", json_string(&reason)),
                         )
                         .await;
                         continue;
@@ -243,9 +240,11 @@ async fn session_loop(
                 }
             }
             _ => {
-                let _ =
-                    write_frame(&mut stream, "{\"kind\":\"error\",\"reason\":\"unknown-frame\"}")
-                        .await;
+                let _ = write_frame(
+                    &mut stream,
+                    "{\"kind\":\"error\",\"reason\":\"unknown-frame\"}",
+                )
+                .await;
             }
         }
     }

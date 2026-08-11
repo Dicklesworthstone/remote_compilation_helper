@@ -186,10 +186,9 @@ impl ShadowPlane {
         // `class`, and `key_hex` are structurally safe (conn id, enum
         // name, hex).
         let argv_redacted = redact_argv(&observation.argv);
-        let argv0_json = serde_json::to_string(
-            argv_redacted.first().map(String::as_str).unwrap_or(""),
-        )
-        .unwrap_or_else(|_| "\"\"".to_string());
+        let argv0_json =
+            serde_json::to_string(argv_redacted.first().map(String::as_str).unwrap_or(""))
+                .unwrap_or_else(|_| "\"\"".to_string());
         let receipt = format!(
             "{{\"v\":1,\"kind\":\"shadow-receipt\",\"trace\":\"{trace}\",\
              \"class\":\"{class}\",\"key\":\"{key_hex}\",\

@@ -43,9 +43,19 @@ fn doctor_is_green_against_a_live_daemon() {
         .output()
         .unwrap();
     let out = String::from_utf8_lossy(&doctor.stdout);
-    assert_eq!(doctor.status.code(), Some(0), "doctor should not Fail: {out}");
-    assert!(out.contains("\"id\":\"daemon\",\"severity\":\"ok\""), "{out}");
-    assert!(out.contains("\"id\":\"socket-perms\",\"severity\":\"ok\""), "{out}");
+    assert_eq!(
+        doctor.status.code(),
+        Some(0),
+        "doctor should not Fail: {out}"
+    );
+    assert!(
+        out.contains("\"id\":\"daemon\",\"severity\":\"ok\""),
+        "{out}"
+    );
+    assert!(
+        out.contains("\"id\":\"socket-perms\",\"severity\":\"ok\""),
+        "{out}"
+    );
     // On Linux workers this is canonical:ok; on macOS edge it's a warn —
     // either way the OVERALL must not be Fail.
     assert!(
@@ -75,6 +85,9 @@ fn doctor_warns_not_fails_when_daemon_is_dead() {
     // Fail-open: a dead daemon is a WARN, exit code 0 (not a broken
     // install a CI gate should red on).
     assert_eq!(doctor.status.code(), Some(0), "{out}");
-    assert!(out.contains("\"id\":\"daemon\",\"severity\":\"warn\""), "{out}");
+    assert!(
+        out.contains("\"id\":\"daemon\",\"severity\":\"warn\""),
+        "{out}"
+    );
     assert!(out.contains("fail-open"), "{out}");
 }

@@ -164,7 +164,9 @@ fn free_disk_mib(dir: &std::path::Path) -> u64 {
         .and_then(|o| {
             String::from_utf8(o.stdout).ok().and_then(|text| {
                 text.lines().nth(1).and_then(|line| {
-                    line.split_whitespace().nth(3).and_then(|kb| kb.parse::<u64>().ok())
+                    line.split_whitespace()
+                        .nth(3)
+                        .and_then(|kb| kb.parse::<u64>().ok())
                 })
             })
         })
@@ -187,7 +189,9 @@ pub fn execute_canonical(
     home_backing: &std::path::Path,
 ) -> ExecResult {
     use rabs_sandbox::canonical_mounts::CanonicalMountPlan;
-    use rabs_sandbox::canonical_namespace::{HostIsolationSupport, build_canonical_argv, command_for};
+    use rabs_sandbox::canonical_namespace::{
+        HostIsolationSupport, build_canonical_argv, command_for,
+    };
 
     let support = HostIsolationSupport::probe();
     if !support.missing_for_canonical().is_empty() {
