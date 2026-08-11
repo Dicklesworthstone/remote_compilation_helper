@@ -1,0 +1,25 @@
+[package]
+name = "rabs-wrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "RABS tiny RUSTC_WRAPPER binary: breaker-gated daemon consult, exec passthrough (bridge plan S2)"
+publish = false
+
+# Tiny-wrapper profile discipline (A021): the workspace release profile
+# is already opt-level=z + LTO + panic=abort + strip. Dependency budget
+# is deliberately minimal — rabs-protocol only; no async runtime, no
+# serde (hand-rolled frames): the p95 <10ms budget is the design.
+[dependencies]
+rabs-protocol = { path = "../rabs-protocol" }
+
+[dev-dependencies]
+tempfile = "3.25.0"
+
+[lints.rust]
+unsafe_code = "forbid"

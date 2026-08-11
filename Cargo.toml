@@ -16,6 +16,7 @@ members = [
     "rabs-key",
     "rabs-cas",
     "rabs-sandbox",
+    "rabs-wrap",
     "rabs-scheduler",
     "rabs-replay",
     "rabs-asupersync",

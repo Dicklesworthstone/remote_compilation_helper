@@ -4913,6 +4913,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rabs-wrap"
+version = "1.0.56"
+dependencies = [
+ "rabs-protocol",
+ "tempfile",
+]
+
+[[package]]
 name = "rabsd"
 version = "1.0.56"
 dependencies = [
