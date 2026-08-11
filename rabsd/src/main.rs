@@ -318,20 +318,24 @@ fn main() {
                 Ok(())
             })
         });
+    let state_dir = std::path::PathBuf::from(
+        std::env::var("RABS_STATE_DIR")
+            .unwrap_or_else(|_| default_under_home(".cache/rch/rabs-state")),
+    );
     let options = DaemonRunOptions {
         run_for,
         boot_marker: Some(std::path::PathBuf::from(marker)),
         edge_work: Some(rabsd::edge::server::edge_work(
             rabsd::edge::server::EdgeServerConfig {
                 socket_path: std::path::PathBuf::from(&config.socket_path),
-                state_dir: std::path::PathBuf::from(
-                    std::env::var("RABS_STATE_DIR")
-                        .unwrap_or_else(|_| default_under_home(".cache/rch/rabs-state")),
-                ),
+                state_dir: state_dir.clone(),
                 coord,
             },
         )),
         coord_work: Some(coord_work),
+        // W1 (bd-hfhq2): the janitor region mounts the on-disk rabs-cas
+        // store under the state dir and reconciles it fail-closed at boot.
+        janitor_work: Some(rabsd::janitor::store::janitor_work(state_dir.join("cas"))),
         ..DaemonRunOptions::default()
     };
     match run_daemon(options) {

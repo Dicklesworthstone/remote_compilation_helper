@@ -17,3 +17,4 @@
 pub mod coord;
 pub mod doctor;
 pub mod edge;
+pub mod janitor;
