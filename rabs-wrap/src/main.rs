@@ -169,6 +169,15 @@ fn main() {
 
     // Probes: exec instantly, no state, no socket, no consult.
     if !is_probe(&args) {
+        // The consult argv is the FULL command the compiler runs:
+        // argv[0] is the real tool (the daemon stats it for the
+        // toolchain-identity key component and records it as argv0),
+        // followed by every rustc argument. Sending only the args would
+        // leave the daemon statting `--crate-name` and mislabeling
+        // receipts.
+        let consult_argv: Vec<String> = std::iter::once(real_rustc.clone())
+            .chain(args.iter().cloned())
+            .collect();
         let path = breaker_path();
         let policy = BreakerPolicy::default();
         let state = load_state(&path);
@@ -183,7 +192,7 @@ fn main() {
                     &socket_path(),
                     connect_timeout_ms,
                     decision_timeout_ms,
-                    &args,
+                    &consult_argv,
                 );
                 let attempt = if outcome.is_ok() {
                     AttemptOutcome::Succeeded
@@ -204,7 +213,7 @@ fn main() {
                     &socket_path(),
                     connect_timeout_ms,
                     decision_timeout_ms,
-                    &args,
+                    &consult_argv,
                 );
                 let attempt = if outcome.is_ok() {
                     AttemptOutcome::Succeeded

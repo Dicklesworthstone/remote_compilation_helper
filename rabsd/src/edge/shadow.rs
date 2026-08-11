@@ -23,7 +23,7 @@ use rabs_key::action_key::compute_action_key;
 use rabs_key::typed_digest::compute;
 use rabs_protocol::descriptor::{ActionClass, ActionDescriptor};
 use rabs_protocol::redaction::redact_argv;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -125,10 +125,12 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The shadow plane: persisted completion index + receipt stream.
+/// The shadow plane: persisted completion index + receipt stream. The
+/// index is a SET of seen keys — would-have-hit is presence, not count
+/// (a shadow hit is "this key completed before", nothing finer).
 #[derive(Debug)]
 pub struct ShadowPlane {
-    index: BTreeMap<String, u64>,
+    index: BTreeSet<String>,
     index_path: PathBuf,
     receipts_path: PathBuf,
     consults: u64,
@@ -140,14 +142,14 @@ impl ShadowPlane {
         std::fs::create_dir_all(state_dir)?;
         let index_path = state_dir.join("shadow-index.ndjson");
         let receipts_path = state_dir.join("shadow-receipts.ndjson");
-        let mut index = BTreeMap::new();
+        let mut index = BTreeSet::new();
         if let Ok(text) = std::fs::read_to_string(&index_path) {
             for line in text.lines() {
                 if let Some(key) = line
                     .strip_prefix("{\"key\":\"")
                     .and_then(|rest| rest.split('"').next())
                 {
-                    *index.entry(key.to_string()).or_insert(0) += 1;
+                    index.insert(key.to_string());
                 }
             }
         }
@@ -173,30 +175,40 @@ impl ShadowPlane {
         let breakdown = compute_action_key(&descriptor);
         let key_hex = hex(&breakdown.final_key.bytes);
         let flight = flight_of(&key_hex);
-        let would_have_hit_upper_bound = self.index.contains_key(&key_hex);
+        let would_have_hit_upper_bound = self.index.contains(&key_hex);
         let class = format!("{:?}", descriptor.action_class);
 
         // Receipt first (a crash between receipt and index loses a
         // completion, never a receipt — receipts are the audit trail).
+        // argv0 is user-controlled, so it MUST be JSON-escaped: a path
+        // carrying a quote/backslash/control byte would otherwise tear
+        // the receipt (the INV-4 fault S8 guards against). `trace`,
+        // `class`, and `key_hex` are structurally safe (conn id, enum
+        // name, hex).
         let argv_redacted = redact_argv(&observation.argv);
+        let argv0_json = serde_json::to_string(
+            argv_redacted.first().map(String::as_str).unwrap_or(""),
+        )
+        .unwrap_or_else(|_| "\"\"".to_string());
         let receipt = format!(
             "{{\"v\":1,\"kind\":\"shadow-receipt\",\"trace\":\"{trace}\",\
              \"class\":\"{class}\",\"key\":\"{key_hex}\",\
              \"hit_upper_bound\":{would_have_hit_upper_bound},\
              \"flight\":\"{flight}\",\
              \"grade\":\"shadow-upper-bound\",\"decision\":\"pass-through\",\
-             \"argv0\":\"{}\",\"argc\":{}}}",
-            argv_redacted.first().map(String::as_str).unwrap_or(""),
+             \"argv0\":{argv0_json},\"argc\":{}}}",
             observation.argv.len(),
         );
         append_line(&self.receipts_path, &receipt)?;
 
         // Record the completion (shadow-observed: pass-through always
-        // completes locally).
+        // completes locally). Persist the key only on first sight — the
+        // on-disk index is one line per unique key, and the in-memory
+        // set mirrors it exactly.
         if !would_have_hit_upper_bound {
             append_line(&self.index_path, &format!("{{\"key\":\"{key_hex}\"}}"))?;
+            self.index.insert(key_hex.clone());
         }
-        *self.index.entry(key_hex.clone()).or_insert(0) += 1;
 
         Ok(ShadowDecision {
             key_hex,
@@ -379,5 +391,28 @@ mod tests {
         // argv0 is recorded; argv payload beyond argv0 stays OUT of the
         // receipt entirely (only the key digest carries it).
         assert!(!receipts.contains("hunter2"), "{receipts}");
+    }
+
+    #[test]
+    fn hostile_argv0_does_not_tear_the_receipt() {
+        // A tool path carrying JSON-breaking bytes must NOT produce a
+        // malformed receipt (INV-4): argv0 is JSON-escaped.
+        let dir = tempfile::tempdir().unwrap();
+        let mut plane = ShadowPlane::open(dir.path()).unwrap();
+        let invocation = ConsultObservation {
+            argv: vec![
+                "/weird/rustc\"with\\quote\tand\ttab\n".to_string(),
+                "--crate-name".to_string(),
+                "fx".to_string(),
+            ],
+            cwd: "/work".to_string(),
+            env_names: vec![],
+        };
+        plane.on_consult("t1", &invocation, |_| "leader").unwrap();
+        let receipts = std::fs::read_to_string(dir.path().join("shadow-receipts.ndjson")).unwrap();
+        assert_eq!(receipts.lines().count(), 1, "no torn/multi-line receipt");
+        // The single line parses as valid JSON and round-trips argv0.
+        let value: serde_json::Value = serde_json::from_str(receipts.trim()).unwrap();
+        assert_eq!(value["argv0"], "/weird/rustc\"with\\quote\tand\ttab\n");
     }
 }

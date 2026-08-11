@@ -151,10 +151,12 @@ pub fn sample_pressure(staging_dir: &std::path::Path) -> PressureSample {
 
 #[cfg(target_os = "linux")]
 fn free_disk_mib(dir: &std::path::Path) -> u64 {
-    // `df -k` is portable across the fleet and avoids a libc dep in a
-    // forbid-unsafe crate.
+    // `df -Pk`: POSIX output guarantees ONE line per filesystem (a long
+    // device name will not wrap and misalign the columns), avoids a
+    // libc dep in a forbid-unsafe crate, and is portable across the
+    // fleet. A misparse is a benign 0 (honest "unknown"), never a crash.
     let output = std::process::Command::new("df")
-        .arg("-k")
+        .arg("-Pk")
         .arg(dir)
         .output();
     output
