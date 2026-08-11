@@ -135,7 +135,12 @@ fn kill_daemon_at_seeded_offsets_never_breaks_or_wedges_a_build() {
                 );
             }
         }
-        wait_for_socket(&socket, false); // socket gone after kill
+        // SIGKILL leaves the socket file behind (no clean shutdown ran).
+        // That is exactly the stale-socket the next boot's liveness-probe
+        // takeover (S3) handles — but this harness restarts fast, so we
+        // remove it ourselves to keep each round independent. (In
+        // production the takeover would do this.)
+        let _ = std::fs::remove_file(&socket);
     }
 }
 
