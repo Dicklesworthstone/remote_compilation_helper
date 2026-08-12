@@ -114,6 +114,15 @@ pub fn sample_manifest() -> CanonicalActionResultManifest {
 /// exactly the A018 `SemanticDivergence` shape.
 #[must_use]
 pub fn manifest_with_output(output_tag: u8) -> CanonicalActionResultManifest {
+    manifest_with_output_object(&tagged_object(output_tag))
+}
+
+/// A manifest whose single materializable output is `object` — used
+/// when that object must be a REAL blob (serving tests materialize its
+/// bytes), not a synthetic tagged digest.
+#[must_use]
+pub fn manifest_with_output_object(object: &ObjectId) -> CanonicalActionResultManifest {
+    let object = object.clone();
     CanonicalActionResultManifest {
         action_key: sample_action_key(),
         canonical_descriptor_digest: tagged_digest("rabs.descriptor.sha256.v1", 8),
@@ -124,7 +133,7 @@ pub fn manifest_with_output(output_tag: u8) -> CanonicalActionResultManifest {
         logical_outputs: vec![LogicalOutput {
             role: OutputRole::Materializable,
             virtual_path: RawBytes::new(b"out/lib.rlib".to_vec()),
-            object: tagged_object(output_tag),
+            object,
         }],
         semantic_result_digest: tagged_digest(SEMANTIC_PROJECTION_DOMAIN, 0),
         observable_result_digest: tagged_digest(OBSERVABLE_PROJECTION_DOMAIN, 0),
@@ -218,7 +227,21 @@ pub fn divergent_offer_under(coordinator: &CoordinatorAuthority) -> OfferPrepare
 pub fn offer_with_manifest_bytes(
     coordinator: &CoordinatorAuthority,
 ) -> (OfferPreparedActionResult, Vec<u8>) {
-    offer_with_bytes(coordinator, 41, 51)
+    offer_with_bytes(coordinator, &tagged_object(41), 51)
+}
+
+/// An offer whose materializable output is a REAL object the caller has
+/// put in a blob store — the fixture a serving test needs, since serving
+/// materializes that object's actual bytes.
+///
+/// # Panics
+/// As [`offer_with_manifest_bytes`].
+#[must_use]
+pub fn offer_serving_object(
+    coordinator: &CoordinatorAuthority,
+    output: &ObjectId,
+) -> (OfferPreparedActionResult, Vec<u8>) {
+    offer_with_bytes(coordinator, output, 51)
 }
 
 /// The divergent counterpart of [`offer_with_manifest_bytes`]: same
@@ -230,7 +253,7 @@ pub fn offer_with_manifest_bytes(
 pub fn divergent_offer_with_manifest_bytes(
     coordinator: &CoordinatorAuthority,
 ) -> (OfferPreparedActionResult, Vec<u8>) {
-    offer_with_bytes(coordinator, 42, 53)
+    offer_with_bytes(coordinator, &tagged_object(42), 53)
 }
 
 /// Two-pass build: stamp the manifest once to learn its final bytes,
@@ -240,10 +263,10 @@ pub fn divergent_offer_with_manifest_bytes(
 /// would silently produce an id that names nothing.
 fn offer_with_bytes(
     coordinator: &CoordinatorAuthority,
-    output_tag: u8,
+    output: &ObjectId,
     evidence_tag: u8,
 ) -> (OfferPreparedActionResult, Vec<u8>) {
-    let stamped = offer_for(coordinator, output_tag, 50, evidence_tag, Vec::new());
+    let stamped = offer_for_object(coordinator, output, 50, evidence_tag, Vec::new());
     let bytes = crate::manifest_codec::encode_manifest_v1(&stamped.manifest);
     let manifest_id = ObjectId(
         crate::digest_set::digest_set(&bytes, crate::digest_set::DigestRequest::default(), None)
@@ -279,10 +302,27 @@ fn offer_for(
     evidence_tag: u8,
     ancestors: Vec<ProvisionalAncestorRef>,
 ) -> OfferPreparedActionResult {
+    offer_for_object(
+        coordinator,
+        &tagged_object(output_tag),
+        manifest_tag,
+        evidence_tag,
+        ancestors,
+    )
+}
+
+/// [`offer_for`] with the materializable output given as an object id.
+fn offer_for_object(
+    coordinator: &CoordinatorAuthority,
+    output: &ObjectId,
+    manifest_tag: u8,
+    evidence_tag: u8,
+    ancestors: Vec<ProvisionalAncestorRef>,
+) -> OfferPreparedActionResult {
     let manifest_id = tagged_object(manifest_tag);
     OfferPreparedActionResult::build(
         attempt_authority_for(coordinator),
-        manifest_with_output(output_tag),
+        manifest_with_output_object(output),
         manifest_id.clone(),
         sample_evidence(&manifest_id),
         tagged_object(evidence_tag),

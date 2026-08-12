@@ -25,12 +25,19 @@
 //! 4. `committed_state_survives_a_kill_dash_nine_and_reboot` — the
 //!    committed pointer, its pin, and its serving state survive SIGKILL
 //!    and a reboot that reconciles clean.
+//! 5. `a_committed_action_serves_its_real_bytes_into_a_worktree` — the
+//!    payoff (bd-iy2e0): `serve_action` materializes the committed
+//!    artifact's actual bytes into a fresh worktree, and refuses once a
+//!    divergence quarantines the action.
+//! 6. `serving_an_uncommitted_action_is_a_typed_miss_not_an_empty_hit` —
+//!    a miss is `NotServable(NoRecord)`, never an empty "hit".
 //!
-//! NOT proven here (named so nothing is implied): the offer does not
-//! arrive over the wire from a worker (that protocol is J024 — this drives
-//! the in-process coordinator API a wire handler will call), and the
-//! "crash exactly between link and metadata commit" matrix stays at
-//! library fidelity in rabs-cas's H015 crash matrix.
+//! NOT proven here (named so nothing is implied): neither the offer nor
+//! the serve request arrives over the wire (J024 / bd-1vf05 — these drive
+//! the in-process coordinator API a wire handler will call), no wrapper
+//! yet skips a compile on the strength of a hit, and the "crash exactly
+//! between link and metadata commit" matrix stays at library fidelity in
+//! rabs-cas's H015 crash matrix.
 #![cfg(unix)]
 
 use std::process::{Command, Stdio};
@@ -39,6 +46,7 @@ use std::time::Duration;
 
 use rabs_asupersync::daemon_runtime::{DaemonRunOptions, SubsystemWork, run_daemon};
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, PutOutcome, put_if_absent};
+use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::metadata_store::{RabsMetadataStore, RusqliteEngine, SqlMetadataStore, digest_key};
 use rabs_cas::publication::{
     AUTHORITY_DIGEST_DOMAIN, DIVERGENCE_EVIDENCE_PIN_CLASS, OfferPreparedActionResult,
@@ -47,10 +55,12 @@ use rabs_cas::publication::{
 use rabs_cas::serving_state::{ServeDecision, serving_gate};
 use rabs_cas::test_support::{
     divergent_offer_with_manifest_bytes, install_admission_world, install_offer_closure,
-    offer_under, offer_with_manifest_bytes, sample_action_key, sample_expected_descriptor,
+    offer_serving_object, offer_under, offer_with_manifest_bytes, sample_action_key,
+    sample_expected_descriptor,
 };
 use rabs_protocol::result_identity::DivergenceClass;
-use rabsd::coord::live::{CoordLive, cluster_id, load_manifest};
+use rabs_protocol::result_identity::ObjectId;
+use rabsd::coord::live::{CoordLive, ServeOutcome, cluster_id, load_manifest};
 use rabsd::janitor::store::{LiveCas, mount_and_reconcile};
 
 /// Run the real binary over `state_dir` for a short bounded life.
@@ -65,6 +75,19 @@ fn boot_binary(state_dir: &std::path::Path, ms: &str) -> std::process::Output {
         .stderr(Stdio::piped())
         .output()
         .expect("run rabsd")
+}
+
+/// Now, in microseconds since the Unix epoch. The commit writes the
+/// H040 serving record at its column defaults (clock epoch 0), so the
+/// gate is always asked at epoch 0 in these tests.
+fn now_micros() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_micros(),
+    )
+    .expect("micros fit i64")
 }
 
 /// The value of a `"field":N` or `"field":"text"` pair in a JSON line.
@@ -277,13 +300,7 @@ fn coordinator_commits_then_quarantines_divergence_under_running_daemon() {
 
     // 4. Serving is off. (The commit writes the H040 record at its column
     //    defaults — clock epoch 0 — so the gate is asked at that epoch.)
-    let now = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_micros(),
-    )
-    .expect("micros fit i64");
+    let now = now_micros();
     match serving_gate(&mut store, &digest_key(&action_key), now, 0).expect("gate") {
         ServeDecision::NotServable { disposition } => assert_eq!(disposition, "quarantined"),
         other => panic!("a quarantined action must not serve, gate said {other:?}"),
@@ -495,16 +512,117 @@ fn committed_state_survives_a_kill_dash_nine_and_reboot() {
         Some(false),
         "the publication reachability pin must survive and stay held"
     );
-    let now = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_micros(),
-    )
-    .expect("micros fit i64");
+    let now = now_micros();
     assert_eq!(
         serving_gate(&mut store, &digest_key(&action_key), now, 0).expect("gate"),
         ServeDecision::Servable,
         "an undisputed commit must still serve after the crash"
     );
+}
+
+#[test]
+fn a_committed_action_serves_its_real_bytes_into_a_worktree() {
+    // The first path in RABS by which a cache hit becomes files on disk
+    // (bd-iy2e0): gate -> reload the committed manifest from CAS bytes
+    // -> materialize its outputs into a live worktree.
+    let dir = tempfile::tempdir().unwrap();
+    let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).expect("mount"));
+    let coord = CoordLive::with_cas(Arc::clone(&cas));
+    let authority = coord
+        .acquire_boot_authority(&cluster_id())
+        .expect("authority");
+
+    // The artifact a worker produced, really in the byte store.
+    let artifact = b"the compiled rlib bytes a worker uploaded".repeat(64);
+    let object = {
+        let mut store = cas.store().lock().expect("store lock");
+        let declared = digest_set(&artifact, DigestRequest::default(), None)
+            .expect("digest")
+            .atp_content_id;
+        let mut reader: &[u8] = &artifact;
+        put_if_absent(
+            cas.layout(),
+            &mut *store,
+            &declared,
+            &mut reader,
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .expect("put artifact");
+        ObjectId(declared)
+    };
+
+    let (offer, manifest_bytes) = offer_serving_object(&authority, &object);
+    {
+        let mut store = cas.store().lock().expect("store lock");
+        install_admission_world(&mut *store, &authority);
+    }
+    store_manifest_object(&cas, &offer, &manifest_bytes);
+    let outcome = coord
+        .commit_offer(&offer, &sample_expected_descriptor())
+        .expect("commit");
+    assert!(
+        matches!(outcome, PublicationOutcome::Committed(_)),
+        "expected a commit, got {outcome:?}"
+    );
+
+    // Serve it into a worktree that does not exist yet.
+    let worktree = dir.path().join("worktree");
+    let now = now_micros();
+    let served = coord
+        .serve_action(&sample_action_key(), &worktree, now, 0)
+        .expect("serve");
+    let ServeOutcome::Served { files } = served else {
+        panic!("expected a served hit, got {served:?}");
+    };
+    assert_eq!(files, vec![worktree.join("out").join("lib.rlib")]);
+    assert_eq!(
+        std::fs::read(&files[0]).expect("read served artifact"),
+        artifact,
+        "the served file must be the committed bytes"
+    );
+
+    // A quarantine switches serving off: same action, now refused.
+    let (divergent, divergent_bytes) = divergent_offer_with_manifest_bytes(&authority);
+    store_manifest_object(&cas, &divergent, &divergent_bytes);
+    let outcome = coord
+        .commit_offer(&divergent, &sample_expected_descriptor())
+        .expect("classified");
+    assert!(
+        matches!(outcome, PublicationOutcome::Quarantined(_)),
+        "expected a quarantine, got {outcome:?}"
+    );
+    let after = coord
+        .serve_action(&sample_action_key(), &dir.path().join("worktree2"), now, 0)
+        .expect("serve after quarantine");
+    match after {
+        ServeOutcome::NotServable(ServeDecision::NotServable { disposition }) => {
+            assert_eq!(disposition, "quarantined");
+        }
+        other => panic!("a quarantined action must not serve, got {other:?}"),
+    }
+    assert!(
+        !dir.path().join("worktree2").exists(),
+        "a refused serve must write nothing"
+    );
+}
+
+#[test]
+fn serving_an_uncommitted_action_is_a_typed_miss_not_an_empty_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).expect("mount"));
+    let coord = CoordLive::with_cas(Arc::clone(&cas));
+    coord
+        .acquire_boot_authority(&cluster_id())
+        .expect("authority");
+    let outcome = coord
+        .serve_action(
+            &sample_action_key(),
+            &dir.path().join("worktree"),
+            now_micros(),
+            0,
+        )
+        .expect("serve");
+    assert_eq!(outcome, ServeOutcome::NotServable(ServeDecision::NoRecord));
+    assert!(!dir.path().join("worktree").exists());
 }

@@ -25,22 +25,27 @@
 //! abandoned so nothing hides.
 
 use crate::coord::target_lease::TargetLeaseRegistry;
-use crate::edge::destination_arbiter::DestinationArbiter;
+use crate::edge::destination_arbiter::{BundleId, DestinationArbiter};
 use crate::janitor::store::LiveCas;
 use rabs_cas::blob_store::RAW_PROFILE_V1;
 use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
 use rabs_cas::manifest_codec::decode_manifest_v1;
+use rabs_cas::materialization::{decide_materialization, materialize_object};
 use rabs_cas::metadata_store::{AuthorityRow, RabsMetadataStore, StoreError, digest_key};
 use rabs_cas::publication::{
     AUTHORITY_DIGEST_DOMAIN, CommitDurabilityProfile, OBSERVABLE_PROJECTION_DOMAIN,
     OfferPreparedActionResult, OfferRefusal, PublicationOutcome, SEMANTIC_PROJECTION_DOMAIN,
     authority_digest, process_offer,
 };
+use rabs_cas::serving_state::{ServeDecision, serving_gate};
 use rabs_key::logical_output_map::DOMAIN_ARTIFACT_BUNDLE_ROOT;
 use rabs_key::typed_digest::{DOMAIN_ACTION_KEY, DOMAIN_DESCRIPTOR};
 use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
-use rabs_protocol::result_identity::{CanonicalActionResultManifest, DigestAlgorithm, TypedDigest};
+use rabs_protocol::result_identity::{
+    CanonicalActionResultManifest, DigestAlgorithm, OutputRole, TypedDigest,
+};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -96,6 +101,119 @@ impl std::fmt::Display for CommitRefusal {
             Self::Store(error) => write!(f, "store error: {error}"),
         }
     }
+}
+
+/// The answer to a serve request that is not a fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeOutcome {
+    /// Materialized; these files now exist (empty when the committed
+    /// manifest declares no materializable output).
+    Served {
+        /// The destinations written, in manifest order.
+        files: Vec<PathBuf>,
+    },
+    /// The serving gate said no. The typed decision is preserved —
+    /// "quarantined" and "expired TTL" are not the same fact.
+    NotServable(ServeDecision),
+    /// Servable disposition, no publication row: a torn store, never a
+    /// hit.
+    NoCommit,
+    /// The committed manifest's bytes could not be read back (missing
+    /// or undecodable copy). Conservative: no hit, nothing written.
+    ManifestUnavailable {
+        /// The manifest object key that could not be loaded.
+        key: String,
+    },
+}
+
+/// Why a serve could not even be attempted. Nothing is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeError {
+    /// No store is mounted.
+    NoStore,
+    /// A lock was poisoned by a panic elsewhere.
+    StoreUnavailable,
+    /// The metadata store refused a lookup.
+    Store(String),
+    /// A manifest's virtual path would escape the destination root.
+    /// Refused — a cache hit must never write outside the worktree it
+    /// was asked to fill.
+    UnsafeVirtualPath {
+        /// The offending path, escaped for display.
+        path: String,
+    },
+    /// Another bundle holds an overlapping destination (D031).
+    DestinationConflict {
+        /// The destination that overlapped.
+        path: String,
+        /// The bundle holding it.
+        holder: String,
+    },
+    /// Materializing one output failed.
+    Materialize {
+        /// Which destination.
+        path: String,
+        /// The typed materialization failure.
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for ServeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoStore => write!(f, "no rabs-cas store mounted"),
+            Self::StoreUnavailable => write!(f, "store lock poisoned"),
+            Self::Store(error) => write!(f, "store error: {error}"),
+            Self::UnsafeVirtualPath { path } => {
+                write!(f, "virtual path {path:?} escapes the destination root")
+            }
+            Self::DestinationConflict { path, holder } => {
+                write!(f, "destination {path} is held by {holder}")
+            }
+            Self::Materialize { path, reason } => write!(f, "materializing {path}: {reason}"),
+        }
+    }
+}
+
+/// Join a manifest's virtual path under `root`, or `None` if it would
+/// leave: absolute paths, any `..` or `.` component, empty paths, and
+/// (on unix) embedded NULs are all refused. A served artifact writes
+/// where the caller said, or nowhere.
+fn resolve_destination(root: &Path, virtual_path: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    if virtual_path.is_empty() || virtual_path.contains(&0) || virtual_path[0] == b'/' {
+        return None;
+    }
+    let mut out = root.to_path_buf();
+    let mut components = 0_usize;
+    for segment in virtual_path.split(|b| *b == b'/') {
+        if segment.is_empty() || segment == b".." || segment == b"." {
+            return None;
+        }
+        out.push(std::ffi::OsStr::from_bytes(segment));
+        components += 1;
+    }
+    (components > 0).then_some(out)
+}
+
+/// Materialize every planned output, stopping at the first failure.
+fn install_all(
+    store: &mut dyn RabsMetadataStore,
+    plan: &[(TypedDigest, PathBuf, String)],
+) -> Result<Vec<PathBuf>, ServeError> {
+    let mut written = Vec::with_capacity(plan.len());
+    for (object, path, text) in plan {
+        // The destination is a subscriber's mutable target tree, and no
+        // reflink isolation has been verified here (nothing computes
+        // that yet), so the policy resolves to a private copy.
+        let mode = decide_materialization(true, false, false);
+        materialize_object(store, object, path, mode).map_err(|e| ServeError::Materialize {
+            path: text.clone(),
+            reason: e.to_string(),
+        })?;
+        written.push(path.clone());
+    }
+    Ok(written)
 }
 
 /// The live coordinator state shared edge↔coord in-process.
@@ -293,6 +411,108 @@ impl CoordLive {
             CommitDurabilityProfile::RequireDurableClosure,
         )
         .map_err(CommitRefusal::Offer)
+    }
+
+    /// Serve a committed action into a live worktree: the first path in
+    /// RABS by which a cache hit becomes files on disk.
+    ///
+    /// Order matters and is fail-closed at every step:
+    ///
+    /// 1. the H040 serving gate decides — anything but `Servable` (no
+    ///    record, quarantined, blocked, expired) returns the typed
+    ///    decision and writes nothing;
+    /// 2. the committed manifest is reloaded from its CAS bytes, so
+    ///    what gets materialized is what was committed, not what some
+    ///    process remembered;
+    /// 3. every destination is resolved under `destination_root` and
+    ///    refused if it escapes (absolute, `..`, empty);
+    /// 4. the D031 arbiter reserves ALL of them all-or-nothing, so two
+    ///    concurrent serves cannot install into overlapping paths;
+    /// 5. only then do bytes land, each verified against its object id
+    ///    and renamed into place.
+    ///
+    /// A failure part-way leaves the files already written in place —
+    /// they are individually correct, verified artifacts — and reports
+    /// the failure; the caller must not treat a partial serve as a hit.
+    ///
+    /// # Errors
+    /// A typed [`ServeError`]. The non-error non-serve cases (nothing
+    /// committed, not servable) are [`ServeOutcome`] variants, because
+    /// they are normal answers, not faults.
+    pub fn serve_action(
+        &self,
+        action_key: &TypedDigest,
+        destination_root: &Path,
+        now_unix_micros: i64,
+        now_epoch: u64,
+    ) -> Result<ServeOutcome, ServeError> {
+        let cas = self.cas.as_ref().ok_or(ServeError::NoStore)?;
+        let key = digest_key(action_key);
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| ServeError::StoreUnavailable)?;
+        declare_coordinator_domains(&mut *store);
+
+        match serving_gate(&mut *store, &key, now_unix_micros, now_epoch)
+            .map_err(|e| ServeError::Store(format!("{e:?}")))?
+        {
+            ServeDecision::Servable => {}
+            decision => return Ok(ServeOutcome::NotServable(decision)),
+        }
+        let Some(manifest_key) = store
+            .published_manifest_key(action_key)
+            .map_err(|e| ServeError::Store(format!("{e:?}")))?
+        else {
+            // A servable disposition with no publication row is a torn
+            // store, not a hit.
+            return Ok(ServeOutcome::NoCommit);
+        };
+        let Some(manifest) = load_manifest(&mut *store, &manifest_key) else {
+            return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
+        };
+
+        // Resolve destinations first: nothing is reserved, and no byte
+        // is written, until every path is known to stay inside the root.
+        let mut plan: Vec<(TypedDigest, PathBuf, String)> = Vec::new();
+        for output in &manifest.logical_outputs {
+            if output.role != OutputRole::Materializable {
+                continue;
+            }
+            let path = resolve_destination(destination_root, output.virtual_path.as_bytes())
+                .ok_or_else(|| ServeError::UnsafeVirtualPath {
+                    path: output.virtual_path.escaped(),
+                })?;
+            let text = path.to_string_lossy().into_owned();
+            plan.push((output.object.0.clone(), path, text));
+        }
+        if plan.is_empty() {
+            return Ok(ServeOutcome::Served { files: Vec::new() });
+        }
+
+        // D031: reserve every destination all-or-nothing before any
+        // install, so a concurrent serve into an overlapping path is
+        // refused rather than interleaved.
+        let bundle = BundleId(format!("serve:{key}:{}", self.next_seq()));
+        let paths: Vec<String> = plan.iter().map(|(_, _, text)| text.clone()).collect();
+        {
+            let mut arbiter = self
+                .arbiter
+                .lock()
+                .map_err(|_| ServeError::StoreUnavailable)?;
+            arbiter.reserve(&bundle, &paths).map_err(|conflict| {
+                ServeError::DestinationConflict {
+                    path: conflict.path,
+                    holder: conflict.holder.0,
+                }
+            })?;
+        }
+        let result = install_all(&mut *store, &plan);
+        if let Ok(mut arbiter) = self.arbiter.lock() {
+            arbiter.release(&bundle);
+        }
+        let files = result?;
+        Ok(ServeOutcome::Served { files })
     }
 
     /// Allocate a pin id unique to this incarnation.
