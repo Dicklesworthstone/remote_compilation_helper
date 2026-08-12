@@ -61,9 +61,23 @@ fn spawn_daemon(dir: &std::path::Path) -> Child {
         .env("RABS_STATE_DIR", dir.join("state"))
         .env("RABS_CONFIG", "/nonexistent-rabs-config")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // The daemon's diagnostics go to a file, not /dev/null: a red
+        // chaos run with no daemon-side evidence is a red run you cannot
+        // diagnose. Appended, so every round of a test accumulates.
+        .stderr(Stdio::from(
+            std::fs::File::options()
+                .create(true)
+                .append(true)
+                .open(dir.join("daemon.err"))
+                .expect("daemon log"),
+        ))
         .spawn()
         .expect("spawn rabsd")
+}
+
+/// The daemon's own diagnostics, for a failure message.
+fn daemon_log(dir: &std::path::Path) -> String {
+    std::fs::read_to_string(dir.join("daemon.err")).unwrap_or_default()
 }
 
 fn wait_for_socket(socket: &std::path::Path, up: bool) {
@@ -247,8 +261,15 @@ fn compressed_soak_no_receipt_gaps_or_build_failures() {
         .expect("receipts exist");
     let receipt_lines = receipts.lines().filter(|l| !l.is_empty()).count();
     assert_eq!(
-        receipt_lines, builds as usize,
-        "receipt/consult gap: {receipt_lines} receipts for {builds} builds (seed {SEED:#x})"
+        receipt_lines,
+        builds as usize,
+        "receipt/consult gap: {receipt_lines} receipts for {builds} builds (seed {SEED:#x})\n\
+         breaker: {:?}\n\
+         daemon log:\n{}",
+        std::fs::read(dir.path().join("breaker"))
+            .ok()
+            .and_then(|b| rabs_protocol::wrapper_breaker::decode_state(&b)),
+        daemon_log(dir.path())
     );
     for line in receipts.lines().filter(|l| !l.is_empty()) {
         let value: serde_json::Value = serde_json::from_str(line).expect("well-formed receipt");

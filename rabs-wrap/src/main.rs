@@ -152,11 +152,30 @@ fn consult(
     writer.write_all(b"\n").map_err(|_| ())?;
     line.clear();
     reader.read_line(&mut line).map_err(|_| ())?;
-    if line.contains("\"decision\"") {
+    if consult_succeeded(&line) {
         Ok(())
     } else {
         Err(())
     }
+}
+
+/// Did the daemon actually answer this consult, or only admit that it
+/// could not?
+///
+/// The breaker exists to notice a daemon that is not serving us. A
+/// `decision` frame in `shadow-error` mode is the daemon reporting its
+/// OWN failure — counting that as a healthy attempt keeps the breaker
+/// closed against a daemon that is answering nothing useful, so the
+/// wrapper pays the consult latency on every single rustc invocation for
+/// as long as the fault lasts. It is a failed attempt.
+///
+/// Deliberately string-shaped, not serde: the wrapper's whole budget is
+/// p95 <10 ms and it hand-rolls its JSON by design.
+fn consult_succeeded(reply: &str) -> bool {
+    if !reply.contains("\"kind\":\"decision\"") {
+        return false; // refusal, garbage, or a truncated line
+    }
+    !reply.contains("\"mode\":\"shadow-error\"")
 }
 
 fn main() {
@@ -273,6 +292,32 @@ mod tests {
         // Corrupt: fresh closed, never an error.
         std::fs::write(&path, b"\xff\xfe garbage").unwrap();
         assert_eq!(load_state(path_str), BreakerState::fresh());
+    }
+
+    #[test]
+    fn a_daemon_reporting_its_own_failure_is_a_failed_attempt() {
+        // A real answer.
+        assert!(consult_succeeded(
+            "{\"kind\":\"decision\",\"decision\":\"pass-through\",\"mode\":\"shadow\",\
+             \"key\":\"ab\",\"hit_upper_bound\":false,\"class\":\"crate\",\"flight\":\"leader\"}"
+        ));
+        // Coord down but the edge still answering: the shadow plane did
+        // its job, so the consult itself succeeded.
+        assert!(consult_succeeded(
+            "{\"kind\":\"decision\",\"decision\":\"pass-through\",\
+             \"mode\":\"shadow-coord-degraded\"}"
+        ));
+        // The daemon admitting it could not decide — the breaker must
+        // see this, or it never opens against a broken shadow plane.
+        assert!(!consult_succeeded(
+            "{\"kind\":\"decision\",\"decision\":\"pass-through\",\"mode\":\"shadow-error\"}"
+        ));
+        // Refusals and noise are failures.
+        assert!(!consult_succeeded(
+            "{\"kind\":\"refusal\",\"reason\":\"unknown-frame\",\"detail\":\"consult\"}"
+        ));
+        assert!(!consult_succeeded(""));
+        assert!(!consult_succeeded("{\"kind\":\"hello-ok\"}"));
     }
 
     #[test]

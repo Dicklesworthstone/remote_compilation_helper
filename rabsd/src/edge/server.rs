@@ -343,15 +343,30 @@ async fn handle_connection(
                                 decision.would_have_hit_upper_bound,
                                 decision.class,
                             ),
-                            Err(()) => "{\"kind\":\"decision\",\"decision\":\"pass-through\",\
+                            Err(()) => {
+                                // The daemon admitting it could not
+                                // decide. This used to be silent, which
+                                // made a degraded shadow plane invisible
+                                // in the logs AND (until the wrapper
+                                // learned to count it) invisible to the
+                                // breaker.
+                                log_line(
+                                    "rabsd-edge-shadow-error",
+                                    &[("trace", &trace), ("key_class", "unknown")],
+                                );
+                                "{\"kind\":\"decision\",\"decision\":\"pass-through\",\
                                  \"mode\":\"shadow-error\"}"
-                                .to_string(),
+                                    .to_string()
+                            }
                         }
                     }
                     None => "{\"kind\":\"decision\",\"decision\":\"pass-through\",\
                          \"mode\":\"unshadowed\"}"
                         .to_string(),
                 }
+            }
+            Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("serve") => {
+                serve_reply(&coord, &value)
             }
             Ok(other) => refusal(
                 "unknown-frame",
@@ -374,6 +389,94 @@ async fn handle_connection(
     for key in open_flights {
         coord.end_flight(&key);
     }
+}
+
+/// Handle a `serve` frame: materialize a committed action's outputs
+/// into a caller-named worktree (bd-1vf05 — the first way to reach
+/// [`CoordLive::serve_action`] from outside the daemon process).
+///
+/// Every answer is typed and distinguishable: a miss, a quarantine, and
+/// a fault are three different replies, because a caller that may skip
+/// work on a hit must never confuse them. The destination must be an
+/// ABSOLUTE path — a relative one would resolve against the daemon's
+/// working directory, which is not the caller's.
+///
+/// [`CoordLive::serve_action`]: crate::coord::live::CoordLive::serve_action
+fn serve_reply(
+    coord: &std::sync::Arc<crate::coord::live::CoordLive>,
+    value: &serde_json::Value,
+) -> String {
+    use crate::coord::live::ServeOutcome;
+
+    let Some(action_key) = value
+        .get("action_key")
+        .and_then(|k| k.as_str())
+        .and_then(action_key_from_hex)
+    else {
+        return refusal("bad-action-key", "expected 64 hex characters");
+    };
+    let Some(destination) = value.get("destination_root").and_then(|d| d.as_str()) else {
+        return refusal("missing-destination", "serve requires destination_root");
+    };
+    let destination = std::path::Path::new(destination);
+    if !destination.is_absolute() {
+        return refusal("relative-destination", "destination_root must be absolute");
+    }
+    // The committed serving record carries clock epoch 0 (its column
+    // default) until the coordinator populates a real clock epoch, so
+    // the gate is asked at that epoch; the instant is the daemon's own.
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros()),
+    )
+    .unwrap_or(i64::MAX);
+    match coord.serve_action(&action_key, destination, now, 0) {
+        Ok(ServeOutcome::Served { files }) => {
+            let list: Vec<String> = files
+                .iter()
+                .map(|f| format!("\"{}\"", f.display().to_string().replace('"', "'")))
+                .collect();
+            format!(
+                "{{\"kind\":\"serve-result\",\"outcome\":\"served\",\"files\":[{}]}}",
+                list.join(",")
+            )
+        }
+        Ok(ServeOutcome::NotServable(decision)) => format!(
+            "{{\"kind\":\"serve-result\",\"outcome\":\"not-servable\",\"reason\":\"{}\"}}",
+            format!("{decision:?}").replace('"', "'")
+        ),
+        Ok(ServeOutcome::NoCommit) => {
+            "{\"kind\":\"serve-result\",\"outcome\":\"no-commit\"}".to_string()
+        }
+        Ok(ServeOutcome::ManifestUnavailable { key }) => format!(
+            "{{\"kind\":\"serve-result\",\"outcome\":\"manifest-unavailable\",\"key\":\"{}\"}}",
+            key.replace('"', "'")
+        ),
+        Err(error) => format!(
+            "{{\"kind\":\"serve-result\",\"outcome\":\"error\",\"reason\":\"{}\"}}",
+            error.to_string().replace('"', "'")
+        ),
+    }
+}
+
+/// A 64-hex action key, typed under THIS build's action-key domain — the
+/// domain is never taken from the wire (R121).
+fn action_key_from_hex(hex: &str) -> Option<rabs_protocol::result_identity::TypedDigest> {
+    use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0_u8; 32];
+    let (pairs, _) = hex.as_bytes().as_chunks::<2>();
+    for (slot, pair) in bytes.iter_mut().zip(pairs) {
+        *slot = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(TypedDigest {
+        algorithm: DigestAlgorithm::Sha256V1,
+        domain: rabs_key::typed_digest::DOMAIN_ACTION_KEY,
+        bytes,
+    })
 }
 
 /// Parse the full consult observation (argv + cwd + env names); None
