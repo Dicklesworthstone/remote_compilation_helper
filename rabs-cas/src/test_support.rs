@@ -205,6 +205,70 @@ pub fn divergent_offer_under(coordinator: &CoordinatorAuthority) -> OfferPrepare
     offer_for(coordinator, 42, 52, 53, Vec::new())
 }
 
+/// The commit-ready offer whose `manifest_id` is the REAL content id of
+/// its canonical manifest bytes, together with those bytes — so a caller
+/// can `put_if_absent` them into an actual blob store and prove the
+/// coordinator can RELOAD the committed manifest from the CAS (bd-h8sp5)
+/// instead of remembering it in process memory.
+///
+/// # Panics
+/// If the fixture's own two-pass construction is inconsistent (the
+/// re-stamped manifest must encode to the bytes its id was taken from).
+#[must_use]
+pub fn offer_with_manifest_bytes(
+    coordinator: &CoordinatorAuthority,
+) -> (OfferPreparedActionResult, Vec<u8>) {
+    offer_with_bytes(coordinator, 41, 51)
+}
+
+/// The divergent counterpart of [`offer_with_manifest_bytes`]: same
+/// action key, different materializable output, real manifest bytes.
+///
+/// # Panics
+/// As [`offer_with_manifest_bytes`].
+#[must_use]
+pub fn divergent_offer_with_manifest_bytes(
+    coordinator: &CoordinatorAuthority,
+) -> (OfferPreparedActionResult, Vec<u8>) {
+    offer_with_bytes(coordinator, 42, 53)
+}
+
+/// Two-pass build: stamp the manifest once to learn its final bytes,
+/// take the content id of those bytes, then rebuild the offer with that
+/// id (and the evidence rebound to it). The second stamp is by
+/// construction identical to the first — asserted, because a drift here
+/// would silently produce an id that names nothing.
+fn offer_with_bytes(
+    coordinator: &CoordinatorAuthority,
+    output_tag: u8,
+    evidence_tag: u8,
+) -> (OfferPreparedActionResult, Vec<u8>) {
+    let stamped = offer_for(coordinator, output_tag, 50, evidence_tag, Vec::new());
+    let bytes = crate::manifest_codec::encode_manifest_v1(&stamped.manifest);
+    let manifest_id = ObjectId(
+        crate::digest_set::digest_set(&bytes, crate::digest_set::DigestRequest::default(), None)
+            .expect("digest the manifest bytes")
+            .atp_content_id,
+    );
+    let offer = OfferPreparedActionResult::build(
+        attempt_authority_for(coordinator),
+        stamped.manifest,
+        manifest_id.clone(),
+        sample_evidence(&manifest_id),
+        tagged_object(evidence_tag),
+        tagged_digest("rabs.observation-stream.sha256.v1", 9),
+        &sample_declared(),
+        Vec::new(),
+    )
+    .expect("sample offer fixtures are internally consistent");
+    assert_eq!(
+        crate::manifest_codec::encode_manifest_v1(&offer.manifest),
+        bytes,
+        "re-stamping must not change the manifest bytes its id was taken from"
+    );
+    (offer, bytes)
+}
+
 /// Build an offer from the fixture parts: `output_tag` selects the
 /// materializable output object, `manifest_tag`/`evidence_tag` the
 /// manifest and evidence object ids.
@@ -307,6 +371,16 @@ pub fn install_offer_closure(store: &mut dyn RabsMetadataStore, offer: &OfferPre
         closure.push(snapshot.0.clone());
     }
     for id in &closure {
+        // An object that ALREADY has a durable copy is left alone: when
+        // a caller has put real bytes in a real blob store (the manifest
+        // object, say), fabricating a second location beside them would
+        // hand readers a path with nothing behind it.
+        if store
+            .object_durably_located(id)
+            .expect("check object location")
+        {
+            continue;
+        }
         let key = crate::metadata_store::digest_key(id);
         store.record_object(id, 64).expect("record object");
         store

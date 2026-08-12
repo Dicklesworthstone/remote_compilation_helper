@@ -18,7 +18,11 @@
 //!    with a different result is quarantined as `SemanticDivergence`: the
 //!    committed pointer survives untouched, an incident row is appended,
 //!    the losing candidate is pinned, and serving is switched off.
-//! 3. `committed_state_survives_a_kill_dash_nine_and_reboot` — the
+//! 3. `divergence_is_classified_from_cas_bytes_after_a_restart` — a
+//!    coordinator with no memory of the commit still classifies a
+//!    same-key candidate correctly, because it reloads the committed
+//!    manifest out of its CAS bytes (bd-h8sp5).
+//! 4. `committed_state_survives_a_kill_dash_nine_and_reboot` — the
 //!    committed pointer, its pin, and its serving state survive SIGKILL
 //!    and a reboot that reconciles clean.
 //!
@@ -34,18 +38,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rabs_asupersync::daemon_runtime::{DaemonRunOptions, SubsystemWork, run_daemon};
+use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, PutOutcome, put_if_absent};
 use rabs_cas::metadata_store::{RabsMetadataStore, RusqliteEngine, SqlMetadataStore, digest_key};
 use rabs_cas::publication::{
-    AUTHORITY_DIGEST_DOMAIN, DIVERGENCE_EVIDENCE_PIN_CLASS, PublicationOutcome,
+    AUTHORITY_DIGEST_DOMAIN, DIVERGENCE_EVIDENCE_PIN_CLASS, OfferPreparedActionResult,
+    PublicationOutcome,
 };
 use rabs_cas::serving_state::{ServeDecision, serving_gate};
 use rabs_cas::test_support::{
-    divergent_offer_under, install_admission_world, install_offer_closure, offer_under,
-    sample_action_key, sample_expected_descriptor,
+    divergent_offer_with_manifest_bytes, install_admission_world, install_offer_closure,
+    offer_under, offer_with_manifest_bytes, sample_action_key, sample_expected_descriptor,
 };
 use rabs_protocol::result_identity::DivergenceClass;
-use rabsd::coord::live::{CoordLive, cluster_id};
-use rabsd::janitor::store::mount_and_reconcile;
+use rabsd::coord::live::{CoordLive, cluster_id, load_manifest};
+use rabsd::janitor::store::{LiveCas, mount_and_reconcile};
 
 /// Run the real binary over `state_dir` for a short bounded life.
 fn boot_binary(state_dir: &std::path::Path, ms: &str) -> std::process::Output {
@@ -166,17 +172,19 @@ fn coordinator_commits_then_quarantines_divergence_under_running_daemon() {
                 .map_err(|e| format!("authority: {e}"))?;
 
             // A worker's world: the action entry, generation, attempt and
-            // lease under THIS coordinator's authority, plus both offers'
-            // object closures durably located (an offer whose bytes are
-            // not durable is refused before any transaction opens).
-            let first = offer_under(&authority);
-            let second = divergent_offer_under(&authority);
+            // lease under THIS coordinator's authority, both manifests'
+            // real bytes in the blob store (the coordinator reads the
+            // committed one back to classify the second offer), and both
+            // closures durably located — an offer whose bytes are not
+            // durable is refused before any transaction opens.
+            let (first, first_bytes) = offer_with_manifest_bytes(&authority);
+            let (second, second_bytes) = divergent_offer_with_manifest_bytes(&authority);
             {
                 let mut store = cas_for_region.store().lock().expect("store lock");
                 install_admission_world(&mut *store, &authority);
-                install_offer_closure(&mut *store, &first);
-                install_offer_closure(&mut *store, &second);
             }
+            store_manifest_object(&cas_for_region, &first, &first_bytes);
+            store_manifest_object(&cas_for_region, &second, &second_bytes);
 
             let commit = coord_for_region
                 .commit_offer(&first, &sample_expected_descriptor())
@@ -280,6 +288,106 @@ fn coordinator_commits_then_quarantines_divergence_under_running_daemon() {
         ServeDecision::NotServable { disposition } => assert_eq!(disposition, "quarantined"),
         other => panic!("a quarantined action must not serve, gate said {other:?}"),
     }
+}
+
+/// Put the manifest's canonical bytes into the REAL blob store, so the
+/// coordinator can read the committed manifest back the way production
+/// will: object bytes on disk, location row in the store.
+fn store_manifest_object(cas: &LiveCas, offer: &OfferPreparedActionResult, bytes: &[u8]) {
+    let mut store = cas.store().lock().expect("store lock");
+    let mut reader = bytes;
+    let outcome = put_if_absent(
+        cas.layout(),
+        &mut *store,
+        &offer.manifest_id.0,
+        &mut reader,
+        PutLimits::default(),
+        DurabilityPolicy::FULL,
+    )
+    .expect("put manifest bytes");
+    assert!(
+        matches!(
+            outcome,
+            PutOutcome::Stored { .. } | PutOutcome::IdempotentDuplicate { .. }
+        ),
+        "manifest bytes must land in the store: {outcome:?}"
+    );
+    install_offer_closure(&mut *store, offer);
+}
+
+#[test]
+fn divergence_is_classified_from_cas_bytes_after_a_restart() {
+    // The point of bd-h8sp5: A018 classification needs the COMMITTED
+    // manifest, and a restarted coordinator remembers nothing. Reading
+    // it back out of its CAS bytes is what keeps a same-key,
+    // different-result offer a QUARANTINE instead of degrading into a
+    // CommittedManifestUnavailable refusal.
+    let dir = tempfile::tempdir().unwrap();
+    let cas_root = dir.path().join("cas");
+
+    // Incarnation 1: commit the first result.
+    {
+        let cas = Arc::new(mount_and_reconcile(&cas_root).expect("mount"));
+        let coord = CoordLive::with_cas(Arc::clone(&cas));
+        let authority = coord
+            .acquire_boot_authority(&cluster_id())
+            .expect("authority");
+        let (offer, bytes) = offer_with_manifest_bytes(&authority);
+        {
+            let mut store = cas.store().lock().expect("store lock");
+            install_admission_world(&mut *store, &authority);
+        }
+        store_manifest_object(&cas, &offer, &bytes);
+        let outcome = coord
+            .commit_offer(&offer, &sample_expected_descriptor())
+            .expect("commit");
+        assert!(
+            matches!(outcome, PublicationOutcome::Committed(_)),
+            "expected a commit, got {outcome:?}"
+        );
+    }
+
+    // Incarnation 2: a brand-new process-level coordinator over the same
+    // on-disk store — no memory of incarnation 1 whatsoever.
+    let cas = Arc::new(mount_and_reconcile(&cas_root).expect("re-mount"));
+    let coord = CoordLive::with_cas(Arc::clone(&cas));
+    let authority = coord
+        .acquire_boot_authority(&cluster_id())
+        .expect("authority");
+    assert_eq!(authority.term, 2, "the reboot must advance the term");
+
+    let (divergent, bytes) = divergent_offer_with_manifest_bytes(&authority);
+    store_manifest_object(&cas, &divergent, &bytes);
+    let outcome = coord
+        .commit_offer(&divergent, &sample_expected_descriptor())
+        .expect("the divergent offer must be admitted and classified");
+    let PublicationOutcome::Quarantined(quarantine) = outcome else {
+        panic!("expected a quarantine across the restart, got {outcome:?}");
+    };
+    assert_eq!(quarantine.class, DivergenceClass::SemanticDivergence);
+
+    // And the committed manifest really was reloaded from bytes, not
+    // guessed: it decodes to a manifest whose semantic digest is the one
+    // the incident says the candidate diverged from.
+    let committed_key = {
+        let mut store = cas.store().lock().expect("store lock");
+        store
+            .published_manifest_key(&sample_action_key())
+            .expect("published key")
+            .expect("a committed pointer")
+    };
+    let reloaded = {
+        let mut store = cas.store().lock().expect("store lock");
+        load_manifest(&mut *store, &committed_key).expect("manifest reloads from its CAS bytes")
+    };
+    assert_ne!(
+        reloaded.semantic_result_digest, divergent.manifest.semantic_result_digest,
+        "the two candidates must genuinely differ semantically"
+    );
+    assert_eq!(
+        digest_key(&reloaded.action_key),
+        digest_key(&sample_action_key())
+    );
 }
 
 #[test]

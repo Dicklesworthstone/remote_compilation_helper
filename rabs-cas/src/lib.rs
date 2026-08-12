@@ -49,6 +49,7 @@ pub mod dependency_snapshot;
 pub mod digest_set;
 pub mod gc;
 pub mod link_bundle;
+pub mod manifest_codec;
 pub mod manifest_validation;
 pub mod materialization;
 pub mod metadata_store;

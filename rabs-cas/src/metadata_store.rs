@@ -830,6 +830,17 @@ pub trait RabsMetadataStore {
     /// Whether an object has at least one recorded location.
     fn object_located(&mut self, object: &TypedDigest) -> Result<bool, StoreError>;
 
+    /// Every NON-QUARANTINED stored copy of an object, as
+    /// `(store_path, encoding, durable)`, ordered by path so the answer
+    /// is stable. A reader (materialization, manifest reload) needs the
+    /// path, not just the boolean — and must never be handed a
+    /// quarantined copy, which is exactly why this filters the same way
+    /// [`RabsMetadataStore::object_located`] does.
+    fn object_locations(
+        &mut self,
+        object: &TypedDigest,
+    ) -> Result<Vec<(String, String, bool)>, StoreError>;
+
     /// Record object metadata (digest + logical size; never bytes).
     fn record_object(&mut self, id: &TypedDigest, logical_size: u64) -> Result<(), StoreError>;
 
@@ -2250,6 +2261,29 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             &[SqlValue::Text(digest_key(object))],
         )?;
         Ok(!rows.is_empty())
+    }
+
+    fn object_locations(
+        &mut self,
+        object: &TypedDigest,
+    ) -> Result<Vec<(String, String, bool)>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT store_path, encoding, durable FROM object_locations \
+             WHERE object_key = ?1 AND quarantined = 0 ORDER BY store_path",
+            &[SqlValue::Text(digest_key(object))],
+        )?;
+        rows.iter()
+            .map(|row| {
+                let [path, encoding, durable] = row.as_slice() else {
+                    return Err(StoreError::Corruption("object location shape".into()));
+                };
+                Ok((
+                    expect_text(path, "store_path")?,
+                    expect_text(encoding, "encoding")?,
+                    expect_u64(durable, "durable")? != 0,
+                ))
+            })
+            .collect()
     }
 
     fn record_object(&mut self, id: &TypedDigest, logical_size: u64) -> Result<(), StoreError> {

@@ -27,13 +27,19 @@
 use crate::coord::target_lease::TargetLeaseRegistry;
 use crate::edge::destination_arbiter::DestinationArbiter;
 use crate::janitor::store::LiveCas;
+use rabs_cas::blob_store::RAW_PROFILE_V1;
+use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
+use rabs_cas::manifest_codec::decode_manifest_v1;
 use rabs_cas::metadata_store::{AuthorityRow, RabsMetadataStore, StoreError, digest_key};
 use rabs_cas::publication::{
-    AUTHORITY_DIGEST_DOMAIN, CommitDurabilityProfile, OfferPreparedActionResult, OfferRefusal,
-    PublicationOutcome, authority_digest, process_offer,
+    AUTHORITY_DIGEST_DOMAIN, CommitDurabilityProfile, OBSERVABLE_PROJECTION_DOMAIN,
+    OfferPreparedActionResult, OfferRefusal, PublicationOutcome, SEMANTIC_PROJECTION_DOMAIN,
+    authority_digest, process_offer,
 };
+use rabs_key::logical_output_map::DOMAIN_ARTIFACT_BUNDLE_ROOT;
+use rabs_key::typed_digest::{DOMAIN_ACTION_KEY, DOMAIN_DESCRIPTOR};
 use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
-use rabs_protocol::result_identity::{CanonicalActionResultManifest, TypedDigest};
+use rabs_protocol::result_identity::{CanonicalActionResultManifest, DigestAlgorithm, TypedDigest};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -105,14 +111,6 @@ pub struct CoordLive {
     cas: Option<std::sync::Arc<LiveCas>>,
     /// The authority acquired at coord boot; `None` until then.
     authority: Mutex<Option<CoordinatorAuthority>>,
-    /// Canonical manifests this coordinator has admitted this
-    /// incarnation, by manifest digest key. `process_offer` needs the
-    /// COMMITTED manifest to classify a same-key candidate (A018); after
-    /// a restart this cache is empty, so a divergent offer against a
-    /// pre-restart commit is refused (`CommittedManifestUnavailable`)
-    /// rather than mis-classified. Durable manifest reload from the CAS
-    /// bytes is the next slice.
-    manifests: Mutex<HashMap<String, CanonicalActionResultManifest>>,
     /// High half of every pin id this incarnation allocates: pin ids must
     /// not collide with pins written by a previous boot, and the store has
     /// no id allocator. Seeded from the boot instant.
@@ -187,10 +185,7 @@ impl CoordLive {
     pub fn acquire_boot_authority(&self, cluster_id: &str) -> Result<CoordinatorAuthority, String> {
         let cas = self.cas.as_ref().ok_or("no rabs-cas store mounted")?;
         let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
-        // A fresh incarnation has written nothing yet, so it must declare
-        // the authority domain before it can read back the row a previous
-        // boot left (R121 fail-closed domain restore).
-        store.intern_domain(AUTHORITY_DIGEST_DOMAIN);
+        declare_coordinator_domains(&mut *store);
         let prior = store
             .active_authority()
             .map_err(|e| format!("active authority: {e:?}"))?;
@@ -262,25 +257,37 @@ impl CoordLive {
         if self.authority().is_none() {
             return Err(CommitRefusal::NoAuthority);
         }
-        // Remember the offered manifest BEFORE admission: if this one
-        // commits it becomes the committed manifest a later same-key
-        // candidate is classified against (A018).
-        let mut manifests = self
-            .manifests
-            .lock()
-            .map_err(|_| CommitRefusal::StoreUnavailable)?;
-        manifests.insert(digest_key(&offer.manifest_id.0), offer.manifest.clone());
         let pin_id = self.next_pin_id();
         let seq = self.next_seq();
         let mut store = cas
             .store()
             .lock()
             .map_err(|_| CommitRefusal::StoreUnavailable)?;
+
+        // A018 classification needs the COMMITTED manifest for this key.
+        // Resolve it up front, out of its CAS bytes: `process_offer`
+        // borrows the store for the whole admission, so the resolver it
+        // takes cannot itself touch the store — and the only key it ever
+        // asks for is this one. Reading the bytes (rather than
+        // remembering the manifest in process memory) is what makes
+        // classification survive a restart.
+        let committed_key = store
+            .published_manifest_key(&offer.manifest.action_key)
+            .map_err(|e| CommitRefusal::Store(format!("{e:?}")))?;
+        let committed = match &committed_key {
+            Some(key) => load_manifest(&mut *store, key),
+            None => None,
+        };
+        let resolver = |key: &str| match (&committed_key, &committed) {
+            (Some(committed_key), Some(manifest)) if committed_key == key => Some(manifest.clone()),
+            _ => None,
+        };
+
         process_offer(
             &mut *store,
             offer,
             expected_descriptor,
-            |key| manifests.get(key).cloned(),
+            resolver,
             pin_id,
             seq,
             CommitDurabilityProfile::RequireDurableClosure,
@@ -376,6 +383,80 @@ impl CoordLive {
     pub fn arbiter(&self) -> &Mutex<DestinationArbiter> {
         &self.arbiter
     }
+}
+
+/// Declare every digest domain the coordinator reads back out of a
+/// store a PREVIOUS incarnation wrote.
+///
+/// Domain restore is fail-closed (R121): a process may only re-type a
+/// stored domain it names itself, as a `'static` from its own build.
+/// Writes intern implicitly, which covers everything within one
+/// incarnation — but a fresh coordinator's very first acts are READS
+/// (its predecessor's authority row, the committed publication for a key
+/// it is about to admit), so it declares them here at boot. Anything not
+/// on this list still fails closed.
+pub fn declare_coordinator_domains(store: &mut dyn RabsMetadataStore) {
+    for domain in [
+        AUTHORITY_DIGEST_DOMAIN,
+        DOMAIN_ACTION_KEY,
+        DOMAIN_DESCRIPTOR,
+        DOMAIN_ARTIFACT_BUNDLE_ROOT,
+        ATP_OBJECT_CONTENT_DOMAIN,
+        SEMANTIC_PROJECTION_DOMAIN,
+        OBSERVABLE_PROJECTION_DOMAIN,
+    ] {
+        store.intern_domain(domain);
+    }
+}
+
+/// Load a canonical result manifest out of its CAS bytes, by object
+/// digest key (`domain:hex`, as stored on the publication row).
+///
+/// `None` for every "cannot be sure" case — an unparsable key, a key
+/// that is not an object id, no non-quarantined raw copy, unreadable
+/// bytes, or bytes that do not decode. A caller that needs the manifest
+/// then refuses conservatively; a wrong manifest would mean a wrong
+/// divergence verdict, which is far worse than a refusal.
+#[must_use]
+pub fn load_manifest(
+    store: &mut dyn RabsMetadataStore,
+    manifest_key: &str,
+) -> Option<CanonicalActionResultManifest> {
+    let object = object_id_from_key(manifest_key)?;
+    let locations = store.object_locations(&object).ok()?;
+    locations
+        .into_iter()
+        // Only the raw representation is bytes-as-stored; compressed and
+        // packed copies need their own decoders (H030) and are skipped
+        // rather than mis-read.
+        .filter(|(_, encoding, _)| encoding == RAW_PROFILE_V1)
+        .find_map(|(path, _, _)| {
+            let bytes = std::fs::read(&path).ok()?;
+            decode_manifest_v1(&bytes).ok()
+        })
+}
+
+/// Parse a `rabs.object.sha256.v1:<64 hex>` digest key back into a typed
+/// digest. The domain is this build's `'static` constant — a key naming
+/// any other domain is refused, never re-typed (R121).
+fn object_id_from_key(key: &str) -> Option<TypedDigest> {
+    let hex = key
+        .strip_prefix(ATP_OBJECT_CONTENT_DOMAIN)?
+        .strip_prefix(':')?;
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0_u8; 32];
+    let (pairs, _) = hex.as_bytes().as_chunks::<2>();
+    for (slot, pair) in bytes.iter_mut().zip(pairs) {
+        let text = std::str::from_utf8(pair).ok()?;
+        *slot = u8::from_str_radix(text, 16).ok()?;
+    }
+    Some(TypedDigest {
+        algorithm: DigestAlgorithm::Sha256V1,
+        domain: ATP_OBJECT_CONTENT_DOMAIN,
+        bytes,
+    })
 }
 
 /// The cluster this coordinator claims (`RABS_CLUSTER_ID`, default
