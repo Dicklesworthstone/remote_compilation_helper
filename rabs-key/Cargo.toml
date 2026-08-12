@@ -24,5 +24,11 @@ rabs-protocol = { path = "../rabs-protocol" }
 # authoritative digests. no-default-features; pure computation only.
 sha2 = { workspace = true }
 
+# Test-only. The A002 dependency-direction gate exempts dev-dependencies
+# (they do not ship in the crate's cone); the output-derivation
+# conformance test needs a scratch directory to run real rustc into.
+[dev-dependencies]
+tempfile = "3.25.0"
+
 [lints.rust]
 unsafe_code = "forbid"

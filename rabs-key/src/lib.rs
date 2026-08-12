@@ -73,6 +73,7 @@ pub mod linker_profiles;
 pub mod logical_output_map;
 pub mod native_wrappers;
 pub mod output_declarations;
+pub mod output_derivation;
 pub mod output_platform;
 pub mod path_policy;
 pub mod presentation;
