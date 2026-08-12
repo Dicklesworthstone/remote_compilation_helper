@@ -29,7 +29,11 @@
 //!    payoff (bd-iy2e0): `serve_action` materializes the committed
 //!    artifact's actual bytes into a fresh worktree, and refuses once a
 //!    divergence quarantines the action.
-//! 6. `serving_an_uncommitted_action_is_a_typed_miss_not_an_empty_hit` —
+//! 6. `a_hit_whose_outputs_differ_from_the_callers_work_is_refused` —
+//!    the interlock (bd-6uuiq): a caller that states what its own work
+//!    would produce gets a refusal, and no bytes, whenever the commit
+//!    would deliver a different file set.
+//! 7. `serving_an_uncommitted_action_is_a_typed_miss_not_an_empty_hit` —
 //!    a miss is `NotServable(NoRecord)`, never an empty "hit".
 //!
 //! NOT proven here (named so nothing is implied): neither the offer nor
@@ -40,6 +44,7 @@
 //! rabs-cas's H015 crash matrix.
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -60,7 +65,7 @@ use rabs_cas::test_support::{
 };
 use rabs_protocol::result_identity::DivergenceClass;
 use rabs_protocol::result_identity::ObjectId;
-use rabsd::coord::live::{CoordLive, ServeOutcome, cluster_id, load_manifest};
+use rabsd::coord::live::{CoordLive, ExpectedOutputs, ServeOutcome, cluster_id, load_manifest};
 use rabsd::janitor::store::{LiveCas, mount_and_reconcile};
 
 /// Run the real binary over `state_dir` for a short bounded life.
@@ -570,7 +575,15 @@ fn a_committed_action_serves_its_real_bytes_into_a_worktree() {
     let worktree = dir.path().join("worktree");
     let now = now_micros();
     let served = coord
-        .serve_action(&sample_action_key(), &worktree, now, 0)
+        .serve_action(
+            &sample_action_key(),
+            &worktree,
+            // The interlock: this caller states exactly what its own
+            // work would have produced, and the commit must match.
+            &ExpectedOutputs::Exactly(BTreeSet::from(["out/lib.rlib".to_owned()])),
+            now,
+            0,
+        )
         .expect("serve");
     let ServeOutcome::Served { files } = served else {
         panic!("expected a served hit, got {served:?}");
@@ -593,7 +606,13 @@ fn a_committed_action_serves_its_real_bytes_into_a_worktree() {
         "expected a quarantine, got {outcome:?}"
     );
     let after = coord
-        .serve_action(&sample_action_key(), &dir.path().join("worktree2"), now, 0)
+        .serve_action(
+            &sample_action_key(),
+            &dir.path().join("worktree2"),
+            &ExpectedOutputs::WhateverWasCommitted,
+            now,
+            0,
+        )
         .expect("serve after quarantine");
     match after {
         ServeOutcome::NotServable(ServeDecision::NotServable { disposition }) => {
@@ -604,6 +623,118 @@ fn a_committed_action_serves_its_real_bytes_into_a_worktree() {
     assert!(
         !dir.path().join("worktree2").exists(),
         "a refused serve must write nothing"
+    );
+}
+
+#[test]
+fn a_hit_whose_outputs_differ_from_the_callers_work_is_refused() {
+    // THE interlock (bd-6uuiq). A caller about to skip work states what
+    // that work would produce. If the committed result produces anything
+    // else, serving it would hand back a build missing files it was
+    // promised — so it is not a hit, and not a single byte is written.
+    let dir = tempfile::tempdir().unwrap();
+    let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).expect("mount"));
+    let coord = CoordLive::with_cas(Arc::clone(&cas));
+    let authority = coord
+        .acquire_boot_authority(&cluster_id())
+        .expect("authority");
+
+    let artifact = b"a committed rlib".to_vec();
+    let object = {
+        let mut store = cas.store().lock().expect("store lock");
+        let declared = digest_set(&artifact, DigestRequest::default(), None)
+            .expect("digest")
+            .atp_content_id;
+        let mut reader: &[u8] = &artifact;
+        put_if_absent(
+            cas.layout(),
+            &mut *store,
+            &declared,
+            &mut reader,
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .expect("put artifact");
+        ObjectId(declared)
+    };
+    let (offer, manifest_bytes) = offer_serving_object(&authority, &object);
+    {
+        let mut store = cas.store().lock().expect("store lock");
+        install_admission_world(&mut *store, &authority);
+    }
+    store_manifest_object(&cas, &offer, &manifest_bytes);
+    coord
+        .commit_offer(&offer, &sample_expected_descriptor())
+        .expect("commit");
+
+    // The caller's work would produce a `.rmeta` too — this commit does
+    // not have one.
+    let worktree = dir.path().join("worktree");
+    let outcome = coord
+        .serve_action(
+            &sample_action_key(),
+            &worktree,
+            &ExpectedOutputs::Exactly(BTreeSet::from([
+                "out/lib.rlib".to_owned(),
+                "out/lib.rmeta".to_owned(),
+            ])),
+            now_micros(),
+            0,
+        )
+        .expect("serve");
+    match outcome {
+        ServeOutcome::OutputSetMismatch {
+            missing,
+            unexpected,
+        } => {
+            assert_eq!(missing, vec!["out/lib.rmeta".to_owned()]);
+            assert!(unexpected.is_empty(), "{unexpected:?}");
+        }
+        other => panic!("a differing output set must refuse, got {other:?}"),
+    }
+    assert!(
+        !worktree.exists(),
+        "a refused serve must not create the worktree, let alone files"
+    );
+
+    // The mirror case: the caller expects LESS than the commit produces.
+    let outcome = coord
+        .serve_action(
+            &sample_action_key(),
+            &worktree,
+            &ExpectedOutputs::Exactly(BTreeSet::new()),
+            now_micros(),
+            0,
+        )
+        .expect("serve");
+    match outcome {
+        ServeOutcome::OutputSetMismatch {
+            missing,
+            unexpected,
+        } => {
+            assert!(missing.is_empty(), "{missing:?}");
+            assert_eq!(unexpected, vec!["out/lib.rlib".to_owned()]);
+        }
+        other => panic!("an extra committed output must refuse, got {other:?}"),
+    }
+
+    // And the matching set still serves.
+    let served = coord
+        .serve_action(
+            &sample_action_key(),
+            &worktree,
+            &ExpectedOutputs::Exactly(BTreeSet::from(["out/lib.rlib".to_owned()])),
+            now_micros(),
+            0,
+        )
+        .expect("serve");
+    assert!(
+        matches!(served, ServeOutcome::Served { .. }),
+        "an exact match must serve, got {served:?}"
+    );
+    assert_eq!(
+        std::fs::read(worktree.join("out").join("lib.rlib")).expect("served"),
+        artifact
     );
 }
 
@@ -619,6 +750,7 @@ fn serving_an_uncommitted_action_is_a_typed_miss_not_an_empty_hit() {
         .serve_action(
             &sample_action_key(),
             &dir.path().join("worktree"),
+            &ExpectedOutputs::WhateverWasCommitted,
             now_micros(),
             0,
         )

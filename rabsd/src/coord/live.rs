@@ -124,6 +124,36 @@ pub enum ServeOutcome {
         /// The manifest object key that could not be loaded.
         key: String,
     },
+    /// The committed result does not produce the output set the caller
+    /// said its work would produce. NOT a hit: materializing it would
+    /// leave the caller's build missing files it was promised, or
+    /// carrying files it never asked for.
+    OutputSetMismatch {
+        /// Expected by the caller, absent from the commit.
+        missing: Vec<String>,
+        /// Present in the commit, not expected by the caller.
+        unexpected: Vec<String>,
+    },
+}
+
+/// What the caller says the work it is about to skip would produce.
+///
+/// A serve that lands a different set of files than the caller's own
+/// work would have produced is the one failure mode a cache must never
+/// have: a build silently missing (or gaining) a file. So the check is
+/// opt-OUT and explicit — never satisfied by a caller that simply forgot
+/// to state its expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpectedOutputs {
+    /// The caller's derived output set (filenames relative to the
+    /// destination root, e.g. from `rabs_key::output_derivation`). The
+    /// committed manifest's materializable outputs must equal it
+    /// exactly.
+    Exactly(std::collections::BTreeSet<String>),
+    /// The caller is not skipping any work and accepts whatever the
+    /// commit declares: operator and diagnostic paths only. A wrapper
+    /// must never use this.
+    WhateverWasCommitted,
 }
 
 /// Why a serve could not even be attempted. Nothing is written.
@@ -424,11 +454,14 @@ impl CoordLive {
     /// 2. the committed manifest is reloaded from its CAS bytes, so
     ///    what gets materialized is what was committed, not what some
     ///    process remembered;
-    /// 3. every destination is resolved under `destination_root` and
+    /// 3. the commit's materializable outputs are checked against
+    ///    `expected` — a caller skipping work must get exactly the files
+    ///    that work would have produced, or no hit at all;
+    /// 4. every destination is resolved under `destination_root` and
     ///    refused if it escapes (absolute, `..`, empty);
-    /// 4. the D031 arbiter reserves ALL of them all-or-nothing, so two
+    /// 5. the D031 arbiter reserves ALL of them all-or-nothing, so two
     ///    concurrent serves cannot install into overlapping paths;
-    /// 5. only then do bytes land, each verified against its object id
+    /// 6. only then do bytes land, each verified against its object id
     ///    and renamed into place.
     ///
     /// A failure part-way leaves the files already written in place —
@@ -443,6 +476,7 @@ impl CoordLive {
         &self,
         action_key: &TypedDigest,
         destination_root: &Path,
+        expected: &ExpectedOutputs,
         now_unix_micros: i64,
         now_epoch: u64,
     ) -> Result<ServeOutcome, ServeError> {
@@ -471,6 +505,32 @@ impl CoordLive {
         let Some(manifest) = load_manifest(&mut *store, &manifest_key) else {
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
         };
+
+        // The interlock: does this commit produce what the caller's own
+        // work would have produced? Checked BEFORE any path resolution,
+        // reservation, or byte — a mismatch must cost nothing.
+        if let ExpectedOutputs::Exactly(expected) = expected {
+            let mut committed_outputs = std::collections::BTreeSet::new();
+            for output in &manifest.logical_outputs {
+                if output.role != OutputRole::Materializable {
+                    continue;
+                }
+                // No lossy comparison in a safety interlock: a path this
+                // build cannot even read is a path it cannot promise.
+                let text = std::str::from_utf8(output.virtual_path.as_bytes()).map_err(|_| {
+                    ServeError::UnsafeVirtualPath {
+                        path: output.virtual_path.escaped(),
+                    }
+                })?;
+                committed_outputs.insert(text.to_owned());
+            }
+            if committed_outputs != *expected {
+                return Ok(ServeOutcome::OutputSetMismatch {
+                    missing: expected.difference(&committed_outputs).cloned().collect(),
+                    unexpected: committed_outputs.difference(expected).cloned().collect(),
+                });
+            }
+        }
 
         // Resolve destinations first: nothing is reserved, and no byte
         // is written, until every path is known to stay inside the root.

@@ -406,7 +406,7 @@ fn serve_reply(
     coord: &std::sync::Arc<crate::coord::live::CoordLive>,
     value: &serde_json::Value,
 ) -> String {
-    use crate::coord::live::ServeOutcome;
+    use crate::coord::live::{ExpectedOutputs, ServeOutcome};
 
     let Some(action_key) = value
         .get("action_key")
@@ -422,6 +422,26 @@ fn serve_reply(
     if !destination.is_absolute() {
         return refusal("relative-destination", "destination_root must be absolute");
     }
+    // The caller's expectation. A frame that omits `expected_outputs`
+    // is explicitly saying it is skipping no work (operator/diagnostic
+    // use); a caller that IS skipping work states its derived set and
+    // gets a refusal on any mismatch.
+    let expected = match value.get("expected_outputs") {
+        None => ExpectedOutputs::WhateverWasCommitted,
+        Some(list) => {
+            let Some(items) = list.as_array() else {
+                return refusal("bad-expected-outputs", "expected_outputs must be an array");
+            };
+            let mut set = std::collections::BTreeSet::new();
+            for item in items {
+                let Some(text) = item.as_str() else {
+                    return refusal("bad-expected-outputs", "entries must be strings");
+                };
+                set.insert(text.to_owned());
+            }
+            ExpectedOutputs::Exactly(set)
+        }
+    };
     // The committed serving record carries clock epoch 0 (its column
     // default) until the coordinator populates a real clock epoch, so
     // the gate is asked at that epoch; the instant is the daemon's own.
@@ -431,7 +451,7 @@ fn serve_reply(
             .map_or(0, |d| d.as_micros()),
     )
     .unwrap_or(i64::MAX);
-    match coord.serve_action(&action_key, destination, now, 0) {
+    match coord.serve_action(&action_key, destination, &expected, now, 0) {
         Ok(ServeOutcome::Served { files }) => {
             let list: Vec<String> = files
                 .iter()
@@ -453,6 +473,24 @@ fn serve_reply(
             "{{\"kind\":\"serve-result\",\"outcome\":\"manifest-unavailable\",\"key\":\"{}\"}}",
             key.replace('"', "'")
         ),
+        Ok(ServeOutcome::OutputSetMismatch {
+            missing,
+            unexpected,
+        }) => {
+            let quote = |items: &[String]| {
+                items
+                    .iter()
+                    .map(|p| format!("\"{}\"", p.replace('"', "'")))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            format!(
+                "{{\"kind\":\"serve-result\",\"outcome\":\"output-set-mismatch\",\
+                 \"missing\":[{}],\"unexpected\":[{}]}}",
+                quote(&missing),
+                quote(&unexpected)
+            )
+        }
         Err(error) => format!(
             "{{\"kind\":\"serve-result\",\"outcome\":\"error\",\"reason\":\"{}\"}}",
             error.to_string().replace('"', "'")

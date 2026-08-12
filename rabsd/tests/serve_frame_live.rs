@@ -176,6 +176,42 @@ fn the_running_daemon_serves_a_committed_hit_over_the_socket() {
         "the daemon must materialize the committed bytes"
     );
 
+    // The interlock over the wire: a caller stating an output set the
+    // commit does not produce gets a refusal naming the difference, and
+    // nothing is written.
+    let mismatch = round_trip(
+        &mut stream,
+        &format!(
+            "{{\"kind\":\"serve\",\"action_key\":\"{key}\",\"destination_root\":\"{}\",\
+             \"expected_outputs\":[\"out/lib.rlib\",\"out/lib.rmeta\"]}}",
+            dir.path().join("mismatch").display()
+        ),
+    );
+    assert!(
+        mismatch.contains("\"outcome\":\"output-set-mismatch\"")
+            && mismatch.contains("out/lib.rmeta"),
+        "expected an output-set refusal, got {mismatch}"
+    );
+    assert!(!dir.path().join("mismatch").exists());
+
+    // Stating the RIGHT set serves.
+    let matched = round_trip(
+        &mut stream,
+        &format!(
+            "{{\"kind\":\"serve\",\"action_key\":\"{key}\",\"destination_root\":\"{}\",\
+             \"expected_outputs\":[\"out/lib.rlib\"]}}",
+            dir.path().join("matched").display()
+        ),
+    );
+    assert!(
+        matched.contains("\"outcome\":\"served\""),
+        "an exact match must serve, got {matched}"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("matched").join("out").join("lib.rlib")).expect("served"),
+        artifact
+    );
+
     // A key nobody committed is a typed MISS, distinguishable from a hit
     // and from a fault — the distinction a caller that may skip work
     // depends on.
