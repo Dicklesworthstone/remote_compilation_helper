@@ -61,3 +61,8 @@ pub mod staging_journal;
 pub mod startup_reconciliation;
 pub mod tree_manifest;
 pub mod trust_evidence;
+
+/// Public offer / ready-store builders for downstream live commit tests
+/// (bd-g900u). Feature-gated; never compiled into a normal build.
+#[cfg(feature = "test-support")]
+pub mod test_support;

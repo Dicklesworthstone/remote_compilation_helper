@@ -14,6 +14,12 @@ publish = false
 [lib]
 doctest = false
 
+[features]
+# Public offer / ready-store builders for downstream LIVE commit tests
+# (bd-g900u). Off by default; never in a normal build. rabsd enables it as
+# a dev-dependency feature only.
+test-support = []
+
 # Core storage semantics stay Tokio-free and Asupersync-free; filesystem
 # effects are permitted here (this crate OWNS durable storage). The metadata
 # store abstraction gains a reference-SQLite backend and a gated FrankenSQLite
