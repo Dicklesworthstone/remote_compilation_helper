@@ -172,7 +172,17 @@ fn capture_contract(channel: &str) -> ContractFingerprint {
         .lines()
         // Keys that embed crate/package specifics or point at OUR
         // logging stay out of the cross-machine contract shape.
-        .filter(|key| !key.starts_with("CARGO_PKG_") && !key.starts_with("RABS_"))
+        //
+        // `CARGO_BIN_EXE_*` is the same class of leak, and a nastier one:
+        // the fixture build inherits this HARNESS's environment, so every
+        // binary target we ever add to `rabsd` would otherwise show up as
+        // "drift" in the channel's cargo→wrapper interface. It names our
+        // own binaries; cargo never presents it to a real wrapper run.
+        .filter(|key| {
+            !key.starts_with("CARGO_PKG_")
+                && !key.starts_with("CARGO_BIN_EXE_")
+                && !key.starts_with("RABS_")
+        })
         .map(str::to_string)
         .collect();
 

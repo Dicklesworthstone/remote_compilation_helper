@@ -297,31 +297,27 @@ fn main() {
 
     let marker = std::env::var("RABS_BOOT_MARKER")
         .unwrap_or_else(|_| default_under_home(".cache/rch/rabsd.boot"));
-    // The live coordinator (S6): shared edge<->coord in-process, with
-    // the structural authority split intact — the coord region owns its
-    // availability; the edge only consults it.
-    let coord = std::sync::Arc::new(rabsd::coord::live::CoordLive::new());
-    let coord_for_region = std::sync::Arc::clone(&coord);
-    let coord_work: rabs_asupersync::daemon_runtime::SubsystemWork =
-        Box::new(move |cx, mut shutdown| {
-            Box::pin(async move {
-                if std::env::var("RABS_LAB_COORD_DOWN").is_ok() {
-                    // Lab fault injection: the coord region dies at boot;
-                    // edge consults must survive in degraded mode and the
-                    // receipt must show this region abandoned.
-                    return Err("lab: coord region down (RABS_LAB_COORD_DOWN)".to_string());
-                }
-                coord_for_region.mark_up();
-                cx.trace("coord region up: leases + arbiter + singleflight mounted");
-                shutdown.wait().await;
-                coord_for_region.mark_down();
-                Ok(())
-            })
-        });
     let state_dir = std::path::PathBuf::from(
         std::env::var("RABS_STATE_DIR")
             .unwrap_or_else(|_| default_under_home(".cache/rch/rabs-state")),
     );
+
+    // W1 (bd-hfhq2 / bd-epyez): mount the on-disk rabs-cas store ONCE,
+    // before the regions exist, because two regions need the same handle:
+    // the janitor owns its lifetime, and the coordinator — the only role
+    // that may commit (I8/I9/I10) — publishes through it. A failed mount
+    // is carried into the janitor region so it still lands in the
+    // shutdown receipt as that region's abandoned obligation.
+    let mounted =
+        rabsd::janitor::store::mount_and_reconcile(&state_dir.join("cas")).map(std::sync::Arc::new);
+    // The live coordinator (S6): shared edge<->coord in-process, with
+    // the structural authority split intact — the coord region owns its
+    // availability; the edge only consults it.
+    let coord = std::sync::Arc::new(match &mounted {
+        Ok(cas) => rabsd::coord::live::CoordLive::with_cas(std::sync::Arc::clone(cas)),
+        Err(_) => rabsd::coord::live::CoordLive::new(),
+    });
+    let coord_work = rabsd::coord::live::coord_work(std::sync::Arc::clone(&coord));
     let options = DaemonRunOptions {
         run_for,
         boot_marker: Some(std::path::PathBuf::from(marker)),
@@ -333,9 +329,9 @@ fn main() {
             },
         )),
         coord_work: Some(coord_work),
-        // W1 (bd-hfhq2): the janitor region mounts the on-disk rabs-cas
-        // store under the state dir and reconciles it fail-closed at boot.
-        janitor_work: Some(rabsd::janitor::store::janitor_work(state_dir.join("cas"))),
+        // W1 (bd-hfhq2): the janitor region owns the mounted, fail-closed
+        // reconciled store for the daemon lifetime.
+        janitor_work: Some(rabsd::janitor::store::janitor_work_holding(mounted)),
         ..DaemonRunOptions::default()
     };
     match run_daemon(options) {

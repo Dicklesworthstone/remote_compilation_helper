@@ -73,16 +73,22 @@ fn hundred_boot_shutdown_cycles_all_obligation_clean() {
     // THE S1 acceptance loop: 100 real boot/shutdown cycles, every
     // receipt clean, every marker removed. Unique socket per test —
     // the default path collides across concurrent daemons (found live
-    // on hz2 when S3 landed the edge server).
+    // on hz2 when S3 landed the edge server). Unique STATE DIR too: the
+    // janitor mounts a real store under it and the coordinator acquires
+    // its authority there, so sharing the default directory would make
+    // concurrent daemons fight over one store (and scribble on the
+    // developer's own).
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("rabsd.boot");
     let socket = dir.path().join("rabsd.sock");
+    let state = dir.path().join("state");
     for cycle in 0..100 {
         let (stdout, stderr, code, _) = run_capture(
             &["--run-for-ms", "5"],
             &[
                 ("RABS_BOOT_MARKER", marker.to_str().unwrap()),
                 ("RABS_SOCKET_PATH", socket.to_str().unwrap()),
+                ("RABS_STATE_DIR", state.to_str().unwrap()),
                 ("RABS_CONFIG", "/nonexistent-rabs-config"),
             ],
         );
@@ -100,12 +106,13 @@ fn hundred_boot_shutdown_cycles_all_obligation_clean() {
 }
 
 fn spawn_daemon(marker: &std::path::Path) -> Child {
-    // Unique socket beside the marker: concurrent daemons on one host
-    // must never share the default socket path.
+    // Unique socket AND state dir beside the marker: concurrent daemons
+    // on one host must never share the default socket path or the store.
     let socket = marker.with_extension("sock");
     rabsd()
         .env("RABS_BOOT_MARKER", marker)
         .env("RABS_SOCKET_PATH", &socket)
+        .env("RABS_STATE_DIR", marker.with_extension("state"))
         .env("RABS_CONFIG", "/nonexistent-rabs-config")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -163,6 +170,10 @@ fn kill_nine_leaves_evidence_and_next_boot_reports_recovery() {
         &[
             ("RABS_BOOT_MARKER", marker.to_str().unwrap()),
             ("RABS_SOCKET_PATH", socket.to_str().unwrap()),
+            (
+                "RABS_STATE_DIR",
+                marker.with_extension("state").to_str().unwrap(),
+            ),
             ("RABS_CONFIG", "/nonexistent-rabs-config"),
         ],
     );

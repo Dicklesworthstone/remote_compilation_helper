@@ -49,7 +49,6 @@
   },
   "env_keys": [
     "CARGO",
-    "CARGO_BIN_EXE_rabs_noop_bench",
     "CARGO_BIN_NAME",
     "CARGO_CRATE_NAME",
     "CARGO_HOME",

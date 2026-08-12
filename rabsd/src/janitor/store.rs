@@ -11,6 +11,7 @@
 //! daemon lifetime, release on shutdown.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use rabs_asupersync::daemon_runtime::SubsystemWork;
 use rabs_cas::blob_store::BlobStoreLayout;
@@ -60,18 +61,60 @@ impl FilesystemReality for OsFilesystem {
     }
 }
 
-/// A live, reconciled store held by the janitor region.
-pub struct MountedCas {
+/// A live, reconciled store: mounted once at boot, owned by the janitor
+/// region for the daemon lifetime, and SHARED with the coordinator, which
+/// is the only role allowed to commit through it (I8/I9/I10).
+///
+/// The metadata handle sits behind a `Mutex` because rusqlite's
+/// `Connection` is `Send` but not `Sync`; the lock is also the in-process
+/// serialization point for the compare-and-set publication transaction.
+pub struct LiveCas {
     /// Metadata index (action pointers, location rows, tombstones).
-    pub store: SqlMetadataStore<RusqliteEngine>,
+    store: Mutex<SqlMetadataStore<RusqliteEngine>>,
     /// Content-addressed blob byte store layout.
-    pub layout: BlobStoreLayout,
+    layout: BlobStoreLayout,
+    /// Store root the layout and metadata db live under.
+    cas_root: PathBuf,
     /// Startup reconciliation refused serving (torn authoritative state).
     pub serving_refused: bool,
     /// Count of drift rows repaired during reconciliation.
     pub repaired: usize,
     /// Count of drift rows reported (orphans; nothing touched).
     pub reported: usize,
+}
+
+impl LiveCas {
+    /// The metadata index. Callers hold the lock only for the duration of
+    /// one store transaction.
+    #[must_use]
+    pub fn store(&self) -> &Mutex<SqlMetadataStore<RusqliteEngine>> {
+        &self.store
+    }
+
+    /// The content-addressed byte store layout.
+    #[must_use]
+    pub fn layout(&self) -> &BlobStoreLayout {
+        &self.layout
+    }
+
+    /// The store root.
+    #[must_use]
+    pub fn cas_root(&self) -> &Path {
+        &self.cas_root
+    }
+}
+
+impl std::fmt::Debug for LiveCas {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // SqlMetadataStore is not Debug (and printing it would mean
+        // taking the lock from a formatter); report the mount facts.
+        f.debug_struct("LiveCas")
+            .field("cas_root", &self.cas_root)
+            .field("serving_refused", &self.serving_refused)
+            .field("repaired", &self.repaired)
+            .field("reported", &self.reported)
+            .finish()
+    }
 }
 
 /// Open the blob layout + metadata index under `cas_root` and reconcile
@@ -82,7 +125,7 @@ pub struct MountedCas {
 /// the janitor is fail-open at the *daemon* level (its Err becomes an
 /// abandoned-obligation reason in the shutdown receipt, builds still pass
 /// through locally), but the store itself reconciles fail-*closed*.
-pub fn mount_and_reconcile(cas_root: &Path) -> Result<MountedCas, String> {
+pub fn mount_and_reconcile(cas_root: &Path) -> Result<LiveCas, String> {
     std::fs::create_dir_all(cas_root)
         .map_err(|e| format!("cas root {}: {e}", cas_root.display()))?;
     let layout = BlobStoreLayout::open(&cas_root.join("blobs"))
@@ -95,32 +138,44 @@ pub fn mount_and_reconcile(cas_root: &Path) -> Result<MountedCas, String> {
     let report =
         reconcile_startup(&mut store, &filesystem).map_err(|e| format!("reconcile: {e:?}"))?;
 
-    Ok(MountedCas {
-        store,
+    Ok(LiveCas {
+        store: Mutex::new(store),
         layout,
+        cas_root: cas_root.to_path_buf(),
         serving_refused: matches!(report.serving, ServingDecision::Refused(_)),
         repaired: report.repaired.len(),
         reported: report.reported.len(),
     })
 }
 
-/// Build the janitor region work: mount the store, reconcile fail-closed,
-/// hold it for the daemon lifetime, release on shutdown.
-pub fn janitor_work(cas_root: PathBuf) -> SubsystemWork {
+/// Build the janitor region work around an ALREADY-MOUNTED store.
+///
+/// The mount is lifted out of the region because the coordinator needs
+/// the same handle to commit through (a region owns its work, not the
+/// process's shared state). The region keeps its two obligations: publish
+/// the boot evidence, and hold the store until shutdown so the metadata
+/// handle is released exactly once, cleanly.
+///
+/// A failed mount is passed in as the `Err` it was: the region returns it,
+/// so a torn or unopenable store still shows up as the janitor's abandoned
+/// obligation in the shutdown receipt instead of vanishing.
+pub fn janitor_work_holding(mounted: Result<Arc<LiveCas>, String>) -> SubsystemWork {
     Box::new(move |cx, mut shutdown| {
         Box::pin(async move {
-            let mounted = mount_and_reconcile(&cas_root)?;
+            let mounted = mounted?;
             // Structured boot evidence: a mounted, reconciled store.
             println!(
                 "{{\"v\":1,\"kind\":\"janitor-cas-mounted\",\"root\":{:?},\"serving_refused\":{},\"repaired\":{},\"reported\":{}}}",
-                cas_root.display().to_string(),
+                mounted.cas_root().display().to_string(),
                 mounted.serving_refused,
                 mounted.repaired,
                 mounted.reported,
             );
             cx.trace("janitor region up: rabs-cas store mounted + reconciled");
-            // Own the store for the region lifetime; drop on shutdown
-            // flushes and releases the metadata handle cleanly.
+            // Hold a reference for the region lifetime, so the store
+            // outlives every region that may still be using it; the
+            // metadata handle is released when the last holder (janitor
+            // or coordinator) drops after shutdown.
             let _held = mounted;
             shutdown.wait().await;
             Ok(())

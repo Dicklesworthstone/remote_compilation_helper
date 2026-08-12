@@ -704,6 +704,22 @@ pub trait RabsMetadataStore {
     /// Applied schema version.
     fn schema_version(&mut self) -> Result<u32, StoreError>;
 
+    /// Declare a digest domain this process is prepared to read back.
+    ///
+    /// Restoring a stored digest requires the READING process to already
+    /// know its domain as a `&'static str` (R121: a domain a process
+    /// never named cannot be silently re-typed on read — the read fails
+    /// with [`StoreError::DomainNotInterned`]). Writes intern implicitly,
+    /// which is enough within one incarnation; a FRESH process that must
+    /// read rows an earlier incarnation wrote — the coordinator reading
+    /// back the authority it left behind, at boot, before it has written
+    /// anything — declares them here first.
+    ///
+    /// This does not weaken the fence: the caller can only pass a
+    /// `'static` domain its own code holds, so an unknown domain in the
+    /// database still cannot be restored.
+    fn intern_domain(&mut self, domain: &'static str);
+
     /// Acquire the coordinator authority slot. Refused while a DIFFERENT
     /// unreleased authority holds it; re-acquiring the same digest is
     /// idempotent.
@@ -1677,6 +1693,10 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 .map_err(|_| StoreError::Corruption("negative schema version".into())),
             _ => Err(StoreError::Corruption("missing schema_epochs".into())),
         }
+    }
+
+    fn intern_domain(&mut self, domain: &'static str) {
+        self.intern(domain);
     }
 
     fn acquire_authority(&mut self, row: &AuthorityRow) -> Result<(), StoreError> {

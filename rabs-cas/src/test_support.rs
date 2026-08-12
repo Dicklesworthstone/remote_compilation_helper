@@ -72,7 +72,17 @@ pub fn sample_coordinator_authority() -> CoordinatorAuthority {
 /// The full attempt authority carried by an offer.
 #[must_use]
 pub fn sample_attempt_authority() -> AttemptAuthority {
-    let coordinator = sample_coordinator_authority();
+    attempt_authority_for(&sample_coordinator_authority())
+}
+
+/// The full attempt authority under a CALLER-SUPPLIED coordinator
+/// authority — the live daemon acquires its own (fresh incarnation,
+/// advanced term) at boot, so a live commit test cannot use the fixture
+/// coordinator: `process_offer`'s first fence compares the offer's
+/// authority digest against the store's ACTIVE row.
+#[must_use]
+pub fn attempt_authority_for(coordinator: &CoordinatorAuthority) -> AttemptAuthority {
+    let coordinator = coordinator.clone();
     let created_under = authority_digest(&coordinator);
     AttemptAuthority {
         coordinator,
@@ -95,6 +105,15 @@ pub fn sample_attempt_authority() -> AttemptAuthority {
 /// projection digests are placeholders here; `build()` stamps them.
 #[must_use]
 pub fn sample_manifest() -> CanonicalActionResultManifest {
+    manifest_with_output(41)
+}
+
+/// A canonical result manifest whose single materializable output is the
+/// object tagged `output_tag`. Two manifests differing only in that tag
+/// share an action key but carry different semantic result digests —
+/// exactly the A018 `SemanticDivergence` shape.
+#[must_use]
+pub fn manifest_with_output(output_tag: u8) -> CanonicalActionResultManifest {
     CanonicalActionResultManifest {
         action_key: sample_action_key(),
         canonical_descriptor_digest: tagged_digest("rabs.descriptor.sha256.v1", 8),
@@ -105,7 +124,7 @@ pub fn sample_manifest() -> CanonicalActionResultManifest {
         logical_outputs: vec![LogicalOutput {
             role: OutputRole::Materializable,
             virtual_path: RawBytes::new(b"out/lib.rlib".to_vec()),
-            object: tagged_object(41),
+            object: tagged_object(output_tag),
         }],
         semantic_result_digest: tagged_digest(SEMANTIC_PROJECTION_DOMAIN, 0),
         observable_result_digest: tagged_digest(OBSERVABLE_PROJECTION_DOMAIN, 0),
@@ -160,13 +179,49 @@ pub fn sample_offer() -> OfferPreparedActionResult {
 pub fn sample_offer_with_ancestors(
     ancestors: Vec<ProvisionalAncestorRef>,
 ) -> OfferPreparedActionResult {
-    let manifest_id = tagged_object(50);
+    offer_for(&sample_coordinator_authority(), 41, 50, 51, ancestors)
+}
+
+/// The commit-ready offer under a caller-supplied coordinator authority
+/// (the live-daemon counterpart of [`sample_offer`]).
+///
+/// # Panics
+/// If `build` rejects the fixtures (it never should).
+#[must_use]
+pub fn offer_under(coordinator: &CoordinatorAuthority) -> OfferPreparedActionResult {
+    offer_for(coordinator, 41, 50, 51, Vec::new())
+}
+
+/// A SECOND offer for the SAME action key under the same authority whose
+/// materializable output is a different object: same key, different
+/// result. `process_offer` must quarantine it as
+/// `DivergenceClass::SemanticDivergence` and leave the committed row
+/// untouched.
+///
+/// # Panics
+/// If `build` rejects the fixtures (it never should).
+#[must_use]
+pub fn divergent_offer_under(coordinator: &CoordinatorAuthority) -> OfferPreparedActionResult {
+    offer_for(coordinator, 42, 52, 53, Vec::new())
+}
+
+/// Build an offer from the fixture parts: `output_tag` selects the
+/// materializable output object, `manifest_tag`/`evidence_tag` the
+/// manifest and evidence object ids.
+fn offer_for(
+    coordinator: &CoordinatorAuthority,
+    output_tag: u8,
+    manifest_tag: u8,
+    evidence_tag: u8,
+    ancestors: Vec<ProvisionalAncestorRef>,
+) -> OfferPreparedActionResult {
+    let manifest_id = tagged_object(manifest_tag);
     OfferPreparedActionResult::build(
-        sample_attempt_authority(),
-        sample_manifest(),
+        attempt_authority_for(coordinator),
+        manifest_with_output(output_tag),
         manifest_id.clone(),
         sample_evidence(&manifest_id),
-        tagged_object(51),
+        tagged_object(evidence_tag),
         tagged_digest("rabs.observation-stream.sha256.v1", 9),
         &sample_declared(),
         ancestors,
@@ -181,16 +236,34 @@ pub fn sample_offer_with_ancestors(
 /// # Panics
 /// If any store operation fails on a fresh store.
 pub fn install_ready_store(store: &mut dyn RabsMetadataStore) {
-    let auth = authority_digest(&sample_coordinator_authority());
+    let coordinator = sample_coordinator_authority();
     store
         .acquire_authority(&AuthorityRow {
-            digest: auth.clone(),
+            digest: authority_digest(&coordinator),
             cluster_id: "cluster-a".to_owned(),
             incarnation: 77,
             term: 3,
             acquired_seq: 1,
         })
         .expect("acquire authority");
+    install_admission_world(store, &coordinator);
+    install_offer_closure(store, &offer_under(&coordinator));
+}
+
+/// Everything `process_offer` admits against EXCEPT the coordinator
+/// authority row: the action entry, the generation, the attempt, and the
+/// execution lease, all bound to `coordinator`. Split out of
+/// [`install_ready_store`] because a live daemon has already acquired its
+/// own authority at boot — a test must build its world UNDER that one, not
+/// acquire a second (which the store refuses as `AuthorityHeld`).
+///
+/// # Panics
+/// If any store operation fails.
+pub fn install_admission_world(
+    store: &mut dyn RabsMetadataStore,
+    coordinator: &CoordinatorAuthority,
+) {
+    let auth = authority_digest(coordinator);
     store
         .upsert_action_entry(&ActionEntryRow {
             action_key: sample_action_key(),
@@ -201,22 +274,44 @@ pub fn install_ready_store(store: &mut dyn RabsMetadataStore) {
     store
         .create_generation(&auth, 11, &sample_action_key())
         .expect("create generation");
-    store.record_attempt(20, 11, "worker-a", 1).expect("attempt");
+    store
+        .record_attempt(20, 11, "worker-a", 1)
+        .expect("attempt");
     store.acquire_lease(30, 20, 1, 100).expect("lease");
-    for tag in [40u8, 41, 50, 51, 60, 61, 62, 63] {
-        let id = tagged_object(tag);
-        store.record_object(&id.0, 64).expect("record object");
-        store
-            .add_location(&id.0, &format!("/cas/{tag}"), Some(1), "raw", true)
-            .expect("locate object");
+}
+
+/// Record and DURABLY locate every object in `offer`'s commit closure —
+/// manifest, evidence bundle, the F035-derived artifact bundle root, each
+/// logical output, and each evidence constituent. Under
+/// `CommitDurabilityProfile::RequireDurableClosure` a located-but-volatile
+/// object is a typed refusal, so the locations are written durable.
+///
+/// # Panics
+/// If any store operation fails.
+pub fn install_offer_closure(store: &mut dyn RabsMetadataStore, offer: &OfferPreparedActionResult) {
+    let mut closure = vec![
+        offer.manifest_id.0.clone(),
+        offer.evidence_id.0.clone(),
+        offer.evidence.execution_snapshot_root.0.clone(),
+        offer.evidence.observed_input_report.0.clone(),
+        offer.evidence.raw_process_and_event_evidence.0.clone(),
+        offer.evidence.provenance_receipt.0.clone(),
+    ];
+    if let Some(root) = &offer.manifest.artifact_bundle_root {
+        closure.push(root.0.clone());
     }
-    // build() stamps the F035-derived bundle root; the closure check
-    // requires it located like any other object.
-    if let Some(root) = &sample_offer().manifest.artifact_bundle_root {
-        store.record_object(&root.0, 0).expect("record bundle root");
+    for output in &offer.manifest.logical_outputs {
+        closure.push(output.object.0.clone());
+    }
+    if let Some(snapshot) = &offer.evidence.incremental_snapshot {
+        closure.push(snapshot.0.clone());
+    }
+    for id in &closure {
+        let key = crate::metadata_store::digest_key(id);
+        store.record_object(id, 64).expect("record object");
         store
-            .add_location(&root.0, "/cas/bundle-root", Some(1), "raw", true)
-            .expect("locate bundle root");
+            .add_location(id, &format!("/cas/{key}"), Some(1), "raw", true)
+            .expect("locate object");
     }
 }
 

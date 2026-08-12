@@ -33,6 +33,9 @@ rabs-asupersync = { path = "../rabs-asupersync" }
 
 [dev-dependencies]
 tempfile = "3.25.0"
+# bd-g900u: the public offer / ready-store builders, so the live commit
+# tests (bd-epyez) can drive the real publication engine from out here.
+rabs-cas = { path = "../rabs-cas", features = ["test-support"] }
 
 [lints.rust]
 unsafe_code = "forbid"
