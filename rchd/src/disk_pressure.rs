@@ -219,7 +219,13 @@ impl DiskPressureMonitor {
             let disk_free_ratio = next.disk_free_ratio.unwrap_or(-1.0);
             let disk_io_util_pct = next.disk_io_util_pct.unwrap_or(-1.0);
             let memory_pressure = next.memory_pressure.unwrap_or(-1.0);
-            let telemetry_age_secs = next.telemetry_age_secs.unwrap_or(u64::MAX);
+            // -1 = "never received", consistent with the other unknown-value
+            // sentinels above (previously u64::MAX, which rendered as
+            // 18446744073709551615 in logs/status).
+            let telemetry_age_secs = next
+                .telemetry_age_secs
+                .and_then(|age| i64::try_from(age).ok())
+                .unwrap_or(-1);
 
             match next.state {
                 PressureState::Critical => warn!(
