@@ -19,8 +19,26 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::debug;
 
-const CAPABILITIES_REFRESH_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
-const CAPABILITIES_REFRESH_WORKER_BUDGET: Duration = Duration::from_secs(8);
+// Sized for a *loaded* worker, not an idle one.
+//
+// `rch-wkr capabilities` shells out to rustc/node/npm/go/zig/cargo-zigbuild and
+// stats the disk, behind a fresh SSH handshake. On an idle box that is ~1s; on a
+// busy build host it is far more. Measured across the fleet with builds running
+// (10-core workers at load 45-60): 2.9s, 6.3s, 7.2s, 8.6s, **15.8s**. Against the
+// former 4s/8s pair every one of those hosts failed its probe.
+//
+// That failure is self-defeating: a probe that only fails under load means
+// `disk_free_gb` goes stale exactly on the workers that are actively filling
+// their disks, and `is_low_disk()` returns `None` for missing data — so the
+// low-disk admission gate FAILS OPEN and the dispatcher keeps feeding a worker
+// that is about to hit ENOSPC.
+//
+// This is a low-frequency operator query (`rch workers capabilities --refresh`),
+// not one of the ~30s poll loops, and refreshes run concurrently across workers,
+// so a generous ceiling costs nothing in the common case and only ever shortens
+// the tail.
+const CAPABILITIES_REFRESH_PROBE_TIMEOUT: Duration = Duration::from_secs(25);
+const CAPABILITIES_REFRESH_WORKER_BUDGET: Duration = Duration::from_secs(35);
 
 fn duration_millis_i64(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)

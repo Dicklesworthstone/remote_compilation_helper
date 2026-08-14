@@ -32,6 +32,17 @@ const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// Default timeout for health check SSH connection.
 const DEFAULT_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Timeout for the background capability probe.
+///
+/// Separate from [`DEFAULT_CHECK_TIMEOUT`] on purpose: liveness detection must
+/// stay tight, but the capability probe is spawned detached and blocks nothing.
+/// It runs `rch-wkr capabilities`, which execs rustc/node/npm/go/zig/
+/// cargo-zigbuild and stats the disk behind a fresh SSH handshake — measured at
+/// 6-16s on loaded 10-core build hosts, versus 2.9s idle. Reusing the 10s
+/// liveness budget dropped capability data on precisely the busiest workers,
+/// leaving `disk_free_gb` stale so the low-disk admission gate fails open.
+const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(25);
+
 /// Threshold for degraded status (slow response).
 const DEGRADED_THRESHOLD_MS: u64 = 5000;
 
@@ -520,7 +531,17 @@ impl HealthMonitor {
                         // Probe capabilities after successful health check
                         // This runs in the background to avoid slowing down health checks
                         let worker_clone = worker.clone();
-                        let timeout = config.check_timeout;
+                        // Deliberately NOT `config.check_timeout`. That budget governs
+                        // liveness detection and must stay tight, but this probe already
+                        // runs detached (see the spawn below), so a slow probe delays
+                        // nothing. `rch-wkr capabilities` shells out to six toolchain
+                        // binaries behind a fresh SSH handshake; on loaded build hosts it
+                        // was measured at 6-16s, so a 10s liveness budget silently dropped
+                        // capability data on exactly the busiest workers. Stale
+                        // `disk_free_gb` makes `is_low_disk()` return `None`, and the
+                        // low-disk admission gate then FAILS OPEN — the dispatcher keeps
+                        // scheduling onto a worker that is about to run out of disk.
+                        let timeout = CAPABILITY_PROBE_TIMEOUT;
                         let probe_pool = ssh_pool.clone();
                         tokio::spawn(async move {
                             if let Some(capabilities) = probe_worker_capabilities(
