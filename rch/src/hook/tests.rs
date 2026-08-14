@@ -3298,7 +3298,7 @@ fn test_wrap_command_with_telemetry_handles_comments() {
 }
 
 #[test]
-fn test_add_cargo_isolation_adds_unique_cargo_home() {
+fn test_add_cargo_isolation_uses_durable_per_worker_cargo_home() {
     let _guard = test_guard!();
     let worker_id = rch_common::WorkerId::new("test-worker");
 
@@ -3309,19 +3309,28 @@ fn test_add_cargo_isolation_adds_unique_cargo_home() {
     assert!(isolated.starts_with("sh -c "));
     assert!(!isolated.starts_with("CARGO_HOME="));
     // The staging base is resolved on the worker (no hardcoded /tmp) and the
-    // basename keeps the rch-cargo-home- prefix that cleanup matches.
+    // basename uses the durable rch-cargo-cache- prefix (NOT the per-job
+    // rch-cargo-home- prefix that orphan cleanup matches).
     assert!(
-        !isolated.contains("/tmp/rch-cargo-home-"),
+        !isolated.contains("/tmp/rch-cargo-cache-"),
         "must not hardcode /tmp: {isolated}"
     );
     assert!(isolated.contains("RCH_CH_BASE="));
     assert!(isolated.contains("/data/tmp"));
-    assert!(isolated.contains("mkdir -p \"${RCH_CH_BASE}/rch-cargo-home-test-worker-"));
-    assert!(isolated.contains("CARGO_HOME=\"${RCH_CH_BASE}/rch-cargo-home-test-worker-"));
+    assert!(isolated.contains("mkdir -p \"${RCH_CH_BASE}/rch-cargo-cache-test-worker\""));
+    assert!(isolated.contains("CARGO_HOME=\"${RCH_CH_BASE}/rch-cargo-cache-test-worker\""));
+    assert!(!isolated.contains("rch-cargo-home-"));
     assert!(isolated.contains("cargo build --release"));
-    assert!(isolated.contains("status=$?"));
-    assert!(isolated.contains("exit $status"));
-    assert!(isolated.contains("rm -rf \"${RCH_CH_BASE}/rch-cargo-home-test-worker-"));
+    // Git-dependency fetches go through the git CLI when the worker has git.
+    assert!(isolated.contains("CARGO_NET_GIT_FETCH_WITH_CLI=true"));
+    assert!(isolated.contains("command -v git"));
+    // Issue #42: the cache dir is durable across jobs — the wrapper must not
+    // delete it after the build.
+    assert!(!isolated.contains("rm "));
+
+    // The same worker always maps to the same cache dir (that IS the reuse).
+    let again = add_cargo_isolation(cargo_command, &worker_id);
+    assert_eq!(isolated, again);
 }
 
 #[test]
@@ -3623,17 +3632,17 @@ fn test_add_cargo_isolation_handles_complex_cargo_commands() {
 
     assert!(isolated.starts_with("sh -c "));
     assert!(
-        !isolated.contains("/tmp/rch-cargo-home-"),
+        !isolated.contains("/tmp/rch-cargo-cache-"),
         "must not hardcode /tmp: {isolated}"
     );
-    assert!(isolated.contains("mkdir -p \"${RCH_CH_BASE}/rch-cargo-home-worker-123-"));
-    assert!(isolated.contains("CARGO_HOME=\"${RCH_CH_BASE}/rch-cargo-home-worker-123-"));
+    assert!(isolated.contains("mkdir -p \"${RCH_CH_BASE}/rch-cargo-cache-worker-123\""));
+    assert!(isolated.contains("CARGO_HOME=\"${RCH_CH_BASE}/rch-cargo-cache-worker-123\""));
     assert!(isolated.contains(
         "cd /some/path && RUSTFLAGS=\"-C target-cpu=native\" cargo test --release --features=foo"
     ));
-    assert!(isolated.contains("status=$?"));
-    assert!(isolated.contains("exit $status"));
-    assert!(isolated.contains("rm -rf \"${RCH_CH_BASE}/rch-cargo-home-worker-123-"));
+    // The durable cache must never be deleted by the job wrapper (issue #42).
+    assert!(!isolated.contains("rch-cargo-cache-worker-123/ "));
+    assert!(!isolated.contains("rm "));
 }
 
 #[test]

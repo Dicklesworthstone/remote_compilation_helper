@@ -3913,27 +3913,43 @@ fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
         return command.to_string();
     }
 
-    // Generate unique cargo home per worker session to prevent cache lock contention
-    let session_id = std::process::id();
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    // Durable per-worker CARGO_HOME (issue #42). The old scheme created a
+    // unique CARGO_HOME per job and deleted it afterwards, which forced every
+    // job to re-download the registry and — far worse — re-clone and re-pack
+    // every Cargo *Git* dependency from scratch. For a large Git dependency
+    // that pack step alone can exceed the external build timeout, so the job
+    // is killed, the work is discarded, and the next attempt starts over: an
+    // unbounded loop that never reaches compilation.
+    //
+    // A single per-worker cache dir fixes that: registry downloads and git
+    // db/checkout state persist across jobs (and across timeout kills — a
+    // completed fetch stays completed). Concurrent jobs on the same worker
+    // coordinate through Cargo's own package-cache lock, which lives inside
+    // the (now shared) CARGO_HOME — sharing the lock is what makes concurrent
+    // cache access safe; the old per-job split actually defeated it.
+    //
     // The staging base is resolved on the worker at execution time (honoring
     // $TMPDIR / /data/tmp / /tmp) rather than hardcoding /tmp, so these caches
     // don't eat RAM on tmpfs-/tmp hosts. `cargo_home` is therefore a shell
-    // expression (`${RCH_CH_BASE}/rch-cargo-home-…`) and must be double-quoted,
+    // expression (`${RCH_CH_BASE}/rch-cargo-cache-…`) and must be double-quoted,
     // not shell-escaped, so `$RCH_CH_BASE` expands; the worker_id is sanitized
-    // and the rest is numeric, so the basename needs no further escaping.
+    // so the basename needs no further escaping. The durable dir deliberately
+    // uses the `rch-cargo-cache-` prefix, NOT the legacy per-job
+    // `rch-cargo-home-` prefix that orphan-cleanup passes match on — this dir
+    // is not an orphan and must survive between jobs.
+    //
+    // `CARGO_NET_GIT_FETCH_WITH_CLI` routes Cargo's git-dependency fetches
+    // through the git CLI when available: for pathological repositories the
+    // libgit2 pack path can spin at ~100% CPU for over an hour where git
+    // itself finishes in minutes.
     let safe_worker_id = sanitize_cargo_home_token(worker_id.as_str());
-    let cargo_home =
-        rch_common::remote_cargo_home_expr(&format!("{safe_worker_id}-{session_id}-{timestamp}"));
+    let cargo_home = rch_common::remote_cargo_cache_expr(&safe_worker_id);
     let quoted_cargo_home = format!("\"{cargo_home}\"");
     let base_prelude = rch_common::remote_cargo_home_base_prelude();
 
     let escaped_command = shell_escape::escape(command.into());
     let script = format!(
-        "{base_prelude}; mkdir -p {cargo_home} || exit $?; export CARGO_HOME={cargo_home}; sh -c {command}; status=$?; rm -rf {cargo_home}; exit $status",
+        "{base_prelude}; mkdir -p {cargo_home} || exit $?; export CARGO_HOME={cargo_home}; if command -v git >/dev/null 2>&1; then export CARGO_NET_GIT_FETCH_WITH_CLI=true; fi; sh -c {command}",
         base_prelude = base_prelude,
         cargo_home = quoted_cargo_home,
         command = escaped_command
@@ -3941,8 +3957,8 @@ fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
 
     // The transfer layer may prepend `timeout ...` directly before this string.
     // Running the env assignment inside an explicit shell prevents `timeout`
-    // from trying to exec `CARGO_HOME=...` as argv[0], while preserving the
-    // original cargo exit status after cleanup.
+    // from trying to exec `CARGO_HOME=...` as argv[0]. The wrapped command is
+    // the script's final statement, so its exit status propagates unchanged.
     format!("sh -c {}", shell_escape::escape(script.into()))
 }
 

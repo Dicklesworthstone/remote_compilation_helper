@@ -212,6 +212,33 @@ pub fn remote_cargo_home_expr(suffix: &str) -> String {
     )
 }
 
+/// Basename prefix of the *durable* per-worker Cargo cache dir used as
+/// `CARGO_HOME` for offloaded builds (issue #42).
+///
+/// Deliberately distinct from [`RCH_CARGO_HOME_PREFIX`]: that prefix names
+/// throwaway per-job staging dirs which orphan-cleanup passes (in-tree and
+/// external, e.g. sbh) are allowed to reap. Dirs with THIS prefix are
+/// long-lived caches — registry downloads and git-dependency db/checkout
+/// state persist here across jobs so an interrupted/timed-out job's
+/// dependency preparation is reusable by the next one. Reapers must not treat
+/// them as orphans (worker disk-pressure reclaim may still clear them; the
+/// only cost is a cold cache).
+pub const RCH_CARGO_CACHE_PREFIX: &str = "rch-cargo-cache-";
+
+/// The shell expression (referencing the variable set by
+/// [`remote_cargo_home_base_prelude`]) for the durable per-worker Cargo cache
+/// dir whose `worker` token is already path-safe.
+///
+/// Returns an unquoted expression that must be embedded in a context where the
+/// shell expands `$VAR` (i.e. inside double quotes or bare).
+pub fn remote_cargo_cache_expr(worker: &str) -> String {
+    format!(
+        "${{{var}}}/{prefix}{worker}",
+        var = RCH_CARGO_HOME_BASE_VAR,
+        prefix = RCH_CARGO_CACHE_PREFIX
+    )
+}
+
 impl Default for RemoteCompilationTest {
     fn default() -> Self {
         Self {

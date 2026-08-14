@@ -204,8 +204,8 @@ pub use queue_contract::{
 // build (a windows rch-wkr) fails to resolve the import.
 #[cfg(unix)]
 pub use remote_compilation::{
-    RCH_CARGO_HOME_BASE_VAR, RCH_CARGO_HOME_PREFIX, remote_cargo_home_base_prelude,
-    remote_cargo_home_expr,
+    RCH_CARGO_CACHE_PREFIX, RCH_CARGO_HOME_BASE_VAR, RCH_CARGO_HOME_PREFIX,
+    remote_cargo_cache_expr, remote_cargo_home_base_prelude, remote_cargo_home_expr,
 };
 pub use repo_updater_contract::{
     MockRepoUpdaterAdapter, REPO_UPDATER_ALIAS_PROJECTS_ROOT, REPO_UPDATER_CANONICAL_PROJECTS_ROOT,
