@@ -5261,7 +5261,10 @@ async fn test_verify_remote_dependency_manifests_blocks_stale_outcomes_determini
     assert_eq!(preflight.reason_code, DEPENDENCY_PREFLIGHT_CODE_STALE);
     assert_eq!(
         preflight.remediation,
-        DEPENDENCY_PREFLIGHT_REMEDIATION_STALE
+        format!(
+            "{} To explicitly refresh this worker's RCH-managed source cache, run `rch sync --worker worker-stale-verify --force`, then rerun the Cargo command.",
+            DEPENDENCY_PREFLIGHT_REMEDIATION_STALE
+        )
     );
     mock::set_thread_mock_override(None);
 }

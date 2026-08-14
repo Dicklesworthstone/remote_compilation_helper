@@ -163,7 +163,7 @@ pub(super) struct DependencyPreflightReport {
 #[error("dependency preflight verification failed [{reason_code}]")]
 pub(super) struct DependencyPreflightFailure {
     pub(super) reason_code: &'static str,
-    pub(super) remediation: &'static str,
+    pub(super) remediation: String,
     report: DependencyPreflightReport,
 }
 
@@ -177,7 +177,7 @@ impl DependencyPreflightFailure {
             .unwrap_or(DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN);
         Self {
             reason_code,
-            remediation,
+            remediation: dependency_preflight_remediation(reason_code, remediation, &report.worker),
             report,
         }
     }
@@ -194,6 +194,24 @@ impl DependencyPreflightFailure {
     pub(super) fn evidence_summary(&self) -> String {
         dependency_preflight_evidence_summary(&self.report.evidence)
     }
+}
+
+fn dependency_preflight_remediation(
+    reason_code: &str,
+    remediation: &str,
+    worker_id: &str,
+) -> String {
+    if matches!(
+        reason_code,
+        DEPENDENCY_PREFLIGHT_CODE_MISSING | DEPENDENCY_PREFLIGHT_CODE_STALE
+    ) {
+        let worker = shell_escape::escape(worker_id.into());
+        return format!(
+            "{remediation} To explicitly refresh this worker's RCH-managed source cache, run `rch sync --worker {worker} --force`, then rerun the Cargo command."
+        );
+    }
+
+    remediation.to_string()
 }
 
 fn dependency_preflight_status_label(status: DependencyPreflightStatus) -> &'static str {
