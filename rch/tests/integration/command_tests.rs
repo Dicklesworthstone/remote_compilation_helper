@@ -75,6 +75,29 @@ fn test_exec_refuses_non_compilation_local_fallback_when_remote_required() {
     );
 }
 
+#[test]
+fn test_exec_refuses_shell_wrapped_cargo_without_local_fallback() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_exec_refuses_shell_wrapped_cargo_without_local_fallback");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .args(["exec", "--", "sh", "-c", "cargo build --release"])
+        .output()
+        .expect("Failed to run rch exec shell-wrapped cargo command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "shell-wrapped cargo must fail before either remote execution or local fallback"
+    );
+    assert!(stdout.trim().is_empty(), "stdout={stdout:?}");
+    assert_contains(&stderr, "[RCH-E301] refusing shell-wrapped cargo command");
+    assert_contains(&stderr, "invoke `rch exec -- cargo ...` directly");
+
+    crate::test_log!("TEST PASS: test_exec_refuses_shell_wrapped_cargo_without_local_fallback");
+}
+
 // =============================================================================
 // Subcommand Help Tests
 // =============================================================================

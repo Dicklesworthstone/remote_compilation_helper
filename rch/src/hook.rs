@@ -442,6 +442,42 @@ fn normalize_exec_command_parts(command_parts: &[String]) -> Vec<String> {
     command_parts.to_vec()
 }
 
+/// `rch exec` guarantees artifact synchronization only for a direct Cargo
+/// invocation. A shell wrapper hides the artifact destination: running `sh -c
+/// 'cargo build'` remotely may succeed while leaving the caller's local binary
+/// stale.
+///
+/// Reject that specific shape rather than falling back to the local shell. The
+/// caller must invoke cargo directly, where the target-dir and artifact-sync
+/// pipeline can prove which bytes came home.
+fn shell_wrapped_cargo_command(command_parts: &[String]) -> bool {
+    let parts = normalize_exec_command_parts(command_parts);
+    let Some(shell) = parts.first() else {
+        return false;
+    };
+    let shell_name = Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str());
+    if !matches!(shell_name, Some("sh" | "bash" | "dash" | "zsh")) {
+        return false;
+    }
+
+    let script = parts.iter().skip(1).enumerate().find_map(|(index, arg)| {
+        let short_option_with_command = arg.strip_prefix('-').is_some_and(|options| {
+            !options.starts_with('-')
+                && options.chars().all(char::is_alphabetic)
+                && options.contains('c')
+        });
+        if arg == "-c" || short_option_with_command {
+            parts.get(index + 2).map(String::as_str)
+        } else {
+            None
+        }
+    });
+
+    script.is_some_and(|script| classify_command(script).is_compilation)
+}
+
 fn env_flag_enabled(value: &str) -> bool {
     matches!(
         value.to_ascii_lowercase().as_str(),
@@ -1875,6 +1911,13 @@ pub async fn run_exec(
     let command = join_exec_command(&command_parts);
     if command.is_empty() {
         anyhow::bail!("No command provided to exec");
+    }
+    if shell_wrapped_cargo_command(&command_parts) {
+        let reporter = HookReporter::new(OutputVisibility::Summary);
+        reporter.summary_critical(
+            "[RCH-E301] refusing shell-wrapped cargo command: RCH cannot safely synchronize its artifacts; invoke `rch exec -- cargo ...` directly",
+        );
+        std::process::exit(EXIT_BUILD_ERROR);
     }
     // A clean-overlay request can never fall back to the ambient local tree,
     // even if the caller omitted RCH_REQUIRE_REMOTE. Doing so would silently

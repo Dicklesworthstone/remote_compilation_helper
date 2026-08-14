@@ -784,6 +784,31 @@ fn local_fallback_command_bypasses_cargo_wrapper() {
 }
 
 #[test]
+fn shell_wrapped_cargo_command_is_detected_before_exec_fallback() {
+    let _guard = test_guard!();
+    assert!(shell_wrapped_cargo_command(&[
+        "bash".to_string(),
+        "-lc".to_string(),
+        "cargo build --release".to_string(),
+    ]));
+    assert!(shell_wrapped_cargo_command(&[
+        "sh".to_string(),
+        "-c".to_string(),
+        "cargo clippy --workspace --all-targets && cargo build --release --example probe"
+            .to_string(),
+    ]));
+    assert!(!shell_wrapped_cargo_command(&[
+        "sh".to_string(),
+        "-c".to_string(),
+        "echo cargo build".to_string(),
+    ]));
+    assert!(!shell_wrapped_cargo_command(&[
+        "cargo".to_string(),
+        "build".to_string(),
+    ]));
+}
+
+#[test]
 fn remote_required_fallback_refuses_before_building_local_shell_command() {
     let _guard = test_guard!();
     let command = "bash -lc 'cargo test --lib focused_case -- --nocapture'";
