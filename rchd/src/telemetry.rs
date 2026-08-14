@@ -158,6 +158,24 @@ impl TelemetryStore {
         stats
     }
 
+    /// Persist a completed benchmark's SpeedScore.
+    ///
+    /// Writes synchronously (via a blocking task) so callers can observe the
+    /// persisted state before acting on it — `should_benchmark` reads
+    /// `latest_speedscore` on the very next scheduler pass, and a fire-and-
+    /// forget write would leave a window where a freshly benchmarked worker is
+    /// still classified as `NewWorker` (issue #40).
+    ///
+    /// Without persistent storage configured this is a no-op `Ok(())`, which
+    /// matches the reader (`latest_speedscore` returns `Ok(None)`).
+    pub async fn record_speedscore(&self, worker_id: &str, score: SpeedScore) -> anyhow::Result<()> {
+        let Some(storage) = self.storage.clone() else {
+            return Ok(());
+        };
+        let worker_id = worker_id.to_string();
+        tokio::task::spawn_blocking(move || storage.insert_speedscore(&worker_id, &score)).await?
+    }
+
     /// Fetch latest SpeedScore for a worker from persistent storage.
     pub async fn latest_speedscore(&self, worker_id: &str) -> anyhow::Result<Option<SpeedScore>> {
         let Some(storage) = self.storage.clone() else {
