@@ -428,6 +428,91 @@ pub fn num_cpus() -> u32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// macOS (Darwin) collection — no /proc filesystem
+// ---------------------------------------------------------------------------
+
+/// Parse `sysctl -n vm.loadavg` output: `{ 1.63 1.75 1.84 }`.
+///
+/// Darwin has no `/proc/loadavg`, so runnable/total process counts are not
+/// available from this source; they are reported as zero.
+pub fn parse_darwin_loadavg(content: &str) -> Option<LoadAverage> {
+    let trimmed = content.trim().trim_start_matches('{').trim_end_matches('}');
+    let mut parts = trimmed.split_whitespace();
+    let one_min = parts.next()?.parse::<f64>().ok()?;
+    let five_min = parts.next()?.parse::<f64>().ok()?;
+    let fifteen_min = parts.next()?.parse::<f64>().ok()?;
+    Some(LoadAverage {
+        one_min,
+        five_min,
+        fifteen_min,
+        running_processes: 0,
+        total_processes: 0,
+    })
+}
+
+/// Run `sysctl -n <key>` and return trimmed stdout.
+///
+/// Tries the canonical absolute path first (non-login SSH sessions may lack
+/// `/usr/sbin` in `PATH`), then falls back to `PATH` resolution.
+fn darwin_sysctl(key: &str) -> Result<String, String> {
+    for program in ["/usr/sbin/sysctl", "sysctl"] {
+        match std::process::Command::new(program).arg("-n").arg(key).output() {
+            Ok(output) if output.status.success() => {
+                return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+            }
+            Ok(output) => {
+                return Err(format!(
+                    "sysctl -n {key} failed with status {}",
+                    output.status
+                ));
+            }
+            Err(_) => continue,
+        }
+    }
+    Err(format!("sysctl binary not found for key {key}"))
+}
+
+/// Collect CPU telemetry on macOS without `/proc`.
+///
+/// Load averages come from `sysctl vm.loadavg` and are exact. Per-core jiffies
+/// deltas are Linux-specific, so `overall_percent` is a documented
+/// load-derived estimate: `load_1m / num_cores * 100`, clamped to 0-100. That
+/// is the right shape for the consumers of this field (idle detection and
+/// drift heuristics compare against coarse thresholds), and it is honest data
+/// from the host rather than a fabricated zero.
+pub fn collect_darwin() -> Result<CpuTelemetry, CpuError> {
+    let loadavg_raw = darwin_sysctl("vm.loadavg").map_err(CpuError::ReadLoadAvgError)?;
+    let load_average = parse_darwin_loadavg(&loadavg_raw).ok_or_else(|| {
+        CpuError::ParseError(format!("unparseable vm.loadavg output: {loadavg_raw}"))
+    })?;
+
+    let num_cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
+
+    let overall_percent = (load_average.one_min / f64::from(num_cores.max(1)) * 100.0)
+        .clamp(0.0, 100.0);
+
+    let telemetry = CpuTelemetry {
+        timestamp: Utc::now(),
+        overall_percent,
+        per_core_percent: Vec::new(),
+        num_cores,
+        load_average,
+        psi: None,
+    };
+
+    debug!(
+        overall_percent = %telemetry.overall_percent,
+        num_cores = %telemetry.num_cores,
+        load_1m = %telemetry.load_average.one_min,
+        "CPU telemetry collected (darwin)"
+    );
+
+    Ok(telemetry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,5 +1081,31 @@ ctxt 1234567"#;
         }
 
         info!("TEST PASS: test_loadavg_from_proc_on_linux");
+    }
+
+    #[test]
+    fn test_parse_darwin_loadavg() {
+        let load = parse_darwin_loadavg("{ 1.63 1.75 1.84 }").expect("should parse");
+        assert!((load.one_min - 1.63).abs() < 1e-9);
+        assert!((load.five_min - 1.75).abs() < 1e-9);
+        assert!((load.fifteen_min - 1.84).abs() < 1e-9);
+        assert_eq!(load.running_processes, 0);
+        assert_eq!(load.total_processes, 0);
+
+        // Trailing newline (as emitted by sysctl -n) is tolerated.
+        assert!(parse_darwin_loadavg("{ 0.10 0.20 0.30 }\n").is_some());
+
+        // Garbage is rejected, not zero-filled.
+        assert!(parse_darwin_loadavg("").is_none());
+        assert!(parse_darwin_loadavg("{ one two three }").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_collect_darwin_on_macos() {
+        let cpu = collect_darwin().expect("darwin CPU collection should succeed on macOS");
+        assert!(cpu.num_cores >= 1);
+        assert!(cpu.load_average.one_min >= 0.0);
+        assert!((0.0..=100.0).contains(&cpu.overall_percent));
     }
 }

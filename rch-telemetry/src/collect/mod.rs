@@ -42,6 +42,17 @@ pub fn collect_telemetry(
     include_network: bool,
     worker_id: String,
 ) -> Result<WorkerTelemetry> {
+    // Darwin has no /proc filesystem, so the Linux collectors below would
+    // abort on the very first read and the telemetry command would exit 1 on
+    // every poll — leaving macOS workers permanently in `telemetry_gap` /
+    // "degraded" on the daemon side. Use the platform-native collectors
+    // instead: real load/memory figures, with the Linux-only subsystems
+    // (per-core deltas, disk IO, network, PSI) honestly absent rather than
+    // fabricated.
+    if cfg!(target_os = "macos") {
+        return collect_telemetry_darwin(worker_id);
+    }
+
     let start = Instant::now();
 
     let (_baseline_cpu, prev_stats, prev_per_core) = CpuTelemetry::collect(None, None)?;
@@ -89,5 +100,44 @@ pub fn collect_telemetry(
         disk,
         network,
         duration_ms,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regression for issue #39: on macOS the telemetry snapshot must succeed
+    /// (previously the first /proc read aborted the whole collection and
+    /// `rch-wkr telemetry` exited 1 on every daemon poll, leaving macOS
+    /// workers permanently in `telemetry_gap` / degraded).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn collect_telemetry_succeeds_on_macos() {
+        let telemetry = super::collect_telemetry(0, true, true, "test-worker".to_string())
+            .expect("telemetry collection must succeed on macOS");
+        assert_eq!(telemetry.worker_id, "test-worker");
+        assert!(telemetry.cpu.num_cores >= 1);
+        assert!(telemetry.memory.total_gb > 0.0);
+        // Linux-only subsystems are honestly absent, not fabricated.
+        assert!(telemetry.disk.is_none());
+        assert!(telemetry.network.is_none());
+        // And the snapshot serializes for the wire.
+        telemetry.to_json().expect("snapshot should serialize");
+    }
+}
+
+/// Darwin snapshot: portable CPU (loadavg-based) + memory collectors; the
+/// disk and network subsystems are `None` (their fields are optional in the
+/// wire protocol, and the daemon's pressure policy treats absent disk IO /
+/// network figures as unknown rather than as a telemetry failure).
+fn collect_telemetry_darwin(worker_id: String) -> Result<WorkerTelemetry> {
+    let start = Instant::now();
+
+    let cpu = cpu::collect_darwin()?;
+    let memory = MemoryTelemetry::collect_darwin()?;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    Ok(WorkerTelemetry::new(
+        worker_id, cpu, memory, None, None, duration_ms,
     ))
 }

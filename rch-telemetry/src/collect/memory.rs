@@ -303,6 +303,162 @@ impl MemoryTelemetry {
             psi,
         }
     }
+
+    /// Collect memory telemetry on macOS without `/proc`.
+    ///
+    /// Sources: `sysctl hw.memsize` (total RAM), `vm_stat` (page counts for
+    /// the available-memory estimate), `sysctl vm.swapusage` (swap). The
+    /// numbers are normalized into a [`MemoryInfo`] so the pressure-score
+    /// formula is byte-for-byte the same one Linux workers use.
+    pub fn collect_darwin() -> Result<Self, MemoryError> {
+        let total_bytes: u64 = darwin_command_output(&["/usr/sbin/sysctl", "sysctl"], &["-n", "hw.memsize"])?
+            .trim()
+            .parse()
+            .map_err(|_| MemoryError::MissingField("hw.memsize".to_string()))?;
+
+        let vm_stat_raw = darwin_command_output(&["/usr/bin/vm_stat", "vm_stat"], &[])?;
+        let available_bytes = parse_darwin_vm_stat_available_bytes(&vm_stat_raw)
+            .ok_or_else(|| MemoryError::MissingField("vm_stat pages".to_string()))?;
+
+        let swapusage_raw =
+            darwin_command_output(&["/usr/sbin/sysctl", "sysctl"], &["-n", "vm.swapusage"])?;
+        let (swap_total_kb, swap_used_kb) =
+            parse_darwin_swapusage_kb(&swapusage_raw).unwrap_or((0, 0));
+
+        let info = MemoryInfo {
+            total_kb: total_bytes / 1024,
+            free_kb: available_bytes / 1024,
+            available_kb: available_bytes / 1024,
+            buffers_kb: 0,
+            cached_kb: 0,
+            swap_total_kb,
+            swap_free_kb: swap_total_kb.saturating_sub(swap_used_kb),
+            // Darwin exposes no meaningful equivalent of Linux dirty/writeback
+            // page counters through these interfaces; report zero rather than
+            // fabricate.
+            dirty_kb: 0,
+            writeback_kb: 0,
+        };
+
+        let telemetry = Self::from_info(&info, None);
+
+        debug!(
+            total_gb = %telemetry.total_gb,
+            available_gb = %telemetry.available_gb,
+            used_pct = %telemetry.used_percent,
+            pressure = %telemetry.pressure_score,
+            swap_gb = %telemetry.swap_used_gb,
+            "Memory telemetry collected (darwin)"
+        );
+
+        Ok(telemetry)
+    }
+}
+
+/// Run a command (first existing candidate path wins) and return stdout.
+fn darwin_command_output(programs: &[&str], args: &[&str]) -> Result<String, MemoryError> {
+    for program in programs {
+        match std::process::Command::new(program).args(args).output() {
+            Ok(output) if output.status.success() => {
+                return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+            Ok(output) => {
+                return Err(MemoryError::ParseError {
+                    field: (*program).to_string(),
+                    value: format!("exited with status {}", output.status),
+                });
+            }
+            Err(_) => continue,
+        }
+    }
+    Err(MemoryError::MissingField(format!(
+        "command not found: {}",
+        programs.join(" / ")
+    )))
+}
+
+/// Parse `vm_stat` output into an available-memory estimate in bytes.
+///
+/// `vm_stat` reports page counts with the page size in its header:
+///
+/// ```text
+/// Mach Virtual Memory Statistics: (page size of 16384 bytes)
+/// Pages free:                              137494.
+/// Pages inactive:                          294370.
+/// Pages speculative:                        56521.
+/// Pages purgeable:                          21353.
+/// ```
+///
+/// Available ≈ (free + inactive + speculative + purgeable) × page size, the
+/// same shape as the kernel's `MemAvailable` estimate on Linux (memory that
+/// can be handed to new allocations without swapping).
+pub fn parse_darwin_vm_stat_available_bytes(content: &str) -> Option<u64> {
+    let mut page_size: u64 = 0;
+    let mut free: u64 = 0;
+    let mut inactive: u64 = 0;
+    let mut speculative: u64 = 0;
+    let mut purgeable: u64 = 0;
+    let mut found_free = false;
+
+    for line in content.lines() {
+        if line.contains("page size of") {
+            page_size = line
+                .split("page size of")
+                .nth(1)?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()?;
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value: u64 = match value.trim().trim_end_matches('.').parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match key.trim() {
+            "Pages free" => {
+                free = value;
+                found_free = true;
+            }
+            "Pages inactive" => inactive = value,
+            "Pages speculative" => speculative = value,
+            "Pages purgeable" => purgeable = value,
+            _ => {}
+        }
+    }
+
+    if page_size == 0 || !found_free {
+        return None;
+    }
+    Some((free + inactive + speculative + purgeable).saturating_mul(page_size))
+}
+
+/// Parse `sysctl -n vm.swapusage` output into (total_kb, used_kb).
+///
+/// Format: `total = 2048.00M  used = 1120.75M  free = 927.25M  (encrypted)`.
+pub fn parse_darwin_swapusage_kb(content: &str) -> Option<(u64, u64)> {
+    fn value_kb(content: &str, key: &str) -> Option<u64> {
+        let after = content.split(key).nth(1)?.split('=').nth(1)?;
+        let token = after.split_whitespace().next()?;
+        let (number, unit) = token.split_at(token.len().saturating_sub(1));
+        let number: f64 = number.parse().ok()?;
+        let kb = match unit {
+            "K" => number,
+            "M" => number * 1024.0,
+            "G" => number * 1024.0 * 1024.0,
+            "T" => number * 1024.0 * 1024.0 * 1024.0,
+            // Unit-less means bytes.
+            _ => token.parse::<f64>().ok()? / 1024.0,
+        };
+        Some(kb.max(0.0) as u64)
+    }
+
+    let total = value_kb(content, "total")?;
+    let used = value_kb(content, "used")?;
+    Some((total, used))
 }
 
 #[cfg(test)]
@@ -718,5 +874,64 @@ full avg10=0.20 avg60=0.15 avg300=0.05 total=5678"#;
         assert_eq!(mem.dirty_kb, deser.dirty_kb);
 
         info!("TEST PASS: test_serialization_roundtrip");
+    }
+
+    #[test]
+    fn test_parse_darwin_vm_stat_available_bytes() {
+        let output = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+Pages free:                              100000.\n\
+Pages active:                            500000.\n\
+Pages inactive:                          200000.\n\
+Pages speculative:                        50000.\n\
+Pages throttled:                              0.\n\
+Pages wired down:                        300000.\n\
+Pages purgeable:                          25000.\n";
+        let available =
+            parse_darwin_vm_stat_available_bytes(output).expect("should parse vm_stat");
+        // (100000 + 200000 + 50000 + 25000) * 16384
+        assert_eq!(available, 375_000 * 16_384);
+
+        // Missing page size or free count is a parse failure, not zero.
+        assert!(parse_darwin_vm_stat_available_bytes("Pages free: 5.\n").is_none());
+        assert!(
+            parse_darwin_vm_stat_available_bytes(
+                "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_parse_darwin_swapusage_kb() {
+        let (total, used) =
+            parse_darwin_swapusage_kb("total = 2048.00M  used = 1120.75M  free = 927.25M  (encrypted)")
+                .expect("should parse swapusage");
+        assert_eq!(total, 2048 * 1024);
+        assert_eq!(used, (1120.75_f64 * 1024.0) as u64);
+
+        let (total_g, used_g) = parse_darwin_swapusage_kb("total = 3.00G  used = 0.50G  free = 2.50G")
+            .expect("should parse G units");
+        assert_eq!(total_g, 3 * 1024 * 1024);
+        assert_eq!(used_g, 512 * 1024);
+
+        // No swap configured.
+        let (total_zero, used_zero) =
+            parse_darwin_swapusage_kb("total = 0.00M  used = 0.00M  free = 0.00M")
+                .expect("should parse zero swap");
+        assert_eq!(total_zero, 0);
+        assert_eq!(used_zero, 0);
+
+        assert!(parse_darwin_swapusage_kb("").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_collect_darwin_on_macos() {
+        let mem = MemoryTelemetry::collect_darwin()
+            .expect("darwin memory collection should succeed on macOS");
+        assert!(mem.total_gb > 0.0);
+        assert!(mem.available_gb > 0.0);
+        assert!((0.0..=100.0).contains(&mem.used_percent));
+        assert!((0.0..=100.0).contains(&mem.pressure_score));
     }
 }
