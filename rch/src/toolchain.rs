@@ -209,13 +209,24 @@ pub fn parse_rustc_version(version_str: &str) -> Result<ToolchainInfo, Toolchain
     {
         let _version = caps.get(1).unwrap().as_str();
         let channel_suffix = caps.get(2).map(|m| m.as_str());
-        let date = caps.get(3).map(|m| m.as_str().to_string());
 
         let channel = match channel_suffix {
             Some("-nightly") => "nightly".to_string(),
             Some("-beta") => "beta".to_string(),
             Some(other) => other.trim_start_matches('-').to_string(),
             None => "stable".to_string(),
+        };
+
+        // The captured date is the compiler's *commit* date. For nightly/beta
+        // it matches the rustup archive date, so `nightly-<date>` resolves. A
+        // stable compiler's commit date is NOT a rustup stable archive date:
+        // `stable-<commit-date>` is unresolvable ("no release found"), so a
+        // worker preflight of that synthetic name can never succeed. Keep the
+        // date only for dated channels and let stable float as plain `stable`.
+        let date = if channel_suffix.is_some() {
+            caps.get(3).map(|m| m.as_str().to_string())
+        } else {
+            None
         };
 
         return Ok(ToolchainInfo {
@@ -312,7 +323,20 @@ mod tests {
     fn test_parse_rustc_version_stable() {
         let info = parse_rustc_version("rustc 1.75.0 (82e1608df 2023-12-21)").unwrap();
         assert_eq!(info.channel, "stable");
-        assert_eq!(info.date, Some("2023-12-21".to_string()));
+        // Commit date must NOT leak into the toolchain identity for stable:
+        // `stable-2023-12-21` is not a rustup archive name and cannot be
+        // installed. The identifier handed to `rustup run` must be `stable`.
+        assert_eq!(info.date, None);
+        assert_eq!(info.rustup_toolchain(), "stable");
+    }
+
+    #[test]
+    fn test_parse_rustc_version_stable_fallback_resolvable_identifier() {
+        // Regression for issue #43: the exact scenario from the report.
+        let info = parse_rustc_version("rustc 1.97.1 (8bab26f4f 2026-07-14)").unwrap();
+        assert_eq!(info.channel, "stable");
+        assert_eq!(info.rustup_toolchain(), "stable");
+        assert!(!info.rustup_toolchain().contains("2026-07-14"));
     }
 
     #[test]
