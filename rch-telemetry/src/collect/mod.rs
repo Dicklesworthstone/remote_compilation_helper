@@ -103,28 +103,6 @@ pub fn collect_telemetry(
     ))
 }
 
-#[cfg(test)]
-mod tests {
-    /// Regression for issue #39: on macOS the telemetry snapshot must succeed
-    /// (previously the first /proc read aborted the whole collection and
-    /// `rch-wkr telemetry` exited 1 on every daemon poll, leaving macOS
-    /// workers permanently in `telemetry_gap` / degraded).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn collect_telemetry_succeeds_on_macos() {
-        let telemetry = super::collect_telemetry(0, true, true, "test-worker".to_string())
-            .expect("telemetry collection must succeed on macOS");
-        assert_eq!(telemetry.worker_id, "test-worker");
-        assert!(telemetry.cpu.num_cores >= 1);
-        assert!(telemetry.memory.total_gb > 0.0);
-        // Linux-only subsystems are honestly absent, not fabricated.
-        assert!(telemetry.disk.is_none());
-        assert!(telemetry.network.is_none());
-        // And the snapshot serializes for the wire.
-        telemetry.to_json().expect("snapshot should serialize");
-    }
-}
-
 /// Darwin snapshot: portable CPU (loadavg-based) + memory collectors; the
 /// disk and network subsystems are `None` (their fields are optional in the
 /// wire protocol, and the daemon's pressure policy treats absent disk IO /
@@ -145,4 +123,26 @@ fn collect_telemetry_darwin(worker_id: String) -> Result<WorkerTelemetry> {
         None,
         duration_ms,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regression for issue #39: on macOS the telemetry snapshot must succeed
+    /// (previously the first /proc read aborted the whole collection and
+    /// `rch-wkr telemetry` exited 1 on every daemon poll, leaving macOS
+    /// workers permanently in `telemetry_gap` / degraded).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn collect_telemetry_succeeds_on_macos() {
+        let telemetry = super::collect_telemetry(0, true, true, "test-worker".to_string())
+            .expect("telemetry collection must succeed on macOS");
+        assert_eq!(telemetry.worker_id, "test-worker");
+        assert!(telemetry.cpu.num_cores >= 1);
+        assert!(telemetry.memory.total_gb > 0.0);
+        // Linux-only subsystems are honestly absent, not fabricated.
+        assert!(telemetry.disk.is_none());
+        assert!(telemetry.network.is_none());
+        // And the snapshot serializes for the wire.
+        telemetry.to_json().expect("snapshot should serialize");
+    }
 }
