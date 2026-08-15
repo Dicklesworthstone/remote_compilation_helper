@@ -138,6 +138,11 @@ fn collect_telemetry_darwin(worker_id: String) -> Result<WorkerTelemetry> {
     let duration_ms = start.elapsed().as_millis() as u64;
 
     Ok(WorkerTelemetry::new(
-        worker_id, cpu, memory, None, None, duration_ms,
+        worker_id,
+        cpu,
+        memory,
+        None,
+        None,
+        duration_ms,
     ))
 }

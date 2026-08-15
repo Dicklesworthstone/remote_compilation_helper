@@ -457,7 +457,11 @@ pub fn parse_darwin_loadavg(content: &str) -> Option<LoadAverage> {
 /// `/usr/sbin` in `PATH`), then falls back to `PATH` resolution.
 fn darwin_sysctl(key: &str) -> Result<String, String> {
     for program in ["/usr/sbin/sysctl", "sysctl"] {
-        match std::process::Command::new(program).arg("-n").arg(key).output() {
+        match std::process::Command::new(program)
+            .arg("-n")
+            .arg(key)
+            .output()
+        {
             Ok(output) if output.status.success() => {
                 return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
             }
@@ -491,8 +495,8 @@ pub fn collect_darwin() -> Result<CpuTelemetry, CpuError> {
         .map(|n| n.get() as u32)
         .unwrap_or(1);
 
-    let overall_percent = (load_average.one_min / f64::from(num_cores.max(1)) * 100.0)
-        .clamp(0.0, 100.0);
+    let overall_percent =
+        (load_average.one_min / f64::from(num_cores.max(1)) * 100.0).clamp(0.0, 100.0);
 
     let telemetry = CpuTelemetry {
         timestamp: Utc::now(),

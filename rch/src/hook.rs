@@ -455,9 +455,7 @@ fn shell_wrapped_cargo_command(command_parts: &[String]) -> bool {
     let Some(shell) = parts.first() else {
         return false;
     };
-    let shell_name = Path::new(shell)
-        .file_name()
-        .and_then(|name| name.to_str());
+    let shell_name = Path::new(shell).file_name().and_then(|name| name.to_str());
     if !matches!(shell_name, Some("sh" | "bash" | "dash" | "zsh")) {
         return false;
     }

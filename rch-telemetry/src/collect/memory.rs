@@ -311,10 +311,11 @@ impl MemoryTelemetry {
     /// numbers are normalized into a [`MemoryInfo`] so the pressure-score
     /// formula is byte-for-byte the same one Linux workers use.
     pub fn collect_darwin() -> Result<Self, MemoryError> {
-        let total_bytes: u64 = darwin_command_output(&["/usr/sbin/sysctl", "sysctl"], &["-n", "hw.memsize"])?
-            .trim()
-            .parse()
-            .map_err(|_| MemoryError::MissingField("hw.memsize".to_string()))?;
+        let total_bytes: u64 =
+            darwin_command_output(&["/usr/sbin/sysctl", "sysctl"], &["-n", "hw.memsize"])?
+                .trim()
+                .parse()
+                .map_err(|_| MemoryError::MissingField("hw.memsize".to_string()))?;
 
         let vm_stat_raw = darwin_command_output(&["/usr/bin/vm_stat", "vm_stat"], &[])?;
         let available_bytes = parse_darwin_vm_stat_available_bytes(&vm_stat_raw)
@@ -886,8 +887,7 @@ Pages speculative:                        50000.\n\
 Pages throttled:                              0.\n\
 Pages wired down:                        300000.\n\
 Pages purgeable:                          25000.\n";
-        let available =
-            parse_darwin_vm_stat_available_bytes(output).expect("should parse vm_stat");
+        let available = parse_darwin_vm_stat_available_bytes(output).expect("should parse vm_stat");
         // (100000 + 200000 + 50000 + 25000) * 16384
         assert_eq!(available, 375_000 * 16_384);
 
@@ -903,14 +903,16 @@ Pages purgeable:                          25000.\n";
 
     #[test]
     fn test_parse_darwin_swapusage_kb() {
-        let (total, used) =
-            parse_darwin_swapusage_kb("total = 2048.00M  used = 1120.75M  free = 927.25M  (encrypted)")
-                .expect("should parse swapusage");
+        let (total, used) = parse_darwin_swapusage_kb(
+            "total = 2048.00M  used = 1120.75M  free = 927.25M  (encrypted)",
+        )
+        .expect("should parse swapusage");
         assert_eq!(total, 2048 * 1024);
         assert_eq!(used, (1120.75_f64 * 1024.0) as u64);
 
-        let (total_g, used_g) = parse_darwin_swapusage_kb("total = 3.00G  used = 0.50G  free = 2.50G")
-            .expect("should parse G units");
+        let (total_g, used_g) =
+            parse_darwin_swapusage_kb("total = 3.00G  used = 0.50G  free = 2.50G")
+                .expect("should parse G units");
         assert_eq!(total_g, 3 * 1024 * 1024);
         assert_eq!(used_g, 512 * 1024);
 

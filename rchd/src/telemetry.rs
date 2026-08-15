@@ -168,7 +168,11 @@ impl TelemetryStore {
     ///
     /// Without persistent storage configured this is a no-op `Ok(())`, which
     /// matches the reader (`latest_speedscore` returns `Ok(None)`).
-    pub async fn record_speedscore(&self, worker_id: &str, score: SpeedScore) -> anyhow::Result<()> {
+    pub async fn record_speedscore(
+        &self,
+        worker_id: &str,
+        score: SpeedScore,
+    ) -> anyhow::Result<()> {
         let Some(storage) = self.storage.clone() else {
             return Ok(());
         };
