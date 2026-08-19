@@ -39,6 +39,10 @@ use super::formatting::{cache_hit, detect_target_label, emit_job_banner, render_
 use super::progress_reporting::{BuildHeartbeatLoop, mark_heartbeat_progress};
 use super::remote_result::RemoteExecutionResult;
 use super::repo_updater::maybe_sync_repo_set_with_repo_updater;
+use super::source_fidelity::{
+    PreparedSourceContentRoot, finalize_source_content_receipt, prepare_source_content_root,
+    verify_source_content_roots,
+};
 use super::ssh::ensure_worker_projects_topology;
 use super::*;
 
@@ -181,8 +185,19 @@ pub(super) async fn execute_remote_compilation(
     durable_lease: Option<&DurableLeaseWriter>,
     topology_policy: &PathTopologyPolicy,
     clean_overlay: Option<&CleanOverlaySpec>,
+    source_content_receipt: bool,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
+    if source_content_receipt && WorkerPlatform::from_worker(&worker_config).is_windows() {
+        anyhow::bail!("source-content receipts require the Unix rsync transport");
+    }
+    let source_content_build_id = if source_content_receipt {
+        Some(build_id.ok_or_else(|| {
+            anyhow::anyhow!("source-content receipt requires a durable remote build id")
+        })?)
+    } else {
+        None
+    };
 
     // Get current working directory and normalize it to the canonical project root.
     let project_root =
@@ -233,6 +248,17 @@ pub(super) async fn execute_remote_compilation(
                     report_json
                 ));
             }
+            if source_content_receipt {
+                warn!(
+                    "Dependency planner could not prove the exact source closure on {} [{}]: refusing source-content receipt mode ({})",
+                    worker_config.id, decision.reason_code, decision.remediation
+                );
+                reporter.verbose(&format!(
+                    "[RCH] dependency planner refusal [{}]: source-content receipt requires an exact closure — {}",
+                    decision.reason_code, decision.remediation
+                ));
+                return Err(DependencyPreflightFailure::from_report(report).into());
+            }
             if exact_dependency_closure_sync
                 && should_force_local_fallback_for_runtime_fail_open(decision.reason_code)
             {
@@ -271,12 +297,67 @@ pub(super) async fn execute_remote_compilation(
             topology_policy,
         )
     };
+    // Proof runs use an invocation-unique remote source root. Without this, a
+    // concurrent ordinary sync of the same project hash could mutate the tree
+    // after verification but before Cargo opens a source file.
+    let project_hash = if let Some(proof_build_id) = source_content_build_id {
+        blake3::hash(
+            format!(
+                "rch.source_content_remote_root.v1\0{}\0{}\0{}",
+                project_hash, proof_build_id, worker_config.id
+            )
+            .as_bytes(),
+        )
+        .to_hex()
+        .to_string()
+    } else {
+        project_hash
+    };
     let mut sync_plan = build_sync_closure_plan(
         &raw_sync_roots,
         &normalized_project_root,
         &project_hash,
         topology_policy,
     );
+    if let Some(proof_build_id) = source_content_build_id {
+        let proof_base = format!(
+            "{}/source-content-{}-{}",
+            transfer_config.remote_base.trim_end_matches('/'),
+            proof_build_id,
+            &project_hash[..project_hash.len().min(16)]
+        );
+        for entry in &mut sync_plan {
+            let relative = entry
+                .local_root
+                .strip_prefix(topology_policy.canonical_root())
+                .with_context(|| {
+                    format!(
+                        "source-content root {} is outside canonical topology {}",
+                        entry.local_root.display(),
+                        topology_policy.canonical_root().display()
+                    )
+                })?;
+            let relative = relative.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "source-content remote relative path is not UTF-8: {}",
+                    relative.display()
+                )
+            })?;
+            if relative.is_empty() || relative.chars().any(char::is_control) {
+                anyhow::bail!("source-content remote relative path is invalid");
+            }
+            entry.remote_root = format!("{proof_base}/{relative}");
+            entry.root_hash = blake3::hash(
+                format!(
+                    "rch.source_content_root_hash.v1\0{}\0{}\0{}",
+                    entry.root_hash, proof_build_id, relative
+                )
+                .as_bytes(),
+            )
+            .to_hex()
+            .to_string();
+        }
+    }
     if clean_overlay.is_some() {
         if sync_plan.len() != 1 || !sync_plan[0].is_primary {
             anyhow::bail!(
@@ -426,6 +507,7 @@ pub(super) async fn execute_remote_compilation(
     });
     let mut primary_pipeline: Option<TransferPipeline> = None;
     let mut aggregate_sync_result: Option<SyncResult> = None;
+    let mut prepared_source_roots: Vec<PreparedSourceContentRoot> = Vec::new();
 
     // Step 1: Sync project to remote
     info!("Syncing project to worker {}...", worker_config.id);
@@ -476,15 +558,27 @@ pub(super) async fn execute_remote_compilation(
                 root_pipeline = root_pipeline.with_remote_cargo_target_dir_name(name.clone());
             }
         }
+        if source_content_receipt {
+            root_pipeline = root_pipeline.with_sync_checksum(true);
+        }
+
+        let prepared_source_root = if source_content_receipt {
+            Some(
+                prepare_source_content_root(prepared_source_roots.len(), entry, &root_pipeline)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         if let Some(spec) = clean_overlay {
             reporter.verbose(&format!(
                 "[RCH] clean-overlay transfer estimator bypassed for immutable base {}",
                 spec.base_commit()
             ));
-        } else if exact_dependency_closure_sync {
+        } else if exact_dependency_closure_sync || source_content_receipt {
             reporter.verbose(&format!(
-                "[RCH] exact dependency closure sync required; bypassing transfer estimator for {}",
+                "[RCH] exact source sync required; bypassing transfer estimator for {}",
                 entry.local_root.display()
             ));
         } else if let Some(skip_reason) = root_pipeline.should_skip_transfer(&worker_config).await {
@@ -593,10 +687,13 @@ pub(super) async fn execute_remote_compilation(
                 if entry.is_primary {
                     primary_pipeline = Some(root_pipeline);
                 }
+                if let Some(prepared) = prepared_source_root {
+                    prepared_source_roots.push(prepared);
+                }
                 root_outcomes.push((entry.clone(), SyncRootOutcome::Synced));
             }
             Err(e) => {
-                if entry.is_primary || exact_dependency_closure_sync {
+                if entry.is_primary || exact_dependency_closure_sync || source_content_receipt {
                     // Cargo dependency-closure builds must not continue against
                     // stale sibling repositories on the worker.
                     if let Some(history) =
@@ -721,6 +818,20 @@ pub(super) async fn execute_remote_compilation(
 
     if exact_dependency_closure_sync {
         verify_remote_dependency_manifests(&worker_config, &root_outcomes, reporter).await?;
+    }
+
+    if source_content_build_id.is_some() {
+        if prepared_source_roots.len() != sync_plan.len() {
+            anyhow::bail!(
+                "source-content proof prepared {} of {} planned roots",
+                prepared_source_roots.len(),
+                sync_plan.len()
+            );
+        }
+        // Admission check immediately before Cargo opens the isolated source
+        // tree. The same roots are verified again after Cargo exits, and only
+        // then is the single receipt emitted.
+        verify_source_content_roots(&worker_config, &prepared_source_roots).await?;
     }
 
     // Step 2: Execute command remotely with streaming output
@@ -858,6 +969,21 @@ pub(super) async fn execute_remote_compilation(
         "[RCH] exec done: exit={} in {}ms",
         result.exit_code, result.duration_ms
     ));
+
+    if let Some(proof_build_id) = source_content_build_id {
+        let receipt = finalize_source_content_receipt(
+            &worker_config,
+            proof_build_id,
+            command,
+            result.exit_code,
+            &prepared_source_roots,
+        )
+        .await?;
+        reporter.summary_critical(&format!(
+            "[RCH] source content receipt: {}",
+            receipt.canonical_json()?
+        ));
+    }
 
     {
         let mut state = ui_state.borrow_mut();

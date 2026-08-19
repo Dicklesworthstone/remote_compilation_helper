@@ -529,6 +529,9 @@ USAGE:
         /// Use the clean baseline without any working-tree overlay
         #[arg(long, requires = "clean_overlay", conflicts_with = "overlay_path")]
         no_overlay: bool,
+        /// Emit a worker-verified per-root manifest for the exact transferred source bytes
+        #[arg(long, conflicts_with = "clean_overlay")]
+        source_content_receipt: bool,
         /// The compilation command to execute remotely
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
@@ -2036,8 +2039,19 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 clean_overlay,
                 overlay_path,
                 no_overlay,
+                source_content_receipt,
                 command,
-            } => hook::run_exec(base, clean_overlay, overlay_path, no_overlay, command).await,
+            } => {
+                hook::run_exec(
+                    base,
+                    clean_overlay,
+                    overlay_path,
+                    no_overlay,
+                    source_content_receipt,
+                    command,
+                )
+                .await
+            }
             Commands::Hook { action } => handle_hook(action, &ctx).await,
             Commands::Shim { action } => handle_shim(action, &ctx),
             Commands::Agents { action } => handle_agents(action, &ctx).await,
@@ -5269,6 +5283,7 @@ mod tests {
                 clean_overlay,
                 overlay_path,
                 no_overlay,
+                source_content_receipt,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
@@ -5278,6 +5293,7 @@ mod tests {
                     vec![PathBuf::from("src/lib.rs"), PathBuf::from("tests/slice.rs")]
                 );
                 assert!(!no_overlay);
+                assert!(!source_content_receipt);
                 assert_eq!(command, vec!["cargo", "test"]);
             }
             _ => fail_expected("Expected clean-overlay exec command"),
@@ -5305,12 +5321,14 @@ mod tests {
                 clean_overlay,
                 overlay_path,
                 no_overlay,
+                source_content_receipt,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
                 assert!(clean_overlay);
                 assert!(overlay_path.is_empty());
                 assert!(no_overlay);
+                assert!(!source_content_receipt);
                 assert_eq!(command, vec!["cargo", "check"]);
             }
             _ => fail_expected("Expected base-only clean-overlay exec command"),
@@ -5349,9 +5367,60 @@ mod tests {
             "--clean-overlay",
             "--overlay-path",
             "--no-overlay",
+            "--source-content-receipt",
         ] {
             assert!(help.contains(flag), "exec help missing {flag}: {help}");
         }
+    }
+
+    #[test]
+    fn cli_parses_exec_source_content_receipt() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--source-content-receipt",
+            "--",
+            "cargo",
+            "check",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Exec {
+                base,
+                clean_overlay,
+                overlay_path,
+                no_overlay,
+                source_content_receipt,
+                command,
+            }) => {
+                assert!(base.is_none());
+                assert!(!clean_overlay);
+                assert!(overlay_path.is_empty());
+                assert!(!no_overlay);
+                assert!(source_content_receipt);
+                assert_eq!(command, vec!["cargo", "check"]);
+            }
+            _ => fail_expected("Expected source-content receipt exec command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_source_content_receipt_with_clean_overlay() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--base",
+            "HEAD",
+            "--clean-overlay",
+            "--no-overlay",
+            "--source-content-receipt",
+            "--",
+            "cargo",
+            "check",
+        ]);
+        assert!(result.is_err());
     }
 
     #[test]

@@ -24,7 +24,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::Instant as TokioInstant;
 use tokio::time::sleep;
@@ -83,6 +83,74 @@ fn is_windows_drive_abs_path(path: &str) -> bool {
         && (bytes[2] == b'/' || bytes[2] == b'\\')
 }
 
+pub(crate) async fn read_bounded_output_stream<R>(
+    mut reader: R,
+    max_bytes: usize,
+) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(output);
+        }
+        let next_len = output.len().checked_add(read).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "command output size overflow",
+            )
+        })?;
+        if next_len > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("command output exceeded {max_bytes} bytes"),
+            ));
+        }
+        output.extend_from_slice(&chunk[..read]);
+    }
+}
+
+async fn run_source_content_rsync_capture(
+    mut cmd: Command,
+    operation: &str,
+    operation_timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    cmd.kill_on_drop(true);
+    let mut child = cmd.spawn().with_context(|| format!("spawn {operation}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("source-content rsync stdout was not piped")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("source-content rsync stderr was not piped")?;
+
+    let collect = async {
+        let (stdout, stderr) = tokio::try_join!(
+            read_bounded_output_stream(stdout, MAX_SOURCE_CONTENT_RSYNC_OUTPUT_BYTES),
+            read_bounded_output_stream(stderr, MAX_SOURCE_CONTENT_RSYNC_OUTPUT_BYTES),
+        )?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+
+    match tokio::time::timeout(operation_timeout, collect).await {
+        Ok(result) => result.with_context(|| format!("collect {operation}")),
+        Err(_) => anyhow::bail!(
+            "{operation} timed out after {}ms",
+            operation_timeout.as_millis()
+        ),
+    }
+}
+
 /// Top-level members `retrieve_artifacts_windows` archives from the remote root.
 ///
 /// A project ROOT (it has a `Cargo.toml`) yields only `./target`, so a
@@ -102,6 +170,7 @@ fn windows_retrieve_members(project_root: &Path) -> Vec<&'static str> {
 }
 
 const PROJECT_HASH_CONTENT_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_SOURCE_CONTENT_RSYNC_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const PROJECT_HASH_KEY_FILES: &[&str] = &[
     // Rust project files
     "Cargo.toml",
@@ -128,6 +197,13 @@ const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[
     ".rch-go/",
     ".franken_whisper/tools/ffmpeg/",
 ];
+// Host-local language environments are neither source nor portable build
+// inputs.  They commonly contain absolute symlinks (for example
+// `.venv-*/lib64`) that rsync would otherwise copy into a foreign workspace
+// proof root.  Keep these exclusions unconditional even when a user replaces
+// the configurable default list.
+const SOURCE_EPHEMERAL_EXCLUDE_PATTERNS: &[&str] =
+    &[".venv/", ".venv-*/", "venv/", "venv-*/", "__pycache__/"];
 const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str = ".rch-target";
 
 /// Environment variables whose values we ALWAYS rewrite to a managed,
@@ -881,6 +957,7 @@ pub(crate) fn configure_clean_git_command(command: &mut Command) {
 }
 
 /// Transfer pipeline for remote compilation.
+#[derive(Clone)]
 pub struct TransferPipeline {
     /// Local project root.
     project_root: PathBuf,
@@ -1415,6 +1492,11 @@ impl TransferPipeline {
                 excludes.push((*pattern).to_string());
             }
         }
+        for pattern in SOURCE_EPHEMERAL_EXCLUDE_PATTERNS {
+            if !excludes.iter().any(|existing| existing == pattern) {
+                excludes.push((*pattern).to_string());
+            }
+        }
 
         // Linked git worktree: its `.git` is a FILE pointing back into the parent
         // repo (`gitdir: …/.git/worktrees/<name>`). That path does not exist on
@@ -1456,6 +1538,206 @@ impl TransferPipeline {
         }
 
         excludes
+    }
+
+    /// Return the exact filter policy used by source uploads.
+    ///
+    /// Source-content receipts bind these values alongside the file manifest so
+    /// a verifier can distinguish a byte-identical manifest produced under a
+    /// different include/exclude policy.
+    pub(crate) fn source_content_filter_policy(
+        &self,
+    ) -> (Option<Vec<String>>, Vec<String>, bool, bool) {
+        (
+            self.sync_include_patterns.clone(),
+            self.get_effective_excludes(),
+            self.sync_delete,
+            self.sync_checksum,
+        )
+    }
+
+    fn append_sync_filter_args(&self, cmd: &mut Command, effective_excludes: &[String]) {
+        if let Some(include_patterns) = &self.sync_include_patterns {
+            cmd.arg("--prune-empty-dirs");
+            for pattern in include_patterns {
+                cmd.arg("--include").arg(pattern);
+            }
+            cmd.arg("--exclude").arg("*");
+        } else {
+            for pattern in effective_excludes {
+                cmd.arg("--exclude").arg(pattern);
+            }
+        }
+    }
+
+    /// Enumerate the exact regular-file universe selected by the upload's
+    /// rsync filters without creating or changing a destination tree.
+    ///
+    /// Reusing rsync for selection is deliberate: a second glob interpreter
+    /// would eventually drift from rsync's first-match-wins semantics and let a
+    /// receipt authenticate a different set of files than the transfer itself.
+    pub(crate) async fn enumerate_source_content_files(&self) -> Result<Vec<PathBuf>> {
+        if self.worker_platform.is_windows() {
+            anyhow::bail!("source-content receipts require the rsync transport");
+        }
+
+        let effective_excludes = self.get_effective_excludes();
+        let nonexistent_destination = std::env::temp_dir().join(format!(
+            "rch-source-content-enumeration-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut cmd = Command::new("rsync");
+        cmd.env("LC_ALL", "C");
+        cmd.arg("-arni").arg("--out-format=%i\t%n").arg("--no-motd");
+        add_portable_rsync_archive_args(&mut cmd);
+        self.append_sync_filter_args(&mut cmd, &effective_excludes);
+        cmd.arg(format!("{}/", self.project_root.display()))
+            .arg(format!("{}/", nonexistent_destination.display()));
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let output = run_source_content_rsync_capture(
+            cmd,
+            "source-content transfer-universe enumeration",
+            self.source_sync_attempt_timeout(&effective_excludes),
+        )
+        .await?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "source-content enumeration failed (exit {:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        if !output.stderr.is_empty() {
+            anyhow::bail!(
+                "source-content enumeration produced stderr: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let stdout = std::str::from_utf8(&output.stdout)
+            .context("source-content enumeration output was not UTF-8")?;
+        let mut paths = Vec::new();
+        for line in stdout.lines() {
+            if line.is_empty() || line.starts_with("created directory ") {
+                continue;
+            }
+            let (itemized, raw_path) = line.split_once('\t').ok_or_else(|| {
+                anyhow::anyhow!("unexpected source-content enumeration line: {line:?}")
+            })?;
+            if itemized.as_bytes().get(1) == Some(&b'd') {
+                continue;
+            }
+            if itemized.as_bytes().get(1) != Some(&b'f') {
+                anyhow::bail!(
+                    "source-content proof refuses non-regular rsync item {itemized:?} at {raw_path:?}"
+                );
+            }
+            let relative = raw_path.strip_prefix("./").unwrap_or(raw_path);
+            if relative.is_empty()
+                || relative.chars().any(char::is_control)
+                || Path::new(relative).components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+            {
+                anyhow::bail!("unsafe source-content path emitted by rsync: {raw_path:?}");
+            }
+            paths.push(PathBuf::from(relative));
+        }
+        paths.sort();
+        if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+            anyhow::bail!("source-content enumeration emitted duplicate paths");
+        }
+        Ok(paths)
+    }
+
+    /// Prove that a checksum-aware rsync would transfer no selected file and
+    /// delete no selected remote entry. Directory metadata differences are not
+    /// source bytes and are intentionally ignored here; the per-file remote
+    /// verifier independently checks type, length, mode, and SHA-256.
+    pub(crate) async fn verify_source_content_rsync_barrier(
+        &self,
+        worker: &WorkerConfig,
+    ) -> Result<()> {
+        if self.worker_platform.is_windows() {
+            anyhow::bail!("source-content receipts require the rsync transport");
+        }
+
+        let remote_path = self.remote_path();
+        let escaped_remote_path = escape(Cow::from(&remote_path));
+        let destination = format!("{}@{}:{}", worker.user, worker.host, escaped_remote_path);
+        let effective_excludes = self.get_effective_excludes();
+        let identity_file = shellexpand::tilde(&worker.identity_file);
+        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
+        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+
+        let mut cmd = Command::new("rsync");
+        cmd.env("LC_ALL", "C");
+        cmd.arg("-azn")
+            .arg("--checksum")
+            .arg("--itemize-changes")
+            .arg("--out-format=%i\t%n")
+            .arg("--no-motd")
+            .arg("-e")
+            .arg(ssh_command)
+            .arg("--rsync-path")
+            .arg(format!("mkdir -p {} && rsync", escaped_remote_path));
+        add_portable_rsync_archive_args(&mut cmd);
+        if self.sync_delete {
+            cmd.arg("--delete");
+        }
+        self.append_sync_filter_args(&mut cmd, &effective_excludes);
+        cmd.arg(format!("{}/", self.project_root.display()))
+            .arg(destination);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let output = run_source_content_rsync_capture(
+            cmd,
+            "source-content rsync no-delta barrier",
+            self.source_sync_attempt_timeout(&effective_excludes),
+        )
+        .await?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "source-content rsync barrier failed (exit {:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        if !output.stderr.is_empty() {
+            anyhow::bail!(
+                "source-content rsync barrier produced stderr: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let stdout = std::str::from_utf8(&output.stdout)
+            .context("source-content rsync barrier output was not UTF-8")?;
+        let changed = stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .filter(|line| {
+                !line
+                    .split_once('\t')
+                    .is_some_and(|(itemized, _)| itemized.as_bytes().get(1) == Some(&b'd'))
+            })
+            .collect::<Vec<_>>();
+        if !changed.is_empty() {
+            let preview = changed
+                .iter()
+                .take(8)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            anyhow::bail!(
+                "source-content rsync barrier detected {} remote delta(s): {}",
+                changed.len(),
+                preview
+            );
+        }
+        Ok(())
     }
 
     /// Belt-and-suspenders source-integrity guard for retrieval (RCH bug
@@ -2040,18 +2322,7 @@ fi",
         cmd.arg("--rsync-path")
             .arg(format!("mkdir -p {} && rsync", escaped_remote_path));
 
-        if let Some(include_patterns) = &self.sync_include_patterns {
-            cmd.arg("--prune-empty-dirs");
-            for pattern in include_patterns {
-                cmd.arg("--include").arg(pattern);
-            }
-            cmd.arg("--exclude").arg("*");
-        } else {
-            // Add exclude patterns (config defaults + .rchignore)
-            for pattern in effective_excludes {
-                cmd.arg("--exclude").arg(pattern);
-            }
-        }
+        self.append_sync_filter_args(&mut cmd, effective_excludes);
 
         // Add zstd compression if available (rsync 3.2.3+)
         let compression_level = self.compression_level_for_transfer();
@@ -2111,18 +2382,7 @@ fi",
         cmd.arg("--rsync-path")
             .arg(format!("mkdir -p {} && rsync", escaped_remote_path));
 
-        if let Some(include_patterns) = &self.sync_include_patterns {
-            cmd.arg("--prune-empty-dirs");
-            for pattern in include_patterns {
-                cmd.arg("--include").arg(pattern);
-            }
-            cmd.arg("--exclude").arg("*");
-        } else {
-            // Add exclude patterns (config defaults + .rchignore)
-            for pattern in effective_excludes {
-                cmd.arg("--exclude").arg(pattern);
-            }
-        }
+        self.append_sync_filter_args(&mut cmd, effective_excludes);
 
         // Add zstd compression if available (rsync 3.2.3+)
         let compression_level = self.compression_level_for_transfer();
@@ -4375,6 +4635,21 @@ pub fn default_c_cpp_artifact_patterns() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_output_stream_refuses_one_byte_over_cap() {
+        assert_eq!(
+            read_bounded_output_stream(&b"abcd"[..], 4)
+                .await
+                .expect("exact-cap output"),
+            b"abcd"
+        );
+        let error = read_bounded_output_stream(&b"abcde"[..], 4)
+            .await
+            .expect_err("one byte over cap must refuse");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "command output exceeded 4 bytes");
+    }
     use rch_common::WorkerId;
     use rch_common::mock::Phase;
     use rch_common::test_guard;
@@ -6476,6 +6751,8 @@ node_modules/
         assert!(effective.contains(&".rch-target/".to_string()));
         assert!(effective.contains(&".rch-tmp/".to_string()));
         assert!(effective.contains(&".franken_whisper/tools/ffmpeg/".to_string()));
+        assert!(effective.contains(&".venv/".to_string()));
+        assert!(effective.contains(&".venv-*/".to_string()));
     }
 
     #[test]

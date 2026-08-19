@@ -33,10 +33,14 @@ pub async fn run_exec(
     clean_overlay: bool,
     overlay_paths: Vec<PathBuf>,
     no_overlay: bool,
+    source_content_receipt: bool,
     command_parts: Vec<String>,
 ) -> anyhow::Result<()> {
     if clean_overlay || base.is_some() || !overlay_paths.is_empty() || no_overlay {
         anyhow::bail!("clean-overlay remote execution is not supported on non-Unix clients");
+    }
+    if source_content_receipt {
+        anyhow::bail!("source-content receipts require the Unix rsync transport");
     }
     let command = command_parts.join(" ");
     if command.is_empty() {

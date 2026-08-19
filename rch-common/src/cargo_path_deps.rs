@@ -1149,6 +1149,7 @@ struct ManifestDocument {
     package_name: Option<String>,
     has_workspace: bool,
     workspace_members: Vec<String>,
+    workspace_dependency_names: BTreeSet<String>,
     workspace_path_dependencies: BTreeMap<String, String>,
     patch_path_dependencies: BTreeMap<String, String>,
     path_dependencies: Vec<ManifestDependency>,
@@ -1422,7 +1423,9 @@ fn visit_manifest_for_materialization(
             dependency,
             workspace_path_dependencies,
             patch_path_dependencies,
-        ) else {
+            &canonical_manifest,
+        )?
+        else {
             continue;
         };
         let (dependency_root, dependency_manifest) = resolve_materialization_dependency_manifest(
@@ -1630,7 +1633,9 @@ fn visit_manifest_recursive(
             dependency,
             workspace_path_dependencies,
             patch_path_dependencies,
-        ) else {
+            &canonical_manifest,
+        )?
+        else {
             continue;
         };
         validate_absolute_dependency_scope(
@@ -1725,29 +1730,93 @@ fn resolve_manifest_dependency_candidate(
     dependency: &ManifestDependency,
     workspace_path_dependencies: &BTreeMap<String, String>,
     patch_path_dependencies: &BTreeMap<String, String>,
-) -> Option<PathBuf> {
+    declaring_manifest: &Path,
+) -> Result<Option<PathBuf>, CargoPathDependencyError> {
     if let Some(raw_dependency_path) = dependency.dependency_path.as_deref() {
-        return Some(resolve_dependency_candidate(
+        return Ok(Some(resolve_dependency_candidate(
             package_root,
             raw_dependency_path,
-        ));
+        )));
     }
 
-    if dependency.uses_workspace_inheritance
-        && let Some(raw_dependency_path) =
+    if dependency.uses_workspace_inheritance {
+        if let Some(raw_dependency_path) =
             workspace_path_dependencies.get(&dependency.dependency_name)
-    {
-        return Some(resolve_dependency_candidate(
-            workspace_root,
-            raw_dependency_path,
-        ));
+        {
+            return Ok(Some(resolve_dependency_candidate(
+                workspace_root,
+                raw_dependency_path,
+            )));
+        }
+
+        // A direct path dependency can itself be a member of a different
+        // workspace. When cargo metadata is unavailable, its `{ workspace =
+        // true }` dependencies must be resolved against that enclosing
+        // workspace, not the entry package's workspace. Otherwise the fallback
+        // stops at the directly named member and omits active transitive local
+        // crates (for example fastapi -> fastapi-core).
+        for ancestor in package_root.ancestors() {
+            let candidate_manifest = ancestor.join("Cargo.toml");
+            if candidate_manifest == declaring_manifest || !candidate_manifest.is_file() {
+                continue;
+            }
+            let candidate = read_manifest_document(&candidate_manifest)?;
+            if !candidate.has_workspace {
+                continue;
+            }
+            let Some(raw_dependency_path) = candidate
+                .workspace_path_dependencies
+                .get(&dependency.dependency_name)
+            else {
+                if candidate
+                    .workspace_dependency_names
+                    .contains(&dependency.dependency_name)
+                {
+                    if let Some(raw_dependency_path) =
+                        patch_path_dependencies.get(&dependency.dependency_name)
+                    {
+                        return Ok(Some(resolve_dependency_candidate(
+                            workspace_root,
+                            raw_dependency_path,
+                        )));
+                    }
+                    // The dependency is inherited from the enclosing
+                    // workspace, but resolves from a registry or Git rather
+                    // than a local path. It is outside the source-sync closure.
+                    return Ok(None);
+                }
+                return Err(CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::ManifestParseFailure,
+                    format!(
+                        "workspace-inherited dependency '{}' is not defined by {}",
+                        dependency.dependency_name,
+                        candidate_manifest.display()
+                    ),
+                )
+                .with_manifest_path(declaring_manifest)
+                .with_dependency_name(dependency.dependency_name.clone()));
+            };
+            return Ok(Some(resolve_dependency_candidate(
+                ancestor,
+                raw_dependency_path,
+            )));
+        }
+        return Err(CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::ManifestParseFailure,
+            format!(
+                "workspace-inherited dependency '{}' has no enclosing workspace",
+                dependency.dependency_name
+            ),
+        )
+        .with_manifest_path(declaring_manifest)
+        .with_dependency_name(dependency.dependency_name.clone()));
     }
 
-    patch_path_dependencies
+    Ok(patch_path_dependencies
         .get(&dependency.dependency_name)
         .map(|raw_dependency_path| {
             resolve_dependency_candidate(workspace_root, raw_dependency_path)
-        })
+        }))
 }
 
 fn read_manifest_document(
@@ -1794,10 +1863,15 @@ fn read_manifest_document(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let workspace_path_dependencies = table
+    let workspace_dependencies = table
         .get("workspace")
         .and_then(toml::Value::as_table)
-        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(|workspace| workspace.get("dependencies"));
+    let workspace_dependency_names = workspace_dependencies
+        .and_then(toml::Value::as_table)
+        .map(|dependencies| dependencies.keys().cloned().collect())
+        .unwrap_or_default();
+    let workspace_path_dependencies = workspace_dependencies
         .map(collect_named_path_dependencies)
         .unwrap_or_default();
     let patch_path_dependencies = table
@@ -1857,6 +1931,7 @@ fn read_manifest_document(
         package_name,
         has_workspace,
         workspace_members,
+        workspace_dependency_names,
         workspace_path_dependencies,
         patch_path_dependencies,
         path_dependencies,
@@ -3854,6 +3929,116 @@ shared_dep = { path = "../shared/shared_dep" }
                 to: shared_canonical,
                 dependency_name: "shared_dep".to_string(),
             }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_fallback_resolves_foreign_workspace_inherited_path_dependencies() {
+        let fixture = TopologyFixture::new("manifest-foreign-workspace-shared");
+        let scenario_root = fixture
+            .canonical_root
+            .join("manifest_foreign_workspace_shared");
+        let app_root = scenario_root.join("app");
+        let foreign_workspace = scenario_root.join("foreign");
+        let api_root = foreign_workspace.join("crates/api");
+        let core_root = foreign_workspace.join("crates/core");
+
+        write_lib_crate(&core_root, "foreign_core", &[]);
+        std::fs::create_dir_all(api_root.join("src")).expect("create foreign api src");
+        std::fs::write(
+            api_root.join("Cargo.toml"),
+            r#"[package]
+name = "foreign_api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+foreign_core = { workspace = true }
+asupersync = { workspace = true }
+"#,
+        )
+        .expect("write foreign api manifest");
+        std::fs::write(api_root.join("src/lib.rs"), "pub fn api() {}\n")
+            .expect("write foreign api lib");
+        std::fs::write(
+            foreign_workspace.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/api", "crates/core"]
+resolver = "3"
+
+[workspace.dependencies]
+foreign_core = { path = "crates/core" }
+asupersync = "0.3.9"
+"#,
+        )
+        .expect("write foreign workspace manifest");
+        write_bin_crate(
+            &app_root,
+            "foreign_workspace_app",
+            &[("foreign_api", "../foreign/crates/api")],
+        );
+
+        let graph = resolve_cargo_path_dependency_graph_with_policy_and_provider(
+            &app_root,
+            &fixture.policy(),
+            |_| {
+                Err(CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                    "force manifest fallback",
+                ))
+            },
+        )
+        .expect("manifest fallback should traverse the foreign workspace dependency");
+
+        let app = app_root.canonicalize().expect("canonical app");
+        let api = api_root.canonicalize().expect("canonical api");
+        let core = core_root.canonicalize().expect("canonical core");
+        assert_eq!(graph.root_packages, vec![app.clone()]);
+        assert_eq!(
+            graph.edges,
+            vec![
+                CargoPathDependencyEdge {
+                    from: app,
+                    to: api.clone(),
+                    dependency_name: "foreign_api".to_string(),
+                },
+                CargoPathDependencyEdge {
+                    from: api,
+                    to: core,
+                    dependency_name: "foreign_core".to_string(),
+                },
+            ]
+        );
+        let materialization =
+            resolve_materialization_from_manifests(&app_root.join("Cargo.toml"), &fixture.policy())
+                .expect("materialization fallback should retain the same foreign path closure");
+        assert_eq!(materialization.edges, graph.edges);
+
+        std::fs::write(
+            foreign_workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/api\", \"crates/core\"]\nresolver = \"3\"\n\n[workspace.dependencies]\nasupersync = \"0.3.9\"\n",
+        )
+        .expect("remove inherited dependency declaration");
+        let refusal = resolve_cargo_path_dependency_graph_with_policy_and_provider(
+            &app_root,
+            &fixture.policy(),
+            |_| {
+                Err(CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                    "force manifest fallback",
+                ))
+            },
+        )
+        .expect_err("missing foreign workspace dependency must fail closed");
+        assert_eq!(
+            refusal.kind(),
+            &CargoPathDependencyErrorKind::ManifestParseFailure
+        );
+        assert!(
+            refusal
+                .detail()
+                .contains("workspace-inherited dependency 'foreign_core' is not defined")
         );
     }
 

@@ -5673,6 +5673,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         None,
         &policy,
         None,
+        false,
     )
     .await;
 
@@ -5785,6 +5786,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         None,
         &policy,
         None,
+        false,
     )
     .await;
 
@@ -5885,6 +5887,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         None,
         &policy,
         None,
+        false,
     )
     .await;
 
@@ -5908,6 +5911,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         None,
         &policy,
         None,
+        false,
     )
     .await;
 

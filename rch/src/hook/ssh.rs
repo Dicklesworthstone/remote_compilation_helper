@@ -34,6 +34,8 @@
 
 use super::*;
 
+const MAX_OFFLOAD_SSH_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+
 pub(super) fn should_skip_remote_preflight(worker: &WorkerConfig) -> bool {
     mock::is_mock_enabled() || mock::is_mock_worker(worker)
 }
@@ -41,6 +43,34 @@ pub(super) fn should_skip_remote_preflight(worker: &WorkerConfig) -> bool {
 pub(super) async fn run_offload_ssh_command(
     worker: &WorkerConfig,
     remote_cmd: &str,
+    timeout_duration: Duration,
+) -> anyhow::Result<Output> {
+    run_offload_ssh_command_with_optional_stdin(worker, remote_cmd, None, timeout_duration).await
+}
+
+/// Execute a hardened control-plane SSH command while streaming a bounded
+/// caller-supplied payload to its stdin. Source-content verification uses this
+/// instead of placing thousands of file identities in argv, where shell/OS
+/// limits would make the proof denominator depend on repository size.
+pub(super) async fn run_offload_ssh_command_with_stdin(
+    worker: &WorkerConfig,
+    remote_cmd: &str,
+    stdin_payload: &[u8],
+    timeout_duration: Duration,
+) -> anyhow::Result<Output> {
+    run_offload_ssh_command_with_optional_stdin(
+        worker,
+        remote_cmd,
+        Some(stdin_payload),
+        timeout_duration,
+    )
+    .await
+}
+
+async fn run_offload_ssh_command_with_optional_stdin(
+    worker: &WorkerConfig,
+    remote_cmd: &str,
+    stdin_payload: Option<&[u8]>,
     timeout_duration: Duration,
 ) -> anyhow::Result<Output> {
     let identity_file = shellexpand::tilde(&worker.identity_file);
@@ -56,6 +86,11 @@ pub(super) async fn run_offload_ssh_command(
     cmd.arg("-i").arg(identity_file.as_ref());
     cmd.arg(&destination);
     cmd.arg(build_remote_shell_command(remote_cmd));
+    if stdin_payload.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     // Spawn manually instead of `cmd.output()` so the local SSH process is
@@ -68,7 +103,7 @@ pub(super) async fn run_offload_ssh_command(
     cmd.kill_on_drop(true);
 
     use anyhow::Context as _;
-    use tokio::io::AsyncReadExt as _;
+    use tokio::io::AsyncWriteExt as _;
 
     let mut child = cmd
         .spawn()
@@ -76,24 +111,38 @@ pub(super) async fn run_offload_ssh_command(
 
     // Drain stdout/stderr concurrently with the wait so that even verbose
     // remote output never deadlocks the child on a full pipe buffer.
+    let mut stdin_pipe = child.stdin.take();
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
+    let stdin_payload = stdin_payload.map(<[u8]>::to_vec);
     let collect = async {
-        let stdout_fut = async {
-            let mut buf = Vec::new();
-            if let Some(p) = stdout_pipe.as_mut() {
-                p.read_to_end(&mut buf).await?;
+        let stdin_fut = async {
+            if let (Some(mut pipe), Some(payload)) = (stdin_pipe.take(), stdin_payload.as_deref()) {
+                pipe.write_all(payload).await?;
+                pipe.shutdown().await?;
+                drop(pipe);
             }
-            Ok::<_, std::io::Error>(buf)
+            Ok::<_, std::io::Error>(())
+        };
+        let stdout_fut = async {
+            match stdout_pipe.take() {
+                Some(pipe) => {
+                    crate::transfer::read_bounded_output_stream(pipe, MAX_OFFLOAD_SSH_OUTPUT_BYTES)
+                        .await
+                }
+                None => Ok(Vec::new()),
+            }
         };
         let stderr_fut = async {
-            let mut buf = Vec::new();
-            if let Some(p) = stderr_pipe.as_mut() {
-                p.read_to_end(&mut buf).await?;
+            match stderr_pipe.take() {
+                Some(pipe) => {
+                    crate::transfer::read_bounded_output_stream(pipe, MAX_OFFLOAD_SSH_OUTPUT_BYTES)
+                        .await
+                }
+                None => Ok(Vec::new()),
             }
-            Ok::<_, std::io::Error>(buf)
         };
-        let (stdout_bytes, stderr_bytes) = tokio::try_join!(stdout_fut, stderr_fut)?;
+        let ((), stdout_bytes, stderr_bytes) = tokio::try_join!(stdin_fut, stdout_fut, stderr_fut)?;
         let status = child.wait().await?;
         Ok::<_, std::io::Error>(Output {
             status,

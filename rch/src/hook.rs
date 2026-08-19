@@ -1904,6 +1904,7 @@ pub async fn run_exec(
     clean_overlay: bool,
     overlay_paths: Vec<PathBuf>,
     no_overlay: bool,
+    source_content_receipt: bool,
     command_parts: Vec<String>,
 ) -> anyhow::Result<()> {
     let command = join_exec_command(&command_parts);
@@ -1920,7 +1921,7 @@ pub async fn run_exec(
     // A clean-overlay request can never fall back to the ambient local tree,
     // even if the caller omitted RCH_REQUIRE_REMOTE. Doing so would silently
     // defeat the entire peer-dirt exclusion guarantee.
-    let require_remote = exec_requires_remote() || clean_overlay;
+    let require_remote = exec_requires_remote() || clean_overlay || source_content_receipt;
 
     // Classify the command
     let classification = classify_command(&command);
@@ -2181,7 +2182,14 @@ pub async fn run_exec(
     // `compilation.allow_local_fallback`. Genuine build/test failures and
     // SSH-timeout fail-closed cases stay terminal (retrying wastes fleet cycles).
     let allow_local_fallback = config.compilation.allow_local_fallback;
-    let max_attempts = max_remote_attempts();
+    // A source-content receipt is bound to one selected worker and one remote
+    // root set. Retrying on another worker would emit multiple competing proof
+    // envelopes for one invocation, so proof mode is deliberately single-shot.
+    let max_attempts = if source_content_receipt {
+        1
+    } else {
+        max_remote_attempts()
+    };
     let mut tried_workers: Vec<WorkerId> = Vec::new();
     // The worker set requested for the CURRENT `response`. Attempt 1 uses the
     // operator's env pin (`RCH_WORKER(S)`); each retry pins the chosen bigger
@@ -2335,6 +2343,7 @@ pub async fn run_exec(
             Some(&durable_lease),
             &topology_policy,
             clean_overlay_spec.as_ref(),
+            source_content_receipt,
         )
         .await;
         let remote_elapsed = remote_start.elapsed();
@@ -2836,6 +2845,10 @@ mod progress_reporting;
 mod transfer_orchestration;
 use transfer_orchestration::execute_remote_compilation;
 
+// Exact source-byte manifest construction and worker-side re-verification for
+// `rch exec --source-content-receipt` proof runs.
+mod source_fidelity;
+
 // The repo_updater pre-sync subsystem (closure-convergence orchestration +
 // adapter invocation + contract/auth resolution + sync-root detection) lives in
 // the `repo_updater` submodule. Its `maybe_sync_repo_set_with_repo_updater` entry
@@ -3240,6 +3253,7 @@ async fn handle_selection_response(
         None,
         &topology_policy,
         None,
+        false,
     )
     .await;
     let remote_elapsed = remote_start.elapsed();

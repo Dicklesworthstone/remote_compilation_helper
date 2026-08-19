@@ -492,6 +492,35 @@ RCH_REQUIRE_REMOTE=1 rch exec -- cargo test --workspace
 RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+### Exact source-content receipts
+
+Proof-oriented callers can require a single-worker, fail-closed source transfer
+and retain the exact regular-file bytes admitted on that worker:
+
+```bash
+RCH_REQUIRE_REMOTE=1 rch exec --source-content-receipt -- \
+  cargo test --locked --workspace
+```
+
+Receipt mode resolves the active Cargo path-dependency closure, gives every
+root an invocation-unique worker path, transfers with checksum comparison, and
+reopens every selected file before and after the command. The emitted
+`rch.source_content_receipt.v1` JSON binds the worker and build IDs, exact
+command digest and exit code, transfer filter policy, per-root file paths,
+lengths, executable bits, SHA-256 digests, and content roots. Any unproved
+dependency closure, transfer delta, worker verification error, local lasting
+change, retry, or local fallback refuses the invocation instead of emitting a
+receipt. Receipt mode currently requires the Unix rsync transport and cannot be
+combined with clean-overlay mode.
+
+The receipt is emitted after the remote command and its post-command source
+barrier, but before ordinary artifact retrieval completes. Artifact-grade
+callers must therefore retain both the receipt and the later successful
+retrieval/terminal transcript; the receipt alone is not proof that build
+artifacts reached the caller. A recursive local mutation watcher is still
+needed when transient edit-and-restore (ABA) detection is part of the caller's
+source-stability contract.
+
 ### Clean Git overlays for shared working trees
 
 `rch exec` can build an immutable committed tree plus an explicit, repeatable
