@@ -14,10 +14,17 @@ use std::fs::File;
 
 const ROOT_SCHEMA: &str = "rch.source_content_root.v1";
 const RECEIPT_SCHEMA: &str = "rch.source_content_receipt.v1";
-const MAX_SOURCE_CONTENT_FILES: usize = 50_000;
+// Large tracked conformance corpora are legitimate source inputs.  The
+// FrankenNetworkX dependency currently contributes about 74k selected files,
+// so keep a finite one-over boundary without rejecting that authentic tree.
+const MAX_SOURCE_CONTENT_FILES: usize = 100_000;
 const MAX_SOURCE_CONTENT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_REMOTE_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
-const MAX_SOURCE_CONTENT_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
+// The receipt repeats each selected path and SHA-256 for independently synced
+// workspace and crate roots.  A 32 MiB cap closes the current ~100k-entry
+// dependency closure while remaining equal to the bounded rsync/remote-manifest
+// capture budget.
+const MAX_SOURCE_CONTENT_RECEIPT_BYTES: usize = 32 * 1024 * 1024;
 const REMOTE_VERIFY_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
