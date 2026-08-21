@@ -67,6 +67,14 @@ pub struct WorkerProbeResult {
     /// human-readable `error` field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    /// Exact runtime/toolchain capability inventory returned by `rch-wkr`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<WorkerCapabilities>,
+    /// Project-declared rustup components absent from this worker's matching
+    /// toolchain. Non-empty means connectivity succeeded but command admission
+    /// must not report the worker as ready.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_components: Vec<String>,
 }
 
 /// Per-error-code tally for a batch probe.
@@ -78,6 +86,8 @@ pub struct WorkerProbeSummary {
     pub healthy: usize,
     /// Workers that reachable but failed the health check.
     pub unhealthy: usize,
+    /// Reachable workers missing a project-declared toolchain component.
+    pub capability_missing: usize,
     /// Workers that failed to connect / errored.
     pub failed: usize,
     /// Error-code tally, keyed by `"RCH-Exxx"`. Errors without a mapped code

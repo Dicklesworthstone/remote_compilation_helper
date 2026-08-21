@@ -547,6 +547,8 @@ mod tests {
             latency_ms: Some(42),
             error: None,
             error_code: None,
+            capabilities: None,
+            missing_components: Vec::new(),
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["id"], "worker1");
@@ -566,6 +568,8 @@ mod tests {
             latency_ms: None,
             error: Some("Connection refused".to_string()),
             error_code: Some("RCH-E108".to_string()),
+            capabilities: None,
+            missing_components: Vec::new(),
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["status"], "unreachable");

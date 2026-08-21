@@ -129,8 +129,10 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
     // than as "known to lack it".
     s.push_str(&format!(
         "for tc in $({rustup} toolchain list 2>/dev/null | awk '{{print $1}}'); do \
+           rh=$({rustup} run \"$tc\" rustc -vV 2>/dev/null | awk '$1 == \"host:\" {{print $2; exit}}'); \
            {rustup} component list --installed --toolchain \"$tc\" 2>/dev/null \
-             | awk -v p=\"$P\" -v t=\"$tc\" '{{print p\"component=\"t\":\"$1}}'; \
+             | awk -v p=\"$P\" -v t=\"$tc\" -v h=\"$rh\" \
+                 '{{n=$1; if (h != \"\") sub(\"-\" h \"$\", \"\", n); print p\"component=\"t\":\"n}}'; \
          done; "
     ));
     // JS runtimes (PATH-resolved is acceptable for these advisory facts).
@@ -689,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn script_uses_exact_paths_and_probes_all_facts() {
+    fn script_uses_exact_paths_and_probes_all_component_facts() {
         let script = build_capability_probe_script(&spec());
         // Exact rch-wkr path is embedded (not PATH-resolved).
         assert!(script.contains("/home/rch/.local/bin/rch-wkr"));
@@ -704,6 +706,8 @@ mod tests {
         // nightly, and probing only the default would report it healthy
         // (bd-vc61a).
         assert!(script.contains("component list --installed --toolchain"));
+        assert!(script.contains("rustc -vV"));
+        assert!(script.contains("sub(\"-\" h \"$\""));
         assert!(
             script.contains("for tc in"),
             "component probe must loop over every installed toolchain"

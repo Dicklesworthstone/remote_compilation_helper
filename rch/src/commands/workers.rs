@@ -36,6 +36,7 @@ use super::types::{
 };
 
 use crate::hook::required_runtime_for_kind;
+use crate::toolchain::{detect_declared_components, detect_toolchain};
 
 // =============================================================================
 // Workers-Specific Helper Functions
@@ -43,9 +44,50 @@ use crate::hook::required_runtime_for_kind;
 
 pub(super) fn has_any_capabilities(capabilities: &WorkerCapabilities) -> bool {
     capabilities.rustc_version.is_some()
+        || !capabilities.rustup_toolchains.is_empty()
+        || !capabilities.rustup_components.is_empty()
         || capabilities.bun_version.is_some()
         || capabilities.node_version.is_some()
         || capabilities.npm_version.is_some()
+}
+
+#[cfg(unix)]
+async fn probe_connected_worker_capabilities(client: &mut SshClient) -> Result<WorkerCapabilities> {
+    let output = client
+        .execute("if command -v rch-wkr >/dev/null 2>&1; then rch-wkr capabilities; else ~/.local/bin/rch-wkr capabilities; fi")
+        .await
+        .context("worker capability command failed")?;
+    if !output.success() {
+        anyhow::bail!(
+            "worker capability command exited {}: {}",
+            output.exit_code,
+            output.stderr.trim()
+        );
+    }
+    serde_json::from_str(&output.stdout).context("worker capability JSON was invalid")
+}
+
+fn missing_declared_components(
+    capabilities: &WorkerCapabilities,
+    toolchain: Option<&str>,
+    declared_components: &[String],
+) -> Vec<String> {
+    let Some(toolchain) = toolchain else {
+        return declared_components.to_vec();
+    };
+    declared_components
+        .iter()
+        .filter(|component| !capabilities.has_rustup_component(toolchain, component))
+        .cloned()
+        .collect()
+}
+
+fn format_rustup_component_matrix(capabilities: &WorkerCapabilities) -> String {
+    if capabilities.rustup_components.is_empty() {
+        "unknown".to_string()
+    } else {
+        capabilities.rustup_components.join(", ")
+    }
 }
 
 /// Probe local runtime capabilities by running version commands in parallel.
@@ -763,6 +805,15 @@ pub async fn workers_probe(
 ) -> Result<()> {
     let workers = load_workers_from_config()?;
     let style = ctx.theme();
+    let project_root = std::env::current_dir().ok();
+    let declared_components = project_root
+        .as_deref()
+        .map(detect_declared_components)
+        .unwrap_or_default();
+    let declared_toolchain = project_root
+        .as_deref()
+        .and_then(|root| detect_toolchain(root).ok())
+        .map(|toolchain| toolchain.rustup_toolchain());
 
     if workers.is_empty() {
         if ctx.is_json() {
@@ -850,20 +901,76 @@ pub async fn workers_probe(
                     Ok(true) => {
                         let latency =
                             u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let capability_result =
+                            probe_connected_worker_capabilities(&mut client).await;
+                        let capabilities = capability_result.as_ref().ok().cloned();
+                        let missing_components = capabilities.as_ref().map_or_else(
+                            || declared_components.clone(),
+                            |capabilities| {
+                                missing_declared_components(
+                                    capabilities,
+                                    declared_toolchain.as_deref(),
+                                    &declared_components,
+                                )
+                            },
+                        );
+                        let capability_error =
+                            capability_result.as_ref().err().map(ToString::to_string);
+                        let (status, error, error_code) = if let Some(error) = capability_error {
+                            (
+                                "capability_unknown".to_string(),
+                                Some(error),
+                                Some(ErrorCode::WorkerMissingToolchain.code_string()),
+                            )
+                        } else if !missing_components.is_empty() {
+                            let toolchain = declared_toolchain.as_deref().unwrap_or("<unknown>");
+                            (
+                                "capability_missing".to_string(),
+                                Some(format!(
+                                    "missing rustup component(s) for {toolchain}: {}",
+                                    missing_components.join(", ")
+                                )),
+                                Some(ErrorCode::WorkerMissingToolchain.code_string()),
+                            )
+                        } else {
+                            ("ok".to_string(), None, None)
+                        };
                         results.push(WorkerProbeResult {
                             id: worker.id.as_str().to_string(),
                             host: worker.host.clone(),
-                            status: "ok".to_string(),
+                            status: status.clone(),
                             latency_ms: Some(latency),
-                            error: None,
-                            error_code: None,
+                            error: error.clone(),
+                            error_code: error_code.clone(),
+                            capabilities: capabilities.clone(),
+                            missing_components: missing_components.clone(),
                         });
                         if !ctx.is_json() {
-                            println!(
-                                "{} ({}ms)",
-                                StatusIndicator::Success.with_label(style, "OK"),
-                                style.muted(&latency.to_string())
-                            );
+                            if status == "ok" {
+                                println!(
+                                    "{} ({}ms)",
+                                    StatusIndicator::Success.with_label(style, "OK"),
+                                    style.muted(&latency.to_string())
+                                );
+                            } else {
+                                println!(
+                                    "{} ({}ms) [{}]",
+                                    StatusIndicator::Warning
+                                        .with_label(style, "CAPABILITY_MISSING"),
+                                    style.muted(&latency.to_string()),
+                                    style.highlight(error_code.as_deref().unwrap_or("RCH-E205"))
+                                );
+                                if let Some(error) = error.as_deref() {
+                                    println!("    {}", style.warning(error));
+                                }
+                            }
+                            if let Some(capabilities) = capabilities.as_ref() {
+                                println!(
+                                    "    {} {}",
+                                    style.key("Rustup components:"),
+                                    style.value(&format_rustup_component_matrix(capabilities))
+                                );
+                            }
                         }
                     }
                     Ok(false) => {
@@ -878,6 +985,8 @@ pub async fn workers_probe(
                             latency_ms: None,
                             error: Some("Health check failed".to_string()),
                             error_code: Some(code),
+                            capabilities: None,
+                            missing_components: Vec::new(),
                         });
                         if !ctx.is_json() {
                             println!(
@@ -897,6 +1006,8 @@ pub async fn workers_probe(
                             latency_ms: None,
                             error: Some(report.clone()),
                             error_code: Some(code.clone()),
+                            capabilities: None,
+                            missing_components: Vec::new(),
                         });
                         if !ctx.is_json() {
                             println!(
@@ -921,6 +1032,8 @@ pub async fn workers_probe(
                     latency_ms: None,
                     error: Some(report.clone()),
                     error_code: Some(code.clone()),
+                    capabilities: None,
+                    missing_components: Vec::new(),
                 });
                 if !ctx.is_json() {
                     println!(
@@ -958,6 +1071,7 @@ pub(crate) fn summarize_probe_results(results: &[WorkerProbeResult]) -> WorkerPr
         match result.status.as_str() {
             "ok" | "healthy" => summary.healthy += 1,
             "unhealthy" => summary.unhealthy += 1,
+            "capability_missing" | "capability_unknown" => summary.capability_missing += 1,
             _ => summary.failed += 1,
         }
         if let Some(code) = &result.error_code {
@@ -984,6 +1098,12 @@ fn format_probe_summary_line(
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!("{} healthy", summary.healthy));
+    if summary.capability_missing > 0 {
+        parts.push(format!(
+            "{} capability missing/unknown",
+            summary.capability_missing
+        ));
+    }
     // BTreeMap iteration is sorted by key, so output order is deterministic.
     for (code, count) in &summary.by_error_code {
         parts.push(format!("{} {}", count, code));
@@ -1821,6 +1941,8 @@ mod probe_summary_tests {
             latency_ms: None,
             error: error.map(String::from),
             error_code: error_code.map(String::from),
+            capabilities: None,
+            missing_components: Vec::new(),
         }
     }
 
@@ -1839,6 +1961,7 @@ mod probe_summary_tests {
         assert_eq!(s.healthy, 2);
         assert_eq!(s.unhealthy, 1);
         assert_eq!(s.failed, 3);
+        assert_eq!(s.capability_missing, 0);
         assert_eq!(s.by_error_code.get("RCH-E100"), Some(&1));
         assert_eq!(s.by_error_code.get("RCH-E108"), Some(&2));
         assert_eq!(s.by_error_code.get("RCH-E202"), Some(&1));
@@ -1849,6 +1972,42 @@ mod probe_summary_tests {
         let results = vec![mk("error", None, Some("something weird"))];
         let s = summarize_probe_results(&results);
         assert_eq!(s.by_error_code.get("other"), Some(&1));
+    }
+
+    #[test]
+    fn summarize_separates_component_capability_gaps_from_connectivity_failures() {
+        let results = vec![mk(
+            "capability_missing",
+            Some("RCH-E205"),
+            Some("missing clippy"),
+        )];
+        let summary = summarize_probe_results(&results);
+        assert_eq!(summary.capability_missing, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.by_error_code.get("RCH-E205"), Some(&1));
+    }
+
+    #[test]
+    fn declared_components_use_exact_toolchain_scoped_inventory() {
+        let capabilities = WorkerCapabilities {
+            rustup_components: vec![
+                "stable-x86_64-unknown-linux-gnu:clippy".to_string(),
+                "nightly-2026-07-05-x86_64-unknown-linux-gnu:rustfmt".to_string(),
+            ],
+            ..WorkerCapabilities::default()
+        };
+        assert_eq!(
+            missing_declared_components(
+                &capabilities,
+                Some("nightly-2026-07-05"),
+                &["clippy".to_string(), "rustfmt".to_string()],
+            ),
+            vec!["clippy"]
+        );
+        assert_eq!(
+            format_rustup_component_matrix(&capabilities),
+            "stable-x86_64-unknown-linux-gnu:clippy, nightly-2026-07-05-x86_64-unknown-linux-gnu:rustfmt"
+        );
     }
 
     #[test]

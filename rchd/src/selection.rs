@@ -19,8 +19,8 @@ use crate::ui::workers::{debug_routing_enabled, log_routing_decision};
 use crate::workers::{WorkerPool, WorkerState};
 use rand::RngExt;
 use rch_common::{
-    CircuitBreakerConfig, CircuitState, CommandPriority, RequiredRuntime, SelectionConfig,
-    SelectionDiagnostics, SelectionReason, SelectionRequest, SelectionStrategy,
+    CircuitBreakerConfig, CircuitState, CommandPriority, CompilationKind, RequiredRuntime,
+    SelectionConfig, SelectionDiagnostics, SelectionReason, SelectionRequest, SelectionStrategy,
     SelectionWeightConfig, SshClient, SshOptions, ToolchainInfo, WorkerCapabilities, WorkerId,
     WorkerSelectionDiagnostic, WorkerSelectionDiagnosticDecision, WorkerStatus, classify_command,
 };
@@ -1344,6 +1344,7 @@ impl WorkerSelector {
 
             let toolchain_mismatch =
                 toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities);
+            let component_mismatch = rustup_component_capability_mismatch(request, &capabilities);
             let cached_toolchain_failure = if let Some(toolchain) = request.toolchain.as_ref() {
                 let toolchain_name = toolchain.rustup_toolchain();
                 worker
@@ -1426,6 +1427,9 @@ impl WorkerSelector {
                             request.required_runtime
                         ),
                     )
+                } else if let Some(reason) = component_mismatch {
+                    push_reason_code(&mut reason_codes, "toolchain.component_missing");
+                    (WorkerSelectionDiagnosticDecision::Deny, reason)
                 } else if let Some(reason) = toolchain_mismatch {
                     push_reason_code(&mut reason_codes, "toolchain.version_mismatch");
                     (WorkerSelectionDiagnosticDecision::Deny, reason)
@@ -1762,6 +1766,7 @@ impl WorkerSelector {
         let mut preferred_without_health: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
         let mut filtered_by_health = 0usize;
         let mut filtered_by_hard_preflight = 0usize;
+        let mut filtered_by_component = 0usize;
         let mut filtered_by_convergence = 0usize;
         let mut filtered_by_pressure = 0usize;
         let mut filtered_by_os_gate = 0usize;
@@ -1845,6 +1850,13 @@ impl WorkerSelector {
             any_has_runtime = true;
 
             let capabilities = worker.capabilities().await;
+            if let Some(reason) = rustup_component_capability_mismatch(request, &capabilities) {
+                debug!("Worker {} excluded: {}", worker_id, reason);
+                metrics::inc_reliability_error("selection", "toolchain_component_missing");
+                filtered_by_hard_preflight += 1;
+                filtered_by_component += 1;
+                continue;
+            }
             if let Some(reason) =
                 toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities)
             {
@@ -2263,6 +2275,11 @@ impl WorkerSelector {
                 "All candidate workers failed hard preflight checks (count={})",
                 filtered_by_hard_preflight
             );
+            if filtered_by_component > 0 {
+                return Err(SelectionReason::NoAdmissibleWorkers(format!(
+                    "missing_toolchain_component={filtered_by_component}"
+                )));
+            }
             if filtered_by_pressure > 0
                 || filtered_by_slots > 0
                 || filtered_by_capacity > 0
@@ -2890,6 +2907,7 @@ pub async fn select_worker_with_config(
     let mut any_has_capacity = false;
     let mut any_has_runtime = false;
     let mut filtered_by_capacity = 0usize;
+    let mut filtered_by_component = 0usize;
 
     for worker in workers {
         let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
@@ -2955,6 +2973,13 @@ pub async fn select_worker_with_config(
         }
 
         any_has_runtime = true;
+
+        let capabilities = worker.capabilities().await;
+        if let Some(reason) = rustup_component_capability_mismatch(request, &capabilities) {
+            filtered_by_component += 1;
+            debug!("Worker {} excluded: {}", worker_id, reason);
+            continue;
+        }
 
         if total_slots < request.estimated_cores {
             filtered_by_capacity += 1;
@@ -3023,6 +3048,16 @@ pub async fn select_worker_with_config(
                 worker: None,
                 reason: SelectionReason::NoAdmissibleWorkers(format!(
                     "insufficient_total_slots={filtered_by_capacity}"
+                )),
+                diagnostics: None,
+            };
+        }
+
+        if filtered_by_component > 0 {
+            return SelectionResult {
+                worker: None,
+                reason: SelectionReason::NoAdmissibleWorkers(format!(
+                    "missing_toolchain_component={filtered_by_component}"
                 )),
                 diagnostics: None,
             };
@@ -3388,6 +3423,65 @@ fn toolchain_capability_mismatch(
     let local = rustc_version_key(&toolchain.full_version)?;
     let worker = rustc_version_key(worker_raw)?;
     (local != worker).then(|| format!("rustc_version_mismatch:local={local}:worker={worker}"))
+}
+
+fn required_rustup_component(request: &SelectionRequest) -> Option<&'static str> {
+    let command = request.command.as_deref()?;
+    let classification = classify_command(command);
+    if matches!(classification.kind, Some(CompilationKind::CargoClippy)) {
+        return Some("clippy");
+    }
+
+    // Ordinary `cargo fmt` stays local. The one remotely admitted form is the
+    // exact clean-overlay `cargo fmt --check` lane, whose project identity is
+    // deliberately tagged by the hook. Keep this guard so prose or an unrelated
+    // command containing the words `cargo fmt` cannot create a capability gate.
+    if request.project.contains("::clean-overlay::") && direct_cargo_fmt_check(command) {
+        return Some("rustfmt");
+    }
+    None
+}
+
+fn direct_cargo_fmt_check(command: &str) -> bool {
+    let tokens = command
+        .split_whitespace()
+        .map(|token| token.trim_matches(['\'', '"']))
+        .collect::<Vec<_>>();
+    let Some(cargo_index) = tokens.iter().position(|token| {
+        *token == "cargo"
+            || token
+                .rsplit_once('/')
+                .is_some_and(|(_, name)| name == "cargo")
+    }) else {
+        return false;
+    };
+    let mut subcommand_index = cargo_index + 1;
+    if tokens
+        .get(subcommand_index)
+        .is_some_and(|token| token.starts_with('+'))
+    {
+        subcommand_index += 1;
+    }
+    tokens.get(subcommand_index) == Some(&"fmt")
+        && tokens[subcommand_index + 1..].contains(&"--check")
+}
+
+fn rustup_component_capability_mismatch(
+    request: &SelectionRequest,
+    capabilities: &WorkerCapabilities,
+) -> Option<String> {
+    let component = required_rustup_component(request)?;
+    let Some(toolchain) = request
+        .toolchain
+        .as_ref()
+        .map(ToolchainInfo::rustup_toolchain)
+    else {
+        return Some(format!(
+            "capability_missing:rustup_component:<unknown>:{component}"
+        ));
+    };
+    (!capabilities.has_rustup_component(&toolchain, component))
+        .then(|| format!("capability_missing:rustup_component:{toolchain}:{component}"))
 }
 
 fn is_floating_rust_channel(channel: &str) -> bool {
@@ -4774,6 +4868,83 @@ mod tests {
         };
 
         assert!(toolchain_capability_mismatch(Some(&local), &caps).is_none());
+    }
+
+    fn pinned_component_request(project: &str, command: &str) -> SelectionRequest {
+        SelectionRequest {
+            project: project.to_string(),
+            command: Some(command.to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: Some(ToolchainInfo {
+                channel: "nightly".to_string(),
+                date: Some("2026-07-05".to_string()),
+                full_version: "nightly-2026-07-05".to_string(),
+            }),
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        }
+    }
+
+    #[test]
+    fn rustup_component_requirement_is_command_specific_and_fail_closed() {
+        let clippy = pinned_component_request("asupersync", "cargo clippy --workspace");
+        assert_eq!(required_rustup_component(&clippy), Some("clippy"));
+
+        let fmt = pinned_component_request(
+            "asupersync::clean-overlay::0123456789abcdef",
+            "cargo fmt --check",
+        );
+        assert_eq!(required_rustup_component(&fmt), Some("rustfmt"));
+        let ordinary_fmt = pinned_component_request("asupersync", "cargo fmt --check");
+        assert_eq!(required_rustup_component(&ordinary_fmt), None);
+
+        let capabilities = WorkerCapabilities {
+            rustup_components: vec![
+                "nightly-2026-07-05-x86_64-unknown-linux-gnu:rustfmt".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(rustup_component_capability_mismatch(&fmt, &capabilities).is_none());
+        assert_eq!(
+            rustup_component_capability_mismatch(&clippy, &capabilities).as_deref(),
+            Some("capability_missing:rustup_component:nightly-2026-07-05:clippy")
+        );
+    }
+
+    #[tokio::test]
+    async fn clippy_component_selection_refuses_worker_without_pinned_component() {
+        let pool = WorkerPool::new();
+        let worker = make_worker("missing-clippy", 8, 80.0);
+        worker
+            .set_capabilities(WorkerCapabilities {
+                rustc_version: Some("rustc 1.88.0-nightly".to_string()),
+                rustup_toolchains: vec!["nightly-2026-07-05-x86_64-unknown-linux-gnu".to_string()],
+                rustup_components: vec![
+                    "nightly-2026-07-05-x86_64-unknown-linux-gnu:rustfmt".to_string(),
+                ],
+                projects_root_ok: Some(true),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(worker).await;
+
+        let request = pinned_component_request("asupersync", "cargo clippy --workspace");
+        let result = WorkerSelector::default().select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        assert_eq!(
+            result.reason,
+            SelectionReason::NoAdmissibleWorkers("missing_toolchain_component=1".to_string())
+        );
+        let diagnostics = result.diagnostics.expect("component refusal diagnostics");
+        assert!(
+            diagnostics.workers[0]
+                .reason_codes
+                .iter()
+                .any(|code| code == "toolchain.component_missing")
+        );
     }
 
     #[tokio::test]

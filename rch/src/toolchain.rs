@@ -54,6 +54,50 @@ pub fn detect_toolchain(project_root: &Path) -> Result<ToolchainInfo, ToolchainE
     detect_from_rustc()
 }
 
+/// Read the components explicitly declared by the project's rust-toolchain
+/// file. Plain-text legacy files declare no components. Invalid or unreadable
+/// files return an empty set so callers can still report connectivity without
+/// inventing requirements.
+pub fn detect_declared_components(project_root: &Path) -> Vec<String> {
+    for path in [
+        project_root.join("rust-toolchain.toml"),
+        project_root.join("rust-toolchain"),
+    ] {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let components = parse_declared_components(&content);
+        if !components.is_empty() || content.trim_start().starts_with('[') {
+            return components;
+        }
+    }
+    Vec::new()
+}
+
+fn parse_declared_components(content: &str) -> Vec<String> {
+    let Ok(value) = toml::from_str::<toml::Value>(content) else {
+        return Vec::new();
+    };
+    let Some(values) = value
+        .get("toolchain")
+        .and_then(|toolchain| toolchain.get("components"))
+        .and_then(toml::Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut components = values
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|component| !component.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    components.sort();
+    components.dedup();
+    components
+}
+
 /// Parse a rust-toolchain.toml file.
 fn parse_toolchain_file(path: &Path) -> Result<ToolchainInfo, ToolchainError> {
     let content = std::fs::read_to_string(path)?;
@@ -539,6 +583,19 @@ mod tests {
         let info = detect_toolchain(tmp.path()).unwrap();
         assert_eq!(info.channel, "nightly");
         assert_eq!(info.date, Some("2024-06-01".to_string()));
+    }
+
+    #[test]
+    fn test_parse_declared_components_is_sorted_deduplicated_and_nonblank() {
+        let components = parse_declared_components(
+            r#"
+                [toolchain]
+                channel = "nightly-2026-07-05"
+                components = ["rustfmt", "clippy", "rustfmt", ""]
+            "#,
+        );
+        assert_eq!(components, vec!["clippy", "rustfmt"]);
+        assert!(parse_declared_components("nightly-2026-07-05").is_empty());
     }
 
     #[test]

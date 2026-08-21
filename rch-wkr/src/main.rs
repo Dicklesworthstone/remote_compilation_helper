@@ -401,6 +401,10 @@ fn probe_capabilities() -> WorkerCapabilities {
         capabilities.rustc_version = parse_rustc_version_stdout(&version_str);
     }
 
+    let (toolchains, components) = probe_rustup_inventory();
+    capabilities.rustup_toolchains = toolchains;
+    capabilities.rustup_components = components;
+
     // Probe bun version
     let bun_cmd = run_bun_version_command();
 
@@ -503,6 +507,91 @@ fn probe_capabilities() -> WorkerCapabilities {
     capabilities.projects_root_checked_at_unix_ms = Some(current_unix_ms());
 
     capabilities
+}
+
+/// Probe every installed rustup toolchain and retain toolchain-qualified,
+/// normalized component facts for routing. A failed sub-probe contributes no
+/// facts, which makes component admission fail closed for that toolchain.
+fn probe_rustup_inventory() -> (Vec<String>, Vec<String>) {
+    use std::process::Command;
+
+    let Ok(output) = Command::new("rustup").args(["toolchain", "list"]).output() else {
+        return (Vec::new(), Vec::new());
+    };
+    if !output.status.success() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut toolchains = parse_rustup_toolchains(&String::from_utf8_lossy(&output.stdout));
+    let mut components = Vec::new();
+    for toolchain in &toolchains {
+        let host = Command::new("rustup")
+            .args(["run", toolchain, "rustc", "-vV"])
+            .output()
+            .ok()
+            .filter(|result| result.status.success())
+            .and_then(|result| parse_rustc_host(&String::from_utf8_lossy(&result.stdout)));
+
+        let Some(output) = Command::new("rustup")
+            .args(["component", "list", "--installed", "--toolchain", toolchain])
+            .output()
+            .ok()
+            .filter(|result| result.status.success())
+        else {
+            continue;
+        };
+        components.extend(parse_rustup_components(
+            toolchain,
+            host.as_deref(),
+            &String::from_utf8_lossy(&output.stdout),
+        ));
+    }
+    toolchains.sort();
+    toolchains.dedup();
+    components.sort();
+    components.dedup();
+    (toolchains, components)
+}
+
+fn parse_rustup_toolchains(stdout: &str) -> Vec<String> {
+    let mut toolchains = stdout
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    toolchains.sort();
+    toolchains.dedup();
+    toolchains
+}
+
+fn parse_rustc_host(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("host:")
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn parse_rustup_components(toolchain: &str, host: Option<&str>, stdout: &str) -> Vec<String> {
+    let host_suffix = host.map(|host| format!("-{host}"));
+    let mut components = stdout
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            let normalized = host_suffix
+                .as_deref()
+                .and_then(|suffix| name.strip_suffix(suffix))
+                .unwrap_or(name);
+            format!("{toolchain}:{normalized}")
+        })
+        .collect::<Vec<_>>();
+    components.sort();
+    components.dedup();
+    components
 }
 
 /// Resolve the worker's topology roots, honoring `RCH_WKR_CANONICAL_ROOT` /
@@ -1026,6 +1115,44 @@ mod tests {
         let parsed = parse_rustc_version_stdout("rustc 1.87.0-nightly (abc 2026-01-01)\n");
         assert_eq!(parsed.as_deref(), Some("1.87.0-nightly"));
         println!("TEST PASS: test_parse_rustc_version_stdout_extracts_semver");
+    }
+
+    #[test]
+    fn test_parse_rustup_component_inventory_normalizes_only_the_exact_host_suffix() {
+        let _guard = test_guard!();
+        let toolchains = parse_rustup_toolchains(
+            "stable-x86_64-unknown-linux-gnu\nnightly-2026-07-05-x86_64-unknown-linux-gnu (default)\n",
+        );
+        assert_eq!(
+            toolchains,
+            vec![
+                "nightly-2026-07-05-x86_64-unknown-linux-gnu",
+                "stable-x86_64-unknown-linux-gnu"
+            ]
+        );
+        assert_eq!(
+            parse_rustc_host("rustc 1.99.0-nightly\nhost: x86_64-unknown-linux-gnu\n").as_deref(),
+            Some("x86_64-unknown-linux-gnu")
+        );
+
+        let components = parse_rustup_components(
+            "nightly-2026-07-05-x86_64-unknown-linux-gnu",
+            Some("x86_64-unknown-linux-gnu"),
+            "cargo-x86_64-unknown-linux-gnu\nclippy-x86_64-unknown-linux-gnu\nclippy-preview\nrust-src\nrustfmt-x86_64-unknown-linux-gnu\n",
+        );
+        assert!(components.iter().any(|fact| fact.ends_with(":clippy")));
+        assert!(components.iter().any(|fact| fact.ends_with(":rustfmt")));
+        assert!(components.iter().any(|fact| fact.ends_with(":rust-src")));
+        assert!(
+            components
+                .iter()
+                .any(|fact| fact.ends_with(":clippy-preview"))
+        );
+        assert!(
+            !components
+                .iter()
+                .any(|fact| fact.ends_with(":clippy-x86_64-unknown-linux-gnu"))
+        );
     }
 
     #[test]

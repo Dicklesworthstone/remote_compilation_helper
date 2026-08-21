@@ -752,6 +752,15 @@ pub struct WorkerCapabilities {
     /// Rust compiler version (from `rustc --version`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rustc_version: Option<String>,
+    /// Installed rustup toolchains, including their host triple when rustup
+    /// reports one (for example `nightly-2026-07-05-x86_64-unknown-linux-gnu`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rustup_toolchains: Vec<String>,
+    /// Installed rustup components as `<toolchain>:<component>` facts. Component
+    /// names are normalized by removing only the probed host-triple suffix, so
+    /// `clippy-preview` can never satisfy a `clippy` requirement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rustup_components: Vec<String>,
     /// Bun runtime version (from `bun --version`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bun_version: Option<String>,
@@ -860,6 +869,21 @@ impl WorkerCapabilities {
     /// Check if this worker has Rust installed.
     pub fn has_rust(&self) -> bool {
         self.rustc_version.is_some()
+    }
+
+    /// Check whether `component` is installed for `toolchain`.
+    ///
+    /// Rustup reports pinned toolchains with a host-triple suffix. The request
+    /// carries the project pin without that suffix, so the owner half uses the
+    /// same exact-or-`-`-boundary prefix rule as toolchain admission. The
+    /// component half is exact.
+    pub fn has_rustup_component(&self, toolchain: &str, component: &str) -> bool {
+        let owner_prefix = format!("{toolchain}-");
+        self.rustup_components.iter().any(|fact| {
+            fact.split_once(':').is_some_and(|(owner, name)| {
+                name == component && (owner == toolchain || owner.starts_with(&owner_prefix))
+            })
+        })
     }
 
     /// Check if this worker has Nix installed (nix binary + `/nix/store`).
@@ -3617,6 +3641,8 @@ retry_max = 2
         let _guard = test_guard!();
         let caps = WorkerCapabilities::default();
         assert!(caps.rustc_version.is_none());
+        assert!(caps.rustup_toolchains.is_empty());
+        assert!(caps.rustup_components.is_empty());
         assert!(caps.bun_version.is_none());
         assert!(caps.node_version.is_none());
         assert!(caps.npm_version.is_none());
@@ -3644,6 +3670,25 @@ retry_max = 2
 
         caps.rustc_version = Some("rustc 1.76.0 (07dca489a 2024-02-04)".to_string());
         assert!(caps.has_rust());
+    }
+
+    #[test]
+    fn test_worker_capabilities_components_are_toolchain_scoped_and_exact() {
+        let _guard = test_guard!();
+        let caps = WorkerCapabilities {
+            rustup_components: vec![
+                "stable-x86_64-unknown-linux-gnu:clippy".to_string(),
+                "nightly-2026-07-05-x86_64-unknown-linux-gnu:rustfmt".to_string(),
+                "beta-x86_64-unknown-linux-gnu:clippy-preview".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert!(caps.has_rustup_component("stable", "clippy"));
+        assert!(caps.has_rustup_component("nightly-2026-07-05", "rustfmt"));
+        assert!(!caps.has_rustup_component("nightly-2026-07-05", "clippy"));
+        assert!(!caps.has_rustup_component("beta", "clippy"));
+        assert!(!caps.has_rustup_component("nightly-2026-07-0", "rustfmt"));
     }
 
     #[test]

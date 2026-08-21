@@ -657,6 +657,8 @@ mod tests {
                     )| {
                         WorkerCapabilities {
                             rustc_version,
+                            rustup_toolchains: Vec::new(),
+                            rustup_components: Vec::new(),
                             bun_version,
                             node_version,
                             npm_version,
