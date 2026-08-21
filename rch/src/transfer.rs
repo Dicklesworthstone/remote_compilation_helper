@@ -1365,6 +1365,24 @@ impl TransferPipeline {
         }
     }
 
+    /// Format one env assignment for the remote command prefix.
+    ///
+    /// Managed directory values are resolved to their PHYSICAL path on the
+    /// worker (`pwd -P`) at execution time. Worker mirror layouts route the
+    /// synced project root through symlinks (e.g. `/Users/... -> /data/...`),
+    /// and consumers that walk TMPDIR ancestors with `O_NOFOLLOW` hardening
+    /// (pi's auth storage does, and refuses even trusted symlinks when the
+    /// job runs as root) fail with ENOTDIR on such a path. `cd` runs after
+    /// the `mkdir -p` ensure-dirs step, so the directory exists; if it still
+    /// fails, fall back to the literal managed path.
+    fn format_env_assignment(&self, key: &str, escaped: &str, managed_dir: bool) -> String {
+        if managed_dir && !self.worker_platform.is_windows() {
+            format!("{key}=\"$(cd {escaped} 2>/dev/null && pwd -P || printf %s {escaped})\"")
+        } else {
+            format!("{key}={escaped}")
+        }
+    }
+
     fn build_remote_env_plan(&self, remote_path: &str) -> RemoteEnvPlan {
         let mut parts = Vec::new();
         let mut applied = Vec::new();
@@ -1407,13 +1425,14 @@ impl TransferPipeline {
                 continue;
             };
 
+            let managed_dir = ensure_dir.is_some();
             if let Some(dir) = ensure_dir
                 && !ensure_dirs.iter().any(|existing| existing == &dir)
             {
                 ensure_dirs.push(dir);
             }
 
-            parts.push(format!("{key}={escaped}"));
+            parts.push(self.format_env_assignment(key, &escaped, managed_dir));
             applied.push(key.to_string());
         }
 
@@ -1438,7 +1457,7 @@ impl TransferPipeline {
             if !ensure_dirs.iter().any(|existing| existing == &ensure_dir) {
                 ensure_dirs.push(ensure_dir);
             }
-            parts.push(format!("{key}={escaped}"));
+            parts.push(self.format_env_assignment(key, &escaped, true));
             applied.push(key.to_string());
         }
 
@@ -6006,11 +6025,14 @@ mod tests {
 
         let worker_scoped_root = pipeline.remote_path();
         let command = pipeline.build_remote_command("cargo test --no-run", None);
-        assert!(command.contains(&format!(
-            "CARGO_TARGET_DIR='{}/.rch-target'",
-            worker_scoped_root
+        assert!(command.contains(&managed_assignment(
+            "CARGO_TARGET_DIR",
+            &format!("{worker_scoped_root}/.rch-target")
         )));
-        assert!(command.contains(&format!("TMPDIR='{}/.rch-tmp'", worker_scoped_root)));
+        assert!(command.contains(&managed_assignment(
+            "TMPDIR",
+            &format!("{worker_scoped_root}/.rch-tmp")
+        )));
         assert!(command.contains("mkdir -p"));
         assert!(command.contains(&format!("{}/.rch-target", worker_scoped_root)));
         assert!(command.contains(&format!("{}/.rch-tmp", worker_scoped_root)));
@@ -6020,6 +6042,12 @@ mod tests {
             "host-local tmpfs path should not be forwarded to worker"
         );
         assert!(command.contains(&worker_scoped_root));
+    }
+
+    /// Expected form of a managed directory assignment in the remote command:
+    /// resolved to the physical path on the worker (see `format_env_assignment`).
+    fn managed_assignment(key: &str, path: &str) -> String {
+        format!("{key}=\"$(cd '{path}' 2>/dev/null && pwd -P || printf %s '{path}')\"")
     }
 
     #[test]
@@ -6040,23 +6068,35 @@ mod tests {
         let command = pipeline.build_remote_command("cargo build", None);
 
         assert!(
-            command.contains(&format!("CARGO_TARGET_DIR='{}/.rch-target'", root)),
+            command.contains(&managed_assignment(
+                "CARGO_TARGET_DIR",
+                &format!("{root}/.rch-target")
+            )),
             "CARGO_TARGET_DIR must be injected: {command}"
         );
         assert!(
-            command.contains(&format!("TMPDIR='{}/.rch-tmp'", root)),
+            command.contains(&managed_assignment("TMPDIR", &format!("{root}/.rch-tmp"))),
             "TMPDIR must be injected: {command}"
         );
         assert!(
-            command.contains(&format!("GOCACHE='{}/.rch-go/cache'", root)),
+            command.contains(&managed_assignment(
+                "GOCACHE",
+                &format!("{root}/.rch-go/cache")
+            )),
             "GOCACHE must be injected: {command}"
         );
         assert!(
-            command.contains(&format!("GOMODCACHE='{}/.rch-go/mod'", root)),
+            command.contains(&managed_assignment(
+                "GOMODCACHE",
+                &format!("{root}/.rch-go/mod")
+            )),
             "GOMODCACHE must be injected: {command}"
         );
         assert!(
-            command.contains(&format!("GOPATH='{}/.rch-go/path'", root)),
+            command.contains(&managed_assignment(
+                "GOPATH",
+                &format!("{root}/.rch-go/path")
+            )),
             "GOPATH must be injected: {command}"
         );
         // Each managed dir must be mkdir'd before the build.
@@ -6090,7 +6130,10 @@ mod tests {
         let command = pipeline.build_remote_command("cargo build", None);
 
         assert!(
-            command.contains(&format!("CARGO_TARGET_DIR='{}/.rch-target'", root)),
+            command.contains(&managed_assignment(
+                "CARGO_TARGET_DIR",
+                &format!("{root}/.rch-target")
+            )),
             "absolute target-dir must be rewritten to managed path: {command}"
         );
         assert!(
@@ -6169,9 +6212,9 @@ mod tests {
 
         let worker_scoped_root = pipeline.remote_path();
         let command = pipeline.build_remote_command("cargo test --no-run", None);
-        assert!(command.contains(&format!(
-            "CARGO_TARGET_DIR='{}/.rch-target-worker-job-42'",
-            worker_scoped_root
+        assert!(command.contains(&managed_assignment(
+            "CARGO_TARGET_DIR",
+            &format!("{worker_scoped_root}/.rch-target-worker-job-42")
         )));
         assert!(command.contains(&format!("{}/.rch-target-worker-job-42", worker_scoped_root)));
         assert!(!command.contains(&format!("{}/.rch-target'", worker_scoped_root)));

@@ -25,7 +25,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.57"
+version = "1.0.58"
 edition = "2024"
 license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 authors = ["Remote Compilation Helper Contributors"]
