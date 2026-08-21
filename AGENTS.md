@@ -1094,3 +1094,5 @@ serves that outcome and never becomes the product.
   deterrent. The full catalog with countermeasures lives in the
   just-say-no-to-process-porn-and-ceremony skill; ask the operator for it
   if you cannot resolve that reference.
+
+For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
