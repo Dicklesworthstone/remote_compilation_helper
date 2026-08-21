@@ -36,8 +36,15 @@ set -euo pipefail
 # Configuration
 # ============================================================================
 
-INSTALLER_VERSION="1.0.52"
+# Last-resort floor used only when every release-discovery path fails. Keep it in
+# step with the newest published release; enforce_no_downgrade() stops a stale
+# value here from clobbering a newer install.
+INSTALLER_VERSION="1.0.57"
 VERSION="${VERSION:-}"  # Set dynamically based on install mode
+# Records whether the caller pinned a version (VERSION=... or --version), which
+# suppresses the no-downgrade guard so deliberate rollbacks still work.
+VERSION_EXPLICIT=false
+SKIP_INSTALL_NO_DOWNGRADE=false
 REPO_URL="https://github.com/Dicklesworthstone/remote_compilation_helper"
 GITHUB_REPO="Dicklesworthstone/remote_compilation_helper"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}"
@@ -1008,6 +1015,7 @@ extract_checksum_from_manifest() {
 detect_target_version() {
     # If VERSION already set (e.g., from environment), use it
     if [[ -n "${VERSION:-}" ]]; then
+        VERSION_EXPLICIT=true
         return 0
     fi
 
@@ -1053,7 +1061,7 @@ detect_target_version() {
     # If offline tarball, try to extract from filename
     if [[ -n "${OFFLINE_TARBALL:-}" ]]; then
         local tarball_version
-        tarball_version=$(echo "$OFFLINE_TARBALL" | sed -n 's/.*rch-v\?\([0-9][0-9.]*\).*/\1/p')
+        tarball_version=$(echo "$OFFLINE_TARBALL" | sed -n 's/.*rch-v*\([0-9][0-9.]*\).*/\1/p')
         if [[ -n "$tarball_version" ]]; then
             VERSION="$tarball_version"
             return 0
@@ -1062,15 +1070,73 @@ detect_target_version() {
 
     # Try to fetch latest from GitHub (with timeout)
     local latest
+    # NB: use "v*" not "v\?" - \? is a GNU sed extension that BSD sed (macOS)
+    # does not understand, where it silently yields an empty match and sends us
+    # down the stale-fallback path.
     latest=$(curl -sL --connect-timeout 5 "${GITHUB_API}/releases/latest" 2>/dev/null | \
-             sed -n 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/p' | head -1)
+             sed -n 's/.*"tag_name": *"v*\([^"]*\)".*/\1/p' | head -1)
     if [[ -n "$latest" ]]; then
         VERSION="$latest"
         return 0
     fi
 
-    # Fallback to installer version
+    # The api.github.com endpoint above is rate limited to 60 requests/hour for
+    # unauthenticated clients, per source IP. A host that installs many tools in
+    # one batch (or several hosts behind one NAT) exhausts that budget, and the
+    # rate-limited response carries no "tag_name" — so the parse above yields an
+    # empty string and we silently fall through. Retry via the github.com
+    # releases/latest redirect, which is not part of the API rate limit: it 302s
+    # to .../releases/tag/vX.Y.Z, so the resolved URL carries the version.
+    local latest_url
+    latest_url=$(curl -sL -o /dev/null --connect-timeout 5 --max-time 20 \
+                 -w '%{url_effective}' "${REPO_URL}/releases/latest" 2>/dev/null)
+    latest=$(printf '%s' "$latest_url" | sed -n 's|.*/releases/tag/v*\([0-9][0-9.]*\).*|\1|p')
+    if [[ -n "$latest" ]]; then
+        VERSION="$latest"
+        return 0
+    fi
+
+    # Fallback to installer version. This is a floor, not a target: it goes stale
+    # every release, so enforce_no_downgrade() below refuses to replace a newer
+    # existing install with it.
     VERSION="$INSTALLER_VERSION"
+}
+
+# Refuse to replace an existing install with an older one.
+#
+# Version discovery is best-effort (network, API rate limits, offline installs),
+# and every fallback path is stale by construction. Without this guard a
+# transient lookup failure turns a routine "keep tools updated" run into a
+# silent DOWNGRADE of a working binary — which is exactly how the fleet ended up
+# running rch 1.0.52 while 1.0.57 was the published release.
+#
+# An explicitly requested version (VERSION=... or --version) is always honoured,
+# so intentional rollbacks still work.
+version_gt() {
+    [[ "$1" != "$2" ]] && \
+        [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V 2>/dev/null | tail -1)" == "$1" ]]
+}
+
+enforce_no_downgrade() {
+    [[ "${VERSION_EXPLICIT:-false}" == "true" ]] && return 0
+    [[ -n "${OFFLINE_TARBALL:-}" ]] && return 0
+    [[ "${FROM_SOURCE:-false}" == "true" ]] && return 0
+    [[ -x "$INSTALL_DIR/rch" ]] || return 0
+
+    local current
+    current=$("$INSTALL_DIR/rch" --version 2>/dev/null | head -1 | sed 's/rch //' | awk '{print $1}')
+    [[ -n "$current" ]] || return 0
+    [[ -n "${VERSION:-}" ]] || return 0
+
+    if version_gt "$current" "$VERSION"; then
+        warn "Installed rch v${current} is newer than resolved target v${VERSION}."
+        warn "This usually means the release lookup failed (GitHub API rate limit) and"
+        warn "the installer fell back to its built-in floor. Keeping v${current}."
+        info "To force a specific version anyway: VERSION=${VERSION} $0"
+        VERSION="$current"
+        SKIP_INSTALL_NO_DOWNGRADE=true
+    fi
+    return 0
 }
 
 # ============================================================================
@@ -2701,6 +2767,13 @@ main() {
 
     # Acquire lock
     acquire_lock
+
+    # Never let a failed release lookup downgrade a working install
+    enforce_no_downgrade
+    if [[ "$SKIP_INSTALL_NO_DOWNGRADE" == "true" ]]; then
+        success "rch v${VERSION} is already installed and newer than the resolved target; nothing to do."
+        exit 0
+    fi
 
     # Check for existing installation (shows upgrade banner)
     check_existing_install || true
