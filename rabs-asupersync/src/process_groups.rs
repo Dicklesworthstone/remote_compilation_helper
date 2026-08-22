@@ -274,6 +274,49 @@ impl ManagedProcessGroup {
         self.leader.wait_with_output()
     }
 
+    /// Bounded-drain successor to [`Self::wait_with_output`] (bead G007;
+    /// risk R36). Both pipes drain concurrently into STRICT per-stream
+    /// bounds: heads stay resident (diagnostics live there), overflow
+    /// streams incrementally to spill files (`stdout.spill` /
+    /// `stderr.spill` under `limits.spill_dir`) instead of growing
+    /// memory.
+    ///
+    /// Ordering encodes the cancellation contract: lanes start first,
+    /// leader exit is observed, [`reap_residuals`] forces EOF for any
+    /// orphaned descendant still holding a pipe write end (so a cancelled
+    /// action completes deterministically instead of hanging), lanes are
+    /// joined with everything written up to the kill captured — THEN the
+    /// exit status is returned. A plain `read-to-end + wait` cannot give
+    /// that guarantee: an orphan-held pipe blocks EOF indefinitely.
+    ///
+    /// # Errors
+    /// Typed [`io::Error`] from lane drains, spill writes, or the wait.
+    pub fn wait_with_bounded_drain(
+        self,
+        limits: &crate::stream_drain::DrainLimits,
+    ) -> io::Result<crate::stream_drain::DrainedOutput> {
+        use crate::stream_drain::{join_lane, spawn_lanes};
+        let pgid = self.pgid;
+        let mut leader = self.leader;
+        let (out_lane, err_lane) = spawn_lanes(&mut leader, limits);
+        let status = leader.wait()?;
+        // Post-leader closer BEFORE joining lanes: orphaned descendants
+        // can hold pipe write ends indefinitely; killing the group forces
+        // EOF so the joins below always terminate. In the natural-exit
+        // happy path this is a single /proc probe returning 0.
+        let residual_group_members = reap_residuals(pgid);
+        let stdout =
+            out_lane.map_or_else(|| Ok(crate::stream_drain::LaneDrain::empty()), join_lane)?;
+        let stderr =
+            err_lane.map_or_else(|| Ok(crate::stream_drain::LaneDrain::empty()), join_lane)?;
+        Ok(crate::stream_drain::DrainedOutput {
+            status,
+            stdout,
+            stderr,
+            residual_group_members,
+        })
+    }
+
     /// Post-leader-exit closer: guarantee NO live member survives
     /// management. Polls briefly for natural exit (orphans reparent to
     /// pid 1 and are reaped), escalates to a group KILL at half grace,

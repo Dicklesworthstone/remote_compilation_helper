@@ -182,6 +182,8 @@ async fn session_loop(
     let home = std::env::temp_dir().join(format!("rabs-wkr-home-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&cargo_home);
     let _ = std::fs::create_dir_all(&home);
+    let spills = std::env::temp_dir().join(format!("rabs-wkr-spill-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&spills);
 
     // Steady state: exec requests, pings, and periodic heartbeats.
     loop {
@@ -222,17 +224,29 @@ async fn session_loop(
                         continue;
                     }
                 };
-                let result = execute_canonical(&request, &cargo_home, &home, report.slots);
+                let result = execute_canonical(&request, &cargo_home, &home, report.slots, &spills);
                 let reply = format!(
                     "{{\"kind\":\"exec-result\",\"request_id\":{},\"exit_code\":{},\
                      \"stdout_sha256\":{},\"stderr_sha256\":{},\"executed\":{},\
-                     \"residual_group_members\":{}}}",
+                     \"residual_group_members\":{},\"stdout_spill_bytes\":{},\
+                     \"stderr_spill_bytes\":{},\"stdout_spill_path\":{},\
+                     \"stderr_spill_path\":{}}}",
                     result.request_id,
                     result.exit_code,
                     json_string(&result.stdout_sha256),
                     json_string(&result.stderr_sha256),
                     result.executed,
                     result.residual_group_members,
+                    result.stdout_spill_bytes,
+                    result.stderr_spill_bytes,
+                    match &result.stdout_spill_path {
+                        Some(p) => json_string(p),
+                        None => "null".into(),
+                    },
+                    match &result.stderr_spill_path {
+                        Some(p) => json_string(p),
+                        None => "null".into(),
+                    },
                 );
                 if !write_frame(&mut stream, &reply).await {
                     return Ok(());

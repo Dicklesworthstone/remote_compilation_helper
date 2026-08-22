@@ -87,7 +87,13 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
         toolchain_backing: toolchain.path().display().to_string(),
         workspace_backing: workspace.path().display().to_string(),
     };
-    let result = execute_canonical(&request, toolchain.path(), workspace.path(), 6);
+    let result = execute_canonical(
+        &request,
+        toolchain.path(),
+        workspace.path(),
+        6,
+        &workspace.path().join("spills"),
+    );
 
     assert!(result.executed, "namespace host must execute, not refuse");
     assert_eq!(result.exit_code, 0, "grep must find the coordination var");

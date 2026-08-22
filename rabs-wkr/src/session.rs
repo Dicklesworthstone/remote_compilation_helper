@@ -86,6 +86,16 @@ pub struct ExecResult {
     /// cleanup (bead G006). 0 = the managed group resolved fully; any
     /// other value is an honest incident record for the receipt.
     pub residual_group_members: u32,
+    /// Bytes diverted to the stdout spill archive when stdout exceeded
+    /// G007's per-stream resident bound (0 = fully resident).
+    pub stdout_spill_bytes: u64,
+    /// Bytes diverted to the stderr spill archive under the same policy.
+    pub stderr_spill_bytes: u64,
+    /// Worker-side path of the stdout spill archive (retrievable offer;
+    /// transport to the edge is later-bead work).
+    pub stdout_spill_path: Option<String>,
+    /// Worker-side path of the stderr spill archive.
+    pub stderr_spill_path: Option<String>,
 }
 
 /// Typed handshake refusal.
@@ -112,6 +122,34 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex(&hasher.finalize())
+}
+
+/// SHA-256 of a G007 drained stream: the digest covers the FULL byte
+/// sequence the action wrote — resident head first, then every spilled
+/// byte read back incrementally from the archive — so a spilled stream
+/// and a fully-resident one with identical content hash identically.
+///
+/// # Errors
+/// Typed [`std::io::Error`] if the spill archive cannot be re-read; the
+/// caller reports a typed non-result rather than a fabricated digest.
+fn stream_digest(lane: &rabs_asupersync::stream_drain::LaneDrain) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read as _;
+    let mut hasher = Sha256::new();
+    hasher.update(lane.resident());
+    if let Some(spill) = lane.spill() {
+        let file = std::fs::File::open(&spill.path)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            let n = reader.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&chunk[..n]);
+        }
+    }
+    Ok(hex(&hasher.finalize()))
 }
 
 /// Probe this host's real capability (the scheduler consumes it).
@@ -183,29 +221,41 @@ fn free_disk_mib(_dir: &std::path::Path) -> u64 {
     0
 }
 
+/// Per-stream RESIDENT bound for canonical execution output (G007):
+/// heads carry diagnostics; overflow streams to disk spill archives.
+const EXEC_STREAM_RESIDENT_BOUND: usize = 1024 * 1024;
+
 /// Execute one canonical request through the PROVEN rabs-sandbox
 /// launcher. On a host that cannot run the namespace, returns a typed
 /// non-result (`executed: false`) — never a fabricated success.
 ///
 /// G006 lifecycle ownership:
 /// - The action leads its OWN process group
-///   ([`rabs_asupersync::process_groups`]);
-///   after the leader exits, [`reap_residuals`] guarantees no member of
-///   that group survives (count reported honestly).
+///   ([`rabs_asupersync::process_groups`]); after the leader exits, the
+///   escalating residual closer (inside
+///   `wait_with_bounded_drain`) guarantees no member of that group
+///   survives; the count is reported honestly on the wire.
 /// - The worker owns the concurrency budget: any client-supplied
 ///   make-style coordination env is replaced with the worker-local
 ///   `-j<slots>` budget ([`crate::jobserver`]) BEFORE the namespace argv
 ///   is compiled, so no foreign jobserver handle can leak through
 ///   `extra_env`.
+/// - Output capture is BOUNDED (G007): each stream keeps a resident
+///   head ([`EXEC_STREAM_RESIDENT_BOUND`]); overflow streams to
+///   retrievable spill archives under `spill_root`, result digests cover
+///   the FULL stream, and draining continues through cancellation — an
+///   orphaned descendant holding a pipe cannot hang the attempt because
+///   the residual closer forces EOF before lanes join.
 #[must_use]
 pub fn execute_canonical(
     request: &CanonicalExecRequest,
     cargo_home_backing: &std::path::Path,
     home_backing: &std::path::Path,
     slots: u32,
+    spill_root: &std::path::Path,
 ) -> ExecResult {
     use crate::jobserver::replace_with_worker_local;
-    use rabs_asupersync::process_groups::{ManagedProcessGroup, reap_residuals};
+    use rabs_asupersync::process_groups::ManagedProcessGroup;
     use rabs_asupersync::region_tree::Attribution;
     use rabs_sandbox::canonical_mounts::CanonicalMountPlan;
     use rabs_sandbox::canonical_namespace::{
@@ -221,6 +271,10 @@ pub fn execute_canonical(
             stderr_sha256: sha256_hex(b""),
             executed: false,
             residual_group_members: 0,
+            stdout_spill_bytes: 0,
+            stderr_spill_bytes: 0,
+            stdout_spill_path: None,
+            stderr_spill_path: None,
         };
     }
 
@@ -241,10 +295,10 @@ pub fn execute_canonical(
     };
 
     // Managed process-group execution (bead G006): the action leads its
-    // own fresh POSIX group; wait_with_output DRAINS both pipes
-    // concurrently while waiting, so chatty builds cannot deadlock on a
-    // full kernel pipe buffer. Unbounded in-memory capture is the
-    // documented stopgap until G007's bounded spill objects replace it.
+    // own fresh POSIX group. Output capture is the G007 bounded drain:
+    // both pipes drain concurrently into strict per-stream bounds, so a
+    // chatty build can neither deadlock on a full pipe buffer NOR exhaust
+    // memory — overflow lands in retrievable spill archives.
     let mut command = command_for(&launch);
     command
         .stdin(Stdio::null())
@@ -260,12 +314,14 @@ pub fn execute_canonical(
     let Ok(group) = ManagedProcessGroup::spawn_command(command, attribution) else {
         return exec_error(request.request_id);
     };
-    let pgid = group.pgid();
-    match group.wait_with_output() {
+    let limits = rabs_asupersync::stream_drain::DrainLimits {
+        resident_bound: EXEC_STREAM_RESIDENT_BOUND,
+        spill_dir: spill_root.join(format!("attempt-{}", request.request_id)),
+    };
+    match group.wait_with_bounded_drain(&limits) {
         Ok(output) => {
-            // Post-leader closer: TERM-resistant descendants are KILLed;
-            // the residual count is reported honestly on the wire.
-            let residual_group_members = reap_residuals(pgid);
+            // The residual closer already ran inside
+            // wait_with_bounded_drain; its honest count rides the output.
             // ExecResult's documented wire contract: exit code, with a
             // signal death encoded 128+signal (AGENTS.md exit-code
             // semantics; std gives no code for a signaled process).
@@ -276,19 +332,31 @@ pub fn execute_canonical(
             });
             #[cfg(not(unix))]
             let exit_code = output.status.code().unwrap_or(-1);
+            // Full-stream digests (resident head ++ spill archive). A
+            // digest failure means the offer would be unverifiable, so
+            // report the typed non-result instead of a fabricated hash.
+            let (stdout_sha256, stderr_sha256) =
+                match (stream_digest(&output.stdout), stream_digest(&output.stderr)) {
+                    (Ok(s), Ok(e)) => (s, e),
+                    _ => return exec_error(request.request_id),
+                };
             ExecResult {
                 request_id: request.request_id,
                 exit_code,
-                stdout_sha256: sha256_hex(&output.stdout),
-                stderr_sha256: sha256_hex(&output.stderr),
+                stdout_sha256,
+                stderr_sha256,
                 executed: true,
-                residual_group_members,
+                residual_group_members: output.residual_group_members,
+                stdout_spill_bytes: output.stdout.spilled_bytes(),
+                stderr_spill_bytes: output.stderr.spilled_bytes(),
+                stdout_spill_path: output.stdout.spill().map(|s| s.path.display().to_string()),
+                stderr_spill_path: output.stderr.spill().map(|s| s.path.display().to_string()),
             }
         }
         Err(_) => {
-            // Leader wait failed; still close out whatever joined the
-            // group before reporting the typed non-result.
-            let _ = reap_residuals(pgid);
+            // Drain or wait failed; the residual closer already ran
+            // inside wait_with_bounded_drain. Report the typed
+            // non-result.
             exec_error(request.request_id)
         }
     }
@@ -302,6 +370,10 @@ fn exec_error(request_id: u64) -> ExecResult {
         stderr_sha256: sha256_hex(b""),
         executed: false,
         residual_group_members: 0,
+        stdout_spill_bytes: 0,
+        stderr_spill_bytes: 0,
+        stdout_spill_path: None,
+        stderr_spill_path: None,
     }
 }
 
@@ -386,6 +458,10 @@ mod tests {
             stderr_sha256: sha256_hex(b""),
             executed: true,
             residual_group_members: 0,
+            stdout_spill_bytes: 0,
+            stderr_spill_bytes: 0,
+            stdout_spill_path: None,
+            stderr_spill_path: None,
         };
         assert_eq!(result.request_id, 9);
         assert_eq!(
@@ -414,7 +490,7 @@ mod tests {
             toolchain_backing: "/tc".into(),
             workspace_backing: "/ws".into(),
         };
-        let result = execute_canonical(&request, dir.path(), dir.path(), 4);
+        let result = execute_canonical(&request, dir.path(), dir.path(), 4, dir.path());
         assert!(!result.executed, "no fabricated success off-Linux");
     }
 }

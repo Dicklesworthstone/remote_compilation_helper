@@ -43,4 +43,5 @@ pub mod cargo_launch;
 pub mod jobserver;
 pub mod process_groups;
 pub mod root_permits;
+pub mod stream_drain;
 pub mod termination;
