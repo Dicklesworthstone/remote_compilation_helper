@@ -477,8 +477,15 @@ pub(super) async fn execute_remote_compilation(
     // visible to this client-side preflight; such deployments must keep
     // compile-time default roots present or extend this call to a shared
     // resolver before relying on plain 'rch exec' there.
-    ensure_worker_projects_topology(&worker_config, reporter, &PathTopologyPolicy::default())
-        .await?;
+    ensure_worker_projects_topology(
+        &worker_config,
+        reporter,
+        &PathTopologyPolicy::default(),
+        normalized_project_root
+            .file_name()
+            .and_then(|name| name.to_str()),
+    )
+    .await?;
 
     // Best-effort repo convergence for ordinary multi-repo dependency graphs.
     // A clean-overlay run already names an immutable base; mutating repositories
@@ -486,7 +493,6 @@ pub(super) async fn execute_remote_compilation(
     if clean_overlay.is_none() {
         maybe_sync_repo_set_with_repo_updater(&worker_config, &sync_roots, reporter).await;
     }
-
     // Build transfer pipelines with color mode, command timeout, and compilation kind.
     // When the in-session watchdog is active it enforces the real build cap
     // remotely (same timeout_for_kind value). Give the local SSH stream a grace
