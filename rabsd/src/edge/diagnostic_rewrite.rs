@@ -235,6 +235,62 @@ pub fn translate_rendered(mapping: &SubscriberMapping, text: &str) -> Translatio
     }
 }
 
+// ---------------------------------------------------------------------
+// K006 presentation feasibility: non-JSON and mixed transcripts go
+// through presentation variants or bypass (plan §86) — never emitted
+// half-structured.
+// ---------------------------------------------------------------------
+
+/// How a subscriber requires the transcript presented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequiredPresentation {
+    /// Human/rendered passthrough: any bytes are faithful.
+    Rendered,
+    /// Line-delimited JSON only (Cargo consumes NDJSON): any rendered
+    /// text line makes faithful structured replay impossible.
+    StructuredJsonOnly,
+}
+
+/// Whether a stored transcript can satisfy the required presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayFeasibility {
+    /// Every record satisfies the requirement.
+    Faithful,
+    /// At least one line is not valid JSON (or is an oversized spill,
+    /// which by construction is not a single NDJSON event): bypass
+    /// serving rather than emit a stream Cargo would misparse.
+    BypassNonJson,
+}
+
+/// Decide structured-replay feasibility WITHOUT walking bytes through
+/// sinks: a cheap scan validating each stored line as JSON. Spilled
+/// lines exceed any line bound, so under `StructuredJsonOnly` they
+/// force bypass on sight. Rendered presentation is always faithful —
+/// byte fidelity does not depend on content shape.
+#[must_use]
+pub fn transcript_replay_feasibility(
+    observations: &[rabs_protocol::stream_chunker::CanonicalObservation],
+    required: RequiredPresentation,
+) -> ReplayFeasibility {
+    let structured_only = required == RequiredPresentation::StructuredJsonOnly;
+    for obs in observations {
+        match obs {
+            rabs_protocol::stream_chunker::CanonicalObservation::Line { bytes, .. } => {
+                if structured_only && serde_json::from_slice::<serde_json::Value>(bytes).is_err() {
+                    return ReplayFeasibility::BypassNonJson;
+                }
+            }
+            rabs_protocol::stream_chunker::CanonicalObservation::SpilledLine { .. } => {
+                if structured_only {
+                    return ReplayFeasibility::BypassNonJson;
+                }
+            }
+            rabs_protocol::stream_chunker::CanonicalObservation::TerminalExit { .. } => {}
+        }
+    }
+    ReplayFeasibility::Faithful
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +441,67 @@ mod tests {
             panic!()
         };
         assert_eq!(out, "path /home/alice/proj/target/debug/fx");
+    }
+
+    #[test]
+    fn k006_structured_requirement_bypasses_non_json_and_spilled_lines() {
+        use crate::edge::diagnostic_rewrite::{
+            ReplayFeasibility, RequiredPresentation, transcript_replay_feasibility,
+        };
+        use rabs_protocol::stream_chunker::CanonicalObservation;
+        use rabs_protocol::stream_chunker::StdStream;
+
+        let json_line = CanonicalObservation::Line {
+            stream: StdStream::Stdout,
+            seq: 1,
+            bytes: br#"{"reason":"compiler-artifact","target":{"kind":["lib"]}}"#.to_vec(),
+        };
+        let rendered_line = CanonicalObservation::Line {
+            stream: StdStream::Stderr,
+            seq: 2,
+            bytes: b"warning: unused import\n".to_vec(),
+        };
+        let spilled = CanonicalObservation::SpilledLine {
+            stream: StdStream::Stderr,
+            seq: 3,
+            spill_id: 1,
+            total_bytes: 500,
+        };
+        let exit = CanonicalObservation::TerminalExit { code: 0 };
+
+        // Rendered presentation is always faithful: byte fidelity does
+        // not depend on content shape.
+        assert_eq!(
+            transcript_replay_feasibility(
+                &[rendered_line.clone(), exit.clone()],
+                RequiredPresentation::Rendered
+            ),
+            ReplayFeasibility::Faithful
+        );
+        // All-JSON transcript satisfies the structured requirement.
+        assert_eq!(
+            transcript_replay_feasibility(
+                &[json_line.clone(), exit.clone()],
+                RequiredPresentation::StructuredJsonOnly
+            ),
+            ReplayFeasibility::Faithful
+        );
+        // ONE human line in a mixed stream makes structured replay
+        // impossible: bypass, never a half-structured emission.
+        assert_eq!(
+            transcript_replay_feasibility(
+                &[json_line.clone(), rendered_line.clone(), exit],
+                RequiredPresentation::StructuredJsonOnly
+            ),
+            ReplayFeasibility::BypassNonJson
+        );
+        // A spilled line is by construction not a single NDJSON event.
+        assert_eq!(
+            transcript_replay_feasibility(
+                &[json_line, spilled],
+                RequiredPresentation::StructuredJsonOnly
+            ),
+            ReplayFeasibility::BypassNonJson
+        );
     }
 }
