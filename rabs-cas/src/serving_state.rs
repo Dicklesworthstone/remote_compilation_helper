@@ -241,9 +241,7 @@ pub fn classify_deterministic_failure(
     if !trust_policy_permits {
         return Err(FailureRefusal::TrustPolicyRefused);
     }
-    Ok(FailureAdmission {
-        normalized_exit,
-    })
+    Ok(FailureAdmission { normalized_exit })
 }
 
 /// What revalidation concluded about a served failure.
@@ -763,6 +761,305 @@ mod tests {
                 &[],
             ),
             Err(StoreError::StaleServingRevision)
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // K007: R28-class publication fixtures + served-failure TTL /
+    // revalidation lifecycle.
+    // -------------------------------------------------------------------
+
+    /// Every R28-class terminal outcome refuses publication with its
+    /// named class (OOM/signals NEVER publish); exit 0 is not a
+    /// failure; a plain nonzero exit with every gate open is admitted;
+    /// each closed gate yields its typed refusal in bead-check order.
+    #[test]
+    fn k007_r28_class_never_publishes() {
+        let r28 = [
+            (TerminalOutcome::Oom, "oom"),
+            (TerminalOutcome::Signal(9), "signal"),
+            (TerminalOutcome::Signal(137), "signal"),
+            (TerminalOutcome::Cancelled, "cancelled"),
+            (TerminalOutcome::Timeout, "timeout"),
+            (TerminalOutcome::WorkerLost, "worker-loss"),
+            (TerminalOutcome::TransportFailed, "transport-failure"),
+            (TerminalOutcome::Panicked, "panic"),
+        ];
+        for (outcome, class) in r28 {
+            assert_eq!(
+                classify_deterministic_failure(outcome, true, true, true, true, true),
+                Err(FailureRefusal::NotDeterministic(class)),
+                "{class} must never publish as a deterministic failure"
+            );
+        }
+        assert_eq!(
+            classify_deterministic_failure(TerminalOutcome::Exit(0), true, true, true, true, true),
+            Err(FailureRefusal::ZeroExitIsNotAFailure),
+        );
+        assert_eq!(
+            classify_deterministic_failure(
+                TerminalOutcome::Exit(101),
+                true,
+                true,
+                true,
+                true,
+                true
+            ),
+            Ok(FailureAdmission {
+                normalized_exit: 101
+            }),
+        );
+        // The first closed gate wins, in bead-check order.
+        assert_eq!(
+            classify_deterministic_failure(
+                TerminalOutcome::Exit(1),
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
+            Err(FailureRefusal::CaptureIncomplete),
+        );
+        assert_eq!(
+            classify_deterministic_failure(
+                TerminalOutcome::Exit(1),
+                true,
+                false,
+                false,
+                false,
+                false
+            ),
+            Err(FailureRefusal::InputsNotClosed),
+        );
+        assert_eq!(
+            classify_deterministic_failure(
+                TerminalOutcome::Exit(1),
+                true,
+                true,
+                false,
+                false,
+                false
+            ),
+            Err(FailureRefusal::UndeclaredSideEffects),
+        );
+        assert_eq!(
+            classify_deterministic_failure(
+                TerminalOutcome::Exit(1),
+                true,
+                true,
+                true,
+                false,
+                false
+            ),
+            Err(FailureRefusal::ClassPolicyRefused),
+        );
+        assert_eq!(
+            classify_deterministic_failure(TerminalOutcome::Exit(1), true, true, true, true, false),
+            Err(FailureRefusal::TrustPolicyRefused),
+        );
+    }
+
+    /// Served-failure lifecycle: short-TTL serving, expiry suppression,
+    /// stale-revision refusal, byte-identical revalidation appending
+    /// evidence and renewing the window, divergent revalidation
+    /// quarantining the action as a soundness incident. Run identically
+    /// on any backend; returns the final snapshot for differential
+    /// comparison.
+    fn k007_lifecycle_scenarios(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+        let (active, action_key) = published_fixture(store);
+        let action_typed = digest("rabs.action-key.sha256.v1", 7);
+
+        // Revalidation without a serving record is a typed refusal.
+        assert_eq!(
+            apply_revalidation(
+                store,
+                &active,
+                "missing:key",
+                &digest("rabs.action-key.sha256.v1", 99),
+                1,
+                21,
+                10,
+                "exit=1|diag=d1",
+                "exit=1|diag=d1",
+                "manifest-a",
+                "manifest-a",
+                "ev-a",
+                1_000,
+                1,
+                None,
+            ),
+            Err(RevalidationError::NoServingRecord)
+        );
+
+        // The admitted failure serves under the SHORT default TTL.
+        store
+            .put_serving_record(
+                &active,
+                &action_key,
+                "servable",
+                1,
+                &validity(1_000_000, Some(DEFAULT_REVALIDATION_TTL_MICROS), 0, 1),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            serving_gate(
+                store,
+                &action_key,
+                1_000_000 + i64::try_from(DEFAULT_REVALIDATION_TTL_MICROS / 2).unwrap(),
+                1,
+            )
+            .unwrap(),
+            ServeDecision::Servable
+        );
+        // Expiry suppresses serving (re-execution gets scheduled).
+        assert_eq!(
+            serving_gate(
+                store,
+                &action_key,
+                1_000_000 + i64::try_from(DEFAULT_REVALIDATION_TTL_MICROS + 1).unwrap(),
+                1,
+            )
+            .unwrap(),
+            ServeDecision::ExpiredTtl
+        );
+
+        // A wrong expected revision never clobbers stored state.
+        assert_eq!(
+            apply_revalidation(
+                store,
+                &active,
+                &action_key,
+                &action_typed,
+                7,
+                21,
+                10,
+                "exit=1|diag=d1",
+                "exit=1|diag=d1",
+                "manifest-a",
+                "manifest-a",
+                "ev-a",
+                1_040_000,
+                1,
+                None,
+            ),
+            Err(RevalidationError::StaleRevision { stored: 1 })
+        );
+
+        // Byte-identical reproduction APPENDS evidence and renews the
+        // window at the next revision.
+        assert_eq!(
+            apply_revalidation(
+                store,
+                &active,
+                &action_key,
+                &action_typed,
+                1,
+                21,
+                10,
+                "exit=1|diag=d1",
+                "exit=1|diag=d1",
+                "manifest-a",
+                "manifest-a",
+                "ev-a",
+                1_040_000,
+                1,
+                None,
+            ),
+            Ok(RevalidationVerdict::IdenticalEvidenceAppended { new_revision: 2 })
+        );
+        assert_eq!(
+            store
+                .serving_record(&action_key)
+                .unwrap()
+                .unwrap()
+                .state_revision,
+            2
+        );
+        // Renewed from 1_040_000 under the default TTL.
+        assert_eq!(
+            serving_gate(
+                store,
+                &action_key,
+                1_040_000 + i64::try_from(DEFAULT_REVALIDATION_TTL_MICROS / 2).unwrap(),
+                1,
+            )
+            .unwrap(),
+            ServeDecision::Servable
+        );
+        assert_eq!(
+            serving_gate(
+                store,
+                &action_key,
+                1_040_000 + i64::try_from(DEFAULT_REVALIDATION_TTL_MICROS + 1).unwrap(),
+                1,
+            )
+            .unwrap(),
+            ServeDecision::ExpiredTtl
+        );
+
+        // Success under the same key is a SOUNDNESS INCIDENT: recorded,
+        // quarantined, serving suppressed.
+        assert_eq!(
+            apply_revalidation(
+                store,
+                &active,
+                &action_key,
+                &action_typed,
+                2,
+                22,
+                11,
+                "exit=1|diag=d1",
+                "success",
+                "manifest-a",
+                "manifest-b",
+                "ev-b",
+                1_060_000,
+                1,
+                None,
+            ),
+            Ok(RevalidationVerdict::SoundnessIncidentQuarantined {
+                incident_seq: 3,
+                new_revision: 3,
+            })
+        );
+        let incidents = store.list_divergence_incidents(&action_key).unwrap();
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].class, "soundness");
+        assert_eq!(incidents[0].seq, 3);
+        let record = store.serving_record(&action_key).unwrap().unwrap();
+        assert_eq!(record.disposition, "quarantined");
+        assert_eq!(
+            record.blocking,
+            vec![("action-entry".to_owned(), action_key.clone())]
+        );
+        assert_eq!(
+            serving_gate(store, &action_key, 1_060_000, 1).unwrap(),
+            ServeDecision::NotServable {
+                disposition: "quarantined".to_owned(),
+            }
+        );
+
+        store.differential_snapshot().unwrap()
+    }
+
+    #[test]
+    fn k007_failure_ttl_lifecycle_reference_backend() {
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        k007_lifecycle_scenarios(&mut store);
+    }
+
+    #[test]
+    fn k007_failure_ttl_lifecycle_differential_reference_vs_frankensqlite() {
+        let reference_engine = RusqliteEngine::open(&fresh_path("k007ref")).unwrap();
+        let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+        let candidate_engine = FsqliteEngine::open(&fresh_path("k007fsq")).unwrap();
+        let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
+        assert_eq!(
+            k007_lifecycle_scenarios(&mut reference),
+            k007_lifecycle_scenarios(&mut candidate)
         );
     }
 }
