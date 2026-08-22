@@ -100,6 +100,37 @@ rch daemon logs --level warn
 rch daemon logs --since "1 hour ago"
 ```
 
+
+### Doctor: RUSTC_WRAPPER and one-time rebuilds
+
+`rch doctor` reports the state of Cargo's compile-wrapper variables
+(`RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`). Their rebuild semantics
+differ, and the check explains exactly what each one does — verified
+against current cargo by `rch/tests/rustc_wrapper_fingerprint_fixture.rs`:
+
+| Variable | In Cargo fingerprints? | Effect of enable / change / remove |
+|---|---|---|
+| `RUSTC_WRAPPER` | No | Never forces a rebuild. The wrapper must still exec the real compiler. |
+| `RUSTC_WORKSPACE_WRAPPER` | Yes (the value) | First use of a given value compiles the workspace once; reuse is incremental; removal falls back to previously valid artifacts without recompiling. |
+
+What the check reports:
+
+- **Pass** — no wrapper configured, a plain `RUSTC_WRAPPER` that resolves,
+  or an unchanged `RUSTC_WORKSPACE_WRAPPER`.
+- **Warning** — first observation of a `RUSTC_WORKSPACE_WRAPPER`, its value
+  changed since the last doctor run, or the configured wrapper binary is
+  missing/unreadable.
+
+The one-time rebuild after enabling or changing a workspace wrapper is
+expected behavior (Cargo fingerprints the wrapper value), not a regression.
+Doctor persists a small identity marker under `~/.cache/rch/` to distinguish
+"first observation" from "unchanged" across runs.
+
+```bash
+# See the check in machine-readable form
+rch doctor --json | jq '.checks[] | select(.name == "rustc_wrapper")'
+```
+
 ## Health Check Script
 
 Create a health check for your monitoring system:

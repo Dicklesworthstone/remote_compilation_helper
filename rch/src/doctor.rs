@@ -19,7 +19,7 @@ use directories::ProjectDirs;
 use rch_common::{ApiResponse, ReliabilityReasonCode};
 use rch_telemetry::TelemetryStorage;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -764,6 +764,7 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
     // Run all checks
     check_prerequisites(&mut checks, ctx, &options);
     check_configuration(&mut checks, ctx, &options);
+    checks.extend(rustc_wrapper_checks());
     check_ssh_keys(&mut checks, ctx, &options, &mut fixes_applied);
     check_hooks(&mut checks, ctx, &options, &mut fixes_applied);
     check_daemon(&mut checks, ctx, &options, &mut fixes_applied);
@@ -4344,6 +4345,278 @@ fn start_daemon_with_binary(
         "daemon process started but did not accept connections within {}s",
         timeout.as_secs()
     ))
+}
+
+// ============================================================================
+// RUSTC_WRAPPER first-enable cold-rebuild advisory (C013 / bead .21.13)
+// ============================================================================
+
+// Cargo folds `RUSTC_WRAPPER` / `RUSTC_WORKSPACE_WRAPPER` into the
+// fingerprint of every crate, so enabling a wrapper — or changing the
+// wrapper binary's identity — recompiles the workspace exactly once.
+// Users read that as a regression; this check detects first enablement
+// and identity change against a small cache-file marker and explains
+// the semantics before they do.
+
+/// Last-seen wrapper identity per env var (blake3 hex of binary prefix).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RustcWrapperState {
+    wrappers: BTreeMap<String, String>,
+}
+
+const RUSTC_WRAPPER_STATE_FILE: &str = "doctor-rustc-wrapper-state.json";
+
+fn rustc_wrapper_state_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("rch").join(RUSTC_WRAPPER_STATE_FILE))
+}
+
+fn load_rustc_wrapper_state() -> RustcWrapperState {
+    let Some(path) = rustc_wrapper_state_path() else {
+        return RustcWrapperState::default();
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => RustcWrapperState::default(),
+    }
+}
+
+fn store_rustc_wrapper_state(state: &RustcWrapperState) -> bool {
+    let Some(path) = rustc_wrapper_state_path() else {
+        return false;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_vec(state) {
+        Ok(bytes) => std::fs::write(&path, bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// One observed wrapper env var: raw value plus resolved binary digest.
+#[derive(Debug, Clone)]
+struct WrapperObservation {
+    env_var: &'static str,
+    raw_value: String,
+    resolved: Option<PathBuf>,
+    /// blake3 hex over the first 4 MiB of the wrapper binary; `None`
+    /// when the binary is missing or unreadable.
+    identity: Option<String>,
+}
+
+const WRAPPER_IDENTITY_PREFIX_BYTES: u64 = 4 * 1024 * 1024;
+
+fn hash_wrapper_identity(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file.take(WRAPPER_IDENTITY_PREFIX_BYTES), &mut hasher).ok()?;
+    let hex = hasher.finalize().to_hex();
+    Some(hex.as_str()[..32].to_string())
+}
+
+fn wrapper_binary_path(raw: &str) -> Option<PathBuf> {
+    if raw.contains('/') {
+        // Explicit path (cargo resolves it relative to cwd; doctor
+        // reports what it can see from its own cwd).
+        let candidate = Path::new(raw);
+        if candidate.is_file() {
+            Some(candidate.to_path_buf())
+        } else {
+            None
+        }
+    } else {
+        which(raw).ok()
+    }
+}
+
+fn observe_wrapper(env_var: &'static str) -> Option<WrapperObservation> {
+    let raw_value = std::env::var(env_var).ok()?;
+    if raw_value.trim().is_empty() {
+        return None;
+    }
+    let resolved = wrapper_binary_path(&raw_value);
+    let identity = resolved.as_deref().and_then(hash_wrapper_identity);
+    Some(WrapperObservation {
+        env_var,
+        raw_value,
+        resolved,
+        identity,
+    })
+}
+
+/// What the recorded state says about this observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapperVerdict {
+    FirstEnablement,
+    Unchanged,
+    IdentityChanged,
+}
+
+fn wrapper_verdict(state: &RustcWrapperState, obs: &WrapperObservation) -> WrapperVerdict {
+    // Only called with a hashed identity; unhashable binaries are
+    // reported by their own check arm before this runs.
+    match state.wrappers.get(obs.env_var) {
+        None => WrapperVerdict::FirstEnablement,
+        Some(prev) if *prev == obs.identity.as_deref().expect("hashed") => {
+            WrapperVerdict::Unchanged
+        }
+        Some(_) => WrapperVerdict::IdentityChanged,
+    }
+}
+
+/// Pure core of the check: verdicts for already-observed wrappers.
+/// State is loaded by the caller and rewritten best-effort afterwards.
+fn rustc_wrapper_results(
+    state: &RustcWrapperState,
+    observed: &[WrapperObservation],
+) -> Vec<CheckResult> {
+    const MONITORING_DOC: &str = "docs/guides/monitoring.md (RUSTC_WRAPPER section)";
+    if observed.is_empty() {
+        return vec![CheckResult {
+            category: "toolchain".to_string(),
+            name: "rustc_wrapper".to_string(),
+            status: CheckStatus::Pass,
+            message: "RUSTC_WRAPPER not set".to_string(),
+            details: Some(
+                "No compile wrapper configured; no wrapper-related fingerprint churn possible."
+                    .to_string(),
+            ),
+            suggestion: None,
+            fixable: false,
+            fix_applied: false,
+            fix_message: None,
+        }];
+    }
+
+    let mut results = Vec::new();
+    let mut new_state = state.clone();
+    for obs in observed {
+        let (status, message, details, suggestion);
+        // Empirically pinned on cargo 1.100-nightly (see the fixture):
+        // plain RUSTC_WRAPPER is NOT part of any fingerprint — enable,
+        // swap, or remove never recompiles. RUSTC_WORKSPACE_WRAPPER IS
+        // fingerprinted: first use of a given value compiles once, and
+        // removal falls back to previously valid artifacts.
+        let fingerprinted = obs.env_var == "RUSTC_WORKSPACE_WRAPPER";
+        match (&obs.resolved, &obs.identity) {
+            (None, _) => {
+                status = CheckStatus::Warning;
+                message = format!(
+                    "{} set to '{}' but the wrapper binary was not found",
+                    obs.env_var, obs.raw_value
+                );
+                details = Some(
+                    "Cargo invokes this binary for every compilation; a missing \
+                     wrapper breaks or stalls builds."
+                        .to_string(),
+                );
+                suggestion = Some(
+                    "Fix the path, unset the variable, or install the wrapper binary".to_string(),
+                );
+            }
+            (Some(path), identity) if !fingerprinted => {
+                status = CheckStatus::Pass;
+                message = format!("{} wrapper active: '{}'", obs.env_var, obs.raw_value);
+                details = Some(format!(
+                    "Wrapper binary: {}. Plain RUSTC_WRAPPER is not part of \
+                     Cargo's fingerprints (verified on current cargo): enabling, \
+                     swapping, or removing it does NOT force a rebuild. The \
+                     wrapper must still exec the real compiler.",
+                    path.display()
+                ));
+                suggestion = None;
+                // No identity tracking needed when nothing is fingerprinted;
+                // drop any stale marker so old state cannot confuse later
+                // toolchains that change semantics.
+                new_state.wrappers.remove(obs.env_var);
+                let _ = identity;
+            }
+            (Some(path), Some(_)) => match wrapper_verdict(state, obs) {
+                WrapperVerdict::FirstEnablement => {
+                    status = CheckStatus::Warning;
+                    message = format!(
+                        "{} wrapper enabled (first observation): '{}'",
+                        obs.env_var, obs.raw_value
+                    );
+                    details = Some(format!(
+                        "Wrapper binary: {}. Cargo fingerprints include this \
+                         variable, so its first use compiles the workspace once \
+                         — expected, NOT a regression. Subsequent builds are \
+                         incremental; removing it falls back to previously \
+                         valid artifacts without recompiling.",
+                        path.display()
+                    ));
+                    suggestion = Some(format!("See {MONITORING_DOC}"));
+                }
+                WrapperVerdict::Unchanged => {
+                    status = CheckStatus::Pass;
+                    message = format!("{} wrapper unchanged since last doctor run", obs.env_var);
+                    details = Some(format!(
+                        "Wrapper binary: {} — identity matches the recorded \
+                         marker; no rebuild expected.",
+                        path.display()
+                    ));
+                    suggestion = None;
+                }
+                WrapperVerdict::IdentityChanged => {
+                    status = CheckStatus::Warning;
+                    message = format!(
+                        "{} wrapper value changed since last doctor run",
+                        obs.env_var
+                    );
+                    details = Some(format!(
+                        "Wrapper binary: {}. A new wrapper value compiles the \
+                         workspace once (the value is fingerprinted, not the \
+                         binary contents) — expected after upgrading or \
+                         replacing the wrapper, NOT a regression.",
+                        path.display()
+                    ));
+                    suggestion = Some(format!("See {MONITORING_DOC}"));
+                }
+            },
+            (Some(path), None) => {
+                status = CheckStatus::Warning;
+                message = format!(
+                    "{} wrapper binary exists but could not be hashed",
+                    obs.env_var
+                );
+                details = Some(format!(
+                    "Wrapper binary: {}. Identity tracking skipped for this run.",
+                    path.display()
+                ));
+                suggestion = Some("Check file permissions".to_string());
+            }
+        }
+        if fingerprinted && let Some(identity) = &obs.identity {
+            new_state
+                .wrappers
+                .insert(obs.env_var.to_string(), identity.clone());
+        }
+        results.push(CheckResult {
+            category: "toolchain".to_string(),
+            name: "rustc_wrapper".to_string(),
+            status,
+            message,
+            details,
+            suggestion,
+            fixable: false,
+            fix_applied: false,
+            fix_message: None,
+        });
+    }
+    // Best-effort persistence: a failed write degrades the next run to
+    // "first observation" wording, never blocks the check itself.
+    let _ = store_rustc_wrapper_state(&new_state);
+    results
+}
+
+fn rustc_wrapper_checks() -> Vec<CheckResult> {
+    let observed: Vec<WrapperObservation> = ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"]
+        .into_iter()
+        .filter_map(observe_wrapper)
+        .collect();
+    let state = load_rustc_wrapper_state();
+    rustc_wrapper_results(&state, &observed)
 }
 
 fn start_daemon_for_doctor(socket_path: &Path, timeout: Duration) -> Result<(), String> {
@@ -8756,5 +9029,215 @@ exit 0\n"
             "rotating details must NOT change the fingerprint"
         );
         // TEST PASS: fingerprint stability across rotating details
+    }
+}
+
+#[cfg(test)]
+mod rustc_wrapper_tests {
+    use super::*;
+
+    fn obs(
+        env_var: &'static str,
+        raw: &str,
+        resolved: Option<&str>,
+        identity: Option<&str>,
+    ) -> WrapperObservation {
+        WrapperObservation {
+            env_var,
+            raw_value: raw.to_string(),
+            resolved: resolved.map(PathBuf::from),
+            identity: identity.map(str::to_string),
+        }
+    }
+
+    fn single(observation: &WrapperObservation) -> CheckResult {
+        let state = RustcWrapperState::default();
+        rustc_wrapper_results(&state, std::slice::from_ref(observation))
+            .pop()
+            .expect("one check per observed wrapper")
+    }
+
+    #[test]
+    fn no_wrappers_yields_single_pass() {
+        let results = rustc_wrapper_results(&RustcWrapperState::default(), &[]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, CheckStatus::Pass);
+        assert!(results[0].message.contains("not set"));
+    }
+
+    #[test]
+    fn workspace_first_enablement_warns_and_explains_one_time_rebuild() {
+        let check = single(&obs(
+            "RUSTC_WORKSPACE_WRAPPER",
+            "/usr/local/bin/sccache",
+            Some("/usr/local/bin/sccache"),
+            Some("deadbeef"),
+        ));
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert!(
+            check.message.contains("first observation"),
+            "{:?}",
+            check.message
+        );
+        assert!(
+            check
+                .details
+                .as_deref()
+                .unwrap_or_default()
+                .contains("NOT a regression"),
+            "must explicitly defuse the regression interpretation"
+        );
+    }
+
+    #[test]
+    fn plain_wrapper_is_pass_and_not_fingerprinted() {
+        // Verified on current cargo: plain RUSTC_WRAPPER never moves
+        // fingerprints, so a healthy wrapper is a Pass with an explicit
+        // "no rebuild" explanation — not a warning.
+        let check = single(&obs(
+            "RUSTC_WRAPPER",
+            "/usr/local/bin/sccache",
+            Some("/usr/local/bin/sccache"),
+            Some("deadbeef"),
+        ));
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(check.message.contains("wrapper active"));
+        assert!(
+            check
+                .details
+                .as_deref()
+                .unwrap_or_default()
+                .contains("does NOT force a rebuild"),
+        );
+    }
+
+    #[test]
+    fn plain_wrapper_drops_stale_state_marker() {
+        // Semantics changed across cargo versions; a marker recorded for
+        // the plain variable must be removed, never consulted.
+        let state = RustcWrapperState {
+            wrappers: BTreeMap::from([("RUSTC_WRAPPER".to_string(), "stale".to_string())]),
+        };
+        let results = rustc_wrapper_results(
+            &state,
+            &[obs(
+                "RUSTC_WRAPPER",
+                "/usr/bin/true",
+                Some("/usr/bin/true"),
+                Some("beef"),
+            )],
+        );
+        assert_eq!(results[0].status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn workspace_unchanged_wrapper_passes() {
+        let state = RustcWrapperState {
+            wrappers: BTreeMap::from([(
+                "RUSTC_WORKSPACE_WRAPPER".to_string(),
+                "deadbeef".to_string(),
+            )]),
+        };
+        let results = rustc_wrapper_results(
+            &state,
+            &[obs(
+                "RUSTC_WORKSPACE_WRAPPER",
+                "/usr/bin/sccache",
+                Some("/usr/bin/sccache"),
+                Some("deadbeef"),
+            )],
+        );
+        assert_eq!(results[0].status, CheckStatus::Pass);
+        assert!(results[0].message.contains("unchanged"));
+    }
+
+    #[test]
+    fn changed_value_warns() {
+        let state = RustcWrapperState {
+            wrappers: BTreeMap::from([(
+                "RUSTC_WORKSPACE_WRAPPER".to_string(),
+                "cafebabe".to_string(),
+            )]),
+        };
+        let results = rustc_wrapper_results(
+            &state,
+            &[obs(
+                "RUSTC_WORKSPACE_WRAPPER",
+                "/usr/bin/sccache",
+                Some("/usr/bin/sccache"),
+                Some("deadbeef"),
+            )],
+        );
+        assert_eq!(results[0].status, CheckStatus::Warning);
+        assert!(results[0].message.contains("value changed"));
+    }
+
+    #[test]
+    fn missing_binary_warns() {
+        let check = single(&obs("RUSTC_WRAPPER", "/nope/missing-wrapper", None, None));
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert!(check.message.contains("was not found"));
+    }
+
+    #[test]
+    fn unhashable_workspace_wrapper_warns_and_skips_tracking() {
+        // Without a hash we cannot track identity across runs, so this
+        // is a warning every run — truthful and rare (unreadable file).
+        let state = RustcWrapperState {
+            wrappers: BTreeMap::from([(
+                "RUSTC_WORKSPACE_WRAPPER".to_string(),
+                "mywrapper".to_string(),
+            )]),
+        };
+        let results = rustc_wrapper_results(
+            &state,
+            &[obs(
+                "RUSTC_WORKSPACE_WRAPPER",
+                "mywrapper",
+                Some("/bin/mywrapper"),
+                None,
+            )],
+        );
+        assert_eq!(results[0].status, CheckStatus::Warning);
+        assert!(results[0].message.contains("could not be hashed"));
+    }
+
+    #[test]
+    fn workspace_wrapper_is_observed_independently() {
+        let results = rustc_wrapper_results(
+            &RustcWrapperState::default(),
+            &[obs(
+                "RUSTC_WORKSPACE_WRAPPER",
+                "/usr/bin/true",
+                Some("/usr/bin/true"),
+                Some("beef"),
+            )],
+        );
+        assert_eq!(results.len(), 1);
+        assert!(results[0].message.contains("RUSTC_WORKSPACE_WRAPPER"));
+    }
+
+    #[test]
+    fn wrapper_binary_path_resolves_via_which() {
+        // `sh` exists on every dev/CI box; no PATH entry needed.
+        let found = wrapper_binary_path("sh");
+        assert!(found.is_some(), "which(sh) should resolve");
+        assert!(!found.unwrap().as_os_str().is_empty());
+        assert!(wrapper_binary_path("/definitely/not/here").is_none());
+        assert!(wrapper_binary_path("definitely-not-a-real-binary-xyz").is_none());
+    }
+
+    #[test]
+    fn identity_hash_is_stable_and_bounded() {
+        let dir = tempfile::tempdir().expect("dir");
+        let bin = dir.path().join("wrapper");
+        std::fs::write(&bin, b"#!/bin/sh\nexec \"$@\"\n").expect("write");
+        let a = hash_wrapper_identity(&bin).expect("hash");
+        let b = hash_wrapper_identity(&bin).expect("hash");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 32);
+        std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").expect("rewrite");
+        let c = hash_wrapper_identity(&bin).expect("hash");
+        assert_ne!(a, c, "content change must change identity");
     }
 }
