@@ -12,6 +12,25 @@ use rch_common::{
 use std::io::Read;
 use std::path::PathBuf;
 
+// The pure command-parsing / project-identity helpers are platform-neutral
+// and are shared verbatim with the Unix hook (bd-86oa1): one implementation,
+// included by path into both backends so they can never drift.
+#[path = "hook/command_parsing.rs"]
+mod command_parsing;
+
+pub(crate) use command_parsing::{
+    cargo_job_count_for_command, estimate_cores_for_command, extract_project_name,
+    extract_project_name_with_policy, preferred_workers_from_env,
+};
+
+/// Install the fail-open hook-mode panic handler.
+///
+/// On Unix this prevents a panic in classify/serde/cache from surfacing as a
+/// non-zero exit (which Claude Code would interpret as "deny"). The non-Unix
+/// stub always allows, so there is nothing to install — the no-op exists so
+/// `main` keeps a single call shape on every platform.
+pub(crate) fn install_hook_mode_panic_handler() {}
+
 /// Run the PreToolUse hook.
 ///
 /// On non-Unix platforms, RCH currently cannot talk to `rchd` (Unix sockets),
@@ -70,7 +89,6 @@ pub async fn run_exec(
 ///
 /// On non-Unix platforms this returns an error, which upstream treats as
 /// "daemon unreachable" and fails open to local execution.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn query_daemon(
     _socket_path: &str,
     _project: &str,
@@ -81,6 +99,7 @@ pub(crate) async fn query_daemon(
     _command_priority: CommandPriority,
     _classification_duration_us: u64,
     _hook_pid: Option<u32>,
+    _local_wrapper_id: Option<&str>,
     _wait_for_worker: bool,
     _preferred_workers: &[WorkerId],
 ) -> anyhow::Result<SelectionResponse> {

@@ -1462,8 +1462,7 @@ fn test_classification_rejects_shell_metachars() {
 fn test_extract_project_name() {
     let _guard = test_guard!();
     // The function uses current directory, but we can test it runs
-    let project = extract_project_name();
-    // Should return something (either actual dir name or "unknown")
+    let project = command_parsing::extract_project_name();
     assert!(!project.is_empty());
 }
 
@@ -1563,7 +1562,9 @@ fn test_selected_worker_to_config() {
 #[test]
 fn test_parse_preferred_workers_dedupes_ordered_values() {
     let _guard = test_guard!();
-    let workers = dedupe_worker_ids(parse_preferred_workers(" ts2, vmi1,,ts2 , vmi2 "));
+    let workers = command_parsing::dedupe_worker_ids(command_parsing::parse_preferred_workers(
+        " ts2, vmi1,,ts2 , vmi2 ",
+    ));
     let ids: Vec<&str> = workers.iter().map(|worker| worker.as_str()).collect();
     assert_eq!(ids, vec!["ts2", "vmi1", "vmi2"]);
 }

@@ -133,8 +133,6 @@ const EXIT_REMOTE_REQUIRED_REFUSED: i32 = 103;
 
 const RCH_CARGO_WRAPPER_BYPASS_ENV: &str = "RCH_CARGO_WRAPPER_BYPASS";
 const RCH_REQUIRE_REMOTE_ENV: &str = "RCH_REQUIRE_REMOTE";
-const RCH_WORKER_ENV: &str = "RCH_WORKER";
-const RCH_WORKERS_ENV: &str = "RCH_WORKERS";
 
 /// Opt-out knob for remote target-dir REUSE. When set to a truthy value the hook
 /// falls back to the legacy unique-per-job remote target dir name
@@ -495,36 +493,6 @@ fn role_requires_remote(role: rch_common::BoxRole) -> bool {
     role == rch_common::BoxRole::Dispatcher
         && std::env::var(RCH_REQUIRE_REMOTE_ENV).is_err()
         && std::env::var("RCH_FORCE_REMOTE").is_err()
-}
-
-pub(crate) fn preferred_workers_from_env() -> Vec<WorkerId> {
-    let mut preferred = Vec::new();
-    if let Ok(value) = std::env::var(RCH_WORKER_ENV) {
-        preferred.extend(parse_preferred_workers(&value));
-    }
-    if let Ok(value) = std::env::var(RCH_WORKERS_ENV) {
-        preferred.extend(parse_preferred_workers(&value));
-    }
-    dedupe_worker_ids(preferred)
-}
-
-fn parse_preferred_workers(value: &str) -> Vec<WorkerId> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(WorkerId::new)
-        .collect()
-}
-
-fn dedupe_worker_ids(workers: Vec<WorkerId>) -> Vec<WorkerId> {
-    let mut deduped = Vec::new();
-    for worker in workers {
-        if !deduped.contains(&worker) {
-            deduped.push(worker);
-        }
-    }
-    deduped
 }
 
 fn requested_worker_outcome(
@@ -3016,7 +2984,10 @@ pub(crate) use daemon_ipc::{query_daemon, release_worker, restart_admission_is_c
 // `-j` / `--ignored` / `--exact` / filtered-test detectors stay `pub(super)` for
 // the test suite, and the numeric `parse_*` helpers stay module-private.
 mod command_parsing;
-pub(crate) use command_parsing::{cargo_job_count_for_command, estimate_cores_for_command};
+pub(crate) use command_parsing::{
+    cargo_job_count_for_command, estimate_cores_for_command, extract_project_name_with_policy,
+    preferred_workers_from_env,
+};
 
 // Human-facing job-output rendering (compile-summary panel, job banner, and the
 // duration/speed/profile/target formatting + detection helpers) lives in the
@@ -3602,60 +3573,6 @@ async fn handle_selection_response(
             HookOutput::allow()
         }
     }
-}
-
-/// Extract project name from current working directory using the default
-/// path topology policy.
-///
-/// Prefer [`extract_project_name_with_policy`] when a configured
-/// [`PathTopologyPolicy`] is available, so error messages reference the
-/// configured roots rather than the compiled-in defaults. This shim is
-/// retained for test coverage and for callers that provably operate under
-/// the default topology.
-#[allow(dead_code)]
-pub(crate) fn extract_project_name() -> String {
-    extract_project_name_with_policy(&PathTopologyPolicy::default())
-}
-
-/// Extract project name from current working directory, honoring the
-/// supplied [`PathTopologyPolicy`].
-pub(crate) fn extract_project_name_with_policy(policy: &PathTopologyPolicy) -> String {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("unknown"));
-    let normalized_cwd = match normalize_project_path_with_policy(&cwd, policy) {
-        Ok(normalized) => {
-            for decision in normalized.decision_trace() {
-                debug!("[RCH] project identity normalization: {}", decision);
-            }
-            normalized.canonical_path().to_path_buf()
-        }
-        Err(err) => {
-            warn!(
-                "Project path normalization failed for {}: {}",
-                cwd.display(),
-                err
-            );
-            for decision in err.decision_trace() {
-                debug!(
-                    "[RCH] project identity normalization failed at: {}",
-                    decision
-                );
-            }
-            cwd.clone()
-        }
-    };
-
-    let name = normalized_cwd
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    // Compute short hash of the canonical project path to ensure stable identity
-    // across equivalent aliases (for example /dp/repo and /data/projects/repo).
-    // This prevents cache affinity collisions for projects with same dir name (e.g. "app")
-    let hash = blake3::hash(normalized_cwd.to_string_lossy().as_bytes()).to_hex();
-    let short_hash = &hash[..8];
-
-    format!("{}-{}", name, short_hash)
 }
 
 fn command_priority_from_env(reporter: &HookReporter) -> CommandPriority {

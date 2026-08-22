@@ -1,14 +1,27 @@
-//! Command-string parsing utilities: tokenization and the cargo flag/env
-//! analyzers that feed classification and core estimation.
+//! Pure, PLATFORM-NEUTRAL helper functions shared by every hook backend.
 //!
-//! Pure functions over the raw command string — no daemon/hook state. Principal
-//! items: [`estimate_cores_for_command`] (offload core sizing) and
+//! Command-string parsing: tokenization and the cargo flag/env analyzers that
+//! feed classification and core estimation. Principal items:
+//! [`estimate_cores_for_command`] (offload core sizing) and
 //! [`cargo_job_count_for_command`] are `pub(crate)` (also called by
 //! `commands::status`); [`tokenize_command`] is the shared lexer; the
 //! `--test-threads` / `-j` / `--ignored` / `--exact` / filtered-test detectors
 //! are `pub(super)` for the test suite. The numeric `parse_*` helpers stay
 //! module-private.
-use super::*;
+//!
+//! Also hosts two more pure helpers that both the Unix hook and the non-Unix
+//! stub need verbatim: project identity extraction (canonical path + short
+//! blake3 suffix) and preferred-worker env parsing (`RCH_WORKER(S)`).
+//!
+//! NOTHING in this module may depend on daemon/socket/SSH state or on a
+//! specific parent module: it is included verbatim (`#[path]`) by the
+//! non-Unix hook stub (bd-86oa1).
+
+use rch_common::CompilationKind;
+use rch_common::WorkerId;
+use rch_common::normalize_project_path_with_policy;
+use rch_common::path_topology::PathTopologyPolicy;
+use tracing::{debug, warn};
 
 fn parse_u32(value: &str) -> Option<u32> {
     value
@@ -300,4 +313,86 @@ pub(crate) fn estimate_cores_for_command(
             .max(1),
         None => build_default,
     }
+}
+
+// --- Preferred-worker env selection (moved verbatim from hook.rs, bd-86oa1) ---
+
+const RCH_WORKER_ENV: &str = "RCH_WORKER";
+const RCH_WORKERS_ENV: &str = "RCH_WORKERS";
+
+pub(crate) fn preferred_workers_from_env() -> Vec<WorkerId> {
+    let mut preferred = Vec::new();
+    if let Ok(value) = std::env::var(RCH_WORKER_ENV) {
+        preferred.extend(parse_preferred_workers(&value));
+    }
+    if let Ok(value) = std::env::var(RCH_WORKERS_ENV) {
+        preferred.extend(parse_preferred_workers(&value));
+    }
+    dedupe_worker_ids(preferred)
+}
+
+pub(super) fn parse_preferred_workers(value: &str) -> Vec<WorkerId> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(WorkerId::new)
+        .collect()
+}
+
+pub(super) fn dedupe_worker_ids(workers: Vec<WorkerId>) -> Vec<WorkerId> {
+    let mut deduped = Vec::new();
+    for worker in workers {
+        if !deduped.contains(&worker) {
+            deduped.push(worker);
+        }
+    }
+    deduped
+}
+
+/// Default-policy convenience shim (retained for test coverage).
+#[allow(dead_code)]
+pub(crate) fn extract_project_name() -> String {
+    extract_project_name_with_policy(&PathTopologyPolicy::default())
+}
+
+/// Extract project name from current working directory, honoring the
+/// supplied [`PathTopologyPolicy`].
+pub(crate) fn extract_project_name_with_policy(policy: &PathTopologyPolicy) -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("unknown"));
+    let normalized_cwd = match normalize_project_path_with_policy(&cwd, policy) {
+        Ok(normalized) => {
+            for decision in normalized.decision_trace() {
+                debug!("[RCH] project identity normalization: {}", decision);
+            }
+            normalized.canonical_path().to_path_buf()
+        }
+        Err(err) => {
+            warn!(
+                "Project path normalization failed for {}: {}",
+                cwd.display(),
+                err
+            );
+            for decision in err.decision_trace() {
+                debug!(
+                    "[RCH] project identity normalization failed at: {}",
+                    decision
+                );
+            }
+            cwd.clone()
+        }
+    };
+
+    let name = normalized_cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Compute short hash of the canonical project path to ensure stable identity
+    // across equivalent aliases (for example /dp/repo and /data/projects/repo).
+    // This prevents cache affinity collisions for projects with same dir name (e.g. "app")
+    let hash = blake3::hash(normalized_cwd.to_string_lossy().as_bytes()).to_hex();
+    let short_hash = &hash[..8];
+
+    format!("{}-{}", name, short_hash)
 }
