@@ -56,6 +56,7 @@ pub mod decision_receipt;
 pub mod dep_links;
 pub mod descriptor;
 pub mod directive_manifest;
+pub mod directive_validation;
 pub mod domain_plumbing;
 pub mod durable_ids;
 pub mod edge_fence;
