@@ -39,6 +39,7 @@ pub mod obligations;
 pub mod region_tree;
 pub mod supervision;
 
+pub mod attempt_outcome;
 pub mod cargo_launch;
 pub mod jobserver;
 pub mod process_groups;
