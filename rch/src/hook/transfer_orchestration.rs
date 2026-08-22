@@ -186,10 +186,18 @@ pub(super) async fn execute_remote_compilation(
     topology_policy: &PathTopologyPolicy,
     clean_overlay: Option<&CleanOverlaySpec>,
     source_content_receipt: bool,
+    // Declared job result directories (bd-p0yoo), repository-relative.
+    // Retrieved after the command completes on ANY exit code; a directory
+    // that is missing or only partially transferable fails the invocation
+    // loudly instead of surfacing the job's bare exit status.
+    result_dirs: &[PathBuf],
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
     if source_content_receipt && WorkerPlatform::from_worker(&worker_config).is_windows() {
         anyhow::bail!("source-content receipts require the Unix rsync transport");
+    }
+    if !result_dirs.is_empty() && WorkerPlatform::from_worker(&worker_config).is_windows() {
+        anyhow::bail!("--result-dir requires the Unix rsync transport; worker is Windows");
     }
     let source_content_build_id = if source_content_receipt {
         Some(build_id.ok_or_else(|| {
@@ -1237,6 +1245,47 @@ pub(super) async fn execute_remote_compilation(
         }
     }
 
+    // Step 3b: declared job result directories (bd-p0yoo). Unlike patterned
+    // artifact sync-back above, this is NOT gated on `result.success()`:
+    // GH#27 exists precisely because non-compilation jobs (sharded tests,
+    // fuzzers, mutation testing) produce their valuable output on FAILURE
+    // exits too. Each directory is pulled as an explicit rsync source, so a
+    // directory the job never created is a hard error rather than a silent
+    // zero-file success. Any failure overrides the surfaced exit code below
+    // (issue #19 Fix 1 precedent): silently accepting a run whose declared
+    // outputs are absent would be the exact footgun this feature forbids.
+    let mut result_dir_failures: Vec<String> = Vec::new();
+    if !result_dirs.is_empty() {
+        if let Some(loop_ref) = heartbeat_loop.as_ref() {
+            loop_ref.update_phase(
+                BuildHeartbeatPhase::SyncDown,
+                Some("result_dir_sync_start".to_string()),
+            );
+            loop_ref.flush().await;
+        }
+        for dir in result_dirs {
+            match pipeline.retrieve_result_dir(&worker_config, dir).await {
+                Ok(retrieved) => {
+                    reporter.verbose(&format!(
+                        "[RCH] result dir '{}': {} files, {} bytes",
+                        dir.display(),
+                        retrieved.files_transferred,
+                        retrieved.bytes_transferred
+                    ));
+                }
+                Err(e) => {
+                    warn!(
+                        "Declared result dir '{}' could not be retrieved from {}: {}",
+                        dir.display(),
+                        worker_config.id,
+                        e
+                    );
+                    result_dir_failures.push(format!("{}: {}", dir.display(), e));
+                }
+            }
+        }
+    }
+
     // Step 4: Extract and forward telemetry (piggybacked in stdout)
     let extraction = extract_piggybacked_telemetry(&result.stdout);
     if let Some(error) = extraction.extraction_error {
@@ -1331,30 +1380,54 @@ pub(super) async fn execute_remote_compilation(
     // build-failure-class exit code. The retrieval layer already turns exit-0
     // partial transfers into `TransferError::SyncFailed` (transfer.rs); this
     // propagates that as a non-zero hook exit instead of swallowing it.
-    let exit_code =
-        if result.success() && artifacts_failed && kind_produces_transferable_artifacts(kind) {
-            let code = ErrorCode::BuildArtifactMissing;
-            // stderr, not just `warn!`: this MUST reach the operator/agent even when
-            // tracing is silenced. stderr is the diagnostics stream (AGENTS.md).
-            eprintln!(
-                "[RCH] {} remote compile on {} SUCCEEDED but build artifacts could not be \
+    let exit_code = if !result_dir_failures.is_empty() {
+        // Declared job result directories (bd-p0yoo) could not be retrieved.
+        // This outranks the job's own exit status: a run whose declared
+        // outputs are absent or partial is untrustworthy no matter what the
+        // command reported, and GH#27 requires reliable result return
+        // INCLUDING on nonzero exits. Same loud-fatal treatment as the
+        // artifact sync-back failure below (issue #19 Fix 1 precedent).
+        let code = ErrorCode::BuildArtifactMissing;
+        // stderr, not just `warn!`: this MUST reach the operator/agent even
+        // when tracing is silenced. stderr is the diagnostics stream.
+        eprintln!(
+            "[RCH] {} job on {} exited {} but declared result directories could \
+         not be retrieved — the invocation's outputs are INCOMPLETE: {}. \
+         Treating as a transfer failure (exit {EXIT_ARTIFACT_TRANSFER_FAILED}).",
+            code.code_string(),
+            worker_config.id,
+            result.exit_code,
+            result_dir_failures.join("; "),
+        );
+        warn!(
+            "Result-dir retrieval failed on {} after remote exit {}; \
+         returning exit {} so the caller knows declared outputs are missing",
+            worker_config.id, result.exit_code, EXIT_ARTIFACT_TRANSFER_FAILED
+        );
+        EXIT_ARTIFACT_TRANSFER_FAILED
+    } else if result.success() && artifacts_failed && kind_produces_transferable_artifacts(kind) {
+        let code = ErrorCode::BuildArtifactMissing;
+        // stderr, not just `warn!`: this MUST reach the operator/agent even when
+        // tracing is silenced. stderr is the diagnostics stream (AGENTS.md).
+        eprintln!(
+            "[RCH] {} remote compile on {} SUCCEEDED but build artifacts could not be \
              retrieved — the local build is INCOMPLETE (expected binaries/libraries are \
              missing). Treating as a build failure (exit {EXIT_ARTIFACT_TRANSFER_FAILED}); \
              re-run to rebuild, or check connectivity to the worker.",
-                code.code_string(),
-                worker_config.id,
-            );
-            warn!(
-                "Artifact transfer failed after a successful remote compile on {} [{}]; \
+            code.code_string(),
+            worker_config.id,
+        );
+        warn!(
+            "Artifact transfer failed after a successful remote compile on {} [{}]; \
              returning exit {} so the caller knows the local build is incomplete",
-                worker_config.id,
-                code.code_string(),
-                EXIT_ARTIFACT_TRANSFER_FAILED
-            );
+            worker_config.id,
+            code.code_string(),
             EXIT_ARTIFACT_TRANSFER_FAILED
-        } else {
-            result.exit_code
-        };
+        );
+        EXIT_ARTIFACT_TRANSFER_FAILED
+    } else {
+        result.exit_code
+    };
 
     Ok(RemoteExecutionResult {
         exit_code,
