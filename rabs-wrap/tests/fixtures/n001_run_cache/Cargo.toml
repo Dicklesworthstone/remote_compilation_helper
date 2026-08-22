@@ -1,0 +1,13 @@
+[package]
+name = "n001_probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Deliberately STANDALONE (empty [workspace]): the N001 contract probes must
+# build this fixture with stable/beta/nightly cargo binaries directly,
+# untouched by the outer repository's workspace, profiles, or lints.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
