@@ -25,8 +25,17 @@
 //! jobserver carried through the workspace bind by PATH: one budget,
 //! shared by every descendant, sized from the execution grant.
 
-/// Env var names that carry make/cargo coordination state.
+/// Env var names that carry make/cargo coordination state — including
+/// descriptor/auth material that is NEVER valid from a client (bead
+/// I003, risk R7: a leaked host-local descriptor hangs or oversubscribes
+/// the remote action).
 pub const COORDINATION_ENV_VARS: &[&str] = &["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"];
+
+/// Client-supplied LOGICAL capacity claims (bead I003): never trusted.
+/// The child-visible capacity value is the WORKER-authored canonical
+/// `NUM_JOBS`, derived from the execution grant — a client's claim says
+/// nothing about THIS host's budget.
+pub const CAPACITY_ENV_VARS: &[&str] = &["NUM_JOBS"];
 
 /// Whether `name` is a coordination variable (exact, case-sensitive:
 /// canonical env keys are uppercase by construction and I21 forbids
@@ -36,9 +45,21 @@ pub fn is_coordination_var(name: &str) -> bool {
     COORDINATION_ENV_VARS.contains(&name)
 }
 
+/// Whether `name` is a client capacity claim replaced by the canonical
+/// value.
+#[must_use]
+pub fn is_local_capacity_var(name: &str) -> bool {
+    CAPACITY_ENV_VARS.contains(&name)
+}
+
 /// Remove every client-supplied coordination variable in place.
 pub fn strip_client_coordination(env: &mut Vec<(String, String)>) {
     env.retain(|(k, _)| !is_coordination_var(k));
+}
+
+/// Remove every client-supplied capacity claim in place.
+pub fn strip_client_capacity(env: &mut Vec<(String, String)>) {
+    env.retain(|(k, _)| !is_local_capacity_var(k));
 }
 
 /// The worker-authored parallelism budget. Floors at 1 slot: an action
@@ -49,12 +70,23 @@ pub fn worker_makeflags(slots: u32) -> String {
     format!("-j{}", slots.max(1))
 }
 
-/// Replace any client coordination state with the worker-local budget:
-/// strip [`COORDINATION_ENV_VARS`], then author exactly one
-/// `MAKEFLAGS=-j<slots>`. Output stays name-sorted (I21 presentation).
+/// The worker-authored canonical logical capacity (bead I003): tools
+/// that consult `NUM_JOBS` directly get the SAME grant the MAKEFLAGS
+/// budget carries — one number, one source of truth.
+#[must_use]
+pub fn worker_num_jobs(slots: u32) -> String {
+    slots.max(1).to_string()
+}
+
+/// Replace any client authority state with the worker-local canon:
+/// strip [`COORDINATION_ENV_VARS`] and [`CAPACITY_ENV_VARS`], then
+/// author exactly one `MAKEFLAGS=-j<slots>` and one `NUM_JOBS=<slots>`.
+/// Output stays name-sorted (I21 presentation).
 pub fn replace_with_worker_local(env: &mut Vec<(String, String)>, slots: u32) {
     strip_client_coordination(env);
+    strip_client_capacity(env);
     env.push(("MAKEFLAGS".to_string(), worker_makeflags(slots)));
+    env.push(("NUM_JOBS".to_string(), worker_num_jobs(slots)));
     env.sort_by(|a, b| a.0.cmp(&b.0));
     env.dedup_by(|a, b| a.0 == b.0);
 }
@@ -180,6 +212,8 @@ mod tests {
         assert_eq!(worker_makeflags(32), "-j32");
         assert_eq!(worker_makeflags(1), "-j1");
         assert_eq!(worker_makeflags(0), "-j1");
+        assert_eq!(worker_num_jobs(32), "32");
+        assert_eq!(worker_num_jobs(0), "1");
     }
 
     #[test]
@@ -189,12 +223,14 @@ mod tests {
             ("MAKEFLAGS", "-j999 --jobserver-auth=3,4"),
             ("PATH", "/bin"),
             ("MFLAGS", "smuggled"),
+            ("NUM_JOBS", "999"),
         ]);
         replace_with_worker_local(&mut env, 12);
         assert_eq!(
             env,
             vec![
                 ("MAKEFLAGS".to_string(), "-j12".to_string()),
+                ("NUM_JOBS".to_string(), "12".to_string()),
                 ("PATH".to_string(), "/bin".to_string()),
                 ("RUST_LOG".to_string(), "debug".to_string()),
             ]
@@ -208,5 +244,20 @@ mod tests {
         let once = env.clone();
         replace_with_worker_local(&mut env, 4);
         assert_eq!(once, env, "re-running the replacement changes nothing");
+    }
+
+    #[test]
+    fn i003_client_capacity_claims_are_replaced_by_canonical_value() {
+        let mut env = env_of(&[("NUM_JOBS", "999"), ("PATH", "/bin")]);
+        assert!(is_local_capacity_var("NUM_JOBS"));
+        assert!(!is_local_capacity_var("NUM_JOBS_V2"));
+        replace_with_worker_local(&mut env, 3);
+        let map: std::collections::BTreeMap<_, _> = env.into_iter().collect();
+        assert_eq!(map.get("NUM_JOBS").unwrap(), "3", "canonical capacity wins");
+        assert_eq!(
+            map.get("MAKEFLAGS").unwrap(),
+            "-j3",
+            "budget and capacity agree"
+        );
     }
 }

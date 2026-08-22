@@ -305,3 +305,80 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
             .map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn i003_remote_request_carries_no_local_descriptors() {
+        // THE acceptance: a remote request structurally cannot name
+        // local FDs or auth strings. A frame stuffed with every
+        // descriptor-ish key the ecosystem has ever used parses to a
+        // request whose fields are ONLY the canonical set — unknown
+        // keys are ignored, never surfaced.
+        let frame = serde_json::json!({
+            "kind": "canonical-exec",
+            "request_id": 1,
+            "program": "true",
+            "args": [],
+            "toolchain_backing": "/tc",
+            "workspace_backing": "/ws",
+            "jobserver_fds": "3,4",
+            "jobserver_auth_fd": 7,
+            "--jobserver-auth": "fifo:/tmp/x",
+            "inherited_fds": [3, 4, 5],
+            "descriptor_socket": "/tmp/ancillary.sock"
+        });
+        let req = parse_exec_request(&frame).expect("parses");
+        let CanonicalExecRequest {
+            request_id,
+            program,
+            args,
+            toolchain_backing,
+            workspace_backing,
+            jobserver_grant,
+        } = req;
+        assert_eq!(request_id, 1);
+        assert_eq!(program, "true");
+        assert!(args.is_empty());
+        assert_eq!(toolchain_backing, "/tc");
+        assert_eq!(workspace_backing, "/ws");
+        assert_eq!(jobserver_grant, None);
+    }
+
+    #[test]
+    fn i003_grant_field_is_the_only_capacity_channel() {
+        let frame = serde_json::json!({
+            "kind": "canonical-exec",
+            "request_id": 2,
+            "program": "true",
+            "args": [],
+            "toolchain_backing": "/tc",
+            "workspace_backing": "/ws",
+            "jobserver_grant": 65536
+        });
+        let req = parse_exec_request(&frame).expect("parses");
+        assert_eq!(
+            req.jobserver_grant,
+            Some(65536),
+            "in-range grant passes through"
+        );
+
+        let frame = serde_json::json!({
+            "kind": "canonical-exec",
+            "request_id": 3,
+            "program": "true",
+            "args": [],
+            "toolchain_backing": "/tc",
+            "workspace_backing": "/ws",
+            "jobserver_grant": 4294967296u64
+        });
+        let req = parse_exec_request(&frame).expect("parses");
+        assert_eq!(
+            req.jobserver_grant,
+            Some(u32::MAX),
+            "oversized grants clamp, never widen"
+        );
+    }
+}

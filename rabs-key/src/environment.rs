@@ -66,6 +66,42 @@ pub enum EnvDisposition {
     PresentationOnly,
 }
 
+/// Make/cargo descriptor-AUTH variables (bead I003, risk R7): their
+/// values are host-local transport (fds, fifo paths) — never semantics,
+/// never valid from a client request. The worker reconstructs them per
+/// host; a construction that recorded one is a policy refusal.
+pub const DESCRIPTOR_AUTH_VARS: &[&[u8]] = &[b"MAKEFLAGS", b"MFLAGS", b"CARGO_MAKEFLAGS"];
+
+/// The canonical logical-capacity variable the WORKER authors from the
+/// execution grant. A CLIENT-supplied value is a capacity CLAIM — also
+/// volatile (it says nothing about the host that will run the action);
+/// only the worker-authored value keys, via
+/// [`canonical_capacity_disposition`].
+pub const CANONICAL_CAPACITY_VAR: &[u8] = b"NUM_JOBS";
+
+/// Disposition for a client-presented coordination/capacity variable:
+/// `Some(VolatileRefusal)` for every name this bead strips from remote
+/// requests, `None` when the name is none of ours (caller classifies).
+#[must_use]
+pub fn client_coordination_disposition(name: &[u8]) -> Option<EnvDisposition> {
+    if DESCRIPTOR_AUTH_VARS.contains(&name) || name == CANONICAL_CAPACITY_VAR {
+        Some(EnvDisposition::VolatileRefusal)
+    } else {
+        None
+    }
+}
+
+/// Disposition of the WORKER-authored canonical capacity value: it can
+/// affect build behavior, so it keys — as a named normalization (the
+/// normalizer identity + decimal bytes), not raw passthrough.
+#[must_use]
+pub fn canonical_capacity_disposition(slots: u32) -> EnvDisposition {
+    EnvDisposition::SemanticNormalized {
+        normalizer: "i003.canonical-capacity.v1".to_string(),
+        normalized: slots.to_string().into_bytes(),
+    }
+}
+
 /// One PATH lookup result in canonical resolution order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathToolEntry {
@@ -360,5 +396,60 @@ mod tests {
         b.variables
             .push((b"X".to_vec(), EnvDisposition::SemanticHashed(b"1".to_vec())));
         assert_ne!(digest_of(&a), digest_of(&b));
+    }
+    #[test]
+    fn i003_descriptor_auth_vars_are_volatile_and_never_move_the_key() {
+        let baseline = digest_of(&base());
+        // Every descriptor-auth var: refused, and its presence/absence
+        // never forks the key (transport is reconstructed per host).
+        for name in ["MAKEFLAGS", "MFLAGS"] {
+            let mut with = base();
+            with.variables
+                .push((name.as_bytes().to_vec(), EnvDisposition::VolatileRefusal));
+            assert_eq!(
+                baseline,
+                digest_of(&with),
+                "{name} refusal is key-invariant"
+            );
+            assert!(client_coordination_disposition(name.as_bytes()).is_some());
+        }
+        assert_eq!(
+            client_coordination_disposition(b"CARGO_MAKEFLAGS"),
+            Some(EnvDisposition::VolatileRefusal)
+        );
+        // Not one of ours: caller classifies.
+        assert_eq!(client_coordination_disposition(b"RUSTFLAGS"), None);
+    }
+
+    #[test]
+    fn i003_canonical_capacity_is_semantic_and_keys_on_value() {
+        // The worker-authored NUM_JOBS keys as a named normalization.
+        let mut a = base();
+        a.variables
+            .push((b"NUM_JOBS".to_vec(), canonical_capacity_disposition(6)));
+        let mut b = base();
+        b.variables
+            .push((b"NUM_JOBS".to_vec(), canonical_capacity_disposition(12)));
+        assert_ne!(
+            digest_of(&a),
+            digest_of(&b),
+            "capacity value can affect behavior: it must key"
+        );
+        // Same slots via a different normalizer identity = different
+        // construction (the normalization itself is part of semantics).
+        let mut c = base();
+        c.variables.push((
+            b"NUM_JOBS".to_vec(),
+            EnvDisposition::SemanticNormalized {
+                normalizer: "i003.canonical-capacity.v0".to_string(),
+                normalized: b"6".to_vec(),
+            },
+        ));
+        assert_ne!(digest_of(&a), digest_of(&c), "normalizer identity keys");
+        // A client capacity CLAIM (never worker-authored) refuses.
+        assert_eq!(
+            client_coordination_disposition(b"NUM_JOBS"),
+            Some(EnvDisposition::VolatileRefusal)
+        );
     }
 }

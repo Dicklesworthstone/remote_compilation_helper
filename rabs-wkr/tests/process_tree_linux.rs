@@ -46,11 +46,17 @@ fn env_surgery_replaces_client_coordination_with_worker_budget() {
             "-j999 --jobserver-auth=7,8".to_string(),
         ),
         ("CARGO_MAKEFLAGS".to_string(), "smuggled".to_string()),
+        ("NUM_JOBS".to_string(), "999".to_string()),
         ("RUST_LOG".to_string(), "debug".to_string()),
     ];
     replace_with_worker_local(&mut env, 6);
     let map: BTreeMap<String, String> = env.into_iter().collect();
     assert_eq!(map.get("MAKEFLAGS").unwrap(), "-j6");
+    assert_eq!(
+        map.get("NUM_JOBS").unwrap(),
+        "6",
+        "canonical capacity agrees with the budget (I003)"
+    );
     assert!(!map.contains_key("CARGO_MAKEFLAGS"));
     assert!(!map.contains_key("MFLAGS"));
     assert_eq!(map.get("PATH").unwrap(), "/bin");
