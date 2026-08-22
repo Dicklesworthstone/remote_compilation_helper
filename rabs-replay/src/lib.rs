@@ -32,13 +32,12 @@ pub mod benchmark_report;
 pub mod intent_to_green;
 pub mod minimizer;
 pub mod scenario_labels;
+pub mod shadow_pipeline;
 pub mod stratified_selection;
 
-use std::process::Command;
-use std::time::Instant;
 
 use rabs_protocol::invocation_record::NormalizedOutcome;
-use rabs_protocol::redaction::{REDACTED, correlation_hash};
+use rabs_protocol::redaction::REDACTED;
 
 /// One replayable invocation, reconstructed from a corpus line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,43 +171,7 @@ impl ExecutionPath for StockPath {
     }
 
     fn execute(&mut self, invocation: &ReplayCommand) -> PathObservation {
-        let started = Instant::now();
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&invocation.command)
-            .current_dir(&invocation.cwd)
-            .output();
-        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        match output {
-            Ok(output) => {
-                #[cfg(unix)]
-                let outcome = {
-                    use std::os::unix::process::ExitStatusExt;
-                    output.status.code().map_or_else(
-                        || NormalizedOutcome::Signaled(output.status.signal().unwrap_or(0)),
-                        NormalizedOutcome::Exited,
-                    )
-                };
-                #[cfg(not(unix))]
-                let outcome = NormalizedOutcome::Exited(output.status.code().unwrap_or(-1));
-                PathObservation {
-                    path_name: self.name().to_owned(),
-                    availability: Availability::Executed,
-                    outcome: Some(outcome),
-                    stdout_digest: correlation_hash(&output.stdout),
-                    stderr_digest: correlation_hash(&output.stderr),
-                    duration_ms,
-                }
-            }
-            Err(_) => PathObservation {
-                path_name: self.name().to_owned(),
-                availability: Availability::Unavailable,
-                outcome: None,
-                stdout_digest: 0,
-                stderr_digest: 0,
-                duration_ms,
-            },
-        }
+        crate::shadow_pipeline::really_execute(self.name(), invocation)
     }
 }
 
