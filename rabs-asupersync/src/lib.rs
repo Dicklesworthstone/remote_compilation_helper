@@ -31,8 +31,6 @@
 //! - Domain crates (`rabs-protocol`, `rabs-action`, `rabs-key`,
 //!   `rabs-scheduler`, core `rabs-cas`) must never depend on this crate.
 
-pub use asupersync;
-
 pub mod crashpack;
 pub mod daemon_runtime;
 pub mod delivery_obligations;

@@ -44,6 +44,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::pin::Pin;
 
+use asupersync::actor::Actor;
+use asupersync::cx::Cx;
 use rabs_action::generation_fence::{FenceDecision, GenerationFence};
 use rabs_action::serving_transitions::{
     RefuseReason, ServingTransitionTrigger, TransitionDecision, evaluate,
@@ -51,10 +53,9 @@ use rabs_action::serving_transitions::{
 use rabs_action::state_machines::{
     AttemptState, ExposureFrontiers, PublicationSlotState, SubscriberDeliveryState,
 };
-use rabs_asupersync::asupersync::actor::Actor;
-use rabs_asupersync::asupersync::cx::Cx;
 use rabs_asupersync::region_tree::{Attribution, RegionSpec, attribution_chains, coordinator_root};
 use rabs_key::action_key::{ActionKeyBreakdown, compute_action_key};
+use rabs_protocol::authority_matrix::IsolationProfile;
 use rabs_protocol::descriptor::{ActionDescriptor, SubscriberKind};
 use rabs_protocol::durable_ids::BuildOperationId;
 use rabs_protocol::generation::{
@@ -128,6 +129,76 @@ impl AttemptPurpose {
 /// key and its delivery state is ITS OWN — the actor holds neither a
 /// global operation id nor a global commit bit.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionRequirements {
+    /// Evidence bundles that must back the publication before serving.
+    pub minimum_evidence_bundles: u32,
+    /// Isolation profiles this subscriber accepts; `None` = any.
+    pub acceptable_isolation: Option<Vec<IsolationProfile>>,
+    /// Privacy scope that must match the attestation; `None` = any.
+    pub privacy_scope: Option<String>,
+    /// Output-platform contract digest that must match; `None` = any.
+    pub platform: Option<TypedDigest>,
+}
+
+impl SubscriptionRequirements {
+    /// Accept anything the fleet produces (the common agent case).
+    #[must_use]
+    pub const fn unrestricted() -> Self {
+        Self {
+            minimum_evidence_bundles: 0,
+            acceptable_isolation: None,
+            privacy_scope: None,
+            platform: None,
+        }
+    }
+}
+
+/// Execution properties ATTESTED alongside a candidate offer; the facts
+/// per-subscriber requirement filtering compares against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResultAttestation {
+    /// Isolation profile the attempt actually ran under.
+    pub isolation_attained: IsolationProfile,
+    /// Privacy scope the execution was contained within.
+    pub privacy_scope: String,
+    /// Output-platform contract digest the execution targeted.
+    pub platform: TypedDigest,
+}
+
+/// Per-subscriber outcome when consulting requirement filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequirementDecision {
+    /// This subscriber may be served from the committed result now.
+    Served,
+    /// Identity-compatible but unsatisfied today (e.g. evidence
+    /// shortfall): a verification attempt can still satisfy it.
+    NeedsAdditionalVerification,
+    /// This result can NEVER serve this subscriber as-is.
+    Refused(RequirementRefusal),
+}
+
+/// Why a committed result can never satisfy a subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequirementRefusal {
+    /// Attained isolation profile not in the accepted set.
+    IsolationUnacceptable,
+    /// Attested privacy scope differs from the demanded scope.
+    PrivacyScopeMismatch,
+    /// Attested platform contract differs from the demanded platform.
+    PlatformMismatch,
+}
+
+/// The strongest live interest across all subscribers: max priority and
+/// earliest deadline (`None` deadline = unbounded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrongestInterest {
+    /// Highest queue priority among live interests.
+    pub priority: u8,
+    /// Earliest deadline among live interests, if any is bounded.
+    pub earliest_deadline_unix_micros: Option<i64>,
+}
+/// Per-subscriber record for one operation's subscription.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subscriber {
     /// The build operation this subscription belongs to (per-subscriber).
     pub operation: BuildOperationId,
@@ -143,6 +214,11 @@ pub struct Subscriber {
     pub delivery: SubscriberDeliveryState,
     /// This subscriber's two exposure frontiers.
     pub frontiers: ExposureFrontiers,
+    /// What this subscription demands before accepting a result.
+    pub requirements: SubscriptionRequirements,
+    /// Reference count of live interests for THIS operation (§21.1);
+    /// the subscription dies only when it reaches zero.
+    pub interests: u32,
 }
 
 /// One concrete attempt registered under the active generation.
@@ -213,7 +289,10 @@ pub struct PreparedCandidateOffer {
     /// Terminal deterministic failure rather than success.
     pub deterministic_failure: bool,
     /// Evidence bundle digest accompanying the offer.
+    /// Evidence bundle digest accompanying the offer.
     pub evidence_bundle: TypedDigest,
+    /// Execution properties attested by the offering attempt.
+    pub attestation: ResultAttestation,
 }
 
 /// The compare-and-set winner state.
@@ -227,6 +306,8 @@ pub struct CasWinner {
     pub deterministic_failure: bool,
     /// Event sequence of the CAS decision.
     pub decided_at_event: u64,
+    /// Attestation captured from the winning offer.
+    pub attestation: ResultAttestation,
 }
 
 /// Append-only evidence entry.
@@ -311,8 +392,12 @@ pub enum JoinReceipt {
     /// No result yet and no generation open: awaiting coordinator
     /// `open_generation`.
     AwaitingGeneration,
-    /// Known subscriber re-joined; context refreshed.
-    Rejoined,
+    /// Known subscriber re-joined; context refreshed and its interest
+    /// reference count incremented.
+    Rejoined {
+        /// Live interest count for the operation after the re-join.
+        interests: u32,
+    },
 }
 
 /// Outcome of opening a generation.
@@ -387,6 +472,12 @@ pub enum CancelReceipt {
         /// How many interests remain.
         retained: usize,
     },
+    /// One reference of a multi-interest operation detached; the
+    /// subscription itself survives with this many interests left.
+    InterestDecremented {
+        /// Remaining interest references for the operation.
+        remaining: u32,
+    },
     /// Last interest left while an attempt was near-complete: policy let
     /// the cache-populating generation finish.
     LastInterestFinishedForCache,
@@ -437,6 +528,8 @@ pub struct JoinRequest {
     pub deadline_unix_micros: Option<i64>,
     /// Presentation contract digest.
     pub presentation: TypedDigest,
+    /// What this subscription demands before accepting a result.
+    pub requirements: SubscriptionRequirements,
 }
 
 /// Registration of one attempt under its own lease.
@@ -700,19 +793,29 @@ impl ActionActor {
         now_unix_micros: i64,
         clock_epoch: u64,
     ) -> JoinReceipt {
-        if let Some(existing) = self.subscribers.get_mut(&request.operation.0) {
-            existing.kind = request.kind;
-            existing.queue_priority = existing.queue_priority.max(request.queue_priority);
-            existing.deadline_unix_micros =
-                match (existing.deadline_unix_micros, request.deadline_unix_micros) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                };
-            existing.presentation = request.presentation;
+        let rejoined_interests =
+            if let Some(existing) = self.subscribers.get_mut(&request.operation.0) {
+                // Reference-counted interest (§21.1): a re-join increments
+                // the operation's live interest count while refreshing
+                // context; per-subscriber fallback/presentation state stays
+                // ITS OWN.
+                existing.interests = existing.interests.saturating_add(1);
+                existing.kind = request.kind;
+                existing.queue_priority = existing.queue_priority.max(request.queue_priority);
+                existing.deadline_unix_micros =
+                    match (existing.deadline_unix_micros, request.deadline_unix_micros) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                existing.presentation = request.presentation.clone();
+                Some(existing.interests)
+            } else {
+                None
+            };
+        if let Some(interests) = rejoined_interests {
             self.push(EventKind::Rejoined);
-            return JoinReceipt::Rejoined;
+            return JoinReceipt::Rejoined { interests };
         }
-
         let receipt = if self.slot == PublicationSlotState::Committed {
             match self.serving.as_ref() {
                 Some(record) if record.may_serve_now(now_unix_micros, clock_epoch) => {
@@ -740,6 +843,8 @@ impl ActionActor {
                 presentation: request.presentation,
                 delivery: SubscriberDeliveryState::Subscribed,
                 frontiers: ExposureFrontiers::default(),
+                requirements: request.requirements,
+                interests: 1,
             },
         );
         self.push(EventKind::Joined);
@@ -762,15 +867,98 @@ impl ActionActor {
         self.push(EventKind::Promoted);
         PromoteReceipt::Promoted
     }
+    /// Strongest live interest across subscribers (§21.1): maximum queue
+    /// priority and earliest deadline, computed over CURRENT state so it
+    /// tracks promotions and cancellations without stale caches.
+    #[must_use]
+    pub fn strongest_interest(&self) -> Option<StrongestInterest> {
+        self.subscribers.values().fold(None, |acc, subscriber| {
+            let priority = subscriber.queue_priority;
+            let deadline = subscriber.deadline_unix_micros;
+            Some(match acc {
+                None => StrongestInterest {
+                    priority,
+                    earliest_deadline_unix_micros: deadline,
+                },
+                Some(mut strongest) => {
+                    strongest.priority = strongest.priority.max(priority);
+                    strongest.earliest_deadline_unix_micros =
+                        match (strongest.earliest_deadline_unix_micros, deadline) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        };
+                    strongest
+                }
+            })
+        })
+    }
+
+    /// Whether optional-work brownout is currently suspended (§21.2):
+    /// brownout never applies while foreground interest exists.
+    #[must_use]
+    pub const fn brownout_suspended(&self) -> bool {
+        self.foreground_interest
+    }
+
+    /// Requirement filtering for ONE subscriber against the committed
+    /// winner's attestation (G004 acceptance): identity mismatches refuse
+    /// outright; an evidence shortfall stays satisfiable through
+    /// verification attempts. `None` = unknown operation.
+    #[must_use]
+    pub fn serving_filter(&self, operation: &BuildOperationId) -> Option<RequirementDecision> {
+        let subscriber = self.subscribers.get(&operation.0)?;
+        let requirements = &subscriber.requirements;
+        let Some(winner) = self.winner.as_ref() else {
+            // Still executing: waiting IS pending verification.
+            return Some(RequirementDecision::NeedsAdditionalVerification);
+        };
+        let attested = &winner.attestation;
+        if let Some(acceptable) = &requirements.acceptable_isolation
+            && !acceptable.contains(&attested.isolation_attained)
+        {
+            return Some(RequirementDecision::Refused(
+                RequirementRefusal::IsolationUnacceptable,
+            ));
+        }
+        if let Some(scope) = &requirements.privacy_scope
+            && *scope != attested.privacy_scope
+        {
+            return Some(RequirementDecision::Refused(
+                RequirementRefusal::PrivacyScopeMismatch,
+            ));
+        }
+        if let Some(platform) = &requirements.platform
+            && *platform != attested.platform
+        {
+            return Some(RequirementDecision::Refused(
+                RequirementRefusal::PlatformMismatch,
+            ));
+        }
+        if u32::try_from(self.evidence.len()).unwrap_or(u32::MAX)
+            < requirements.minimum_evidence_bundles
+        {
+            return Some(RequirementDecision::NeedsAdditionalVerification);
+        }
+        Some(RequirementDecision::Served)
+    }
 
     /// Remove ONE subscriber's retained interest (§21.3): closes only that
     /// subscriber's delivery obligation. Shared work continues while any
     /// interest remains; the last cancellation consults policy — finish a
     /// near-complete cache-populating generation, else cancel and drain.
     pub fn cancel_subscriber(&mut self, operation: BuildOperationId) -> CancelReceipt {
-        if self.subscribers.remove(&operation.0).is_none() {
+        let Some(subscriber) = self.subscribers.get_mut(&operation.0) else {
             return CancelReceipt::UnknownSubscriber;
+        };
+        if subscriber.interests > 1 {
+            // Reference-counted interest: only ONE reference detaches; the
+            // subscription (and its delivery state) survives.
+            subscriber.interests -= 1;
+            let remaining = subscriber.interests;
+            self.push(EventKind::Cancelled);
+            return CancelReceipt::InterestDecremented { remaining };
         }
+        self.subscribers.remove(&operation.0);
         self.push(EventKind::Cancelled);
 
         let retained = self.subscribers.len();
@@ -1077,6 +1265,7 @@ impl ActionActor {
             canonical_result: offer.canonical_result.clone(),
             deterministic_failure: offer.deterministic_failure,
             decided_at_event: self.next_seq,
+            attestation: offer.attestation.clone(),
         });
 
         self.serving = Some(ActionServingStateRecord {
@@ -1481,6 +1670,7 @@ mod tests {
             queue_priority: priority,
             deadline_unix_micros: None,
             presentation: d(77),
+            requirements: SubscriptionRequirements::unrestricted(),
         }
     }
 
@@ -1541,6 +1731,15 @@ mod tests {
             canonical_result: d(result_tag),
             deterministic_failure: failure,
             evidence_bundle: d(result_tag + 100),
+            attestation: attestation(),
+        }
+    }
+
+    fn attestation() -> ResultAttestation {
+        ResultAttestation {
+            isolation_attained: IsolationProfile::StrictHermeticLinux,
+            privacy_scope: "test-scope".into(),
+            platform: d(7),
         }
     }
 
@@ -2112,5 +2311,192 @@ mod tests {
         }
         assert_eq!(host.core.slot(), PublicationSlotState::Executing);
         assert_eq!(host.core.attempts().count(), 1);
+    }
+
+    // -- G004: promotion retains work ---------------------------------------
+
+    #[test]
+    fn promotion_retains_generation_attempts_and_region() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        assert_eq!(
+            actor.join(
+                join_request(OP_ONE.0, SubscriberKind::Speculative, 3),
+                1_100,
+                0
+            ),
+            JoinReceipt::JoinedExecution
+        );
+        // Partial execution exists BEFORE the promotion.
+        assert_eq!(
+            actor.advance_attempt(AttemptId(1), AttemptState::LeaseAccepted),
+            AdvanceAttemptReceipt::Advanced
+        );
+        let generation_before = actor.active_generation().cloned();
+        let region_before = actor.region().clone();
+
+        assert_eq!(actor.promote(OP_ONE), PromoteReceipt::Promoted);
+
+        // Same actor, same key, same generation; transferred inputs and
+        // partial execution retained (§21.2).
+        assert_eq!(actor.active_generation(), generation_before.as_ref());
+        assert_eq!(actor.region(), &region_before);
+        assert_eq!(actor.attempts().count(), 1);
+        assert_eq!(
+            actor.attempts().next().map(|entry| entry.state),
+            Some(AttemptState::LeaseAccepted)
+        );
+        assert!(actor.has_foreground_interest());
+        assert!(actor.brownout_suspended());
+        assert_eq!(events_of(&actor, EventKind::Promoted), 1);
+    }
+
+    // -- G004: reference-counted interests ----------------------------------
+
+    #[test]
+    fn interest_refcount_survives_partial_cancel() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        assert_eq!(
+            actor.join(
+                join_request(OP_ONE.0, SubscriberKind::ForegroundAgent, 40),
+                1_100,
+                0
+            ),
+            JoinReceipt::JoinedExecution
+        );
+        // A second interest handle for the SAME operation.
+        assert_eq!(
+            actor.join(
+                join_request(OP_ONE.0, SubscriberKind::ForegroundAgent, 50),
+                1_150,
+                0
+            ),
+            JoinReceipt::Rejoined { interests: 2 }
+        );
+
+        // First detach: only one reference dies; delivery state survives.
+        assert_eq!(
+            actor.cancel_subscriber(OP_ONE),
+            CancelReceipt::InterestDecremented { remaining: 1 }
+        );
+        assert!(actor.subscriber(&OP_ONE).is_some());
+        assert_eq!(actor.slot(), PublicationSlotState::Executing);
+
+        // Last detach: the real cancellation policy runs.
+        assert_eq!(
+            actor.cancel_subscriber(OP_ONE),
+            CancelReceipt::LastInterestCancelledGeneration
+        );
+        assert!(actor.subscriber(&OP_ONE).is_none());
+    }
+
+    #[test]
+    fn strongest_interest_aggregates_priority_and_deadline() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        let mut bounded = join_request(OP_ONE.0, SubscriberKind::CiRequired, 30);
+        bounded.deadline_unix_micros = Some(5_000);
+        let mut urgent = join_request(OP_TWO.0, SubscriberKind::Speculative, 90);
+        urgent.deadline_unix_micros = Some(2_000);
+
+        assert_eq!(actor.strongest_interest(), None);
+        assert_eq!(actor.join(bounded, 1_100, 0), JoinReceipt::JoinedExecution);
+        assert_eq!(actor.join(urgent, 1_100, 0), JoinReceipt::JoinedExecution);
+
+        let strongest = actor.strongest_interest().expect("interests live");
+        assert_eq!(strongest.priority, 90);
+        assert_eq!(strongest.earliest_deadline_unix_micros, Some(2_000));
+
+        // The aggregate tracks cancellations.
+        let _ = actor.cancel_subscriber(OP_TWO);
+        let strongest = actor.strongest_interest().expect("one remains");
+        assert_eq!(strongest.priority, 30);
+        assert_eq!(strongest.earliest_deadline_unix_micros, Some(5_000));
+    }
+
+    // -- G004: per-subscriber requirement filtering ---------------------------
+
+    #[test]
+    fn serving_filter_matches_requirements_per_subscriber() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        assert_eq!(
+            actor.join(
+                join_request(OP_ONE.0, SubscriberKind::ForegroundAgent, 10),
+                1_100,
+                0
+            ),
+            JoinReceipt::JoinedExecution
+        );
+        // Pre-commit: compatible subscribers wait as pending verification;
+        // unknown operations have no filter answer at all.
+        assert_eq!(
+            actor.serving_filter(&OP_ONE),
+            Some(RequirementDecision::NeedsAdditionalVerification)
+        );
+        assert_eq!(actor.serving_filter(&OP_TWO), None, "unknown operation");
+
+        drive_to_offer(&mut actor, 1);
+        assert_eq!(
+            actor.offer_candidate(offer(1, 42, false)),
+            OfferReceipt::AcceptedAsWinner
+        );
+
+        // Post-commit joiners land on committed-but-EvidencePending.
+        let mut demanding = join_request(OP_TWO.0, SubscriberKind::DeterminismAudit, 20);
+        demanding.requirements.minimum_evidence_bundles = 2;
+        assert_eq!(
+            actor.join(demanding, 1_200, 0),
+            JoinReceipt::CommittedButNotServable(ActionServingDisposition::EvidencePending)
+        );
+        let mut wrong_isolation = join_request(3, SubscriberKind::ForegroundAgent, 30);
+        wrong_isolation.requirements.acceptable_isolation =
+            Some(vec![IsolationProfile::VolatileLocal]);
+        let _ = actor.join(wrong_isolation, 1_200, 0);
+        let mut wrong_scope = join_request(4, SubscriberKind::CiRequired, 40);
+        wrong_scope.requirements.privacy_scope = Some("other-scope".into());
+        let _ = actor.join(wrong_scope, 1_200, 0);
+        let mut wrong_platform = join_request(5, SubscriberKind::CiRequired, 50);
+        wrong_platform.requirements.platform = Some(d(99));
+        let _ = actor.join(wrong_platform, 1_200, 0);
+
+        // Unrestricted subscriber: served.
+        assert_eq!(
+            actor.serving_filter(&OP_ONE),
+            Some(RequirementDecision::Served)
+        );
+        // Evidence shortfall stays satisfiable via verification attempts.
+        assert_eq!(
+            actor.serving_filter(&OP_TWO),
+            Some(RequirementDecision::NeedsAdditionalVerification)
+        );
+        // Identity mismatches can NEVER be served from this result.
+        assert_eq!(
+            actor.serving_filter(&BuildOperationId(3)),
+            Some(RequirementDecision::Refused(
+                RequirementRefusal::IsolationUnacceptable
+            ))
+        );
+        assert_eq!(
+            actor.serving_filter(&BuildOperationId(4)),
+            Some(RequirementDecision::Refused(
+                RequirementRefusal::PrivacyScopeMismatch
+            ))
+        );
+        assert_eq!(
+            actor.serving_filter(&BuildOperationId(5)),
+            Some(RequirementDecision::Refused(
+                RequirementRefusal::PlatformMismatch
+            ))
+        );
+
+        // Completing evidence upgrades the shortfall to Served.
+        actor.record_evidence(d(80), false);
+        actor.record_evidence(d(81), false);
+        assert_eq!(
+            actor.serving_filter(&OP_TWO),
+            Some(RequirementDecision::Served)
+        );
     }
 }

@@ -16,10 +16,10 @@
 //! from a dead incarnation) is removed and taken over, and the takeover
 //! is logged.
 
-use rabs_asupersync::asupersync::cx::Cx;
-use rabs_asupersync::asupersync::io::{AsyncReadExt, AsyncWriteExt};
-use rabs_asupersync::asupersync::net::unix::{UnixListener, UnixStream};
-use rabs_asupersync::asupersync::signal::ShutdownReceiver;
+use asupersync::cx::Cx;
+use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+use asupersync::net::unix::{UnixListener, UnixStream};
+use asupersync::signal::ShutdownReceiver;
 use rabs_asupersync::daemon_runtime::SubsystemWork;
 use rabs_protocol::socket_admission::{
     AdmissionPolicy, ConnectionEvidence, PeerCredentials, SocketMetadata, TokenContext, admit,

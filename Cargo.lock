@@ -4911,6 +4911,7 @@ dependencies = [
 name = "rabs-wkr"
 version = "1.0.58"
 dependencies = [
+ "asupersync 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4)",
  "rabs-action",
  "rabs-asupersync",
  "rabs-cas",

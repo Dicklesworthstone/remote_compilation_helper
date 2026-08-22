@@ -12,10 +12,10 @@
 //!
 //! `--once` serves exactly one request then exits (acceptance harness).
 
-use rabs_asupersync::asupersync::cx::Cx;
-use rabs_asupersync::asupersync::io::{AsyncReadExt, AsyncWriteExt};
-use rabs_asupersync::asupersync::net::TcpStream;
-use rabs_asupersync::asupersync::runtime::RuntimeBuilder;
+use asupersync::cx::Cx;
+use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+use asupersync::net::TcpStream;
+use asupersync::runtime::RuntimeBuilder;
 use rabs_wkr::session::{
     CanonicalExecRequest, execute_canonical, probe_capability, sample_pressure,
 };

@@ -79,6 +79,7 @@ pub mod peer_limits;
 pub mod peer_queues;
 pub mod portability;
 pub mod pressure;
+pub mod provenance_receipt;
 pub mod raw_bytes;
 pub mod reason_codes;
 pub mod reconnect;
