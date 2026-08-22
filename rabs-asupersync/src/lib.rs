@@ -40,3 +40,6 @@ pub mod obligation_dashboard;
 pub mod obligations;
 pub mod region_tree;
 pub mod supervision;
+
+pub mod jobserver;
+pub mod process_groups;

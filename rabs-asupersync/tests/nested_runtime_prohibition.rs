@@ -4,9 +4,13 @@
 //! Long-running daemons own ONE runtime. Nested/re-entrant `block_on`
 //! (a runtime entered from inside another's task) deadlocks
 //! current-thread executors and breaks timer semantics — the classic
-//! production hang. This gate scans every rabs crate's sources for the
 //! forbidden patterns and fails CI on any hit outside an explicit,
-//! justified allowlist (currently empty).
+//! justified allowlist. The allowlist is NOT a relaxation: every entry
+//! must name a TOP-LEVEL daemon runtime entry (one owned runtime per
+//! daemon — the allowed shape), carry a written justification, and stay
+//! verifiable (the `allowlist_entries_point_at_live_pattern_sites`
+//! test fails if an entry's file stops existing or stops containing
+//! the pattern, so stale entries can never silently mask new code).
 //!
 //! The scan runs in CI like the A002/A004 gates; the detector itself
 //! is unit-tested against known-bad snippets (the planted negative) so
@@ -22,6 +26,33 @@ const FORBIDDEN: [&str; 4] = [
     "Runtime::new()",
     "new_current_thread()",
 ];
+
+/// Justified allowlist: files where a runtime entry is the TOP-LEVEL
+/// daemon boot, not a nested/re-entrant one (bead G013's allowed shape:
+/// one owned runtime per daemon). Tuple = (path suffix from the
+/// workspace root, justification).
+///
+/// Adding an entry requires ALL of: the file boots a whole daemon (its
+/// caller is a `main`, never an async context), the justification names
+/// that binary, and a reviewer sign-off in the commit message.
+const ALLOWED_RUNTIME_ENTRIES: &[(&str, &str)] = &[
+    (
+        "rabs-asupersync/src/daemon_runtime.rs",
+        "boot_daemon builds the rabsd daemon's ONE current-thread runtime and drives the root region from it; its only callers are daemon binaries' main paths",
+    ),
+    (
+        "rabs-wkr/src/main.rs",
+        "the rabs-wkr worker binary's main owns its single runtime and block_on-drives the ATP session loop from it",
+    ),
+];
+
+/// Path suffixes above are matched against the workspace-relative path.
+fn is_allowed_runtime_entry(path: &Path) -> bool {
+    let rendered = path.to_string_lossy();
+    ALLOWED_RUNTIME_ENTRIES
+        .iter()
+        .any(|(suffix, _)| rendered.ends_with(suffix))
+}
 
 /// Scan one source string; returns the forbidden patterns found on
 /// non-comment lines.
@@ -80,9 +111,13 @@ fn no_rabs_crate_contains_nested_runtime_patterns() {
     for file in &files {
         let source = fs::read_to_string(file).unwrap();
         let violations = violations_in(&source);
-        if !violations.is_empty() {
-            offenders.push(format!("{}: {:?}", file.display(), violations));
+        if violations.is_empty() {
+            continue;
         }
+        if is_allowed_runtime_entry(file) {
+            continue; // justified top-level daemon entry (see allowlist)
+        }
+        offenders.push(format!("{}: {:?}", file.display(), violations));
     }
     assert!(
         offenders.is_empty(),
@@ -115,4 +150,28 @@ fn handler(rt: &tokio::runtime::Runtime) {
     // the prohibition).
     let comment_only = "// never call .block_on( inside a task\n";
     assert!(violations_in(comment_only).is_empty());
+}
+
+#[test]
+fn allowlist_entries_point_at_live_pattern_sites() {
+    // Anti-rot guard: an allowlist entry whose file vanished or no
+    // longer contains any forbidden pattern is STALE — it would mask
+    // future hits in a reused path and must be pruned by a human.
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    assert!(
+        !ALLOWED_RUNTIME_ENTRIES.is_empty(),
+        "allowlist entries were removed; if the runtime entries moved, \
+         update them — never delete the guard silently"
+    );
+    for (suffix, justification) in ALLOWED_RUNTIME_ENTRIES {
+        let path = workspace.join(suffix);
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("allowlisted file {suffix} unreadable: {e}"));
+        let violations = violations_in(&source);
+        assert!(
+            !violations.is_empty(),
+            "stale allowlist entry {suffix} ({justification}): the file \
+             no longer contains a runtime entry — prune the entry"
+        );
+    }
 }

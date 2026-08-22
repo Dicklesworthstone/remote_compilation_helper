@@ -17,5 +17,4 @@
 //! generic daemon binary (the plan explicitly rejects extending `atpd`).
 
 pub mod jobserver;
-pub mod process_group;
 pub mod session;

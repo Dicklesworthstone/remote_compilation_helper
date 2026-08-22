@@ -188,7 +188,8 @@ fn free_disk_mib(_dir: &std::path::Path) -> u64 {
 /// non-result (`executed: false`) — never a fabricated success.
 ///
 /// G006 lifecycle ownership:
-/// - The action leads its OWN process group ([`crate::process_group`]);
+/// - The action leads its OWN process group
+///   ([`rabs_asupersync::process_groups`]);
 ///   after the leader exits, [`reap_residuals`] guarantees no member of
 ///   that group survives (count reported honestly).
 /// - The worker owns the concurrency budget: any client-supplied
@@ -204,11 +205,13 @@ pub fn execute_canonical(
     slots: u32,
 ) -> ExecResult {
     use crate::jobserver::replace_with_worker_local;
-    use crate::process_group::{ManagedProcessGroup, reap_residuals};
+    use rabs_asupersync::process_groups::{ManagedProcessGroup, reap_residuals};
+    use rabs_asupersync::region_tree::Attribution;
     use rabs_sandbox::canonical_mounts::CanonicalMountPlan;
     use rabs_sandbox::canonical_namespace::{
         HostIsolationSupport, build_canonical_argv, command_for,
     };
+    use std::process::Stdio;
     let support = HostIsolationSupport::probe();
     if !support.missing_for_canonical().is_empty() {
         return ExecResult {
@@ -242,10 +245,22 @@ pub fn execute_canonical(
     // concurrently while waiting, so chatty builds cannot deadlock on a
     // full kernel pipe buffer. Unbounded in-memory capture is the
     // documented stopgap until G007's bounded spill objects replace it.
-    let Ok(group) = ManagedProcessGroup::spawn(command_for(&launch)) else {
+    let mut command = command_for(&launch);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Attribution starts with what the worker knows — the coordinator's
+    // request id; full authority/generation context rides the wire via
+    // G003's ActionActor and extends this chain later.
+    let attribution = Attribution {
+        attempt: Some(request.request_id.to_string()),
+        ..Attribution::default()
+    };
+    let Ok(group) = ManagedProcessGroup::spawn_command(command, attribution) else {
         return exec_error(request.request_id);
     };
-    let pgid = group.pgid;
+    let pgid = group.pgid();
     match group.wait_with_output() {
         Ok(output) => {
             // Post-leader closer: TERM-resistant descendants are KILLed;
