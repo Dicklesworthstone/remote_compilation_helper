@@ -42,6 +42,7 @@ pub mod layout;
 pub mod leak_scanner;
 pub mod metadata_policy;
 pub mod network_isolation;
+pub mod observation;
 pub mod path_remap;
 pub mod process_context;
 pub mod pseudo_files;
