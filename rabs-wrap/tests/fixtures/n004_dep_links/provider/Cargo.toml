@@ -1,0 +1,13 @@
+[package]
+name = "n004_dep_provider"
+version = "0.1.0"
+edition = "2021"
+links = "Sys-Probe_v1"
+publish = false
+
+# Deliberately STANDALONE (empty [workspace]): N004 probes real cargo
+# behavior per channel, untouched by the outer repository.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
