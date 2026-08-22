@@ -972,10 +972,17 @@ mod tests {
             missing_root.display(),
             rendered
         );
+        // The fixture itself may live under the default root (e.g. a
+        // checkout at /data/projects/...), so a bare substring check
+        // would false-fire on the legitimate fixture paths carried by
+        // the rendered input/detail. Strip them first; any leftover
+        // citation of the compiled-in default is a real leak.
+        let stripped = rendered.replace(fixture.root.to_string_lossy().as_ref(), "");
         assert!(
-            !rendered.contains("/data/projects"),
-            "error must not leak default /data/projects when a custom \
-             canonical_root is configured. got: {}",
+            !stripped.contains(DEFAULT_CANONICAL_PROJECT_ROOT),
+            "error must not leak default {} when a custom canonical_root \
+             is configured. got: {}",
+            DEFAULT_CANONICAL_PROJECT_ROOT,
             rendered
         );
     }
