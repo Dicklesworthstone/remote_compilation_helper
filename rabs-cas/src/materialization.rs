@@ -522,6 +522,143 @@ pub fn materialize_action_outputs(
     })
 }
 
+// ---------------------------------------------------------------------
+// Gated verbatim artifact-notification replay (K005; plan §87 steps
+// 4–7; verified against Cargo source at pin 04b8ad83).
+//
+// Cargo's CURRENT process parses the rustc artifact-notification line
+// (the JSON with an "artifact" key) and — when the path ends in
+// `.rmeta` — marks its internal metadata dependency edge complete,
+// unblocking dependents. This is NOT Cargo's outward `compiler-artifact`
+// message: only Cargo generates that, and nothing here ever constructs
+// it (D008 rule 2). The replay emits ONLY bytes a previous real build
+// stored: this module has no serde model of any notification shape and
+// no constructor for one — synthesis is structurally impossible.
+//
+// The gating invariant is the whole point: a line becomes emittable
+// exactly when its announced output is FULLY materialized (verified +
+// renamed + stamped), never before. On a cache hit the stream Cargo
+// observes therefore matches stock pipelining where it matters: the
+// `.rmeta` notification arrives first and every other notification
+// arrives after its file exists.
+// ---------------------------------------------------------------------
+
+/// One rustc artifact-notification line stored from the winning
+/// attempt, bound to the output it announces. `exact_line` is replayed
+/// BYTE-VERBATIM — it carries the exact output path Cargo requested,
+/// and rewriting it would hand Cargo a path it never asked for (D008
+/// rule 1; subscriber translation is a separate layer's concern and
+/// deliberately does not apply to notifications).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredArtifactNotification {
+    /// Byte-verbatim JSON line (no trailing newline).
+    pub exact_line: Vec<u8>,
+    /// The destination path this line announces; must equal the
+    /// `PlannedActionOutput::destination` it gates on.
+    pub announced_destination: PathBuf,
+}
+
+/// Why a replay plan cannot be built. Every variant is a refusal to
+/// serve, never a best-effort stream: emitting an event whose output
+/// cannot be proven complete would corrupt Cargo's dependency state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayPlanError {
+    /// A line announces a path that is not in the materialization
+    /// plan: there is no proof its file exists.
+    UnboundLine {
+        /// The unbindable announced path.
+        path: String,
+    },
+    /// Two lines announce the same output. Exactly-once replay makes
+    /// duplicates unrepresentable rather than deduplicated.
+    DuplicateAnnouncement {
+        /// The twice-announced path.
+        path: String,
+    },
+    /// A zero-byte stored line: not a notification.
+    EmptyLine,
+}
+
+impl std::fmt::Display for ReplayPlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnboundLine { path } => {
+                write!(f, "notification names {path}, which is not in the plan")
+            }
+            Self::DuplicateAnnouncement { path } => {
+                write!(f, "two notifications announce {path}")
+            }
+            Self::EmptyLine => write!(f, "stored notification line is empty"),
+        }
+    }
+}
+
+impl std::error::Error for ReplayPlanError {}
+
+/// Build the gated replay stream for a SUCCESSFUL action
+/// materialization (plan §87 steps 4–7).
+///
+/// The returned lines are the caller's own stored bytes verbatim, in
+/// emission order: each line appears exactly once, positioned at the
+/// point its announced output completed installation — so `.rmeta`
+/// lines lead (K004 head phase), and no line can ever precede its
+/// file. Outputs without a stored notification produce no event.
+///
+/// The empty stream is valid: some actions (deterministic failures
+/// bypass serving entirely; some outputs have no notification) replay
+/// nothing.
+///
+/// # Errors
+/// [`ReplayPlanError`] — the caller must bypass serving rather than
+/// emit a partial or unprovable stream.
+pub fn plan_notification_replay(
+    receipt: &ActionMaterializationReceipt,
+    lines: &[StoredArtifactNotification],
+) -> Result<Vec<Vec<u8>>, ReplayPlanError> {
+    if lines.iter().any(|l| l.exact_line.is_empty()) {
+        return Err(ReplayPlanError::EmptyLine);
+    }
+    let mut by_destination: std::collections::HashMap<&Path, &StoredArtifactNotification> =
+        std::collections::HashMap::with_capacity(lines.len());
+    for line in lines {
+        if by_destination
+            .insert(line.announced_destination.as_path(), line)
+            .is_some()
+        {
+            return Err(ReplayPlanError::DuplicateAnnouncement {
+                path: line.announced_destination.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    // Every announced path must be a planned, installed output;
+    // otherwise no proof of completeness exists for it.
+    let installed_by_destination: std::collections::HashMap<&Path, usize> = receipt
+        .installed
+        .iter()
+        .enumerate()
+        .map(|(position, done)| (done.destination.as_path(), position))
+        .collect();
+    for line in lines {
+        if !installed_by_destination.contains_key(line.announced_destination.as_path()) {
+            return Err(ReplayPlanError::UnboundLine {
+                path: line.announced_destination.to_string_lossy().into_owned(),
+            });
+        }
+    }
+
+    // Walk installation order; emit each announcing line at the point
+    // its output became complete. The gate is structural: the loop
+    // iterates INSTALLED outputs only, so a line cannot precede its
+    // file under any input ordering.
+    let mut stream = Vec::with_capacity(lines.len());
+    for done in &receipt.installed {
+        if let Some(line) = by_destination.get(done.destination.as_path()) {
+            stream.push(line.exact_line.clone());
+        }
+    }
+    Ok(stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1155,6 +1292,185 @@ mod tests {
                 ..
             })
         ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // K005: gated verbatim artifact-notification replay.
+    // -----------------------------------------------------------------
+
+    use crate::materialization::StoredArtifactNotification;
+
+    fn notification(destination: &Path, body: &str) -> StoredArtifactNotification {
+        StoredArtifactNotification {
+            exact_line: body.as_bytes().to_vec(),
+            announced_destination: destination.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn replay_is_gated_on_materialization_and_byte_verbatim() {
+        let (dir, layout, mut store) = k004_fixture("k005-gated");
+        let head = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::ProvisionalMetadata,
+            "libg.rmeta",
+            b"meta",
+        );
+        let depinfo = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::DepInfo,
+            "libg.d",
+            b"d",
+        );
+        let rlib = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::Materializable,
+            "libg.rlib",
+            b"code",
+        );
+        let receipt = materialize_action_outputs(
+            &mut store,
+            &[depinfo.clone(), rlib.clone(), head.clone()],
+            MaterializationMode::PrivateCopy,
+        )
+        .expect("hit");
+
+        // dep-info carries NO stored notification: no event for it.
+        let lines = [
+            notification(
+                &rlib.destination,
+                r#"{"artifact":"/wt/target/debug/libg.rlib","notification":true}"#,
+            ),
+            notification(
+                &head.destination,
+                r#"{"artifact":"/wt/target/debug/libg.rmeta","notification":true}"#,
+            ),
+        ];
+        let stream = plan_notification_replay(&receipt, &lines).expect("stream");
+        assert_eq!(stream.len(), 2, "exactly the stored lines, once each");
+        assert!(
+            stream[0].windows(11).any(|w| w == b"libg.rmeta\""),
+            ".rmeta notification must lead: it is what unblocks dependents"
+        );
+        assert_eq!(
+            stream[1], lines[0].exact_line,
+            "tail line is byte-verbatim after its output"
+        );
+    }
+
+    #[test]
+    fn unbound_duplicate_and_empty_lines_are_typed_refusals() {
+        let (dir, layout, mut store) = k004_fixture("k005-refusals");
+        let head = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::ProvisionalMetadata,
+            "m.rmeta",
+            b"m",
+        );
+        let receipt = materialize_action_outputs(
+            &mut store,
+            std::slice::from_ref(&head),
+            MaterializationMode::PrivateCopy,
+        )
+        .expect("hit");
+
+        let stranger = dir.join("not-in-plan.rlib");
+        assert_eq!(
+            plan_notification_replay(&receipt, &[notification(&stranger, r#"{"artifact":"x"}"#)],),
+            Err(ReplayPlanError::UnboundLine {
+                path: stranger.to_string_lossy().into_owned()
+            }),
+            "no proof of completeness -> refuse, never emit"
+        );
+        let line = notification(&head.destination, r#"{"artifact":"m"}"#);
+        assert_eq!(
+            plan_notification_replay(&receipt, &[line.clone(), line]),
+            Err(ReplayPlanError::DuplicateAnnouncement {
+                path: head.destination.to_string_lossy().into_owned()
+            }),
+            "exactly-once makes duplicates unrepresentable"
+        );
+        assert_eq!(
+            plan_notification_replay(&receipt, &[notification(&head.destination, "")]),
+            Err(ReplayPlanError::EmptyLine),
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_hit_stream_matches_stock_pipelining() {
+        // THE acceptance scenario. Stock pipelining observable order:
+        // the .rmeta notification FIRST (Cargo's metadata edge
+        // completes; dependents start), then remaining notifications,
+        // each only after its output exists on disk. The cache-hit
+        // stream must reproduce exactly that, from verbatim bytes.
+        let (dir, layout, mut store) = k004_fixture("k005-stock-pipelining");
+        let head = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::ProvisionalMetadata,
+            "libs.rmeta",
+            b"meta",
+        );
+        let rlib = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::Materializable,
+            "libs.rlib",
+            b"code",
+        );
+        let receipt = materialize_action_outputs(
+            &mut store,
+            &[rlib.clone(), head.clone()],
+            MaterializationMode::PrivateCopy,
+        )
+        .expect("hit");
+
+        let rmeta_line =
+            br#"{"artifact":"/wt/target/debug/deps/libs.rmeta","focus":["Meta"]}"#.to_vec();
+        let rlib_line =
+            br#"{"artifact":"/wt/target/debug/deps/libs.rlib","focus":["Codegen"]}"#.to_vec();
+        let stock_order = vec![rmeta_line.clone(), rlib_line.clone()];
+
+        // Input deliberately REVERSED vs stock: gating, not input
+        // order, produces the pipelining sequence.
+        let stream = plan_notification_replay(
+            &receipt,
+            &[
+                StoredArtifactNotification {
+                    exact_line: rlib_line,
+                    announced_destination: rlib.destination.clone(),
+                },
+                StoredArtifactNotification {
+                    exact_line: rmeta_line,
+                    announced_destination: head.destination.clone(),
+                },
+            ],
+        )
+        .expect("stream");
+
+        assert_eq!(
+            stream, stock_order,
+            ".rmeta leads; each line follows its file"
+        );
+
+        // Structural anti-synthesis: every emitted byte came from a
+        // stored line — the module exposes no constructor that could
+        // have produced these bytes by itself.
+        for (emitted, stored) in stream.iter().zip(stock_order.iter()) {
+            assert_eq!(emitted, stored);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }
