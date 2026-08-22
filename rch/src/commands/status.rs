@@ -3054,6 +3054,11 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
         running: bool,
         pid: Option<u32>,
         uptime_secs: Option<u64>,
+        /// Version the daemon reports about itself (may lag the CLI when a
+        /// stale binary is still running under a supervisor).
+        version: Option<String>,
+        /// Socket path the daemon believes it is serving.
+        socket_path: Option<String>,
     }
 
     #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -3105,6 +3110,8 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                                 running: true,
                                 pid: Some(daemon_status.daemon.pid),
                                 uptime_secs: Some(daemon_status.daemon.uptime_secs),
+                                version: Some(daemon_status.daemon.version.clone()),
+                                socket_path: Some(daemon_status.daemon.socket_path.clone()),
                             };
 
                             let workers_info = WorkersCheckInfo {
@@ -3113,13 +3120,19 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                                 unhealthy: unhealthy.clone(),
                             };
 
-                            let (status, exit_code, issues) = derive_check_outcome(
+                            let (status, exit_code, mut issues) = derive_check_outcome(
                                 total_count,
                                 healthy_count,
                                 &unhealthy,
                                 &daemon_status.issues,
                                 hook_installed,
                             );
+                            if let Some(issue) = daemon_version_issue(
+                                &daemon_status.daemon.version,
+                                env!("CARGO_PKG_VERSION"),
+                            ) {
+                                issues.push(issue);
+                            }
                             (status, exit_code, daemon_info, workers_info, issues)
                         }
                         Err(_) => {
@@ -3127,6 +3140,8 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                                 running: true,
                                 pid: None,
                                 uptime_secs: None,
+                                version: None,
+                                socket_path: None,
                             };
                             let workers_info = WorkersCheckInfo {
                                 total: 0,
@@ -3148,6 +3163,8 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                         running: true,
                         pid: None,
                         uptime_secs: None,
+                        version: None,
+                        socket_path: None,
                     };
                     let workers_info = WorkersCheckInfo {
                         total: 0,
@@ -3170,6 +3187,8 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                 running: false,
                 pid: None,
                 uptime_secs: None,
+                version: None,
+                socket_path: None,
             };
             let workers_info = WorkersCheckInfo {
                 total: 0,
@@ -3189,6 +3208,45 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
     let hook_info = HookCheckInfo {
         installed: hook_installed,
     };
+
+    // A second rchd — typically an old binary kept alive by a supervisor
+    // (systemd Restart=always) while the CLI talks to a different socket —
+    // presents as permanently frozen telemetry that no deploy or probe can
+    // move (#44). Name every extra rchd process so the operator sees it here
+    // instead of chasing the telemetry pipeline.
+    let mut issues = issues;
+    let mut known_pids: Vec<u32> = vec![std::process::id()];
+    if let Some(pid) = daemon_info.pid {
+        known_pids.push(pid);
+    }
+    // When the daemon answered but its pid was unparsable we cannot tell the
+    // real daemon apart from a stray one — skip the scan instead of accusing
+    // the live daemon of being its own duplicate.
+    let extra_daemons = if daemon_info.running && daemon_info.pid.is_none() {
+        Vec::new()
+    } else {
+        find_extra_rchd_processes(&known_pids)
+    };
+    if !extra_daemons.is_empty() {
+        let issue = if daemon_info.running {
+            format!(
+                "{} rchd process(es) running besides the daemon answering this socket: {} — \
+                 a stale daemon under a supervisor can serve a different socket with frozen \
+                 telemetry; stop it or repoint its unit at the current binary",
+                extra_daemons.len(),
+                extra_daemons.join("; ")
+            )
+        } else {
+            format!(
+                "{} rchd process(es) are running but none answers the socket this CLI \
+                 resolved: {} — the CLI and daemon likely disagree on socket_path (check \
+                 the [general] socket_path override in ~/.config/rch/config.toml)",
+                extra_daemons.len(),
+                extra_daemons.join("; ")
+            )
+        };
+        issues.push(issue);
+    }
 
     let response = CheckResponse {
         status: status.clone(),
@@ -3219,6 +3277,9 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                 workers_info.healthy,
                 workers_info.total
             );
+            for issue in &issues {
+                println!("  {} {}", style.warning("\u{26A0}"), style.warning(issue));
+            }
         }
         "degraded" => {
             if workers_info.unhealthy.is_empty() {
@@ -3341,8 +3402,110 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
     Ok(())
 }
 
+/// One-line issue when the daemon self-reports a different version than this
+/// CLI — the strongest cheap signal that a stale rchd binary is still running
+/// (or that the daemon simply predates an upgrade and needs a restart).
+fn daemon_version_issue(daemon_version: &str, cli_version: &str) -> Option<String> {
+    if daemon_version == cli_version {
+        return None;
+    }
+    Some(format!(
+        "Daemon reports version {daemon_version} but this CLI is {cli_version} — a stale \
+         rchd binary may still be running; `rch daemon restart` to reload the current one"
+    ))
+}
+
+/// Best-effort scan for rchd processes other than the known pids.
+/// Returns human-readable `pid N: <args>` descriptions. Unix only; empty on
+/// other platforms and on any `ps` failure (never blocks the health check).
+#[cfg(unix)]
+fn find_extra_rchd_processes(known_pids: &[u32]) -> Vec<String> {
+    let output = match std::process::Command::new("ps")
+        .args(["-axo", "pid=,args="])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    parse_rchd_process_lines(&String::from_utf8_lossy(&output.stdout), known_pids)
+}
+
+#[cfg(not(unix))]
+fn find_extra_rchd_processes(_known_pids: &[u32]) -> Vec<String> {
+    Vec::new()
+}
+
+/// Pure parser behind [`find_extra_rchd_processes`]: pick `rchd` argv0
+/// basenames out of `ps -axo pid=,args=` output, skipping known pids.
+#[cfg(unix)]
+fn parse_rchd_process_lines(ps_output: &str, known_pids: &[u32]) -> Vec<String> {
+    let mut extras = Vec::new();
+    for line in ps_output.lines() {
+        let trimmed = line.trim_start();
+        let Some((pid_text, rest)) = trimmed.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            continue;
+        };
+        if known_pids.contains(&pid) {
+            continue;
+        }
+        let args = rest.trim_start();
+        let Some(argv0) = args.split_whitespace().next() else {
+            continue;
+        };
+        if argv0.rsplit('/').next().unwrap_or(argv0) != "rchd" {
+            continue;
+        }
+        let mut described: String = args.chars().take(120).collect();
+        if described.len() < args.len() {
+            described.push('\u{2026}');
+        }
+        extras.push(format!("pid {pid}: {described}"));
+    }
+    extras
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn daemon_version_issue_flags_only_mismatches() {
+        assert!(super::daemon_version_issue("1.0.57", "1.0.57").is_none());
+        let issue = super::daemon_version_issue("1.0.52", "1.0.57").expect("mismatch");
+        assert!(issue.contains("1.0.52"), "{issue}");
+        assert!(issue.contains("1.0.57"), "{issue}");
+        assert!(issue.contains("rch daemon restart"), "{issue}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rchd_process_scan_skips_known_pids_and_non_rchd() {
+        let ps = "\
+  101 /usr/local/bin/rchd --foreground --workers-config /etc/rch/workers.toml
+  202 /home/user/.local/bin/rchd --socket /tmp/rch.sock
+  303 rchd
+  404 /usr/bin/orchd --daemon
+  505 vim rchd.log
+  606 ps -axo pid=,args=
+";
+        let extras = super::parse_rchd_process_lines(ps, &[101]);
+        assert_eq!(extras.len(), 2, "{extras:?}");
+        assert!(extras[0].starts_with("pid 202: "), "{extras:?}");
+        assert!(extras[1].starts_with("pid 303: "), "{extras:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rchd_process_scan_truncates_long_args() {
+        let args = format!("/usr/local/bin/rchd {}", "x".repeat(300));
+        let ps = format!("  999 {args}\n");
+        let extras = super::parse_rchd_process_lines(&ps, &[]);
+        assert_eq!(extras.len(), 1);
+        assert!(extras[0].chars().count() < 140, "{}", extras[0]);
+        assert!(extras[0].ends_with('\u{2026}'), "{}", extras[0]);
+    }
+
     use super::*;
     use crate::ui::context::OutputConfig;
     use crate::ui::writer::SharedOutputBuffer;

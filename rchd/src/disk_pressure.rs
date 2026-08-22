@@ -326,6 +326,7 @@ pub fn evaluate_pressure_policy(
             classify_without_fresh_telemetry(
                 disk_free_gb.unwrap_or_default(),
                 disk_free_ratio.unwrap_or_default(),
+                latest.is_some(),
                 config,
             )
         };
@@ -444,6 +445,7 @@ fn classify_with_fresh_telemetry(
 fn classify_without_fresh_telemetry(
     disk_free_gb: f64,
     disk_free_ratio: f64,
+    ever_received: bool,
     config: &DiskPressurePolicyConfig,
 ) -> (PressureState, PressureConfidence, String, String) {
     if disk_free_gb <= config.critical_free_gb || disk_free_ratio <= config.critical_free_ratio {
@@ -463,10 +465,19 @@ fn classify_without_fresh_telemetry(
         );
     }
 
+    // Distinguish the two very different operator stories behind a gap (#44):
+    // a record that exists but aged past `telemetry_stale_after` (collection
+    // stopped or a frozen daemon), versus nothing ever ingested under this
+    // configured worker id (keying/collection never worked at all).
+    let reason_code = if ever_received {
+        "telemetry_stale"
+    } else {
+        "telemetry_never_received"
+    };
     (
         PressureState::TelemetryGap,
         PressureConfidence::Low,
-        "telemetry_unavailable".to_string(),
+        reason_code.to_string(),
         "fail_open_telemetry_gap".to_string(),
     )
 }
@@ -586,8 +597,20 @@ mod tests {
         let result = evaluate_pressure_policy(&caps, Some(&telemetry), &cfg);
         assert_eq!(result.state, PressureState::TelemetryGap);
         assert_eq!(result.confidence, PressureConfidence::Low);
-        assert_eq!(result.reason_code, "telemetry_unavailable");
+        assert_eq!(result.reason_code, "telemetry_stale");
         assert!(!result.telemetry_fresh);
+    }
+
+    #[test]
+    fn pressure_policy_distinguishes_never_received_telemetry() {
+        let caps = test_capabilities(80.0, 200.0);
+        let cfg = DiskPressurePolicyConfig::default();
+
+        let result = evaluate_pressure_policy(&caps, None, &cfg);
+        assert_eq!(result.state, PressureState::TelemetryGap);
+        assert_eq!(result.confidence, PressureConfidence::Low);
+        assert_eq!(result.reason_code, "telemetry_never_received");
+        assert_eq!(result.telemetry_age_secs, None);
     }
 
     #[test]

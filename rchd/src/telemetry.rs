@@ -518,7 +518,7 @@ pub async fn collect_telemetry_from_worker_pooled(
         return Err(anyhow::anyhow!("Telemetry command returned empty output"));
     }
 
-    let telemetry =
+    let mut telemetry =
         WorkerTelemetry::from_json(payload).context("Failed to parse telemetry JSON")?;
 
     if !telemetry.is_compatible() {
@@ -528,7 +528,39 @@ pub async fn collect_telemetry_from_worker_pooled(
         );
     }
 
+    if let Some(payload_id) = reconcile_polled_worker_id(worker_id.as_str(), &mut telemetry) {
+        warn!(
+            worker = worker_id.as_str(),
+            payload_worker_id = payload_id.as_str(),
+            "Telemetry payload arrived under a different worker id than the configured \
+             worker being polled (RCH_WORKER_ID unset or stale worker binary?); re-keying \
+             to the configured id so pressure lookups and persistence agree"
+        );
+    }
+
     Ok(telemetry)
+}
+
+/// Re-key a polled telemetry payload to the configured worker id.
+///
+/// `rch-wkr telemetry` falls back to `RCH_WORKER_ID` / `HOSTNAME` /
+/// `"unknown-worker"` when its `--worker-id` override is absent (manual
+/// invocations, older worker binaries). The daemon keys pressure lookups and
+/// the in-memory store by the *configured* id, so a divergent payload id
+/// would accumulate under a key the policy never reads — presenting as a
+/// permanently `telemetry_unavailable` worker while collection succeeds every
+/// minute (#44). Returns the original payload id when it disagreed.
+fn reconcile_polled_worker_id(
+    configured_id: &str,
+    telemetry: &mut WorkerTelemetry,
+) -> Option<String> {
+    if telemetry.worker_id == configured_id {
+        return None;
+    }
+    Some(std::mem::replace(
+        &mut telemetry.worker_id,
+        configured_id.to_string(),
+    ))
 }
 
 /// Total attempts (1 initial + retries) for a single worker poll per cycle.
@@ -645,6 +677,23 @@ mod tests {
     use rch_common::test_guard;
     use rch_telemetry::collect::cpu::{CpuTelemetry, LoadAverage};
     use rch_telemetry::collect::memory::MemoryTelemetry;
+
+    #[test]
+    fn reconcile_polled_worker_id_accepts_matching_ids() {
+        let mut telemetry = make_telemetry("w1", 10.0, 20.0);
+        assert_eq!(reconcile_polled_worker_id("w1", &mut telemetry), None);
+        assert_eq!(telemetry.worker_id, "w1");
+    }
+
+    #[test]
+    fn reconcile_polled_worker_id_rekeys_mismatched_payloads() {
+        let mut telemetry = make_telemetry("unknown-worker", 10.0, 20.0);
+        assert_eq!(
+            reconcile_polled_worker_id("w1", &mut telemetry),
+            Some("unknown-worker".to_string())
+        );
+        assert_eq!(telemetry.worker_id, "w1");
+    }
 
     #[test]
     fn poll_failure_rendering_carries_transport_elapsed_and_bounded_error() {

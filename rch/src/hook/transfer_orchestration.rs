@@ -1303,10 +1303,24 @@ pub(super) async fn execute_remote_compilation(
     if let Some(error) = extraction.extraction_error {
         warn!("Telemetry extraction failed: {}", error);
     }
-    if let Some(telemetry) = extraction.telemetry
-        && let Err(e) = send_telemetry(socket_path, TelemetrySource::Piggyback, &telemetry).await
-    {
-        warn!("Failed to forward telemetry to daemon: {}", e);
+    if let Some(mut telemetry) = extraction.telemetry {
+        // The hook knows exactly which configured worker ran this build, while
+        // rch-wkr on the worker only knows RCH_WORKER_ID/hostname fallbacks
+        // ("unknown-worker" when unset). The daemon keys pressure freshness by
+        // configured ids, so re-key here — otherwise the payload lands under a
+        // key no policy ever reads (#44).
+        if telemetry.worker_id != worker_config.id.as_str() {
+            warn!(
+                configured_worker = worker_config.id.as_str(),
+                payload_worker_id = telemetry.worker_id.as_str(),
+                "Piggybacked telemetry carried a divergent worker id; re-keying to the \
+                 configured worker (set RCH_WORKER_ID on the worker to silence this)"
+            );
+            telemetry.worker_id = worker_config.id.as_str().to_string();
+        }
+        if let Err(e) = send_telemetry(socket_path, TelemetrySource::Piggyback, &telemetry).await {
+            warn!("Failed to forward telemetry to daemon: {}", e);
+        }
     }
 
     if is_test_kind(kind)
