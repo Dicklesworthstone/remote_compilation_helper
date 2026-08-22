@@ -33,6 +33,7 @@
 
 pub mod canonical_mounts;
 pub mod canonical_namespace;
+pub mod cgroup_envelope;
 pub mod edit_watcher;
 pub mod env_builder;
 pub mod equality_suite;
