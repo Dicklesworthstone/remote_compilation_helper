@@ -106,6 +106,10 @@ dirs = "6.0"
 # File watching (for hot-reload)
 notify = "8.2"
 
+# Filesystem timestamp setting (K004 freshness policy: coherent mtime
+# stamping of materialized cache hits; safe wrapper over utimensat)
+filetime = "0.2"
+
 # Metrics and Observability
 prometheus = "0.14"
 lazy_static = "1.5"

@@ -4862,6 +4862,7 @@ name = "rabs-cas"
 version = "1.0.58"
 dependencies = [
  "blake3",
+ "filetime",
  "fsqlite",
  "rabs-key",
  "rabs-protocol",

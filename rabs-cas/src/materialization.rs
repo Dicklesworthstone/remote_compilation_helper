@@ -42,8 +42,11 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime};
 
-use rabs_protocol::result_identity::TypedDigest;
+use filetime::FileTime;
+use rabs_protocol::raw_bytes::RawBytes;
+use rabs_protocol::result_identity::{OutputRole, TypedDigest};
 
 use crate::blob_store::RAW_PROFILE_V1;
 use crate::digest_set::{DigestRequest, StreamingObjectWriter};
@@ -93,6 +96,13 @@ pub enum MaterializeError {
     },
     /// The metadata store refused a lookup.
     Store(String),
+    /// An action-level plan declared the same destination path twice
+    /// (K004): refused before any installation begins, because two
+    /// writers to one path have no coherent ordering.
+    DuplicateDestination {
+        /// The duplicated destination path.
+        path: String,
+    },
 }
 
 impl std::fmt::Display for MaterializeError {
@@ -108,6 +118,9 @@ impl std::fmt::Display for MaterializeError {
             } => write!(f, "{path} holds {found}, not {expected}"),
             Self::Io { step, error } => write!(f, "{step}: {error}"),
             Self::Store(error) => write!(f, "store: {error}"),
+            Self::DuplicateDestination { path } => {
+                write!(f, "action plan declares {path} as a destination twice")
+            }
         }
     }
 }
@@ -308,6 +321,205 @@ pub const fn decide_materialization(
     }
     // Unverified reflink or none: PRIVATE COPY, never a hardlink.
     MaterializationMode::PrivateCopy
+}
+
+// ---------------------------------------------------------------------
+// Action-level pipelined materialization (K004; plan §87; invariant I12).
+//
+// Cargo completes its internal metadata dependency edge when it parses
+// a rustc artifact-notification line whose path ends in `.rmeta`. On a
+// cache hit, serving therefore has ONE ordering obligation: the exact
+// `.rmeta` output must be fetched, verified, and fully materialized —
+// including its freshness metadata — before any other output is touched,
+// because the caller may replay the notification the moment this
+// function's head phase is done (the replay itself is K005's contract).
+// ---------------------------------------------------------------------
+
+/// One declared output of a cached action, resolved to its local
+/// destination. The caller owns the virtual-to-real mapping (plan §87
+/// step 1: "resolve the exact `.rmeta` logical output and
+/// Cargo-requested path"); this layer owns ordering, verification,
+/// atomicity, and freshness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedActionOutput {
+    /// Role tag from the canonical logical-output map. Rows with
+    /// [`OutputRole::ProvisionalMetadata`] are the pipelining head.
+    pub role: OutputRole,
+    /// Canonical virtual path (byte-preserving receipt identity).
+    pub virtual_path: RawBytes,
+    /// The committed CAS object this destination must receive.
+    pub object: TypedDigest,
+    /// The local path Cargo requested.
+    pub destination: PathBuf,
+}
+
+/// One installed output with its measured latency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputMaterialized {
+    /// Role tag.
+    pub role: OutputRole,
+    /// Canonical virtual path.
+    pub virtual_path: RawBytes,
+    /// Where the bytes were installed.
+    pub destination: PathBuf,
+    /// Verified bytes written.
+    pub bytes: u64,
+    /// This output's install latency, nanoseconds.
+    pub nanos: u128,
+}
+
+/// Success receipt for one action materialization. Latencies here are
+/// MEASURED, not assumed: the bead's small-artifact hit target (<50ms)
+/// is a property callers observe through `head_nanos`, not a claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionMaterializationReceipt {
+    /// Wall-clock nanoseconds for the whole call.
+    pub total_nanos: u128,
+    /// Wall-clock nanoseconds from call start through completion of
+    /// the LAST `.rmeta`-role output — the pipelining gate. Zero when
+    /// the plan declares no provisional metadata.
+    pub head_nanos: u128,
+    /// Wall-clock nanoseconds spent on the tail phase alone.
+    pub tail_nanos: u128,
+    /// Outputs in installation order (head first, then tail).
+    pub installed: Vec<OutputMaterialized>,
+}
+
+/// Why an action-level materialization aborted. The already-installed
+/// prefix stays on disk (each file was verified before its rename) but
+/// is reported so no caller can mistake it for a servable result:
+/// plan §87 replays events only against a FULLY materializable result,
+/// so any failure means bypass serving for this action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionMaterializeFailure {
+    /// Successfully installed prefix, in order.
+    pub installed: Vec<OutputMaterialized>,
+    /// The refusal that stopped the action.
+    pub error: MaterializeError,
+}
+
+/// Deterministic within-phase order: byte order by canonical virtual
+/// path, then role rank, then destination path. Not input order — this
+/// function's receipt must be reproducible even for hand-built plans.
+fn role_rank(role: OutputRole) -> u8 {
+    match role {
+        OutputRole::ProvisionalMetadata => 0,
+        OutputRole::DepInfo => 1,
+        OutputRole::BuildScriptMetadata => 2,
+        OutputRole::TestSideEffect => 3,
+        OutputRole::Materializable => 4,
+    }
+}
+
+fn planned_order_key(p: &PlannedActionOutput) -> (Vec<u8>, u8, PathBuf) {
+    (
+        p.virtual_path.as_bytes().to_vec(),
+        role_rank(p.role),
+        p.destination.clone(),
+    )
+}
+
+/// Install ONE declared output: verify-and-rename via
+/// [`materialize_object`], then apply the freshness stamp (plan §30:
+/// outputs newer than inputs from Cargo's perspective). Stamping is
+/// gated on `mode.mtime_permitted()` structurally — mtime changes are
+/// ever applied only to private materializations.
+fn install_one(
+    store: &mut dyn RabsMetadataStore,
+    out: &PlannedActionOutput,
+    freshness: FileTime,
+    mode: MaterializationMode,
+) -> Result<OutputMaterialized, MaterializeError> {
+    let began = Instant::now();
+    let bytes = materialize_object(store, &out.object, &out.destination, mode)?;
+    if mode.mtime_permitted() {
+        filetime::set_file_mtime(&out.destination, freshness).map_err(io_err("set-mtime"))?;
+    }
+    Ok(OutputMaterialized {
+        role: out.role,
+        virtual_path: out.virtual_path.clone(),
+        destination: out.destination.clone(),
+        bytes,
+        nanos: began.elapsed().as_nanos(),
+    })
+}
+
+/// Materialize a cached action's outputs with `.rmeta` first (K004;
+/// plan §87 steps 1–3 and 6).
+///
+/// Ordering contract: every [`OutputRole::ProvisionalMetadata`] output
+/// is fetched, byte-verified, atomically renamed into place, and
+/// freshness-stamped BEFORE any other output begins. Within each phase
+/// the order is deterministic ([`planned_order_key`]). Every installed
+/// file carries the SAME freshness timestamp captured once at call
+/// start, so the bundle is coherent from Cargo's mtime-sensitive
+/// freshness view (risk R6: incoherent hit mtimes cause rebuild storms
+/// or false freshness) and repeated hits stay storm-free.
+///
+/// Fail-fast: the first refusal aborts the action and returns the
+/// installed prefix plus the error. A corrupt CAS copy refuses
+/// immediately (`ContentMismatch`) rather than trying another location
+/// — silently substituting a second copy would hide store corruption.
+///
+/// # Errors
+/// [`ActionMaterializeFailure`] with the installed prefix; duplicate
+/// destinations are refused before anything is touched.
+pub fn materialize_action_outputs(
+    store: &mut dyn RabsMetadataStore,
+    outputs: &[PlannedActionOutput],
+    mode: MaterializationMode,
+) -> Result<ActionMaterializationReceipt, ActionMaterializeFailure> {
+    // Destination arbiter, action scale (plan §30.1): reserve every
+    // declared path BEFORE installing anything; two rows claiming one
+    // path have no coherent ordering.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for out in outputs {
+        let key = out.destination.to_string_lossy().into_owned();
+        if !seen.insert(key.clone()) {
+            return Err(ActionMaterializeFailure {
+                installed: Vec::new(),
+                error: MaterializeError::DuplicateDestination { path: key },
+            });
+        }
+    }
+
+    let mut ordered: Vec<&PlannedActionOutput> = outputs.iter().collect();
+    ordered.sort_by_key(|p| planned_order_key(p));
+    let (heads, tails): (Vec<_>, Vec<_>) = ordered
+        .into_iter()
+        .partition(|out| out.role == OutputRole::ProvisionalMetadata);
+
+    let freshness = FileTime::from_system_time(SystemTime::now());
+    let started = Instant::now();
+    let mut installed = Vec::with_capacity(outputs.len());
+
+    for out in &heads {
+        match install_one(store, out, freshness, mode) {
+            Ok(done) => installed.push(done),
+            Err(error) => {
+                return Err(ActionMaterializeFailure { installed, error });
+            }
+        }
+    }
+    let head_nanos = started.elapsed().as_nanos();
+
+    let tail_started = Instant::now();
+    for out in &tails {
+        match install_one(store, out, freshness, mode) {
+            Ok(done) => installed.push(done),
+            Err(error) => {
+                return Err(ActionMaterializeFailure { installed, error });
+            }
+        }
+    }
+    let tail_nanos = tail_started.elapsed().as_nanos();
+
+    Ok(ActionMaterializationReceipt {
+        total_nanos: started.elapsed().as_nanos(),
+        head_nanos,
+        tail_nanos,
+        installed,
+    })
 }
 
 #[cfg(test)]
@@ -572,6 +784,377 @@ mod tests {
             "the hazard is real: alias mutation rewrites CAS bytes — \
              which is exactly why no writable-hardlink mode exists"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // K004: pipelined action materialization (.rmeta first; plan §87).
+    // -----------------------------------------------------------------
+
+    use crate::blob_store::{BlobStoreLayout, DurabilityPolicy, PutLimits, put_if_absent};
+    use crate::digest_set::digest_set;
+    use crate::metadata_store::{RusqliteEngine, SqlMetadataStore};
+    use rabs_protocol::raw_bytes::RawBytes;
+    use rabs_protocol::result_identity::OutputRole;
+
+    type TestStore = SqlMetadataStore<RusqliteEngine>;
+
+    /// One action, ONE store: every output object of an action goes
+    /// into this store, because a served hit resolves through a single
+    /// CAS. Returns the scratch dir (destination parent), the layout,
+    /// and the store.
+    fn k004_fixture(name: &str) -> (PathBuf, BlobStoreLayout, TestStore) {
+        let dir = scratch_dir(name);
+        let layout = BlobStoreLayout::open(&dir.join("blobs")).unwrap();
+        let engine = RusqliteEngine::open(&dir.join("meta.sqlite")).unwrap();
+        let store = SqlMetadataStore::open(engine).unwrap();
+        (dir, layout, store)
+    }
+
+    /// Commit `bytes` into the shared store and declare the planned
+    /// output Cargo asked for.
+    fn planned(
+        dir: &Path,
+        layout: &BlobStoreLayout,
+        store: &mut TestStore,
+        role: OutputRole,
+        name: &str,
+        bytes: &[u8],
+    ) -> PlannedActionOutput {
+        let declared = digest_set(bytes, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+        let mut reader = bytes;
+        put_if_absent(
+            layout,
+            store,
+            &declared,
+            &mut reader,
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .expect("put");
+        PlannedActionOutput {
+            role,
+            virtual_path: RawBytes::new(name.as_bytes().to_vec()),
+            object: declared,
+            destination: dir.join(name),
+        }
+    }
+
+    /// Rot the stored copy of `object` behind the store's back.
+    fn rot(store: &mut TestStore, object: &TypedDigest) {
+        let cas_path = store.object_locations(object).unwrap()[0].0.clone();
+        fs::write(cas_path, b"tampered!!!!").unwrap();
+    }
+
+    #[test]
+    fn rmeta_installs_before_everything_else_even_when_tail_copy_is_corrupt() {
+        // THE ordering proof, black-box: corrupt ONE tail object's
+        // stored copy. The action must fail — but the `.rmeta` must
+        // already be on disk with exact verified bytes, proving the
+        // head phase completed before the failing tail began.
+        let (dir, layout, mut store) = k004_fixture("k004-head-first");
+        let head = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::ProvisionalMetadata,
+            "libfeat.rmeta",
+            b"the exact provisional metadata",
+        );
+        let tail_a = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::Materializable,
+            "b_libfeat.rlib",
+            b"codegen a",
+        );
+        let tail_b = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::Materializable,
+            "a_libfeat.rlib",
+            b"codegen b",
+        );
+        rot(&mut store, &tail_b.object);
+
+        let failure = materialize_action_outputs(
+            &mut store,
+            &[tail_a, tail_b.clone(), head.clone()],
+            MaterializationMode::PrivateCopy,
+        )
+        .expect_err("corrupt tail copy must abort");
+        assert!(
+            matches!(failure.error, MaterializeError::ContentMismatch { .. }),
+            "unexpected error: {:?}",
+            failure.error
+        );
+        // Head installed BEFORE any tail work:
+        assert_eq!(
+            fs::read(&head.destination).unwrap(),
+            b"the exact provisional metadata",
+            ".rmeta must be fully installed before the tail failed"
+        );
+        // The deterministic tail order ran a_libfeat (corrupt) first,
+        // so NOTHING of the tail survived; only the head is installed.
+        assert_eq!(failure.installed.len(), 1);
+        assert_eq!(failure.installed[0].virtual_path, head.virtual_path);
+        assert!(
+            !tail_b.destination.exists(),
+            "the corrupt copy must install nothing"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_rmeta_aborts_before_any_tail_output_is_installed() {
+        let (dir, layout, mut store) = k004_fixture("k004-corrupt-head");
+        let head = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::ProvisionalMetadata,
+            "libx.rmeta",
+            b"provisional metadata bytes",
+        );
+        let tail = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::Materializable,
+            "libx.rlib",
+            b"codegen",
+        );
+        rot(&mut store, &head.object);
+
+        let failure = materialize_action_outputs(
+            &mut store,
+            &[tail, head.clone()],
+            MaterializationMode::PrivateCopy,
+        )
+        .expect_err("corrupt head must abort");
+        assert!(matches!(
+            failure.error,
+            MaterializeError::ContentMismatch { .. }
+        ));
+        assert!(failure.installed.is_empty());
+        assert!(!dir.join("libx.rlib").exists(), "no tail output may exist");
+        assert!(!head.destination.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn freshness_stamp_is_one_coherent_instant_newer_than_preexisting_state() {
+        // Plan §30 / risk R6: every output carries the SAME fresh mtime
+        // so Cargo's mtime-sensitive freshness sees one coherent bundle,
+        // newer than anything that predated the hit.
+        let (dir, layout, mut store) = k004_fixture("k004-freshness");
+        let head = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::ProvisionalMetadata,
+            "m.rmeta",
+            b"meta",
+        );
+        let depinfo = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::DepInfo,
+            "lib.d",
+            b"dep info",
+        );
+        let rlib = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::Materializable,
+            "lib.rlib",
+            b"codegen",
+        );
+
+        // Pre-existing files at the destinations (an older build's
+        // outputs): the hit must land strictly NEWER than these.
+        for out in [&head, &depinfo, &rlib] {
+            fs::write(&out.destination, b"stale older build").unwrap();
+        }
+        let stale = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+        );
+        for out in [&head, &depinfo, &rlib] {
+            filetime::set_file_mtime(&out.destination, stale).unwrap();
+        }
+
+        let receipt = materialize_action_outputs(
+            &mut store,
+            &[rlib, depinfo, head],
+            MaterializationMode::PrivateCopy,
+        )
+        .expect("hit");
+        assert_eq!(receipt.installed.len(), 3);
+
+        let stamps: Vec<_> = receipt
+            .installed
+            .iter()
+            .map(|done| {
+                filetime::FileTime::from_last_modification_time(
+                    &fs::metadata(&done.destination).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(stamps[0], stamps[1], "one coherent bundle stamp");
+        assert_eq!(stamps[1], stamps[2], "one coherent bundle stamp");
+        assert!(
+            stamps[0]
+                > filetime::FileTime::from_system_time(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(60)
+                ),
+            "hit outputs must be newer than recent inputs"
+        );
+
+        // Bytes are the committed objects, not the stale files.
+        assert_eq!(fs::read(dir.join("m.rmeta")).unwrap(), b"meta");
+        assert_eq!(fs::read(dir.join("lib.rlib")).unwrap(), b"codegen");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn receipt_order_is_deterministic_and_head_phase_is_measured() {
+        let (dir, layout, mut store) = k004_fixture("k004-receipt");
+        let head = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::ProvisionalMetadata,
+            "z.rmeta",
+            b"m",
+        );
+        let t1 = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::Materializable,
+            "c.rlib",
+            b"1",
+        );
+        let t2 = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::Materializable,
+            "a.rlib",
+            b"2",
+        );
+        let t3 = planned(&dir, &layout, &mut store, OutputRole::DepInfo, "b.d", b"3");
+
+        // Input order deliberately scrambled; head declared LAST.
+        let receipt = materialize_action_outputs(
+            &mut store,
+            &[t3, t1, head.clone(), t2],
+            MaterializationMode::PrivateCopy,
+        )
+        .expect("hit");
+
+        let names: Vec<String> = receipt
+            .installed
+            .iter()
+            .map(|d| d.virtual_path.as_utf8().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "z.rmeta".to_owned(),
+                "a.rlib".to_owned(),
+                "b.d".to_owned(),
+                "c.rlib".to_owned()
+            ],
+            "head first, then deterministic virtual-path byte order"
+        );
+        assert!(receipt.head_nanos >= receipt.installed[0].nanos);
+        assert!(receipt.tail_nanos > 0);
+        assert!(receipt.total_nanos >= receipt.head_nanos + receipt.tail_nanos);
+        assert!(
+            receipt.head_nanos < 50_000_000,
+            "small-artifact head phase took {}ns; the <50ms hit target is \
+             a property this layer must exhibit on trivial inputs",
+            receipt.head_nanos
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_destinations_are_refused_before_any_installation() {
+        let (dir, layout, mut store) = k004_fixture("k004-duplicate");
+        let a = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::Materializable,
+            "same.rlib",
+            b"1",
+        );
+        let other = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::DepInfo,
+            "other.d",
+            b"2",
+        );
+        let collision = PlannedActionOutput {
+            role: OutputRole::Materializable,
+            virtual_path: RawBytes::new(b"different-virtual".to_vec()),
+            object: other.object.clone(),
+            destination: a.destination.clone(),
+        };
+        let failure = materialize_action_outputs(
+            &mut store,
+            &[a.clone(), collision],
+            MaterializationMode::PrivateCopy,
+        )
+        .expect_err("duplicate destination");
+        assert!(matches!(
+            failure.error,
+            MaterializeError::DuplicateDestination { .. }
+        ));
+        assert!(failure.installed.is_empty());
+        assert!(!a.destination.exists(), "nothing installed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_plan_is_a_vacuous_success_and_unsupported_modes_refuse() {
+        let (dir, layout, mut store) = k004_fixture("k004-empty");
+        let receipt = materialize_action_outputs(&mut store, &[], MaterializationMode::PrivateCopy)
+            .expect("empty plan");
+        assert_eq!(receipt.installed, Vec::new());
+        // Vacuous phases still cost the elapsed() call itself — a few
+        // hundred ns — so the honest assertion is the <50ms gate, not
+        // a literal zero.
+        assert!(receipt.head_nanos < 50_000_000);
+        assert!(receipt.tail_nanos < 50_000_000);
+
+        // The mode policy still rules at action level: an unimplemented
+        // mode is refused, never downgraded.
+        let out = planned(
+            &dir,
+            &layout,
+            &mut store,
+            OutputRole::Materializable,
+            "x.rlib",
+            b"x",
+        );
+        assert!(matches!(
+            materialize_action_outputs(&mut store, &[out], MaterializationMode::ReadOnlyBind),
+            Err(ActionMaterializeFailure {
+                error: MaterializeError::ModeUnsupported(MaterializationMode::ReadOnlyBind),
+                ..
+            })
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 }

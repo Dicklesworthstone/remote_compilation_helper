@@ -44,6 +44,9 @@ blake3 = { workspace = true }
 # implementations of the root computation could silently drift). Pure
 # sibling crate; depends only on rabs-protocol.
 rabs-key = { path = "../rabs-key" }
+# K004: coherent freshness stamping of materialized outputs (plan §30 —
+# outputs newer than inputs, private materializations only).
+filetime = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"
