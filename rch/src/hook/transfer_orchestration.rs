@@ -472,6 +472,11 @@ pub(super) async fn execute_remote_compilation(
     // config roots here demanded worker /data be a symlink to a freshly
     // mkdir'd /Users/jemanuel and refused every real fleet store with
     // RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK (status 42) by construction.
+    // Known limitation: hosts that relocate their store via the worker-side
+    // RCH_WKR_CANONICAL_ROOT / RCH_WKR_ALIAS_ROOT overrides (rch-wkr) are not
+    // visible to this client-side preflight; such deployments must keep
+    // compile-time default roots present or extend this call to a shared
+    // resolver before relying on plain 'rch exec' there.
     ensure_worker_projects_topology(&worker_config, reporter, &PathTopologyPolicy::default())
         .await?;
 
