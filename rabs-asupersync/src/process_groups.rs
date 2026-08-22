@@ -168,6 +168,13 @@ impl ManagedProcessGroup {
                 if !probe
                     .iter()
                     .any(|m| m.pid == i32::try_from(pgid).unwrap_or(-1))
+                    // Re-check exit before condemning: a leader that
+                    // exited between try_wait and the scan above is a
+                    // zombie our membership filter hides — the group WAS
+                    // honored, and wait_with_output will surface the
+                    // status. Only a STILL-RUNNING leader absent from
+                    // every pgrp means the platform ignored the request.
+                    && group.leader.try_wait()?.is_none()
                 {
                     return Err(io::Error::other(format!(
                         "process_group(0) not honored: live leader pid {pgid} not found in any /proc pgrp"
@@ -223,7 +230,7 @@ impl ManagedProcessGroup {
             Ok(())
         } else {
             Err(io::Error::other(format!(
-                "kill -{} -{} failed: {status}",
+                "kill -{} -- -{} failed: {status}",
                 sig.name(),
                 self.pgid
             )))
