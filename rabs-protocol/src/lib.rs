@@ -54,6 +54,7 @@ pub mod control_reserve;
 pub mod dashboards;
 pub mod decision_receipt;
 pub mod descriptor;
+pub mod directive_manifest;
 pub mod domain_plumbing;
 pub mod durable_ids;
 pub mod edge_fence;
