@@ -1,0 +1,12 @@
+[package]
+name = "n011_golden_provider"
+version = "0.1.0"
+edition = "2021"
+links = "GoldenLinks"
+publish = false
+
+# Standalone ([workspace]): goldens must come from untouched cargo.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
