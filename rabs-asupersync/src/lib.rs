@@ -44,3 +44,4 @@ pub mod supervision;
 pub mod jobserver;
 pub mod process_groups;
 pub mod root_permits;
+pub mod termination;
