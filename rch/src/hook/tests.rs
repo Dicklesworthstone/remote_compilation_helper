@@ -3690,6 +3690,47 @@ fn test_job_kind_pipeline_contract() {
 }
 
 #[test]
+fn test_validate_job_result_dirs_accepts_relative_paths_and_dedupes() {
+    let _guard = test_guard!();
+    let validated = validate_job_result_dirs(vec![
+        PathBuf::from("results/shard-a"),
+        PathBuf::from("./fuzz/corpus"),
+        // Duplicate (after `./` normalization) must collapse, preserving the
+        // first occurrence's position.
+        PathBuf::from("results/shard-a"),
+    ])
+    .expect("valid result dirs");
+    assert_eq!(
+        validated,
+        vec![
+            PathBuf::from("results/shard-a"),
+            PathBuf::from("fuzz/corpus"),
+        ],
+        "result dirs must normalize `.` segments and dedupe"
+    );
+}
+
+#[test]
+fn test_validate_job_result_dirs_rejects_unsafe_paths() {
+    let _guard = test_guard!();
+    let unsafe_inputs = [
+        PathBuf::from("../escape"),
+        PathBuf::from("results/../../escape"),
+        PathBuf::from("/absolute/path"),
+        PathBuf::from(r"back\slash"),
+        PathBuf::from("results/café"),
+        PathBuf::new(),
+    ];
+    for input in unsafe_inputs {
+        assert!(
+            validate_job_result_dirs(vec![input.clone()]).is_err(),
+            "unsafe result dir {:?} must be rejected before any transfer",
+            input
+        );
+    }
+}
+
+#[test]
 fn test_add_cargo_isolation_skips_non_cargo_commands() {
     let _guard = test_guard!();
     let worker_id = rch_common::WorkerId::new("test-worker");
@@ -5756,6 +5797,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         &policy,
         None,
         false,
+        &[],
     )
     .await;
 
@@ -5869,6 +5911,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         &policy,
         None,
         false,
+        &[],
     )
     .await;
 
@@ -5970,6 +6013,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &policy,
         None,
         false,
+        &[],
     )
     .await;
 
@@ -5994,6 +6038,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &policy,
         None,
         false,
+        &[],
     )
     .await;
 

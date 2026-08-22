@@ -3712,6 +3712,176 @@ fi",
         })
     }
 
+    /// Build the rsync command that pulls one declared job result directory.
+    ///
+    /// Explicit source path instead of the pattern machinery used by
+    /// [`Self::build_retrieve_command`]: rsync itself fails when the source
+    /// does not exist on the worker, which is precisely the loud
+    /// missing-declared-output semantic bd-p0yoo requires.
+    fn build_result_dir_retrieve_command(
+        &self,
+        worker: &WorkerConfig,
+        escaped_remote_path: &str,
+        rel: &Path,
+    ) -> Command {
+        let mut cmd = Command::new("rsync");
+        // Force C locale for consistent output parsing.
+        cmd.env("LC_ALL", "C");
+
+        let identity_file = shellexpand::tilde(&worker.identity_file);
+        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
+        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+
+        // Same transport hardening as artifact retrieval: --safe-links blocks
+        // symlink traversal out of the declared tree.
+        cmd.arg("-az");
+        add_portable_rsync_archive_args(&mut cmd);
+        cmd.arg("--stats")
+            .arg("--safe-links")
+            .arg("-e")
+            .arg(ssh_command);
+
+        let compression_level = self.compression_level_for_transfer();
+        if compression_level > 0 {
+            cmd.arg("--compress-choice=zstd");
+            cmd.arg(format!("--compress-level={}", compression_level));
+        }
+        if let Some(bwlimit) = self.transfer_config.bwlimit_kbps
+            && bwlimit > 0
+        {
+            cmd.arg(format!("--bwlimit={}", bwlimit));
+        }
+
+        // Trailing slash on BOTH sides copies the CONTENTS of `<remote>/<rel>/`
+        // into `<project_root>/<rel>/`, so declared paths materialize at their
+        // identical repository-relative location locally.
+        let rel_str = rel.as_os_str().to_string_lossy();
+        let escaped_rel = escape(Cow::from(rel_str.as_ref()));
+        let source = format!(
+            "{}@{}:{}/{}/",
+            worker.user, worker.host, escaped_remote_path, escaped_rel
+        );
+        let local_dest = format!("{}/{}/", self.project_root.display(), rel.display());
+        cmd.arg(&source).arg(local_dest);
+
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd
+    }
+
+    /// Retrieve one declared job result directory (bd-p0yoo).
+    ///
+    /// Runs its own rsync per directory with the directory as an explicit
+    /// source, so a directory the job never created is a hard rsync error
+    /// rather than a silent zero-file success. Any error means the invocation's
+    /// declared outputs are INCOMPLETE and callers must fail loudly.
+    pub async fn retrieve_result_dir(
+        &self,
+        worker: &WorkerConfig,
+        rel: &Path,
+    ) -> Result<SyncResult> {
+        if self.worker_platform.is_windows() {
+            return Err(anyhow::anyhow!(
+                "result-dir retrieval requires the Unix rsync transport; worker {} is Windows",
+                worker.id
+            ));
+        }
+
+        // Defense in depth: re-validate here rather than trusting the caller.
+        // `rel` is interpolated into a remote rsync source spec AND joined
+        // into the local project root below, so the repository-relative rules
+        // (no traversal, no absolute, ASCII-only) must hold at this boundary.
+        let rel =
+            &crate::hook::normalize_repository_relative_path("--result-dir", rel).map_err(|e| {
+                TransferError::SyncFailed {
+                    reason: e.to_string(),
+                    exit_code: None,
+                    stderr: String::new(),
+                }
+            })?;
+
+        // Materialize the local destination tree first so nested relative
+        // paths (`out/shards/a`) do not depend on rsync creating parents.
+        std::fs::create_dir_all(self.project_root.join(rel)).map_err(|e| {
+            TransferError::SyncFailed {
+                reason: format!("failed to create local result dir {}", rel.display()),
+                exit_code: None,
+                stderr: e.to_string(),
+            }
+        })?;
+
+        let remote_path = self.remote_path();
+
+        if use_mock_transport(worker) {
+            // Mock transports have no existence model; exercise the same
+            // pattern-based plumbing the mock artifact path uses so mock-based
+            // tests cover the call wiring end to end.
+            let patterns = [format!("{}/**", rel.display())];
+            return self.retrieve_artifacts(worker, &patterns).await;
+        }
+
+        let escaped_remote_path = escape(Cow::from(&remote_path));
+        let start = std::time::Instant::now();
+        let retry_config = self.effective_rsync_retry_config();
+        let output = execute_rsync_with_retry(&retry_config, "retrieve_result_dir", || {
+            self.build_result_dir_retrieve_command(worker, &escaped_remote_path, rel)
+        })
+        .await?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        if !output.status.success() {
+            warn!(
+                "Declared result dir '{}' retrieval failed from {}: {}",
+                rel.display(),
+                worker.id,
+                stderr
+            );
+            return Err(TransferError::SyncFailed {
+                reason: format!(
+                    "declared result dir '{}' missing or unreadable on worker",
+                    rel.display()
+                ),
+                exit_code: output.status.code(),
+                stderr: stderr.clone(),
+            }
+            .into());
+        }
+
+        // Exit-0-but-incomplete guard, same as artifact retrieval.
+        if let Some(indicator) = detect_partial_transfer(&stderr) {
+            warn!(
+                "rsync exited 0 but reported a partial result-dir retrieval for '{}' (matched '{}')",
+                rel.display(),
+                indicator
+            );
+            return Err(TransferError::SyncFailed {
+                reason: format!(
+                    "partial retrieval of declared result dir '{}' despite exit 0 ({indicator})",
+                    rel.display()
+                ),
+                exit_code: output.status.code(),
+                stderr: stderr.clone(),
+            }
+            .into());
+        }
+
+        let bytes_transferred = parse_rsync_bytes(&stdout);
+        let files_transferred = parse_rsync_files(&stdout);
+        let duration_ms = start.elapsed().as_millis() as u64;
+        info!(
+            "Result dir '{}' retrieved in {}ms ({} files, {} bytes)",
+            rel.display(),
+            duration_ms,
+            files_transferred,
+            bytes_transferred
+        );
+        Ok(SyncResult {
+            bytes_transferred,
+            files_transferred,
+            duration_ms,
+        })
+    }
     /// Retrieve build artifacts with streaming progress output.
     pub async fn retrieve_artifacts_streaming<F>(
         &self,
@@ -8569,6 +8739,57 @@ Total file size: 123 bytes";
             "unreadable project_root must yield empty excludes (got {excludes:?})"
         );
         // TEST PASS: unreadable root is non-fatal
+    }
+
+    #[test]
+    fn build_result_dir_retrieve_command_targets_declared_relative_dir() {
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir_all(temp.path().join("results/shard-a")).expect("mkdir results");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: rch_common::WorkerId::new("w1"),
+            host: "203.0.113.9".to_string(),
+            user: "ubuntu".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+        let cmd = pipeline.build_result_dir_retrieve_command(
+            &worker,
+            "/tmp/rch/proj_abc123",
+            Path::new("results/shard-a"),
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        // Explicit SOURCE (not pattern machinery) so rsync itself fails when
+        // the declared dir is missing on the worker — loud missing-output.
+        let source = args
+            .iter()
+            .find(|a| a.contains("@") && a.contains(":/"))
+            .expect("rsync remote source argument");
+        assert!(
+            source.ends_with("/tmp/rch/proj_abc123/results/shard-a/"),
+            "source must be the declared dir under the remote root with trailing slash; got {source}"
+        );
+        // Destination mirrors the repository-relative location locally.
+        let dest = args.last().expect("destination argument");
+        assert!(
+            dest.starts_with(&format!("{}/results/shard-a/", temp.path().display())),
+            "dest must mirror the relative location in the project root; got {dest}"
+        );
+        // Symlink-traversal hardening stays on for job result pulls.
+        assert!(args.iter().any(|a| a == "--safe-links"));
     }
 
     #[test]

@@ -1271,7 +1271,10 @@ fn record_hook_incident(event: &IncidentEvent) {
     }
 }
 
-fn normalize_clean_overlay_path(path: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn normalize_repository_relative_path(
+    label: &str,
+    path: &Path,
+) -> anyhow::Result<PathBuf> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -1279,31 +1282,54 @@ fn normalize_clean_overlay_path(path: &Path) -> anyhow::Result<PathBuf> {
             Component::Normal(part) => normalized.push(part),
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 anyhow::bail!(
-                    "clean-overlay path must be repository-relative without '..': {}",
+                    "{label} must be repository-relative without '..': {}",
                     path.display()
                 );
             }
         }
     }
     if normalized.as_os_str().is_empty() {
-        anyhow::bail!("clean-overlay path must not be empty or the repository root");
+        anyhow::bail!("{label} must not be empty or the repository root");
     }
-    let normalized_label = normalized.to_str().ok_or_else(|| {
-        anyhow::anyhow!("clean-overlay path must be valid UTF-8: {}", path.display())
-    })?;
+    let normalized_label = normalized
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("{label} must be valid UTF-8: {}", path.display()))?;
     if !normalized_label.is_ascii() {
         anyhow::bail!(
-            "clean-overlay path must contain only ASCII characters to avoid cross-platform filesystem aliases: {}",
+            "{label} must contain only ASCII characters to avoid cross-platform filesystem aliases: {}",
             path.display()
         );
     }
     if normalized_label.contains('\\') || normalized_label.chars().any(char::is_control) {
         anyhow::bail!(
-            "clean-overlay path may not contain backslashes or control characters: {}",
+            "{label} may not contain backslashes or control characters: {}",
             path.display()
         );
     }
     Ok(normalized)
+}
+
+/// Normalize a clean-overlay overlay path (shared rules with result dirs).
+fn normalize_clean_overlay_path(path: &Path) -> anyhow::Result<PathBuf> {
+    normalize_repository_relative_path("clean-overlay path", path)
+}
+
+/// Normalize and dedupe declared job result directories (`rch exec --job
+/// --result-dir`, bd-p0yoo). Same repository-relative safety rules as
+/// clean-overlay paths: no traversal, no absolute paths, ASCII-only, no
+/// backslashes or control characters — these strings are interpolated into
+/// remote rsync source specs, so an adversarial value must not be able to
+/// escape the synced project tree.
+fn validate_job_result_dirs(dirs: Vec<PathBuf>) -> anyhow::Result<Vec<PathBuf>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut validated = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let normalized = normalize_repository_relative_path("--result-dir", &dir)?;
+        if seen.insert(normalized.clone()) {
+            validated.push(normalized);
+        }
+    }
+    Ok(validated)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1899,6 +1925,7 @@ fn is_clean_overlay_cargo_fmt_check(command_parts: &[String]) -> bool {
     subcommand == "fmt" && parts.any(|part| part == "--check")
 }
 
+#[allow(clippy::too_many_arguments)] // Pipeline wiring favors explicit params
 pub async fn run_exec(
     base: Option<String>,
     clean_overlay: bool,
@@ -1906,6 +1933,7 @@ pub async fn run_exec(
     no_overlay: bool,
     source_content_receipt: bool,
     job: bool,
+    result_dirs: Vec<PathBuf>,
     command_parts: Vec<String>,
 ) -> anyhow::Result<()> {
     let command = join_exec_command(&command_parts);
@@ -1928,6 +1956,17 @@ pub async fn run_exec(
     // bd-bu3fb) the classifier is bypassed entirely and the command is admitted
     // as a `CompilationKind::Job`: the hook can never produce this kind, so
     // auto-delegation of non-compilation workloads remains impossible.
+
+    // Declared job result directories (bd-p0yoo) are validated up front so an
+    // unsafe path fails before any worker selection or transfer happens.
+    let result_dirs = match validate_job_result_dirs(result_dirs) {
+        Ok(validated) => validated,
+        Err(e) => {
+            let reporter = HookReporter::new(OutputVisibility::Summary);
+            reporter.summary_critical(&format!("[RCH-E001] {e}"));
+            std::process::exit(2);
+        }
+    };
     let classification = if job {
         Classification::compilation(
             CompilationKind::Job,
@@ -2356,6 +2395,7 @@ pub async fn run_exec(
             &topology_policy,
             clean_overlay_spec.as_ref(),
             source_content_receipt,
+            &result_dirs,
         )
         .await;
         let remote_elapsed = remote_start.elapsed();
@@ -3276,6 +3316,7 @@ async fn handle_selection_response(
         &topology_policy,
         None,
         false,
+        &[],
     )
     .await;
     let remote_elapsed = remote_start.elapsed();

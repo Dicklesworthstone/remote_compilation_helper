@@ -544,6 +544,14 @@ USAGE:
             conflicts_with_all = ["clean_overlay", "source_content_receipt"]
         )]
         job: bool,
+        /// Repository-relative directory to sync back from the worker after
+        /// the job completes — INCLUDING on nonzero exit (crash logs, partial
+        /// fuzz corpora, sharded test output). Repeatable; duplicates are
+        /// collapsed. Requires --job. A declared directory that is missing or
+        /// only partially transferable on the worker fails the invocation
+        /// loudly (exit 102) regardless of the job's own exit status.
+        #[arg(long, value_name = "DIR", requires = "job")]
+        result_dir: Vec<PathBuf>,
         /// The compilation command to execute remotely
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
@@ -2053,6 +2061,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 no_overlay,
                 source_content_receipt,
                 job,
+                result_dir,
                 command,
             } => {
                 hook::run_exec(
@@ -2062,6 +2071,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                     no_overlay,
                     source_content_receipt,
                     job,
+                    result_dir,
                     command,
                 )
                 .await
@@ -5299,6 +5309,7 @@ mod tests {
                 no_overlay,
                 source_content_receipt,
                 job,
+                result_dir,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
@@ -5310,6 +5321,7 @@ mod tests {
                 assert!(!no_overlay);
                 assert!(!source_content_receipt);
                 assert!(!job);
+                assert!(result_dir.is_empty());
                 assert_eq!(command, vec!["cargo", "test"]);
             }
             _ => fail_expected("Expected clean-overlay exec command"),
@@ -5339,6 +5351,7 @@ mod tests {
                 no_overlay,
                 source_content_receipt,
                 job,
+                result_dir,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
@@ -5347,6 +5360,7 @@ mod tests {
                 assert!(no_overlay);
                 assert!(!source_content_receipt);
                 assert!(!job);
+                assert!(result_dir.is_empty());
                 assert_eq!(command, vec!["cargo", "check"]);
             }
             _ => fail_expected("Expected base-only clean-overlay exec command"),
@@ -5387,6 +5401,7 @@ mod tests {
             "--no-overlay",
             "--source-content-receipt",
             "--job",
+            "--result-dir",
         ] {
             assert!(help.contains(flag), "exec help missing {flag}: {help}");
         }
@@ -5412,6 +5427,7 @@ mod tests {
                 no_overlay,
                 source_content_receipt,
                 job,
+                result_dir,
                 command,
             }) => {
                 assert!(base.is_none());
@@ -5420,6 +5436,7 @@ mod tests {
                 assert!(!no_overlay);
                 assert!(source_content_receipt);
                 assert!(!job);
+                assert!(result_dir.is_empty());
                 assert_eq!(command, vec!["cargo", "check"]);
             }
             _ => fail_expected("Expected source-content receipt exec command"),
@@ -5457,6 +5474,7 @@ mod tests {
                 no_overlay,
                 source_content_receipt,
                 job,
+                result_dir,
                 command,
             }) => {
                 assert!(job, "--job must parse as explicit job admission");
@@ -5465,6 +5483,7 @@ mod tests {
                 assert!(overlay_path.is_empty());
                 assert!(!no_overlay);
                 assert!(!source_content_receipt);
+                assert!(result_dir.is_empty());
                 assert_eq!(command, vec!["pytest", "-x", "-q"]);
             }
             _ => fail_expected("Expected job-mode exec command"),
@@ -5488,6 +5507,63 @@ mod tests {
             "pytest",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_parses_exec_result_dir_repeatable() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--job",
+            "--result-dir",
+            "results/shard-a",
+            "--result-dir",
+            "fuzz/corpus",
+            "--",
+            "./run_fuzzer.sh",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Exec {
+                job,
+                result_dir,
+                command,
+                ..
+            }) => {
+                assert!(job);
+                assert_eq!(
+                    result_dir,
+                    vec![
+                        PathBuf::from("results/shard-a"),
+                        PathBuf::from("fuzz/corpus")
+                    ],
+                    "--result-dir must be repeatable and order-preserving"
+                );
+                assert_eq!(command, vec!["./run_fuzzer.sh"]);
+            }
+            _ => fail_expected("Expected job-mode exec with result dirs"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_result_dir_without_job() {
+        let _guard = test_guard!();
+        // Declared result directories are a job-admission feature (bd-p0yoo):
+        // ordinary compilation execs keep their artifact contract unchanged.
+        let result = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--result-dir",
+            "results",
+            "--",
+            "cargo",
+            "build",
+        ]);
+        assert!(
+            result.is_err(),
+            "--result-dir without --job must be refused"
+        );
     }
 
     #[test]
