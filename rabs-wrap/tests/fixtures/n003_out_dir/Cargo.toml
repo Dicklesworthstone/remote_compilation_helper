@@ -1,0 +1,11 @@
+[package]
+name = "n003_probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone ([workspace]) so probes run under any channel untouched.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
