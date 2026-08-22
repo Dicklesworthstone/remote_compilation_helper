@@ -82,6 +82,10 @@ pub struct ExecResult {
     /// cannot run the canonical namespace; a typed non-result, not a
     /// fake success).
     pub executed: bool,
+    /// Live process-group members still present after post-exit
+    /// cleanup (bead G006). 0 = the managed group resolved fully; any
+    /// other value is an honest incident record for the receipt.
+    pub residual_group_members: u32,
 }
 
 /// Typed handshake refusal.
@@ -182,17 +186,29 @@ fn free_disk_mib(_dir: &std::path::Path) -> u64 {
 /// Execute one canonical request through the PROVEN rabs-sandbox
 /// launcher. On a host that cannot run the namespace, returns a typed
 /// non-result (`executed: false`) — never a fabricated success.
+///
+/// G006 lifecycle ownership:
+/// - The action leads its OWN process group ([`crate::process_group`]);
+///   after the leader exits, [`reap_residuals`] guarantees no member of
+///   that group survives (count reported honestly).
+/// - The worker owns the concurrency budget: any client-supplied
+///   make-style coordination env is replaced with the worker-local
+///   `-j<slots>` budget ([`crate::jobserver`]) BEFORE the namespace argv
+///   is compiled, so no foreign jobserver handle can leak through
+///   `extra_env`.
 #[must_use]
 pub fn execute_canonical(
     request: &CanonicalExecRequest,
     cargo_home_backing: &std::path::Path,
     home_backing: &std::path::Path,
+    slots: u32,
 ) -> ExecResult {
+    use crate::jobserver::replace_with_worker_local;
+    use crate::process_group::{ManagedProcessGroup, reap_residuals};
     use rabs_sandbox::canonical_mounts::CanonicalMountPlan;
     use rabs_sandbox::canonical_namespace::{
         HostIsolationSupport, build_canonical_argv, command_for,
     };
-
     let support = HostIsolationSupport::probe();
     if !support.missing_for_canonical().is_empty() {
         return ExecResult {
@@ -201,6 +217,7 @@ pub fn execute_canonical(
             stdout_sha256: sha256_hex(b""),
             stderr_sha256: sha256_hex(b""),
             executed: false,
+            residual_group_members: 0,
         };
     }
 
@@ -210,21 +227,55 @@ pub fn execute_canonical(
         cargo_home_backing,
         home_backing,
     );
-    let Ok(spec) = plan.to_spec() else {
+    let Ok(mut spec) = plan.to_spec() else {
         return exec_error(request.request_id);
     };
+    // Worker-local jobserver authority runs on the FINAL env: extra_env
+    // may carry smuggled coordination keys, so replacement must see them.
+    replace_with_worker_local(&mut spec.env, slots);
     let Ok(launch) = build_canonical_argv(&spec, &support, &request.program, &request.args) else {
         return exec_error(request.request_id);
     };
-    match command_for(&launch).output() {
-        Ok(output) => ExecResult {
-            request_id: request.request_id,
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout_sha256: sha256_hex(&output.stdout),
-            stderr_sha256: sha256_hex(&output.stderr),
-            executed: true,
-        },
-        Err(_) => exec_error(request.request_id),
+
+    // Managed process-group execution (bead G006): the action leads its
+    // own fresh POSIX group; wait_with_output DRAINS both pipes
+    // concurrently while waiting, so chatty builds cannot deadlock on a
+    // full kernel pipe buffer. Unbounded in-memory capture is the
+    // documented stopgap until G007's bounded spill objects replace it.
+    let Ok(group) = ManagedProcessGroup::spawn(command_for(&launch)) else {
+        return exec_error(request.request_id);
+    };
+    let pgid = group.pgid;
+    match group.wait_with_output() {
+        Ok(output) => {
+            // Post-leader closer: TERM-resistant descendants are KILLed;
+            // the residual count is reported honestly on the wire.
+            let residual_group_members = reap_residuals(pgid);
+            // ExecResult's documented wire contract: exit code, with a
+            // signal death encoded 128+signal (AGENTS.md exit-code
+            // semantics; std gives no code for a signaled process).
+            #[cfg(unix)]
+            let exit_code = output.status.code().unwrap_or_else(|| {
+                use std::os::unix::process::ExitStatusExt;
+                output.status.signal().map_or(-1, |s| 128 + s)
+            });
+            #[cfg(not(unix))]
+            let exit_code = output.status.code().unwrap_or(-1);
+            ExecResult {
+                request_id: request.request_id,
+                exit_code,
+                stdout_sha256: sha256_hex(&output.stdout),
+                stderr_sha256: sha256_hex(&output.stderr),
+                executed: true,
+                residual_group_members,
+            }
+        }
+        Err(_) => {
+            // Leader wait failed; still close out whatever joined the
+            // group before reporting the typed non-result.
+            let _ = reap_residuals(pgid);
+            exec_error(request.request_id)
+        }
     }
 }
 
@@ -235,6 +286,7 @@ fn exec_error(request_id: u64) -> ExecResult {
         stdout_sha256: sha256_hex(b""),
         stderr_sha256: sha256_hex(b""),
         executed: false,
+        residual_group_members: 0,
     }
 }
 
@@ -318,6 +370,7 @@ mod tests {
             stdout_sha256: sha256_hex(b"hello"),
             stderr_sha256: sha256_hex(b""),
             executed: true,
+            residual_group_members: 0,
         };
         assert_eq!(result.request_id, 9);
         assert_eq!(
@@ -346,8 +399,7 @@ mod tests {
             toolchain_backing: "/tc".into(),
             workspace_backing: "/ws".into(),
         };
-        let dir = tempfile::tempdir().unwrap();
-        let result = execute_canonical(&request, dir.path(), dir.path());
+        let result = execute_canonical(&request, dir.path(), dir.path(), 4);
         assert!(!result.executed, "no fabricated success off-Linux");
     }
 }

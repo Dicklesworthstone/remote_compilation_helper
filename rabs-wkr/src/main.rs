@@ -222,15 +222,17 @@ async fn session_loop(
                         continue;
                     }
                 };
-                let result = execute_canonical(&request, &cargo_home, &home);
+                let result = execute_canonical(&request, &cargo_home, &home, report.slots);
                 let reply = format!(
                     "{{\"kind\":\"exec-result\",\"request_id\":{},\"exit_code\":{},\
-                     \"stdout_sha256\":{},\"stderr_sha256\":{},\"executed\":{}}}",
+                     \"stdout_sha256\":{},\"stderr_sha256\":{},\"executed\":{},\
+                     \"residual_group_members\":{}}}",
                     result.request_id,
                     result.exit_code,
                     json_string(&result.stdout_sha256),
                     json_string(&result.stderr_sha256),
                     result.executed,
+                    result.residual_group_members,
                 );
                 if !write_frame(&mut stream, &reply).await {
                     return Ok(());
