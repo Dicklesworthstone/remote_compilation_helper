@@ -35,7 +35,6 @@ use rabs_protocol::stream_chunker::{CanonicalObservation, StdStream};
 use serde_json::{Value, json};
 
 const FIXTURE_NAME: &str = "n011_goldens";
-const LINKS: &[u8] = b"GoldenLinks";
 const CARGO_PHASE_BUDGET_SECS: u64 = 180;
 const CHANNELS: [&str; 3] = ["stable", "beta", "nightly"];
 
@@ -219,9 +218,7 @@ fn installed_channels() -> Vec<String> {
             else {
                 continue;
             };
-            if out.status.success()
-                && !String::from_utf8_lossy(&out.stdout).trim().is_empty()
-            {
+            if out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
                 found.push(name.to_owned());
             }
         }
@@ -261,8 +258,9 @@ fn build_consumer(channel: &str, project: &Path) -> RunOutcome {
 // --- Fixture staging -------------------------------------------------------
 
 fn copy_fixture(scratch: &Path) -> PathBuf {
-    let src_root =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(FIXTURE_NAME);
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(FIXTURE_NAME);
     let project = scratch.join(FIXTURE_NAME);
     for pkg in ["provider", "consumer"] {
         fs::create_dir_all(project.join(pkg).join("src")).expect("mkdir package src");
