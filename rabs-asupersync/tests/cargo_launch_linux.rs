@@ -129,13 +129,17 @@ fn action_consumes_exactly_the_preloaded_token_bytes() {
     let _ = std::fs::remove_file(&out_path);
 
     let mut set = ObligationSet::default();
-    let mut launch = gate.launch(
+    let mut launch = gate
+        .launch(
             // Extract the fifo path from the INJECTED auth (the exact
             // handshake nested make performs) and consume EXACTLY the
             // preloaded count — the writer stays open parent-side, so
-            // an unbounded read would wait for EOF forever.
+            // an unbounded read would wait for EOF forever. POSIX sh
+            // ONLY: fleet /bin/sh is dash, whose read has no `-n`, so
+            // per-byte consumption uses `dd bs=1 count=1` per fresh
+            // fifo open (each token = one byte, one open).
             &spec(
-                r#"p=${MAKEFLAGS#*fifo:}; n=0; while [ "$n" -lt 4 ]; do IFS= read -r -n1 b < "$p" || break; n=$((n+1)); done; echo "$n" > "$COUNT_OUT""#,
+                r#"p=${MAKEFLAGS#*fifo:}; n=0; while [ "$n" -lt 4 ]; do if dd bs=1 count=1 <"$p" >/dev/null 2>&1; then n=$((n+1)); else break; fi; done; echo "$n" > "$COUNT_OUT""#,
             ),
             &mut set,
             TOKENS,
