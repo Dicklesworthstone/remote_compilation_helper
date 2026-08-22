@@ -18,6 +18,7 @@
 //! leases; prior-authority prepared candidates may contribute verified
 //! immutable blobs and evidence but can never publish (risk R120).
 
+pub mod action_actor;
 pub mod target_lease;
 
 pub mod live;

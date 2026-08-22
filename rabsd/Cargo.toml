@@ -36,6 +36,11 @@ tempfile = "3.25.0"
 # bd-g900u: the public offer / ready-store builders, so the live commit
 # tests (bd-epyez) can drive the real publication engine from out here.
 rabs-cas = { path = "../rabs-cas", features = ["test-support"] }
+# G003: the actor-shell smoke test constructs `Cx::for_testing()`, which
+# asupersync gates behind `test-internals` (br-asupersync-2x6hbi) so
+# production code cannot mint an all-caps context out of band. Dev-graph
+# only; the pin matches rabs-asupersync's exact-revision rule (bead A003).
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "62d398ea17519d7e80cbdb32e062d70647cd58a4", default-features = false, features = ["proc-macros", "test-internals"] }
 
 [lints.rust]
 unsafe_code = "forbid"
