@@ -26,9 +26,12 @@
 //! processed); quarantine rows themselves are released by the H012
 //! repair flow, not here.
 
+use rabs_protocol::result_identity::TypedDigest;
 use rabs_protocol::serving::ServingValidity;
 
-use crate::metadata_store::{RabsMetadataStore, StoreError};
+use crate::metadata_store::{
+    DivergenceIncidentRow, QuarantineScope, RabsMetadataStore, StoreError,
+};
 
 /// Disposition string under which serving is possible at all.
 pub const SERVABLE_DISPOSITION: &str = "servable";
@@ -96,6 +99,321 @@ pub fn serving_gate(
     Ok(ServeDecision::Servable)
 }
 
+// ---------------------------------------------------------------------
+// Deterministic-failure publication classification + TTL-governed
+// serving/revalidation (K007; plan §66; risk R28).
+//
+// A FAILED attempt may publish only as an ADMITTED deterministic
+// failure — one publication path shared with success (I16) — and its
+// manifest carries canonical diagnostics plus the normalized outcome,
+// never materializable outputs (`CanonicalActionResultManifest::validate`
+// refuses outputs on `DeterministicFailure` structurally). Everything
+// that makes a failure NON-deterministic — OOM, signals, cancellation,
+// timeout, worker loss, transport failure, panic — is a named variant
+// here, so "never publish" is exhaustive over the R28 class by
+// construction, not by string matching.
+//
+// Served failures live under a SHORT revalidation TTL: expiry
+// suppresses serving and schedules re-execution. Revalidation is the
+// soundness experiment: byte-identical reproduction APPENDS evidence
+// and renews the window; success or a DIFFERENT failure under the same
+// key is a soundness incident — divergence recorded, action
+// quarantined, serving suppressed.
+// ---------------------------------------------------------------------
+
+/// Default short revalidation TTL for served dependency failures.
+pub const DEFAULT_REVALIDATION_TTL_MICROS: u64 = 60_000_000;
+
+/// Normalized terminal outcome of one attempt. The non-`Exit` variants
+/// ARE the R28 never-publish class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalOutcome {
+    /// The tool terminated itself with this exit code.
+    Exit(i32),
+    /// The process died to memory pressure.
+    Oom,
+    /// The process died to signal N (including 128+N translations).
+    Signal(i32),
+    /// Cancelled before natural termination.
+    Cancelled,
+    /// Killed at a configured deadline.
+    Timeout,
+    /// The worker vanished mid-attempt.
+    WorkerLost,
+    /// Transfer/transport error corrupted the attempt.
+    TransportFailed,
+    /// The executor itself panicked.
+    Panicked,
+}
+
+/// Why a failed attempt may not publish as a deterministic failure.
+/// Every variant is a REFUSAL TO SERVE, never a downgrade to success
+/// or a silent drop of the diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailureRefusal {
+    /// Exit 0 is a SUCCESS candidate, not a failure.
+    ZeroExitIsNotAFailure,
+    /// An R28-class outcome: nondeterministic by nature.
+    NotDeterministic(&'static str),
+    /// Canonical diagnostics/events were not fully captured.
+    CaptureIncomplete,
+    /// Positive or negative input closure is not closed.
+    InputsNotClosed,
+    /// The attempt declared (or cannot disclaim) undeclared side
+    /// effects.
+    UndeclaredSideEffects,
+    /// The action class policy refuses failure caching.
+    ClassPolicyRefused,
+    /// The trust policy refuses failure serving for this action.
+    TrustPolicyRefused,
+}
+
+impl std::fmt::Display for FailureRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroExitIsNotAFailure => write!(f, "exit 0 is a success candidate"),
+            Self::NotDeterministic(class) => write!(f, "nondeterministic outcome: {class}"),
+            Self::CaptureIncomplete => write!(f, "canonical capture incomplete"),
+            Self::InputsNotClosed => write!(f, "input closure not closed"),
+            Self::UndeclaredSideEffects => write!(f, "undeclared side effects"),
+            Self::ClassPolicyRefused => write!(f, "class policy refuses failure caching"),
+            Self::TrustPolicyRefused => write!(f, "trust policy refuses failure serving"),
+        }
+    }
+}
+
+impl std::error::Error for FailureRefusal {}
+
+/// Admission receipt for a deterministic-failure publication: the
+/// normalized outcome a failure manifest carries (with the canonical
+/// diagnostics object references).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureAdmission {
+    /// The normalized nonzero exit code (signal/OOM classes never get
+    /// here, so this IS the deterministic observable).
+    pub normalized_exit: i32,
+}
+
+/// Decide whether a failed attempt may publish under
+/// [`rabs_protocol::result_identity::ResultKind::DeterministicFailure`].
+/// Checks run in bead order; the first refusal wins.
+///
+/// # Errors
+/// [`FailureRefusal`] — the attempt stays unpublished; callers may
+/// still report its diagnostics as a plain local failure.
+pub fn classify_deterministic_failure(
+    outcome: TerminalOutcome,
+    capture_complete: bool,
+    inputs_closed: bool,
+    no_undeclared_side_effects: bool,
+    class_policy_permits: bool,
+    trust_policy_permits: bool,
+) -> Result<FailureAdmission, FailureRefusal> {
+    let normalized_exit = match outcome {
+        TerminalOutcome::Exit(0) => {
+            return Err(FailureRefusal::ZeroExitIsNotAFailure);
+        }
+        TerminalOutcome::Exit(code) => code,
+        TerminalOutcome::Oom => return Err(FailureRefusal::NotDeterministic("oom")),
+        TerminalOutcome::Signal(_) => {
+            return Err(FailureRefusal::NotDeterministic("signal"));
+        }
+        TerminalOutcome::Cancelled => return Err(FailureRefusal::NotDeterministic("cancelled")),
+        TerminalOutcome::Timeout => return Err(FailureRefusal::NotDeterministic("timeout")),
+        TerminalOutcome::WorkerLost => return Err(FailureRefusal::NotDeterministic("worker-loss")),
+        TerminalOutcome::TransportFailed => {
+            return Err(FailureRefusal::NotDeterministic("transport-failure"));
+        }
+        TerminalOutcome::Panicked => return Err(FailureRefusal::NotDeterministic("panic")),
+    };
+    if !capture_complete {
+        return Err(FailureRefusal::CaptureIncomplete);
+    }
+    if !inputs_closed {
+        return Err(FailureRefusal::InputsNotClosed);
+    }
+    if !no_undeclared_side_effects {
+        return Err(FailureRefusal::UndeclaredSideEffects);
+    }
+    if !class_policy_permits {
+        return Err(FailureRefusal::ClassPolicyRefused);
+    }
+    if !trust_policy_permits {
+        return Err(FailureRefusal::TrustPolicyRefused);
+    }
+    Ok(FailureAdmission {
+        normalized_exit,
+    })
+}
+
+/// What revalidation concluded about a served failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevalidationVerdict {
+    /// Byte-identical failure reproduced under the same key: evidence
+    /// appended, serving renewed with a fresh short TTL at a higher
+    /// revision.
+    IdenticalEvidenceAppended {
+        /// Serving revision written.
+        new_revision: u64,
+    },
+    /// Success or a DIFFERENT failure under the same key: soundness
+    /// incident appended AND the action quarantined (serving
+    /// suppressed until the repair flow releases it).
+    SoundnessIncidentQuarantined {
+        /// Incident sequence recorded.
+        incident_seq: u64,
+        /// Serving revision written.
+        new_revision: u64,
+    },
+}
+
+/// Typed revalidation refusals (distinct from store errors so callers
+/// can distinguish "nothing to revalidate" from storage faults).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevalidationError {
+    /// No serving record exists for this key.
+    NoServingRecord,
+    /// The stored record's revision moved past `expected_revision`:
+    /// someone else revalidated concurrently; retry against fresh
+    /// state instead of clobbering (H040 replay rule).
+    StaleRevision {
+        /// Revision actually stored.
+        stored: u64,
+    },
+    Store(String),
+}
+
+impl std::fmt::Display for RevalidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoServingRecord => write!(f, "no serving record to revalidate"),
+            Self::StaleRevision { stored } => {
+                write!(f, "serving revision moved to {stored}; retry")
+            }
+            Self::Store(error) => write!(f, "store: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RevalidationError {}
+
+/// Apply one revalidation result for a served dependency failure
+/// (K007 lifecycle). Compares the revalidating attempt's observable
+/// signature against the published one:
+///
+/// - identical → verification sample appended (H033), serving renewed
+///   at `expected_revision + 1` with a fresh TTL window;
+/// - different → divergence incident appended (H026), scoped
+///   quarantine row added, serving disposition flipped to
+///   `"quarantined"` at the same higher revision.
+///
+/// `ttl_micros` of `None` uses [`DEFAULT_REVALIDATION_TTL_MICROS`].
+///
+/// # Errors
+/// [`RevalidationError`] — nothing was written unless the store call
+/// itself succeeded partway (each step is one transaction; the
+/// quarantine-before-disposition order means a crash between them
+/// leaves the action blocked-but-unlabeled, which the repair flow
+/// reconciles — never serving-while-quarantined).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_revalidation(
+    store: &mut dyn RabsMetadataStore,
+    authority: &TypedDigest,
+    action_key_str: &str,
+    action_key_typed: &TypedDigest,
+    expected_revision: u64,
+    attempt: u128,
+    generation: u128,
+    published_signature: &str,
+    revalidated_signature: &str,
+    committed_manifest_key: &str,
+    candidate_manifest_key: &str,
+    candidate_evidence_key: &str,
+    now_unix_micros: i64,
+    now_epoch: u64,
+    ttl_micros: Option<u64>,
+) -> Result<RevalidationVerdict, RevalidationError> {
+    let record = store
+        .serving_record(action_key_str)
+        .map_err(|e| RevalidationError::Store(format!("{e:?}")))?
+        .ok_or(RevalidationError::NoServingRecord)?;
+    if record.state_revision != expected_revision {
+        return Err(RevalidationError::StaleRevision {
+            stored: record.state_revision,
+        });
+    }
+    let new_revision = expected_revision + 1;
+    let ttl = ttl_micros.unwrap_or(DEFAULT_REVALIDATION_TTL_MICROS);
+    let validity = ServingValidity {
+        evaluated_at_unix_micros: now_unix_micros,
+        maximum_age_micros: Some(ttl),
+        clock_uncertainty_micros: 0,
+        coordinator_clock_epoch: now_epoch,
+    };
+
+    if published_signature == revalidated_signature {
+        // Byte-identical reproduction: append evidence, renew serving.
+        store
+            .record_verification_sample(action_key_typed, attempt, true, new_revision)
+            .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
+        store
+            .put_serving_record(
+                authority,
+                action_key_str,
+                SERVABLE_DISPOSITION,
+                new_revision,
+                &validity,
+                &[],
+            )
+            .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
+        Ok(RevalidationVerdict::IdenticalEvidenceAppended { new_revision })
+    } else {
+        // Success-or-different-failure under the same key is a
+        // SOUNDNESS INCIDENT: record it, then suppress serving.
+        let seq = new_revision;
+        store
+            .record_divergence_incident(
+                authority,
+                &DivergenceIncidentRow {
+                    action_key: action_key_str.to_owned(),
+                    seq,
+                    class: "soundness".to_owned(),
+                    committed_manifest_key: committed_manifest_key.to_owned(),
+                    candidate_manifest_key: candidate_manifest_key.to_owned(),
+                    candidate_evidence_key: candidate_evidence_key.to_owned(),
+                    candidate_pin_hex: String::new(),
+                    generation_hex: format!("{generation:x}"),
+                    attempt_hex: format!("{attempt:x}"),
+                    detail: format!(
+                        "revalidation diverged: published {published_signature}, \
+                         revalidated {revalidated_signature}"
+                    ),
+                },
+            )
+            .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
+        store
+            .add_quarantine(
+                QuarantineScope::ActionEntry,
+                action_key_str,
+                "k007-soundness-incident",
+            )
+            .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
+        store
+            .put_serving_record(
+                authority,
+                action_key_str,
+                "quarantined",
+                new_revision,
+                &validity,
+                &[(QuarantineScope::ActionEntry, action_key_str.to_owned())],
+            )
+            .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
+        Ok(RevalidationVerdict::SoundnessIncidentQuarantined {
+            incident_seq: seq,
+            new_revision,
+        })
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
