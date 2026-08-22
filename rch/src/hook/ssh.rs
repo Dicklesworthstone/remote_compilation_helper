@@ -205,6 +205,36 @@ fn build_worker_projects_topology_cmd(topology_policy: &PathTopologyPolicy) -> S
     )
 }
 
+/// bd-8iwkm: build the bounded ownership-drift detect+repair command for the
+/// canonical mirror tree. Counts root-owned entries (the rsync exit-23 class),
+/// chowns them to the SSH user via passwordless sudo, and re-counts to prove
+/// the repair. Never deletes; touches only root-owned entries; the alias root
+/// is intentionally not scanned separately because it resolves into (or is
+/// policy-conflicting with) the canonical root, which this sweep already
+/// covers. Exit codes: 0 = ok/repaired/check-unavailable (fail-open), 46 =
+/// repair unavailable (sudo missing/refused), 47 = partial repair.
+fn build_worker_ownership_repair_cmd(canonical_root: &Path, ssh_user: &str) -> String {
+    let root = shell_escape::escape(canonical_root.display().to_string().into());
+    let user = shell_escape::escape(ssh_user.into());
+    format!(
+        "set -e; r={root}; u={user}; \
+         if ! b=$(sudo -n find \"$r\" -xdev -user root -print 2>/dev/null | wc -l); then \
+           printf 'RCH_OWNERSHIP_CHECK_UNAVAILABLE\\n' >&2; exit 0; \
+         fi; \
+         b=$((b + 0)); \
+         if [ \"$b\" -eq 0 ]; then echo RCH_OWNERSHIP_OK; exit 0; fi; \
+         if sudo -n find \"$r\" -xdev -user root -exec chown -h \"$u\" {{}} + 2>/dev/null; then \
+           a=$(sudo -n find \"$r\" -xdev -user root -print 2>/dev/null | wc -l || echo 1); \
+           a=$((a + 0)); \
+           if [ \"$a\" -eq 0 ]; then printf 'RCH_OWNERSHIP_REPAIRED:count=%s\\n' \"$b\"; exit 0; fi; \
+           printf 'RCH_OWNERSHIP_PARTIAL:remaining=%s\\n' \"$a\" >&2; exit 47; \
+         fi; \
+         printf 'RCH_OWNERSHIP_REPAIR_UNAVAILABLE:detected=%s\\n' \"$b\" >&2; exit 46",
+        root = root,
+        user = user,
+    )
+}
+
 pub(super) async fn ensure_worker_projects_topology(
     worker: &WorkerConfig,
     reporter: &HookReporter,
@@ -255,7 +285,64 @@ pub(super) async fn ensure_worker_projects_topology(
         "[RCH] topology preflight ok on {} ({} -> {} enforced)",
         worker.id, alias_display, canonical_display
     ));
+    // bd-8iwkm: root-owned entries inside the canonical mirror tree make
+    // rsync-as-ssh-user fail exit 23 on replace/unlink even when topology is
+    // healthy. Repair them before sync so the failure window closes here
+    // instead of mid-transfer.
+    let repaired =
+        repair_worker_mirror_ownership(worker, reporter, topology_policy.canonical_root()).await?;
+    if repaired > 0 {
+        reporter.summary(&format!(
+            "[RCH] repaired ownership drift on {}: {repaired} root-owned entries chowned to {}",
+            worker.id, worker.user
+        ));
+    }
     Ok(())
+}
+
+/// bd-8iwkm: detect and repair root-owned entries under the worker's
+/// canonical mirror tree. Returns the number of repaired entries; zero means
+/// either no drift or a fail-open check-unavailable (never blocks dispatch).
+async fn repair_worker_mirror_ownership(
+    worker: &WorkerConfig,
+    reporter: &HookReporter,
+    canonical_root: &Path,
+) -> anyhow::Result<u64> {
+    if should_skip_remote_preflight(worker) {
+        reporter.verbose("[RCH] ownership preflight skipped in mock mode");
+        return Ok(0);
+    }
+    if crate::transfer::WorkerPlatform::from_worker(worker).is_windows() {
+        reporter.verbose("[RCH] ownership preflight skipped for Windows worker");
+        return Ok(0);
+    }
+    let cmd = build_worker_ownership_repair_cmd(canonical_root, &worker.user);
+    let output = run_offload_ssh_command(worker, &cmd, Duration::from_secs(60)).await?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "worker mirror ownership repair failed on {} (status {:?}): stdout='{}' stderr='{}' — \
+             root-owned entries under {} block rsync-as-{} (bd-8iwkm)",
+            worker.id,
+            output.status.code(),
+            stdout,
+            stderr,
+            canonical_root.display(),
+            worker.user
+        );
+    }
+    if let Some(count) = stdout
+        .strip_prefix("RCH_OWNERSHIP_REPAIRED:count=")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        reporter.verbose(&format!(
+            "[RCH] ownership drift repaired on {}: {count} entries chowned to {}",
+            worker.id, worker.user
+        ));
+        return Ok(count);
+    }
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -406,6 +493,46 @@ mod tests {
         assert!(
             command.contains(&format!("ln -s -- {canonical} {alias}")),
             "ln create must terminate options before configured paths: {command}"
+        );
+    }
+
+    #[test]
+    fn test_build_worker_ownership_repair_cmd_scopes_and_never_deletes() {
+        let _guard = test_guard!();
+        let command = build_worker_ownership_repair_cmd(Path::new("/data/projects"), "deploy-user");
+
+        assert!(
+            command.contains("'--user root'") || command.contains("-user root"),
+            "sweep must target root-owned entries only: {command}"
+        );
+        assert!(
+            command.contains("r=/data/projects"),
+            "clean canonical root binds verbatim into the sweep variable: {command}"
+        );
+        let spaced =
+            build_worker_ownership_repair_cmd(Path::new("/data/projects with space"), "deploy u");
+        assert!(
+            spaced.contains("r='/data/projects with space'") && spaced.contains("u='deploy u'"),
+            "paths or users with shell metacharacters must be single-quote escaped: {spaced}"
+        );
+        assert!(
+            command.contains("-xdev"),
+            "sweep must not cross filesystem boundaries: {command}"
+        );
+        assert!(
+            command.contains("-exec chown -h"),
+            "repair must chown links themselves without following them: {command}"
+        );
+        assert!(
+            !command.contains(" rm ") && !command.contains("rm -"),
+            "repair must never delete anything (bd-8iwkm constraint): {command}"
+        );
+        assert!(
+            command.contains("RCH_OWNERSHIP_OK")
+                && command.contains("RCH_OWNERSHIP_REPAIRED:count=")
+                && command.contains("exit 46")
+                && command.contains("exit 47"),
+            "all outcome markers and the 46/47 exit codes must be present: {command}"
         );
     }
 
