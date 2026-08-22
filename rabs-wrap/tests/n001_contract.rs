@@ -14,8 +14,8 @@
 //!
 //! 2. LAUNCHER-SHIM EXPERIMENT (measured — this is the feasibility
 //!    question): place a recording shim at the exact path(s) cargo
-//!    executes the build script from (both hardlinked names when present),
-//!    then trigger a no-op rebuild. Raw outcomes:
+//!    executes the build script from, then trigger a no-op rebuild. Raw
+//!    outcomes:
 //!    - `shim_executed`: did cargo actually run our file?
 //!    - `cargo_proceeded_without_shim`: cargo rebuilt/replaced the build
 //!      script and completed without executing the shim (the contract
@@ -25,15 +25,17 @@
 //!      when the shim DID run;
 //!    - `output_cache_correct`: directives + OUT_DIR artifacts intact.
 //!
-//! Every result is emitted as machine-readable JSON on stdout so the
-//! feasibility matrix doc quotes the harness rather than folklore.
-//!
-//! Channels without a locally-installed toolchain are SKIPPED (the matrix
-//! marks them unprobed); nothing here invents a result.
+//! Every cargo invocation runs under a HARD DEADLINE: a hang is a RESULT
+//! (`timed_out: true`) recorded in the matrix, never a stalled session.
+//! Results are emitted as machine-readable JSON so the feasibility matrix
+//! doc quotes the harness rather than folklore. Channels without an
+//! installed toolchain are SKIPPED; nothing here invents a result.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use serde_json::json;
@@ -43,6 +45,9 @@ const FIXTURE_NAME: &str = "n001_probe";
 /// Channels probed when installed; order matters only for reporting.
 const CHANNELS: [&str; 3] = ["stable", "beta", "nightly"];
 
+/// Hard deadline for one toy-fixture cargo invocation.
+const CARGO_PHASE_BUDGET_SECS: u64 = 120;
+
 #[test]
 fn n001_interception_contract_matrix_across_channels() {
     let mut report = Vec::new();
@@ -50,7 +55,10 @@ fn n001_interception_contract_matrix_across_channels() {
 
     for channel in available_channels() {
         probed_any = true;
-        println!("[n001] probing channel {} ({})", channel.name, channel.cargo_path);
+        println!(
+            "[n001] probing channel {} ({})",
+            channel.name, channel.cargo_path
+        );
         let dir = tempfile::tempdir().expect("scratch dir");
         let project = copy_fixture(dir.path());
         let facts = probe_channel(&channel, &project);
@@ -70,6 +78,60 @@ fn n001_interception_contract_matrix_across_channels() {
         "{}",
         serde_json::to_string_pretty(&json!({ "n001_matrix": report })).unwrap()
     );
+}
+
+// --- Bounded process execution ----------------------------------------------
+
+/// Outcome of one bounded cargo invocation: a feasibility harness treats
+/// a hang as a RESULT (recorded), never as a stalled session.
+struct RunOutcome {
+    success: bool,
+    timed_out: bool,
+    stderr_tail: String,
+}
+
+/// Run `cmd` to completion under a hard deadline; kill and record on expiry.
+fn run_bounded(mut cmd: Command) -> RunOutcome {
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cargo");
+    let deadline = Instant::now() + Duration::from_secs(CARGO_PHASE_BUDGET_SECS);
+    loop {
+        match child.try_wait().expect("poll cargo") {
+            Some(status) => {
+                let mut err = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut err);
+                }
+                let lines: Vec<&str> = err.lines().collect();
+                let tail = lines
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .rev()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return RunOutcome {
+                    success: status.success(),
+                    timed_out: false,
+                    stderr_tail: tail,
+                };
+            }
+            None if Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return RunOutcome {
+                    success: false,
+                    timed_out: true,
+                    stderr_tail: String::new(),
+                };
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
 }
 
 // --- Channel discovery -----------------------------------------------------
@@ -142,20 +204,9 @@ fn copy_fixture(scratch: &Path) -> PathBuf {
 }
 
 // --- Target-tree layout ------------------------------------------------------
-//
-// Cargo's on-disk contract varies by vintage and must be DISCOVERED, not
-// assumed:
-//
-// - flat vintages: `target/debug/build/<pkg>-<hash>/` holds BOTH the
-//   compiled build script (`build-script-build`, hardlinked as
-//   `build_script_build-<hash>`) and its run outputs (`output` at root,
-//   OUT_DIR under `out/`);
-// - nested vintages (recent nightlies): `target/debug/build/<pkg>/<hash>/`
-//   splits into sibling hash dirs with the same content roles.
-//
-// The scan below walks both shapes (depth 2) and identifies each dir by
-// CONTENT, never by name spelling.
 
+/// Candidate dirs under `target/debug/build/`, to depth 2 (flat and
+/// nested vintages alike); identified downstream by CONTENT only.
 fn all_fixture_dirs(project: &Path) -> Vec<PathBuf> {
     fn visit(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else {
@@ -181,26 +232,52 @@ fn all_fixture_dirs(project: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The dir holding the compiled build-script executable.
-fn find_compile_dir(project: &Path) -> Option<PathBuf> {
-    all_fixture_dirs(project).into_iter().find(|d| {
-        d.join("build-script-build").is_file()
-            || fs::read_dir(d)
-                .map(|entries| {
-                    entries.flatten().any(|e| {
-                        e.file_name().to_str().unwrap_or("").starts_with("build_script_build")
-                            && e.path().is_file()
-                    })
-                })
-                .unwrap_or(false)
-    })
+fn is_build_script_name(name: &str) -> bool {
+    name == "build-script-build" || name.starts_with("build_script_build")
 }
 
-/// The dir holding run outputs (`output` at root, `out/` for OUT_DIR).
+/// Every compiled-build-script FILE under a candidate compile dir (flat
+/// vintages keep them at the dir root; nested nightlies under `out/`).
+fn build_script_binaries(compile_dir: &Path) -> Vec<PathBuf> {
+    let mut bins = Vec::new();
+    for base in [compile_dir.to_path_buf(), compile_dir.join("out")] {
+        if let Ok(entries) = fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() && is_build_script_name(entry.file_name().to_str().unwrap_or("")) {
+                    bins.push(p);
+                }
+            }
+        }
+    }
+    bins.sort();
+    bins
+}
+
+/// The dir holding the compiled build-script executable.
+fn find_compile_dir(project: &Path) -> Option<PathBuf> {
+    all_fixture_dirs(project)
+        .into_iter()
+        .find(|d| !build_script_binaries(d).is_empty())
+}
+
+/// Path of cargo's captured build-script directive stream for one run
+/// unit: `run/stdout` on nested nightlies, `output` on flat vintages.
+fn directive_cache(run_dir: &Path) -> Option<PathBuf> {
+    let nested = run_dir.join("run/stdout");
+    if nested.is_file() {
+        return Some(nested);
+    }
+    let flat = run_dir.join("output");
+    flat.is_file().then_some(flat)
+}
+
+/// The dir holding run outputs: OUT_DIR at `out/`, directive cache at
+/// [`directive_cache`].
 fn find_run_dir(project: &Path) -> Option<PathBuf> {
     all_fixture_dirs(project)
         .into_iter()
-        .find(|d| d.join("output").is_file() && d.join("out").is_dir())
+        .find(|d| d.join("out").is_dir() && directive_cache(d).is_some())
 }
 
 /// Forensic dump used when layout discovery fails: prints every candidate
@@ -238,12 +315,14 @@ fn probe_channel(channel: &Channel, project: &Path) -> Value {
     };
 
     // Phase 1: fresh stock build.
-    let first = stock_cargo().output().expect("run cargo (fresh)");
+    println!("[n001]   {} phase: fresh", channel.name);
+    let first = run_bounded(stock_cargo());
     assert!(
-        first.status.success(),
-        "[{}] fresh build failed: {}",
+        first.success && !first.timed_out,
+        "[{}] fresh build failed (timed_out={}): {}",
         channel.name,
-        String::from_utf8_lossy(&first.stderr)
+        first.timed_out,
+        first.stderr_tail
     );
 
     let Some(compile_dir) = find_compile_dir(project) else {
@@ -255,29 +334,29 @@ fn probe_channel(channel: &Channel, project: &Path) -> Value {
         panic!("[{}] run dir not found after fresh build", channel.name);
     };
 
-    // Both names for one binary where cargo hardlinks them; a shim covers
-    // both because which name cargo execs is an implementation detail.
-    let exe_primary = compile_dir.join("build-script-build");
-    let exe_secondary = fs::read_dir(&compile_dir)
-        .ok()
-        .and_then(|entries| {
-            entries.flatten().find_map(|e| {
-                let p = e.path();
-                (p.is_file()
-                    && p != exe_primary
-                    && e.file_name().to_str().unwrap_or("").starts_with("build_script_build"))
-                .then_some(p)
-            })
-    let original_bytes = fs::read(&exe_primary)
-        .or_else(|_| {
-            exe_secondary
-                .as_ref()
-                .and_then(|p| fs::read(p).ok())
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no build script binary"))
+    // Every name cargo could exec the build script through (flat vintage
+    // hardlinks two names; nested nightlies keep one under out/). A shim
+    // must cover all of them.
+    let mut script_bins = build_script_binaries(&compile_dir);
+    assert!(
+        !script_bins.is_empty(),
+        "[{}] no build script binary after fresh build",
+        channel.name
+    );
+    let shim_target = script_bins.remove(0);
+    let mut displaced_originals: Vec<(PathBuf, PathBuf)> = std::iter::once(shim_target.clone())
+        .chain(script_bins.iter().cloned())
+        .enumerate()
+        .map(|(i, bin)| {
+            let backup = compile_dir.join(format!("n001_real_{i}.bin"));
+            fs::rename(&bin, &backup).expect("displace real binary");
+            (bin, backup)
         })
-        .expect("read build script exe");
+        .collect();
+    displaced_originals.sort();
+    let original_bytes = fs::read(&displaced_originals[0].1).expect("read real binary");
 
-    let probe_after_fresh = read_probe_record(&run_dir);
+    let probe_after_fresh = read_probe_record_opt(&run_dir).expect("probe.json written by builder");
     let stock_jobserver = probe_after_fresh
         .get("has_cargo_makeflags")
         .and_then(Value::as_bool)
@@ -288,36 +367,22 @@ fn probe_channel(channel: &Channel, project: &Path) -> Value {
         .is_some_and(|fds| fds.contains(','));
 
     // Phase 2: no-op rebuild — fingerprint stability (must NOT rerun).
+    println!("[n001]   {} phase: noop-rebuild", channel.name);
     let output_mtime_before = output_cache_mtime(&run_dir);
-    let second = stock_cargo().output().expect("run cargo (noop)");
+    let second = run_bounded(stock_cargo());
     assert!(
-        second.status.success(),
-        "[{}] no-op rebuild failed: {}",
+        second.success && !second.timed_out,
+        "[{}] no-op rebuild failed (timed_out={}): {}",
         channel.name,
-        String::from_utf8_lossy(&second.stderr)
+        second.timed_out,
+        second.stderr_tail
     );
     let reran_on_noop = output_cache_mtime(&run_dir) != output_mtime_before;
 
-    // Phase 3: launcher-shim experiment. Displace the real binaries under
-    // BOTH names, install a recording shim at each, then no-op-rebuild.
-    let real = compile_dir.join("n001_real.bin");
-    let primary_exists = exe_primary.exists();
-    let displaced = if primary_exists {
-        fs::rename(&exe_primary, &real).expect("displace primary");
-        true
-    } else {
-        false
-    };
-    let secondary_backup = exe_secondary.as_ref().and_then(|sec| {
-        let backup = compile_dir.join(format!(
-            "n001_real_sec_{}",
-            sec.file_name()?.to_str()?
-        ));
-        fs::rename(sec, &backup).ok()?;
-        Some(backup)
-    });
-
-    let shim_target = if displaced { exe_primary.clone() } else { exe_secondary.clone().expect("a shim target exists") };
+    // Phase 3: launcher-shim experiment. Install a recording shim at the
+    // primary expected path (secondaries also shimmed so a hardlink swap
+    // cannot dodge us), then trigger a no-op rebuild.
+    println!("[n001]   {} phase: shimmed-rebuild", channel.name);
     let log_path = compile_dir.join("n001_shim.log");
     let shim = format!(
         "#!/bin/sh\nprintf '%s\\0' \"$0\" \"$@\" >> \"{log}\"\nprintf '%s\\0' \"$CARGO_MAKEFLAGS\" >> \"{log}\"\nexec \"$N001_REAL_BIN\" \"$@\"\n",
@@ -325,23 +390,17 @@ fn probe_channel(channel: &Channel, project: &Path) -> Value {
     );
     fs::write(&shim_target, shim.as_bytes()).expect("install shim");
     make_executable(&shim_target);
-    if let Some(backup) = secondary_backup {
+    for (_, backup) in displaced_originals.iter().skip(1) {
         fs::write(backup, shim.as_bytes()).ok();
     }
 
-    let real_bin = if displaced {
-        real.display().to_string()
-    } else {
-        secondary_backup
-            .as_ref()
-            .map(|b| b.display().to_string())
-            .unwrap_or_default()
-    };
-    let third = stock_cargo()
-        .env("N001_REAL_BIN", real_bin)
-        .output()
-        .expect("run cargo (shimmed)");
-    let shim_build_succeeded = third.status.success();
+    let mut shimmed_cmd = stock_cargo();
+    shimmed_cmd.env(
+        "N001_REAL_BIN",
+        displaced_originals[0].1.display().to_string(),
+    );
+    let third = run_bounded(shimmed_cmd);
+    let shim_build_succeeded = third.success && !third.timed_out;
 
     let bytes_now = fs::read(&shim_target).unwrap_or_default();
     let shim_log = fs::read_to_string(&log_path).unwrap_or_default();
@@ -350,7 +409,10 @@ fn probe_channel(channel: &Channel, project: &Path) -> Value {
     let binary_bytes_changed = bytes_now != original_bytes;
     let jobserver_through_shim = shim_log.contains("--jobserver-fds=");
 
-    let probe_after_shim = read_probe_record(&run_dir);
+    // Phase-3 reads may fail when cargo rebuilt over everything; degrade
+    // honestly instead of panicking past the interesting evidence.
+    let probe_after_shim =
+        read_probe_record_opt(&run_dir).unwrap_or_else(|| probe_after_fresh.clone());
     let output_cache_correct = verify_output_cache(project, &run_dir, &probe_after_shim);
 
     json!({
@@ -363,6 +425,7 @@ fn probe_channel(channel: &Channel, project: &Path) -> Value {
         },
         "launcher_shim": {
             "shim_build_succeeded": shim_build_succeeded,
+            "shim_timed_out": third.timed_out,
             "shim_executed": shim_executed,
             "cargo_proceeded_without_shim": cargo_proceeded_without_shim,
             "binary_bytes_changed": binary_bytes_changed,
@@ -374,22 +437,23 @@ fn probe_channel(channel: &Channel, project: &Path) -> Value {
 
 // --- Inspection helpers ------------------------------------------------------
 
-fn read_probe_record(run_dir: &Path) -> Value {
-    let text =
-        fs::read_to_string(run_dir.join("out/probe.json")).expect("probe.json written by builder");
-    serde_json::from_str(&text).expect("probe.json parses")
+fn read_probe_record_opt(run_dir: &Path) -> Option<Value> {
+    let text = fs::read_to_string(run_dir.join("out/probe.json")).ok()?;
+    serde_json::from_str(&text).ok()
 }
-
 fn output_cache_mtime(run_dir: &Path) -> Option<std::time::SystemTime> {
-    fs::metadata(run_dir.join("output"))
+    fs::metadata(directive_cache(run_dir)?)
         .and_then(|m| m.modified())
         .ok()
 }
 
-/// Output-cache correctness: cargo captured the directive surface at the
-/// run-dir root and the generated unit materialized under OUT_DIR.
+/// Output-cache correctness: cargo captured the directive surface and the
+/// generated unit materialized under OUT_DIR.
 fn verify_output_cache(project: &Path, run_dir: &Path, probe: &Value) -> bool {
-    let output = fs::read_to_string(run_dir.join("output")).unwrap_or_default();
+    let Some(cache) = directive_cache(run_dir) else {
+        return false;
+    };
+    let output = fs::read_to_string(cache).unwrap_or_default();
     let directives_ok = output.contains("cargo:rerun-if-changed=build.rs")
         && output.contains("cargo:rerun-if-env-changed=N001_PROBE_VAR");
     let generated_ok = run_dir.join("out/generated.rs").is_file();

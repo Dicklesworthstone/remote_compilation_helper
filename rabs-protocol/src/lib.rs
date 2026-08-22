@@ -87,6 +87,7 @@ pub mod redaction;
 pub mod resource_envelope;
 pub mod result_identity;
 pub mod rolling_upgrade;
+pub mod run_cache_gate;
 pub mod schema_registry;
 pub mod secret_redaction;
 pub mod self_host_bypass;
