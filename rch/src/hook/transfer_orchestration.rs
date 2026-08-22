@@ -458,7 +458,14 @@ pub(super) async fn execute_remote_compilation(
     ));
 
     // Ensure deterministic remote topology before any repo synchronization.
-    ensure_worker_projects_topology(&worker_config, reporter, topology_policy).await?;
+    // bd-m7amp: the worker enforces the rch-common DEFAULT worker contract
+    // (/dp -> /data/projects, provisioned identically by `rch workers setup`),
+    // NOT the client box's local canonical/alias roots. Feeding Mac-side
+    // config roots here demanded worker /data be a symlink to a freshly
+    // mkdir'd /Users/jemanuel and refused every real fleet store with
+    // RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK (status 42) by construction.
+    ensure_worker_projects_topology(&worker_config, reporter, &PathTopologyPolicy::default())
+        .await?;
 
     // Best-effort repo convergence for ordinary multi-repo dependency graphs.
     // A clean-overlay run already names an immutable base; mutating repositories
