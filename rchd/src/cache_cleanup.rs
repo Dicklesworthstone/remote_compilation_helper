@@ -117,12 +117,25 @@ fn build_cleanup_command(escaped_base: &str, max_cache_age_hours: u64, min_free_
            if [ -n \"$recent_active\" ]; then continue; fi; \
            size_kb=$(du -sk \"$dir\" 2>/dev/null | awk '{{print $1}}'); \
            if [ -z \"$size_kb\" ]; then size_kb=0; fi; \
-           if rm -rf \"$dir\" 2>/dev/null; then \
+         if rm -rf \"$dir\" 2>/dev/null; then \
+           removed=$((removed + 1)); \
+           freed_kb=$((freed_kb + size_kb)); \
+         elif [ ! -d \"$dir\" ]; then \
+           removed=$((removed + 1)); \
+           freed_kb=$((freed_kb + size_kb)); \
+         elif [ -z \"$(find \"$dir\" -mindepth 1 -print -quit 2>/dev/null)\" ]; then \
+           if rmdir \"$dir\" 2>/dev/null; then \
              removed=$((removed + 1)); \
              freed_kb=$((freed_kb + size_kb)); \
+             printf 'RCH_CLEANUP_HUSK_REAPED dir=%s\\n' \"$dir\" >&2; \
            else \
              remove_errors=$((remove_errors + 1)); \
+             printf 'RCH_CLEANUP_RM_FAILURE dir=%s kb=%s\\n' \"$dir\" \"$size_kb\" >&2; \
            fi; \
+         else \
+           remove_errors=$((remove_errors + 1)); \
+           printf 'RCH_CLEANUP_RM_FAILURE dir=%s kb=%s\\n' \"$dir\" \"$size_kb\" >&2; \
+         fi; \
            if [ \"$low_disk\" -eq 1 ]; then \
              current_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
              if [ -n \"$current_kb\" ] && [ \"$current_kb\" -ge \"$threshold_kb\" ]; then break; fi; \
@@ -1116,5 +1129,131 @@ mod tests {
         assert!(!command.contains("kill -KILL -- -"));
         assert!(command.contains("orphans_killed=$((orphans_killed + 1))"));
         assert!(command.contains("orphans_killed=%s"));
+    }
+
+    #[test]
+    fn test_build_cleanup_command_reconciles_failed_rm_and_reports_diagnostics() {
+        let _guard = test_guard!();
+        let command = build_cleanup_command("'/tmp/rch'", 72, 10);
+        // bd-kwvy8: a nonzero rm does NOT mean nothing was reaped. A
+        // candidate that is already gone was reaped by another writer —
+        // count it.
+        assert!(command.contains("elif [ ! -d \"$dir\" ]; then"));
+        // An empty husk left by a raced/partial removal gets exactly one
+        // rmdir retry; success counts as removed and says so on stderr.
+        assert!(command.contains("RCH_CLEANUP_HUSK_REAPED dir=%s"));
+        // A surviving candidate or an unreapable husk produces a per-dir
+        // diagnostic instead of being silently swallowed by 2>/dev/null.
+        assert!(command.contains("RCH_CLEANUP_RM_FAILURE dir=%s kb=%s"));
+    }
+
+    /// Runs the generated sweep against a scratch tree, optionally with
+    /// directories prepended to PATH (for command shims), capturing
+    /// stdout, stderr, and exit status.
+    fn run_sweep(
+        base: &std::path::Path,
+        prepend_path: &[std::path::PathBuf],
+    ) -> (String, String, Option<i32>) {
+        use std::env::{join_paths, split_paths};
+        let escaped = format!("'{}'", base.display());
+        let command = build_cleanup_command(&escaped, 0, 0);
+        let mut full_path: Vec<std::path::PathBuf> = prepend_path.to_vec();
+        full_path.extend(split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .env("PATH", join_paths(full_path.iter()).expect("join PATH"))
+            .output()
+            .expect("run sweep");
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status.code(),
+        )
+    }
+
+    #[test]
+    fn cleanup_command_reaps_aged_pool_normally() {
+        let _guard = test_guard!();
+        let base = tempfile::tempdir().expect("base");
+        let pool = base
+            .path()
+            .join("gcverify_pool_repo")
+            .join(".rch-target-pool-deadbeefcafe");
+        std::fs::create_dir_all(pool.join("deps")).expect("pool tree");
+        let (stdout, _stderr, code) = run_sweep(base.path(), &[]);
+        assert_eq!(code, Some(0));
+        assert!(stdout.contains("removed=1"), "{stdout}");
+        assert!(stdout.contains("remove_errors=0"), "{stdout}");
+    }
+
+    #[test]
+    fn cleanup_command_reaps_empty_husk_when_rmdir_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = test_guard!();
+        let base = tempfile::tempdir().expect("base");
+        // Empty husk: contents were removed by an interfering writer,
+        // the directory itself remains (bd-kwvy8's hz2 observation).
+        std::fs::create_dir_all(
+            base.path()
+                .join("gcverify_pool_repo")
+                .join(".rch-target-pool-deadbeefcafe"),
+        )
+        .expect("husk");
+        // A shim `rm` that refuses -rf models rm failing mid-removal;
+        // the sweep must reconcile via rmdir and count the reap.
+        let shim_dir = tempfile::tempdir().expect("shim dir");
+        let shim = shim_dir.path().join("rm");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\n[ \"$1\" = \"-rf\" ] && exit 42\nfor real in /usr/bin/rm /bin/rm; do [ -x \"$real\" ] && exec \"$real\" \"$@\"; done\nexit 127\n",
+        )
+        .expect("shim");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod shim");
+        let (stdout, stderr, code) = run_sweep(base.path(), &[shim_dir.path().to_path_buf()]);
+        assert_eq!(code, Some(0));
+        assert!(stdout.contains("removed=1"), "{stdout}");
+        assert!(stdout.contains("remove_errors=0"), "{stdout}");
+        assert!(
+            stderr.contains("RCH_CLEANUP_HUSK_REAPED")
+                && stderr.contains(".rch-target-pool-deadbeefcafe"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn cleanup_command_reports_survivor_and_unreapable_husk_as_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = test_guard!();
+        let base = tempfile::tempdir().expect("base");
+        let survivor = base.path().join("repo_a").join(".rch-target-pool-survivor");
+        std::fs::create_dir_all(survivor.join("nested")).expect("survivor tree");
+        let husk = base.path().join("repo_b").join(".rch-target-pool-husk");
+        std::fs::create_dir_all(&husk).expect("husk");
+        // Read-only pool parents make every removal fail (EACCES): the
+        // survivor stays non-empty; the husk's rmdir retry also fails.
+        let repo_a = base.path().join("repo_a");
+        let repo_b = base.path().join("repo_b");
+        // Read-only POOL PARENTS make every removal fail (EACCES): the
+        // survivor stays non-empty; the husk's rmdir retry also fails.
+        std::fs::set_permissions(&repo_a, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod repo_a");
+        std::fs::set_permissions(&repo_b, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod repo_b");
+        let (stdout, stderr, code) = run_sweep(base.path(), &[]);
+        std::fs::set_permissions(&repo_a, std::fs::Permissions::from_mode(0o755))
+            .expect("restore repo_a");
+        std::fs::set_permissions(&repo_b, std::fs::Permissions::from_mode(0o755))
+            .expect("restore repo_b");
+        assert_eq!(code, Some(1));
+        assert!(stdout.contains("removed=0"), "{stdout}");
+        assert!(stdout.contains("remove_errors=2"), "{stdout}");
+        assert!(
+            stderr.matches("RCH_CLEANUP_RM_FAILURE").count() == 2,
+            "{stderr}"
+        );
+        assert!(stderr.contains(".rch-target-pool-survivor"), "{stderr}");
+        assert!(stderr.contains(".rch-target-pool-husk"), "{stderr}");
     }
 }
