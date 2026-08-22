@@ -1,0 +1,112 @@
+{
+  "channel": "nightly",
+  "dep_vars": [
+    "DEP_GOLDENLINKS_DEP_INFO=extra.d",
+    "DEP_GOLDENLINKS_FUTURE_THING=fv1",
+    "DEP_GOLDENLINKS_METADATA=FEATURE=enabled"
+  ],
+  "directives": [
+    {
+      "key": "rerun-if-changed",
+      "registry_kind": "rerun-if-changed",
+      "seq": 2,
+      "value": "build.rs"
+    },
+    {
+      "key": "rerun-if-env-changed",
+      "registry_kind": "rerun-if-env-changed",
+      "seq": 3,
+      "value": "N011_GOLDEN_VAR"
+    },
+    {
+      "key": "rustc-flags",
+      "registry_kind": "rustc-flags",
+      "seq": 4,
+      "value": "-L /tmp/n011-golden"
+    },
+    {
+      "key": "rustc-env",
+      "registry_kind": "rustc-env",
+      "seq": 5,
+      "value": "N011_GOLDEN=1"
+    },
+    {
+      "key": "rustc-link-lib",
+      "registry_kind": "rustc-link-lib",
+      "seq": 6,
+      "value": "dylib=m"
+    },
+    {
+      "key": "rustc-link-search",
+      "registry_kind": "rustc-link-search",
+      "seq": 7,
+      "value": "native=/tmp/n011-golden"
+    },
+    {
+      "key": "rustc-cdylib-link-arg",
+      "registry_kind": "rustc-cdylib-link-arg",
+      "seq": 8,
+      "value": "-Wl,--golden"
+    },
+    {
+      "key": "warning",
+      "registry_kind": "warning",
+      "seq": 9,
+      "value": "golden warning one"
+    },
+    {
+      "key": "warning",
+      "registry_kind": "warning",
+      "seq": 10,
+      "value": "golden warning two"
+    },
+    {
+      "key": "metadata",
+      "registry_kind": "metadata",
+      "seq": 11,
+      "value": "VERSION=1.0.0-first"
+    },
+    {
+      "key": "metadata",
+      "registry_kind": "metadata",
+      "seq": 12,
+      "value": "VERSION=1.0.0-final"
+    },
+    {
+      "key": "metadata",
+      "registry_kind": "metadata",
+      "seq": 13,
+      "value": "FEATURE=enabled"
+    },
+    {
+      "key": "future_thing",
+      "registry_kind": "<unknown>",
+      "seq": 14,
+      "value": "fv1"
+    },
+    {
+      "key": "dep-info",
+      "registry_kind": "dep-info",
+      "seq": 15,
+      "value": "extra.d"
+    }
+  ],
+  "exit_status": 0,
+  "transcript_lines": [
+    "compiling golden probe",
+    "cargo:rerun-if-changed=build.rs",
+    "cargo:rerun-if-env-changed=N011_GOLDEN_VAR",
+    "cargo:rustc-flags=-L /tmp/n011-golden",
+    "cargo:rustc-env=N011_GOLDEN=1",
+    "cargo:rustc-link-lib=dylib=m",
+    "cargo:rustc-link-search=native=/tmp/n011-golden",
+    "cargo:rustc-cdylib-link-arg=-Wl,--golden",
+    "cargo:warning=golden warning one",
+    "cargo:warning=golden warning two",
+    "cargo:metadata=VERSION=1.0.0-first",
+    "cargo:metadata=VERSION=1.0.0-final",
+    "cargo:metadata=FEATURE=enabled",
+    "cargo:future_thing=fv1",
+    "cargo:dep-info=extra.d"
+  ]
+}

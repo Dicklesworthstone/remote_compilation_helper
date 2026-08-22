@@ -1,0 +1,13 @@
+[package]
+name = "n011_golden_consumer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+n011_golden_provider = { path = "../provider" }
+
+[lib]
+path = "src/lib.rs"
