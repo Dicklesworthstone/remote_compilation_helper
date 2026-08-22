@@ -3743,6 +3743,18 @@ retry_max = 2
     }
 
     #[test]
+    fn test_job_uses_build_timeout_bucket() {
+        let _guard = test_guard!();
+        // Jobs (explicit `rch exec --job`) reuse the standard build-timeout
+        // bucket, so `RCH_BUILD_TIMEOUT_SEC` governs them without new config.
+        let cfg = CompilationConfig::default();
+        assert_eq!(
+            cfg.timeout_for_kind(Some(CompilationKind::Job)),
+            std::time::Duration::from_secs(cfg.build_timeout_sec)
+        );
+    }
+
+    #[test]
     fn test_default_allowlist_includes_nix() {
         let _guard = test_guard!();
         let cfg = ExecutionConfig::default();

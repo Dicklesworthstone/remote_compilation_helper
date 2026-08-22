@@ -18,6 +18,7 @@ pub mod error;
 pub mod fleet;
 #[cfg_attr(not(unix), path = "hook_windows.rs")]
 mod hook;
+pub mod local_builds;
 mod self_healing_overrides;
 pub mod state;
 mod status_display;
@@ -532,6 +533,17 @@ USAGE:
         /// Emit a worker-verified per-root manifest for the exact transferred source bytes
         #[arg(long, conflicts_with = "clean_overlay")]
         source_content_receipt: bool,
+        /// Admit an arbitrary NON-compilation job (sharded tests, fuzzing,
+        /// benchmarks, mutation testing). Bypasses ONLY the compilation
+        /// classifier: the command rides the normal selection/sync/execute/
+        /// heartbeat/release rails, syncs no artifacts back, and its remote
+        /// exit status surfaces verbatim (no toolchain/worker-env rerun
+        /// heuristics). The PreToolUse hook never sets this flag.
+        #[arg(
+            long,
+            conflicts_with_all = ["clean_overlay", "source_content_receipt"]
+        )]
+        job: bool,
         /// The compilation command to execute remotely
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
@@ -2040,6 +2052,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 overlay_path,
                 no_overlay,
                 source_content_receipt,
+                job,
                 command,
             } => {
                 hook::run_exec(
@@ -2048,6 +2061,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                     overlay_path,
                     no_overlay,
                     source_content_receipt,
+                    job,
                     command,
                 )
                 .await
@@ -5284,6 +5298,7 @@ mod tests {
                 overlay_path,
                 no_overlay,
                 source_content_receipt,
+                job,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
@@ -5294,6 +5309,7 @@ mod tests {
                 );
                 assert!(!no_overlay);
                 assert!(!source_content_receipt);
+                assert!(!job);
                 assert_eq!(command, vec!["cargo", "test"]);
             }
             _ => fail_expected("Expected clean-overlay exec command"),
@@ -5322,6 +5338,7 @@ mod tests {
                 overlay_path,
                 no_overlay,
                 source_content_receipt,
+                job,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
@@ -5329,6 +5346,7 @@ mod tests {
                 assert!(overlay_path.is_empty());
                 assert!(no_overlay);
                 assert!(!source_content_receipt);
+                assert!(!job);
                 assert_eq!(command, vec!["cargo", "check"]);
             }
             _ => fail_expected("Expected base-only clean-overlay exec command"),
@@ -5368,6 +5386,7 @@ mod tests {
             "--overlay-path",
             "--no-overlay",
             "--source-content-receipt",
+            "--job",
         ] {
             assert!(help.contains(flag), "exec help missing {flag}: {help}");
         }
@@ -5392,6 +5411,7 @@ mod tests {
                 overlay_path,
                 no_overlay,
                 source_content_receipt,
+                job,
                 command,
             }) => {
                 assert!(base.is_none());
@@ -5399,6 +5419,7 @@ mod tests {
                 assert!(overlay_path.is_empty());
                 assert!(!no_overlay);
                 assert!(source_content_receipt);
+                assert!(!job);
                 assert_eq!(command, vec!["cargo", "check"]);
             }
             _ => fail_expected("Expected source-content receipt exec command"),
@@ -5419,6 +5440,68 @@ mod tests {
             "--",
             "cargo",
             "check",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_parses_exec_job_flag() {
+        let _guard = test_guard!();
+        let cli =
+            Cli::try_parse_from(["rch", "exec", "--job", "--", "pytest", "-x", "-q"]).unwrap();
+        match cli.command {
+            Some(Commands::Exec {
+                base,
+                clean_overlay,
+                overlay_path,
+                no_overlay,
+                source_content_receipt,
+                job,
+                command,
+            }) => {
+                assert!(job, "--job must parse as explicit job admission");
+                assert!(base.is_none());
+                assert!(!clean_overlay);
+                assert!(overlay_path.is_empty());
+                assert!(!no_overlay);
+                assert!(!source_content_receipt);
+                assert_eq!(command, vec!["pytest", "-x", "-q"]);
+            }
+            _ => fail_expected("Expected job-mode exec command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_job_with_clean_overlay() {
+        let _guard = test_guard!();
+        // Job mode and clean-overlay are disjoint admission modes: an overlay
+        // is a Cargo-source guarantee a non-compilation job cannot make.
+        let result = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--job",
+            "--base",
+            "HEAD",
+            "--clean-overlay",
+            "--no-overlay",
+            "--",
+            "pytest",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_rejects_job_with_source_content_receipt() {
+        let _guard = test_guard!();
+        // Receipt mode resolves the active Cargo path-dependency closure; a
+        // non-compilation job has no such closure to prove.
+        let result = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--job",
+            "--source-content-receipt",
+            "--",
+            "pytest",
         ]);
         assert!(result.is_err());
     }

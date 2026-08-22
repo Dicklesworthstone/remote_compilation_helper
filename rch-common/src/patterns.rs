@@ -304,6 +304,19 @@ pub enum CompilationKind {
     /// that is meaningless on a nix-less local host, so these run as
     /// streaming, no-artifact-return commands (exit status is the payload).
     NixBuild,
+
+    // Explicit job admission
+    /// Arbitrary non-compilation workload admitted explicitly via
+    /// `rch exec --job` (sharded tests, fuzzing, benchmarks, mutation testing).
+    ///
+    /// NEVER produced by [`classify_command`] or the PreToolUse hook — the sole
+    /// constructor is the explicit `--job` flag on `rch exec`, so the hook can
+    /// never auto-delegate a command the classifier did not intercept. A job
+    /// rides the normal selection/sync/execute/heartbeat/release rails, syncs
+    /// no artifacts back automatically (exit status is the payload in this
+    /// phase), and surfaces the remote exit status verbatim without
+    /// toolchain/worker-environment reinterpretation.
+    Job,
 }
 
 impl CompilationKind {
@@ -362,6 +375,12 @@ impl CompilationKind {
             // TypeScript. Both `tsc` and `npx tsc` route through this kind; the
             // canonical allowlist base name is "tsc".
             CompilationKind::Tsc => "tsc",
+            // Explicit job admission has no single executable base: a job's
+            // argv[0] is arbitrary. The hook-path execution-allowlist gate can
+            // never observe this kind (only `rch exec --job` constructs it), so
+            // this token exists to keep the mapping total, not to match an
+            // allowlist entry.
+            CompilationKind::Job => "job",
         }
     }
 }
@@ -2672,6 +2691,20 @@ mod tests {
         let wrapped = classify_command("bash -c \"nix build .#foo\"");
         assert!(wrapped.is_compilation, "wrapped nix build should offload");
         assert_eq!(wrapped.kind, Some(CompilationKind::NixBuild));
+    }
+
+    #[test]
+    fn test_job_kind_serde_and_base_token() {
+        let _guard = test_guard!();
+        // The wire name is stable snake_case so rchd/telemetry can record it.
+        let json = serde_json::to_string(&CompilationKind::Job).unwrap();
+        assert_eq!(json, "\"job\"");
+        let round: CompilationKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(round, CompilationKind::Job);
+        // Total mapping token (see command_base docs — the hook-path allowlist
+        // gate can never observe this kind).
+        assert_eq!(CompilationKind::Job.command_base(), "job");
+        assert!(!CompilationKind::Job.is_test_command());
     }
 
     #[test]

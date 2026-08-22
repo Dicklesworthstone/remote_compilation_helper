@@ -2149,6 +2149,7 @@ fi",
             Some(CompilationKind::GoTest) => "go test",
             Some(CompilationKind::GoVet) => "go vet",
             Some(CompilationKind::Tsc) => "tsc",
+            Some(CompilationKind::Job) => "job",
             None => "unknown",
         };
 

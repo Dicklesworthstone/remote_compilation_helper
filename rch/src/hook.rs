@@ -32,14 +32,14 @@ use rch_common::repo_updater_contract::{
     RepoUpdaterOperatorOverride, RepoUpdaterTrustedHostIdentity, RepoUpdaterVerifiedHostIdentity,
 };
 use rch_common::{
-    BuildHeartbeatPhase, BuildHeartbeatRequest, ColorMode, CommandPriority, CommandTimingBreakdown,
-    CompilationKind, ControlState, DependencyClosurePlan, HookInput, HookOutput, IncidentEvent,
-    IncidentEventType, IncidentLedger, IncidentLedgerConfig, IncidentReasonCode, IncidentSource,
-    OutputVisibility, REPO_UPDATER_CANONICAL_PROJECTS_ROOT, RepoUpdaterAdapterCommand,
-    RepoUpdaterAdapterContract, RepoUpdaterAdapterRequest, RepoUpdaterOutputFormat,
-    RequestedWorkerFacts, RequestedWorkerOutcome, RequestedWorkerStatus, RequiredRuntime,
-    SelectedMode, SelectedWorker, SelectionDiagnostics, SelectionReason, SelectionResponse,
-    SelfHealingConfig, ToolchainInfo, TransferConfig, WorkerConfig, WorkerId,
+    BuildHeartbeatPhase, BuildHeartbeatRequest, Classification, ColorMode, CommandPriority,
+    CommandTimingBreakdown, CompilationKind, ControlState, DependencyClosurePlan, HookInput,
+    HookOutput, IncidentEvent, IncidentEventType, IncidentLedger, IncidentLedgerConfig,
+    IncidentReasonCode, IncidentSource, OutputVisibility, REPO_UPDATER_CANONICAL_PROJECTS_ROOT,
+    RepoUpdaterAdapterCommand, RepoUpdaterAdapterContract, RepoUpdaterAdapterRequest,
+    RepoUpdaterOutputFormat, RequestedWorkerFacts, RequestedWorkerOutcome, RequestedWorkerStatus,
+    RequiredRuntime, SelectedMode, SelectedWorker, SelectionDiagnostics, SelectionReason,
+    SelectionResponse, SelfHealingConfig, ToolchainInfo, TransferConfig, WorkerConfig, WorkerId,
     build_dependency_closure_plan_with_policy, build_invocation, classify_command,
     declined_compilation_due_to_structure, default_socket_path, evaluate_requested_worker, mock,
     normalize_project_path_with_policy,
@@ -1905,6 +1905,7 @@ pub async fn run_exec(
     overlay_paths: Vec<PathBuf>,
     no_overlay: bool,
     source_content_receipt: bool,
+    job: bool,
     command_parts: Vec<String>,
 ) -> anyhow::Result<()> {
     let command = join_exec_command(&command_parts);
@@ -1923,8 +1924,19 @@ pub async fn run_exec(
     // defeat the entire peer-dirt exclusion guarantee.
     let require_remote = exec_requires_remote() || clean_overlay || source_content_receipt;
 
-    // Classify the command
-    let classification = classify_command(&command);
+    // Classify the command. In explicit job-admission mode (`rch exec --job`,
+    // bd-bu3fb) the classifier is bypassed entirely and the command is admitted
+    // as a `CompilationKind::Job`: the hook can never produce this kind, so
+    // auto-delegation of non-compilation workloads remains impossible.
+    let classification = if job {
+        Classification::compilation(
+            CompilationKind::Job,
+            1.0,
+            "explicit `rch exec --job` admission",
+        )
+    } else {
+        classify_command(&command)
+    };
     let clean_overlay_fmt_check = clean_overlay && is_clean_overlay_cargo_fmt_check(&command_parts);
     if !classification.is_compilation && !clean_overlay_fmt_check {
         // This should not normally happen because the hook only rewrites
@@ -2439,7 +2451,16 @@ pub async fn run_exec(
                         );
                     }
                     std::process::exit(0);
-                } else if is_toolchain_failure(&result.stderr, result.exit_code) {
+                // bd-bu3fb: a job's completed remote command is terminal truth.
+                // The toolchain and worker-system-dependency heuristics
+                // reinterpret the command's own stderr as a WORKER fault and
+                // re-execute the workload (remotely, then possibly locally via
+                // GatedLocalFallback). A non-compilation job must surface its
+                // remote exit status verbatim instead — so both heuristics are
+                // skipped for jobs and control falls through to the signal /
+                // genuine-failure arms below (which never rerun the command
+                // locally).
+                } else if !job && is_toolchain_failure(&result.stderr, result.exit_code) {
                     // Worker missing the toolchain — another worker may have it.
                     warn!(
                         "Remote toolchain failure on {}; will retry on another worker if available",
@@ -2452,8 +2473,9 @@ pub async fn run_exec(
                             reason: format!("toolchain missing on {}", worker.id),
                         },
                     }
-                } else if let Some(env_failure) =
-                    detect_worker_system_dependency_failure(&result.stderr, result.exit_code)
+                } else if !job
+                    && let Some(env_failure) =
+                        detect_worker_system_dependency_failure(&result.stderr, result.exit_code)
                 {
                     // Worker missing a system dependency — another worker may have it.
                     let error = ErrorCode::BuildEnvError;

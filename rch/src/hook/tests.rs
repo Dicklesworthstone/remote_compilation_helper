@@ -3608,6 +3608,88 @@ fn test_kind_produces_transferable_artifacts() {
 }
 
 #[test]
+fn test_job_admission_is_never_classifier_produced() {
+    let _guard = test_guard!();
+    // bd-bu3fb regression guard: `CompilationKind::Job` exists ONLY for the
+    // explicit `rch exec --job` admission flag. The classifier (and therefore
+    // the PreToolUse hook, which only ever delegates what classify_command
+    // intercepts) must never produce it — otherwise every non-compilation
+    // command an agent runs could be silently shipped to a remote worker.
+    let commands = [
+        // Ordinary non-compilation commands.
+        "ls -la",
+        "git status",
+        "git push origin main",
+        "pytest -x -q",
+        "python3 script.py",
+        "echo hello > out.txt",
+        "curl https://example.com",
+        "grep -rn TODO src/",
+        "rm build/output.o",
+        // Bun package management / execution: explicitly local per AGENTS.md.
+        "bun install",
+        "bun add left-pad",
+        "bun remove left-pad",
+        "bun run dev",
+        "bun build ./index.ts",
+        "bun x prettier .",
+        "bunx prettier .",
+        "bun test --watch",
+        // Nix interactive/mutating forms: local by design.
+        "nix develop",
+        "nix run .#foo",
+        "nix repl",
+        "nix profile list",
+        "nix flake update",
+        "nix store gc",
+        "nix-env -iA nixpkgs.hello",
+        // Package management / watch / piped / backgrounded patterns.
+        "cargo install rch",
+        "cargo clean",
+        "cargo build --watch",
+        "make test | tee log.txt",
+        "cmake --build build &",
+        "bash -lc \"cargo test && cargo test\"",
+        // Even genuine compilations must classify as their OWN kind, never Job.
+        "cargo build --release",
+        "cargo test --workspace",
+        "go test ./...",
+        "tsc --noEmit",
+        "nix build .#default",
+    ];
+    for cmd in commands {
+        let classification = classify_command(cmd);
+        assert_ne!(
+            classification.kind,
+            Some(CompilationKind::Job),
+            "classifier produced job admission for `{cmd}` — the hook would \
+             auto-delegate a command it did not intercept"
+        );
+    }
+}
+
+#[test]
+fn test_job_kind_pipeline_contract() {
+    let _guard = test_guard!();
+    // A job carries no runtime gate: any worker may take it.
+    assert_eq!(
+        required_runtime_for_kind(Some(CompilationKind::Job)),
+        RequiredRuntime::None
+    );
+    // Jobs have no artifact contract in this phase: nothing is synced back and
+    // a sync-back miss can never fail the invocation.
+    assert!(get_artifact_patterns(Some(CompilationKind::Job)).is_empty());
+    assert!(get_project_artifact_patterns(Some(CompilationKind::Job), false).is_empty());
+    assert!(get_project_artifact_patterns(Some(CompilationKind::Job), true).is_empty());
+    assert!(get_custom_target_artifact_patterns(Some(CompilationKind::Job)).is_empty());
+    assert!(!kind_produces_transferable_artifacts(Some(
+        CompilationKind::Job
+    )));
+    // And it is not mistaken for a test kind (cache affinity / record_build).
+    assert!(!CompilationKind::Job.is_test_command());
+}
+
+#[test]
 fn test_add_cargo_isolation_skips_non_cargo_commands() {
     let _guard = test_guard!();
     let worker_id = rch_common::WorkerId::new("test-worker");

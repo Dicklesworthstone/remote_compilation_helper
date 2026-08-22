@@ -73,6 +73,10 @@ pub(super) fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String
         | Some(CompilationKind::GoTest)
         | Some(CompilationKind::GoVet)
         | Some(CompilationKind::Tsc) => Vec::new(),
+        // Jobs (`rch exec --job`) are arbitrary commands; nothing may be synced
+        // back automatically — exit status is the payload in this phase. The
+        // `_` rust catch-all would drag a stale worker-side `target/**` home.
+        Some(CompilationKind::Job) => Vec::new(),
         _ => default_rust_artifact_patterns(),
     }
 }
@@ -140,8 +144,10 @@ pub(super) fn get_custom_target_artifact_patterns(kind: Option<CompilationKind>)
         Some(CompilationKind::CargoTest)
         | Some(CompilationKind::CargoCheck)
         | Some(CompilationKind::CargoClippy)
-        // Nix builds never write into a cargo target dir and return no artifacts.
-        | Some(CompilationKind::NixBuild) => Vec::new(),
+        // Nix builds and jobs never write into a cargo target dir and return
+        // no artifacts.
+        | Some(CompilationKind::NixBuild)
+        | Some(CompilationKind::Job) => Vec::new(),
         Some(CompilationKind::CargoNextest) | Some(CompilationKind::CargoBench) => {
             // Test/bench artifacts are already a narrow allowlist; just rebase them
             // onto the target-dir root (the sync root IS the remote target dir).
@@ -264,6 +270,9 @@ pub(super) fn kind_produces_transferable_artifacts(kind: Option<CompilationKind>
         | Some(CompilationKind::BunTypecheck)
         // Nix builds stream their result; outputs stay in the worker's /nix/store.
         | Some(CompilationKind::NixBuild)
+        // Jobs are arbitrary admitted commands: no artifact contract exists in
+        // this phase, so a sync-back miss can never fail a job.
+        | Some(CompilationKind::Job)
         // Go/TS: only non-emitting forms are ever offloaded (see classify_go /
         // classify_tsc), so there is no required local artifact.
         | Some(CompilationKind::GoBuild)

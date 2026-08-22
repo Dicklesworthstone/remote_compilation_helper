@@ -147,6 +147,7 @@ fn family_token(kind: CompilationKind) -> &'static str {
         CompilationKind::GoTest => "go_test",
         CompilationKind::GoVet => "go_vet",
         CompilationKind::Tsc => "tsc",
+        CompilationKind::Job => "job",
     }
 }
 
