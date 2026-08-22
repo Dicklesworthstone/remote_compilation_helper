@@ -86,6 +86,7 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
         ],
         toolchain_backing: toolchain.path().display().to_string(),
         workspace_backing: workspace.path().display().to_string(),
+        jobserver_grant: None,
     };
     let result = execute_canonical(
         &request,

@@ -18,9 +18,12 @@
 //! worker — not some inherited descriptor — the authority for how many
 //! parallel jobs the action believes it may run.
 //!
-//! Descriptor-level injection (passing real jobserver FDs to processes
-//! inside the namespace) is deliberately NOT here: bwrap offers no fd
-//! passthrough primitive, and that bridge is exactly beads I002/I004.
+//! Descriptor-level injection is impossible (bwrap offers no fd
+//! passthrough), but a bare `MAKEFLAGS=-jN` lets every PLAIN `make`
+//! invoked in a recipe mint its OWN full-size pool — tree-depth
+//! multiplication. [`JobserverBridge`] closes that with a real fifo
+//! jobserver carried through the workspace bind by PATH: one budget,
+//! shared by every descendant, sized from the execution grant.
 
 /// Env var names that carry make/cargo coordination state.
 pub const COORDINATION_ENV_VARS: &[&str] = &["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"];
@@ -54,6 +57,86 @@ pub fn replace_with_worker_local(env: &mut Vec<(String, String)>, slots: u32) {
     env.push(("MAKEFLAGS".to_string(), worker_makeflags(slots)));
     env.sort_by(|a, b| a.0.cmp(&b.0));
     env.dedup_by(|a, b| a.0 == b.0);
+}
+
+/// One attempt's SANDBOX-VISIBLE jobserver (bead I004): a real
+/// named-pipe jobserver minted under the workspace backing so nested
+/// make/cargo/ninja inside the canonical namespace cooperate on ONE
+/// budget instead of each plain `make` in a recipe minting its own
+/// full-size pool (parallelism multiplying by tree depth).
+///
+/// Mechanism: the fifo node lives host-side under the workspace backing
+/// directory, which the canonical namespace bind-mounts at
+/// `rabs_sandbox::layout::WORKSPACE` — both views address the same
+/// in-kernel pipe, so the worker-held writer feeds token bytes that
+/// sandboxed descendants consume by PATH. No fd passthrough required.
+///
+/// Drop unlinks the fifo and closes the writer: stranded readers see
+/// EOF after the final tokens, and no per-attempt node outlives the
+/// attempt.
+#[derive(Debug)]
+pub struct JobserverBridge {
+    /// Host-side path (unlinked on Drop).
+    host_path: std::path::PathBuf,
+    /// Held write end: keeps the fifo open for late readers; its bytes
+    /// ARE the free-slot budget.
+    _writer: std::fs::File,
+    /// The full MAKEFLAGS value to install (budget + fifo auth with the
+    /// IN-SANDBOX path).
+    makeflags: String,
+}
+
+impl JobserverBridge {
+    /// Mint a bridge granting `grant_slots` transferable tokens, with
+    /// the fifo created under `host_dir` — the host path of a directory
+    /// visible inside the namespace at `rabs_sandbox::layout::WORKSPACE`.
+    ///
+    /// # Errors
+    /// Typed [`std::io::Error`] from the mint; callers fail OPEN (plain
+    /// `-jN` env remains authoritative) rather than blocking the action.
+    pub fn mint(grant_slots: u32, host_dir: &std::path::Path) -> std::io::Result<Self> {
+        let slots = grant_slots.max(1);
+        let (host_path, writer, _edge_auth_unused) =
+            rabs_asupersync::jobserver::mint_fifo_jobserver(slots as usize, host_dir)?;
+        let name = host_path.file_name().map_or_else(
+            || "jobserver.fifo".to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let makeflags = format!(
+            "-j{slots} --jobserver-auth=fifo:{}/{}",
+            rabs_sandbox::layout::WORKSPACE,
+            name
+        );
+        Ok(Self {
+            host_path,
+            _writer: writer,
+            makeflags,
+        })
+    }
+
+    /// The full MAKEFLAGS value carrying the in-sandbox auth.
+    #[must_use]
+    pub fn makeflags(&self) -> &str {
+        &self.makeflags
+    }
+
+    /// Install the bridge auth: overwrite the worker-authored MAKEFLAGS
+    /// entry in place (env stays name-sorted; only the value changes).
+    pub fn apply(env: &mut Vec<(String, String)>, bridge: &Self) {
+        for (k, v) in env.iter_mut() {
+            if k == "MAKEFLAGS" {
+                *v = bridge.makeflags.clone();
+                return;
+            }
+        }
+        env.push(("MAKEFLAGS".to_string(), bridge.makeflags.clone()));
+    }
+}
+
+impl Drop for JobserverBridge {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.host_path);
+    }
 }
 
 #[cfg(test)]

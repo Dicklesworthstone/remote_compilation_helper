@@ -26,9 +26,7 @@
 //! validity is therefore provable by ordinary fixtures instead of
 //! asserted.
 
-use std::io::Write;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::obligations::ObligationSet;
@@ -40,13 +38,6 @@ pub const MAKEFLAGS_ENV: &str = "MAKEFLAGS";
 /// Cargo's dialect of the same variable (what cargo sets for build
 /// scripts and what some wrappers consult).
 pub const CARGO_MAKEFLAGS_ENV: &str = "CARGO_MAKEFLAGS";
-
-/// Linux `O_NONBLOCK` (kept literal to avoid a libc dependency in this
-/// forbid-unsafe workspace; the value is fixed by the kernel ABI).
-const O_NONBLOCK: i32 = 0o4000;
-
-/// Launch-path uniqueness for fifo filenames within one worker boot.
-static FIFO_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Why a gated launch could not start.
 #[derive(Debug)]
@@ -162,7 +153,8 @@ impl CargoLaunchGate {
         //    On failure the permit returns via RAII while the OPEN
         //    obligation names the aborted attempt for the ledger.
         let (fifo_path, fifo_writer, auth) =
-            mint_fifo_jobserver(transferable_tokens).map_err(LaunchError::Jobserver)?;
+            crate::jobserver::mint_fifo_jobserver(transferable_tokens, &std::env::temp_dir())
+                .map_err(LaunchError::Jobserver)?;
 
         // 3. Spawn under a managed group with the auth installed BEFORE
         //    any caller configuration (callers cannot shadow it).
@@ -187,46 +179,4 @@ impl CargoLaunchGate {
             }
         }
     }
-}
-
-/// Create the fifo, open the holding write end, preload `tokens` bytes,
-/// and return `(path, writer, auth_string)`.
-fn mint_fifo_jobserver(
-    tokens: usize,
-) -> std::io::Result<(std::path::PathBuf, std::fs::File, String)> {
-    assert!(tokens > 0, "a zero-token jobserver deadlocks every client");
-    let seq = FIFO_SEQ.fetch_add(1, Ordering::Relaxed);
-    let path =
-        std::env::temp_dir().join(format!("rabs-jobserver-{}-{seq}.fifo", std::process::id()));
-    // House style: tiny external helper binaries instead of unsafe libc
-    // bindings (mkfifo is POSIX and present on every fleet host).
-    let made = Command::new("mkfifo")
-        .arg("--mode=0600")
-        .arg(&path)
-        .status()?;
-    if !made.success() {
-        return Err(std::io::Error::other(format!(
-            "mkfifo {} failed: {made}",
-            path.display()
-        )));
-    }
-
-    // Reader first (NONBLOCK: succeeds with no writer yet), and it MUST
-    // stay open across the writer open — a BLOCKING write-only open
-    // with zero readers would hang forever.
-    use std::os::unix::fs::OpenOptionsExt;
-    let prime_reader = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NONBLOCK)
-        .open(&path)?;
-    let mut writer = std::fs::OpenOptions::new().write(true).open(&path)?;
-    // Preload WHILE the prime reader still exists: a fifo write with
-    // zero readers raises EPIPE/SIGPIPE. N readable bytes == N free
-    // compile slots; far below the 64 KiB buffer, so nothing blocks.
-    writer.write_all(&vec![b'|'; tokens])?;
-    // Prime reader may now go away; the held writer keeps the fifo up.
-    drop(prime_reader);
-
-    let auth = format!("-j --jobserver-auth=fifo:{}", path.display());
-    Ok((path, writer, auth))
 }

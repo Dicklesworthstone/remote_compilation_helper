@@ -297,5 +297,11 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
             .and_then(|w| w.as_str())
             .ok_or("exec request missing workspace_backing")?
             .to_string(),
+        // I004: the coordinator's transferable token grant; absent on
+        // pre-bridge coordinators, where the worker's own slots rule.
+        jobserver_grant: value
+            .get("jobserver_grant")
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
     })
 }

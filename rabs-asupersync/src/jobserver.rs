@@ -239,6 +239,74 @@ pub fn replacement_plan(
     }
 }
 
+/// Linux `O_NONBLOCK` (kept literal to avoid a libc dependency in this
+/// forbid-unsafe workspace; the value is fixed by the kernel ABI).
+const FIFO_O_NONBLOCK: i32 = 0o4000;
+
+/// Launch-path uniqueness for fifo filenames within one process.
+static FIFO_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Create a named-pipe jobserver under `dir`, open the holding write
+/// end, preload `tokens` bytes, and return `(fifo_path, writer,
+/// makeflags_value)`.
+///
+/// THE single mint for both injection surfaces: edge-side managed Cargo
+/// launches ([`crate::cargo_launch`], fifo in temp space) and the
+/// worker's sandbox bridge (bead I004, fifo under the workspace backing
+/// so nested make/cargo inside the canonical namespace reach it by PATH
+/// — bwrap offers no fd passthrough, but a bind-mounted directory
+/// carries the fifo node itself, and both namespace views address the
+/// same in-kernel pipe).
+///
+/// # Errors
+/// Typed [`std::io::Error`] from `mkfifo`, the opens, or the preload
+/// write.
+pub fn mint_fifo_jobserver(
+    tokens: usize,
+    dir: &std::path::Path,
+) -> std::io::Result<(std::path::PathBuf, std::fs::File, String)> {
+    assert!(tokens > 0, "a zero-token jobserver deadlocks every client");
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let seq = FIFO_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("rabs-jobserver-{}-{seq}.fifo", std::process::id()));
+    // House style: tiny external helper binaries instead of unsafe libc
+    // bindings (mkfifo is POSIX and present on every fleet host).
+    let made = std::process::Command::new("mkfifo")
+        .arg("--mode=0600")
+        .arg(&path)
+        .status()?;
+    if !made.success() {
+        return Err(std::io::Error::other(format!(
+            "mkfifo {} failed: {made}",
+            path.display()
+        )));
+    }
+
+    // Reader first (NONBLOCK: succeeds with no writer yet), and it MUST
+    // stay open across the writer open — a BLOCKING write-only open
+    // with zero readers would hang forever.
+    let prime_reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FIFO_O_NONBLOCK)
+        .open(&path)?;
+    let mut writer = std::fs::OpenOptions::new().write(true).open(&path)?;
+    // Preload WHILE the prime reader still exists: a fifo write with
+    // zero readers raises EPIPE/SIGPIPE. N readable bytes == N free
+    // compile slots; far below the 64 KiB buffer, so nothing blocks.
+    writer.write_all(&vec![b'|'; tokens])?;
+    // Prime reader may now go away; the held writer keeps the fifo up.
+    drop(prime_reader);
+
+    let auth = format!(
+        "-j{} --jobserver-auth=fifo:{}",
+        tokens.max(1),
+        path.display()
+    );
+    Ok((path, writer, auth))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

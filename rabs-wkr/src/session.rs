@@ -65,6 +65,11 @@ pub struct CanonicalExecRequest {
     pub toolchain_backing: String,
     /// Workspace backing directory (mounts at `/__rabs/workspace`).
     pub workspace_backing: String,
+    /// Execution resource grant for this attempt (bead I004): the
+    /// transferable jobserver token budget the coordinator admits.
+    /// `None` falls back to the worker's own slot count (pre-grant
+    /// coordinators).
+    pub jobserver_grant: Option<u32>,
 }
 
 /// The result of one canonical execution — an OFFER, never a commit.
@@ -290,6 +295,22 @@ pub fn execute_canonical(
     // Worker-local jobserver authority runs on the FINAL env: extra_env
     // may carry smuggled coordination keys, so replacement must see them.
     replace_with_worker_local(&mut spec.env, slots);
+    // Sandbox jobserver bridge (bead I004): one REAL fifo jobserver,
+    // sized by the execution grant, carried through the workspace bind
+    // by PATH so nested make/cargo/ninja share a single budget instead
+    // of multiplying it per tree depth. Fail-open: on mint failure the
+    // plain `-jN` env above stays authoritative. The bridge binding is
+    // held to function end — its writer keeps the fifo alive for the
+    // whole attempt and Drop unlinks the node after the group resolves.
+    let grant = request.jobserver_grant.unwrap_or(slots);
+    let bridge_host_dir = std::path::Path::new(&request.workspace_backing).join(".rabs-jobserver");
+    let bridge = match crate::jobserver::JobserverBridge::mint(grant, &bridge_host_dir) {
+        Ok(bridge) => {
+            crate::jobserver::JobserverBridge::apply(&mut spec.env, &bridge);
+            Some(bridge)
+        }
+        Err(_) => None,
+    };
     let Ok(launch) = build_canonical_argv(&spec, &support, &request.program, &request.args) else {
         return exec_error(request.request_id);
     };
@@ -318,7 +339,7 @@ pub fn execute_canonical(
         resident_bound: EXEC_STREAM_RESIDENT_BOUND,
         spill_dir: spill_root.join(format!("attempt-{}", request.request_id)),
     };
-    match group.wait_with_bounded_drain(&limits) {
+    let outcome = match group.wait_with_bounded_drain(&limits) {
         Ok(output) => {
             // The residual closer already ran inside
             // wait_with_bounded_drain; its honest count rides the output.
@@ -359,7 +380,13 @@ pub fn execute_canonical(
             // non-result.
             exec_error(request.request_id)
         }
-    }
+    };
+    // Group fully resolved (drained + residual closer ran inside the
+    // bounded wait): release the fifo so the node unlinks before the
+    // result frame leaves; early-return paths above already got
+    // Drop-side cleanup.
+    drop(bridge);
+    outcome
 }
 
 fn exec_error(request_id: u64) -> ExecResult {
@@ -483,12 +510,14 @@ mod tests {
     fn non_canonical_host_returns_typed_non_result_not_fake_success() {
         // On macOS the canonical namespace is unavailable: executed=false,
         // never a fabricated exit 0.
+        let dir = tempfile::tempdir().expect("tempdir");
         let request = CanonicalExecRequest {
             request_id: 1,
             program: "true".into(),
             args: vec![],
             toolchain_backing: "/tc".into(),
             workspace_backing: "/ws".into(),
+            jobserver_grant: None,
         };
         let result = execute_canonical(&request, dir.path(), dir.path(), 4, dir.path());
         assert!(!result.executed, "no fabricated success off-Linux");
