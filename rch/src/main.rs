@@ -504,6 +504,8 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
     rch exec -- bun test
     rch exec --base HEAD --clean-overlay --overlay-path src/lib.rs -- cargo test
     rch exec --base HEAD --clean-overlay --no-overlay -- cargo check
+    rch exec --job -- sharded_tests/run.sh
+    rch exec --job --result-dir fuzz/corpus --result-dir crashes -- ./fuzz_target.sh
 
 USAGE:
     This command is primarily used internally by the PreToolUse hook.

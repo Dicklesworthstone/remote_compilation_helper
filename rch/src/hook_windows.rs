@@ -34,6 +34,8 @@ pub async fn run_exec(
     overlay_paths: Vec<PathBuf>,
     no_overlay: bool,
     source_content_receipt: bool,
+    job: bool,
+    result_dirs: Vec<PathBuf>,
     command_parts: Vec<String>,
 ) -> anyhow::Result<()> {
     if clean_overlay || base.is_some() || !overlay_paths.is_empty() || no_overlay {
@@ -41,6 +43,15 @@ pub async fn run_exec(
     }
     if source_content_receipt {
         anyhow::bail!("source-content receipts require the Unix rsync transport");
+    }
+    // Job admission (bd-bu3fb) and declared result dirs (bd-p0yoo) ride the
+    // Unix rsync/daemon transport; keep the refusal explicit rather than
+    // silently running the job locally with different semantics.
+    if job {
+        anyhow::bail!("--job remote admission requires the Unix daemon transport");
+    }
+    if !result_dirs.is_empty() {
+        anyhow::bail!("--result-dir requires the Unix rsync transport");
     }
     let command = command_parts.join(" ");
     if command.is_empty() {

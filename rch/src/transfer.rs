@@ -3799,14 +3799,20 @@ fi",
                 }
             })?;
 
-        // Materialize the local destination tree first so nested relative
-        // paths (`out/shards/a`) do not depend on rsync creating parents.
-        std::fs::create_dir_all(self.project_root.join(rel)).map_err(|e| {
-            TransferError::SyncFailed {
-                reason: format!("failed to create local result dir {}", rel.display()),
-                exit_code: None,
-                stderr: e.to_string(),
-            }
+        // Materialize only the PARENT tree of the local destination so nested
+        // relative paths (`out/shards/a`) work; rsync itself creates the leaf
+        // on success. Pre-creating the leaf would leave a misleading empty
+        // directory behind whenever retrieval fails (bd-p0yoo loud-failure
+        // semantics: nothing should look materialized when it is not).
+        let local_dest = self.project_root.join(rel);
+        let dest_parent = local_dest.parent().unwrap_or(self.project_root.as_path());
+        std::fs::create_dir_all(dest_parent).map_err(|e| TransferError::SyncFailed {
+            reason: format!(
+                "failed to create parent directories for local result dir {}",
+                rel.display()
+            ),
+            exit_code: None,
+            stderr: e.to_string(),
         })?;
 
         let remote_path = self.remote_path();

@@ -243,6 +243,25 @@ rch capabilities --json
 rch robot-docs guide
 ```
 
+### Job Mode (non-compilation workloads)
+
+`rch exec --job` admits an arbitrary NON-compilation workload (sharded tests,
+fuzzing, benchmarks, mutation testing) onto the same remote rails. It bypasses
+ONLY the compilation classifier — the PreToolUse hook never sets it, so
+auto-delegation of ordinary commands is impossible.
+
+```bash
+rch exec --job -- ./run_shards.sh
+# Declared result directories sync back on ANY exit code (including failures):
+rch exec --job --result-dir fuzz/corpus --result-dir crashes -- ./fuzz_target.sh
+```
+
+Semantics: the remote exit status surfaces verbatim; no toolchain/worker-env
+rerun heuristics apply. A declared `--result-dir` that is missing or only
+partially transferable fails loudly (`RCH-E309`, exit 102) regardless of the
+job's own exit status. Paths must be repository-relative; conflicts with
+`--clean-overlay` / `--source-content-receipt` are refused.
+
 ### Config + Diagnostics
 
 ```bash
