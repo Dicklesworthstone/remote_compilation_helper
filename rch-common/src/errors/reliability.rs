@@ -1282,10 +1282,6 @@ mod tests {
             ReliabilityReasonCode::WorkerMirrorOwnershipCheckUnavailable,
             false,
         ),
-        (
-            ReliabilityReasonCode::WorkerMirrorOwnershipUnprobeable,
-            false,
-        ),
         (ReliabilityReasonCode::MirrorOwnershipNoWorkers, false),
     ];
 
