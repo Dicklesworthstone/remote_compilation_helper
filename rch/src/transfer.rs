@@ -204,7 +204,37 @@ const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[
 // the configurable default list.
 const SOURCE_EPHEMERAL_EXCLUDE_PATTERNS: &[&str] =
     &[".venv/", ".venv-*/", "venv/", "venv-*/", "__pycache__/"];
+
+/// Age floors (minutes) for worker-side runtime state reaped at transfer
+/// start (bd-wfumv). TMPDIR scratch under `.rch-tmp/` goes stale within a
+/// day; the durable per-worker Cargo caches (issue #42) and pooled target
+/// stores stay warm across jobs and are reaped only after two weeks of
+/// disuse, so an idle project never pays a re-fetch/re-pack penalty.
+const WORKER_TMP_PRUNE_MAX_AGE_MINS: u64 = 24 * 60;
+const WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS: u64 = 14 * 24 * 60;
+
+/// Shell fragment executed by the remote rsync-path wrapper BEFORE rsync
+/// starts: reaps stale worker-side runtime state so abandoned `.rch-tmp/*`
+/// scratch, orphaned per-worker Cargo caches, and superseded
+/// `.rch-target-*-pool-*` stores cannot grow without bound or feed stale
+/// manifests into later builds (bd-wfumv). All sweeps are age-bounded
+/// `-maxdepth 1` finds: anything in active use is minutes old and can never
+/// match (per-worker Cargo caches additionally refresh their own mtime on
+/// every job via `add_cargo_isolation`). Failures are swallowed — pruning is
+/// opportunistic hygiene and must never fail a transfer.
+fn worker_cache_prune_rsync_path_prefix(escaped_remote_path: &str) -> String {
+    let tmp_mins = WORKER_TMP_PRUNE_MAX_AGE_MINS;
+    let durable_mins = WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS;
+    format!(
+        "find {p}/.rch-tmp -mindepth 1 -maxdepth 1 ! -name 'rch-cargo-cache-*' -mmin +{tmp_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; \
+         find {p}/.rch-tmp -mindepth 1 -maxdepth 1 -name 'rch-cargo-cache-*' -mmin +{durable_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; \
+         find {p} -mindepth 1 -maxdepth 1 -type d -name '.rch-target-*-pool-*' -mmin +{durable_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; ",
+        p = escaped_remote_path
+    )
+}
+
 const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str = ".rch-target";
+
 
 /// Environment variables whose values we ALWAYS rewrite to a managed,
 /// worker-scoped path under the synchronized remote project root — regardless of
@@ -2374,9 +2404,14 @@ fi",
         }
 
         // Create remote directory implicitly using rsync-path wrapper
-        // This saves a separate SSH handshake for 'mkdir -p'
-        cmd.arg("--rsync-path")
-            .arg(format!("mkdir -p {} && rsync", escaped_remote_path));
+        // This saves a separate SSH handshake for 'mkdir -p'. The same remote
+        // shell invocation also reaps stale worker-side runtime state
+        // (bd-wfumv) — see worker_cache_prune_rsync_path_prefix.
+        cmd.arg("--rsync-path").arg(format!(
+            "{}mkdir -p {} && rsync",
+            worker_cache_prune_rsync_path_prefix(escaped_remote_path),
+            escaped_remote_path
+        ));
 
         self.append_sync_filter_args(&mut cmd, effective_excludes);
 
@@ -2434,9 +2469,14 @@ fi",
             cmd.arg("--checksum");
         }
 
-        // Create remote directory implicitly using rsync-path wrapper
-        cmd.arg("--rsync-path")
-            .arg(format!("mkdir -p {} && rsync", escaped_remote_path));
+        // Create remote directory implicitly using rsync-path wrapper; the
+        // same remote shell invocation reaps stale worker-side runtime state
+        // (bd-wfumv) — see worker_cache_prune_rsync_path_prefix.
+        cmd.arg("--rsync-path").arg(format!(
+            "{}mkdir -p {} && rsync",
+            worker_cache_prune_rsync_path_prefix(escaped_remote_path),
+            escaped_remote_path
+        ));
 
         self.append_sync_filter_args(&mut cmd, effective_excludes);
 

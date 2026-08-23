@@ -3937,7 +3937,10 @@ fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
     // so the basename needs no further escaping. The durable dir deliberately
     // uses the `rch-cargo-cache-` prefix, NOT the legacy per-job
     // `rch-cargo-home-` prefix that orphan-cleanup passes match on — this dir
-    // is not an orphan and must survive between jobs.
+    // is not an orphan and must survive between jobs. Each job `touch`es the
+    // cache dir so its top-level mtime doubles as a liveness signal for the
+    // transfer-side janitor sweep (bd-wfumv): only caches unused for
+    // WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS get reaped.
     //
     // `CARGO_NET_GIT_FETCH_WITH_CLI` routes Cargo's git-dependency fetches
     // through the git CLI when available: for pathological repositories the
