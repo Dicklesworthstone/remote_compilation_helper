@@ -530,7 +530,7 @@ mod tests {
         // The gate must classify the consumer as REFUSED (foreign
         // bytes), never silently satisfied.
         store
-            .resolve_provisional_obligations(&b.pin_key(), &digest_key(&obj(999).0))
+            .resolve_provisional_obligations(&b.pin_key(), &digest_key(&obj(250).0))
             .unwrap();
         assert_eq!(
             lineage_gated_terminal_delivery(&mut store, AttemptId(32)).unwrap(),

@@ -1695,6 +1695,14 @@ pub trait RabsMetadataStore {
         ancestor_pin_key: &str,
     ) -> Result<Vec<String>, StoreError>;
 
+    /// All NON-resolved obligations of ONE consuming attempt regardless
+    /// of worker (M017): attempt ids are globally unique, so lineage
+    /// closure walks key on the attempt alone. Ordered by pin key.
+    fn list_open_provisional_obligations_by_attempt(
+        &mut self,
+        consumer_attempt_hex: &str,
+    ) -> Result<Vec<ProvisionalObligationRow>, StoreError>;
+
     /// ALL obligations of ONE consuming attempt regardless of worker or
     /// status (M020): the terminal-delivery gate verifies each row's
     /// final state, including that `resolved` rows resolved to the EXACT

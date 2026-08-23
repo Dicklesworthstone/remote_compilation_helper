@@ -60,6 +60,7 @@ pub mod publication;
 pub mod serving_sample_gate;
 pub mod serving_state;
 pub mod sparse_writer;
+pub mod staging_journal;
 pub mod startup_reconciliation;
 pub mod terminal_gate;
 pub mod tree_manifest;
