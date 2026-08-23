@@ -1211,6 +1211,20 @@ verify_sigstore_bundle() {
 # Skill Installation
 # ============================================================================
 
+# A destination already holds a *full* skill (not the inline stub) when SKILL.md
+# is present and at least one companion reference file exists beside it — the
+# stub only ever writes a lone SKILL.md. Used to keep the stub fallback from
+# downgrading a real skill on unattended re-runs (nightly updaters). See GH#45.
+_rch_skill_is_full() {
+    local dest="$1"
+    [[ -f "${dest}/SKILL.md" ]] || return 1
+    local f
+    for f in "${dest}"/references/*.md "${dest}"/assets/*.toml; do
+        [[ -f "$f" ]] && return 0
+    done
+    return 1
+}
+
 install_skill() {
     local claude_dest="$HOME/.claude/skills/rch"
     local codex_dest="$HOME/.codex/skills/rch"
@@ -1224,15 +1238,20 @@ install_skill() {
     local script_dir
     local skill_url="https://github.com/${GITHUB_REPO}/releases/latest/download/skill.tar.gz"
     local skill_temp="${TEMP_DIR:-/tmp}/skill.tar.gz"
+    # Optional companion files fetched alongside SKILL.md. Keep this in sync with
+    # the actual .claude/skills/rch tree, but a stale entry here is no longer
+    # fatal: only SKILL.md is required (see the fetch loop below), so a renamed
+    # or removed companion degrades to a warning instead of discarding the whole
+    # raw-tree install and falling through to the inline stub.
     local skill_files=(
-        "SKILL.md"
         "assets/workers-template.toml"
+        "references/COMMANDS.md"
         "references/CONFIGURATION.md"
         "references/HOOKS.md"
         "references/OPERATIONS.md"
         "references/TROUBLESHOOTING.md"
         "references/WORKERS.md"
-        "scripts/diagnose-rch.sh"
+        "scripts/validate-setup.sh"
     )
 
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -1254,13 +1273,22 @@ install_skill() {
     fi
 
     mkdir -p "$skill_stage/assets" "$skill_stage/references" "$skill_stage/scripts"
-    for rel_path in "${skill_files[@]}"; do
-        mkdir -p "${skill_stage}/$(dirname "$rel_path")"
-        if ! curl -fsSL "${PROXY_ARGS[@]}" "${skill_raw_base}/${rel_path}" -o "${skill_stage}/${rel_path}" 2>/dev/null; then
-            raw_skill_ok=false
-            break
-        fi
-    done
+    # SKILL.md is mandatory; without it the raw tree cannot yield a usable skill.
+    if ! curl -fsSL "${PROXY_ARGS[@]}" "${skill_raw_base}/SKILL.md" -o "${skill_stage}/SKILL.md" 2>/dev/null; then
+        raw_skill_ok=false
+    fi
+    # Companion files are best-effort: a single missing/renamed file must not
+    # discard the whole install (that regression is what forced every tarball
+    # user onto the inline stub — see GH#45).
+    if $raw_skill_ok; then
+        for rel_path in "${skill_files[@]}"; do
+            mkdir -p "${skill_stage}/$(dirname "$rel_path")"
+            if ! curl -fsSL "${PROXY_ARGS[@]}" "${skill_raw_base}/${rel_path}" -o "${skill_stage}/${rel_path}" 2>/dev/null; then
+                warn "Skill companion file not found (skipping): ${rel_path}"
+                rm -f "${skill_stage}/${rel_path}" 2>/dev/null || true
+            fi
+        done
+    fi
 
     if $raw_skill_ok && cp -R "${skill_stage}/." "$claude_dest/" && cp -R "${skill_stage}/." "$codex_dest/"; then
         success "Installed RCH skill from repository raw skill tree"
@@ -1401,14 +1429,23 @@ Use these files for full depth:
 SKILL_EOF
 )
 
-    # Write to both destinations
-    echo "$skill_content" > "$claude_dest/SKILL.md"
-    installed_claude=true
-    echo "$skill_content" > "$codex_dest/SKILL.md"
-    installed_codex=true
-
-    success "Created RCH skill at $claude_dest"
-    success "Created RCH skill at $codex_dest"
+    # Write to both destinations — but never downgrade an existing full skill to
+    # the stub. On unattended re-runs (e.g. the nightly ACFS updater) a transient
+    # fetch failure must not clobber a real skill already on disk (GH#45).
+    if _rch_skill_is_full "$claude_dest"; then
+        warn "Keeping existing full RCH skill at $claude_dest (not overwriting with stub)"
+    else
+        echo "$skill_content" > "$claude_dest/SKILL.md"
+        installed_claude=true
+        success "Created RCH skill at $claude_dest"
+    fi
+    if _rch_skill_is_full "$codex_dest"; then
+        warn "Keeping existing full RCH skill at $codex_dest (not overwriting with stub)"
+    else
+        echo "$skill_content" > "$codex_dest/SKILL.md"
+        installed_codex=true
+        success "Created RCH skill at $codex_dest"
+    fi
     show_skill_info "$installed_claude" "$installed_codex"
 }
 
