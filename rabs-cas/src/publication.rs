@@ -692,6 +692,13 @@ pub fn process_offer(
     // commit C over a hole at A.
     let ancestor_rows = verify_provisional_ancestry(store, offer, &manifest_resolver)?;
 
+    // 7.6. Consumption-obligation cross-check (M008): the offer's
+    // self-declared ancestor set is verified above; this gate verifies it
+    // against the coordinator-recorded M006 obligations of the offering
+    // attempt — concealed consumption, cancelled lineages, and
+    // not-yet-finalized producers all refuse here.
+    verify_consumption_obligations(store, offer, &manifest_resolver)?;
+
     // 8. Same-key candidates: divergence taxonomy, never overwrite.
     if let Some(committed_key) = store.published_manifest_key(&offer.manifest.action_key)? {
         let candidate_key = digest_key(&offer.manifest_id.0);
@@ -908,8 +915,7 @@ fn verify_consumption_obligations(
         // (a) The offer must declare what it durably consumed.
         let declared = offer.provisional_ancestors.iter().any(|a| {
             digest_key(&a.producer_action_key) == obligation.producer_action_key
-                && output_role_tag(a.role)
-                    == u64::try_from(obligation.role_tag).unwrap_or(u64::MAX)
+                && output_role_tag(a.role) == u64::try_from(obligation.role_tag).unwrap_or(u64::MAX)
                 && a.virtual_path.as_bytes() == obligation.virtual_path.as_slice()
         });
         if !declared {
@@ -933,8 +939,7 @@ fn verify_consumption_obligations(
             .logical_outputs
             .iter()
             .find(|o| {
-                output_role_tag(o.role)
-                    == u64::try_from(obligation.role_tag).unwrap_or(u64::MAX)
+                output_role_tag(o.role) == u64::try_from(obligation.role_tag).unwrap_or(u64::MAX)
                     && o.virtual_path.as_bytes() == obligation.virtual_path.as_slice()
             })
             .ok_or_else(|| OfferRefusal::AncestorOutputMissing {
@@ -945,7 +950,7 @@ fn verify_consumption_obligations(
         if committed_key != obligation.object_key
             && !store.has_adoption_edge(
                 &obligation.producer_action_key,
-                &output_role_name_for_tag(obligation.role_tag),
+                output_role_name_for_tag(obligation.role_tag),
                 &obligation.virtual_path,
                 &obligation.object_key,
                 &committed_key,
@@ -1209,7 +1214,8 @@ mod tests {
     use rabs_protocol::wire_time::PeerId;
 
     use crate::metadata_store::{
-        ActionEntryRow, AuthorityRow, FsqliteEngine, RusqliteEngine, SqlMetadataStore,
+        ActionEntryRow, AuthorityRow, FsqliteEngine, ProvisionalObligationInsert, RusqliteEngine,
+        SqlMetadataStore,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1507,6 +1513,219 @@ mod tests {
         );
         assert_eq!(recorded[0].object_key, digest_key(&object(111).0));
         assert!(!recorded[0].adopted);
+    }
+
+    #[test]
+    fn m008_transitive_debt_blocks_commit_until_producers_finalize() {
+        // T020 A→B→C with DURABLE consumption records: C's attempt owes an
+        // M006 obligation on B's provisional output, recorded before B
+        // commits. The commit transaction refuses until the whole chain
+        // finalizes with-exact-object, then auto-resolves the debt.
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        ready_store(&mut store);
+        let mut manifests = std::collections::BTreeMap::new();
+        plant_producer(
+            &mut store,
+            &mut manifests,
+            100,
+            120,
+            "out/a.rmeta",
+            110,
+            800,
+            vec![],
+        );
+
+        store
+            .record_provisional_consumption(&ProvisionalObligationInsert {
+                consumer_worker: "worker-a".to_owned(),
+                consumer_attempt: 20,
+                pin_key: "test-pin-b".to_owned(),
+                producer_action_key: digest_key(&digest("rabs.action-key.sha256.v1", 101)),
+                producer_generation: 11,
+                producer_attempt: 21,
+                role_tag: 2,
+                virtual_path: b"out/b.rmeta".to_vec(),
+                object_key: digest_key(&object(111).0),
+                created_seq: 1,
+            })
+            .unwrap();
+
+        let resolver = {
+            let manifests = manifests.clone();
+            move |key: &str| manifests.get(key).cloned()
+        };
+        let c_offer = offer_with_ancestors(vec![ancestor_ref(101, "out/b.rmeta", 111)]);
+
+        // B uncommitted: refused; and the obligation stays open (nothing
+        // resolved by a refusal).
+        assert!(matches!(
+            process_offer(
+                &mut store,
+                &c_offer,
+                &expected_descriptor(),
+                resolver,
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            ),
+            Err(OfferRefusal::ProvisionalProducerNotCommitted { .. })
+        ));
+        assert_eq!(
+            store
+                .count_open_provisional_obligations("test-pin-b")
+                .unwrap(),
+            1
+        );
+
+        // B commits (recording its own A-lineage); the SAME offer now
+        // passes and the debt resolves as a side effect of committing.
+        plant_producer(
+            &mut store,
+            &mut manifests,
+            101,
+            121,
+            "out/b.rmeta",
+            111,
+            801,
+            vec![ProvisionalAncestorRow {
+                producer_action_key: digest_key(&digest("rabs.action-key.sha256.v1", 100)),
+                role: "provisional-metadata".to_owned(),
+                virtual_path: b"out/a.rmeta".to_vec(),
+                object_key: digest_key(&object(110).0),
+                adopted: false,
+            }],
+        );
+        let resolver = {
+            let manifests = manifests.clone();
+            move |key: &str| manifests.get(key).cloned()
+        };
+        assert!(matches!(
+            process_offer(
+                &mut store,
+                &c_offer,
+                &expected_descriptor(),
+                resolver,
+                901,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            ),
+            Ok(PublicationOutcome::Committed(_))
+        ));
+        assert_eq!(
+            store
+                .count_open_provisional_obligations("test-pin-b")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn m008_concealed_consumption_refuses_commit() {
+        // The attempt durably consumed a provisional output but offers
+        // WITHOUT declaring that ancestor: H028 would see an empty set
+        // and pass — the obligation cross-check is what catches it.
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        ready_store(&mut store);
+        let mut manifests = std::collections::BTreeMap::new();
+        plant_producer(
+            &mut store,
+            &mut manifests,
+            100,
+            120,
+            "out/a.rmeta",
+            110,
+            800,
+            vec![],
+        );
+        let pin_key = "test-pin-concealed".to_owned();
+        store
+            .record_provisional_consumption(&ProvisionalObligationInsert {
+                consumer_worker: "worker-a".to_owned(),
+                consumer_attempt: 20,
+                pin_key: pin_key.clone(),
+                producer_action_key: digest_key(&digest("rabs.action-key.sha256.v1", 100)),
+                producer_generation: 11,
+                producer_attempt: 20,
+                role_tag: 2,
+                virtual_path: b"out/a.rmeta".to_vec(),
+                object_key: digest_key(&object(110).0),
+                created_seq: 1,
+            })
+            .unwrap();
+        let resolver = {
+            let manifests = manifests.clone();
+            move |key: &str| manifests.get(key).cloned()
+        };
+        let c_offer = offer_with_ancestors(vec![]);
+        assert_eq!(
+            process_offer(
+                &mut store,
+                &c_offer,
+                &expected_descriptor(),
+                resolver,
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            )
+            .unwrap_err(),
+            OfferRefusal::UndeclaredProvisionalConsumption { pin_key }
+        );
+    }
+
+    #[test]
+    fn m008_cancelled_lineage_permanently_refuses_commit() {
+        // Producer committed AND honestly declared — but its lineage was
+        // CANCELLED (failed/superseded): the descendant can never publish.
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        ready_store(&mut store);
+        let mut manifests = std::collections::BTreeMap::new();
+        plant_producer(
+            &mut store,
+            &mut manifests,
+            100,
+            120,
+            "out/a.rmeta",
+            110,
+            800,
+            vec![],
+        );
+        let pin_key = "test-pin-cancelled".to_owned();
+        store
+            .record_provisional_consumption(&ProvisionalObligationInsert {
+                consumer_worker: "worker-a".to_owned(),
+                consumer_attempt: 20,
+                pin_key: pin_key.clone(),
+                producer_action_key: digest_key(&digest("rabs.action-key.sha256.v1", 100)),
+                producer_generation: 11,
+                producer_attempt: 20,
+                role_tag: 2,
+                virtual_path: b"out/a.rmeta".to_vec(),
+                object_key: digest_key(&object(110).0),
+                created_seq: 1,
+            })
+            .unwrap();
+        store.cancel_provisional_obligations(&pin_key).unwrap();
+        let resolver = {
+            let manifests = manifests.clone();
+            move |key: &str| manifests.get(key).cloned()
+        };
+        let c_offer = offer_with_ancestors(vec![ancestor_ref(100, "out/a.rmeta", 110)]);
+        assert_eq!(
+            process_offer(
+                &mut store,
+                &c_offer,
+                &expected_descriptor(),
+                resolver,
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+            )
+            .unwrap_err(),
+            OfferRefusal::ConsumptionLineageCancelled { pin_key }
+        );
     }
 
     #[test]
