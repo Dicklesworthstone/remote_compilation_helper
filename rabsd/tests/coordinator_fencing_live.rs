@@ -213,4 +213,3 @@ fn coordinator_dies_after_prepare_before_commit() {
     );
     assert_nothing_published(&cas);
 }
-

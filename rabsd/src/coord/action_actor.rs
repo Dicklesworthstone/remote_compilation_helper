@@ -1920,8 +1920,8 @@ mod tests {
         assert_eq!(serving.state_revision, 1);
         assert_eq!(
             serving.coordinator_authority_digest,
-            d(200),
-            "serving stamps the creating authority digest"
+            coordinator_authority_digest(&authority_under_test()),
+            "serving stamps the creating authority digest (F033 canonical form)"
         );
 
         // Drain the winner to Finished; the publication stays immutable.
