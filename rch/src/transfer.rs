@@ -237,7 +237,6 @@ fn worker_cache_prune_rsync_path_prefix(escaped_remote_path: &str) -> String {
 
 const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str = ".rch-target";
 
-
 /// Environment variables whose values we ALWAYS rewrite to a managed,
 /// worker-scoped path under the synchronized remote project root — regardless of
 /// whether the local process forwarded them. These control where build
@@ -5963,14 +5962,22 @@ mod tests {
         };
 
         let root = pipeline.remote_path();
-        let cmd = pipeline.build_sync_command(&worker, &format!("mockuser@mock://worker:{root}"), &root, &[]);
+        let cmd = pipeline.build_sync_command(
+            &worker,
+            &format!("mockuser@mock://worker:{root}"),
+            &root,
+            &[],
+        );
 
         let args: Vec<String> = cmd
             .as_std()
             .get_args()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect();
-        let idx = args.iter().position(|arg| arg == "--rsync-path").expect("--rsync-path");
+        let idx = args
+            .iter()
+            .position(|arg| arg == "--rsync-path")
+            .expect("--rsync-path");
         let path_val = args.get(idx + 1).expect("rsync-path value");
 
         // bd-wfumv: every source upload reaps stale worker-side runtime state
