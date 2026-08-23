@@ -322,10 +322,10 @@ impl WaiterRegistry {
 
     /// Release a permit's slot (idempotent).
     pub fn release(&mut self, permit: &mut WaiterPermit) {
-        if let Some((root, attempt)) = permit.take_release() {
-            if let Some(state) = self.roots.get_mut(&root) {
-                state.waiters.remove(&attempt);
-            }
+        if let Some((root, attempt)) = permit.take_release()
+            && let Some(state) = self.roots.get_mut(&root)
+        {
+            state.waiters.remove(&attempt);
         }
     }
 
