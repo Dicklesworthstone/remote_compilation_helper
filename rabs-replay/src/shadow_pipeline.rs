@@ -63,10 +63,7 @@ pub trait ShadowServingBackend {
     fn decide(&mut self, invocation: &ReplayCommand) -> ServingDecision;
     /// The authoritative cached observation for a serve decision;
     /// `None` is a typed miss that falls back to private execution.
-    fn served_observation(
-        &mut self,
-        invocation: &ReplayCommand,
-    ) -> Option<CachedObservation>;
+    fn served_observation(&mut self, invocation: &ReplayCommand) -> Option<CachedObservation>;
 }
 
 /// REALLY execute the invocation (`sh -c` in the recorded cwd), shared
@@ -140,19 +137,19 @@ impl ExecutionPath for ShadowServingPath<'_> {
     }
 
     fn execute(&mut self, invocation: &ReplayCommand) -> PathObservation {
-        if self.backend.decide(invocation) == ServingDecision::ServeFromCache {
-            if let Some(cached) = self.backend.served_observation(invocation) {
-                return PathObservation {
-                    path_name: SHADOW_SERVING_PATH_NAME.to_owned(),
-                    availability: Availability::CacheHit,
-                    outcome: Some(cached.outcome),
-                    stdout_digest: cached.stdout_digest,
-                    stderr_digest: cached.stderr_digest,
-                    // Serving performs no tool work; the wall clock of
-                    // a hit measures the lookup, reported as zero.
-                    duration_ms: 0,
-                };
-            }
+        if self.backend.decide(invocation) == ServingDecision::ServeFromCache
+            && let Some(cached) = self.backend.served_observation(invocation)
+        {
+            return PathObservation {
+                path_name: SHADOW_SERVING_PATH_NAME.to_owned(),
+                availability: Availability::CacheHit,
+                outcome: Some(cached.outcome),
+                stdout_digest: cached.stdout_digest,
+                stderr_digest: cached.stderr_digest,
+                // Serving performs no tool work; the wall clock of a
+                // hit measures the lookup, reported as zero.
+                duration_ms: 0,
+            };
         }
         really_execute(SHADOW_SERVING_PATH_NAME, invocation)
     }
@@ -233,10 +230,7 @@ mod tests {
                 .unwrap_or(ServingDecision::ServeFromCache)
         }
 
-        fn served_observation(
-            &mut self,
-            invocation: &ReplayCommand,
-        ) -> Option<CachedObservation> {
+        fn served_observation(&mut self, invocation: &ReplayCommand) -> Option<CachedObservation> {
             self.cache.get(&invocation.command).copied()
         }
     }
@@ -339,8 +333,8 @@ mod tests {
 
     #[test]
     fn skipped_records_stay_first_class_in_the_session() {
-        let lines = ["{\"argv_redacted\": [\"cmd\", \"REDACTED\"]}"];
         let mut backend = FakeBackend::default();
+        let lines = ["{\"argv_redacted\": [\"cmd\", \"[REDACTED:secret]\"]}"];
         let report = run_shadow_pipeline(&lines, &mut backend);
         assert_eq!(report.session.rows.len(), 0);
         assert_eq!(report.session.skipped_redacted, 1);
