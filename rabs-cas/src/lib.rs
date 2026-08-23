@@ -67,6 +67,7 @@ pub mod startup_reconciliation;
 pub mod terminal_gate;
 pub mod tree_manifest;
 pub mod trust_evidence;
+pub mod worker_reconcile;
 
 pub mod l1_cache;
 /// Public offer / ready-store builders for downstream live commit tests
