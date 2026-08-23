@@ -60,6 +60,7 @@ impl Default for TuiConfig {
 }
 
 /// Run the TUI dashboard.
+#[cfg(unix)]
 pub async fn run_tui(config: TuiConfig) -> Result<()> {
     // Non-interactive modes MUST NOT manipulate the terminal.
     if config.dump_state {
@@ -106,6 +107,14 @@ pub async fn run_tui(config: TuiConfig) -> Result<()> {
     drop(backend);
 
     result
+}
+
+/// Non-Unix terminals are not supported by the ftui tty backend yet; the
+/// dashboard refuses explicitly instead of failing deep inside backend open
+/// (bd-86oa1).
+#[cfg(not(unix))]
+pub async fn run_tui(_config: TuiConfig) -> Result<()> {
+    anyhow::bail!("rch dashboard requires a Unix terminal (ftui tty backend)")
 }
 
 /// Fetch fresh data from daemon and update TUI state.
