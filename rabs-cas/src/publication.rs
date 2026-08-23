@@ -239,6 +239,18 @@ const fn output_role_name(role: OutputRole) -> &'static str {
     }
 }
 
+/// Inverse of [`output_role_name`] for stored role tags (obligation rows
+/// persist the numeric tag; adoption edges key by name).
+const fn output_role_name_for_tag(tag: i64) -> &'static str {
+    match tag {
+        1 => "dep-info",
+        2 => "provisional-metadata",
+        3 => "build-script-metadata",
+        4 => "test-side-effect",
+        _ => "materializable",
+    }
+}
+
 /// A prepared result offered for publication, carrying FULL authority
 /// identity (never bare ids).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,6 +454,20 @@ pub enum OfferRefusal {
         producer: String,
         /// Escaped virtual path of the divergent output.
         path: String,
+    },
+    /// The attempt durably CONSUMED a provisional output (an open M006
+    /// obligation) whose producer lineage the offer does not declare —
+    /// concealed consumption is never a commit.
+    UndeclaredProvisionalConsumption {
+        /// Canonical key of the consumed provisional pin.
+        pin_key: String,
+    },
+    /// A consumed producer lineage was CANCELLED (producer failed,
+    /// superseded without adoption, or lost authority): the descendant
+    /// can never publish (M006/M007).
+    ConsumptionLineageCancelled {
+        /// Canonical key of the cancelled pin.
+        pin_key: String,
     },
     /// The store refused or failed.
     Store(StoreError),
@@ -853,6 +879,87 @@ fn verify_provisional_ancestry(
     }
     Ok(direct_rows)
 }
+/// M008: cross-check the offer against the DURABLE M006 consumption
+/// obligations of the offering attempt. H028's walk verifies the offer's
+/// SELF-declared ancestor set; obligations are coordinator-recorded truth
+/// of what the attempt actually consumed via `resolve_for_reader`. Every
+/// non-resolved obligation must be (a) honestly declared by the offer,
+/// and (b) finalized — producer committed resolving that logical output
+/// to the EXACT consumed object (or an explicit adoption edge) — in which
+/// case it auto-resolves; a cancelled lineage refuses permanently.
+///
+/// # Errors
+/// Typed [`OfferRefusal`]s; store failures.
+fn verify_consumption_obligations(
+    store: &mut dyn RabsMetadataStore,
+    offer: &OfferPreparedActionResult,
+    manifest_resolver: &impl Fn(&str) -> Option<CanonicalActionResultManifest>,
+) -> Result<(), OfferRefusal> {
+    let rows = store.list_open_provisional_obligations(
+        offer.authority.worker_peer_id.0.as_str(),
+        &format!("{:032x}", offer.authority.attempt_id.0),
+    )?;
+    for obligation in rows {
+        if obligation.status == "cancelled" {
+            return Err(OfferRefusal::ConsumptionLineageCancelled {
+                pin_key: obligation.pin_key,
+            });
+        }
+        // (a) The offer must declare what it durably consumed.
+        let declared = offer.provisional_ancestors.iter().any(|a| {
+            digest_key(&a.producer_action_key) == obligation.producer_action_key
+                && output_role_tag(a.role)
+                    == u64::try_from(obligation.role_tag).unwrap_or(u64::MAX)
+                && a.virtual_path.as_bytes() == obligation.virtual_path.as_slice()
+        });
+        if !declared {
+            return Err(OfferRefusal::UndeclaredProvisionalConsumption {
+                pin_key: obligation.pin_key,
+            });
+        }
+        // (b) Producer finalized with-exact-object (or adopted). Same
+        // judgment as H028's walk; on satisfaction the obligation closes.
+        let manifest_key = store
+            .published_manifest_key_str(&obligation.producer_action_key)?
+            .ok_or_else(|| OfferRefusal::ProvisionalProducerNotCommitted {
+                producer: obligation.producer_action_key.clone(),
+            })?;
+        let manifest = manifest_resolver(&manifest_key).ok_or_else(|| {
+            OfferRefusal::AncestorManifestUnavailable {
+                producer: obligation.producer_action_key.clone(),
+            }
+        })?;
+        let output = manifest
+            .logical_outputs
+            .iter()
+            .find(|o| {
+                output_role_tag(o.role)
+                    == u64::try_from(obligation.role_tag).unwrap_or(u64::MAX)
+                    && o.virtual_path.as_bytes() == obligation.virtual_path.as_slice()
+            })
+            .ok_or_else(|| OfferRefusal::AncestorOutputMissing {
+                producer: obligation.producer_action_key.clone(),
+                path: RawBytes::new(obligation.virtual_path.clone()).escaped(),
+            })?;
+        let committed_key = digest_key(&output.object.0);
+        if committed_key != obligation.object_key
+            && !store.has_adoption_edge(
+                &obligation.producer_action_key,
+                &output_role_name_for_tag(obligation.role_tag),
+                &obligation.virtual_path,
+                &obligation.object_key,
+                &committed_key,
+            )?
+        {
+            return Err(OfferRefusal::DivergentProvisionalAncestor {
+                producer: obligation.producer_action_key.clone(),
+                path: RawBytes::new(obligation.virtual_path.clone()).escaped(),
+            });
+        }
+        store.resolve_provisional_obligations(&obligation.pin_key, &committed_key)?;
+    }
+    Ok(())
+}
 
 const fn divergence_class_tag(class: DivergenceClass) -> &'static str {
     match class {
@@ -889,7 +996,6 @@ fn escalation_decision(trust_state: &str) -> &'static str {
     }
 }
 
-/// The H026 divergence quarantine: quarantine the ACTION, disable
 /// serving with a per-class disposition, preserve BOTH candidates (the
 /// committed row is untouched; the losing candidate gets a durable
 /// `divergence-evidence` pin plus reachability edges and its evidence is
