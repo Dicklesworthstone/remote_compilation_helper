@@ -2897,9 +2897,11 @@ mod repo_updater;
 // The offload-pipeline SSH primitives (`run_offload_ssh_command`, the remote
 // topology-enforcement preflight, and the mock-mode skip gate) live in the
 // `ssh` submodule. They are consumed only by the sibling submodules
-// (`dependency_closure`, `transfer_orchestration`, `repo_updater`), which import
-// what they need directly from `super::ssh` — `hook` itself no longer calls them.
-mod ssh;
+// (`dependency_closure`, `transfer_orchestration`, `repo_updater`) import what
+// they need directly from `super::ssh`, and the doctor's mirror-ownership probe
+// consumes the same items via `crate::hook::ssh`, so the module stays
+// crate-internal (`pub(crate)`) rather than fully private.
+pub(crate) mod ssh;
 
 // The dependency-closure sync planning + remote dependency-preflight cluster
 // (sync-closure plan/manifest, sync-topology predicates, cargo manifest/workspace

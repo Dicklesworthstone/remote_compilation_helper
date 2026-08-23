@@ -298,7 +298,7 @@ fn aggregate_verdict(diagnostics: &[ReliabilityDiagnostic]) -> ReliabilityVerdic
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 enum ReliabilityCategory {
     Topology,
     RepoPresence,
@@ -1095,6 +1095,7 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
             tokio::spawn(async move {
                 let mut set = tokio::task::JoinSet::new();
                 for (idx, worker) in workers.into_iter().enumerate() {
+                    let root = root.clone();
                     set.spawn(async move {
                         let probe =
                             crate::hook::ssh::probe_worker_mirror_ownership(&worker, &root).await;
@@ -1134,7 +1135,7 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
     let (helper_diags_override, helpers_outcome) =
         join_isolated_blocking_probe("helper_compatibility", helpers_handle).await;
     let (ownership_results, ownership_outcome) =
-        join_isolated_async_probe("mirror_ownership", ownership_handle).await;
+        join_ownership_probe(ownership_handle).await;
     let join_elapsed_ms = join_start.elapsed().as_millis() as u64;
     tracing::info!(
         target: "rch::doctor::probes",
@@ -1327,6 +1328,48 @@ where
             tracing::warn!(
                 target: "rch::doctor::probes",
                 probe = probe_name,
+                error = %join_err,
+                "doctor.probe.cancelled",
+            );
+            (None, ProbeOutcome::Cancelled)
+        }
+    }
+}
+
+/// Dedicated joiner for the mirror-ownership probe: unlike the generic async
+/// probe helper, the ownership fan-out has no tokio-level timeout layer (each
+/// SSH round-trip is individually bounded inside `probe_worker_mirror_ownership`),
+/// so the JoinHandle resolves straight to the collected per-worker results.
+async fn join_ownership_probe(
+    handle: Option<tokio::task::JoinHandle<Vec<crate::hook::ssh::MirrorOwnershipProbe>>>,
+) -> (
+    Option<Vec<crate::hook::ssh::MirrorOwnershipProbe>>,
+    ProbeOutcome,
+) {
+    let Some(handle) = handle else {
+        return (None, ProbeOutcome::Skipped);
+    };
+    match handle.await {
+        Ok(value) => (Some(value), ProbeOutcome::Ok),
+        Err(join_err) if join_err.is_panic() => {
+            let payload = join_err.into_panic();
+            let panic_msg = payload
+                .downcast::<String>()
+                .map(|b| *b)
+                .or_else(|p| p.downcast::<&'static str>().map(|b| (*b).to_string()))
+                .unwrap_or_else(|_| "<non-string panic payload>".to_string());
+            tracing::error!(
+                target: "rch::doctor::probes",
+                probe = "mirror_ownership",
+                panic = %panic_msg,
+                "doctor.probe.panicked",
+            );
+            (None, ProbeOutcome::Panicked)
+        }
+        Err(join_err) => {
+            tracing::warn!(
+                target: "rch::doctor::probes",
+                probe = "mirror_ownership",
                 error = %join_err,
                 "doctor.probe.cancelled",
             );
@@ -2259,7 +2302,7 @@ fn reliability_mirror_ownership_diagnostics(
                          cannot run and dispatch-time repair fails open",
                         ReliabilityReasonCode::WorkerMirrorOwnershipCheckUnavailable,
                     )
-                    .with_worker(worker_id)
+                    .with_worker(worker_id.clone())
                     .with_remediation(
                         format!("ssh {worker_id} 'sudo -n true'"),
                         validation,
@@ -5720,6 +5763,147 @@ mod tests {
             "saved_time": null
         }))
         .expect("daemon status fixture should parse")
+    }
+
+    // ========================
+    // Mirror-ownership diagnostics (bd-kugfc)
+    // ========================
+
+    fn ownership_worker(id: &str) -> rch_common::WorkerConfig {
+        serde_json::from_value(json!({
+            "id": id,
+            "host": "worker.example",
+            "user": "ubuntu",
+            "identity_file": "/tmp/id_ed25519",
+            "total_slots": 8
+        }))
+        .expect("worker config fixture should parse")
+    }
+
+    #[test]
+    fn mirror_ownership_maps_each_probe_outcome_to_its_code() {
+        let workers = vec![
+            ownership_worker("w-clean"),
+            ownership_worker("w-drift"),
+            ownership_worker("w-sudo"),
+            ownership_worker("w-dead"),
+            ownership_worker("w-mock"),
+        ];
+        let results = vec![
+            crate::hook::ssh::MirrorOwnershipProbe::Healthy,
+            crate::hook::ssh::MirrorOwnershipProbe::Drift { count: 3 },
+            crate::hook::ssh::MirrorOwnershipProbe::CheckUnavailable,
+            crate::hook::ssh::MirrorOwnershipProbe::Unprobeable("ssh refused".to_string()),
+            crate::hook::ssh::MirrorOwnershipProbe::Skipped,
+        ];
+
+        let diags = reliability_mirror_ownership_diagnostics(
+            Some(&workers),
+            None,
+            Some(&results),
+            ProbeOutcome::Ok,
+            None,
+        );
+
+        let by_code = |code: ReliabilityReasonCode| {
+            diags.iter().filter(|d| d.code == code).collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            by_code(ReliabilityReasonCode::WorkerMirrorOwnershipHealthy).len(),
+            1
+        );
+        let drift = by_code(ReliabilityReasonCode::WorkerMirrorOwnershipDrift);
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].severity, ReliabilitySeverity::Warning);
+        assert_eq!(drift[0].worker_id.as_deref(), Some("w-drift"));
+        assert!(
+            drift[0]
+                .remediation_command
+                .as_deref()
+                .unwrap_or_default()
+                .contains("chown"),
+            "drift remediation must name the chown fix"
+        );
+        assert_eq!(
+            by_code(ReliabilityReasonCode::WorkerMirrorOwnershipCheckUnavailable).len(),
+            1
+        );
+        let dead = by_code(ReliabilityReasonCode::WorkerMirrorOwnershipUnprobeable);
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].worker_id.as_deref(), Some("w-dead"));
+        // Skipped workers emit nothing; total = healthy + drift + sudo + dead.
+        assert_eq!(diags.len(), 4);
+    }
+
+    #[test]
+    fn mirror_ownership_fleet_fallback_when_probe_bucket_dies() {
+        let workers = vec![ownership_worker("w1"), ownership_worker("w2")];
+        let diags = reliability_mirror_ownership_diagnostics(
+            Some(&workers),
+            None,
+            None,
+            ProbeOutcome::Timeout,
+            None,
+        );
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].code,
+            ReliabilityReasonCode::WorkerMirrorOwnershipUnprobeable
+        );
+        assert_eq!(diags[0].severity, ReliabilitySeverity::Warning);
+        assert!(diags[0].message.contains("timeout"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn mirror_ownership_reports_empty_fleet_and_config_failures() {
+        let empty: Vec<rch_common::WorkerConfig> = Vec::new();
+        let diags = reliability_mirror_ownership_diagnostics(
+            Some(&empty),
+            None,
+            Some(&Vec::new()),
+            ProbeOutcome::Ok,
+            None,
+        );
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].code,
+            ReliabilityReasonCode::MirrorOwnershipNoWorkers
+        );
+        assert_eq!(diags[0].severity, ReliabilitySeverity::Info);
+
+        let config_err = reliability_mirror_ownership_diagnostics(
+            None,
+            Some("parse error".to_string()),
+            None,
+            ProbeOutcome::Ok,
+            None,
+        );
+        assert_eq!(config_err.len(), 1);
+        assert_eq!(
+            config_err[0].code,
+            ReliabilityReasonCode::WorkerMirrorOwnershipUnprobeable
+        );
+        assert!(
+            config_err[0]
+                .details
+                .as_deref()
+                .unwrap_or_default()
+                .contains("parse error")
+        );
+
+        let root_err = reliability_mirror_ownership_diagnostics(
+            None,
+            None,
+            None,
+            ProbeOutcome::Ok,
+            Some(&"toml broken".to_string()),
+        );
+        assert_eq!(root_err.len(), 1);
+        assert_eq!(
+            root_err[0].code,
+            ReliabilityReasonCode::WorkerMirrorOwnershipUnprobeable
+        );
     }
 
     #[test]

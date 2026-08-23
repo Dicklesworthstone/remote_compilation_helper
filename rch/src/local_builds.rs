@@ -108,6 +108,7 @@ fn read_comm(proc_dir: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+#[cfg(target_os = "linux")]
 fn is_zombie(proc_dir: &Path) -> bool {
     stat_fields(proc_dir)
         .map(|(_, state, _)| state == 'Z')
@@ -234,6 +235,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn stat_parser_handles_spaces_and_parens_in_comm() {
         let dir = tempfile::tempdir().expect("dir");

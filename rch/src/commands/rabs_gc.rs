@@ -222,7 +222,7 @@ pub fn next_seq(store: &mut dyn RabsMetadataStore) -> Result<u64, StoreError> {
     Ok(match rows.first().and_then(|r| r.first()) {
         // MAX over persisted u64 counts is non-negative by construction;
         // a negative value would be store corruption, clamped to restart.
-        Some(SqlValue::Int(n)) => u64::try_from(n.max(0)).unwrap_or(1),
+        Some(SqlValue::Int(n)) => u64::try_from((*n).max(0)).unwrap_or(1),
         _ => 1,
     })
 }
@@ -542,6 +542,13 @@ fn print_plan(receipt: &GcPlanReceipt) {
             "{} count={}",
             RC_QUARANTINE_RECLAIM_CANDIDATE, receipt.quarantine_reclaim_candidates
         );
+    }
+}
+
+/// One line per reclaimed-or-skipped location, prefixed by its section label.
+fn print_locations(label: &str, locations: &[LocationDto]) {
+    for location in locations {
+        println!("{label} {} {}", location.object_key, location.store_path);
     }
 }
 
@@ -979,7 +986,10 @@ mod tests {
     fn missing_cas_root_refuses_without_creating() {
         let dir = TempDir::new().expect("tempdir");
         let root = dir.path().join("nope");
-        let err = open_store(&root).expect_err("must refuse");
+        let err = match open_store(&root) {
+            Err(err) => err,
+            Ok(_) => panic!("must refuse a missing CAS root"),
+        };
         assert!(err.to_string().contains(RC_CAS_ROOT_MISSING), "{err}");
         assert!(!root.exists(), "must not create anything");
     }

@@ -2077,7 +2077,9 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 project,
                 dry_run,
             } => commands::sync_force(force, worker, all, project, dry_run, &ctx).await,
-            Commands::Rabs { action } => commands::rabs_gc::run(action, &ctx).await,
+            Commands::Rabs {
+                action: commands::rabs_gc::RabsCommand::Gc { action },
+            } => commands::rabs_gc::run(action, &ctx).await,
             Commands::Why { action } => commands::why::run(action, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
             Commands::Cache { action } => handle_cache(action, &ctx).await,
