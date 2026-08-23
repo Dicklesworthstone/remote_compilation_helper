@@ -1743,6 +1743,7 @@ pub trait RabsMetadataStore {
         installed_path: &[u8],
         state: &str,
     ) -> Result<(), StoreError>;
+    /// Open provisional pins minted by ONE action generation (M007
     /// generation-failure invalidation trigger), ordered by pin key.
     fn list_open_provisional_pins_for_action_generation(
         &mut self,
