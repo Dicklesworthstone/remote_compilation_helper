@@ -2361,7 +2361,12 @@ mod tests {
     fn actor_shell_processes_messages_under_a_test_cx() {
         let cx = Cx::for_testing();
         let mut host = ActionActorHost {
-            core: ActionActor::new(descriptor(), &authority_under_test(), "coord-shell-test", 1_000),
+            core: ActionActor::new(
+                descriptor(),
+                &authority_under_test(),
+                "coord-shell-test",
+                1_000,
+            ),
         };
         let waker = std::task::Waker::noop();
         let mut task = std::task::Context::from_waker(waker);
