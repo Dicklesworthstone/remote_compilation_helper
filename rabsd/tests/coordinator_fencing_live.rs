@@ -309,3 +309,88 @@ fn prior_authority_generations_are_closed_and_publication_reissues_fresh() {
         "expected a commit for the fresh reissue, got {outcome:?}"
     );
 }
+
+#[test]
+fn stale_candidates_contribute_blobs_but_never_publish_after_restart() {
+    // T043/R120: the ALLOWANCE side of the fence. A candidate prepared
+    // under the old term keeps full value as verified immutable content —
+    // its manifest bytes land in the blob store and its closure objects
+    // stay durably located — while publication itself stays impossible:
+    // the offer door refuses the dead authority, and no serving pointer
+    // ever appears. Contribution without authority; safety without loss.
+    let dir = tempfile::tempdir().unwrap();
+    let cas_root = dir.path().join("cas");
+
+    // Incarnation 1, term 1: prepare a candidate (bytes + durable
+    // closure), then die BEFORE committing.
+    let prepared = {
+        let cas = Arc::new(mount_and_reconcile(&cas_root).expect("mount"));
+        let coord = CoordLive::with_cas(Arc::clone(&cas));
+        let authority = coord
+            .acquire_boot_authority(&cluster_id())
+            .expect("authority");
+        assert_eq!(authority.term, 1);
+        {
+            let mut store = cas.store().lock().expect("store lock");
+            install_admission_world(&mut *store, &authority);
+        }
+        let (offer, bytes) = offer_with_manifest_bytes(&authority);
+        store_manifest_object(&cas, &offer, &bytes);
+        (offer, bytes)
+    };
+
+    // Incarnation 2, term 2 over the same store.
+    let cas = Arc::new(mount_and_reconcile(&cas_root).expect("re-mount"));
+    let coord = CoordLive::with_cas(Arc::clone(&cas));
+    let live = coord
+        .acquire_boot_authority(&cluster_id())
+        .expect("authority");
+    assert_eq!(live.term, 2);
+
+    // CONTRIBUTION allowed: the stale candidate's manifest bytes are REAL
+    // verified immutable content — they survived the restart's reconcile
+    // (which prunes any location whose bytes are not actually on disk)
+    // and re-putting them into the NEW incarnation's blob store succeeds
+    // idempotently. Fixture-fabricated closure locations, by contrast,
+    // are correctly NOT treated as contributed value: reconcile drops
+    // locations with nothing behind them.
+    {
+        let mut store = cas.store().lock().expect("store lock");
+        assert!(
+            store
+                .object_durably_located(&prepared.0.manifest_id.0)
+                .expect("location check"),
+            "the stale candidate's real manifest bytes survive as durable content"
+        );
+    }
+    let mut reader = prepared.1.as_slice();
+    let put = put_if_absent(
+        cas.layout(),
+        &mut *cas.store().lock().expect("store lock"),
+        &prepared.0.manifest_id.0,
+        &mut reader,
+        PutLimits::default(),
+        DurabilityPolicy::FULL,
+    )
+    .expect("blob contribution must succeed");
+    assert!(
+        matches!(
+            put,
+            PutOutcome::Stored { .. } | PutOutcome::IdempotentDuplicate { .. }
+        ),
+        "stale candidates contribute verified blobs: {put:?}"
+    );
+
+    // PUBLICATION refused: same candidate, same door, new term.
+    let refusal = coord
+        .commit_offer(&prepared.0, &sample_expected_descriptor())
+        .expect_err("a stale candidate may contribute but never publish");
+    assert_eq!(
+        refusal,
+        CommitRefusal::StaleAuthority {
+            offered_term: 1,
+            active_term: 2,
+        }
+    );
+    assert_nothing_published(&cas);
+}
