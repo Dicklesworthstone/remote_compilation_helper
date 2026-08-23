@@ -330,8 +330,15 @@ fn main() {
         )),
         coord_work: Some(coord_work),
         // W1 (bd-hfhq2): the janitor region owns the mounted, fail-closed
-        // reconciled store for the daemon lifetime.
-        janitor_work: Some(rabsd::janitor::store::janitor_work_holding(mounted)),
+        // reconciled store for the daemon lifetime — INCLUDING the GC
+        // sweep + quota evidence (advisory; escalation belongs to the
+        // disk-pressure subsystem). Quota arrives via RABS_QUOTA_BYTES.
+        janitor_work: Some(rabsd::janitor::store::janitor_work_with_gc(
+            mounted,
+            std::env::var("RABS_QUOTA_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok()),
+        )),
         ..DaemonRunOptions::default()
     };
     match run_daemon(options) {

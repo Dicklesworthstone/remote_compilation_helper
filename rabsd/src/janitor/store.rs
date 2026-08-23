@@ -81,6 +81,8 @@ pub struct LiveCas {
     pub repaired: usize,
     /// Count of drift rows reported (orphans; nothing touched).
     pub reported: usize,
+    /// Monotonic plan-sequence for janitor-owned GC receipts.
+    pub gc_seq: std::sync::atomic::AtomicU64,
 }
 
 impl LiveCas {
@@ -145,6 +147,7 @@ pub fn mount_and_reconcile(cas_root: &Path) -> Result<LiveCas, String> {
         serving_refused: matches!(report.serving, ServingDecision::Refused(_)),
         repaired: report.repaired.len(),
         reported: report.reported.len(),
+        gc_seq: std::sync::atomic::AtomicU64::new(1),
     })
 }
 
@@ -176,6 +179,119 @@ pub fn janitor_work_holding(mounted: Result<Arc<LiveCas>, String>) -> SubsystemW
             // outlives every region that may still be using it; the
             // metadata handle is released when the last holder (janitor
             // or coordinator) drops after shutdown.
+            let _held = mounted;
+            shutdown.wait().await;
+            Ok(())
+        })
+    })
+}
+
+/// Summary of one janitor-owned GC sweep (W1: quota/GC ownership).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcSweepSummary {
+    /// Locations the plan marked for reclaim.
+    pub planned: u64,
+    /// Locations actually reclaimed this pass.
+    pub reclaimed: u64,
+    /// Locations skipped (protected re-check or concurrent use).
+    pub skipped: u64,
+}
+
+impl LiveCas {
+    /// Total bytes of blob content under the store root — the quota
+    /// input. Directory walk; no caching (the janitor runs rarely).
+    #[must_use]
+    pub fn store_usage_bytes(&self) -> u64 {
+        fn walk(dir: &Path) -> u64 {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return 0;
+            };
+            let mut total = 0;
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    total += walk(&p);
+                } else if let Ok(meta) = p.metadata() {
+                    total += meta.len();
+                }
+            }
+            total
+        }
+        walk(&self.cas_root)
+    }
+
+    /// Run one GC sweep over the live store: plan with the default
+    /// world (unlisted objects are CommittedResult/cold), then execute.
+    /// The plan `seq` comes from an internal monotonic counter so
+    /// receipt rows never collide across sweeps.
+    ///
+    /// # Errors
+    /// A string reason if planning or execution fails against the
+    /// metadata store.
+    pub fn gc_sweep(&self, mode: rabs_cas::gc::GcMode) -> Result<GcSweepSummary, String> {
+        use rabs_cas::gc::{GcWorld, execute_gc, plan_gc};
+        let seq = self
+            .gc_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut store = self.store.lock().map_err(|_| "metadata lock poisoned")?;
+        let plan = plan_gc(&mut *store, &GcWorld::default(), mode, seq)
+            .map_err(|e| format!("gc plan: {e:?}"))?;
+        let receipt = execute_gc(&mut *store, &plan).map_err(|e| format!("gc exec: {e:?}"))?;
+        Ok(GcSweepSummary {
+            planned: receipt.planned as u64,
+            reclaimed: receipt.reclaimed.len() as u64,
+            skipped: receipt.skipped.len() as u64,
+        })
+    }
+}
+
+/// Build the janitor region work WITH quota/GC ownership — the W1
+/// remainder. After boot evidence the region RUNS one GC sweep and
+/// publishes usage/quota evidence, then holds the store for its
+/// lifetime exactly as [`janitor_work_holding`] does.
+///
+/// `quota_bytes` is advisory-first: a breach is PUBLISHED loudly
+/// (`janitor-quota-exceeded` evidence) but does not tear the store or
+/// refuse serving by itself — enforcement escalation belongs to the
+/// disk-pressure subsystem, not to silent deletion.
+pub fn janitor_work_with_gc(
+    mounted: Result<Arc<LiveCas>, String>,
+    quota_bytes: Option<u64>,
+) -> SubsystemWork {
+    Box::new(move |cx, mut shutdown| {
+        Box::pin(async move {
+            let mounted = mounted?;
+            println!(
+                "{{\"v\":1,\"kind\":\"janitor-cas-mounted\",\"root\":{:?},\"serving_refused\":{},\"repaired\":{},\"reported\":{}}}",
+                mounted.cas_root().display().to_string(),
+                mounted.serving_refused,
+                mounted.repaired,
+                mounted.reported,
+            );
+            match mounted.gc_sweep(rabs_cas::gc::GcMode::Normal) {
+                Ok(s) => println!(
+                    "{{\"v\":1,\"kind\":\"janitor-gc-sweep\",\"planned\":{},\"reclaimed\":{},\"skipped\":{}}}",
+                    s.planned, s.reclaimed, s.skipped
+                ),
+                Err(reason) => println!(
+                    "{{\"v\":1,\"kind\":\"janitor-gc-sweep-failed\",\"reason\":{:?}}}",
+                    reason
+                ),
+            }
+            let usage = mounted.store_usage_bytes();
+            if let Some(q) = quota_bytes {
+                if usage > q {
+                    println!(
+                        "{{\"v\":1,\"kind\":\"janitor-quota-exceeded\",\"bytes\":{},\"quota_bytes\":{}}}",
+                        usage, q
+                    );
+                }
+            }
+            println!(
+                "{{\"v\":1,\"kind\":\"janitor-store-usage\",\"bytes\":{}}}",
+                usage
+            );
+            cx.trace("janitor region up: store mounted, gc swept, quota checked");
             let _held = mounted;
             shutdown.wait().await;
             Ok(())
