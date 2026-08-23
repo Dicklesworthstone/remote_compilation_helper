@@ -35,7 +35,6 @@ pub mod scenario_labels;
 pub mod shadow_pipeline;
 pub mod stratified_selection;
 
-
 use rabs_protocol::invocation_record::NormalizedOutcome;
 use rabs_protocol::redaction::REDACTED;
 
@@ -425,10 +424,11 @@ mod tests {
 
     #[test]
     fn b005_outcomes_replay_with_signal_vs_exit_preserved() {
-        let lines = [record_line(
-            "sh -c 'kill -9 $$'",
-            NormalizedOutcome::Signaled(9),
-        )];
+        // The DIRECT child is what Rust observes, so the recorded
+        // command must BE the signaling tool for the true terminal
+        // condition to surface: one shell layer, `kill -9 $$` kills
+        // that very shell, and waitpid reports Signaled(9).
+        let lines = [record_line("kill -9 $$", NormalizedOutcome::Signaled(9))];
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let mut baseline = StockPath;
         let invocation = parse_corpus_line(refs[0]).unwrap();
@@ -438,6 +438,25 @@ mod tests {
             observation.outcome,
             Some(NormalizedOutcome::Signaled(9)),
             "a SIGKILLed replay is observed as signaled, never 137"
+        );
+
+        // A recording that NESTS a shell inside StockPath's own `sh -c`
+        // surfaces POSIX's 128+N convention instead: dash never re-raises,
+        // so the outer shell exits normally with code 137 and that IS the
+        // faithful observation of what ran (bd-xbux4 root cause — not a
+        // worker regression; verified identical on local + all workers).
+        let nested = [record_line(
+            "sh -c 'kill -9 $$'",
+            NormalizedOutcome::Signaled(9),
+        )];
+        let nested_refs: Vec<&str> = nested.iter().map(String::as_str).collect();
+        let mut baseline = StockPath;
+        let nested_invocation = parse_corpus_line(nested_refs[0]).unwrap();
+        let nested_observation = baseline.execute(&nested_invocation);
+        assert_eq!(
+            nested_observation.outcome,
+            Some(NormalizedOutcome::Exited(137)),
+            "nested shells convert child SIGKILL into exit 128+N by POSIX"
         );
     }
 
