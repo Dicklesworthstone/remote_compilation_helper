@@ -62,6 +62,7 @@ pub mod domain_plumbing;
 pub mod durable_ids;
 pub mod edge_fence;
 pub mod envelope;
+pub mod failure_post_state;
 pub mod frame_extensions;
 pub mod framing;
 pub mod generation;
