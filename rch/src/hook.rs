@@ -1985,10 +1985,18 @@ pub async fn run_exec(
     // Extract project name honoring configured path topology.
     let project = extract_project_name_with_policy(&topology_policy);
 
+    // Layer 0 pack (bd-bqu38): resolve knob env pairs once; empty unless the
+    // `[layer0]` section enables the pack.
+    let layer0_env: Vec<(String, String)> = config
+        .layer0
+        .active_env()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
     // Estimate cores needed
     let estimated_cores =
         estimate_cores_for_command(classification.kind, &command, &config.compilation);
-
     // Detect toolchain — ONLY for Rust kinds.
     //
     // `detect_toolchain` returns the ambient rustup toolchain (e.g. from
@@ -2364,6 +2372,7 @@ pub async fn run_exec(
             clean_overlay_spec.as_ref(),
             source_content_receipt,
             &result_dirs,
+            &layer0_env,
         )
         .await;
         let remote_elapsed = remote_start.elapsed();
@@ -2373,7 +2382,6 @@ pub async fn run_exec(
                 error
             );
         }
-
         // Release worker slots
         let release_exit_code = result
             .as_ref()
@@ -3287,6 +3295,7 @@ async fn handle_selection_response(
         &topology_policy,
         None,
         false,
+        &[],
         &[],
     )
     .await;

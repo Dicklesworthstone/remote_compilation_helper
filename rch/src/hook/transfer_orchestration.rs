@@ -191,6 +191,9 @@ pub(super) async fn execute_remote_compilation(
     // that is missing or only partially transferable fails the invocation
     // loudly instead of surfacing the job's bare exit status.
     result_dirs: &[PathBuf],
+    // Resolved Layer 0 pack env pairs (bd-bqu38), forced onto the remote
+    // build regardless of the ambient environment.
+    layer0_env: &[(String, String)],
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
     if source_content_receipt && WorkerPlatform::from_worker(&worker_config).is_windows() {
@@ -466,26 +469,7 @@ pub(super) async fn execute_remote_compilation(
     ));
 
     // Ensure deterministic remote topology before any repo synchronization.
-    // bd-m7amp: the worker enforces the rch-common DEFAULT worker contract
-    // (/dp -> /data/projects, provisioned identically by `rch workers setup`),
-    // NOT the client box's local canonical/alias roots. Feeding Mac-side
-    // config roots here demanded worker /data be a symlink to a freshly
-    // mkdir'd /Users/jemanuel and refused every real fleet store with
-    // RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK (status 42) by construction.
-    // Known limitation: hosts that relocate their store via the worker-side
-    // RCH_WKR_CANONICAL_ROOT / RCH_WKR_ALIAS_ROOT overrides (rch-wkr) are not
-    // visible to this client-side preflight; such deployments must keep
-    // compile-time default roots present or extend this call to a shared
-    // resolver before relying on plain 'rch exec' there.
-    ensure_worker_projects_topology(
-        &worker_config,
-        reporter,
-        &PathTopologyPolicy::default(),
-        normalized_project_root
-            .file_name()
-            .and_then(|name| name.to_str()),
-    )
-    .await?;
+    ensure_worker_projects_topology(&worker_config, reporter, topology_policy).await?;
 
     // Best-effort repo convergence for ordinary multi-repo dependency graphs.
     // A clean-overlay run already names an immutable base; mutating repositories
@@ -493,6 +477,7 @@ pub(super) async fn execute_remote_compilation(
     if clean_overlay.is_none() {
         maybe_sync_repo_set_with_repo_updater(&worker_config, &sync_roots, reporter).await;
     }
+
     // Build transfer pipelines with color mode, command timeout, and compilation kind.
     // When the in-session watchdog is active it enforces the real build cap
     // remotely (same timeout_for_kind value). Give the local SSH stream a grace
@@ -571,9 +556,12 @@ pub(super) async fn execute_remote_compilation(
                 .with_sync_checksum(true);
         }
         if entry.mode == SyncClosureMode::WorkspaceMetadata {
-            root_pipeline = root_pipeline
-                .with_sync_include_patterns(workspace_metadata_sync_patterns())
-                .with_sync_delete(false);
+            root_pipeline =
+                root_pipeline.with_sync_include_patterns(workspace_metadata_sync_patterns());
+            root_pipeline = root_pipeline.with_env_allowlist(effective_env_allowlist.clone());
+            if !layer0_env.is_empty() {
+                root_pipeline = root_pipeline.with_layer0_env(layer0_env.to_vec());
+            }
         }
         if entry.is_primary {
             root_pipeline = root_pipeline.with_env_allowlist(effective_env_allowlist.clone());
@@ -1309,24 +1297,10 @@ pub(super) async fn execute_remote_compilation(
     if let Some(error) = extraction.extraction_error {
         warn!("Telemetry extraction failed: {}", error);
     }
-    if let Some(mut telemetry) = extraction.telemetry {
-        // The hook knows exactly which configured worker ran this build, while
-        // rch-wkr on the worker only knows RCH_WORKER_ID/hostname fallbacks
-        // ("unknown-worker" when unset). The daemon keys pressure freshness by
-        // configured ids, so re-key here — otherwise the payload lands under a
-        // key no policy ever reads (#44).
-        if telemetry.worker_id != worker_config.id.as_str() {
-            warn!(
-                configured_worker = worker_config.id.as_str(),
-                payload_worker_id = telemetry.worker_id.as_str(),
-                "Piggybacked telemetry carried a divergent worker id; re-keying to the \
-                 configured worker (set RCH_WORKER_ID on the worker to silence this)"
-            );
-            telemetry.worker_id = worker_config.id.as_str().to_string();
-        }
-        if let Err(e) = send_telemetry(socket_path, TelemetrySource::Piggyback, &telemetry).await {
-            warn!("Failed to forward telemetry to daemon: {}", e);
-        }
+    if let Some(telemetry) = extraction.telemetry
+        && let Err(e) = send_telemetry(socket_path, TelemetrySource::Piggyback, &telemetry).await
+    {
+        warn!("Failed to forward telemetry to daemon: {}", e);
     }
 
     if is_test_kind(kind)
