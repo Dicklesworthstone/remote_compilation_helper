@@ -40,6 +40,7 @@ use rabs_cas::metadata_store::RabsMetadataStore;
 use rabs_cas::publication::OfferPreparedActionResult;
 use rabs_cas::test_support::{
     install_admission_world, install_offer_closure, offer_with_manifest_bytes, sample_action_key,
+    sample_expected_descriptor,
 };
 use rabsd::coord::live::{CommitRefusal, CoordLive, cluster_id};
 use rabsd::janitor::store::{LiveCas, mount_and_reconcile};
@@ -213,10 +214,3 @@ fn coordinator_dies_after_prepare_before_commit() {
     assert_nothing_published(&cas);
 }
 
-/// The store this suite opens directly (only while no daemon runs over
-/// it) must know the authority-digest domain its rows use (R121: an
-/// undeclared domain is a fail-closed read, not a silent re-type).
-#[allow(dead_code)]
-fn declare_read_domains(store: &mut SqlMetadataStore<RusqliteEngine>) {
-    store.intern_domain(AUTHORITY_DIGEST_DOMAIN);
-}
