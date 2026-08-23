@@ -1436,6 +1436,15 @@ enum CacheAction {
         /// Actually delete (default is a dry-run report only).
         #[arg(long)]
         execute: bool,
+
+        /// Additional staging-base directories to sweep (repeatable).
+        ///
+        /// The configured `transfer.remote_base` is always swept. Fleet
+        /// deployments that have drifted across bases (e.g. a legacy
+        /// `/tmp/rch-sync` from an older default) pass those here so orphaned
+        /// sessions on tmpfs mounts get reaped too (bd-p1vlb / bd-lvbax).
+        #[arg(long, value_name = "PATH")]
+        base: Vec<PathBuf>,
     },
 
     /// Show remote per-job/pooled target dirs on workers: path, size, idle age,
@@ -3786,17 +3795,25 @@ async fn handle_cache(action: CacheAction, ctx: &OutputContext) -> Result<()> {
         CacheAction::Clean {
             older,
             project,
+            base,
             execute,
-        } => handle_cache_clean(older, project, execute, ctx).await,
+        } => handle_cache_clean(older, project, base, execute, ctx).await,
         CacheAction::Status { workers } => handle_cache_status(workers, ctx).await,
     }
 }
 
-/// `rch cache clean`: prune stale local staging trees under the configured
-/// `transfer.remote_base`. Dry-run unless `execute`. (bd-s3433)
+/// `rch cache clean`: prune stale staging trees. Dry-run unless `execute`.
+/// (bd-s3433; multi-base support bd-p1vlb.)
+///
+/// The configured `transfer.remote_base` is always swept. Extra `--base`
+/// directories cover fleet deployments whose sessions predate a remote_base
+/// change (e.g. a legacy `/tmp/rch-sync` on tmpfs) and would otherwise be
+/// invisible to GC — observed growing to 37G on one worker before manual
+/// intervention (bd-lvbax).
 async fn handle_cache_clean(
     older: String,
     project: Option<String>,
+    extra_bases: Vec<PathBuf>,
     execute: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -3804,41 +3821,70 @@ async fn handle_cache_clean(
         .map_err(|e| anyhow::anyhow!("invalid --older value: {e}"))?;
 
     let config = crate::config::load_config().unwrap_or_default();
-    let remote_base = PathBuf::from(&config.transfer.remote_base);
+    let mut bases = vec![PathBuf::from(&config.transfer.remote_base)];
+    for base in extra_bases {
+        if !bases.contains(&base) {
+            bases.push(base);
+        }
+    }
 
     let now = std::time::SystemTime::now();
-    let trees =
-        cache_gc::enumerate_staging_trees(&remote_base, project.as_deref(), now).map_err(|e| {
-            anyhow::anyhow!("failed to enumerate staging trees under {remote_base:?}: {e}")
-        })?;
-    let plan =
-        cache_gc::plan_staging_gc(&trees, cache_gc::StagingGcPolicy { min_age }, &remote_base);
+    let mut combined = cache_gc::StagingGcPlan {
+        entries: Vec::new(),
+        prunable_bytes: 0,
+        prunable_count: 0,
+        total_bytes: 0,
+    };
+    let mut outcome = cache_gc::StagingGcOutcome {
+        removed_count: 0,
+        removed_bytes: 0,
+        failed: Vec::new(),
+    };
+    for base in &bases {
+        let trees = cache_gc::enumerate_staging_trees(base, project.as_deref(), now)
+            .map_err(|e| anyhow::anyhow!("failed to enumerate staging trees under {base:?}: {e}"))?;
+        let plan =
+            cache_gc::plan_staging_gc(&trees, cache_gc::StagingGcPolicy { min_age }, base);
+        if execute {
+            let o = cache_gc::execute_staging_gc(&plan, base);
+            outcome.removed_count += o.removed_count;
+            outcome.removed_bytes += o.removed_bytes;
+            outcome.failed.extend(o.failed);
+        }
+        combined.entries.extend(plan.entries);
+        combined.prunable_bytes += plan.prunable_bytes;
+        combined.prunable_count += plan.prunable_count;
+        combined.total_bytes += plan.total_bytes;
+    }
 
     let style = ctx.theme();
     if execute {
-        let outcome = cache_gc::execute_staging_gc(&plan, &remote_base);
         if ctx.is_json() {
             let _ = ctx.json(&ApiResponse::ok("cache clean", &outcome));
         } else {
             println!(
-                "Pruned {} tree(s), reclaimed {} ({} failed)",
+                "Pruned {} tree(s), reclaimed {} ({} failed) across {} base(s)",
                 outcome.removed_count,
                 cache_gc::human_bytes(outcome.removed_bytes),
-                outcome.failed.len()
+                outcome.failed.len(),
+                bases.len()
             );
         }
     } else if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("cache clean", &plan));
+        let _ = ctx.json(&ApiResponse::ok("cache clean", &combined));
     } else {
+        for base in &bases {
+            println!("base {}", base.display());
+        }
         println!(
-            "Dry run over {} ({} tree(s), {} total). Would prune {} tree(s), reclaim {}.",
-            remote_base.display(),
-            plan.entries.len(),
-            cache_gc::human_bytes(plan.total_bytes),
-            plan.prunable_count,
-            cache_gc::human_bytes(plan.prunable_bytes)
+            "Dry run over {} base(s) ({} tree(s), {} total). Would prune {} tree(s), reclaim {}.",
+            bases.len(),
+            combined.entries.len(),
+            cache_gc::human_bytes(combined.total_bytes),
+            combined.prunable_count,
+            cache_gc::human_bytes(combined.prunable_bytes)
         );
-        for e in plan
+        for e in combined
             .entries
             .iter()
             .filter(|e| matches!(e.action, cache_gc::GcAction::Prune))

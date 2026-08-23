@@ -3877,6 +3877,43 @@ fi",
     ///
     /// Runs its own rsync per directory with the directory as an explicit
     /// source, so a directory the job never created is a hard rsync error
+    /// Best-effort removal of an invocation-unique remote tree (bd-p1vlb).
+    ///
+    /// Clean-overlay roots are per-run by construction (a job nonce is hashed
+    /// into the remote root), so nothing else ever shares or reuses them —
+    /// but each holds a full materialized snapshot. Without explicit reaping,
+    /// every overlay run leaks hundreds of MB to GBs on the worker's staging
+    /// base (observed: a 37G `/tmp/rch-sync` tmpfs pile within days,
+    /// bd-lvbax). All errors are swallowed by the caller; reaping is
+    /// opportunistic hygiene and must never affect the surfaced job result.
+    pub async fn reap_remote_tree(&self, worker: &WorkerConfig, root: &str) -> Result<()> {
+        if self.worker_platform.is_windows() {
+            // Overlay transport is rsync/ssh-only today; nothing to reap.
+            return Ok(());
+        }
+        let identity_file = shellexpand::tilde(&worker.identity_file);
+        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
+        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let target = escape(Cow::from(format!("{}@{}", worker.user, worker.host)));
+        // The root is `[A-Za-z0-9/-]` by construction (hash + project id);
+        // quote it anyway so a future naming scheme cannot turn the removal
+        // into word-splitting.
+        let quoted_root = format!("'{}'", root.replace('\'', "'\\''"));
+        let script = format!("{ssh_command} {target} -- rm -rf -- {quoted_root}");
+        let status = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .await?;
+        if !status.success() {
+            anyhow::bail!(
+                "remote reap of {root} on {} exited with {status}",
+                worker.id
+            );
+        }
+        Ok(())
+    }
+
     /// rather than a silent zero-file success. Any error means the invocation's
     /// declared outputs are INCOMPLETE and callers must fail loudly.
     pub async fn retrieve_result_dir(

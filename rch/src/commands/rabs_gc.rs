@@ -587,7 +587,11 @@ fn print_history(receipt: &GcHistoryReceipt) {
 /// # Errors
 /// Propagates store/mount/parse failures under the caller's exit-code
 /// convention.
-pub async fn run(action: GcAction, ctx: &OutputContext) -> anyhow::Result<()> {
+pub async fn run_gc(action: GcAction, ctx: &OutputContext) -> anyhow::Result<()> {
+    run_gc_inner(action, ctx).await
+}
+
+async fn run_gc_inner(action: GcAction, ctx: &OutputContext) -> anyhow::Result<()> {
     match action {
         GcAction::Plan {
             cas_root,
