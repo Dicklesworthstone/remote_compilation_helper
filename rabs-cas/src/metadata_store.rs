@@ -2228,6 +2228,40 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
             created_seq: expect_u64(created, "obligation seq")?,
         })
     }
+
+    /// Shared row mapper for `provisional_install_journal` SELECTs
+    /// (single source of truth for the 10-column shape; R121 domain
+    /// restore included).
+    fn map_install_row(&self, row: &[SqlValue]) -> Result<ProvisionalInstallRecord, StoreError> {
+        let [
+            pin,
+            worker,
+            attempt_hex,
+            path,
+            algo,
+            domain,
+            bytes,
+            object_key,
+            seq,
+            state,
+        ] = row
+        else {
+            return Err(StoreError::Corruption("install journal shape".into()));
+        };
+        Ok(ProvisionalInstallRecord {
+            pin_key: expect_text(pin, "install pin")?,
+            consumer_worker: expect_text(worker, "install worker")?,
+            consumer_attempt_hex: expect_text(attempt_hex, "install attempt")?,
+            installed_path: match path {
+                SqlValue::Blob(b) => b.clone(),
+                _ => return Err(StoreError::Corruption("install path shape".into())),
+            },
+            object: self.restore_digest(algo, domain, bytes)?,
+            object_key: expect_text(object_key, "install object")?,
+            installed_seq: expect_u64(seq, "install seq")?,
+            state: expect_text(state, "install state")?,
+        })
+    }
 }
 
 fn expect_u64(v: &SqlValue, what: &str) -> Result<u64, StoreError> {
@@ -5617,6 +5651,13 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                  ORDER BY descendant_pin_key, ancestor_pin_key",
             ),
             (
+                "provisional_install_journal",
+                "SELECT pin_key, consumer_worker, consumer_attempt_hex, installed_path, \
+                 obj_algo, obj_domain, obj_bytes, object_key, installed_seq, state \
+                 FROM provisional_install_journal \
+                 ORDER BY pin_key, consumer_attempt_hex, installed_path",
+            ),
+            (
                 "provisional_obligations",
                 "SELECT consumer_worker, consumer_attempt_hex, pin_key, producer_action_key, \
                  producer_generation_hex, producer_attempt_hex, role, virtual_path, object_key, \
@@ -5754,6 +5795,111 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         rows.iter()
             .map(|row| Self::map_obligation_row(row))
             .collect()
+    }
+
+    fn insert_provisional_install(
+        &mut self,
+        install: &ProvisionalInstallInsert,
+    ) -> Result<(), StoreError> {
+        let row = install.clone();
+        // R121: intern the object's domain for fail-closed restoration.
+        self.intern(row.object.domain);
+        self.in_txn(move |engine| {
+            engine.execute(
+                "INSERT OR IGNORE INTO provisional_install_journal \
+                 (pin_key, consumer_worker, consumer_attempt_hex, installed_path, \
+                 obj_algo, obj_domain, obj_bytes, object_key, installed_seq, state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'installed')",
+                &[
+                    SqlValue::Text(row.pin_key),
+                    SqlValue::Text(row.consumer_worker),
+                    SqlValue::Text(u128_hex(row.consumer_attempt)),
+                    SqlValue::Blob(row.installed_path),
+                    SqlValue::Text(algo_tag(row.object.algorithm).to_owned()),
+                    SqlValue::Text(row.object.domain.to_owned()),
+                    SqlValue::Blob(row.object.bytes.to_vec()),
+                    SqlValue::Text(digest_key(&row.object)),
+                    SqlValue::Int(row.installed_seq as i64),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_provisional_installs_for_pins(
+        &mut self,
+        pin_keys: &[String],
+    ) -> Result<Vec<ProvisionalInstallRecord>, StoreError> {
+        if pin_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..pin_keys.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let params: Vec<SqlValue> = pin_keys
+            .iter()
+            .map(|key| SqlValue::Text(key.clone()))
+            .collect();
+        let rows = self.engine.query(
+            &format!(
+                "SELECT pin_key, consumer_worker, consumer_attempt_hex, installed_path, \
+                 obj_algo, obj_domain, obj_bytes, object_key, installed_seq, state \
+                 FROM provisional_install_journal WHERE pin_key IN ({placeholders}) \
+                 ORDER BY pin_key, consumer_attempt_hex, installed_path"
+            ),
+            &params,
+        )?;
+        rows.iter()
+            .map(|row| Self::map_install_row(self, row))
+            .collect()
+    }
+
+    fn list_provisional_installs_by_state(
+        &mut self,
+        state: &str,
+    ) -> Result<Vec<ProvisionalInstallRecord>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT pin_key, consumer_worker, consumer_attempt_hex, installed_path, \
+             obj_algo, obj_domain, obj_bytes, object_key, installed_seq, state \
+             FROM provisional_install_journal WHERE state = ?1 \
+             ORDER BY pin_key, consumer_attempt_hex, installed_path",
+            &[SqlValue::Text(state.to_owned())],
+        )?;
+        rows.iter()
+            .map(|row| Self::map_install_row(self, row))
+            .collect()
+    }
+
+    fn set_provisional_install_state(
+        &mut self,
+        pin_key: &str,
+        consumer_attempt_hex: &str,
+        installed_path: &[u8],
+        state: &str,
+    ) -> Result<(), StoreError> {
+        let (pin_key, attempt_hex, path, state) = (
+            pin_key.to_owned(),
+            consumer_attempt_hex.to_owned(),
+            installed_path.to_vec(),
+            state.to_owned(),
+        );
+        self.in_txn(move |engine| {
+            let affected = engine.execute(
+                "UPDATE provisional_install_journal SET state = ?4 \
+                 WHERE pin_key = ?1 AND consumer_attempt_hex = ?2 AND installed_path = ?3",
+                &[
+                    SqlValue::Text(pin_key),
+                    SqlValue::Text(attempt_hex),
+                    SqlValue::Blob(path),
+                    SqlValue::Text(state),
+                ],
+            )?;
+            if affected == 0 {
+                return Err(StoreError::UnknownPin);
+            }
+            Ok(())
+        })
     }
 
     fn list_provisional_obligations_for_pin(
@@ -6712,6 +6858,7 @@ mod tests {
             "pins",
             "provenance_edges",
             "provisional_ancestry",
+            "provisional_install_journal",
             "provisional_obligations",
             "provisional_pin_grants",
             "provisional_pin_lineage",
