@@ -1064,6 +1064,10 @@ pub struct RchConfig {
     /// disk pressure, and smoke defaults (bd-...remediation-ocv9i.17.1).
     #[serde(default)]
     pub remediation: crate::remediation_config::RemediationConfig,
+    /// Layer 0 configuration pack knobs (bd-bqu38 / M-1 §149). Defaults OFF;
+    /// injected as CARGO_PROFILE_* env vars into remote cargo builds.
+    #[serde(default)]
+    pub layer0: Layer0Config,
 }
 
 /// Doctor reliability subsystem configuration.

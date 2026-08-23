@@ -5107,6 +5107,7 @@ dependencies = [
  "miette",
  "proptest",
  "pulldown-cmark",
+ "rabs-cas",
  "rabs-key",
  "rabs-protocol",
  "rch-common",

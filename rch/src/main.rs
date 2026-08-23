@@ -496,6 +496,19 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
         action: commands::why::WhyAction,
     },
 
+
+    /// RABS content-addressed store operator commands
+    ///
+    /// Operator surface over the RABS CAS engines (plan §173): bounded
+    /// JSON/TOON receipts with stable reason codes.
+    #[command(after_help = r#"EXAMPLES:
+    rch rabs gc plan
+    rch rabs gc run --mode emergency --protect sha256:deadbeef
+    rch rabs gc history --limit 20 --json"#)]
+    Rabs {
+        #[command(subcommand)]
+        action: commands::rabs_gc::RabsCommand,
+    },
     /// Preflight a command's admission before expensive work
     ///
     /// Read-only and side-effect free: classifies the command, derives the
@@ -2064,6 +2077,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 project,
                 dry_run,
             } => commands::sync_force(force, worker, all, project, dry_run, &ctx).await,
+            Commands::Rabs { action } => commands::rabs_gc::run(action, &ctx).await,
             Commands::Why { action } => commands::why::run(action, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
             Commands::Cache { action } => handle_cache(action, &ctx).await,

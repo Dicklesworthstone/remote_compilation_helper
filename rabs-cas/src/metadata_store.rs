@@ -44,8 +44,9 @@ use rabs_protocol::serving::ServingValidity;
 /// carry their durability state; v13 = H028 provisional-ancestor
 /// lineage + adoption edges; v14 = M004 provisional `.rmeta` upload
 /// pins + authorized-visibility grants; v15 = M006 dependent-action
-/// provisional-consumption obligations).
-pub const SCHEMA_VERSION: u32 = 15;
+/// provisional-consumption obligations; v16 = M017 transitive
+/// pin-lineage closure edges + producer contract bindings on pins).
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -355,6 +356,27 @@ pub const MIGRATIONS: &[Migration] = &[
          PRIMARY KEY (consumer_worker, consumer_attempt_hex, pin_key))",
         ],
     },
+    Migration {
+        // M017: transitive pin-lineage closure + producer contract
+        // bindings. Every prepared descendant pin materializes the FULL
+        // transitive ancestor-pin closure at open time (edges written in
+        // the SAME transaction as the pin row, so a tear can never leave
+        // a pin without its recorded ancestry), and each pin binds the
+        // toolchain/event contract digests its producer ran under — the
+        // equality a different-winning-attempt adoption must prove.
+        version: 16,
+        statements: &[
+            "ALTER TABLE provisional_pins ADD COLUMN toolchain_contract_key \
+         TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provisional_pins ADD COLUMN event_contract_key \
+         TEXT NOT NULL DEFAULT ''",
+            "CREATE TABLE provisional_pin_lineage (descendant_pin_key TEXT NOT NULL, \
+         ancestor_pin_key TEXT NOT NULL, \
+         PRIMARY KEY (descendant_pin_key, ancestor_pin_key))",
+            "CREATE INDEX idx_provisional_pin_lineage_ancestor \
+         ON provisional_pin_lineage (ancestor_pin_key)",
+        ],
+    },
 ];
 
 /// Typed store errors (comparable so the differential harness can assert
@@ -534,7 +556,10 @@ pub struct ProvisionalAncestorRow {
 /// `(authority, action key, generation, attempt, lease, logical output)`.
 /// State columns are read-side facts: `adopted_object_key` records a
 /// winner adoption (§65.1), `invalidated_reason` a producer failure or
-/// supersession, `released` the post-drain close.
+/// supersession, `released` the post-drain close. The contract keys
+/// (M017) bind the toolchain/event contracts the producer ran under;
+/// empty on pre-v16 rows, and a different-winning-attempt adoption
+/// refuses fail-closed against an unbound pin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionalPinRecord {
     /// Canonical digest key of the identity tuple.
@@ -568,11 +593,21 @@ pub struct ProvisionalPinRecord {
     pub invalidated_reason: Option<String>,
     /// Whether the pin is closed (drained or invalidated).
     pub released: bool,
+    /// Digest key of the producer's toolchain contract (F007); empty when
+    /// the pin predates v16 or the caller bound no contracts.
+    pub toolchain_contract_key: String,
+    /// Digest key of the producer's event contract; same binding rules.
+    pub event_contract_key: String,
 }
 
 /// Insert payload for a new provisional-upload pin. Identity scalars are
 /// raw values (hex encoding happens at the SQL boundary); the object is a
 /// full typed digest so its domain is interned on write (R121).
+///
+/// M017: `ancestor_pin_keys` is the COMPLETE transitive ancestor-pin
+/// closure of the producing attempt, computed by the caller and written
+/// in the SAME transaction as the pin row — a prepared descendant always
+/// carries its full lineage, and no tear can strip it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionalPinInsert {
     /// Canonical digest key of the identity tuple.
@@ -598,8 +633,15 @@ pub struct ProvisionalPinInsert {
     pub protective_pin_id: u128,
     /// Human-auditable reason stored with the protective pin.
     pub reason: String,
+    /// Digest key of the producer's toolchain contract (F007); empty when
+    /// unbound — different-winner adoption then refuses fail-closed.
+    pub toolchain_contract_key: String,
+    /// Digest key of the producer's event contract; empty when unbound.
+    pub event_contract_key: String,
+    /// Complete transitive ancestor-pin closure (M017), sorted for
+    /// deterministic SQL ordering.
+    pub ancestor_pin_keys: Vec<String>,
 }
-
 /// One dependent-action provisional-consumption obligation (M006; plan
 /// §65): the consumer attempt consumed `object_key` as the producer
 /// tuple's provisional `(role, virtual_path)` output. Status lifecycle:
@@ -1613,6 +1655,21 @@ pub trait RabsMetadataStore {
         pin_key: &str,
     ) -> Result<Vec<ProvisionalObligationRow>, StoreError>;
 
+    /// Ancestor pin keys of one provisional pin (M017): the materialized
+    /// transitive closure recorded at open time, ordered by key.
+    fn list_provisional_pin_ancestors(
+        &mut self,
+        descendant_pin_key: &str,
+    ) -> Result<Vec<String>, StoreError>;
+
+    /// Descendant pin keys whose recorded closure contains this pin
+    /// (M017) — the reverse edge that makes lineage invalidation cascade
+    /// transitively. Ordered by key.
+    fn list_provisional_pin_descendants(
+        &mut self,
+        ancestor_pin_key: &str,
+    ) -> Result<Vec<String>, StoreError>;
+
     /// The recorded provisional-ancestor lineage of a committed consumer
     /// (H028), ordered by (producer, role, path) — input to the
     /// transitive closure walk at a dependent's commit.
@@ -1929,7 +1986,7 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
     }
 
     /// Shared row mapper for `provisional_pins` SELECTs (single source of
-    /// truth for the 17-column shape; R121 domain restore included).
+    /// truth for the 19-column shape; R121 domain restore included).
     fn map_provisional_pin_row(
         &self,
         row: &[SqlValue],
@@ -1952,6 +2009,8 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
             adopted,
             invalidation,
             released,
+            toolchain_contract,
+            event_contract,
         ] = row
         else {
             return Err(StoreError::Corruption("provisional pin shape".into()));
@@ -1978,6 +2037,8 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
             adopted_object_key: expect_opt_text(adopted, "provisional adoption")?,
             invalidated_reason: expect_opt_text(invalidation, "provisional invalidation")?,
             released: expect_u64(released, "provisional released")? != 0,
+            toolchain_contract_key: expect_text(toolchain_contract, "provisional toolchain contract")?,
+            event_contract_key: expect_text(event_contract, "provisional event contract")?,
         })
     }
 
@@ -4762,57 +4823,13 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             "SELECT pin_key, authority_key, action_key, generation_hex, attempt_hex, \
              lease_hex, role, virtual_path, obj_algo, obj_domain, obj_bytes, object_key, \
              protective_pin_hex, renewal_seq, adopted_object_key, invalidated_reason, \
-             released FROM provisional_pins WHERE pin_key = ?1",
+             released, toolchain_contract_key, event_contract_key \
+             FROM provisional_pins WHERE pin_key = ?1",
             &[SqlValue::Text(pin_key.to_owned())],
         )?;
-        let Some(row) = rows.into_iter().next() else {
-            return Ok(None);
-        };
-        let [
-            pin,
-            authority,
-            action,
-            generation,
-            attempt,
-            lease,
-            role,
-            path,
-            algo,
-            domain,
-            bytes,
-            object,
-            protective,
-            renewal,
-            adopted,
-            invalidation,
-            released,
-        ] = row.as_slice()
-        else {
-            return Err(StoreError::Corruption("provisional pin shape".into()));
-        };
-        Ok(Some(ProvisionalPinRecord {
-            pin_key: expect_text(pin, "provisional pin key")?,
-            authority_key: expect_text(authority, "provisional authority")?,
-            action_key: expect_text(action, "provisional action")?,
-            generation_hex: expect_text(generation, "provisional generation")?,
-            attempt_hex: expect_text(attempt, "provisional attempt")?,
-            lease_hex: expect_text(lease, "provisional lease")?,
-            role_tag: match role {
-                SqlValue::Int(v) => *v,
-                _ => return Err(StoreError::Corruption("provisional role shape".into())),
-            },
-            virtual_path: match path {
-                SqlValue::Blob(b) => b.clone(),
-                _ => return Err(StoreError::Corruption("provisional path shape".into())),
-            },
-            object: self.restore_digest(algo, domain, bytes)?,
-            object_key: expect_text(object, "provisional object")?,
-            protective_pin_hex: expect_text(protective, "provisional protective pin")?,
-            renewal_seq: expect_u64(renewal, "provisional renewal")?,
-            adopted_object_key: expect_opt_text(adopted, "provisional adoption")?,
-            invalidated_reason: expect_opt_text(invalidation, "provisional invalidation")?,
-            released: expect_u64(released, "provisional released")? != 0,
-        }))
+        rows.first()
+            .map(|row| self.map_provisional_pin_row(row))
+            .transpose()
     }
 
     fn insert_provisional_pin(&mut self, pin: &ProvisionalPinInsert) -> Result<(), StoreError> {
@@ -4825,23 +4842,26 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 "INSERT INTO provisional_pins (pin_key, authority_key, action_key, \
                  generation_hex, attempt_hex, lease_hex, role, virtual_path, obj_algo, \
                  obj_domain, obj_bytes, object_key, protective_pin_hex, renewal_seq, \
-                 adopted_object_key, invalidated_reason, released) \
+                 adopted_object_key, invalidated_reason, released, \
+                 toolchain_contract_key, event_contract_key) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, \
-                 NULL, NULL, 0)",
+                 NULL, NULL, 0, ?14, ?15)",
                 &[
-                    SqlValue::Text(row.pin_key),
-                    SqlValue::Text(row.authority_key),
-                    SqlValue::Text(row.action_key),
+                    SqlValue::Text(row.pin_key.clone()),
+                    SqlValue::Text(row.authority_key.clone()),
+                    SqlValue::Text(row.action_key.clone()),
                     SqlValue::Text(u128_hex(row.generation)),
                     SqlValue::Text(u128_hex(row.attempt)),
                     SqlValue::Text(u128_hex(row.lease)),
                     SqlValue::Int(row.role_tag),
-                    SqlValue::Blob(row.virtual_path),
+                    SqlValue::Blob(row.virtual_path.clone()),
                     SqlValue::Text(algo_tag(row.object.algorithm).to_owned()),
                     SqlValue::Text(row.object.domain.to_owned()),
                     SqlValue::Blob(row.object.bytes.to_vec()),
                     SqlValue::Text(digest_key(&row.object)),
                     SqlValue::Text(u128_hex(row.protective_pin_id)),
+                    SqlValue::Text(row.toolchain_contract_key.clone()),
+                    SqlValue::Text(row.event_contract_key.clone()),
                 ],
             )?;
             // The GC-protective twin in `pins` (H010 semantics): same
@@ -4859,8 +4879,55 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     SqlValue::Text(row.reason),
                 ],
             )?;
+            // M017: the materialized transitive ancestor closure is born
+            // in the SAME transaction as the pin — a tear can never leave
+            // a prepared descendant without its recorded lineage.
+            for ancestor_key in &row.ancestor_pin_keys {
+                engine.execute(
+                    "INSERT OR IGNORE INTO provisional_pin_lineage \
+                     (descendant_pin_key, ancestor_pin_key) VALUES (?1, ?2)",
+                    &[
+                        SqlValue::Text(row.pin_key.clone()),
+                        SqlValue::Text(ancestor_key.clone()),
+                    ],
+                )?;
+            }
             Ok(())
         })
+    }
+
+    fn list_provisional_pin_ancestors(
+        &mut self,
+        descendant_pin_key: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT ancestor_pin_key FROM provisional_pin_lineage \
+             WHERE descendant_pin_key = ?1 ORDER BY ancestor_pin_key",
+            &[SqlValue::Text(descendant_pin_key.to_owned())],
+        )?;
+        rows.into_iter()
+            .map(|row| match row.first() {
+                Some(SqlValue::Text(k)) => Ok(k.clone()),
+                _ => Err(StoreError::Corruption("pin lineage ancestor shape".into())),
+            })
+            .collect()
+    }
+
+    fn list_provisional_pin_descendants(
+        &mut self,
+        ancestor_pin_key: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT descendant_pin_key FROM provisional_pin_lineage \
+             WHERE ancestor_pin_key = ?1 ORDER BY descendant_pin_key",
+            &[SqlValue::Text(ancestor_pin_key.to_owned())],
+        )?;
+        rows.into_iter()
+            .map(|row| match row.first() {
+                Some(SqlValue::Text(k)) => Ok(k.clone()),
+                _ => Err(StoreError::Corruption("pin lineage descendant shape".into())),
+            })
+            .collect()
     }
 
     fn record_provisional_grant(
@@ -5370,12 +5437,18 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 "SELECT pin_key, authority_key, action_key, generation_hex, attempt_hex, \
                  lease_hex, role, virtual_path, obj_algo, obj_domain, obj_bytes, object_key, \
                  protective_pin_hex, renewal_seq, adopted_object_key, invalidated_reason, \
-                 released FROM provisional_pins ORDER BY pin_key",
+                 released, toolchain_contract_key, event_contract_key \
+                 FROM provisional_pins ORDER BY pin_key",
             ),
             (
                 "provisional_pin_grants",
                 "SELECT pin_key, grantee_kind, grantee_id, granted_seq \
                  FROM provisional_pin_grants ORDER BY pin_key, grantee_kind, grantee_id",
+            ),
+            (
+                "provisional_pin_lineage",
+                "SELECT descendant_pin_key, ancestor_pin_key FROM provisional_pin_lineage \
+                 ORDER BY descendant_pin_key, ancestor_pin_key",
             ),
             (
                 "provisional_obligations",
@@ -5434,7 +5507,8 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             "SELECT pin_key, authority_key, action_key, generation_hex, attempt_hex, \
              lease_hex, role, virtual_path, obj_algo, obj_domain, obj_bytes, object_key, \
              protective_pin_hex, renewal_seq, adopted_object_key, invalidated_reason, \
-             released FROM provisional_pins \
+             released, toolchain_contract_key, event_contract_key \
+             FROM provisional_pins \
              WHERE action_key = ?1 AND generation_hex = ?2 AND released = 0 ORDER BY pin_key",
             &[
                 SqlValue::Text(action_key.to_owned()),
@@ -5454,7 +5528,8 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             "SELECT pin_key, authority_key, action_key, generation_hex, attempt_hex, \
              lease_hex, role, virtual_path, obj_algo, obj_domain, obj_bytes, object_key, \
              protective_pin_hex, renewal_seq, adopted_object_key, invalidated_reason, \
-             released FROM provisional_pins WHERE action_key = ?1 AND released = 0 \
+             released, toolchain_contract_key, event_contract_key \
+             FROM provisional_pins WHERE action_key = ?1 AND released = 0 \
              ORDER BY pin_key",
             &[SqlValue::Text(action_key.to_owned())],
         )?;
@@ -5471,7 +5546,8 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             "SELECT pin_key, authority_key, action_key, generation_hex, attempt_hex, \
              lease_hex, role, virtual_path, obj_algo, obj_domain, obj_bytes, object_key, \
              protective_pin_hex, renewal_seq, adopted_object_key, invalidated_reason, \
-             released FROM provisional_pins WHERE authority_key = ?1 AND released = 0 \
+             released, toolchain_contract_key, event_contract_key \
+             FROM provisional_pins WHERE authority_key = ?1 AND released = 0 \
              ORDER BY pin_key",
             &[SqlValue::Text(authority_key.to_owned())],
         )?;
@@ -6437,7 +6513,7 @@ mod tests {
             "provenance_edges",
             "provisional_ancestry",
             "provisional_obligations",
-            "provisional_pin_grants",
+            "provisional_pin_lineage",
             "provisional_pins",
             "quarantines",
             "schema_epochs",
