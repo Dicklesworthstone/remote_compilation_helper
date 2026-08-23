@@ -127,3 +127,5 @@ docs/evidence/fleet_deploy_audit_*.json
 .repo_janitor_workspace/
 # Wrangler local state
 .wrangler/
+# br doctor per-run artifacts
+.doctor/

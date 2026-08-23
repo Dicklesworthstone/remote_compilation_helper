@@ -54,3 +54,5 @@ sync_base.jsonl
 # .beads.db.schema-migration-<ts>-<pid>-0.vacuum-fsqlite-ns-{gate,use}.
 *-fsqlite-ns-gate
 *-fsqlite-ns-use
+.write.lock
+*.tmp
