@@ -47,8 +47,10 @@ use rabs_protocol::serving::ServingValidity;
 /// provisional-consumption obligations; v16 = M017 transitive
 /// pin-lineage closure edges + producer contract bindings on pins;
 /// v17 = M020 per-edge min-hop depths (I025 transitive-depth bounds)
-/// on the lineage closure).
-pub const SCHEMA_VERSION: u32 = 17;
+/// on the lineage closure; v18 = M019 provisional install journal
+/// (edge-local records of outputs installed before lineage closure,
+/// with ownership-safe recovery state).
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -391,6 +393,26 @@ pub const MIGRATIONS: &[Migration] = &[
         statements: &["ALTER TABLE provisional_pin_lineage ADD COLUMN \
          min_hops INTEGER NOT NULL DEFAULT 1"],
     },
+    Migration {
+        // M019: provisional install journal (R86). Edge-local record of
+        // EVERY output installed to a real path before its lineage
+        // closed, keyed by (pin, consumer attempt, exact path) so
+        // recovery can be ownership-safe: a path is removed only when
+        // its CURRENT bytes still hash to the recorded object AND the
+        // path is one this operation recorded; anything else is marked
+        // dirty for Cargo revalidation — never guess-deleted.
+        version: 18,
+        statements: &[
+            "CREATE TABLE provisional_install_journal (pin_key TEXT NOT NULL, \
+         consumer_worker TEXT NOT NULL, consumer_attempt_hex TEXT NOT NULL, \
+         installed_path BLOB NOT NULL, obj_algo TEXT NOT NULL, \
+         obj_domain TEXT NOT NULL, obj_bytes BLOB NOT NULL, object_key TEXT NOT NULL, \
+         installed_seq INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'installed', \
+         PRIMARY KEY (pin_key, consumer_attempt_hex, installed_path))",
+            "CREATE INDEX idx_provisional_install_state \
+         ON provisional_install_journal (state)",
+        ],
+    },
 ];
 
 /// Typed store errors (comparable so the differential harness can assert
@@ -718,6 +740,51 @@ pub struct ProvisionalObligationInsert {
     pub object_key: String,
     /// Coordinator sequence at consumption.
     pub created_seq: u64,
+}
+
+/// One provisional install-journal row (M019/R86): an output this
+/// operation installed to a REAL path before its lineage closed.
+/// `object` is the identity the installed bytes had at record time;
+/// recovery removes the path only when current bytes still hash to it,
+/// otherwise marks the row dirty for Cargo revalidation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionalInstallRecord {
+    /// Pin whose lineage the installed output belonged to.
+    pub pin_key: String,
+    /// Worker running the consuming/installing attempt.
+    pub consumer_worker: String,
+    /// Installing attempt id (hex).
+    pub consumer_attempt_hex: String,
+    /// Exact recorded path bytes (full path; recovery never touches
+    /// anything not recorded verbatim).
+    pub installed_path: Vec<u8>,
+    /// Identity of the installed bytes at record time.
+    pub object: TypedDigest,
+    /// Derived digest key of [`Self::object`].
+    pub object_key: String,
+    /// Coordinator sequence at install.
+    pub installed_seq: u64,
+    /// Lifecycle state (`installed` | `removed` | `dirty`).
+    pub state: String,
+}
+
+/// Insert payload for one provisional install journal row (identity
+/// scalars raw; encoding at the SQL boundary).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionalInstallInsert {
+    /// Pin whose lineage the installed output belongs to.
+    pub pin_key: String,
+    /// Worker running the installing attempt.
+    pub consumer_worker: String,
+    /// Installing attempt id.
+    pub consumer_attempt: u128,
+    /// Exact recorded path bytes.
+    pub installed_path: Vec<u8>,
+    /// Identity of the installed bytes (recomputed from disk by the
+    /// caller at record time — journal what IS there).
+    pub object: TypedDigest,
+    /// Coordinator sequence at install.
+    pub installed_seq: u64,
 }
 
 /// Result kind tag persisted with a publication.
