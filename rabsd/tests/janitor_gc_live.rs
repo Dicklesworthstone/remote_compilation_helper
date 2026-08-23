@@ -8,7 +8,7 @@
 use rabs_cas::blob_store::{BlobStoreLayout, DurabilityPolicy, PutLimits, put_if_absent};
 use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::metadata_store::{RusqliteEngine, SqlMetadataStore};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 fn boot_once(state_dir: &std::path::Path, quota: Option<&str>) -> std::process::Output {

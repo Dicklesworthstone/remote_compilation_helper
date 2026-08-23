@@ -512,35 +512,32 @@ mod tests {
                 }
                 30..=54 => {
                     // Start a random queued build (duplicate starts allowed).
-                    if let Some(&id) = live_builds.first() {
-                        if let Some(step) = translator
+                    if let Some(&id) = live_builds.first()
+                        && let Some(step) = translator
                             .translate_line(step_no, &line("build_started", id))
                             .unwrap()
-                        {
-                            all_steps.push(step);
-                        }
+                    {
+                        all_steps.push(step);
                     }
                 }
                 55..=69 => {
                     // Cancel a random build (possibly already cancelled).
-                    if let Some(&id) = live_builds.last() {
-                        if let Some(step) = translator
+                    if let Some(&id) = live_builds.last()
+                        && let Some(step) = translator
                             .translate_line(step_no, &line("cancellation_requested", id))
                             .unwrap()
-                        {
-                            all_steps.push(step);
-                        }
+                    {
+                        all_steps.push(step);
                     }
                 }
                 70..=84 => {
                     // Complete + retire a random build.
-                    if let Some(id) = live_builds.pop() {
-                        if let Some(step) = translator
+                    if let Some(id) = live_builds.pop()
+                        && let Some(step) = translator
                             .translate_line(step_no, &line("build_completed", id))
                             .unwrap()
-                        {
-                            all_steps.push(step);
-                        }
+                    {
+                        all_steps.push(step);
                     }
                 }
                 85..=94 => {
@@ -555,13 +552,12 @@ mod tests {
                 }
                 _ => {
                     // Duplicate queue of an existing build (JOIN).
-                    if let Some(&id) = live_builds.first() {
-                        if let Some(step) = translator
+                    if let Some(&id) = live_builds.first()
+                        && let Some(step) = translator
                             .translate_line(step_no, &line("build_queued", id))
                             .unwrap()
-                        {
-                            all_steps.push(step);
-                        }
+                    {
+                        all_steps.push(step);
                     }
                 }
             }

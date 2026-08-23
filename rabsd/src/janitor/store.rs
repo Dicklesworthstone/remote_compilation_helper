@@ -279,13 +279,13 @@ pub fn janitor_work_with_gc(
                 ),
             }
             let usage = mounted.store_usage_bytes();
-            if let Some(q) = quota_bytes {
-                if usage > q {
-                    println!(
-                        "{{\"v\":1,\"kind\":\"janitor-quota-exceeded\",\"bytes\":{},\"quota_bytes\":{}}}",
-                        usage, q
-                    );
-                }
+            if let Some(q) = quota_bytes
+                && usage > q
+            {
+                println!(
+                    "{{\"v\":1,\"kind\":\"janitor-quota-exceeded\",\"bytes\":{},\"quota_bytes\":{}}}",
+                    usage, q
+                );
             }
             println!(
                 "{{\"v\":1,\"kind\":\"janitor-store-usage\",\"bytes\":{}}}",
