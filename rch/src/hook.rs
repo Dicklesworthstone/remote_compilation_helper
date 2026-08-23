@@ -3953,7 +3953,7 @@ fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
 
     let escaped_command = shell_escape::escape(command.into());
     let script = format!(
-        "{base_prelude}; mkdir -p {cargo_home} || exit $?; export CARGO_HOME={cargo_home}; if command -v git >/dev/null 2>&1; then export CARGO_NET_GIT_FETCH_WITH_CLI=true; fi; sh -c {command}",
+        "{base_prelude}; mkdir -p {cargo_home} || exit $?; touch {cargo_home} 2>/dev/null || true; export CARGO_HOME={cargo_home}; if command -v git >/dev/null 2>&1; then export CARGO_NET_GIT_FETCH_WITH_CLI=true; fi; sh -c {command}",
         base_prelude = base_prelude,
         cargo_home = quoted_cargo_home,
         command = escaped_command
