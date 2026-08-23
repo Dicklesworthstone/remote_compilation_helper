@@ -46,6 +46,7 @@
 
 pub mod authority;
 pub mod authority_matrix;
+pub mod build_script_policy;
 pub mod capability_tokens;
 pub mod class_policy;
 pub mod compat_doctor;
@@ -64,6 +65,7 @@ pub mod envelope;
 pub mod frame_extensions;
 pub mod framing;
 pub mod generation;
+pub mod generator_detection;
 pub mod identity_store;
 pub mod incident_bundle;
 pub mod incremental_snapshot;
