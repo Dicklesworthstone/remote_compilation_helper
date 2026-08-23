@@ -101,9 +101,10 @@ pub fn lineage_gated_terminal_delivery(
     })
 }
 
-/// The transitive-lineage depth a waiting wrapper occupies (I025): the
-/// longest min-hop ancestor chain among the pins it directly consumed.
-/// Zero when the attempt consumed nothing provisional.
+/// The transitive-lineage depth a waiting wrapper occupies (I025): one
+/// hop to each directly-consumed provisional pin plus that pin's
+/// deepest recorded ancestor chain. Zero when the attempt consumed
+/// nothing provisional.
 ///
 /// # Errors
 /// Store failures.
@@ -115,7 +116,11 @@ pub fn lineage_wait_depth(
     for obligation in store
         .list_open_provisional_obligations_by_attempt(&format!("{:032x}", consumer_attempt.0))?
     {
-        depth = depth.max(store.provisional_pin_closure_depth(&obligation.pin_key)?);
+        depth = depth.max(
+            store
+                .provisional_pin_closure_depth(&obligation.pin_key)?
+                .saturating_add(1),
+        );
     }
     Ok(depth)
 }
@@ -135,10 +140,13 @@ pub struct WaiterBounds {
     pub max_lineage_depth: u64,
 }
 
-/// The transitive-lineage depth a waiting wrapper occupies (I025): one
-/// hop to each directly-consumed provisional pin plus that pin's
-/// deepest recorded ancestor chain. Zero when the attempt consumed
-/// nothing provisional.
+impl Default for WaiterBounds {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 8,
+            reserved_progress_slots: 1,
+            max_lineage_depth: 16,
+        }
     }
 }
 
