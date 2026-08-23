@@ -59,7 +59,8 @@ use rabs_cas::publication::{
 };
 use rabs_cas::serving_state::{ServeDecision, serving_gate};
 use rabs_cas::test_support::{
-    divergent_offer_with_manifest_bytes, install_admission_world, install_offer_closure,
+    divergent_offer_with_manifest_bytes, divergent_offer_with_manifest_bytes_with_ids,
+    install_admission_world, install_admission_world_with_ids, install_offer_closure,
     offer_serving_object, offer_under, offer_with_manifest_bytes, sample_action_key,
     sample_expected_descriptor,
 };
@@ -370,15 +371,35 @@ fn divergence_is_classified_from_cas_bytes_after_a_restart() {
     }
 
     // Incarnation 2: a brand-new process-level coordinator over the same
-    // on-disk store — no memory of incarnation 1 whatsoever.
+    // on-disk store — no memory of incarnation 1 whatsoever. G020/R120:
+    // its boot CLOSED incarnation 1's generations, so the divergent
+    // candidate reissues in a FRESH generation bound to the new authority
+    // (ids above the never-reuse high-water mark; the old attempt id is
+    // burned) — prior-authority execution may contribute verified blobs
+    // but can never publish under the new term.
     let cas = Arc::new(mount_and_reconcile(&cas_root).expect("re-mount"));
     let coord = CoordLive::with_cas(Arc::clone(&cas));
     let authority = coord
         .acquire_boot_authority(&cluster_id())
         .expect("authority");
     assert_eq!(authority.term, 2, "the reboot must advance the term");
+    assert_eq!(
+        coord.closed_prior_generations(),
+        1,
+        "boot must close the single generation the prior term left active"
+    );
 
-    let (divergent, bytes) = divergent_offer_with_manifest_bytes(&authority);
+    let reissue_ids = rabs_cas::test_support::FixtureAttemptIds {
+        generation: 12,
+        attempt: 21,
+        lease: 31,
+    };
+    {
+        let mut store = cas.store().lock().expect("store lock");
+        install_admission_world_with_ids(&mut *store, &authority, reissue_ids);
+    }
+    let (divergent, bytes) =
+        divergent_offer_with_manifest_bytes_with_ids(&authority, reissue_ids);
     store_manifest_object(&cas, &divergent, &bytes);
     let outcome = coord
         .commit_offer(&divergent, &sample_expected_descriptor())

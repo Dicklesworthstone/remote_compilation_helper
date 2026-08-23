@@ -1920,8 +1920,8 @@ mod tests {
         assert_eq!(serving.state_revision, 1);
         assert_eq!(
             serving.coordinator_authority_digest,
-            d(200),
-            "serving stamps the creating authority digest"
+            coordinator_authority_digest(&authority_under_test()),
+            "serving stamps the creating authority digest (F033 canonical form)"
         );
 
         // Drain the winner to Finished; the publication stays immutable.
@@ -2361,7 +2361,12 @@ mod tests {
     fn actor_shell_processes_messages_under_a_test_cx() {
         let cx = Cx::for_testing();
         let mut host = ActionActorHost {
-            core: ActionActor::new(descriptor(), &authority_under_test(), "coord-shell-test", 1_000),
+            core: ActionActor::new(
+                descriptor(),
+                &authority_under_test(),
+                "coord-shell-test",
+                1_000,
+            ),
         };
         let waker = std::task::Waker::noop();
         let mut task = std::task::Context::from_waker(waker);

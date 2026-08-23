@@ -287,6 +287,11 @@ pub struct CoordLive {
     /// rows are keyed by (action, seq); a reused seq with different
     /// content is a typed store refusal, never a silent patch).
     next_seq: AtomicU64,
+    /// Generations closed by this incarnation's authority acquisition
+    /// (G020/R120): every still-active generation minted under a PRIOR
+    /// authority, tombstoned at boot so no prior-authority attempt can
+    /// ever publish.
+    closed_prior_generations: AtomicU64,
 }
 
 impl std::fmt::Debug for CoordLive {
@@ -381,13 +386,25 @@ impl CoordLive {
         let digest = authority_digest(&authority);
         store
             .acquire_authority(&AuthorityRow {
-                digest,
+                digest: digest.clone(),
                 cluster_id: cluster_id.to_owned(),
                 incarnation: u128::from(self.boot_nonce),
                 term,
                 acquired_seq: self.next_seq(),
             })
             .map_err(|e: StoreError| format!("acquire authority: {e:?}"))?;
+        // G020/R120: this term supersedes every prior one. Durably close
+        // all still-active generations minted under earlier authorities so
+        // no prior-authority attempt can publish; publication-eligible
+        // work reissues only in fresh generations minted (above the
+        // never-reuse high-water mark) under THIS authority. Fail-closed:
+        // if closure cannot be made durable, this incarnation refuses the
+        // authority rather than running where R120 is unenforceable — the
+        // acquired row is released and re-acquired at the next boot.
+        let closed = store
+            .close_generations_for_other_authorities(&digest)
+            .map_err(|e: StoreError| format!("close prior-authority generations: {e:?}"))?;
+        self.closed_prior_generations.store(closed, Ordering::Relaxed);
         drop(store);
         *self
             .authority
@@ -400,6 +417,13 @@ impl CoordLive {
     #[must_use]
     pub fn authority(&self) -> Option<CoordinatorAuthority> {
         self.authority.lock().ok().and_then(|a| a.clone())
+    }
+
+    /// How many prior-authority generations this incarnation's boot
+    /// closed (G020); zero for the first boot over a fresh store.
+    #[must_use]
+    pub fn closed_prior_generations(&self) -> u64 {
+        self.closed_prior_generations.load(Ordering::Relaxed)
     }
 
     /// Commit a worker's prepared-result offer: the coordinator-only
@@ -671,11 +695,13 @@ impl CoordLive {
         format!(
             "{{\"v\":1,\"kind\":\"coord-status\",\"available\":{},\"open_flights\":{open_flights},\
              \"lease_registry_mounted\":{lease_holders},\"destination_arbiter_mounted\":{reservations},\
-             \"cas_mounted\":{},\"authority_held\":{},\"authority_term\":{}}}",
+             \"cas_mounted\":{},\"authority_held\":{},\"authority_term\":{},\
+             \"closed_prior_authority_generations\":{}}}",
             self.available(),
             self.cas.is_some(),
             authority.is_some(),
             authority.map_or(0, |a| a.term),
+            self.closed_prior_generations(),
         )
     }
 
@@ -797,12 +823,13 @@ pub fn coord_work(
                 Ok(authority) => println!(
                     "{{\"v\":1,\"kind\":\"coord-authority-acquired\",\"cluster_id\":\"{}\",\
                      \"credential_generation\":{},\"term\":{},\"incarnation\":\"{}\",\
-                     \"digest\":\"{}\"}}",
+                     \"digest\":\"{}\",\"prior_generations_closed\":{}}}",
                     authority.cluster_id.0,
                     authority.credential_generation,
                     authority.term,
                     authority.incarnation_id.0,
                     digest_key(&authority_digest(&authority)),
+                    coord.closed_prior_generations(),
                 ),
                 Err(reason) => println!(
                     "{{\"v\":1,\"kind\":\"coord-authority-refused\",\"reason\":\"{}\"}}",
