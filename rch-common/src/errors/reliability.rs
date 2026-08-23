@@ -244,6 +244,8 @@ impl ReliabilityReasonCode {
             Self::RepoConvergenceFailed => "RepoConvergenceFailed",
             Self::RepoConvergenceDrift => "RepoConvergenceDrift",
             Self::RepoConvergenceNoWorkers => "RepoConvergenceNoWorkers",
+            Self::RepoConvergenceReady => "RepoConvergenceReady",
+            Self::WorkerRepoNotReady => "WorkerRepoNotReady",
             Self::HelperAvailable => "HelperAvailable",
             Self::HelperMissing => "HelperMissing",
             Self::HelperProbeUnavailable => "HelperProbeUnavailable",
