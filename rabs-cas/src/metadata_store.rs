@@ -45,8 +45,10 @@ use rabs_protocol::serving::ServingValidity;
 /// lineage + adoption edges; v14 = M004 provisional `.rmeta` upload
 /// pins + authorized-visibility grants; v15 = M006 dependent-action
 /// provisional-consumption obligations; v16 = M017 transitive
-/// pin-lineage closure edges + producer contract bindings on pins).
-pub const SCHEMA_VERSION: u32 = 16;
+/// pin-lineage closure edges + producer contract bindings on pins;
+/// v17 = M020 per-edge min-hop depths (I025 transitive-depth bounds)
+/// on the lineage closure).
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -377,6 +379,18 @@ pub const MIGRATIONS: &[Migration] = &[
          ON provisional_pin_lineage (ancestor_pin_key)",
         ],
     },
+    Migration {
+        // M020: per-edge min-hop depths on the materialized closure
+        // (I025). Depth is computed at pin-open time by layered BFS over
+        // the ancestors' own recorded depths and lets the terminal-gate
+        // layer bound lineage-waiting wrappers by TRANSITIVE DEPTH, not
+        // just count. Legacy (v16) rows read as depth 1 — a conservative
+        // underestimate only for pre-M020 pins, which never carried
+        // multi-hop closures anyway.
+        version: 17,
+        statements: &["ALTER TABLE provisional_pin_lineage ADD COLUMN \
+         min_hops INTEGER NOT NULL DEFAULT 1"],
+    },
 ];
 
 /// Typed store errors (comparable so the differential harness can assert
@@ -607,7 +621,9 @@ pub struct ProvisionalPinRecord {
 /// M017: `ancestor_pin_keys` is the COMPLETE transitive ancestor-pin
 /// closure of the producing attempt, computed by the caller and written
 /// in the SAME transaction as the pin row — a prepared descendant always
-/// carries its full lineage, and no tear can strip it.
+/// carries its full lineage, and no tear can strip it. Each entry pairs
+/// the ancestor key with its MIN-HOP distance from the new pin (M020):
+/// 1 for direct ancestors, min-over-parents otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionalPinInsert {
     /// Canonical digest key of the identity tuple.
@@ -638,9 +654,10 @@ pub struct ProvisionalPinInsert {
     pub toolchain_contract_key: String,
     /// Digest key of the producer's event contract; empty when unbound.
     pub event_contract_key: String,
-    /// Complete transitive ancestor-pin closure (M017), sorted for
-    /// deterministic SQL ordering.
-    pub ancestor_pin_keys: Vec<String>,
+    /// Complete transitive ancestor-pin closure (M017): (ancestor key,
+    /// min-hop distance from this pin) pairs, sorted for deterministic
+    /// SQL ordering. Distances feed I025 transitive-depth bounds.
+    pub ancestor_pin_keys: Vec<(String, u64)>,
 }
 /// One dependent-action provisional-consumption obligation (M006; plan
 /// §65): the consumer attempt consumed `object_key` as the producer
@@ -1655,12 +1672,18 @@ pub trait RabsMetadataStore {
         pin_key: &str,
     ) -> Result<Vec<ProvisionalObligationRow>, StoreError>;
 
-    /// Ancestor pin keys of one provisional pin (M017): the materialized
-    /// transitive closure recorded at open time, ordered by key.
+    /// Ancestor pin keys of one provisional pin with their min-hop
+    /// distances (M017/M020): the materialized transitive closure
+    /// recorded at open time, ordered by key.
     fn list_provisional_pin_ancestors(
         &mut self,
         descendant_pin_key: &str,
-    ) -> Result<Vec<String>, StoreError>;
+    ) -> Result<Vec<(String, u64)>, StoreError>;
+
+    /// Longest min-hop chain in one pin's recorded closure — the pin's
+    /// transitive lineage depth (M020/I025). Zero for a root producer.
+    fn provisional_pin_closure_depth(&mut self, descendant_pin_key: &str)
+        -> Result<u64, StoreError>;
 
     /// Descendant pin keys whose recorded closure contains this pin
     /// (M017) — the reverse edge that makes lineage invalidation cascade
@@ -1670,10 +1693,11 @@ pub trait RabsMetadataStore {
         ancestor_pin_key: &str,
     ) -> Result<Vec<String>, StoreError>;
 
-    /// All NON-resolved obligations of ONE consuming attempt regardless
-    /// of worker (M017): attempt ids are globally unique, so lineage
-    /// closure walks key on the attempt alone. Ordered by pin key.
-    fn list_open_provisional_obligations_by_attempt(
+    /// ALL obligations of ONE consuming attempt regardless of worker or
+    /// status (M020): the terminal-delivery gate verifies each row's
+    /// final state, including that `resolved` rows resolved to the EXACT
+    /// consumed object. Ordered by (status, pin key).
+    fn list_provisional_obligations_by_attempt_all(
         &mut self,
         consumer_attempt_hex: &str,
     ) -> Result<Vec<ProvisionalObligationRow>, StoreError>;
@@ -4893,13 +4917,14 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             // M017: the materialized transitive ancestor closure is born
             // in the SAME transaction as the pin — a tear can never leave
             // a prepared descendant without its recorded lineage.
-            for ancestor_key in &row.ancestor_pin_keys {
+            for (ancestor_key, min_hops) in &row.ancestor_pin_keys {
                 engine.execute(
                     "INSERT OR IGNORE INTO provisional_pin_lineage \
-                     (descendant_pin_key, ancestor_pin_key) VALUES (?1, ?2)",
+                     (descendant_pin_key, ancestor_pin_key, min_hops) VALUES (?1, ?2, ?3)",
                     &[
                         SqlValue::Text(row.pin_key.clone()),
                         SqlValue::Text(ancestor_key.clone()),
+                        SqlValue::Int(*min_hops as i64),
                     ],
                 )?;
             }
@@ -4910,18 +4935,35 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
     fn list_provisional_pin_ancestors(
         &mut self,
         descendant_pin_key: &str,
-    ) -> Result<Vec<String>, StoreError> {
+    ) -> Result<Vec<(String, u64)>, StoreError> {
         let rows = self.engine.query(
-            "SELECT ancestor_pin_key FROM provisional_pin_lineage \
+            "SELECT ancestor_pin_key, min_hops FROM provisional_pin_lineage \
              WHERE descendant_pin_key = ?1 ORDER BY ancestor_pin_key",
             &[SqlValue::Text(descendant_pin_key.to_owned())],
         )?;
         rows.into_iter()
-            .map(|row| match row.first() {
-                Some(SqlValue::Text(k)) => Ok(k.clone()),
+            .map(|row| match row.as_slice() {
+                [SqlValue::Text(k), SqlValue::Int(h)] => {
+                    Ok((k.clone(), u64::try_from(*h).unwrap_or(0)))
+                }
                 _ => Err(StoreError::Corruption("pin lineage ancestor shape".into())),
             })
             .collect()
+    }
+
+    fn provisional_pin_closure_depth(
+        &mut self,
+        descendant_pin_key: &str,
+    ) -> Result<u64, StoreError> {
+        let rows = self.engine.query(
+            "SELECT COALESCE(MAX(min_hops), 0) FROM provisional_pin_lineage \
+             WHERE descendant_pin_key = ?1",
+            &[SqlValue::Text(descendant_pin_key.to_owned())],
+        )?;
+        match rows.first().map(Vec::as_slice) {
+            Some([SqlValue::Int(h)]) => Ok(u64::try_from(*h).unwrap_or(0)),
+            _ => Err(StoreError::Corruption("pin lineage depth shape".into())),
+        }
     }
 
     fn list_provisional_pin_descendants(
@@ -5460,7 +5502,8 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             ),
             (
                 "provisional_pin_lineage",
-                "SELECT descendant_pin_key, ancestor_pin_key FROM provisional_pin_lineage \
+                "SELECT descendant_pin_key, ancestor_pin_key, min_hops \
+                 FROM provisional_pin_lineage \
                  ORDER BY descendant_pin_key, ancestor_pin_key",
             ),
             (
@@ -5579,6 +5622,23 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
              status, resolution_object_key, created_seq FROM provisional_obligations \
              WHERE consumer_attempt_hex = ?1 AND status != 'resolved' \
              ORDER BY pin_key",
+            &[SqlValue::Text(consumer_attempt_hex.to_owned())],
+        )?;
+        rows.iter()
+            .map(|row| Self::map_obligation_row(row))
+            .collect()
+    }
+
+    fn list_provisional_obligations_by_attempt_all(
+        &mut self,
+        consumer_attempt_hex: &str,
+    ) -> Result<Vec<ProvisionalObligationRow>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT consumer_worker, consumer_attempt_hex, pin_key, producer_action_key, \
+             producer_generation_hex, producer_attempt_hex, role, virtual_path, object_key, \
+             status, resolution_object_key, created_seq FROM provisional_obligations \
+             WHERE consumer_attempt_hex = ?1 \
+             ORDER BY status, pin_key",
             &[SqlValue::Text(consumer_attempt_hex.to_owned())],
         )?;
         rows.iter()

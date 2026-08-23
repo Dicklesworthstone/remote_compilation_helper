@@ -396,18 +396,29 @@ pub fn open_provisional_pin(
     // SAME insert transaction as the pin row (M017 store contract), so a
     // prepared descendant always carries its lineage — no tear can strip
     // it, and invalidation can always reach every consuming descendant.
-    let mut visited = std::collections::BTreeSet::new();
-    let mut worklist: Vec<String> = store
+    // M020: layered relaxation computes each ancestor's MIN-HOP distance
+    // from this pin. Direct ancestors sit at depth 1; an ancestor A seen
+    // through parent P sits at dist(P) + (P's recorded min-hops to A).
+    // Stored depths are minimal by induction — every pin wrote its own
+    // closure the same way — so one pass over parents' rows yields exact
+    // minima, which the terminal-gate layer bounds by TRANSITIVE DEPTH
+    // (I025), not just waiter count.
+    let mut best: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut frontier: Vec<(String, u64)> = store
         .list_open_provisional_obligations_by_attempt(&format!("{:032x}", identity.attempt.0))?
         .into_iter()
-        .map(|obligation| obligation.pin_key)
+        .map(|obligation| (obligation.pin_key, 1))
         .collect();
-    while let Some(ancestor_key) = worklist.pop() {
-        if visited.insert(ancestor_key.clone()) {
-            worklist.extend(store.list_provisional_pin_ancestors(&ancestor_key)?);
+    while let Some((key, hops)) = frontier.pop() {
+        if best.get(&key).is_some_and(|&known| known <= hops) {
+            continue;
+        }
+        best.insert(key.clone(), hops);
+        for (ancestor_key, stored_hops) in store.list_provisional_pin_ancestors(&key)? {
+            frontier.push((ancestor_key, hops + stored_hops));
         }
     }
-    let ancestor_pin_keys: Vec<String> = visited.into_iter().collect();
+    let ancestor_pin_keys: Vec<(String, u64)> = best.into_iter().collect();
     let digest = identity.digest();
     // Deterministic 128-bit protective-pin id derived from the identity
     // digest; the SQL UNIQUE constraint on `pins.id_hex` fails closed in
@@ -633,7 +644,7 @@ pub fn verify_transitive_lineage(
             ),
         });
     }
-    for ancestor_pin_key in store.list_provisional_pin_ancestors(&pin_key)? {
+    for (ancestor_pin_key, _min_hops) in store.list_provisional_pin_ancestors(&pin_key)? {
         let Some(ancestor) = store.provisional_pin_row(&ancestor_pin_key)? else {
             return Err(ProvisionalPinError::AncestorLineageUnresolved {
                 pin_key: pin_key.clone(),
