@@ -974,6 +974,10 @@ pub struct TransferPipeline {
     color_mode: ColorMode,
     /// Environment variables to forward to workers.
     env_allowlist: Vec<String>,
+    /// Layer 0 configuration-pack env pairs (bd-bqu38): config-resolved
+    /// `CARGO_PROFILE_*` assignments forced onto the remote build, bypassing
+    /// the ambient-environment allowlist lookup entirely.
+    layer0_env: Vec<(String, String)>,
     /// Optional environment overrides for testing.
     env_overrides: Option<HashMap<String, String>>,
     /// Compilation kind for command-specific handling.
@@ -1097,6 +1101,7 @@ impl TransferPipeline {
             ssh_options,
             color_mode: ColorMode::default(),
             env_allowlist: Vec::new(),
+            layer0_env: Vec::new(),
             env_overrides: None,
             compilation_kind: None,
             compilation_config: rch_common::CompilationConfig::default(),
@@ -1144,6 +1149,18 @@ impl TransferPipeline {
     /// Set environment allowlist for remote execution.
     pub fn with_env_allowlist(mut self, allowlist: Vec<String>) -> Self {
         self.env_allowlist = allowlist;
+        self
+    }
+
+    /// Force Layer 0 configuration-pack env pairs (bd-bqu38).
+    ///
+    /// These are resolved from the `[layer0]` config knobs by the caller and
+    /// applied verbatim on the remote side — they do NOT consult the ambient
+    /// local environment, so a knob takes effect even when the invoking shell
+    /// has no such variable set.
+    #[must_use]
+    pub fn with_layer0_env(mut self, layer0_env: Vec<(String, String)>) -> Self {
+        self.layer0_env = layer0_env;
         self
     }
 
@@ -1458,6 +1475,25 @@ impl TransferPipeline {
                 ensure_dirs.push(ensure_dir);
             }
             parts.push(self.format_env_assignment(key, &escaped, true));
+            applied.push(key.to_string());
+        }
+
+        // Layer 0 configuration pack (bd-bqu38): explicit config-resolved
+        // assignments (e.g. CARGO_PROFILE_RELEASE_LTO=thin). These never come
+        // from the ambient local environment — they are resolved from the
+        // `[layer0]` knobs — so they bypass the allowlist lookup and apply
+        // even when the caller's environment is empty. Skip any key already
+        // applied above so an operator-forwarded duplicate cannot disagree
+        // with the pack.
+        for (key, value) in &self.layer0_env {
+            if applied.iter().any(|k| k == key) {
+                continue;
+            }
+            let Some(escaped) = shell_escape_value(value) else {
+                warn!("Rejecting Layer 0 env var '{key}': unsafe characters in value");
+                continue;
+            };
+            parts.push(self.format_env_assignment(key, &escaped, false));
             applied.push(key.to_string());
         }
 
@@ -8798,6 +8834,65 @@ Total file size: 123 bytes";
         assert!(args.iter().any(|a| a == "--safe-links"));
     }
 
+    #[test]
+    fn test_layer0_env_pairs_are_injected_verbatim() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_layer0_env(vec![
+            ("CARGO_PROFILE_RELEASE_LTO".to_string(), "thin".to_string()),
+            (
+                "CARGO_PROFILE_RELEASE_CODEGEN_UNITS".to_string(),
+                "1".to_string(),
+            ),
+        ]);
+        let env_prefix = pipeline.build_env_prefix();
+        assert!(
+            env_prefix.prefix.contains("CARGO_PROFILE_RELEASE_LTO=thin"),
+            "layer0 pairs must be emitted as assignments: {}",
+            env_prefix.prefix
+        );
+        assert!(
+            env_prefix
+                .prefix
+                .contains("CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1")
+        );
+        assert!(
+            env_prefix
+                .applied
+                .contains(&"CARGO_PROFILE_RELEASE_LTO".to_string())
+        );
+        assert!(
+            env_prefix
+                .applied
+                .contains(&"CARGO_PROFILE_RELEASE_CODEGEN_UNITS".to_string())
+        );
+    }
+
+    #[test]
+    fn test_layer0_env_absent_by_default() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        );
+
+        let env_prefix = pipeline.build_env_prefix();
+        assert!(!env_prefix.prefix.contains("CARGO_PROFILE_"));
+        assert!(
+            !env_prefix
+                .applied
+                .iter()
+                .any(|k| k.starts_with("CARGO_PROFILE_")),
+            "no Layer 0 knob may inject unless resolved and attached"
+        );
+    }
     #[test]
     fn build_retrieve_command_excludes_local_source_dirs_at_anchored_paths() {
         // TEST START: integration test — build the retrieve command for a

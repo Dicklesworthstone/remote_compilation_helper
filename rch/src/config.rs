@@ -612,6 +612,11 @@ struct PartialRchConfig {
     // "unknown key" branch in collect_value_sources below.
     #[serde(default)]
     path_topology: PartialPathTopologyConfig,
+    // Layer 0 configuration pack knobs (bd-bqu38). Without this field the
+    // `[layer0]` TOML section would silently deserialize to nothing — the
+    // same trap issue #10 documented for path_topology.
+    #[serde(default)]
+    layer0: PartialLayer0Config,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -620,6 +625,12 @@ struct PartialPathTopologyConfig {
     alias_root: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct PartialLayer0Config {
+    enabled: Option<bool>,
+    release_lto_thin: Option<bool>,
+    release_codegen_units_1: Option<bool>,
+}
 #[derive(Debug, Default, Deserialize)]
 struct PartialGeneralConfig {
     enabled: Option<bool>,
@@ -1568,6 +1579,20 @@ fn apply_layer(
         config.path_topology.alias_root = Some(alias_root.clone());
         set_source(sources, "path_topology.alias_root", source.clone());
     }
+
+    // Layer 0 pack knobs (bd-bqu38). Plain bools: Some ⇒ set.
+    if let Some(enabled) = layer.layer0.enabled {
+        config.layer0.enabled = enabled;
+        set_source(sources, "layer0.enabled", source.clone());
+    }
+    if let Some(lto_thin) = layer.layer0.release_lto_thin {
+        config.layer0.release_lto_thin = lto_thin;
+        set_source(sources, "layer0.release_lto_thin", source.clone());
+    }
+    if let Some(cgu_1) = layer.layer0.release_codegen_units_1 {
+        config.layer0.release_codegen_units_1 = cgu_1;
+        set_source(sources, "layer0.release_codegen_units_1", source.clone());
+    }
 }
 
 fn set_source(sources: &mut ConfigSourceMap, key: &str, source: ConfigValueSource) {
@@ -1646,6 +1671,22 @@ fn merge_config(mut base: RchConfig, overlay: RchConfig) -> RchConfig {
         base.path_topology
             .alias_root
             .clone_from(&overlay.path_topology.alias_root);
+    }
+
+    // Merge layer0 section (bd-bqu38): overlay wins when meaningfully set —
+    // i.e., differs from the compiled-in default (every knob OFF).
+    if overlay.layer0.enabled != default.layer0.enabled {
+        base.layer0.enabled.clone_from(&overlay.layer0.enabled);
+    }
+    if overlay.layer0.release_lto_thin != default.layer0.release_lto_thin {
+        base.layer0
+            .release_lto_thin
+            .clone_from(&overlay.layer0.release_lto_thin);
+    }
+    if overlay.layer0.release_codegen_units_1 != default.layer0.release_codegen_units_1 {
+        base.layer0
+            .release_codegen_units_1
+            .clone_from(&overlay.layer0.release_codegen_units_1);
     }
 
     base
