@@ -53,6 +53,7 @@ pub mod manifest_codec;
 pub mod manifest_validation;
 pub mod materialization;
 pub mod metadata_store;
+pub mod native_children;
 pub mod pack;
 pub mod pin_leases;
 pub mod provisional_pins;

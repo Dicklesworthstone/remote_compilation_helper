@@ -49,8 +49,9 @@ use rabs_protocol::serving::ServingValidity;
 /// v17 = M020 per-edge min-hop depths (I025 transitive-depth bounds)
 /// on the lineage closure; v18 = M019 provisional install journal
 /// (edge-local records of outputs installed before lineage closure,
-/// with ownership-safe recovery state).
-pub const SCHEMA_VERSION: u32 = 18;
+/// with ownership-safe recovery state); v19 = L008 native child
+/// bindings gating parent build-script publication.
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -411,6 +412,20 @@ pub const MIGRATIONS: &[Migration] = &[
          PRIMARY KEY (pin_key, consumer_attempt_hex, installed_path))",
             "CREATE INDEX idx_provisional_install_state \
          ON provisional_install_journal (state)",
+        ],
+    },
+    Migration {
+        // L008: native child bindings. A build-script (parent) action
+        // declares the native child actions whose outputs it consumes;
+        // the parent's publication is refused while any binding stays
+        // `bound` (child unresolved) and flips to `satisfied` — with an
+        // idempotent provenance edge — once the child result commits.
+        version: 19,
+        statements: &[
+            "CREATE TABLE native_child_bindings (parent_action_key TEXT NOT NULL, \
+         child_action_key TEXT NOT NULL, bound_seq INTEGER NOT NULL, \
+         state TEXT NOT NULL DEFAULT 'bound', \
+         PRIMARY KEY (parent_action_key, child_action_key))",
         ],
     },
 ];
@@ -1753,6 +1768,32 @@ pub trait RabsMetadataStore {
         pin_key: &str,
         consumer_attempt_hex: &str,
         installed_path: &[u8],
+        state: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Bind native child actions to a parent build-script action
+    /// (L008). Idempotent per (parent, child); children are appended to
+    /// any existing set.
+    fn bind_native_children(
+        &mut self,
+        parent_action_key: &str,
+        child_action_keys: &[String],
+        bound_seq: u64,
+    ) -> Result<(), StoreError>;
+
+    /// All native child bindings of one parent action with their
+    /// states (`bound` | `satisfied`), ordered by child key.
+    fn list_native_child_bindings(
+        &mut self,
+        parent_action_key: &str,
+    ) -> Result<Vec<(String, String)>, StoreError>;
+
+    /// Transition one binding's state (`bound` → `satisfied`). Unknown
+    /// rows are a typed error.
+    fn set_native_child_binding_state(
+        &mut self,
+        parent_action_key: &str,
+        child_action_key: &str,
         state: &str,
     ) -> Result<(), StoreError>;
     /// Open provisional pins minted by ONE action generation (M007
@@ -5615,6 +5656,12 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                  ORDER BY worker, capability",
             ),
             (
+                "native_child_bindings",
+                "SELECT parent_action_key, child_action_key, bound_seq, state \
+                 FROM native_child_bindings \
+                 ORDER BY parent_action_key, child_action_key",
+            ),
+            (
                 "worker_health_samples",
                 "SELECT worker, seq, healthy, detail FROM worker_health_samples \
                  ORDER BY worker, seq",
@@ -5919,6 +5966,78 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     SqlValue::Text(pin_key),
                     SqlValue::Text(attempt_hex),
                     SqlValue::Blob(path),
+                    SqlValue::Text(state),
+                ],
+            )?;
+            if affected == 0 {
+                return Err(StoreError::UnknownPin);
+            }
+            Ok(())
+        })
+    }
+
+    fn bind_native_children(
+        &mut self,
+        parent_action_key: &str,
+        child_action_keys: &[String],
+        bound_seq: u64,
+    ) -> Result<(), StoreError> {
+        let parent = parent_action_key.to_owned();
+        let children: Vec<String> = child_action_keys.to_vec();
+        self.in_txn(move |engine| {
+            for child in children {
+                engine.execute(
+                    "INSERT OR IGNORE INTO native_child_bindings \
+                     (parent_action_key, child_action_key, bound_seq, state) \
+                     VALUES (?1, ?2, ?3, 'bound')",
+                    &[
+                        SqlValue::Text(parent.clone()),
+                        SqlValue::Text(child),
+                        SqlValue::Int(bound_seq as i64),
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    fn list_native_child_bindings(
+        &mut self,
+        parent_action_key: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT child_action_key, state FROM native_child_bindings \
+             WHERE parent_action_key = ?1 ORDER BY child_action_key",
+            &[SqlValue::Text(parent_action_key.to_owned())],
+        )?;
+        rows.into_iter()
+            .map(|row| match row.as_slice() {
+                [SqlValue::Text(child), SqlValue::Text(state)] => {
+                    Ok((child.clone(), state.clone()))
+                }
+                _ => Err(StoreError::Corruption("native child binding shape".into())),
+            })
+            .collect()
+    }
+
+    fn set_native_child_binding_state(
+        &mut self,
+        parent_action_key: &str,
+        child_action_key: &str,
+        state: &str,
+    ) -> Result<(), StoreError> {
+        let (parent, child, state) = (
+            parent_action_key.to_owned(),
+            child_action_key.to_owned(),
+            state.to_owned(),
+        );
+        self.in_txn(move |engine| {
+            let affected = engine.execute(
+                "UPDATE native_child_bindings SET state = ?3 \
+                 WHERE parent_action_key = ?1 AND child_action_key = ?2",
+                &[
+                    SqlValue::Text(parent),
+                    SqlValue::Text(child),
                     SqlValue::Text(state),
                 ],
             )?;
@@ -6782,9 +6901,8 @@ mod tests {
         store.advance_worker_fence(&active, "worker-a", 7).unwrap();
         store.advance_edge_fence(&active, "edge-1", 9).unwrap();
     }
-
     fn h038_fence_check_after_reopen(store: &mut dyn RabsMetadataStore) {
-        // Fences must survive restart: the stale incarnations refused
+        // Fence rows written by the seed survive the reopen: values set
         // before the reopen stay refused after it.
         store.acquire_authority(&authority(1)).unwrap();
         let active = digest("rabs.authority.sha256.v1", 1);
@@ -6875,6 +6993,7 @@ mod tests {
             "key_breakdowns",
             "manifests",
             "materialization_records",
+            "native_child_bindings",
             "object_edges",
             "object_locations",
             "objects",

@@ -473,6 +473,12 @@ pub enum OfferRefusal {
         /// Canonical key of the cancelled pin.
         pin_key: String,
     },
+    /// A bound native child action is unresolved (L008): the parent
+    /// build-script result cannot commit until the child commits.
+    NativeChildUnresolved {
+        /// Digest of the unresolved child action key.
+        child_action_key: String,
+    },
     /// The store refused or failed.
     Store(StoreError),
 }
@@ -702,6 +708,19 @@ pub fn process_offer(
     // attempt — concealed consumption, cancelled lineages, and
     // not-yet-finalized producers all refuse here.
     verify_consumption_obligations(store, offer, &manifest_resolver)?;
+
+    // 7.7. Native child resolution gate (L008): a build-script parent
+    // with bound native children cannot commit while any child result
+    // is unresolved — provenance edges are written on satisfaction.
+    crate::native_children::enforce_native_children_resolved(store, &offer.manifest.action_key)
+        .map_err(|err| match err {
+            crate::native_children::NativeChildError::ChildUnresolved { child_action_key } => {
+                OfferRefusal::NativeChildUnresolved { child_action_key }
+            }
+            crate::native_children::NativeChildError::Store(store_err) => {
+                OfferRefusal::Store(store_err)
+            }
+        })?;
 
     // 8. Same-key candidates: divergence taxonomy, never overwrite.
     if let Some(committed_key) = store.published_manifest_key(&offer.manifest.action_key)? {
