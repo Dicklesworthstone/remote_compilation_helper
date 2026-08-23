@@ -4852,6 +4852,7 @@ name = "rabs-asupersync"
 version = "1.0.58"
 dependencies = [
  "asupersync 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4)",
+ "parking_lot",
  "rabs-action",
  "rabs-protocol",
  "tempfile",
@@ -5106,6 +5107,7 @@ dependencies = [
  "miette",
  "proptest",
  "pulldown-cmark",
+ "rabs-key",
  "rabs-protocol",
  "rch-common",
  "rch-telemetry",
