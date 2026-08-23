@@ -2301,6 +2301,55 @@ impl CompilationConfig {
     }
 }
 
+/// Version of the Layer 0 configuration pack schema (bd-bqu38 / M-1 §149).
+///
+/// Bump when a knob is added, removed, or its meaning changes; consumers
+/// record the version alongside emitted baselines so regressions are
+/// attributable to a specific pack revision.
+pub const LAYER0_PACK_VERSION: &str = "1";
+
+/// Layer 0 configuration pack knobs (bd-bqu38).
+///
+/// Every knob defaults to OFF and toggles independently — the kill/rollback
+/// contract from the master plan (§149: removed from defaults if it regresses
+/// representative p95, output equivalence, debugger behavior, or
+/// compatibility). Knobs are injected into remote cargo builds as
+/// `CARGO_PROFILE_*` environment variables, so enabling one never mutates any
+/// user-owned `.cargo/config.toml`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Layer0Config {
+    /// Master switch: nothing is injected unless this is on.
+    pub enabled: bool,
+    /// `profile.release.lto = "thin"` via `CARGO_PROFILE_RELEASE_LTO=thin`.
+    pub release_lto_thin: bool,
+    /// `profile.release.codegen-units = 1` via
+    /// `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`.
+    pub release_codegen_units_1: bool,
+}
+
+impl Layer0Config {
+    /// Environment pairs to inject into a remote cargo build.
+    ///
+    /// Empty unless [`Self::enabled`] — the master switch gates every knob so
+    /// an operator can disable the whole pack with one key. Order is stable
+    /// (declaration order) for deterministic emission and test assertions.
+    #[must_use]
+    pub fn active_env(&self) -> Vec<(&'static str, &'static str)> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let mut env = Vec::new();
+        if self.release_lto_thin {
+            env.push(("CARGO_PROFILE_RELEASE_LTO", "thin"));
+        }
+        if self.release_codegen_units_1 {
+            env.push(("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1"));
+        }
+        env
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferConfig {
     /// zstd compression level (1-19).
@@ -3754,6 +3803,54 @@ retry_max = 2
         );
     }
 
+    #[test]
+    fn test_layer0_disabled_by_default_and_env_gated() {
+        let _guard = test_guard!();
+        let cfg = Layer0Config::default();
+        assert!(!cfg.enabled);
+        // Master switch off ⇒ nothing injects even with knobs on.
+        let knobs_on = Layer0Config {
+            enabled: false,
+            release_lto_thin: true,
+            release_codegen_units_1: true,
+        };
+        assert!(cfg.active_env().is_empty());
+        assert!(knobs_on.active_env().is_empty());
+    }
+
+    #[test]
+    fn test_layer0_knobs_emit_stable_env_pairs() {
+        let _guard = test_guard!();
+        let lto_only = Layer0Config {
+            enabled: true,
+            release_lto_thin: true,
+            release_codegen_units_1: false,
+        };
+        assert_eq!(
+            lto_only.active_env(),
+            vec![("CARGO_PROFILE_RELEASE_LTO", "thin")]
+        );
+        let both = Layer0Config {
+            enabled: true,
+            release_lto_thin: true,
+            release_codegen_units_1: true,
+        };
+        assert_eq!(
+            both.active_env(),
+            vec![
+                ("CARGO_PROFILE_RELEASE_LTO", "thin"),
+                ("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1"),
+            ],
+            "emission order must stay stable for deterministic baselines"
+        );
+    }
+
+    #[test]
+    fn test_layer0_pack_version_is_recorded() {
+        let _guard = test_guard!();
+        // Baselines record the pack version; it must exist and be non-empty.
+        assert!(!LAYER0_PACK_VERSION.is_empty());
+    }
     #[test]
     fn test_default_allowlist_includes_nix() {
         let _guard = test_guard!();
