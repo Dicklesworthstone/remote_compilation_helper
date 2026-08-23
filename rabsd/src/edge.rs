@@ -27,3 +27,4 @@ pub mod server;
 pub mod shadow;
 pub mod shadow_lifecycle;
 pub mod snapshot_lineage;
+pub mod transport_suites;

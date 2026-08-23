@@ -84,6 +84,25 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// The submitted action idempotency keys, in arrival order
+    /// (read-only view for reconciliation gates and suite audits).
+    #[must_use]
+    pub fn submitted_keys(&self) -> &[u128] {
+        &self.submitted
+    }
+
+    /// The accepted lease identities (read-only view).
+    #[must_use]
+    pub fn leases(&self) -> &[DurableWireIdentity] {
+        &self.leases
+    }
+
+    /// The cancelled attempt identities (read-only view).
+    #[must_use]
+    pub fn cancelled(&self) -> &[DurableWireIdentity] {
+        &self.cancelled
+    }
+
     /// Handle a message under the catalog's idempotency rules.
     pub fn handle(&mut self, message: &RabsMessage, message_term: u64) -> HandlerOutcome {
         // Stale authority fails closed BEFORE any state is touched.
