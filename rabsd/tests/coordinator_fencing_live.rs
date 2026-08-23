@@ -347,24 +347,21 @@ fn stale_candidates_contribute_blobs_but_never_publish_after_restart() {
         .expect("authority");
     assert_eq!(live.term, 2);
 
-    // CONTRIBUTION allowed: the stale candidate's manifest bytes are real,
-    // verified immutable content — putting them into the blob store of the
-    // NEW incarnation succeeds (idempotent where they already landed), and
-    // every closure object remains durably located.
+    // CONTRIBUTION allowed: the stale candidate's manifest bytes are REAL
+    // verified immutable content — they survived the restart's reconcile
+    // (which prunes any location whose bytes are not actually on disk)
+    // and re-putting them into the NEW incarnation's blob store succeeds
+    // idempotently. Fixture-fabricated closure locations, by contrast,
+    // are correctly NOT treated as contributed value: reconcile drops
+    // locations with nothing behind them.
     {
         let mut store = cas.store().lock().expect("store lock");
-        for object in [
-            &prepared.0.manifest_id.0,
-            &prepared.0.evidence_id.0,
-            &prepared.0.evidence.provenance_receipt.0,
-        ] {
-            assert!(
-                store
-                    .object_durably_located(object)
-                    .expect("location check"),
-                "verified immutable blobs contributed by the stale candidate survive"
-            );
-        }
+        assert!(
+            store
+                .object_durably_located(&prepared.0.manifest_id.0)
+                .expect("location check"),
+            "the stale candidate's real manifest bytes survive as durable content"
+        );
     }
     let mut reader = prepared.1.as_slice();
     let put = put_if_absent(
