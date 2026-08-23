@@ -2584,6 +2584,15 @@ min_local_time_ms = 2000
 build_slots = 4
 test_slots = 8
 check_slots = 2
+# External-timeout caps per command kind (seconds). The wrapper SIGKILLs the
+# remote command at these budgets (exit 137), so cold-cache heavy graphs
+# (large dep trees, first build of a new toolchain) can exceed the build
+# default — raise it rather than losing the run. Defaults: 300 / 1800 / 600.
+# Per-invocation env overrides: RCH_BUILD_TIMEOUT_SEC, RCH_TEST_TIMEOUT_SEC,
+# RCH_BUN_TIMEOUT_SEC.
+build_timeout_sec = 300
+test_timeout_sec = 1800
+bun_timeout_sec = 600
 
 [transfer]
 # zstd compression level (1-19)
