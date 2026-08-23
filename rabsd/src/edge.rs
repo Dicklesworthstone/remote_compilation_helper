@@ -25,4 +25,5 @@ pub mod diagnostic_rewrite;
 pub mod mtime_choreography;
 pub mod server;
 pub mod shadow;
+pub mod shadow_lifecycle;
 pub mod snapshot_lineage;
