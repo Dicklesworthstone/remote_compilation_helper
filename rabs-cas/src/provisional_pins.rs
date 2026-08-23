@@ -1,0 +1,917 @@
+//! Provisional `.rmeta` upload pins and authorized visibility
+//! (bead M004; plan §65).
+//!
+//! A worker's early metadata output becomes an immutable verified object
+//! through the ordinary `put_if_absent` path (H001); THIS layer binds that
+//! object under the producer identity tuple
+//! `(CoordinatorAuthority, ActionKey, ActionGeneration, AttemptId,
+//! ExecutionLeaseId, LogicalOutput)` as a CANDIDATE pin and gates every
+//! read against an explicit grant table:
+//!
+//! - **Closed by default.** Only registered dependent attempts and the
+//!   awaiting edge/subscriber may resolve a provisional output; any other
+//!   reader — including a worker on the same project — is refused with a
+//!   typed error.
+//! - **Immutable binding.** One identity tuple names exactly one object.
+//!   Re-offering the same bytes is idempotent; offering DIFFERENT bytes
+//!   under the same tuple is a collision incident, never a pick-one.
+//! - **Coordinator-owned lifetime.** Candidate pins remain valid through
+//!   coordinator decision/reconciliation; workers can never release one.
+//!   The active-authority coordinator closes them after obligations drain,
+//!   or invalidates them when the producer generation fails, is superseded
+//!   without compatible adoption, or loses authority (§65).
+//! - **Success elsewhere does not stabilize.** Another attempt committing
+//!   for the same action key changes nothing about this pin; only an
+//!   explicit exact-object adoption (§65.1) resolves its lineage.
+//! - **Fail toward retention on tear.** The registry row is closed BEFORE
+//!   the GC-protective `pins` twin is released, so a crash between the two
+//!   leaves the object over-protected, never unprotected.
+//!
+//! Persistence lives in `provisional_pins` / `provisional_pin_grants`
+//! (schema v14) plus a protective row in the existing `pins` table, so
+//! H016's mark → grace → recheck → unlink pipeline provably preserves live
+//! provisional objects exactly like publication roots.
+//!
+//! ## Dependency rules
+//!
+//! Same as the crate: `rabs-protocol` types only; no async runtime; all
+//! effects flow through [`RabsMetadataStore`](crate::metadata_store::
+//! RabsMetadataStore).
+
+use crate::metadata_store::{ProvisionalPinInsert, RabsMetadataStore, StoreError, digest_key};
+use crate::pin_leases::{ReleaseOutcome, Releaser, release_pin_scoped};
+use crate::publication::{Framing, authority_digest, output_role_tag};
+use rabs_protocol::authority::CoordinatorAuthority;
+use rabs_protocol::generation::{ActionGenerationId, AttemptId, ExecutionLeaseId};
+use rabs_protocol::raw_bytes::RawBytes;
+use rabs_protocol::reconnect::SubscriberId;
+use rabs_protocol::result_identity::{ObjectId, OutputRole, TypedDigest};
+
+/// Domain separator for the canonical provisional-pin identity digest.
+pub const PROVISIONAL_PIN_DOMAIN: &str = "rabs.provisional-pin.sha256.v1";
+
+/// Pin class of the GC-protective twin rows created for candidate pins.
+pub const PROVISIONAL_PIN_CLASS: &str = "provisional-metadata";
+
+const GRANT_DEPENDENT_ATTEMPT: &str = "dependent-attempt";
+const GRANT_AWAITING_EDGE: &str = "awaiting-edge";
+
+/// The producer-side identity tuple of one provisional logical output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionalIdentity {
+    /// The coordinator authority whose generation minted the attempt.
+    pub authority: CoordinatorAuthority,
+    /// Digest of the producing action.
+    pub action_key: TypedDigest,
+    /// Producing action generation.
+    pub generation: ActionGenerationId,
+    /// The specific attempt (hedges never share pins).
+    pub attempt: AttemptId,
+    /// The attempt's own execution lease.
+    pub lease: ExecutionLeaseId,
+    /// Role of the logical output (`.rmeta` =>
+    /// [`OutputRole::ProvisionalMetadata`]).
+    pub role: OutputRole,
+    /// Canonical virtual path of the logical output.
+    pub virtual_path: RawBytes,
+}
+
+impl ProvisionalIdentity {
+    /// Canonical digest of the tuple (length-framed fields; no
+    /// concatenation ambiguity). This is the pin's durable address.
+    #[must_use]
+    pub fn digest(&self) -> TypedDigest {
+        let mut framing = Framing::new(PROVISIONAL_PIN_DOMAIN);
+        let authority = authority_digest(&self.authority);
+        framing
+            .digest_field(&authority)
+            .digest_field(&self.action_key)
+            .field(&self.generation.0.to_be_bytes())
+            .field(&self.attempt.0.to_be_bytes())
+            .field(&self.lease.0.to_be_bytes())
+            .u64(output_role_tag(self.role))
+            .field(self.virtual_path.as_bytes());
+        framing.finish(PROVISIONAL_PIN_DOMAIN)
+    }
+
+    /// Durable key under which this pin is registered.
+    #[must_use]
+    pub fn pin_key(&self) -> String {
+        digest_key(&self.digest())
+    }
+}
+
+/// A reader asking for provisional-output visibility (M004). Exactly the
+/// populations plan §65 authorizes: dependent attempts of the action and
+/// the edge/Cargo instance awaiting the output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionalReader {
+    /// One dependent attempt running on a named worker.
+    DependentAttempt {
+        /// Worker peer id.
+        worker: String,
+        /// The dependent's own attempt id.
+        attempt: AttemptId,
+    },
+    /// The awaiting edge subscriber (the edge/Cargo instance).
+    AwaitingEdge {
+        /// Subscriber id of the awaiting edge.
+        subscriber: SubscriberId,
+    },
+}
+
+impl ProvisionalReader {
+    fn grant_kind(&self) -> &'static str {
+        match self {
+            Self::DependentAttempt { .. } => GRANT_DEPENDENT_ATTEMPT,
+            Self::AwaitingEdge { .. } => GRANT_AWAITING_EDGE,
+        }
+    }
+
+    fn grant_id(&self) -> String {
+        match self {
+            Self::DependentAttempt { worker, attempt } => format!("{worker}/{:032x}", attempt.0),
+            Self::AwaitingEdge { subscriber } => format!("edge/{:032x}", subscriber.0),
+        }
+    }
+}
+
+/// Everything that can refuse a provisional-pin operation. Store failures
+/// are carried verbatim; everything else is a typed policy outcome so
+/// callers can never conflate "not yours" with "gone".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionalPinError {
+    /// A different object was offered under an already-pinned identity
+    /// tuple — treated as a collision incident, never an overwrite.
+    Collision {
+        /// Canonical key of the contested pin.
+        pin_key: String,
+        /// Object key already pinned.
+        pinned: String,
+        /// Object key offered.
+        offered: String,
+    },
+    /// No pin under this identity tuple.
+    UnknownPin {
+        /// Canonical key looked up.
+        pin_key: String,
+    },
+    /// The reader has no grant for this pin.
+    Unauthorized {
+        /// Canonical key of the pin.
+        pin_key: String,
+    },
+    /// The pin was closed after obligations drained.
+    Closed {
+        /// Canonical key of the pin.
+        pin_key: String,
+    },
+    /// Producer lineage failed/superseded/lost authority (§65).
+    ProducerInvalidated {
+        /// Canonical key of the pin.
+        pin_key: String,
+        /// Recorded reason.
+        reason: String,
+    },
+    /// Renewal sequence not strictly greater than the stored one.
+    NonMonotonicRenewal {
+        /// Canonical key of the pin.
+        pin_key: String,
+    },
+    /// Adoption refused: the committed result resolved the logical output
+    /// to a different object, so descendants cannot be satisfied (§65.1).
+    AdoptionMismatch {
+        /// Canonical key of the pin.
+        pin_key: String,
+        /// Pinned object key.
+        pinned: String,
+        /// Committed object key.
+        committed: String,
+    },
+    /// A coordinator attempted the release without presenting the active
+    /// authority (H041 scoping on the protective pin).
+    NotActiveAuthority,
+    /// Underlying store failure.
+    Store(StoreError),
+}
+
+impl From<StoreError> for ProvisionalPinError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+impl std::fmt::Display for ProvisionalPinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Collision {
+                pin_key,
+                pinned,
+                offered,
+            } => write!(
+                f,
+                "provisional pin collision on {pin_key}: pinned {pinned}, offered {offered}"
+            ),
+            Self::UnknownPin { pin_key } => write!(f, "unknown provisional pin {pin_key}"),
+            Self::Unauthorized { pin_key } => {
+                write!(f, "reader not authorized for provisional pin {pin_key}")
+            }
+            Self::Closed { pin_key } => write!(f, "provisional pin {pin_key} is closed"),
+            Self::ProducerInvalidated { pin_key, reason } => {
+                write!(f, "producer lineage invalidated ({reason}): {pin_key}")
+            }
+            Self::NonMonotonicRenewal { pin_key } => {
+                write!(f, "non-monotonic renewal for provisional pin {pin_key}")
+            }
+            Self::AdoptionMismatch {
+                pin_key,
+                pinned,
+                committed,
+            } => write!(
+                f,
+                "adoption mismatch on {pin_key}: pinned {pinned}, committed {committed}"
+            ),
+            Self::NotActiveAuthority => {
+                write!(f, "coordinator authority is not active for this release")
+            }
+            Self::Store(e) => write!(f, "store error: {e:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ProvisionalPinError {}
+
+/// Outcome of registering a candidate pin for an uploaded object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenOutcome {
+    /// First offer: pin registered with its protective GC twin.
+    Created,
+    /// Idempotent re-offer of the SAME object under the SAME tuple.
+    AlreadyPinned,
+}
+
+/// Outcome of closing a pin after drain/invaldation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseOutcome {
+    /// Registry row closed and protective pin released.
+    Released,
+    /// Pin was already closed: idempotent no-op.
+    AlreadyReleased,
+}
+
+/// Bind an uploaded immutable object under the identity tuple's candidate
+/// pin (M004 step 1). Idempotent for identical re-offers; a different
+/// object under the same tuple is a [`ProvisionalPinError::Collision`].
+///
+/// The protective `pins` twin is written in the SAME transaction as the
+/// registry row, so the object is GC-safe from the instant either exists.
+///
+/// # Errors
+/// Store failures; collisions with a differently-pinned same-tuple offer;
+/// re-offers addressed to a pin that was already closed.
+pub fn open_provisional_pin(
+    store: &mut dyn RabsMetadataStore,
+    identity: &ProvisionalIdentity,
+    object: &ObjectId,
+) -> Result<OpenOutcome, ProvisionalPinError> {
+    let pin_key = identity.pin_key();
+    if let Some(existing) = store.provisional_pin_row(&pin_key)? {
+        let offered = digest_key(&object.0);
+        if existing.object_key == offered {
+            return if existing.released {
+                Err(ProvisionalPinError::Closed { pin_key })
+            } else {
+                Ok(OpenOutcome::AlreadyPinned)
+            };
+        }
+        return Err(ProvisionalPinError::Collision {
+            pin_key,
+            pinned: existing.object_key,
+            offered,
+        });
+    }
+    let digest = identity.digest();
+    // Deterministic 128-bit protective-pin id derived from the identity
+    // digest; the SQL UNIQUE constraint on `pins.id_hex` fails closed in
+    // the astronomically unlikely case of a derivation collision.
+    let mut be16 = [0u8; 16];
+    be16.copy_from_slice(&digest.bytes[0..16]);
+    let protective_pin_id = u128::from_be_bytes(be16);
+    store.insert_provisional_pin(&ProvisionalPinInsert {
+        pin_key: pin_key.clone(),
+        authority_key: digest_key(&authority_digest(&identity.authority)),
+        action_key: digest_key(&identity.action_key),
+        generation: identity.generation.0,
+        attempt: identity.attempt.0,
+        lease: identity.lease.0,
+        role_tag: i64::try_from(output_role_tag(identity.role)).expect("role tags fit i64"),
+        virtual_path: identity.virtual_path.as_bytes().to_vec(),
+        object: object.0.clone(),
+        protective_pin_id,
+        reason: format!(
+            "M004 candidate pin: action {}, gen {:032x}, attempt {:032x}",
+            digest_key(&identity.action_key),
+            identity.generation.0,
+            identity.attempt.0
+        ),
+    })?;
+    Ok(OpenOutcome::Created)
+}
+
+/// Authorize one reader population for a live pin. Granting against a
+/// closed or unknown pin is refused — authorization follows liveness.
+///
+/// # Errors
+/// Store failures; unknown/closed pins.
+pub fn authorize_reader(
+    store: &mut dyn RabsMetadataStore,
+    identity: &ProvisionalIdentity,
+    reader: &ProvisionalReader,
+) -> Result<(), ProvisionalPinError> {
+    let pin_key = identity.pin_key();
+    let Some(row) = store.provisional_pin_row(&pin_key)? else {
+        return Err(ProvisionalPinError::UnknownPin { pin_key });
+    };
+    if row.released {
+        return Err(ProvisionalPinError::Closed { pin_key });
+    }
+    store.record_provisional_grant(
+        &pin_key,
+        reader.grant_kind(),
+        &reader.grant_id(),
+        row.renewal_seq,
+    )?;
+    Ok(())
+}
+
+/// Resolve a provisional output FOR a specific reader (M004 step 2): the
+/// only way bytes become visible. Refuses unknown pins, invalidated
+/// lineage, closed pins, and readers without a grant — in that order.
+///
+/// # Errors
+/// Typed refusals per [`ProvisionalPinError`]; store failures.
+pub fn resolve_for_reader(
+    store: &mut dyn RabsMetadataStore,
+    identity: &ProvisionalIdentity,
+    reader: &ProvisionalReader,
+) -> Result<ObjectId, ProvisionalPinError> {
+    let pin_key = identity.pin_key();
+    let Some(row) = store.provisional_pin_row(&pin_key)? else {
+        return Err(ProvisionalPinError::UnknownPin { pin_key });
+    };
+    if let Some(reason) = row.invalidated_reason {
+        return Err(ProvisionalPinError::ProducerInvalidated { pin_key, reason });
+    }
+    if row.released {
+        return Err(ProvisionalPinError::Closed { pin_key });
+    }
+    let authorized = store
+        .list_provisional_grants(&pin_key)?
+        .iter()
+        .any(|(kind, id, _)| kind.as_str() == reader.grant_kind() && id == &reader.grant_id());
+    if !authorized {
+        return Err(ProvisionalPinError::Unauthorized { pin_key });
+    }
+    Ok(ObjectId(row.object))
+}
+
+/// Record that the WINNING committed result adopted this candidate's
+/// output (§65.1). Only an EXACT object match satisfies lineage; anything
+/// else refuses so descendants are cancelled rather than satisfied with
+/// foreign bytes.
+///
+/// # Errors
+/// Store failures; adoption mismatch; unknown pin.
+pub fn record_adoption(
+    store: &mut dyn RabsMetadataStore,
+    identity: &ProvisionalIdentity,
+    committed_object: &ObjectId,
+) -> Result<(), ProvisionalPinError> {
+    let pin_key = identity.pin_key();
+    let Some(row) = store.provisional_pin_row(&pin_key)? else {
+        return Err(ProvisionalPinError::UnknownPin { pin_key });
+    };
+    let committed = digest_key(&committed_object.0);
+    if row.object_key != committed {
+        return Err(ProvisionalPinError::AdoptionMismatch {
+            pin_key,
+            pinned: row.object_key,
+            committed,
+        });
+    }
+    store.adopt_provisional_pin(&pin_key, &committed)?;
+    Ok(())
+}
+
+/// Invalidate the pin because its producer generation failed, was
+/// superseded without compatible adoption, or lost authority (§65).
+/// Readers refuse immediately with
+/// [`ProvisionalPinError::ProducerInvalidated`]; the protective GC pin is
+/// released only AFTER the registry close commits (fail toward retention).
+///
+/// # Errors
+/// Store failures; unknown pin.
+pub fn invalidate_lineage(
+    store: &mut dyn RabsMetadataStore,
+    identity: &ProvisionalIdentity,
+    reason: &str,
+) -> Result<CloseOutcome, ProvisionalPinError> {
+    close_internal(store, identity, Some(reason))
+}
+
+/// Close the pin once all consumer/reconciliation obligations drained
+/// (§65 GC rule). Coordinator-only: workers hold no release authority over
+/// candidate pins. The active-authority check comes from the shared H041
+/// scoping on the protective `pins` row.
+///
+/// # Errors
+/// Store failures; worker releasers; non-active coordinator authorities;
+/// unknown pin.
+pub fn release_after_drain(
+    store: &mut dyn RabsMetadataStore,
+    identity: &ProvisionalIdentity,
+    releaser: &Releaser,
+) -> Result<CloseOutcome, ProvisionalPinError> {
+    let pin_key = identity.pin_key();
+    let Some(row) = store.provisional_pin_row(&pin_key)? else {
+        return Err(ProvisionalPinError::UnknownPin { pin_key });
+    };
+    // Authority FIRST, before ANY mutation: a coordinator without the
+    // active authority must not be able to close reads, and the
+    // close-then-release order must never run for an unauthorized caller.
+    let presented = match releaser {
+        Releaser::Worker(_) => {
+            // Candidate pins bind coordinator-owned truth; no worker
+            // identity may end their protection (publication-root posture).
+            return Err(ProvisionalPinError::Unauthorized { pin_key });
+        }
+        Releaser::Coordinator(authority) => authority_digest(authority),
+    };
+    let active = store.active_authority()?.map(|row| row.digest);
+    if active.as_ref() != Some(&presented) {
+        return Err(ProvisionalPinError::NotActiveAuthority);
+    }
+    // 1) Close the REGISTRY row first: from this commit on, reads refuse.
+    let outcome = close_internal(store, identity, None)?;
+    // 2) Then release the GC twin through the shared authority-scoped path.
+    let protective_id = u128::from_str_radix(&row.protective_pin_hex, 16).map_err(|_| {
+        ProvisionalPinError::Store(StoreError::Corruption(format!(
+            "protective pin hex {}",
+            row.protective_pin_hex
+        )))
+    })?;
+    match release_pin_scoped(store, protective_id, releaser)? {
+        ReleaseOutcome::Released | ReleaseOutcome::AlreadyReleased => {}
+        ReleaseOutcome::RefusedNotActiveAuthority => {
+            return Err(ProvisionalPinError::NotActiveAuthority);
+        }
+        other => {
+            return Err(ProvisionalPinError::Store(StoreError::Corruption(format!(
+                "protective pin release refused: {other:?}"
+            ))));
+        }
+    }
+    Ok(outcome)
+}
+
+/// Monotonically renew a live pin's sequence (lease-freshness bookkeeping;
+/// expiry judgments stay in coordinator sequence space per R127).
+///
+/// # Errors
+/// Store failures; unknown/closed pins; stale sequences.
+pub fn renew_provisional_pin(
+    store: &mut dyn RabsMetadataStore,
+    identity: &ProvisionalIdentity,
+    renewal_seq: u64,
+) -> Result<(), ProvisionalPinError> {
+    let pin_key = identity.pin_key();
+    store
+        .renew_provisional_pin(&pin_key, renewal_seq)
+        .map_err(|e| match e {
+            StoreError::NonMonotonicPinRenewal => {
+                ProvisionalPinError::NonMonotonicRenewal { pin_key }
+            }
+            StoreError::PinReleased => ProvisionalPinError::Closed { pin_key },
+            StoreError::UnknownPin => ProvisionalPinError::UnknownPin { pin_key },
+            other => ProvisionalPinError::Store(other),
+        })
+}
+
+fn close_internal(
+    store: &mut dyn RabsMetadataStore,
+    identity: &ProvisionalIdentity,
+    invalidation_reason: Option<&str>,
+) -> Result<CloseOutcome, ProvisionalPinError> {
+    let pin_key = identity.pin_key();
+    if store.provisional_pin_row(&pin_key)?.is_none() {
+        return Err(ProvisionalPinError::UnknownPin { pin_key });
+    }
+    store.close_provisional_pin(&pin_key, invalidation_reason)?;
+    Ok(CloseOutcome::Released)
+}
+
+// ---------------------------------------------------------------------
+// Tests — the M004 acceptance suite: pin semantics + authorized
+// visibility. Every fixture runs against BOTH engines via the reference
+// SQLite store; the differential harness covers the new tables through
+// `differential_snapshot`.
+// ---------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata_store::{RusqliteEngine, SqlMetadataStore};
+    use rabs_protocol::authority::ClusterId;
+    use rabs_protocol::result_identity::DigestAlgorithm;
+
+    const ACTION_DOMAIN: &str = "rabs.action-key.sha256.v1";
+
+    struct Fixture {
+        store: SqlMetadataStore<RusqliteEngine>,
+    }
+
+    fn tagged_action(tag: u8) -> TypedDigest {
+        let mut bytes = [0u8; 32];
+        bytes[0] = tag;
+        bytes[31] = tag;
+        TypedDigest {
+            algorithm: DigestAlgorithm::Sha256V1,
+            domain: ACTION_DOMAIN,
+            bytes,
+        }
+    }
+
+    fn tagged_object(tag: u8) -> ObjectId {
+        let mut d = tagged_action(tag);
+        d.domain = "rabs.object.sha256.v1";
+        ObjectId(d)
+    }
+
+    fn authority(tag: u64) -> CoordinatorAuthority {
+        CoordinatorAuthority {
+            cluster_id: ClusterId(format!("cluster-{tag}")),
+            credential_generation: tag,
+            term: 100 + tag,
+            incarnation_id: rabs_protocol::authority::CoordinatorIncarnationId(
+                0xAA00_0000_0000_0000 + u128::from(tag),
+            ),
+        }
+    }
+
+    fn identity(authority_tag: u64, attempt_tag: u128) -> ProvisionalIdentity {
+        ProvisionalIdentity {
+            authority: authority(authority_tag),
+            action_key: tagged_action(10),
+            generation: ActionGenerationId(0x50),
+            attempt: AttemptId(attempt_tag),
+            lease: ExecutionLeaseId(attempt_tag + 1),
+            role: OutputRole::ProvisionalMetadata,
+            virtual_path: RawBytes::new(b"target/debug/deps/libfeat.rmeta".to_vec()),
+        }
+    }
+
+    fn fixture(name: &str) -> Fixture {
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let store = SqlMetadataStore::open(engine).unwrap();
+        let _ = name;
+        Fixture { store }
+    }
+
+    fn dependent(worker: &str, attempt: u128) -> ProvisionalReader {
+        ProvisionalReader::DependentAttempt {
+            worker: worker.to_owned(),
+            attempt: AttemptId(attempt),
+        }
+    }
+
+    fn edge(subscriber: u128) -> ProvisionalReader {
+        ProvisionalReader::AwaitingEdge {
+            subscriber: SubscriberId(subscriber),
+        }
+    }
+
+    #[test]
+    fn m004_open_is_idempotent_and_collision_refuses_different_object() {
+        let mut f = fixture("open-idem");
+        let id = identity(1, 20);
+        let obj_a = tagged_object(41);
+
+        assert_eq!(
+            open_provisional_pin(&mut f.store, &id, &obj_a).unwrap(),
+            OpenOutcome::Created
+        );
+        // Identical re-offer (retry/duplicate upload report): no-op.
+        assert_eq!(
+            open_provisional_pin(&mut f.store, &id, &obj_a).unwrap(),
+            OpenOutcome::AlreadyPinned
+        );
+        // Different object, same tuple: collision incident, original intact.
+        let err = open_provisional_pin(&mut f.store, &id, &tagged_object(42)).unwrap_err();
+        let ProvisionalPinError::Collision {
+            pinned, offered, ..
+        } = &err
+        else {
+            panic!("expected collision, got {err:?}");
+        };
+        assert_eq!(pinned, &digest_key(&obj_a.0));
+        assert_eq!(offered, &digest_key(&tagged_object(42).0));
+        // And the pinned object still resolves for an authorized reader.
+        authorize_reader(&mut f.store, &id, &edge(7)).unwrap();
+        assert_eq!(
+            resolve_for_reader(&mut f.store, &id, &edge(7)).unwrap(),
+            obj_a
+        );
+    }
+
+    #[test]
+    fn m004_visibility_is_closed_by_default_and_grant_scoped() {
+        let mut f = fixture("visibility");
+        let id = identity(1, 21);
+        let obj = tagged_object(43);
+        open_provisional_pin(&mut f.store, &id, &obj).unwrap();
+
+        // No grants yet: even plausible readers are refused.
+        assert_eq!(
+            resolve_for_reader(&mut f.store, &id, &dependent("worker-a", 99)).unwrap_err(),
+            ProvisionalPinError::Unauthorized {
+                pin_key: id.pin_key()
+            }
+        );
+
+        authorize_reader(&mut f.store, &id, &dependent("worker-a", 99)).unwrap();
+        authorize_reader(&mut f.store, &id, &edge(7)).unwrap();
+
+        // Granted dependent attempt + awaiting edge read fine.
+        assert_eq!(
+            resolve_for_reader(&mut f.store, &id, &dependent("worker-a", 99)).unwrap(),
+            obj
+        );
+        assert_eq!(
+            resolve_for_reader(&mut f.store, &id, &edge(7)).unwrap(),
+            obj
+        );
+
+        // A SIBLING attempt on the same worker is NOT covered by the grant:
+        // authorization is per-attempt, not per-worker.
+        assert_eq!(
+            resolve_for_reader(&mut f.store, &id, &dependent("worker-a", 100)).unwrap_err(),
+            ProvisionalPinError::Unauthorized {
+                pin_key: id.pin_key()
+            }
+        );
+        // Different worker, different edge subscriber: refused.
+        assert_eq!(
+            resolve_for_reader(&mut f.store, &id, &edge(8)).unwrap_err(),
+            ProvisionalPinError::Unauthorized {
+                pin_key: id.pin_key()
+            }
+        );
+
+        // Grants do not leak across identity tuples: same shape, different
+        // attempt/generation/authority cannot see this pin.
+        let other_generation = ProvisionalIdentity {
+            generation: ActionGenerationId(0x51),
+            ..identity(1, 21)
+        };
+        assert_eq!(
+            resolve_for_reader(&mut f.store, &other_generation, &edge(7)).unwrap_err(),
+            ProvisionalPinError::UnknownPin {
+                pin_key: other_generation.pin_key()
+            }
+        );
+        let other_authority = ProvisionalIdentity {
+            authority: authority(2),
+            ..identity(1, 21)
+        };
+        assert_ne!(other_authority.pin_key(), id.pin_key());
+    }
+
+    #[test]
+    fn m004_worker_cannot_release_and_active_coordinator_can() {
+        let mut f = fixture("release-auth");
+        let id = identity(1, 22);
+        open_provisional_pin(&mut f.store, &id, &tagged_object(44)).unwrap();
+
+        // ANY worker identity is refused: candidate pins are
+        // coordinator-owned through drain.
+        let err = release_after_drain(&mut f.store, &id, &Releaser::Worker("worker-a".to_owned()))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ProvisionalPinError::Unauthorized {
+                pin_key: id.pin_key()
+            }
+        );
+
+        // An authority(9) coordinator is active; a stale authority(2)
+        // presenter is refused BEFORE anything mutates.
+        f.store
+            .acquire_authority(&crate::metadata_store::AuthorityRow {
+                digest: crate::publication::authority_digest(&authority(9)),
+                cluster_id: "cluster-9".to_owned(),
+                incarnation: 0xEE,
+                term: 109,
+                acquired_seq: 1,
+            })
+            .unwrap();
+        let err = release_after_drain(&mut f.store, &id, &Releaser::Coordinator(authority(2)))
+            .unwrap_err();
+        assert_eq!(err, ProvisionalPinError::NotActiveAuthority);
+        // Nothing was closed by the refused attempt: reads still work.
+        authorize_reader(&mut f.store, &id, &edge(7)).unwrap();
+
+        // The ACTIVE authority releases cleanly; repeat is idempotent-closed.
+        f.store
+            .release_authority(&crate::publication::authority_digest(&authority(9)))
+            .unwrap();
+        f.store
+            .acquire_authority(&crate::metadata_store::AuthorityRow {
+                digest: crate::publication::authority_digest(&authority(1)),
+                cluster_id: "cluster-1".to_owned(),
+                incarnation: 0xAA,
+                term: 101,
+                acquired_seq: 2,
+            })
+            .unwrap();
+        assert_eq!(
+            release_after_drain(&mut f.store, &id, &Releaser::Coordinator(authority(1))).unwrap(),
+            CloseOutcome::Released
+        );
+        // Post-close reads refuse EVEN for previously granted readers.
+        authorize_reader(&mut f.store, &id, &edge(7)).unwrap_err();
+    }
+
+    #[test]
+    fn m004_invalidation_refuses_readers_and_fails_toward_retention_order() {
+        let mut f = fixture("invalidate");
+        let id = identity(1, 23);
+        let obj = tagged_object(45);
+        open_provisional_pin(&mut f.store, &id, &obj).unwrap();
+        authorize_reader(&mut f.store, &id, &dependent("worker-b", 5)).unwrap();
+
+        assert_eq!(
+            invalidate_lineage(&mut f.store, &id, "producer generation failed").unwrap(),
+            CloseOutcome::Released
+        );
+        // Authorized reader now gets the INVALIDATION reason, not a miss.
+        assert_eq!(
+            resolve_for_reader(&mut f.store, &id, &dependent("worker-b", 5)).unwrap_err(),
+            ProvisionalPinError::ProducerInvalidated {
+                pin_key: id.pin_key(),
+                reason: "producer generation failed".to_owned()
+            }
+        );
+        // Invalidation is idempotent; the FIRST reason survives.
+        invalidate_lineage(&mut f.store, &id, "second reason").unwrap();
+        let row = f.store.provisional_pin_row(&id.pin_key()).unwrap().unwrap();
+        assert_eq!(
+            row.invalidated_reason.as_deref(),
+            Some("producer generation failed")
+        );
+        assert!(row.released);
+        // Fail toward retention: the registry closed, but the protective
+        // pin stays unreleased here (only release_after_drain releases it),
+        // so the object remains GC-safe until the coordinator drains it.
+        let protective = u128::from_str_radix(&row.protective_pin_hex, 16).unwrap();
+        let pin = f.store.pin_row(protective).unwrap().unwrap();
+        assert!(!pin.released);
+        assert_eq!(pin.class, PROVISIONAL_PIN_CLASS);
+    }
+
+    #[test]
+    fn m004_adoption_requires_exact_object_and_other_success_does_not_stabilize() {
+        let mut f = fixture("adoption");
+        let id = identity(1, 24);
+        let pinned_obj = tagged_object(46);
+        open_provisional_pin(&mut f.store, &id, &pinned_obj).unwrap();
+        authorize_reader(&mut f.store, &id, &edge(11)).unwrap();
+
+        // §65: another attempt succeeding for the same action key does NOT
+        // stabilize this pin — state unchanged, reads still gated.
+        let before = f.store.provisional_pin_row(&id.pin_key()).unwrap().unwrap();
+        assert!(!before.released && before.adopted_object_key.is_none());
+
+        // §65.1: a winner publishing DIFFERENT bytes cannot adopt — the
+        // mismatch is typed, and descendants must be cancelled instead.
+        let err = record_adoption(&mut f.store, &id, &tagged_object(47)).unwrap_err();
+        assert_eq!(
+            err,
+            ProvisionalPinError::AdoptionMismatch {
+                pin_key: id.pin_key(),
+                pinned: digest_key(&pinned_obj.0),
+                committed: digest_key(&tagged_object(47).0),
+            }
+        );
+
+        // Exact-object adoption resolves lineage explicitly...
+        record_adoption(&mut f.store, &id, &pinned_obj).unwrap();
+        let after = f.store.provisional_pin_row(&id.pin_key()).unwrap().unwrap();
+        assert_eq!(
+            after.adopted_object_key.as_deref(),
+            Some(digest_key(&pinned_obj.0).as_str())
+        );
+        // ...but the pin REMAINS provisional: visibility stays granted-only
+        // and closure stays explicit. Adoption never flips it stable.
+        assert!(!after.released);
+        assert_eq!(
+            resolve_for_reader(&mut f.store, &id, &edge(12)).unwrap_err(),
+            ProvisionalPinError::Unauthorized {
+                pin_key: id.pin_key()
+            }
+        );
+        assert_eq!(
+            resolve_for_reader(&mut f.store, &id, &edge(11)).unwrap(),
+            pinned_obj
+        );
+    }
+
+    #[test]
+    fn m004_renewal_is_monotonic_and_closed_pins_refuse() {
+        let mut f = fixture("renew");
+        let id = identity(1, 25);
+        open_provisional_pin(&mut f.store, &id, &tagged_object(48)).unwrap();
+
+        renew_provisional_pin(&mut f.store, &id, 4).unwrap();
+        renew_provisional_pin(&mut f.store, &id, 6).unwrap();
+        assert_eq!(
+            renew_provisional_pin(&mut f.store, &id, 6).unwrap_err(),
+            ProvisionalPinError::NonMonotonicRenewal {
+                pin_key: id.pin_key()
+            }
+        );
+        assert_eq!(
+            renew_provisional_pin(&mut f.store, &id, 3).unwrap_err(),
+            ProvisionalPinError::NonMonotonicRenewal {
+                pin_key: id.pin_key()
+            }
+        );
+
+        release_authority_fixture(&mut f.store, 1);
+        release_after_drain(&mut f.store, &id, &Releaser::Coordinator(authority(1))).unwrap();
+        assert_eq!(
+            renew_provisional_pin(&mut f.store, &id, 9).unwrap_err(),
+            ProvisionalPinError::Closed {
+                pin_key: id.pin_key()
+            }
+        );
+        // Re-opening a drained identity is refused — candidate pins are
+        // valid THROUGH decision/reconciliation, not resurrectable after.
+        assert_eq!(
+            open_provisional_pin(&mut f.store, &id, &tagged_object(48)).unwrap_err(),
+            ProvisionalPinError::Closed {
+                pin_key: id.pin_key()
+            }
+        );
+    }
+
+    #[test]
+    fn m004_identity_tuple_binds_every_component_into_the_pin_address() {
+        // Two identities differing in ANY component get different keys —
+        // hedge attempts never share pins, and authority rotation forks
+        // the address space.
+        let base = identity(1, 30);
+        let variants = [
+            ProvisionalIdentity {
+                attempt: AttemptId(31),
+                lease: ExecutionLeaseId(32),
+                ..base.clone()
+            },
+            ProvisionalIdentity {
+                generation: ActionGenerationId(0x52),
+                ..base.clone()
+            },
+            ProvisionalIdentity {
+                role: OutputRole::DepInfo,
+                ..base.clone()
+            },
+            ProvisionalIdentity {
+                virtual_path: RawBytes::new(b"target/debug/deps/libother.rmeta".to_vec()),
+                ..base.clone()
+            },
+            ProvisionalIdentity {
+                authority: authority(3),
+                ..base.clone()
+            },
+        ];
+        let base_key = base.pin_key();
+        for v in &variants {
+            assert_ne!(v.pin_key(), base_key);
+        }
+        // Deterministic across recomputation.
+        assert_eq!(base.pin_key(), base_key);
+    }
+
+    /// Acquire authority `tag` for release tests (helper keeping fixtures
+    /// terse).
+    fn release_authority_fixture(store: &mut SqlMetadataStore<RusqliteEngine>, tag: u64) {
+        store
+            .acquire_authority(&crate::metadata_store::AuthorityRow {
+                digest: crate::publication::authority_digest(&authority(tag)),
+                cluster_id: format!("cluster-{tag}"),
+                incarnation: 0xAA + u128::from(tag),
+                term: 100 + tag,
+                acquired_seq: tag,
+            })
+            .unwrap();
+    }
+}

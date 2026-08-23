@@ -55,6 +55,7 @@ pub mod materialization;
 pub mod metadata_store;
 pub mod pack;
 pub mod pin_leases;
+pub mod provisional_pins;
 pub mod publication;
 pub mod serving_sample_gate;
 pub mod serving_state;

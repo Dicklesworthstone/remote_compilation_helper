@@ -71,32 +71,32 @@ pub const DIVERGENCE_EVIDENCE_PIN_CLASS: &str = "divergence-evidence";
 
 /// Length-delimited canonical framing (the F034 pattern): every field is
 /// `len(u64 be) || bytes`, so no concatenation ambiguity exists.
-struct Framing(Sha256);
+pub(crate) struct Framing(Sha256);
 
 impl Framing {
-    fn new(domain: &str) -> Self {
+    pub(crate) fn new(domain: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update((domain.len() as u64).to_be_bytes());
         hasher.update(domain.as_bytes());
         Self(hasher)
     }
 
-    fn field(&mut self, bytes: &[u8]) -> &mut Self {
+    pub(crate) fn field(&mut self, bytes: &[u8]) -> &mut Self {
         self.0.update((bytes.len() as u64).to_be_bytes());
         self.0.update(bytes);
         self
     }
 
-    fn u64(&mut self, v: u64) -> &mut Self {
+    pub(crate) fn u64(&mut self, v: u64) -> &mut Self {
         self.field(&v.to_be_bytes())
     }
 
-    fn digest_field(&mut self, d: &TypedDigest) -> &mut Self {
+    pub(crate) fn digest_field(&mut self, d: &TypedDigest) -> &mut Self {
         self.field(d.domain.as_bytes());
         self.field(&d.bytes)
     }
 
-    fn finish(self, domain: &'static str) -> TypedDigest {
+    pub(crate) fn finish(self, domain: &'static str) -> TypedDigest {
         TypedDigest {
             algorithm: DigestAlgorithm::Sha256V1,
             domain,
@@ -126,7 +126,7 @@ const fn result_kind_tag(kind: ResultKind) -> u64 {
     }
 }
 
-const fn output_role_tag(role: OutputRole) -> u64 {
+pub(crate) const fn output_role_tag(role: OutputRole) -> u64 {
     match role {
         OutputRole::Materializable => 0,
         OutputRole::DepInfo => 1,

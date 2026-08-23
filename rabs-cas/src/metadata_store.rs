@@ -42,8 +42,9 @@ use rabs_protocol::serving::ServingValidity;
 /// append-only divergence incidents; v11 = H029 evidence rows name the
 /// canonical result manifest they support; v12 = H032 location rows
 /// carry their durability state; v13 = H028 provisional-ancestor
-/// lineage + adoption edges).
-pub const SCHEMA_VERSION: u32 = 13;
+/// lineage + adoption edges; v14 = M004 provisional `.rmeta` upload
+/// pins + authorized-visibility grants).
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -311,6 +312,29 @@ pub const MIGRATIONS: &[Migration] = &[
          PRIMARY KEY (producer_action_key, role, virtual_path, from_object_key))",
         ],
     },
+    Migration {
+        // M004: provisional `.rmeta` upload pins (plan §65). One row per
+        // candidate pin binding an early metadata object to its full
+        // producer identity tuple; grants name the ONLY readers (dependent
+        // attempts + the awaiting edge/subscriber) — visibility is closed
+        // by default and every read is authorized against this table.
+        version: 14,
+        statements: &[
+            "CREATE TABLE provisional_pins (pin_key TEXT PRIMARY KEY, \
+         authority_key TEXT NOT NULL, action_key TEXT NOT NULL, \
+         generation_hex TEXT NOT NULL, attempt_hex TEXT NOT NULL, \
+         lease_hex TEXT NOT NULL, role INTEGER NOT NULL, \
+         virtual_path BLOB NOT NULL, obj_algo TEXT NOT NULL, \
+         obj_domain TEXT NOT NULL, obj_bytes BLOB NOT NULL, \
+         object_key TEXT NOT NULL, protective_pin_hex TEXT NOT NULL, \
+         renewal_seq INTEGER NOT NULL DEFAULT 0, adopted_object_key TEXT, \
+         invalidated_reason TEXT, released INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE provisional_pin_grants (pin_key TEXT NOT NULL, \
+         grantee_kind TEXT NOT NULL, grantee_id TEXT NOT NULL, \
+         granted_seq INTEGER NOT NULL, \
+         PRIMARY KEY (pin_key, grantee_kind, grantee_id))",
+        ],
+    },
 ];
 
 /// Typed store errors (comparable so the differential harness can assert
@@ -483,6 +507,77 @@ pub struct ProvisionalAncestorRow {
     /// Whether an explicit adoption edge (not exact-object identity)
     /// established compatibility.
     pub adopted: bool,
+}
+
+/// One provisional-upload pin row (M004; plan §65): an early `.rmeta`
+/// object bound to its full producer identity tuple
+/// `(authority, action key, generation, attempt, lease, logical output)`.
+/// State columns are read-side facts: `adopted_object_key` records a
+/// winner adoption (§65.1), `invalidated_reason` a producer failure or
+/// supersession, `released` the post-drain close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionalPinRecord {
+    /// Canonical digest key of the identity tuple.
+    pub pin_key: String,
+    /// Digest key of the minting coordinator authority.
+    pub authority_key: String,
+    /// Digest key of the producer action.
+    pub action_key: String,
+    /// Producer generation id (hex).
+    pub generation_hex: String,
+    /// Producer attempt id (hex).
+    pub attempt_hex: String,
+    /// Producer execution lease id (hex).
+    pub lease_hex: String,
+    /// Role tag of the logical output.
+    pub role_tag: i64,
+    /// Canonical virtual path bytes.
+    pub virtual_path: Vec<u8>,
+    /// The pinned object (domain-restored digest).
+    pub object: TypedDigest,
+    /// Derived digest key of [`Self::object`].
+    pub object_key: String,
+    /// Hex id of the protective row in `pins` keeping this object
+    /// GC-safe while the candidate pin is live.
+    pub protective_pin_hex: String,
+    /// Monotonic renewal sequence.
+    pub renewal_seq: u64,
+    /// Object key of the committed result that adopted this pin, if any.
+    pub adopted_object_key: Option<String>,
+    /// Why the producer lineage failed/superseded/lost authority, if it did.
+    pub invalidated_reason: Option<String>,
+    /// Whether the pin is closed (drained or invalidated).
+    pub released: bool,
+}
+
+/// Insert payload for a new provisional-upload pin. Identity scalars are
+/// raw values (hex encoding happens at the SQL boundary); the object is a
+/// full typed digest so its domain is interned on write (R121).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionalPinInsert {
+    /// Canonical digest key of the identity tuple.
+    pub pin_key: String,
+    /// Digest key of the minting coordinator authority.
+    pub authority_key: String,
+    /// Digest key of the producer action.
+    pub action_key: String,
+    /// Producer generation id.
+    pub generation: u128,
+    /// Producer attempt id.
+    pub attempt: u128,
+    /// Producer execution lease id.
+    pub lease: u128,
+    /// Role tag of the logical output.
+    pub role_tag: i64,
+    /// Canonical virtual path bytes.
+    pub virtual_path: Vec<u8>,
+    /// The pinned object.
+    pub object: TypedDigest,
+    /// Deterministic id of the protective `pins` row (derived from the
+    /// pin digest by the caller).
+    pub protective_pin_id: u128,
+    /// Human-auditable reason stored with the protective pin.
+    pub reason: String,
 }
 
 /// Result kind tag persisted with a publication.
@@ -1383,6 +1478,56 @@ pub trait RabsMetadataStore {
         consumer_action_key: &str,
     ) -> Result<Vec<ProvisionalAncestorRow>, StoreError>;
 
+    /// One provisional-upload pin row by canonical key (M004).
+    fn provisional_pin_row(
+        &mut self,
+        pin_key: &str,
+    ) -> Result<Option<ProvisionalPinRecord>, StoreError>;
+
+    /// Register a provisional-upload pin AND its protective `pins` row in
+    /// ONE transaction (M004): the object is GC-safe from the instant the
+    /// registry row exists, and no tear can leave one without the other.
+    fn insert_provisional_pin(&mut self, pin: &ProvisionalPinInsert) -> Result<(), StoreError>;
+
+    /// Grant one reader visibility of a provisional output (M004). The
+    /// grant table IS the authorization truth; readers absent from it are
+    /// refused.
+    fn record_provisional_grant(
+        &mut self,
+        pin_key: &str,
+        grantee_kind: &str,
+        grantee_id: &str,
+        granted_seq: u64,
+    ) -> Result<(), StoreError>;
+
+    /// Grants of one provisional pin, ordered by (kind, id).
+    fn list_provisional_grants(
+        &mut self,
+        pin_key: &str,
+    ) -> Result<Vec<(String, String, u64)>, StoreError>;
+
+    /// Monotonically renew a provisional pin's sequence; refuses closed
+    /// pins and stale sequences.
+    fn renew_provisional_pin(&mut self, pin_key: &str, renewal_seq: u64) -> Result<(), StoreError>;
+
+    /// Close a provisional pin: mark it released (recording WHY when the
+    /// producer lineage failed/superseded/lost authority) so reads refuse
+    /// immediately. Closing happens BEFORE the protective pin is released
+    /// by the caller — a tear between the two fails toward retention.
+    fn close_provisional_pin(
+        &mut self,
+        pin_key: &str,
+        invalidation_reason: Option<&str>,
+    ) -> Result<(), StoreError>;
+
+    /// Record a winner adoption (§65.1) on a provisional pin. Callers
+    /// MUST have verified exact-object compatibility first; this only
+    /// persists the resolution.
+    fn adopt_provisional_pin(
+        &mut self,
+        pin_key: &str,
+        committed_object_key: &str,
+    ) -> Result<(), StoreError>;
     /// Record that a consumer was served this action's published result
     /// (a `served-to` provenance edge; idempotent). This is what H026
     /// escalation later enumerates — serving paths must call it when they
@@ -1666,6 +1811,14 @@ fn expect_u128(v: &SqlValue, what: &str) -> Result<u128, StoreError> {
 fn expect_text(v: &SqlValue, what: &str) -> Result<String, StoreError> {
     match v {
         SqlValue::Text(t) => Ok(t.clone()),
+        _ => Err(StoreError::Corruption(format!("{what} shape"))),
+    }
+}
+
+fn expect_opt_text(v: &SqlValue, what: &str) -> Result<Option<String>, StoreError> {
+    match v {
+        SqlValue::Null => Ok(None),
+        SqlValue::Text(t) => Ok(Some(t.clone())),
         _ => Err(StoreError::Corruption(format!("{what} shape"))),
     }
 }
@@ -4363,6 +4516,251 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             .collect()
     }
 
+    fn provisional_pin_row(
+        &mut self,
+        pin_key: &str,
+    ) -> Result<Option<ProvisionalPinRecord>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT pin_key, authority_key, action_key, generation_hex, attempt_hex, \
+             lease_hex, role, virtual_path, obj_algo, obj_domain, obj_bytes, object_key, \
+             protective_pin_hex, renewal_seq, adopted_object_key, invalidated_reason, \
+             released FROM provisional_pins WHERE pin_key = ?1",
+            &[SqlValue::Text(pin_key.to_owned())],
+        )?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let [
+            pin,
+            authority,
+            action,
+            generation,
+            attempt,
+            lease,
+            role,
+            path,
+            algo,
+            domain,
+            bytes,
+            object,
+            protective,
+            renewal,
+            adopted,
+            invalidation,
+            released,
+        ] = row.as_slice()
+        else {
+            return Err(StoreError::Corruption("provisional pin shape".into()));
+        };
+        Ok(Some(ProvisionalPinRecord {
+            pin_key: expect_text(pin, "provisional pin key")?,
+            authority_key: expect_text(authority, "provisional authority")?,
+            action_key: expect_text(action, "provisional action")?,
+            generation_hex: expect_text(generation, "provisional generation")?,
+            attempt_hex: expect_text(attempt, "provisional attempt")?,
+            lease_hex: expect_text(lease, "provisional lease")?,
+            role_tag: match role {
+                SqlValue::Int(v) => *v,
+                _ => return Err(StoreError::Corruption("provisional role shape".into())),
+            },
+            virtual_path: match path {
+                SqlValue::Blob(b) => b.clone(),
+                _ => return Err(StoreError::Corruption("provisional path shape".into())),
+            },
+            object: self.restore_digest(algo, domain, bytes)?,
+            object_key: expect_text(object, "provisional object")?,
+            protective_pin_hex: expect_text(protective, "provisional protective pin")?,
+            renewal_seq: expect_u64(renewal, "provisional renewal")?,
+            adopted_object_key: expect_opt_text(adopted, "provisional adoption")?,
+            invalidated_reason: expect_opt_text(invalidation, "provisional invalidation")?,
+            released: expect_u64(released, "provisional released")? != 0,
+        }))
+    }
+
+    fn insert_provisional_pin(&mut self, pin: &ProvisionalPinInsert) -> Result<(), StoreError> {
+        let row = pin.clone();
+        // R121: intern the object's domain so later reads in THIS process
+        // can restore the typed digest fail-closed.
+        self.intern(row.object.domain);
+        self.in_txn(move |engine| {
+            engine.execute(
+                "INSERT INTO provisional_pins (pin_key, authority_key, action_key, \
+                 generation_hex, attempt_hex, lease_hex, role, virtual_path, obj_algo, \
+                 obj_domain, obj_bytes, object_key, protective_pin_hex, renewal_seq, \
+                 adopted_object_key, invalidated_reason, released) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, \
+                 NULL, NULL, 0)",
+                &[
+                    SqlValue::Text(row.pin_key),
+                    SqlValue::Text(row.authority_key),
+                    SqlValue::Text(row.action_key),
+                    SqlValue::Text(u128_hex(row.generation)),
+                    SqlValue::Text(u128_hex(row.attempt)),
+                    SqlValue::Text(u128_hex(row.lease)),
+                    SqlValue::Int(row.role_tag),
+                    SqlValue::Blob(row.virtual_path),
+                    SqlValue::Text(algo_tag(row.object.algorithm).to_owned()),
+                    SqlValue::Text(row.object.domain.to_owned()),
+                    SqlValue::Blob(row.object.bytes.to_vec()),
+                    SqlValue::Text(digest_key(&row.object)),
+                    SqlValue::Text(u128_hex(row.protective_pin_id)),
+                ],
+            )?;
+            // The GC-protective twin in `pins` (H010 semantics): same
+            // transaction, so the registry row and the protection root are
+            // born together.
+            engine.execute(
+                "INSERT INTO pins (id_hex, id, root_key, owner, class, expires_at_seq, \
+                 released, evidence, renewal_seq, durable, reason) \
+                 VALUES (?1, ?2, ?3, 'coordinator', 'provisional-metadata', NULL, 0, \
+                 NULL, 0, 1, ?4)",
+                &[
+                    SqlValue::Text(u128_hex(row.protective_pin_id)),
+                    SqlValue::Blob(row.protective_pin_id.to_be_bytes().to_vec()),
+                    SqlValue::Text(digest_key(&row.object)),
+                    SqlValue::Text(row.reason),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn record_provisional_grant(
+        &mut self,
+        pin_key: &str,
+        grantee_kind: &str,
+        grantee_id: &str,
+        granted_seq: u64,
+    ) -> Result<(), StoreError> {
+        let (pin_key, kind, id) = (
+            pin_key.to_owned(),
+            grantee_kind.to_owned(),
+            grantee_id.to_owned(),
+        );
+        self.in_txn(move |engine| {
+            engine.execute(
+                "INSERT OR IGNORE INTO provisional_pin_grants \
+                 (pin_key, grantee_kind, grantee_id, granted_seq) VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    SqlValue::Text(pin_key),
+                    SqlValue::Text(kind),
+                    SqlValue::Text(id),
+                    SqlValue::Int(granted_seq as i64),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_provisional_grants(
+        &mut self,
+        pin_key: &str,
+    ) -> Result<Vec<(String, String, u64)>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT grantee_kind, grantee_id, granted_seq FROM provisional_pin_grants \
+             WHERE pin_key = ?1 ORDER BY grantee_kind, grantee_id",
+            &[SqlValue::Text(pin_key.to_owned())],
+        )?;
+        rows.iter()
+            .map(|row| {
+                let [kind, id, seq] = row.as_slice() else {
+                    return Err(StoreError::Corruption("provisional grant shape".into()));
+                };
+                Ok((
+                    expect_text(kind, "grant kind")?,
+                    expect_text(id, "grant id")?,
+                    expect_u64(seq, "grant seq")?,
+                ))
+            })
+            .collect()
+    }
+
+    fn renew_provisional_pin(&mut self, pin_key: &str, renewal_seq: u64) -> Result<(), StoreError> {
+        let pin_key = pin_key.to_owned();
+        self.in_txn(move |engine| {
+            let rows = engine.query(
+                "SELECT renewal_seq, released FROM provisional_pins WHERE pin_key = ?1",
+                &[SqlValue::Text(pin_key.clone())],
+            )?;
+            let Some(row) = rows.first() else {
+                return Err(StoreError::UnknownPin);
+            };
+            let [stored, released] = row.as_slice() else {
+                return Err(StoreError::Corruption("provisional renewal shape".into()));
+            };
+            if expect_u64(released, "released")? != 0 {
+                return Err(StoreError::PinReleased);
+            }
+            if renewal_seq <= expect_u64(stored, "renewal")? {
+                return Err(StoreError::NonMonotonicPinRenewal);
+            }
+            engine.execute(
+                "UPDATE provisional_pins SET renewal_seq = ?1 WHERE pin_key = ?2",
+                &[SqlValue::Int(renewal_seq as i64), SqlValue::Text(pin_key)],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn close_provisional_pin(
+        &mut self,
+        pin_key: &str,
+        invalidation_reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let pin_key = pin_key.to_owned();
+        let reason = invalidation_reason.map(str::to_owned);
+        self.in_txn(move |engine| {
+            // Idempotent close; the protective pin is left for the caller
+            // to release AFTER this commit (fail toward retention on tear).
+            let changed = engine.execute(
+                "UPDATE provisional_pins SET released = 1, invalidated_reason = \
+                 COALESCE(?1, invalidated_reason) WHERE pin_key = ?2 AND released = 0",
+                &[
+                    reason.map(SqlValue::Text).unwrap_or(SqlValue::Null),
+                    SqlValue::Text(pin_key.clone()),
+                ],
+            )?;
+            if changed == 0
+                && engine
+                    .query(
+                        "SELECT 1 FROM provisional_pins WHERE pin_key = ?1",
+                        &[SqlValue::Text(pin_key)],
+                    )?
+                    .is_empty()
+            {
+                return Err(StoreError::UnknownPin);
+            }
+            Ok(())
+        })
+    }
+
+    fn adopt_provisional_pin(
+        &mut self,
+        pin_key: &str,
+        committed_object_key: &str,
+    ) -> Result<(), StoreError> {
+        let pin_key = pin_key.to_owned();
+        let committed = committed_object_key.to_owned();
+        self.in_txn(move |engine| {
+            let changed = engine.execute(
+                "UPDATE provisional_pins SET adopted_object_key = ?1 \
+                 WHERE pin_key = ?2 AND adopted_object_key IS NULL",
+                &[SqlValue::Text(committed), SqlValue::Text(pin_key.clone())],
+            )?;
+            if changed == 0
+                && engine
+                    .query(
+                        "SELECT 1 FROM provisional_pins WHERE pin_key = ?1",
+                        &[SqlValue::Text(pin_key)],
+                    )?
+                    .is_empty()
+            {
+                return Err(StoreError::UnknownPin);
+            }
+            Ok(())
+        })
+    }
+
     fn record_served_consumer(
         &mut self,
         action_key: &str,
@@ -4614,6 +5012,18 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 "SELECT producer_action_key, role, virtual_path, from_object_key, \
                  to_object_key FROM adoption_edges \
                  ORDER BY producer_action_key, role, virtual_path, from_object_key",
+            ),
+            (
+                "provisional_pins",
+                "SELECT pin_key, authority_key, action_key, generation_hex, attempt_hex, \
+                 lease_hex, role, virtual_path, obj_algo, obj_domain, obj_bytes, object_key, \
+                 protective_pin_hex, renewal_seq, adopted_object_key, invalidated_reason, \
+                 released FROM provisional_pins ORDER BY pin_key",
+            ),
+            (
+                "provisional_pin_grants",
+                "SELECT pin_key, grantee_kind, grantee_id, granted_seq \
+                 FROM provisional_pin_grants ORDER BY pin_key, grantee_kind, grantee_id",
             ),
         ];
         let mut lines = Vec::new();
@@ -5579,6 +5989,8 @@ mod tests {
             "pins",
             "provenance_edges",
             "provisional_ancestry",
+            "provisional_pin_grants",
+            "provisional_pins",
             "quarantines",
             "schema_epochs",
             "serving_blocking_quarantines",
