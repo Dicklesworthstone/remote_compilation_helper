@@ -134,4 +134,63 @@ for profile in release daemon-release; do
         { echo "### $profile FAILED" >> "$CRIT_LOG"; true; }
 done
 
+# ----------------------------------------------------------------------------
+# A021 acceptance tail: live-fleet traces against a real worker. Opt-in via
+# FLEET_TRACES=1 because every scenario performs real remote work. Traces ride
+# the same wrapper/daemon binaries the split profiles produce; timings are
+# wall-clock around whole `rch exec` invocations (admission + sync + remote
+# run), which is exactly what an agent experiences.
+if [[ "${FLEET_TRACES:-0}" == "1" ]]; then
+    TRACE_REPS="${TRACE_REPS:-5}"
+    STORM_N="${STORM_N:-4}"
+    # Small workspace crates so storm members mostly measure scheduling +
+    # transfer rather than one giant rustc invocation.
+    STORM_CRATES="${STORM_CRATES:-rabs-key rabs-protocol rch-common rabs-cas}"
+
+    trace_emit() { # scenario rep elapsed_ns detail
+        emit "{\"schema\":\"rabs.fleet-trace\",\"schema_version\":1,\"worker\":\"$WORKER\",\"scenario\":\"$1\",\"rep\":$2,\"elapsed_ns\":$3,\"detail\":\"$4\"}"
+    }
+
+    timed_remote() { # runs remainder as one remote invocation; echoes elapsed_ns
+        local s e
+        s=$(ns_now)
+        RCH_WORKER="$WORKER" RCH_FORCE_REMOTE=1 rch exec "$@" >/dev/null 2>&1 || true
+        e=$(ns_now)
+        echo $((e - s))
+    }
+
+    echo "==> fleet trace: pure transfer/sync floor (--job true)" >&2
+    for i in $(seq 1 "$TRACE_REPS"); do
+        trace_emit transfer_sync "$i" "$(timed_remote --job -- true)" "no-op job; admission+sync overhead"
+    done
+
+    echo "==> fleet trace: worker cache hit (warm cargo check)" >&2
+    for i in $(seq 1 "$TRACE_REPS"); do
+        trace_emit cache_hit_warm "$i" "$(timed_remote -- cargo check -p rch-common)" "warm pooled target dir"
+    done
+
+    echo "==> fleet trace: cold target (full recompile of one crate graph)" >&2
+    cold_dir="/tmp/rch_cold_target_$$"
+    trace_emit cache_miss_cold 1 "$(timed_remote -- env CARGO_TARGET_DIR="$cold_dir" cargo check -p rch-common)" "fresh CARGO_TARGET_DIR"
+
+    echo "==> fleet trace: compile storm ($STORM_N concurrent execs)" >&2
+    read -r -a storm_arr <<<"$STORM_CRATES"
+    storm_tmp="$(mktemp -d)"
+    storm_s=$(ns_now)
+    for i in $(seq 0 $((STORM_N - 1))); do
+        crate=${storm_arr[$((i % ${#storm_arr[@]}))]}
+        (
+            el=$(timed_remote -- cargo check -p "$crate")
+            echo "$el" >"$storm_tmp/$i"
+        ) &
+    done
+    wait
+    storm_e=$(ns_now)
+    for i in $(seq 0 $((STORM_N - 1))); do
+        [[ -f "$storm_tmp/$i" ]] && trace_emit compile_storm_member "$i" "$(cat "$storm_tmp/$i")" "crate $i"
+    done
+    trace_emit compile_storm_wall 0 $((storm_e - storm_s)) "$STORM_N concurrent execs"
+    rm -rf "$storm_tmp"
+fi
+
 echo "==> evidence: $OUT (+ criterion log: $CRIT_LOG)" >&2
