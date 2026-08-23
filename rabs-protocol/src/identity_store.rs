@@ -17,6 +17,14 @@
 //! - sessions BIND to the generation they handshook at: after a
 //!   rotation, a stale-generation binding refuses typed — the peer
 //!   must re-handshake under the new key.
+//!
+//! Transport binding (bead S002): an identity used for ATP
+//! authorization must bind to what the TRANSPORT authenticated — a
+//! session is admitted only when the wire-claimed peer id IS the
+//! transport-authenticated one AND the store verifies its fingerprint
+//! at the current generation. Configuration labels are aliases: they
+//! name an EXPECTATION for operators and can never substitute for the
+//! transport proof.
 
 /// Trust scopes an identity can hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +129,72 @@ pub enum BindingVerdict {
     },
     /// Revoked or unknown identity.
     IdentityGone,
+}
+
+/// What the transport layer AUTHENTICATED at handshake (bead S002):
+/// the public-key-derived peer id plus the key fingerprint the
+/// transport proof actually verified. Configuration labels never
+/// appear here — a label is an alias, not evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportIdentity {
+    /// The peer id the transport proof authenticated.
+    pub peer_id: [u8; 32],
+    /// The key fingerprint the transport proof verified.
+    pub fingerprint: [u8; 32],
+}
+
+/// A session whose identity claim PROVED: the wire claim was the
+/// transport-authenticated peer and the store verified its fingerprint
+/// at the current generation. Feed [`BoundSession::binding`] to
+/// [`IdentityStore::check_binding`] to keep it fenced across rotations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundSession {
+    /// The durable session binding at the verified generation.
+    pub binding: SessionBinding,
+    /// The trust scope the verified identity holds.
+    pub scope: TrustScope,
+}
+
+/// Typed refusals for binding a session to the transport-
+/// authenticated identity. Every mismatch is named, never guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingRefusal {
+    /// The wire-claimed peer id diverges from the transport-
+    /// authenticated one: the channel presented itself as another peer.
+    ClaimedIdMismatch,
+    /// Peer unknown to the store.
+    UnknownPeer,
+    /// The identity is revoked (terminal).
+    RevokedIdentity,
+    /// The authenticated fingerprint is not the CURRENT generation's.
+    FingerprintMismatch {
+        /// The historical generation whose fingerprint WOULD have
+        /// matched (a stale key after rotation), or `None` for a
+        /// fingerprint never seen under this peer.
+        matches_generation: Option<u32>,
+    },
+}
+
+/// Operator-facing label → expected-peer aliases ("the worker we call
+/// `css`"). Resolving a label yields an EXPECTATION to check against
+/// authenticated evidence; no API here turns a label into a session,
+/// because configuration labels are aliases, never proof (S002).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LabelAliases {
+    map: std::collections::BTreeMap<String, [u8; 32]>,
+}
+
+impl LabelAliases {
+    /// Alias a label to the peer id it must observe to be honored.
+    pub fn alias(&mut self, label: &str, peer_id: [u8; 32]) {
+        self.map.insert(label.to_owned(), peer_id);
+    }
+
+    /// The peer a label NAMES — the expectation, not a credential.
+    #[must_use]
+    pub fn resolve(&self, label: &str) -> Option<[u8; 32]> {
+        self.map.get(label).copied()
+    }
 }
 
 /// The append-only identity store.
@@ -276,6 +350,42 @@ impl IdentityStore {
                 bound: binding.generation,
                 current: view.generation,
             }
+        }
+    }
+
+    /// Bind a session's identity to what the transport authenticated
+    /// (bead S002). Admission requires BOTH halves of the proof:
+    /// the wire-claimed peer id must BE the transport-authenticated
+    /// peer id, and the store must verify the authenticated
+    /// fingerprint at the CURRENT generation. Any divergence is a
+    /// typed refusal — a configuration label naming the peer is an
+    /// expectation for [`LabelAliases::resolve`], never a substitute.
+    ///
+    /// # Errors
+    /// [`BindingRefusal`] naming the failed half of the proof.
+    pub fn bind_transport_identity(
+        &self,
+        claimed_peer: &[u8; 32],
+        transport: &TransportIdentity,
+        session_id: u64,
+    ) -> Result<BoundSession, BindingRefusal> {
+        if *claimed_peer != transport.peer_id {
+            return Err(BindingRefusal::ClaimedIdMismatch);
+        }
+        match self.verify(&transport.peer_id, &transport.fingerprint) {
+            VerifyVerdict::Valid { generation, scope } => Ok(BoundSession {
+                binding: SessionBinding {
+                    peer_id: transport.peer_id,
+                    generation,
+                    session_id,
+                },
+                scope,
+            }),
+            VerifyVerdict::Mismatch { matches_generation } => {
+                Err(BindingRefusal::FingerprintMismatch { matches_generation })
+            }
+            VerifyVerdict::RevokedIdentity => Err(BindingRefusal::RevokedIdentity),
+            VerifyVerdict::UnknownPeer => Err(BindingRefusal::UnknownPeer),
         }
     }
 
@@ -439,5 +549,184 @@ mod tests {
         store.rotate([8; 32], KEY_3, 3).expect("rotates");
         let after: Vec<IdentityRecord> = store.history(&PEER).into_iter().cloned().collect();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn binding_requires_the_claim_to_be_the_authenticated_peer() {
+        // THE acceptance: the wire claim must BE the transport-
+        // authenticated identity before the store is even consulted.
+        let mut store = IdentityStore::default();
+        store
+            .create(PEER, KEY_1, TrustScope::Worker, 1)
+            .expect("creates");
+        let transport = TransportIdentity {
+            peer_id: PEER,
+            fingerprint: KEY_1,
+        };
+        let bound = store
+            .bind_transport_identity(&PEER, &transport, 77)
+            .expect("binds");
+        assert_eq!(
+            bound,
+            BoundSession {
+                binding: SessionBinding {
+                    peer_id: PEER,
+                    generation: 1,
+                    session_id: 77,
+                },
+                scope: TrustScope::Worker,
+            }
+        );
+        // A channel authenticated as one peer claiming another: refused
+        // typed, and nothing binds.
+        let impostor = TransportIdentity {
+            peer_id: [8; 32],
+            fingerprint: [8; 32],
+        };
+        store
+            .create([8; 32], [8; 32], TrustScope::Worker, 2)
+            .expect("creates impostor");
+        assert_eq!(
+            store.bind_transport_identity(&PEER, &impostor, 78),
+            Err(BindingRefusal::ClaimedIdMismatch)
+        );
+    }
+
+    #[test]
+    fn labels_are_aliases_never_proof() {
+        // The operator labels the worker "css" → an EXPECTATION about
+        // which peer must show up. Resolving the label grants nothing:
+        // only the transport proof of THAT peer admits the session.
+        let mut aliases = LabelAliases::default();
+        aliases.alias("css", PEER);
+        assert_eq!(aliases.resolve("css"), Some(PEER));
+        assert_eq!(aliases.resolve("unknown"), None);
+        let mut store = IdentityStore::default();
+        store
+            .create(PEER, KEY_1, TrustScope::Worker, 1)
+            .expect("creates");
+        store
+            .create([9; 32], [9; 32], TrustScope::Worker, 2)
+            .expect("creates stranger");
+        // A stranger's channel claiming the LABELED peer id: refused —
+        // saying the label's name over someone else's key proves
+        // nothing.
+        let stranger = TransportIdentity {
+            peer_id: [9; 32],
+            fingerprint: [9; 32],
+        };
+        assert_eq!(
+            store.bind_transport_identity(&PEER, &stranger, 5),
+            Err(BindingRefusal::ClaimedIdMismatch)
+        );
+        // And the labeled peer itself still needs its fingerprint
+        // verified — a correct id with a wrong key is no better.
+        let forged = TransportIdentity {
+            peer_id: PEER,
+            fingerprint: [9; 32],
+        };
+        assert_eq!(
+            store.bind_transport_identity(&PEER, &forged, 6),
+            Err(BindingRefusal::FingerprintMismatch {
+                matches_generation: None
+            })
+        );
+    }
+
+    #[test]
+    fn stale_generation_fingerprints_refuse_typed_naming_history() {
+        let mut store = IdentityStore::default();
+        store
+            .create(PEER, KEY_1, TrustScope::Worker, 1)
+            .expect("creates");
+        store.rotate(PEER, KEY_2, 2).expect("rotates");
+        store.rotate(PEER, KEY_3, 3).expect("rotates");
+        // Each historical key names the generation it belonged to (the
+        // R008 signal), never falls back to acceptance.
+        for (key, generation) in [(KEY_1, Some(1)), (KEY_2, Some(2))] {
+            let stale = TransportIdentity {
+                peer_id: PEER,
+                fingerprint: key,
+            };
+            assert_eq!(
+                store.bind_transport_identity(&PEER, &stale, 7),
+                Err(BindingRefusal::FingerprintMismatch {
+                    matches_generation: generation
+                }),
+                "stale key at generation {:?}",
+                generation
+            );
+        }
+        // The CURRENT key binds, pinned to its generation.
+        let current = TransportIdentity {
+            peer_id: PEER,
+            fingerprint: KEY_3,
+        };
+        let bound = store
+            .bind_transport_identity(&PEER, &current, 8)
+            .expect("current key binds");
+        assert_eq!(bound.binding.generation, 3);
+    }
+
+    #[test]
+    fn revoked_and_unknown_peers_cannot_bind() {
+        let mut store = IdentityStore::default();
+        store
+            .create(PEER, KEY_1, TrustScope::Worker, 1)
+            .expect("creates");
+        let unknown = TransportIdentity {
+            peer_id: [9; 32],
+            fingerprint: [9; 32],
+        };
+        assert_eq!(
+            store.bind_transport_identity(&[9; 32], &unknown, 9),
+            Err(BindingRefusal::UnknownPeer)
+        );
+        store.revoke(PEER, 2).expect("revokes");
+        let revoked = TransportIdentity {
+            peer_id: PEER,
+            fingerprint: KEY_1,
+        };
+        assert_eq!(
+            store.bind_transport_identity(&PEER, &revoked, 10),
+            Err(BindingRefusal::RevokedIdentity),
+            "revocation is terminal for binding too"
+        );
+    }
+
+    #[test]
+    fn bound_sessions_compose_with_generation_fencing() {
+        // A bound session is exactly a SessionBinding: rotation fences
+        // it typed, and ONLY a fresh bind under the new key re-admits.
+        let mut store = IdentityStore::default();
+        store
+            .create(PEER, KEY_1, TrustScope::Coordinator, 1)
+            .expect("creates");
+        let transport = TransportIdentity {
+            peer_id: PEER,
+            fingerprint: KEY_1,
+        };
+        let bound = store
+            .bind_transport_identity(&PEER, &transport, 11)
+            .expect("binds");
+        assert_eq!(store.check_binding(&bound.binding), BindingVerdict::Bound);
+        store.rotate(PEER, KEY_2, 2).expect("rotates");
+        assert_eq!(
+            store.check_binding(&bound.binding),
+            BindingVerdict::StaleGeneration {
+                bound: 1,
+                current: 2,
+            }
+        );
+        // Re-handshake under the rotated key: a NEW bind at generation 2.
+        let rotated = TransportIdentity {
+            peer_id: PEER,
+            fingerprint: KEY_2,
+        };
+        let rebound = store
+            .bind_transport_identity(&PEER, &rotated, 12)
+            .expect("re-binds after rotation");
+        assert_eq!(rebound.binding.generation, 2);
+        assert_eq!(store.check_binding(&rebound.binding), BindingVerdict::Bound);
     }
 }
