@@ -241,7 +241,7 @@ const fn output_role_name(role: OutputRole) -> &'static str {
 
 /// Inverse of [`output_role_name`] for stored role tags (obligation rows
 /// persist the numeric tag; adoption edges key by name).
-const fn output_role_name_for_tag(tag: i64) -> &'static str {
+pub(crate) const fn output_role_name_for_tag(tag: i64) -> &'static str {
     match tag {
         1 => "dep-info",
         2 => "provisional-metadata",

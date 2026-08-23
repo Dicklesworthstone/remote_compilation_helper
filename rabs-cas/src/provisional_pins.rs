@@ -43,7 +43,9 @@ use crate::metadata_store::{
     ProvisionalObligationInsert, ProvisionalPinInsert, RabsMetadataStore, StoreError, digest_key,
 };
 use crate::pin_leases::{ReleaseOutcome, Releaser, release_pin_scoped};
-use crate::publication::{Framing, authority_digest, output_role_tag};
+use crate::publication::{
+    Framing, authority_digest, output_role_name_for_tag, output_role_tag,
+};
 use rabs_protocol::authority::CoordinatorAuthority;
 use rabs_protocol::generation::{ActionGenerationId, AttemptId, ExecutionLeaseId};
 use rabs_protocol::raw_bytes::RawBytes;
@@ -139,6 +141,18 @@ impl ProvisionalReader {
     }
 }
 
+/// Toolchain/event contracts a producer ran under (M017). Opaque digests:
+/// this layer proves BINDING EQUALITY between a candidate pin and a
+/// would-be different winning attempt; the digests' semantics live in
+/// the descriptor/event layers above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducerContracts {
+    /// Toolchain contract digest (the F007 descriptor component).
+    pub toolchain: TypedDigest,
+    /// Event-stream contract digest under which outputs were emitted.
+    pub events: TypedDigest,
+}
+
 /// Everything that can refuse a provisional-pin operation. Store failures
 /// are carried verbatim; everything else is a typed policy outcome so
 /// callers can never conflate "not yours" with "gone".
@@ -204,6 +218,46 @@ pub enum ProvisionalPinError {
     },
     /// Underlying store failure.
     Store(StoreError),
+    /// Different-winner adoption proposed from the SAME producer
+    /// attempt/generation — the ordinary commit-resolution path owns that
+    /// case (M017).
+    SameWinningAttempt {
+        /// Canonical key of the pin.
+        pin_key: String,
+    },
+    /// The winning attempt committed for a DIFFERENT action key than the
+    /// pinned producer — foreign truth can never adopt this lineage.
+    ForeignAction {
+        /// Canonical key of the pin.
+        pin_key: String,
+    },
+    /// The winner's toolchain/event contracts differ from the contracts
+    /// bound at pin open, or the pin predates contract binding — adoption
+    /// refuses fail-closed (M017).
+    ContractMismatch {
+        /// Canonical key of the pin.
+        pin_key: String,
+    },
+    /// Transitive verification failed: an ancestor obligation of the
+    /// producing attempt is not resolved to its exact consumed object.
+    AncestorLineageUnresolved {
+        /// Canonical key of the pin being resolved/adopted.
+        pin_key: String,
+        /// Canonical key of the ancestor pin at fault.
+        ancestor_pin_key: String,
+        /// What state was found instead.
+        detail: String,
+    },
+    /// Transitive verification failed permanently: an ancestor lineage
+    /// was invalidated or adopted with foreign bytes — refused for good.
+    AncestorLineageDiverged {
+        /// Canonical key of the pin being resolved/adopted.
+        pin_key: String,
+        /// Canonical key of the ancestor pin at fault.
+        ancestor_pin_key: String,
+        /// What divergence was found.
+        detail: String,
+    },
 }
 
 impl From<StoreError> for ProvisionalPinError {
@@ -252,6 +306,34 @@ impl std::fmt::Display for ProvisionalPinError {
                 f,
                 "provisional pin {pin_key} still has {open_count} open consumer obligation(s)"
             ),
+            Self::SameWinningAttempt { pin_key } => write!(
+                f,
+                "same producer attempt already owns commit resolution for {pin_key}"
+            ),
+            Self::ForeignAction { pin_key } => write!(
+                f,
+                "winning attempt serves a different action than pinned producer of {pin_key}"
+            ),
+            Self::ContractMismatch { pin_key } => write!(
+                f,
+                "winner toolchain/event contracts differ from pin binding on {pin_key}"
+            ),
+            Self::AncestorLineageUnresolved {
+                pin_key,
+                ancestor_pin_key,
+                detail,
+            } => write!(
+                f,
+                "ancestor lineage unresolved for {pin_key} at {ancestor_pin_key}: {detail}"
+            ),
+            Self::AncestorLineageDiverged {
+                pin_key,
+                ancestor_pin_key,
+                detail,
+            } => write!(
+                f,
+                "ancestor lineage diverged for {pin_key} at {ancestor_pin_key}: {detail}"
+            ),
             Self::Store(e) => write!(f, "store error: {e:?}"),
         }
     }
@@ -291,6 +373,7 @@ pub fn open_provisional_pin(
     store: &mut dyn RabsMetadataStore,
     identity: &ProvisionalIdentity,
     object: &ObjectId,
+    contracts: &ProducerContracts,
 ) -> Result<OpenOutcome, ProvisionalPinError> {
     let pin_key = identity.pin_key();
     if let Some(existing) = store.provisional_pin_row(&pin_key)? {
@@ -308,6 +391,25 @@ pub fn open_provisional_pin(
             offered,
         });
     }
+    // M017: materialize the COMPLETE transitive ancestor-pin closure of
+    // the producing attempt BEFORE the pin exists. The attempt's inbound
+    // obligations name its direct ancestors; each ancestor's own recorded
+    // closure is transitively closed over. The full edge set ships in the
+    // SAME insert transaction as the pin row (M017 store contract), so a
+    // prepared descendant always carries its lineage — no tear can strip
+    // it, and invalidation can always reach every consuming descendant.
+    let mut visited = std::collections::BTreeSet::new();
+    let mut worklist: Vec<String> = store
+        .list_open_provisional_obligations_by_attempt(&format!("{:032x}", identity.attempt.0))?
+        .into_iter()
+        .map(|obligation| obligation.pin_key)
+        .collect();
+    while let Some(ancestor_key) = worklist.pop() {
+        if visited.insert(ancestor_key.clone()) {
+            worklist.extend(store.list_provisional_pin_ancestors(&ancestor_key)?);
+        }
+    }
+    let ancestor_pin_keys: Vec<String> = visited.into_iter().collect();
     let digest = identity.digest();
     // Deterministic 128-bit protective-pin id derived from the identity
     // digest; the SQL UNIQUE constraint on `pins.id_hex` fails closed in
@@ -332,6 +434,9 @@ pub fn open_provisional_pin(
             identity.generation.0,
             identity.attempt.0
         ),
+        toolchain_contract_key: digest_key(&contracts.toolchain),
+        event_contract_key: digest_key(&contracts.events),
+        ancestor_pin_keys,
     })?;
     Ok(OpenOutcome::Created)
 }
@@ -436,6 +541,7 @@ pub fn record_adoption(
             committed,
         });
     }
+    verify_transitive_lineage(store, identity)?;
     store.adopt_provisional_pin(&pin_key, &committed)?;
     store.resolve_provisional_obligations(&pin_key, &committed)?;
     Ok(())
@@ -463,19 +569,228 @@ pub fn resolve_consumers_on_commit(
     if row.object_key != committed {
         return Err(ProvisionalPinError::AdoptionMismatch {
             pin_key,
-            pinned: row.object_key,
-            committed,
+            pinned: row.object_key.clone(),
+            committed: committed.clone(),
         });
     }
+    // M017: commit resolution is gated on the WHOLE transitive ancestor
+    // closure being exactly resolved — a descendant never satisfies its
+    // consumers on top of unresolved or diverged upstream truth.
+    verify_transitive_lineage(store, identity)?;
     store.adopt_provisional_pin(&pin_key, &committed)?;
     Ok(store.resolve_provisional_obligations(&pin_key, &committed)?)
 }
 
-/// Invalidate the pin because its producer generation failed, was
+/// M017 transitive lineage verification: the pin's whole materialized
+/// ancestor closure must be exactly resolved before this pin may commit-
+/// resolve or be adopted. Concretely:
+///
+/// - the producing attempt carries NO non-resolved inbound obligation
+///   (open blocks the commit; cancelled refuses it permanently), and
+/// - every closure member is either adopted with EXACTLY its pinned
+///   object (the §65.1 marker) or cleanly drained after such resolution.
+///
+/// Exactness composes inductively: each ancestor satisfied these same
+/// conditions at ITS resolution, so a clear walk proves the full chain.
+///
+/// # Errors
+/// Typed [`ProvisionalPinError`]s; store failures.
+pub fn verify_transitive_lineage(
+    store: &mut dyn RabsMetadataStore,
+    identity: &ProvisionalIdentity,
+) -> Result<(), ProvisionalPinError> {
+    let pin_key = identity.pin_key();
+    let Some(row) = store.provisional_pin_row(&pin_key)? else {
+        return Err(ProvisionalPinError::UnknownPin { pin_key });
+    };
+    if let Some(reason) = row.invalidated_reason {
+        return Err(ProvisionalPinError::ProducerInvalidated { pin_key, reason });
+    }
+    if row.released {
+        return Err(ProvisionalPinError::Closed { pin_key });
+    }
+    for obligation in
+        store.list_open_provisional_obligations_by_attempt(&format!("{:032x}", identity.attempt.0))?
+    {
+        if obligation.status == "cancelled" {
+            return Err(ProvisionalPinError::AncestorLineageDiverged {
+                pin_key,
+                ancestor_pin_key: obligation.pin_key,
+                detail: format!(
+                    "producing attempt consumed cancelled object {}",
+                    obligation.object_key
+                ),
+            });
+        }
+        return Err(ProvisionalPinError::AncestorLineageUnresolved {
+            pin_key: pin_key.clone(),
+            ancestor_pin_key: obligation.pin_key.clone(),
+            detail: format!(
+                "inbound obligation status {} on consumed object {}",
+                obligation.status, obligation.object_key
+            ),
+        });
+    }
+    for ancestor_key in store.list_provisional_pin_ancestors(&pin_key)? {
+        let Some(ancestor) = store.provisional_pin_row(&ancestor_key)? else {
+            return Err(ProvisionalPinError::AncestorLineageUnresolved {
+                pin_key: pin_key.clone(),
+                ancestor_pin_key,
+                detail: "closure member missing from registry".to_owned(),
+            });
+        };
+        if let Some(reason) = ancestor.invalidated_reason {
+            return Err(ProvisionalPinError::AncestorLineageDiverged {
+                pin_key: pin_key.clone(),
+                ancestor_pin_key,
+                detail: format!("invalidated: {reason}"),
+            });
+        }
+        match &ancestor.adopted_object_key {
+            Some(adopted) if *adopted == ancestor.object_key => {}
+            Some(adopted) => {
+                return Err(ProvisionalPinError::AncestorLineageDiverged {
+                    pin_key: pin_key.clone(),
+                    ancestor_pin_key,
+                    detail: format!("adopted foreign bytes {adopted}"),
+                });
+            }
+            None if ancestor.released => {}
+            None => {
+                return Err(ProvisionalPinError::AncestorLineageUnresolved {
+                    pin_key: pin_key.clone(),
+                    ancestor_pin_key,
+                    detail: "ancestor not yet adopted".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Context of the WINNING attempt proposing to adopt a candidate's
+/// output (M017): a DIFFERENT producer attempt/generation of the SAME
+/// action, running under EQUAL toolchain/event contracts, committed by
+/// the active coordinator authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WinningAttemptContext {
+    /// Active coordinator authority committing the winner (records the
+    /// adoption edge).
+    pub authority: CoordinatorAuthority,
+    /// The action both attempts serve.
+    pub action_key: TypedDigest,
+    /// Winner generation.
+    pub generation: ActionGenerationId,
+    /// Winner attempt id — must differ from the pinned producer's.
+    pub attempt: AttemptId,
+    /// Contracts the winner ran under.
+    pub contracts: ProducerContracts,
+}
+
+/// Outcome of a different-winning-attempt adoption proposal (M017).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptionOutcome {
+    /// Exact-object, contract-equal adoption: lineage satisfied and the
+    /// pin's consumer obligations resolved.
+    Adopted {
+        /// How many open obligations resolved.
+        obligations_resolved: usize,
+    },
+    /// Divergent object: the pin AND every transitive descendant pin were
+    /// invalidated and all consuming descendants are refused permanently.
+    DivergenceCancelled {
+        /// Pins invalidated by the cascade (including this one).
+        pins_invalidated: usize,
+        /// Open obligations cancelled across the cascade.
+        obligations_cancelled: usize,
+    },
+}
+
+/// M017 different-winning-attempt adoption (§65.1): a winner OTHER than
+/// the pinned producer attempt satisfies lineage only when its committed
+/// result contains the SAME logical output object ID under EQUAL
+/// toolchain/event contracts (an explicit adoption edge). A differing
+/// object cancels/refuses ALL consuming descendants via the transitive
+/// cascade.
+///
+/// # Errors
+/// Typed [`ProvisionalPinError`]s; store failures.
+pub fn adopt_from_winning_attempt(
+    store: &mut dyn RabsMetadataStore,
+    identity: &ProvisionalIdentity,
+    winner: &WinningAttemptContext,
+    committed_object: &ObjectId,
+) -> Result<AdoptionOutcome, ProvisionalPinError> {
+    let pin_key = identity.pin_key();
+    let Some(row) = store.provisional_pin_row(&pin_key)? else {
+        return Err(ProvisionalPinError::UnknownPin { pin_key });
+    };
+    if let Some(reason) = row.invalidated_reason {
+        return Err(ProvisionalPinError::ProducerInvalidated { pin_key, reason });
+    }
+    if row.released {
+        return Err(ProvisionalPinError::Closed { pin_key });
+    }
+    if winner.action_key != identity.action_key {
+        return Err(ProvisionalPinError::ForeignAction { pin_key });
+    }
+    if winner.attempt == identity.attempt && winner.generation == identity.generation {
+        return Err(ProvisionalPinError::SameWinningAttempt { pin_key });
+    }
+    // Contract equality is fail-closed: an unbound (pre-v16) pin or any
+    // contract difference refuses the adoption outright.
+    if row.toolchain_contract_key.is_empty()
+        || row.event_contract_key.is_empty()
+        || row.toolchain_contract_key != digest_key(&winner.contracts.toolchain)
+        || row.event_contract_key != digest_key(&winner.contracts.events)
+    {
+        return Err(ProvisionalPinError::ContractMismatch { pin_key });
+    }
+    let committed = digest_key(&committed_object.0);
+    if committed != row.object_key {
+        // DIVERGENCE: the winner resolved this logical output to foreign
+        // bytes — every consuming descendant is refused, transitively.
+        let reason = format!(
+            "winning attempt {:032x}/{:032x} committed divergent object {} \
+             for logical output of {}",
+            winner.generation.0,
+            winner.attempt.0,
+            committed,
+            row.object_key
+        );
+        let counts = close_and_cancel_cascading(store, &pin_key, &reason)?;
+        return Ok(AdoptionOutcome::DivergenceCancelled {
+            pins_invalidated: counts.pins,
+            obligations_cancelled: counts.obligations,
+        });
+    }
+    verify_transitive_lineage(store, identity)?;
+    // Explicit adoption edge, recorded under the ACTIVE authority the
+    // winner commits with (store-gated).
+    store.record_adoption_edge(
+        &authority_digest(&winner.authority),
+        &digest_key(&identity.action_key),
+        output_role_name_for_tag(row.role_tag),
+        &row.virtual_path,
+        &row.object_key,
+        &committed,
+    )?;
+    store.adopt_provisional_pin(&pin_key, &committed)?;
+    let resolved = store.resolve_provisional_obligations(&pin_key, &committed)?;
+    Ok(AdoptionOutcome::Adopted {
+        obligations_resolved: resolved,
+    })
+}
+/// Invalidate a pin because its producer generation failed, was
 /// superseded without compatible adoption, or lost authority (§65).
 /// Readers refuse immediately with
 /// [`ProvisionalPinError::ProducerInvalidated`]; the protective GC pin is
 /// released only AFTER the registry close commits (fail toward retention).
+///
+/// M017: invalidation CASCADES — every pin whose materialized closure
+/// contains this one is invalidated too, and all their consumer
+/// obligations are cancelled, so refusal reaches the whole descendant
+/// tree in one event instead of relying on each hop to re-discover it.
 ///
 /// # Errors
 /// Store failures; unknown pin.
@@ -484,11 +799,12 @@ pub fn invalidate_lineage(
     identity: &ProvisionalIdentity,
     reason: &str,
 ) -> Result<CloseOutcome, ProvisionalPinError> {
-    let outcome = close_internal(store, identity, Some(reason))?;
-    // Cancelled obligations PERMANENTLY refuse the descendant's terminal
-    // positive delivery (plan §65: lineage failure cancels descendants).
-    store.cancel_provisional_obligations(&identity.pin_key())?;
-    Ok(outcome)
+    let pin_key = identity.pin_key();
+    if store.provisional_pin_row(&pin_key)?.is_none() {
+        return Err(ProvisionalPinError::UnknownPin { pin_key });
+    }
+    close_and_cancel_cascading(store, &pin_key, reason)?;
+    Ok(CloseOutcome::Released)
 }
 
 /// Terminal-path gate for one descendant attempt (M006 acceptance): a
@@ -664,17 +980,46 @@ pub struct InvalidationSummary {
     pub obligations_cancelled: usize,
 }
 
-fn close_and_cancel(
+/// Per-root counts of one cascading invalidation.
+struct CascadeCounts {
+    pins: usize,
+    obligations: usize,
+}
+
+fn close_and_cancel_cascading(
     store: &mut dyn RabsMetadataStore,
-    pin_key: &str,
+    root_pin_key: &str,
     reason: &str,
-) -> Result<usize, ProvisionalPinError> {
-    // Registry first (reads refuse immediately), then cancel the pin's
-    // open obligations — descendants flip to Refused at their terminal
-    // gate. The protective GC twin stays for the coordinator's drain
-    // pass (fail toward retention on tear).
-    store.close_provisional_pin(pin_key, Some(reason))?;
-    Ok(store.cancel_provisional_obligations(pin_key)?)
+) -> Result<CascadeCounts, ProvisionalPinError> {
+    // M017: the descendant set is the materialized reverse closure —
+    // every pin whose recorded ancestry contains the root, transitively —
+    // so ONE pass reaches the whole tree. Registry rows close FIRST
+    // (reads refuse immediately), then each pin's open obligations are
+    // cancelled; descendants flip to Refused at their terminal gates.
+    // The protective GC twins stay for the coordinator's drain pass
+    // (fail toward retention on tear), exactly as for the root pin.
+    let mut pending: Vec<String> = vec![root_pin_key.to_owned()];
+    pending.extend(store.list_provisional_pin_descendants(root_pin_key)?);
+    pending.sort();
+    pending.dedup();
+    let mut counts = CascadeCounts {
+        pins: 0,
+        obligations: 0,
+    };
+    for key in pending {
+        // Already-released members (an earlier cascade or batch entry
+        // reached them first) are skipped, keeping counts honest.
+        let Some(row) = store.provisional_pin_row(&key)? else {
+            continue;
+        };
+        if row.released {
+            continue;
+        }
+        store.close_provisional_pin(&key, Some(reason))?;
+        counts.pins += 1;
+        counts.obligations += store.cancel_provisional_obligations(&key)?;
+    }
+    Ok(counts)
 }
 
 /// R39 trigger 1 — GENERATION FAILURE: the producer generation failed or
@@ -698,8 +1043,9 @@ pub fn invalidate_lineage_for_generation_failure(
         obligations_cancelled: 0,
     };
     for row in &rows {
-        summary.obligations_cancelled += close_and_cancel(store, &row.pin_key, reason)?;
-        summary.pins_invalidated += 1;
+        let counts = close_and_cancel_cascading(store, &row.pin_key, reason)?;
+        summary.pins_invalidated += counts.pins;
+        summary.obligations_cancelled += counts.obligations;
     }
     Ok(summary)
 }
@@ -722,8 +1068,9 @@ pub fn invalidate_lineage_for_authority_loss(
         obligations_cancelled: 0,
     };
     for row in &rows {
-        summary.obligations_cancelled += close_and_cancel(store, &row.pin_key, reason)?;
-        summary.pins_invalidated += 1;
+        let counts = close_and_cancel_cascading(store, &row.pin_key, reason)?;
+        summary.pins_invalidated += counts.pins;
+        summary.obligations_cancelled += counts.obligations;
     }
     Ok(summary)
 }
@@ -752,8 +1099,9 @@ pub fn invalidate_unadopted_lineage_for_action(
         if committed_output_keys.contains(&row.object_key) {
             continue;
         }
-        summary.obligations_cancelled += close_and_cancel(store, &row.pin_key, reason)?;
-        summary.pins_invalidated += 1;
+        let counts = close_and_cancel_cascading(store, &row.pin_key, reason)?;
+        summary.pins_invalidated += counts.pins;
+        summary.obligations_cancelled += counts.obligations;
     }
     Ok(summary)
 }
@@ -867,7 +1215,7 @@ mod tests {
             OpenOutcome::AlreadyPinned
         );
         // Different object, same tuple: collision incident, original intact.
-        let err = open_provisional_pin(&mut f.store, &id, &tagged_object(42)).unwrap_err();
+        let err = open_provisional_pin(&mut f.store, &id, &tagged_object(42), &m017_ctx()).unwrap_err();
         let ProvisionalPinError::Collision {
             pinned, offered, ..
         } = &err
@@ -889,7 +1237,7 @@ mod tests {
         let mut f = fixture("visibility");
         let id = identity(1, 21);
         let obj = tagged_object(43);
-        open_provisional_pin(&mut f.store, &id, &obj).unwrap();
+        open_provisional_pin(&mut f.store, &id, &obj, &m017_ctx()).unwrap();
 
         // No grants yet: even plausible readers are refused.
         assert_eq!(
@@ -951,7 +1299,7 @@ mod tests {
     fn m004_worker_cannot_release_and_active_coordinator_can() {
         let mut f = fixture("release-auth");
         let id = identity(1, 22);
-        open_provisional_pin(&mut f.store, &id, &tagged_object(44)).unwrap();
+        open_provisional_pin(&mut f.store, &id, &tagged_object(44), &m017_ctx()).unwrap();
 
         // ANY worker identity is refused: candidate pins are
         // coordinator-owned through drain.
@@ -1007,7 +1355,7 @@ mod tests {
         let mut f = fixture("invalidate");
         let id = identity(1, 23);
         let obj = tagged_object(45);
-        open_provisional_pin(&mut f.store, &id, &obj).unwrap();
+        open_provisional_pin(&mut f.store, &id, &obj, &m017_ctx()).unwrap();
         authorize_reader(&mut f.store, &id, &dependent("worker-b", 5)).unwrap();
 
         assert_eq!(
@@ -1044,7 +1392,7 @@ mod tests {
         let mut f = fixture("adoption");
         let id = identity(1, 24);
         let pinned_obj = tagged_object(46);
-        open_provisional_pin(&mut f.store, &id, &pinned_obj).unwrap();
+        open_provisional_pin(&mut f.store, &id, &pinned_obj, &m017_ctx()).unwrap();
         authorize_reader(&mut f.store, &id, &edge(11)).unwrap();
 
         // §65: another attempt succeeding for the same action key does NOT
@@ -1090,7 +1438,7 @@ mod tests {
     fn m004_renewal_is_monotonic_and_closed_pins_refuse() {
         let mut f = fixture("renew");
         let id = identity(1, 25);
-        open_provisional_pin(&mut f.store, &id, &tagged_object(48)).unwrap();
+        open_provisional_pin(&mut f.store, &id, &tagged_object(48), &m017_ctx()).unwrap();
 
         renew_provisional_pin(&mut f.store, &id, 4).unwrap();
         renew_provisional_pin(&mut f.store, &id, 6).unwrap();
@@ -1168,7 +1516,7 @@ mod tests {
         let mut f = fixture("m006-create");
         let producer = identity(1, 60);
         let obj = tagged_object(61);
-        open_provisional_pin(&mut f.store, &producer, &obj).unwrap();
+        open_provisional_pin(&mut f.store, &producer, &obj, &m017_ctx()).unwrap();
         authorize_reader(&mut f.store, &producer, &dependent("worker-c", 70)).unwrap();
         authorize_reader(&mut f.store, &producer, &edge(80)).unwrap();
 
@@ -1219,7 +1567,7 @@ mod tests {
         let mut f = fixture("m006-gate");
         let producer = identity(1, 62);
         let obj = tagged_object(63);
-        open_provisional_pin(&mut f.store, &producer, &obj).unwrap();
+        open_provisional_pin(&mut f.store, &producer, &obj, &m017_ctx()).unwrap();
         authorize_reader(&mut f.store, &producer, &dependent("worker-d", 71)).unwrap();
         resolve_for_reader(&mut f.store, &producer, &dependent("worker-d", 71)).unwrap();
 
@@ -1263,7 +1611,7 @@ mod tests {
     fn m006_invalidation_permanently_refuses_the_descendant() {
         let mut f = fixture("m006-refuse");
         let producer = identity(1, 65);
-        open_provisional_pin(&mut f.store, &producer, &tagged_object(66)).unwrap();
+        open_provisional_pin(&mut f.store, &producer, &tagged_object(66), &m017_ctx()).unwrap();
         authorize_reader(&mut f.store, &producer, &dependent("worker-e", 72)).unwrap();
         resolve_for_reader(&mut f.store, &producer, &dependent("worker-e", 72)).unwrap();
 
@@ -1288,7 +1636,7 @@ mod tests {
     fn m006_drain_refuses_while_consumer_debt_is_open() {
         let mut f = fixture("m006-debt");
         let producer = identity(1, 67);
-        open_provisional_pin(&mut f.store, &producer, &tagged_object(68)).unwrap();
+        open_provisional_pin(&mut f.store, &producer, &tagged_object(68), &m017_ctx()).unwrap();
         authorize_reader(&mut f.store, &producer, &dependent("worker-g", 73)).unwrap();
         resolve_for_reader(&mut f.store, &producer, &dependent("worker-g", 73)).unwrap();
 
@@ -1343,9 +1691,9 @@ mod tests {
             action_key: tagged_action(11),
             ..identity(1, 81)
         };
-        open_provisional_pin(&mut f.store, &producer_a, &tagged_object(90)).unwrap();
-        open_provisional_pin(&mut f.store, &producer_b, &tagged_object(91)).unwrap();
-        open_provisional_pin(&mut f.store, &bystander, &tagged_object(92)).unwrap();
+        open_provisional_pin(&mut f.store, &producer_a, &tagged_object(90), &m017_ctx()).unwrap();
+        open_provisional_pin(&mut f.store, &producer_b, &tagged_object(91), &m017_ctx()).unwrap();
+        open_provisional_pin(&mut f.store, &bystander, &tagged_object(92), &m017_ctx()).unwrap();
         for (producer, consumer_attempt) in [
             (&producer_a, 91_u128),
             (&producer_b, 91_u128),
@@ -1401,8 +1749,8 @@ mod tests {
         let mut f = fixture("m007-authloss");
         let dead_authority_pin = identity(1, 82);
         let live_authority_pin = identity(2, 83);
-        open_provisional_pin(&mut f.store, &dead_authority_pin, &tagged_object(93)).unwrap();
-        open_provisional_pin(&mut f.store, &live_authority_pin, &tagged_object(94)).unwrap();
+        open_provisional_pin(&mut f.store, &dead_authority_pin, &tagged_object(93), &m017_ctx()).unwrap();
+        open_provisional_pin(&mut f.store, &live_authority_pin, &tagged_object(94), &m017_ctx()).unwrap();
 
         let summary = invalidate_lineage_for_authority_loss(
             &mut f.store,
@@ -1435,8 +1783,8 @@ mod tests {
             ..identity(1, 84)
         };
         let winner_object = tagged_object(95);
-        open_provisional_pin(&mut f.store, &kept, &winner_object).unwrap();
-        open_provisional_pin(&mut f.store, &divergent, &tagged_object(96)).unwrap();
+        open_provisional_pin(&mut f.store, &kept, &winner_object, &m017_ctx()).unwrap();
+        open_provisional_pin(&mut f.store, &divergent, &tagged_object(96), &m017_ctx()).unwrap();
         authorize_reader(&mut f.store, &divergent, &dependent("worker-i", 95)).unwrap();
         resolve_for_reader(&mut f.store, &divergent, &dependent("worker-i", 95)).unwrap();
 
@@ -1475,7 +1823,7 @@ mod tests {
         let mut f = fixture("m007-trace");
         let producer = identity(1, 85);
         let obj = tagged_object(97);
-        open_provisional_pin(&mut f.store, &producer, &obj).unwrap();
+        open_provisional_pin(&mut f.store, &producer, &obj, &m017_ctx()).unwrap();
         // Dependent 1 consumed and later resolved via exact commit.
         authorize_reader(&mut f.store, &producer, &dependent("worker-j", 96)).unwrap();
         resolve_for_reader(&mut f.store, &producer, &dependent("worker-j", 96)).unwrap();

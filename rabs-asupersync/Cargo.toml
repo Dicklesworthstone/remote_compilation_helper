@@ -32,6 +32,7 @@ rabs-protocol = { path = "../rabs-protocol" }
 
 [dev-dependencies]
 tempfile = "3.25.0"
+parking_lot = "0.12"
 
 [lints.rust]
 unsafe_code = "forbid"

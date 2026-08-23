@@ -1670,6 +1670,14 @@ pub trait RabsMetadataStore {
         ancestor_pin_key: &str,
     ) -> Result<Vec<String>, StoreError>;
 
+    /// All NON-resolved obligations of ONE consuming attempt regardless
+    /// of worker (M017): attempt ids are globally unique, so lineage
+    /// closure walks key on the attempt alone. Ordered by pin key.
+    fn list_open_provisional_obligations_by_attempt(
+        &mut self,
+        consumer_attempt_hex: &str,
+    ) -> Result<Vec<ProvisionalObligationRow>, StoreError>;
+
     /// The recorded provisional-ancestor lineage of a committed consumer
     /// (H028), ordered by (producer, role, path) — input to the
     /// transitive closure walk at a dependent's commit.
@@ -5553,6 +5561,23 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         )?;
         rows.iter()
             .map(|row| self.map_provisional_pin_row(row))
+            .collect()
+    }
+
+    fn list_open_provisional_obligations_by_attempt(
+        &mut self,
+        consumer_attempt_hex: &str,
+    ) -> Result<Vec<ProvisionalObligationRow>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT consumer_worker, consumer_attempt_hex, pin_key, producer_action_key, \
+             producer_generation_hex, producer_attempt_hex, role, virtual_path, object_key, \
+             status, resolution_object_key, created_seq FROM provisional_obligations \
+             WHERE consumer_attempt_hex = ?1 AND status != 'resolved' \
+             ORDER BY pin_key",
+            &[SqlValue::Text(consumer_attempt_hex.to_owned())],
+        )?;
+        rows.iter()
+            .map(|row| Self::map_obligation_row(row))
             .collect()
     }
 
