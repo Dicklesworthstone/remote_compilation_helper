@@ -43,9 +43,7 @@ use crate::metadata_store::{
     ProvisionalObligationInsert, ProvisionalPinInsert, RabsMetadataStore, StoreError, digest_key,
 };
 use crate::pin_leases::{ReleaseOutcome, Releaser, release_pin_scoped};
-use crate::publication::{
-    Framing, authority_digest, output_role_name_for_tag, output_role_tag,
-};
+use crate::publication::{Framing, authority_digest, output_role_name_for_tag, output_role_tag};
 use rabs_protocol::authority::CoordinatorAuthority;
 use rabs_protocol::generation::{ActionGenerationId, AttemptId, ExecutionLeaseId};
 use rabs_protocol::raw_bytes::RawBytes;
@@ -609,9 +607,13 @@ pub fn verify_transitive_lineage(
     if row.released {
         return Err(ProvisionalPinError::Closed { pin_key });
     }
-    for obligation in
-        store.list_open_provisional_obligations_by_attempt(&format!("{:032x}", identity.attempt.0))?
+    if let Some(obligation) = store
+        .list_open_provisional_obligations_by_attempt(&format!("{:032x}", identity.attempt.0))?
+        .into_iter()
+        .next()
     {
+        // list_*_by_attempt returns only non-resolved rows: open blocks
+        // the commit, cancelled refuses it permanently.
         if obligation.status == "cancelled" {
             return Err(ProvisionalPinError::AncestorLineageDiverged {
                 pin_key,
@@ -631,8 +633,8 @@ pub fn verify_transitive_lineage(
             ),
         });
     }
-    for ancestor_key in store.list_provisional_pin_ancestors(&pin_key)? {
-        let Some(ancestor) = store.provisional_pin_row(&ancestor_key)? else {
+    for ancestor_pin_key in store.list_provisional_pin_ancestors(&pin_key)? {
+        let Some(ancestor) = store.provisional_pin_row(&ancestor_pin_key)? else {
             return Err(ProvisionalPinError::AncestorLineageUnresolved {
                 pin_key: pin_key.clone(),
                 ancestor_pin_key,
@@ -753,10 +755,7 @@ pub fn adopt_from_winning_attempt(
         let reason = format!(
             "winning attempt {:032x}/{:032x} committed divergent object {} \
              for logical output of {}",
-            winner.generation.0,
-            winner.attempt.0,
-            committed,
-            row.object_key
+            winner.generation.0, winner.attempt.0, committed, row.object_key
         );
         let counts = close_and_cancel_cascading(store, &pin_key, &reason)?;
         return Ok(AdoptionOutcome::DivergenceCancelled {
@@ -1206,16 +1205,17 @@ mod tests {
         let obj_a = tagged_object(41);
 
         assert_eq!(
-            open_provisional_pin(&mut f.store, &id, &obj_a).unwrap(),
+            open_provisional_pin(&mut f.store, &id, &obj_a, &m017_ctx()).unwrap(),
             OpenOutcome::Created
         );
         // Identical re-offer (retry/duplicate upload report): no-op.
         assert_eq!(
-            open_provisional_pin(&mut f.store, &id, &obj_a).unwrap(),
+            open_provisional_pin(&mut f.store, &id, &obj_a, &m017_ctx()).unwrap(),
             OpenOutcome::AlreadyPinned
         );
         // Different object, same tuple: collision incident, original intact.
-        let err = open_provisional_pin(&mut f.store, &id, &tagged_object(42), &m017_ctx()).unwrap_err();
+        let err =
+            open_provisional_pin(&mut f.store, &id, &tagged_object(42), &m017_ctx()).unwrap_err();
         let ProvisionalPinError::Collision {
             pinned, offered, ..
         } = &err
@@ -1466,7 +1466,7 @@ mod tests {
         // Re-opening a drained identity is refused — candidate pins are
         // valid THROUGH decision/reconciliation, not resurrectable after.
         assert_eq!(
-            open_provisional_pin(&mut f.store, &id, &tagged_object(48)).unwrap_err(),
+            open_provisional_pin(&mut f.store, &id, &tagged_object(48), &m017_ctx()).unwrap_err(),
             ProvisionalPinError::Closed {
                 pin_key: id.pin_key()
             }
@@ -1749,8 +1749,20 @@ mod tests {
         let mut f = fixture("m007-authloss");
         let dead_authority_pin = identity(1, 82);
         let live_authority_pin = identity(2, 83);
-        open_provisional_pin(&mut f.store, &dead_authority_pin, &tagged_object(93), &m017_ctx()).unwrap();
-        open_provisional_pin(&mut f.store, &live_authority_pin, &tagged_object(94), &m017_ctx()).unwrap();
+        open_provisional_pin(
+            &mut f.store,
+            &dead_authority_pin,
+            &tagged_object(93),
+            &m017_ctx(),
+        )
+        .unwrap();
+        open_provisional_pin(
+            &mut f.store,
+            &live_authority_pin,
+            &tagged_object(94),
+            &m017_ctx(),
+        )
+        .unwrap();
 
         let summary = invalidate_lineage_for_authority_loss(
             &mut f.store,
@@ -1866,5 +1878,306 @@ mod tests {
                 acquired_seq: tag,
             })
             .unwrap();
+    }
+
+    /// Shared contract binding for fixtures (opaque digests; equality is
+    /// all the CAS layer proves).
+    fn m017_ctx() -> ProducerContracts {
+        ProducerContracts {
+            toolchain: tagged_action(200),
+            events: tagged_action(201),
+        }
+    }
+
+    /// A DIFFERENT contract binding (for mismatch refusals).
+    fn m017_other_ctx() -> ProducerContracts {
+        ProducerContracts {
+            toolchain: tagged_action(202),
+            events: tagged_action(203),
+        }
+    }
+
+    /// Build an A->B->C provisional chain (T020): B consumed A's output,
+    /// C consumed B's; every descendant pin carries its full transitive
+    /// ancestor closure from open time.
+    fn m017_chain(
+        name: &str,
+    ) -> (
+        Fixture,
+        ProvisionalIdentity,
+        ProvisionalIdentity,
+        ProvisionalIdentity,
+    ) {
+        let mut f = fixture(name);
+        let a = identity(1, 30);
+        let b = identity(1, 31);
+        let c = identity(1, 32);
+        open_provisional_pin(&mut f.store, &a, &tagged_object(141), &m017_ctx()).unwrap();
+        authorize_reader(&mut f.store, &a, &dependent("worker-b", 31)).unwrap();
+        resolve_for_reader(&mut f.store, &a, &dependent("worker-b", 31)).unwrap();
+        open_provisional_pin(&mut f.store, &b, &tagged_object(142), &m017_ctx()).unwrap();
+        authorize_reader(&mut f.store, &b, &dependent("worker-c", 32)).unwrap();
+        resolve_for_reader(&mut f.store, &b, &dependent("worker-c", 32)).unwrap();
+        open_provisional_pin(&mut f.store, &c, &tagged_object(143), &m017_ctx()).unwrap();
+        (f, a, b, c)
+    }
+
+    #[test]
+    fn m017_transitive_closure_materialized_at_open() {
+        let (mut f, a, b, c) = m017_chain("m017-closure");
+
+        // B's closure: exactly its direct ancestor.
+        assert_eq!(
+            f.store
+                .list_provisional_pin_ancestors(&b.pin_key())
+                .unwrap(),
+            vec![a.pin_key()]
+        );
+        // C's closure: the FULL transitive set {A, B}, not just B.
+        assert_eq!(
+            f.store
+                .list_provisional_pin_ancestors(&c.pin_key())
+                .unwrap(),
+            {
+                let mut v = vec![a.pin_key(), b.pin_key()];
+                v.sort();
+                v
+            }
+        );
+        // Reverse edges reach every transitive descendant from the root.
+        assert_eq!(
+            f.store
+                .list_provisional_pin_descendants(&a.pin_key())
+                .unwrap(),
+            {
+                let mut v = vec![b.pin_key(), c.pin_key()];
+                v.sort();
+                v
+            }
+        );
+    }
+
+    #[test]
+    fn m017_commit_resolution_gates_on_whole_closure() {
+        let (mut f, a, b, c) = m017_chain("m017-gate");
+
+        // Resolving C while its producing attempt still owes B an open
+        // obligation refuses typed, naming the unresolved ancestor.
+        assert_eq!(
+            resolve_consumers_on_commit(&mut f.store, &c, &tagged_object(143)).unwrap_err(),
+            ProvisionalPinError::AncestorLineageUnresolved {
+                pin_key: c.pin_key(),
+                ancestor_pin_key: b.pin_key(),
+                detail: format!(
+                    "inbound obligation status open on consumed object {}",
+                    digest_key(&tagged_object(142).0)
+                ),
+            }
+        );
+
+        // Exact resolution order root-first: A adopts, B then verifies
+        // against its whole closure, C last.
+        record_adoption(&mut f.store, &a, &tagged_object(141)).unwrap();
+        assert_eq!(
+            resolve_consumers_on_commit(&mut f.store, &b, &tagged_object(142)).unwrap(),
+            1
+        );
+        assert_eq!(
+            resolve_consumers_on_commit(&mut f.store, &c, &tagged_object(143)).unwrap(),
+            0
+        );
+        // Both consumers' gates are clear once the chain closed.
+        assert_eq!(
+            descendant_terminal_gate(&mut f.store, "worker-b", AttemptId(31)).unwrap(),
+            TerminalGate::Clear
+        );
+        assert_eq!(
+            descendant_terminal_gate(&mut f.store, "worker-c", AttemptId(32)).unwrap(),
+            TerminalGate::Clear
+        );
+    }
+
+    #[test]
+    fn m017_different_winner_same_object_adopts_with_explicit_edge() {
+        let (mut f, a, _b, _c) = m017_chain("m017-adopt");
+        release_authority_fixture(&mut f.store, 5);
+
+        let winner = WinningAttemptContext {
+            authority: authority(5),
+            action_key: a.action_key.clone(),
+            generation: ActionGenerationId(0x51),
+            attempt: AttemptId(39),
+            contracts: m017_ctx(),
+        };
+        // Same logical output object under EQUAL contracts: adopted.
+        assert_eq!(
+            adopt_from_winning_attempt(&mut f.store, &a, &winner, &tagged_object(141)).unwrap(),
+            AdoptionOutcome::Adopted {
+                obligations_resolved: 1
+            }
+        );
+        // The explicit edge is durable (from == to: exact-object).
+        assert!(
+            f.store
+                .has_adoption_edge(
+                    &digest_key(&a.action_key),
+                    output_role_name_for_tag(i64::try_from(output_role_tag(a.role)).unwrap()),
+                    a.virtual_path.as_bytes(),
+                    &digest_key(&tagged_object(141).0),
+                    &digest_key(&tagged_object(141).0)
+                )
+                .unwrap()
+        );
+        // B's gate cleared by the adoption.
+        assert_eq!(
+            descendant_terminal_gate(&mut f.store, "worker-b", AttemptId(31)).unwrap(),
+            TerminalGate::Clear
+        );
+    }
+
+    #[test]
+    fn m017_divergent_winner_cascades_refusal_to_descendants() {
+        let (mut f, a, b, c) = m017_chain("m017-diverge");
+        release_authority_fixture(&mut f.store, 5);
+
+        let winner = WinningAttemptContext {
+            authority: authority(5),
+            action_key: a.action_key.clone(),
+            generation: ActionGenerationId(0x51),
+            attempt: AttemptId(39),
+            contracts: m017_ctx(),
+        };
+        // Divergent object: the pin AND both transitive descendants
+        // invalidate in ONE cascade; every consumer cancels.
+        assert_eq!(
+            adopt_from_winning_attempt(&mut f.store, &a, &winner, &tagged_object(199)).unwrap(),
+            AdoptionOutcome::DivergenceCancelled {
+                pins_invalidated: 3,
+                obligations_cancelled: 2,
+            }
+        );
+        for pin in [&a, &b, &c] {
+            assert!(matches!(
+                resolve_for_reader(&mut f.store, pin, &edge(77)),
+                Err(ProvisionalPinError::ProducerInvalidated { .. })
+            ));
+        }
+        // Descendant terminal gates REFUSE permanently, naming lineage.
+        for (worker, attempt) in [("worker-b", 31_u128), ("worker-c", 32)] {
+            assert!(matches!(
+                descendant_terminal_gate(&mut f.store, worker, AttemptId(attempt)).unwrap(),
+                TerminalGate::Refused { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn m017_adoption_refuses_foreign_actions_same_attempt_and_contracts() {
+        let (mut f, a, _b, _c) = m017_chain("m017-refuse");
+        release_authority_fixture(&mut f.store, 5);
+
+        let base = WinningAttemptContext {
+            authority: authority(5),
+            action_key: a.action_key.clone(),
+            generation: ActionGenerationId(0x51),
+            attempt: AttemptId(39),
+            contracts: m017_ctx(),
+        };
+        // Different action key: foreign truth can never adopt.
+        assert_eq!(
+            adopt_from_winning_attempt(
+                &mut f.store,
+                &a,
+                &WinningAttemptContext {
+                    action_key: tagged_action(11),
+                    ..base.clone()
+                },
+                &tagged_object(141)
+            )
+            .unwrap_err(),
+            ProvisionalPinError::ForeignAction {
+                pin_key: a.pin_key()
+            }
+        );
+        // Same attempt AND generation: the ordinary commit path owns it.
+        assert_eq!(
+            adopt_from_winning_attempt(
+                &mut f.store,
+                &a,
+                &WinningAttemptContext {
+                    generation: a.generation,
+                    attempt: a.attempt,
+                    ..base.clone()
+                },
+                &tagged_object(141)
+            )
+            .unwrap_err(),
+            ProvisionalPinError::SameWinningAttempt {
+                pin_key: a.pin_key()
+            }
+        );
+        // Different toolchain/event contracts: refuse fail-closed.
+        assert_eq!(
+            adopt_from_winning_attempt(
+                &mut f.store,
+                &a,
+                &WinningAttemptContext {
+                    contracts: m017_other_ctx(),
+                    ..base
+                },
+                &tagged_object(141)
+            )
+            .unwrap_err(),
+            ProvisionalPinError::ContractMismatch {
+                pin_key: a.pin_key()
+            }
+        );
+    }
+
+    #[test]
+    fn m017_release_after_drain_does_not_cascade() {
+        let mut f = fixture("m017-drain");
+        let a = identity(1, 40);
+        let b = identity(1, 41);
+        open_provisional_pin(&mut f.store, &a, &tagged_object(144), &m017_ctx()).unwrap();
+        authorize_reader(&mut f.store, &a, &dependent("worker-x", 41)).unwrap();
+        resolve_for_reader(&mut f.store, &a, &dependent("worker-x", 41)).unwrap();
+        open_provisional_pin(&mut f.store, &b, &tagged_object(145), &m017_ctx()).unwrap();
+
+        // Drain A's debt via exact adoption, then GC-close it.
+        record_adoption(&mut f.store, &a, &tagged_object(144)).unwrap();
+        release_authority_fixture(&mut f.store, 1);
+        release_after_drain(&mut f.store, &a, &Releaser::Coordinator(authority(1))).unwrap();
+
+        // The DESCENDANT pin stays live: a plain drain close never
+        // invalidates downstream lineage.
+        authorize_reader(&mut f.store, &b, &edge(78)).unwrap();
+        assert_eq!(
+            resolve_for_reader(&mut f.store, &b, &edge(78)).unwrap(),
+            tagged_object(145)
+        );
+    }
+
+    #[test]
+    fn m017_batch_supersession_trigger_cascades_through_pins() {
+        let (mut f, _a, _b, _c) = m017_chain("m017-batch");
+
+        // The winner committed objects that do NOT include A's pinned
+        // output: the M007 supersession trigger invalidates the WHOLE
+        // descendant tree transitively (was single-hop before M017).
+        let committed = std::collections::BTreeSet::from([digest_key(&tagged_object(198).0)]);
+        let summary = invalidate_unadopted_lineage_for_action(
+            &mut f.store,
+            &tagged_action(10),
+            &committed,
+            "superseded without compatible adoption",
+        )
+        .unwrap();
+        assert_eq!(summary.pins_invalidated, 3);
+        assert_eq!(summary.obligations_cancelled, 2);
+        assert!(matches!(
+            descendant_terminal_gate(&mut f.store, "worker-c", AttemptId(32)).unwrap(),
+            TerminalGate::Refused { .. }
+        ));
     }
 }

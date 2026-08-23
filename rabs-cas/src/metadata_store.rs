@@ -2045,7 +2045,10 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
             adopted_object_key: expect_opt_text(adopted, "provisional adoption")?,
             invalidated_reason: expect_opt_text(invalidation, "provisional invalidation")?,
             released: expect_u64(released, "provisional released")? != 0,
-            toolchain_contract_key: expect_text(toolchain_contract, "provisional toolchain contract")?,
+            toolchain_contract_key: expect_text(
+                toolchain_contract,
+                "provisional toolchain contract",
+            )?,
             event_contract_key: expect_text(event_contract, "provisional event contract")?,
         })
     }
@@ -4933,7 +4936,9 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         rows.into_iter()
             .map(|row| match row.first() {
                 Some(SqlValue::Text(k)) => Ok(k.clone()),
-                _ => Err(StoreError::Corruption("pin lineage descendant shape".into())),
+                _ => Err(StoreError::Corruption(
+                    "pin lineage descendant shape".into(),
+                )),
             })
             .collect()
     }
@@ -6538,6 +6543,7 @@ mod tests {
             "provenance_edges",
             "provisional_ancestry",
             "provisional_obligations",
+            "provisional_pin_grants",
             "provisional_pin_lineage",
             "provisional_pins",
             "quarantines",
