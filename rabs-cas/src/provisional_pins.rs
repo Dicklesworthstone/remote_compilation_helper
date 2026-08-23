@@ -27,10 +27,11 @@
 //!   the GC-protective `pins` twin is released, so a crash between the two
 //!   leaves the object over-protected, never unprotected.
 //!
-//! Persistence lives in `provisional_pins` / `provisional_pin_grants`
-//! (schema v14) plus a protective row in the existing `pins` table, so
-//! H016's mark → grace → recheck → unlink pipeline provably preserves live
-//! provisional objects exactly like publication roots.
+//! Persistence lives in `provisional_pins`, `provisional_pin_grants`,
+//! and `provisional_obligations` (schema v15) plus a protective row in
+//! the existing `pins` table, so H016's mark → grace → recheck → unlink
+//! pipeline provably preserves live provisional objects exactly like
+//! publication roots.
 //!
 //! ## Dependency rules
 //!
@@ -38,7 +39,9 @@
 //! effects flow through [`RabsMetadataStore`](crate::metadata_store::
 //! RabsMetadataStore).
 
-use crate::metadata_store::{ProvisionalPinInsert, RabsMetadataStore, StoreError, digest_key};
+use crate::metadata_store::{
+    ProvisionalObligationInsert, ProvisionalPinInsert, RabsMetadataStore, StoreError, digest_key,
+};
 use crate::pin_leases::{ReleaseOutcome, Releaser, release_pin_scoped};
 use crate::publication::{Framing, authority_digest, output_role_tag};
 use rabs_protocol::authority::CoordinatorAuthority;
@@ -191,6 +194,14 @@ pub enum ProvisionalPinError {
     /// A coordinator attempted the release without presenting the active
     /// authority (H041 scoping on the protective pin).
     NotActiveAuthority,
+    /// Drain attempted while live descendant obligations are still open
+    /// (§65 GC rule: garbage-collect only after all obligations drain).
+    UnresolvedConsumerDebt {
+        /// Canonical key of the pin still carrying open obligations.
+        pin_key: String,
+        /// How many open obligations remain.
+        open_count: usize,
+    },
     /// Underlying store failure.
     Store(StoreError),
 }
@@ -234,6 +245,13 @@ impl std::fmt::Display for ProvisionalPinError {
             Self::NotActiveAuthority => {
                 write!(f, "coordinator authority is not active for this release")
             }
+            Self::UnresolvedConsumerDebt {
+                pin_key,
+                open_count,
+            } => write!(
+                f,
+                "provisional pin {pin_key} still has {open_count} open consumer obligation(s)"
+            ),
             Self::Store(e) => write!(f, "store error: {e:?}"),
         }
     }
@@ -372,6 +390,25 @@ pub fn resolve_for_reader(
     if !authorized {
         return Err(ProvisionalPinError::Unauthorized { pin_key });
     }
+    // M006: a dependent attempt CONSUMING the output carries a
+    // DirectProducerCommit obligation — its terminal paths stay blocked
+    // until the producer lineage resolves. Edge subscribers only observe;
+    // they never offer results, so no obligation attaches to them.
+    // Idempotent: repeat reads by the same attempt keep one row.
+    if let ProvisionalReader::DependentAttempt { worker, attempt } = reader {
+        store.record_provisional_consumption(&ProvisionalObligationInsert {
+            consumer_worker: worker.clone(),
+            consumer_attempt: attempt.0,
+            pin_key: pin_key.clone(),
+            producer_action_key: digest_key(&identity.action_key),
+            producer_generation: identity.generation.0,
+            producer_attempt: identity.attempt.0,
+            role_tag: i64::try_from(output_role_tag(identity.role)).expect("role tags fit i64"),
+            virtual_path: identity.virtual_path.as_bytes().to_vec(),
+            object_key: row.object_key.clone(),
+            created_seq: row.renewal_seq,
+        })?;
+    }
     Ok(ObjectId(row.object))
 }
 
@@ -400,7 +437,38 @@ pub fn record_adoption(
         });
     }
     store.adopt_provisional_pin(&pin_key, &committed)?;
+    store.resolve_provisional_obligations(&pin_key, &committed)?;
     Ok(())
+}
+
+/// Resolve the consumer obligations of one provisional pin because its
+/// producer committed a result carrying the EXACT pinned object (the
+/// normal lineage-closure path; plan §65 "producer resolves the entire
+/// ancestor closure"). A different object is an adoption mismatch: the
+/// coordinator must cancel the descendants instead of satisfying them
+/// with foreign bytes.
+///
+/// # Errors
+/// Store failures; adoption mismatch; unknown pin.
+pub fn resolve_consumers_on_commit(
+    store: &mut dyn RabsMetadataStore,
+    identity: &ProvisionalIdentity,
+    committed_object: &ObjectId,
+) -> Result<usize, ProvisionalPinError> {
+    let pin_key = identity.pin_key();
+    let Some(row) = store.provisional_pin_row(&pin_key)? else {
+        return Err(ProvisionalPinError::UnknownPin { pin_key });
+    };
+    let committed = digest_key(&committed_object.0);
+    if row.object_key != committed {
+        return Err(ProvisionalPinError::AdoptionMismatch {
+            pin_key,
+            pinned: row.object_key,
+            committed,
+        });
+    }
+    store.adopt_provisional_pin(&pin_key, &committed)?;
+    Ok(store.resolve_provisional_obligations(&pin_key, &committed)?)
 }
 
 /// Invalidate the pin because its producer generation failed, was
@@ -416,7 +484,72 @@ pub fn invalidate_lineage(
     identity: &ProvisionalIdentity,
     reason: &str,
 ) -> Result<CloseOutcome, ProvisionalPinError> {
-    close_internal(store, identity, Some(reason))
+    let outcome = close_internal(store, identity, Some(reason))?;
+    // Cancelled obligations PERMANENTLY refuse the descendant's terminal
+    // positive delivery (plan §65: lineage failure cancels descendants).
+    store.cancel_provisional_obligations(&identity.pin_key())?;
+    Ok(outcome)
+}
+
+/// Terminal-path gate for one descendant attempt (M006 acceptance): a
+/// descendant that consumed provisional metadata may not offer a result
+/// or receive terminal positive delivery until every obligation resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalGate {
+    /// No unresolved obligations: terminal paths may proceed.
+    Clear,
+    /// Open obligations: producer lineage not yet resolved — BLOCKED.
+    Blocked {
+        /// Pin keys of the open obligations (producer lineage addresses).
+        pending_pin_keys: Vec<String>,
+    },
+    /// Cancelled obligations: producer lineage FAILED — this descendant
+    /// is refused, permanently; it can never publish.
+    Refused {
+        /// Pin keys of the cancelled obligations.
+        cancelled_pin_keys: Vec<String>,
+    },
+}
+
+/// Evaluate the descendant's terminal gate. `Refused` dominates `Blocked`:
+/// once any ancestor lineage failed, the descendant cannot publish no
+/// matter what other ancestors do.
+///
+/// # Errors
+/// Store failures.
+pub fn descendant_terminal_gate(
+    store: &mut dyn RabsMetadataStore,
+    consumer_worker: &str,
+    consumer_attempt: AttemptId,
+) -> Result<TerminalGate, ProvisionalPinError> {
+    let rows = store.list_open_provisional_obligations(
+        consumer_worker,
+        &format!("{:032x}", consumer_attempt.0),
+    )?;
+    let mut blocked = Vec::new();
+    let mut refused = Vec::new();
+    for row in rows {
+        match row.status.as_str() {
+            "open" => blocked.push(row.pin_key),
+            "cancelled" => refused.push(row.pin_key),
+            other => {
+                return Err(ProvisionalPinError::Store(StoreError::Corruption(format!(
+                    "obligation status {other:?}"
+                ))));
+            }
+        }
+    }
+    Ok(if !refused.is_empty() {
+        TerminalGate::Refused {
+            cancelled_pin_keys: refused,
+        }
+    } else if !blocked.is_empty() {
+        TerminalGate::Blocked {
+            pending_pin_keys: blocked,
+        }
+    } else {
+        TerminalGate::Clear
+    })
 }
 
 /// Close the pin once all consumer/reconciliation obligations drained
@@ -447,9 +580,21 @@ pub fn release_after_drain(
         }
         Releaser::Coordinator(authority) => authority_digest(authority),
     };
-    let active = store.active_authority()?.map(|row| row.digest);
+    let active = store
+        .active_authority()?
+        .map(|authority_row| authority_row.digest);
     if active.as_ref() != Some(&presented) {
         return Err(ProvisionalPinError::NotActiveAuthority);
+    }
+    // §65 GC rule: garbage-collect only after ALL consumer and
+    // reconciliation obligations drain. OPEN obligations mean live
+    // descendants still await this lineage's resolution.
+    let open_debt = store.count_open_provisional_obligations(&pin_key)?;
+    if open_debt > 0 {
+        return Err(ProvisionalPinError::UnresolvedConsumerDebt {
+            pin_key,
+            open_count: open_debt,
+        });
     }
     // 1) Close the REGISTRY row first: from this commit on, reads refuse.
     let outcome = close_internal(store, identity, None)?;
@@ -899,6 +1044,173 @@ mod tests {
         }
         // Deterministic across recomputation.
         assert_eq!(base.pin_key(), base_key);
+    }
+
+    /// Acquire authority `tag` for release tests (helper keeping fixtures
+    #[test]
+    fn m006_consumption_creates_exactly_one_lineage_obligation() {
+        let mut f = fixture("m006-create");
+        let producer = identity(1, 60);
+        let obj = tagged_object(61);
+        open_provisional_pin(&mut f.store, &producer, &obj).unwrap();
+        authorize_reader(&mut f.store, &producer, &dependent("worker-c", 70)).unwrap();
+        authorize_reader(&mut f.store, &producer, &edge(80)).unwrap();
+
+        // Dependent attempt consumes: obligation binds the FULL lineage
+        // (producer action/generation/attempt + logical output + object).
+        resolve_for_reader(&mut f.store, &producer, &dependent("worker-c", 70)).unwrap();
+        let rows = f
+            .store
+            .list_open_provisional_obligations("worker-c", &format!("{:032x}", 70))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.pin_key, producer.pin_key());
+        assert_eq!(row.producer_action_key, digest_key(&producer.action_key));
+        assert_eq!(
+            row.producer_generation_hex,
+            format!("{:032x}", producer.generation.0)
+        );
+        assert_eq!(
+            row.producer_attempt_hex,
+            format!("{:032x}", producer.attempt.0)
+        );
+        assert_eq!(row.object_key, digest_key(&obj.0));
+        assert_eq!(row.status, "open");
+
+        // Repeat consumption is idempotent (one obligation per
+        // consumer/pin pair).
+        resolve_for_reader(&mut f.store, &producer, &dependent("worker-c", 70)).unwrap();
+        assert_eq!(
+            f.store
+                .list_open_provisional_obligations("worker-c", &format!("{:032x}", 70))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Edge subscribers observe; they never carry obligations.
+        resolve_for_reader(&mut f.store, &producer, &edge(80)).unwrap();
+        let debt = f
+            .store
+            .count_open_provisional_obligations(&producer.pin_key())
+            .unwrap();
+        assert_eq!(debt, 1, "only the dependent attempt owes a commit");
+    }
+
+    #[test]
+    fn m006_terminal_gate_blocks_until_exact_object_commit_resolves() {
+        let mut f = fixture("m006-gate");
+        let producer = identity(1, 62);
+        let obj = tagged_object(63);
+        open_provisional_pin(&mut f.store, &producer, &obj).unwrap();
+        authorize_reader(&mut f.store, &producer, &dependent("worker-d", 71)).unwrap();
+        resolve_for_reader(&mut f.store, &producer, &dependent("worker-d", 71)).unwrap();
+
+        // Acceptance: terminal paths BLOCKED while the lineage is open.
+        assert_eq!(
+            descendant_terminal_gate(&mut f.store, "worker-d", AttemptId(71)).unwrap(),
+            TerminalGate::Blocked {
+                pending_pin_keys: vec![producer.pin_key()]
+            }
+        );
+
+        // A DIFFERENT object committing cannot satisfy the lineage — typed
+        // refusal, still blocked afterwards.
+        let err =
+            resolve_consumers_on_commit(&mut f.store, &producer, &tagged_object(64)).unwrap_err();
+        assert!(matches!(err, ProvisionalPinError::AdoptionMismatch { .. }));
+        assert!(matches!(
+            descendant_terminal_gate(&mut f.store, "worker-d", AttemptId(71)).unwrap(),
+            TerminalGate::Blocked { .. }
+        ));
+
+        // The EXACT pinned object commits: lineage resolves, gate clears,
+        // and the resolution records what satisfied it.
+        let resolved = resolve_consumers_on_commit(&mut f.store, &producer, &obj).unwrap();
+        assert_eq!(resolved, 1);
+        assert_eq!(
+            descendant_terminal_gate(&mut f.store, "worker-d", AttemptId(71)).unwrap(),
+            TerminalGate::Clear
+        );
+        let rows = f
+            .store
+            .list_open_provisional_obligations("worker-d", &format!("{:032x}", 71))
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "resolved obligations leave the non-resolved set"
+        );
+    }
+
+    #[test]
+    fn m006_invalidation_permanently_refuses_the_descendant() {
+        let mut f = fixture("m006-refuse");
+        let producer = identity(1, 65);
+        open_provisional_pin(&mut f.store, &producer, &tagged_object(66)).unwrap();
+        authorize_reader(&mut f.store, &producer, &dependent("worker-e", 72)).unwrap();
+        resolve_for_reader(&mut f.store, &producer, &dependent("worker-e", 72)).unwrap();
+
+        invalidate_lineage(&mut f.store, &producer, "producer generation failed").unwrap();
+
+        // Refused DOMINATES: even though other pins could be open, a
+        // failed ancestor means this descendant can NEVER publish.
+        assert_eq!(
+            descendant_terminal_gate(&mut f.store, "worker-e", AttemptId(72)).unwrap(),
+            TerminalGate::Refused {
+                cancelled_pin_keys: vec![producer.pin_key()]
+            }
+        );
+        // And reads of the dead output refuse with the invalidation reason.
+        assert!(matches!(
+            resolve_for_reader(&mut f.store, &producer, &dependent("worker-e", 72)),
+            Err(ProvisionalPinError::ProducerInvalidated { .. })
+        ));
+    }
+
+    #[test]
+    fn m006_drain_refuses_while_consumer_debt_is_open() {
+        let mut f = fixture("m006-debt");
+        let producer = identity(1, 67);
+        open_provisional_pin(&mut f.store, &producer, &tagged_object(68)).unwrap();
+        authorize_reader(&mut f.store, &producer, &dependent("worker-g", 73)).unwrap();
+        resolve_for_reader(&mut f.store, &producer, &dependent("worker-g", 73)).unwrap();
+
+        release_authority_fixture(&mut f.store, 1);
+        // §65 GC rule: live descendant obligations block the drain.
+        let err = release_after_drain(
+            &mut f.store,
+            &producer,
+            &Releaser::Coordinator(authority(1)),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ProvisionalPinError::UnresolvedConsumerDebt {
+                pin_key: producer.pin_key(),
+                open_count: 1
+            }
+        );
+        // Registry row NOT closed by the refused drain: consumers unaffected.
+        assert!(
+            !f.store
+                .provisional_pin_row(&producer.pin_key())
+                .unwrap()
+                .unwrap()
+                .released
+        );
+
+        // Resolve the debt; now the active authority drains cleanly.
+        resolve_consumers_on_commit(&mut f.store, &producer, &tagged_object(68)).unwrap();
+        assert_eq!(
+            release_after_drain(
+                &mut f.store,
+                &producer,
+                &Releaser::Coordinator(authority(1))
+            )
+            .unwrap(),
+            CloseOutcome::Released
+        );
     }
 
     /// Acquire authority `tag` for release tests (helper keeping fixtures

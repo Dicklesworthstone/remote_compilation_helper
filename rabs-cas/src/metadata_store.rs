@@ -43,8 +43,9 @@ use rabs_protocol::serving::ServingValidity;
 /// canonical result manifest they support; v12 = H032 location rows
 /// carry their durability state; v13 = H028 provisional-ancestor
 /// lineage + adoption edges; v14 = M004 provisional `.rmeta` upload
-/// pins + authorized-visibility grants).
-pub const SCHEMA_VERSION: u32 = 14;
+/// pins + authorized-visibility grants; v15 = M006 dependent-action
+/// provisional-consumption obligations).
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -335,6 +336,25 @@ pub const MIGRATIONS: &[Migration] = &[
          PRIMARY KEY (pin_key, grantee_kind, grantee_id))",
         ],
     },
+    Migration {
+        // M006: dependent-action provisional obligations. Consuming a
+        // provisional output creates ONE row binding the consumer attempt
+        // to the producer lineage (action/generation/attempt, logical
+        // output, exact object). Open rows block the descendant's terminal
+        // paths; resolved rows record the satisfying commit; cancelled
+        // rows permanently refuse it (producer lineage failed/superseded).
+        version: 15,
+        statements: &[
+            "CREATE TABLE provisional_obligations (consumer_worker TEXT NOT NULL, \
+         consumer_attempt_hex TEXT NOT NULL, pin_key TEXT NOT NULL, \
+         producer_action_key TEXT NOT NULL, producer_generation_hex TEXT NOT NULL, \
+         producer_attempt_hex TEXT NOT NULL, role INTEGER NOT NULL, \
+         virtual_path BLOB NOT NULL, object_key TEXT NOT NULL, \
+         status TEXT NOT NULL DEFAULT 'open', resolution_object_key TEXT, \
+         created_seq INTEGER NOT NULL, \
+         PRIMARY KEY (consumer_worker, consumer_attempt_hex, pin_key))",
+        ],
+    },
 ];
 
 /// Typed store errors (comparable so the differential harness can assert
@@ -578,6 +598,67 @@ pub struct ProvisionalPinInsert {
     pub protective_pin_id: u128,
     /// Human-auditable reason stored with the protective pin.
     pub reason: String,
+}
+
+/// One dependent-action provisional-consumption obligation (M006; plan
+/// §65): the consumer attempt consumed `object_key` as the producer
+/// tuple's provisional `(role, virtual_path)` output. Status lifecycle:
+/// `open` (blocks descendant terminal paths) → `resolved` (producer
+/// committed/adoption satisfied the lineage with `resolution_object_key`)
+/// or `cancelled` (producer failed/superseded — the descendant is refused,
+/// never published).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionalObligationRow {
+    /// Worker running the consuming attempt.
+    pub consumer_worker: String,
+    /// Consuming attempt id (hex).
+    pub consumer_attempt_hex: String,
+    /// Canonical key of the consumed provisional pin.
+    pub pin_key: String,
+    /// Digest key of the producer action.
+    pub producer_action_key: String,
+    /// Producer generation id (hex).
+    pub producer_generation_hex: String,
+    /// Producer attempt id (hex).
+    pub producer_attempt_hex: String,
+    /// Role tag of the consumed logical output.
+    pub role_tag: i64,
+    /// Canonical virtual path bytes.
+    pub virtual_path: Vec<u8>,
+    /// Digest key of the exact object consumed.
+    pub object_key: String,
+    /// Lifecycle status (`open` | `resolved` | `cancelled`).
+    pub status: String,
+    /// Object key of the commit that resolved the obligation, if resolved.
+    pub resolution_object_key: Option<String>,
+    /// Coordinator sequence at consumption.
+    pub created_seq: u64,
+}
+
+/// Insert payload for one consumption obligation (identity scalars raw;
+/// encoding at the SQL boundary).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionalObligationInsert {
+    /// Worker running the consuming attempt.
+    pub consumer_worker: String,
+    /// Consuming attempt id.
+    pub consumer_attempt: u128,
+    /// Canonical key of the consumed provisional pin.
+    pub pin_key: String,
+    /// Digest key of the producer action.
+    pub producer_action_key: String,
+    /// Producer generation id.
+    pub producer_generation: u128,
+    /// Producer attempt id.
+    pub producer_attempt: u128,
+    /// Role tag of the consumed logical output.
+    pub role_tag: i64,
+    /// Canonical virtual path bytes.
+    pub virtual_path: Vec<u8>,
+    /// Digest key of the exact object consumed.
+    pub object_key: String,
+    /// Coordinator sequence at consumption.
+    pub created_seq: u64,
 }
 
 /// Result kind tag persisted with a publication.
@@ -1469,6 +1550,39 @@ pub trait RabsMetadataStore {
         from_object_key: &str,
         to_object_key: &str,
     ) -> Result<bool, StoreError>;
+    /// Record (idempotently) that a dependent attempt consumed a
+    /// provisional output, creating its DirectProducerCommit obligation
+    /// (M006). Repeat reads of the same output by the same attempt do not
+    /// duplicate the row.
+    fn record_provisional_consumption(
+        &mut self,
+        consumption: &ProvisionalObligationInsert,
+    ) -> Result<(), StoreError>;
+
+    /// All NON-resolved obligations of one consumer attempt, ordered by
+    /// (status, pin key): `open` rows block terminal paths, `cancelled`
+    /// rows refuse them.
+    fn list_open_provisional_obligations(
+        &mut self,
+        consumer_worker: &str,
+        consumer_attempt_hex: &str,
+    ) -> Result<Vec<ProvisionalObligationRow>, StoreError>;
+
+    /// Resolve every open obligation on one pin (producer committed /
+    /// adoption satisfied the lineage); returns how many rows resolved.
+    fn resolve_provisional_obligations(
+        &mut self,
+        pin_key: &str,
+        resolution_object_key: &str,
+    ) -> Result<usize, StoreError>;
+
+    /// Cancel every open obligation on one pin (producer lineage failed /
+    /// superseded / lost authority); returns how many rows cancelled.
+    fn cancel_provisional_obligations(&mut self, pin_key: &str) -> Result<usize, StoreError>;
+
+    /// Number of OPEN (unresolved, uncancelled) obligations on one pin —
+    /// the consumer-debt figure the §65 drain/GC rule gates on.
+    fn count_open_provisional_obligations(&mut self, pin_key: &str) -> Result<usize, StoreError>;
 
     /// The recorded provisional-ancestor lineage of a committed consumer
     /// (H028), ordered by (producer, role, path) — input to the
@@ -4761,6 +4875,120 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         })
     }
 
+    fn record_provisional_consumption(
+        &mut self,
+        consumption: &ProvisionalObligationInsert,
+    ) -> Result<(), StoreError> {
+        let row = consumption.clone();
+        self.in_txn(move |engine| {
+            engine.execute(
+                "INSERT OR IGNORE INTO provisional_obligations (consumer_worker, \
+                 consumer_attempt_hex, pin_key, producer_action_key, \
+                 producer_generation_hex, producer_attempt_hex, role, virtual_path, \
+                 object_key, status, resolution_object_key, created_seq) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', NULL, ?10)",
+                &[
+                    SqlValue::Text(row.consumer_worker),
+                    SqlValue::Text(u128_hex(row.consumer_attempt)),
+                    SqlValue::Text(row.pin_key),
+                    SqlValue::Text(row.producer_action_key),
+                    SqlValue::Text(u128_hex(row.producer_generation)),
+                    SqlValue::Text(u128_hex(row.producer_attempt)),
+                    SqlValue::Int(row.role_tag),
+                    SqlValue::Blob(row.virtual_path),
+                    SqlValue::Text(row.object_key),
+                    SqlValue::Int(to_seq(row.created_seq, "consumption seq")?),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_open_provisional_obligations(
+        &mut self,
+        consumer_worker: &str,
+        consumer_attempt_hex: &str,
+    ) -> Result<Vec<ProvisionalObligationRow>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT consumer_worker, consumer_attempt_hex, pin_key, producer_action_key, \
+             producer_generation_hex, producer_attempt_hex, role, virtual_path, object_key, \
+             status, resolution_object_key, created_seq FROM provisional_obligations \
+             WHERE consumer_worker = ?1 AND consumer_attempt_hex = ?2 AND status != 'resolved' \
+             ORDER BY status, pin_key",
+            &[
+                SqlValue::Text(consumer_worker.to_owned()),
+                SqlValue::Text(consumer_attempt_hex.to_owned()),
+            ],
+        )?;
+        rows.iter()
+            .map(|row| {
+                let [
+                    worker,
+                    attempt_hex,
+                    pin,
+                    action,
+                    generation,
+                    producer,
+                    role,
+                    path,
+                    object,
+                    status,
+                    resolution,
+                    created,
+                ] = row.as_slice()
+                else {
+                    return Err(StoreError::Corruption("obligation row shape".into()));
+                };
+                Ok(ProvisionalObligationRow {
+                    consumer_worker: expect_text(worker, "obligation worker")?,
+                    consumer_attempt_hex: expect_text(attempt_hex, "obligation attempt")?,
+                    pin_key: expect_text(pin, "obligation pin")?,
+                    producer_action_key: expect_text(action, "obligation action")?,
+                    producer_generation_hex: expect_text(generation, "obligation generation")?,
+                    producer_attempt_hex: expect_text(producer, "obligation producer")?,
+                    role_tag: match role {
+                        SqlValue::Int(v) => *v,
+                        _ => return Err(StoreError::Corruption("obligation role shape".into())),
+                    },
+                    virtual_path: match path {
+                        SqlValue::Blob(b) => b.clone(),
+                        _ => return Err(StoreError::Corruption("obligation path shape".into())),
+                    },
+                    object_key: expect_text(object, "obligation object")?,
+                    status: expect_text(status, "obligation status")?,
+                    resolution_object_key: expect_opt_text(resolution, "obligation resolution")?,
+                    created_seq: expect_u64(created, "obligation seq")?,
+                })
+            })
+            .collect()
+    }
+
+    fn resolve_provisional_obligations(
+        &mut self,
+        pin_key: &str,
+        resolution_object_key: &str,
+    ) -> Result<usize, StoreError> {
+        let (pin_key, resolved) = (pin_key.to_owned(), resolution_object_key.to_owned());
+        self.in_txn(move |engine| {
+            engine.execute(
+                "UPDATE provisional_obligations SET status = 'resolved', \
+                 resolution_object_key = ?1 WHERE pin_key = ?2 AND status = 'open'",
+                &[SqlValue::Text(resolved), SqlValue::Text(pin_key)],
+            )
+        })
+    }
+
+    fn cancel_provisional_obligations(&mut self, pin_key: &str) -> Result<usize, StoreError> {
+        let pin_key = pin_key.to_owned();
+        self.in_txn(move |engine| {
+            engine.execute(
+                "UPDATE provisional_obligations SET status = 'cancelled' \
+                 WHERE pin_key = ?1 AND status = 'open'",
+                &[SqlValue::Text(pin_key)],
+            )
+        })
+    }
+
     fn record_served_consumer(
         &mut self,
         action_key: &str,
@@ -5025,6 +5253,13 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 "SELECT pin_key, grantee_kind, grantee_id, granted_seq \
                  FROM provisional_pin_grants ORDER BY pin_key, grantee_kind, grantee_id",
             ),
+            (
+                "provisional_obligations",
+                "SELECT consumer_worker, consumer_attempt_hex, pin_key, producer_action_key, \
+                 producer_generation_hex, producer_attempt_hex, role, virtual_path, object_key, \
+                 status, resolution_object_key, created_seq FROM provisional_obligations \
+                 ORDER BY consumer_worker, consumer_attempt_hex, pin_key",
+            ),
         ];
         let mut lines = Vec::new();
         for (table, sql) in DUMPS {
@@ -5047,6 +5282,23 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             }
         }
         Ok(lines)
+    }
+
+    fn count_open_provisional_obligations(&mut self, pin_key: &str) -> Result<usize, StoreError> {
+        let rows = self.engine.query(
+            "SELECT COUNT(*) FROM provisional_obligations \
+             WHERE pin_key = ?1 AND status = 'open'",
+            &[SqlValue::Text(pin_key.to_owned())],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(0);
+        };
+        expect_u64(
+            row.first()
+                .ok_or_else(|| StoreError::Corruption("obligation count shape".into()))?,
+            "obligation count",
+        )
+        .map(|v| v as usize)
     }
 }
 
@@ -5989,6 +6241,7 @@ mod tests {
             "pins",
             "provenance_edges",
             "provisional_ancestry",
+            "provisional_obligations",
             "provisional_pin_grants",
             "provisional_pins",
             "quarantines",
