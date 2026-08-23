@@ -1682,8 +1682,10 @@ pub trait RabsMetadataStore {
 
     /// Longest min-hop chain in one pin's recorded closure — the pin's
     /// transitive lineage depth (M020/I025). Zero for a root producer.
-    fn provisional_pin_closure_depth(&mut self, descendant_pin_key: &str)
-        -> Result<u64, StoreError>;
+    fn provisional_pin_closure_depth(
+        &mut self,
+        descendant_pin_key: &str,
+    ) -> Result<u64, StoreError>;
 
     /// Descendant pin keys whose recorded closure contains this pin
     /// (M017) — the reverse edge that makes lineage invalidation cascade

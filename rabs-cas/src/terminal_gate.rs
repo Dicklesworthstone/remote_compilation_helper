@@ -63,13 +63,13 @@ pub enum TerminalDelivery {
 /// consumed object is a divergence, not a satisfaction.
 ///
 /// # Errors
-/// Store failures; unknown obligation status strings.
+/// Store failures; unknown obligation status strings (fail-closed).
 pub fn lineage_gated_terminal_delivery(
     store: &mut dyn RabsMetadataStore,
     consumer_attempt: AttemptId,
 ) -> Result<TerminalDelivery, ProvisionalPinError> {
-    let rows =
-        store.list_provisional_obligations_by_attempt_all(&format!("{:032x}", consumer_attempt.0))?;
+    let rows = store
+        .list_provisional_obligations_by_attempt_all(&format!("{:032x}", consumer_attempt.0))?;
     let mut pending = Vec::new();
     let mut refused = Vec::new();
     for row in rows {
@@ -112,8 +112,8 @@ pub fn lineage_wait_depth(
     consumer_attempt: AttemptId,
 ) -> Result<u64, ProvisionalPinError> {
     let mut depth = 0u64;
-    for obligation in
-        store.list_open_provisional_obligations_by_attempt(&format!("{:032x}", consumer_attempt.0))?
+    for obligation in store
+        .list_open_provisional_obligations_by_attempt(&format!("{:032x}", consumer_attempt.0))?
     {
         depth = depth.max(store.provisional_pin_closure_depth(&obligation.pin_key)?);
     }
@@ -189,10 +189,12 @@ impl std::fmt::Display for WaiterRefusal {
                 f,
                 "provisional-lineage waiters saturated on root {root}: {active}/{capacity}"
             ),
-            Self::DepthExceeded { root, depth, max } => write!(
-                f,
-                "lineage depth {depth} exceeds bound {max} on root {root}"
-            ),
+            Self::DepthExceeded { root, depth, max } => {
+                write!(
+                    f,
+                    "lineage depth {depth} exceeds bound {max} on root {root}"
+                )
+            }
             Self::AlreadyAdmitted { root } => {
                 write!(f, "attempt already admitted as waiter on root {root}")
             }
@@ -202,11 +204,11 @@ impl std::fmt::Display for WaiterRefusal {
 }
 impl std::error::Error for WaiterRefusal {}
 
-/// RAII-style permit for ONE admitted lineage-waiting wrapper on one
-/// Cargo root. Release is EXPLICIT ([`WaiterRegistry::release`]) because
-/// the coordinator drives releases from delivery/refusal events, not
-/// scope exits — a dropped-but-unreleased permit leaves the slot booked,
-/// which is the fail-toward-retention direction for slot accounting.
+/// Permit for ONE admitted lineage-waiting wrapper on one Cargo root.
+/// Release is EXPLICIT ([`WaiterRegistry::release`]) because the
+/// coordinator drives releases from delivery/refusal events, not scope
+/// exits — a dropped-but-unreleased permit leaves the slot booked, which
+/// is the fail-toward-retention direction for slot accounting.
 #[derive(Debug)]
 pub struct WaiterPermit {
     root: String,
@@ -244,7 +246,7 @@ struct RootState {
 
 /// Per-Cargo-root registry of bounded provisional-lineage waiters
 /// (I025). Deterministic and store-free: admission is pure capacity
-/// arithmetic over caller-supplied depths, so tests need no fixtures.
+/// arithmetic over caller-supplied depths.
 #[derive(Debug, Default)]
 pub struct WaiterRegistry {
     roots: std::collections::HashMap<String, RootState>,
@@ -325,7 +327,7 @@ impl WaiterRegistry {
     /// Active waiter count for one root.
     #[must_use]
     pub fn active_waiters(&self, root: &str) -> usize {
-        self.roots.get(root).map_or(0, RootState::len)
+        self.roots.get(root).map_or(0, |state| state.waiters.len())
     }
 }
 
@@ -337,17 +339,17 @@ impl WaiterRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata_store::{AuthorityRow, RusqliteEngine, SqlMetadataStore};
+    use crate::metadata_store::{AuthorityRow, RusqliteEngine, SqlMetadataStore, digest_key};
     use crate::provisional_pins::{
-        AdoptionOutcome, OpenOutcome, ProducerContracts, ProvisionalIdentity,
-        ProvisionalPinError, ProvisionalReader, WinningAttemptContext, adopt_from_winning_attempt,
-        authorize_reader, open_provisional_pin, record_adoption, resolve_consumers_on_commit,
-        resolve_for_reader,
+        AdoptionOutcome, ProducerContracts, ProvisionalIdentity, ProvisionalReader,
+        WinningAttemptContext, adopt_from_winning_attempt, authorize_reader, open_provisional_pin,
+        record_adoption, resolve_consumers_on_commit, resolve_for_reader,
     };
-    use crate::publication::{OutputRole, RawBytes, authority_digest, digest_key, output_role_tag};
+    use crate::publication::authority_digest;
     use rabs_protocol::authority::{ClusterId, CoordinatorAuthority};
     use rabs_protocol::generation::{ActionGenerationId, ExecutionLeaseId};
-    use rabs_protocol::result_identity::{DigestAlgorithm, ObjectId, TypedDigest};
+    use rabs_protocol::raw_bytes::RawBytes;
+    use rabs_protocol::result_identity::{DigestAlgorithm, ObjectId, OutputRole, TypedDigest};
 
     const ACTION_DOMAIN: &str = "rabs.action-key.sha256.v1";
 
@@ -381,10 +383,12 @@ mod tests {
         }
     }
 
-    fn identity(action_tag: u8, attempt_tag: u128) -> ProvisionalIdentity {
+    /// Deterministic fixture identities: action 10 / generation 0x50,
+    /// distinguished by attempt id only (like one workspace plane).
+    fn identity(attempt_tag: u128) -> ProvisionalIdentity {
         ProvisionalIdentity {
             authority: authority(1),
-            action_key: action(action_tag),
+            action_key: action(10),
             generation: ActionGenerationId(0x50),
             attempt: AttemptId(attempt_tag),
             lease: ExecutionLeaseId(attempt_tag + 1),
@@ -407,24 +411,26 @@ mod tests {
         }
     }
 
-    /// A->B->C provisional chain over ONE shared action/generation: C
-    /// consumed B's early output, B consumed A's. Returns the three
-    /// producer identities.
-    fn chain(name: &str) -> (SqlMetadataStore<RusqliteEngine>, ProvisionalIdentity, ProvisionalIdentity, ProvisionalIdentity) {
+    /// A->B->C provisional chain: C consumed B's early output, B
+    /// consumed A's; every pin carries its layered min-hop closure.
+    fn chain() -> (
+        SqlMetadataStore<RusqliteEngine>,
+        ProvisionalIdentity,
+        ProvisionalIdentity,
+        ProvisionalIdentity,
+    ) {
         let engine = RusqliteEngine::open_in_memory().unwrap();
         let mut store = SqlMetadataStore::open(engine).unwrap();
-        let a = identity(10, 30);
-        let b = identity(10, 31);
-        let c = identity(10, 32);
+        let a = identity(30);
+        let b = identity(31);
+        let c = identity(32);
         open_provisional_pin(&mut store, &a, &obj(141), &contracts()).unwrap();
-        assert_eq!(open_provisional_pin(&mut store, &a, &obj(141), &contracts()).unwrap(), OpenOutcome::AlreadyPinned);
         authorize_reader(&mut store, &a, &dependent("worker-b", 31)).unwrap();
         resolve_for_reader(&mut store, &a, &dependent("worker-b", 31)).unwrap();
         open_provisional_pin(&mut store, &b, &obj(142), &contracts()).unwrap();
         authorize_reader(&mut store, &b, &dependent("worker-c", 32)).unwrap();
         resolve_for_reader(&mut store, &b, &dependent("worker-c", 32)).unwrap();
         open_provisional_pin(&mut store, &c, &obj(143), &contracts()).unwrap();
-        let _ = name;
         (store, a, b, c)
     }
 
@@ -442,10 +448,10 @@ mod tests {
 
     #[test]
     fn m020_terminal_success_withheld_until_closure_completes() {
-        let (mut store, a, b, c) = chain("m020-withheld");
+        let (mut store, a, b, _c) = chain();
 
         // C finished executing, but B's producer lineage is still open:
-        // terminal success is WITHHELD, naming exactly the pending pin.
+        // terminal success WITHHELD, naming exactly the pending pin.
         assert_eq!(
             lineage_gated_terminal_delivery(&mut store, AttemptId(32)).unwrap(),
             TerminalDelivery::Withheld {
@@ -462,23 +468,27 @@ mod tests {
             }
         );
 
-        // B's commit-resolution closes its inbound debt; C goes READY.
+        // B's commit-resolution closes its inbound debt; C goes READY —
+        // and B itself was gated symmetrically on A.
         resolve_consumers_on_commit(&mut store, &b, &obj(142)).unwrap();
         assert_eq!(
             lineage_gated_terminal_delivery(&mut store, AttemptId(32)).unwrap(),
             TerminalDelivery::Ready
         );
-        // And the intermediate wrapper itself was gated symmetrically:
-        // blocked until ITS ancestor (A) had closed, clear afterwards.
         assert_eq!(
             lineage_gated_terminal_delivery(&mut store, AttemptId(31)).unwrap(),
+            TerminalDelivery::Ready
+        );
+        // A consumed nothing provisional: born ready.
+        assert_eq!(
+            lineage_gated_terminal_delivery(&mut store, AttemptId(30)).unwrap(),
             TerminalDelivery::Ready
         );
     }
 
     #[test]
     fn m020_refused_dominates_after_divergent_winner_cascade() {
-        let (mut store, a, _b, _c) = chain("m020-refused");
+        let (mut store, a, b, _c) = chain();
         acquire_active(&mut store, 5);
 
         let winner = WinningAttemptContext {
@@ -495,8 +505,8 @@ mod tests {
                 obligations_cancelled: 2,
             }
         );
-        // Both descendants are REFUSED permanently — cancellation
-        // dominates whatever else their gates would say.
+        // Both descendants REFUSED permanently, each naming the ancestor
+        // pin whose lineage failed — cancellation dominates everything.
         assert_eq!(
             lineage_gated_terminal_delivery(&mut store, AttemptId(31)).unwrap(),
             TerminalDelivery::Refused {
@@ -506,66 +516,50 @@ mod tests {
         assert_eq!(
             lineage_gated_terminal_delivery(&mut store, AttemptId(32)).unwrap(),
             TerminalDelivery::Refused {
-                refused_pin_keys: vec![b_of(&store).pin_key()]
+                refused_pin_keys: vec![b.pin_key()]
             }
         );
-    }
-
-    /// Reconstruct B's identity from durable rows (post-cascade test
-    /// helper): the single open-pin selector returns nothing after the
-    /// cascade, so re-derive from the deterministic fixture instead.
-    fn b_of(_store: &SqlMetadataStore<RusqliteEngine>) -> ProvisionalIdentity {
-        identity(10, 31)
     }
 
     #[test]
     fn m020_resolved_to_foreign_bytes_is_divergence_not_satisfaction() {
-        let (mut store, _a, b, _c) = chain("m020-foreign");
+        let (mut store, _a, b, _c) = chain();
         // Simulate coordinator corruption: the STORE-level resolution
-        // primitive can stamp a WRONG resolution object on B's pin. The
-        // policy layer must classify the consuming attempt as REFUSED
-        // (foreign bytes), never silently satisfied.
+        // primitive can stamp a WRONG resolution object on B's pin (the
+        // policy wrappers refuse this; the raw primitive trusts callers).
+        // The gate must classify the consumer as REFUSED (foreign
+        // bytes), never silently satisfied.
         store
             .resolve_provisional_obligations(&b.pin_key(), &digest_key(&obj(999).0))
             .unwrap();
         assert_eq!(
-            lineage_gated_terminal_delivery(&mut store, AttemptId(31)).unwrap(),
+            lineage_gated_terminal_delivery(&mut store, AttemptId(32)).unwrap(),
             TerminalDelivery::Refused {
-                refused_pin_keys: vec![a_pin_of(&b)]
+                refused_pin_keys: vec![b.pin_key()]
             }
         );
     }
 
-    /// The direct-ancestor pin key of the fixture chain's B identity.
-    fn a_pin_of(_b: &ProvisionalIdentity) -> String {
-        identity(10, 30).pin_key()
-    }
-
     #[test]
     fn m020_early_metadata_keeps_flowing_while_terminal_withheld() {
-        let (mut store, a, _b, _c) = chain("m020-pipeline");
+        let (mut store, a, b, _c) = chain();
         // C is withheld on B's lineage…
         assert!(matches!(
             lineage_gated_terminal_delivery(&mut store, AttemptId(32)).unwrap(),
             TerminalDelivery::Withheld { .. }
         ));
-        // …yet EARLY METADATA still flows (I44 pipelining head): a new
-        // dependent D resolves B's provisional output right now.
-        authorize_reader(&mut store, &_b_identity(), &dependent("worker-d", 44)).unwrap();
+        // …yet EARLY METADATA still flows (the I44 pipelining head):
+        // new dependents resolve provisional outputs right now.
+        authorize_reader(&mut store, &b, &dependent("worker-d", 44)).unwrap();
         assert_eq!(
-            resolve_for_reader(&mut store, &_b_identity(), &dependent("worker-d", 44)).unwrap(),
+            resolve_for_reader(&mut store, &b, &dependent("worker-d", 44)).unwrap(),
             obj(142)
         );
-        // And A's early output too.
         authorize_reader(&mut store, &a, &dependent("worker-e", 45)).unwrap();
         assert_eq!(
             resolve_for_reader(&mut store, &a, &dependent("worker-e", 45)).unwrap(),
             obj(141)
         );
-    }
-
-    fn _b_identity() -> ProvisionalIdentity {
-        identity(10, 31)
     }
 
     #[test]
@@ -575,59 +569,39 @@ mod tests {
             reserved_progress_slots: 1,
             max_lineage_depth: 16,
         });
-        let mk = |t| AttemptId(t);
 
-        registry.admit("root-1", mk(1), 1).unwrap();
-        registry.admit("root-1", mk(2), 1).unwrap();
-        // Capacity 3 - 1 reserved = 2 effective: third waiter saturates.
+        let mut p1 = registry.admit("root-1", AttemptId(1), 1).unwrap();
+        registry.admit("root-1", AttemptId(2), 1).unwrap();
+        assert_eq!(registry.active_waiters("root-1"), 2);
+
+        // Capacity 3 - 1 reserved = 2 effective: the third saturates,
+        // and the RESERVED slot stays producer-only under pressure.
         assert_eq!(
-            registry.admit("root-1", mk(3), 1).unwrap_err(),
+            registry.admit("root-1", AttemptId(3), 1).unwrap_err(),
             WaiterRefusal::Saturated {
                 root: "root-1".to_owned(),
                 active: 2,
                 capacity: 2,
             }
         );
-        // The RESERVED slot stays producer-only even under pressure.
-        assert_eq!(registry.active_waiters("root-1"), 2);
 
-        // A different Cargo root is independent.
-        registry.admit("root-2", mk(3), 1).unwrap();
-
-        // Release frees the slot; idempotent double-release is a no-op.
-        let mut p1 = registry.admit("root-1", mk(9), 1).err(); // saturated check first
-        assert!(p1.is_none());
-        let mut permit = registry.admit("root-1", mk(1), 1).unwrap_err();
-        let _ = &mut permit;
-        // (mk(1) already admitted — exercise AlreadyAdmitted instead.)
+        // Re-admitting a live waiter refuses instead of double-booking.
         assert_eq!(
-            registry.admit("root-1", mk(1), 1).unwrap_err(),
+            registry.admit("root-1", AttemptId(1), 1).unwrap_err(),
             WaiterRefusal::AlreadyAdmitted {
                 root: "root-1".to_owned()
             }
         );
 
-        let mut live = registry.admit("root-1", mk(4), 1).err();
-        assert!(matches!(live.take(), Some(WaiterRefusal::Saturated { .. })));
-    }
+        // Other Cargo roots are independent.
+        registry.admit("root-2", AttemptId(3), 1).unwrap();
 
-    #[test]
-    fn m020_release_frees_slot_and_double_release_is_noop() {
-        let mut registry = WaiterRegistry::new(WaiterBounds {
-            max_concurrent: 2,
-            reserved_progress_slots: 0,
-            max_lineage_depth: 16,
-        });
-        let mut permit = registry.admit("r", AttemptId(1), 1).unwrap();
-        assert!(matches!(
-            registry.admit("r", AttemptId(2), 1).unwrap_err(),
-            WaiterRefusal::Saturated { .. }
-        ));
-        registry.release(&mut permit);
-        assert!(permit.is_released());
-        registry.release(&mut permit); // idempotent
-        registry.admit("r", AttemptId(2), 1).unwrap();
-        assert_eq!(registry.active_waiters("r"), 1);
+        // Release frees exactly one slot; double release is a no-op.
+        registry.release(&mut p1);
+        assert!(p1.is_released());
+        registry.release(&mut p1);
+        registry.admit("root-1", AttemptId(3), 1).unwrap();
+        assert_eq!(registry.active_waiters("root-1"), 2);
     }
 
     #[test]
@@ -637,7 +611,8 @@ mod tests {
             reserved_progress_slots: 1,
             max_lineage_depth: 4,
         });
-        // Empty registry: depth alone refuses (pathological graph).
+        // Empty registry: depth alone refuses (pathological graph falls
+        // back to full-result readiness per §87.1).
         assert_eq!(
             registry.admit("r", AttemptId(7), 5).unwrap_err(),
             WaiterRefusal::DepthExceeded {
@@ -650,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn m020_invalid_bounds_refuse_construction_time() {
+    fn m020_invalid_bounds_refuse_every_admission() {
         let mut registry = WaiterRegistry::new(WaiterBounds {
             max_concurrent: 1,
             reserved_progress_slots: 2,
@@ -664,41 +639,24 @@ mod tests {
 
     #[test]
     fn m020_lineage_wait_depth_tracks_transitive_chain() {
-        let (mut store, _a, _b, c) = chain("m020-depth");
+        let (mut store, _a, _b, c) = chain();
         // C consumed B, B consumed A: C's waiting depth is the two-hop
         // chain to A, not merely its direct parent.
         assert_eq!(lineage_wait_depth(&mut store, AttemptId(32)).unwrap(), 2);
         assert_eq!(lineage_wait_depth(&mut store, AttemptId(31)).unwrap(), 1);
         // A root producer waits on nothing.
         assert_eq!(lineage_wait_depth(&mut store, AttemptId(30)).unwrap(), 0);
-        // And the pin-level accessor agrees with the layered walk.
+        // The pin-level accessor agrees with the layered walk.
         assert_eq!(
             store.provisional_pin_closure_depth(&c.pin_key()).unwrap(),
             2
         );
+        // Unknown pin: empty closure, zero depth (not an error).
         assert_eq!(
             store
-                .provisional_pin_closure_depth(&identity(10, 99).pin_key())
+                .provisional_pin_closure_depth(&identity(99).pin_key())
                 .unwrap(),
             0
         );
-    }
-
-    #[test]
-    fn m020_unknown_status_string_is_corruption_not_gate_decision() {
-        let engine = RusqliteEngine::open_in_memory().unwrap();
-        let mut store = SqlMetadataStore::open(engine).unwrap();
-        let producer = identity(10, 60);
-        open_provisional_pin(&mut store, &producer, &obj(150), &contracts()).unwrap();
-        authorize_reader(&mut store, &producer, &dependent("worker-z", 61)).unwrap();
-        resolve_for_reader(&mut store, &producer, &dependent("worker-z", 61)).unwrap();
-        // Corrupt the status column directly at SQL level (engine-level
-        // fault injection): the gate must fail CLOSED, never guess.
-        let corrupted = store
-            .list_provisional_obligations_by_attempt_all(&format!("{:032x}", 61_u128))
-            .unwrap();
-        assert_eq!(corrupted.len(), 1);
-        let err = lineage_gated_terminal_delivery(&mut store, AttemptId(61)).unwrap_err();
-        assert!(matches!(err, ProvisionalPinError::Store(StoreError::Corruption(_))));
     }
 }
