@@ -3910,6 +3910,7 @@ fn reap_surface_config() -> Result<(String, u32, u32, u32)> {
 /// a loaded worker run to tens of GB (observed live: vmi1152480's enumeration
 /// exceeded 300s while hz2's took ~4min). These are explicit operator
 /// commands, not hook-path work, so a long ceiling is the right trade.
+#[cfg(unix)]
 async fn run_reap_surface_command(
     worker: &rch_common::WorkerConfig,
     command: &str,
@@ -3923,6 +3924,16 @@ async fn run_reap_surface_command(
     let result = client.execute(command).await;
     let _ = client.disconnect().await;
     result
+}
+
+/// Non-Unix clients have no SSH transport; reap/gc/sweep surface enumeration
+/// is refused instead of silently degrading (bd-86oa1).
+#[cfg(not(unix))]
+async fn run_reap_surface_command(
+    _worker: &rch_common::WorkerConfig,
+    _command: &str,
+) -> Result<rch_common::CommandResult> {
+    anyhow::bail!("cache reap/gc/sweep require the Unix SSH transport")
 }
 
 /// `rch cache status` (bead 6dj11): read-only, per-worker enumeration of
@@ -4272,6 +4283,7 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
 /// if at least one worker warmed; non-zero (exit 1) if all workers
 /// failed. This mirrors the fail-open philosophy from AGENTS.md (other
 /// workers should still be usable even if one is down).
+#[cfg(unix)]
 async fn handle_cache_warm(
     worker_filter: Vec<String>,
     project: Option<PathBuf>,
@@ -4490,6 +4502,16 @@ async fn handle_cache_warm(
     Ok(())
 }
 
+/// Non-Unix clients have no SSH transport and no transfer pipeline; warming
+/// remote caches is refused instead of silently doing nothing (bd-86oa1).
+#[cfg(not(unix))]
+async fn handle_cache_warm(
+    _worker_filter: Vec<String>,
+    _project: Option<PathBuf>,
+    _ctx: &OutputContext,
+) -> Result<()> {
+    anyhow::bail!("cache warm requires the Unix SSH transport")
+}
 /// Format a `WorkerConfig` slice's IDs for error messages.
 fn ctx_worker_ids(workers: &[rch_common::WorkerConfig]) -> String {
     if workers.is_empty() {
