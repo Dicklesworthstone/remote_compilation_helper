@@ -1710,7 +1710,39 @@ pub trait RabsMetadataStore {
     /// the consumer-debt figure the §65 drain/GC rule gates on.
     fn count_open_provisional_obligations(&mut self, pin_key: &str) -> Result<usize, StoreError>;
 
-    /// Open provisional pins minted by ONE action generation (M007
+    /// Record (idempotently) one provisional output installed to a real
+    /// path before lineage closure (M019/R86). The journal is the
+    /// ownership truth for recovery: paths absent from it are never
+    /// touched.
+    fn insert_provisional_install(
+        &mut self,
+        install: &ProvisionalInstallInsert,
+    ) -> Result<(), StoreError>;
+
+    /// Journal rows for the given pins, ANY state, ordered by
+    /// (pin key, attempt, path) — the recovery sweep's input.
+    fn list_provisional_installs_for_pins(
+        &mut self,
+        pin_keys: &[String],
+    ) -> Result<Vec<ProvisionalInstallRecord>, StoreError>;
+
+    /// Journal rows in ONE state (e.g. `dirty` for the Cargo
+    /// revalidation audit), ordered by (pin key, attempt, path).
+    fn list_provisional_installs_by_state(
+        &mut self,
+        state: &str,
+    ) -> Result<Vec<ProvisionalInstallRecord>, StoreError>;
+
+    /// Transition one journal row's state (`installed` → `removed` |
+    /// `dirty`). Unknown rows are a typed error — recovery never
+    /// invents bookkeeping.
+    fn set_provisional_install_state(
+        &mut self,
+        pin_key: &str,
+        consumer_attempt_hex: &str,
+        installed_path: &[u8],
+        state: &str,
+    ) -> Result<(), StoreError>;
     /// generation-failure invalidation trigger), ordered by pin key.
     fn list_open_provisional_pins_for_action_generation(
         &mut self,
