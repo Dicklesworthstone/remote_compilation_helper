@@ -298,6 +298,7 @@ fn aggregate_verdict(diagnostics: &[ReliabilityDiagnostic]) -> ReliabilityVerdic
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 enum ReliabilityCategory {
     Topology,
     RepoPresence,
