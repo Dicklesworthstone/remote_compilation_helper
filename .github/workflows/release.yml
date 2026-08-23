@@ -87,16 +87,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-linux-x86_64
-      - name: Build
-        run: cargo build --release --target x86_64-unknown-linux-gnu
+      # A021 split profiles: the hook CLI ships from wrapper-release
+      # (startup/footprint first); daemons/workers ship from daemon-release
+      # (throughput, symbols retained for crashpacks).
+      - name: Build (A021 split profiles)
+        run: |
+          cargo build --profile wrapper-release --target x86_64-unknown-linux-gnu -p rch
+          cargo build --profile daemon-release --target x86_64-unknown-linux-gnu -p rchd -p rch-wkr
       - name: Package
         run: |
           mkdir -p dist
-          cd target/x86_64-unknown-linux-gnu/release
-          # Strip binaries for smaller size (symbols already stripped via profile.release)
-          tar -czf ../../../dist/rch-${{ needs.plan.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz rch rchd rch-wkr
-          cd ../../../dist
-          sha256sum rch-${{ needs.plan.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz > rch-${{ needs.plan.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz.sha256
+          T=x86_64-unknown-linux-gnu
+          # Flat member names: install.sh extracts and installs $TEMP_DIR/<bin>.
+          tar -czf dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz \
+            -C "$PWD/target/${T}/wrapper-release" rch \
+            -C "$PWD/target/${T}/daemon-release" rchd rch-wkr
+          sha256sum dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz > dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: dist-linux-x86_64
@@ -119,15 +125,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-linux-musl
-      - name: Build
-        run: cargo build --release --target x86_64-unknown-linux-musl
+      # A021 split profiles (see build-linux-x86_64 for rationale).
+      - name: Build (A021 split profiles)
+        run: |
+          cargo build --profile wrapper-release --target x86_64-unknown-linux-musl -p rch
+          cargo build --profile daemon-release --target x86_64-unknown-linux-musl -p rchd -p rch-wkr
       - name: Package
         run: |
           mkdir -p dist
-          cd target/x86_64-unknown-linux-musl/release
-          tar -czf ../../../dist/rch-${{ needs.plan.outputs.tag }}-x86_64-unknown-linux-musl.tar.gz rch rchd rch-wkr
-          cd ../../../dist
-          sha256sum rch-${{ needs.plan.outputs.tag }}-x86_64-unknown-linux-musl.tar.gz > rch-${{ needs.plan.outputs.tag }}-x86_64-unknown-linux-musl.tar.gz.sha256
+          T=x86_64-unknown-linux-musl
+          tar -czf dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz \
+            -C "$PWD/target/${T}/wrapper-release" rch \
+            -C "$PWD/target/${T}/daemon-release" rchd rch-wkr
+          sha256sum dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz > dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: dist-linux-x86_64-musl
@@ -149,15 +159,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-linux-aarch64
-      - name: Build
-        run: cargo build --release --target aarch64-unknown-linux-gnu
+      # A021 split profiles (see build-linux-x86_64 for rationale).
+      - name: Build (A021 split profiles)
+        run: |
+          cargo build --profile wrapper-release --target aarch64-unknown-linux-gnu -p rch
+          cargo build --profile daemon-release --target aarch64-unknown-linux-gnu -p rchd -p rch-wkr
       - name: Package
         run: |
           mkdir -p dist
-          cd target/aarch64-unknown-linux-gnu/release
-          tar -czf ../../../dist/rch-${{ needs.plan.outputs.tag }}-aarch64-unknown-linux-gnu.tar.gz rch rchd rch-wkr
-          cd ../../../dist
-          sha256sum rch-${{ needs.plan.outputs.tag }}-aarch64-unknown-linux-gnu.tar.gz > rch-${{ needs.plan.outputs.tag }}-aarch64-unknown-linux-gnu.tar.gz.sha256
+          T=aarch64-unknown-linux-gnu
+          tar -czf dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz \
+            -C "$PWD/target/${T}/wrapper-release" rch \
+            -C "$PWD/target/${T}/daemon-release" rchd rch-wkr
+          sha256sum dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz > dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: dist-linux-aarch64
@@ -178,15 +192,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-macos-x86_64
-      - name: Build
-        run: cargo build --release --target x86_64-apple-darwin
+      # A021 split profiles (see build-linux-x86_64 for rationale).
+      - name: Build (A021 split profiles)
+        run: |
+          cargo build --profile wrapper-release --target x86_64-apple-darwin -p rch
+          cargo build --profile daemon-release --target x86_64-apple-darwin -p rchd -p rch-wkr
       - name: Package
         run: |
           mkdir -p dist
-          cd target/x86_64-apple-darwin/release
-          tar -czf ../../../dist/rch-${{ needs.plan.outputs.tag }}-x86_64-apple-darwin.tar.gz rch rchd rch-wkr
-          cd ../../../dist
-          shasum -a 256 rch-${{ needs.plan.outputs.tag }}-x86_64-apple-darwin.tar.gz > rch-${{ needs.plan.outputs.tag }}-x86_64-apple-darwin.tar.gz.sha256
+          T=x86_64-apple-darwin
+          tar -czf dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz \
+            -C "$PWD/target/${T}/wrapper-release" rch \
+            -C "$PWD/target/${T}/daemon-release" rchd rch-wkr
+          shasum -a 256 dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz > dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: dist-macos-x86_64
@@ -207,15 +225,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-macos-aarch64
-      - name: Build
-        run: cargo build --release --target aarch64-apple-darwin
+      # A021 split profiles (see build-linux-x86_64 for rationale).
+      - name: Build (A021 split profiles)
+        run: |
+          cargo build --profile wrapper-release --target aarch64-apple-darwin -p rch
+          cargo build --profile daemon-release --target aarch64-apple-darwin -p rchd -p rch-wkr
       - name: Package
         run: |
           mkdir -p dist
-          cd target/aarch64-apple-darwin/release
-          tar -czf ../../../dist/rch-${{ needs.plan.outputs.tag }}-aarch64-apple-darwin.tar.gz rch rchd rch-wkr
-          cd ../../../dist
-          shasum -a 256 rch-${{ needs.plan.outputs.tag }}-aarch64-apple-darwin.tar.gz > rch-${{ needs.plan.outputs.tag }}-aarch64-apple-darwin.tar.gz.sha256
+          T=aarch64-apple-darwin
+          tar -czf dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz \
+            -C "$PWD/target/${T}/wrapper-release" rch \
+            -C "$PWD/target/${T}/daemon-release" rchd rch-wkr
+          shasum -a 256 dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz > dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: dist-macos-aarch64
@@ -236,16 +258,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-windows-x86_64
-      - name: Build
+      # A021 split profiles (see build-linux-x86_64 for rationale).
+      - name: Build (A021 split profiles)
         # Windows: skip rich-ui feature (rich_rust not available)
         # Note: rchd is not built on Windows (requires unix-sockets feature)
-        run: cargo build --release --no-default-features --target x86_64-pc-windows-msvc
+        run: |
+          cargo build --profile wrapper-release --no-default-features --target x86_64-pc-windows-msvc -p rch
+          cargo build --profile daemon-release --no-default-features --target x86_64-pc-windows-msvc -p rch-wkr
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
           # Note: rchd.exe is not available on Windows (requires unix-sockets)
-          Compress-Archive -Path target/x86_64-pc-windows-msvc/release/rch.exe,target/x86_64-pc-windows-msvc/release/rch-wkr.exe -DestinationPath dist/rch-${{ needs.plan.outputs.tag }}-x86_64-pc-windows-msvc.zip
+          Compress-Archive -Path target/x86_64-pc-windows-msvc/wrapper-release/rch.exe,target/x86_64-pc-windows-msvc/daemon-release/rch-wkr.exe -DestinationPath dist/rch-${{ needs.plan.outputs.tag }}-x86_64-pc-windows-msvc.zip
           $hash = (Get-FileHash dist/rch-${{ needs.plan.outputs.tag }}-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
           "$hash  rch-${{ needs.plan.outputs.tag }}-x86_64-pc-windows-msvc.zip" | Out-File -FilePath dist/rch-${{ needs.plan.outputs.tag }}-x86_64-pc-windows-msvc.zip.sha256 -Encoding ascii -NoNewline
       - uses: actions/upload-artifact@v4

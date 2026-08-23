@@ -632,6 +632,30 @@ install_binary_file() {
     mv -f "$temp_path" "$dest_path"
 }
 
+# A021 split-profile installer: resolve NAME built under PROFILE, falling back
+# to the legacy single-profile target/release layout. Required binaries abort
+# the install when missing; optional ones (the RABS spine) are skipped with a
+# note so a transient spine breakage can never block the core fleet install.
+install_split_binary() {
+    local name="$1" profile="$2" required="$3"
+    local candidate src=""
+    for candidate in "$TARGET_DIR/$profile/$name" "$TARGET_DIR/release/$name"; do
+        if [[ -f "$candidate" ]]; then
+            src="$candidate"
+            break
+        fi
+    done
+    if [[ -z "$src" ]]; then
+        if [[ "$required" == "required" ]]; then
+            die "Binary not found: $name (looked in $TARGET_DIR/$profile/ and $TARGET_DIR/release/)"
+        fi
+        info "Optional binary $name not present; skipping"
+        return 0
+    fi
+    install_binary_file "$src" "$INSTALL_DIR/$name"
+    success "Installed $name ($profile)"
+}
+
 build_from_source() {
     info "Building from source..."
 
@@ -647,42 +671,47 @@ build_from_source() {
 
     cd "$project_dir"
 
-    # Build release binaries
-    if $USE_GUM; then
-        spin "Building release binaries..." cargo +nightly build --release
+    # A021 split profiles: hook CLI under wrapper-release (startup +
+    # footprint first), daemon/worker under daemon-release (throughput,
+    # symbols retained for crashpacks). The RABS spine builds best-effort.
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        TARGET_DIR="${CARGO_TARGET_DIR%/}"
     else
-        info "Building release binaries (this may take a while)..."
-        cargo +nightly build --release
+        TARGET_DIR="$project_dir/target"
     fi
 
-    # Copy binaries - respect CARGO_TARGET_DIR if set
-    local target_dir
-    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-        target_dir="$CARGO_TARGET_DIR/release"
+    if $USE_GUM; then
+        spin "Building rch (wrapper-release profile)..." cargo +nightly build --profile wrapper-release -p rch
+        spin "Building rchd + rch-wkr (daemon-release profile)..." cargo +nightly build --profile daemon-release -p rchd -p rch-wkr
+        info "Building RABS spine binaries (best-effort)..."
+        if ! { cargo +nightly build --profile wrapper-release -p rabs-wrap \
+            && cargo +nightly build --profile daemon-release -p rabsd -p rabs-wkr; }; then
+            info "RABS spine build unavailable; installing core binaries only"
+        fi
     else
-        target_dir="$project_dir/target/release"
+        info "Building rch (wrapper-release profile; this may take a while)..."
+        cargo +nightly build --profile wrapper-release -p rch
+        info "Building rchd + rch-wkr (daemon-release profile)..."
+        cargo +nightly build --profile daemon-release -p rchd -p rch-wkr
+        info "Building RABS spine binaries (best-effort)..."
+        if ! { cargo +nightly build --profile wrapper-release -p rabs-wrap \
+            && cargo +nightly build --profile daemon-release -p rabsd -p rabs-wkr; }; then
+            info "RABS spine build unavailable; installing core binaries only"
+        fi
     fi
 
     if [[ "$MODE" == "worker" ]]; then
-        if [[ -f "$target_dir/$WORKER_BIN" ]]; then
-            install_binary_file "$target_dir/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
-            success "Installed $WORKER_BIN"
-        else
-            die "Worker binary not found: $target_dir/$WORKER_BIN"
-        fi
+        install_split_binary "$WORKER_BIN" "daemon-release" required
+        install_split_binary "rabs-wkr" "daemon-release" optional
     else
-        # Local mode: install hook, daemon, and worker binary (needed for fleet deploy)
-        for binary in "$HOOK_BIN" "$DAEMON_BIN" "$WORKER_BIN"; do
-            if [[ -f "$target_dir/$binary" ]]; then
-                install_binary_file "$target_dir/$binary" "$INSTALL_DIR/$binary"
-                success "Installed $binary"
-            else
-                if [[ "$binary" == "$WORKER_BIN" ]]; then
-                    die "Worker binary not found: $target_dir/$binary (required for fleet deploy)"
-                fi
-                die "Binary not found: $target_dir/$binary"
-            fi
-        done
+        # Local mode: hook CLI from wrapper-release; daemon and worker from
+        # daemon-release (worker binary needed for fleet deploy).
+        install_split_binary "$HOOK_BIN" "wrapper-release" required
+        install_split_binary "$DAEMON_BIN" "daemon-release" required
+        install_split_binary "$WORKER_BIN" "daemon-release" required
+        install_split_binary "rabs-wrap" "wrapper-release" optional
+        install_split_binary "rabsd" "daemon-release" optional
+        install_split_binary "rabs-wkr" "daemon-release" optional
     fi
 
     success "Build complete"
@@ -886,45 +915,51 @@ clone_and_build_from_source() {
 
     cd "$TEMP_DIR/rch" || die "Failed to change to cloned repository directory"
 
-    # Build release binaries
-    if $USE_GUM; then
-        if ! spin "Building release binaries (this may take a few minutes)..." cargo +nightly build --release; then
-            die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
-        fi
+    # A021 split profiles (see build_from_source for rationale).
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        TARGET_DIR="${CARGO_TARGET_DIR%/}"
     else
-        info "Building release binaries (this may take a few minutes)..."
-        if ! cargo +nightly build --release; then
-            die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
-        fi
+        TARGET_DIR="$TEMP_DIR/rch/target"
     fi
 
-    # Install binaries - respect CARGO_TARGET_DIR if set
-    local target_dir
-    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-        target_dir="$CARGO_TARGET_DIR/release"
+    if $USE_GUM; then
+        if ! spin "Building rch (wrapper-release profile; this may take a few minutes)..." cargo +nightly build --profile wrapper-release -p rch; then
+            die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
+        fi
+        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo +nightly build --profile daemon-release -p rchd -p rch-wkr; then
+            die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
+        fi
+        info "Building RABS spine binaries (best-effort)..."
+        if ! { cargo +nightly build --profile wrapper-release -p rabs-wrap \
+            && cargo +nightly build --profile daemon-release -p rabsd -p rabs-wkr; }; then
+            info "RABS spine build unavailable; installing core binaries only"
+        fi
     else
-        target_dir="$TEMP_DIR/rch/target/release"
+        info "Building rch (wrapper-release profile; this may take a few minutes)..."
+        if ! cargo +nightly build --profile wrapper-release -p rch; then
+            die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
+        fi
+        info "Building rchd + rch-wkr (daemon-release profile)..."
+        if ! cargo +nightly build --profile daemon-release -p rchd -p rch-wkr; then
+            die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
+        fi
+        info "Building RABS spine binaries (best-effort)..."
+        if ! { cargo +nightly build --profile wrapper-release -p rabs-wrap \
+            && cargo +nightly build --profile daemon-release -p rabsd -p rabs-wkr; }; then
+            info "RABS spine build unavailable; installing core binaries only"
+        fi
     fi
 
     if [[ "$MODE" == "worker" ]]; then
-        if [[ -f "$target_dir/$WORKER_BIN" ]]; then
-            install_binary_file "$target_dir/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
-            success "Installed $WORKER_BIN"
-        else
-            die "Worker binary not found after build"
-        fi
+        install_split_binary "$WORKER_BIN" "daemon-release" required
+        install_split_binary "rabs-wkr" "daemon-release" optional
     else
-        for binary in "$HOOK_BIN" "$DAEMON_BIN" "$WORKER_BIN"; do
-            if [[ -f "$target_dir/$binary" ]]; then
-                install_binary_file "$target_dir/$binary" "$INSTALL_DIR/$binary"
-                success "Installed $binary"
-            else
-                if [[ "$binary" == "$WORKER_BIN" ]]; then
-                    die "Worker binary not found after build (required for fleet deploy)"
-                fi
-                die "Binary not found after build: $binary"
-            fi
-        done
+        install_split_binary "$HOOK_BIN" "wrapper-release" required
+        install_split_binary "$DAEMON_BIN" "daemon-release" required
+        install_split_binary "$WORKER_BIN" "daemon-release" required
+        install_split_binary "rabs-wrap" "wrapper-release" optional
+        install_split_binary "rabsd" "daemon-release" optional
+        install_split_binary "rabs-wkr" "daemon-release" optional
     fi
 
     success "Build from source complete"
