@@ -88,6 +88,7 @@ pub mod portability;
 pub mod post_state_replacement;
 pub mod pressure;
 pub mod provenance_receipt;
+pub mod publication_messages;
 pub mod raw_bytes;
 pub mod reason_codes;
 pub mod reconnect;
