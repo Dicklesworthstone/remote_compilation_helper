@@ -207,11 +207,13 @@ const SOURCE_EPHEMERAL_EXCLUDE_PATTERNS: &[&str] =
 
 /// Age floors (minutes) for worker-side runtime state reaped at transfer
 /// start (bd-wfumv). TMPDIR scratch under `.rch-tmp/` goes stale within a
-/// day; the durable per-worker Cargo caches (issue #42) and pooled target
-/// stores stay warm across jobs and are reaped only after two weeks of
-/// disuse, so an idle project never pays a re-fetch/re-pack penalty.
+/// day; durable per-worker Cargo caches (issue #42) and pooled target
+/// stores keep their top-level mtime refreshed by every job that uses them
+/// (`add_cargo_isolation` touches the cache dir), so a three-day floor only
+/// reaps caches whose project has been idle far longer than any active
+/// session — an idle return pays one amortized re-fetch, never a per-job one.
 const WORKER_TMP_PRUNE_MAX_AGE_MINS: u64 = 24 * 60;
-const WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS: u64 = 14 * 24 * 60;
+const WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS: u64 = 3 * 24 * 60;
 
 /// Shell fragment executed by the remote rsync-path wrapper BEFORE rsync
 /// starts: reaps stale worker-side runtime state so abandoned `.rch-tmp/*`
@@ -5939,6 +5941,56 @@ mod tests {
 
         assert!(args.iter().any(|arg| arg == "--compress-choice=zstd"));
         assert!(args.iter().any(|arg| arg == "--compress-level=7"));
+    }
+
+    #[test]
+    fn test_rsync_path_prefix_prunes_stale_worker_runtime_state() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/test"),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let root = pipeline.remote_path();
+        let cmd = pipeline.build_sync_command(&worker, &format!("mockuser@mock://worker:{root}"), &root, &[]);
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        let idx = args.iter().position(|arg| arg == "--rsync-path").expect("--rsync-path");
+        let path_val = args.get(idx + 1).expect("rsync-path value");
+
+        // bd-wfumv: every source upload reaps stale worker-side runtime state
+        // ahead of the transfer, with durable caches on a much longer floor.
+        assert!(path_val.starts_with("find "));
+        assert!(path_val.contains(&format!(
+            "find {root}/.rch-tmp -mindepth 1 -maxdepth 1 ! -name 'rch-cargo-cache-*' -mmin +{WORKER_TMP_PRUNE_MAX_AGE_MINS}"
+        )));
+        assert!(path_val.contains(&format!(
+            "-name 'rch-cargo-cache-*' -mmin +{WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS}"
+        )));
+        assert!(path_val.contains(&format!(
+            "-type d -name '.rch-target-*-pool-*' -mmin +{WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS}"
+        )));
+
+        // The prune must run before the mkdir/rsync pair it wraps.
+        let mkdir_idx = path_val
+            .find(&format!("mkdir -p {root} && rsync"))
+            .expect("mkdir && rsync suffix");
+        assert!(path_val.find("find ").expect("find prefix") < mkdir_idx);
     }
 
     #[test]
