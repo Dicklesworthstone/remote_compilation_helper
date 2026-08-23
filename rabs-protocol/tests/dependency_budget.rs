@@ -33,14 +33,22 @@ const BUDGETS: &[(&str, usize, &str)] = &[
     ("rabs-scheduler", 1, "rabs-protocol only (pure policy)"),
     (
         "rabs-cas",
-        6,
+        7,
         "protocol + rusqlite/fsqlite differential store pair + sha2 \
          (authoritative digests) + blake3 (H002 LOCAL fingerprints only, \
          workspace-reviewed, structurally excluded from TypedDigest) + \
          rabs-key (H039: publication admission reuses F035's one \
-         bundle-root implementation; pure sibling, protocol-only deps)",
+         bundle-root implementation; pure sibling, protocol-only deps) + \
+         filetime (K004: preserve stock Cargo mtime semantics on \
+         materialized outputs so downstream fingerprints match stock)",
     ),
     ("rabs-sandbox", 4, "protocol + reviewed namespace/fs crates"),
+    (
+        "rabs-wrap",
+        3,
+        "protocol + tempfile (wrapper-local staging scratch) + serde_json \
+         (wrapper control-plane frames)",
+    ),
     (
         "rabs-replay",
         2,
@@ -49,7 +57,14 @@ const BUDGETS: &[(&str, usize, &str)] = &[
          its purpose)",
     ),
     ("rabs-asupersync", 3, "asupersync + protocol (+1 headroom)"),
-    ("rabsd", 10, "composes the domain crates + runtime adapter"),
+    (
+        "rabsd",
+        12,
+        "composes the domain crates (rabs-action/rabs-key/rabs-cas/\
+         rabs-sandbox/rabs-scheduler) + the asupersync runtime adapter \
+         (rabs-asupersync + asupersync) + configuration surfaces (serde, \
+         serde_json, toml) + tempfile (daemon-owned staging scratch)",
+    ),
     ("rabs-wkr", 8, "composes execution-relevant domain crates"),
 ];
 
