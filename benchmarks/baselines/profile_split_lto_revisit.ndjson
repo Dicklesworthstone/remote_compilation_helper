@@ -1,0 +1,24 @@
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"release","binary":"rch","role":"wrapper","size_bytes":13401064,"startup_median_ns":9319553}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"release","binary":"rabs-wrap","role":"wrapper","size_bytes":375408,"startup_median_ns":6202302}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"release","binary":"rchd","role":"daemon","size_bytes":8343528,"startup_median_ns":null}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"release","binary":"rabsd","role":"daemon","size_bytes":2675184,"startup_median_ns":null}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"release","binary":"rch-wkr","role":"daemon","size_bytes":2417640,"startup_median_ns":null}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"release","binary":"rabs-wkr","role":"daemon","size_bytes":1229392,"startup_median_ns":null}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"wrapper-release","binary":"rch","role":"wrapper","size_bytes":18130744,"startup_median_ns":9993105}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"wrapper-release","binary":"rabs-wrap","role":"wrapper","size_bytes":456688,"startup_median_ns":6246791}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"daemon-release","binary":"rchd","role":"daemon","size_bytes":21624256,"startup_median_ns":null}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"daemon-release","binary":"rabsd","role":"daemon","size_bytes":8196464,"startup_median_ns":null}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"daemon-release","binary":"rch-wkr","role":"daemon","size_bytes":7239168,"startup_median_ns":null}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"daemon-release","binary":"rabs-wkr","role":"daemon","size_bytes":5144968,"startup_median_ns":null}
+{"schema":"rabs.fleet-trace","schema_version":1,"worker":"vmi1152480","scenario":"transfer_sync","rep":1,"elapsed_ns":9669876,"detail":"no-op job; admission+sync overhead"}
+{"schema":"rabs.fleet-trace","schema_version":1,"worker":"vmi1152480","scenario":"transfer_sync","rep":2,"elapsed_ns":9196549,"detail":"no-op job; admission+sync overhead"}
+{"schema":"rabs.fleet-trace","schema_version":1,"worker":"vmi1152480","scenario":"transfer_sync","rep":3,"elapsed_ns":9199665,"detail":"no-op job; admission+sync overhead"}
+{"schema":"rabs.fleet-trace","schema_version":1,"worker":"vmi1152480","scenario":"cache_hit_warm","rep":1,"elapsed_ns":51046044895,"detail":"warm pooled target dir"}
+{"schema":"rabs.fleet-trace","schema_version":1,"worker":"vmi1152480","scenario":"cache_hit_warm","rep":2,"elapsed_ns":13755596656,"detail":"warm pooled target dir"}
+{"schema":"rabs.fleet-trace","schema_version":1,"worker":"vmi1152480","scenario":"cache_hit_warm","rep":3,"elapsed_ns":18791307581,"detail":"warm pooled target dir"}
+{"schema":"rabs.fleet-trace","schema_version":1,"worker":"vmi1152480","scenario":"cache_miss_cold","rep":1,"elapsed_ns":19811128470,"detail":"fresh CARGO_TARGET_DIR"}
+{"schema":"rabs.fleet-trace","schema_version":1,"worker":"vmi1152480","scenario":"compile_storm_member","rep":0,"elapsed_ns":7261157238,"detail":"crate 0"}
+{"schema":"rabs.fleet-trace","schema_version":1,"worker":"vmi1152480","scenario":"compile_storm_member","rep":1,"elapsed_ns":18798587791,"detail":"crate 1"}
+{"schema":"rabs.fleet-trace","schema_version":1,"worker":"vmi1152480","scenario":"compile_storm_member","rep":2,"elapsed_ns":22212434536,"detail":"crate 2"}
+{"schema":"rabs.fleet-trace","schema_version":1,"worker":"vmi1152480","scenario":"compile_storm_member","rep":3,"elapsed_ns":24641896158,"detail":"crate 3"}
+{"schema":"rabs.fleet-trace","schema_version":1,"worker":"vmi1152480","scenario":"compile_storm_wall","rep":0,"elapsed_ns":24736837363,"detail":"4 concurrent execs"}

@@ -151,27 +151,31 @@ if [[ "${FLEET_TRACES:-0}" == "1" ]]; then
         emit "{\"schema\":\"rabs.fleet-trace\",\"schema_version\":1,\"worker\":\"$WORKER\",\"scenario\":\"$1\",\"rep\":$2,\"elapsed_ns\":$3,\"detail\":\"$4\"}"
     }
 
-    timed_remote() { # runs remainder as one remote invocation; echoes elapsed_ns
-        local s e
+    # Runs remainder as one remote invocation; echoes "<elapsed_ns> <first output
+    # line>". The output marker proves the command really executed remotely —
+    # without it a silent local fallback would masquerade as a ~10ms transfer.
+    timed_remote() {
+        local s e out
         s=$(ns_now)
-        RCH_WORKER="$WORKER" RCH_FORCE_REMOTE=1 rch exec "$@" >/dev/null 2>&1 || true
+        out=$(RCH_WORKER="$WORKER" RCH_FORCE_REMOTE=1 rch exec "$@" 2>/dev/null | head -1)
         e=$(ns_now)
-        echo $((e - s))
+        echo "$((e - s)) ${out:0:64}"
     }
-
-    echo "==> fleet trace: pure transfer/sync floor (--job true)" >&2
+    echo "==> fleet trace: pure transfer/sync floor (--job echo)" >&2
     for i in $(seq 1 "$TRACE_REPS"); do
-        trace_emit transfer_sync "$i" "$(timed_remote --job -- true)" "no-op job; admission+sync overhead"
+        read -r el marker <<<"$(timed_remote --job -- echo remote-alive)"
+        trace_emit transfer_sync "$i" "$el" "no-op job; admission+sync; marker=${marker:-none}"
     done
 
     echo "==> fleet trace: worker cache hit (warm cargo check)" >&2
     for i in $(seq 1 "$TRACE_REPS"); do
-        trace_emit cache_hit_warm "$i" "$(timed_remote -- cargo check -p rch-common)" "warm pooled target dir"
+        read -r el _ <<<"$(timed_remote -- cargo check -p rch-common)"
+        trace_emit cache_hit_warm "$i" "$el" "warm pooled target dir"
     done
 
-    echo "==> fleet trace: cold target (full recompile of one crate graph)" >&2
     cold_dir="/tmp/rch_cold_target_$$"
-    trace_emit cache_miss_cold 1 "$(timed_remote -- env CARGO_TARGET_DIR="$cold_dir" cargo check -p rch-common)" "fresh CARGO_TARGET_DIR"
+    read -r el _ <<<"$(timed_remote -- env CARGO_TARGET_DIR="$cold_dir" cargo check -p rch-common)"
+    trace_emit cache_miss_cold 1 "$el" "fresh CARGO_TARGET_DIR"
 
     echo "==> fleet trace: compile storm ($STORM_N concurrent execs)" >&2
     read -r -a storm_arr <<<"$STORM_CRATES"
@@ -180,7 +184,8 @@ if [[ "${FLEET_TRACES:-0}" == "1" ]]; then
     for i in $(seq 0 $((STORM_N - 1))); do
         crate=${storm_arr[$((i % ${#storm_arr[@]}))]}
         (
-            el=$(timed_remote -- cargo check -p "$crate")
+            out=$(timed_remote -- cargo check -p "$crate")
+            el=${out%% *}
             echo "$el" >"$storm_tmp/$i"
         ) &
     done
