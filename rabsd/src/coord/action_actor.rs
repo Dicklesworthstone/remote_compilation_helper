@@ -55,6 +55,8 @@ use rabs_action::state_machines::{
 };
 use rabs_asupersync::region_tree::{Attribution, RegionSpec, attribution_chains, coordinator_root};
 use rabs_key::action_key::{ActionKeyBreakdown, compute_action_key};
+use rabs_key::authority_binding::coordinator_authority_digest;
+use rabs_protocol::authority::CoordinatorAuthority;
 use rabs_protocol::authority_matrix::IsolationProfile;
 use rabs_protocol::descriptor::{ActionDescriptor, SubscriberKind};
 use rabs_protocol::durable_ids::BuildOperationId;
@@ -409,6 +411,9 @@ pub enum OpenGenerationReceipt {
     RefusedSlotNotAbsent(PublicationSlotState),
     /// The fence rejected the generation id as previously seen (ABA).
     RefusedGenerationReused,
+    /// The generation was minted under a different coordinator authority
+    /// (stale term/incarnation): it never opens here (G019; F033).
+    RefusedStaleAuthority,
 }
 
 /// Outcome of registering an attempt.
@@ -428,6 +433,10 @@ pub enum RegisterAttemptReceipt {
     RefusedRetryBudgetExhausted,
     /// Generation hedge budget exhausted.
     RefusedHedgeBudgetExhausted,
+    /// The attempt presented a CoordinatorAuthority other than this
+    /// incarnation's: stale or malformed, refused before any state
+    /// inspection (G019; F033).
+    RefusedStaleAuthority,
 }
 
 /// Outcome of advancing an attempt.
@@ -539,6 +548,10 @@ pub struct RegisterAttempt {
     pub attempt: AttemptId,
     /// The generation this attempt believes it executes under.
     pub generation: ActionGenerationId,
+    /// Digest of the FULL CoordinatorAuthority this attempt presents,
+    /// recomputed by the caller from the one full copy (F033). Must equal
+    /// the actor's own [`ActionActor::new`] authority digest.
+    pub presented_authority_digest: TypedDigest,
     /// This attempt's own execution lease.
     pub lease: ExecutionLeaseId,
     /// Executing worker.
@@ -605,6 +618,11 @@ pub struct ActionActor {
     descriptor: ActionDescriptor,
     breakdown: ActionKeyBreakdown,
     authority_label: String,
+    /// Digest of the coordinator authority this incarnation holds (F033).
+    /// Generations opened and attempts registered here must present exactly
+    /// this digest; the full authority value stays at the wire/edge layer —
+    /// this core sees only the reduced fencing identity.
+    authority_digest: TypedDigest,
     region: RegionSpec,
     boot_micros: i64,
 
@@ -632,10 +650,17 @@ pub struct ActionActor {
 }
 
 impl ActionActor {
-    /// New actor bound to `authority_label`, computing the action key once
-    /// from `descriptor`. `boot_unix_micros` seeds serving validity.
+    /// New actor bound to `authority_label` and to the fencing identity of
+    /// `coordinator`: only generations and attempts created under exactly
+    /// that authority are admitted (G019). Computes the action key once
+    /// from `descriptor`; `boot_unix_micros` seeds serving validity.
     #[must_use]
-    pub fn new(descriptor: ActionDescriptor, authority_label: &str, boot_unix_micros: i64) -> Self {
+    pub fn new(
+        descriptor: ActionDescriptor,
+        coordinator: &CoordinatorAuthority,
+        authority_label: &str,
+        boot_unix_micros: i64,
+    ) -> Self {
         let breakdown = compute_action_key(&descriptor);
         let region = coordinator_root(authority_label, &short_hex(&breakdown.final_key), "pending");
         let mut actor = Self {
@@ -643,6 +668,7 @@ impl ActionActor {
             breakdown,
             authority_label: authority_label.to_owned(),
             region,
+            authority_digest: coordinator_authority_digest(coordinator),
             boot_micros: boot_unix_micros,
             slot: PublicationSlotState::Absent,
             active_generation: None,
@@ -1009,10 +1035,15 @@ impl ActionActor {
 
     /// Open the single active generation (slot Absent → Executing). The
     /// coordinator mints the never-reused id; the fence tombstones any
-    /// reuse (ABA), and closing a generation tombstones it forever.
+    /// reuse (ABA), and closing a generation tombstones it forever. A
+    /// generation minted under a stale authority is refused BEFORE the
+    /// reuse fence so a replayed stale id cannot burn its slot (G019).
     pub fn open_generation(&mut self, generation: ActionGeneration) -> OpenGenerationReceipt {
         if self.slot != PublicationSlotState::Absent {
             return OpenGenerationReceipt::RefusedSlotNotAbsent(self.slot);
+        }
+        if generation.created_under_authority_digest != self.authority_digest {
+            return OpenGenerationReceipt::RefusedStaleAuthority;
         }
         let generation_id = generation.generation_id;
         if let FenceDecision::RejectReused = self.fence.admit(generation_id) {
@@ -1075,6 +1106,12 @@ impl ActionActor {
     /// purposes require the active generation; audits require a committed
     /// publication (they compare against the winner, never publish first).
     pub fn register_attempt(&mut self, registration: RegisterAttempt) -> RegisterAttemptReceipt {
+        // G019 lease-admission fence: an attempt presenting any authority
+        // other than this incarnation's is stale or malformed and refuses
+        // before ANY state inspection (F033 digest equality).
+        if registration.presented_authority_digest != self.authority_digest {
+            return RegisterAttemptReceipt::RefusedStaleAuthority;
+        }
         let audit = registration.purpose.is_audit();
         match (self.active_generation.as_ref(), audit) {
             (Some(active), _) if active.generation_id == registration.generation => {}
@@ -1651,15 +1688,34 @@ mod tests {
         }
     }
 
+    fn authority_under_test() -> CoordinatorAuthority {
+        CoordinatorAuthority {
+            cluster_id: rabs_protocol::authority::ClusterId("cluster-test".into()),
+            credential_generation: 1,
+            term: 1,
+            incarnation_id: rabs_protocol::authority::CoordinatorIncarnationId(0xC001),
+        }
+    }
+
+    /// A DIFFERENT live-looking authority (advanced term + fresh
+    /// incarnation): anything bound to it is stale for `actor()`.
+    fn foreign_authority() -> CoordinatorAuthority {
+        CoordinatorAuthority {
+            term: 2,
+            incarnation_id: rabs_protocol::authority::CoordinatorIncarnationId(0xC002),
+            ..authority_under_test()
+        }
+    }
+
     fn actor() -> ActionActor {
-        ActionActor::new(descriptor(), "coord-test", 1_000)
+        ActionActor::new(descriptor(), &authority_under_test(), "coord-test", 1_000)
     }
 
     fn generation(id: u128) -> ActionGeneration {
         ActionGeneration {
             generation_id: ActionGenerationId(id),
             per_key_ordinal: 1,
-            created_under_authority_digest: d(200),
+            created_under_authority_digest: coordinator_authority_digest(&authority_under_test()),
         }
     }
 
@@ -1683,6 +1739,7 @@ mod tests {
         RegisterAttempt {
             attempt: AttemptId(attempt),
             generation: ActionGenerationId(0x60),
+            presented_authority_digest: coordinator_authority_digest(&authority_under_test()),
             lease: ExecutionLeaseId(lease),
             worker: PeerId("wkr-1".into()),
             worker_boot_generation: WorkerBootGeneration(7),
@@ -1700,6 +1757,37 @@ mod tests {
             actor.register_attempt(registration(1, 11, 111, AttemptPurpose::Primary)),
             RegisterAttemptReceipt::Registered
         );
+    }
+
+    #[test]
+    fn generation_created_under_stale_authority_is_refused_before_the_reuse_fence() {
+        let mut actor = actor();
+        let mut stale = generation(0x71);
+        stale.created_under_authority_digest = coordinator_authority_digest(&foreign_authority());
+        assert_eq!(
+            actor.open_generation(stale),
+            OpenGenerationReceipt::RefusedStaleAuthority
+        );
+        // The refusal fired BEFORE the reuse fence consumed the id, so the
+        // same id still opens under the CURRENT authority.
+        assert_eq!(
+            actor.open_generation(generation(0x71)),
+            OpenGenerationReceipt::Opened
+        );
+    }
+
+    #[test]
+    fn attempt_presenting_stale_authority_is_refused_before_lease_admission() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        let mut stale = registration(2, 12, 112, AttemptPurpose::Primary);
+        stale.presented_authority_digest = coordinator_authority_digest(&foreign_authority());
+        assert_eq!(
+            actor.register_attempt(stale),
+            RegisterAttemptReceipt::RefusedStaleAuthority
+        );
+        // Nothing leaked into attempt state: identity precedes admission.
+        assert!(!actor.attempts.contains_key(&2));
     }
 
     /// Walk the success spine up to `PreparedResultOffered`.
@@ -2273,7 +2361,7 @@ mod tests {
     fn actor_shell_processes_messages_under_a_test_cx() {
         let cx = Cx::for_testing();
         let mut host = ActionActorHost {
-            core: ActionActor::new(descriptor(), "coord-shell-test", 1_000),
+            core: ActionActor::new(descriptor(), &authority_under_test(), "coord-shell-test", 1_000),
         };
         let waker = std::task::Waker::noop();
         let mut task = std::task::Context::from_waker(waker);

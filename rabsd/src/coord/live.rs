@@ -83,6 +83,15 @@ pub enum CommitRefusal {
     /// The coordinator has not acquired its authority (coord region
     /// down, or authority acquisition failed at boot).
     NoAuthority,
+    /// The offer's CoordinatorAuthority does not match the authority this
+    /// incarnation holds: it was prepared under a dead coordinator and can
+    /// never publish here (G019; F033 digest equality).
+    StaleAuthority {
+        /// Term the offering attempt was created under.
+        offered_term: u64,
+        /// Term this coordinator holds.
+        active_term: u64,
+    },
     /// The store mutex was poisoned by a panic in another commit.
     StoreUnavailable,
     /// The publication engine refused the offer (typed A018/H011 fence).
@@ -99,6 +108,14 @@ impl std::fmt::Display for CommitRefusal {
             Self::StoreUnavailable => write!(f, "store lock poisoned"),
             Self::Offer(refusal) => write!(f, "offer refused: {refusal:?}"),
             Self::Store(error) => write!(f, "store error: {error}"),
+            Self::StaleAuthority {
+                offered_term,
+                active_term,
+            } => write!(
+                f,
+                "offer prepared under stale coordinator authority \
+                 (offered term {offered_term}, active term {active_term})"
+            ),
         }
     }
 }
@@ -402,8 +419,16 @@ impl CoordLive {
         expected_descriptor: &TypedDigest,
     ) -> Result<PublicationOutcome, CommitRefusal> {
         let cas = self.cas.as_ref().ok_or(CommitRefusal::NoStore)?;
-        if self.authority().is_none() {
-            return Err(CommitRefusal::NoAuthority);
+        let held = self.authority().ok_or(CommitRefusal::NoAuthority)?;
+        // G019 offer-admission fence: refuse an offer prepared under any
+        // OTHER authority BEFORE the store transaction opens — a dead
+        // incarnation's attempts never publish here, independent of what
+        // the durable active row or `process_offer` would later say.
+        if authority_digest(&offer.authority.coordinator) != authority_digest(&held) {
+            return Err(CommitRefusal::StaleAuthority {
+                offered_term: offer.authority.coordinator.term,
+                active_term: held.term,
+            });
         }
         let pin_id = self.next_pin_id();
         let seq = self.next_seq();

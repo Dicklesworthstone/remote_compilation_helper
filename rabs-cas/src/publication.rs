@@ -51,7 +51,13 @@ use crate::metadata_store::{
 use crate::trust_evidence::DISPOSITION_QUARANTINED;
 
 /// Domain separator for the canonical coordinator-authority digest.
-pub const AUTHORITY_DIGEST_DOMAIN: &str = "rabs.coordinator-authority.sha256.v1";
+///
+/// The digest itself has ONE implementation — F033's
+/// [`rabs_key::authority_binding::coordinator_authority_digest`] — and this
+/// constant aliases that function's domain so the store-interning label can
+/// never drift from the digest domain (G019: two encodings of one fencing
+/// identity made cross-layer binding comparisons meaningless).
+pub const AUTHORITY_DIGEST_DOMAIN: &str = rabs_key::typed_digest::DOMAIN_COORDINATOR_AUTHORITY;
 /// Domain separator for the v1 semantic result projection.
 pub const SEMANTIC_PROJECTION_DOMAIN: &str = "rabs.semantic-result-projection.sha256.v1";
 /// Domain separator for the v1 observable result projection.
@@ -108,15 +114,13 @@ impl Framing {
 /// Canonical digest of a FULL coordinator authority value. The generation
 /// stores only this digest (risk R117: two independently mutable full
 /// copies are forbidden by construction).
+///
+/// Delegates to F033's single implementation in `rabs-key`; every layer
+/// (actor lease admission, offer admission, publication) compares digests
+/// produced by this one function (G019).
 #[must_use]
 pub fn authority_digest(authority: &rabs_protocol::authority::CoordinatorAuthority) -> TypedDigest {
-    let mut framing = Framing::new(AUTHORITY_DIGEST_DOMAIN);
-    framing
-        .field(authority.cluster_id.0.as_bytes())
-        .u64(authority.credential_generation)
-        .u64(authority.term)
-        .field(&authority.incarnation_id.0.to_be_bytes());
-    framing.finish(AUTHORITY_DIGEST_DOMAIN)
+    rabs_key::authority_binding::coordinator_authority_digest(authority)
 }
 
 const fn result_kind_tag(kind: ResultKind) -> u64 {
