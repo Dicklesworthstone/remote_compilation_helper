@@ -269,7 +269,7 @@ dependencies = [
 [[package]]
 name = "asupersync"
 version = "0.3.10"
-source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4#62d398ea17519d7e80cbdb32e062d70647cd58a4"
+source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=107adf1df8d274b37c6ed9a12471fe3da44429f2#107adf1df8d274b37c6ed9a12471fe3da44429f2"
 dependencies = [
  "aes-gcm",
  "asupersync-macros",
@@ -278,9 +278,9 @@ dependencies = [
  "chacha20poly1305 0.11.0",
  "crc32fast",
  "crossbeam-queue",
- "franken-decision 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4)",
- "franken-evidence 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4)",
- "franken-kernel 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4)",
+ "franken-decision 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=107adf1df8d274b37c6ed9a12471fe3da44429f2)",
+ "franken-evidence 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=107adf1df8d274b37c6ed9a12471fe3da44429f2)",
+ "franken-kernel 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=107adf1df8d274b37c6ed9a12471fe3da44429f2)",
  "futures-lite",
  "getrandom 0.4.3",
  "hashbrown 0.17.1",
@@ -325,7 +325,7 @@ dependencies = [
 [[package]]
 name = "asupersync-macros"
 version = "0.3.10"
-source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4#62d398ea17519d7e80cbdb32e062d70647cd58a4"
+source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=107adf1df8d274b37c6ed9a12471fe3da44429f2#107adf1df8d274b37c6ed9a12471fe3da44429f2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1624,10 +1624,10 @@ dependencies = [
 [[package]]
 name = "franken-decision"
 version = "0.3.10"
-source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4#62d398ea17519d7e80cbdb32e062d70647cd58a4"
+source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=107adf1df8d274b37c6ed9a12471fe3da44429f2#107adf1df8d274b37c6ed9a12471fe3da44429f2"
 dependencies = [
- "franken-evidence 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4)",
- "franken-kernel 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4)",
+ "franken-evidence 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=107adf1df8d274b37c6ed9a12471fe3da44429f2)",
+ "franken-kernel 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=107adf1df8d274b37c6ed9a12471fe3da44429f2)",
  "serde",
 ]
 
@@ -1644,7 +1644,7 @@ dependencies = [
 [[package]]
 name = "franken-evidence"
 version = "0.3.10"
-source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4#62d398ea17519d7e80cbdb32e062d70647cd58a4"
+source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=107adf1df8d274b37c6ed9a12471fe3da44429f2#107adf1df8d274b37c6ed9a12471fe3da44429f2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1662,7 +1662,7 @@ dependencies = [
 [[package]]
 name = "franken-kernel"
 version = "0.3.10"
-source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4#62d398ea17519d7e80cbdb32e062d70647cd58a4"
+source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=107adf1df8d274b37c6ed9a12471fe3da44429f2#107adf1df8d274b37c6ed9a12471fe3da44429f2"
 dependencies = [
  "serde",
 ]
@@ -4851,7 +4851,7 @@ dependencies = [
 name = "rabs-asupersync"
 version = "1.0.58"
 dependencies = [
- "asupersync 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4)",
+ "asupersync 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=107adf1df8d274b37c6ed9a12471fe3da44429f2)",
  "parking_lot",
  "rabs-action",
  "rabs-protocol",
@@ -4912,7 +4912,7 @@ dependencies = [
 name = "rabs-wkr"
 version = "1.0.58"
 dependencies = [
- "asupersync 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4)",
+ "asupersync 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=107adf1df8d274b37c6ed9a12471fe3da44429f2)",
  "rabs-action",
  "rabs-asupersync",
  "rabs-cas",
@@ -4936,7 +4936,7 @@ dependencies = [
 name = "rabsd"
 version = "1.0.58"
 dependencies = [
- "asupersync 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=62d398ea17519d7e80cbdb32e062d70647cd58a4)",
+ "asupersync 0.3.10 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=107adf1df8d274b37c6ed9a12471fe3da44429f2)",
  "rabs-action",
  "rabs-asupersync",
  "rabs-cas",

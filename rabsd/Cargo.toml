@@ -32,7 +32,7 @@ rabs-scheduler = { path = "../rabs-scheduler" }
 rabs-asupersync = { path = "../rabs-asupersync" }
 # Direct runtime dependency (imports moved off the adapter re-export to
 # satisfy the I14 boundary test; pin matches rabs-asupersync's A003 rule).
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "62d398ea17519d7e80cbdb32e062d70647cd58a4", default-features = false, features = ["proc-macros"] }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "107adf1df8d274b37c6ed9a12471fe3da44429f2", default-features = false, features = ["proc-macros"] }
 
 [dev-dependencies]
 tempfile = "3.25.0"
@@ -43,7 +43,7 @@ rabs-cas = { path = "../rabs-cas", features = ["test-support"] }
 # asupersync gates behind `test-internals` (br-asupersync-2x6hbi) so
 # production code cannot mint an all-caps context out of band. Dev-graph
 # only; the pin matches rabs-asupersync's exact-revision rule (bead A003).
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "62d398ea17519d7e80cbdb32e062d70647cd58a4", default-features = false, features = ["proc-macros", "test-internals"] }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "107adf1df8d274b37c6ed9a12471fe3da44429f2", default-features = false, features = ["proc-macros", "test-internals"] }
 
 [lints.rust]
 unsafe_code = "forbid"
