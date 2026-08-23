@@ -1584,6 +1584,35 @@ pub trait RabsMetadataStore {
     /// the consumer-debt figure the §65 drain/GC rule gates on.
     fn count_open_provisional_obligations(&mut self, pin_key: &str) -> Result<usize, StoreError>;
 
+    /// Open provisional pins minted by ONE action generation (M007
+    /// generation-failure invalidation trigger), ordered by pin key.
+    fn list_open_provisional_pins_for_action_generation(
+        &mut self,
+        action_key: &str,
+        generation_hex: &str,
+    ) -> Result<Vec<ProvisionalPinRecord>, StoreError>;
+
+    /// Open provisional pins of an action across ALL generations (M007
+    /// supersession trigger), ordered by pin key.
+    fn list_open_provisional_pins_for_action(
+        &mut self,
+        action_key: &str,
+    ) -> Result<Vec<ProvisionalPinRecord>, StoreError>;
+
+    /// Open provisional pins minted under one coordinator authority
+    /// (M007 authority-loss trigger), ordered by pin key.
+    fn list_open_provisional_pins_for_authority(
+        &mut self,
+        authority_key: &str,
+    ) -> Result<Vec<ProvisionalPinRecord>, StoreError>;
+
+    /// ALL consumption obligations on one pin — every status — the M007
+    /// causal-trace record of which dependents started from this output.
+    fn list_provisional_obligations_for_pin(
+        &mut self,
+        pin_key: &str,
+    ) -> Result<Vec<ProvisionalObligationRow>, StoreError>;
+
     /// The recorded provisional-ancestor lineage of a committed consumer
     /// (H028), ordered by (producer, role, path) — input to the
     /// transitive closure walk at a dependent's commit.
@@ -1897,6 +1926,101 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
             }
             Some(_) => Err(StoreError::Corruption("high-water shape".into())),
         }
+    }
+
+    /// Shared row mapper for `provisional_pins` SELECTs (single source of
+    /// truth for the 17-column shape; R121 domain restore included).
+    fn map_provisional_pin_row(
+        &self,
+        row: &[SqlValue],
+    ) -> Result<ProvisionalPinRecord, StoreError> {
+        let [
+            pin,
+            authority,
+            action,
+            generation,
+            attempt,
+            lease,
+            role,
+            path,
+            algo,
+            domain,
+            bytes,
+            object,
+            protective,
+            renewal,
+            adopted,
+            invalidation,
+            released,
+        ] = row
+        else {
+            return Err(StoreError::Corruption("provisional pin shape".into()));
+        };
+        Ok(ProvisionalPinRecord {
+            pin_key: expect_text(pin, "provisional pin key")?,
+            authority_key: expect_text(authority, "provisional authority")?,
+            action_key: expect_text(action, "provisional action")?,
+            generation_hex: expect_text(generation, "provisional generation")?,
+            attempt_hex: expect_text(attempt, "provisional attempt")?,
+            lease_hex: expect_text(lease, "provisional lease")?,
+            role_tag: match role {
+                SqlValue::Int(v) => *v,
+                _ => return Err(StoreError::Corruption("provisional role shape".into())),
+            },
+            virtual_path: match path {
+                SqlValue::Blob(b) => b.clone(),
+                _ => return Err(StoreError::Corruption("provisional path shape".into())),
+            },
+            object: self.restore_digest(algo, domain, bytes)?,
+            object_key: expect_text(object, "provisional object")?,
+            protective_pin_hex: expect_text(protective, "provisional protective pin")?,
+            renewal_seq: expect_u64(renewal, "provisional renewal")?,
+            adopted_object_key: expect_opt_text(adopted, "provisional adoption")?,
+            invalidated_reason: expect_opt_text(invalidation, "provisional invalidation")?,
+            released: expect_u64(released, "provisional released")? != 0,
+        })
+    }
+
+    /// Shared row mapper for `provisional_obligations` SELECTs (single
+    /// source of truth for the 12-column shape).
+    fn map_obligation_row(row: &[SqlValue]) -> Result<ProvisionalObligationRow, StoreError> {
+        let [
+            worker,
+            attempt_hex,
+            pin,
+            action,
+            generation,
+            producer,
+            role,
+            path,
+            object,
+            status,
+            resolution,
+            created,
+        ] = row
+        else {
+            return Err(StoreError::Corruption("obligation row shape".into()));
+        };
+        Ok(ProvisionalObligationRow {
+            consumer_worker: expect_text(worker, "obligation worker")?,
+            consumer_attempt_hex: expect_text(attempt_hex, "obligation attempt")?,
+            pin_key: expect_text(pin, "obligation pin")?,
+            producer_action_key: expect_text(action, "obligation action")?,
+            producer_generation_hex: expect_text(generation, "obligation generation")?,
+            producer_attempt_hex: expect_text(producer, "obligation producer")?,
+            role_tag: match role {
+                SqlValue::Int(v) => *v,
+                _ => return Err(StoreError::Corruption("obligation role shape".into())),
+            },
+            virtual_path: match path {
+                SqlValue::Blob(b) => b.clone(),
+                _ => return Err(StoreError::Corruption("obligation path shape".into())),
+            },
+            object_key: expect_text(object, "obligation object")?,
+            status: expect_text(status, "obligation status")?,
+            resolution_object_key: expect_opt_text(resolution, "obligation resolution")?,
+            created_seq: expect_u64(created, "obligation seq")?,
+        })
     }
 }
 
@@ -5299,6 +5423,77 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             "obligation count",
         )
         .map(|v| v as usize)
+    }
+
+    fn list_open_provisional_pins_for_action_generation(
+        &mut self,
+        action_key: &str,
+        generation_hex: &str,
+    ) -> Result<Vec<ProvisionalPinRecord>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT pin_key, authority_key, action_key, generation_hex, attempt_hex, \
+             lease_hex, role, virtual_path, obj_algo, obj_domain, obj_bytes, object_key, \
+             protective_pin_hex, renewal_seq, adopted_object_key, invalidated_reason, \
+             released FROM provisional_pins \
+             WHERE action_key = ?1 AND generation_hex = ?2 AND released = 0 ORDER BY pin_key",
+            &[
+                SqlValue::Text(action_key.to_owned()),
+                SqlValue::Text(generation_hex.to_owned()),
+            ],
+        )?;
+        rows.iter()
+            .map(|row| self.map_provisional_pin_row(row))
+            .collect()
+    }
+
+    fn list_open_provisional_pins_for_action(
+        &mut self,
+        action_key: &str,
+    ) -> Result<Vec<ProvisionalPinRecord>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT pin_key, authority_key, action_key, generation_hex, attempt_hex, \
+             lease_hex, role, virtual_path, obj_algo, obj_domain, obj_bytes, object_key, \
+             protective_pin_hex, renewal_seq, adopted_object_key, invalidated_reason, \
+             released FROM provisional_pins WHERE action_key = ?1 AND released = 0 \
+             ORDER BY pin_key",
+            &[SqlValue::Text(action_key.to_owned())],
+        )?;
+        rows.iter()
+            .map(|row| self.map_provisional_pin_row(row))
+            .collect()
+    }
+
+    fn list_open_provisional_pins_for_authority(
+        &mut self,
+        authority_key: &str,
+    ) -> Result<Vec<ProvisionalPinRecord>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT pin_key, authority_key, action_key, generation_hex, attempt_hex, \
+             lease_hex, role, virtual_path, obj_algo, obj_domain, obj_bytes, object_key, \
+             protective_pin_hex, renewal_seq, adopted_object_key, invalidated_reason, \
+             released FROM provisional_pins WHERE authority_key = ?1 AND released = 0 \
+             ORDER BY pin_key",
+            &[SqlValue::Text(authority_key.to_owned())],
+        )?;
+        rows.iter()
+            .map(|row| self.map_provisional_pin_row(row))
+            .collect()
+    }
+
+    fn list_provisional_obligations_for_pin(
+        &mut self,
+        pin_key: &str,
+    ) -> Result<Vec<ProvisionalObligationRow>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT consumer_worker, consumer_attempt_hex, pin_key, producer_action_key, \
+             producer_generation_hex, producer_attempt_hex, role, virtual_path, object_key, \
+             status, resolution_object_key, created_seq FROM provisional_obligations \
+             WHERE pin_key = ?1 ORDER BY consumer_worker, consumer_attempt_hex",
+            &[SqlValue::Text(pin_key.to_owned())],
+        )?;
+        rows.iter()
+            .map(|row| Self::map_obligation_row(row))
+            .collect()
     }
 }
 
