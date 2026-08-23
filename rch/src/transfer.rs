@@ -3873,10 +3873,6 @@ fi",
         cmd
     }
 
-    /// Retrieve one declared job result directory (bd-p0yoo).
-    ///
-    /// Runs its own rsync per directory with the directory as an explicit
-    /// source, so a directory the job never created is a hard rsync error
     /// Best-effort removal of an invocation-unique remote tree (bd-p1vlb).
     ///
     /// Clean-overlay roots are per-run by construction (a job nonce is hashed
@@ -3914,6 +3910,10 @@ fi",
         Ok(())
     }
 
+    /// Retrieve one declared job result directory (bd-p0yoo).
+    ///
+    /// Runs its own rsync per directory with the directory as an explicit
+    /// source, so a directory the job never created is a hard rsync error
     /// rather than a silent zero-file success. Any error means the invocation's
     /// declared outputs are INCOMPLETE and callers must fail loudly.
     pub async fn retrieve_result_dir(
