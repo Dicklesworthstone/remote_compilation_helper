@@ -725,7 +725,7 @@ mod tests {
         store: SqlMetadataStore<RusqliteEngine>,
     }
 
-    fn fresh_store(tag: &str) -> TestStore {
+    fn fresh_store(_tag: &str) -> TestStore {
         let dir = TempDir::new().expect("tempdir");
         let engine = RusqliteEngine::open(&dir.path().join("meta.sqlite")).expect("engine opens");
         let store = SqlMetadataStore::open(engine).expect("store opens");

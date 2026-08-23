@@ -496,7 +496,6 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
         action: commands::why::WhyAction,
     },
 
-
     /// RABS content-addressed store operator commands
     ///
     /// Operator surface over the RABS CAS engines (plan §173): bounded
