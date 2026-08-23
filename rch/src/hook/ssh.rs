@@ -235,6 +235,106 @@ fn build_worker_ownership_repair_cmd(canonical_root: &Path, ssh_user: &str) -> S
     )
 }
 
+/// bd-kugfc: detection-only ownership probe command for the canonical
+/// mirror tree. Counts root-owned entries and mutates nothing — the
+/// doctor must stay read-only. Contract mirrors the repair command's
+/// sentinels where meaningful: stdout `RCH_OWNERSHIP_OK` or
+/// `RCH_OWNERSHIP_DRIFT:count=N` (exit 0), stderr
+/// `RCH_OWNERSHIP_CHECK_UNAVAILABLE` when passwordless sudo is
+/// unavailable (also exit 0 — same fail-open posture as dispatch).
+fn build_worker_ownership_detect_cmd(canonical_root: &Path) -> String {
+    let root = shell_escape::escape(canonical_root.display().to_string().into());
+    format!(
+        "set -e; r={root}; \
+         if ! b=$(sudo -n find \"$r\" -xdev -user root -print 2>/dev/null | wc -l); then \
+           printf 'RCH_OWNERSHIP_CHECK_UNAVAILABLE\\n' >&2; exit 0; \
+         fi; \
+         b=$((b + 0)); \
+         if [ \"$b\" -eq 0 ]; then echo RCH_OWNERSHIP_OK; \
+         else printf 'RCH_OWNERSHIP_DRIFT:count=%s\\n' \"$b\"; fi",
+        root = root,
+    )
+}
+
+/// bd-kugfc: outcome of one worker's detection-only mirror-ownership
+/// probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MirrorOwnershipProbe {
+    /// Probe intentionally not run (mock mode or Windows worker —
+    /// neither has the Unix canonical/alias mirror-tree semantics).
+    Skipped,
+    /// No root-owned entries under the canonical mirror tree.
+    Healthy,
+    /// Drift detected: N root-owned entries will make rsync-as-ssh-user
+    /// fail exit 23 until repaired.
+    Drift { count: u64 },
+    /// The worker cannot run the count (passwordless sudo unavailable);
+    /// dispatch-time repair fails open silently in this state too.
+    CheckUnavailable,
+    /// SSH transport failure, timeout, or unrecognized output; drift
+    /// state on this worker is unknown.
+    Unprobeable(String),
+}
+
+/// Pure classifier for the detect-command output so the parsing
+/// contract stays unit-testable without an SSH fleet.
+fn parse_ownership_detect_output(
+    status_success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> MirrorOwnershipProbe {
+    if !status_success {
+        // `set -e` makes any non-zero exit an unexpected shell failure
+        // (the sentinel paths all exit 0 by construction).
+        return MirrorOwnershipProbe::Unprobeable(format!(
+            "probe exited non-zero: stderr='{}'",
+            stderr.trim()
+        ));
+    }
+    if stderr.contains("RCH_OWNERSHIP_CHECK_UNAVAILABLE") {
+        return MirrorOwnershipProbe::CheckUnavailable;
+    }
+    if let Some(count) = stdout
+        .trim()
+        .strip_prefix("RCH_OWNERSHIP_DRIFT:count=")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return MirrorOwnershipProbe::Drift { count };
+    }
+    if stdout.contains("RCH_OWNERSHIP_OK") {
+        return MirrorOwnershipProbe::Healthy;
+    }
+    MirrorOwnershipProbe::Unprobeable(format!(
+        "unrecognized probe output: stdout='{}' stderr='{}'",
+        stdout.trim(),
+        stderr.trim()
+    ))
+}
+
+/// bd-kugfc: run the detection-only ownership probe against one worker.
+/// Read-only by contract — it never chowns, deletes, or otherwise
+/// mutates the worker. Bounded to 8s so the reliability doctor's outer
+/// per-probe ceiling (10s) stays authoritative across the fan-out.
+pub(crate) async fn probe_worker_mirror_ownership(
+    worker: &WorkerConfig,
+    canonical_root: &Path,
+) -> MirrorOwnershipProbe {
+    if should_skip_remote_preflight(worker)
+        || crate::transfer::WorkerPlatform::from_worker(worker).is_windows()
+    {
+        return MirrorOwnershipProbe::Skipped;
+    }
+    let cmd = build_worker_ownership_detect_cmd(canonical_root);
+    match run_offload_ssh_command(worker, &cmd, Duration::from_secs(8)).await {
+        Ok(output) => parse_ownership_detect_output(
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        ),
+        Err(err) => MirrorOwnershipProbe::Unprobeable(err.to_string()),
+    }
+}
+
 pub(super) async fn ensure_worker_projects_topology(
     worker: &WorkerConfig,
     reporter: &HookReporter,
@@ -825,6 +925,79 @@ exec /bin/ln \"$@\"\n",
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK"),
             "refusal must keep its structured error code"
+        );
+    }
+
+    #[test]
+    fn test_parse_ownership_detect_output_classifies_all_contract_paths() {
+        let _guard = test_guard!();
+
+        assert_eq!(
+            parse_ownership_detect_output(true, "RCH_OWNERSHIP_OK\n", ""),
+            MirrorOwnershipProbe::Healthy
+        );
+        assert_eq!(
+            parse_ownership_detect_output(true, "RCH_OWNERSHIP_DRIFT:count=7\n", ""),
+            MirrorOwnershipProbe::Drift { count: 7 }
+        );
+        assert_eq!(
+            parse_ownership_detect_output(true, "", "RCH_OWNERSHIP_CHECK_UNAVAILABLE\n"),
+            MirrorOwnershipProbe::CheckUnavailable
+        );
+        // Non-zero exit is unprobeable even when a sentinel also appears —
+        // `set -e` means the script never intends a non-zero exit.
+        assert!(matches!(
+            parse_ownership_detect_output(false, "", "boom"),
+            MirrorOwnershipProbe::Unprobeable(_)
+        ));
+        // Unrecognized stdout with exit 0 is honestly unprobeable too.
+        assert!(matches!(
+            parse_ownership_detect_output(true, "hello?", ""),
+            MirrorOwnershipProbe::Unprobeable(_)
+        ));
+    }
+
+    #[test]
+    fn test_build_worker_ownership_detect_cmd_is_read_only_and_escapes_root() {
+        let _guard = test_guard!();
+
+        let weird = PathBuf::from("/tmp/rch own';root");
+        let cmd = build_worker_ownership_detect_cmd(&weird);
+
+        assert!(
+            !cmd.contains("chown"),
+            "detect command must never mutate worker state: {cmd}"
+        );
+        assert!(
+            !cmd.contains("rm "),
+            "detect command must never delete: {cmd}"
+        );
+        assert!(
+            cmd.contains("sudo -n find \"$r\" -xdev -user root -print"),
+            "detect command must only count root-owned entries: {cmd}"
+        );
+        assert!(
+            cmd.contains("'\\''"),
+            "shell metacharacters in the configured root must be escaped: {cmd}"
+        );
+
+        // The generated script must execute as valid shell. Run it against
+        // a tempdir root; depending on whether passwordless sudo exists in
+        // this environment it either reports OK/DRIFT or CHECK_UNAVAILABLE,
+        // but it must always exit 0 (fail-open contract).
+        let scratch = tempfile::tempdir().expect("temp dir");
+        std::fs::write(scratch.path().join("marker"), b"x").expect("write marker");
+        let output = std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(build_worker_ownership_detect_cmd(scratch.path()))
+            .output()
+            .expect("run detect command locally");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "detect command is fail-open; status={:?} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

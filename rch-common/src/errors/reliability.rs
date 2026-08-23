@@ -15,9 +15,8 @@
 //! | R200-R299  | ProcessTriage         | Cancellation cleanup + process debt    |
 //! | R300-R399  | RepoConvergence       | Worker repo-state convergence          |
 //! | R400-R499  | HelperCompatibility   | rsync / ssh / cargo / zstd availability |
-//! | R500-R599  | RolloutPosture        | self-healing config flags              |
 //! | R600-R699  | SchemaCompatibility   | Cross-binary schema-version drift      |
-//!
+//! | R700-R799  | MirrorOwnership       | Worker mirror-tree ownership drift     |
 //! Discipline:
 //! - Variant identifiers are CamelCase.
 //! - Each variant has a fixed `RCH-Rnnn` code returned by [`ReliabilityReasonCode::code`].
@@ -50,6 +49,7 @@ pub enum ReliabilityCategoryKind {
     HelperCompatibility,
     RolloutPosture,
     SchemaCompatibility,
+    MirrorOwnership,
 }
 
 impl ReliabilityCategoryKind {
@@ -67,6 +67,7 @@ impl ReliabilityCategoryKind {
             Self::HelperCompatibility => "helper_compatibility",
             Self::RolloutPosture => "rollout_posture",
             Self::SchemaCompatibility => "schema_compatibility",
+            Self::MirrorOwnership => "mirror_ownership",
         }
     }
 }
@@ -186,6 +187,25 @@ pub enum ReliabilityReasonCode {
     SchemaCompatible,
     /// Schema versions are incompatible.
     SchemaIncompatible,
+
+    // ---- MirrorOwnership (R700-R799) ----
+    /// A worker's canonical mirror tree has no root-owned entries (Pass).
+    WorkerMirrorOwnershipHealthy,
+    /// A worker's canonical mirror tree contains root-owned entries that
+    /// will make rsync-as-ssh-user fail exit 23 until repaired. The
+    /// dispatch-time preflight self-heals these (bd-8iwkm); this code
+    /// surfaces the drift proactively, before a dispatch hits it.
+    WorkerMirrorOwnershipDrift,
+    /// The worker's ownership probe could not run because passwordless
+    /// sudo is unavailable to the SSH user; dispatch-time repair fails
+    /// open silently in this state.
+    WorkerMirrorOwnershipCheckUnavailable,
+    /// The per-worker ownership probe did not complete (SSH transport
+    /// error or timeout); drift state on that worker is unknown.
+    WorkerMirrorOwnershipUnprobeable,
+    /// No workers are configured, so there is nothing to probe (Info;
+    /// the topology probe reports this condition as its own code).
+    MirrorOwnershipNoWorkers,
 }
 
 impl ReliabilityReasonCode {
@@ -224,8 +244,6 @@ impl ReliabilityReasonCode {
             Self::RepoConvergenceFailed => "RepoConvergenceFailed",
             Self::RepoConvergenceDrift => "RepoConvergenceDrift",
             Self::RepoConvergenceNoWorkers => "RepoConvergenceNoWorkers",
-            Self::RepoConvergenceReady => "RepoConvergenceReady",
-            Self::WorkerRepoNotReady => "WorkerRepoNotReady",
             Self::HelperAvailable => "HelperAvailable",
             Self::HelperMissing => "HelperMissing",
             Self::HelperProbeUnavailable => "HelperProbeUnavailable",
@@ -243,6 +261,11 @@ impl ReliabilityReasonCode {
             Self::SocketPathMismatch => "SocketPathMismatch",
             Self::SchemaCompatible => "SchemaCompatible",
             Self::SchemaIncompatible => "SchemaIncompatible",
+            Self::WorkerMirrorOwnershipHealthy => "WorkerMirrorOwnershipHealthy",
+            Self::WorkerMirrorOwnershipDrift => "WorkerMirrorOwnershipDrift",
+            Self::WorkerMirrorOwnershipCheckUnavailable => "WorkerMirrorOwnershipCheckUnavailable",
+            Self::WorkerMirrorOwnershipUnprobeable => "WorkerMirrorOwnershipUnprobeable",
+            Self::MirrorOwnershipNoWorkers => "MirrorOwnershipNoWorkers",
         }
     }
 
@@ -311,6 +334,13 @@ impl ReliabilityReasonCode {
             // R600-R699 — SchemaCompatibility
             Self::SchemaCompatible => "RCH-R600",
             Self::SchemaIncompatible => "RCH-R601",
+
+            // R700-R799 — MirrorOwnership
+            Self::WorkerMirrorOwnershipHealthy => "RCH-R700",
+            Self::WorkerMirrorOwnershipDrift => "RCH-R701",
+            Self::WorkerMirrorOwnershipCheckUnavailable => "RCH-R702",
+            Self::WorkerMirrorOwnershipUnprobeable => "RCH-R703",
+            Self::MirrorOwnershipNoWorkers => "RCH-R704",
         }
     }
 
@@ -372,6 +402,12 @@ impl ReliabilityReasonCode {
             | Self::SocketPathMismatch => C::RolloutPosture,
 
             Self::SchemaCompatible | Self::SchemaIncompatible => C::SchemaCompatibility,
+
+            Self::WorkerMirrorOwnershipHealthy
+            | Self::WorkerMirrorOwnershipDrift
+            | Self::WorkerMirrorOwnershipCheckUnavailable
+            | Self::WorkerMirrorOwnershipUnprobeable
+            | Self::MirrorOwnershipNoWorkers => C::MirrorOwnership,
         }
     }
 
@@ -448,6 +484,14 @@ impl ReliabilityReasonCode {
             // requires a fresh process.
             Self::SchemaCompatible => false,
             Self::SchemaIncompatible => true,
+
+            // Mirror ownership is external worker state; the dispatch-time
+            // preflight self-heals it without any rch/rchd process restart.
+            Self::WorkerMirrorOwnershipHealthy
+            | Self::WorkerMirrorOwnershipDrift
+            | Self::WorkerMirrorOwnershipCheckUnavailable
+            | Self::WorkerMirrorOwnershipUnprobeable
+            | Self::MirrorOwnershipNoWorkers => false,
         }
     }
 
@@ -544,6 +588,21 @@ impl ReliabilityReasonCode {
             Self::SchemaIncompatible => {
                 "Upgrade rch / rchd / rch-wkr binaries to the same release."
             }
+            Self::WorkerMirrorOwnershipHealthy => "No action needed.",
+            Self::WorkerMirrorOwnershipDrift => {
+                "Root-owned entries under the worker's canonical mirror tree block \
+                 rsync-as-ssh-user; the dispatch-time preflight self-heals them \
+                 (bd-8iwkm), or chown them to the SSH user on the worker now."
+            }
+            Self::WorkerMirrorOwnershipCheckUnavailable => {
+                "Verify passwordless sudo (`sudo -n true`) for the SSH user on the \
+                 worker; ownership detection and repair fail open until then."
+            }
+            Self::WorkerMirrorOwnershipUnprobeable => {
+                "Run `rch workers probe --all`; the ownership probe could not reach \
+                 the worker over SSH."
+            }
+            Self::MirrorOwnershipNoWorkers => "No action needed.",
         }
     }
 
@@ -597,6 +656,11 @@ impl ReliabilityReasonCode {
         Self::SocketPathMismatch,
         Self::SchemaCompatible,
         Self::SchemaIncompatible,
+        Self::WorkerMirrorOwnershipHealthy,
+        Self::WorkerMirrorOwnershipDrift,
+        Self::WorkerMirrorOwnershipCheckUnavailable,
+        Self::WorkerMirrorOwnershipUnprobeable,
+        Self::MirrorOwnershipNoWorkers,
     ];
 }
 
@@ -943,6 +1007,31 @@ impl ReliabilityReasonCode {
                 authored_at: "2026-05-16",
             }),
 
+            // ---------------- Mirror ownership ----------------
+            WorkerMirrorOwnershipDrift => Some(RunbookEntry {
+                symptoms: &[
+                    "`rch doctor --reliability` reports `RCH-R701` (Warning) per affected worker",
+                    "Root-owned entries under the worker's canonical mirror tree",
+                    "rsync uploads to this worker can fail exit 23 on replace/unlink",
+                ],
+                diagnosis_steps: &[
+                    "rch doctor --reliability --scope=ownership --json | jq '.data.diagnostics[] | select(.code==\"RCH-R701\")'",
+                    "ssh <user>@<host> 'sudo find /data/projects -xdev -user root -print | head -20'",
+                ],
+                remediation_steps: &[
+                    "# The dispatch-time preflight self-heals drift automatically (bd-8iwkm);",
+                    "# any offloaded build triggers the repair. To fix immediately:",
+                    "ssh <user>@<host> 'sudo find /data/projects -xdev -user root -exec chown -h <user> {} +'",
+                ],
+                verification_command: "rch doctor --reliability --scope=ownership",
+                escalation: None,
+                references: &[
+                    "bd-8iwkm (dispatch-time detect+repair)",
+                    "RCH-R702 — sudo unavailable, repair fails open",
+                ],
+                authored_at: "2026-08-23",
+            }),
+
             // ---------------- All other variants return None ----------------
             //
             // Pass / Info codes describe healthy states and don't merit
@@ -1011,6 +1100,7 @@ mod tests {
                 ReliabilityCategoryKind::HelperCompatibility => 400..=499,
                 ReliabilityCategoryKind::RolloutPosture => 500..=599,
                 ReliabilityCategoryKind::SchemaCompatibility => 600..=699,
+                ReliabilityCategoryKind::MirrorOwnership => 700..=799,
             };
             assert!(
                 expected_range.contains(&n),
@@ -1183,6 +1273,14 @@ mod tests {
         // SchemaCompatibility
         (ReliabilityReasonCode::SchemaCompatible, false),
         (ReliabilityReasonCode::SchemaIncompatible, true),
+        // MirrorOwnership
+        (ReliabilityReasonCode::WorkerMirrorOwnershipHealthy, false),
+        (ReliabilityReasonCode::WorkerMirrorOwnershipDrift, false),
+        (
+            ReliabilityReasonCode::WorkerMirrorOwnershipCheckUnavailable,
+            false,
+        ),
+        (ReliabilityReasonCode::MirrorOwnershipNoWorkers, false),
     ];
 
     #[test]

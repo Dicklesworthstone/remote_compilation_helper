@@ -166,9 +166,7 @@ async fn subsystem_flow_future(witness: Arc<Mutex<FlowWitness>>) -> &'static str
 
 /// Drive an instrumented future to completion with the noop waker
 /// (same discipline as the upstream runner's own poller).
-fn poll_to_result<F: Future>(
-    future: InstrumentedFuture<F>,
-) -> InstrumentedPollResult<F::Output> {
+fn poll_to_result<F: Future>(future: InstrumentedFuture<F>) -> InstrumentedPollResult<F::Output> {
     use std::task::{Context, Poll, Waker};
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);

@@ -719,9 +719,10 @@ CHECKS PERFORMED:
         lenient: bool,
 
         /// Subset of probes to run, comma-separated. Default = `all`.
-        /// Valid values: `all`, `topology`, `convergence`, `pressure`,
-        /// `triage`, `helpers`, `rollout`, `schema`. Multi-scope:
-        /// `--scope topology,pressure`. Only meaningful with `--reliability`.
+        /// Valid values: `all`, `topology`, `ownership`, `convergence`,
+        /// `pressure`, `triage`, `helpers`, `rollout`, `schema`.
+        /// Multi-scope: `--scope topology,pressure`. Only meaningful with
+        /// `--reliability`.
         #[arg(
             long,
             requires = "reliability",

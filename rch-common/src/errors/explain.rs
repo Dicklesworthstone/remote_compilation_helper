@@ -299,6 +299,7 @@ const fn reliability_category_str(c: ReliabilityCategoryKind) -> &'static str {
         ReliabilityCategoryKind::HelperCompatibility => "helper_compatibility",
         ReliabilityCategoryKind::RolloutPosture => "rollout_posture",
         ReliabilityCategoryKind::SchemaCompatibility => "schema_compatibility",
+        ReliabilityCategoryKind::MirrorOwnership => "mirror_ownership",
     }
 }
 

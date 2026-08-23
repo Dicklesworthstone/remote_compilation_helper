@@ -144,9 +144,7 @@ impl MissCause {
             Self::NegativeDependencyChanged => {
                 "a previously failed open/listing/lookup now resolves differently"
             }
-            Self::DependencyArtifactChanged => {
-                "the exact dependency artifacts consumed changed"
-            }
+            Self::DependencyArtifactChanged => "the exact dependency artifacts consumed changed",
             Self::InvocationChanged => "invocation flags/profile/features changed",
             Self::EnvironmentChanged => "the presented environment changed",
             Self::ToolchainChanged => "toolchain identity changed",
@@ -182,9 +180,7 @@ impl LookupOutcome {
         match self {
             Self::FirstSeen => "no prior entry for this key: first seen",
             Self::ServingBlocked => "entry exists but its serving disposition blocks it",
-            Self::TrustRefused => {
-                "entry exists but the subscriber's minimum trust tier is unmet"
-            }
+            Self::TrustRefused => "entry exists but the subscriber's minimum trust tier is unmet",
             Self::MaterializationUnavailable => {
                 "entry exists but its object closure is not materializable now"
             }
@@ -315,7 +311,10 @@ mod tests {
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(codes.len(), total, "reason codes must be unique");
-        assert!(all.iter().all(|c| !c.code().is_empty() && !c.explain().is_empty()));
+        assert!(
+            all.iter()
+                .all(|c| !c.code().is_empty() && !c.explain().is_empty())
+        );
     }
 
     #[test]

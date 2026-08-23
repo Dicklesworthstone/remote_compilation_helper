@@ -298,8 +298,6 @@ fn aggregate_verdict(diagnostics: &[ReliabilityDiagnostic]) -> ReliabilityVerdic
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
 enum ReliabilityCategory {
     Topology,
     RepoPresence,
@@ -308,6 +306,7 @@ enum ReliabilityCategory {
     HelperCompatibility,
     RolloutPosture,
     SchemaCompatibility,
+    MirrorOwnership,
 }
 
 impl ReliabilityCategory {
@@ -320,6 +319,7 @@ impl ReliabilityCategory {
             Self::HelperCompatibility => "helper_compatibility",
             Self::RolloutPosture => "rollout_posture",
             Self::SchemaCompatibility => "schema_compatibility",
+            Self::MirrorOwnership => "mirror_ownership",
         }
     }
 }
@@ -330,18 +330,22 @@ impl ReliabilityCategory {
 /// Each named variant maps to one of the `reliability_*_diagnostics`
 /// probes in `run_reliability_doctor`. Operators triaging a known
 /// symptom can pass `--scope=pressure` (or any subset, comma-separated)
-/// to skip the irrelevant probes — typical 7-probe sweep takes ~1.5s
-/// against an 8-worker fleet, scope=topology is ~50ms.
+/// to skip the irrelevant probes — typical 8-probe sweep takes ~2s
+/// against an 8-worker fleet (the ownership fan-out adds one bounded
+/// SSH round-trip per worker, run concurrently), scope=topology is
+/// still ~50ms.
 ///
 /// Naming uses the operator-facing labels per the bead: `convergence`
 /// (not `repo_presence`), `triage` (not `process_debt`), `helpers`
 /// (not `helper_compatibility`), `rollout` (not `rollout_posture`),
-/// `schema` (not `schema_compatibility`).
+/// `schema` (not `schema_compatibility`). `ownership` probes per-worker
+/// mirror-tree ownership drift (bd-kugfc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReliabilityScope {
     All,
     Topology,
+    Ownership,
     Convergence,
     Pressure,
     Triage,
@@ -357,6 +361,7 @@ impl ReliabilityScope {
         match self {
             Self::All => "all",
             Self::Topology => "topology",
+            Self::Ownership => "ownership",
             Self::Convergence => "convergence",
             Self::Pressure => "pressure",
             Self::Triage => "triage",
@@ -374,6 +379,7 @@ impl std::str::FromStr for ReliabilityScope {
         match trimmed.as_str() {
             "all" => Ok(Self::All),
             "topology" => Ok(Self::Topology),
+            "ownership" => Ok(Self::Ownership),
             "convergence" => Ok(Self::Convergence),
             "pressure" => Ok(Self::Pressure),
             "triage" => Ok(Self::Triage),
@@ -381,7 +387,7 @@ impl std::str::FromStr for ReliabilityScope {
             "rollout" => Ok(Self::Rollout),
             "schema" => Ok(Self::Schema),
             other => Err(format!(
-                "unknown scope value '{other}' (valid: all, topology, convergence, pressure, triage, helpers, rollout, schema)"
+                "unknown scope value '{other}' (valid: all, topology, ownership, convergence, pressure, triage, helpers, rollout, schema)"
             )),
         }
     }
@@ -418,7 +424,7 @@ impl ReliabilityScopeSet {
     }
 
     fn needs_worker_config(&self) -> bool {
-        self.matches(ReliabilityScope::Topology)
+        self.matches(ReliabilityScope::Topology) || self.matches(ReliabilityScope::Ownership)
     }
 
     fn needs_daemon_status(&self) -> bool {
@@ -448,6 +454,7 @@ impl ReliabilityScopeSet {
         let mut names = Vec::new();
         for (scope, name) in [
             (ReliabilityScope::Topology, "topology"),
+            (ReliabilityScope::Ownership, "ownership"),
             (ReliabilityScope::Convergence, "convergence"),
             (ReliabilityScope::Pressure, "pressure"),
             (ReliabilityScope::Triage, "triage"),
@@ -470,7 +477,7 @@ impl std::str::FromStr for ReliabilityScopeSet {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let trimmed = s.trim();
         if trimmed.is_empty() {
-            return Err("scope list is empty (pass --scope=all or one of: topology, convergence, pressure, triage, helpers, rollout, schema)".to_string());
+            return Err("scope list is empty (pass --scope=all or one of: topology, ownership, convergence, pressure, triage, helpers, rollout, schema)".to_string());
         }
         let mut out: Vec<ReliabilityScope> = Vec::new();
         for segment in trimmed.split(',') {
@@ -986,9 +993,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// The order of diagnostics in the final response is independent of the
 /// parallelism order: the `scope.matches(...)` branches at the bottom
-/// iterate in a fixed (Topology, Convergence, Pressure, Triage,
-/// Helpers, Rollout, Schema) sequence over the joined results, so
-/// output is byte-stable across runs even if probes finish in
+/// iterate in a fixed (Topology, Ownership, Convergence, Pressure,
+/// Triage, Helpers, Rollout, Schema) sequence over the joined results,
+/// so output is byte-stable across runs even if probes finish in
 /// different orders.
 async fn collect_reliability_response_once(options: &DoctorOptions) -> ReliabilityDoctorResponse {
     // Probe gating per --scope (t01). Each branch runs only when the
@@ -1019,15 +1026,16 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
 
     // Phase 2 — sync file I/O. These are microseconds each and can run
     // on the current thread while the spawned probes are in flight.
-    let config_result = if scope.needs_rollout_config() {
-        Some(crate::config::load_config())
-    } else {
-        None
-    };
+    let config_result =
+        if scope.needs_rollout_config() || scope.matches(ReliabilityScope::Ownership) {
+            Some(crate::config::load_config())
+        } else {
+            None
+        };
     tracing::debug!(
         target: "rch::doctor::config_loads",
         loaded = matches!(config_result.as_ref(), Some(Ok(_))),
-        skipped = !scope.needs_rollout_config(),
+        skipped = !(scope.needs_rollout_config() || scope.matches(ReliabilityScope::Ownership)),
         "doctor.config.load",
     );
 
@@ -1040,6 +1048,80 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
         (None, None)
     };
 
+    // bd-kugfc: resolve the canonical mirror root from config (falling
+    // back to the compiled-in default only when config loads cleanly but
+    // leaves it unset). A config-load failure is surfaced by the
+    // ownership diagnostics builder as an unprobeable state rather than
+    // silently probing a possibly-wrong default tree.
+    let ownership_canonical_root: Result<PathBuf, String> =
+        if scope.matches(ReliabilityScope::Ownership) {
+            match config_result.as_ref() {
+                Some(Ok(config)) => Ok(config
+                    .path_topology
+                    .to_policy()
+                    .canonical_root()
+                    .to_path_buf()),
+                Some(Err(error)) => Err(error.to_string()),
+                None => Err("config load skipped unexpectedly".to_string()),
+            }
+        } else {
+            Err("ownership scope not selected".to_string())
+        };
+
+    let (workers, worker_config_error) = if scope.needs_worker_config() {
+        match load_workers_from_config() {
+            Ok(workers) => (Some(workers), None),
+            Err(err) => (None, Some(err.to_string())),
+        }
+    } else {
+        (None, None)
+    };
+    // Phase 2.5 — bd-kugfc: the ownership probe needs the loaded worker
+    // list, so it spawns after Phase 2 and joins with everything else in
+    // Phase 3. Each worker gets one bounded SSH round-trip, run
+    // concurrently; per-worker results are placed back by index so the
+    // diagnostic order stays byte-stable regardless of completion order.
+    let ownership_handle: Option<
+        tokio::task::JoinHandle<Vec<crate::hook::ssh::MirrorOwnershipProbe>>,
+    > = if scope.matches(ReliabilityScope::Ownership) && ownership_canonical_root.is_ok() {
+        workers.as_ref().filter(|ws| !ws.is_empty()).map(|ws| {
+            let workers = ws.clone();
+            let workers_len = workers.len();
+            let root = ownership_canonical_root
+                .as_ref()
+                .expect("checked is_ok above")
+                .clone();
+            tokio::spawn(async move {
+                let mut set = tokio::task::JoinSet::new();
+                for (idx, worker) in workers.into_iter().enumerate() {
+                    set.spawn(async move {
+                        let probe =
+                            crate::hook::ssh::probe_worker_mirror_ownership(&worker, &root).await;
+                        (idx, probe)
+                    });
+                }
+                // Slots start honestly unprobeable; a panicked task leaves
+                // its slot in that state instead of masquerading as healthy.
+                let mut results = vec![
+                    crate::hook::ssh::MirrorOwnershipProbe::Unprobeable(
+                        "probe task did not report".to_string(),
+                    );
+                    workers_len
+                ];
+                while let Some(joined) = set.join_next().await {
+                    if let Ok((idx, probe)) = joined {
+                        if let Some(slot) = results.get_mut(idx) {
+                            *slot = probe;
+                        }
+                    }
+                }
+                results
+            })
+        })
+    } else {
+        None
+    };
+
     // Phase 3 — join the spawned probes. `join_isolated_probe` collapses
     // the three failure modes (timeout, panic, RPC error) into the
     // single `None` outcome that downstream diagnostic builders
@@ -1050,6 +1132,8 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
         join_isolated_async_probe("repo_convergence", convergence_handle).await;
     let (helper_diags_override, helpers_outcome) =
         join_isolated_blocking_probe("helper_compatibility", helpers_handle).await;
+    let (ownership_results, ownership_outcome) =
+        join_isolated_async_probe("mirror_ownership", ownership_handle).await;
     let join_elapsed_ms = join_start.elapsed().as_millis() as u64;
     tracing::info!(
         target: "rch::doctor::probes",
@@ -1068,13 +1152,21 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
         probes_count = probes_to_run.len(),
         "doctor.scope.applied",
     );
-
     let mut diagnostics = Vec::new();
     if scope.matches(ReliabilityScope::Topology) {
         diagnostics.extend(reliability_topology_diagnostics(
             workers.as_deref(),
             daemon_status.as_ref(),
+            worker_config_error.clone(),
+        ));
+    }
+    if scope.matches(ReliabilityScope::Ownership) {
+        diagnostics.extend(reliability_mirror_ownership_diagnostics(
+            workers.as_deref(),
             worker_config_error,
+            ownership_results.as_ref(),
+            ownership_outcome,
+            ownership_canonical_root.as_ref().err(),
         ));
     }
     if scope.matches(ReliabilityScope::Convergence) {
@@ -2035,6 +2127,158 @@ fn reliability_topology_diagnostics(
 
     diagnostics.extend(status.workers.iter().map(worker_topology_diagnostic));
     diagnostics
+}
+
+/// bd-kugfc: build mirror-ownership diagnostics from the per-worker
+/// detection-only probe results.
+///
+/// Inputs arrive pre-joined: `probe_results` is `Some` only when the
+/// fan-out task itself completed (per-worker slots then carry their own
+/// outcome, including per-task panics as [`MirrorOwnershipProbe::Unprobeable`]);
+/// `None` means the whole probe bucket failed to produce data (timeout,
+/// panic in the fan-out task) and one fleet-level unprobeable diagnostic
+/// is synthesized instead. Ordering follows the caller's worker-config
+/// order, so output stays byte-stable across runs.
+fn reliability_mirror_ownership_diagnostics(
+    workers: Option<&[rch_common::WorkerConfig]>,
+    worker_config_error: Option<String>,
+    probe_results: Option<&Vec<crate::hook::ssh::MirrorOwnershipProbe>>,
+    outcome: ProbeOutcome,
+    canonical_root_error: Option<&String>,
+) -> Vec<ReliabilityDiagnostic> {
+    let validation = "rch doctor --reliability --scope=ownership --json";
+
+    if let Some(error) = worker_config_error {
+        return vec![
+            ReliabilityDiagnostic::new(
+                ReliabilityCategory::MirrorOwnership,
+                "mirror_ownership",
+                ReliabilitySeverity::Warning,
+                "Workers configuration unavailable; mirror-tree ownership not probed",
+                ReliabilityReasonCode::WorkerMirrorOwnershipUnprobeable,
+            )
+            .with_details(format!("workers config error: {error}"))
+            .with_remediation("rch config doctor --json", validation),
+        ];
+    }
+
+    if let Some(error) = canonical_root_error {
+        return vec![
+            ReliabilityDiagnostic::new(
+                ReliabilityCategory::MirrorOwnership,
+                "mirror_ownership",
+                ReliabilitySeverity::Warning,
+                "Config load failed; cannot resolve the canonical mirror root to probe",
+                ReliabilityReasonCode::WorkerMirrorOwnershipUnprobeable,
+            )
+            .with_details(format!("config error: {error}"))
+            .with_remediation("rch config doctor --json", validation),
+        ];
+    }
+
+    let Some(workers) = workers else {
+        return vec![];
+    };
+    if workers.is_empty() {
+        return vec![ReliabilityDiagnostic::new(
+            ReliabilityCategory::MirrorOwnership,
+            "mirror_ownership",
+            ReliabilitySeverity::Info,
+            "No workers are configured; nothing to probe for ownership drift",
+            ReliabilityReasonCode::MirrorOwnershipNoWorkers,
+        )];
+    }
+
+    // The fan-out task died without producing per-worker slots — report
+    // honestly at fleet level using the join outcome forensics.
+    let Some(results) = probe_results else {
+        return vec![
+            ReliabilityDiagnostic::new(
+                ReliabilityCategory::MirrorOwnership,
+                "mirror_ownership",
+                ReliabilitySeverity::Warning,
+                format!(
+                    "Mirror-ownership probe did not complete ({})",
+                    outcome.label()
+                ),
+                ReliabilityReasonCode::WorkerMirrorOwnershipUnprobeable,
+            )
+            .with_remediation("rch workers probe --all", validation),
+        ];
+    };
+
+    workers
+        .iter()
+        .zip(results.iter())
+        .filter_map(|(worker, probe)| {
+            let worker_id = worker.id.to_string();
+            match probe {
+                crate::hook::ssh::MirrorOwnershipProbe::Skipped => None,
+                crate::hook::ssh::MirrorOwnershipProbe::Healthy => Some(
+                    ReliabilityDiagnostic::new(
+                        ReliabilityCategory::MirrorOwnership,
+                        "mirror_ownership",
+                        ReliabilitySeverity::Pass,
+                        "Mirror tree has no root-owned entries",
+                        ReliabilityReasonCode::WorkerMirrorOwnershipHealthy,
+                    )
+                    .with_worker(worker_id),
+                ),
+                crate::hook::ssh::MirrorOwnershipProbe::Drift { count } => {
+                    let user = &worker.user;
+                    let host = &worker.host;
+                    let manual_fix = format!(
+                        "ssh {user}@{host} 'sudo find <canonical-root> -xdev -user root -exec chown -h {user} {{}} +'"
+                    );
+                    Some(
+                        ReliabilityDiagnostic::new(
+                            ReliabilityCategory::MirrorOwnership,
+                            "mirror_ownership",
+                            ReliabilitySeverity::Warning,
+                            format!(
+                                "{count} root-owned entr{} under the canonical mirror tree; \
+                                 rsync-as-{user} will fail exit 23 until repaired",
+                                if *count == 1 { "y" } else { "ies" }
+                            ),
+                            ReliabilityReasonCode::WorkerMirrorOwnershipDrift,
+                        )
+                        .with_worker(worker_id)
+                        .with_details(format!(
+                            "drift_count={count}; self-heals at the next dispatch preflight (bd-8iwkm)"
+                        ))
+                        .with_remediation(manual_fix, validation),
+                    )
+                }
+                crate::hook::ssh::MirrorOwnershipProbe::CheckUnavailable => Some(
+                    ReliabilityDiagnostic::new(
+                        ReliabilityCategory::MirrorOwnership,
+                        "mirror_ownership",
+                        ReliabilitySeverity::Warning,
+                        "Passwordless sudo unavailable on worker; ownership check \
+                         cannot run and dispatch-time repair fails open",
+                        ReliabilityReasonCode::WorkerMirrorOwnershipCheckUnavailable,
+                    )
+                    .with_worker(worker_id)
+                    .with_remediation(
+                        format!("ssh {worker_id} 'sudo -n true'"),
+                        validation,
+                    ),
+                ),
+                crate::hook::ssh::MirrorOwnershipProbe::Unprobeable(reason) => Some(
+                    ReliabilityDiagnostic::new(
+                        ReliabilityCategory::MirrorOwnership,
+                        "mirror_ownership",
+                        ReliabilitySeverity::Warning,
+                        "Ownership probe could not reach the worker; drift state unknown",
+                        ReliabilityReasonCode::WorkerMirrorOwnershipUnprobeable,
+                    )
+                    .with_worker(worker_id)
+                    .with_details(reason.clone())
+                    .with_remediation("rch workers probe --all", validation),
+                ),
+            }
+        })
+        .collect()
 }
 
 /// Outcome of a defensive parse: a known categorical value OR the raw
