@@ -129,3 +129,6 @@ docs/evidence/fleet_deploy_audit_*.json
 .wrangler/
 # br doctor per-run artifacts
 .doctor/
+
+# I014 policy-overhead probe: machine-local timing, appended per test run
+benchmarks/baselines/i014_scheduler_storm.ndjson
