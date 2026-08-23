@@ -655,7 +655,123 @@ fn close_internal(
     Ok(CloseOutcome::Released)
 }
 
-// ---------------------------------------------------------------------
+/// Aggregate outcome of a batch lineage invalidation (M007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidationSummary {
+    /// Provisional pins closed (registry + reason recorded).
+    pub pins_invalidated: usize,
+    /// Open consumer obligations cancelled by the invalidation.
+    pub obligations_cancelled: usize,
+}
+
+fn close_and_cancel(
+    store: &mut dyn RabsMetadataStore,
+    pin_key: &str,
+    reason: &str,
+) -> Result<usize, ProvisionalPinError> {
+    // Registry first (reads refuse immediately), then cancel the pin's
+    // open obligations — descendants flip to Refused at their terminal
+    // gate. The protective GC twin stays for the coordinator's drain
+    // pass (fail toward retention on tear).
+    store.close_provisional_pin(pin_key, Some(reason))?;
+    Ok(store.cancel_provisional_obligations(pin_key)?)
+}
+
+/// R39 trigger 1 — GENERATION FAILURE: the producer generation failed or
+/// was tombstoned; every provisional output it minted is invalidated and
+/// its dependents cancelled.
+///
+/// # Errors
+/// Store failures.
+pub fn invalidate_lineage_for_generation_failure(
+    store: &mut dyn RabsMetadataStore,
+    action_key: &TypedDigest,
+    generation: ActionGenerationId,
+    reason: &str,
+) -> Result<InvalidationSummary, ProvisionalPinError> {
+    let rows = store.list_open_provisional_pins_for_action_generation(
+        &digest_key(action_key),
+        &format!("{:032x}", generation.0),
+    )?;
+    let mut summary = InvalidationSummary {
+        pins_invalidated: 0,
+        obligations_cancelled: 0,
+    };
+    for row in &rows {
+        summary.obligations_cancelled += close_and_cancel(store, &row.pin_key, reason)?;
+        summary.pins_invalidated += 1;
+    }
+    Ok(summary)
+}
+
+/// R39 trigger 2 — AUTHORITY LOSS: the minting coordinator lost authority
+/// (term superseded/operator reset); everything it pinned provisionally
+/// is invalidated.
+///
+/// # Errors
+/// Store failures.
+pub fn invalidate_lineage_for_authority_loss(
+    store: &mut dyn RabsMetadataStore,
+    authority: &CoordinatorAuthority,
+    reason: &str,
+) -> Result<InvalidationSummary, ProvisionalPinError> {
+    let rows = store
+        .list_open_provisional_pins_for_authority(&digest_key(&authority_digest(authority)))?;
+    let mut summary = InvalidationSummary {
+        pins_invalidated: 0,
+        obligations_cancelled: 0,
+    };
+    for row in &rows {
+        summary.obligations_cancelled += close_and_cancel(store, &row.pin_key, reason)?;
+        summary.pins_invalidated += 1;
+    }
+    Ok(summary)
+}
+
+/// R39 trigger 3 — SUPERSESSION WITHOUT COMPATIBLE ADOPTION: a winner
+/// committed the action resolving logical outputs to `committed_output_keys`
+/// (digest keys); every still-open pin of that action whose object is NOT
+/// among them consumed truth that can never be adopted — invalidated.
+/// Pins matching committed objects stay open for the normal resolution
+/// path ([`resolve_consumers_on_commit`]).
+///
+/// # Errors
+/// Store failures.
+pub fn invalidate_unadopted_lineage_for_action(
+    store: &mut dyn RabsMetadataStore,
+    action_key: &TypedDigest,
+    committed_output_keys: &std::collections::BTreeSet<String>,
+    reason: &str,
+) -> Result<InvalidationSummary, ProvisionalPinError> {
+    let rows = store.list_open_provisional_pins_for_action(&digest_key(action_key))?;
+    let mut summary = InvalidationSummary {
+        pins_invalidated: 0,
+        obligations_cancelled: 0,
+    };
+    for row in &rows {
+        if committed_output_keys.contains(&row.object_key) {
+            continue;
+        }
+        summary.obligations_cancelled += close_and_cancel(store, &row.pin_key, reason)?;
+        summary.pins_invalidated += 1;
+    }
+    Ok(summary)
+}
+
+/// Causal trace for one provisional output (M007): EVERY dependent that
+/// started from it — resolved, open, or cancelled — with full consumer
+/// identity and status. This answers "which dependents consumed this
+/// output" durably, after the fact.
+///
+/// # Errors
+/// Store failures.
+pub fn provisional_causal_trace(
+    store: &mut dyn RabsMetadataStore,
+    pin_key: &str,
+) -> Result<Vec<crate::metadata_store::ProvisionalObligationRow>, ProvisionalPinError> {
+    Ok(store.list_provisional_obligations_for_pin(pin_key)?)
+}
+
 // Tests — the M004 acceptance suite: pin semantics + authorized
 // visibility. Every fixture runs against BOTH engines via the reference
 // SQLite store; the differential harness covers the new tables through
@@ -1210,6 +1326,183 @@ mod tests {
             )
             .unwrap(),
             CloseOutcome::Released
+        );
+    }
+
+    #[test]
+    fn m007_generation_failure_invalidates_pins_and_refuses_dependents() {
+        let mut f = fixture("m007-genfail");
+        // Two outputs from ONE generation of one action, plus a pin from
+        // a DIFFERENT action that must survive.
+        let producer_a = identity(1, 80);
+        let producer_b = ProvisionalIdentity {
+            virtual_path: RawBytes::new(b"target/debug/deps/libother.rmeta".to_vec()),
+            ..identity(1, 80)
+        };
+        let bystander = ProvisionalIdentity {
+            action_key: tagged_action(11),
+            ..identity(1, 81)
+        };
+        open_provisional_pin(&mut f.store, &producer_a, &tagged_object(90)).unwrap();
+        open_provisional_pin(&mut f.store, &producer_b, &tagged_object(91)).unwrap();
+        open_provisional_pin(&mut f.store, &bystander, &tagged_object(92)).unwrap();
+        for (producer, consumer_attempt) in [
+            (&producer_a, 91_u128),
+            (&producer_b, 91_u128),
+            (&bystander, 92_u128),
+        ] {
+            authorize_reader(
+                &mut f.store,
+                producer,
+                &dependent("worker-h", consumer_attempt),
+            )
+            .unwrap();
+            resolve_for_reader(
+                &mut f.store,
+                producer,
+                &dependent("worker-h", consumer_attempt),
+            )
+            .unwrap();
+        }
+
+        // The generation fails: BOTH of its pins invalidate; the
+        // bystander (different action) is untouched.
+        let summary = invalidate_lineage_for_generation_failure(
+            &mut f.store,
+            &tagged_action(10),
+            ActionGenerationId(0x50),
+            "generation tombstoned after worker loss",
+        )
+        .unwrap();
+        assert_eq!(summary.pins_invalidated, 2);
+        assert_eq!(summary.obligations_cancelled, 2);
+
+        // The ONE consumer of both outputs is REFUSED with BOTH cancelled
+        // pins aggregated (the gate refuses on any failed ancestor and
+        // names them all).
+        let mut expected = vec![producer_a.pin_key(), producer_b.pin_key()];
+        expected.sort();
+        assert_eq!(
+            descendant_terminal_gate(&mut f.store, "worker-h", AttemptId(91)).unwrap(),
+            TerminalGate::Refused {
+                cancelled_pin_keys: expected
+            }
+        );
+        // ...while the bystander's consumer is merely still Blocked (its
+        // lineage never failed).
+        assert!(matches!(
+            descendant_terminal_gate(&mut f.store, "worker-h", AttemptId(92)).unwrap(),
+            TerminalGate::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn m007_authority_loss_invalidates_only_that_authoritys_pins() {
+        let mut f = fixture("m007-authloss");
+        let dead_authority_pin = identity(1, 82);
+        let live_authority_pin = identity(2, 83);
+        open_provisional_pin(&mut f.store, &dead_authority_pin, &tagged_object(93)).unwrap();
+        open_provisional_pin(&mut f.store, &live_authority_pin, &tagged_object(94)).unwrap();
+
+        let summary = invalidate_lineage_for_authority_loss(
+            &mut f.store,
+            &authority(1),
+            "operator reset superseded term",
+        )
+        .unwrap();
+        assert_eq!(summary.pins_invalidated, 1);
+
+        // Dead authority's pin refuses reads with the invalidation reason;
+        // the other authority's pin still serves authorized readers.
+        authorize_reader(&mut f.store, &dead_authority_pin, &edge(21)).unwrap_err();
+        assert!(matches!(
+            resolve_for_reader(&mut f.store, &dead_authority_pin, &edge(22)),
+            Err(ProvisionalPinError::ProducerInvalidated { .. })
+        ));
+        authorize_reader(&mut f.store, &live_authority_pin, &edge(23)).unwrap();
+        assert_eq!(
+            resolve_for_reader(&mut f.store, &live_authority_pin, &edge(23)).unwrap(),
+            tagged_object(94)
+        );
+    }
+
+    #[test]
+    fn m007_supersession_keeps_exact_objects_and_invalidates_divergent() {
+        let mut f = fixture("m007-supersede");
+        let kept = identity(1, 84);
+        let divergent = ProvisionalIdentity {
+            virtual_path: RawBytes::new(b"target/debug/deps/libother.rmeta".to_vec()),
+            ..identity(1, 84)
+        };
+        let winner_object = tagged_object(95);
+        open_provisional_pin(&mut f.store, &kept, &winner_object).unwrap();
+        open_provisional_pin(&mut f.store, &divergent, &tagged_object(96)).unwrap();
+        authorize_reader(&mut f.store, &divergent, &dependent("worker-i", 95)).unwrap();
+        resolve_for_reader(&mut f.store, &divergent, &dependent("worker-i", 95)).unwrap();
+
+        // The winner committed an output map containing ONLY the exact
+        // object the `kept` pin carries: that pin survives for the normal
+        // resolution path; the divergent one can never be adopted.
+        let mut committed = std::collections::BTreeSet::new();
+        committed.insert(digest_key(&winner_object.0));
+        let summary = invalidate_unadopted_lineage_for_action(
+            &mut f.store,
+            &tagged_action(10),
+            &committed,
+            "superseded without compatible adoption",
+        )
+        .unwrap();
+        assert_eq!(summary.pins_invalidated, 1);
+        assert_eq!(summary.obligations_cancelled, 1);
+
+        // Kept pin still open and servable to a newly granted reader.
+        authorize_reader(&mut f.store, &kept, &edge(31)).unwrap();
+        assert_eq!(
+            resolve_for_reader(&mut f.store, &kept, &edge(31)).unwrap(),
+            winner_object
+        );
+        // Divergent consumer permanently refused.
+        assert_eq!(
+            descendant_terminal_gate(&mut f.store, "worker-i", AttemptId(95)).unwrap(),
+            TerminalGate::Refused {
+                cancelled_pin_keys: vec![divergent.pin_key()]
+            }
+        );
+    }
+
+    #[test]
+    fn m007_causal_trace_records_dependents_across_statuses() {
+        let mut f = fixture("m007-trace");
+        let producer = identity(1, 85);
+        let obj = tagged_object(97);
+        open_provisional_pin(&mut f.store, &producer, &obj).unwrap();
+        // Dependent 1 consumed and later resolved via exact commit.
+        authorize_reader(&mut f.store, &producer, &dependent("worker-j", 96)).unwrap();
+        resolve_for_reader(&mut f.store, &producer, &dependent("worker-j", 96)).unwrap();
+        resolve_consumers_on_commit(&mut f.store, &producer, &obj).unwrap();
+        // Dependent 2 consumed and got cancelled by invalidation.
+        let doomed = identity(1, 85);
+        let _ = doomed;
+        authorize_reader(&mut f.store, &producer, &dependent("worker-k", 97)).unwrap();
+        resolve_for_reader(&mut f.store, &producer, &dependent("worker-k", 97)).unwrap();
+        invalidate_lineage(&mut f.store, &producer, "superseded").unwrap();
+
+        // The causal trace answers "which dependents started from this
+        // output" across ALL statuses — resolved AND cancelled.
+        let trace = provisional_causal_trace(&mut f.store, &producer.pin_key()).unwrap();
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace[0].consumer_worker, "worker-j");
+        assert_eq!(trace[0].status, "resolved");
+        assert_eq!(
+            trace[0].resolution_object_key.as_deref(),
+            Some(digest_key(&obj.0).as_str())
+        );
+        assert_eq!(trace[1].consumer_worker, "worker-k");
+        assert_eq!(trace[1].status, "cancelled");
+        // Full lineage binding survives in the trace rows.
+        assert_eq!(
+            trace[0].producer_action_key,
+            digest_key(&producer.action_key)
         );
     }
 
