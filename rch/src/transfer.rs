@@ -1087,12 +1087,6 @@ struct RemoteEnvPlan {
     env_prefix: EnvPrefix,
     /// Directories that must exist before command execution.
     ensure_dirs: Vec<String>,
-    /// Managed temp directories (`TMPDIR`/`TMP`/`TEMP` values) that are
-    /// chmodded to `1700` right after creation so a permissive worker umask
-    /// (e.g. `002`) can never leave them group-writable without the sticky
-    /// bit. Consumers such as atomic-write durability code validate ancestor
-    /// permissions and refuse group-writable, non-sticky parents.
-    restricted_dirs: Vec<String>,
 }
 
 impl TransferPipeline {
@@ -1442,7 +1436,6 @@ impl TransferPipeline {
         let mut applied = Vec::new();
         let mut rejected = Vec::new();
         let mut ensure_dirs = Vec::new();
-        let mut restricted_dirs = Vec::new();
 
         for raw_key in &self.env_allowlist {
             let key = raw_key.trim();
@@ -1481,15 +1474,10 @@ impl TransferPipeline {
             };
 
             let managed_dir = ensure_dir.is_some();
-            if let Some(dir) = ensure_dir {
-                if !ensure_dirs.iter().any(|existing| existing == &dir) {
-                    ensure_dirs.push(dir.clone());
-                }
-                if matches!(key, "TMPDIR" | "TMP" | "TEMP")
-                    && !restricted_dirs.iter().any(|existing| existing == &dir)
-                {
-                    restricted_dirs.push(dir);
-                }
+            if let Some(dir) = ensure_dir
+                && !ensure_dirs.iter().any(|existing| existing == &dir)
+            {
+                ensure_dirs.push(dir);
             }
 
             parts.push(self.format_env_assignment(key, &escaped, managed_dir));
@@ -1511,19 +1499,12 @@ impl TransferPipeline {
             else {
                 continue;
             };
-            if !ensure_dirs.iter().any(|existing| existing == &ensure_dir) {
-                ensure_dirs.push(ensure_dir.clone());
-            }
-            if matches!(key, "TMPDIR" | "TMP" | "TEMP")
-                && !restricted_dirs
-                    .iter()
-                    .any(|existing| existing == &ensure_dir)
-            {
-                restricted_dirs.push(ensure_dir);
-            }
             let Some(escaped) = shell_escape_value(&managed_value) else {
                 continue;
             };
+            if !ensure_dirs.iter().any(|existing| existing == &ensure_dir) {
+                ensure_dirs.push(ensure_dir);
+            }
             parts.push(self.format_env_assignment(key, &escaped, true));
             applied.push(key.to_string());
         }
@@ -1560,7 +1541,6 @@ impl TransferPipeline {
                 rejected,
             },
             ensure_dirs,
-            restricted_dirs,
         }
     }
 
@@ -2050,17 +2030,7 @@ impl TransferPipeline {
                 .map(|dir| escape(Cow::from(dir.as_str())).to_string())
                 .collect::<Vec<_>>()
                 .join(" ");
-            let mut command = format!("mkdir -p {} && ", escaped_dirs);
-            if !env_plan.restricted_dirs.is_empty() && !self.worker_platform.is_windows() {
-                let escaped_restricted = env_plan
-                    .restricted_dirs
-                    .iter()
-                    .map(|dir| escape(Cow::from(dir.as_str())).to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                command.push_str(&format!("chmod 1700 {} && ", escaped_restricted));
-            }
-            command
+            format!("mkdir -p {} && ", escaped_dirs)
         };
 
         // Force LC_ALL=C to ensure English output for error parsing.
@@ -6444,40 +6414,6 @@ mod tests {
         // Each managed dir must be mkdir'd before the build.
         assert!(command.contains("mkdir -p"));
         assert!(command.contains(&format!("{}/.rch-go/cache", root)));
-    }
-
-    #[test]
-    fn test_managed_temp_dir_is_chmodded_owner_only_with_sticky_bit() {
-        let _guard = test_guard!();
-        // A permissive worker umask (e.g. `002`) makes `mkdir -p` produce a
-        // group-writable `.rch-tmp` without the sticky bit. Consumers that
-        // validate ancestor permissions before atomic writes (e.g.
-        // fastmcp-cli config durability tests) refuse such parents, so rch
-        // must tighten every managed TEMP-family directory right after
-        // creating it — and only those directories.
-        let pipeline = TransferPipeline::new(
-            PathBuf::from("/tmp/project"),
-            "project".to_string(),
-            "hash".to_string(),
-            TransferConfig::default(),
-        )
-        .with_env_overrides(HashMap::new()); // nothing forwarded; forced keys inject TMPDIR
-
-        let root = pipeline.remote_path();
-        let command = pipeline.build_remote_command("cargo build", None);
-
-        assert!(
-            command.contains(&format!("chmod 1700 {}/.rch-tmp", root)),
-            "managed .rch-tmp must be tightened to 1700: {command}"
-        );
-        assert!(
-            !command.contains(&format!("chmod 1700 {}/.rch-target", root)),
-            "target dir is not a TEMP-family dir and must not be chmodded: {command}"
-        );
-        assert!(
-            !command.contains(&format!("chmod 1700 {}/.rch-go", root)),
-            "go cache dirs are not TEMP-family dirs and must not be chmodded: {command}"
-        );
     }
 
     #[test]
