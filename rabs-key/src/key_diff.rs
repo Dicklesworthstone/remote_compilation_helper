@@ -113,6 +113,84 @@ pub fn diff_breakdowns(prior: &ActionKeyBreakdown, current: &ActionKeyBreakdown)
     causes
 }
 
+impl MissCause {
+    /// Stable machine-readable reason code (K009 wire format; never
+    /// renamed — consumers match on these strings).
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::SourceChanged => "source-changed",
+            Self::NegativeDependencyChanged => "negative-dependency-changed",
+            Self::DependencyArtifactChanged => "dependency-artifact-changed",
+            Self::InvocationChanged => "invocation-changed",
+            Self::EnvironmentChanged => "environment-changed",
+            Self::ToolchainChanged => "toolchain-changed",
+            Self::PlatformChanged => "platform-changed",
+            Self::SandboxPolicyChanged => "sandbox-policy-changed",
+            Self::BuildPathPolicyChanged => "build-path-policy-changed",
+            Self::WorkingDirectoryChanged => "working-directory-changed",
+            Self::ExecutionSemanticsChanged => "execution-semantics-changed",
+            Self::OutputDeclarationsChanged => "output-declarations-changed",
+            Self::EpochMismatch => "epoch-mismatch",
+            Self::ActionClassChanged => "action-class-changed",
+        }
+    }
+
+    /// One-line human explanation of why the prior entry missed.
+    #[must_use]
+    pub const fn explain(self) -> &'static str {
+        match self {
+            Self::SourceChanged => "positive source input set changed",
+            Self::NegativeDependencyChanged => {
+                "a previously failed open/listing/lookup now resolves differently"
+            }
+            Self::DependencyArtifactChanged => {
+                "the exact dependency artifacts consumed changed"
+            }
+            Self::InvocationChanged => "invocation flags/profile/features changed",
+            Self::EnvironmentChanged => "the presented environment changed",
+            Self::ToolchainChanged => "toolchain identity changed",
+            Self::PlatformChanged => "output-platform contract changed",
+            Self::SandboxPolicyChanged => "sandbox semantic policy changed",
+            Self::BuildPathPolicyChanged => "build-path semantic policy changed",
+            Self::WorkingDirectoryChanged => "virtual working directory changed",
+            Self::ExecutionSemanticsChanged => "execution-semantics contract changed",
+            Self::OutputDeclarationsChanged => "declared logical outputs changed",
+            Self::EpochMismatch => {
+                "key or projection epoch differs (cold namespace, not a component change)"
+            }
+            Self::ActionClassChanged => "action class differs entirely",
+        }
+    }
+}
+
+impl LookupOutcome {
+    /// Stable machine-readable refusal/lookup reason code (K009).
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::FirstSeen => "first-seen",
+            Self::ServingBlocked => "serving-blocked",
+            Self::TrustRefused => "trust-refused",
+            Self::MaterializationUnavailable => "materialization-unavailable",
+        }
+    }
+
+    /// One-line human explanation of the index-level outcome.
+    #[must_use]
+    pub const fn explain(self) -> &'static str {
+        match self {
+            Self::FirstSeen => "no prior entry for this key: first seen",
+            Self::ServingBlocked => "entry exists but its serving disposition blocks it",
+            Self::TrustRefused => {
+                "entry exists but the subscriber's minimum trust tier is unmet"
+            }
+            Self::MaterializationUnavailable => {
+                "entry exists but its object closure is not materializable now"
+            }
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +290,48 @@ mod tests {
         let a = compute_action_key(&descriptor());
         let b = compute_action_key(&descriptor());
         assert!(diff_breakdowns(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn k009_cause_codes_are_unique_and_total() {
+        let all = [
+            MissCause::SourceChanged,
+            MissCause::NegativeDependencyChanged,
+            MissCause::DependencyArtifactChanged,
+            MissCause::InvocationChanged,
+            MissCause::EnvironmentChanged,
+            MissCause::ToolchainChanged,
+            MissCause::PlatformChanged,
+            MissCause::SandboxPolicyChanged,
+            MissCause::BuildPathPolicyChanged,
+            MissCause::WorkingDirectoryChanged,
+            MissCause::ExecutionSemanticsChanged,
+            MissCause::OutputDeclarationsChanged,
+            MissCause::EpochMismatch,
+            MissCause::ActionClassChanged,
+        ];
+        let mut codes: Vec<&str> = all.iter().map(|c| c.code()).collect();
+        let total = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), total, "reason codes must be unique");
+        assert!(all.iter().all(|c| !c.code().is_empty() && !c.explain().is_empty()));
+    }
+
+    #[test]
+    fn k009_outcome_codes_are_stable() {
+        let outcomes = [
+            (LookupOutcome::FirstSeen, "first-seen"),
+            (LookupOutcome::ServingBlocked, "serving-blocked"),
+            (LookupOutcome::TrustRefused, "trust-refused"),
+            (
+                LookupOutcome::MaterializationUnavailable,
+                "materialization-unavailable",
+            ),
+        ];
+        for (outcome, code) in outcomes {
+            assert_eq!(outcome.code(), code);
+            assert!(!outcome.explain().is_empty());
+        }
     }
 }

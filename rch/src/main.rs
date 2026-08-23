@@ -481,6 +481,21 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
         dry_run: bool,
     },
 
+    /// Explain cache misses and refusals with stable reason codes
+    ///
+    /// Offline miss attribution per plan §102: diffs two seeded key
+    /// breakdowns (F013 taxonomy) or renders an index-level refusal
+    /// code. Use `--json` for the machine-readable envelope.
+    #[command(after_help = r#"EXAMPLES:
+    rch why miss --prior prior.json --current current.json
+    cat current.json | rch why miss --prior prior.json --current -
+    rch why refusal --outcome first-seen
+    rch why refusal --outcome trust-refused"#)]
+    Why {
+        #[command(subcommand)]
+        action: commands::why::WhyAction,
+    },
+
     /// Preflight a command's admission before expensive work
     ///
     /// Read-only and side-effect free: classifies the command, derives the
@@ -2049,6 +2064,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 project,
                 dry_run,
             } => commands::sync_force(force, worker, all, project, dry_run, &ctx).await,
+            Commands::Why { action } => commands::why::run(action, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
             Commands::Cache { action } => handle_cache(action, &ctx).await,
             Commands::Gc { dry_run, workers } => handle_gc(dry_run, workers, &ctx).await,
@@ -2414,6 +2430,18 @@ fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
         },
         Some(Commands::Diagnose { .. }) => {
             let schema = schema_for!(DiagnoseResponse);
+            serde_json::to_string_pretty(&schema)?
+        }
+        Some(Commands::Why {
+            action: commands::why::WhyAction::Miss { .. },
+        }) => {
+            let schema = schema_for!(commands::why::MissExplanation);
+            serde_json::to_string_pretty(&schema)?
+        }
+        Some(Commands::Why {
+            action: commands::why::WhyAction::Refusal { .. },
+        }) => {
+            let schema = schema_for!(commands::why::RefusalExplanation);
             serde_json::to_string_pretty(&schema)?
         }
         Some(Commands::Hook { action }) => match action {
@@ -6314,6 +6342,40 @@ mod tests {
                 assert!(dry_run);
             }
             _ => fail_expected("Expected diagnose command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_why_miss_and_refusal() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "why",
+            "miss",
+            "--prior",
+            "p.json",
+            "--current",
+            "c.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Why {
+                action: commands::why::WhyAction::Miss { prior, current },
+            }) => {
+                assert_eq!(prior, "p.json");
+                assert_eq!(current, "c.json");
+            }
+            _ => fail_expected("Expected why miss command"),
+        }
+        let cli =
+            Cli::try_parse_from(["rch", "why", "refusal", "--outcome", "first-seen"]).unwrap();
+        match cli.command {
+            Some(Commands::Why {
+                action: commands::why::WhyAction::Refusal { outcome },
+            }) => {
+                assert_eq!(outcome, "first-seen");
+            }
+            _ => fail_expected("Expected why refusal command"),
         }
     }
 

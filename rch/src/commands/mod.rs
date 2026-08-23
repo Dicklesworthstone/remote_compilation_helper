@@ -22,6 +22,7 @@ mod speedscore;
 mod status;
 mod sync;
 pub mod types;
+pub mod why;
 mod workers;
 mod workers_deploy;
 mod workers_init;
