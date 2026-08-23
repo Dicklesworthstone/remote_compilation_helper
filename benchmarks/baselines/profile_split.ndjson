@@ -1,0 +1,12 @@
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"release","binary":"rch","role":"wrapper","size_bytes":13401064,"startup_median_ns":9467827}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"release","binary":"rabs-wrap","role":"wrapper","size_bytes":375408,"startup_median_ns":6284143}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"release","binary":"rchd","role":"daemon","size_bytes":8343528,"startup_median_ns":null}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"release","binary":"rabsd","role":"daemon","size_bytes":2674320,"startup_median_ns":null}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"release","binary":"rch-wkr","role":"daemon","size_bytes":2417640,"startup_median_ns":null}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"release","binary":"rabs-wkr","role":"daemon","size_bytes":1229392,"startup_median_ns":null}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"wrapper-release","binary":"rch","role":"wrapper","size_bytes":18130744,"startup_median_ns":9922800}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"wrapper-release","binary":"rabs-wrap","role":"wrapper","size_bytes":456400,"startup_median_ns":6494467}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"daemon-release","binary":"rchd","role":"daemon","size_bytes":21624256,"startup_median_ns":null}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"daemon-release","binary":"rabsd","role":"daemon","size_bytes":8190256,"startup_median_ns":null}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"daemon-release","binary":"rch-wkr","role":"daemon","size_bytes":7239168,"startup_median_ns":null}
+{"schema":"rabs.profile-benchmark","schema_version":1,"worker":"vmi1152480","profile":"daemon-release","binary":"rabs-wkr","role":"daemon","size_bytes":5144968,"startup_median_ns":null}

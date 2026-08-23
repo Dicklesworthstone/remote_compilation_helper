@@ -166,6 +166,32 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# A021 — tiny-wrapper profile (rch hook CLI, rabs-wrap): startup
+# latency + footprint first. panic=unwind is NON-NEGOTIABLE here
+# (I49 containment: no guard process wraps these, so an abort would
+# take the shell down with it); LTO is deliberately ABSENT until the
+# profile_benchmark.sh startup evidence justifies enabling it.
+[profile.wrapper-release]
+inherits = "release"
+opt-level = "z"
+strip = true
+panic = "unwind"
+codegen-units = 1
+lto = false
+
+# A021 — daemon/worker profile (rchd, rabsd, rch-wkr, rabs-wkr):
+# sustained throughput over footprint. Symbols are RETAINED
+# (strip=false) so crashpacks stay debuggable per release policy; LTO
+# is thin as the measured default until full-trace benchmarks argue
+# otherwise; no abort (a daemon panic unwinds and is contained).
+[profile.daemon-release]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = false
+
 # cargo-dist configuration for automated releases
 [workspace.metadata.dist]
 cargo-dist-version = "0.26.0"
