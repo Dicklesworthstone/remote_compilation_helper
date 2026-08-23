@@ -31,17 +31,15 @@
 //! (J024 handlers), publication-layer divergence handling under a LIVE
 //! authority (covered by `coord_commit_live.rs`), and actor-level lease
 //! admission (unit tests beside `ActionActor`).
-#![cfg(unix)]
 
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, PutOutcome, put_if_absent};
-use rabs_cas::metadata_store::{RabsMetadataStore, RusqliteEngine, SqlMetadataStore};
-use rabs_cas::publication::{AUTHORITY_DIGEST_DOMAIN, OfferPreparedActionResult};
+use rabs_cas::metadata_store::RabsMetadataStore;
+use rabs_cas::publication::OfferPreparedActionResult;
 use rabs_cas::test_support::{
     install_admission_world, install_offer_closure, offer_with_manifest_bytes, sample_action_key,
-    sample_expected_descriptor,
 };
 use rabsd::coord::live::{CommitRefusal, CoordLive, cluster_id};
 use rabsd::janitor::store::{LiveCas, mount_and_reconcile};
@@ -188,7 +186,6 @@ fn coordinator_dies_after_prepare_before_commit() {
         offer
         // <-- death here: prepare done, commit_offer never called
     };
-
     // Post-crash inspection over the same durable store: prepared-but-
     // uncommitted is INVISIBLE — no publication pointer exists.
     let cas = Arc::new(mount_and_reconcile(&cas_root).expect("re-mount"));
