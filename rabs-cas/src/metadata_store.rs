@@ -1051,6 +1051,18 @@ pub trait RabsMetadataStore {
     /// Tombstone a generation (the id stays burned forever).
     fn tombstone_generation(&mut self, id: u128) -> Result<(), StoreError>;
 
+    /// G020/R120: on a coordinator term/incarnation change, close every
+    /// still-ACTIVE generation created under any authority other than
+    /// `active`. Returns how many generations were closed. Idempotent:
+    /// already-tombstoned generations are left alone, and the active
+    /// authority's own generations are never touched. Publication-eligible
+    /// work reissues only in fresh generations minted under `active`
+    /// (whose ids sit above the never-reuse high-water mark).
+    fn close_generations_for_other_authorities(
+        &mut self,
+        active: &TypedDigest,
+    ) -> Result<u64, StoreError>;
+
     /// Record an attempt (append-only; duplicate id is an error).
     fn record_attempt(
         &mut self,
@@ -2505,6 +2517,21 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         })
     }
 
+    fn close_generations_for_other_authorities(
+        &mut self,
+        active: &TypedDigest,
+    ) -> Result<u64, StoreError> {
+        let active = digest_key(active);
+        self.in_txn(move |engine| {
+            let closed = engine.execute(
+                "UPDATE action_generations SET tombstoned = 1 \
+                 WHERE tombstoned = 0 AND authority_key != ?1",
+                &[SqlValue::Text(active)],
+            )?;
+            u64::try_from(closed)
+                .map_err(|_| StoreError::Corruption("generation close count out of range".into()))
+        })
+    }
     fn tombstone_generation(&mut self, id: u128) -> Result<(), StoreError> {
         self.in_txn(move |engine| {
             let changed = engine.execute(

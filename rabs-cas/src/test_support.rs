@@ -69,6 +69,27 @@ pub fn sample_coordinator_authority() -> CoordinatorAuthority {
     }
 }
 
+/// The (generation, attempt, lease) triple naming one admission world.
+/// Restart-reissue fixtures mint FRESH ids: store uniqueness makes the
+/// sample triple single-use across incarnations (attempt ids are unique,
+/// and generation ids must rise above the never-reuse high-water mark).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixtureAttemptIds {
+    /// Generation id (strictly above the high-water mark when created).
+    pub generation: u128,
+    /// Attempt id (unique per store).
+    pub attempt: u128,
+    /// Execution lease id (unique per store).
+    pub lease: u128,
+}
+
+/// The sample triple every single-world helper uses.
+pub const SAMPLE_ATTEMPT_IDS: FixtureAttemptIds = FixtureAttemptIds {
+    generation: 11,
+    attempt: 20,
+    lease: 30,
+};
+
 /// The full attempt authority carried by an offer.
 #[must_use]
 pub fn sample_attempt_authority() -> AttemptAuthority {
@@ -82,18 +103,29 @@ pub fn sample_attempt_authority() -> AttemptAuthority {
 /// authority digest against the store's ACTIVE row.
 #[must_use]
 pub fn attempt_authority_for(coordinator: &CoordinatorAuthority) -> AttemptAuthority {
+    attempt_authority_with_ids(coordinator, SAMPLE_ATTEMPT_IDS)
+}
+
+/// [`attempt_authority_for`] bound to a caller-supplied identity triple —
+/// the fresh-generation reissue path (G020): a restarted coordinator's
+/// world needs ids the previous incarnation never used.
+#[must_use]
+fn attempt_authority_with_ids(
+    coordinator: &CoordinatorAuthority,
+    ids: FixtureAttemptIds,
+) -> AttemptAuthority {
     let coordinator = coordinator.clone();
     let created_under = authority_digest(&coordinator);
     AttemptAuthority {
         coordinator,
         action_key: sample_action_key(),
         action_generation: ActionGeneration {
-            generation_id: ActionGenerationId(11),
+            generation_id: ActionGenerationId(ids.generation),
             per_key_ordinal: 1,
             created_under_authority_digest: created_under,
         },
-        attempt_id: AttemptId(20),
-        execution_lease_id: ExecutionLeaseId(30),
+        attempt_id: AttemptId(ids.attempt),
+        execution_lease_id: ExecutionLeaseId(ids.lease),
         lease_renewal_seq: LeaseRenewalSeq(1),
         worker_peer_id: PeerId("worker-a".to_owned()),
         worker_boot_generation: WorkerBootGeneration(1),
@@ -266,7 +298,18 @@ fn offer_with_bytes(
     output: &ObjectId,
     evidence_tag: u8,
 ) -> (OfferPreparedActionResult, Vec<u8>) {
-    let stamped = offer_for_object(coordinator, output, 50, evidence_tag, Vec::new());
+    offer_with_bytes_with_ids(coordinator, output, evidence_tag, SAMPLE_ATTEMPT_IDS)
+}
+
+/// [`offer_with_bytes`] under a caller-supplied identity triple (G020
+/// fresh-generation reissue fixtures).
+fn offer_with_bytes_with_ids(
+    coordinator: &CoordinatorAuthority,
+    output: &ObjectId,
+    evidence_tag: u8,
+    ids: FixtureAttemptIds,
+) -> (OfferPreparedActionResult, Vec<u8>) {
+    let stamped = offer_for_object(coordinator, output, 50, evidence_tag, Vec::new(), ids);
     let bytes = crate::manifest_codec::encode_manifest_v1(&stamped.manifest);
     let manifest_id = ObjectId(
         crate::digest_set::digest_set(&bytes, crate::digest_set::DigestRequest::default(), None)
@@ -274,7 +317,7 @@ fn offer_with_bytes(
             .atp_content_id,
     );
     let offer = OfferPreparedActionResult::build(
-        attempt_authority_for(coordinator),
+        attempt_authority_with_ids(coordinator, ids),
         stamped.manifest,
         manifest_id.clone(),
         sample_evidence(&manifest_id),
@@ -308,20 +351,23 @@ fn offer_for(
         manifest_tag,
         evidence_tag,
         ancestors,
+        SAMPLE_ATTEMPT_IDS,
     )
 }
 
 /// [`offer_for`] with the materializable output given as an object id.
+#[allow(clippy::too_many_arguments)]
 fn offer_for_object(
     coordinator: &CoordinatorAuthority,
     output: &ObjectId,
     manifest_tag: u8,
     evidence_tag: u8,
     ancestors: Vec<ProvisionalAncestorRef>,
+    ids: FixtureAttemptIds,
 ) -> OfferPreparedActionResult {
     let manifest_id = tagged_object(manifest_tag);
     OfferPreparedActionResult::build(
-        attempt_authority_for(coordinator),
+        attempt_authority_with_ids(coordinator, ids),
         manifest_with_output_object(output),
         manifest_id.clone(),
         sample_evidence(&manifest_id),
@@ -367,6 +413,21 @@ pub fn install_admission_world(
     store: &mut dyn RabsMetadataStore,
     coordinator: &CoordinatorAuthority,
 ) {
+    install_admission_world_with_ids(store, coordinator, SAMPLE_ATTEMPT_IDS);
+}
+
+/// [`install_admission_world`] under a caller-supplied identity triple —
+/// the fresh-generation reissue path (G020): after a restart closes the
+/// prior incarnation's generations, the new authority's world needs
+/// ids above the never-reuse high-water mark and a never-used attempt.
+///
+/// # Panics
+/// If any store operation fails.
+pub fn install_admission_world_with_ids(
+    store: &mut dyn RabsMetadataStore,
+    coordinator: &CoordinatorAuthority,
+    ids: FixtureAttemptIds,
+) {
     let auth = authority_digest(coordinator);
     store
         .upsert_action_entry(&ActionEntryRow {
@@ -376,12 +437,43 @@ pub fn install_admission_world(
         })
         .expect("upsert action entry");
     store
-        .create_generation(&auth, 11, &sample_action_key())
+        .create_generation(&auth, ids.generation, &sample_action_key())
         .expect("create generation");
     store
-        .record_attempt(20, 11, "worker-a", 1)
+        .record_attempt(ids.attempt, ids.generation, "worker-a", 1)
         .expect("attempt");
-    store.acquire_lease(30, 20, 1, 100).expect("lease");
+    store
+        .acquire_lease(ids.lease, ids.attempt, 1, 100)
+        .expect("lease");
+}
+
+/// [`offer_with_manifest_bytes`] under a caller-supplied identity triple:
+/// the offer side of a fresh-generation reissue world (G020). The
+/// attempt/lease/generation ids here MUST match those installed by
+/// [`install_admission_world_with_ids`].
+///
+/// # Panics
+/// As [`offer_with_manifest_bytes`].
+#[must_use]
+pub fn offer_with_manifest_bytes_with_ids(
+    coordinator: &CoordinatorAuthority,
+    ids: FixtureAttemptIds,
+) -> (OfferPreparedActionResult, Vec<u8>) {
+    offer_with_bytes_with_ids(coordinator, &tagged_object(41), 51, ids)
+}
+
+/// The divergent counterpart of [`offer_with_manifest_bytes_with_ids`]:
+/// same action key, different materializable output, real manifest
+/// bytes, under a fresh-generation identity triple (G020 reissue).
+///
+/// # Panics
+/// As [`offer_with_manifest_bytes`].
+#[must_use]
+pub fn divergent_offer_with_manifest_bytes_with_ids(
+    coordinator: &CoordinatorAuthority,
+    ids: FixtureAttemptIds,
+) -> (OfferPreparedActionResult, Vec<u8>) {
+    offer_with_bytes_with_ids(coordinator, &tagged_object(42), 53, ids)
 }
 
 /// Record and DURABLY locate every object in `offer`'s commit closure —

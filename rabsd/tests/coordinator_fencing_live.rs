@@ -37,10 +37,11 @@ use std::sync::Arc;
 
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, PutOutcome, put_if_absent};
 use rabs_cas::metadata_store::RabsMetadataStore;
-use rabs_cas::publication::OfferPreparedActionResult;
+use rabs_cas::publication::{OfferPreparedActionResult, PublicationOutcome};
 use rabs_cas::test_support::{
-    install_admission_world, install_offer_closure, offer_with_manifest_bytes, sample_action_key,
-    sample_expected_descriptor,
+    FixtureAttemptIds, install_admission_world, install_admission_world_with_ids,
+    install_offer_closure, offer_with_manifest_bytes, offer_with_manifest_bytes_with_ids,
+    sample_action_key, sample_expected_descriptor,
 };
 use rabsd::coord::live::{CommitRefusal, CoordLive, cluster_id};
 use rabsd::janitor::store::{LiveCas, mount_and_reconcile};
@@ -212,4 +213,99 @@ fn coordinator_dies_after_prepare_before_commit() {
         "expected the offer-door stale-authority refusal, got {refusal:?}"
     );
     assert_nothing_published(&cas);
+}
+
+#[test]
+fn prior_authority_generations_are_closed_and_publication_reissues_fresh() {
+    // G020/R120 acceptance (T043 precursor): a term change durably closes
+    // the prior authority's still-active generations, a prepared
+    // prior-authority candidate can never publish, and publication-
+    // eligible work reissues ONLY in a fresh generation bound to the new
+    // authority — which then commits end-to-end.
+    let dir = tempfile::tempdir().unwrap();
+    let cas_root = dir.path().join("cas");
+
+    // Incarnation 1, term 1: generation 11 active, attempt prepared.
+    let stale_offer = {
+        let cas = Arc::new(mount_and_reconcile(&cas_root).expect("mount"));
+        let coord = CoordLive::with_cas(Arc::clone(&cas));
+        let authority = coord
+            .acquire_boot_authority(&cluster_id())
+            .expect("authority");
+        assert_eq!(authority.term, 1);
+        {
+            let mut store = cas.store().lock().expect("store lock");
+            install_admission_world(&mut *store, &authority);
+            assert!(
+                !store
+                    .generation_state(11)
+                    .expect("generation state")
+                    .expect("generation exists")
+                    .tombstoned,
+                "the prior generation starts ACTIVE"
+            );
+        }
+        let (offer, bytes) = offer_with_manifest_bytes(&authority);
+        store_manifest_object(&cas, &offer, &bytes);
+        offer
+    };
+
+    // Incarnation 2, term 2: boot must DURABLY close generation 11.
+    let cas = Arc::new(mount_and_reconcile(&cas_root).expect("re-mount"));
+    let coord = CoordLive::with_cas(Arc::clone(&cas));
+    let authority = coord
+        .acquire_boot_authority(&cluster_id())
+        .expect("authority");
+    assert_eq!(authority.term, 2);
+    assert_eq!(
+        coord.closed_prior_generations(),
+        1,
+        "boot closed exactly the one prior-authority generation"
+    );
+    {
+        let state = cas
+            .store()
+            .lock()
+            .expect("store lock")
+            .generation_state(11)
+            .expect("generation state")
+            .expect("generation row survives");
+        assert!(
+            state.tombstoned,
+            "the prior authority's active generation is TOMBSTONED on disk"
+        );
+    }
+
+    let refusal = coord
+        .commit_offer(&stale_offer, &sample_expected_descriptor())
+        .expect_err("prior-authority publication must be refused");
+    assert_eq!(
+        refusal,
+        CommitRefusal::StaleAuthority {
+            offered_term: 1,
+            active_term: 2,
+        }
+    );
+
+    // ...while fresh work reissues in a NEW authority-bound generation
+    // (id above the never-reuse high-water mark, never-used attempt and
+    // lease) and commits END-TO-END under the new term.
+    let reissue_ids = FixtureAttemptIds {
+        generation: 12,
+        attempt: 21,
+        lease: 31,
+    };
+    {
+        let mut store = cas.store().lock().expect("store lock");
+        install_admission_world_with_ids(&mut *store, &authority, reissue_ids);
+    }
+    let (fresh, bytes) = offer_with_manifest_bytes_with_ids(&authority, reissue_ids);
+    store_manifest_object(&cas, &fresh, &bytes);
+    let outcome = coord
+        .commit_offer(&fresh, &sample_expected_descriptor())
+        .expect("the fresh-generation reissue must commit");
+    assert!(
+        matches!(outcome, PublicationOutcome::Committed(_)),
+        "expected a commit for the fresh reissue, got {outcome:?}"
+    );
 }
