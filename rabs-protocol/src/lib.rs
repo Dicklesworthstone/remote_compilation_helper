@@ -116,6 +116,7 @@ pub mod version_negotiation;
 pub mod volatility;
 pub mod wire_time;
 pub mod worker_fence;
+pub mod workspace_lane;
 pub mod wrapper_breaker;
 pub mod wrapper_diagnostics;
 pub mod wrapper_panic;

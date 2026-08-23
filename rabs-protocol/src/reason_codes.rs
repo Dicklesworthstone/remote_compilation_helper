@@ -196,6 +196,12 @@ pub const REGISTRY: &[ReasonCode] = &[
         summary: "Build-path semantics route this action to the path-preserving lane.",
     },
     ReasonCode {
+        family: ReasonFamily::Path,
+        code: "PATH_WORKSPACE_PARENT_NONCANONICAL",
+        summary: "Workspace parent is outside the canonical namespace; \
+                  cross-worktree serving refused, dependency/local lane only.",
+    },
+    ReasonCode {
         family: ReasonFamily::Toolchain,
         code: "TOOLCHAIN_CONTRACT_MISMATCH",
         summary: "Toolchain identity differs from the entry's contract.",
@@ -339,7 +345,7 @@ mod tests {
     fn registry_change_is_deliberate() {
         let fp = registry_fingerprint();
         assert_eq!(
-            fp, 0x179c_dad8_0ffc_0675,
+            fp, 0x39f6_571c_1349_6160,
             "reason-code registry changed (fingerprint {fp:#x}); codes are \
              append-only within a protocol major — if this change only adds \
              codes, update this golden in the same commit"

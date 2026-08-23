@@ -412,6 +412,140 @@ impl DeliveryEngine {
             last_fully_delivered_seq: self.durable.acked_frontier,
         }
     }
+    /// The acknowledged frontier: items `1..=n` are fully exposed AND
+    /// acknowledged (read view for the wire layer).
+    #[must_use]
+    pub fn acked_frontier(&self) -> u64 {
+        self.durable.acked_frontier
+    }
+
+    /// The terminal (last) sequence of the validated plan.
+    #[must_use]
+    pub fn terminal_seq(&self) -> u64 {
+        self.plan.len()
+    }
+}
+
+/// Local-protocol messages for the stateful lane (bead J031; risk
+/// R124): the concrete wire mirror of the C019 engine's intent /
+/// acknowledgement / uncertainty / completion states. The four are
+/// DELIBERATELY distinct message shapes — no message conflates intent,
+/// acknowledgement, uncertainty, or completion — so a reconnect
+/// fixture (T046) interprets each by its constructor alone:
+///
+/// - [`StatefulLaneMessage::SubscriberStatefulCommitIntent`] rides
+///   BEFORE any visible effect (the I43 write-ahead order, on the
+///   wire);
+/// - [`StatefulLaneMessage::SubscriberStatefulAcknowledged`] is a
+///   full-write acknowledgement of COMPLETE exposure only;
+/// - [`StatefulLaneMessage::SubscriberStatefulDeliveryUncertain`] is
+///   the reconnect carrier of the uncertain interval — it asserts a
+///   frontier and names at most ONE possibly-landed item;
+/// - [`StatefulLaneMessage::SubscriberDeliveryComplete`] exists only
+///   after the terminal item is acknowledged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatefulLaneMessage {
+    /// Edge → wrapper: the write-ahead commit-intent header for the
+    /// next stateful item. Its arrival precedes every visible effect
+    /// for that sequence (I43).
+    SubscriberStatefulCommitIntent {
+        /// The sequence whose commit is intended.
+        seq: u64,
+    },
+    /// Wrapper → edge: full-write acknowledgement — the item's effect
+    /// is COMPLETE and visible; nothing partial is ever acknowledged.
+    SubscriberStatefulAcknowledged {
+        /// The fully delivered sequence.
+        seq: u64,
+    },
+    /// Wrapper → edge on reconnect: last fully acknowledged frontier
+    /// plus the one item that may have landed without its ack landing
+    /// (the C019 uncertain interval). Resolution is the edge's job via
+    /// destination inspection — never a blind replay (R97).
+    SubscriberStatefulDeliveryUncertain {
+        /// Last fully acknowledged sequence.
+        last_acked_seq: u64,
+        /// The item in the uncertain interval, if any.
+        uncertain_seq: Option<u64>,
+    },
+    /// Edge → wrapper: the delivery is COMPLETE — terminal item
+    /// acknowledged, therefore (plan order) every owned output
+    /// delivered. No other message implies completion.
+    SubscriberDeliveryComplete {
+        /// The terminal (last) sequence of the plan.
+        last_seq: u64,
+    },
+}
+
+/// Edge-side outcome of applying a wrapper stateful acknowledgement —
+/// the J012 idempotency doctrine mirrored onto this lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatefulAckOutcome {
+    /// The exposing item was acknowledged; the frontier advanced one.
+    Acknowledged,
+    /// A duplicate ack for an already-acknowledged item: no-op.
+    AlreadyAcknowledged,
+    /// An ack for an item the lane is not currently exposing (never
+    /// sent, already resolved otherwise, or skipping ahead): refused,
+    /// nothing changes.
+    RefusedNotExposing {
+        /// The sequence the loop expects next.
+        expected: u64,
+    },
+}
+
+/// Apply a wrapper `SubscriberStatefulAcknowledged` to the edge
+/// engine: duplicates are harmless no-ops, anything the lane is not
+/// mid-exposing refuses typed with the expected sequence.
+///
+/// # Errors
+/// Never returns `Err`; refusals are values in
+/// [`StatefulAckOutcome`] (the caller reports them on the wire).
+pub fn edge_apply_stateful_ack(
+    engine: &mut DeliveryEngine,
+    seq: u64,
+) -> Result<StatefulAckOutcome, std::convert::Infallible> {
+    if seq <= engine.acked_frontier() {
+        return Ok(StatefulAckOutcome::AlreadyAcknowledged);
+    }
+    match engine.ack(seq) {
+        Ok(()) => Ok(StatefulAckOutcome::Acknowledged),
+        Err(DeliveryError::NotExposing { .. }) => Ok(StatefulAckOutcome::RefusedNotExposing {
+            expected: engine.acked_frontier() + 1,
+        }),
+        // Unreachable for a non-uncertain engine above the frontier:
+        // `ack` refuses only NotExposing here. Kept total anyway.
+        Err(_) => Ok(StatefulAckOutcome::RefusedNotExposing {
+            expected: engine.acked_frontier() + 1,
+        }),
+    }
+}
+
+/// Build the wrapper's reconnect message from the durable truth (the
+/// wire form of [`DeliveryEngine::classify`]): the acknowledged
+/// frontier plus at most one uncertain item.
+#[must_use]
+pub fn wrapper_uncertainty_message(engine: &DeliveryEngine) -> StatefulLaneMessage {
+    let last_acked_seq = engine.acked_frontier();
+    let uncertain_seq = match engine.classify() {
+        RecoveryClass::DeliveryUncertain { seq } => Some(seq),
+        _ => None,
+    };
+    StatefulLaneMessage::SubscriberStatefulDeliveryUncertain {
+        last_acked_seq,
+        uncertain_seq,
+    }
+}
+
+/// The completion message, exactly when the terminal item is
+/// acknowledged — `None` before, so completion can never be implied
+/// early.
+#[must_use]
+pub fn edge_complete_message(engine: &DeliveryEngine) -> Option<StatefulLaneMessage> {
+    let last_seq = engine.terminal_seq();
+    engine
+        .delivery_complete()
+        .then_some(StatefulLaneMessage::SubscriberDeliveryComplete { last_seq })
 }
 
 #[cfg(test)]
@@ -676,5 +810,202 @@ mod tests {
             engine.resolve_uncertain(DestinationInspection::EffectLanded),
             Err(DeliveryError::NothingUncertain)
         );
+    }
+    // -----------------------------------------------------------------
+    // J031: the stateful lane's WIRE messages. No message conflates
+    // intent, acknowledgement, uncertainty, or completion (R124), and
+    // reconnect fixtures interpret each by its constructor alone.
+    // -----------------------------------------------------------------
+
+    fn transcript_stateful_terminal_plan() -> DeliveryPlan {
+        DeliveryPlan::new(vec![
+            DeliveryItemKind::Transcript,
+            DeliveryItemKind::StatefulWrite,
+            DeliveryItemKind::Terminal,
+        ])
+        .expect("valid plan")
+    }
+
+    #[test]
+    fn intent_ack_and_completion_are_distinct_wire_events() {
+        let mut engine = DeliveryEngine::new(transcript_stateful_terminal_plan());
+        let mut world = VisibleWorld::default();
+
+        // Completion is NEVER implied before the terminal ack — not by
+        // intents, not by frontier progress.
+        assert_eq!(edge_complete_message(&engine), None);
+
+        // seq 1 is a TRANSCRIPT item: it needs NO commit intent (the
+        // stateful lane must not conflate lanes either).
+        engine.begin_expose(1, &mut world).expect("exposes");
+        assert_eq!(
+            edge_apply_stateful_ack(&mut engine, 1),
+            Ok(StatefulAckOutcome::Acknowledged)
+        );
+        assert_eq!(edge_complete_message(&engine), None);
+
+        // seq 2 IS stateful: its CommitIntent arrives BEFORE any
+        // visible effect (I43 on the wire).
+        engine.record_intent(2).expect("stateful item takes intent");
+        engine.begin_expose(2, &mut world).expect("exposes");
+        assert_eq!(edge_complete_message(&engine), None);
+        assert_eq!(
+            edge_apply_stateful_ack(&mut engine, 2),
+            Ok(StatefulAckOutcome::Acknowledged)
+        );
+
+        // Only the TERMINAL acknowledgement completes — and then the
+        // completion message names exactly the last sequence.
+        engine.begin_expose(3, &mut world).expect("exposes");
+        assert_eq!(
+            edge_apply_stateful_ack(&mut engine, 3),
+            Ok(StatefulAckOutcome::Acknowledged)
+        );
+        assert_eq!(
+            edge_complete_message(&engine),
+            Some(StatefulLaneMessage::SubscriberDeliveryComplete { last_seq: 3 })
+        );
+    }
+
+    #[test]
+    fn duplicate_stateful_acks_are_idempotent_no_ops() {
+        let mut engine = DeliveryEngine::new(transcript_stateful_terminal_plan());
+        let mut world = VisibleWorld::default();
+        engine.begin_expose(1, &mut world).expect("exposes");
+        assert_eq!(
+            edge_apply_stateful_ack(&mut engine, 1),
+            Ok(StatefulAckOutcome::Acknowledged)
+        );
+        // The replayed ack: harmless, and the frontier did not move.
+        assert_eq!(
+            edge_apply_stateful_ack(&mut engine, 1),
+            Ok(StatefulAckOutcome::AlreadyAcknowledged)
+        );
+        assert_eq!(engine.acked_frontier(), 1);
+        // A post-completion replay of the terminal ack behaves the
+        // same once delivery finished.
+        engine.record_intent(2).expect("intents");
+        engine.begin_expose(2, &mut world).expect("exposes");
+        edge_apply_stateful_ack(&mut engine, 2).expect("acks");
+        engine.begin_expose(3, &mut world).expect("exposes");
+        edge_apply_stateful_ack(&mut engine, 3).expect("acks");
+        assert_eq!(
+            edge_apply_stateful_ack(&mut engine, 3),
+            Ok(StatefulAckOutcome::AlreadyAcknowledged)
+        );
+    }
+
+    #[test]
+    fn an_ack_for_an_item_not_being_exposed_refuses_with_the_expectation() {
+        let mut engine = DeliveryEngine::new(transcript_stateful_terminal_plan());
+        let mut world = VisibleWorld::default();
+        // Nothing exposed yet: an ack for seq 1 refuses, naming what
+        // the loop expected — it never advances anything.
+        assert_eq!(
+            edge_apply_stateful_ack(&mut engine, 1),
+            Ok(StatefulAckOutcome::RefusedNotExposing { expected: 1 })
+        );
+        assert_eq!(engine.acked_frontier(), 0);
+        // Skipping ahead past a live exposure refuses too.
+        engine.begin_expose(1, &mut world).expect("exposes");
+        assert_eq!(
+            edge_apply_stateful_ack(&mut engine, 2),
+            Ok(StatefulAckOutcome::RefusedNotExposing { expected: 1 })
+        );
+        assert_eq!(engine.acked_frontier(), 0);
+    }
+
+    #[test]
+    fn reconnect_uncertainty_is_interpreted_without_conflation() {
+        let mut world = VisibleWorld::default();
+        let mut engine = DeliveryEngine::new(transcript_stateful_terminal_plan());
+        engine.begin_expose(1, &mut world).expect("exposes");
+        edge_apply_stateful_ack(&mut engine, 1).expect("acks");
+        // Intent recorded, effect visible, ack NOT yet arrived: crash.
+        engine.record_intent(2).expect("intents");
+        engine.begin_expose(2, &mut world).expect("effect lands");
+
+        let recovered = engine.crash();
+        // The wrapper's reconnect report carries EXACTLY the uncertain
+        // interval — a frontier plus at most one possibly-landed item,
+        // never an implied completion or a fabricated intent.
+        assert_eq!(
+            wrapper_uncertainty_message(&recovered),
+            StatefulLaneMessage::SubscriberStatefulDeliveryUncertain {
+                last_acked_seq: 1,
+                uncertain_seq: Some(2),
+            }
+        );
+        // The report is PURE: asking twice answers identically and
+        // mutates nothing (no blind replay may hide in a report).
+        assert_eq!(
+            wrapper_uncertainty_message(&recovered),
+            wrapper_uncertainty_message(&recovered)
+        );
+
+        // Destination inspection resolves the interval; each answer is
+        // interpreted per ITS meaning only:
+        let mut landed = recovered.clone();
+        landed
+            .resolve_uncertain(world.inspect(2))
+            .expect("resolves");
+        // Landed ⇒ completed WITHOUT re-exposure (only the ack was
+        // lost): the world shows ONE exposure for seq 2.
+        assert_eq!(landed.acked_frontier(), 2);
+        assert_eq!(
+            world.exposed.iter().filter(|s| **s == 2).count(),
+            1,
+            "EffectLanded must not double-apply (R97)"
+        );
+
+        // The ABSENT twin: a separate engine crashed AFTER the intent
+        // but BEFORE any effect — same uncertain interval on the wire,
+        // opposite destination truth.
+        let mut absent_world = VisibleWorld::default();
+        let mut pre_effect = DeliveryEngine::new(transcript_stateful_terminal_plan());
+        pre_effect
+            .begin_expose(1, &mut absent_world)
+            .expect("exposes");
+        edge_apply_stateful_ack(&mut pre_effect, 1).expect("acks");
+        pre_effect.record_intent(2).expect("intents");
+        let absent = pre_effect.crash();
+        assert_eq!(
+            wrapper_uncertainty_message(&absent),
+            StatefulLaneMessage::SubscriberStatefulDeliveryUncertain {
+                last_acked_seq: 1,
+                uncertain_seq: Some(2),
+            },
+            "same wire shape — the DESTINATION decides the meaning"
+        );
+        assert_eq!(absent_world.inspect(2), DestinationInspection::EffectAbsent);
+        let mut absent = absent;
+        absent
+            .resolve_uncertain(absent_world.inspect(2))
+            .expect("resolves");
+        // Absent ⇒ re-exposure under the ALREADY-recorded intent.
+        absent
+            .begin_expose(2, &mut absent_world)
+            .expect("re-exposes");
+        assert_eq!(
+            edge_apply_stateful_ack(&mut absent, 2),
+            Ok(StatefulAckOutcome::Acknowledged)
+        );
+        assert_eq!(absent.acked_frontier(), 2);
+    }
+
+    #[test]
+    fn completion_is_never_emitted_early_even_after_full_frontier_minus_one() {
+        let mut engine = DeliveryEngine::new(transcript_stateful_terminal_plan());
+        let mut world = VisibleWorld::default();
+        engine.begin_expose(1, &mut world).expect("exposes");
+        edge_apply_stateful_ack(&mut engine, 1).expect("acks");
+        engine.record_intent(2).expect("intents");
+        engine.begin_expose(2, &mut world).expect("exposes");
+        edge_apply_stateful_ack(&mut engine, 2).expect("acks");
+        // Everything but the terminal is acknowledged: still no
+        // completion message — SubscriberDeliveryComplete exists ONLY
+        // behind the terminal ack.
+        assert_eq!(engine.acked_frontier(), 2);
+        assert_eq!(edge_complete_message(&engine), None);
     }
 }
