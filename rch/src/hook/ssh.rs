@@ -205,39 +205,32 @@ fn build_worker_projects_topology_cmd(topology_policy: &PathTopologyPolicy) -> S
     )
 }
 
-/// bd-8iwkm: build the bounded ownership-drift detect+repair command for ONE
-/// dispatched project's subtree under the canonical mirror tree. Root-owned
-/// entries there make rsync-as-ssh-user fail exit 23 on replace/unlink.
-/// Scoping to the project subtree (not the whole store) keeps the probe
-/// sub-second on 400-repo workers; drift elsewhere heals as those projects
-/// dispatch. Never deletes; touches only root-owned entries. Exit codes:
-/// 0 = ok/repaired/check-unavailable (fail-open), 46 = repair unavailable
-/// (sudo missing/refused), 47 = partial repair.
-fn build_worker_ownership_repair_cmd(
-    canonical_root: &Path,
-    project_dir: &str,
-    ssh_user: &str,
-) -> String {
+/// bd-8iwkm: build the bounded ownership-drift detect+repair command for the
+/// canonical mirror tree. Counts root-owned entries (the rsync exit-23 class),
+/// chowns them to the SSH user via passwordless sudo, and re-counts to prove
+/// the repair. Never deletes; touches only root-owned entries; the alias root
+/// is intentionally not scanned separately because it resolves into (or is
+/// policy-conflicting with) the canonical root, which this sweep already
+/// covers. Exit codes: 0 = ok/repaired/check-unavailable (fail-open), 46 =
+/// repair unavailable (sudo missing/refused), 47 = partial repair.
+fn build_worker_ownership_repair_cmd(canonical_root: &Path, ssh_user: &str) -> String {
     let root = shell_escape::escape(canonical_root.display().to_string().into());
-    let dir = shell_escape::escape(project_dir.into());
     let user = shell_escape::escape(ssh_user.into());
     format!(
-        "set -e; r={root}; p={dir}; u={user}; t=\"$r/$p\"; \
-         [ -d \"$t\" ] || {{ echo RCH_OWNERSHIP_OK; exit 0; }}; \
-         if ! b=$(sudo -n find \"$t\" -xdev -user root -print 2>/dev/null | wc -l); then \
+        "set -e; r={root}; u={user}; \
+         if ! b=$(sudo -n find \"$r\" -xdev -user root -print 2>/dev/null | wc -l); then \
            printf 'RCH_OWNERSHIP_CHECK_UNAVAILABLE\\n' >&2; exit 0; \
          fi; \
          b=$((b + 0)); \
          if [ \"$b\" -eq 0 ]; then echo RCH_OWNERSHIP_OK; exit 0; fi; \
-         if sudo -n find \"$t\" -xdev -user root -exec chown -h \"$u\" {{}} + 2>/dev/null; then \
-           a=$(sudo -n find \"$t\" -xdev -user root -print 2>/dev/null | wc -l || echo 1); \
+         if sudo -n find \"$r\" -xdev -user root -exec chown -h \"$u\" {{}} + 2>/dev/null; then \
+           a=$(sudo -n find \"$r\" -xdev -user root -print 2>/dev/null | wc -l || echo 1); \
            a=$((a + 0)); \
            if [ \"$a\" -eq 0 ]; then printf 'RCH_OWNERSHIP_REPAIRED:count=%s\\n' \"$b\"; exit 0; fi; \
            printf 'RCH_OWNERSHIP_PARTIAL:remaining=%s\\n' \"$a\" >&2; exit 47; \
          fi; \
          printf 'RCH_OWNERSHIP_REPAIR_UNAVAILABLE:detected=%s\\n' \"$b\" >&2; exit 46",
         root = root,
-        dir = dir,
         user = user,
     )
 }
@@ -246,7 +239,6 @@ pub(super) async fn ensure_worker_projects_topology(
     worker: &WorkerConfig,
     reporter: &HookReporter,
     topology_policy: &PathTopologyPolicy,
-    project_dir: Option<&str>,
 ) -> anyhow::Result<()> {
     if should_skip_remote_preflight(worker) {
         reporter.verbose("[RCH] topology preflight skipped in mock mode");
@@ -291,19 +283,14 @@ pub(super) async fn ensure_worker_projects_topology(
     }
     reporter.verbose(&format!(
         "[RCH] topology preflight ok on {} ({} -> {} enforced)",
-        worker.id, alias_display, canonical_display,
+        worker.id, alias_display, canonical_display
     ));
-    // bd-8iwkm: root-owned entries inside the dispatched project's subtree of
-    // the canonical mirror tree make rsync-as-ssh-user fail exit 23 on
-    // replace/unlink even when topology is healthy. Repair them before sync so
-    // the failure window closes here instead of mid-transfer.
-    let repaired = repair_worker_mirror_ownership(
-        worker,
-        reporter,
-        topology_policy.canonical_root(),
-        project_dir,
-    )
-    .await?;
+    // bd-8iwkm: root-owned entries inside the canonical mirror tree make
+    // rsync-as-ssh-user fail exit 23 on replace/unlink even when topology is
+    // healthy. Repair them before sync so the failure window closes here
+    // instead of mid-transfer.
+    let repaired =
+        repair_worker_mirror_ownership(worker, reporter, topology_policy.canonical_root()).await?;
     if repaired > 0 {
         reporter.summary(&format!(
             "[RCH] repaired ownership drift on {}: {repaired} root-owned entries chowned to {}",
@@ -313,15 +300,13 @@ pub(super) async fn ensure_worker_projects_topology(
     Ok(())
 }
 
-/// bd-8iwkm: detect and repair root-owned entries under the dispatched
-/// project's subtree of the canonical mirror tree. Returns the number of
-/// repaired entries; zero means either no drift, an absent subtree (first
-/// dispatch), or a fail-open check-unavailable (never blocks dispatch).
+/// bd-8iwkm: detect and repair root-owned entries under the worker's
+/// canonical mirror tree. Returns the number of repaired entries; zero means
+/// either no drift or a fail-open check-unavailable (never blocks dispatch).
 async fn repair_worker_mirror_ownership(
     worker: &WorkerConfig,
     reporter: &HookReporter,
     canonical_root: &Path,
-    project_dir: Option<&str>,
 ) -> anyhow::Result<u64> {
     if should_skip_remote_preflight(worker) {
         reporter.verbose("[RCH] ownership preflight skipped in mock mode");
@@ -331,10 +316,7 @@ async fn repair_worker_mirror_ownership(
         reporter.verbose("[RCH] ownership preflight skipped for Windows worker");
         return Ok(0);
     }
-    let Some(project_dir) = project_dir else {
-        return Ok(0);
-    };
-    let cmd = build_worker_ownership_repair_cmd(canonical_root, project_dir, worker.user.as_str());
+    let cmd = build_worker_ownership_repair_cmd(canonical_root, &worker.user);
     let output = run_offload_ssh_command(worker, &cmd, Duration::from_secs(60)).await?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() {
@@ -517,34 +499,21 @@ mod tests {
     #[test]
     fn test_build_worker_ownership_repair_cmd_scopes_and_never_deletes() {
         let _guard = test_guard!();
-        let command = build_worker_ownership_repair_cmd(
-            Path::new("/data/projects"),
-            "eidetic_engine_cli",
-            "deploy-user",
-        );
+        let command = build_worker_ownership_repair_cmd(Path::new("/data/projects"), "deploy-user");
 
         assert!(
             command.contains("'--user root'") || command.contains("-user root"),
             "sweep must target root-owned entries only: {command}"
         );
         assert!(
-            command.contains("r=/data/projects") && command.contains("p=eidetic_engine_cli"),
-            "clean roots bind verbatim into the sweep variables: {command}"
+            command.contains("r=/data/projects"),
+            "clean canonical root binds verbatim into the sweep variable: {command}"
         );
+        let spaced =
+            build_worker_ownership_repair_cmd(Path::new("/data/projects with space"), "deploy u");
         assert!(
-            command.contains("t=\"$r/$p\"") && command.contains("[ -d \"$t\" ]"),
-            "sweep must target only the dispatched project's existing subtree: {command}"
-        );
-        let spaced = build_worker_ownership_repair_cmd(
-            Path::new("/data/projects with space"),
-            "project dir",
-            "deploy u",
-        );
-        assert!(
-            spaced.contains("r='/data/projects with space'")
-                && spaced.contains("p='project dir'")
-                && spaced.contains("u='deploy u'"),
-            "paths, projects, or users with shell metacharacters must be single-quote escaped: {spaced}"
+            spaced.contains("r='/data/projects with space'") && spaced.contains("u='deploy u'"),
+            "paths or users with shell metacharacters must be single-quote escaped: {spaced}"
         );
         assert!(
             command.contains("-xdev"),

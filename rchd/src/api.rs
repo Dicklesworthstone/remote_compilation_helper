@@ -818,27 +818,6 @@ pub async fn handle_connection(
                                 telemetry.worker_id
                             );
                         }
-                        // Pressure lookups key on configured worker ids, so a
-                        // payload naming an id that matches no configured
-                        // worker (e.g. rch-wkr's silent `unknown-worker` /
-                        // hostname fallback) accumulates under a key no policy
-                        // ever reads — the undiagnosable half of #44. Accept
-                        // it (historical behaviour) but say so loudly.
-                        if ctx
-                            .pool
-                            .get(&WorkerId::new(telemetry.worker_id.clone()))
-                            .await
-                            .is_none()
-                        {
-                            warn!(
-                                payload_worker_id = telemetry.worker_id.as_str(),
-                                source = %source,
-                                "Ingested telemetry names a worker id that matches no \
-                                 configured worker; it can never satisfy pressure \
-                                 freshness for any worker (check RCH_WORKER_ID on the \
-                                 worker and the ids in workers.toml)"
-                            );
-                        }
                         ctx.telemetry.ingest(telemetry, source);
                         ("{\"status\":\"ok\"}".to_string(), "application/json")
                     }
@@ -3315,15 +3294,11 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
                 ),
             });
         } else if pressure.state == crate::disk_pressure::PressureState::TelemetryGap {
-            let freshness = match pressure.telemetry_age_secs {
-                Some(age) => format!("last accepted {age}s ago"),
-                None => "never received under this worker id".to_string(),
-            };
             issues.push(Issue {
                 severity: "warning".to_string(),
                 summary: format!(
-                    "Worker '{}' has stale/missing pressure telemetry ({}; {})",
-                    worker_id, pressure.reason_code, freshness
+                    "Worker '{}' has stale/missing pressure telemetry ({})",
+                    worker_id, pressure.reason_code
                 ),
                 // Telemetry ingest is daemon-driven: only the periodic
                 // TelemetryPoller (or worker piggyback) calls

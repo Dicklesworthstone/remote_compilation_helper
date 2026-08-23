@@ -21,11 +21,8 @@
 //! back to ancestry alone. Non-Linux platforms report no local builds
 //! rather than guessing.
 
-#[cfg(target_os = "linux")]
 use std::collections::HashSet;
-#[cfg(target_os = "linux")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// One unmanaged compiler process found running locally.
 #[derive(Debug, Clone)]
@@ -41,7 +38,6 @@ pub struct LocalBuild {
 pub const MANAGED_BYPASS_ENV: &str = "RCH_CARGO_WRAPPER_BYPASS";
 
 /// Bounded PPID walk: /proc ancestry cycles would hang the scan.
-#[cfg(target_os = "linux")]
 const MAX_ANCESTRY_DEPTH: usize = 16;
 
 /// Scan the live process table for unmanaged compiler processes.
@@ -101,12 +97,10 @@ fn scan_local_builds_in(proc_root: &Path) -> Vec<LocalBuild> {
 /// the kernel, so prefix matching covers suffixed names (`rustc-lld`,
 /// versioned cargo wrappers).
 #[must_use]
-#[cfg(target_os = "linux")]
 fn is_compiler_comm(comm: &str) -> bool {
     comm == "cargo" || comm.starts_with("rustc")
 }
 
-#[cfg(target_os = "linux")]
 fn read_comm(proc_dir: &Path) -> Option<String> {
     std::fs::read_to_string(proc_dir.join("comm"))
         .ok()
@@ -114,7 +108,6 @@ fn read_comm(proc_dir: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-#[cfg(target_os = "linux")]
 fn is_zombie(proc_dir: &Path) -> bool {
     stat_fields(proc_dir)
         .map(|(_, state, _)| state == 'Z')
@@ -132,7 +125,6 @@ fn is_rch_managed(proc_root: &Path, pid: i32) -> bool {
 
 /// NUL-separated environ contains `RCH_CARGO_WRAPPER_BYPASS=`.
 #[must_use]
-#[cfg(target_os = "linux")]
 fn environ_has_bypass(environ_path: &Path) -> bool {
     std::fs::read(environ_path)
         .map(|env| {
@@ -186,7 +178,7 @@ fn stat_fields(proc_dir: &Path) -> Option<(i32, char, i32)> {
     Some((pid, state, ppid))
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
