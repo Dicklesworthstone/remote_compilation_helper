@@ -851,8 +851,8 @@ async fn try_retry_on_bigger_worker(
         command_priority,
         0,
         Some(std::process::id()),
+        local_wrapper_id,
         false, // do not block waiting on one specific worker during a retry
-        &preferred,
         false, // retry upsizing is compilation-scoped; never job mode
     )
     .await
@@ -2091,7 +2091,7 @@ pub async fn run_exec(
         Some(&wrapper_id),
         wait_for_worker,
         &preferred_workers,
-        classification.kind == CompilationKind::Job,
+        classification.kind == Some(CompilationKind::Job),
     )
     .await
     {
@@ -2137,9 +2137,11 @@ pub async fn run_exec(
                         required_runtime,
                         command_priority,
                         0,
+                        Some(std::process::id()),
+                        Some(&wrapper_id),
                         wait_for_worker,
                         &preferred_workers,
-                        classification.kind == CompilationKind::Job,
+                        classification.kind == Some(CompilationKind::Job),
                     )
                     .await
                     .ok()
