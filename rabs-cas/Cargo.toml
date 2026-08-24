@@ -53,3 +53,7 @@ unsafe_code = "forbid"
 
 [dev-dependencies]
 tempfile = "3.25.0"
+# L009: shadow-comparison engine (K008 Stage 2) driven from this
+# crate's integration suite; dev-deps are exempt from the A002
+# dependency-direction gate.
+rabs-replay = { path = "../rabs-replay" }

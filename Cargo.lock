@@ -4867,6 +4867,7 @@ dependencies = [
  "fsqlite",
  "rabs-key",
  "rabs-protocol",
+ "rabs-replay",
  "rusqlite",
  "sha2 0.10.9",
  "tempfile",
