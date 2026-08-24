@@ -58,6 +58,7 @@ pub mod doctest_actions;
 pub mod environment;
 pub mod epochs;
 pub mod event_contracts;
+pub mod event_stream_separation;
 pub mod extern_resolution;
 pub mod family_key;
 pub mod filesystem_class;
