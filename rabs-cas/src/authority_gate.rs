@@ -377,7 +377,7 @@ fn operation_script(
         "publish-conflict",
         &store.commit_publication(&active, None, &publication(7, 2, 41)),
     );
-    let mut failure_action = ActionEntryRow {
+    let failure_action = ActionEntryRow {
         action_key: digest("rabs.action-key.sha256.v1", 8),
         key_epoch: 3,
         projection_epoch: 4,
