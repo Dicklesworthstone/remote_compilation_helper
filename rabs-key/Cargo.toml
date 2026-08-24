@@ -29,6 +29,10 @@ sha2 = { workspace = true }
 # conformance test needs a scratch directory to run real rustc into.
 [dev-dependencies]
 tempfile = "3.25.0"
+# Test-only JSON parser: K013 golden fixtures cross-check the
+# production discriminator scanner against a real parser. The A002
+# gate exempts dev-dependencies; nothing here ships.
+serde_json = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

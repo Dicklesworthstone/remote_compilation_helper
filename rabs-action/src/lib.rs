@@ -38,8 +38,11 @@
 //!   `rabs-protocol` causal/budget values.
 
 pub mod benchmark_policy;
+pub mod capability_probe;
+pub mod cargo_command_eligibility;
 pub mod generation_fence;
 pub mod incremental_gate;
+pub mod rust_analyzer_launch;
 pub mod serving_transitions;
 pub mod snapshot_capture;
 pub mod state_machines;
