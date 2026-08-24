@@ -714,6 +714,92 @@ pub async fn run_doctor(
     Ok(())
 }
 
+/// Entry point for `rch rabs inventory` (K010).
+///
+/// # Errors
+/// Propagates store/mount failures under the caller's exit-code
+/// convention.
+pub async fn run_inventory(
+    cas_root: Option<PathBuf>,
+    l2_root: Option<PathBuf>,
+    allow_namespace: Vec<String>,
+    ctx: &OutputContext,
+) -> anyhow::Result<()> {
+    let root = resolve_cas_root(cas_root.as_deref())?;
+    let mut store = open_store(&root)?;
+    let l2 = l2_root.unwrap_or_else(default_l2_root);
+    let policy = rabs_cas::cache_inventory::NamespacePolicy::allowing(allow_namespace.clone());
+    let report = rabs_cas::cache_inventory::build_report(&mut store, None, &l2, &policy)?;
+
+    if ctx.is_json() || ctx.is_toon() {
+        ctx.json(&ApiResponse::ok(
+            "rabs inventory",
+            &JsonInventory::of(&report),
+        ))?;
+    } else {
+        print_inventory(&report);
+    }
+    Ok(())
+}
+
+fn default_l2_root() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".cache").join("rch")
+    } else {
+        PathBuf::from("/tmp")
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct JsonInventory {
+    l1_present: bool,
+    l1_capacity: Option<usize>,
+    l1_live_entries: Option<usize>,
+    restricted_project_count: u32,
+    visible_projects: Vec<String>,
+    toolchain_workers: Vec<String>,
+    action_entries: u64,
+}
+
+impl JsonInventory {
+    fn of(r: &rabs_cas::cache_inventory::CacheInventoryReport) -> Self {
+        Self {
+            l1_present: r.l1.is_some(),
+            l1_capacity: r.l1.as_ref().map(|l| l.capacity),
+            l1_live_entries: r.l1.as_ref().map(|l| l.entries.len()),
+            restricted_project_count: r.restricted_project_count,
+            visible_projects: r.l2_visible.iter().map(|p| p.project.clone()).collect(),
+            toolchain_workers: r.toolchains.iter().map(|t| t.worker.clone()).collect(),
+            action_entries: r.store.action_entries,
+        }
+    }
+}
+
+fn print_inventory(report: &rabs_cas::cache_inventory::CacheInventoryReport) {
+    match &report.l1 {
+        Some(l1) => println!(
+            "L1 edge cache: capacity {}, live entries {}",
+            l1.capacity,
+            l1.entries.len()
+        ),
+        None => println!("L1 edge cache: not mounted in this process"),
+    }
+    for p in &report.l2_visible {
+        println!("L2 project {}: {} result dir(s)", p.project, p.hash_dirs);
+    }
+    println!(
+        "restricted projects (names hidden): {}",
+        report.restricted_project_count
+    );
+    for t in &report.toolchains {
+        println!("toolchains on {}: {}", t.worker, t.toolchains.join(", "));
+    }
+    println!(
+        "store: {} action entries, {} workers with recorded capabilities",
+        report.store.action_entries, report.store.workers_with_capabilities
+    );
+}
+
 /// Operations lagging the live-progress watermark by more than this are
 /// stale by default.
 pub const DEFAULT_MIN_SEQ_LAG: u64 = 1_000;
@@ -891,6 +977,20 @@ pub enum RabsCommand {
         /// many seqs count as stale
         #[arg(long, value_name = "SEQS", default_value_t = 1_000)]
         min_seq_lag: u64,
+    },
+    /// What is cached where: edge L1, local L2 projects, toolchains,
+    /// store facts — with namespace existence-hiding (K006/K010 ACL)
+    Inventory {
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+        /// L2 cache root to enumerate (default: ~/.cache/rch)
+        #[arg(long, value_name = "DIR")]
+        l2_root: Option<PathBuf>,
+        /// Project namespace whose names this viewer may see
+        /// (repeatable; unlisted namespaces collapse into a count)
+        #[arg(long, value_name = "NAMESPACE")]
+        allow_namespace: Vec<String>,
     },
 }
 

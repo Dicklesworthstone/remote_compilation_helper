@@ -4869,6 +4869,7 @@ dependencies = [
  "rabs-protocol",
  "rusqlite",
  "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]
@@ -4876,6 +4877,7 @@ name = "rabs-key"
 version = "1.0.58"
 dependencies = [
  "rabs-protocol",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
 ]
