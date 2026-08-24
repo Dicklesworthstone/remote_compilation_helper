@@ -1528,8 +1528,10 @@ pub trait RabsMetadataStore {
     /// Atomically admit a worker session under the active coordinator:
     /// evaluate the durable boot-generation/incarnation fence, advance
     /// it on admission, and append the open session row in the SAME
-    /// transaction. Rejections are typed [`WorkerAdmission`] values and
-    /// write nothing.
+    /// transaction. Rejections are typed [`WorkerAdmission`] values.
+    /// Stale/identity refusals write nothing; clone ambiguity atomically
+    /// persists the ambiguity and revokes that worker's live leases while
+    /// appending no session row.
     fn admit_worker_session(
         &mut self,
         authority: &TypedDigest,
@@ -2151,10 +2153,32 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
         Ok(store)
     }
 
-    /// Direct engine access for diagnostic/repair tooling and for test
-    /// fixtures that must SEED corrupted or torn states the public API
-    /// refuses to produce (H013 drift fixtures).
-    pub fn engine_mut(&mut self) -> &mut E {
+    /// Highest durable operation update sequence, clamped to the initial
+    /// sequence floor used by operator tooling.
+    ///
+    /// This narrow query keeps cross-crate diagnostics from receiving a
+    /// mutable SQL escape hatch around authority and clone fencing.
+    pub fn operation_update_high_water(&mut self) -> Result<u64, StoreError> {
+        let rows = self
+            .engine
+            .query("SELECT COALESCE(MAX(updated_seq), 1) FROM operations", &[])?;
+        let [row] = rows.as_slice() else {
+            return Err(StoreError::Corruption(
+                "operation update high-water row count".into(),
+            ));
+        };
+        let [value] = row.as_slice() else {
+            return Err(StoreError::Corruption(
+                "operation update high-water shape".into(),
+            ));
+        };
+        Ok(expect_u64(value, "operation update high-water")?.max(1))
+    }
+
+    /// Crate-internal engine access for reconciliation, authority-gate,
+    /// crash-injection, and corruption fixtures. External callers cannot
+    /// bypass the transactional metadata API with arbitrary SQL.
+    pub(crate) fn engine_mut(&mut self) -> &mut E {
         &mut self.engine
     }
 
@@ -2247,6 +2271,7 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
             bytes,
         })
     }
+
 
     fn digest_params(d: &TypedDigest) -> [SqlValue; 3] {
         [

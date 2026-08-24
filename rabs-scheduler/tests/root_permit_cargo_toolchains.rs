@@ -45,7 +45,7 @@ fn scratch_crate(dir: &std::path::Path) {
     std::fs::create_dir_all(dir.join("src")).expect("crate dirs");
     std::fs::write(
         dir.join("Cargo.toml"),
-        "[package]\nname = \"i019_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        "[package]\nname = \"i019_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
     )
     .expect("manifest");
     std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").expect("entrypoint");

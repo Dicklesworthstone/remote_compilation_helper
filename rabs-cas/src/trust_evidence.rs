@@ -318,8 +318,8 @@ pub fn report_compromise(
 mod tests {
     use super::*;
     use crate::metadata_store::{
-        ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationRow, ResultKindTag,
-        RusqliteEngine, SqlMetadataStore,
+        ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationRow,
+        ResultKindTag, RusqliteEngine, SqlMetadataStore,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 

@@ -119,6 +119,48 @@ pub enum AttemptLeaseRefusal {
     Store(StoreError),
 }
 
+/// Opaque proof that the durable coordinator transaction admitted this
+/// exact attempt/lease/worker tuple. Only this module can mint one; the
+/// pure action actor consumes it instead of raw worker claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedAttemptLease {
+    authority: AttemptAuthority,
+}
+
+impl ValidatedAttemptLease {
+    pub(crate) const fn authority(&self) -> &AttemptAuthority {
+        &self.authority
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(authority: AttemptAuthority) -> Self {
+        Self { authority }
+    }
+}
+
+/// Opaque proof that a durable compare-and-swap accepted one renewal
+/// under the exact current worker fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedLeaseRenewal {
+    authority: AttemptAuthority,
+    renewal: LeaseRenewal,
+}
+
+impl ValidatedLeaseRenewal {
+    pub(crate) const fn authority(&self) -> &AttemptAuthority {
+        &self.authority
+    }
+
+    pub(crate) const fn renewal(&self) -> LeaseRenewal {
+        self.renewal
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(authority: AttemptAuthority, renewal: LeaseRenewal) -> Self {
+        Self { authority, renewal }
+    }
+}
+
 impl std::fmt::Display for CommitRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -448,8 +490,9 @@ impl CoordLive {
 
     /// Admit one worker connection through the durable S022 fence.
     /// The returned sequence exists only for admitted sessions and must
-    /// be presented to [`Self::release_worker_session`]; rejections write
-    /// neither the fence nor the session journal.
+    /// be presented to [`Self::release_worker_session`]. Stale/identity
+    /// refusals write nothing; clone ambiguity durably marks the fence and
+    /// revokes the worker's leases but appends no session journal row.
     ///
     /// # Errors
     /// A precise reason if the CAS, coordinator authority, lock, or
@@ -513,7 +556,7 @@ impl CoordLive {
         &self,
         authority: &AttemptAuthority,
         expires_at_seq: u64,
-    ) -> Result<(), AttemptLeaseRefusal> {
+    ) -> Result<ValidatedAttemptLease, AttemptLeaseRefusal> {
         let cas = self.cas.as_ref().ok_or(AttemptLeaseRefusal::NoStore)?;
         let held = self
             .authority()
@@ -528,7 +571,10 @@ impl CoordLive {
             .map_err(|_| AttemptLeaseRefusal::StoreUnavailable)?;
         store
             .admit_attempt_lease(authority, recorded_seq, expires_at_seq)
-            .map_err(AttemptLeaseRefusal::Store)
+            .map_err(AttemptLeaseRefusal::Store)?;
+        Ok(ValidatedAttemptLease {
+            authority: authority.clone(),
+        })
     }
 
     /// Renew one attempt lease by durable compare-and-swap, revalidating
@@ -542,7 +588,7 @@ impl CoordLive {
         authority: &AttemptAuthority,
         renewal: LeaseRenewal,
         expires_at_seq: u64,
-    ) -> Result<(), AttemptLeaseRefusal> {
+    ) -> Result<ValidatedLeaseRenewal, AttemptLeaseRefusal> {
         let cas = self.cas.as_ref().ok_or(AttemptLeaseRefusal::NoStore)?;
         let held = self
             .authority()
@@ -556,7 +602,11 @@ impl CoordLive {
             .map_err(|_| AttemptLeaseRefusal::StoreUnavailable)?;
         store
             .renew_attempt_lease(authority, renewal, expires_at_seq)
-            .map_err(AttemptLeaseRefusal::Store)
+            .map_err(AttemptLeaseRefusal::Store)?;
+        Ok(ValidatedLeaseRenewal {
+            authority: authority.clone(),
+            renewal,
+        })
     }
 
     /// Commit a worker's prepared-result offer: the coordinator-only

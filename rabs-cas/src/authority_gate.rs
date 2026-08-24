@@ -377,12 +377,45 @@ fn operation_script(
         "publish-conflict",
         &store.commit_publication(&active, None, &publication(7, 2, 41)),
     );
+    let mut failure_action = ActionEntryRow {
+        action_key: digest("rabs.action-key.sha256.v1", 8),
+        key_epoch: 3,
+        projection_epoch: 4,
+    };
+    outcome(
+        &mut t,
+        "failure-upsert-action",
+        &store.upsert_action_entry(&failure_action),
+    );
+    let mut failure_authority = renewed_authority.clone();
+    failure_authority.action_key = failure_action.action_key.clone();
+    failure_authority.action_generation.generation_id = ActionGenerationId(12);
+    failure_authority.action_generation.per_key_ordinal = 1;
+    failure_authority.attempt_id = AttemptId(23);
+    failure_authority.execution_lease_id = ExecutionLeaseId(31);
+    failure_authority.lease_renewal_seq = LeaseRenewalSeq(1);
+    outcome(
+        &mut t,
+        "failure-gen-create",
+        &store.create_bound_generation(
+            &active,
+            &failure_authority.action_generation,
+            &failure_action.action_key,
+        ),
+    );
+    outcome(
+        &mut t,
+        "failure-lease",
+        &store.admit_attempt_lease(&failure_authority, 6, 100),
+    );
     let mut failure_row = publication(8, 3, 42);
+    failure_row.winner_generation = failure_authority.action_generation.generation_id.0;
+    failure_row.winner_attempt = failure_authority.attempt_id.0;
     failure_row.result_kind = ResultKindTag::DeterministicFailure;
     outcome(
         &mut t,
         "publish-det-failure",
-        &store.commit_publication(&active, None, &failure_row),
+        &store.commit_publication(&active, Some(&failure_authority), &failure_row),
     );
     let extra_evidence = digest("rabs.evidence-bundle.sha256.v1", 90);
     let manifest_key = digest_key(&publication_row.manifest_digest);
@@ -394,7 +427,7 @@ fn operation_script(
             &manifest_key,
             &extra_evidence,
             11,
-            20,
+            publication_row.winner_attempt,
         ),
     );
     outcome(
@@ -405,7 +438,7 @@ fn operation_script(
             &manifest_key,
             &extra_evidence,
             11,
-            20,
+            publication_row.winner_attempt,
         ),
     );
 
@@ -873,8 +906,9 @@ fn crash_lane(
             // Committed work, then an open transaction dropped without
             // COMMIT: the drop is the simulated crash.
             let mut store = open_store(opener, &path)?;
-            store.acquire_authority(&authority(1))?;
-            let active = digest("rabs.authority.sha256.v1", 1);
+            let active_authority = authority(1);
+            let active = active_authority.digest.clone();
+            store.acquire_authority(&active_authority)?;
             let action = ActionEntryRow {
                 action_key: digest("rabs.action-key.sha256.v1", 7),
                 key_epoch: 0,

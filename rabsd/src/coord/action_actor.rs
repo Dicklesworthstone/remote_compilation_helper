@@ -44,6 +44,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::pin::Pin;
 
+use crate::coord::live::{ValidatedAttemptLease, ValidatedLeaseRenewal};
 use asupersync::actor::Actor;
 use asupersync::cx::Cx;
 use rabs_action::generation_fence::{FenceDecision, GenerationFence};
@@ -437,6 +438,8 @@ pub enum RegisterAttemptReceipt {
     /// incarnation's: stale or malformed, refused before any state
     /// inspection (G019; F033).
     RefusedStaleAuthority,
+    /// The validated lease belongs to another action actor.
+    RefusedForeignAction,
 }
 
 /// Outcome of advancing an attempt.
@@ -544,22 +547,9 @@ pub struct JoinRequest {
 /// Registration of one attempt under its own lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterAttempt {
-    /// Unique attempt identity.
-    pub attempt: AttemptId,
-    /// The generation this attempt believes it executes under.
-    pub generation: ActionGenerationId,
-    /// Digest of the FULL CoordinatorAuthority this attempt presents,
-    /// recomputed by the caller from the one full copy (F033). Must equal
-    /// the actor's own [`ActionActor::new`] authority digest.
-    pub presented_authority_digest: TypedDigest,
-    /// This attempt's own execution lease.
-    pub lease: ExecutionLeaseId,
-    /// Executing worker.
-    pub worker: PeerId,
-    /// Worker durable boot generation.
-    pub worker_boot_generation: WorkerBootGeneration,
-    /// Worker process incarnation.
-    pub worker_incarnation: WorkerIncarnationId,
+    /// Opaque receipt minted only after the durable coordinator admitted
+    /// the full attempt/lease/worker authority tuple.
+    pub validated: ValidatedAttemptLease,
     /// Why this attempt exists.
     pub purpose: AttemptPurpose,
 }
@@ -583,10 +573,7 @@ pub enum ActionActorMsg {
         to: AttemptState,
     },
     /// Renew one attempt's lease.
-    RenewLease {
-        attempt: AttemptId,
-        renewal: LeaseRenewal,
-    },
+    RenewLease(ValidatedLeaseRenewal),
     /// Offer a prepared candidate for compare-and-set.
     OfferCandidate(Box<PreparedCandidateOffer>),
     /// Append evidence; optionally completes required evidence.
@@ -1106,27 +1093,31 @@ impl ActionActor {
     /// purposes require the active generation; audits require a committed
     /// publication (they compare against the winner, never publish first).
     pub fn register_attempt(&mut self, registration: RegisterAttempt) -> RegisterAttemptReceipt {
+        let authority = registration.validated.authority();
         // G019 lease-admission fence: an attempt presenting any authority
         // other than this incarnation's is stale or malformed and refuses
         // before ANY state inspection (F033 digest equality).
-        if registration.presented_authority_digest != self.authority_digest {
+        if coordinator_authority_digest(&authority.coordinator) != self.authority_digest {
             return RegisterAttemptReceipt::RefusedStaleAuthority;
+        }
+        if authority.action_key != self.breakdown.final_key {
+            return RegisterAttemptReceipt::RefusedForeignAction;
         }
         let audit = registration.purpose.is_audit();
         match (self.active_generation.as_ref(), audit) {
-            (Some(active), _) if active.generation_id == registration.generation => {}
+            (Some(active), _) if active == &authority.action_generation => {}
             (None, true) if self.slot == PublicationSlotState::Committed => {}
             (Some(_), _) => return RegisterAttemptReceipt::RefusedForeignGeneration,
             (None, _) => return RegisterAttemptReceipt::RefusedNoActiveGeneration,
         }
 
-        if self.attempts.contains_key(&registration.attempt.0) {
+        if self.attempts.contains_key(&authority.attempt_id.0) {
             return RegisterAttemptReceipt::RefusedDuplicateAttempt;
         }
         if self
             .attempts
             .values()
-            .any(|attempt| attempt.lease == registration.lease)
+            .any(|attempt| attempt.lease == authority.execution_lease_id)
         {
             return RegisterAttemptReceipt::RefusedDuplicateLease;
         }
@@ -1145,25 +1136,25 @@ impl ActionActor {
 
         let recorded_at_event = self.next_seq + 1;
         self.selection_receipts.push(SelectionReceipt {
-            attempt: registration.attempt,
-            worker: registration.worker.clone(),
-            worker_boot_generation: registration.worker_boot_generation,
+            attempt: authority.attempt_id,
+            worker: authority.worker_peer_id.clone(),
+            worker_boot_generation: authority.worker_boot_generation,
             purpose: registration.purpose,
             recorded_at_event,
         });
         self.attempts.insert(
-            registration.attempt.0,
+            authority.attempt_id.0,
             AttemptEntry {
-                attempt: registration.attempt,
-                generation: registration.generation,
-                lease: registration.lease,
-                worker: registration.worker,
-                worker_boot_generation: registration.worker_boot_generation,
-                worker_incarnation: registration.worker_incarnation,
+                attempt: authority.attempt_id,
+                generation: authority.action_generation.generation_id,
+                lease: authority.execution_lease_id,
+                worker: authority.worker_peer_id.clone(),
+                worker_boot_generation: authority.worker_boot_generation,
+                worker_incarnation: authority.worker_incarnation_id,
                 purpose: registration.purpose,
                 // Registration IS the lease offer from the coordinator.
                 state: AttemptState::LeaseOffered,
-                lease_renewal_seq: LeaseRenewalSeq(0),
+                lease_renewal_seq: authority.lease_renewal_seq,
             },
         );
         self.push(EventKind::AttemptRegistered);
@@ -1192,10 +1183,26 @@ impl ActionActor {
 
     /// Evaluate a lease renewal against the owning attempt only. A sibling
     /// hedge's renewal is inert here (I31/R62).
-    pub fn renew_lease(&mut self, attempt_id: AttemptId, renewal: LeaseRenewal) -> RenewalDecision {
-        let Some(attempt) = self.attempts.get_mut(&attempt_id.0) else {
+    pub fn renew_lease(&mut self, validated: ValidatedLeaseRenewal) -> RenewalDecision {
+        let authority = validated.authority();
+        let renewal = validated.renewal();
+        if coordinator_authority_digest(&authority.coordinator) != self.authority_digest
+            || authority.action_key != self.breakdown.final_key
+        {
+            return RenewalDecision::RefuseWrongLease;
+        }
+        let Some(attempt) = self.attempts.get_mut(&authority.attempt_id.0) else {
             return RenewalDecision::RefuseWrongLease;
         };
+        if attempt.generation != authority.action_generation.generation_id
+            || attempt.lease != authority.execution_lease_id
+            || attempt.worker != authority.worker_peer_id
+            || attempt.worker_boot_generation != authority.worker_boot_generation
+            || attempt.worker_incarnation != authority.worker_incarnation_id
+            || attempt.lease_renewal_seq != authority.lease_renewal_seq
+        {
+            return RenewalDecision::RefuseWrongLease;
+        }
         let probe = AttemptAuthorityProbe {
             lease: attempt.lease,
             seq: attempt.lease_renewal_seq,
@@ -1531,8 +1538,8 @@ impl ActionActor {
             ActionActorMsg::AdvanceAttempt { attempt, to } => {
                 let _ = self.advance_attempt(attempt, to);
             }
-            ActionActorMsg::RenewLease { attempt, renewal } => {
-                let _ = self.renew_lease(attempt, renewal);
+            ActionActorMsg::RenewLease(validated) => {
+                let _ = self.renew_lease(validated);
             }
             ActionActorMsg::OfferCandidate(offer) => {
                 let _ = self.offer_candidate(*offer);
@@ -1736,14 +1743,21 @@ mod tests {
         incarnation: u128,
         purpose: AttemptPurpose,
     ) -> RegisterAttempt {
+        let coordinator = authority_under_test();
         RegisterAttempt {
-            attempt: AttemptId(attempt),
-            generation: ActionGenerationId(0x60),
-            presented_authority_digest: coordinator_authority_digest(&authority_under_test()),
-            lease: ExecutionLeaseId(lease),
-            worker: PeerId("wkr-1".into()),
-            worker_boot_generation: WorkerBootGeneration(7),
-            worker_incarnation: WorkerIncarnationId(incarnation),
+            validated: ValidatedAttemptLease::for_test(
+                rabs_protocol::generation::AttemptAuthority {
+                    coordinator,
+                    action_key: compute_action_key(&descriptor()).final_key,
+                    action_generation: generation(0x60),
+                    attempt_id: AttemptId(attempt),
+                    execution_lease_id: ExecutionLeaseId(lease),
+                    lease_renewal_seq: LeaseRenewalSeq(0),
+                    worker_peer_id: PeerId("wkr-1".into()),
+                    worker_boot_generation: WorkerBootGeneration(7),
+                    worker_incarnation_id: WorkerIncarnationId(incarnation),
+                },
+            ),
             purpose,
         }
     }
@@ -1781,7 +1795,9 @@ mod tests {
         let mut actor = actor();
         open_with_primary(&mut actor);
         let mut stale = registration(2, 12, 112, AttemptPurpose::Primary);
-        stale.presented_authority_digest = coordinator_authority_digest(&foreign_authority());
+        let mut stale_authority = stale.validated.authority().clone();
+        stale_authority.coordinator = foreign_authority();
+        stale.validated = ValidatedAttemptLease::for_test(stale_authority);
         assert_eq!(
             actor.register_attempt(stale),
             RegisterAttemptReceipt::RefusedStaleAuthority
@@ -2140,13 +2156,16 @@ mod tests {
         // Sibling-hedge independence: a renewal for hedge TWO's lease is
         // inert when evaluated against the primary's attempt.
         assert_eq!(
-            actor.renew_lease(
-                AttemptId(1),
+            actor.renew_lease(ValidatedLeaseRenewal::for_test(
+                registration(1, 12, 111, AttemptPurpose::Primary)
+                    .validated
+                    .authority()
+                    .clone(),
                 LeaseRenewal {
                     lease: ExecutionLeaseId(12),
                     seq: LeaseRenewalSeq(5),
-                }
-            ),
+                },
+            )),
             RenewalDecision::RefuseWrongLease
         );
     }
