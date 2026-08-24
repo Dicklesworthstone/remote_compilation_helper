@@ -17,6 +17,7 @@
 //! explicit bounded handoff (risk R118).
 
 pub mod build_script_state;
+pub mod cargo_resolution;
 pub mod checksum_freshness;
 pub mod content_index;
 pub mod dep_info;

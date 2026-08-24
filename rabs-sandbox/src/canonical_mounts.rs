@@ -135,8 +135,6 @@ pub struct CanonicalMountPlan {
     /// Extra explicitly-declared env pairs (merged over the canonical base;
     /// the plan's own keys win to keep mounts and env consistent).
     pub extra_env: Vec<(String, String)>,
-    /// Network default-deny unless a fetch lane explicitly opts in.
-    pub allow_network: bool,
     /// Immutable-source mode (D004): when a coherent D018 snapshot backs
     /// the workspace, its provenance is bound here and the workspace
     /// mounts READ-ONLY — the build cannot mutate source, and a mutation
@@ -167,7 +165,6 @@ impl CanonicalMountPlan {
             incremental_units: Vec::new(),
             secret_slots: Vec::new(),
             extra_env: Vec::new(),
-            allow_network: false,
             immutable_source: None,
         }
     }
@@ -312,7 +309,6 @@ impl CanonicalMountPlan {
         spec.ro_binds = ro;
         spec.rw_binds = rw;
         spec.env = env;
-        spec.allow_network = self.allow_network;
         Ok(spec)
     }
 }

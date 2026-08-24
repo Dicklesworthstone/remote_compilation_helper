@@ -164,7 +164,7 @@ pub struct CanonicalNamespaceSpec {
     pub hostname: String,
     /// Whether the network namespace is shared with the host. `false`
     /// (default-deny) is required for `StrictHermeticLinux`.
-    pub allow_network: bool,
+    pub(crate) allow_network: bool,
     /// Working directory inside the namespace.
     pub cwd: PathBuf,
 }
@@ -182,6 +182,14 @@ impl CanonicalNamespaceSpec {
             allow_network: false,
             cwd: PathBuf::from(layout::WORKSPACE),
         }
+    }
+
+    /// Whether this spec would share the host network. Public callers may
+    /// inspect this fact but cannot widen it; E025's brokered fetch keeps it
+    /// false.
+    #[must_use]
+    pub const fn allows_network(&self) -> bool {
+        self.allow_network
     }
 }
 
