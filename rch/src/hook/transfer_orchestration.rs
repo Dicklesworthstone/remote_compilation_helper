@@ -369,6 +369,7 @@ pub(super) async fn execute_remote_compilation(
             .to_string();
         }
     }
+    let mut overlay_remote_root: Option<String> = None;
     if clean_overlay.is_some() {
         if sync_plan.len() != 1 || !sync_plan[0].is_primary {
             anyhow::bail!(
@@ -378,6 +379,7 @@ pub(super) async fn execute_remote_compilation(
         }
         let remote_base = transfer_config.remote_base.trim_end_matches('/');
         sync_plan[0].remote_root = format!("{remote_base}/{project_id}/{project_hash}");
+        overlay_remote_root = Some(sync_plan[0].remote_root.clone());
         sync_plan[0].root_hash.clone_from(&project_hash);
     }
     // Relocate every closure root under the Windows build base so all downstream
@@ -1434,6 +1436,27 @@ pub(super) async fn execute_remote_compilation(
     } else {
         result.exit_code
     };
+
+    // bd-p1vlb: a clean-overlay root is invocation-unique (a job nonce is
+    // hashed into it) and holds a full materialized snapshot; once artifacts
+    // and declared result dirs are retrieved above, the tree is dead weight
+    // on the worker's staging base. Best-effort reap: failures only log —
+    // residue is caught by periodic `rch cache clean --base` sweeps — and
+    // never affect the surfaced exit code.
+    if let Some(overlay_remote_root) = overlay_remote_root.as_deref() {
+        match pipeline
+            .reap_remote_tree(&worker_config, overlay_remote_root)
+            .await
+        {
+            Ok(()) => reporter.verbose(&format!(
+                "[RCH] clean-overlay remote root {overlay_remote_root} reaped"
+            )),
+            Err(e) => warn!(
+                "clean-overlay reap of {} on {} failed (residue ages out): {e}",
+                overlay_remote_root, worker_config.id
+            ),
+        }
+    }
 
     Ok(RemoteExecutionResult {
         exit_code,

@@ -812,15 +812,27 @@ fn probe_load_average() -> Option<(f64, f64, f64)> {
 
 /// Probe disk space for project workspace filesystem (free and total in GB).
 ///
-/// We intentionally prefer the project roots because /tmp may be a small tmpfs
-/// on some workers and can produce false pressure signals. Roots honor
-/// `RCH_WKR_CANONICAL_ROOT` / `RCH_WKR_ALIAS_ROOT` (see rch#15).
+/// Worst-case free space across the project roots AND /tmp (bd-lvbax).
+///
+/// An earlier version preferred the project roots and only fell back to
+/// /tmp, treating a small tmpfs as a false pressure signal. The opposite is
+/// true in practice: vmi1149989's /tmp tmpfs hit 100% while / was healthy,
+/// breaking scp/mktemp for every build on that worker while pressure scoring
+/// stayed green. Pressure reporting must see the tightest mount a build can
+/// actually touch, so sample all candidates and report the minimum free.
 fn probe_disk_space() -> Option<(f64, f64)> {
     use std::path::Path;
     let (canonical, alias) = resolved_topology_roots();
-    [canonical.as_path(), alias.as_path(), Path::new("/tmp")]
-        .iter()
-        .find_map(|path| probe_disk_space_for(path))
+    let mut worst: Option<(f64, f64)> = None;
+    for path in [canonical.as_path(), alias.as_path(), Path::new("/tmp")] {
+        if let Some((free_gb, total_gb)) = probe_disk_space_for(path) {
+            worst = match worst {
+                Some((worst_free, _)) if worst_free <= free_gb => worst,
+                _ => Some((free_gb, total_gb)),
+            };
+        }
+    }
+    worst
 }
 
 fn probe_disk_space_for(path: &std::path::Path) -> Option<(f64, f64)> {
