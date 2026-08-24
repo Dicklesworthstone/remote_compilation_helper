@@ -9,6 +9,8 @@
 # Usage:
 #   RCH_PROFILE_WORKER=vmi1152480 scripts/profile_benchmark.sh [out.ndjson]
 #   SKIP_BUILDS=1 RCH_PROFILE_WORKER=... scripts/profile_benchmark.sh  # measure-only
+#   FLEET_TRACES=1 [TRACE_REPS=5] [STORM_N=4] [STORM_CRATES="..."] ... # live-fleet
+#     traces (transfer/sync floor, warm cache hit, cold target, compile storm)
 set -uo pipefail
 
 WORKER="${RCH_PROFILE_WORKER:-ovh-a}"

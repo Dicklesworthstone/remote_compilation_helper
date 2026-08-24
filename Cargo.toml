@@ -170,7 +170,12 @@ strip = true
 # latency + footprint first. panic=unwind is NON-NEGOTIABLE here
 # (I49 containment: no guard process wraps these, so an abort would
 # take the shell down with it); LTO is deliberately ABSENT until the
-# profile_benchmark.sh startup evidence justifies enabling it.
+# profile_benchmark.sh startup evidence justifies enabling it. LTO
+# revisit (bd-7f81c): fat-LTO proxy on rabs-wrap showed -15.6% size
+# with no detectable CPU-time penalty, but the decisive rch-specific
+# sample was blocked by a broken main; see benchmarks/baselines/
+# profile_split_lto_revisit.ndjson ("rabs.lto-revisit" record) for the
+# one-command re-check before flipping lto on.
 [profile.wrapper-release]
 inherits = "release"
 opt-level = "z"
