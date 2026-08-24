@@ -2102,6 +2102,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                         min_seq_lag,
                     },
             } => commands::rabs_gc::run_doctor(cas_root, min_seq_lag, &ctx).await,
+            Commands::Why { action } => commands::why::run(action, &ctx).await,
             Commands::Rabs {
                 action:
                     commands::rabs_gc::RabsCommand::Inventory {
@@ -2136,6 +2137,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                     job,
                     result_dir,
                     command,
+                    &ctx,
                 )
                 .await
             }

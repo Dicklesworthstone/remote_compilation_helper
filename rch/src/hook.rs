@@ -703,6 +703,21 @@ fn exit_with_local_fallback(
     reason: &str,
     require_remote: bool,
 ) -> ! {
+    // bd-uoh4x: machine consumers learn the fallback decision even when the
+    // locally-run command's own exit code is all the process surfaces.
+    emit_exec_envelope(&ExecResultEnvelope {
+        api_version: "1.0",
+        command,
+        outcome: "completed",
+        location: "local",
+        fallback_reason: Some(reason),
+        worker_id: None,
+        remote_exit_code: None,
+        duration_ms: None,
+        timing: None,
+        result_dirs: None,
+        error_code: None,
+    });
     let mut child = match local_fallback_command_for_policy(command, require_remote) {
         Ok(child) => child,
         Err(LocalFallbackRefusal::RemoteRequired) => {
@@ -711,6 +726,19 @@ fn exit_with_local_fallback(
             // is an indistinguishable empty rc=1 (rch#31). Route it through the
             // always-on stderr channel, and give retryable refusals a distinct code.
             reporter.summary_critical(&remote_required_refusal_summary(reason));
+            emit_exec_envelope(&ExecResultEnvelope {
+                api_version: "1.0",
+                command,
+                outcome: "refused",
+                location: "local",
+                fallback_reason: Some(reason),
+                worker_id: None,
+                remote_exit_code: None,
+                duration_ms: None,
+                timing: None,
+                result_dirs: None,
+                error_code: None,
+            });
             if remote_required_refusal_is_retryable(reason) {
                 std::process::exit(EXIT_REMOTE_REQUIRED_REFUSED);
             }
@@ -719,7 +747,22 @@ fn exit_with_local_fallback(
     };
 
     match child.status() {
-        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Ok(status) => {
+            emit_exec_envelope(&ExecResultEnvelope {
+                api_version: "1.0",
+                command,
+                outcome: "completed",
+                location: "local",
+                fallback_reason: Some(reason),
+                worker_id: None,
+                remote_exit_code: status.code(),
+                duration_ms: None,
+                timing: None,
+                result_dirs: None,
+                error_code: None,
+            });
+            std::process::exit(status.code().unwrap_or(1))
+        }
         Err(error) => {
             reporter.summary(&format!("[RCH] local fallback failed: {error}"));
             std::process::exit(EXIT_BUILD_ERROR);
@@ -1904,7 +1947,13 @@ pub async fn run_exec(
     job: bool,
     result_dirs: Vec<PathBuf>,
     command_parts: Vec<String>,
+    out_ctx: &crate::ui::context::OutputContext,
 ) -> anyhow::Result<()> {
+    let exec_start = std::time::Instant::now();
+    // bd-uoh4x: machine consumers (`--json` / `--format`) get a result
+    // envelope on stdout at every terminal path. Remote command output keeps
+    // streaming to stderr, so stdout stays envelope-only.
+    set_machine_output(out_ctx.is_json());
     let command = join_exec_command(&command_parts);
     if command.is_empty() {
         anyhow::bail!("No command provided to exec");
@@ -1914,6 +1963,19 @@ pub async fn run_exec(
         reporter.summary_critical(
             "[RCH-E301] refusing shell-wrapped cargo command: RCH cannot safely synchronize its artifacts; invoke `rch exec -- cargo ...` directly",
         );
+        emit_exec_envelope(&ExecResultEnvelope {
+            api_version: "1.0",
+            command: &command,
+            outcome: "refused",
+            location: "local",
+            fallback_reason: Some("shell-wrapped cargo command"),
+            worker_id: None,
+            remote_exit_code: None,
+            duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+            timing: None,
+            result_dirs: None,
+            error_code: Some("RCH-E301"),
+        });
         std::process::exit(EXIT_BUILD_ERROR);
     }
     // A clean-overlay request can never fall back to the ambient local tree,
@@ -1933,6 +1995,19 @@ pub async fn run_exec(
         Err(e) => {
             let reporter = HookReporter::new(OutputVisibility::Summary);
             reporter.summary_critical(&format!("[RCH-E001] {e}"));
+            emit_exec_envelope(&ExecResultEnvelope {
+                api_version: "1.0",
+                command: &command,
+                outcome: "collection_error",
+                location: "local",
+                fallback_reason: None,
+                worker_id: None,
+                remote_exit_code: None,
+                duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                timing: None,
+                result_dirs: None,
+                error_code: Some("RCH-E001"),
+            });
             std::process::exit(2);
         }
     };
@@ -2379,6 +2454,11 @@ pub async fn run_exec(
         )
         .await;
         let remote_elapsed = remote_start.elapsed();
+        // bd-uoh4x: snapshot for envelope emission — the match below may move
+        // `result`, and transport-failure paths have no successful result at
+        // all (their envelopes carry None for both).
+        let exec_timing = result.as_ref().ok().map(|r| r.timing.clone());
+        let exec_dir_stats = result.as_ref().ok().map(|r| r.result_dirs.clone());
         if let Err(error) = durable_lease.heartbeat("finalize") {
             warn!(
                 "Failed to persist durable lease finalize heartbeat: {}",
@@ -2469,6 +2549,19 @@ pub async fn run_exec(
                             error
                         );
                     }
+                    emit_exec_envelope(&ExecResultEnvelope {
+                        api_version: "1.0",
+                        command: &remote_command,
+                        outcome: "completed",
+                        location: "remote",
+                        fallback_reason: None,
+                        worker_id: Some(worker.id.as_str()),
+                        remote_exit_code: Some(result.exit_code),
+                        duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                        timing: Some(&result.timing),
+                        result_dirs: Some(&result.result_dirs),
+                        error_code: None,
+                    });
                     std::process::exit(0);
                 // bd-bu3fb: a job's completed remote command is terminal truth.
                 // The toolchain and worker-system-dependency heuristics
@@ -2629,6 +2722,19 @@ pub async fn run_exec(
                         },
                     }
                 } else {
+                    emit_exec_envelope(&ExecResultEnvelope {
+                        api_version: "1.0",
+                        command: &remote_command,
+                        outcome: "completed",
+                        location: "remote",
+                        fallback_reason: None,
+                        worker_id: Some(worker.id.as_str()),
+                        remote_exit_code: Some(result.exit_code),
+                        duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                        timing: exec_timing.as_ref(),
+                        result_dirs: exec_dir_stats.as_deref(),
+                        error_code: None,
+                    });
                     // Genuine build/test failure — the crate is broken and fails
                     // identically on every worker, so do NOT retry or flood local.
                     reporter.summary(&format!(
@@ -2710,6 +2816,19 @@ pub async fn run_exec(
                             error
                         );
                     }
+                    emit_exec_envelope(&ExecResultEnvelope {
+                        api_version: "1.0",
+                        command: &remote_command,
+                        outcome: "transport_error",
+                        location: "remote",
+                        fallback_reason: Some("fail_closed_no_local_fallback"),
+                        worker_id: Some(worker.id.as_str()),
+                        timing: exec_timing.as_ref(),
+                        result_dirs: exec_dir_stats.as_deref(),
+                        remote_exit_code: None,
+                        duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                        error_code: None,
+                    });
                     std::process::exit(EXIT_BUILD_ERROR);
                 }
 
@@ -2770,6 +2889,19 @@ pub async fn run_exec(
                 // Terminal non-zero exit: the line explaining it must reach the
                 // agent even at stock visibility (rch#31).
                 reporter.summary_critical(&summary);
+                emit_exec_envelope(&ExecResultEnvelope {
+                    api_version: "1.0",
+                    command: &remote_command,
+                    outcome: "completed",
+                    location: "remote",
+                    fallback_reason: None,
+                    worker_id: Some(fault.failed_worker.as_str()),
+                    remote_exit_code: Some(code),
+                    duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                    timing: exec_timing.as_ref(),
+                    result_dirs: exec_dir_stats.as_deref(),
+                    error_code: None,
+                });
                 if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal() {
                     warn!(
                         "Failed to persist acknowledged durable lease terminal state: {}",
@@ -2798,6 +2930,19 @@ pub async fn run_exec(
                         error
                     );
                 }
+                emit_exec_envelope(&ExecResultEnvelope {
+                    api_version: "1.0",
+                    command: &remote_command,
+                    outcome: "completed",
+                    location: "remote",
+                    fallback_reason: Some("worker_env_remediation"),
+                    worker_id: Some(fault.failed_worker.as_str()),
+                    remote_exit_code: Some(code),
+                    duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                    timing: exec_timing.as_ref(),
+                    result_dirs: exec_dir_stats.as_deref(),
+                    error_code: None,
+                });
                 std::process::exit(code);
             }
             RemoteFaultExhaustAction::GatedLocalFallback { reason } => {
@@ -2888,13 +3033,6 @@ use transfer_orchestration::execute_remote_compilation;
 
 // Exact source-byte manifest construction and worker-side re-verification for
 // `rch exec --source-content-receipt` proof runs.
-mod source_fidelity;
-
-// The repo_updater pre-sync subsystem (closure-convergence orchestration +
-// adapter invocation + contract/auth resolution + sync-root detection) lives in
-// the `repo_updater` submodule. Its `maybe_sync_repo_set_with_repo_updater` entry
-// point is consumed by `execute_remote_compilation` in the sibling
-// `transfer_orchestration` submodule, which imports it directly.
 mod repo_updater;
 
 // The offload-pipeline SSH primitives (`run_offload_ssh_command`, the remote
@@ -2914,6 +3052,7 @@ pub(crate) mod ssh;
 // `run_exec` error downcasts; the sibling `transfer_orchestration` imports the
 // sync-closure planners + verifier directly from `super::dependency_closure`.
 mod dependency_closure;
+
 use dependency_closure::{
     DEPENDENCY_PREFLIGHT_CODE_MATERIALIZATION, DEPENDENCY_PREFLIGHT_CODE_POLICY,
     DEPENDENCY_PREFLIGHT_CODE_TIMEOUT, DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
@@ -2923,6 +3062,9 @@ use dependency_closure::{
     DependencyPreflightReport, DependencyPreflightStatus,
 };
 
+// Exact source-byte manifest construction and worker-side re-verification for
+// `rch exec --source-content-receipt` proof runs.
+mod source_fidelity;
 // The remote-execution result type (`RemoteExecutionResult`) and the outcome
 // classifiers that interpret it live in the `remote_result` submodule. The four
 // classifier fns below are consumed by `run_hook` / `run_exec`; the sibling
@@ -2930,8 +3072,9 @@ use dependency_closure::{
 // directly from `super::remote_result`.
 mod remote_result;
 use remote_result::{
-    detect_cargo_workspace_inheritance_failure, detect_worker_system_dependency_failure,
-    is_cpu_capability_signal, is_signal_killed, is_toolchain_failure, signal_name,
+    ExecResultDirStat, ExecResultEnvelope, detect_cargo_workspace_inheritance_failure,
+    detect_worker_system_dependency_failure, emit_exec_envelope, is_cpu_capability_signal,
+    is_signal_killed, is_toolchain_failure, machine_output, set_machine_output, signal_name,
     wrapped_cpu_capability_signal,
 };
 
@@ -2942,7 +3085,7 @@ use remote_result::{
 // `resolve_forwarded_cargo_target_dir` + `rewrite_cargo_target_dir_command_for_remote`,
 // and `add_cargo_isolation` shares `sanitize_cargo_home_token`, so those three are
 // imported here; the sibling `transfer_orchestration` imports the dir-naming / env
-// helpers it needs directly from `super::cargo_target_dir`.
+// overrides directly from `super::cargo_target_dir`.
 mod cargo_target_dir;
 use cargo_target_dir::{
     resolve_forwarded_cargo_target_dir, rewrite_cargo_target_dir_command_for_remote,

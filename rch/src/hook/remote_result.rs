@@ -38,6 +38,71 @@ pub(super) struct RemoteExecutionResult {
     pub(super) duration_ms: u64,
     /// Per-phase timing breakdown.
     pub(super) timing: CommandTimingBreakdown,
+    /// Per declared-result-dir collection outcome (bd-p0yoo), for the
+    /// machine-readable envelope (bd-uoh4x). Empty when no dirs declared.
+    pub(super) result_dirs: Vec<ExecResultDirStat>,
+}
+
+/// Collection outcome of one declared job result directory (bd-uoh4x).
+#[derive(Debug, Clone, serde::Serialize)]
+pub(super) struct ExecResultDirStat {
+    pub path: String,
+    pub files: u64,
+    pub bytes: u64,
+    /// "ok" or a short failure classification ("missing", "transfer_failed").
+    pub status: String,
+}
+
+/// Machine-readable execution envelope emitted on stdout when the exec
+/// invocation requested machine output (`--json` / `--format`) — bd-uoh4x.
+///
+/// `outcome` describes DELIVERY, not build success: `completed` means the
+/// remote command ran and its outputs were handled (whatever the exit code),
+/// `transport_error` / `collection_error` mean RCH itself failed to deliver.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ExecResultEnvelope<'a> {
+    pub api_version: &'static str,
+    pub command: &'a str,
+    pub outcome: &'a str,
+    pub location: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<&'a CommandTimingBreakdown>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_dirs: Option<&'a [ExecResultDirStat]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<&'a str>,
+}
+
+/// Whether THIS invocation requested machine output on stdout (bd-uoh4x).
+/// Set once by `run_exec` from its OutputContext; the PreToolUse hook path
+/// never sets it, so hook protocol stdout stays pristine.
+static MACHINE_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn set_machine_output(on: bool) {
+    MACHINE_OUTPUT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(super) fn machine_output() -> bool {
+    MACHINE_OUTPUT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Print the execution envelope to stdout when machine output is active.
+/// Never prints otherwise and never touches stderr (diagnostics stream).
+pub(super) fn emit_exec_envelope(env: &ExecResultEnvelope<'_>) {
+    if !machine_output() {
+        return;
+    }
+    if let Ok(line) = serde_json::to_string(env) {
+        println!("{line}");
+    }
 }
 
 /// Check if the failure is a toolchain-related infrastructure failure.
