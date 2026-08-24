@@ -41,8 +41,7 @@ use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use rabs_protocol::serving::ServingValidity;
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::{
-    WorkerAdmission, WorkerIncarnationFenceRecord, WorkerLeaseBindingRejection,
-    WorkerSessionOffer,
+    WorkerAdmission, WorkerIncarnationFenceRecord, WorkerLeaseBindingRejection, WorkerSessionOffer,
 };
 
 /// Current schema version (v8 = the full H038 authoritative table set;
@@ -2272,7 +2271,6 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
         })
     }
 
-
     fn digest_params(d: &TypedDigest) -> [SqlValue; 3] {
         [
             SqlValue::Text(algo_tag(d.algorithm).to_owned()),
@@ -2332,11 +2330,7 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
     ) -> Result<TypedDigest, StoreError> {
         let coordinator = Self::attempt_authority_digest(authority);
         Self::require_active(engine, &coordinator)?;
-        if authority
-            .action_generation
-            .created_under_authority_digest
-            != coordinator
-        {
+        if authority.action_generation.created_under_authority_digest != coordinator {
             return Err(StoreError::AttemptAuthorityMismatch);
         }
         let rows = engine.query(
@@ -2355,7 +2349,9 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
             ));
         }
         let [action_key, authority_key, tombstoned, ordinal] = row.as_slice() else {
-            return Err(StoreError::Corruption("action generation binding shape".into()));
+            return Err(StoreError::Corruption(
+                "action generation binding shape".into(),
+            ));
         };
         if expect_u64(tombstoned, "generation tombstoned")? != 0 {
             return Err(StoreError::GenerationTombstoned);
@@ -2425,7 +2421,9 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
             return Err(StoreError::UnknownLease);
         };
         if rows.len() != 1 {
-            return Err(StoreError::Corruption("duplicate execution lease rows".into()));
+            return Err(StoreError::Corruption(
+                "duplicate execution lease rows".into(),
+            ));
         }
         let [
             attempt_hex,
@@ -6974,8 +6972,7 @@ mod tests {
 
     fn bound_attempt_authority() -> AttemptAuthority {
         let coordinator = coordinator_authority();
-        let created_under =
-            rabs_key::authority_binding::coordinator_authority_digest(&coordinator);
+        let created_under = rabs_key::authority_binding::coordinator_authority_digest(&coordinator);
         AttemptAuthority {
             coordinator,
             action_key: digest("rabs.action-key.sha256.v1", 7),
@@ -8051,9 +8048,7 @@ mod tests {
                 &replacement.action_key,
             )
             .unwrap();
-        store
-            .admit_attempt_lease(&replacement, 201, 300)
-            .unwrap();
+        store.admit_attempt_lease(&replacement, 201, 300).unwrap();
         assert_eq!(
             store.validate_attempt_lease(&replacement),
             Ok(LeaseState {

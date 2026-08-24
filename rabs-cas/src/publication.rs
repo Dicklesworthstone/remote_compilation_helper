@@ -47,8 +47,8 @@ use rabs_protocol::result_identity::{
 use sha2::{Digest, Sha256};
 
 use crate::metadata_store::{
-    CommitOutcome, DivergenceIncidentRow, ProvisionalAncestorRow, PublicationRow,
-    QuarantineScope, RabsMetadataStore, ResultKindTag, StoreError, digest_key,
+    CommitOutcome, DivergenceIncidentRow, ProvisionalAncestorRow, PublicationRow, QuarantineScope,
+    RabsMetadataStore, ResultKindTag, StoreError, digest_key,
 };
 use crate::trust_evidence::DISPOSITION_QUARANTINED;
 

@@ -255,10 +255,7 @@ mod tests {
 
         let mut selected = offer(3, 22);
         selected.reenrollment_proof = Some(1);
-        assert_eq!(
-            r.evaluate(&selected),
-            WorkerAdmission::AdmitViaReenrollment
-        );
+        assert_eq!(r.evaluate(&selected), WorkerAdmission::AdmitViaReenrollment);
         assert_eq!(
             r.evaluate(&offer(4, 33)),
             WorkerAdmission::RejectCloneAmbiguity,
