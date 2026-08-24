@@ -398,8 +398,7 @@ fn divergence_is_classified_from_cas_bytes_after_a_restart() {
         let mut store = cas.store().lock().expect("store lock");
         install_admission_world_with_ids(&mut *store, &authority, reissue_ids);
     }
-    let (divergent, bytes) =
-        divergent_offer_with_manifest_bytes_with_ids(&authority, reissue_ids);
+    let (divergent, bytes) = divergent_offer_with_manifest_bytes_with_ids(&authority, reissue_ids);
     store_manifest_object(&cas, &divergent, &bytes);
     let outcome = coord
         .commit_offer(&divergent, &sample_expected_descriptor())

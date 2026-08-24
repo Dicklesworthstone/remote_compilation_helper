@@ -404,7 +404,8 @@ impl CoordLive {
         let closed = store
             .close_generations_for_other_authorities(&digest)
             .map_err(|e: StoreError| format!("close prior-authority generations: {e:?}"))?;
-        self.closed_prior_generations.store(closed, Ordering::Relaxed);
+        self.closed_prior_generations
+            .store(closed, Ordering::Relaxed);
         drop(store);
         *self
             .authority

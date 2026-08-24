@@ -479,11 +479,9 @@ pub fn history_receipt(
                 "gc_receipts.mode missing or not text".to_owned(),
             ));
         };
-        let numbers @ [_, _, _] = [cols.next(), cols.next(), cols.next()] else {
-            return Err(StoreError::Backend(
-                "gc_receipts counters incomplete".to_owned(),
-            ));
-        };
+        // A fixed-size array pattern always matches; the counters are
+        // Option<SqlValue> and mapped to 0 below when absent.
+        let numbers = [cols.next(), cols.next(), cols.next()];
         let [planned, reclaimed, skipped] = numbers.map(|v| match v {
             Some(SqlValue::Int(n)) => u64::try_from(n.max(0)).unwrap_or(0),
             _ => 0,

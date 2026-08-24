@@ -853,6 +853,7 @@ async fn try_retry_on_bigger_worker(
         Some(std::process::id()),
         local_wrapper_id,
         false, // do not block waiting on one specific worker during a retry
+        &preferred,
         false, // retry upsizing is compilation-scoped; never job mode
     )
     .await

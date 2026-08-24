@@ -1040,15 +1040,6 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
         "doctor.config.load",
     );
 
-    let (workers, worker_config_error) = if scope.needs_worker_config() {
-        match load_workers_from_config() {
-            Ok(workers) => (Some(workers), None),
-            Err(err) => (None, Some(err.to_string())),
-        }
-    } else {
-        (None, None)
-    };
-
     // bd-kugfc: resolve the canonical mirror root from config (falling
     // back to the compiled-in default only when config loads cleanly but
     // leaves it unset). A config-load failure is surfaced by the
@@ -1111,10 +1102,10 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
                     workers_len
                 ];
                 while let Some(joined) = set.join_next().await {
-                    if let Ok((idx, probe)) = joined {
-                        if let Some(slot) = results.get_mut(idx) {
-                            *slot = probe;
-                        }
+                    if let Ok((idx, probe)) = joined
+                        && let Some(slot) = results.get_mut(idx)
+                    {
+                        *slot = probe;
                     }
                 }
                 results

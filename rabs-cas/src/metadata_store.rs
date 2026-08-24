@@ -430,7 +430,6 @@ pub const MIGRATIONS: &[Migration] = &[
     },
 ];
 
-
 impl std::fmt::Display for StoreError {
     /// Delegates to the derived [`Debug`] output: the enum is closed over by
     /// this crate's tests, every variant is information-carrying, and a
@@ -1036,8 +1035,7 @@ pub trait RabsMetadataStore {
     /// Raw read-only SQL over the store backend (`?1..?N` placeholders).
     /// Escape hatch for operator surfaces (e.g. `rch rabs gc` receipts)
     /// whose schemas are owned by the rch crate, not by typed methods here.
-    fn query(&mut self, sql: &str, params: &[SqlValue])
-    -> Result<Vec<Vec<SqlValue>>, StoreError>;
+    fn query(&mut self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, StoreError>;
 
     /// Declare a digest domain this process is prepared to read back.
     ///
@@ -2397,8 +2395,7 @@ fn evidence_key_rows(rows: &[Vec<SqlValue>]) -> Result<Vec<String>, StoreError> 
 }
 
 impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
-    fn query(&mut self, sql: &str, params: &[SqlValue])
-    -> Result<Vec<Vec<SqlValue>>, StoreError> {
+    fn query(&mut self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, StoreError> {
         self.engine.query(sql, params)
     }
 

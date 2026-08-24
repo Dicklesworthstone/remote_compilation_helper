@@ -1336,15 +1336,18 @@ mod tests {
         }
 
         fn make_request(project: &str, cores: u32) -> SelectionRequest {
-            SelectionRequest { job_mode: false, project: project.to_string(),
-            command: None,
-            command_priority: CommandPriority::Normal,
-            estimated_cores: cores,
-            preferred_workers: vec![],
-            toolchain: None,
-            required_runtime: RequiredRuntime::default(),
-            classification_duration_us: None,
-            hook_pid: None, }
+            SelectionRequest {
+                job_mode: false,
+                project: project.to_string(),
+                command: None,
+                command_priority: CommandPriority::Normal,
+                estimated_cores: cores,
+                preferred_workers: vec![],
+                toolchain: None,
+                required_runtime: RequiredRuntime::default(),
+                classification_duration_us: None,
+                hook_pid: None,
+            }
         }
 
         #[tokio::test]
