@@ -4906,6 +4906,7 @@ name = "rabs-scheduler"
 version = "1.0.58"
 dependencies = [
  "rabs-protocol",
+ "tempfile",
 ]
 
 [[package]]
