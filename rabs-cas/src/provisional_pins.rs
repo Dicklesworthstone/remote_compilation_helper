@@ -1937,23 +1937,20 @@ mod tests {
     fn m017_transitive_closure_materialized_at_open() {
         let (mut f, a, b, c) = m017_chain("m017-closure");
 
-        // B's closure: exactly its direct ancestor.
+        // B's closure: exactly its direct ancestor, one hop away.
         assert_eq!(
             f.store
                 .list_provisional_pin_ancestors(&b.pin_key())
                 .unwrap(),
-            vec![a.pin_key()]
+            vec![(a.pin_key(), 1)]
         );
-        // C's closure: the FULL transitive set {A, B}, not just B.
+        // C's closure: the FULL transitive set {A, B} with MIN-HOP
+        // distances — A two hops up, B directly.
         assert_eq!(
             f.store
                 .list_provisional_pin_ancestors(&c.pin_key())
                 .unwrap(),
-            {
-                let mut v = vec![a.pin_key(), b.pin_key()];
-                v.sort();
-                v
-            }
+            vec![(a.pin_key(), 2), (b.pin_key(), 1)]
         );
         // Reverse edges reach every transitive descendant from the root.
         assert_eq!(

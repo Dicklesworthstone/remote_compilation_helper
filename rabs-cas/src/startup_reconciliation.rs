@@ -364,6 +364,7 @@ mod tests {
         store
             .commit_publication(
                 &auth,
+                None,
                 &PublicationRow {
                     action_key: action,
                     descriptor_digest: digest("rabs.descriptor.sha256.v1", 8),

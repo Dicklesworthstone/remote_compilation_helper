@@ -16,8 +16,9 @@
 //!    `created_under_authority_digest` must equal that digest (the F033
 //!    equality check — one full authority copy, bound by digest);
 //! 2. generation fence: the generation exists and is not tombstoned;
-//! 3. attempt/lease fences: the attempt exists under that generation and
-//!    its execution lease is unreleased;
+//! 3. attempt/lease/worker fences: the exact normalized lease-to-attempt
+//!    binding, renewal sequence, boot generation, process incarnation, and
+//!    current non-ambiguous worker fence all agree;
 //! 4. descriptor reload + byte-compare against the coordinator's own copy;
 //! 5. key + epoch validation against the action entry;
 //! 6. INDEPENDENT digest recompute: the coordinator recomputes
@@ -51,7 +52,13 @@ use crate::metadata_store::{
 use crate::trust_evidence::DISPOSITION_QUARANTINED;
 
 /// Domain separator for the canonical coordinator-authority digest.
-pub const AUTHORITY_DIGEST_DOMAIN: &str = "rabs.coordinator-authority.sha256.v1";
+///
+/// The digest itself has ONE implementation — F033's
+/// [`rabs_key::authority_binding::coordinator_authority_digest`] — and this
+/// constant aliases that function's domain so the store-interning label can
+/// never drift from the digest domain (G019: two encodings of one fencing
+/// identity made cross-layer binding comparisons meaningless).
+pub const AUTHORITY_DIGEST_DOMAIN: &str = rabs_key::typed_digest::DOMAIN_COORDINATOR_AUTHORITY;
 /// Domain separator for the v1 semantic result projection.
 pub const SEMANTIC_PROJECTION_DOMAIN: &str = "rabs.semantic-result-projection.sha256.v1";
 /// Domain separator for the v1 observable result projection.
@@ -108,15 +115,13 @@ impl Framing {
 /// Canonical digest of a FULL coordinator authority value. The generation
 /// stores only this digest (risk R117: two independently mutable full
 /// copies are forbidden by construction).
+///
+/// Delegates to F033's single implementation in `rabs-key`; every layer
+/// (actor lease admission, offer admission, publication) compares digests
+/// produced by this one function (G019).
 #[must_use]
 pub fn authority_digest(authority: &rabs_protocol::authority::CoordinatorAuthority) -> TypedDigest {
-    let mut framing = Framing::new(AUTHORITY_DIGEST_DOMAIN);
-    framing
-        .field(authority.cluster_id.0.as_bytes())
-        .u64(authority.credential_generation)
-        .u64(authority.term)
-        .field(&authority.incarnation_id.0.to_be_bytes());
-    framing.finish(AUTHORITY_DIGEST_DOMAIN)
+    rabs_key::authority_binding::coordinator_authority_digest(authority)
 }
 
 const fn result_kind_tag(kind: ResultKind) -> u64 {
@@ -469,6 +474,12 @@ pub enum OfferRefusal {
         /// Canonical key of the cancelled pin.
         pin_key: String,
     },
+    /// A bound native child action is unresolved (L008): the parent
+    /// build-script result cannot commit until the child commits.
+    NativeChildUnresolved {
+        /// Digest of the unresolved child action key.
+        child_action_key: String,
+    },
     /// The store refused or failed.
     Store(StoreError),
 }
@@ -605,10 +616,11 @@ pub fn process_offer(
     if !store.attempt_exists(attempt_id, generation_id)? {
         return Err(OfferRefusal::UnknownAttempt);
     }
-    match store.lease_state(offer.authority.execution_lease_id.0)? {
-        None => return Err(OfferRefusal::UnknownLease),
-        Some(state) if state.released => return Err(OfferRefusal::LeaseReleased),
-        Some(_) => {}
+    match store.validate_attempt_lease(&offer.authority) {
+        Ok(_) => {}
+        Err(StoreError::UnknownLease) => return Err(OfferRefusal::UnknownLease),
+        Err(StoreError::LeaseReleased) => return Err(OfferRefusal::LeaseReleased),
+        Err(error) => return Err(OfferRefusal::Store(error)),
     }
 
     // 4. Descriptor reload + byte-compare.
@@ -699,6 +711,19 @@ pub fn process_offer(
     // not-yet-finalized producers all refuse here.
     verify_consumption_obligations(store, offer, &manifest_resolver)?;
 
+    // 7.7. Native child resolution gate (L008): a build-script parent
+    // with bound native children cannot commit while any child result
+    // is unresolved — provenance edges are written on satisfaction.
+    crate::native_children::enforce_native_children_resolved(store, &offer.manifest.action_key)
+        .map_err(|err| match err {
+            crate::native_children::NativeChildError::ChildUnresolved { child_action_key } => {
+                OfferRefusal::NativeChildUnresolved { child_action_key }
+            }
+            crate::native_children::NativeChildError::Store(store_err) => {
+                OfferRefusal::Store(store_err)
+            }
+        })?;
+
     // 8. Same-key candidates: divergence taxonomy, never overwrite.
     if let Some(committed_key) = store.published_manifest_key(&offer.manifest.action_key)? {
         let candidate_key = digest_key(&offer.manifest_id.0);
@@ -754,7 +779,7 @@ pub fn process_offer(
         pin_owner: "coordinator".to_owned(),
         provisional_ancestors: ancestor_rows,
     };
-    match store.commit_publication(&offered_authority, &row)? {
+    match store.commit_publication(&offered_authority, Some(&offer.authority), &row)? {
         CommitOutcome::Committed => {}
         // The pipeline checked for an existing row above; hitting either
         // branch here means the store's own CAS caught a same-key row —
@@ -1212,6 +1237,7 @@ mod tests {
     };
     use rabs_protocol::result_identity::LogicalOutput;
     use rabs_protocol::wire_time::PeerId;
+    use rabs_protocol::worker_fence::WorkerSessionOffer;
 
     use crate::metadata_store::{
         ActionEntryRow, AuthorityRow, FsqliteEngine, ProvisionalObligationInsert, RusqliteEngine,
@@ -1324,7 +1350,8 @@ mod tests {
     /// action entry, generation, attempt, lease, and every closure object
     /// located.
     fn ready_store(store: &mut dyn RabsMetadataStore) {
-        let auth = authority_digest(&coordinator_authority());
+        let attempt_authority = attempt_authority();
+        let auth = authority_digest(&attempt_authority.coordinator);
         store
             .acquire_authority(&AuthorityRow {
                 digest: auth.clone(),
@@ -1342,10 +1369,27 @@ mod tests {
             })
             .unwrap();
         store
-            .create_generation(&auth, 11, &digest("rabs.action-key.sha256.v1", 7))
+            .create_bound_generation(
+                &auth,
+                &attempt_authority.action_generation,
+                &digest("rabs.action-key.sha256.v1", 7),
+            )
             .unwrap();
-        store.record_attempt(20, 11, "worker-a", 1).unwrap();
-        store.acquire_lease(30, 20, 1, 100).unwrap();
+        store
+            .admit_worker_session(
+                &auth,
+                &WorkerSessionOffer {
+                    worker_peer_id: attempt_authority.worker_peer_id.clone(),
+                    boot_generation: attempt_authority.worker_boot_generation,
+                    incarnation: attempt_authority.worker_incarnation_id,
+                    reenrollment_proof: None,
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .admit_attempt_lease(&attempt_authority, 1, 100)
+            .unwrap();
         for tag in [40, 41, 50, 51, 60, 61, 62, 63] {
             let id = object(tag);
             store.record_object(&id.0, 64).unwrap();
@@ -1405,6 +1449,7 @@ mod tests {
             store
                 .commit_publication(
                     &auth,
+                    None,
                     &PublicationRow {
                         action_key: action,
                         descriptor_digest: expected_descriptor(),

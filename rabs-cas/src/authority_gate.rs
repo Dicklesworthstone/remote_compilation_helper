@@ -39,7 +39,14 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
+use rabs_protocol::generation::{
+    ActionGeneration, ActionGenerationId, AttemptAuthority, AttemptId, ExecutionLeaseId,
+    LeaseRenewal, LeaseRenewalSeq, WorkerBootGeneration, WorkerIncarnationId,
+};
 use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
+use rabs_protocol::wire_time::PeerId;
+use rabs_protocol::worker_fence::WorkerSessionOffer;
 
 use crate::metadata_store::{
     ActionEntryRow, AuthorityRow, FsqliteEngine, GcReceiptRow, PublicationRow, RabsMetadataStore,
@@ -146,12 +153,51 @@ fn digest(domain: &'static str, tag: u8) -> TypedDigest {
 }
 
 fn authority(tag: u8) -> AuthorityRow {
+    let coordinator = coordinator_authority(tag);
     AuthorityRow {
-        digest: digest("rabs.authority.sha256.v1", tag),
+        digest: rabs_key::authority_binding::coordinator_authority_digest(&coordinator),
         cluster_id: "gate-cluster".to_owned(),
         incarnation: u128::from(tag),
         term: u64::from(tag),
         acquired_seq: 1,
+    }
+}
+
+fn coordinator_authority(tag: u8) -> CoordinatorAuthority {
+    CoordinatorAuthority {
+        cluster_id: ClusterId("gate-cluster".to_owned()),
+        credential_generation: 1,
+        term: u64::from(tag),
+        incarnation_id: CoordinatorIncarnationId(u128::from(tag)),
+    }
+}
+
+fn attempt_authority() -> AttemptAuthority {
+    let coordinator = coordinator_authority(1);
+    let created_under = rabs_key::authority_binding::coordinator_authority_digest(&coordinator);
+    AttemptAuthority {
+        coordinator,
+        action_key: digest("rabs.action-key.sha256.v1", 7),
+        action_generation: ActionGeneration {
+            generation_id: ActionGenerationId(11),
+            per_key_ordinal: 1,
+            created_under_authority_digest: created_under,
+        },
+        attempt_id: AttemptId(22),
+        execution_lease_id: ExecutionLeaseId(30),
+        lease_renewal_seq: LeaseRenewalSeq(1),
+        worker_peer_id: PeerId("lease-worker".to_owned()),
+        worker_boot_generation: WorkerBootGeneration(1),
+        worker_incarnation_id: WorkerIncarnationId(5),
+    }
+}
+
+fn worker_offer(generation: u64, incarnation: u128) -> WorkerSessionOffer {
+    WorkerSessionOffer {
+        worker_peer_id: PeerId("worker-a".to_owned()),
+        boot_generation: WorkerBootGeneration(generation),
+        incarnation: WorkerIncarnationId(incarnation),
+        reenrollment_proof: None,
     }
 }
 
@@ -194,8 +240,8 @@ fn operation_script(
     store: &mut dyn RabsMetadataStore,
 ) -> (Vec<String>, Result<Vec<String>, StoreError>) {
     let mut t = Vec::new();
-    let active = digest("rabs.authority.sha256.v1", 1);
-    let wrong = digest("rabs.authority.sha256.v1", 2);
+    let active = authority(1).digest;
+    let wrong = authority(2).digest;
     let action = ActionEntryRow {
         action_key: digest("rabs.action-key.sha256.v1", 7),
         key_epoch: 3,
@@ -240,7 +286,11 @@ fn operation_script(
     outcome(
         &mut t,
         "gen-create-2",
-        &store.create_generation(&active, 11, &action.action_key),
+        &store.create_bound_generation(
+            &active,
+            &attempt_authority().action_generation,
+            &action.action_key,
+        ),
     );
     outcome(
         &mut t,
@@ -257,42 +307,82 @@ fn operation_script(
         "attempt-unknown-gen",
         &store.record_attempt(21, 999, "worker-a", 6),
     );
-    outcome(&mut t, "lease", &store.acquire_lease(30, 20, 1, 100));
-    outcome(&mut t, "lease-renew", &store.renew_lease(30, 2, 200));
-    outcome(&mut t, "lease-stale", &store.renew_lease(30, 2, 300));
+    let lease_authority = attempt_authority();
+    outcome(
+        &mut t,
+        "lease-worker-session",
+        &store.admit_worker_session(
+            &active,
+            &WorkerSessionOffer {
+                worker_peer_id: lease_authority.worker_peer_id.clone(),
+                boot_generation: lease_authority.worker_boot_generation,
+                incarnation: lease_authority.worker_incarnation_id,
+                reenrollment_proof: None,
+            },
+            4,
+        ),
+    );
+    outcome(
+        &mut t,
+        "lease",
+        &store.admit_attempt_lease(&lease_authority, 5, 100),
+    );
+    let renewal = LeaseRenewal {
+        lease: lease_authority.execution_lease_id,
+        seq: LeaseRenewalSeq(2),
+    };
+    outcome(
+        &mut t,
+        "lease-renew",
+        &store.renew_attempt_lease(&lease_authority, renewal, 200),
+    );
+    outcome(
+        &mut t,
+        "lease-stale",
+        &store.renew_attempt_lease(&lease_authority, renewal, 300),
+    );
     outcome(&mut t, "lease-release", &store.release_lease(30));
+    let mut renewed_authority = lease_authority;
+    renewed_authority.lease_renewal_seq = LeaseRenewalSeq(2);
     outcome(
         &mut t,
         "lease-renew-released",
-        &store.renew_lease(30, 3, 300),
+        &store.renew_attempt_lease(
+            &renewed_authority,
+            LeaseRenewal {
+                lease: renewed_authority.execution_lease_id,
+                seq: LeaseRenewalSeq(3),
+            },
+            300,
+        ),
     );
     let publication_row = publication(7, 1, 40);
     outcome(
         &mut t,
         "publish-wrong-authority",
-        &store.commit_publication(&wrong, &publication_row),
+        &store.commit_publication(&wrong, None, &publication_row),
     );
     outcome(
         &mut t,
         "publish",
-        &store.commit_publication(&active, &publication_row),
+        &store.commit_publication(&active, None, &publication_row),
     );
     outcome(
         &mut t,
         "publish-idempotent",
-        &store.commit_publication(&active, &publication_row),
+        &store.commit_publication(&active, None, &publication_row),
     );
     outcome(
         &mut t,
         "publish-conflict",
-        &store.commit_publication(&active, &publication(7, 2, 41)),
+        &store.commit_publication(&active, None, &publication(7, 2, 41)),
     );
     let mut failure_row = publication(8, 3, 42);
     failure_row.result_kind = ResultKindTag::DeterministicFailure;
     outcome(
         &mut t,
         "publish-det-failure",
-        &store.commit_publication(&active, &failure_row),
+        &store.commit_publication(&active, None, &failure_row),
     );
     let extra_evidence = digest("rabs.evidence-bundle.sha256.v1", 90);
     let manifest_key = digest_key(&publication_row.manifest_digest);
@@ -453,12 +543,44 @@ fn operation_script(
     outcome(
         &mut t,
         "worker-fence",
-        &store.advance_worker_fence(&active, "worker-a", 3),
+        &store.admit_worker_session(&active, &worker_offer(3, 30), 1_000),
     );
     outcome(
         &mut t,
         "worker-fence-stale",
-        &store.advance_worker_fence(&active, "worker-a", 2),
+        &store.admit_worker_session(&active, &worker_offer(2, 20), 1_001),
+    );
+    outcome(
+        &mut t,
+        "worker-fence-clone",
+        &store.admit_worker_session(&active, &worker_offer(3, 31), 1_002),
+    );
+    outcome(
+        &mut t,
+        "worker-fence-read",
+        &store.worker_incarnation_fence(&PeerId("worker-a".to_owned())),
+    );
+    outcome(
+        &mut t,
+        "worker-session-release-wrong",
+        &store.release_worker_session(
+            &active,
+            &PeerId("worker-a".to_owned()),
+            WorkerIncarnationId(31),
+            1_000,
+            1_003,
+        ),
+    );
+    outcome(
+        &mut t,
+        "worker-session-release",
+        &store.release_worker_session(
+            &active,
+            &PeerId("worker-a".to_owned()),
+            WorkerIncarnationId(30),
+            1_000,
+            1_003,
+        ),
     );
     outcome(
         &mut t,

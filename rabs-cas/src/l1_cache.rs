@@ -25,7 +25,7 @@
 //! Bounded by construction: `capacity` is hard (FIFO eviction) — an
 //! unbounded cache on a long-lived daemon is a leak with good PR.
 
-use crate::metadata_store::{ActionEntryRow, StoreError};
+use crate::metadata_store::{ActionEntryRow, StoreError, digest_key};
 use rabs_protocol::result_identity::TypedDigest;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -224,6 +224,11 @@ impl L1ActionCache {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+    /// Configured capacity (for inventory/status surfaces).
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
 
     /// Whether the cache holds no entries.
     #[must_use]
@@ -254,11 +259,40 @@ impl L1ActionCache {
             miss_p99_nanos: percentile(&self.miss_latencies.samples, 99.0),
         }
     }
+
+    /// Inventory view of every LIVE entry, FIFO order (oldest first).
+    /// Read-only: inventory never mutates cache state.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<L1EntrySnapshot> {
+        self.order
+            .iter()
+            .filter_map(|key| {
+                let entry = self.entries.get(key)?;
+                Some(L1EntrySnapshot {
+                    key: digest_key(key),
+                    key_epoch: entry.row.key_epoch,
+                    projection_epoch: entry.row.projection_epoch,
+                })
+            })
+            .collect()
+    }
 }
 
 /// Convenience alias so callers can express "the store's error type"
 /// without naming [`StoreError`] twice in one signature.
 pub type L1StoreError = StoreError;
+
+/// One live entry, exposed for inventory surfaces (K010). Key is the
+/// store-form digest text; epochs come from the cached row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L1EntrySnapshot {
+    /// Store-form digest key.
+    pub key: String,
+    /// Key epoch of the cached row.
+    pub key_epoch: u32,
+    /// Projection epoch of the cached row.
+    pub projection_epoch: u32,
+}
 
 #[cfg(test)]
 mod tests {

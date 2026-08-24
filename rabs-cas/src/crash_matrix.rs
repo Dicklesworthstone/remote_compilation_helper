@@ -50,6 +50,7 @@ use rabs_protocol::result_identity::{
     LogicalOutput, ObjectId, OutputRole, ResultKind, TypedDigest,
 };
 use rabs_protocol::wire_time::PeerId;
+use rabs_protocol::worker_fence::WorkerSessionOffer;
 
 use crate::metadata_store::{
     ActionEntryRow, AuthorityRow, RabsMetadataStore, SqlEngine, SqlMetadataStore, SqlValue,
@@ -245,7 +246,8 @@ const DIVERGENT_UPLOAD_TAGS: [u8; 3] = [42, 52, 55];
 /// same function is both the first attempt and the coordinator's
 /// restart path.
 fn ensure_setup(store: &mut dyn RabsMetadataStore) -> Result<(), StoreError> {
-    let auth = authority_digest(&coordinator());
+    let attempt_authority = attempt_authority();
+    let auth = authority_digest(&attempt_authority.coordinator);
     // Always RE-ACQUIRE (idempotent by digest): this is exactly what a
     // restarted coordinator does, and it re-interns the authority's
     // digest domain so the fail-closed R121 restore path accepts the
@@ -257,19 +259,35 @@ fn ensure_setup(store: &mut dyn RabsMetadataStore) -> Result<(), StoreError> {
         term: 3,
         acquired_seq: 1,
     })?;
+    if store
+        .worker_incarnation_fence(&attempt_authority.worker_peer_id)?
+        .is_none()
+    {
+        store.admit_worker_session(
+            &auth,
+            &WorkerSessionOffer {
+                worker_peer_id: attempt_authority.worker_peer_id.clone(),
+                boot_generation: attempt_authority.worker_boot_generation,
+                incarnation: attempt_authority.worker_incarnation_id,
+                reenrollment_proof: None,
+            },
+            1,
+        )?;
+    }
     store.upsert_action_entry(&ActionEntryRow {
         action_key: digest("rabs.action-key.sha256.v1", 7),
         key_epoch: 1,
         projection_epoch: 1,
     })?;
     if store.generation_state(11)?.is_none() {
-        store.create_generation(&auth, 11, &digest("rabs.action-key.sha256.v1", 7))?;
-    }
-    if !store.attempt_exists(20, 11)? {
-        store.record_attempt(20, 11, "worker-a", 1)?;
+        store.create_bound_generation(
+            &auth,
+            &attempt_authority.action_generation,
+            &digest("rabs.action-key.sha256.v1", 7),
+        )?;
     }
     if store.lease_state(30)?.is_none() {
-        store.acquire_lease(30, 20, 1, 100)?;
+        store.admit_attempt_lease(&attempt_authority, 1, 100)?;
     }
     Ok(())
 }

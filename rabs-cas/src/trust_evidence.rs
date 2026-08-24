@@ -385,7 +385,7 @@ mod tests {
             provisional_ancestors: Vec::new(),
         };
         assert_eq!(
-            store.commit_publication(&active, &row).unwrap(),
+            store.commit_publication(&active, None, &row).unwrap(),
             CommitOutcome::Committed
         );
         (active, action.action_key)
