@@ -8,9 +8,71 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ---
 
-## [Unreleased] (since v1.0.56)
+## [Unreleased]
 
 No unreleased changes yet.
+
+## [v1.0.58] -- 2026-08-24 (release)
+
+278 commits since v1.0.57. Two themes: **RABS**, a new build-sidecar subsystem that lands
+in full, and **job mode**, which opens rch's remote-execution rails to work that is not a
+compilation.
+
+(v1.0.57 shipped as a GitHub release on 2026-08-15 without a changelog entry; this section
+covers v1.0.57..v1.0.58 only.)
+
+### Job mode — remote execution for non-compilation work
+
+- **`rch exec --job`** admits a command that the classifier would otherwise reject. The
+  transparent shell hook's compilation-only admission is unchanged; this is an explicit,
+  opt-in path for work that is deliberately remote.
+
+  ```
+  rch exec --job --result-dir fuzz/corpus --result-dir crashes -- ./fuzz_target.sh
+  ```
+
+- **`--result-dir`** declares directories to bring back, repeatable and order-preserving.
+  It is refused without `--job`, so it cannot quietly widen sync-back for ordinary builds.
+- **Job-mode admissions queue on active-project exclusion** rather than being refused
+  outright. Previously the queue activated only for `AllWorkersBusy`, so a sharded caller
+  hit `NoAdmissibleWorkers` and got no wait at all.
+- **Exactly one structured result envelope per invocation**, emitted at every terminal
+  path, with stdout kept envelope-only while remote command output streams to stderr. This
+  is what lets a caller distinguish "the remote command exited non-zero", "rch fell back
+  locally and *that* exited non-zero", and "rch itself failed" — a distinction numeric exit
+  status cannot carry, since `RCH-Ennn` values are diagnostic identifiers rather than a
+  disjoint exit namespace.
+
+  Addresses the proposal in GH#27.
+
+### RABS — Asupersync-native Accelerated Build Sidecar
+
+A new subsystem across `rabs-cas`, `rabs-protocol`, `rabs-key`, `rabs-scheduler`,
+`rabs-sandbox`, `rabs-action`, `rabs-replay`, `rabs-wrap`, `rabs-asupersync`, `rabs-wkr`
+and `rabsd`. All RABS crates are `publish = false`.
+
+- **Content-addressed store** with ownership-safe provisional recovery, a native-child
+  gate, worker reconcile, and cache inventory.
+- **Cacheability gating** that refuses to cache a build script whose output depends on an
+  imported clock, with suffix-tolerant clock detection and a zero-divergence gate plus
+  cacheability report.
+- **Scheduler** with permit-chain total ordering, cross-edge single-flight, plane grants,
+  and bounded lineage waiters.
+- **Durable coordinator fencing** over protocol primitives, with worker fences and
+  coordinator lease tracking.
+- **Sandbox** network-isolation policy contracts and brokered-fetch lease validation, with
+  canonical mounts and a namespace spec.
+- **Edge cargo resolution** contract and snapshot validation.
+
+### rch / rchd / rch-wkr
+
+- **Worker-state hygiene**: multi-base GC, reconcile and inventory CLI, plus a
+  mirror-ownership probe.
+- **Honest disk-pressure reporting** and expanded probe diagnostics in worker selection.
+
+### Fixed
+
+- 26 fixes across the workspace, concentrated in `rch` and the RABS crates.
 
 ---
 
