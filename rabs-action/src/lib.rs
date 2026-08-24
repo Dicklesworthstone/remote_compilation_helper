@@ -38,6 +38,7 @@
 //!   `rabs-protocol` causal/budget values.
 
 pub mod benchmark_policy;
+pub mod cargo_command_eligibility;
 pub mod generation_fence;
 pub mod incremental_gate;
 pub mod serving_transitions;
