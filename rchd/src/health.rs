@@ -1337,6 +1337,7 @@ mod tests {
 
         fn make_request(project: &str, cores: u32) -> SelectionRequest {
             SelectionRequest {
+                job_mode: false,
                 project: project.to_string(),
                 command: None,
                 command_priority: CommandPriority::Normal,

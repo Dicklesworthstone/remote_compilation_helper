@@ -659,6 +659,7 @@ mod tests {
                             rustc_version,
                             rustup_toolchains: Vec::new(),
                             rustup_components: Vec::new(),
+                            probe_warnings: Vec::new(),
                             bun_version,
                             node_version,
                             npm_version,

@@ -73,6 +73,7 @@ mod tests {
 
     fn select_request(project: &str) -> SelectionRequest {
         SelectionRequest {
+            job_mode: false,
             project: project.to_string(),
             command: None,
             command_priority: CommandPriority::Normal,

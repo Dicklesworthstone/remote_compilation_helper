@@ -157,6 +157,13 @@ pub struct SelectionRequest {
     /// This tracks how long the 5-tier classification took on the hook side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classification_duration_us: Option<u64>,
+    /// Job-mode admission (bd-g7rpy): set by `rch exec --job` only. When the
+    /// one-active-job-per-project-per-worker guard excludes every otherwise-
+    /// eligible worker, a job request may QUEUE on that exclusion instead of
+    /// failing over to local execution. Compilation requests never set it,
+    /// preserving their immediate NoAdmissibleWorkers behavior.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub job_mode: bool,
     /// Process ID of the hook (for active build tracking).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_pid: Option<u32>,
@@ -761,6 +768,13 @@ pub struct WorkerCapabilities {
     /// `clippy-preview` can never satisfy a `clippy` requirement.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rustup_components: Vec<String>,
+    /// Non-fatal diagnostics gathered while probing (for example a tool binary
+    /// that had to be resolved from a well-known fallback location because the
+    /// caller's PATH was minimal). Empty in the common case; clients may
+    /// surface these so "no facts" is distinguishable from "facts show
+    /// absence" (bd-deft5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probe_warnings: Vec<String>,
     /// Bun runtime version (from `bun --version`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bun_version: Option<String>,
