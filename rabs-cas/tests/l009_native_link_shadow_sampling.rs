@@ -37,8 +37,8 @@
 
 use rabs_cas::link_bundle::{LinkOutput, LinkResultBundle, StockLinkOutcome, equivalent_to_stock};
 use rabs_cas::metadata_store::{
-    ActionEntryRow, AuthorityRow, CommitOutcome, PublicationPermit, PublicationRow,
-    RabsMetadataStore, ResultKindTag, RusqliteEngine, SqlMetadataStore,
+    ActionEntryRow, AuthorityRow, CommitOutcome, PublicationRow, RabsMetadataStore, ResultKindTag,
+    RusqliteEngine, SqlMetadataStore,
 };
 use rabs_cas::serving_sample_gate::{
     ActionClassRisk, SampleGateDecision, SamplingPolicy, key_bucket_basis_points,
@@ -478,10 +478,10 @@ fn l009_cross_worker_sampling_promotes_and_failure_demotes() {
     st.admit_attempt_lease(&winner, 5, 1_000).unwrap();
     st.admit_attempt_lease(&second_worker, 6, 1_000).unwrap();
     st.admit_attempt_lease(&third_worker, 7, 1_000).unwrap();
-    let permit = PublicationPermit::for_attempt(&winner);
     assert_eq!(
         st.commit_publication(
-            permit,
+            &authority,
+            Some(&winner),
             &PublicationRow {
                 action_key: action.clone(),
                 descriptor_digest: d("rabs.descriptor.sha256.v1", 1),
