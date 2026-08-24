@@ -25,6 +25,12 @@ pub struct WorkerIncarnationFenceRecord {
     pub highest_boot_generation: WorkerBootGeneration,
     /// The active incarnation for that generation, if a session is live.
     pub active_incarnation: Option<WorkerIncarnationId>,
+    /// A same-generation competing incarnation was observed. While set,
+    /// neither contender is authoritative: sessions and execution leases
+    /// fail closed until a fresh operator re-enrollment proof selects one
+    /// lineage. A copied process cannot self-resolve by incrementing its
+    /// boot counter.
+    pub clone_ambiguous: bool,
     /// Highest operator re-enrollment generation consumed.
     pub operator_reenrollment_generation: u64,
 }
@@ -69,6 +75,26 @@ pub enum WorkerAdmission {
     RejectIdentityMismatch,
 }
 
+/// Why a worker-bound execution lease is not current at a durable fence.
+///
+/// This decision is deliberately independent of lease sequence/state: it
+/// answers only whether the worker tuple that owns an attempt is the one
+/// unambiguously active tuple NOW.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerLeaseBindingRejection {
+    /// The lease names another durable worker identity.
+    IdentityMismatch,
+    /// The lease's boot generation is not the fence's current high-water.
+    BootGenerationMismatch,
+    /// The worker has no active session.
+    NoActiveIncarnation,
+    /// The lease belongs to a different process incarnation.
+    IncarnationMismatch,
+    /// A same-generation clone conflict is unresolved; neither contender
+    /// may continue using leases.
+    CloneAmbiguous,
+}
+
 impl WorkerIncarnationFenceRecord {
     /// Evaluate a session offer against this fence row.
     #[must_use]
@@ -90,6 +116,9 @@ impl WorkerIncarnationFenceRecord {
         {
             return WorkerAdmission::AdmitViaReenrollment;
         }
+        if self.clone_ambiguous {
+            return WorkerAdmission::RejectCloneAmbiguity;
+        }
         if offer.boot_generation > self.highest_boot_generation {
             return WorkerAdmission::AdmitNewGeneration;
         }
@@ -98,6 +127,33 @@ impl WorkerIncarnationFenceRecord {
             None => WorkerAdmission::AdmitResume,
             Some(active) if active == offer.incarnation => WorkerAdmission::AdmitReconnect,
             Some(_) => WorkerAdmission::RejectCloneAmbiguity,
+        }
+    }
+
+    /// Check whether an attempt/lease's worker tuple is the exact active,
+    /// unambiguous owner of this fence.
+    ///
+    /// # Errors
+    /// A typed reason when the binding is stale, inactive, or ambiguous.
+    pub fn validate_lease_binding(
+        &self,
+        worker: &PeerId,
+        boot_generation: WorkerBootGeneration,
+        incarnation: WorkerIncarnationId,
+    ) -> Result<(), WorkerLeaseBindingRejection> {
+        if worker != &self.worker_peer_id {
+            return Err(WorkerLeaseBindingRejection::IdentityMismatch);
+        }
+        if boot_generation != self.highest_boot_generation {
+            return Err(WorkerLeaseBindingRejection::BootGenerationMismatch);
+        }
+        if self.clone_ambiguous {
+            return Err(WorkerLeaseBindingRejection::CloneAmbiguous);
+        }
+        match self.active_incarnation {
+            None => Err(WorkerLeaseBindingRejection::NoActiveIncarnation),
+            Some(active) if active == incarnation => Ok(()),
+            Some(_) => Err(WorkerLeaseBindingRejection::IncarnationMismatch),
         }
     }
 }
@@ -111,6 +167,7 @@ mod tests {
             worker_peer_id: PeerId("wkr-1".into()),
             highest_boot_generation: WorkerBootGeneration(generation),
             active_incarnation: active.map(WorkerIncarnationId),
+            clone_ambiguous: false,
             operator_reenrollment_generation: 0,
         }
     }
@@ -176,6 +233,34 @@ mod tests {
             consumed.evaluate(&o),
             WorkerAdmission::RejectCloneAmbiguity,
             "a replayed proof must not resolve ambiguity"
+        );
+    }
+
+    #[test]
+    fn durable_ambiguity_fences_incumbent_sessions_and_leases() {
+        let mut r = record(3, Some(11));
+        r.clone_ambiguous = true;
+        assert_eq!(
+            r.evaluate(&offer(3, 11)),
+            WorkerAdmission::RejectCloneAmbiguity,
+            "the incumbent is not privileged once two clones are visible"
+        );
+        assert_eq!(
+            r.validate_lease_binding(
+                &PeerId("wkr-1".into()),
+                WorkerBootGeneration(3),
+                WorkerIncarnationId(11),
+            ),
+            Err(WorkerLeaseBindingRejection::CloneAmbiguous)
+        );
+
+        let mut selected = offer(3, 22);
+        selected.reenrollment_proof = Some(1);
+        assert_eq!(r.evaluate(&selected), WorkerAdmission::AdmitViaReenrollment);
+        assert_eq!(
+            r.evaluate(&offer(4, 33)),
+            WorkerAdmission::RejectCloneAmbiguity,
+            "a self-reported boot increment cannot adjudicate which clone is legitimate"
         );
     }
 

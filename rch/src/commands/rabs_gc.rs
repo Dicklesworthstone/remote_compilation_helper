@@ -807,17 +807,7 @@ pub const DEFAULT_MIN_SEQ_LAG: u64 = 1_000;
 fn operations_watermark<E: rabs_cas::metadata_store::SqlEngine>(
     store: &mut rabs_cas::metadata_store::SqlMetadataStore<E>,
 ) -> anyhow::Result<u64> {
-    let rows = store
-        .engine_mut()
-        .query("SELECT COALESCE(MAX(updated_seq), 1) FROM operations", &[])?;
-    Ok(rows
-        .first()
-        .and_then(|r| r.first())
-        .map(|v| match v {
-            SqlValue::Int(n) => (*n).max(1) as u64,
-            _ => 1,
-        })
-        .unwrap_or(1))
+    Ok(store.operation_update_high_water()?)
 }
 
 /// The real CAS directory, viewed through [`FilesystemReality`].

@@ -20,6 +20,7 @@ fn fence(generation: u64, active: Option<u128>) -> WorkerIncarnationFenceRecord 
         worker_peer_id: PeerId("wkr-1".into()),
         highest_boot_generation: WorkerBootGeneration(generation),
         active_incarnation: active.map(WorkerIncarnationId),
+        clone_ambiguous: false,
         operator_reenrollment_generation: 0,
     }
 }
@@ -52,9 +53,21 @@ fn t038_cloned_disk_image_fails_closed_until_enrollment() {
     // incarnation — is the clone-ambiguity case: rejected, because
     // incarnation fencing DETECTS duplication but cannot prove which
     // clone is legitimate (I54).
-    let record = fence(3, Some(11));
+    let mut record = fence(3, Some(11));
     assert_eq!(
         record.evaluate(&offer(3, 22)),
+        WorkerAdmission::RejectCloneAmbiguity
+    );
+    // The coordinator persists the observation. From that point the
+    // incumbent is no more trustworthy than the challenger, and a clone
+    // cannot self-select by incrementing its copied boot counter.
+    record.clone_ambiguous = true;
+    assert_eq!(
+        record.evaluate(&offer(3, 11)),
+        WorkerAdmission::RejectCloneAmbiguity
+    );
+    assert_eq!(
+        record.evaluate(&offer(4, 11)),
         WorkerAdmission::RejectCloneAmbiguity
     );
     // Operator enrollment is the sanctioned resolution: a FRESH proof

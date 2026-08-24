@@ -16,8 +16,9 @@
 //!    `created_under_authority_digest` must equal that digest (the F033
 //!    equality check — one full authority copy, bound by digest);
 //! 2. generation fence: the generation exists and is not tombstoned;
-//! 3. attempt/lease fences: the attempt exists under that generation and
-//!    its execution lease is unreleased;
+//! 3. attempt/lease/worker fences: the exact normalized lease-to-attempt
+//!    binding, renewal sequence, boot generation, process incarnation, and
+//!    current non-ambiguous worker fence all agree;
 //! 4. descriptor reload + byte-compare against the coordinator's own copy;
 //! 5. key + epoch validation against the action entry;
 //! 6. INDEPENDENT digest recompute: the coordinator recomputes
@@ -45,8 +46,8 @@ use rabs_protocol::result_identity::{
 use sha2::{Digest, Sha256};
 
 use crate::metadata_store::{
-    CommitOutcome, DivergenceIncidentRow, ProvisionalAncestorRow, PublicationRow, QuarantineScope,
-    RabsMetadataStore, ResultKindTag, StoreError, digest_key,
+    CommitOutcome, DivergenceIncidentRow, ProvisionalAncestorRow, PublicationPermit,
+    PublicationRow, QuarantineScope, RabsMetadataStore, ResultKindTag, StoreError, digest_key,
 };
 use crate::trust_evidence::DISPOSITION_QUARANTINED;
 
@@ -615,10 +616,11 @@ pub fn process_offer(
     if !store.attempt_exists(attempt_id, generation_id)? {
         return Err(OfferRefusal::UnknownAttempt);
     }
-    match store.lease_state(offer.authority.execution_lease_id.0)? {
-        None => return Err(OfferRefusal::UnknownLease),
-        Some(state) if state.released => return Err(OfferRefusal::LeaseReleased),
-        Some(_) => {}
+    match store.validate_attempt_lease(&offer.authority) {
+        Ok(_) => {}
+        Err(StoreError::UnknownLease) => return Err(OfferRefusal::UnknownLease),
+        Err(StoreError::LeaseReleased) => return Err(OfferRefusal::LeaseReleased),
+        Err(error) => return Err(OfferRefusal::Store(error)),
     }
 
     // 4. Descriptor reload + byte-compare.
@@ -777,7 +779,7 @@ pub fn process_offer(
         pin_owner: "coordinator".to_owned(),
         provisional_ancestors: ancestor_rows,
     };
-    match store.commit_publication(&offered_authority, &row)? {
+    match store.commit_publication(PublicationPermit::for_attempt(&offer.authority), &row)? {
         CommitOutcome::Committed => {}
         // The pipeline checked for an existing row above; hitting either
         // branch here means the store's own CAS caught a same-key row —
@@ -1235,6 +1237,7 @@ mod tests {
     };
     use rabs_protocol::result_identity::LogicalOutput;
     use rabs_protocol::wire_time::PeerId;
+    use rabs_protocol::worker_fence::WorkerSessionOffer;
 
     use crate::metadata_store::{
         ActionEntryRow, AuthorityRow, FsqliteEngine, ProvisionalObligationInsert, RusqliteEngine,
@@ -1347,7 +1350,8 @@ mod tests {
     /// action entry, generation, attempt, lease, and every closure object
     /// located.
     fn ready_store(store: &mut dyn RabsMetadataStore) {
-        let auth = authority_digest(&coordinator_authority());
+        let attempt_authority = attempt_authority();
+        let auth = authority_digest(&attempt_authority.coordinator);
         store
             .acquire_authority(&AuthorityRow {
                 digest: auth.clone(),
@@ -1365,10 +1369,27 @@ mod tests {
             })
             .unwrap();
         store
-            .create_generation(&auth, 11, &digest("rabs.action-key.sha256.v1", 7))
+            .create_bound_generation(
+                &auth,
+                &attempt_authority.action_generation,
+                &digest("rabs.action-key.sha256.v1", 7),
+            )
             .unwrap();
-        store.record_attempt(20, 11, "worker-a", 1).unwrap();
-        store.acquire_lease(30, 20, 1, 100).unwrap();
+        store
+            .admit_worker_session(
+                &auth,
+                &WorkerSessionOffer {
+                    worker_peer_id: attempt_authority.worker_peer_id.clone(),
+                    boot_generation: attempt_authority.worker_boot_generation,
+                    incarnation: attempt_authority.worker_incarnation_id,
+                    reenrollment_proof: None,
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .admit_attempt_lease(&attempt_authority, 1, 100)
+            .unwrap();
         for tag in [40, 41, 50, 51, 60, 61, 62, 63] {
             let id = object(tag);
             store.record_object(&id.0, 64).unwrap();
@@ -1427,7 +1448,7 @@ mod tests {
         assert_eq!(
             store
                 .commit_publication(
-                    &auth,
+                    PublicationPermit::for_fixture(&auth),
                     &PublicationRow {
                         action_key: action,
                         descriptor_digest: expected_descriptor(),

@@ -307,8 +307,8 @@ pub fn apply_operator_reset(
 mod tests {
     use super::*;
     use crate::metadata_store::{
-        ActionEntryRow, AuthorityRow, FsqliteEngine, PublicationRow, ResultKindTag, RusqliteEngine,
-        SqlEngine, SqlMetadataStore, digest_key,
+        ActionEntryRow, AuthorityRow, FsqliteEngine, PublicationPermit, PublicationRow,
+        ResultKindTag, RusqliteEngine, SqlEngine, SqlMetadataStore, digest_key,
     };
     use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -363,7 +363,7 @@ mod tests {
         }
         store
             .commit_publication(
-                &auth,
+                PublicationPermit::for_fixture(&auth),
                 &PublicationRow {
                     action_key: action,
                     descriptor_digest: digest("rabs.descriptor.sha256.v1", 8),

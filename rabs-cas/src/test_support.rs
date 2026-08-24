@@ -26,6 +26,7 @@ use rabs_protocol::result_identity::{
     OutputRole, ResultKind, TypedDigest,
 };
 use rabs_protocol::wire_time::PeerId;
+use rabs_protocol::worker_fence::WorkerSessionOffer;
 
 use crate::metadata_store::{ActionEntryRow, AuthorityRow, RabsMetadataStore};
 use crate::publication::{
@@ -429,6 +430,7 @@ pub fn install_admission_world_with_ids(
     ids: FixtureAttemptIds,
 ) {
     let auth = authority_digest(coordinator);
+    let attempt_authority = attempt_authority_with_ids(coordinator, ids);
     store
         .upsert_action_entry(&ActionEntryRow {
             action_key: sample_action_key(),
@@ -437,14 +439,27 @@ pub fn install_admission_world_with_ids(
         })
         .expect("upsert action entry");
     store
-        .create_generation(&auth, ids.generation, &sample_action_key())
+        .create_bound_generation(
+            &auth,
+            &attempt_authority.action_generation,
+            &sample_action_key(),
+        )
         .expect("create generation");
     store
-        .record_attempt(ids.attempt, ids.generation, "worker-a", 1)
-        .expect("attempt");
+        .admit_worker_session(
+            &auth,
+            &WorkerSessionOffer {
+                worker_peer_id: attempt_authority.worker_peer_id.clone(),
+                boot_generation: attempt_authority.worker_boot_generation,
+                incarnation: attempt_authority.worker_incarnation_id,
+                reenrollment_proof: None,
+            },
+            1,
+        )
+        .expect("worker session");
     store
-        .acquire_lease(ids.lease, ids.attempt, 1, 100)
-        .expect("lease");
+        .admit_attempt_lease(&attempt_authority, 1, 100)
+        .expect("attempt lease");
 }
 
 /// [`offer_with_manifest_bytes`] under a caller-supplied identity triple:

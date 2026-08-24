@@ -265,8 +265,8 @@ pub fn quarantine_served_divergence(
 mod tests {
     use super::*;
     use crate::metadata_store::{
-        ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationRow, ResultKindTag,
-        RusqliteEngine, SqlMetadataStore,
+        ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationPermit,
+        PublicationRow, ResultKindTag, RusqliteEngine, SqlMetadataStore,
     };
     use crate::serving_state::{SERVABLE_DISPOSITION, ServeDecision, serving_gate};
     use rabs_protocol::result_identity::DigestAlgorithm;
@@ -334,7 +334,9 @@ mod tests {
             provisional_ancestors: Vec::new(),
         };
         assert_eq!(
-            store.commit_publication(&active, &row).unwrap(),
+            store
+                .commit_publication(PublicationPermit::for_fixture(&active), &row)
+                .unwrap(),
             CommitOutcome::Committed
         );
         digest_key(&entry.action_key)

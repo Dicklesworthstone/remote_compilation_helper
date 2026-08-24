@@ -41,7 +41,7 @@ use rabs_cas::serving_state::{ServeDecision, serving_gate};
 use rabs_key::logical_output_map::DOMAIN_ARTIFACT_BUNDLE_ROOT;
 use rabs_key::typed_digest::{DOMAIN_ACTION_KEY, DOMAIN_DESCRIPTOR};
 use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
-use rabs_protocol::generation::WorkerIncarnationId;
+use rabs_protocol::generation::{AttemptAuthority, LeaseRenewal, WorkerIncarnationId};
 use rabs_protocol::result_identity::{
     CanonicalActionResultManifest, DigestAlgorithm, OutputRole, TypedDigest,
 };
@@ -101,6 +101,64 @@ pub enum CommitRefusal {
     Offer(OfferRefusal),
     /// A store error surfaced outside `process_offer`.
     Store(String),
+}
+
+/// Why the live coordinator did not grant or renew a worker-bound
+/// execution lease. A refusal never emits an actor message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptLeaseRefusal {
+    /// No authoritative CAS metadata store is mounted.
+    NoStore,
+    /// This coordinator has not acquired its boot authority.
+    NoAuthority,
+    /// The request belongs to another coordinator incarnation.
+    StaleAuthority,
+    /// The metadata-store mutex is unavailable.
+    StoreUnavailable,
+    /// A typed durable authority/fence refusal.
+    Store(StoreError),
+}
+
+/// Opaque proof that the durable coordinator transaction admitted this
+/// exact attempt/lease/worker tuple. Only this module can mint one; the
+/// pure action actor consumes it instead of raw worker claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedAttemptLease {
+    authority: AttemptAuthority,
+}
+
+impl ValidatedAttemptLease {
+    pub(crate) const fn authority(&self) -> &AttemptAuthority {
+        &self.authority
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(authority: AttemptAuthority) -> Self {
+        Self { authority }
+    }
+}
+
+/// Opaque proof that a durable compare-and-swap accepted one renewal
+/// under the exact current worker fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedLeaseRenewal {
+    authority: AttemptAuthority,
+    renewal: LeaseRenewal,
+}
+
+impl ValidatedLeaseRenewal {
+    pub(crate) const fn authority(&self) -> &AttemptAuthority {
+        &self.authority
+    }
+
+    pub(crate) const fn renewal(&self) -> LeaseRenewal {
+        self.renewal
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(authority: AttemptAuthority, renewal: LeaseRenewal) -> Self {
+        Self { authority, renewal }
+    }
 }
 
 impl std::fmt::Display for CommitRefusal {
@@ -432,8 +490,9 @@ impl CoordLive {
 
     /// Admit one worker connection through the durable S022 fence.
     /// The returned sequence exists only for admitted sessions and must
-    /// be presented to [`Self::release_worker_session`]; rejections write
-    /// neither the fence nor the session journal.
+    /// be presented to [`Self::release_worker_session`]. Stale/identity
+    /// refusals write nothing; clone ambiguity durably marks the fence and
+    /// revokes the worker's leases but appends no session journal row.
     ///
     /// # Errors
     /// A precise reason if the CAS, coordinator authority, lock, or
@@ -484,6 +543,66 @@ impl CoordLive {
                 ended_seq,
             )
             .map_err(|e| format!("worker session release: {e:?}"))
+    }
+
+    /// Atomically grant one attempt and its execution lease under the
+    /// exact active worker boot-generation/incarnation tuple.
+    ///
+    /// # Errors
+    /// A typed refusal when this coordinator/store is unavailable, the
+    /// request names stale coordinator authority, or any durable generation
+    /// or worker fence rejects it.
+    pub fn admit_attempt_lease(
+        &self,
+        authority: &AttemptAuthority,
+        expires_at_seq: u64,
+    ) -> Result<ValidatedAttemptLease, AttemptLeaseRefusal> {
+        let cas = self.cas.as_ref().ok_or(AttemptLeaseRefusal::NoStore)?;
+        let held = self.authority().ok_or(AttemptLeaseRefusal::NoAuthority)?;
+        if authority_digest(&authority.coordinator) != authority_digest(&held) {
+            return Err(AttemptLeaseRefusal::StaleAuthority);
+        }
+        let recorded_seq = self.next_seq();
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| AttemptLeaseRefusal::StoreUnavailable)?;
+        store
+            .admit_attempt_lease(authority, recorded_seq, expires_at_seq)
+            .map_err(AttemptLeaseRefusal::Store)?;
+        Ok(ValidatedAttemptLease {
+            authority: authority.clone(),
+        })
+    }
+
+    /// Renew one attempt lease by durable compare-and-swap, revalidating
+    /// the exact current worker fence in the same transaction.
+    ///
+    /// # Errors
+    /// As [`Self::admit_attempt_lease`], plus lease ownership/sequence
+    /// refusals.
+    pub fn renew_attempt_lease(
+        &self,
+        authority: &AttemptAuthority,
+        renewal: LeaseRenewal,
+        expires_at_seq: u64,
+    ) -> Result<ValidatedLeaseRenewal, AttemptLeaseRefusal> {
+        let cas = self.cas.as_ref().ok_or(AttemptLeaseRefusal::NoStore)?;
+        let held = self.authority().ok_or(AttemptLeaseRefusal::NoAuthority)?;
+        if authority_digest(&authority.coordinator) != authority_digest(&held) {
+            return Err(AttemptLeaseRefusal::StaleAuthority);
+        }
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| AttemptLeaseRefusal::StoreUnavailable)?;
+        store
+            .renew_attempt_lease(authority, renewal, expires_at_seq)
+            .map_err(AttemptLeaseRefusal::Store)?;
+        Ok(ValidatedLeaseRenewal {
+            authority: authority.clone(),
+            renewal,
+        })
     }
 
     /// Commit a worker's prepared-result offer: the coordinator-only
@@ -908,7 +1027,11 @@ pub fn coord_work(
 mod tests {
     use super::*;
     use crate::janitor::store::mount_and_reconcile;
-    use rabs_protocol::generation::WorkerBootGeneration;
+    use rabs_cas::test_support::{attempt_authority_for, offer_under, sample_expected_descriptor};
+    use rabs_protocol::generation::{
+        AttemptId, ExecutionLeaseId, LeaseRenewalSeq, WorkerBootGeneration,
+    };
+    use rabs_protocol::worker_fence::WorkerLeaseBindingRejection;
     use std::sync::Arc;
 
     fn worker_offer(generation: u64, incarnation: u128) -> WorkerSessionOffer {
@@ -1037,8 +1160,11 @@ mod tests {
         let (resume, resumed_seq) = coord
             .admit_worker_session(&worker_offer(5, 0x22))
             .expect("resume admission");
-        assert_eq!(resume, WorkerAdmission::AdmitResume);
-        assert!(resumed_seq.is_some());
+        assert_eq!(resume, WorkerAdmission::RejectCloneAmbiguity);
+        assert_eq!(
+            resumed_seq, None,
+            "ending sessions cannot select the legitimate clone"
+        );
 
         drop(coord);
         drop(cas);
@@ -1076,5 +1202,166 @@ mod tests {
             .expect("replayed proof decision");
         assert_eq!(rejected_replay, WorkerAdmission::RejectCloneAmbiguity);
         assert_eq!(replay_seq, None);
+    }
+
+    #[test]
+    fn t038_clone_ambiguity_durably_revokes_old_leases_until_reenrollment() {
+        let dir = tempfile::tempdir().expect("temp store");
+        let cas = Arc::new(mount_and_reconcile(dir.path()).expect("mount"));
+        let coord = CoordLive::with_cas(Arc::clone(&cas));
+        let coordinator = coord
+            .acquire_boot_authority("test-cluster")
+            .expect("authority");
+        let authority_digest = authority_digest(&coordinator);
+
+        let first = worker_offer(5, 0x11);
+        assert_eq!(
+            coord.admit_worker_session(&first).expect("first session").0,
+            WorkerAdmission::AdmitNewGeneration
+        );
+
+        let mut incumbent = attempt_authority_for(&coordinator);
+        incumbent.worker_boot_generation = WorkerBootGeneration(5);
+        incumbent.worker_incarnation_id = WorkerIncarnationId(0x11);
+        {
+            let mut store = cas.store().lock().expect("store lock");
+            store
+                .upsert_action_entry(&rabs_cas::metadata_store::ActionEntryRow {
+                    action_key: incumbent.action_key.clone(),
+                    key_epoch: 1,
+                    projection_epoch: 1,
+                })
+                .expect("action entry");
+            store
+                .create_bound_generation(
+                    &authority_digest,
+                    &incumbent.action_generation,
+                    &incumbent.action_key,
+                )
+                .expect("bound generation");
+        }
+        coord
+            .admit_attempt_lease(&incumbent, 100)
+            .expect("incumbent lease");
+        let first_renewal = LeaseRenewal {
+            lease: incumbent.execution_lease_id,
+            seq: LeaseRenewalSeq(2),
+        };
+        coord
+            .renew_attempt_lease(&incumbent, first_renewal, 200)
+            .expect("incumbent renewal");
+        incumbent.lease_renewal_seq = LeaseRenewalSeq(2);
+
+        assert_eq!(
+            coord
+                .admit_worker_session(&worker_offer(5, 0x22))
+                .expect("clone decision"),
+            (WorkerAdmission::RejectCloneAmbiguity, None)
+        );
+        assert_eq!(
+            coord
+                .admit_worker_session(&first)
+                .expect("incumbent reconnect decision"),
+            (WorkerAdmission::RejectCloneAmbiguity, None),
+            "ambiguity fences the incumbent as well as the challenger"
+        );
+        assert_eq!(
+            coord.renew_attempt_lease(
+                &incumbent,
+                LeaseRenewal {
+                    lease: incumbent.execution_lease_id,
+                    seq: LeaseRenewalSeq(3),
+                },
+                300,
+            ),
+            Err(AttemptLeaseRefusal::Store(StoreError::WorkerLeaseRejected(
+                WorkerLeaseBindingRejection::CloneAmbiguous,
+            )))
+        );
+
+        let mut stale_offer = offer_under(&coordinator);
+        stale_offer.authority = incumbent.clone();
+        assert_eq!(
+            coord.commit_offer(&stale_offer, &sample_expected_descriptor()),
+            Err(CommitRefusal::Offer(OfferRefusal::Store(
+                StoreError::WorkerLeaseRejected(WorkerLeaseBindingRejection::CloneAmbiguous),
+            )))
+        );
+        {
+            let mut store = cas.store().lock().expect("store lock");
+            assert!(
+                !store
+                    .has_publication(&incumbent.action_key)
+                    .expect("publication query")
+            );
+            assert!(
+                store
+                    .worker_incarnation_fence(&incumbent.worker_peer_id)
+                    .expect("fence query")
+                    .expect("worker fence")
+                    .clone_ambiguous
+            );
+            assert!(
+                store
+                    .lease_state(incumbent.execution_lease_id.0)
+                    .expect("lease query")
+                    .expect("incumbent lease")
+                    .released,
+                "clone detection durably revokes pre-ambiguity leases"
+            );
+        }
+
+        drop(coord);
+        drop(cas);
+        let reopened = Arc::new(mount_and_reconcile(dir.path()).expect("reopen"));
+        let mut store = reopened.store().lock().expect("reopened store lock");
+        assert_eq!(
+            store.validate_attempt_lease(&incumbent),
+            Err(StoreError::WorkerLeaseRejected(
+                WorkerLeaseBindingRejection::CloneAmbiguous,
+            )),
+            "ambiguity survives process/store reopen"
+        );
+
+        let mut selected = worker_offer(5, 0x22);
+        selected.reenrollment_proof = Some(1);
+        assert_eq!(
+            store.admit_worker_session(&authority_digest, &selected, 400),
+            Ok(WorkerAdmission::AdmitViaReenrollment)
+        );
+        assert_eq!(
+            store.validate_attempt_lease(&incumbent),
+            Err(StoreError::WorkerLeaseRejected(
+                WorkerLeaseBindingRejection::IncarnationMismatch,
+            )),
+            "the revoked incumbent lease cannot revive after selecting another clone"
+        );
+
+        let mut replacement = incumbent.clone();
+        replacement.attempt_id = AttemptId(21);
+        replacement.execution_lease_id = ExecutionLeaseId(31);
+        replacement.lease_renewal_seq = LeaseRenewalSeq(1);
+        replacement.worker_incarnation_id = WorkerIncarnationId(0x22);
+        store
+            .admit_attempt_lease(&replacement, 401, 500)
+            .expect("replacement lease");
+        store
+            .renew_attempt_lease(
+                &replacement,
+                LeaseRenewal {
+                    lease: replacement.execution_lease_id,
+                    seq: LeaseRenewalSeq(2),
+                },
+                600,
+            )
+            .expect("replacement renewal");
+        replacement.lease_renewal_seq = LeaseRenewalSeq(2);
+        assert_eq!(
+            store.validate_attempt_lease(&replacement),
+            Ok(rabs_cas::metadata_store::LeaseState {
+                released: false,
+                renewal_seq: 2,
+            })
+        );
     }
 }

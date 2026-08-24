@@ -34,12 +34,14 @@
 
 use std::collections::HashMap;
 
-use rabs_protocol::generation::{WorkerBootGeneration, WorkerIncarnationId};
+use rabs_protocol::generation::{
+    ActionGeneration, AttemptAuthority, LeaseRenewal, WorkerBootGeneration, WorkerIncarnationId,
+};
 use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use rabs_protocol::serving::ServingValidity;
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::{
-    WorkerAdmission, WorkerIncarnationFenceRecord, WorkerSessionOffer,
+    WorkerAdmission, WorkerIncarnationFenceRecord, WorkerLeaseBindingRejection, WorkerSessionOffer,
 };
 
 /// Current schema version (v8 = the full H038 authoritative table set;
@@ -56,8 +58,10 @@ use rabs_protocol::worker_fence::{
 /// (edge-local records of outputs installed before lineage closure,
 /// with ownership-safe recovery state); v19 = L008 native child
 /// bindings gating parent build-script publication; v20 = S022 durable
-/// worker boot-generation and active-incarnation fencing.
-pub const SCHEMA_VERSION: u32 = 20;
+/// worker boot-generation and active-incarnation fencing; v21 = T038
+/// durable clone ambiguity plus normalized worker bindings on attempts
+/// (every execution lease links through its attempt).
+pub const SCHEMA_VERSION: u32 = 21;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -451,6 +455,22 @@ pub const MIGRATIONS: &[Migration] = &[
          operator_reenrollment_generation BLOB NOT NULL DEFAULT X'0000000000000000'",
         ],
     },
+    Migration {
+        // T038/I47: clone detection fences BOTH contenders until a fresh
+        // proof selects one. Attempts created before this migration remain
+        // NULL-bound and therefore can never acquire/renew a live lease or
+        // publish; silently defaulting them to a current worker would turn
+        // unknown legacy provenance into authority.
+        version: 21,
+        statements: &[
+            "ALTER TABLE worker_incarnation_fences ADD COLUMN \
+         clone_ambiguous INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE action_generations ADD COLUMN per_key_ordinal BLOB",
+            "ALTER TABLE action_attempts ADD COLUMN worker_boot_generation BLOB",
+            "ALTER TABLE action_attempts ADD COLUMN worker_incarnation BLOB",
+            "ALTER TABLE action_attempts ADD COLUMN execution_lease_hex TEXT",
+        ],
+    },
 ];
 
 impl std::fmt::Display for StoreError {
@@ -482,10 +502,30 @@ pub enum StoreError {
     GenerationIdNotAboveHighWater,
     /// Attempt id already recorded (attempts are append-only).
     DuplicateAttempt,
+    /// Execution lease id already exists.
+    DuplicateLease,
     /// Referenced generation does not exist.
     UnknownGeneration,
+    /// Referenced generation was closed and may issue no new/renewed work.
+    GenerationTombstoned,
     /// Referenced lease does not exist.
     UnknownLease,
+    /// The lease row names a different attempt than the presented full
+    /// attempt authority.
+    LeaseAttemptMismatch,
+    /// The attempt row is legacy/unbound or disagrees with the presented
+    /// generation/worker tuple.
+    AttemptAuthorityMismatch,
+    /// A pre-v21 generation or attempt lacks the authority columns needed
+    /// to prove a lease binding; legacy uncertainty always fails closed.
+    LegacyUnboundAuthority,
+    /// No durable worker fence exists for the attempt's worker.
+    UnknownWorkerFence,
+    /// The attempt's bound worker tuple is stale, inactive, or ambiguous.
+    WorkerLeaseRejected(WorkerLeaseBindingRejection),
+    /// The renewal sequence carried by an authority-bearing message does
+    /// not equal the store's last accepted value.
+    LeaseRenewalMismatch,
     /// Lease already released.
     LeaseReleased,
     /// Renewal sequence not strictly greater than the stored one.
@@ -613,6 +653,53 @@ pub struct PublicationRow {
     /// transaction as the publication pointer (H028; I32). Empty when
     /// the result consumed no provisional outputs.
     pub provisional_ancestors: Vec<ProvisionalAncestorRow>,
+}
+
+/// Sealed authority capability for a publication transaction.
+///
+/// Production callers can construct this only from a full, worker-bound
+/// [`AttemptAuthority`]. The coordinator-only constructor exists solely in
+/// unit-test builds for fixtures that exercise unrelated metadata behavior;
+/// it is absent from production artifacts.
+#[derive(Debug, Clone, Copy)]
+pub struct PublicationPermit<'a> {
+    source: PublicationPermitSource<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PublicationPermitSource<'a> {
+    Attempt(&'a AttemptAuthority),
+    #[cfg(test)]
+    Fixture(&'a TypedDigest),
+}
+
+impl<'a> PublicationPermit<'a> {
+    /// Bind a publication to one exact attempt, execution lease, renewal,
+    /// worker boot generation, and worker incarnation.
+    #[must_use]
+    pub const fn for_attempt(authority: &'a AttemptAuthority) -> Self {
+        Self {
+            source: PublicationPermitSource::Attempt(authority),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_fixture(authority: &'a TypedDigest) -> Self {
+        Self {
+            source: PublicationPermitSource::Fixture(authority),
+        }
+    }
+
+    fn into_parts(self) -> (TypedDigest, Option<AttemptAuthority>) {
+        match self.source {
+            PublicationPermitSource::Attempt(attempt) => (
+                rabs_key::authority_binding::coordinator_authority_digest(&attempt.coordinator),
+                Some(attempt.clone()),
+            ),
+            #[cfg(test)]
+            PublicationPermitSource::Fixture(authority) => (authority.clone(), None),
+        }
+    }
 }
 
 /// One verified provisional-ancestor lineage row (H028): the consumer
@@ -1100,6 +1187,16 @@ pub trait RabsMetadataStore {
         action_key: &TypedDigest,
     ) -> Result<(), StoreError>;
 
+    /// Create a generation with its full v21 authority binding. Unlike
+    /// [`Self::create_generation`], this persists the diagnostic ordinal;
+    /// only bound generations may receive live execution leases.
+    fn create_bound_generation(
+        &mut self,
+        authority: &TypedDigest,
+        generation: &ActionGeneration,
+        action_key: &TypedDigest,
+    ) -> Result<(), StoreError>;
+
     /// Tombstone a generation (the id stays burned forever).
     fn tombstone_generation(&mut self, id: u128) -> Result<(), StoreError>;
 
@@ -1115,7 +1212,11 @@ pub trait RabsMetadataStore {
         active: &TypedDigest,
     ) -> Result<u64, StoreError>;
 
-    /// Record an attempt (append-only; duplicate id is an error).
+    /// Record an attempt without granting an execution lease (append-only;
+    /// duplicate id is an error). This observational/recovery seam leaves
+    /// the v21 authority-binding columns NULL, so the row can never pass a
+    /// lease or publication gate. Live admission must use
+    /// [`Self::admit_attempt_lease`].
     fn record_attempt(
         &mut self,
         id: u128,
@@ -1124,20 +1225,24 @@ pub trait RabsMetadataStore {
         seq: u64,
     ) -> Result<(), StoreError>;
 
-    /// Acquire an execution lease for an attempt.
-    fn acquire_lease(
+    /// Atomically record an attempt and acquire its execution lease after
+    /// validating the full authority, generation, and exact active,
+    /// non-ambiguous worker tuple.
+    fn admit_attempt_lease(
         &mut self,
-        id: u128,
-        attempt: u128,
-        renewal_seq: u64,
+        authority: &AttemptAuthority,
+        recorded_seq: u64,
         expires_at_seq: u64,
     ) -> Result<(), StoreError>;
 
-    /// Renew a lease: `renewal_seq` must be strictly greater than stored.
-    fn renew_lease(
+    /// Renew an execution lease after revalidating its normalized
+    /// lease-to-attempt link and the attempt's exact current worker fence.
+    /// The authority carries the last accepted sequence; `renewal` must
+    /// name the same lease and advance it strictly (a durable CAS).
+    fn renew_attempt_lease(
         &mut self,
-        id: u128,
-        renewal_seq: u64,
+        authority: &AttemptAuthority,
+        renewal: LeaseRenewal,
         expires_at_seq: u64,
     ) -> Result<(), StoreError>;
 
@@ -1146,10 +1251,13 @@ pub trait RabsMetadataStore {
 
     /// Coordinator-only atomic publication commit (row + serving state +
     /// winner evidence row + reachability pin in ONE transaction;
-    /// conflicts quarantine).
+    /// conflicts quarantine). Live offer admission supplies
+    /// a sealed [`PublicationPermit`] so the exact lease and worker fence
+    /// are revalidated inside this same transaction. Production permits
+    /// are constructible only from a full [`AttemptAuthority`].
     fn commit_publication(
         &mut self,
-        authority: &TypedDigest,
+        permit: PublicationPermit<'_>,
         row: &PublicationRow,
     ) -> Result<CommitOutcome, StoreError>;
 
@@ -1192,6 +1300,14 @@ pub trait RabsMetadataStore {
 
     /// Lease state (released flag + last renewal), if the lease exists.
     fn lease_state(&mut self, id: u128) -> Result<Option<LeaseState>, StoreError>;
+
+    /// Revalidate one authority-bearing attempt/lease against the durable
+    /// normalized binding and the worker's current non-ambiguous fence.
+    /// The returned state belongs to this exact attempt and lease.
+    fn validate_attempt_lease(
+        &mut self,
+        authority: &AttemptAuthority,
+    ) -> Result<LeaseState, StoreError>;
 
     /// Whether an object has at least one recorded location.
     fn object_located(&mut self, object: &TypedDigest) -> Result<bool, StoreError>;
@@ -1457,8 +1573,10 @@ pub trait RabsMetadataStore {
     /// Atomically admit a worker session under the active coordinator:
     /// evaluate the durable boot-generation/incarnation fence, advance
     /// it on admission, and append the open session row in the SAME
-    /// transaction. Rejections are typed [`WorkerAdmission`] values and
-    /// write nothing.
+    /// transaction. Rejections are typed [`WorkerAdmission`] values.
+    /// Stale/identity refusals write nothing; clone ambiguity atomically
+    /// persists the ambiguity and revokes that worker's live leases while
+    /// appending no session row.
     fn admit_worker_session(
         &mut self,
         authority: &TypedDigest,
@@ -2080,10 +2198,32 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
         Ok(store)
     }
 
-    /// Direct engine access for diagnostic/repair tooling and for test
-    /// fixtures that must SEED corrupted or torn states the public API
-    /// refuses to produce (H013 drift fixtures).
-    pub fn engine_mut(&mut self) -> &mut E {
+    /// Highest durable operation update sequence, clamped to the initial
+    /// sequence floor used by operator tooling.
+    ///
+    /// This narrow query keeps cross-crate diagnostics from receiving a
+    /// mutable SQL escape hatch around authority and clone fencing.
+    pub fn operation_update_high_water(&mut self) -> Result<u64, StoreError> {
+        let rows = self
+            .engine
+            .query("SELECT COALESCE(MAX(updated_seq), 1) FROM operations", &[])?;
+        let [row] = rows.as_slice() else {
+            return Err(StoreError::Corruption(
+                "operation update high-water row count".into(),
+            ));
+        };
+        let [value] = row.as_slice() else {
+            return Err(StoreError::Corruption(
+                "operation update high-water shape".into(),
+            ));
+        };
+        Ok(expect_u64(value, "operation update high-water")?.max(1))
+    }
+
+    /// Crate-internal engine access for reconciliation, authority-gate,
+    /// crash-injection, and corruption fixtures. External callers cannot
+    /// bypass the transactional metadata API with arbitrary SQL.
+    pub(crate) fn engine_mut(&mut self) -> &mut E {
         &mut self.engine
     }
 
@@ -2177,6 +2317,46 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
         })
     }
 
+    fn create_bound_generation(
+        &mut self,
+        authority: &TypedDigest,
+        generation: &ActionGeneration,
+        action_key: &TypedDigest,
+    ) -> Result<(), StoreError> {
+        if generation.created_under_authority_digest != *authority {
+            return Err(StoreError::AttemptAuthorityMismatch);
+        }
+        let authority = authority.clone();
+        let action = digest_key(action_key);
+        let generation = generation.clone();
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let id = generation.generation_id.0;
+            let high_water = SqlMetadataStore::<E>::generation_high_water(engine)?;
+            if id <= high_water {
+                return Err(StoreError::GenerationIdNotAboveHighWater);
+            }
+            engine.execute(
+                "INSERT INTO action_generations \
+                 (id_hex, id, action_key, authority_key, tombstoned, per_key_ordinal) \
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                &[
+                    SqlValue::Text(u128_hex(id)),
+                    SqlValue::Blob(u128_blob(id)),
+                    SqlValue::Text(action),
+                    SqlValue::Text(digest_key(&authority)),
+                    SqlValue::Blob(u64_blob(generation.per_key_ordinal)),
+                ],
+            )?;
+            engine.execute(
+                "INSERT OR REPLACE INTO generation_high_water (kind, value) \
+                 VALUES ('action-generation', ?1)",
+                &[SqlValue::Blob(u128_blob(id))],
+            )?;
+            Ok(())
+        })
+    }
+
     fn digest_params(d: &TypedDigest) -> [SqlValue; 3] {
         [
             SqlValue::Text(algo_tag(d.algorithm).to_owned()),
@@ -2224,6 +2404,159 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
             Some(active) if active == digest_key(authority) => Ok(()),
             _ => Err(StoreError::NotActiveAuthority),
         }
+    }
+
+    fn attempt_authority_digest(authority: &AttemptAuthority) -> TypedDigest {
+        rabs_key::authority_binding::coordinator_authority_digest(&authority.coordinator)
+    }
+
+    fn require_attempt_context(
+        engine: &mut E,
+        authority: &AttemptAuthority,
+    ) -> Result<TypedDigest, StoreError> {
+        let coordinator = Self::attempt_authority_digest(authority);
+        Self::require_active(engine, &coordinator)?;
+        if authority.action_generation.created_under_authority_digest != coordinator {
+            return Err(StoreError::AttemptAuthorityMismatch);
+        }
+        let rows = engine.query(
+            "SELECT action_key, authority_key, tombstoned, per_key_ordinal \
+             FROM action_generations WHERE id_hex = ?1",
+            &[SqlValue::Text(u128_hex(
+                authority.action_generation.generation_id.0,
+            ))],
+        )?;
+        let Some(row) = rows.first() else {
+            return Err(StoreError::UnknownGeneration);
+        };
+        if rows.len() != 1 {
+            return Err(StoreError::Corruption(
+                "duplicate action generation rows".into(),
+            ));
+        }
+        let [action_key, authority_key, tombstoned, ordinal] = row.as_slice() else {
+            return Err(StoreError::Corruption(
+                "action generation binding shape".into(),
+            ));
+        };
+        if expect_u64(tombstoned, "generation tombstoned")? != 0 {
+            return Err(StoreError::GenerationTombstoned);
+        }
+        let stored_ordinal = match ordinal {
+            SqlValue::Null => return Err(StoreError::LegacyUnboundAuthority),
+            value => expect_u64_blob(value, "generation ordinal")?,
+        };
+        if expect_text(action_key, "generation action key")? != digest_key(&authority.action_key)
+            || expect_text(authority_key, "generation authority")? != digest_key(&coordinator)
+            || stored_ordinal != authority.action_generation.per_key_ordinal
+        {
+            return Err(StoreError::AttemptAuthorityMismatch);
+        }
+        Ok(coordinator)
+    }
+
+    fn require_worker_lease_binding(
+        engine: &mut E,
+        worker: &PeerId,
+        boot_generation: WorkerBootGeneration,
+        incarnation: WorkerIncarnationId,
+    ) -> Result<(), StoreError> {
+        let rows = engine.query(
+            "SELECT highest_boot_generation, incarnation, active, \
+             operator_reenrollment_generation, clone_ambiguous \
+             FROM worker_incarnation_fences WHERE worker = ?1",
+            &[SqlValue::Text(worker.0.clone())],
+        )?;
+        let Some(row) = rows.first() else {
+            return Err(StoreError::UnknownWorkerFence);
+        };
+        if rows.len() != 1 {
+            return Err(StoreError::Corruption("duplicate worker fence rows".into()));
+        }
+        let fence = decode_worker_incarnation_fence(&worker.0, row)?;
+        fence
+            .validate_lease_binding(worker, boot_generation, incarnation)
+            .map_err(StoreError::WorkerLeaseRejected)
+    }
+
+    fn revoke_worker_leases(engine: &mut E, worker: &str) -> Result<(), StoreError> {
+        engine.execute(
+            "UPDATE execution_leases SET released = 1 \
+             WHERE released = 0 AND attempt_hex IN \
+             (SELECT id_hex FROM action_attempts WHERE worker = ?1)",
+            &[SqlValue::Text(worker.to_owned())],
+        )?;
+        Ok(())
+    }
+
+    fn bound_lease_state(
+        engine: &mut E,
+        authority: &AttemptAuthority,
+    ) -> Result<LeaseState, StoreError> {
+        Self::require_attempt_context(engine, authority)?;
+        let rows = engine.query(
+            "SELECT l.attempt_hex, l.released, l.renewal_seq, \
+                    a.generation_hex, a.worker, a.worker_boot_generation, \
+                    a.worker_incarnation, a.execution_lease_hex \
+             FROM execution_leases l \
+             LEFT JOIN action_attempts a ON a.id_hex = l.attempt_hex \
+             WHERE l.id_hex = ?1",
+            &[SqlValue::Text(u128_hex(authority.execution_lease_id.0))],
+        )?;
+        let Some(row) = rows.first() else {
+            return Err(StoreError::UnknownLease);
+        };
+        if rows.len() != 1 {
+            return Err(StoreError::Corruption(
+                "duplicate execution lease rows".into(),
+            ));
+        }
+        let [
+            attempt_hex,
+            released,
+            renewal_seq,
+            generation_hex,
+            worker,
+            boot,
+            incarnation,
+            attempt_lease_hex,
+        ] = row.as_slice()
+        else {
+            return Err(StoreError::Corruption("bound lease row shape".into()));
+        };
+        if expect_text(attempt_hex, "lease attempt")? != u128_hex(authority.attempt_id.0) {
+            return Err(StoreError::LeaseAttemptMismatch);
+        }
+        let (stored_boot, stored_incarnation, stored_attempt_lease) =
+            match (boot, incarnation, attempt_lease_hex) {
+                (SqlValue::Null, _, _) | (_, SqlValue::Null, _) | (_, _, SqlValue::Null) => {
+                    return Err(StoreError::LegacyUnboundAuthority);
+                }
+                (boot, incarnation, attempt_lease) => (
+                    expect_u64_blob(boot, "attempt worker boot generation")?,
+                    expect_u128(incarnation, "attempt worker incarnation")?,
+                    expect_text(attempt_lease, "attempt execution lease")?,
+                ),
+            };
+        if expect_text(generation_hex, "attempt generation")?
+            != u128_hex(authority.action_generation.generation_id.0)
+            || expect_text(worker, "attempt worker")? != authority.worker_peer_id.0
+            || stored_boot != authority.worker_boot_generation.0
+            || stored_incarnation != authority.worker_incarnation_id.0
+            || stored_attempt_lease != u128_hex(authority.execution_lease_id.0)
+        {
+            return Err(StoreError::AttemptAuthorityMismatch);
+        }
+        Self::require_worker_lease_binding(
+            engine,
+            &authority.worker_peer_id,
+            authority.worker_boot_generation,
+            authority.worker_incarnation_id,
+        )?;
+        Ok(LeaseState {
+            released: expect_u64(released, "released")? != 0,
+            renewal_seq: expect_u64(renewal_seq, "renewal_seq")?,
+        })
     }
 
     fn generation_high_water(engine: &mut E) -> Result<u128, StoreError> {
@@ -2425,6 +2758,7 @@ fn decode_worker_incarnation_fence(
         incarnation,
         active,
         operator_reenrollment_generation,
+        clone_ambiguous,
     ] = row
     else {
         return Err(StoreError::Corruption("worker fence shape".into()));
@@ -2446,6 +2780,15 @@ fn decode_worker_incarnation_fence(
             "worker boot generation",
         )?),
         active_incarnation,
+        clone_ambiguous: match expect_u64(clone_ambiguous, "clone ambiguous")? {
+            0 => false,
+            1 => true,
+            other => {
+                return Err(StoreError::Corruption(format!(
+                    "clone ambiguous flag {other}"
+                )));
+            }
+        },
         operator_reenrollment_generation: expect_u64_blob(
             operator_reenrollment_generation,
             "worker reenrollment generation",
@@ -2676,6 +3019,15 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         })
     }
 
+    fn create_bound_generation(
+        &mut self,
+        authority: &TypedDigest,
+        generation: &ActionGeneration,
+        action_key: &TypedDigest,
+    ) -> Result<(), StoreError> {
+        SqlMetadataStore::create_bound_generation(self, authority, generation, action_key)
+    }
+
     fn close_generations_for_other_authorities(
         &mut self,
         active: &TypedDigest,
@@ -2744,26 +3096,71 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         })
     }
 
-    fn acquire_lease(
+    fn admit_attempt_lease(
         &mut self,
-        id: u128,
-        attempt: u128,
-        renewal_seq: u64,
+        authority: &AttemptAuthority,
+        recorded_seq: u64,
         expires_at_seq: u64,
     ) -> Result<(), StoreError> {
-        let renewal = i64::try_from(renewal_seq)
+        let authority = authority.clone();
+        let recorded = i64::try_from(recorded_seq)
+            .map_err(|_| StoreError::Corruption("recorded_seq out of range".into()))?;
+        let renewal = i64::try_from(authority.lease_renewal_seq.0)
             .map_err(|_| StoreError::Corruption("renewal_seq out of range".into()))?;
         let expires = i64::try_from(expires_at_seq)
             .map_err(|_| StoreError::Corruption("expires_at_seq out of range".into()))?;
         self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_attempt_context(engine, &authority)?;
+            SqlMetadataStore::<E>::require_worker_lease_binding(
+                engine,
+                &authority.worker_peer_id,
+                authority.worker_boot_generation,
+                authority.worker_incarnation_id,
+            )?;
+            let attempt_id = authority.attempt_id.0;
+            if !engine
+                .query(
+                    "SELECT id_hex FROM action_attempts WHERE id_hex = ?1",
+                    &[SqlValue::Text(u128_hex(attempt_id))],
+                )?
+                .is_empty()
+            {
+                return Err(StoreError::DuplicateAttempt);
+            }
+            let lease_id = authority.execution_lease_id.0;
+            if !engine
+                .query(
+                    "SELECT id_hex FROM execution_leases WHERE id_hex = ?1",
+                    &[SqlValue::Text(u128_hex(lease_id))],
+                )?
+                .is_empty()
+            {
+                return Err(StoreError::DuplicateLease);
+            }
+            engine.execute(
+                "INSERT INTO action_attempts \
+                 (id_hex, id, generation_hex, worker, seq, \
+                  worker_boot_generation, worker_incarnation, execution_lease_hex) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    SqlValue::Text(u128_hex(attempt_id)),
+                    SqlValue::Blob(u128_blob(attempt_id)),
+                    SqlValue::Text(u128_hex(authority.action_generation.generation_id.0)),
+                    SqlValue::Text(authority.worker_peer_id.0.clone()),
+                    SqlValue::Int(recorded),
+                    SqlValue::Blob(u64_blob(authority.worker_boot_generation.0)),
+                    SqlValue::Blob(u128_blob(authority.worker_incarnation_id.0)),
+                    SqlValue::Text(u128_hex(lease_id)),
+                ],
+            )?;
             engine.execute(
                 "INSERT INTO execution_leases \
                  (id_hex, id, attempt_hex, renewal_seq, expires_at_seq, released) \
                  VALUES (?1, ?2, ?3, ?4, ?5, 0)",
                 &[
-                    SqlValue::Text(u128_hex(id)),
-                    SqlValue::Blob(u128_blob(id)),
-                    SqlValue::Text(u128_hex(attempt)),
+                    SqlValue::Text(u128_hex(lease_id)),
+                    SqlValue::Blob(u128_blob(lease_id)),
+                    SqlValue::Text(u128_hex(attempt_id)),
                     SqlValue::Int(renewal),
                     SqlValue::Int(expires),
                 ],
@@ -2772,40 +3169,38 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         })
     }
 
-    fn renew_lease(
+    fn renew_attempt_lease(
         &mut self,
-        id: u128,
-        renewal_seq: u64,
+        authority: &AttemptAuthority,
+        renewal: LeaseRenewal,
         expires_at_seq: u64,
     ) -> Result<(), StoreError> {
+        let authority = authority.clone();
         let expires = i64::try_from(expires_at_seq)
             .map_err(|_| StoreError::Corruption("expires_at_seq out of range".into()))?;
         self.in_txn(move |engine| {
-            let rows = engine.query(
-                "SELECT renewal_seq, released FROM execution_leases WHERE id_hex = ?1",
-                &[SqlValue::Text(u128_hex(id))],
-            )?;
-            let Some(row) = rows.first() else {
-                return Err(StoreError::UnknownLease);
-            };
-            let [stored_seq, released] = row.as_slice() else {
-                return Err(StoreError::Corruption("lease row shape".into()));
-            };
-            if expect_u64(released, "released")? != 0 {
+            let state = SqlMetadataStore::<E>::bound_lease_state(engine, &authority)?;
+            if state.released {
                 return Err(StoreError::LeaseReleased);
             }
-            if renewal_seq <= expect_u64(stored_seq, "renewal_seq")? {
+            if renewal.lease != authority.execution_lease_id {
+                return Err(StoreError::LeaseAttemptMismatch);
+            }
+            if authority.lease_renewal_seq.0 != state.renewal_seq {
+                return Err(StoreError::LeaseRenewalMismatch);
+            }
+            if renewal.seq.0 <= state.renewal_seq {
                 return Err(StoreError::NonMonotonicRenewal);
             }
-            let renewal = i64::try_from(renewal_seq)
+            let renewal_seq = i64::try_from(renewal.seq.0)
                 .map_err(|_| StoreError::Corruption("renewal_seq out of range".into()))?;
             engine.execute(
                 "UPDATE execution_leases SET renewal_seq = ?1, expires_at_seq = ?2 \
                  WHERE id_hex = ?3",
                 &[
-                    SqlValue::Int(renewal),
+                    SqlValue::Int(renewal_seq),
                     SqlValue::Int(expires),
-                    SqlValue::Text(u128_hex(id)),
+                    SqlValue::Text(u128_hex(authority.execution_lease_id.0)),
                 ],
             )?;
             Ok(())
@@ -2827,17 +3222,35 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
 
     fn commit_publication(
         &mut self,
-        authority: &TypedDigest,
+        permit: PublicationPermit<'_>,
         row: &PublicationRow,
     ) -> Result<CommitOutcome, StoreError> {
         self.intern(row.action_key.domain);
         self.intern(row.descriptor_digest.domain);
         self.intern(row.manifest_digest.domain);
         self.intern(row.evidence_digest.domain);
-        let authority = authority.clone();
+        let (authority, attempt_authority) = permit.into_parts();
         let row = row.clone();
         self.in_txn(move |engine| {
-            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            match &attempt_authority {
+                Some(attempt) => {
+                    if SqlMetadataStore::<E>::attempt_authority_digest(attempt) != authority
+                        || row.action_key != attempt.action_key
+                        || row.winner_generation != attempt.action_generation.generation_id.0
+                        || row.winner_attempt != attempt.attempt_id.0
+                    {
+                        return Err(StoreError::AttemptAuthorityMismatch);
+                    }
+                    let state = SqlMetadataStore::<E>::bound_lease_state(engine, attempt)?;
+                    if state.released {
+                        return Err(StoreError::LeaseReleased);
+                    }
+                    if state.renewal_seq != attempt.lease_renewal_seq.0 {
+                        return Err(StoreError::LeaseRenewalMismatch);
+                    }
+                }
+                None => SqlMetadataStore::<E>::require_active(engine, &authority)?,
+            }
             let action = digest_key(&row.action_key);
             let existing = engine.query(
                 "SELECT descriptor_domain, descriptor_bytes FROM action_publications \
@@ -3067,6 +3480,20 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             released: expect_u64(released, "released")? != 0,
             renewal_seq: expect_u64(renewal_seq, "renewal_seq")?,
         }))
+    }
+
+    fn validate_attempt_lease(
+        &mut self,
+        authority: &AttemptAuthority,
+    ) -> Result<LeaseState, StoreError> {
+        let state = SqlMetadataStore::<E>::bound_lease_state(&mut self.engine, authority)?;
+        if state.released {
+            return Err(StoreError::LeaseReleased);
+        }
+        if state.renewal_seq != authority.lease_renewal_seq.0 {
+            return Err(StoreError::LeaseRenewalMismatch);
+        }
+        Ok(state)
     }
 
     fn object_located(&mut self, object: &TypedDigest) -> Result<bool, StoreError> {
@@ -4031,33 +4458,41 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             SqlMetadataStore::<E>::require_active(engine, &authority)?;
             let rows = engine.query(
                 "SELECT highest_boot_generation, incarnation, active, \
-                 operator_reenrollment_generation FROM worker_incarnation_fences \
+                 operator_reenrollment_generation, clone_ambiguous \
+                 FROM worker_incarnation_fences \
                  WHERE worker = ?1",
                 &[SqlValue::Text(worker.clone())],
             )?;
-            let (admission, fence) = match rows.as_slice() {
+            let (admission, fence, revoke_prior_leases) = match rows.as_slice() {
                 [] => (
                     WorkerAdmission::AdmitNewGeneration,
                     WorkerIncarnationFenceRecord {
                         worker_peer_id: offer.worker_peer_id.clone(),
                         highest_boot_generation: offer.boot_generation,
                         active_incarnation: Some(offer.incarnation),
+                        clone_ambiguous: false,
                         operator_reenrollment_generation: offer
                             .reenrollment_proof
                             .unwrap_or_default(),
                     },
+                    false,
                 ),
                 [row] => {
+                    let prior_incarnation =
+                        WorkerIncarnationId(expect_u128(&row[1], "worker incarnation")?);
                     let mut fence = decode_worker_incarnation_fence(&worker, row)?;
                     let admission = fence.evaluate(&offer);
-                    match admission {
+                    let revoke_prior_leases = match admission {
                         WorkerAdmission::AdmitNewGeneration => {
                             fence.highest_boot_generation = offer.boot_generation;
                             fence.active_incarnation = Some(offer.incarnation);
+                            fence.clone_ambiguous = false;
+                            true
                         }
-                        WorkerAdmission::AdmitReconnect => {}
+                        WorkerAdmission::AdmitReconnect => false,
                         WorkerAdmission::AdmitResume => {
                             fence.active_incarnation = Some(offer.incarnation);
+                            prior_incarnation != offer.incarnation
                         }
                         WorkerAdmission::AdmitViaReenrollment => {
                             let proof = offer.reenrollment_proof.ok_or_else(|| {
@@ -4071,18 +4506,32 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                             // must remain stale after operator recovery.
                             fence.highest_boot_generation = offer.boot_generation;
                             fence.active_incarnation = Some(offer.incarnation);
+                            fence.clone_ambiguous = false;
                             fence.operator_reenrollment_generation = proof;
+                            true
+                        }
+                        WorkerAdmission::RejectCloneAmbiguity => {
+                            engine.execute(
+                                "UPDATE worker_incarnation_fences \
+                                 SET clone_ambiguous = 1 WHERE worker = ?1",
+                                &[SqlValue::Text(worker.clone())],
+                            )?;
+                            SqlMetadataStore::<E>::revoke_worker_leases(engine, &worker)?;
+                            return Ok(admission);
                         }
                         WorkerAdmission::RejectStaleBootGeneration
-                        | WorkerAdmission::RejectCloneAmbiguity
                         | WorkerAdmission::RejectIdentityMismatch => return Ok(admission),
-                    }
-                    (admission, fence)
+                    };
+                    (admission, fence, revoke_prior_leases)
                 }
                 _ => {
                     return Err(StoreError::Corruption("duplicate worker fence rows".into()));
                 }
             };
+
+            if revoke_prior_leases {
+                SqlMetadataStore::<E>::revoke_worker_leases(engine, &worker)?;
+            }
 
             let active_incarnation = fence.active_incarnation.ok_or_else(|| {
                 StoreError::Corruption("admitted worker fence is inactive".into())
@@ -4117,12 +4566,14 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             engine.execute(
                 "INSERT OR REPLACE INTO worker_incarnation_fences \
                  (worker, incarnation, highest_boot_generation, active, \
-                  operator_reenrollment_generation) VALUES (?1, ?2, ?3, 1, ?4)",
+                  operator_reenrollment_generation, clone_ambiguous) \
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5)",
                 &[
                     SqlValue::Text(worker.clone()),
                     SqlValue::Blob(u128_blob(active_incarnation.0)),
                     SqlValue::Blob(u64_blob(fence.highest_boot_generation.0)),
                     SqlValue::Blob(u64_blob(fence.operator_reenrollment_generation)),
+                    SqlValue::Int(i64::from(fence.clone_ambiguous)),
                 ],
             )?;
             if insert_session {
@@ -4156,7 +4607,8 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             SqlMetadataStore::<E>::require_active(engine, &authority)?;
             let rows = engine.query(
                 "SELECT highest_boot_generation, incarnation, active, \
-                 operator_reenrollment_generation FROM worker_incarnation_fences \
+                 operator_reenrollment_generation, clone_ambiguous \
+                 FROM worker_incarnation_fences \
                  WHERE worker = ?1",
                 &[SqlValue::Text(worker.clone())],
             )?;
@@ -4233,7 +4685,8 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
     ) -> Result<Option<WorkerIncarnationFenceRecord>, StoreError> {
         let rows = self.engine.query(
             "SELECT highest_boot_generation, incarnation, active, \
-             operator_reenrollment_generation FROM worker_incarnation_fences \
+             operator_reenrollment_generation, clone_ambiguous \
+             FROM worker_incarnation_fences \
              WHERE worker = ?1",
             &[SqlValue::Text(worker.0.clone())],
         )?;
@@ -5795,7 +6248,7 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             ),
             (
                 "action_generations",
-                "SELECT id_hex, id, action_key, authority_key, tombstoned \
+                "SELECT id_hex, id, action_key, authority_key, tombstoned, per_key_ordinal \
                  FROM action_generations ORDER BY id_hex",
             ),
             (
@@ -5804,7 +6257,8 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             ),
             (
                 "action_attempts",
-                "SELECT id_hex, id, generation_hex, worker, seq FROM action_attempts \
+                "SELECT id_hex, id, generation_hex, worker, seq, worker_boot_generation, \
+                 worker_incarnation, execution_lease_hex FROM action_attempts \
                  ORDER BY id_hex",
             ),
             (
@@ -5911,7 +6365,8 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             (
                 "worker_incarnation_fences",
                 "SELECT worker, incarnation, highest_boot_generation, active, \
-                 operator_reenrollment_generation FROM worker_incarnation_fences \
+                 operator_reenrollment_generation, clone_ambiguous \
+                 FROM worker_incarnation_fences \
                  ORDER BY worker",
             ),
             (
@@ -6518,6 +6973,10 @@ impl SqlEngine for FsqliteEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
+    use rabs_protocol::generation::{
+        ActionGenerationId, AttemptId, ExecutionLeaseId, LeaseRenewalSeq,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -6542,6 +7001,46 @@ mod tests {
             incarnation: u128::from(tag),
             term: u64::from(tag),
             acquired_seq: 1,
+        }
+    }
+
+    fn coordinator_authority() -> CoordinatorAuthority {
+        CoordinatorAuthority {
+            cluster_id: ClusterId("cluster-a".to_owned()),
+            credential_generation: 1,
+            term: 1,
+            incarnation_id: CoordinatorIncarnationId(1),
+        }
+    }
+
+    fn bound_authority_row() -> AuthorityRow {
+        let coordinator = coordinator_authority();
+        AuthorityRow {
+            digest: rabs_key::authority_binding::coordinator_authority_digest(&coordinator),
+            cluster_id: "cluster-a".to_owned(),
+            incarnation: 1,
+            term: 1,
+            acquired_seq: 1,
+        }
+    }
+
+    fn bound_attempt_authority() -> AttemptAuthority {
+        let coordinator = coordinator_authority();
+        let created_under = rabs_key::authority_binding::coordinator_authority_digest(&coordinator);
+        AttemptAuthority {
+            coordinator,
+            action_key: digest("rabs.action-key.sha256.v1", 7),
+            action_generation: ActionGeneration {
+                generation_id: ActionGenerationId(11),
+                per_key_ordinal: 1,
+                created_under_authority_digest: created_under,
+            },
+            attempt_id: AttemptId(22),
+            execution_lease_id: ExecutionLeaseId(30),
+            lease_renewal_seq: LeaseRenewalSeq(1),
+            worker_peer_id: PeerId("lease-worker".to_owned()),
+            worker_boot_generation: WorkerBootGeneration(3),
+            worker_incarnation_id: WorkerIncarnationId(99),
         }
     }
 
@@ -6576,13 +7075,14 @@ mod tests {
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
 
         // Single-writer authority.
-        store.acquire_authority(&authority(1)).unwrap();
-        store.acquire_authority(&authority(1)).unwrap(); // idempotent
+        let bound_authority = bound_authority_row();
+        store.acquire_authority(&bound_authority).unwrap();
+        store.acquire_authority(&bound_authority).unwrap(); // idempotent
         assert!(matches!(
             store.acquire_authority(&authority(2)),
             Err(StoreError::AuthorityHeld { .. })
         ));
-        assert_eq!(store.active_authority().unwrap().unwrap(), authority(1));
+        assert_eq!(store.active_authority().unwrap().unwrap(), bound_authority);
 
         // Action entries round-trip.
         let action = ActionEntryRow {
@@ -6603,7 +7103,7 @@ mod tests {
         );
 
         // Generations: coordinator-only + never-reused ids.
-        let active = digest("rabs.authority.sha256.v1", 1);
+        let active = bound_authority_row().digest;
         let wrong = digest("rabs.authority.sha256.v1", 2);
         assert_eq!(
             store.create_generation(&wrong, 10, &action.action_key),
@@ -6622,8 +7122,13 @@ mod tests {
             store.create_generation(&active, 9, &action.action_key),
             Err(StoreError::GenerationIdNotAboveHighWater)
         );
+        let attempt_authority = bound_attempt_authority();
         store
-            .create_generation(&active, 11, &action.action_key)
+            .create_bound_generation(
+                &active,
+                &attempt_authority.action_generation,
+                &action.action_key,
+            )
             .unwrap();
 
         // Attempts: append-only.
@@ -6637,21 +7142,70 @@ mod tests {
             Err(StoreError::UnknownGeneration)
         );
 
-        // Leases: strictly monotonic renewal, no renewal after release.
-        store.acquire_lease(30, 20, 1, 100).unwrap();
-        store.renew_lease(30, 2, 200).unwrap();
+        // Leases: exact worker binding + durable compare-and-swap renewal,
+        // with no renewal after release.
+        store
+            .admit_worker_session(
+                &active,
+                &WorkerSessionOffer {
+                    worker_peer_id: attempt_authority.worker_peer_id.clone(),
+                    boot_generation: attempt_authority.worker_boot_generation,
+                    incarnation: attempt_authority.worker_incarnation_id,
+                    reenrollment_proof: None,
+                },
+                4,
+            )
+            .unwrap();
+        store
+            .admit_attempt_lease(&attempt_authority, 5, 100)
+            .unwrap();
+        let renewal = LeaseRenewal {
+            lease: attempt_authority.execution_lease_id,
+            seq: LeaseRenewalSeq(2),
+        };
+        store
+            .renew_attempt_lease(&attempt_authority, renewal, 200)
+            .unwrap();
         assert_eq!(
-            store.renew_lease(30, 2, 300),
+            store.renew_attempt_lease(&attempt_authority, renewal, 300),
+            Err(StoreError::LeaseRenewalMismatch)
+        );
+        let mut current_authority = attempt_authority.clone();
+        current_authority.lease_renewal_seq = LeaseRenewalSeq(2);
+        assert_eq!(
+            store.renew_attempt_lease(
+                &current_authority,
+                LeaseRenewal {
+                    lease: current_authority.execution_lease_id,
+                    seq: LeaseRenewalSeq(2),
+                },
+                300,
+            ),
             Err(StoreError::NonMonotonicRenewal)
         );
+        let mut unknown = current_authority.clone();
+        unknown.execution_lease_id = rabs_protocol::generation::ExecutionLeaseId(31);
         assert_eq!(
-            store.renew_lease(30, 1, 300),
-            Err(StoreError::NonMonotonicRenewal)
+            store.renew_attempt_lease(
+                &unknown,
+                LeaseRenewal {
+                    lease: unknown.execution_lease_id,
+                    seq: LeaseRenewalSeq(3),
+                },
+                300,
+            ),
+            Err(StoreError::UnknownLease)
         );
-        assert_eq!(store.renew_lease(31, 3, 300), Err(StoreError::UnknownLease));
         store.release_lease(30).unwrap();
         assert_eq!(
-            store.renew_lease(30, 3, 300),
+            store.renew_attempt_lease(
+                &current_authority,
+                LeaseRenewal {
+                    lease: current_authority.execution_lease_id,
+                    seq: LeaseRenewalSeq(3),
+                },
+                300,
+            ),
             Err(StoreError::LeaseReleased)
         );
 
@@ -6659,20 +7213,27 @@ mod tests {
         // conflict-quarantined on descriptor mismatch.
         let publication_row = publication(7, 1, 40);
         assert_eq!(
-            store.commit_publication(&wrong, &publication_row),
+            store.commit_publication(PublicationPermit::for_fixture(&wrong), &publication_row),
             Err(StoreError::NotActiveAuthority)
         );
         assert_eq!(
-            store.commit_publication(&active, &publication_row).unwrap(),
+            store
+                .commit_publication(PublicationPermit::for_fixture(&active), &publication_row)
+                .unwrap(),
             CommitOutcome::Committed
         );
         assert_eq!(
-            store.commit_publication(&active, &publication_row).unwrap(),
+            store
+                .commit_publication(PublicationPermit::for_fixture(&active), &publication_row)
+                .unwrap(),
             CommitOutcome::IdempotentDuplicate
         );
         assert_eq!(
             store
-                .commit_publication(&active, &publication(7, 2, 41))
+                .commit_publication(
+                    PublicationPermit::for_fixture(&active),
+                    &publication(7, 2, 41),
+                )
                 .unwrap(),
             CommitOutcome::ConflictQuarantined
         );
@@ -6947,7 +7508,8 @@ mod tests {
         );
         assert_eq!(
             store.admit_worker_session(&active, &worker_offer("worker-a", 3, 22), 1_107),
-            Ok(WorkerAdmission::AdmitResume)
+            Ok(WorkerAdmission::RejectCloneAmbiguity),
+            "session release cannot adjudicate a detected clone"
         );
         let mut rolled_back = worker_offer("worker-a", 1, 99);
         rolled_back.reenrollment_proof = Some(1);
@@ -6975,6 +7537,7 @@ mod tests {
                 worker_peer_id: PeerId("worker-a".into()),
                 highest_boot_generation: WorkerBootGeneration(3),
                 active_incarnation: Some(WorkerIncarnationId(99)),
+                clone_ambiguous: true,
                 operator_reenrollment_generation: 1,
             }))
         );
@@ -7346,7 +7909,14 @@ mod tests {
         );
         assert_eq!(
             store.admit_worker_session(&active, &worker_offer("worker-a", 8, 80), 703),
-            Ok(WorkerAdmission::AdmitNewGeneration)
+            Ok(WorkerAdmission::RejectCloneAmbiguity),
+            "a self-reported boot increment cannot select the legitimate clone"
+        );
+        let mut resolved = worker_offer("worker-a", 8, 80);
+        resolved.reenrollment_proof = Some(1);
+        assert_eq!(
+            store.admit_worker_session(&active, &resolved, 704),
+            Ok(WorkerAdmission::AdmitViaReenrollment)
         );
     }
 
@@ -7386,9 +7956,162 @@ mod tests {
                 worker_peer_id: PeerId("legacy-worker".to_owned()),
                 highest_boot_generation: WorkerBootGeneration(0),
                 active_incarnation: Some(WorkerIncarnationId(0xCAFE)),
+                clone_ambiguous: true,
                 operator_reenrollment_generation: 0,
             })),
-            "a pre-S022 row migrates conservatively as an active generation-zero fence"
+            "a pre-S022 row migrates as an ambiguous active generation-zero fence"
+        );
+    }
+
+    fn seed_v20_attempt_lease<E: SqlEngine>(engine: &mut E) {
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 20)
+        {
+            engine.execute("BEGIN", &[]).unwrap();
+            for statement in migration.statements {
+                engine.execute(statement, &[]).unwrap();
+            }
+            engine
+                .execute(
+                    "INSERT INTO schema_epochs (version, applied_seq) VALUES (?1, 0)",
+                    &[SqlValue::Int(i64::from(migration.version))],
+                )
+                .unwrap();
+            engine.execute("COMMIT", &[]).unwrap();
+        }
+
+        let authority = bound_authority_row().digest;
+        let action = digest("rabs.action-key.sha256.v1", 7);
+        engine
+            .execute(
+                "INSERT INTO action_generations \
+                 (id_hex, id, action_key, authority_key, tombstoned) \
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                &[
+                    SqlValue::Text(u128_hex(11)),
+                    SqlValue::Blob(u128_blob(11)),
+                    SqlValue::Text(digest_key(&action)),
+                    SqlValue::Text(digest_key(&authority)),
+                ],
+            )
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO generation_high_water (kind, value) \
+                 VALUES ('action-generation', ?1)",
+                &[SqlValue::Blob(u128_blob(11))],
+            )
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO action_attempts (id_hex, id, generation_hex, worker, seq) \
+                 VALUES (?1, ?2, ?3, 'lease-worker', 5)",
+                &[
+                    SqlValue::Text(u128_hex(22)),
+                    SqlValue::Blob(u128_blob(22)),
+                    SqlValue::Text(u128_hex(11)),
+                ],
+            )
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO execution_leases \
+                 (id_hex, id, attempt_hex, renewal_seq, expires_at_seq, released) \
+                 VALUES (?1, ?2, ?3, 1, 100, 0)",
+                &[
+                    SqlValue::Text(u128_hex(30)),
+                    SqlValue::Blob(u128_blob(30)),
+                    SqlValue::Text(u128_hex(22)),
+                ],
+            )
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO worker_incarnation_fences \
+                 (worker, incarnation, highest_boot_generation, active, \
+                  operator_reenrollment_generation) \
+                 VALUES ('lease-worker', ?1, ?2, 1, ?3)",
+                &[
+                    SqlValue::Blob(u128_blob(99)),
+                    SqlValue::Blob(u64_blob(3)),
+                    SqlValue::Blob(u64_blob(0)),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn assert_v20_attempt_lease_fails_closed(store: &mut dyn RabsMetadataStore) {
+        assert_eq!(store.schema_version(), Ok(SCHEMA_VERSION));
+        store.acquire_authority(&bound_authority_row()).unwrap();
+        assert_eq!(
+            store.worker_incarnation_fence(&PeerId("lease-worker".to_owned())),
+            Ok(Some(WorkerIncarnationFenceRecord {
+                worker_peer_id: PeerId("lease-worker".to_owned()),
+                highest_boot_generation: WorkerBootGeneration(3),
+                active_incarnation: Some(WorkerIncarnationId(99)),
+                clone_ambiguous: true,
+                operator_reenrollment_generation: 0,
+            }))
+        );
+        let legacy = bound_attempt_authority();
+        assert_eq!(
+            store.validate_attempt_lease(&legacy),
+            Err(StoreError::LegacyUnboundAuthority)
+        );
+        assert_eq!(
+            store.renew_attempt_lease(
+                &legacy,
+                LeaseRenewal {
+                    lease: legacy.execution_lease_id,
+                    seq: LeaseRenewalSeq(2),
+                },
+                200,
+            ),
+            Err(StoreError::LegacyUnboundAuthority)
+        );
+        let mut legacy_row = publication(7, 1, 40);
+        legacy_row.winner_generation = 11;
+        legacy_row.winner_attempt = 22;
+        assert_eq!(
+            store.commit_publication(PublicationPermit::for_attempt(&legacy), &legacy_row),
+            Err(StoreError::LegacyUnboundAuthority)
+        );
+        assert!(!store.has_publication(&legacy.action_key).unwrap());
+
+        let mut selected = worker_offer("lease-worker", 3, 100);
+        selected.reenrollment_proof = Some(1);
+        assert_eq!(
+            store.admit_worker_session(&bound_authority_row().digest, &selected, 200),
+            Ok(WorkerAdmission::AdmitViaReenrollment)
+        );
+        let mut replacement = legacy;
+        replacement.action_generation.generation_id = ActionGenerationId(12);
+        replacement.action_generation.per_key_ordinal = 2;
+        replacement.attempt_id = AttemptId(23);
+        replacement.execution_lease_id = ExecutionLeaseId(31);
+        replacement.worker_incarnation_id = WorkerIncarnationId(100);
+        store
+            .upsert_action_entry(&ActionEntryRow {
+                action_key: replacement.action_key.clone(),
+                key_epoch: 1,
+                projection_epoch: 1,
+            })
+            .unwrap();
+        store
+            .create_bound_generation(
+                &bound_authority_row().digest,
+                &replacement.action_generation,
+                &replacement.action_key,
+            )
+            .unwrap();
+        store.admit_attempt_lease(&replacement, 201, 300).unwrap();
+        assert_eq!(
+            store.validate_attempt_lease(&replacement),
+            Ok(LeaseState {
+                released: false,
+                renewal_seq: 1,
+            })
         );
     }
 
@@ -7414,6 +8137,30 @@ mod tests {
         let engine = FsqliteEngine::open(&path).unwrap();
         let mut store = SqlMetadataStore::open(engine).unwrap();
         assert_v19_worker_fence_migrated(&mut store);
+    }
+
+    #[test]
+    fn t038_migrates_populated_v20_attempt_lease_fail_closed_reference() {
+        let path = fresh_path("t038-v20-ref");
+        {
+            let mut engine = RusqliteEngine::open(&path).unwrap();
+            seed_v20_attempt_lease(&mut engine);
+        }
+        let engine = RusqliteEngine::open(&path).unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        assert_v20_attempt_lease_fails_closed(&mut store);
+    }
+
+    #[test]
+    fn t038_migrates_populated_v20_attempt_lease_fail_closed_frankensqlite() {
+        let path = fresh_path("t038-v20-fsq");
+        {
+            let mut engine = FsqliteEngine::open(&path).unwrap();
+            seed_v20_attempt_lease(&mut engine);
+        }
+        let engine = FsqliteEngine::open(&path).unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        assert_v20_attempt_lease_fails_closed(&mut store);
     }
 
     #[test]
@@ -7544,7 +8291,9 @@ mod tests {
         let mut row = publication(9, 3, 90);
         row.result_kind = ResultKindTag::DeterministicFailure;
         assert_eq!(
-            store.commit_publication(&active, &row).unwrap(),
+            store
+                .commit_publication(PublicationPermit::for_fixture(&active), &row)
+                .unwrap(),
             CommitOutcome::Committed
         );
         let dump = store.differential_snapshot().unwrap();

@@ -416,8 +416,9 @@ pub fn apply_revalidation(
 mod tests {
     use super::*;
     use crate::metadata_store::{
-        ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationRow,
-        QuarantineScope, ResultKindTag, RusqliteEngine, SqlMetadataStore, digest_key,
+        ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationPermit,
+        PublicationRow, QuarantineScope, ResultKindTag, RusqliteEngine, SqlMetadataStore,
+        digest_key,
     };
     use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -488,7 +489,9 @@ mod tests {
             provisional_ancestors: Vec::new(),
         };
         assert_eq!(
-            store.commit_publication(&active, &row).unwrap(),
+            store
+                .commit_publication(PublicationPermit::for_fixture(&active), &row)
+                .unwrap(),
             CommitOutcome::Committed
         );
         (active, digest_key(&action.action_key))
