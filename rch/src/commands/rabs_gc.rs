@@ -655,7 +655,215 @@ async fn run_gc_inner(action: GcAction, ctx: &OutputContext) -> anyhow::Result<(
     Ok(())
 }
 
-/// `rch rabs <group>` command groups (R005 lands the `gc` group).
+/// Entry point for `rch rabs worker reconcile <worker>` (R006).
+///
+/// # Errors
+/// Propagates store/mount failures under the caller's exit-code
+/// convention.
+pub async fn run_worker_reconcile(
+    worker: String,
+    cas_root: Option<PathBuf>,
+    ctx: &OutputContext,
+) -> anyhow::Result<()> {
+    let root = resolve_cas_root(cas_root.as_deref())?;
+    let mut store = open_store(&root)?;
+    let now_seq = operations_watermark(&mut store)?;
+    let fs = CasFilesystem { root };
+    let report = rabs_cas::worker_reconcile::reconcile_worker(
+        &mut store,
+        &fs,
+        &worker,
+        now_seq,
+        DEFAULT_MIN_SEQ_LAG,
+    )?;
+    if ctx.is_json() || ctx.is_toon() {
+        ctx.json(&ApiResponse::ok(
+            "rabs worker reconcile",
+            &JsonReport::of(&report),
+        ))?;
+    } else {
+        print_worker_report(&report);
+    }
+    Ok(())
+}
+
+/// Entry point for `rch rabs doctor` (R006, read-only half).
+///
+/// # Errors
+/// Propagates store/mount failures under the caller's exit-code
+/// convention.
+pub async fn run_doctor(
+    cas_root: Option<PathBuf>,
+    min_seq_lag: u64,
+    ctx: &OutputContext,
+) -> anyhow::Result<()> {
+    let root = resolve_cas_root(cas_root.as_deref())?;
+    let mut store = open_store(&root)?;
+    let now_seq = operations_watermark(&mut store)?;
+    let proposals = rabs_cas::worker_reconcile::find_stale_state(&mut store, now_seq, min_seq_lag)?;
+    if ctx.is_json() || ctx.is_toon() {
+        let shim: Vec<JsonProposal> = proposals.iter().map(JsonProposal::of).collect();
+        ctx.json(&ApiResponse::ok("rabs doctor", &shim))?;
+    } else if proposals.is_empty() {
+        println!("rabs doctor: no stale operations or expired-looking pins");
+    } else {
+        println!("rabs doctor: {} proposed resolution(s):", proposals.len());
+        for p in &proposals {
+            println!("  {} -> {}", p.target, p.action);
+            println!("      {}", p.remediation);
+        }
+    }
+    Ok(())
+}
+
+/// Operations lagging the live-progress watermark by more than this are
+/// stale by default.
+pub const DEFAULT_MIN_SEQ_LAG: u64 = 1_000;
+
+fn operations_watermark<E: rabs_cas::metadata_store::SqlEngine>(
+    store: &mut rabs_cas::metadata_store::SqlMetadataStore<E>,
+) -> anyhow::Result<u64> {
+    let rows = store
+        .engine_mut()
+        .query("SELECT COALESCE(MAX(updated_seq), 1) FROM operations", &[])?;
+    Ok(rows
+        .first()
+        .and_then(|r| r.first())
+        .map(|v| match v {
+            SqlValue::Int(n) => (*n).max(1) as u64,
+            _ => 1,
+        })
+        .unwrap_or(1))
+}
+
+/// The real CAS directory, viewed through [`FilesystemReality`].
+struct CasFilesystem {
+    root: PathBuf,
+}
+
+impl rabs_cas::startup_reconciliation::FilesystemReality for CasFilesystem {
+    fn exists(&self, store_path: &str) -> bool {
+        self.root.join(store_path).exists()
+    }
+
+    fn all_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        self.walk(&self.root, &mut out, 0);
+        out
+    }
+}
+
+impl CasFilesystem {
+    fn walk(&self, dir: &Path, out: &mut Vec<String>, depth: u8) {
+        const MAX_DEPTH: u8 = 8;
+        const MAX_ENTRIES: usize = 50_000;
+        if depth > MAX_DEPTH || out.len() >= MAX_ENTRIES {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                self.walk(&path, out, depth + 1);
+            } else if let Ok(rel) = path.strip_prefix(&self.root) {
+                out.push(rel.to_string_lossy().into_owned());
+            }
+            if out.len() >= MAX_ENTRIES {
+                return;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct JsonProposal {
+    target: String,
+    action: String,
+    remediation: String,
+}
+
+impl JsonProposal {
+    fn of(p: &rabs_cas::worker_reconcile::ProposedResolution) -> Self {
+        Self {
+            target: p.target.clone(),
+            action: p.action.clone(),
+            remediation: p.remediation.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct JsonReport {
+    worker: String,
+    sessions_ended: u32,
+    repaired_count: usize,
+    reported_orphans: Vec<String>,
+    serving_allowed: bool,
+    stale_operations: Vec<JsonProposal>,
+    proposals: Vec<JsonProposal>,
+}
+
+impl JsonReport {
+    fn of(r: &rabs_cas::worker_reconcile::WorkerReconcileReport) -> Self {
+        Self {
+            worker: r.worker.clone(),
+            sessions_ended: r.sessions_ended,
+            repaired_count: r.repaired.len(),
+            reported_orphans: r.reported_orphans.clone(),
+            serving_allowed: matches!(
+                r.serving,
+                rabs_cas::startup_reconciliation::ServingDecision::Allowed
+            ),
+            stale_operations: r
+                .stale_operations
+                .iter()
+                .map(operation_json_proposal)
+                .collect(),
+            proposals: r.proposals.iter().map(JsonProposal::of).collect(),
+        }
+    }
+}
+
+fn operation_json_proposal(op: &rabs_cas::worker_reconcile::StaleOperation) -> JsonProposal {
+    JsonProposal {
+        target: format!("operation:{}", op.id_hex),
+        action: format!("update_operation_state({}, \"abandoned\")", op.id_hex),
+        remediation: format!("non-terminal '{}' untouched for {} seqs", op.state, op.lag),
+    }
+}
+
+fn print_worker_report(report: &rabs_cas::worker_reconcile::WorkerReconcileReport) {
+    println!(
+        "worker reconcile {}: {} session(s) ended, {} location drift repaired, \
+         {} orphan(s) reported, serving {}",
+        report.worker,
+        report.sessions_ended,
+        report.repaired.len(),
+        report.reported_orphans.len(),
+        if matches!(
+            report.serving,
+            rabs_cas::startup_reconciliation::ServingDecision::Allowed
+        ) {
+            "allowed"
+        } else {
+            "REFUSED"
+        }
+    );
+    if report.proposals.is_empty() {
+        println!("  no stale operations or expired-looking pins");
+    } else {
+        println!("  proposed resolution(s): {}", report.proposals.len());
+        for p in &report.proposals {
+            println!("    {} -> {}", p.target, p.action);
+            println!("        {}", p.remediation);
+        }
+    }
+}
+
+/// `rch rabs <group>` command groups (R005 lands `gc`; R006 lands
+/// `worker` + `doctor`).
 #[derive(Debug, Subcommand)]
 pub enum RabsCommand {
     /// Content-addressed store garbage collection (H014 engine)
@@ -666,6 +874,41 @@ pub enum RabsCommand {
         /// GC operation
         #[command(subcommand)]
         action: GcAction,
+    },
+    /// Worker reconciliation + stale-operation doctor (R006)
+    #[command(
+        after_help = "EXAMPLES:\n    rch rabs worker reconcile worker-a\n    rch rabs worker reconcile worker-a --json\n    rch rabs doctor --min-seq-lag 1000"
+    )]
+    Worker {
+        /// Worker operation
+        #[command(subcommand)]
+        action: WorkerAction,
+    },
+    /// Find stale operations/pins and propose safe resolution (read-only)
+    Doctor {
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+        /// Operations lagging the live-progress watermark by more than this
+        /// many seqs count as stale
+        #[arg(long, value_name = "SEQS", default_value_t = 1_000)]
+        min_seq_lag: u64,
+    },
+}
+
+/// One worker operation.
+#[derive(Debug, Subcommand)]
+pub enum WorkerAction {
+    /// A gone worker's open sessions are ended, store drift is repaired
+    /// against filesystem reality, and safe-resolution proposals are
+    /// listed for anything stale. Proposals are NEVER auto-applied.
+    Reconcile {
+        /// Worker identity
+        #[arg(value_name = "WORKER")]
+        worker: String,
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
     },
 }
 

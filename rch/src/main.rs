@@ -2088,7 +2088,20 @@ async fn run(args: Vec<OsString>) -> Result<()> {
             } => commands::sync_force(force, worker, all, project, dry_run, &ctx).await,
             Commands::Rabs {
                 action: commands::rabs_gc::RabsCommand::Gc { action },
-            } => commands::rabs_gc::run(action, &ctx).await,
+            } => commands::rabs_gc::run_gc(action, &ctx).await,
+            Commands::Rabs {
+                action:
+                    commands::rabs_gc::RabsCommand::Worker {
+                        action: commands::rabs_gc::WorkerAction::Reconcile { worker, cas_root },
+                    },
+            } => commands::rabs_gc::run_worker_reconcile(worker, cas_root, &ctx).await,
+            Commands::Rabs {
+                action:
+                    commands::rabs_gc::RabsCommand::Doctor {
+                        cas_root,
+                        min_seq_lag,
+                    },
+            } => commands::rabs_gc::run_doctor(cas_root, min_seq_lag, &ctx).await,
             Commands::Why { action } => commands::why::run(action, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
             Commands::Cache { action } => handle_cache(action, &ctx).await,
@@ -3841,10 +3854,11 @@ async fn handle_cache_clean(
         failed: Vec::new(),
     };
     for base in &bases {
-        let trees = cache_gc::enumerate_staging_trees(base, project.as_deref(), now)
-            .map_err(|e| anyhow::anyhow!("failed to enumerate staging trees under {base:?}: {e}"))?;
-        let plan =
-            cache_gc::plan_staging_gc(&trees, cache_gc::StagingGcPolicy { min_age }, base);
+        let trees =
+            cache_gc::enumerate_staging_trees(base, project.as_deref(), now).map_err(|e| {
+                anyhow::anyhow!("failed to enumerate staging trees under {base:?}: {e}")
+            })?;
+        let plan = cache_gc::plan_staging_gc(&trees, cache_gc::StagingGcPolicy { min_age }, base);
         if execute {
             let o = cache_gc::execute_staging_gc(&plan, base);
             outcome.removed_count += o.removed_count;
