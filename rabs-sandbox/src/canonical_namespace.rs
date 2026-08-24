@@ -34,6 +34,8 @@
 //! It is part of the recorded boundary, not hidden behind one.
 
 use crate::layout;
+#[cfg(unix)]
+use rabs_protocol::raw_bytes::RawBytes;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -417,15 +419,11 @@ fn require_support(support: &HostIsolationSupport) -> Result<(), IsolationError>
     }
 }
 
-/// Compile the canonical Cargo-driver namespace into a deterministic
-/// `bwrap` argv. Pure: no processes are spawned, so the builder (and its
-/// tests) run on every platform; execution requires a host whose
-/// [`HostIsolationSupport`] passed [`require`](HostIsolationSupport::missing_for_canonical).
-pub fn build_canonical_argv(
+fn build_canonical_os_argv(
     spec: &CanonicalNamespaceSpec,
     support: &HostIsolationSupport,
-    program: &str,
-    args: &[String],
+    program: OsString,
+    args: impl IntoIterator<Item = OsString>,
 ) -> Result<NamespaceLaunch, IsolationError> {
     require_support(support)?;
     if spec.hostname.is_empty() || !spec.hostname.is_ascii() {
@@ -455,9 +453,9 @@ pub fn build_canonical_argv(
     argv.push("--chdir".into());
     argv.push(spec.cwd.clone().into_os_string());
     argv.push("--".into());
-    argv.push(program.into());
+    argv.push(program);
     for arg in args {
-        argv.push(arg.into());
+        argv.push(arg);
     }
 
     let boundary = NamespaceBoundary {
@@ -474,6 +472,52 @@ pub fn build_canonical_argv(
         die_with_parent: true,
     };
     Ok(NamespaceLaunch { argv, boundary })
+}
+
+/// Compile a UTF-8 program and argv into a deterministic canonical `bwrap`
+/// launch. This is the compatibility wrapper for callers whose invocation is
+/// already known to be UTF-8; Unix callers holding protocol-native bytes
+/// should use [`build_canonical_argv_raw`] instead.
+///
+/// Pure: no processes are spawned, so the builder (and its tests) run on
+/// every platform; execution requires a host whose [`HostIsolationSupport`]
+/// passed [`require`](HostIsolationSupport::missing_for_canonical).
+pub fn build_canonical_argv(
+    spec: &CanonicalNamespaceSpec,
+    support: &HostIsolationSupport,
+    program: &str,
+    args: &[String],
+) -> Result<NamespaceLaunch, IsolationError> {
+    build_canonical_os_argv(
+        spec,
+        support,
+        OsString::from(program),
+        args.iter().map(OsString::from),
+    )
+}
+
+/// Compile protocol-native raw Unix program/argv bytes without a UTF-8 or
+/// lossy presentation round trip.
+///
+/// The resulting [`OsString`] elements carry exactly the bytes in each
+/// [`RawBytes`] value. `command_for` therefore presents the same program and
+/// arguments to `execve` after bubblewrap has established the namespace.
+#[cfg(unix)]
+pub fn build_canonical_argv_raw(
+    spec: &CanonicalNamespaceSpec,
+    support: &HostIsolationSupport,
+    program: &RawBytes,
+    args: &[RawBytes],
+) -> Result<NamespaceLaunch, IsolationError> {
+    use std::os::unix::ffi::OsStringExt;
+
+    build_canonical_os_argv(
+        spec,
+        support,
+        OsString::from_vec(program.as_bytes().to_vec()),
+        args.iter()
+            .map(|arg| OsString::from_vec(arg.as_bytes().to_vec())),
+    )
 }
 
 /// Materialize a nested per-action CLOSED input view. Same builder, same
@@ -554,6 +598,38 @@ mod tests {
         assert!(s.contains(&"--die-with-parent".to_string()));
         assert_eq!(s[0], "bwrap");
         assert!(a.boundary.satisfies_strict_hermetic_linux());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_canonical_argv_preserves_non_utf8_program_and_argument_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let spec = CanonicalNamespaceSpec::new();
+        let program = RawBytes::new(b"/tool/carg\xFFo".to_vec());
+        let args = [
+            RawBytes::new(b"bu\xFEild".to_vec()),
+            RawBytes::new(b"--package=cr\x80ate".to_vec()),
+        ];
+        let launch = build_canonical_argv_raw(&spec, &full_support(), &program, &args).unwrap();
+        let separator = launch
+            .argv
+            .iter()
+            .rposition(|arg| arg.as_os_str() == std::ffi::OsStr::new("--"))
+            .expect("bubblewrap command separator");
+
+        assert_eq!(
+            launch.argv[separator + 1].as_os_str().as_bytes(),
+            program.as_bytes()
+        );
+        assert_eq!(
+            launch.argv[separator + 2].as_os_str().as_bytes(),
+            args[0].as_bytes()
+        );
+        assert_eq!(
+            launch.argv[separator + 3].as_os_str().as_bytes(),
+            args[1].as_bytes()
+        );
     }
 
     #[test]
