@@ -58,10 +58,17 @@ impl GeneratorPattern {
             Self::Vergen => &[b"vergen::", b"vergen_emit", b"Emitter::default()"],
             Self::Built => &[b"built::"],
             Self::TimestampEmbedding => &[
-                b"SystemTime::now()",
-                b"chrono::Utc::now()",
+                // Suffix-tolerant tokens: build scripts overwhelmingly
+                // import-then-call (`use chrono::Utc;` … `Utc::now()`),
+                // so requiring fully-qualified paths missed the most
+                // common spelling (found by the N008 flag-coverage
+                // test; bead remote_compilation_helper-rabs-root-4pidu.32.8).
+                b"SystemTime::now(",
+                b"Utc::now(",
+                b"Local::now(",
                 b"time::OffsetDateTime",
-                b"time::Instant::now()",
+                b"OffsetDateTime::now_utc(",
+                b"time::Instant::now(",
             ],
             Self::GitDescribe => &[
                 b"git describe",
@@ -293,5 +300,29 @@ mod tests {
             Volatility::Volatile { reasons } => assert_eq!(reasons.len(), 5),
             other => panic!("expected volatile, got {other:?}"),
         }
+    }
+
+    /// Imported clock calls are detected: `use chrono::Utc;` +
+    /// bare `Utc::now()` is the dominant real-world spelling, and a
+    /// detector that only knows fully-qualified paths lets timestamp
+    /// embedding masquerade as Stable (N008 regression).
+    #[test]
+    fn n006_imported_clock_call_forms_are_detected() {
+        let chrono_import = b"use chrono::Utc;\nlet t = Utc::now();\n".as_slice();
+        assert_eq!(
+            patterns_of(&detect_generators(chrono_import)),
+            vec![GeneratorPattern::TimestampEmbedding]
+        );
+        let local_now = b"use chrono::Local;\nlet t = Local::now();\n".as_slice();
+        assert_eq!(
+            patterns_of(&detect_generators(local_now)),
+            vec![GeneratorPattern::TimestampEmbedding]
+        );
+        let time_crate =
+            b"use time::OffsetDateTime;\nlet t = OffsetDateTime::now_utc();\n".as_slice();
+        assert_eq!(
+            patterns_of(&detect_generators(time_crate)),
+            vec![GeneratorPattern::TimestampEmbedding]
+        );
     }
 }
