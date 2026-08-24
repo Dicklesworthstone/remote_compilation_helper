@@ -88,7 +88,10 @@ pub enum ContextDisposition {
     Keyed { value: Vec<u8> },
     /// The canonical form enters the digest under a versioned normalizer
     /// name; raw observations that normalize identically share a key.
-    Normalized { normalizer: &'static str, canonical: Vec<u8> },
+    Normalized {
+        normalizer: &'static str,
+        canonical: Vec<u8>,
+    },
     /// Excluded from the digest entirely. The refusal reason is
     /// deterministic bookkeeping, NOT key input.
     VolatileRefused { reason: &'static str },
@@ -114,7 +117,9 @@ pub enum SystemContextError {
 fn keyed(tag: &[u8], value: &[u8]) -> ContextDisposition {
     let mut enc = CanonicalEncoder::new();
     enc.bytes(tag).bytes(value);
-    ContextDisposition::Keyed { value: enc.finish() }
+    ContextDisposition::Keyed {
+        value: enc.finish(),
+    }
 }
 
 fn normalize_cwd(observed: &[u8]) -> Vec<u8> {
@@ -130,7 +135,6 @@ fn normalize_cwd(observed: &[u8]) -> Vec<u8> {
 /// # Errors
 /// [`SystemContextError::NonCanonicalWorkingDir`] when the observed cwd
 /// escapes the configured canonical prefix.
-#[must_use]
 pub fn classify(field: &SystemContextField) -> Result<ContextDisposition, SystemContextError> {
     Ok(match field {
         // Size / permissions / exec bit: identity facts.
@@ -171,7 +175,10 @@ pub fn classify(field: &SystemContextField) -> Result<ContextDisposition, System
         // action did not plan in the canonical namespace — exactly what
         // M014's gate refuses upstream; here it cannot be canonicalized
         // honestly, so it errors rather than keying host-local bytes.
-        SystemContextField::WorkingDir { observed, canonical_prefix } => {
+        SystemContextField::WorkingDir {
+            observed,
+            canonical_prefix,
+        } => {
             let norm = normalize_cwd(observed);
             if norm.starts_with(canonical_prefix.as_slice()) {
                 ContextDisposition::Normalized {
@@ -186,7 +193,11 @@ pub fn classify(field: &SystemContextField) -> Result<ContextDisposition, System
         }
         // rlimits: (resource, cur, max) keys through the named
         // normalizer — stack exhaustion changes some codegen paths.
-        SystemContextField::Rlimit { resource, current, max } => ContextDisposition::Normalized {
+        SystemContextField::Rlimit {
+            resource,
+            current,
+            max,
+        } => ContextDisposition::Normalized {
             normalizer: "d026.rlimit.v1",
             canonical: {
                 let mut enc = CanonicalEncoder::new();
@@ -206,18 +217,30 @@ pub fn classify(field: &SystemContextField) -> Result<ContextDisposition, System
 ///
 /// # Errors
 /// Propagates the working-directory rule.
-#[must_use]
 pub fn system_context_digest(
     fields: &[SystemContextField],
 ) -> Result<TypedDigest, SystemContextError> {
+    // The length prefix counts ONLY key-participating fields: a
+    // volatile-refused entry contributes NOTHING — not even to the
+    // count — so adding/removing noise cannot perturb the digest
+    // (T024: "noise cannot leak in OR out").
+    let mut participating = 0u64;
+    for field in fields {
+        if classify(field)?.keys() {
+            participating += 1;
+        }
+    }
     let mut enc = CanonicalEncoder::new();
-    enc.u64(fields.len() as u64);
+    enc.u64(participating);
     for field in fields {
         match classify(field)? {
             ContextDisposition::Keyed { value } => {
                 enc.bytes(b"keyed").bytes(&value);
             }
-            ContextDisposition::Normalized { normalizer, canonical } => {
+            ContextDisposition::Normalized {
+                normalizer,
+                canonical,
+            } => {
                 enc.bytes(b"norm").str(normalizer).bytes(&canonical);
             }
             ContextDisposition::VolatileRefused { .. } => {}
@@ -250,7 +273,11 @@ mod tests {
                 observed: b"/data/projects/acme".to_vec(),
                 canonical_prefix: b"/data/projects".to_vec(),
             },
-            SystemContextField::Rlimit { resource: 3, current: 8 << 20, max: u64::MAX },
+            SystemContextField::Rlimit {
+                resource: 3,
+                current: 8 << 20,
+                max: u64::MAX,
+            },
         ]
     }
 
@@ -285,7 +312,10 @@ mod tests {
             base
         );
         // Affinity mask churn: scheduling noise never keys.
-        assert_eq!(mutated(6, SystemContextField::CpuAffinity(vec![0x0F, 0xF0])), base);
+        assert_eq!(
+            mutated(6, SystemContextField::CpuAffinity(vec![0x0F, 0xF0])),
+            base
+        );
         // Inherited descriptor count: transport, never semantics.
         assert_eq!(mutated(7, SystemContextField::InheritedFds(9)), base);
     }
@@ -304,7 +334,11 @@ mod tests {
         assert_ne!(
             mutated(
                 10,
-                SystemContextField::Rlimit { resource: 3, current: 16 << 20, max: u64::MAX }
+                SystemContextField::Rlimit {
+                    resource: 3,
+                    current: 16 << 20,
+                    max: u64::MAX
+                }
             ),
             base
         );
