@@ -43,6 +43,7 @@ pub mod advise;
 pub mod affected_tests;
 pub mod authority_binding;
 pub mod binary_dep_info;
+pub mod build_script_cacheability;
 pub mod build_script_directives;
 pub mod build_script_reexec_audit;
 pub mod canonical;
