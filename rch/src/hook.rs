@@ -3074,7 +3074,7 @@ mod remote_result;
 use remote_result::{
     ExecResultDirStat, ExecResultEnvelope, detect_cargo_workspace_inheritance_failure,
     detect_worker_system_dependency_failure, emit_exec_envelope, is_cpu_capability_signal,
-    is_signal_killed, is_toolchain_failure, machine_output, set_machine_output, signal_name,
+    is_signal_killed, is_toolchain_failure, set_machine_output, signal_name,
     wrapped_cpu_capability_signal,
 };
 

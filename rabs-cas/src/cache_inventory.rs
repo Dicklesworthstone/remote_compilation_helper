@@ -40,7 +40,9 @@ impl NamespacePolicy {
     /// Allow-list constructor.
     #[must_use]
     pub fn allowing<I: IntoIterator<Item = String>>(namespaces: I) -> Self {
-        Self { allowed: namespaces.into_iter().map(|n| (n, ())).collect() }
+        Self {
+            allowed: namespaces.into_iter().map(|n| (n, ())).collect(),
+        }
     }
 
     /// Whether a project's NAME may appear in this view.
@@ -151,13 +153,15 @@ fn count_first_int<E: SqlEngine>(
 fn store_facts<E: SqlEngine>(
     store: &mut SqlMetadataStore<E>,
 ) -> Result<StoreCacheFacts, crate::metadata_store::StoreError> {
-    let action_entries =
-        count_first_int(store, "SELECT COUNT(*) FROM action_entries")?;
+    let action_entries = count_first_int(store, "SELECT COUNT(*) FROM action_entries")?;
     let workers_with_capabilities = count_first_int(
         store,
         "SELECT COUNT(DISTINCT worker) FROM worker_capabilities",
     )?;
-    Ok(StoreCacheFacts { action_entries, workers_with_capabilities })
+    Ok(StoreCacheFacts {
+        action_entries,
+        workers_with_capabilities,
+    })
 }
 
 fn worker_toolchains<E: SqlEngine>(
