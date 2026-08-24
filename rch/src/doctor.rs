@@ -1134,8 +1134,7 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
         join_isolated_async_probe("repo_convergence", convergence_handle).await;
     let (helper_diags_override, helpers_outcome) =
         join_isolated_blocking_probe("helper_compatibility", helpers_handle).await;
-    let (ownership_results, ownership_outcome) =
-        join_ownership_probe(ownership_handle).await;
+    let (ownership_results, ownership_outcome) = join_ownership_probe(ownership_handle).await;
     let join_elapsed_ms = join_start.elapsed().as_millis() as u64;
     tracing::info!(
         target: "rch::doctor::probes",

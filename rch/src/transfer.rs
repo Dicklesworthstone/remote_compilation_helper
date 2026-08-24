@@ -1518,7 +1518,9 @@ impl TransferPipeline {
                 ensure_dirs.push(ensure_dir.clone());
             }
             if matches!(key, "TMPDIR" | "TMP" | "TEMP")
-                && !restricted_dirs.iter().any(|existing| existing == &ensure_dir)
+                && !restricted_dirs
+                    .iter()
+                    .any(|existing| existing == &ensure_dir)
             {
                 restricted_dirs.push(ensure_dir);
             }
