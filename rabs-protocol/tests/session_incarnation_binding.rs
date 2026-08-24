@@ -65,6 +65,13 @@ fn t038_cloned_disk_image_fails_closed_until_enrollment() {
         record.evaluate(&enrolled),
         WorkerAdmission::AdmitViaReenrollment
     );
+    let mut rolled_back = offer(2, 22);
+    rolled_back.reenrollment_proof = Some(2);
+    assert_eq!(
+        record.evaluate(&rolled_back),
+        WorkerAdmission::RejectStaleBootGeneration,
+        "re-enrollment cannot lower the global boot high-water"
+    );
     let mut consumed = fence(3, Some(11));
     consumed.operator_reenrollment_generation = 1;
     assert_eq!(

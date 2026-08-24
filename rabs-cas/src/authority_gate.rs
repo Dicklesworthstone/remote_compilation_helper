@@ -39,7 +39,10 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use rabs_protocol::generation::{WorkerBootGeneration, WorkerIncarnationId};
 use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
+use rabs_protocol::wire_time::PeerId;
+use rabs_protocol::worker_fence::WorkerSessionOffer;
 
 use crate::metadata_store::{
     ActionEntryRow, AuthorityRow, FsqliteEngine, GcReceiptRow, PublicationRow, RabsMetadataStore,
@@ -152,6 +155,15 @@ fn authority(tag: u8) -> AuthorityRow {
         incarnation: u128::from(tag),
         term: u64::from(tag),
         acquired_seq: 1,
+    }
+}
+
+fn worker_offer(generation: u64, incarnation: u128) -> WorkerSessionOffer {
+    WorkerSessionOffer {
+        worker_peer_id: PeerId("worker-a".to_owned()),
+        boot_generation: WorkerBootGeneration(generation),
+        incarnation: WorkerIncarnationId(incarnation),
+        reenrollment_proof: None,
     }
 }
 
@@ -453,12 +465,44 @@ fn operation_script(
     outcome(
         &mut t,
         "worker-fence",
-        &store.advance_worker_fence(&active, "worker-a", 3),
+        &store.admit_worker_session(&active, &worker_offer(3, 30), 1_000),
     );
     outcome(
         &mut t,
         "worker-fence-stale",
-        &store.advance_worker_fence(&active, "worker-a", 2),
+        &store.admit_worker_session(&active, &worker_offer(2, 20), 1_001),
+    );
+    outcome(
+        &mut t,
+        "worker-fence-clone",
+        &store.admit_worker_session(&active, &worker_offer(3, 31), 1_002),
+    );
+    outcome(
+        &mut t,
+        "worker-fence-read",
+        &store.worker_incarnation_fence(&PeerId("worker-a".to_owned())),
+    );
+    outcome(
+        &mut t,
+        "worker-session-release-wrong",
+        &store.release_worker_session(
+            &active,
+            &PeerId("worker-a".to_owned()),
+            WorkerIncarnationId(31),
+            1_000,
+            1_003,
+        ),
+    );
+    outcome(
+        &mut t,
+        "worker-session-release",
+        &store.release_worker_session(
+            &active,
+            &PeerId("worker-a".to_owned()),
+            WorkerIncarnationId(30),
+            1_000,
+            1_003,
+        ),
     );
     outcome(
         &mut t,

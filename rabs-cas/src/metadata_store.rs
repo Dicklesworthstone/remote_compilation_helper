@@ -34,8 +34,13 @@
 
 use std::collections::HashMap;
 
+use rabs_protocol::generation::{WorkerBootGeneration, WorkerIncarnationId};
 use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use rabs_protocol::serving::ServingValidity;
+use rabs_protocol::wire_time::PeerId;
+use rabs_protocol::worker_fence::{
+    WorkerAdmission, WorkerIncarnationFenceRecord, WorkerSessionOffer,
+};
 
 /// Current schema version (v8 = the full H038 authoritative table set;
 /// v9 = H040 revisioned authority-bound serving state; v10 = H026
@@ -50,8 +55,9 @@ use rabs_protocol::serving::ServingValidity;
 /// on the lineage closure; v18 = M019 provisional install journal
 /// (edge-local records of outputs installed before lineage closure,
 /// with ownership-safe recovery state); v19 = L008 native child
-/// bindings gating parent build-script publication.
-pub const SCHEMA_VERSION: u32 = 19;
+/// bindings gating parent build-script publication; v20 = S022 durable
+/// worker boot-generation and active-incarnation fencing.
+pub const SCHEMA_VERSION: u32 = 20;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -428,6 +434,23 @@ pub const MIGRATIONS: &[Migration] = &[
          PRIMARY KEY (parent_action_key, child_action_key))",
         ],
     },
+    Migration {
+        // S022/I47: a worker incarnation is random, so it is NOT an
+        // ordered high-water value. The durable ordering fence is the
+        // worker's boot generation; the random incarnation names the
+        // one live session admitted for that identity/generation. Old
+        // rows conservatively remain active at generation zero until an
+        // exact-incarnation release or a newer boot supersedes them.
+        version: 20,
+        statements: &[
+            "ALTER TABLE worker_incarnation_fences ADD COLUMN \
+         highest_boot_generation BLOB NOT NULL DEFAULT X'0000000000000000'",
+            "ALTER TABLE worker_incarnation_fences ADD COLUMN \
+         active INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE worker_incarnation_fences ADD COLUMN \
+         operator_reenrollment_generation BLOB NOT NULL DEFAULT X'0000000000000000'",
+        ],
+    },
 ];
 
 impl std::fmt::Display for StoreError {
@@ -481,8 +504,6 @@ pub enum StoreError {
     /// Peer authority term below the recorded per-peer high-water
     /// (a stale view of that peer; H038).
     StalePeerAuthority,
-    /// Worker incarnation below the recorded fence.
-    StaleWorkerIncarnation,
     /// Edge incarnation below the recorded fence, or a handoff whose
     /// active incarnation does not exceed its named predecessor.
     StaleEdgeIncarnation,
@@ -1433,21 +1454,39 @@ pub trait RabsMetadataStore {
         peer_id: &str,
     ) -> Result<Option<(u64, u64)>, StoreError>;
 
-    /// Advance a worker's incarnation fence. Strictly monotone: a lower
-    /// incarnation is refused as stale, an equal one is an idempotent
-    /// no-op.
-    fn advance_worker_fence(
+    /// Atomically admit a worker session under the active coordinator:
+    /// evaluate the durable boot-generation/incarnation fence, advance
+    /// it on admission, and append the open session row in the SAME
+    /// transaction. Rejections are typed [`WorkerAdmission`] values and
+    /// write nothing.
+    fn admit_worker_session(
         &mut self,
         authority: &TypedDigest,
-        worker: &str,
-        incarnation: u128,
-    ) -> Result<(), StoreError>;
+        offer: &WorkerSessionOffer,
+        started_seq: u64,
+    ) -> Result<WorkerAdmission, StoreError>;
 
-    /// The fenced incarnation for a worker, if any.
-    fn worker_fence(&mut self, worker: &str) -> Result<Option<u128>, StoreError>;
+    /// End the exact admitted worker session and clear the active
+    /// incarnation in the SAME transaction. A stale/different session
+    /// cannot clear the current incarnation and returns `false`.
+    fn release_worker_session(
+        &mut self,
+        authority: &TypedDigest,
+        worker: &PeerId,
+        incarnation: WorkerIncarnationId,
+        started_seq: u64,
+        ended_seq: u64,
+    ) -> Result<bool, StoreError>;
 
-    /// Advance an edge's incarnation fence (same monotonicity contract
-    /// as [`Self::advance_worker_fence`]).
+    /// The durable worker fence row, if this identity has ever been
+    /// admitted.
+    fn worker_incarnation_fence(
+        &mut self,
+        worker: &PeerId,
+    ) -> Result<Option<WorkerIncarnationFenceRecord>, StoreError>;
+
+    /// Advance an edge's ordered incarnation fence. A lower incarnation
+    /// is refused as stale; equality is an idempotent no-op.
     fn advance_edge_fence(
         &mut self,
         authority: &TypedDigest,
@@ -1561,8 +1600,11 @@ pub trait RabsMetadataStore {
         manifest: &TypedDigest,
     ) -> Result<Option<(String, u64)>, StoreError>;
 
-    /// Record the start of a worker session (append-only; a conflicting
-    /// rewrite of the same (worker, start) is refused).
+    /// Record a worker session journal row without granting authority.
+    /// This is an append-only recovery/fixture seam; live coordinator
+    /// admission must use [`Self::admit_worker_session`] so the fence and
+    /// journal change atomically. A conflicting rewrite of the same
+    /// (worker, start) is refused.
     fn record_worker_session(
         &mut self,
         worker: &str,
@@ -1570,8 +1612,10 @@ pub trait RabsMetadataStore {
         started_seq: u64,
     ) -> Result<(), StoreError>;
 
-    /// Mark a worker session ended. Returns whether an open session row
-    /// was updated.
+    /// Mark only the journal row ended; this does not clear an active
+    /// authority fence. Live teardown must use
+    /// [`Self::release_worker_session`]. Returns whether an open session
+    /// row was updated.
     fn end_worker_session(
         &mut self,
         worker: &str,
@@ -2016,6 +2060,10 @@ fn u128_blob(v: u128) -> Vec<u8> {
     v.to_be_bytes().to_vec()
 }
 
+fn u64_blob(v: u64) -> Vec<u8> {
+    v.to_be_bytes().to_vec()
+}
+
 fn u128_hex(v: u128) -> String {
     hex(&v.to_be_bytes())
 }
@@ -2353,6 +2401,56 @@ fn expect_u128(v: &SqlValue, what: &str) -> Result<u128, StoreError> {
         }
         _ => Err(StoreError::Corruption(format!("{what} shape"))),
     }
+}
+
+fn expect_u64_blob(v: &SqlValue, what: &str) -> Result<u64, StoreError> {
+    match v {
+        SqlValue::Blob(b) => {
+            let bytes: [u8; 8] = b
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Corruption(format!("{what} not 8 bytes")))?;
+            Ok(u64::from_be_bytes(bytes))
+        }
+        _ => Err(StoreError::Corruption(format!("{what} shape"))),
+    }
+}
+
+fn decode_worker_incarnation_fence(
+    worker: &str,
+    row: &[SqlValue],
+) -> Result<WorkerIncarnationFenceRecord, StoreError> {
+    let [
+        highest_boot_generation,
+        incarnation,
+        active,
+        operator_reenrollment_generation,
+    ] = row
+    else {
+        return Err(StoreError::Corruption("worker fence shape".into()));
+    };
+    let incarnation = WorkerIncarnationId(expect_u128(incarnation, "worker incarnation")?);
+    let active_incarnation = match expect_u64(active, "worker fence active")? {
+        0 => None,
+        1 => Some(incarnation),
+        other => {
+            return Err(StoreError::Corruption(format!(
+                "worker fence active flag {other}"
+            )));
+        }
+    };
+    Ok(WorkerIncarnationFenceRecord {
+        worker_peer_id: PeerId(worker.to_owned()),
+        highest_boot_generation: WorkerBootGeneration(expect_u64_blob(
+            highest_boot_generation,
+            "worker boot generation",
+        )?),
+        active_incarnation,
+        operator_reenrollment_generation: expect_u64_blob(
+            operator_reenrollment_generation,
+            "worker reenrollment generation",
+        )?,
+    })
 }
 
 fn expect_text(v: &SqlValue, what: &str) -> Result<String, StoreError> {
@@ -3919,53 +4017,230 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         )))
     }
 
-    fn advance_worker_fence(
+    fn admit_worker_session(
         &mut self,
         authority: &TypedDigest,
-        worker: &str,
-        incarnation: u128,
-    ) -> Result<(), StoreError> {
+        offer: &WorkerSessionOffer,
+        started_seq: u64,
+    ) -> Result<WorkerAdmission, StoreError> {
         let authority = authority.clone();
-        let worker = worker.to_owned();
+        let offer = offer.clone();
+        let worker = offer.worker_peer_id.0.clone();
+        let started = to_seq(started_seq, "started_seq")?;
         self.in_txn(move |engine| {
             SqlMetadataStore::<E>::require_active(engine, &authority)?;
             let rows = engine.query(
-                "SELECT incarnation FROM worker_incarnation_fences WHERE worker = ?1",
+                "SELECT highest_boot_generation, incarnation, active, \
+                 operator_reenrollment_generation FROM worker_incarnation_fences \
+                 WHERE worker = ?1",
                 &[SqlValue::Text(worker.clone())],
             )?;
-            if let Some(row) = rows.first() {
-                let stored = expect_u128(
-                    row.first()
-                        .ok_or_else(|| StoreError::Corruption("worker fence shape".into()))?,
-                    "worker fence",
-                )?;
-                if incarnation < stored {
-                    return Err(StoreError::StaleWorkerIncarnation);
+            let (admission, fence) = match rows.as_slice() {
+                [] => (
+                    WorkerAdmission::AdmitNewGeneration,
+                    WorkerIncarnationFenceRecord {
+                        worker_peer_id: offer.worker_peer_id.clone(),
+                        highest_boot_generation: offer.boot_generation,
+                        active_incarnation: Some(offer.incarnation),
+                        operator_reenrollment_generation: offer
+                            .reenrollment_proof
+                            .unwrap_or_default(),
+                    },
+                ),
+                [row] => {
+                    let mut fence = decode_worker_incarnation_fence(&worker, row)?;
+                    let admission = fence.evaluate(&offer);
+                    match admission {
+                        WorkerAdmission::AdmitNewGeneration => {
+                            fence.highest_boot_generation = offer.boot_generation;
+                            fence.active_incarnation = Some(offer.incarnation);
+                        }
+                        WorkerAdmission::AdmitReconnect => {}
+                        WorkerAdmission::AdmitResume => {
+                            fence.active_incarnation = Some(offer.incarnation);
+                        }
+                        WorkerAdmission::AdmitViaReenrollment => {
+                            let proof = offer.reenrollment_proof.ok_or_else(|| {
+                                StoreError::Corruption(
+                                    "reenrollment admission without proof".into(),
+                                )
+                            })?;
+                            // `evaluate` admits re-enrollment only at or
+                            // above the durable global high-water. Never
+                            // lower it: an old clone at the former mark
+                            // must remain stale after operator recovery.
+                            fence.highest_boot_generation = offer.boot_generation;
+                            fence.active_incarnation = Some(offer.incarnation);
+                            fence.operator_reenrollment_generation = proof;
+                        }
+                        WorkerAdmission::RejectStaleBootGeneration
+                        | WorkerAdmission::RejectCloneAmbiguity
+                        | WorkerAdmission::RejectIdentityMismatch => return Ok(admission),
+                    }
+                    (admission, fence)
                 }
-                if incarnation == stored {
-                    return Ok(()); // idempotent
+                _ => {
+                    return Err(StoreError::Corruption("duplicate worker fence rows".into()));
                 }
-            }
+            };
+
+            let active_incarnation = fence.active_incarnation.ok_or_else(|| {
+                StoreError::Corruption("admitted worker fence is inactive".into())
+            })?;
+            let existing = engine.query(
+                "SELECT incarnation, ended_seq FROM worker_sessions \
+                 WHERE worker = ?1 AND started_seq = ?2",
+                &[SqlValue::Text(worker.clone()), SqlValue::Int(started)],
+            )?;
+            let insert_session = match existing.as_slice() {
+                [] => true,
+                [row] => {
+                    let [stored_incarnation, ended_seq] = row.as_slice() else {
+                        return Err(StoreError::Corruption("worker session shape".into()));
+                    };
+                    if expect_u128(stored_incarnation, "session incarnation")?
+                        == active_incarnation.0
+                        && matches!(ended_seq, SqlValue::Null)
+                    {
+                        false
+                    } else {
+                        return Err(StoreError::AppendConflict("worker_sessions".into()));
+                    }
+                }
+                _ => {
+                    return Err(StoreError::Corruption(
+                        "duplicate worker session rows".into(),
+                    ));
+                }
+            };
+
             engine.execute(
-                "INSERT OR REPLACE INTO worker_incarnation_fences (worker, incarnation) \
-                 VALUES (?1, ?2)",
+                "INSERT OR REPLACE INTO worker_incarnation_fences \
+                 (worker, incarnation, highest_boot_generation, active, \
+                  operator_reenrollment_generation) VALUES (?1, ?2, ?3, 1, ?4)",
                 &[
-                    SqlValue::Text(worker),
-                    SqlValue::Blob(u128_blob(incarnation)),
+                    SqlValue::Text(worker.clone()),
+                    SqlValue::Blob(u128_blob(active_incarnation.0)),
+                    SqlValue::Blob(u64_blob(fence.highest_boot_generation.0)),
+                    SqlValue::Blob(u64_blob(fence.operator_reenrollment_generation)),
                 ],
             )?;
-            Ok(())
+            if insert_session {
+                engine.execute(
+                    "INSERT INTO worker_sessions \
+                     (worker, incarnation, started_seq, ended_seq) VALUES (?1, ?2, ?3, NULL)",
+                    &[
+                        SqlValue::Text(worker),
+                        SqlValue::Blob(u128_blob(active_incarnation.0)),
+                        SqlValue::Int(started),
+                    ],
+                )?;
+            }
+            Ok(admission)
         })
     }
 
-    fn worker_fence(&mut self, worker: &str) -> Result<Option<u128>, StoreError> {
+    fn release_worker_session(
+        &mut self,
+        authority: &TypedDigest,
+        worker: &PeerId,
+        incarnation: WorkerIncarnationId,
+        started_seq: u64,
+        ended_seq: u64,
+    ) -> Result<bool, StoreError> {
+        let authority = authority.clone();
+        let worker = worker.0.clone();
+        let started = to_seq(started_seq, "started_seq")?;
+        let ended = to_seq(ended_seq, "ended_seq")?;
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let rows = engine.query(
+                "SELECT highest_boot_generation, incarnation, active, \
+                 operator_reenrollment_generation FROM worker_incarnation_fences \
+                 WHERE worker = ?1",
+                &[SqlValue::Text(worker.clone())],
+            )?;
+            let fence = match rows.as_slice() {
+                [] => return Ok(false),
+                [row] => decode_worker_incarnation_fence(&worker, row)?,
+                _ => {
+                    return Err(StoreError::Corruption("duplicate worker fence rows".into()));
+                }
+            };
+            if fence.active_incarnation != Some(incarnation) {
+                return Ok(false);
+            }
+            let ended_session = engine.execute(
+                "UPDATE worker_sessions SET ended_seq = ?1 \
+                 WHERE worker = ?2 AND incarnation = ?3 AND started_seq = ?4 \
+                 AND ended_seq IS NULL",
+                &[
+                    SqlValue::Int(ended),
+                    SqlValue::Text(worker.clone()),
+                    SqlValue::Blob(u128_blob(incarnation.0)),
+                    SqlValue::Int(started),
+                ],
+            )?;
+            if ended_session == 0 {
+                return Ok(false);
+            }
+            let remaining = engine.query(
+                "SELECT COUNT(*) FROM worker_sessions \
+                 WHERE worker = ?1 AND incarnation = ?2 AND ended_seq IS NULL",
+                &[
+                    SqlValue::Text(worker.clone()),
+                    SqlValue::Blob(u128_blob(incarnation.0)),
+                ],
+            )?;
+            let remaining = match remaining.as_slice() {
+                [row] => match row.as_slice() {
+                    [value] => expect_u64(value, "open worker session count")?,
+                    _ => {
+                        return Err(StoreError::Corruption(
+                            "open worker session count shape".into(),
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(StoreError::Corruption(
+                        "open worker session count shape".into(),
+                    ));
+                }
+            };
+            if remaining > 0 {
+                return Ok(true);
+            }
+            let cleared = engine.execute(
+                "UPDATE worker_incarnation_fences SET active = 0 \
+                 WHERE worker = ?1 AND incarnation = ?2 AND active = 1",
+                &[
+                    SqlValue::Text(worker),
+                    SqlValue::Blob(u128_blob(incarnation.0)),
+                ],
+            )?;
+            if cleared != 1 {
+                return Err(StoreError::Corruption(
+                    "worker session ended without clearing its fence".into(),
+                ));
+            }
+            Ok(true)
+        })
+    }
+
+    fn worker_incarnation_fence(
+        &mut self,
+        worker: &PeerId,
+    ) -> Result<Option<WorkerIncarnationFenceRecord>, StoreError> {
         let rows = self.engine.query(
-            "SELECT incarnation FROM worker_incarnation_fences WHERE worker = ?1",
-            &[SqlValue::Text(worker.to_owned())],
+            "SELECT highest_boot_generation, incarnation, active, \
+             operator_reenrollment_generation FROM worker_incarnation_fences \
+             WHERE worker = ?1",
+            &[SqlValue::Text(worker.0.clone())],
         )?;
-        match rows.first().and_then(|r| r.first()) {
-            None => Ok(None),
-            Some(v) => Ok(Some(expect_u128(v, "worker fence")?)),
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => decode_worker_incarnation_fence(&worker.0, row).map(Some),
+            _ => Err(StoreError::Corruption("duplicate worker fence rows".into())),
         }
     }
 
@@ -5635,7 +5910,9 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             ),
             (
                 "worker_incarnation_fences",
-                "SELECT worker, incarnation FROM worker_incarnation_fences ORDER BY worker",
+                "SELECT worker, incarnation, highest_boot_generation, active, \
+                 operator_reenrollment_generation FROM worker_incarnation_fences \
+                 ORDER BY worker",
             ),
             (
                 "edge_incarnation_fences",
@@ -6268,6 +6545,15 @@ mod tests {
         }
     }
 
+    fn worker_offer(worker: &str, generation: u64, incarnation: u128) -> WorkerSessionOffer {
+        WorkerSessionOffer {
+            worker_peer_id: PeerId(worker.to_owned()),
+            boot_generation: WorkerBootGeneration(generation),
+            incarnation: WorkerIncarnationId(incarnation),
+            reenrollment_proof: None,
+        }
+    }
+
     fn publication(action_tag: u8, descriptor_tag: u8, pin: u128) -> PublicationRow {
         PublicationRow {
             action_key: digest("rabs.action-key.sha256.v1", action_tag),
@@ -6591,17 +6877,125 @@ mod tests {
         );
         assert_eq!(store.peer_authority_high_water("peer-2").unwrap(), None);
 
-        // H038: worker fences are strictly monotone, idempotent at
-        // equality.
-        store.advance_worker_fence(&active, "worker-a", 3).unwrap();
-        store.advance_worker_fence(&active, "worker-a", 3).unwrap();
+        // S022/I47: BOOT generations are monotone; random incarnation
+        // IDs are equality fences, never ordered counters. Admission and
+        // the open-session journal append are one transaction.
+        let first = worker_offer("worker-a", 3, 11);
         assert_eq!(
-            store.advance_worker_fence(&active, "worker-a", 2),
-            Err(StoreError::StaleWorkerIncarnation)
+            store.admit_worker_session(&wrong, &first, 1_100),
+            Err(StoreError::NotActiveAuthority)
         );
-        store.advance_worker_fence(&active, "worker-a", 4).unwrap();
-        assert_eq!(store.worker_fence("worker-a").unwrap(), Some(4));
-        assert_eq!(store.worker_fence("worker-b").unwrap(), None);
+        assert_eq!(
+            store.admit_worker_session(&active, &first, 1_100),
+            Ok(WorkerAdmission::AdmitNewGeneration)
+        );
+        assert_eq!(
+            store.admit_worker_session(&active, &first, 1_100),
+            Ok(WorkerAdmission::AdmitReconnect),
+            "same session admission is idempotent"
+        );
+        assert_eq!(
+            store.admit_worker_session(&active, &first, 1_101),
+            Ok(WorkerAdmission::AdmitReconnect),
+            "one incarnation may hold multiple reconnect sessions"
+        );
+        assert_eq!(
+            store.admit_worker_session(&active, &worker_offer("worker-a", 2, u128::MAX), 1_102,),
+            Ok(WorkerAdmission::RejectStaleBootGeneration)
+        );
+        assert_eq!(
+            store.admit_worker_session(&active, &worker_offer("worker-a", 3, 22), 1_103),
+            Ok(WorkerAdmission::RejectCloneAmbiguity)
+        );
+        assert!(
+            !store
+                .release_worker_session(
+                    &active,
+                    &PeerId("worker-a".into()),
+                    WorkerIncarnationId(22),
+                    1_100,
+                    1_104,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .release_worker_session(
+                    &active,
+                    &PeerId("worker-a".into()),
+                    WorkerIncarnationId(11),
+                    1_100,
+                    1_104,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.admit_worker_session(&active, &worker_offer("worker-a", 3, 22), 1_105),
+            Ok(WorkerAdmission::RejectCloneAmbiguity),
+            "releasing one reconnect must not clear another open session's fence"
+        );
+        assert!(
+            store
+                .release_worker_session(
+                    &active,
+                    &PeerId("worker-a".into()),
+                    WorkerIncarnationId(11),
+                    1_101,
+                    1_106,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.admit_worker_session(&active, &worker_offer("worker-a", 3, 22), 1_107),
+            Ok(WorkerAdmission::AdmitResume)
+        );
+        let mut rolled_back = worker_offer("worker-a", 1, 99);
+        rolled_back.reenrollment_proof = Some(1);
+        assert_eq!(
+            store.admit_worker_session(&active, &rolled_back, 1_108),
+            Ok(WorkerAdmission::RejectStaleBootGeneration),
+            "operator proof cannot lower the durable global high-water"
+        );
+        let mut reenrolled = worker_offer("worker-a", 3, 99);
+        reenrolled.reenrollment_proof = Some(1);
+        assert_eq!(
+            store.admit_worker_session(&active, &reenrolled, 1_109),
+            Ok(WorkerAdmission::AdmitViaReenrollment)
+        );
+        let mut replay = worker_offer("worker-a", 3, 100);
+        replay.reenrollment_proof = Some(1);
+        assert_eq!(
+            store.admit_worker_session(&active, &replay, 1_110),
+            Ok(WorkerAdmission::RejectCloneAmbiguity),
+            "a consumed operator proof cannot pick a second clone"
+        );
+        assert_eq!(
+            store.worker_incarnation_fence(&PeerId("worker-a".into())),
+            Ok(Some(WorkerIncarnationFenceRecord {
+                worker_peer_id: PeerId("worker-a".into()),
+                highest_boot_generation: WorkerBootGeneration(3),
+                active_incarnation: Some(WorkerIncarnationId(99)),
+                operator_reenrollment_generation: 1,
+            }))
+        );
+        assert_eq!(
+            store.worker_incarnation_fence(&PeerId("worker-b".into())),
+            Ok(None)
+        );
+
+        let max_generation = worker_offer("worker-max", u64::MAX, u128::MAX);
+        assert_eq!(
+            store.admit_worker_session(&active, &max_generation, 1_111),
+            Ok(WorkerAdmission::AdmitNewGeneration)
+        );
+        assert_eq!(
+            store
+                .worker_incarnation_fence(&PeerId("worker-max".into()))
+                .unwrap()
+                .unwrap()
+                .highest_boot_generation,
+            WorkerBootGeneration(u64::MAX),
+        );
 
         // H038: edge handoff — at most one active row, predecessor NAMED
         // and matching the fence, fence advances only at resolve.
@@ -6918,7 +7312,10 @@ mod tests {
     fn h038_fence_seed(store: &mut dyn RabsMetadataStore) {
         store.acquire_authority(&authority(1)).unwrap();
         let active = digest("rabs.authority.sha256.v1", 1);
-        store.advance_worker_fence(&active, "worker-a", 7).unwrap();
+        assert_eq!(
+            store.admit_worker_session(&active, &worker_offer("worker-a", 7, 70), 700),
+            Ok(WorkerAdmission::AdmitNewGeneration)
+        );
         store.advance_edge_fence(&active, "edge-1", 9).unwrap();
     }
     fn h038_fence_check_after_reopen(store: &mut dyn RabsMetadataStore) {
@@ -6926,21 +7323,101 @@ mod tests {
         // before the reopen stay refused after it.
         store.acquire_authority(&authority(1)).unwrap();
         let active = digest("rabs.authority.sha256.v1", 1);
-        assert_eq!(store.worker_fence("worker-a").unwrap(), Some(7));
+        assert_eq!(
+            store
+                .worker_incarnation_fence(&PeerId("worker-a".into()))
+                .unwrap()
+                .unwrap()
+                .highest_boot_generation,
+            WorkerBootGeneration(7)
+        );
         assert_eq!(store.edge_fence("edge-1").unwrap(), Some(9));
         assert_eq!(
-            store.advance_worker_fence(&active, "worker-a", 6),
-            Err(StoreError::StaleWorkerIncarnation)
+            store.admit_worker_session(&active, &worker_offer("worker-a", 6, 60), 701),
+            Ok(WorkerAdmission::RejectStaleBootGeneration)
+        );
+        assert_eq!(
+            store.admit_worker_session(&active, &worker_offer("worker-a", 7, 71), 702),
+            Ok(WorkerAdmission::RejectCloneAmbiguity)
         );
         assert_eq!(
             store.advance_edge_fence(&active, "edge-1", 8),
             Err(StoreError::StaleEdgeIncarnation)
         );
-        store.advance_worker_fence(&active, "worker-a", 8).unwrap();
+        assert_eq!(
+            store.admit_worker_session(&active, &worker_offer("worker-a", 8, 80), 703),
+            Ok(WorkerAdmission::AdmitNewGeneration)
+        );
+    }
+
+    fn seed_v19_worker_fence<E: SqlEngine>(engine: &mut E) {
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 19)
+        {
+            engine.execute("BEGIN", &[]).unwrap();
+            for statement in migration.statements {
+                engine.execute(statement, &[]).unwrap();
+            }
+            engine
+                .execute(
+                    "INSERT INTO schema_epochs (version, applied_seq) VALUES (?1, 0)",
+                    &[SqlValue::Int(i64::from(migration.version))],
+                )
+                .unwrap();
+            engine.execute("COMMIT", &[]).unwrap();
+        }
+        engine
+            .execute(
+                "INSERT INTO worker_incarnation_fences (worker, incarnation) VALUES (?1, ?2)",
+                &[
+                    SqlValue::Text("legacy-worker".to_owned()),
+                    SqlValue::Blob(u128_blob(0xCAFE)),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn assert_v19_worker_fence_migrated(store: &mut dyn RabsMetadataStore) {
+        assert_eq!(store.schema_version(), Ok(SCHEMA_VERSION));
+        assert_eq!(
+            store.worker_incarnation_fence(&PeerId("legacy-worker".to_owned())),
+            Ok(Some(WorkerIncarnationFenceRecord {
+                worker_peer_id: PeerId("legacy-worker".to_owned()),
+                highest_boot_generation: WorkerBootGeneration(0),
+                active_incarnation: Some(WorkerIncarnationId(0xCAFE)),
+                operator_reenrollment_generation: 0,
+            })),
+            "a pre-S022 row migrates conservatively as an active generation-zero fence"
+        );
     }
 
     #[test]
-    fn h038_fences_survive_reopen_reference() {
+    fn s022_migrates_populated_v19_worker_fence_reference() {
+        let path = fresh_path("s022-v19-ref");
+        {
+            let mut engine = RusqliteEngine::open(&path).unwrap();
+            seed_v19_worker_fence(&mut engine);
+        }
+        let engine = RusqliteEngine::open(&path).unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        assert_v19_worker_fence_migrated(&mut store);
+    }
+
+    #[test]
+    fn s022_migrates_populated_v19_worker_fence_frankensqlite() {
+        let path = fresh_path("s022-v19-fsq");
+        {
+            let mut engine = FsqliteEngine::open(&path).unwrap();
+            seed_v19_worker_fence(&mut engine);
+        }
+        let engine = FsqliteEngine::open(&path).unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        assert_v19_worker_fence_migrated(&mut store);
+    }
+
+    #[test]
+    fn s022_and_h038_fences_survive_reopen_reference() {
         let path = fresh_path("h038-fence-ref");
         {
             let engine = RusqliteEngine::open(&path).unwrap();
@@ -6953,7 +7430,7 @@ mod tests {
     }
 
     #[test]
-    fn h038_fences_survive_reopen_frankensqlite() {
+    fn s022_and_h038_fences_survive_reopen_frankensqlite() {
         let path = fresh_path("h038-fence-fsq");
         {
             let engine = FsqliteEngine::open(&path).unwrap();

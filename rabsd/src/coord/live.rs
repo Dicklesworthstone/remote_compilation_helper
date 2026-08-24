@@ -41,9 +41,12 @@ use rabs_cas::serving_state::{ServeDecision, serving_gate};
 use rabs_key::logical_output_map::DOMAIN_ARTIFACT_BUNDLE_ROOT;
 use rabs_key::typed_digest::{DOMAIN_ACTION_KEY, DOMAIN_DESCRIPTOR};
 use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
+use rabs_protocol::generation::WorkerIncarnationId;
 use rabs_protocol::result_identity::{
     CanonicalActionResultManifest, DigestAlgorithm, OutputRole, TypedDigest,
 };
+use rabs_protocol::wire_time::PeerId;
+use rabs_protocol::worker_fence::{WorkerAdmission, WorkerSessionOffer};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -425,6 +428,62 @@ impl CoordLive {
     #[must_use]
     pub fn closed_prior_generations(&self) -> u64 {
         self.closed_prior_generations.load(Ordering::Relaxed)
+    }
+
+    /// Admit one worker connection through the durable S022 fence.
+    /// The returned sequence exists only for admitted sessions and must
+    /// be presented to [`Self::release_worker_session`]; rejections write
+    /// neither the fence nor the session journal.
+    ///
+    /// # Errors
+    /// A precise reason if the CAS, coordinator authority, lock, or
+    /// metadata transaction is unavailable.
+    pub fn admit_worker_session(
+        &self,
+        offer: &WorkerSessionOffer,
+    ) -> Result<(WorkerAdmission, Option<u64>), String> {
+        let cas = self.cas.as_ref().ok_or("no rabs-cas store mounted")?;
+        let held = self.authority().ok_or("no coordinator authority")?;
+        let started_seq = self.next_seq();
+        let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
+        let admission = store
+            .admit_worker_session(&authority_digest(&held), offer, started_seq)
+            .map_err(|e| format!("worker session admission: {e:?}"))?;
+        let admitted = matches!(
+            admission,
+            WorkerAdmission::AdmitNewGeneration
+                | WorkerAdmission::AdmitReconnect
+                | WorkerAdmission::AdmitResume
+                | WorkerAdmission::AdmitViaReenrollment
+        );
+        Ok((admission, admitted.then_some(started_seq)))
+    }
+
+    /// End the exact worker session that owns the active incarnation.
+    /// A stale connection cannot clear a newer session's fence.
+    ///
+    /// # Errors
+    /// A precise reason if the CAS, coordinator authority, lock, or
+    /// metadata transaction is unavailable.
+    pub fn release_worker_session(
+        &self,
+        worker: &PeerId,
+        incarnation: WorkerIncarnationId,
+        started_seq: u64,
+    ) -> Result<bool, String> {
+        let cas = self.cas.as_ref().ok_or("no rabs-cas store mounted")?;
+        let held = self.authority().ok_or("no coordinator authority")?;
+        let ended_seq = self.next_seq();
+        let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
+        store
+            .release_worker_session(
+                &authority_digest(&held),
+                worker,
+                incarnation,
+                started_seq,
+                ended_seq,
+            )
+            .map_err(|e| format!("worker session release: {e:?}"))
     }
 
     /// Commit a worker's prepared-result offer: the coordinator-only
@@ -848,6 +907,18 @@ pub fn coord_work(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::janitor::store::mount_and_reconcile;
+    use rabs_protocol::generation::WorkerBootGeneration;
+    use std::sync::Arc;
+
+    fn worker_offer(generation: u64, incarnation: u128) -> WorkerSessionOffer {
+        WorkerSessionOffer {
+            worker_peer_id: PeerId("worker-a".to_owned()),
+            boot_generation: WorkerBootGeneration(generation),
+            incarnation: WorkerIncarnationId(incarnation),
+            reenrollment_proof: None,
+        }
+    }
 
     #[test]
     fn overlapping_flights_one_leader_then_followers() {
@@ -901,5 +972,109 @@ mod tests {
             status.contains("\"destination_arbiter_mounted\":true"),
             "{status}"
         );
+    }
+
+    #[test]
+    fn worker_fence_is_atomic_exact_owner_and_durable() {
+        let dir = tempfile::tempdir().expect("temp store");
+        let cas = Arc::new(mount_and_reconcile(dir.path()).expect("mount"));
+        let coord = CoordLive::with_cas(Arc::clone(&cas));
+        coord
+            .acquire_boot_authority("test-cluster")
+            .expect("authority");
+
+        let first = worker_offer(5, 0x11);
+        let (admission, started) = coord.admit_worker_session(&first).expect("first admission");
+        assert_eq!(admission, WorkerAdmission::AdmitNewGeneration);
+        let started = started.expect("admitted session sequence");
+
+        let (reconnect, reconnect_started) = coord
+            .admit_worker_session(&first)
+            .expect("reconnect admission");
+        assert_eq!(reconnect, WorkerAdmission::AdmitReconnect);
+        let reconnect_started = reconnect_started.expect("reconnect session sequence");
+        assert_ne!(reconnect_started, started);
+
+        let (clone, clone_started) = coord
+            .admit_worker_session(&worker_offer(5, 0x22))
+            .expect("clone decision");
+        assert_eq!(clone, WorkerAdmission::RejectCloneAmbiguity);
+        assert_eq!(clone_started, None, "a rejected clone opens no session");
+        assert!(
+            !coord
+                .release_worker_session(
+                    &PeerId("worker-a".to_owned()),
+                    WorkerIncarnationId(0x22),
+                    started,
+                )
+                .expect("wrong-owner release")
+        );
+        assert!(
+            coord
+                .release_worker_session(
+                    &PeerId("worker-a".to_owned()),
+                    WorkerIncarnationId(0x11),
+                    started,
+                )
+                .expect("exact-owner release")
+        );
+
+        let (still_clone, still_clone_started) = coord
+            .admit_worker_session(&worker_offer(5, 0x22))
+            .expect("clone decision with reconnect still open");
+        assert_eq!(still_clone, WorkerAdmission::RejectCloneAmbiguity);
+        assert_eq!(still_clone_started, None);
+        assert!(
+            coord
+                .release_worker_session(
+                    &PeerId("worker-a".to_owned()),
+                    WorkerIncarnationId(0x11),
+                    reconnect_started,
+                )
+                .expect("final reconnect release")
+        );
+
+        let (resume, resumed_seq) = coord
+            .admit_worker_session(&worker_offer(5, 0x22))
+            .expect("resume admission");
+        assert_eq!(resume, WorkerAdmission::AdmitResume);
+        assert!(resumed_seq.is_some());
+
+        drop(coord);
+        drop(cas);
+        let reopened = Arc::new(mount_and_reconcile(dir.path()).expect("reopen"));
+        let restarted = CoordLive::with_cas(reopened);
+        restarted
+            .acquire_boot_authority("test-cluster")
+            .expect("restarted authority");
+        let (stale, stale_seq) = restarted
+            .admit_worker_session(&worker_offer(4, 0x33))
+            .expect("stale decision");
+        assert_eq!(stale, WorkerAdmission::RejectStaleBootGeneration);
+        assert_eq!(stale_seq, None);
+
+        let mut rolled_back = worker_offer(1, 0x44);
+        rolled_back.reenrollment_proof = Some(1);
+        let (rejected_reset, rejected_reset_seq) = restarted
+            .admit_worker_session(&rolled_back)
+            .expect("rolled-back reenrollment decision");
+        assert_eq!(rejected_reset, WorkerAdmission::RejectStaleBootGeneration);
+        assert_eq!(rejected_reset_seq, None);
+
+        let mut reenrolled = worker_offer(5, 0x44);
+        reenrolled.reenrollment_proof = Some(1);
+        let (reset, reset_seq) = restarted
+            .admit_worker_session(&reenrolled)
+            .expect("operator reenrollment");
+        assert_eq!(reset, WorkerAdmission::AdmitViaReenrollment);
+        assert!(reset_seq.is_some());
+
+        let mut replay = worker_offer(5, 0x55);
+        replay.reenrollment_proof = Some(1);
+        let (rejected_replay, replay_seq) = restarted
+            .admit_worker_session(&replay)
+            .expect("replayed proof decision");
+        assert_eq!(rejected_replay, WorkerAdmission::RejectCloneAmbiguity);
+        assert_eq!(replay_seq, None);
     }
 }

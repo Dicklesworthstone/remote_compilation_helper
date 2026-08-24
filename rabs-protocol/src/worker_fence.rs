@@ -55,7 +55,8 @@ pub enum WorkerAdmission {
     /// Same generation, no live incarnation (coordinator restarted or the
     /// session dropped): admit this incarnation as the one active.
     AdmitResume,
-    /// Operator re-enrollment proof consumed: admit and record it.
+    /// Fresh operator re-enrollment proof consumed at or above the
+    /// durable boot-generation high-water: admit and record it.
     AdmitViaReenrollment,
     /// Boot generation lower than the high-water mark: a stale or
     /// restored daemon; reject.
@@ -75,15 +76,19 @@ impl WorkerIncarnationFenceRecord {
         if offer.worker_peer_id != self.worker_peer_id {
             return WorkerAdmission::RejectIdentityMismatch;
         }
-        // A FRESH re-enrollment proof resolves any ambiguity by operator
+        // No proof may lower the durable high-water: otherwise a clone
+        // from the old lineage could later present that old high-water
+        // and look strictly newer than the operator-selected worker.
+        if offer.boot_generation < self.highest_boot_generation {
+            return WorkerAdmission::RejectStaleBootGeneration;
+        }
+        // A FRESH re-enrollment proof resolves same-generation clone
+        // ambiguity (or accompanies a newer generation) by operator
         // decision; a stale/replayed proof does not.
         if let Some(proof) = offer.reenrollment_proof
             && proof > self.operator_reenrollment_generation
         {
             return WorkerAdmission::AdmitViaReenrollment;
-        }
-        if offer.boot_generation < self.highest_boot_generation {
-            return WorkerAdmission::RejectStaleBootGeneration;
         }
         if offer.boot_generation > self.highest_boot_generation {
             return WorkerAdmission::AdmitNewGeneration;
@@ -171,6 +176,18 @@ mod tests {
             consumed.evaluate(&o),
             WorkerAdmission::RejectCloneAmbiguity,
             "a replayed proof must not resolve ambiguity"
+        );
+    }
+
+    #[test]
+    fn reenrollment_never_lowers_the_global_boot_high_water() {
+        let r = record(5, Some(11));
+        let mut restored = offer(1, 22);
+        restored.reenrollment_proof = Some(1);
+        assert_eq!(
+            r.evaluate(&restored),
+            WorkerAdmission::RejectStaleBootGeneration,
+            "operator recovery must first advance the durable boot generation"
         );
     }
 

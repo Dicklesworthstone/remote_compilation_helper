@@ -30,6 +30,8 @@ use crate::metadata_store::{RabsMetadataStore, SqlEngine, SqlMetadataStore, SqlV
 use crate::startup_reconciliation::{
     Drift, FilesystemReality, ServingDecision, StartupReport, reconcile_startup,
 };
+use rabs_protocol::generation::WorkerIncarnationId;
+use rabs_protocol::wire_time::PeerId;
 
 /// One still-open worker session row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +40,8 @@ pub struct OpenSession {
     pub worker: String,
     /// Process incarnation blob, hex-rendered.
     pub incarnation_hex: String,
+    /// Parsed process incarnation used for exact-owner fence release.
+    pub incarnation: WorkerIncarnationId,
     /// The session's start sequence (needed to end it).
     pub started_seq: u64,
 }
@@ -113,22 +117,24 @@ fn open_sessions_for_worker<E: SqlEngine>(
          WHERE worker = ?1 AND ended_seq IS NULL",
         &[SqlValue::Text(worker.to_owned())],
     )?;
-    Ok(rows
-        .into_iter()
+    rows.into_iter()
         .map(|row| {
-            let incarnation_hex = match row.get(1) {
-                Some(SqlValue::Blob(bytes)) => {
-                    bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                }
-                other => format!("{other:?}"),
+            let Some(SqlValue::Blob(bytes)) = row.get(1) else {
+                return Err(StoreError::Corruption(
+                    "worker session incarnation shape".into(),
+                ));
             };
-            OpenSession {
+            let incarnation_bytes: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
+                StoreError::Corruption("worker session incarnation not 16 bytes".into())
+            })?;
+            Ok(OpenSession {
                 worker: text_at(&row, 0),
-                incarnation_hex,
+                incarnation_hex: bytes.iter().map(|b| format!("{b:02x}")).collect(),
+                incarnation: WorkerIncarnationId(u128::from_be_bytes(incarnation_bytes)),
                 started_seq: int_at(&row, 2),
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Non-terminal operations lagging the operation watermark by more than
@@ -220,12 +226,36 @@ pub fn reconcile_worker<E: SqlEngine>(
     now_seq: u64,
     min_operation_seq_lag: u64,
 ) -> Result<WorkerReconcileReport, StoreError> {
-    // 1. End every open session row for this worker. `end_worker_session`
-    //    updates only the matching (worker, started_seq) open row and
-    //    reports whether it did — re-runs are naturally idempotent.
+    // 1. End every open session row for this worker. An active
+    //    coordinator authority is mandatory whenever journals need
+    //    mutation: without it, ending a journal while leaving its
+    //    durable incarnation fence active would report a false recovery.
+    let sessions = open_sessions_for_worker(store, worker)?;
+    let active_authority = store.active_authority()?.map(|row| row.digest);
+    if !sessions.is_empty() && active_authority.is_none() {
+        return Err(StoreError::NotActiveAuthority);
+    }
+    let worker_peer_id = PeerId(worker.to_owned());
     let mut sessions_ended = 0u32;
-    for session in open_sessions_for_worker(store, worker)? {
-        if store.end_worker_session(&session.worker, session.started_seq, now_seq)? {
+    for session in sessions {
+        let authority = active_authority
+            .as_ref()
+            .ok_or(StoreError::NotActiveAuthority)?;
+        let ended = if store.release_worker_session(
+            authority,
+            &worker_peer_id,
+            session.incarnation,
+            session.started_seq,
+            now_seq,
+        )? {
+            true
+        } else {
+            // Historical/torn rows may predate or no longer own the
+            // active fence. End their journals without letting them
+            // clear a different incarnation's authority.
+            store.end_worker_session(&session.worker, session.started_seq, now_seq)?
+        };
+        if ended {
             sessions_ended += 1;
         }
     }
@@ -287,6 +317,8 @@ mod tests {
     use crate::publication::authority_digest;
     use crate::startup_reconciliation::SetFilesystem;
     use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
+    use rabs_protocol::generation::WorkerBootGeneration;
+    use rabs_protocol::worker_fence::{WorkerAdmission, WorkerSessionOffer};
 
     /// A store with one ACTIVE authority (operations require it) and two
     /// open sessions for `worker-a`, one abandoned-lagging operation, and
@@ -312,9 +344,21 @@ mod tests {
         store
             .record_worker_session("worker-a", 0x1111, 10)
             .expect("session 1");
-        store
-            .record_worker_session("worker-a", 0x2222, 20)
-            .expect("session 2");
+        assert_eq!(
+            store
+                .admit_worker_session(
+                    &authority_digest(&coordinator),
+                    &WorkerSessionOffer {
+                        worker_peer_id: PeerId("worker-a".to_owned()),
+                        boot_generation: WorkerBootGeneration(1),
+                        incarnation: WorkerIncarnationId(0x2222),
+                        reenrollment_proof: None,
+                    },
+                    20,
+                )
+                .expect("session 2"),
+            WorkerAdmission::AdmitNewGeneration
+        );
         // The STALE operation: touched at seq 100, never advanced.
         store
             .create_operation(
@@ -353,6 +397,15 @@ mod tests {
                 .is_empty(),
             "no open session rows survive"
         );
+        assert_eq!(
+            store
+                .worker_incarnation_fence(&PeerId("worker-a".to_owned()))
+                .unwrap()
+                .unwrap()
+                .active_incarnation,
+            None,
+            "reconciliation clears only the exact active incarnation"
+        );
 
         // FIND: exactly the lagging operation is stale; the watermark op
         // is not.
@@ -366,6 +419,44 @@ mod tests {
                 .iter()
                 .any(|p| p.target == format!("operation:{}", u128_hex(0xAA00))),
             "every finding gets a named safe-resolution proposal"
+        );
+    }
+
+    #[test]
+    fn reconcile_without_authority_preserves_journal_and_fence() {
+        let mut store = seeded_store();
+        let active = store
+            .active_authority()
+            .expect("authority query")
+            .expect("seeded authority")
+            .digest;
+        store.release_authority(&active).expect("release authority");
+
+        assert_eq!(
+            reconcile_worker(
+                &mut store,
+                &SetFilesystem::default(),
+                "worker-a",
+                6_000,
+                100,
+            ),
+            Err(StoreError::NotActiveAuthority)
+        );
+        assert_eq!(
+            open_sessions_for_worker(&mut store, "worker-a")
+                .expect("open sessions")
+                .len(),
+            2,
+            "failed recovery must not end only the journals"
+        );
+        assert_eq!(
+            store
+                .worker_incarnation_fence(&PeerId("worker-a".to_owned()))
+                .expect("worker fence")
+                .expect("seeded fence")
+                .active_incarnation,
+            Some(WorkerIncarnationId(0x2222)),
+            "failed recovery must leave the matching fence untouched"
         );
     }
 
