@@ -732,8 +732,8 @@ impl WorkerSelector {
             // Explicit worker requests are remote allow-sets. Affinity fallback
             // is valid only for automatic selection; otherwise a cached worker
             // could escape the requested set after admission or reservation
-            // changes.
-            if request.preferred_workers.is_empty()
+            if !request.job_mode
+                && request.preferred_workers.is_empty()
                 && let Some(fallback_worker_id) =
                     self.try_fallback(pool, request, excluded_worker_ids).await
             {
@@ -2246,6 +2246,24 @@ impl WorkerSelector {
         }
         if !eligible.is_empty() {
             return Ok(eligible);
+        }
+
+        // bd-g7rpy (GH#27 P4, job mode ONLY): the one-active-job-per-project-
+        // per-worker guard means an N-shard `--job` burst can occupy at most
+        // one slot per worker for this project, so a burst larger than the
+        // worker count leaves every otherwise-eligible worker excluded by an
+        // ACTIVE job — a transient state that resolves as those jobs finish.
+        // Returning an empty eligible set maps to AllWorkersBusy upstream,
+        // which keeps RCH_QUEUE_WHEN_BUSY polling (initial admission AND
+        // queue polls) instead of failing excess shards to local execution.
+        // Compilation requests keep the immediate NoAdmissibleWorkers below.
+        if request.job_mode
+            && filtered_by_active_project > 0
+            && preferred.is_empty()
+            && eligible_without_health.is_empty()
+            && preferred_without_health.is_empty()
+        {
+            return Ok(Vec::new());
         }
 
         if (filtered_by_active_project > 0 || (filtered_by_capacity > 0 && filtered_by_slots == 0))
@@ -3774,6 +3792,7 @@ mod tests {
         rt.block_on(async {
             let worker = make_worker("test", 16, 80.0);
             let request = SelectionRequest {
+                job_mode: false,
                 project: "myproject".to_string(),
                 command: None,
                 command_priority: CommandPriority::Normal,
@@ -3799,6 +3818,7 @@ mod tests {
         rt.block_on(async {
             let worker = make_worker("zero", 0, 80.0);
             let request = SelectionRequest {
+                job_mode: false,
                 project: "myproject".to_string(),
                 command: None,
                 command_priority: CommandPriority::Normal,
@@ -3836,6 +3856,7 @@ mod tests {
             .await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "myproject".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -3859,6 +3880,7 @@ mod tests {
         let pool = WorkerPool::new();
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
+            job_mode: false,
             project: "metrics-fallback-project".to_string(),
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
@@ -3911,6 +3933,7 @@ mod tests {
         assert_eq!(full_worker.available_slots().await, 0);
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "myproject".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -3941,6 +3964,7 @@ mod tests {
         open_worker.open_circuit().await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "myproject".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -3975,6 +3999,7 @@ mod tests {
         worker2.open_circuit().await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "myproject".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4011,6 +4036,7 @@ mod tests {
         worker.half_open_circuit().await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "myproject".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4063,6 +4089,7 @@ mod tests {
         half_open_worker.start_probe(&config).await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "myproject".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4104,6 +4131,7 @@ mod tests {
         half_open_worker.half_open_circuit().await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "myproject".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4139,6 +4167,7 @@ mod tests {
             .await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "myproject".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4170,6 +4199,7 @@ mod tests {
         .await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "myproject".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4206,6 +4236,7 @@ mod tests {
         pool.add_worker(low.config.read().await.clone()).await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "myproject".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4256,6 +4287,7 @@ mod tests {
         half_open_worker.half_open_circuit().await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "myproject".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4414,6 +4446,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4451,6 +4484,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: Some(command.to_string()),
             command_priority: CommandPriority::Normal,
@@ -4501,6 +4535,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: Some("cargo build --target x86_64-pc-windows-msvc".to_string()),
             command_priority: CommandPriority::Normal,
@@ -4612,6 +4647,7 @@ mod tests {
         selector.record_success("warm-worker", "test-project").await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: Some("cargo check".to_string()),
             command_priority: CommandPriority::Normal,
@@ -4656,6 +4692,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4698,6 +4735,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4732,6 +4770,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4795,6 +4834,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4872,6 +4912,7 @@ mod tests {
 
     fn pinned_component_request(project: &str, command: &str) -> SelectionRequest {
         SelectionRequest {
+            job_mode: false,
             project: project.to_string(),
             command: Some(command.to_string()),
             command_priority: CommandPriority::Normal,
@@ -4964,6 +5005,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4999,6 +5041,7 @@ mod tests {
         selector.record_build("cached", "proj", false).await;
 
         let base_request = SelectionRequest {
+            job_mode: false,
             project: "proj".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -5054,6 +5097,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -5090,6 +5134,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "test".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -5141,6 +5186,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "test".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -5205,6 +5251,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "test".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -5256,6 +5303,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let nix_request = SelectionRequest {
+            job_mode: false,
             project: "test".to_string(),
             command: Some("nix build .#foo".to_string()),
             command_priority: CommandPriority::Normal,
@@ -5314,6 +5362,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "frankenterm".to_string(),
             command: Some("cargo build".to_string()),
             command_priority: CommandPriority::Normal,
@@ -5371,6 +5420,75 @@ mod tests {
                 .reason_codes
                 .iter()
                 .any(|code| code == "runtime.unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_job_mode_queues_when_active_project_exclusion_excludes_all() {
+        let pool = WorkerPool::new();
+        let busy_a = make_worker("busy-a", 4, 80.0);
+        busy_a
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.97.0-nightly".to_string()),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(busy_a).await;
+        let busy_b = make_worker("busy-b", 4, 80.0);
+        busy_b
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.97.0-nightly".to_string()),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(busy_b).await;
+
+        let selector = WorkerSelector::default();
+        let mut excluded_worker_ids = HashSet::new();
+        excluded_worker_ids.insert("busy-a".to_string());
+        excluded_worker_ids.insert("busy-b".to_string());
+
+        // Job mode (bd-g7rpy): exclusion by ACTIVE jobs of the same project is
+        // transient — the empty eligible set maps to AllWorkersBusy so
+        // RCH_QUEUE_WHEN_BUSY polling queues instead of failing to local.
+        let job_request = SelectionRequest {
+            job_mode: true,
+            project: "sharded".to_string(),
+            command: Some("./run_shards.sh".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::None,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+        let result = selector
+            .select_with_exclusions(&pool, &job_request, &excluded_worker_ids)
+            .await;
+        assert!(result.worker.is_none());
+        assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+
+        // Compilation requests keep the immediate NoAdmissibleWorkers verdict.
+        let compile_request = SelectionRequest {
+            job_mode: false,
+            project: "sharded".to_string(),
+            command: Some("cargo build".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+        let result = selector
+            .select_with_exclusions(&pool, &compile_request, &excluded_worker_ids)
+            .await;
+        assert!(result.worker.is_none());
+        assert_eq!(
+            result.reason,
+            SelectionReason::NoAdmissibleWorkers("active_project_exclusion=2".to_string())
         );
     }
 
@@ -5447,6 +5565,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "frankenterm".to_string(),
             command: Some("cargo test -p rchd --lib".to_string()),
             command_priority: CommandPriority::Normal,
@@ -5507,6 +5626,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "topology-project".to_string(),
             command: Some("cargo test --no-run".to_string()),
             command_priority: CommandPriority::Normal,
@@ -5542,6 +5662,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "topology-project".to_string(),
             command: Some("cargo build".to_string()),
             command_priority: CommandPriority::Normal,
@@ -5604,6 +5725,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "pressure-plus-busy".to_string(),
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
@@ -5642,6 +5764,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "topology-flap".to_string(),
             command: Some("cargo check".to_string()),
             command_priority: CommandPriority::Normal,
@@ -5700,6 +5823,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "toolchain-project".to_string(),
             command: Some("cargo check".to_string()),
             command_priority: CommandPriority::Normal,
@@ -5760,6 +5884,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "toolchain-project".to_string(),
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
@@ -5815,6 +5940,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "pressure-critical".to_string(),
             command: Some("cargo build".to_string()),
             command_priority: CommandPriority::Normal,
@@ -5861,6 +5987,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "pressure-and-health".to_string(),
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
@@ -5908,6 +6035,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "pressure-mixed".to_string(),
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
@@ -5964,6 +6092,7 @@ mod tests {
 
         let selector = WorkerSelector::default();
         let request = SelectionRequest {
+            job_mode: false,
             project: "pressure-gap".to_string(),
             command: Some("cargo build".to_string()),
             command_priority: CommandPriority::Normal,
@@ -6014,6 +6143,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6064,6 +6194,7 @@ mod tests {
             .await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6100,6 +6231,7 @@ mod tests {
         selector.record_build("test-warm", "proj", false).await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "proj".to_string(),
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
@@ -6141,6 +6273,7 @@ mod tests {
 
         // No cache warmth recorded for either worker
         let request = SelectionRequest {
+            job_mode: false,
             project: "new-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6175,6 +6308,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6232,6 +6366,7 @@ mod tests {
         let selector = WorkerSelector::new();
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6271,6 +6406,7 @@ mod tests {
         );
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6302,6 +6438,7 @@ mod tests {
 
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6338,6 +6475,7 @@ mod tests {
         let selector = WorkerSelector::new();
         selector.record_success("fallback", "test-project").await;
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6377,6 +6515,7 @@ mod tests {
 
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6423,6 +6562,7 @@ mod tests {
 
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6473,6 +6613,7 @@ mod tests {
 
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6696,6 +6837,7 @@ mod tests {
 
         // Make a selection request
         let request = SelectionRequest {
+            job_mode: false,
             project: "audit-test-project".to_string(),
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
@@ -6883,6 +7025,7 @@ mod tests {
         selector.record_success("worker1", "project-a").await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "project-a".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6913,6 +7056,7 @@ mod tests {
         selector.record_success("worker1", "project-a").await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "project-a".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -6958,6 +7102,7 @@ mod tests {
         selector.record_success("worker1", "project-a").await;
 
         let request = SelectionRequest {
+            job_mode: false,
             project: "project-a".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -7046,6 +7191,7 @@ mod tests {
                         command_priority: CommandPriority::Normal,
                         estimated_cores,
                         preferred_workers: vec![],
+                        job_mode: false,
                         toolchain: None,
                         required_runtime: RequiredRuntime::default(),
                         classification_duration_us: None,
@@ -7654,6 +7800,7 @@ mod tests {
             selector.set_reliability(Arc::new(reliability));
 
             let request = SelectionRequest {
+                job_mode: false,
                 project: "reliability-penalty".to_string(),
                 command: Some("cargo build --workspace".to_string()),
                 command_priority: CommandPriority::Normal,
@@ -7716,6 +7863,7 @@ mod tests {
             selector.set_reliability(Arc::new(reliability));
 
             let request = SelectionRequest {
+                job_mode: false,
                 project: "reliability-quarantine".to_string(),
                 command: Some("cargo test".to_string()),
                 command_priority: CommandPriority::Normal,
@@ -7803,6 +7951,7 @@ mod tests {
             selector.set_reliability(reliability.clone());
 
             let request = SelectionRequest {
+                job_mode: false,
                 project: "reliability-recovery".to_string(),
                 command: Some("cargo test".to_string()),
                 command_priority: CommandPriority::Normal,
@@ -7850,6 +7999,7 @@ mod tests {
 
         fn make_selection_request(project: &str) -> SelectionRequest {
             SelectionRequest {
+                job_mode: false,
                 project: project.to_string(),
                 command: Some("cargo build".to_string()),
                 command_priority: CommandPriority::Normal,

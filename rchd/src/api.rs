@@ -1698,6 +1698,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     let mut command = None;
     let mut cores = None;
     let mut wait_for_worker = false;
+    let mut job_mode = false;
     let mut wait_timeout_secs = None;
     let mut toolchain = None;
     let mut required_runtime = RequiredRuntime::default();
@@ -1742,6 +1743,9 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 let pr_str = percent_unescape_query_value(value);
                 command_priority = pr_str.parse().unwrap_or(CommandPriority::Normal);
             }
+            "job_mode" => {
+                job_mode = value == "1" || value.eq_ignore_ascii_case("true");
+            }
             "classification_us" => {
                 // Classification latency from hook (for AGENTS.md compliance tracking)
                 classification_duration_us = value.parse().ok();
@@ -1779,6 +1783,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             required_runtime,
             classification_duration_us,
             hook_pid,
+            job_mode,
         },
         wait_for_worker,
         wait_timeout_secs,
@@ -4240,6 +4245,7 @@ mod tests {
         let pool = WorkerPool::new();
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
+            job_mode: false,
             project: "test".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4272,6 +4278,7 @@ mod tests {
 
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
+            job_mode: false,
             project: "test".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4301,6 +4308,7 @@ mod tests {
 
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
+            job_mode: false,
             project: "test".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4330,6 +4338,7 @@ mod tests {
 
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
+            job_mode: false,
             project: "test".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4365,6 +4374,7 @@ mod tests {
 
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
+            job_mode: false,
             project: "test".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4392,6 +4402,7 @@ mod tests {
         pool.add_worker(make_test_worker("alternate", 8)).await;
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
+            job_mode: false,
             project: "test".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4425,6 +4436,7 @@ mod tests {
 
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
+            job_mode: false,
             project: "test".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4455,6 +4467,7 @@ mod tests {
         let ctx = make_test_context(pool);
         *ctx.admission_barrier.write().await = true;
         let request = SelectionRequest {
+            job_mode: false,
             project: "restart-guard".to_string(),
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
@@ -4580,6 +4593,7 @@ mod tests {
             .record_success("worker2", "test-project")
             .await;
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,
@@ -4608,6 +4622,7 @@ mod tests {
 
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
+            job_mode: false,
             project: "test-project".to_string(),
             command: Some("cargo build --release".to_string()),
             command_priority: CommandPriority::Normal,
@@ -4675,6 +4690,7 @@ mod tests {
 
         let ctx = make_test_context(pool);
         let first_request = SelectionRequest {
+            job_mode: false,
             project: "shared-project".to_string(),
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
@@ -4696,6 +4712,7 @@ mod tests {
         );
 
         let second_request = SelectionRequest {
+            job_mode: false,
             project: "shared-project".to_string(),
             command: Some("cargo test".to_string()),
             command_priority: CommandPriority::Normal,
@@ -4736,6 +4753,7 @@ mod tests {
 
         let ctx = make_test_context(pool);
         let first_request = SelectionRequest {
+            job_mode: false,
             project: "shared-project".to_string(),
             command: Some("cargo build".to_string()),
             command_priority: CommandPriority::Normal,
@@ -4757,6 +4775,7 @@ mod tests {
         );
 
         let second_request = SelectionRequest {
+            job_mode: false,
             project: "shared-project".to_string(),
             command: Some("cargo build".to_string()),
             command_priority: CommandPriority::Normal,
@@ -4779,12 +4798,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_select_worker_job_mode_burst_spreads_then_queues() {
+        // bd-g7rpy: a job burst larger than the worker count spreads one shard
+        // per worker (one-active-job-per-project-per-worker guard), then excess
+        // shards QUEUE (AllWorkersBusy) instead of failing to local. The same
+        // state for a compilation request still returns NoAdmissibleWorkers.
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        pool.add_worker(make_test_worker("worker2", 8)).await;
+
+        let ctx = make_test_context(pool);
+        let shard = |pid: u32, job_mode: bool| SelectionRequest {
+            job_mode,
+            project: "burst-project".to_string(),
+            command: Some("./run_shard.sh".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: Some(pid),
+        };
+
+        let s1 = handle_select_worker(&ctx, shard(101, true), false, None)
+            .await
+            .unwrap();
+        assert_eq!(s1.reason, SelectionReason::Success);
+
+        let s2 = handle_select_worker(&ctx, shard(102, true), false, None)
+            .await
+            .unwrap();
+        assert_eq!(s2.reason, SelectionReason::Success);
+        // Spread: the guard forces shard 2 onto the OTHER worker.
+        let w1 = s1.worker.as_ref().map(|w| w.id.as_str()).unwrap();
+        let w2 = s2.worker.as_ref().map(|w| w.id.as_str()).unwrap();
+        assert_ne!(w1, w2);
+
+        let s3 = handle_select_worker(&ctx, shard(103, true), false, None)
+            .await
+            .unwrap();
+        assert!(s3.worker.is_none());
+        assert_eq!(s3.reason, SelectionReason::AllWorkersBusy);
+
+        // Compilation request in the identical state: unchanged verdict.
+        let compile = handle_select_worker(&ctx, shard(104, false), false, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            compile.reason,
+            SelectionReason::NoAdmissibleWorkers(_)
+        ));
+    }
+    #[tokio::test]
     async fn test_handle_select_worker_allows_different_projects_on_same_worker() {
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
 
         let ctx = make_test_context(pool);
         let first_request = SelectionRequest {
+            job_mode: false,
             project: "project-a".to_string(),
             command: Some("cargo check".to_string()),
             command_priority: CommandPriority::Normal,
@@ -4802,6 +4875,7 @@ mod tests {
         assert_eq!(first_response.reason, SelectionReason::Success);
 
         let second_request = SelectionRequest {
+            job_mode: false,
             project: "project-b".to_string(),
             command: Some("cargo check".to_string()),
             command_priority: CommandPriority::Normal,
@@ -4827,10 +4901,10 @@ mod tests {
     async fn test_handle_select_worker_preferred() {
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
-        pool.add_worker(make_test_worker("worker2", 8)).await;
 
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
+            job_mode: false,
             project: "test".to_string(),
             command: None,
             command_priority: CommandPriority::Normal,

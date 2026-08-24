@@ -61,6 +61,7 @@ pub(crate) async fn query_daemon(
     local_wrapper_id: Option<&str>,
     wait_for_worker: bool,
     preferred_workers: &[WorkerId],
+    job_mode: bool,
 ) -> anyhow::Result<SelectionResponse> {
     // Mock support: RCH_MOCK_CIRCUIT_OPEN simulates all circuits open
     // This needs to be checked in the hook since the daemon may be started
@@ -142,6 +143,11 @@ pub(crate) async fn query_daemon(
             "&preferred_workers={}",
             urlencoding_encode(&legacy_preferred_workers)
         ));
+    }
+
+    // Job-mode admissions (bd-g7rpy) may queue on active-project exclusion.
+    if job_mode {
+        query.push_str("&job_mode=1");
     }
 
     // When all workers are at capacity, queue the build on the daemon instead of
