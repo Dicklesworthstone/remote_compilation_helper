@@ -22,3 +22,6 @@ rabs-protocol = { path = "../rabs-protocol" }
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[dev-dependencies]
+tempfile = "3.25.0"

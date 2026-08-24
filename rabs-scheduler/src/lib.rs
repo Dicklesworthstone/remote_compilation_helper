@@ -35,9 +35,12 @@
 pub mod acquisition_order;
 pub mod break_even;
 pub mod critical_path;
+pub mod cross_edge_registry;
 pub mod fairness;
+pub mod grant_planes;
 pub mod hard_exclusions;
 pub mod health_policy;
+pub mod lineage_waiters;
 pub mod managed_pool;
 pub mod pool_sizing;
 pub mod priority_classes;
