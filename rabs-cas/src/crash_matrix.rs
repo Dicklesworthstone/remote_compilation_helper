@@ -6,7 +6,7 @@
 //! lease), object upload, offer admission, the atomic commit
 //! transaction (publication + serving state + winner evidence +
 //! reachability pin), and the H026 divergence-quarantine sequence
-//! (quarantine → disposition → edges → pin → evidence → incident →
+//! (disposition → quarantine → edges → pin → evidence → incident →
 //! escalation receipts) — including INSIDE store transactions (the
 //! budget expires between `BEGIN` and `COMMIT`, leaving a torn
 //! transaction for the engine to discard on reopen).
@@ -28,8 +28,8 @@
 //!   serving decision of `Allowed`;
 //! - **quarantine monotonicity** (divergence phase): the H026
 //!   stricter-state-first write order is visible in every crash state —
-//!   escalation receipt ⇒ incident row ⇒ preservation pin ⇒ quarantined
-//!   disposition ⇒ quarantine row; the reverse implications may be
+//!   escalation receipt ⇒ incident row ⇒ preservation pin ⇒ quarantine
+//!   row ⇒ quarantined disposition; the reverse implications may be
 //!   absent mid-sequence, the forward ones never.
 //!
 //! The per-boundary reopened snapshots are returned so the caller can
@@ -480,14 +480,14 @@ fn check_recovery(
             (
                 "preservation pin",
                 preservation_pin,
-                "quarantined disposition",
-                quarantined_disposition,
-            ),
-            (
-                "quarantined disposition",
-                quarantined_disposition,
                 "quarantine row",
                 quarantine_row,
+            ),
+            (
+                "quarantine row",
+                quarantine_row,
+                "quarantined disposition",
+                quarantined_disposition,
             ),
         ];
         for (later_name, later, earlier_name, earlier) in chain {

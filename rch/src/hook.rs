@@ -703,21 +703,12 @@ fn exit_with_local_fallback(
     reason: &str,
     require_remote: bool,
 ) -> ! {
-    // bd-uoh4x: machine consumers learn the fallback decision even when the
-    // locally-run command's own exit code is all the process surfaces.
-    emit_exec_envelope(&ExecResultEnvelope {
-        api_version: "1.0",
-        command,
-        outcome: "completed",
-        location: "local",
-        fallback_reason: Some(reason),
-        worker_id: None,
-        remote_exit_code: None,
-        duration_ms: None,
-        timing: None,
-        result_dirs: None,
-        error_code: None,
-    });
+    // bd-uoh4x: exactly ONE envelope per invocation, emitted at the
+    // TERMINAL path only. A pre-run emit here would double-emit on the
+    // completed path (once before the child runs, again below with the
+    // real exit code) and lie on the refusal path (a `completed`
+    // envelope immediately followed by `refused`). Observed live via
+    // job-mode local fallback during bd-uoh4x verification.
     let mut child = match local_fallback_command_for_policy(command, require_remote) {
         Ok(child) => child,
         Err(LocalFallbackRefusal::RemoteRequired) => {
@@ -765,6 +756,19 @@ fn exit_with_local_fallback(
         }
         Err(error) => {
             reporter.summary(&format!("[RCH] local fallback failed: {error}"));
+            emit_exec_envelope(&ExecResultEnvelope {
+                api_version: "1.0",
+                command,
+                outcome: "transport_error",
+                location: "local",
+                fallback_reason: Some(reason),
+                worker_id: None,
+                remote_exit_code: None,
+                duration_ms: None,
+                timing: None,
+                result_dirs: None,
+                error_code: None,
+            });
             std::process::exit(EXIT_BUILD_ERROR);
         }
     }

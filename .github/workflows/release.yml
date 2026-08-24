@@ -47,7 +47,7 @@ jobs:
   # Validate tag and plan the release
   plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
@@ -72,6 +72,24 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Building release for tag: $TAG (version: $VERSION)"
+      # S010 supply-chain gate (bead rabs-root-4pidu.37.10): a release
+      # may not ship while the unsafe-boundary ledger is stale (A011)
+      # or any per-crate dependency budget is exceeded without review
+      # (A012). Both gates are fast pure test binaries; running them in
+      # `plan` blocks every build job upstream of any artifact. The
+      # privileged-helper fuzz requirement rides on the A011 ledger's
+      # entry contract (fuzz status per entry); with zero entries the
+      # obligation is vacuously satisfied.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-06
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-supply-chain-gate
+      - name: Supply-chain gate — unsafe-boundary ledger currency (A011)
+        run: cargo test -p rabs-sandbox --test unsafe_boundary_ledger
+      - name: Supply-chain gate — dependency budgets (A012)
+        run: cargo test -p rabs-protocol --test dependency_budget
 
   # Build for Linux x86_64 (GNU libc)
   build-linux-x86_64:
