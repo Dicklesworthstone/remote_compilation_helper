@@ -2248,46 +2248,6 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
         })
     }
 
-    fn create_bound_generation(
-        &mut self,
-        authority: &TypedDigest,
-        generation: &ActionGeneration,
-        action_key: &TypedDigest,
-    ) -> Result<(), StoreError> {
-        if generation.created_under_authority_digest != *authority {
-            return Err(StoreError::AttemptAuthorityMismatch);
-        }
-        let authority = authority.clone();
-        let action = digest_key(action_key);
-        let generation = generation.clone();
-        self.in_txn(move |engine| {
-            SqlMetadataStore::<E>::require_active(engine, &authority)?;
-            let id = generation.generation_id.0;
-            let high_water = SqlMetadataStore::<E>::generation_high_water(engine)?;
-            if id <= high_water {
-                return Err(StoreError::GenerationIdNotAboveHighWater);
-            }
-            engine.execute(
-                "INSERT INTO action_generations \
-                 (id_hex, id, action_key, authority_key, tombstoned, per_key_ordinal) \
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-                &[
-                    SqlValue::Text(u128_hex(id)),
-                    SqlValue::Blob(u128_blob(id)),
-                    SqlValue::Text(action),
-                    SqlValue::Text(digest_key(&authority)),
-                    SqlValue::Blob(u64_blob(generation.per_key_ordinal)),
-                ],
-            )?;
-            engine.execute(
-                "INSERT OR REPLACE INTO generation_high_water (kind, value) \
-                 VALUES ('action-generation', ?1)",
-                &[SqlValue::Blob(u128_blob(id))],
-            )?;
-            Ok(())
-        })
-    }
-
     fn digest_params(d: &TypedDigest) -> [SqlValue; 3] {
         [
             SqlValue::Text(algo_tag(d.algorithm).to_owned()),
@@ -2939,6 +2899,45 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     SqlValue::Blob(u128_blob(id)),
                     SqlValue::Text(action),
                     SqlValue::Text(digest_key(&authority)),
+                ],
+            )?;
+            engine.execute(
+                "INSERT OR REPLACE INTO generation_high_water (kind, value) \
+                 VALUES ('action-generation', ?1)",
+                &[SqlValue::Blob(u128_blob(id))],
+            )?;
+            Ok(())
+        })
+    }
+    fn create_bound_generation(
+        &mut self,
+        authority: &TypedDigest,
+        generation: &ActionGeneration,
+        action_key: &TypedDigest,
+    ) -> Result<(), StoreError> {
+        if generation.created_under_authority_digest != *authority {
+            return Err(StoreError::AttemptAuthorityMismatch);
+        }
+        let authority = authority.clone();
+        let action = digest_key(action_key);
+        let generation = generation.clone();
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let id = generation.generation_id.0;
+            let high_water = SqlMetadataStore::<E>::generation_high_water(engine)?;
+            if id <= high_water {
+                return Err(StoreError::GenerationIdNotAboveHighWater);
+            }
+            engine.execute(
+                "INSERT INTO action_generations \
+                 (id_hex, id, action_key, authority_key, tombstoned, per_key_ordinal) \
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                &[
+                    SqlValue::Text(u128_hex(id)),
+                    SqlValue::Blob(u128_blob(id)),
+                    SqlValue::Text(action),
+                    SqlValue::Text(digest_key(&authority)),
+                    SqlValue::Blob(u64_blob(generation.per_key_ordinal)),
                 ],
             )?;
             engine.execute(
