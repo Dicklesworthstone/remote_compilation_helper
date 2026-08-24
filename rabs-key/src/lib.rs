@@ -47,6 +47,7 @@ pub mod build_script_directives;
 pub mod canonical;
 pub mod canonical_layout;
 pub mod capability_policy;
+pub mod cargo_config_path_resolution;
 pub mod cargo_config_provenance;
 pub mod dag_browser;
 pub mod dep_info;
