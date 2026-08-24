@@ -77,6 +77,8 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
     // Real backing directories so bwrap's binds succeed.
     let toolchain = tempfile::tempdir().expect("toolchain tempdir");
     let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let cargo_home = tempfile::tempdir().expect("cargo-home tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
 
     // The action writes EVERY coordination var it can see into its own
     // writable workspace — the only honest way to assert what the
@@ -96,8 +98,8 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
     };
     let result = execute_canonical(
         &request,
-        toolchain.path(),
-        workspace.path(),
+        cargo_home.path(),
+        home.path(),
         6,
         &workspace.path().join("spills"),
     );

@@ -558,7 +558,9 @@ impl CoordLive {
         expires_at_seq: u64,
     ) -> Result<ValidatedAttemptLease, AttemptLeaseRefusal> {
         let cas = self.cas.as_ref().ok_or(AttemptLeaseRefusal::NoStore)?;
-        let held = self.authority().ok_or(AttemptLeaseRefusal::NoAuthority)?;
+        let held = self
+            .authority()
+            .ok_or(AttemptLeaseRefusal::NoAuthority)?;
         if authority_digest(&authority.coordinator) != authority_digest(&held) {
             return Err(AttemptLeaseRefusal::StaleAuthority);
         }
@@ -588,7 +590,9 @@ impl CoordLive {
         expires_at_seq: u64,
     ) -> Result<ValidatedLeaseRenewal, AttemptLeaseRefusal> {
         let cas = self.cas.as_ref().ok_or(AttemptLeaseRefusal::NoStore)?;
-        let held = self.authority().ok_or(AttemptLeaseRefusal::NoAuthority)?;
+        let held = self
+            .authority()
+            .ok_or(AttemptLeaseRefusal::NoAuthority)?;
         if authority_digest(&authority.coordinator) != authority_digest(&held) {
             return Err(AttemptLeaseRefusal::StaleAuthority);
         }
@@ -1027,7 +1031,9 @@ pub fn coord_work(
 mod tests {
     use super::*;
     use crate::janitor::store::mount_and_reconcile;
-    use rabs_cas::test_support::{attempt_authority_for, offer_under, sample_expected_descriptor};
+    use rabs_cas::test_support::{
+        attempt_authority_for, offer_under, sample_expected_descriptor,
+    };
     use rabs_protocol::generation::{
         AttemptId, ExecutionLeaseId, LeaseRenewalSeq, WorkerBootGeneration,
     };
@@ -1289,11 +1295,7 @@ mod tests {
         );
         {
             let mut store = cas.store().lock().expect("store lock");
-            assert!(
-                !store
-                    .has_publication(&incumbent.action_key)
-                    .expect("publication query")
-            );
+            assert!(!store.has_publication(&incumbent.action_key).expect("publication query"));
             assert!(
                 store
                     .worker_incarnation_fence(&incumbent.worker_peer_id)

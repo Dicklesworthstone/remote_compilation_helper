@@ -35,12 +35,10 @@
 //! No production code changes: per plan, L009 proves the composition
 //! TEST-FIRST, before any wiring into `serve_action`.
 
-use rabs_cas::link_bundle::{
-    LinkOutput, LinkResultBundle, StockLinkOutcome, equivalent_to_stock,
-};
+use rabs_cas::link_bundle::{LinkOutput, LinkResultBundle, StockLinkOutcome, equivalent_to_stock};
 use rabs_cas::metadata_store::{
-    ActionEntryRow, AuthorityRow, CommitOutcome, PublicationPermit, PublicationRow,
-    ResultKindTag, RabsMetadataStore, RusqliteEngine, SqlMetadataStore,
+    ActionEntryRow, AuthorityRow, CommitOutcome, PublicationRow, RabsMetadataStore, ResultKindTag,
+    RusqliteEngine, SqlMetadataStore,
 };
 use rabs_cas::serving_sample_gate::{
     ActionClassRisk, SampleGateDecision, SamplingPolicy, key_bucket_basis_points,
@@ -50,15 +48,13 @@ use rabs_cas::trust_evidence::{
     DISPOSITION_EVIDENCE_PENDING, DISPOSITION_QUARANTINED, DISPOSITION_SERVABLE, TrustPolicy,
     reevaluate_action,
 };
+use rabs_key::authority_binding::coordinator_authority_digest;
 use rabs_key::hit_verification::{HitVerification, StoredDescriptorEntry, verify_hit};
 use rabs_key::link_invocation::{DriverStyle, parse_link};
 use rabs_key::native_header_closure::{
     HeaderRead, NativeHeaderClosure, VIOLATED_CONTENT_MISMATCH, enforce_closed_view,
 };
-use rabs_key::authority_binding::coordinator_authority_digest;
-use rabs_protocol::authority::{
-    ClusterId, CoordinatorAuthority, CoordinatorIncarnationId,
-};
+use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
 use rabs_protocol::descriptor::{ActionClass, ActionDescriptor};
 use rabs_protocol::generation::{
     ActionGeneration, ActionGenerationId, AttemptAuthority, AttemptId, ExecutionLeaseId,
@@ -66,9 +62,10 @@ use rabs_protocol::generation::{
 };
 use rabs_protocol::invocation_record::NormalizedOutcome;
 use rabs_protocol::redaction::correlation_hash;
-use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::result_identity::{DigestAlgorithm, ObjectId, TypedDigest};
 use rabs_protocol::serving::TrustEvidenceTier;
+use rabs_protocol::wire_time::PeerId;
+use rabs_protocol::worker_fence::WorkerSessionOffer;
 use rabs_replay::shadow_pipeline::{
     CachedObservation, ServingDecision, ShadowServingBackend, run_shadow_pipeline,
 };
@@ -153,15 +150,6 @@ impl ShadowServingBackend for GateBackend<'_> {
     }
 }
 
-fn cached_from_bundle(bundle: &LinkResultBundle) -> CachedObservation {
-    let replayed = bundle.replay();
-    CachedObservation {
-        outcome: NormalizedOutcome::Exited(replayed.exit_code),
-        stdout_digest: correlation_hash(&replayed.stdout),
-        stderr_digest: correlation_hash(&replayed.stderr),
-    }
-}
-
 // ---------------------------------------------------------------------
 // 1. Shadow corpus green + non-vacuous divergence classification
 // ---------------------------------------------------------------------
@@ -190,10 +178,19 @@ fn l009_shadow_corpus_is_green_when_the_cache_is_honest() {
             .unwrap();
     }
 
-    // Honest cache: derived FROM the stock link's own bundle.
-    let bundle = LinkResultBundle::bundle(&stock_link()).unwrap();
+    // Honest cache: the served observation is EXACTLY what stock
+    // produces for this command (a real serving backend stores the
+    // stock run's bytes; anything else would be a divergence by
+    // construction).
     let mut cache = HashMap::new();
-    cache.insert(link_cmd.clone(), cached_from_bundle(&bundle));
+    cache.insert(
+        link_cmd.clone(),
+        CachedObservation {
+            outcome: NormalizedOutcome::Exited(0),
+            stdout_digest: correlation_hash(b"link-out"),
+            stderr_digest: correlation_hash(b""),
+        },
+    );
 
     let mut backend = GateBackend {
         store: &mut st,
@@ -219,12 +216,11 @@ fn l009_shadow_corpus_is_green_when_the_cache_is_honest() {
         "native/workspace class is never sampled"
     );
 
-    let lines = vec![
-        corpus_line(&["printf", "link-out"], "/tmp"),
-        corpus_line(&["printf", "native-out"], "/tmp"),
-    ];
     let report = run_shadow_pipeline(
-        &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+        &[
+            corpus_line(&["printf", "link-out"], "/tmp").as_str(),
+            corpus_line(&["printf", "native-out"], "/tmp").as_str(),
+        ],
         &mut backend,
     );
     assert!(
@@ -257,8 +253,7 @@ fn l009_served_divergence_lands_in_quarantine_required_not_private() {
         poison: Some(cmd.clone()),
     };
     let line = corpus_line(&["printf", "poisoned"], "/tmp");
-    let report =
-        run_shadow_pipeline(&[line.as_str()], &mut backend);
+    let report = run_shadow_pipeline(&[line.as_str()], &mut backend);
     assert_eq!(
         report.quarantine_required,
         vec![cmd],
@@ -299,9 +294,11 @@ fn l009_header_content_change_forks_identity_and_blocks_stale_serve() {
     // while the world moved to v2 are refused with the mismatch code —
     // the compile cannot be served from the stale entry.
     let violations = enforce_closed_view(&declared, &reads_v2).unwrap_err();
-    assert!(violations
-        .iter()
-        .any(|v| v.reason_code == VIOLATED_CONTENT_MISMATCH));
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.reason_code == VIOLATED_CONTENT_MISMATCH)
+    );
 }
 
 #[test]
@@ -330,7 +327,11 @@ fn l009_config_mutation_forks_the_key_and_verify_hit_refuses() {
     let entry = StoredDescriptorEntry::commit(&built_with_env_a);
     // Intact reload validates…
     assert_eq!(
-        verify_hit(&entry, &entry.canonical_descriptor_bytes.clone(), &built_with_env_a),
+        verify_hit(
+            &entry,
+            &entry.canonical_descriptor_bytes.clone(),
+            &built_with_env_a
+        ),
         HitVerification::Validated
     );
     // …but the SAME index entry consulted after a CONFIG change (env
@@ -365,8 +366,9 @@ fn l009_exact_link_hit_preserves_outputs_and_diagnostics() {
             _ => None,
         }
     };
-    let identify_script =
-        |path: &str| -> Option<TypedDigest> { ("layout.ld" == path).then(|| d("rabs.linker-script.v1", 3)) };
+    let identify_script = |path: &str| -> Option<TypedDigest> {
+        ("layout.ld" == path).then(|| d("rabs.linker-script.v1", 3))
+    };
     let args = |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).to_owned()).collect() };
 
     // Parser-level plumbing invariance: driver style normalization
@@ -422,6 +424,25 @@ fn l009_cross_worker_sampling_promotes_and_failure_demotes() {
         acquired_seq: 1,
     })
     .unwrap();
+    // Enroll every worker's incarnation fence BEFORE any attempt
+    // references it (UnknownWorkerFence otherwise).
+    for (worker, boot, incarnation) in [
+        ("worker-a", 1u64, 5u128),
+        ("worker-b", 1, 6),
+        ("worker-c", 1, 7),
+    ] {
+        st.admit_worker_session(
+            &authority,
+            &WorkerSessionOffer {
+                worker_peer_id: PeerId(worker.to_owned()),
+                boot_generation: WorkerBootGeneration(boot),
+                incarnation: WorkerIncarnationId(incarnation),
+                reenrollment_proof: None,
+            },
+            u64::from(incarnation as u8),
+        )
+        .unwrap();
+    }
     let action = d("rabs.action-key.sha256.v1", 9);
     st.upsert_action_entry(&ActionEntryRow {
         action_key: action.clone(),
@@ -429,26 +450,38 @@ fn l009_cross_worker_sampling_promotes_and_failure_demotes() {
         projection_epoch: 0,
     })
     .unwrap();
-    st.create_generation(&authority, 10, &action).unwrap();
-    let attempt_authority = AttemptAuthority {
-        coordinator: coordinator.clone(),
-        action_key: action.clone(),
-        action_generation: ActionGeneration {
-            generation_id: ActionGenerationId(10),
-            per_key_ordinal: 1,
-            created_under_authority_digest: authority.clone(),
-        },
-        attempt_id: AttemptId(20),
-        execution_lease_id: ExecutionLeaseId(20),
-        lease_renewal_seq: LeaseRenewalSeq(1),
-        worker_peer_id: PeerId("worker-a".to_owned()),
-        worker_boot_generation: WorkerBootGeneration(1),
-        worker_incarnation_id: WorkerIncarnationId(5),
-    };
-    let permit = PublicationPermit::for_attempt(&attempt_authority);
+    let attempt_authority =
+        |attempt: u128, lease: u128, worker: &str, incarnation: u128| AttemptAuthority {
+            coordinator: coordinator.clone(),
+            action_key: action.clone(),
+            action_generation: ActionGeneration {
+                generation_id: ActionGenerationId(10),
+                per_key_ordinal: 1,
+                created_under_authority_digest: authority.clone(),
+            },
+            attempt_id: AttemptId(attempt),
+            execution_lease_id: ExecutionLeaseId(lease),
+            lease_renewal_seq: LeaseRenewalSeq(1),
+            worker_peer_id: PeerId(worker.to_owned()),
+            worker_boot_generation: WorkerBootGeneration(1),
+            worker_incarnation_id: WorkerIncarnationId(incarnation),
+        };
+    let winner = attempt_authority(20, 20, "worker-a", 5);
+    let second_worker = attempt_authority(21, 21, "worker-b", 6);
+    let third_worker = attempt_authority(22, 22, "worker-c", 7);
+    // v21 authority binding: only a BOUND generation accepts live
+    // attempt leases.
+    st.create_bound_generation(&authority, &winner.action_generation, &action)
+        .unwrap();
+    // Attempts carry REAL execution-lease bindings (the store refuses
+    // samples for leaseless legacy attempts).
+    st.admit_attempt_lease(&winner, 5, 1_000).unwrap();
+    st.admit_attempt_lease(&second_worker, 6, 1_000).unwrap();
+    st.admit_attempt_lease(&third_worker, 7, 1_000).unwrap();
     assert_eq!(
         st.commit_publication(
-            permit,
+            &authority,
+            Some(&winner),
             &PublicationRow {
                 action_key: action.clone(),
                 descriptor_digest: d("rabs.descriptor.sha256.v1", 1),
@@ -476,23 +509,27 @@ fn l009_cross_worker_sampling_promotes_and_failure_demotes() {
     let eval = reevaluate_action(&mut st, &authority, &action, &policies, 100).unwrap();
     assert_eq!(eval.observed_tier, TrustEvidenceTier::UnverifiedCandidate);
     assert_eq!(eval.disposition, DISPOSITION_EVIDENCE_PENDING);
-
-    // One passed verification on worker-a: shadow-matched, servable.
-    st.record_verification_sample(&action, 20, true, 101).unwrap();
+    st.record_verification_sample(&action, 20, true, 101)
+        .unwrap();
     let eval = reevaluate_action(&mut st, &authority, &action, &policies, 102).unwrap();
     assert_eq!(eval.observed_tier, TrustEvidenceTier::ShadowMatched);
     assert_eq!(eval.disposition, DISPOSITION_SERVABLE);
 
     // A second PASS on a DIFFERENT worker: cross-worker reproduction —
     // the determinism sampling bar for broader serving.
-    st.record_verification_sample(&action, 21, true, 103).unwrap();
+    st.record_verification_sample(&action, 21, true, 103)
+        .unwrap();
     let eval = reevaluate_action(&mut st, &authority, &action, &policies, 104).unwrap();
-    assert_eq!(eval.observed_tier, TrustEvidenceTier::ReproducibleCrossWorker);
+    assert_eq!(
+        eval.observed_tier,
+        TrustEvidenceTier::ReproducibleCrossWorker
+    );
     assert_eq!(eval.disposition, DISPOSITION_SERVABLE);
 
     // A FAILED sample is adverse evidence: instant demotion to
     // quarantined, whatever the earlier ladder said.
-    st.record_verification_sample(&action, 22, false, 105).unwrap();
+    st.record_verification_sample(&action, 22, false, 105)
+        .unwrap();
     let eval = reevaluate_action(&mut st, &authority, &action, &policies, 106).unwrap();
     assert_eq!(eval.adverse_samples, 1);
     assert_eq!(eval.disposition, DISPOSITION_QUARANTINED);

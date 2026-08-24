@@ -90,6 +90,12 @@ impl SnapshotLineage {
         }
     }
 
+    /// Immutable requested-command snapshot this lineage derives from.
+    #[must_use]
+    pub const fn requested(&self) -> RequestedCommandSnapshot {
+        self.requested
+    }
+
     /// Seal the first resolved generation from the private overlay's
     /// derived state. Must happen before any action registers.
     pub fn seal(

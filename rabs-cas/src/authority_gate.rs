@@ -49,9 +49,9 @@ use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::WorkerSessionOffer;
 
 use crate::metadata_store::{
-    ActionEntryRow, AuthorityRow, FsqliteEngine, GcReceiptRow, PublicationPermit, PublicationRow,
-    RabsMetadataStore, ResultKindTag, RusqliteEngine, SCHEMA_VERSION, SqlEngine, SqlMetadataStore,
-    SqlValue, StoreError, TrustEvaluationRow, digest_key,
+    ActionEntryRow, AuthorityRow, FsqliteEngine, GcReceiptRow, PublicationRow, RabsMetadataStore,
+    ResultKindTag, RusqliteEngine, SCHEMA_VERSION, SqlEngine, SqlMetadataStore, SqlValue,
+    StoreError, TrustEvaluationRow, digest_key,
 };
 
 impl SqlEngine for Box<dyn SqlEngine> {
@@ -341,47 +341,41 @@ fn operation_script(
         "lease-stale",
         &store.renew_attempt_lease(&lease_authority, renewal, 300),
     );
+    outcome(&mut t, "lease-release", &store.release_lease(30));
     let mut renewed_authority = lease_authority;
     renewed_authority.lease_renewal_seq = LeaseRenewalSeq(2);
-    let mut publication_row = publication(7, 1, 40);
-    publication_row.winner_generation = renewed_authority.action_generation.generation_id.0;
-    publication_row.winner_attempt = renewed_authority.attempt_id.0;
-    let mut wrong_publication_authority = renewed_authority.clone();
-    wrong_publication_authority.coordinator = coordinator_authority(2);
+    outcome(
+        &mut t,
+        "lease-renew-released",
+        &store.renew_attempt_lease(
+            &renewed_authority,
+            LeaseRenewal {
+                lease: renewed_authority.execution_lease_id,
+                seq: LeaseRenewalSeq(3),
+            },
+            300,
+        ),
+    );
+    let publication_row = publication(7, 1, 40);
     outcome(
         &mut t,
         "publish-wrong-authority",
-        &store.commit_publication(
-            PublicationPermit::for_attempt(&wrong_publication_authority),
-            &publication_row,
-        ),
+        &store.commit_publication(&wrong, None, &publication_row),
     );
     outcome(
         &mut t,
         "publish",
-        &store.commit_publication(
-            PublicationPermit::for_attempt(&renewed_authority),
-            &publication_row,
-        ),
+        &store.commit_publication(&active, None, &publication_row),
     );
     outcome(
         &mut t,
         "publish-idempotent",
-        &store.commit_publication(
-            PublicationPermit::for_attempt(&renewed_authority),
-            &publication_row,
-        ),
+        &store.commit_publication(&active, None, &publication_row),
     );
-    let mut conflict_row = publication(7, 2, 41);
-    conflict_row.winner_generation = renewed_authority.action_generation.generation_id.0;
-    conflict_row.winner_attempt = renewed_authority.attempt_id.0;
     outcome(
         &mut t,
         "publish-conflict",
-        &store.commit_publication(
-            PublicationPermit::for_attempt(&renewed_authority),
-            &conflict_row,
-        ),
+        &store.commit_publication(&active, None, &publication(7, 2, 41)),
     );
     let failure_action = ActionEntryRow {
         action_key: digest("rabs.action-key.sha256.v1", 8),
@@ -421,23 +415,7 @@ fn operation_script(
     outcome(
         &mut t,
         "publish-det-failure",
-        &store.commit_publication(
-            PublicationPermit::for_attempt(&failure_authority),
-            &failure_row,
-        ),
-    );
-    outcome(&mut t, "lease-release", &store.release_lease(30));
-    outcome(
-        &mut t,
-        "lease-renew-released",
-        &store.renew_attempt_lease(
-            &renewed_authority,
-            LeaseRenewal {
-                lease: renewed_authority.execution_lease_id,
-                seq: LeaseRenewalSeq(3),
-            },
-            300,
-        ),
+        &store.commit_publication(&active, Some(&failure_authority), &failure_row),
     );
     let extra_evidence = digest("rabs.evidence-bundle.sha256.v1", 90);
     let manifest_key = digest_key(&publication_row.manifest_digest);

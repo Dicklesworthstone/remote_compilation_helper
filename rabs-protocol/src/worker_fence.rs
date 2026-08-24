@@ -27,9 +27,8 @@ pub struct WorkerIncarnationFenceRecord {
     pub active_incarnation: Option<WorkerIncarnationId>,
     /// A same-generation competing incarnation was observed. While set,
     /// neither contender is authoritative: sessions and execution leases
-    /// fail closed until a fresh operator re-enrollment proof selects one
-    /// lineage. A copied process cannot self-resolve by incrementing its
-    /// boot counter.
+    /// fail closed until a fresh operator re-enrollment proof or a strictly
+    /// newer boot generation selects one lineage.
     pub clone_ambiguous: bool,
     /// Highest operator re-enrollment generation consumed.
     pub operator_reenrollment_generation: u64,
@@ -256,7 +255,10 @@ mod tests {
 
         let mut selected = offer(3, 22);
         selected.reenrollment_proof = Some(1);
-        assert_eq!(r.evaluate(&selected), WorkerAdmission::AdmitViaReenrollment);
+        assert_eq!(
+            r.evaluate(&selected),
+            WorkerAdmission::AdmitViaReenrollment
+        );
         assert_eq!(
             r.evaluate(&offer(4, 33)),
             WorkerAdmission::RejectCloneAmbiguity,

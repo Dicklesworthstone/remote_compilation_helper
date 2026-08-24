@@ -31,7 +31,7 @@
 use crate::canonical_namespace::{Bind, CanonicalNamespaceSpec};
 use crate::layout;
 use crate::snapshot_capture::SnapshotProvenance;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 /// A checksum-addressed immutable content mount (registry unpack or git
 /// checkout). The checksum is the visible-path leaf.
@@ -77,6 +77,19 @@ pub struct UnitMount {
     pub backing: PathBuf,
 }
 
+/// Access policy for the canonical Cargo home.
+///
+/// Ordinary compilation keeps the historical writable behavior. E025's
+/// captured offline closure uses [`Self::ImmutableReadOnly`] so Cargo can
+/// consume the sealed registry/git/config objects without mutating them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CargoHomeMode {
+    /// Normal Cargo cache behavior: `/__rabs/cargo-home` is writable.
+    Writable,
+    /// A pre-materialized captured closure mounted read-only.
+    ImmutableReadOnly,
+}
+
 /// Typed refusal from plan validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MountPlanError {
@@ -87,8 +100,41 @@ pub enum MountPlanError {
         /// The offending value.
         value: String,
     },
-    /// The required toolchain backing is missing.
-    MissingToolchain,
+    /// A required physical backing path is empty.
+    MissingBacking {
+        /// The field whose backing was absent.
+        field: &'static str,
+    },
+    /// A physical backing path is not absolute.
+    RelativeBacking {
+        /// The field carrying the relative path.
+        field: &'static str,
+        /// The rejected path.
+        backing: PathBuf,
+    },
+    /// A physical backing uses `..`, so its lexical identity is ambiguous.
+    NonCanonicalBacking {
+        /// The field carrying the ambiguous path.
+        field: &'static str,
+        /// The rejected path.
+        backing: PathBuf,
+    },
+    /// A hidden physical backing points into the visible namespace.
+    VisibleNamespaceBacking {
+        /// The field carrying the visible path.
+        field: &'static str,
+        /// The rejected path.
+        backing: PathBuf,
+    },
+    /// Two declared mounts have equal or ancestor/descendant physical roots.
+    AliasedCoreBackings {
+        /// The first mount field.
+        first: &'static str,
+        /// The second mount field.
+        second: &'static str,
+        /// The shared (ancestor) physical backing.
+        backing: PathBuf,
+    },
 }
 
 impl std::fmt::Display for MountPlanError {
@@ -97,7 +143,33 @@ impl std::fmt::Display for MountPlanError {
             Self::UnsafeToken { field, value } => {
                 write!(f, "unsafe path token in {field}: {value:?}")
             }
-            Self::MissingToolchain => write!(f, "canonical mount plan requires a toolchain root"),
+            Self::MissingBacking { field } => {
+                write!(f, "canonical mount plan requires physical backing {field}")
+            }
+            Self::RelativeBacking { field, backing } => write!(
+                f,
+                "physical backing {field} must be absolute, got {}",
+                backing.display()
+            ),
+            Self::NonCanonicalBacking { field, backing } => write!(
+                f,
+                "physical backing {field} contains a parent traversal: {}",
+                backing.display()
+            ),
+            Self::VisibleNamespaceBacking { field, backing } => write!(
+                f,
+                "physical backing {field} lies inside the visible namespace: {}",
+                backing.display()
+            ),
+            Self::AliasedCoreBackings {
+                first,
+                second,
+                backing,
+            } => write!(
+                f,
+                "mount backings {first} and {second} overlap at {}",
+                backing.display()
+            ),
         }
     }
 }
@@ -111,8 +183,11 @@ pub struct CanonicalMountPlan {
     pub toolchain_backing: PathBuf,
     /// Writable primary workspace → `/__rabs/workspace`.
     pub workspace_backing: PathBuf,
-    /// cargo-home → `/__rabs/cargo-home` (writable: caches/locks live here).
+    /// cargo-home → `/__rabs/cargo-home`.
     pub cargo_home_backing: PathBuf,
+    /// Whether Cargo home is the ordinary writable cache or an immutable
+    /// captured closure (E025).
+    pub cargo_home_mode: CargoHomeMode,
     /// HOME → `/__rabs/home` (writable).
     pub home_backing: PathBuf,
     /// Registry unpacks → `/__rabs/registry/<checksum>` (read-only).
@@ -135,8 +210,6 @@ pub struct CanonicalMountPlan {
     /// Extra explicitly-declared env pairs (merged over the canonical base;
     /// the plan's own keys win to keep mounts and env consistent).
     pub extra_env: Vec<(String, String)>,
-    /// Network default-deny unless a fetch lane explicitly opts in.
-    pub allow_network: bool,
     /// Immutable-source mode (D004): when a coherent D018 snapshot backs
     /// the workspace, its provenance is bound here and the workspace
     /// mounts READ-ONLY — the build cannot mutate source, and a mutation
@@ -158,6 +231,7 @@ impl CanonicalMountPlan {
             toolchain_backing: toolchain_backing.into(),
             workspace_backing: workspace_backing.into(),
             cargo_home_backing: cargo_home_backing.into(),
+            cargo_home_mode: CargoHomeMode::Writable,
             home_backing: home_backing.into(),
             registry: Vec::new(),
             git: Vec::new(),
@@ -167,7 +241,6 @@ impl CanonicalMountPlan {
             incremental_units: Vec::new(),
             secret_slots: Vec::new(),
             extra_env: Vec::new(),
-            allow_network: false,
             immutable_source: None,
         }
     }
@@ -182,6 +255,13 @@ impl CanonicalMountPlan {
     ) -> Self {
         self.workspace_backing = snapshot_backing.into();
         self.immutable_source = Some(provenance);
+        self
+    }
+
+    /// Mount a fully captured Cargo home read-only for E025 offline replay.
+    #[must_use]
+    pub fn with_immutable_cargo_home(mut self) -> Self {
+        self.cargo_home_mode = CargoHomeMode::ImmutableReadOnly;
         self
     }
 
@@ -217,9 +297,7 @@ impl CanonicalMountPlan {
     /// component first — an unsafe token is a typed refusal, never an argv
     /// that could escape its intended visible path.
     pub fn to_spec(&self) -> Result<CanonicalNamespaceSpec, MountPlanError> {
-        if self.toolchain_backing.as_os_str().is_empty() {
-            return Err(MountPlanError::MissingToolchain);
-        }
+        self.validate_backings()?;
 
         let mut ro: Vec<Bind> = Vec::new();
         let mut rw: Vec<Bind> = Vec::new();
@@ -235,8 +313,16 @@ impl CanonicalMountPlan {
             rw.push(Bind::new(&self.workspace_backing, layout::WORKSPACE));
         }
 
-        // Writable core surfaces.
-        rw.push(Bind::new(&self.cargo_home_backing, layout::CARGO_HOME));
+        // Cargo home remains writable by default. E025's sealed offline
+        // materialization is immutable and therefore read-only.
+        match self.cargo_home_mode {
+            CargoHomeMode::Writable => {
+                rw.push(Bind::new(&self.cargo_home_backing, layout::CARGO_HOME));
+            }
+            CargoHomeMode::ImmutableReadOnly => {
+                ro.push(Bind::new(&self.cargo_home_backing, layout::CARGO_HOME));
+            }
+        }
         rw.push(Bind::new(&self.home_backing, layout::HOME));
 
         // Checksum-addressed immutable content: the checksum IS the leaf.
@@ -312,9 +398,151 @@ impl CanonicalMountPlan {
         spec.ro_binds = ro;
         spec.rw_binds = rw;
         spec.env = env;
-        spec.allow_network = self.allow_network;
         Ok(spec)
     }
+
+    fn validate_backings(&self) -> Result<(), MountPlanError> {
+        let mut backings: Vec<(&'static str, &Path)> = vec![
+            ("toolchain_backing", self.toolchain_backing.as_path()),
+            ("workspace_backing", self.workspace_backing.as_path()),
+            ("cargo_home_backing", self.cargo_home_backing.as_path()),
+            ("home_backing", self.home_backing.as_path()),
+        ];
+        backings.extend(
+            self.registry
+                .iter()
+                .map(|entry| ("registry.backing", entry.backing.as_path())),
+        );
+        backings.extend(
+            self.git
+                .iter()
+                .map(|entry| ("git.backing", entry.backing.as_path())),
+        );
+        backings.extend(
+            self.repos
+                .iter()
+                .map(|entry| ("repos.backing", entry.backing.as_path())),
+        );
+        backings.extend(
+            self.out_units
+                .iter()
+                .map(|entry| ("out_units.backing", entry.backing.as_path())),
+        );
+        backings.extend(
+            self.build_units
+                .iter()
+                .map(|entry| ("build_units.backing", entry.backing.as_path())),
+        );
+        backings.extend(
+            self.incremental_units
+                .iter()
+                .map(|entry| ("incremental_units.backing", entry.backing.as_path())),
+        );
+        backings.extend(
+            self.secret_slots
+                .iter()
+                .map(|entry| ("secret_slots.backing", entry.backing.as_path())),
+        );
+
+        for &(field, backing) in &backings {
+            validate_backing(field, backing)?;
+        }
+
+        let lexical: Vec<PathBuf> = backings
+            .iter()
+            .map(|(_, backing)| normalize_backing(backing))
+            .collect();
+        // Canonicalization is intentionally best-effort. A plan is allowed to
+        // describe roots that the executor will create later, but roots that
+        // already exist must not evade the lexical check through symlinks.
+        // This is a planning-time defense only: the runtime mount opener must
+        // still prevent a checked path from being retargeted before namespace
+        // construction (for example by holding stable directory handles).
+        let canonical: Vec<Option<PathBuf>> = backings
+            .iter()
+            .map(|(_, backing)| std::fs::canonicalize(backing).ok())
+            .collect();
+        for ((field, _), resolved) in backings.iter().zip(&canonical) {
+            if let Some(resolved) = resolved {
+                validate_backing(field, resolved)?;
+            }
+        }
+
+        for first_index in 0..backings.len() {
+            for second_index in (first_index + 1)..backings.len() {
+                let (first, _) = backings[first_index];
+                let (second, _) = backings[second_index];
+                let overlap = overlapping_root(&lexical[first_index], &lexical[second_index])
+                    .or_else(|| {
+                        let first = canonical[first_index].as_deref()?;
+                        let second = canonical[second_index].as_deref()?;
+                        overlapping_root(first, second)
+                    });
+                if let Some(backing) = overlap {
+                    return Err(MountPlanError::AliasedCoreBackings {
+                        first,
+                        second,
+                        backing,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Normalize path components without consulting the filesystem. Parent
+/// traversal has already been refused, so this only removes harmless `.` and
+/// repeated separators before component-wise overlap comparison.
+fn normalize_backing(backing: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in backing.components() {
+        if !matches!(component, Component::CurDir) {
+            normalized.push(component.as_os_str());
+        }
+    }
+    normalized
+}
+
+/// Return the common physical root when either path contains the other.
+/// `Path::starts_with` is component-aware, so `/cache` does not overlap
+/// `/cache-home`.
+fn overlapping_root(first: &Path, second: &Path) -> Option<PathBuf> {
+    if first.starts_with(second) {
+        Some(second.to_path_buf())
+    } else if second.starts_with(first) {
+        Some(first.to_path_buf())
+    } else {
+        None
+    }
+}
+
+fn validate_backing(field: &'static str, backing: &Path) -> Result<(), MountPlanError> {
+    if backing.as_os_str().is_empty() {
+        return Err(MountPlanError::MissingBacking { field });
+    }
+    if !backing.is_absolute() {
+        return Err(MountPlanError::RelativeBacking {
+            field,
+            backing: backing.to_path_buf(),
+        });
+    }
+    if backing
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(MountPlanError::NonCanonicalBacking {
+            field,
+            backing: backing.to_path_buf(),
+        });
+    }
+    if backing.starts_with("/__rabs") || backing.starts_with(layout::SECRETS) {
+        return Err(MountPlanError::VisibleNamespaceBacking {
+            field,
+            backing: backing.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 /// Whether `token` is a safe single visible-path component: non-empty, not
@@ -553,6 +781,211 @@ mod tests {
         let ws = std::path::Path::new(layout::WORKSPACE);
         assert!(spec.rw_binds.iter().any(|b| b.visible == ws));
         assert!(!spec.ro_binds.iter().any(|b| b.visible == ws));
+    }
+
+    #[test]
+    fn cargo_home_is_writable_by_default_and_can_be_sealed_read_only() {
+        let cargo_home = std::path::Path::new(layout::CARGO_HOME);
+        let default_spec = base_plan().to_spec().unwrap();
+        assert!(
+            default_spec
+                .rw_binds
+                .iter()
+                .any(|bind| bind.visible == cargo_home)
+        );
+        assert!(
+            !default_spec
+                .ro_binds
+                .iter()
+                .any(|bind| bind.visible == cargo_home)
+        );
+
+        let immutable_spec = base_plan().with_immutable_cargo_home().to_spec().unwrap();
+        assert!(
+            immutable_spec
+                .ro_binds
+                .iter()
+                .any(|bind| bind.visible == cargo_home)
+        );
+        assert!(
+            !immutable_spec
+                .rw_binds
+                .iter()
+                .any(|bind| bind.visible == cargo_home)
+        );
+    }
+
+    #[test]
+    fn every_empty_core_backing_is_a_typed_refusal() {
+        let cases = [
+            ("toolchain_backing", {
+                let mut plan = base_plan();
+                plan.toolchain_backing = PathBuf::new();
+                plan
+            }),
+            ("workspace_backing", {
+                let mut plan = base_plan();
+                plan.workspace_backing = PathBuf::new();
+                plan
+            }),
+            ("cargo_home_backing", {
+                let mut plan = base_plan();
+                plan.cargo_home_backing = PathBuf::new();
+                plan
+            }),
+            ("home_backing", {
+                let mut plan = base_plan();
+                plan.home_backing = PathBuf::new();
+                plan
+            }),
+        ];
+        for (field, plan) in cases {
+            assert_eq!(
+                plan.to_spec(),
+                Err(MountPlanError::MissingBacking { field })
+            );
+        }
+    }
+
+    #[test]
+    fn relative_and_noncanonical_core_backings_are_typed_refusals() {
+        let mut relative = base_plan();
+        relative.cargo_home_backing = "attempt/cargo-home".into();
+        assert!(matches!(
+            relative.to_spec(),
+            Err(MountPlanError::RelativeBacking {
+                field: "cargo_home_backing",
+                ..
+            })
+        ));
+
+        let mut traversing = base_plan();
+        traversing.workspace_backing = "/backing/attempt/../workspace".into();
+        assert!(matches!(
+            traversing.to_spec(),
+            Err(MountPlanError::NonCanonicalBacking {
+                field: "workspace_backing",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn aliased_core_backings_are_refused_before_namespace_building() {
+        let mut plan = base_plan();
+        plan.cargo_home_backing = "/backing/attempt-9/./home".into();
+        assert_eq!(
+            plan.to_spec(),
+            Err(MountPlanError::AliasedCoreBackings {
+                first: "cargo_home_backing",
+                second: "home_backing",
+                backing: PathBuf::from("/backing/attempt-9/home"),
+            })
+        );
+    }
+
+    #[test]
+    fn ancestor_and_descendant_core_backings_are_refused_in_both_orders() {
+        let mut home_inside_cargo = base_plan();
+        home_inside_cargo.cargo_home_backing = "/backing/cache".into();
+        home_inside_cargo.home_backing = "/backing/cache/home".into();
+        assert_eq!(
+            home_inside_cargo.to_spec(),
+            Err(MountPlanError::AliasedCoreBackings {
+                first: "cargo_home_backing",
+                second: "home_backing",
+                backing: PathBuf::from("/backing/cache"),
+            })
+        );
+
+        let mut cargo_inside_home = base_plan();
+        cargo_inside_home.cargo_home_backing = "/backing/home/cargo".into();
+        cargo_inside_home.home_backing = "/backing/home".into();
+        assert_eq!(
+            cargo_inside_home.to_spec(),
+            Err(MountPlanError::AliasedCoreBackings {
+                first: "cargo_home_backing",
+                second: "home_backing",
+                backing: PathBuf::from("/backing/home"),
+            })
+        );
+    }
+
+    #[test]
+    fn dynamic_read_only_and_writable_backings_must_be_disjoint() {
+        let mut plan = base_plan();
+        plan.registry.push(ChecksumMount::new(
+            "serde-checksum",
+            "/backing/content/serde",
+        ));
+        plan.out_units.push(UnitMount {
+            unit: "serde-build".into(),
+            backing: "/backing/content/serde/out".into(),
+        });
+        assert_eq!(
+            plan.to_spec(),
+            Err(MountPlanError::AliasedCoreBackings {
+                first: "registry.backing",
+                second: "out_units.backing",
+                backing: PathBuf::from("/backing/content/serde"),
+            })
+        );
+    }
+
+    #[test]
+    fn component_prefix_siblings_remain_valid() {
+        let mut plan = base_plan();
+        plan.cargo_home_backing = "/backing/cache".into();
+        plan.home_backing = "/backing/cache-home".into();
+        plan.registry.push(ChecksumMount::new(
+            "serde-checksum",
+            "/backing/content/registry",
+        ));
+        plan.out_units.push(UnitMount {
+            unit: "fixture".into(),
+            backing: "/backing/content/registry-output".into(),
+        });
+        assert!(plan.to_spec().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_symlink_aliases_are_refused() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let toolchain = root.path().join("toolchain");
+        let workspace = root.path().join("workspace");
+        let cargo_home = root.path().join("cargo-home");
+        let home_alias = root.path().join("home-alias");
+        for path in [&toolchain, &workspace, &cargo_home] {
+            std::fs::create_dir(path).unwrap();
+        }
+        symlink(&cargo_home, &home_alias).unwrap();
+
+        let plan = CanonicalMountPlan::new(toolchain, workspace, &cargo_home, home_alias)
+            .with_immutable_cargo_home();
+        assert_eq!(
+            plan.to_spec(),
+            Err(MountPlanError::AliasedCoreBackings {
+                first: "cargo_home_backing",
+                second: "home_backing",
+                backing: std::fs::canonicalize(cargo_home).unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn core_backing_cannot_alias_the_visible_namespace() {
+        let mut plan = base_plan();
+        plan.home_backing = layout::HOME.into();
+        assert!(matches!(
+            plan.to_spec(),
+            Err(MountPlanError::VisibleNamespaceBacking {
+                field: "home_backing",
+                ..
+            })
+        ));
     }
 
     #[test]

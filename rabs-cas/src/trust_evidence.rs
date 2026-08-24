@@ -318,8 +318,8 @@ pub fn report_compromise(
 mod tests {
     use super::*;
     use crate::metadata_store::{
-        ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationPermit,
-        PublicationRow, ResultKindTag, RusqliteEngine, SqlMetadataStore,
+        ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationRow,
+        ResultKindTag, RusqliteEngine, SqlMetadataStore,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -385,9 +385,7 @@ mod tests {
             provisional_ancestors: Vec::new(),
         };
         assert_eq!(
-            store
-                .commit_publication(PublicationPermit::for_fixture(&active), &row)
-                .unwrap(),
+            store.commit_publication(&active, None, &row).unwrap(),
             CommitOutcome::Committed
         );
         (active, action.action_key)

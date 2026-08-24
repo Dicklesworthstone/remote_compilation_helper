@@ -180,9 +180,7 @@ mod tests {
     /// Commit a minimal publication for action `tag` so the child
     /// counts as RESOLVED (mirrors serving_state::published_fixture).
     fn commit_child(store: &mut SqlMetadataStore<RusqliteEngine>, tag: u8) {
-        use crate::metadata_store::{
-            ActionEntryRow, CommitOutcome, PublicationPermit, PublicationRow, ResultKindTag,
-        };
+        use crate::metadata_store::{ActionEntryRow, CommitOutcome, PublicationRow, ResultKindTag};
         let coord = CoordinatorAuthority {
             cluster_id: ClusterId("c".to_owned()),
             credential_generation: 1,
@@ -225,9 +223,7 @@ mod tests {
             provisional_ancestors: Vec::new(),
         };
         assert_eq!(
-            store
-                .commit_publication(PublicationPermit::for_fixture(&active), &row)
-                .unwrap(),
+            store.commit_publication(&active, None, &row).unwrap(),
             CommitOutcome::Committed
         );
     }

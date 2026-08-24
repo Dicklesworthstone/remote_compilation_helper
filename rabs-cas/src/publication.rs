@@ -47,8 +47,8 @@ use rabs_protocol::result_identity::{
 use sha2::{Digest, Sha256};
 
 use crate::metadata_store::{
-    CommitOutcome, DivergenceIncidentRow, ProvisionalAncestorRow, PublicationPermit,
-    PublicationRow, QuarantineScope, RabsMetadataStore, ResultKindTag, StoreError, digest_key,
+    CommitOutcome, DivergenceIncidentRow, ProvisionalAncestorRow, PublicationRow,
+    QuarantineScope, RabsMetadataStore, ResultKindTag, StoreError, digest_key,
 };
 use crate::trust_evidence::DISPOSITION_QUARANTINED;
 
@@ -780,7 +780,7 @@ pub fn process_offer(
         pin_owner: "coordinator".to_owned(),
         provisional_ancestors: ancestor_rows,
     };
-    match store.commit_publication(PublicationPermit::for_attempt(&offer.authority), &row)? {
+    match store.commit_publication(&offered_authority, Some(&offer.authority), &row)? {
         CommitOutcome::Committed => {}
         // The pipeline checked for an existing row above; hitting either
         // branch here means the store's own CAS caught a same-key row —
@@ -1512,7 +1512,8 @@ mod tests {
         assert_eq!(
             store
                 .commit_publication(
-                    PublicationPermit::for_fixture(&auth),
+                    &auth,
+                    None,
                     &PublicationRow {
                         action_key: action,
                         descriptor_digest: expected_descriptor(),

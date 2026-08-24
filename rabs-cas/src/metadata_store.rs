@@ -41,7 +41,8 @@ use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use rabs_protocol::serving::ServingValidity;
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::{
-    WorkerAdmission, WorkerIncarnationFenceRecord, WorkerLeaseBindingRejection, WorkerSessionOffer,
+    WorkerAdmission, WorkerIncarnationFenceRecord, WorkerLeaseBindingRejection,
+    WorkerSessionOffer,
 };
 
 /// Current schema version (v8 = the full H038 authoritative table set;
@@ -655,53 +656,6 @@ pub struct PublicationRow {
     pub provisional_ancestors: Vec<ProvisionalAncestorRow>,
 }
 
-/// Sealed authority capability for a publication transaction.
-///
-/// Production callers can construct this only from a full, worker-bound
-/// [`AttemptAuthority`]. The coordinator-only constructor exists solely in
-/// unit-test builds for fixtures that exercise unrelated metadata behavior;
-/// it is absent from production artifacts.
-#[derive(Debug, Clone, Copy)]
-pub struct PublicationPermit<'a> {
-    source: PublicationPermitSource<'a>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum PublicationPermitSource<'a> {
-    Attempt(&'a AttemptAuthority),
-    #[cfg(test)]
-    Fixture(&'a TypedDigest),
-}
-
-impl<'a> PublicationPermit<'a> {
-    /// Bind a publication to one exact attempt, execution lease, renewal,
-    /// worker boot generation, and worker incarnation.
-    #[must_use]
-    pub const fn for_attempt(authority: &'a AttemptAuthority) -> Self {
-        Self {
-            source: PublicationPermitSource::Attempt(authority),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn for_fixture(authority: &'a TypedDigest) -> Self {
-        Self {
-            source: PublicationPermitSource::Fixture(authority),
-        }
-    }
-
-    fn into_parts(self) -> (TypedDigest, Option<AttemptAuthority>) {
-        match self.source {
-            PublicationPermitSource::Attempt(attempt) => (
-                rabs_key::authority_binding::coordinator_authority_digest(&attempt.coordinator),
-                Some(attempt.clone()),
-            ),
-            #[cfg(test)]
-            PublicationPermitSource::Fixture(authority) => (authority.clone(), None),
-        }
-    }
-}
-
 /// One verified provisional-ancestor lineage row (H028): the consumer
 /// consumed `object_key` as the producer's `(role, virtual_path)`
 /// provisional output; `adopted` records that compatibility went through
@@ -1252,12 +1206,13 @@ pub trait RabsMetadataStore {
     /// Coordinator-only atomic publication commit (row + serving state +
     /// winner evidence row + reachability pin in ONE transaction;
     /// conflicts quarantine). Live offer admission supplies
-    /// a sealed [`PublicationPermit`] so the exact lease and worker fence
-    /// are revalidated inside this same transaction. Production permits
-    /// are constructible only from a full [`AttemptAuthority`].
+    /// `attempt_authority` so the exact lease and worker fence are
+    /// revalidated inside this same transaction. `None` is the narrow
+    /// metadata repair/fixture seam and grants no worker-originated right.
     fn commit_publication(
         &mut self,
-        permit: PublicationPermit<'_>,
+        authority: &TypedDigest,
+        attempt_authority: Option<&AttemptAuthority>,
         row: &PublicationRow,
     ) -> Result<CommitOutcome, StoreError>;
 
@@ -2317,45 +2272,6 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
         })
     }
 
-    fn create_bound_generation(
-        &mut self,
-        authority: &TypedDigest,
-        generation: &ActionGeneration,
-        action_key: &TypedDigest,
-    ) -> Result<(), StoreError> {
-        if generation.created_under_authority_digest != *authority {
-            return Err(StoreError::AttemptAuthorityMismatch);
-        }
-        let authority = authority.clone();
-        let action = digest_key(action_key);
-        let generation = generation.clone();
-        self.in_txn(move |engine| {
-            SqlMetadataStore::<E>::require_active(engine, &authority)?;
-            let id = generation.generation_id.0;
-            let high_water = SqlMetadataStore::<E>::generation_high_water(engine)?;
-            if id <= high_water {
-                return Err(StoreError::GenerationIdNotAboveHighWater);
-            }
-            engine.execute(
-                "INSERT INTO action_generations \
-                 (id_hex, id, action_key, authority_key, tombstoned, per_key_ordinal) \
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-                &[
-                    SqlValue::Text(u128_hex(id)),
-                    SqlValue::Blob(u128_blob(id)),
-                    SqlValue::Text(action),
-                    SqlValue::Text(digest_key(&authority)),
-                    SqlValue::Blob(u64_blob(generation.per_key_ordinal)),
-                ],
-            )?;
-            engine.execute(
-                "INSERT OR REPLACE INTO generation_high_water (kind, value) \
-                 VALUES ('action-generation', ?1)",
-                &[SqlValue::Blob(u128_blob(id))],
-            )?;
-            Ok(())
-        })
-    }
 
     fn digest_params(d: &TypedDigest) -> [SqlValue; 3] {
         [
@@ -2416,7 +2332,11 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
     ) -> Result<TypedDigest, StoreError> {
         let coordinator = Self::attempt_authority_digest(authority);
         Self::require_active(engine, &coordinator)?;
-        if authority.action_generation.created_under_authority_digest != coordinator {
+        if authority
+            .action_generation
+            .created_under_authority_digest
+            != coordinator
+        {
             return Err(StoreError::AttemptAuthorityMismatch);
         }
         let rows = engine.query(
@@ -2435,9 +2355,7 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
             ));
         }
         let [action_key, authority_key, tombstoned, ordinal] = row.as_slice() else {
-            return Err(StoreError::Corruption(
-                "action generation binding shape".into(),
-            ));
+            return Err(StoreError::Corruption("action generation binding shape".into()));
         };
         if expect_u64(tombstoned, "generation tombstoned")? != 0 {
             return Err(StoreError::GenerationTombstoned);
@@ -2507,9 +2425,7 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
             return Err(StoreError::UnknownLease);
         };
         if rows.len() != 1 {
-            return Err(StoreError::Corruption(
-                "duplicate execution lease rows".into(),
-            ));
+            return Err(StoreError::Corruption("duplicate execution lease rows".into()));
         }
         let [
             attempt_hex,
@@ -3018,14 +2934,44 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             Ok(())
         })
     }
-
     fn create_bound_generation(
         &mut self,
         authority: &TypedDigest,
         generation: &ActionGeneration,
         action_key: &TypedDigest,
     ) -> Result<(), StoreError> {
-        SqlMetadataStore::create_bound_generation(self, authority, generation, action_key)
+        if generation.created_under_authority_digest != *authority {
+            return Err(StoreError::AttemptAuthorityMismatch);
+        }
+        let authority = authority.clone();
+        let action = digest_key(action_key);
+        let generation = generation.clone();
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let id = generation.generation_id.0;
+            let high_water = SqlMetadataStore::<E>::generation_high_water(engine)?;
+            if id <= high_water {
+                return Err(StoreError::GenerationIdNotAboveHighWater);
+            }
+            engine.execute(
+                "INSERT INTO action_generations \
+                 (id_hex, id, action_key, authority_key, tombstoned, per_key_ordinal) \
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                &[
+                    SqlValue::Text(u128_hex(id)),
+                    SqlValue::Blob(u128_blob(id)),
+                    SqlValue::Text(action),
+                    SqlValue::Text(digest_key(&authority)),
+                    SqlValue::Blob(u64_blob(generation.per_key_ordinal)),
+                ],
+            )?;
+            engine.execute(
+                "INSERT OR REPLACE INTO generation_high_water (kind, value) \
+                 VALUES ('action-generation', ?1)",
+                &[SqlValue::Blob(u128_blob(id))],
+            )?;
+            Ok(())
+        })
     }
 
     fn close_generations_for_other_authorities(
@@ -3222,14 +3168,16 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
 
     fn commit_publication(
         &mut self,
-        permit: PublicationPermit<'_>,
+        authority: &TypedDigest,
+        attempt_authority: Option<&AttemptAuthority>,
         row: &PublicationRow,
     ) -> Result<CommitOutcome, StoreError> {
         self.intern(row.action_key.domain);
         self.intern(row.descriptor_digest.domain);
         self.intern(row.manifest_digest.domain);
         self.intern(row.evidence_digest.domain);
-        let (authority, attempt_authority) = permit.into_parts();
+        let authority = authority.clone();
+        let attempt_authority = attempt_authority.cloned();
         let row = row.clone();
         self.in_txn(move |engine| {
             match &attempt_authority {
@@ -7026,7 +6974,8 @@ mod tests {
 
     fn bound_attempt_authority() -> AttemptAuthority {
         let coordinator = coordinator_authority();
-        let created_under = rabs_key::authority_binding::coordinator_authority_digest(&coordinator);
+        let created_under =
+            rabs_key::authority_binding::coordinator_authority_digest(&coordinator);
         AttemptAuthority {
             coordinator,
             action_key: digest("rabs.action-key.sha256.v1", 7),
@@ -7213,27 +7162,24 @@ mod tests {
         // conflict-quarantined on descriptor mismatch.
         let publication_row = publication(7, 1, 40);
         assert_eq!(
-            store.commit_publication(PublicationPermit::for_fixture(&wrong), &publication_row),
+            store.commit_publication(&wrong, None, &publication_row),
             Err(StoreError::NotActiveAuthority)
         );
         assert_eq!(
             store
-                .commit_publication(PublicationPermit::for_fixture(&active), &publication_row)
+                .commit_publication(&active, None, &publication_row)
                 .unwrap(),
             CommitOutcome::Committed
         );
         assert_eq!(
             store
-                .commit_publication(PublicationPermit::for_fixture(&active), &publication_row)
+                .commit_publication(&active, None, &publication_row)
                 .unwrap(),
             CommitOutcome::IdempotentDuplicate
         );
         assert_eq!(
             store
-                .commit_publication(
-                    PublicationPermit::for_fixture(&active),
-                    &publication(7, 2, 41),
-                )
+                .commit_publication(&active, None, &publication(7, 2, 41))
                 .unwrap(),
             CommitOutcome::ConflictQuarantined
         );
@@ -8074,7 +8020,7 @@ mod tests {
         legacy_row.winner_generation = 11;
         legacy_row.winner_attempt = 22;
         assert_eq!(
-            store.commit_publication(PublicationPermit::for_attempt(&legacy), &legacy_row),
+            store.commit_publication(&bound_authority_row().digest, Some(&legacy), &legacy_row),
             Err(StoreError::LegacyUnboundAuthority)
         );
         assert!(!store.has_publication(&legacy.action_key).unwrap());
@@ -8105,7 +8051,9 @@ mod tests {
                 &replacement.action_key,
             )
             .unwrap();
-        store.admit_attempt_lease(&replacement, 201, 300).unwrap();
+        store
+            .admit_attempt_lease(&replacement, 201, 300)
+            .unwrap();
         assert_eq!(
             store.validate_attempt_lease(&replacement),
             Ok(LeaseState {
@@ -8291,9 +8239,7 @@ mod tests {
         let mut row = publication(9, 3, 90);
         row.result_kind = ResultKindTag::DeterministicFailure;
         assert_eq!(
-            store
-                .commit_publication(PublicationPermit::for_fixture(&active), &row)
-                .unwrap(),
+            store.commit_publication(&active, None, &row).unwrap(),
             CommitOutcome::Committed
         );
         let dump = store.differential_snapshot().unwrap();
