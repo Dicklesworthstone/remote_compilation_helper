@@ -12,13 +12,15 @@
 //!   valid grants refuse — one grant is least privilege). The grant is
 //!   opaque outside this module and its redaction-safe scope MUST equal the
 //!   digest of an exact [`BoundedNetworkPolicy`].
-//! - **The enforcement.** [`prepare_brokered_fetch`] asks a trusted broker
-//!   to install the exact authority, redirect, request, and byte bounds and
-//!   exposes only a controlled inherited-FD or Unix-socket channel. The
-//!   Cargo namespace RETAINS `--unshare-net`; DNS and remote sockets remain
-//!   broker-owned. The returned lease owns the broker guard and must live
-//!   through the fetch process. Failure leaves the spec closed.
-//!   `allow_network` is crate-private and ordinary mount plans are always
+//! - **The enforcement.** [`prepare_brokered_fetch`] asks a trusted EDGE
+//!   adapter to install the exact authority, redirect, request, and byte
+//!   bounds over a controlled inherited-FD or Unix-socket channel. Cargo is
+//!   not running in this phase; its later namespace RETAINS `--unshare-net`
+//!   and never receives the channel. DNS and remote sockets remain
+//!   broker-owned. [`finish_brokered_fetch`] consumes the one-shot lease,
+//!   revalidates capability authority, checks the broker's observations,
+//!   and only then issues an opaque receipt. Failure leaves the spec closed.
+//!   `allow_network` is private to the namespace module and ordinary mount plans are always
 //!   closed, so there is no public ambient-open bypass.
 //!   Per-action build views stay closed unconditionally (plan §36: fetching
 //!   is its own action; the build action never sees the wire).
@@ -166,6 +168,20 @@ pub enum BoundedNetworkPolicyRefusal {
     InvalidBrokerChannel,
     /// Brokered fetches must retain the closed network namespace.
     CanonicalNetworkMustRemainClosed,
+    /// The operation-bound capability stopped being valid before the
+    /// brokered phase completed.
+    GrantNoLongerValid(String),
+    /// The authoritative capability ledger could not be consulted after the
+    /// broker lane stopped.
+    AuthorityStateUnavailable(String),
+    /// The broker reported an authority outside the exact allowlist.
+    ObservedAuthorityOutsidePolicy(NetworkAuthority),
+    /// The broker's observed counters exceeded an installed bound or were
+    /// internally inconsistent.
+    ObservedBudgetInvalid(&'static str),
+    /// A network-required broker phase completed without one observed
+    /// request; that cannot prove acquisition happened.
+    NoRequestsObserved,
 }
 
 impl BoundedNetworkPolicy {
@@ -239,9 +255,11 @@ impl BoundedNetworkPolicy {
     }
 }
 
-/// The only channel a fetch subprocess may use to reach the trusted broker.
-/// Arbitrary inherited descriptors and filesystem paths are deliberately
-/// not accepted.
+/// The only channel the trusted EDGE fetch adapter may use to reach its
+/// broker. This channel is never handed to Cargo: Cargo remains stopped
+/// until acquisition has completed and its captured inputs can be replayed
+/// with physical network denial. Arbitrary inherited descriptors and
+/// filesystem paths are deliberately not accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrokerChannel {
     /// Explicitly inherited descriptor (standard streams are forbidden).
@@ -272,65 +290,233 @@ impl BrokerChannel {
     }
 }
 
-/// Trusted platform boundary that installs and owns a fetch broker.
-/// Implementations must enforce the exact policy for the lifetime of the
-/// returned guard, including URL normalization, redirects, DNS answers,
-/// proxy use, request count, and accepted response bytes. The broker, not
-/// the sandboxed Cargo process, owns DNS and remote sockets. Returning
+/// Operation/lease context supplied to the trusted broker. The broker must
+/// stop accepting work no later than `expires_seq`; the coordinator also
+/// revalidates revocation and expiry when the guard is finalized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrokerLeaseContext {
+    /// Session bound into the capability.
+    pub session_id: u64,
+    /// Operation bound into the capability.
+    pub operation_id: u64,
+    /// Sequence at which the gate most recently validated the capability.
+    pub validated_at_seq: u64,
+    /// First sequence for which the capability is expired.
+    pub expires_seq: u64,
+}
+
+/// Fresh capability-authority state sampled only after a broker lane has
+/// stopped. The constructor is intentionally explicit: callers provide an
+/// authority callback to [`finish_brokered_fetch`], and the core invokes it
+/// after `BoundedFetchBroker::finish` rather than accepting a stale snapshot
+/// captured before the potentially blocking broker shutdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityAuthoritySnapshot {
+    current_seq: u64,
+    revoked_token_ids: Vec<u64>,
+}
+
+impl CapabilityAuthoritySnapshot {
+    /// Construct a fresh snapshot from the authoritative coordinator ledger.
+    #[must_use]
+    pub fn new(current_seq: u64, revoked_token_ids: Vec<u64>) -> Self {
+        Self {
+            current_seq,
+            revoked_token_ids,
+        }
+    }
+
+    /// Current monotonic coordinator sequence.
+    #[must_use]
+    pub const fn current_seq(&self) -> u64 {
+        self.current_seq
+    }
+
+    /// Token ids revoked as of [`Self::current_seq`].
+    #[must_use]
+    pub fn revoked_token_ids(&self) -> &[u64] {
+        &self.revoked_token_ids
+    }
+}
+
+/// Observed facts returned by the trusted broker only after it has stopped
+/// the fetch lane and all accepted response bytes are final. Authorities
+/// are the actual destinations after redirect/DNS/proxy policy handling,
+/// not merely the declared allowlist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerObservation {
+    /// Actual unique destination authorities, in any order.
+    pub authorities: Vec<NetworkAuthority>,
+    /// Total requests issued, including redirected requests.
+    pub requests: u32,
+    /// Redirects actually followed.
+    pub redirects: u32,
+    /// Total accepted response-body bytes.
+    pub response_bytes: u64,
+}
+
+/// Trusted platform boundary that installs, owns, and FINALIZES a fetch
+/// broker. Implementations must enforce the exact policy for the lifetime
+/// of the returned guard, including URL normalization, redirects, DNS
+/// answers, proxy use, request count, accepted response bytes, and lease
+/// expiry. The broker, not Cargo, owns DNS and remote sockets. Returning
 /// success without doing so is a privileged-adapter integrity bug.
 pub trait BoundedFetchBroker {
     /// Guard whose lifetime owns the broker policy and channel.
     type Guard;
 
-    /// Attach the exact policy to the controlled subprocess channel.
+    /// Attach the exact policy and create the owned edge-to-broker channel.
+    /// The core validates the returned channel before issuing a lease.
     fn attach(
         &mut self,
         policy: &BoundedNetworkPolicy,
-        channel: &BrokerChannel,
-    ) -> Result<Self::Guard, String>;
+        lease: BrokerLeaseContext,
+    ) -> Result<(Self::Guard, BrokerChannel), String>;
+
+    /// Stop the broker lane, consume its guard, and report enforced facts.
+    /// A receipt is not issued until this succeeds and the core validates
+    /// every observed authority/counter against the installed policy.
+    fn finish(&mut self, guard: Self::Guard) -> Result<BrokerObservation, String>;
 
     /// Stable audit name of the concrete enforcement mechanism.
     fn mechanism(&self) -> &'static str;
 }
 
-/// Honest record of the broker bounds installed while the fetch namespace
-/// itself remained network-isolated.
+/// Honest, opaque record of a COMPLETED broker phase while Cargo itself
+/// remained network-isolated. External code can inspect but cannot
+/// construct or mutate this proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedNetworkReceipt {
-    /// Exercised capability token.
-    pub token_id: u64,
-    /// Exact redaction-safe policy binding.
-    pub scope_binding: String,
-    /// Canonical destinations actually installed.
-    pub authorities: Vec<NetworkAuthority>,
-    /// Installed request/redirect/body budgets.
-    pub budget: NetworkBudget,
-    /// Trusted adapter mechanism.
-    pub mechanism: &'static str,
-    /// Controlled channel presented to the fetch subprocess.
-    pub channel: BrokerChannel,
+    token_id: u64,
+    session_id: u64,
+    operation_id: u64,
+    completed_at_seq: u64,
+    scope_binding: String,
+    allowed_authorities: Vec<NetworkAuthority>,
+    observed_authorities: Vec<NetworkAuthority>,
+    budget: NetworkBudget,
+    requests: u32,
+    redirects: u32,
+    response_bytes: u64,
+    mechanism: &'static str,
+    channel: BrokerChannel,
 }
 
-/// Broker lifetime token. Callers must retain this value until the
-/// fetch process and all descendants have exited; dropping it releases the
-/// broker guard.
-#[derive(Debug)]
-pub struct BrokeredFetchLease<G> {
-    guard: G,
-    receipt: BoundedNetworkReceipt,
-}
-
-impl<G> BrokeredFetchLease<G> {
-    /// Enforcement receipt for provenance.
+impl BoundedNetworkReceipt {
+    /// Exercised token id.
     #[must_use]
-    pub const fn receipt(&self) -> &BoundedNetworkReceipt {
-        &self.receipt
+    pub const fn token_id(&self) -> u64 {
+        self.token_id
     }
 
-    /// Borrow the installed guard, primarily for lifecycle integration.
+    /// Session bound into the exercised token.
     #[must_use]
-    pub const fn guard(&self) -> &G {
-        &self.guard
+    pub const fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    /// Operation bound into the exercised token.
+    #[must_use]
+    pub const fn operation_id(&self) -> u64 {
+        self.operation_id
+    }
+
+    /// Coordinator sequence at successful broker finalization.
+    #[must_use]
+    pub const fn completed_at_seq(&self) -> u64 {
+        self.completed_at_seq
+    }
+
+    /// Exact redaction-safe policy binding.
+    #[must_use]
+    pub fn scope_binding(&self) -> &str {
+        &self.scope_binding
+    }
+
+    /// Canonical authorities installed as the allowlist.
+    #[must_use]
+    pub fn allowed_authorities(&self) -> &[NetworkAuthority] {
+        &self.allowed_authorities
+    }
+
+    /// Actual canonical authorities observed by the broker.
+    #[must_use]
+    pub fn observed_authorities(&self) -> &[NetworkAuthority] {
+        &self.observed_authorities
+    }
+
+    /// Installed request/redirect/body budgets.
+    #[must_use]
+    pub const fn budget(&self) -> NetworkBudget {
+        self.budget
+    }
+
+    /// Total observed requests, redirects included.
+    #[must_use]
+    pub const fn requests(&self) -> u32 {
+        self.requests
+    }
+
+    /// Redirects actually followed.
+    #[must_use]
+    pub const fn redirects(&self) -> u32 {
+        self.redirects
+    }
+
+    /// Accepted response-body bytes.
+    #[must_use]
+    pub const fn response_bytes(&self) -> u64 {
+        self.response_bytes
+    }
+
+    /// Stable trusted-adapter mechanism.
+    #[must_use]
+    pub const fn mechanism(&self) -> &'static str {
+        self.mechanism
+    }
+
+    /// Controlled edge-to-broker channel.
+    #[must_use]
+    pub const fn channel(&self) -> &BrokerChannel {
+        &self.channel
+    }
+}
+
+/// Broker lifetime token. It is deliberately opaque and non-cloneable.
+/// Finalize it with [`finish_brokered_fetch`]; merely attaching a broker
+/// never yields provenance that a capture can seal.
+#[derive(Debug)]
+#[must_use = "finish the brokered fetch explicitly to obtain its one-shot receipt"]
+pub struct BrokeredFetchLease<'broker, B: BoundedFetchBroker> {
+    broker: &'broker mut B,
+    guard: Option<B::Guard>,
+    grant: NetworkGrant,
+    policy: BoundedNetworkPolicy,
+    mechanism: &'static str,
+    channel: BrokerChannel,
+}
+
+impl<B: BoundedFetchBroker> BrokeredFetchLease<'_, B> {
+    /// Broker-owned channel available to the trusted edge fetch client for
+    /// the lifetime of this one-shot lease. The channel does not grant
+    /// ambient network access: the broker enforces the installed policy and
+    /// [`finish_brokered_fetch`] consumes the guard before issuing evidence.
+    #[must_use]
+    pub const fn channel(&self) -> &BrokerChannel {
+        &self.channel
+    }
+}
+
+impl<B: BoundedFetchBroker> Drop for BrokeredFetchLease<'_, B> {
+    fn drop(&mut self) {
+        // Cancellation, early return, and unwinding must not detach a live
+        // broker lane. The explicit finalizer takes this guard before it
+        // invokes `finish`, so this fallback cannot finalize the same guard
+        // twice and deliberately discards observations rather than minting a
+        // receipt without completion-time authority validation.
+        if let Some(guard) = self.guard.take() {
+            let _ = self.broker.finish(guard);
+        }
     }
 }
 
@@ -338,23 +524,41 @@ impl<G> BrokeredFetchLease<G> {
 /// only by [`evaluate_open_network`] from a token that validated for THIS
 /// session and operation. Its fields are intentionally opaque: callers can
 /// inspect but cannot fabricate a grant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct NetworkGrant {
-    token_id: u64,
-    scope: String,
+    token: CapabilityToken,
+    validated_at_seq: u64,
 }
 
 impl NetworkGrant {
     /// Exercised token id for receipts.
     #[must_use]
     pub const fn token_id(&self) -> u64 {
-        self.token_id
+        self.token.token_id
     }
 
     /// Redaction-safe bounded-policy binding carried by the token.
     #[must_use]
     pub fn scope(&self) -> &str {
-        &self.scope
+        &self.token.scope
+    }
+
+    /// Session context carried by the token.
+    #[must_use]
+    pub const fn session_id(&self) -> u64 {
+        self.token.session_id
+    }
+
+    /// Operation context carried by the token.
+    #[must_use]
+    pub const fn operation_id(&self) -> u64 {
+        self.token.operation_id
+    }
+
+    /// First sequence for which this grant is expired.
+    #[must_use]
+    pub const fn expires_seq(&self) -> u64 {
+        self.token.expires_seq
     }
 }
 
@@ -411,19 +615,19 @@ pub fn evaluate_open_network(
     // Reusing one id with a changed scope/context/lease is an issuer/audit
     // conflict and refuses before any candidate can win by input order.
     let mut by_id = std::collections::BTreeMap::new();
-    for token in tokens
-        .iter()
-        .filter(|token| token.kind == CapabilityKind::OpenNetwork)
-    {
-        if let Some(prior) = by_id.insert(token.token_id, token) {
-            if prior != token {
-                return Err(NetworkGateRefusal::ConflictingTokenPresentations {
-                    token_id: token.token_id,
-                });
-            }
+    for token in tokens {
+        if let Some(prior) = by_id.insert(token.token_id, token)
+            && prior != token
+        {
+            return Err(NetworkGateRefusal::ConflictingTokenPresentations {
+                token_id: token.token_id,
+            });
         }
     }
-    let candidates: Vec<&CapabilityToken> = by_id.into_values().collect();
+    let candidates: Vec<&CapabilityToken> = by_id
+        .into_values()
+        .filter(|token| token.kind == CapabilityKind::OpenNetwork)
+        .collect();
     let mut valid: Vec<&CapabilityToken> = Vec::new();
     let mut invalid: Option<NetworkGateRefusal> = None;
     for token in &candidates {
@@ -454,8 +658,8 @@ pub fn evaluate_open_network(
     match valid.as_slice() {
         [] => Err(invalid.unwrap_or(NetworkGateRefusal::NoOpenNetworkToken)),
         [token] => Ok(NetworkGrant {
-            token_id: token.token_id,
-            scope: token.scope.clone(),
+            token: (*token).clone(),
+            validated_at_seq: current_seq,
         }),
         _ => Err(NetworkGateRefusal::AmbiguousOpenNetworkGrants {
             valid_token_ids: valid.iter().map(|t| t.token_id).collect(),
@@ -463,48 +667,166 @@ pub fn evaluate_open_network(
     }
 }
 
-/// Bind a validated grant to an exact policy and attach a trusted broker to
-/// a controlled subprocess channel. The canonical namespace MUST still be
-/// closed: Cargo gets the broker channel, never an ambient route or DNS.
-/// The returned lease owns the broker guard and must outlive the fetch.
+/// Bind a validated grant to an exact policy and attach the trusted EDGE
+/// fetch adapter to a controlled broker channel. The canonical namespace
+/// MUST remain closed, and Cargo is not launched during this phase. The
+/// returned one-shot lease owns the broker guard until finalization.
 ///
 /// # Errors
 /// A typed policy refusal. The namespace is never mutated by this function.
-pub fn prepare_brokered_fetch<B: BoundedFetchBroker>(
+pub fn prepare_brokered_fetch<'broker, B: BoundedFetchBroker>(
     spec: &CanonicalNamespaceSpec,
-    grant: &NetworkGrant,
-    policy: &BoundedNetworkPolicy,
-    channel: BrokerChannel,
-    broker: &mut B,
-) -> Result<BrokeredFetchLease<B::Guard>, BoundedNetworkPolicyRefusal> {
-    if spec.allow_network {
+    grant: NetworkGrant,
+    policy: BoundedNetworkPolicy,
+    broker: &'broker mut B,
+    revoked_token_ids: &[u64],
+    current_seq: u64,
+) -> Result<BrokeredFetchLease<'broker, B>, BoundedNetworkPolicyRefusal> {
+    if spec.allows_network() {
         return Err(BoundedNetworkPolicyRefusal::CanonicalNetworkMustRemainClosed);
     }
-    channel.validate()?;
     let expected = policy.scope_binding();
-    if grant.scope != expected {
+    if grant.scope() != expected {
         return Err(BoundedNetworkPolicyRefusal::ScopeMismatch {
             expected,
-            presented: grant.scope.clone(),
+            presented: grant.scope().to_owned(),
         });
     }
+    if current_seq < grant.validated_at_seq {
+        return Err(BoundedNetworkPolicyRefusal::GrantNoLongerValid(
+            "coordinator lease sequence regressed".into(),
+        ));
+    }
+    capability_tokens::validate(
+        &grant.token,
+        revoked_token_ids,
+        current_seq,
+        grant.session_id(),
+        grant.operation_id(),
+    )
+    .map_err(|error| BoundedNetworkPolicyRefusal::GrantNoLongerValid(format!("{error:?}")))?;
     let mechanism = broker.mechanism();
     if mechanism.is_empty() {
         return Err(BoundedNetworkPolicyRefusal::EnforcementMechanismMissing);
     }
-    let guard = broker
-        .attach(policy, &channel)
+    let lease_context = BrokerLeaseContext {
+        session_id: grant.session_id(),
+        operation_id: grant.operation_id(),
+        validated_at_seq: current_seq,
+        expires_seq: grant.expires_seq(),
+    };
+    let (guard, channel) = broker
+        .attach(&policy, lease_context)
         .map_err(BoundedNetworkPolicyRefusal::EnforcementUnavailable)?;
+    if let Err(error) = channel.validate() {
+        // `attach` has already activated the trusted adapter. Consume its
+        // guard before refusing so an invalid returned channel cannot leave
+        // a detached broker lane alive without a lease owner.
+        let _ = broker.finish(guard);
+        return Err(error);
+    }
     Ok(BrokeredFetchLease {
-        guard,
-        receipt: BoundedNetworkReceipt {
-            token_id: grant.token_id,
-            scope_binding: expected,
-            authorities: policy.authorities.clone(),
-            budget: policy.budget,
-            mechanism,
-            channel,
-        },
+        broker,
+        guard: Some(guard),
+        grant,
+        policy,
+        mechanism,
+        channel,
+    })
+}
+
+/// Finalize a one-shot broker lease and issue an opaque receipt only after
+/// the adapter's observations satisfy the exact installed policy. The
+/// capability is revalidated at completion so expiry/revocation cannot be
+/// hidden by an earlier successful attach.
+///
+/// # Errors
+/// A typed refusal for adapter failure, expired/revoked authority, an
+/// out-of-policy destination, or invalid observed counters.
+pub fn finish_brokered_fetch<B, A>(
+    mut lease: BrokeredFetchLease<'_, B>,
+    authority_state: A,
+) -> Result<BoundedNetworkReceipt, BoundedNetworkPolicyRefusal>
+where
+    B: BoundedFetchBroker,
+    A: FnOnce() -> Result<CapabilityAuthoritySnapshot, String>,
+{
+    let guard = lease.guard.take().ok_or_else(|| {
+        BoundedNetworkPolicyRefusal::EnforcementUnavailable(
+            "broker lease guard was already finalized".into(),
+        )
+    })?;
+    let observation = lease
+        .broker
+        .finish(guard)
+        .map_err(BoundedNetworkPolicyRefusal::EnforcementUnavailable)?;
+    let authority =
+        authority_state().map_err(BoundedNetworkPolicyRefusal::AuthorityStateUnavailable)?;
+    let current_seq = authority.current_seq();
+    if current_seq < lease.grant.validated_at_seq {
+        return Err(BoundedNetworkPolicyRefusal::GrantNoLongerValid(
+            "coordinator lease sequence regressed".into(),
+        ));
+    }
+    capability_tokens::validate(
+        &lease.grant.token,
+        authority.revoked_token_ids(),
+        current_seq,
+        lease.grant.session_id(),
+        lease.grant.operation_id(),
+    )
+    .map_err(|error| BoundedNetworkPolicyRefusal::GrantNoLongerValid(format!("{error:?}")))?;
+    if observation.requests == 0 {
+        return Err(BoundedNetworkPolicyRefusal::NoRequestsObserved);
+    }
+    if observation.authorities.is_empty() {
+        return Err(BoundedNetworkPolicyRefusal::ObservedBudgetInvalid(
+            "observed_authorities",
+        ));
+    }
+    if observation.redirects > observation.requests
+        || observation.requests > lease.policy.budget.max_requests
+    {
+        return Err(BoundedNetworkPolicyRefusal::ObservedBudgetInvalid(
+            "requests/redirects",
+        ));
+    }
+    if observation.redirects > lease.policy.budget.max_redirects {
+        return Err(BoundedNetworkPolicyRefusal::ObservedBudgetInvalid(
+            "max_redirects",
+        ));
+    }
+    if observation.response_bytes > lease.policy.budget.max_response_bytes {
+        return Err(BoundedNetworkPolicyRefusal::ObservedBudgetInvalid(
+            "max_response_bytes",
+        ));
+    }
+
+    let mut observed_authorities = observation.authorities;
+    observed_authorities.sort();
+    observed_authorities.dedup();
+    for authority in &observed_authorities {
+        if lease.policy.authorities.binary_search(authority).is_err() {
+            return Err(BoundedNetworkPolicyRefusal::ObservedAuthorityOutsidePolicy(
+                authority.clone(),
+            ));
+        }
+    }
+
+    Ok(BoundedNetworkReceipt {
+        token_id: lease.grant.token_id(),
+        session_id: lease.grant.session_id(),
+        operation_id: lease.grant.operation_id(),
+        completed_at_seq: current_seq,
+        scope_binding: lease.policy.scope_binding(),
+        allowed_authorities: lease.policy.authorities.clone(),
+        observed_authorities,
+        budget: lease.policy.budget,
+        requests: observation.requests,
+        redirects: observation.redirects,
+        response_bytes: observation.response_bytes,
+        mechanism: lease.mechanism,
+        channel: lease.channel.clone(),
     })
 }
 
@@ -515,17 +837,37 @@ fn canonical_host(host: &str) -> bool {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return ip.to_string() == host;
     }
+    // libc/URL parsers commonly accept inet_aton-era IPv4 spellings that
+    // Rust's strict `IpAddr` parser rejects: shortened dotted forms, octal,
+    // hexadecimal, and one-component integers. Letting those fall through as
+    // "DNS" would make the policy authorize one spelling while a broker
+    // connects to another address (often loopback). Canonical IPv4 already
+    // returned above; reject every all-numeric/hex-component legacy form.
+    if looks_like_legacy_ipv4(host) {
+        return false;
+    }
     if host != host.to_ascii_lowercase() || host.ends_with('.') {
         return false;
     }
     host.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
+            && !label.starts_with("xn--")
             && !label.starts_with('-')
             && !label.ends_with('-')
             && label
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+fn looks_like_legacy_ipv4(host: &str) -> bool {
+    host.split('.').all(|component| {
+        !component.is_empty()
+            && (component.bytes().all(|byte| byte.is_ascii_digit())
+                || component.strip_prefix("0x").is_some_and(|hex| {
+                    !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }))
     })
 }
 
@@ -559,7 +901,7 @@ pub fn boundary_isolation_evidence(boundary: &NamespaceBoundary) -> IsolationEvi
                 EnforcementState::Enforced { mechanism: "netns" }
             } else {
                 EnforcementState::NotEnforced {
-                    reason: "open-network-capability",
+                    reason: "network-not-isolated",
                 }
             },
         ),
@@ -729,12 +1071,28 @@ mod tests {
         .unwrap()
     }
 
+    fn authority_at(
+        current_seq: u64,
+        revoked_token_ids: &[u64],
+    ) -> impl FnOnce() -> Result<CapabilityAuthoritySnapshot, String> {
+        let revoked_token_ids = revoked_token_ids.to_vec();
+        move || {
+            Ok(CapabilityAuthoritySnapshot::new(
+                current_seq,
+                revoked_token_ids,
+            ))
+        }
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     struct FakeBrokerGuard;
 
     struct FakeBroker {
         fail: bool,
-        seen: Option<(BoundedNetworkPolicy, BrokerChannel)>,
+        finish_calls: u32,
+        seen: Option<(BoundedNetworkPolicy, BrokerChannel, BrokerLeaseContext)>,
+        channel: BrokerChannel,
+        observation: BrokerObservation,
         mechanism: &'static str,
     }
 
@@ -744,18 +1102,77 @@ mod tests {
         fn attach(
             &mut self,
             policy: &BoundedNetworkPolicy,
-            channel: &BrokerChannel,
-        ) -> Result<Self::Guard, String> {
-            self.seen = Some((policy.clone(), channel.clone()));
+            lease: BrokerLeaseContext,
+        ) -> Result<(Self::Guard, BrokerChannel), String> {
+            self.seen = Some((policy.clone(), self.channel.clone(), lease));
             if self.fail {
                 Err("broker unavailable".into())
             } else {
-                Ok(FakeBrokerGuard)
+                Ok((FakeBrokerGuard, self.channel.clone()))
+            }
+        }
+
+        fn finish(&mut self, _guard: Self::Guard) -> Result<BrokerObservation, String> {
+            self.finish_calls += 1;
+            if self.fail {
+                Err("broker unavailable".into())
+            } else {
+                Ok(self.observation.clone())
             }
         }
 
         fn mechanism(&self) -> &'static str {
             self.mechanism
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum AuthorityMutation {
+        AdvanceTo(u64),
+        Revoke(u64),
+    }
+
+    struct AuthorityMutatingBroker {
+        authority: std::rc::Rc<std::cell::RefCell<CapabilityAuthoritySnapshot>>,
+        mutation: AuthorityMutation,
+        finish_calls: u32,
+    }
+
+    impl BoundedFetchBroker for AuthorityMutatingBroker {
+        type Guard = FakeBrokerGuard;
+
+        fn attach(
+            &mut self,
+            _policy: &BoundedNetworkPolicy,
+            _lease: BrokerLeaseContext,
+        ) -> Result<(Self::Guard, BrokerChannel), String> {
+            Ok((FakeBrokerGuard, BrokerChannel::InheritedFd(7)))
+        }
+
+        fn finish(&mut self, _guard: Self::Guard) -> Result<BrokerObservation, String> {
+            self.finish_calls += 1;
+            let mut authority = self.authority.borrow_mut();
+            match self.mutation {
+                AuthorityMutation::AdvanceTo(current_seq) => {
+                    authority.current_seq = current_seq;
+                }
+                AuthorityMutation::Revoke(token_id) => {
+                    authority.revoked_token_ids.push(token_id);
+                }
+            }
+            Ok(BrokerObservation {
+                authorities: vec![
+                    NetworkAuthority::new(NetworkScheme::Https, "crates.io", 443)
+                        .expect("canonical test authority"),
+                ],
+                requests: 1,
+                redirects: 0,
+                response_bytes: 1,
+            })
+        }
+
+        fn mechanism(&self) -> &'static str {
+            "authority-mutating-test-broker"
         }
     }
 
@@ -843,6 +1260,24 @@ mod tests {
     }
 
     #[test]
+    fn same_token_id_reused_across_capability_kinds_refuses() {
+        let network = open_token(1, 5, 9, "scope-a");
+        let snapshot = capability_tokens::mint(
+            1,
+            CapabilityKind::MaterializeSnapshot,
+            5,
+            9,
+            "snapshot-a",
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            evaluate_open_network(&[snapshot, network], &[], 10, 5, 9),
+            Err(NetworkGateRefusal::ConflictingTokenPresentations { token_id: 1 })
+        );
+    }
+
+    #[test]
     fn brokered_fetch_keeps_namespace_closed_and_records_exact_bounds() {
         let mut spec = CanonicalNamespaceSpec::new();
         spec.rw_binds
@@ -851,15 +1286,29 @@ mod tests {
         let token = open_token(7, 5, 9, &policy.scope_binding());
         let grant = evaluate_open_network(&[token], &[], 10, 5, 9).unwrap();
         let channel = BrokerChannel::InheritedFd(7);
+        let observed =
+            NetworkAuthority::new(NetworkScheme::Https, "static.crates.io", 443).unwrap();
         let mut broker = FakeBroker {
             fail: false,
+            finish_calls: 0,
             seen: None,
+            channel: channel.clone(),
+            observation: BrokerObservation {
+                authorities: vec![observed.clone()],
+                requests: 3,
+                redirects: 1,
+                response_bytes: 4096,
+            },
             mechanism: "edge-fetch-broker-v1",
         };
-        let lease = prepare_brokered_fetch(&spec, &grant, &policy, channel.clone(), &mut broker)
+        let expected_policy = policy.clone();
+        let lease = prepare_brokered_fetch(&spec, grant, policy, &mut broker, &[], 11)
             .expect("exact bounded broker policy attaches");
+        assert_eq!(lease.channel(), &channel);
+        let receipt = finish_brokered_fetch(lease, authority_at(12, &[]))
+            .expect("observed facts fit the installed policy");
 
-        let launch = build_canonical_argv(&spec, &full_support(), "cargo", &["fetch".into()])
+        let launch = build_canonical_argv(&spec, &full_support(), "cargo", &["metadata".into()])
             .expect("spec builds");
         let argv: Vec<String> = launch
             .argv
@@ -871,11 +1320,143 @@ mod tests {
 
         let record = boundary_isolation_evidence(&launch.boundary);
         assert!(record.fully_enforced());
-        assert_eq!(lease.receipt().token_id, 7);
-        assert_eq!(lease.receipt().scope_binding, policy.scope_binding());
-        assert_eq!(lease.receipt().channel, channel);
-        assert_eq!(lease.receipt().mechanism, "edge-fetch-broker-v1");
-        assert_eq!(broker.seen, Some((policy, BrokerChannel::InheritedFd(7))));
+        assert_eq!(receipt.token_id(), 7);
+        assert_eq!(receipt.session_id(), 5);
+        assert_eq!(receipt.operation_id(), 9);
+        assert_eq!(receipt.completed_at_seq(), 12);
+        assert_eq!(receipt.scope_binding(), expected_policy.scope_binding());
+        assert_eq!(receipt.allowed_authorities(), expected_policy.authorities());
+        assert_eq!(receipt.observed_authorities(), &[observed]);
+        assert_eq!(receipt.requests(), 3);
+        assert_eq!(receipt.redirects(), 1);
+        assert_eq!(receipt.response_bytes(), 4096);
+        assert_eq!(receipt.channel(), &channel);
+        assert_eq!(receipt.mechanism(), "edge-fetch-broker-v1");
+        assert_eq!(
+            broker.seen,
+            Some((
+                expected_policy,
+                BrokerChannel::InheritedFd(7),
+                BrokerLeaseContext {
+                    session_id: 5,
+                    operation_id: 9,
+                    validated_at_seq: 11,
+                    expires_seq: 100,
+                },
+            ))
+        );
+    }
+
+    #[test]
+    fn broker_lease_finishes_only_the_instance_that_attached_it() {
+        let spec = CanonicalNamespaceSpec::new();
+        let policy = fetch_policy();
+        let token = open_token(7, 5, 9, &policy.scope_binding());
+        let grant = evaluate_open_network(&[token], &[], 10, 5, 9).unwrap();
+        let observation = BrokerObservation {
+            authorities: vec![
+                NetworkAuthority::new(NetworkScheme::Https, "crates.io", 443).unwrap(),
+            ],
+            requests: 1,
+            redirects: 0,
+            response_bytes: 1,
+        };
+        let mut owner = FakeBroker {
+            fail: false,
+            finish_calls: 0,
+            seen: None,
+            channel: BrokerChannel::InheritedFd(7),
+            observation: observation.clone(),
+            mechanism: "owner-broker",
+        };
+        let other = FakeBroker {
+            fail: false,
+            finish_calls: 0,
+            seen: None,
+            channel: BrokerChannel::InheritedFd(8),
+            observation,
+            mechanism: "other-broker",
+        };
+
+        let lease = prepare_brokered_fetch(&spec, grant, policy, &mut owner, &[], 11).unwrap();
+        let receipt = finish_brokered_fetch(lease, authority_at(12, &[])).unwrap();
+
+        assert_eq!(owner.finish_calls, 1);
+        assert_eq!(other.finish_calls, 0);
+        assert_eq!(receipt.mechanism(), "owner-broker");
+        assert_eq!(receipt.channel(), &BrokerChannel::InheritedFd(7));
+    }
+
+    #[test]
+    fn dropped_broker_lease_finalizes_once_without_minting_a_receipt() {
+        let spec = CanonicalNamespaceSpec::new();
+        let policy = fetch_policy();
+        let token = open_token(7, 5, 9, &policy.scope_binding());
+        let grant = evaluate_open_network(&[token], &[], 10, 5, 9).unwrap();
+        let mut broker = FakeBroker {
+            fail: false,
+            finish_calls: 0,
+            seen: None,
+            channel: BrokerChannel::InheritedFd(7),
+            observation: BrokerObservation {
+                authorities: vec![
+                    NetworkAuthority::new(NetworkScheme::Https, "crates.io", 443).unwrap(),
+                ],
+                requests: 1,
+                redirects: 0,
+                response_bytes: 1,
+            },
+            mechanism: "drop-test-broker",
+        };
+
+        let cancellation: std::thread::Result<()> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let lease =
+                    prepare_brokered_fetch(&spec, grant, policy, &mut broker, &[], 11).unwrap();
+                assert_eq!(lease.channel(), &BrokerChannel::InheritedFd(7));
+                // Simulate cancellation by unwinding before the receipt-
+                // issuing finalizer and authority callback can run.
+                panic!("cancel brokered fetch");
+            }));
+
+        assert!(cancellation.is_err());
+        assert_eq!(
+            broker.finish_calls, 1,
+            "Drop must consume the attached guard exactly once"
+        );
+    }
+
+    #[test]
+    fn completion_queries_authority_after_broker_finish() {
+        for (mutation, expected) in [
+            (AuthorityMutation::Revoke(7), "Revoked"),
+            (AuthorityMutation::AdvanceTo(100), "LeaseExpired"),
+        ] {
+            let spec = CanonicalNamespaceSpec::new();
+            let policy = fetch_policy();
+            let token = open_token(7, 5, 9, &policy.scope_binding());
+            let grant = evaluate_open_network(&[token], &[], 10, 5, 9).unwrap();
+            let authority = std::rc::Rc::new(std::cell::RefCell::new(
+                CapabilityAuthoritySnapshot::new(11, vec![]),
+            ));
+            let mut broker = AuthorityMutatingBroker {
+                authority: std::rc::Rc::clone(&authority),
+                mutation,
+                finish_calls: 0,
+            };
+            let lease = prepare_brokered_fetch(&spec, grant, policy, &mut broker, &[], 11).unwrap();
+            let authority_for_callback = std::rc::Rc::clone(&authority);
+
+            let result =
+                finish_brokered_fetch(lease, move || Ok(authority_for_callback.borrow().clone()));
+
+            assert!(matches!(
+                result,
+                Err(BoundedNetworkPolicyRefusal::GrantNoLongerValid(message))
+                    if message.contains(expected)
+            ));
+            assert_eq!(broker.finish_calls, 1);
+        }
     }
 
     #[test]
@@ -886,17 +1467,19 @@ mod tests {
         let grant = evaluate_open_network(&[wrong], &[], 10, 5, 9).unwrap();
         let mut broker = FakeBroker {
             fail: false,
+            finish_calls: 0,
             seen: None,
+            channel: BrokerChannel::InheritedFd(7),
+            observation: BrokerObservation {
+                authorities: vec![],
+                requests: 1,
+                redirects: 0,
+                response_bytes: 1,
+            },
             mechanism: "edge-fetch-broker-v1",
         };
         assert!(matches!(
-            prepare_brokered_fetch(
-                &spec,
-                &grant,
-                &policy,
-                BrokerChannel::InheritedFd(7),
-                &mut broker,
-            ),
+            prepare_brokered_fetch(&spec, grant, policy.clone(), &mut broker, &[], 10,),
             Err(BoundedNetworkPolicyRefusal::ScopeMismatch { .. })
         ));
         assert!(broker.seen.is_none(), "mismatch refuses before broker use");
@@ -905,16 +1488,154 @@ mod tests {
         let grant = evaluate_open_network(&[token], &[], 10, 5, 9).unwrap();
         broker.fail = true;
         assert!(matches!(
-            prepare_brokered_fetch(
-                &spec,
-                &grant,
-                &policy,
-                BrokerChannel::InheritedFd(7),
-                &mut broker,
-            ),
+            prepare_brokered_fetch(&spec, grant, policy, &mut broker, &[], 10,),
             Err(BoundedNetworkPolicyRefusal::EnforcementUnavailable(_))
         ));
-        assert!(!spec.allow_network);
+        assert!(!spec.allows_network());
+
+        let policy = fetch_policy();
+        let token = open_token(9, 5, 9, &policy.scope_binding());
+        let grant = evaluate_open_network(&[token], &[], 10, 5, 9).unwrap();
+        broker.fail = false;
+        broker.channel = BrokerChannel::InheritedFd(2);
+        assert!(matches!(
+            prepare_brokered_fetch(&spec, grant, policy, &mut broker, &[], 10),
+            Err(BoundedNetworkPolicyRefusal::InvalidBrokerChannel)
+        ));
+        assert_eq!(
+            broker.finish_calls, 1,
+            "an invalid post-attach channel must consume its broker guard"
+        );
+    }
+
+    #[test]
+    fn broker_completion_rechecks_authority_expiry_and_observed_destinations() {
+        let spec = CanonicalNamespaceSpec::new();
+        let policy = fetch_policy();
+
+        let token = open_token(7, 5, 9, &policy.scope_binding());
+        let grant = evaluate_open_network(&[token], &[], 10, 5, 9).unwrap();
+        let mut broker = FakeBroker {
+            fail: false,
+            finish_calls: 0,
+            seen: None,
+            channel: BrokerChannel::InheritedFd(7),
+            observation: BrokerObservation {
+                authorities: vec![
+                    NetworkAuthority::new(NetworkScheme::Https, "evil.example", 443).unwrap(),
+                ],
+                requests: 1,
+                redirects: 0,
+                response_bytes: 1,
+            },
+            mechanism: "edge-fetch-broker-v1",
+        };
+        let lease =
+            prepare_brokered_fetch(&spec, grant, policy.clone(), &mut broker, &[], 10).unwrap();
+        assert!(matches!(
+            finish_brokered_fetch(lease, authority_at(11, &[])),
+            Err(BoundedNetworkPolicyRefusal::ObservedAuthorityOutsidePolicy(
+                _
+            ))
+        ));
+
+        let token = open_token(8, 5, 9, &policy.scope_binding());
+        let grant = evaluate_open_network(&[token], &[], 10, 5, 9).unwrap();
+        broker.observation = BrokerObservation {
+            authorities: vec![
+                NetworkAuthority::new(NetworkScheme::Https, "crates.io", 443).unwrap(),
+            ],
+            requests: 1,
+            redirects: 0,
+            response_bytes: 1,
+        };
+        let lease = prepare_brokered_fetch(&spec, grant, policy, &mut broker, &[], 10).unwrap();
+        assert!(matches!(
+            finish_brokered_fetch(lease, authority_at(100, &[])),
+            Err(BoundedNetworkPolicyRefusal::GrantNoLongerValid(_))
+        ));
+    }
+
+    #[test]
+    fn broker_attach_rechecks_expiry_and_revocation_before_activation() {
+        let spec = CanonicalNamespaceSpec::new();
+        let policy = fetch_policy();
+        let mut broker = FakeBroker {
+            fail: false,
+            finish_calls: 0,
+            seen: None,
+            channel: BrokerChannel::InheritedFd(7),
+            observation: BrokerObservation {
+                authorities: vec![
+                    NetworkAuthority::new(NetworkScheme::Https, "crates.io", 443).unwrap(),
+                ],
+                requests: 1,
+                redirects: 0,
+                response_bytes: 1,
+            },
+            mechanism: "edge-fetch-broker-v1",
+        };
+
+        let expired = open_token(7, 5, 9, &policy.scope_binding());
+        let grant = evaluate_open_network(&[expired], &[], 10, 5, 9).unwrap();
+        assert!(matches!(
+            prepare_brokered_fetch(&spec, grant, policy.clone(), &mut broker, &[], 100),
+            Err(BoundedNetworkPolicyRefusal::GrantNoLongerValid(_))
+        ));
+        assert!(broker.seen.is_none());
+
+        let revoked = open_token(8, 5, 9, &policy.scope_binding());
+        let grant = evaluate_open_network(&[revoked], &[], 10, 5, 9).unwrap();
+        assert!(matches!(
+            prepare_brokered_fetch(&spec, grant, policy, &mut broker, &[8], 11),
+            Err(BoundedNetworkPolicyRefusal::GrantNoLongerValid(_))
+        ));
+        assert!(broker.seen.is_none());
+    }
+
+    #[test]
+    fn broker_completion_rejects_missing_requests_and_counter_overflow() {
+        let spec = CanonicalNamespaceSpec::new();
+        let policy = fetch_policy();
+        let token = open_token(7, 5, 9, &policy.scope_binding());
+        let grant = evaluate_open_network(&[token], &[], 10, 5, 9).unwrap();
+        let mut broker = FakeBroker {
+            fail: false,
+            finish_calls: 0,
+            seen: None,
+            channel: BrokerChannel::InheritedFd(7),
+            observation: BrokerObservation {
+                authorities: vec![],
+                requests: 0,
+                redirects: 0,
+                response_bytes: 0,
+            },
+            mechanism: "edge-fetch-broker-v1",
+        };
+        let lease =
+            prepare_brokered_fetch(&spec, grant, policy.clone(), &mut broker, &[], 10).unwrap();
+        assert_eq!(
+            finish_brokered_fetch(lease, authority_at(11, &[])),
+            Err(BoundedNetworkPolicyRefusal::NoRequestsObserved)
+        );
+
+        let token = open_token(8, 5, 9, &policy.scope_binding());
+        let grant = evaluate_open_network(&[token], &[], 10, 5, 9).unwrap();
+        broker.observation = BrokerObservation {
+            authorities: vec![
+                NetworkAuthority::new(NetworkScheme::Https, "crates.io", 443).unwrap(),
+            ],
+            requests: 1,
+            redirects: policy.budget().max_redirects + 1,
+            response_bytes: 1,
+        };
+        let lease = prepare_brokered_fetch(&spec, grant, policy, &mut broker, &[], 10).unwrap();
+        assert_eq!(
+            finish_brokered_fetch(lease, authority_at(11, &[])),
+            Err(BoundedNetworkPolicyRefusal::ObservedBudgetInvalid(
+                "requests/redirects"
+            ))
+        );
     }
 
     #[test]
@@ -924,12 +1645,13 @@ mod tests {
             "crates.io.",
             "user@crates.io",
             "crates.io/path",
-            "xn--caf-dma.example.",
+            "xn--caf-dma.example",
         ] {
             assert!(NetworkAuthority::new(NetworkScheme::Https, bad, 443).is_err());
         }
         assert!(NetworkAuthority::new(NetworkScheme::Https, "127.0.0.1", 443).is_ok());
         assert!(NetworkAuthority::new(NetworkScheme::Https, "2001:db8::1", 443).is_ok());
+        assert!(NetworkAuthority::new(NetworkScheme::Https, "123.example", 443).is_ok());
         assert!(matches!(
             BoundedNetworkPolicy::new(
                 vec![NetworkAuthority::new(NetworkScheme::Https, "crates.io", 443).unwrap()],
@@ -952,6 +1674,16 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_ipv4_spellings_never_fall_through_as_dns() {
+        for ambiguous in ["127.1", "0177.0.0.1", "2130706433", "0x7f000001"] {
+            assert!(
+                NetworkAuthority::new(NetworkScheme::Https, ambiguous, 443).is_err(),
+                "resolver-ambiguous IPv4 spelling must refuse: {ambiguous}"
+            );
+        }
     }
 
     #[test]

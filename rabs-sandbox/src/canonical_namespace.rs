@@ -166,7 +166,7 @@ pub struct CanonicalNamespaceSpec {
     pub hostname: String,
     /// Whether the network namespace is shared with the host. `false`
     /// (default-deny) is required for `StrictHermeticLinux`.
-    pub(crate) allow_network: bool,
+    allow_network: bool,
     /// Working directory inside the namespace.
     pub cwd: PathBuf,
 }
