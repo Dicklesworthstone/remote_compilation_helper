@@ -74,6 +74,7 @@ pub mod layer0_pack;
 pub mod link_invocation;
 pub mod linker_profiles;
 pub mod logical_output_map;
+pub mod native_header_closure;
 pub mod native_wrappers;
 pub mod output_declarations;
 pub mod output_derivation;

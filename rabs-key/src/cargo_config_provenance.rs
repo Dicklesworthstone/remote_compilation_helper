@@ -521,7 +521,7 @@ impl EffectiveCargoConfigContract {
 
 /// Canonical path check: absolute, no `.`/`..` components, no empty
 /// segments, no trailing slash.
-fn is_canonical_path(path: &[u8]) -> bool {
+pub(crate) fn is_canonical_path(path: &[u8]) -> bool {
     if path.first() != Some(&b'/') || path.last() == Some(&b'/') {
         return false;
     }
