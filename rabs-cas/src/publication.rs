@@ -27,9 +27,10 @@
 //! 7. complete object closure: every referenced object must already have
 //!    a recorded location;
 //! 8. same-key candidates classify through the A018 divergence taxonomy:
-//!    idempotent re-offers append evidence; every divergence class
-//!    quarantines the ACTION and preserves the committed row (no in-place
-//!    patching — correction is quarantine + recompute or a new epoch);
+//!    idempotent re-offers append evidence; semantic and projection-
+//!    completeness divergence quarantine the ACTION, while observable-
+//!    only divergence applies the narrower presentation quarantine. Every
+//!    divergence preserves the committed row (no in-place patching);
 //! 9. commit: publication pointer, serving state, winner evidence row,
 //!    AND the durable reachability pin in ONE store transaction (H009's
 //!    `commit_publication`); the receipt is emitted only after the store
@@ -530,9 +531,9 @@ pub enum PublicationOutcome {
     /// Same manifest already committed: evidence appended, nothing else
     /// changed.
     IdempotentEvidenceAppended,
-    /// Same key, different result: the action is quarantined with the
-    /// A018 divergence class; the committed row is preserved untouched
-    /// and BOTH candidates survive (H026).
+    /// Same key, different result: the A018 class-specific quarantine is
+    /// applied; the committed row is preserved untouched and BOTH
+    /// candidates survive (H026).
     Quarantined(DivergenceQuarantine),
 }
 
@@ -1026,16 +1027,44 @@ fn escalation_decision(trust_state: &str) -> &'static str {
     }
 }
 
-/// serving with a per-class disposition, preserve BOTH candidates (the
-/// committed row is untouched; the losing candidate gets a durable
+/// Install a divergence disposition without ever relaxing an existing
+/// full quarantine. The disposition write is the first fail-closed
+/// mutation: unlike a standalone scoped row, it is consulted directly
+/// by the ordinary serving gate.
+fn set_divergence_serving_disposition(
+    store: &mut dyn RabsMetadataStore,
+    action_key: &str,
+    class: DivergenceClass,
+) -> Result<(), StoreError> {
+    let disposition = match class {
+        DivergenceClass::SemanticDivergence | DivergenceClass::ProjectionCompletenessIncident => {
+            DISPOSITION_QUARANTINED
+        }
+        DivergenceClass::ObservableOnlyDivergence => DISPOSITION_PRESENTATION_QUARANTINED,
+        DivergenceClass::IdempotentSameResult => {
+            return Err(StoreError::Corruption(
+                "idempotent result entered divergence quarantine".into(),
+            ));
+        }
+    };
+    if disposition == DISPOSITION_PRESENTATION_QUARANTINED
+        && store.serving_disposition_key(action_key)?.as_deref() == Some(DISPOSITION_QUARANTINED)
+    {
+        return Ok(());
+    }
+    store.set_serving_disposition_key(action_key, disposition)
+}
+
+/// Apply the class-specific serving quarantine, preserve BOTH candidates
+/// (the committed row is untouched; the losing candidate gets a durable
 /// `divergence-evidence` pin plus reachability edges and its evidence is
 /// appended to the index), open an append-only incident row, and — for
 /// semantic divergence — escalate every consumer previously served this
 /// result, tiered by the action's latest trust/release evaluation.
 ///
-/// Write order is stricter-state-first: a crash mid-sequence can leave
-/// the action quarantined with partial bookkeeping, never bookkept but
-/// unquarantined.
+/// Write order is stricter-state-first within each class: a crash mid-
+/// sequence can leave serving denied with partial bookkeeping, never
+/// bookkept while ordinary replay remains allowed.
 #[allow(clippy::too_many_arguments)]
 fn quarantine_divergence(
     store: &mut dyn RabsMetadataStore,
@@ -1051,23 +1080,23 @@ fn quarantine_divergence(
     let action_key = digest_key(&offer.manifest.action_key);
     let candidate_key = digest_key(&offer.manifest_id.0);
 
-    // 1. Quarantine first (strictest state lands before anything else).
-    store.add_quarantine(
-        QuarantineScope::ActionEntry,
-        &action_key,
-        divergence_quarantine_reason(class),
-    )?;
+    // 1. Deny ordinary replay first. This is the mutation the serving
+    // gate directly consults, so a later bookkeeping failure cannot
+    // leave a known divergence servable. A pre-existing full quarantine
+    // is never downgraded by a later observable-only mismatch.
+    set_divergence_serving_disposition(store, &action_key, class)?;
 
-    // 2. Per-class serving disposition: semantic and
-    // projection-completeness fully disable serving; observable-only is
-    // the narrower presentation quarantine. Either way ordinary replay
-    // is disabled — the serving gate refuses any non-"servable"
-    // disposition.
-    let disposition = match class {
-        DivergenceClass::ObservableOnlyDivergence => DISPOSITION_PRESENTATION_QUARANTINED,
-        _ => DISPOSITION_QUARANTINED,
-    };
-    store.set_serving_disposition_key(&action_key, disposition)?;
+    // 2. Semantic and projection-completeness divergence make the ACTION
+    // suspect and therefore get an action-entry row. Observable-only
+    // divergence stops at the presentation disposition above: the
+    // canonical action result itself is not suspect (T025).
+    if class != DivergenceClass::ObservableOnlyDivergence {
+        store.add_quarantine(
+            QuarantineScope::ActionEntry,
+            &action_key,
+            divergence_quarantine_reason(class),
+        )?;
+    }
 
     // 3. Preserve the losing candidate: reachability edges from its
     // manifest to everything it references, then a durable pin rooted at
@@ -1169,8 +1198,8 @@ pub enum RecomputationCheck {
     /// Both digests match the retained values: the recomputation
     /// reproduces the evicted result; the tombstone is consumed.
     Reproduced,
-    /// The recomputation DIVERGES from the evicted result: an incident —
-    /// the action is quarantined, never silently replaced.
+    /// The recomputation DIVERGES from the evicted result: a class-
+    /// specific quarantine is applied, never a silent replacement.
     Divergence(DivergenceClass),
 }
 
@@ -1195,9 +1224,8 @@ pub fn retain_eviction_tombstone(
 
 /// H034: compare a re-executed result's digests against the eviction
 /// tombstone. A match consumes the tombstone (the result is reproduced
-/// and may republish); a mismatch quarantines the ACTION with the A018
-/// divergence class and LEAVES the tombstone in place as incident
-/// evidence.
+/// and may republish); a mismatch applies the A018 class-specific
+/// quarantine and LEAVES the tombstone in place as incident evidence.
 ///
 /// # Errors
 /// Store errors from the lookup/quarantine writes.
@@ -1219,11 +1247,15 @@ pub fn check_recomputation_against_tombstone(
     } else {
         DivergenceClass::SemanticDivergence
     };
-    store.add_quarantine(
-        QuarantineScope::ActionEntry,
-        &digest_key(action),
-        "post-eviction recomputation divergence",
-    )?;
+    let action_key = digest_key(action);
+    set_divergence_serving_disposition(store, &action_key, class)?;
+    if class == DivergenceClass::SemanticDivergence {
+        store.add_quarantine(
+            QuarantineScope::ActionEntry,
+            &action_key,
+            "post-eviction recomputation divergence",
+        )?;
+    }
     Ok(RecomputationCheck::Divergence(class))
 }
 
@@ -1264,6 +1296,14 @@ mod tests {
         ObjectId(digest("rabs.object.sha256.v1", tag))
     }
 
+    fn content_object(bytes: &[u8]) -> ObjectId {
+        ObjectId(
+            crate::digest_set::digest_set(bytes, crate::digest_set::DigestRequest::default(), None)
+                .unwrap()
+                .atp_content_id,
+        )
+    }
+
     fn coordinator_authority() -> CoordinatorAuthority {
         CoordinatorAuthority {
             cluster_id: ClusterId("cluster-a".to_owned()),
@@ -1291,6 +1331,16 @@ mod tests {
             worker_boot_generation: WorkerBootGeneration(1),
             worker_incarnation_id: WorkerIncarnationId(5),
         }
+    }
+
+    fn distinct_attempt_authority() -> AttemptAuthority {
+        let mut authority = attempt_authority();
+        authority.attempt_id = AttemptId(21);
+        authority.execution_lease_id = ExecutionLeaseId(31);
+        authority.worker_peer_id = PeerId("worker-b".to_owned());
+        authority.worker_boot_generation = WorkerBootGeneration(2);
+        authority.worker_incarnation_id = WorkerIncarnationId(6);
+        authority
     }
 
     fn manifest() -> CanonicalActionResultManifest {
@@ -1410,6 +1460,20 @@ mod tests {
                 .add_location(&root.0, "/cas/bundle-root", Some(1), "raw", true)
                 .unwrap();
         }
+    }
+
+    fn locate_test_object(
+        store: &mut dyn RabsMetadataStore,
+        object: &ObjectId,
+        path: &str,
+        logical_size: usize,
+    ) {
+        store
+            .record_object(&object.0, u64::try_from(logical_size).unwrap())
+            .unwrap();
+        store
+            .add_location(&object.0, path, Some(1), "raw", true)
+            .unwrap();
     }
 
     fn expected_descriptor() -> TypedDigest {
@@ -2961,7 +3025,7 @@ mod tests {
     }
 
     #[test]
-    fn h026_observable_only_divergence_gets_presentation_quarantine() {
+    fn t025_observable_only_divergence_has_presentation_not_action_quarantine() {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
         ready_store(&mut store);
         let action = digest("rabs.action-key.sha256.v1", 7);
@@ -3027,62 +3091,248 @@ mod tests {
         assert_eq!(incidents.len(), 1);
         assert_eq!(incidents[0].class, "observable-only");
         assert!(quarantine.escalations.is_empty());
+        let snapshot = store.differential_snapshot().unwrap();
         assert!(
-            !store
-                .differential_snapshot()
-                .unwrap()
+            !snapshot
                 .iter()
-                .any(|l| l.starts_with("decision_receipts|divergence-escalation|"))
+                .any(|line| { line.starts_with("decision_receipts|divergence-escalation|") })
         );
+        assert!(
+            !snapshot.iter().any(|line| {
+                line.starts_with("quarantines|action-entry|") && line.contains(&action_key)
+            }),
+            "observable-only divergence must not quarantine the canonical action entry"
+        );
+
+        // A later observable-only candidate must never RELAX an existing
+        // full quarantine installed by a stronger incident.
+        store
+            .set_serving_disposition_key(&action_key, DISPOSITION_QUARANTINED)
+            .unwrap();
+        store
+            .add_quarantine(
+                QuarantineScope::ActionEntry,
+                &action_key,
+                "preexisting-full-quarantine",
+            )
+            .unwrap();
+        let later_observable = divergent_offer(
+            &mut store,
+            None,
+            57,
+            58,
+            digest("rabs.observation-stream.sha256.v1", 11),
+        );
+        let committed = first.manifest.clone();
+        let later_outcome = process_offer(
+            &mut store,
+            &later_observable,
+            &expected_descriptor(),
+            move |_| Some(committed.clone()),
+            905,
+            6,
+            CommitDurabilityProfile::RequireDurableClosure,
+        )
+        .unwrap();
+        assert!(matches!(
+            later_outcome,
+            PublicationOutcome::Quarantined(DivergenceQuarantine {
+                class: DivergenceClass::ObservableOnlyDivergence,
+                ..
+            })
+        ));
+        assert_eq!(
+            store.serving_disposition_key(&action_key).unwrap().unwrap(),
+            DISPOSITION_QUARANTINED
+        );
+        assert!(store.differential_snapshot().unwrap().iter().any(|line| {
+            line.starts_with("quarantines|action-entry|")
+                && line.contains("preexisting-full-quarantine")
+        }));
     }
 
     #[test]
-    fn h026_attempt_evidence_difference_appends_normally() {
+    fn t025_distinct_worker_attempts_with_different_evidence_share_canonical_result() {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
         ready_store(&mut store);
         let action = digest("rabs.action-key.sha256.v1", 7);
         let action_key = digest_key(&action);
 
-        let first = offer();
-        assert!(matches!(
-            process_offer(
-                &mut store,
-                &first,
-                &expected_descriptor(),
-                no_committed,
-                900,
-                1,
-                CommitDurabilityProfile::RequireDurableClosure,
-            )
-            .unwrap(),
-            PublicationOutcome::Committed(_)
-        ));
-
-        // Same manifest, DIFFERENT evidence bundle: the third H026 class
-        // — attempt-evidence variation appends normally, no quarantine,
-        // no incident, serving untouched.
-        let manifest_id = object(50);
-        let mut other_evidence = evidence(&manifest_id);
-        other_evidence.provenance_receipt = object(64);
-        store.record_object(&object(64).0, 64).unwrap();
-        store
-            .add_location(&object(64).0, "/cas/64", Some(1), "raw", true)
-            .unwrap();
-        let reoffer = OfferPreparedActionResult::build(
-            attempt_authority(),
+        // Build worker A's result in two passes: stamp the manifest,
+        // encode its canonical bytes, derive the REAL CAS object id, and
+        // rebuild with evidence bound to that content-derived id.
+        let first_authority = attempt_authority();
+        let first_timing_payload = b"worker=worker-a;started=1;elapsed_us=3100;cpu_us=2200";
+        let first_resource_payload = b"worker=worker-a;cores=2;peak_rss_bytes=1048576";
+        let first_timing = content_object(first_timing_payload);
+        let first_resources = content_object(first_resource_payload);
+        let first_placeholder_id = object(50);
+        let mut first_placeholder_evidence = evidence(&first_placeholder_id);
+        first_placeholder_evidence.execution_snapshot_root = first_resources.clone();
+        first_placeholder_evidence.raw_process_and_event_evidence = first_timing.clone();
+        let first_stamped = OfferPreparedActionResult::build(
+            first_authority.clone(),
             manifest(),
-            manifest_id,
-            other_evidence,
+            first_placeholder_id,
+            first_placeholder_evidence,
+            object(51),
+            digest("rabs.observation-stream.sha256.v1", 9),
+            &declared(),
+            Vec::new(),
+        )
+        .unwrap();
+        let first_manifest_bytes =
+            crate::manifest_codec::encode_manifest_v1(&first_stamped.manifest);
+        let first_manifest_id = content_object(&first_manifest_bytes);
+        let mut first_evidence = evidence(&first_manifest_id);
+        first_evidence.execution_snapshot_root = first_resources.clone();
+        first_evidence.raw_process_and_event_evidence = first_timing.clone();
+        let first = OfferPreparedActionResult::build(
+            first_authority,
+            manifest(),
+            first_manifest_id.clone(),
+            first_evidence,
+            object(51),
+            digest("rabs.observation-stream.sha256.v1", 9),
+            &declared(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::manifest_codec::encode_manifest_v1(&first.manifest),
+            first_manifest_bytes
+        );
+        locate_test_object(
+            &mut store,
+            &first_manifest_id,
+            "/cas/manifest-worker-a",
+            first_manifest_bytes.len(),
+        );
+        locate_test_object(
+            &mut store,
+            &first_timing,
+            "/cas/timing-worker-a",
+            first_timing_payload.len(),
+        );
+        locate_test_object(
+            &mut store,
+            &first_resources,
+            "/cas/resources-worker-a",
+            first_resource_payload.len(),
+        );
+        let first_outcome = process_offer(
+            &mut store,
+            &first,
+            &expected_descriptor(),
+            no_committed,
+            900,
+            1,
+            CommitDurabilityProfile::RequireDurableClosure,
+        )
+        .unwrap();
+        let PublicationOutcome::Committed(first_record) = first_outcome else {
+            panic!("expected first commit, got {first_outcome:?}");
+        };
+        assert_eq!(first_record.canonical_result_manifest_id, first_manifest_id);
+
+        // A genuinely distinct attempt runs on another worker at a
+        // later recorded time with its own lease and resource/timing
+        // evidence. None of those attempt facts belong to the canonical
+        // result manifest (R80/R115).
+        let second_authority = distinct_attempt_authority();
+        let auth = authority_digest(&second_authority.coordinator);
+        store
+            .admit_worker_session(
+                &auth,
+                &WorkerSessionOffer {
+                    worker_peer_id: second_authority.worker_peer_id.clone(),
+                    boot_generation: second_authority.worker_boot_generation,
+                    incarnation: second_authority.worker_incarnation_id,
+                    reenrollment_proof: None,
+                },
+                10,
+            )
+            .unwrap();
+        store
+            .admit_attempt_lease(&second_authority, 17, 200)
+            .unwrap();
+
+        let second_timing_payload = b"worker=worker-b;started=10;elapsed_us=8700;cpu_us=6900";
+        let second_resource_payload = b"worker=worker-b;cores=6;peak_rss_bytes=3145728";
+        let second_timing = content_object(second_timing_payload);
+        let second_resources = content_object(second_resource_payload);
+        let second_placeholder_id = object(52);
+        let mut second_placeholder_evidence = evidence(&second_placeholder_id);
+        second_placeholder_evidence.execution_snapshot_root = second_resources.clone();
+        second_placeholder_evidence.raw_process_and_event_evidence = second_timing.clone();
+        let second_stamped = OfferPreparedActionResult::build(
+            second_authority.clone(),
+            manifest(),
+            second_placeholder_id,
+            second_placeholder_evidence,
             object(54),
             digest("rabs.observation-stream.sha256.v1", 9),
             &declared(),
             Vec::new(),
         )
         .unwrap();
-        store.record_object(&object(54).0, 64).unwrap();
-        store
-            .add_location(&object(54).0, "/cas/54", Some(1), "raw", true)
-            .unwrap();
+        let second_manifest_bytes =
+            crate::manifest_codec::encode_manifest_v1(&second_stamped.manifest);
+        let second_manifest_id = content_object(&second_manifest_bytes);
+        let mut second_evidence = evidence(&second_manifest_id);
+        second_evidence.execution_snapshot_root = second_resources.clone();
+        second_evidence.raw_process_and_event_evidence = second_timing.clone();
+        let reoffer = OfferPreparedActionResult::build(
+            second_authority.clone(),
+            manifest(),
+            second_manifest_id.clone(),
+            second_evidence,
+            object(54),
+            digest("rabs.observation-stream.sha256.v1", 9),
+            &declared(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_ne!(
+            first.authority.worker_peer_id,
+            reoffer.authority.worker_peer_id
+        );
+        assert_ne!(first.authority.attempt_id, reoffer.authority.attempt_id);
+        assert_ne!(
+            first.authority.execution_lease_id,
+            reoffer.authority.execution_lease_id
+        );
+        assert_ne!(
+            first.evidence.execution_snapshot_root,
+            reoffer.evidence.execution_snapshot_root
+        );
+        assert_ne!(
+            first.evidence.raw_process_and_event_evidence,
+            reoffer.evidence.raw_process_and_event_evidence
+        );
+        assert_eq!(first_manifest_bytes, second_manifest_bytes);
+        assert_eq!(first_manifest_id, second_manifest_id);
+        assert_eq!(first.manifest_id, reoffer.manifest_id);
+        assert_eq!(first.manifest, reoffer.manifest);
+        locate_test_object(
+            &mut store,
+            &second_manifest_id,
+            "/cas/manifest-worker-b",
+            second_manifest_bytes.len(),
+        );
+        locate_test_object(
+            &mut store,
+            &second_timing,
+            "/cas/timing-worker-b",
+            second_timing_payload.len(),
+        );
+        locate_test_object(
+            &mut store,
+            &second_resources,
+            "/cas/resources-worker-b",
+            second_resource_payload.len(),
+        );
+        locate_test_object(&mut store, &object(54), "/cas/54", 64);
         assert_eq!(
             process_offer(
                 &mut store,
@@ -3090,7 +3340,7 @@ mod tests {
                 &expected_descriptor(),
                 no_committed,
                 904,
-                5,
+                18,
                 CommitDurabilityProfile::RequireDurableClosure,
             )
             .unwrap(),
@@ -3103,10 +3353,34 @@ mod tests {
         // committed canonical manifest, and the per-manifest view shows
         // the appended set.
         let manifest_view = store
-            .list_evidence_keys_for_manifest(&digest_key(&object(50).0))
+            .list_evidence_keys_for_manifest(&digest_key(&first_manifest_id.0))
             .unwrap();
         assert!(manifest_view.contains(&digest_key(&object(51).0)));
         assert!(manifest_view.contains(&digest_key(&object(54).0)));
+        let snapshot = store.differential_snapshot().unwrap();
+        let second_attempt_hex = format!("{:032x}", second_authority.attempt_id.0);
+        let second_attempt_line = snapshot
+            .iter()
+            .find(|line| line.starts_with(&format!("action_attempts|{second_attempt_hex}|")))
+            .expect("second attempt row");
+        let attempt_fields: Vec<_> = second_attempt_line.split('|').collect();
+        assert_eq!(attempt_fields[4], "worker-b");
+        assert_eq!(attempt_fields[5], "17");
+        assert_eq!(
+            attempt_fields[8],
+            format!("{:032x}", second_authority.execution_lease_id.0)
+        );
+        let second_evidence_line = snapshot
+            .iter()
+            .find(|line| {
+                let fields: Vec<_> = line.split('|').collect();
+                fields.len() == 8
+                    && fields[0] == "action_evidence_index"
+                    && fields[6] == second_attempt_hex
+            })
+            .expect("second attempt evidence row");
+        let evidence_fields: Vec<_> = second_evidence_line.split('|').collect();
+        assert_eq!(evidence_fields[7], digest_key(&first_manifest_id.0));
         assert_eq!(
             store.serving_disposition_key(&action_key).unwrap().unwrap(),
             "servable"
@@ -3117,13 +3391,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(
-            !store
-                .differential_snapshot()
-                .unwrap()
-                .iter()
-                .any(|l| l.starts_with("quarantines|"))
-        );
+        assert!(!snapshot.iter().any(|line| line.starts_with("quarantines|")));
     }
 
     #[test]
@@ -3299,8 +3567,31 @@ mod tests {
         }
 
         let action = digest("rabs.action-key.sha256.v1", 7);
-        // Re-execution produces a DIFFERENT semantic result: divergence
-        // incident, quarantined, tombstone preserved as evidence.
+        let action_key = digest_key(&action);
+
+        // Same semantic result, different observable projection: the
+        // narrower presentation quarantine, never an action quarantine.
+        assert_eq!(
+            check_recomputation_against_tombstone(
+                &mut store,
+                &action,
+                &first.manifest.semantic_result_digest,
+                &digest(OBSERVABLE_PROJECTION_DOMAIN, 99),
+            )
+            .unwrap(),
+            RecomputationCheck::Divergence(DivergenceClass::ObservableOnlyDivergence)
+        );
+        assert_eq!(
+            store.serving_disposition_key(&action_key).unwrap().unwrap(),
+            DISPOSITION_PRESENTATION_QUARANTINED
+        );
+        assert!(!store.differential_snapshot().unwrap().iter().any(|line| {
+            line.starts_with("quarantines|action-entry|") && line.contains(&action_key)
+        }));
+
+        // A DIFFERENT semantic result does make the action suspect. The
+        // full quarantine replaces the narrower disposition, while the
+        // tombstone remains incident evidence.
         let outcome = check_recomputation_against_tombstone(
             &mut store,
             &action,
@@ -3312,29 +3603,34 @@ mod tests {
             outcome,
             RecomputationCheck::Divergence(DivergenceClass::SemanticDivergence)
         );
-        assert!(
-            store
-                .differential_snapshot()
-                .unwrap()
-                .iter()
-                .any(|l| l.starts_with("quarantines|")
-                    && l.contains("post-eviction recomputation divergence"))
+        assert_eq!(
+            store.serving_disposition_key(&action_key).unwrap().unwrap(),
+            DISPOSITION_QUARANTINED
         );
+        assert!(store.differential_snapshot().unwrap().iter().any(|line| {
+            line.starts_with("quarantines|action-entry|")
+                && line.contains("post-eviction recomputation divergence")
+        }));
         assert!(
             store.eviction_tombstone(&action).unwrap().is_some(),
             "divergence keeps the tombstone as incident evidence"
         );
 
-        // Same semantic, different observable: the narrower class.
+        // Reversing the arrival order must not downgrade the full
+        // quarantine back to presentation-only.
         assert_eq!(
             check_recomputation_against_tombstone(
                 &mut store,
                 &action,
                 &first.manifest.semantic_result_digest,
-                &digest(OBSERVABLE_PROJECTION_DOMAIN, 99),
+                &digest(OBSERVABLE_PROJECTION_DOMAIN, 98),
             )
             .unwrap(),
             RecomputationCheck::Divergence(DivergenceClass::ObservableOnlyDivergence)
+        );
+        assert_eq!(
+            store.serving_disposition_key(&action_key).unwrap().unwrap(),
+            DISPOSITION_QUARANTINED
         );
 
         // A faithful reproduction matches and CONSUMES the tombstone.
