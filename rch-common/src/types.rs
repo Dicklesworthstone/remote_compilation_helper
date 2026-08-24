@@ -768,6 +768,13 @@ pub struct WorkerCapabilities {
     /// `clippy-preview` can never satisfy a `clippy` requirement.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rustup_components: Vec<String>,
+    /// Non-fatal diagnostics gathered while probing (for example a tool binary
+    /// that had to be resolved from a well-known fallback location because the
+    /// caller's PATH was minimal). Empty in the common case; clients may
+    /// surface these so "no facts" is distinguishable from "facts show
+    /// absence" (bd-deft5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probe_warnings: Vec<String>,
     /// Bun runtime version (from `bun --version`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bun_version: Option<String>,

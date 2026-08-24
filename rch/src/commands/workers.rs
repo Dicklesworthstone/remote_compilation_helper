@@ -970,6 +970,13 @@ pub async fn workers_probe(
                                     style.key("Rustup components:"),
                                     style.value(&format_rustup_component_matrix(capabilities))
                                 );
+                                if !capabilities.probe_warnings.is_empty() {
+                                    println!(
+                                        "    {} {}",
+                                        style.key("Probe warnings:"),
+                                        style.warning(&capabilities.probe_warnings.join("; "))
+                                    );
+                                }
                             }
                         }
                     }

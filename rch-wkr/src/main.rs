@@ -393,17 +393,34 @@ fn probe_capabilities() -> WorkerCapabilities {
 
     let mut capabilities = WorkerCapabilities::new();
 
-    // Probe rustc version
-    if let Ok(output) = Command::new("rustc").args(["--version"]).output()
+    // Probe rustc version. Resolve like the rustup inventory does so a
+    // minimal service PATH cannot silently drop the Rust capability facts.
+    let mut warnings = Vec::new();
+    if let Some(rustc) = resolve_tool_binary("rustc") {
+        if let Ok(output) = Command::new(&rustc.path).args(["--version"]).output()
+            && output.status.success()
+        {
+            let version_str = String::from_utf8_lossy(&output.stdout);
+            capabilities.rustc_version = parse_rustc_version_stdout(&version_str);
+            if !rustc.from_path_lookup {
+                warnings.push(format!(
+                    "rustc resolved from fallback location {}",
+                    rustc.path.display()
+                ));
+            }
+        }
+    } else if let Ok(output) = Command::new("rustc").args(["--version"]).output()
         && output.status.success()
     {
         let version_str = String::from_utf8_lossy(&output.stdout);
         capabilities.rustc_version = parse_rustc_version_stdout(&version_str);
     }
 
-    let (toolchains, components) = probe_rustup_inventory();
+    let (toolchains, components, inventory_warnings) = probe_rustup_inventory();
     capabilities.rustup_toolchains = toolchains;
     capabilities.rustup_components = components;
+    warnings.extend(inventory_warnings);
+    capabilities.probe_warnings = warnings;
 
     // Probe bun version
     let bun_cmd = run_bun_version_command();
@@ -512,27 +529,44 @@ fn probe_capabilities() -> WorkerCapabilities {
 /// Probe every installed rustup toolchain and retain toolchain-qualified,
 /// normalized component facts for routing. A failed sub-probe contributes no
 /// facts, which makes component admission fail closed for that toolchain.
-fn probe_rustup_inventory() -> (Vec<String>, Vec<String>) {
+fn probe_rustup_inventory() -> (Vec<String>, Vec<String>, Vec<String>) {
     use std::process::Command;
 
-    let Ok(output) = Command::new("rustup").args(["toolchain", "list"]).output() else {
-        return (Vec::new(), Vec::new());
+    let mut warnings = Vec::new();
+    let Some(rustup) = resolve_tool_binary("rustup") else {
+        return (Vec::new(), Vec::new(), Vec::new());
+    };
+    if !rustup.from_path_lookup {
+        warnings.push(format!(
+            "rustup resolved from fallback location {}",
+            rustup.path.display()
+        ));
+    }
+    let rustup = &rustup.path;
+
+    let Ok(output) = Command::new(rustup).args(["toolchain", "list"]).output() else {
+        warnings.push("rustup toolchain list failed to spawn".to_owned());
+        return (Vec::new(), Vec::new(), warnings);
     };
     if !output.status.success() {
-        return (Vec::new(), Vec::new());
+        warnings.push(format!(
+            "rustup toolchain list exited {:?}",
+            output.status.code()
+        ));
+        return (Vec::new(), Vec::new(), warnings);
     }
 
     let mut toolchains = parse_rustup_toolchains(&String::from_utf8_lossy(&output.stdout));
     let mut components = Vec::new();
     for toolchain in &toolchains {
-        let host = Command::new("rustup")
+        let host = Command::new(rustup)
             .args(["run", toolchain, "rustc", "-vV"])
             .output()
             .ok()
             .filter(|result| result.status.success())
             .and_then(|result| parse_rustc_host(&String::from_utf8_lossy(&result.stdout)));
 
-        let Some(output) = Command::new("rustup")
+        let Some(output) = Command::new(rustup)
             .args(["component", "list", "--installed", "--toolchain", toolchain])
             .output()
             .ok()
@@ -550,7 +584,69 @@ fn probe_rustup_inventory() -> (Vec<String>, Vec<String>) {
     toolchains.dedup();
     components.sort();
     components.dedup();
-    (toolchains, components)
+    (toolchains, components, warnings)
+}
+
+/// Resolve a tool binary by name without relying solely on the caller's PATH.
+///
+/// Systemd system services inherit a minimal default PATH that does not
+/// include `~/.cargo/bin`, so a root-run daemon probing bare-name `rustup`
+/// silently got "not found" and capability probes reported empty component
+/// facts even though the toolchain was fully installed (bd-deft5). Probe the
+/// caller's PATH first, then the standard cargo/user install locations.
+fn resolve_tool_binary(name: &str) -> Option<ResolvedTool> {
+    resolve_tool_binary_in(
+        std::env::var_os("PATH").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        name,
+    )
+}
+
+/// A resolved tool binary plus how it was found, so callers can distinguish
+/// a plain PATH lookup from a well-known-location fallback worth reporting.
+#[derive(Debug)]
+struct ResolvedTool {
+    path: std::path::PathBuf,
+    from_path_lookup: bool,
+}
+
+fn resolve_tool_binary_in(
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    name: &str,
+) -> Option<ResolvedTool> {
+    use std::path::PathBuf;
+
+    if let Some(paths) = path_var {
+        for dir in std::env::split_paths(paths) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(ResolvedTool {
+                    path: candidate,
+                    from_path_lookup: true,
+                });
+            }
+        }
+    }
+    let mut fallbacks: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home
+        && !home.is_empty()
+    {
+        let home = PathBuf::from(home);
+        fallbacks.push(home.join(".cargo").join("bin").join(name));
+        fallbacks.push(home.join(".local").join("bin").join(name));
+    }
+    // Canonical locations for service contexts where HOME may be /root or
+    // unset regardless of which user provisioned the toolchain.
+    fallbacks.push(PathBuf::from("/root/.cargo/bin").join(name));
+    fallbacks.push(PathBuf::from("/usr/local/bin").join(name));
+    fallbacks
+        .into_iter()
+        .find(|p| p.is_file())
+        .map(|path| ResolvedTool {
+            path,
+            from_path_lookup: false,
+        })
 }
 
 fn parse_rustup_toolchains(stdout: &str) -> Vec<String> {
@@ -1062,6 +1158,62 @@ mod tests {
 
     fn approx_eq(lhs: f64, rhs: f64) -> bool {
         (lhs - rhs).abs() < 1e-9
+    }
+
+    #[test]
+    fn test_resolve_tool_binary_prefers_path_hit_with_provenance() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = dir.path().join("selftest-tool");
+        std::fs::write(&tool, b"#!/bin/sh\n").expect("write tool");
+        let path_var =
+            std::env::join_paths(std::iter::once(dir.path().to_path_buf())).expect("join paths");
+        let resolved = resolve_tool_binary_in(
+            Some(&path_var),
+            Some("/nonexistent-home".as_ref()),
+            "selftest-tool",
+        )
+        .expect("tool should resolve from PATH");
+        assert!(
+            resolved.from_path_lookup,
+            "PATH hit must be reported as such"
+        );
+        assert_eq!(resolved.path, tool);
+    }
+
+    #[test]
+    fn test_resolve_tool_binary_falls_back_to_home_cargo_bin() {
+        let _guard = test_guard!();
+        let home = tempfile::tempdir().expect("tempdir");
+        let cargo_bin = home.path().join(".cargo/bin");
+        std::fs::create_dir_all(&cargo_bin).expect("mkdir cargo bin");
+        let tool = cargo_bin.join("selftest-fallback-tool");
+        std::fs::write(&tool, b"#!/bin/sh\n").expect("write tool");
+        let resolved = resolve_tool_binary_in(
+            Some("/definitely/not/a/tool/dir".as_ref()),
+            Some(home.path().as_os_str()),
+            "selftest-fallback-tool",
+        )
+        .expect("tool should resolve from ~/.cargo/bin fallback");
+        assert!(
+            !resolved.from_path_lookup,
+            "fallback hit must not claim PATH provenance"
+        );
+        assert_eq!(resolved.path, tool);
+    }
+
+    #[test]
+    fn test_resolve_tool_binary_absent_everywhere_is_none() {
+        let _guard = test_guard!();
+        // A name no plausible machine ships in /root/.cargo/bin or
+        // /usr/local/bin; the resolver must answer None rather than inventing
+        // a candidate.
+        let resolved = resolve_tool_binary_in(
+            Some("/definitely/not/a/tool/dir".as_ref()),
+            Some("/definitely/not/a/home".as_ref()),
+            "rch-wkr-resolver-absent-selftest-7f3a9c",
+        );
+        assert!(resolved.is_none(), "unexpected resolution: {resolved:?}");
     }
 
     #[test]
