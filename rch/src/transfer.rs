@@ -204,6 +204,37 @@ const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[
 // the configurable default list.
 const SOURCE_EPHEMERAL_EXCLUDE_PATTERNS: &[&str] =
     &[".venv/", ".venv-*/", "venv/", "venv-*/", "__pycache__/"];
+
+/// Age floors (minutes) for worker-side runtime state reaped at transfer
+/// start (bd-wfumv). TMPDIR scratch under `.rch-tmp/` goes stale within a
+/// day; durable per-worker Cargo caches (issue #42) and pooled target
+/// stores keep their top-level mtime refreshed by every job that uses them
+/// (`add_cargo_isolation` touches the cache dir), so a three-day floor only
+/// reaps caches whose project has been idle far longer than any active
+/// session — an idle return pays one amortized re-fetch, never a per-job one.
+const WORKER_TMP_PRUNE_MAX_AGE_MINS: u64 = 24 * 60;
+const WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS: u64 = 3 * 24 * 60;
+
+/// Shell fragment executed by the remote rsync-path wrapper BEFORE rsync
+/// starts: reaps stale worker-side runtime state so abandoned `.rch-tmp/*`
+/// scratch, orphaned per-worker Cargo caches, and superseded
+/// `.rch-target-*-pool-*` stores cannot grow without bound or feed stale
+/// manifests into later builds (bd-wfumv). All sweeps are age-bounded
+/// `-maxdepth 1` finds: anything in active use is minutes old and can never
+/// match (per-worker Cargo caches additionally refresh their own mtime on
+/// every job via `add_cargo_isolation`). Failures are swallowed — pruning is
+/// opportunistic hygiene and must never fail a transfer.
+fn worker_cache_prune_rsync_path_prefix(escaped_remote_path: &str) -> String {
+    let tmp_mins = WORKER_TMP_PRUNE_MAX_AGE_MINS;
+    let durable_mins = WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS;
+    format!(
+        "find {p}/.rch-tmp -mindepth 1 -maxdepth 1 ! -name 'rch-cargo-cache-*' -mmin +{tmp_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; \
+         find {p}/.rch-tmp -mindepth 1 -maxdepth 1 -name 'rch-cargo-cache-*' -mmin +{durable_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; \
+         find {p} -mindepth 1 -maxdepth 1 -type d -name '.rch-target-*-pool-*' -mmin +{durable_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; ",
+        p = escaped_remote_path
+    )
+}
+
 const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str = ".rch-target";
 
 /// Environment variables whose values we ALWAYS rewrite to a managed,
@@ -1056,6 +1087,12 @@ struct RemoteEnvPlan {
     env_prefix: EnvPrefix,
     /// Directories that must exist before command execution.
     ensure_dirs: Vec<String>,
+    /// Managed temp directories (`TMPDIR`/`TMP`/`TEMP` values) that are
+    /// chmodded to `1700` right after creation so a permissive worker umask
+    /// (e.g. `002`) can never leave them group-writable without the sticky
+    /// bit. Consumers such as atomic-write durability code validate ancestor
+    /// permissions and refuse group-writable, non-sticky parents.
+    restricted_dirs: Vec<String>,
 }
 
 impl TransferPipeline {
@@ -1405,6 +1442,7 @@ impl TransferPipeline {
         let mut applied = Vec::new();
         let mut rejected = Vec::new();
         let mut ensure_dirs = Vec::new();
+        let mut restricted_dirs = Vec::new();
 
         for raw_key in &self.env_allowlist {
             let key = raw_key.trim();
@@ -1443,10 +1481,15 @@ impl TransferPipeline {
             };
 
             let managed_dir = ensure_dir.is_some();
-            if let Some(dir) = ensure_dir
-                && !ensure_dirs.iter().any(|existing| existing == &dir)
-            {
-                ensure_dirs.push(dir);
+            if let Some(dir) = ensure_dir {
+                if !ensure_dirs.iter().any(|existing| existing == &dir) {
+                    ensure_dirs.push(dir.clone());
+                }
+                if matches!(key, "TMPDIR" | "TMP" | "TEMP")
+                    && !restricted_dirs.iter().any(|existing| existing == &dir)
+                {
+                    restricted_dirs.push(dir);
+                }
             }
 
             parts.push(self.format_env_assignment(key, &escaped, managed_dir));
@@ -1472,7 +1515,14 @@ impl TransferPipeline {
                 continue;
             };
             if !ensure_dirs.iter().any(|existing| existing == &ensure_dir) {
-                ensure_dirs.push(ensure_dir);
+                ensure_dirs.push(ensure_dir.clone());
+            }
+            if matches!(key, "TMPDIR" | "TMP" | "TEMP")
+                && !restricted_dirs
+                    .iter()
+                    .any(|existing| existing == &ensure_dir)
+            {
+                restricted_dirs.push(ensure_dir);
             }
             parts.push(self.format_env_assignment(key, &escaped, true));
             applied.push(key.to_string());
@@ -1510,6 +1560,7 @@ impl TransferPipeline {
                 rejected,
             },
             ensure_dirs,
+            restricted_dirs,
         }
     }
 
@@ -1999,7 +2050,17 @@ impl TransferPipeline {
                 .map(|dir| escape(Cow::from(dir.as_str())).to_string())
                 .collect::<Vec<_>>()
                 .join(" ");
-            format!("mkdir -p {} && ", escaped_dirs)
+            let mut command = format!("mkdir -p {} && ", escaped_dirs);
+            if !env_plan.restricted_dirs.is_empty() && !self.worker_platform.is_windows() {
+                let escaped_restricted = env_plan
+                    .restricted_dirs
+                    .iter()
+                    .map(|dir| escape(Cow::from(dir.as_str())).to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                command.push_str(&format!("chmod 1700 {} && ", escaped_restricted));
+            }
+            command
         };
 
         // Force LC_ALL=C to ensure English output for error parsing.
@@ -2374,9 +2435,14 @@ fi",
         }
 
         // Create remote directory implicitly using rsync-path wrapper
-        // This saves a separate SSH handshake for 'mkdir -p'
-        cmd.arg("--rsync-path")
-            .arg(format!("mkdir -p {} && rsync", escaped_remote_path));
+        // This saves a separate SSH handshake for 'mkdir -p'. The same remote
+        // shell invocation also reaps stale worker-side runtime state
+        // (bd-wfumv) — see worker_cache_prune_rsync_path_prefix.
+        cmd.arg("--rsync-path").arg(format!(
+            "{}mkdir -p {} && rsync",
+            worker_cache_prune_rsync_path_prefix(escaped_remote_path),
+            escaped_remote_path
+        ));
 
         self.append_sync_filter_args(&mut cmd, effective_excludes);
 
@@ -2434,9 +2500,14 @@ fi",
             cmd.arg("--checksum");
         }
 
-        // Create remote directory implicitly using rsync-path wrapper
-        cmd.arg("--rsync-path")
-            .arg(format!("mkdir -p {} && rsync", escaped_remote_path));
+        // Create remote directory implicitly using rsync-path wrapper; the
+        // same remote shell invocation reaps stale worker-side runtime state
+        // (bd-wfumv) — see worker_cache_prune_rsync_path_prefix.
+        cmd.arg("--rsync-path").arg(format!(
+            "{}mkdir -p {} && rsync",
+            worker_cache_prune_rsync_path_prefix(escaped_remote_path),
+            escaped_remote_path
+        ));
 
         self.append_sync_filter_args(&mut cmd, effective_excludes);
 
@@ -3802,6 +3873,43 @@ fi",
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd
+    }
+
+    /// Best-effort removal of an invocation-unique remote tree (bd-p1vlb).
+    ///
+    /// Clean-overlay roots are per-run by construction (a job nonce is hashed
+    /// into the remote root), so nothing else ever shares or reuses them —
+    /// but each holds a full materialized snapshot. Without explicit reaping,
+    /// every overlay run leaks hundreds of MB to GBs on the worker's staging
+    /// base (observed: a 37G `/tmp/rch-sync` tmpfs pile within days,
+    /// bd-lvbax). All errors are swallowed by the caller; reaping is
+    /// opportunistic hygiene and must never affect the surfaced job result.
+    pub async fn reap_remote_tree(&self, worker: &WorkerConfig, root: &str) -> Result<()> {
+        if self.worker_platform.is_windows() {
+            // Overlay transport is rsync/ssh-only today; nothing to reap.
+            return Ok(());
+        }
+        let identity_file = shellexpand::tilde(&worker.identity_file);
+        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
+        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let target = escape(Cow::from(format!("{}@{}", worker.user, worker.host)));
+        // The root is `[A-Za-z0-9/-]` by construction (hash + project id);
+        // quote it anyway so a future naming scheme cannot turn the removal
+        // into word-splitting.
+        let quoted_root = format!("'{}'", root.replace('\'', "'\\''"));
+        let script = format!("{ssh_command} {target} -- rm -rf -- {quoted_root}");
+        let status = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .await?;
+        if !status.success() {
+            anyhow::bail!(
+                "remote reap of {root} on {} exited with {status}",
+                worker.id
+            );
+        }
+        Ok(())
     }
 
     /// Retrieve one declared job result directory (bd-p0yoo).
@@ -5902,6 +6010,64 @@ mod tests {
     }
 
     #[test]
+    fn test_rsync_path_prefix_prunes_stale_worker_runtime_state() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/test"),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let root = pipeline.remote_path();
+        let cmd = pipeline.build_sync_command(
+            &worker,
+            &format!("mockuser@mock://worker:{root}"),
+            &root,
+            &[],
+        );
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        let idx = args
+            .iter()
+            .position(|arg| arg == "--rsync-path")
+            .expect("--rsync-path");
+        let path_val = args.get(idx + 1).expect("rsync-path value");
+
+        // bd-wfumv: every source upload reaps stale worker-side runtime state
+        // ahead of the transfer, with durable caches on a much longer floor.
+        assert!(path_val.starts_with("find "));
+        assert!(path_val.contains(&format!(
+            "find {root}/.rch-tmp -mindepth 1 -maxdepth 1 ! -name 'rch-cargo-cache-*' -mmin +{WORKER_TMP_PRUNE_MAX_AGE_MINS}"
+        )));
+        assert!(path_val.contains(&format!(
+            "-name 'rch-cargo-cache-*' -mmin +{WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS}"
+        )));
+        assert!(path_val.contains(&format!(
+            "-type d -name '.rch-target-*-pool-*' -mmin +{WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS}"
+        )));
+
+        // The prune must run before the mkdir/rsync pair it wraps.
+        let mkdir_idx = path_val
+            .find(&format!("mkdir -p {root} && rsync"))
+            .expect("mkdir && rsync suffix");
+        assert!(path_val.find("find ").expect("find prefix") < mkdir_idx);
+    }
+
+    #[test]
     fn test_rsync_commands_disable_owner_and_group_preservation() {
         let _guard = test_guard!();
         let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -6315,6 +6481,39 @@ mod tests {
         // Each managed dir must be mkdir'd before the build.
         assert!(command.contains("mkdir -p"));
         assert!(command.contains(&format!("{}/.rch-go/cache", root)));
+    }
+
+    #[test]
+    fn test_managed_temp_dir_is_chmodded_owner_only_with_sticky_bit() {
+        let _guard = test_guard!();
+        // A permissive worker umask (e.g. `002`) makes `mkdir -p` produce a
+        // group-writable `.rch-tmp` without the sticky bit. Consumers that
+        // validate ancestor permissions before atomic writes refuse such
+        // parents, so rch must tighten every managed TEMP-family directory
+        // right after creating it — and only those directories.
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_env_overrides(HashMap::new()); // nothing forwarded; forced keys inject TMPDIR
+
+        let root = pipeline.remote_path();
+        let command = pipeline.build_remote_command("cargo build", None);
+
+        assert!(
+            command.contains(&format!("chmod 1700 {}/.rch-tmp", root)),
+            "managed .rch-tmp must be tightened to 1700: {command}"
+        );
+        assert!(
+            !command.contains(&format!("chmod 1700 {}/.rch-target", root)),
+            "target dir is not a TEMP-family dir and must not be chmodded: {command}"
+        );
+        assert!(
+            !command.contains(&format!("chmod 1700 {}/.rch-go", root)),
+            "go cache dirs are not TEMP-family dirs and must not be chmodded: {command}"
+        );
     }
 
     #[test]

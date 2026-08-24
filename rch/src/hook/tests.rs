@@ -1656,6 +1656,7 @@ async fn test_daemon_query_missing_socket() {
         None,
         false,
         &[],
+        false,
     )
     .await;
     assert!(result.is_err());
@@ -1742,6 +1743,7 @@ async fn test_daemon_query_protocol() {
         None,
         false,
         &[],
+        false,
     )
     .await;
 
@@ -1829,6 +1831,7 @@ async fn test_daemon_query_sends_preferred_workers() {
         None,
         false,
         &preferred,
+        false,
     )
     .await;
 
@@ -1930,6 +1933,7 @@ async fn test_daemon_query_releases_worker_outside_requested_set() {
         None,
         false,
         &[WorkerId::new("requested")],
+        false,
     )
     .await
     .expect("query should return a structured refusal");
@@ -2027,6 +2031,7 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
         None,
         false,
         &[WorkerId::new("requested")],
+        false,
     )
     .await
     .expect("release failure should remain a structured selection refusal");
@@ -2115,6 +2120,7 @@ async fn test_daemon_query_wait_parameters() {
         None,
         true,
         &[],
+        false,
     )
     .await;
 
@@ -2185,6 +2191,7 @@ async fn test_daemon_query_url_encoding() {
         None,
         false,
         &[],
+        false,
     )
     .await;
     daemon_handle.await.expect("Daemon task");
@@ -7269,6 +7276,7 @@ async fn test_daemon_query_connect_timeout_fail_open() {
         None,
         false,
         &[],
+        false,
     )
     .await;
 
@@ -7385,6 +7393,7 @@ async fn test_daemon_query_partial_response_timeout() {
         None,
         false,
         &[],
+        false,
     )
     .await;
 

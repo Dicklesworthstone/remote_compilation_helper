@@ -457,6 +457,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             None,
             false,
             &preferred_workers,
+            false,
         )
         .await
         {

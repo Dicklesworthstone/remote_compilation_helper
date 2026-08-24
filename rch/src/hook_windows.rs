@@ -102,6 +102,7 @@ pub(crate) async fn query_daemon(
     _local_wrapper_id: Option<&str>,
     _wait_for_worker: bool,
     _preferred_workers: &[WorkerId],
+    _job_mode: bool,
 ) -> anyhow::Result<SelectionResponse> {
     Err(PlatformError::UnixSocketUnsupported)?
 }

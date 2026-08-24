@@ -222,7 +222,7 @@ pub fn next_seq(store: &mut dyn RabsMetadataStore) -> Result<u64, StoreError> {
     Ok(match rows.first().and_then(|r| r.first()) {
         // MAX over persisted u64 counts is non-negative by construction;
         // a negative value would be store corruption, clamped to restart.
-        Some(SqlValue::Int(n)) => u64::try_from(n.max(0)).unwrap_or(1),
+        Some(SqlValue::Int(n)) => u64::try_from((*n).max(0)).unwrap_or(1),
         _ => 1,
     })
 }
@@ -479,11 +479,9 @@ pub fn history_receipt(
                 "gc_receipts.mode missing or not text".to_owned(),
             ));
         };
-        let numbers @ [_, _, _] = [cols.next(), cols.next(), cols.next()] else {
-            return Err(StoreError::Backend(
-                "gc_receipts counters incomplete".to_owned(),
-            ));
-        };
+        // A fixed-size array pattern always matches; the counters are
+        // Option<SqlValue> and mapped to 0 below when absent.
+        let numbers = [cols.next(), cols.next(), cols.next()];
         let [planned, reclaimed, skipped] = numbers.map(|v| match v {
             Some(SqlValue::Int(n)) => u64::try_from(n.max(0)).unwrap_or(0),
             _ => 0,
@@ -545,6 +543,13 @@ fn print_plan(receipt: &GcPlanReceipt) {
     }
 }
 
+/// One line per reclaimed-or-skipped location, prefixed by its section label.
+fn print_locations(label: &str, locations: &[LocationDto]) {
+    for location in locations {
+        println!("{label} {} {}", location.object_key, location.store_path);
+    }
+}
+
 fn print_run(receipt: &GcRunReceipt) {
     println!(
         "run seq={} mode={} planned={} reclaimed={} skipped={} truncated={}",
@@ -580,7 +585,11 @@ fn print_history(receipt: &GcHistoryReceipt) {
 /// # Errors
 /// Propagates store/mount/parse failures under the caller's exit-code
 /// convention.
-pub async fn run(action: GcAction, ctx: &OutputContext) -> anyhow::Result<()> {
+pub async fn run_gc(action: GcAction, ctx: &OutputContext) -> anyhow::Result<()> {
+    run_gc_inner(action, ctx).await
+}
+
+async fn run_gc_inner(action: GcAction, ctx: &OutputContext) -> anyhow::Result<()> {
     match action {
         GcAction::Plan {
             cas_root,
@@ -644,7 +653,301 @@ pub async fn run(action: GcAction, ctx: &OutputContext) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `rch rabs <group>` command groups (R005 lands the `gc` group).
+/// Entry point for `rch rabs worker reconcile <worker>` (R006).
+///
+/// # Errors
+/// Propagates store/mount failures under the caller's exit-code
+/// convention.
+pub async fn run_worker_reconcile(
+    worker: String,
+    cas_root: Option<PathBuf>,
+    ctx: &OutputContext,
+) -> anyhow::Result<()> {
+    let root = resolve_cas_root(cas_root.as_deref())?;
+    let mut store = open_store(&root)?;
+    let now_seq = operations_watermark(&mut store)?;
+    let fs = CasFilesystem { root };
+    let report = rabs_cas::worker_reconcile::reconcile_worker(
+        &mut store,
+        &fs,
+        &worker,
+        now_seq,
+        DEFAULT_MIN_SEQ_LAG,
+    )?;
+    if ctx.is_json() || ctx.is_toon() {
+        ctx.json(&ApiResponse::ok(
+            "rabs worker reconcile",
+            &JsonReport::of(&report),
+        ))?;
+    } else {
+        print_worker_report(&report);
+    }
+    Ok(())
+}
+
+/// Entry point for `rch rabs doctor` (R006, read-only half).
+///
+/// # Errors
+/// Propagates store/mount failures under the caller's exit-code
+/// convention.
+pub async fn run_doctor(
+    cas_root: Option<PathBuf>,
+    min_seq_lag: u64,
+    ctx: &OutputContext,
+) -> anyhow::Result<()> {
+    let root = resolve_cas_root(cas_root.as_deref())?;
+    let mut store = open_store(&root)?;
+    let now_seq = operations_watermark(&mut store)?;
+    let proposals = rabs_cas::worker_reconcile::find_stale_state(&mut store, now_seq, min_seq_lag)?;
+    if ctx.is_json() || ctx.is_toon() {
+        let shim: Vec<JsonProposal> = proposals.iter().map(JsonProposal::of).collect();
+        ctx.json(&ApiResponse::ok("rabs doctor", &shim))?;
+    } else if proposals.is_empty() {
+        println!("rabs doctor: no stale operations or expired-looking pins");
+    } else {
+        println!("rabs doctor: {} proposed resolution(s):", proposals.len());
+        for p in &proposals {
+            println!("  {} -> {}", p.target, p.action);
+            println!("      {}", p.remediation);
+        }
+    }
+    Ok(())
+}
+
+/// Entry point for `rch rabs inventory` (K010).
+///
+/// # Errors
+/// Propagates store/mount failures under the caller's exit-code
+/// convention.
+pub async fn run_inventory(
+    cas_root: Option<PathBuf>,
+    l2_root: Option<PathBuf>,
+    allow_namespace: Vec<String>,
+    ctx: &OutputContext,
+) -> anyhow::Result<()> {
+    let root = resolve_cas_root(cas_root.as_deref())?;
+    let mut store = open_store(&root)?;
+    let l2 = l2_root.unwrap_or_else(default_l2_root);
+    let policy = rabs_cas::cache_inventory::NamespacePolicy::allowing(allow_namespace.clone());
+    let report = rabs_cas::cache_inventory::build_report(&mut store, None, &l2, &policy)?;
+
+    if ctx.is_json() || ctx.is_toon() {
+        ctx.json(&ApiResponse::ok(
+            "rabs inventory",
+            &JsonInventory::of(&report),
+        ))?;
+    } else {
+        print_inventory(&report);
+    }
+    Ok(())
+}
+
+fn default_l2_root() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".cache").join("rch")
+    } else {
+        PathBuf::from("/tmp")
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct JsonInventory {
+    l1_present: bool,
+    l1_capacity: Option<usize>,
+    l1_live_entries: Option<usize>,
+    restricted_project_count: u32,
+    visible_projects: Vec<String>,
+    toolchain_workers: Vec<String>,
+    action_entries: u64,
+}
+
+impl JsonInventory {
+    fn of(r: &rabs_cas::cache_inventory::CacheInventoryReport) -> Self {
+        Self {
+            l1_present: r.l1.is_some(),
+            l1_capacity: r.l1.as_ref().map(|l| l.capacity),
+            l1_live_entries: r.l1.as_ref().map(|l| l.entries.len()),
+            restricted_project_count: r.restricted_project_count,
+            visible_projects: r.l2_visible.iter().map(|p| p.project.clone()).collect(),
+            toolchain_workers: r.toolchains.iter().map(|t| t.worker.clone()).collect(),
+            action_entries: r.store.action_entries,
+        }
+    }
+}
+
+fn print_inventory(report: &rabs_cas::cache_inventory::CacheInventoryReport) {
+    match &report.l1 {
+        Some(l1) => println!(
+            "L1 edge cache: capacity {}, live entries {}",
+            l1.capacity,
+            l1.entries.len()
+        ),
+        None => println!("L1 edge cache: not mounted in this process"),
+    }
+    for p in &report.l2_visible {
+        println!("L2 project {}: {} result dir(s)", p.project, p.hash_dirs);
+    }
+    println!(
+        "restricted projects (names hidden): {}",
+        report.restricted_project_count
+    );
+    for t in &report.toolchains {
+        println!("toolchains on {}: {}", t.worker, t.toolchains.join(", "));
+    }
+    println!(
+        "store: {} action entries, {} workers with recorded capabilities",
+        report.store.action_entries, report.store.workers_with_capabilities
+    );
+}
+
+/// Operations lagging the live-progress watermark by more than this are
+/// stale by default.
+pub const DEFAULT_MIN_SEQ_LAG: u64 = 1_000;
+
+fn operations_watermark<E: rabs_cas::metadata_store::SqlEngine>(
+    store: &mut rabs_cas::metadata_store::SqlMetadataStore<E>,
+) -> anyhow::Result<u64> {
+    let rows = store
+        .engine_mut()
+        .query("SELECT COALESCE(MAX(updated_seq), 1) FROM operations", &[])?;
+    Ok(rows
+        .first()
+        .and_then(|r| r.first())
+        .map(|v| match v {
+            SqlValue::Int(n) => (*n).max(1) as u64,
+            _ => 1,
+        })
+        .unwrap_or(1))
+}
+
+/// The real CAS directory, viewed through [`FilesystemReality`].
+struct CasFilesystem {
+    root: PathBuf,
+}
+
+impl rabs_cas::startup_reconciliation::FilesystemReality for CasFilesystem {
+    fn exists(&self, store_path: &str) -> bool {
+        self.root.join(store_path).exists()
+    }
+
+    fn all_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        self.walk(&self.root, &mut out, 0);
+        out
+    }
+}
+
+impl CasFilesystem {
+    fn walk(&self, dir: &Path, out: &mut Vec<String>, depth: u8) {
+        const MAX_DEPTH: u8 = 8;
+        const MAX_ENTRIES: usize = 50_000;
+        if depth > MAX_DEPTH || out.len() >= MAX_ENTRIES {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                self.walk(&path, out, depth + 1);
+            } else if let Ok(rel) = path.strip_prefix(&self.root) {
+                out.push(rel.to_string_lossy().into_owned());
+            }
+            if out.len() >= MAX_ENTRIES {
+                return;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct JsonProposal {
+    target: String,
+    action: String,
+    remediation: String,
+}
+
+impl JsonProposal {
+    fn of(p: &rabs_cas::worker_reconcile::ProposedResolution) -> Self {
+        Self {
+            target: p.target.clone(),
+            action: p.action.clone(),
+            remediation: p.remediation.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct JsonReport {
+    worker: String,
+    sessions_ended: u32,
+    repaired_count: usize,
+    reported_orphans: Vec<String>,
+    serving_allowed: bool,
+    stale_operations: Vec<JsonProposal>,
+    proposals: Vec<JsonProposal>,
+}
+
+impl JsonReport {
+    fn of(r: &rabs_cas::worker_reconcile::WorkerReconcileReport) -> Self {
+        Self {
+            worker: r.worker.clone(),
+            sessions_ended: r.sessions_ended,
+            repaired_count: r.repaired.len(),
+            reported_orphans: r.reported_orphans.clone(),
+            serving_allowed: matches!(
+                r.serving,
+                rabs_cas::startup_reconciliation::ServingDecision::Allowed
+            ),
+            stale_operations: r
+                .stale_operations
+                .iter()
+                .map(operation_json_proposal)
+                .collect(),
+            proposals: r.proposals.iter().map(JsonProposal::of).collect(),
+        }
+    }
+}
+
+fn operation_json_proposal(op: &rabs_cas::worker_reconcile::StaleOperation) -> JsonProposal {
+    JsonProposal {
+        target: format!("operation:{}", op.id_hex),
+        action: format!("update_operation_state({}, \"abandoned\")", op.id_hex),
+        remediation: format!("non-terminal '{}' untouched for {} seqs", op.state, op.lag),
+    }
+}
+
+fn print_worker_report(report: &rabs_cas::worker_reconcile::WorkerReconcileReport) {
+    println!(
+        "worker reconcile {}: {} session(s) ended, {} location drift repaired, \
+         {} orphan(s) reported, serving {}",
+        report.worker,
+        report.sessions_ended,
+        report.repaired.len(),
+        report.reported_orphans.len(),
+        if matches!(
+            report.serving,
+            rabs_cas::startup_reconciliation::ServingDecision::Allowed
+        ) {
+            "allowed"
+        } else {
+            "REFUSED"
+        }
+    );
+    if report.proposals.is_empty() {
+        println!("  no stale operations or expired-looking pins");
+    } else {
+        println!("  proposed resolution(s): {}", report.proposals.len());
+        for p in &report.proposals {
+            println!("    {} -> {}", p.target, p.action);
+            println!("        {}", p.remediation);
+        }
+    }
+}
+
+/// `rch rabs <group>` command groups (R005 lands `gc`; R006 lands
+/// `worker` + `doctor`).
 #[derive(Debug, Subcommand)]
 pub enum RabsCommand {
     /// Content-addressed store garbage collection (H014 engine)
@@ -655,6 +958,55 @@ pub enum RabsCommand {
         /// GC operation
         #[command(subcommand)]
         action: GcAction,
+    },
+    /// Worker reconciliation + stale-operation doctor (R006)
+    #[command(
+        after_help = "EXAMPLES:\n    rch rabs worker reconcile worker-a\n    rch rabs worker reconcile worker-a --json\n    rch rabs doctor --min-seq-lag 1000"
+    )]
+    Worker {
+        /// Worker operation
+        #[command(subcommand)]
+        action: WorkerAction,
+    },
+    /// Find stale operations/pins and propose safe resolution (read-only)
+    Doctor {
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+        /// Operations lagging the live-progress watermark by more than this
+        /// many seqs count as stale
+        #[arg(long, value_name = "SEQS", default_value_t = 1_000)]
+        min_seq_lag: u64,
+    },
+    /// What is cached where: edge L1, local L2 projects, toolchains,
+    /// store facts — with namespace existence-hiding (K006/K010 ACL)
+    Inventory {
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
+        /// L2 cache root to enumerate (default: ~/.cache/rch)
+        #[arg(long, value_name = "DIR")]
+        l2_root: Option<PathBuf>,
+        /// Project namespace whose names this viewer may see
+        /// (repeatable; unlisted namespaces collapse into a count)
+        #[arg(long, value_name = "NAMESPACE")]
+        allow_namespace: Vec<String>,
+    },
+}
+
+/// One worker operation.
+#[derive(Debug, Subcommand)]
+pub enum WorkerAction {
+    /// A gone worker's open sessions are ended, store drift is repaired
+    /// against filesystem reality, and safe-resolution proposals are
+    /// listed for anything stale. Proposals are NEVER auto-applied.
+    Reconcile {
+        /// Worker identity
+        #[arg(value_name = "WORKER")]
+        worker: String,
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
     },
 }
 
@@ -979,7 +1331,10 @@ mod tests {
     fn missing_cas_root_refuses_without_creating() {
         let dir = TempDir::new().expect("tempdir");
         let root = dir.path().join("nope");
-        let err = open_store(&root).expect_err("must refuse");
+        let err = match open_store(&root) {
+            Err(err) => err,
+            Ok(_) => panic!("must refuse a missing CAS root"),
+        };
         assert!(err.to_string().contains(RC_CAS_ROOT_MISSING), "{err}");
         assert!(!root.exists(), "must not create anything");
     }
