@@ -185,14 +185,23 @@ fn cargo_interception(shim: &Path) -> Interception {
 //
 // Mechanism, per toolchain:
 //   cargo           -> wrapper script (delegates to the canonical shim)
-//   cargo-rch-real  -> HARDLINK to the original binary (same inode)
-// A hardlink (not a move) keeps the code signature intact, duplicates no bytes,
-// and means `cargo` never stops existing for even an instant. The swap-in is an
-// atomic rename, so a concurrent exec sees either the old or new file, never a
-// missing one.
+//   cargo-rch-real  -> the original binary, preserved by hardlinking it first
+// Linking (rather than moving) the original means `cargo` never stops existing
+// for even an instant, copies no bytes, and leaves the code signature intact.
+// The swap-in is an atomic rename, so a concurrent exec sees either the old or
+// the new file, never a missing one. (After the rename the two names no longer
+// share a link count: `cargo` is the new wrapper inode and `cargo-rch-real` is
+// the sole remaining name for the original inode — which is the point.)
 // ---------------------------------------------------------------------------
 
 /// Bumped whenever the toolchain wrapper body changes.
+///
+/// Version `1` is also what the predecessor `wrap_toolchain_cargo.sh` emitted,
+/// and hosts wrapped by that script are already in the field. The two bodies are
+/// behaviourally identical (same bypass check, same shim handoff, same
+/// `RCH_SHIM_REAL_CARGO` export) and differ only in a comment, so they
+/// legitimately share a version and `install` leaves them alone. Bump this the
+/// moment the body changes semantically, which will also converge those hosts.
 const TOOLCHAIN_WRAP_VERSION: &str = "1";
 
 /// Marker identifying an rch-managed toolchain wrapper (vs. the real binary).
