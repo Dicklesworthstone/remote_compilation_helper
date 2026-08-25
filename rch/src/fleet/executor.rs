@@ -1187,7 +1187,11 @@ fn smoke_capability_probe_spec(worker: &WorkerConfig) -> ProbeSpec {
     // literal `~` would never expand and every worker would look like it has a
     // missing binary (the live-fleet bug the mock tests masked by injecting an
     // already-expanded path). Mirrors the daemon bypass-recovery prober.
-    ProbeSpec::new(worker.user.clone(), remote_worker_binary_path(&worker.user))
+    let declared_os = rch_common::declared_os(&worker.tags);
+    ProbeSpec::new(
+        worker.user.clone(),
+        remote_worker_binary_path(&worker.user, declared_os.as_deref()),
+    )
 }
 
 /// Execute the WorkerCapabilitiesExactUserPath smoke scenario against a worker:

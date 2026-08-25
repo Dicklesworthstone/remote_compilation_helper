@@ -189,7 +189,11 @@ impl SshRecoveryProber {
     /// simply omits the worker-binary fact, keeping the worker bypassed (the safe
     /// failure mode — never a false rejoin).
     fn probe_spec(&self, config: &WorkerConfig) -> ProbeSpec {
-        let mut spec = ProbeSpec::new(config.user.clone(), remote_worker_binary_path(&config.user));
+        let declared_os = rch_common::declared_os(&config.tags);
+        let mut spec = ProbeSpec::new(
+            config.user.clone(),
+            remote_worker_binary_path(&config.user, declared_os.as_deref()),
+        );
         spec.disk_roots.clone_from(&self.config.disk_roots);
         spec
     }
@@ -1276,12 +1280,31 @@ mod tests {
     #[test]
     fn rch_wkr_path_is_absolute_per_user() {
         assert_eq!(
-            remote_worker_binary_path("ubuntu"),
+            remote_worker_binary_path("ubuntu", None),
             "/home/ubuntu/.local/bin/rch-wkr"
         );
         assert_eq!(
-            remote_worker_binary_path("root"),
+            remote_worker_binary_path("root", None),
             "/root/.local/bin/rch-wkr"
         );
+        assert_eq!(
+            remote_worker_binary_path("jeffr", Some("windows")),
+            "/c/Users/jeffr/.local/bin/rch-wkr.exe"
+        );
+    }
+
+    #[test]
+    fn recovery_probe_uses_declared_windows_worker_binary_path() {
+        let prober = SshRecoveryProber::new(
+            Arc::new(TelemetryStore::new(Duration::from_secs(300), None)),
+            BypassRecoveryConfig::default(),
+        );
+        let mut worker = worker_config("wsurf");
+        worker.user = "jeffr".to_string();
+        worker.tags = vec![rch_common::os_tag("windows")];
+
+        let spec = prober.probe_spec(&worker);
+
+        assert_eq!(spec.rch_wkr_path, "/c/Users/jeffr/.local/bin/rch-wkr.exe");
     }
 }

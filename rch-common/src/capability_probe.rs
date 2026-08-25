@@ -57,14 +57,19 @@ fn shq(s: &str) -> String {
 }
 
 /// The canonical ABSOLUTE path to the deployed `rch-wkr` binary for a remote
-/// user (`root` -> `/root`, otherwise `/home/<user>`). The probe script
-/// shell-quotes this path, so it MUST be absolute: a literal `~/.local/bin/...`
-/// would be single-quoted and never expand, making `[ -x ... ]` fail and every
-/// worker look like it has a missing binary. Single source of truth for both the
-/// daemon bypass-recovery prober and the `rch self-test --smoke` capability
-/// scenario.
+/// user and host OS. Unix workers use `/root` or `/home/<user>`; Windows workers
+/// run under Git Bash and use `/c/Users/<user>` plus the native `.exe` suffix.
+/// The probe script shell-quotes this path, so it MUST be absolute: a literal
+/// `~/.local/bin/...` would be single-quoted and never expand, making `[ -x ... ]`
+/// fail and every worker look like it has a missing binary. Single source of
+/// truth for both the daemon bypass-recovery prober and the
+/// `rch self-test --smoke` capability scenario.
 #[must_use]
-pub fn remote_worker_binary_path(user: &str) -> String {
+pub fn remote_worker_binary_path(user: &str, declared_os: Option<&str>) -> String {
+    if declared_os.is_some_and(|os| os.eq_ignore_ascii_case("windows")) {
+        return format!("/c/Users/{user}/.local/bin/rch-wkr.exe");
+    }
+
     let home = if user == "root" {
         "/root".to_string()
     } else {
@@ -1090,17 +1095,17 @@ mod tests {
     #[test]
     fn remote_worker_binary_path_is_absolute_per_user() {
         assert_eq!(
-            remote_worker_binary_path("root"),
+            remote_worker_binary_path("root", None),
             "/root/.local/bin/rch-wkr"
         );
         assert_eq!(
-            remote_worker_binary_path("ubuntu"),
+            remote_worker_binary_path("ubuntu", Some("linux")),
             "/home/ubuntu/.local/bin/rch-wkr"
         );
         // The path must be absolute: the probe script single-quotes it, so a
         // literal `~` would never expand and `[ -x ... ]` would always fail.
         for user in ["root", "rch", "ubuntu"] {
-            let path = remote_worker_binary_path(user);
+            let path = remote_worker_binary_path(user, None);
             assert!(!path.contains('~'), "{path} must not contain a tilde");
             assert!(path.starts_with('/'), "{path} must be absolute");
             let spec = ProbeSpec::new(user, path);
@@ -1110,5 +1115,17 @@ mod tests {
             assert!(script.contains("/.local/bin/rch-wkr'"));
             assert!(!script.contains("'~/.local/bin/rch-wkr'"));
         }
+    }
+
+    #[test]
+    fn remote_worker_binary_path_uses_git_bash_home_for_windows() {
+        assert_eq!(
+            remote_worker_binary_path("jeffr", Some("windows")),
+            "/c/Users/jeffr/.local/bin/rch-wkr.exe"
+        );
+        assert_eq!(
+            remote_worker_binary_path("jeffr", Some("WINDOWS")),
+            "/c/Users/jeffr/.local/bin/rch-wkr.exe"
+        );
     }
 }
