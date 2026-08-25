@@ -478,9 +478,17 @@ pub fn parse_reap_errors(stdout: &str) -> Vec<ReapError> {
 #[must_use]
 pub fn enumerate_targets_command(escaped_base: &str) -> String {
     let preamble = candidate_discovery_preamble(escaped_base, "");
+    // Pooled dirs are appended AFTER the preamble, so they need the tmp-base
+    // pass and a second dedup of their own: what `rch gc --dry-run` lists must
+    // be exactly what `worker_sweep_command` would act on, and the sweep's
+    // pooled pass reaches the tmp base. Without this the dry run would omit
+    // precisely the dirs the real run reaps.
+    let dedup = dedup_candidate_file("__tmpf");
     format!(
         "{preamble}\
          find \"$__rt\" -maxdepth 8 -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf\"; \
+         case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf\";; esac; \
+         {dedup}\
          while IFS= read -r d; do \
            [ -d \"$d\" ] || continue; \
            set -- $(find \"$d\" -printf '%T@ %s\\n' 2>/dev/null | awk '{{ t=int($1); if (t>n) n=t; s+=$2 }} END {{ printf \"%d %d\", n, int(s/1024) }}'); \
@@ -884,6 +892,115 @@ mod tests {
         let (removed, _freed) =
             parse_worker_reap_metrics(&stdout).expect("sweep must print its metrics line");
         assert_eq!(removed, 2, "exactly the two idle dirs; stdout: {stdout}");
+    }
+
+    /// `rch gc --dry-run` enumerates; the real run sweeps. If enumerate cannot
+    /// SEE a dir the sweep would reap, the dry run lies about what will happen.
+    /// Both must cover the tmp base, for pooled dirs as well as job/pid dirs.
+    #[cfg(unix)]
+    #[test]
+    fn enumerate_and_sweep_agree_on_tmp_base_discovery() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("projects");
+        let tmpbase = tmp.path().join("scratch");
+        let tmp_pool = tmpbase
+            .join("rch")
+            .join("proj")
+            .join("hash")
+            .join(".rch-target-w1-pool-abc");
+        let base_pool = base.join("repo").join(".rch-target-w1-pool-def");
+        let tmp_job = tmpbase
+            .join("rch")
+            .join("proj")
+            .join("hash")
+            .join(".rch-target-w1-job-1-2-0");
+        for d in [&tmp_pool, &base_pool, &tmp_job] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("artifact.o"), b"xxxx").unwrap();
+        }
+
+        let cmd = enumerate_targets_command(base.to_str().unwrap());
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("TMPDIR", &tmpbase)
+            .output()
+            .expect("enumerate should execute");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "enumerate must be valid sh: {stderr}");
+        assert!(
+            !stderr.contains("syntax error") && !stderr.contains("unexpected"),
+            "enumerate emitted shell errors: {stderr}"
+        );
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let listed: Vec<&str> = stdout
+            .lines()
+            .filter_map(|l| l.strip_prefix("RCH_TARGET_ENTRY "))
+            .filter_map(|rest| rest.splitn(3, ' ').nth(2))
+            .collect();
+
+        for expected in [&tmp_pool, &base_pool, &tmp_job] {
+            let want = expected.to_str().unwrap();
+            assert!(
+                listed.iter().any(|p| *p == want),
+                "enumerate must list {want}; listed: {listed:?}"
+            );
+        }
+        // Dedup must leave each dir exactly once, so the dry run cannot
+        // double-report (and double-count KB) for a single directory.
+        for want in &listed {
+            assert_eq!(
+                listed.iter().filter(|p| *p == want).count(),
+                1,
+                "duplicate entry for {want} in {listed:?}"
+            );
+        }
+    }
+
+    /// When the sync root sits UNDER the tmp base, both discovery passes match
+    /// the same dirs. Without dedup the byte-cap pass would count them twice.
+    #[cfg(unix)]
+    #[test]
+    fn overlapping_roots_are_deduped_not_double_counted() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // base is INSIDE tmpbase: every candidate matches both finds.
+        let tmpbase = tmp.path().join("scratch");
+        let base = tmpbase.join("projects");
+        let stale = base.join("repo").join(".rch-target-w1-job-1-2-0");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("artifact.o"), b"xxxx").unwrap();
+        let aged = Command::new("find")
+            .arg(&stale)
+            .args(["-exec", "touch", "-t", "202001010000", "{}", "+"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !aged {
+            return;
+        }
+
+        let cmd = worker_sweep_command(base.to_str().unwrap(), 60, Some(MIN_POOLED_IDLE_MINUTES), None);
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("TMPDIR", &tmpbase)
+            .output()
+            .expect("sweep should execute");
+        assert!(out.status.success());
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let (removed, _) =
+            parse_worker_reap_metrics(&stdout).expect("sweep must print its metrics line");
+        assert!(!stale.exists(), "the stale dir should be reaped");
+        assert_eq!(
+            removed, 1,
+            "a dir matched by both passes must be counted once; stdout: {stdout}"
+        );
     }
 
     #[test]
