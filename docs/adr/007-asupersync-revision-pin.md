@@ -59,7 +59,43 @@ series:
 
 ## Current pin
 
-`62d398ea17519d7e80cbdb32e062d70647cd58a4` (initial; plan-reviewed).
+`107adf1df8d274b37c6ed9a12471fe3da44429f2` (advanced via `94217a3`, bead `bd-x7y2r`).
+
+### Pin history
+
+| Revision | Landed in | Note |
+|---|---|---|
+| `62d398ea17519d7e80cbdb32e062d70647cd58a4` | initial | The commit the six adversarial plan passes examined (2026-08-06). |
+| `107adf1df8d274b37c6ed9a12471fe3da44429f2` | `94217a3` | Current; evidence below. |
+
+### Evidence for the current pin
+
+`107adf1df8d274b37c6ed9a12471fe3da44429f2` is upstream `693642963` (`br-asupersync-yqlhh7`) carried
+onto the previously reviewed `62d398ea17519d7e80cbdb32e062d70647cd58a4` as branch
+`cargo-hygiene/keep-git-source-manifests-parseable`.
+
+- **Zero lib-code drift** relative to the reviewed revision. The only change
+  is that the fixture-carrier manifest was made valid TOML; the planner
+  script and its contract test now generate the malformed case in a temp
+  directory instead of shipping it as a committed fixture.
+- Because there is no library-code delta, the master plan's behavioral claims
+  about Asupersync (regions, obligations, process groups, ATP
+  objects/journals, deterministic lab, QUIC blockers §44) carry over
+  unchanged from the reviewed commit. The advance reinterprets no durable
+  data, so no schema or key epoch bumps are required (requirement 4).
+- Verified at bump time: `cargo metadata` resolves; an isolated repro emits
+  zero `unclosed table` lines; `cargo check -p rabs-asupersync` completed
+  clean in 94s.
+- Requirement 2's floor — a full workspace fmt/check/clippy/test run — was
+  met during the v1.0.58 release gate: `cargo fmt --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings` both exit 0.
+
+`94217a3` advanced the pin in all four manifests (`rabs-asupersync`,
+`rabs-wkr`, and both `rabsd` sections) without updating this ADR or the
+pin-drift guard in `rabs-asupersync/tests/feature_profile.rs`. The guard then
+caught the divergence during the v1.0.58 release gate — working as designed.
+This section closes requirement 3 for that advance. The guard's strictness is
+unchanged: it still asserts one exact revision, now this one.
 
 ## Consequences
 

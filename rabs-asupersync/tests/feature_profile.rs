@@ -61,7 +61,7 @@ fn asupersync_uses_the_minimal_profile() {
          is a reviewed rabs-profile change (bead A004); line: {dep_line}"
     );
     assert!(
-        dep_line.contains("rev = \"62d398ea17519d7e80cbdb32e062d70647cd58a4\""),
+        dep_line.contains("rev = \"107adf1df8d274b37c6ed9a12471fe3da44429f2\""),
         "pin drift: the revision must match ADR 007's current pin; \
          line: {dep_line}"
     );
