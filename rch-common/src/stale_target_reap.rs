@@ -972,11 +972,19 @@ mod tests {
             .filter_map(|rest| rest.splitn(3, ' ').nth(2))
             .collect();
 
+        // Both roots are canonicalized by the script (`pwd -P`), so compare
+        // canonical paths — on macOS a tempdir under /var resolves to
+        // /private/var and a literal comparison would spuriously fail.
         for expected in [&tmp_pool, &base_pool, &tmp_job] {
-            let want = expected.to_str().unwrap();
+            let want = std::fs::canonicalize(expected).unwrap_or_else(|_| expected.clone());
+            let matched = listed.iter().any(|p| {
+                std::fs::canonicalize(p).map(|c| c == want).unwrap_or(false)
+                    || std::path::Path::new(p) == want
+            });
             assert!(
-                listed.iter().any(|p| *p == want),
-                "enumerate must list {want}; listed: {listed:?}"
+                matched,
+                "enumerate must list {}; listed: {listed:?}",
+                want.display()
             );
         }
         // Dedup must leave each dir exactly once, so the dry run cannot

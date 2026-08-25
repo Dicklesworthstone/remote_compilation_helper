@@ -345,6 +345,18 @@ fn wrap_toolchain_cargo(cargo: &Path) -> Result<WrapOutcome> {
             real.display()
         )
     })?;
+    // Guard the TOCTOU window: if a concurrent `shim install` swapped in its
+    // wrapper between our not-wrapped check and this link, we just preserved a
+    // WRAPPER as the "real" cargo — and writing our wrapper over `cargo` next
+    // would destroy the toolchain's only real binary. Undo and fail loudly
+    // instead; the other run already did the work correctly.
+    if is_toolchain_wrapped(&real) {
+        let _ = std::fs::remove_file(&real);
+        anyhow::bail!(
+            "concurrent wrap detected for {}: refusing to preserve a wrapper as the real cargo",
+            cargo.display()
+        );
+    }
     // Atomic rename over `cargo`; a concurrent exec sees old or new, never gone.
     if let Err(e) = atomic_write(cargo, toolchain_wrap_body().as_bytes()) {
         // Roll back so the toolchain is never left without its real cargo.
@@ -912,6 +924,46 @@ mod tests {
     }
 
     // --- interception classification ---------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_wrap_never_preserves_a_wrapper_as_the_real_cargo() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cargo = bin.join("cargo");
+        // Simulate losing the race: `cargo` is already another run's wrapper,
+        // but no `cargo-rch-real` exists yet, so the not-wrapped path would
+        // otherwise link the wrapper over itself and lose the real binary.
+        // (is_toolchain_wrapped is true here, so we take the refresh path and
+        // must refuse because the real binary is absent.)
+        std::fs::write(&cargo, toolchain_wrap_body()).unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(wrap_toolchain_cargo(&cargo).is_err());
+        // cargo is untouched, and nothing bogus was left behind.
+        assert!(is_toolchain_wrapped(&cargo));
+        assert!(!bin.join(REAL_CARGO_NAME).exists());
+    }
+
+    #[test]
+    fn empty_path_entries_do_not_resolve_cargo_from_cwd() {
+        // A stray ./cargo must not decide the verdict just because PATH has an
+        // empty component. Directly exercises the guard in cargo_interception.
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("shims").join("cargo");
+        std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        std::fs::write(&shim, cargo_shim_body(true)).unwrap();
+        // PATH = ":<shimdir>" — leading empty entry, then the real shim dir.
+        let joined = std::env::join_paths([
+            std::path::PathBuf::new(),
+            shim.parent().unwrap().to_path_buf(),
+        ])
+        .unwrap();
+        // SAFETY: single-threaded test process mutating its own env.
+        unsafe { std::env::set_var("PATH", &joined) };
+        assert_eq!(cargo_interception(&shim), Interception::Direct);
+    }
 
     #[test]
     fn delegating_wrapper_counts_as_interception() {
