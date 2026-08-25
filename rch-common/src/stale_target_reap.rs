@@ -784,9 +784,106 @@ mod tests {
         assert!(cmd.contains("-name \".rch-target-*-pool-*\" -prune"));
         assert!(cmd.contains("RCH_TARGET_ENTRY"));
         assert!(cmd.contains("done < \"$__tmpf\""));
-        // Read-only: the only removal is the tempfile bookkeeping.
+        // Read-only: never a recursive removal, and every `rm` targets a shell
+        // temp-file variable this script created — never a discovered path.
+        // (Stated as an invariant rather than an occurrence count so adding
+        // temp bookkeeping cannot silently weaken it.)
         assert!(!cmd.contains("rm -rf"));
-        assert!(cmd.matches("rm -f").count() == 1 && cmd.contains("rm -f \"$__tmpf\""));
+        let removals: Vec<&str> = cmd
+            .match_indices("rm -f ")
+            .map(|(i, _)| &cmd[i + "rm -f ".len()..])
+            .collect();
+        assert!(
+            !removals.is_empty(),
+            "enumerate should still clean up its temp files"
+        );
+        for tail in removals {
+            assert!(
+                tail.starts_with("\"$__"),
+                "enumerate must only rm its own temp files, found: rm -f {}",
+                &tail[..tail.len().min(40)]
+            );
+        }
+        assert!(cmd.contains("rm -f \"$__tmpf\""));
+    }
+
+    /// The string-shape tests above cannot catch a malformed generated script.
+    /// Actually RUN the sweep against a fixture and assert behaviour: a stale
+    /// pool under the TMP BASE (the case that was invisible before) is reaped,
+    /// a stale job dir under `$base` is reaped, and an ACTIVE dir in either
+    /// location survives.
+    #[cfg(unix)]
+    #[test]
+    fn worker_sweep_executes_and_reaps_only_idle_dirs() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("projects");
+        let tmpbase = tmp.path().join("scratch");
+        // Pools live 3 levels below the tmp base, mirroring the real layout:
+        // <tmpbase>/rch/<project>/<hash>/.rch-target-<worker>-pool-<key>
+        let stale_pool = tmpbase
+            .join("rch")
+            .join("proj")
+            .join("hash")
+            .join(".rch-target-w1-pool-deadbeef");
+        let active_pool = tmpbase
+            .join("rch")
+            .join("proj2")
+            .join("hash")
+            .join(".rch-target-w1-pool-cafe");
+        let stale_job = base.join("repo").join(".rch-target-w1-job-1-2-0");
+        let active_job = base.join("repo").join(".rch-target-w1-job-9-9-9");
+        for d in [&stale_pool, &active_pool, &stale_job, &active_job] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("artifact.o"), b"xxxx").unwrap();
+        }
+
+        // Age the stale ones well past the idle window. Whole-tree, because the
+        // predicate is `find <dir> -mmin -N` over everything inside.
+        for d in [&stale_pool, &stale_job] {
+            let ok = Command::new("find")
+                .arg(d)
+                .args(["-exec", "touch", "-t", "202001010000", "{}", "+"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                return; // no usable find/touch here; nothing to assert
+            }
+        }
+
+        let cmd = worker_sweep_command(base.to_str().unwrap(), 60, Some(MIN_POOLED_IDLE_MINUTES), None);
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("TMPDIR", &tmpbase)
+            .output()
+            .expect("sweep should execute");
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "generated sweep must be a valid script; stderr: {stderr}"
+        );
+        // A malformed script can still exit 0 while emitting syntax errors.
+        assert!(
+            !stderr.contains("syntax error") && !stderr.contains("unexpected"),
+            "generated sweep emitted shell errors: {stderr}"
+        );
+
+        assert!(
+            !stale_pool.exists(),
+            "stale pool under the TMP BASE must be reaped (the regression this fixes)"
+        );
+        assert!(!stale_job.exists(), "stale job dir under $base must be reaped");
+        assert!(active_pool.exists(), "recently-touched pool must survive");
+        assert!(active_job.exists(), "recently-touched job dir must survive");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let (removed, _freed) =
+            parse_worker_reap_metrics(&stdout).expect("sweep must print its metrics line");
+        assert_eq!(removed, 2, "exactly the two idle dirs; stdout: {stdout}");
     }
 
     #[test]
