@@ -43,7 +43,7 @@ use super::source_fidelity::{
     PreparedSourceContentRoot, finalize_source_content_receipt, prepare_source_content_root,
     verify_source_content_roots,
 };
-use super::ssh::ensure_worker_projects_topology;
+use super::ssh::{acquire_remote_source_authority_lock, ensure_worker_projects_topology};
 use super::*;
 
 pub(super) fn source_sync_terminal_summary(
@@ -330,6 +330,21 @@ pub(super) async fn execute_remote_compilation(
         &project_hash,
         topology_policy,
     );
+    // Ordinary Cargo invocations target shared canonical worker paths. Capture
+    // those logical authorities before any proof/overlay/Windows relocation so
+    // overlapping primary projects that share a path dependency take the same
+    // remote lock. Source-content and clean-overlay runs already own isolated
+    // source roots and do not need this mutable-authority guard.
+    let mutable_source_authority_roots = if exact_dependency_closure_sync
+        && source_content_build_id.is_none()
+    {
+        sync_plan
+            .iter()
+            .map(|entry| entry.remote_root.clone())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     if let Some(proof_build_id) = source_content_build_id {
         let proof_base = format!(
             "{}/source-content-{}-{}",
@@ -473,6 +488,39 @@ pub(super) async fn execute_remote_compilation(
     // Ensure deterministic remote topology before any repo synchronization.
     ensure_worker_projects_topology(&worker_config, reporter, topology_policy).await?;
 
+    // Hold every mutable source authority from before repo convergence and the
+    // first rsync until Cargo exits. A sync-only lock is insufficient: another
+    // invocation could otherwise replace a manifest or source file after
+    // preflight while rustc is still opening the closure.
+    let remote_cap = compilation_config.timeout_for_kind(kind);
+    let command_timeout = if compilation_config.external_timeout_enabled() {
+        remote_cap + std::time::Duration::from_secs(30)
+    } else {
+        remote_cap
+    };
+    let mut source_authority_lock = if mutable_source_authority_roots.is_empty()
+        || super::ssh::should_skip_remote_preflight(&worker_config)
+    {
+        None
+    } else {
+        reporter.verbose(&format!(
+            "[RCH] waiting for {} remote source-authority lock(s) on {}",
+            mutable_source_authority_roots.len(),
+            worker_config.id
+        ));
+        let guard = acquire_remote_source_authority_lock(
+            &worker_config,
+            &mutable_source_authority_roots,
+            command_timeout,
+        )
+        .await?;
+        reporter.verbose(&format!(
+            "[RCH] acquired remote source-authority locks on {}",
+            worker_config.id
+        ));
+        Some(guard)
+    };
+
     // Best-effort repo convergence for ordinary multi-repo dependency graphs.
     // A clean-overlay run already names an immutable base; mutating repositories
     // behind that receipt would break the source identity guarantee.
@@ -485,12 +533,6 @@ pub(super) async fn execute_remote_compilation(
     // remotely (same timeout_for_kind value). Give the local SSH stream a grace
     // margin over that cap so a genuine remote group-kill propagates as exit
     // 137 instead of losing the race to a local "SSH command timed out" (#20).
-    let remote_cap = compilation_config.timeout_for_kind(kind);
-    let command_timeout = if compilation_config.external_timeout_enabled() {
-        remote_cap + std::time::Duration::from_secs(30)
-    } else {
-        remote_cap
-    };
     let effective_env_allowlist =
         cargo_target_env_allowlist(&env_allowlist, forwarded_cargo_target_dir.is_some());
     let cargo_env_overrides = cargo_target_env_overrides(forwarded_cargo_target_dir.as_deref());
@@ -849,6 +891,9 @@ pub(super) async fn execute_remote_compilation(
         // then is the single receipt emitted.
         verify_source_content_roots(&worker_config, &prepared_source_roots).await?;
     }
+    if let Some(lock) = source_authority_lock.as_mut() {
+        lock.ensure_held()?;
+    }
 
     // Step 2: Execute command remotely with streaming output
     // Mask sensitive data (API keys, tokens, passwords) before logging
@@ -974,6 +1019,14 @@ pub(super) async fn execute_remote_compilation(
             },
         )
         .await?;
+
+    if let Some(lock) = source_authority_lock.take() {
+        lock.release().await?;
+        reporter.verbose(&format!(
+            "[RCH] released remote source-authority locks on {} after Cargo exit",
+            worker_config.id
+        ));
+    }
 
     let stderr_capture = std::mem::take(&mut *stderr_capture_cell.borrow_mut());
 

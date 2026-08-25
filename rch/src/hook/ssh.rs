@@ -35,6 +35,240 @@
 use super::*;
 
 const MAX_OFFLOAD_SSH_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const REMOTE_SOURCE_AUTHORITY_LOCK_DIR: &str = "/tmp/rch-source-authority-locks";
+
+/// Keeps the worker-side advisory locks for a mutable Cargo source closure alive.
+///
+/// The remote shell blocks on this SSH session's stdin after acquiring every
+/// lock. Dropping the guard kills the local SSH child; the resulting EOF/HUP
+/// tears down the nested `flock` processes and releases their kernel locks.
+pub(super) struct RemoteSourceAuthorityLock {
+    worker_id: WorkerId,
+    child: Option<tokio::process::Child>,
+    stdin: Option<tokio::process::ChildStdin>,
+    stdout_drain: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
+    stderr_drain: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
+}
+
+impl RemoteSourceAuthorityLock {
+    /// Fail closed if the lock-holder SSH process disappeared before Cargo starts.
+    pub(super) fn ensure_held(&mut self) -> anyhow::Result<()> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("remote source-authority lock is not active"))?;
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "remote source-authority lock on {} exited before Cargo started: {}",
+                self.worker_id,
+                status
+            );
+        }
+        Ok(())
+    }
+
+    /// Release the locks after Cargo exits and prove the holder stayed healthy.
+    pub(super) async fn release(mut self) -> anyhow::Result<()> {
+        drop(self.stdin.take());
+        let mut child = self
+            .child
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("remote source-authority lock is not active"))?;
+        let status = match timeout(Duration::from_secs(15), child.wait()).await {
+            Ok(status) => status?,
+            Err(_) => {
+                let _ = child.start_kill();
+                anyhow::bail!(
+                    "timed out releasing remote source-authority lock on {}",
+                    self.worker_id
+                );
+            }
+        };
+        let stdout = join_lock_drain(self.stdout_drain.take()).await?;
+        let stderr = join_lock_drain(self.stderr_drain.take()).await?;
+        if !status.success() {
+            anyhow::bail!(
+                "remote source-authority lock on {} exited unexpectedly: {}; stdout={}; stderr={}",
+                self.worker_id,
+                status,
+                String::from_utf8_lossy(&stdout).trim(),
+                String::from_utf8_lossy(&stderr).trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RemoteSourceAuthorityLock {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+        if let Some(task) = self.stdout_drain.take() {
+            task.abort();
+        }
+        if let Some(task) = self.stderr_drain.take() {
+            task.abort();
+        }
+    }
+}
+
+async fn join_lock_drain(
+    task: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> anyhow::Result<Vec<u8>> {
+    match task {
+        Some(task) => Ok(task.await??),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn source_authority_lock_paths(authority_roots: &[String]) -> Vec<String> {
+    let mut roots = authority_roots.to_vec();
+    roots.sort();
+    roots.dedup();
+    roots
+        .into_iter()
+        .map(|root| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"rch.remote_source_authority_lock.v1\0");
+            hasher.update(root.as_bytes());
+            format!(
+                "{REMOTE_SOURCE_AUTHORITY_LOCK_DIR}/{}.lock",
+                hasher.finalize().to_hex()
+            )
+        })
+        .collect()
+}
+
+fn build_remote_source_authority_lock_cmd(
+    lock_dir: &str,
+    lock_paths: &[String],
+    ready_marker: &str,
+) -> anyhow::Result<String> {
+    if lock_paths.is_empty() {
+        anyhow::bail!("remote source-authority lock set must not be empty");
+    }
+    let mut nested = format!(
+        "sh -c {}",
+        shell_escape::escape(
+            format!("printf '%s\\n' {} && cat >/dev/null", shell_escape::escape(ready_marker.into())).into()
+        )
+    );
+    for path in lock_paths.iter().rev() {
+        nested = format!(
+            "flock -x {} {nested}",
+            shell_escape::escape(path.as_str().into())
+        );
+    }
+    Ok(format!(
+        "set -e; mkdir -p -- {}; exec {nested}",
+        shell_escape::escape(lock_dir.into())
+    ))
+}
+
+/// Acquire sorted, worker-side locks for every mutable canonical source root.
+/// One persistent SSH session owns the whole set, so separate coordinator
+/// processes cannot overwrite any member of a Cargo closure while it compiles.
+pub(super) async fn acquire_remote_source_authority_lock(
+    worker: &WorkerConfig,
+    authority_roots: &[String],
+    wait_timeout: Duration,
+) -> anyhow::Result<RemoteSourceAuthorityLock> {
+    use anyhow::Context as _;
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+
+    let lock_paths = source_authority_lock_paths(authority_roots);
+    let ready_marker = format!("RCH_SOURCE_AUTHORITY_READY:{}", uuid::Uuid::new_v4());
+    let remote_cmd = build_remote_source_authority_lock_cmd(
+        REMOTE_SOURCE_AUTHORITY_LOCK_DIR,
+        &lock_paths,
+        &ready_marker,
+    )?;
+    let identity_file = shellexpand::tilde(&worker.identity_file);
+    let destination = format!("{}@{}", worker.user, worker.host);
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-i").arg(identity_file.as_ref());
+    cmd.arg(&destination);
+    cmd.arg(build_remote_shell_command(&remote_cmd));
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to start source-authority lock on {destination}"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("source-authority lock stdin was not piped"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("source-authority lock stdout was not piped"))?;
+    let mut stdout = tokio::io::BufReader::new(stdout);
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("source-authority lock stderr was not piped"))?;
+    let stderr_drain = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        tokio::io::BufReader::new(stderr)
+            .read_to_end(&mut bytes)
+            .await?;
+        Ok(bytes)
+    });
+
+    let mut observed = String::new();
+    match timeout(wait_timeout, stdout.read_line(&mut observed)).await {
+        Ok(Ok(0)) => {
+            let _ = child.start_kill();
+            let stderr = join_lock_drain(Some(stderr_drain)).await?;
+            anyhow::bail!(
+                "source-authority lock on {} exited before acquisition; stderr={}",
+                worker.id,
+                String::from_utf8_lossy(&stderr).trim()
+            );
+        }
+        Ok(Ok(_)) if observed.trim_end() == ready_marker => {}
+        Ok(Ok(_)) => {
+            let _ = child.start_kill();
+            anyhow::bail!(
+                "source-authority lock on {} emitted an invalid ready marker: {:?}",
+                worker.id,
+                observed.trim_end()
+            );
+        }
+        Ok(Err(err)) => {
+            let _ = child.start_kill();
+            return Err(err).context("failed reading source-authority lock readiness");
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            anyhow::bail!(
+                "timed out waiting {:?} for source-authority locks on {}",
+                wait_timeout,
+                worker.id
+            );
+        }
+    }
+
+    let stdout_drain = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await?;
+        Ok(bytes)
+    });
+    Ok(RemoteSourceAuthorityLock {
+        worker_id: worker.id.clone(),
+        child: Some(child),
+        stdin: Some(stdin),
+        stdout_drain: Some(stdout_drain),
+        stderr_drain: Some(stderr_drain),
+    })
+}
 
 pub(super) fn should_skip_remote_preflight(worker: &WorkerConfig) -> bool {
     mock::is_mock_enabled() || mock::is_mock_worker(worker)
@@ -449,6 +683,133 @@ async fn repair_worker_mirror_ownership(
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[test]
+    fn source_authority_lock_keys_are_sorted_deduplicated_and_root_stable() {
+        let _guard = test_guard!();
+        let forward = source_authority_lock_paths(&[
+            "/data/projects/franken_whisper".to_string(),
+            "/data/projects/frankensqlite".to_string(),
+            "/data/projects/frankensqlite".to_string(),
+        ]);
+        let reverse = source_authority_lock_paths(&[
+            "/data/projects/frankensqlite".to_string(),
+            "/data/projects/franken_whisper".to_string(),
+        ]);
+
+        assert_eq!(forward, reverse, "input order must not change lock order");
+        assert_eq!(forward.len(), 2, "duplicate roots need one authority lock");
+        assert_eq!(
+            source_authority_lock_paths(&["/data/projects/frankensqlite".to_string()]),
+            source_authority_lock_paths(&["/data/projects/frankensqlite".to_string()]),
+            "the same canonical root must serialize source-only revisions even when their project hashes differ"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_local_source_lock(
+        lock_path: &str,
+        marker: &str,
+    ) -> (
+        std::process::Child,
+        std::sync::mpsc::Receiver<std::io::Result<String>>,
+    ) {
+        use std::io::BufRead as _;
+
+        let command = build_remote_source_authority_lock_cmd(
+            "/tmp",
+            &[lock_path.to_string()],
+            marker,
+        )
+        .expect("build source lock command");
+        let mut child = std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(command)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn local source lock holder");
+        let stdout = child.stdout.take().expect("lock holder stdout");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .map(|_| line);
+            let _ = sender.send(result);
+        });
+        (child, receiver)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_authority_lock_is_held_until_owner_stdin_closes() {
+        let _guard = test_guard!();
+        let (mut first, first_ready) = spawn_local_source_lock("/tmp", "FIRST_READY");
+        assert_eq!(
+            first_ready
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first lock acquisition")
+                .expect("first ready line")
+                .trim_end(),
+            "FIRST_READY"
+        );
+
+        let (mut second, second_ready) = spawn_local_source_lock("/tmp", "SECOND_READY");
+        assert!(
+            matches!(
+                second_ready.recv_timeout(Duration::from_millis(200)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a competing sync must remain blocked for the entire execution phase"
+        );
+
+        drop(first.stdin.take());
+        assert!(first.wait().expect("wait for first lock holder").success());
+        assert_eq!(
+            second_ready
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second lock acquisition after first exits")
+                .expect("second ready line")
+                .trim_end(),
+            "SECOND_READY"
+        );
+        drop(second.stdin.take());
+        assert!(second.wait().expect("wait for second lock holder").success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disjoint_source_authorities_do_not_serialize() {
+        let _guard = test_guard!();
+        let current_dir = std::env::current_dir().expect("current directory");
+        let current_dir = current_dir.to_string_lossy().to_string();
+        let (mut first, first_ready) = spawn_local_source_lock("/tmp", "TMP_READY");
+        let (mut second, second_ready) = spawn_local_source_lock(&current_dir, "REPO_READY");
+
+        assert_eq!(
+            first_ready
+                .recv_timeout(Duration::from_secs(2))
+                .expect("tmp authority acquisition")
+                .expect("tmp ready line")
+                .trim_end(),
+            "TMP_READY"
+        );
+        assert_eq!(
+            second_ready
+                .recv_timeout(Duration::from_secs(2))
+                .expect("disjoint authority must acquire concurrently")
+                .expect("repo ready line")
+                .trim_end(),
+            "REPO_READY"
+        );
+
+        drop(first.stdin.take());
+        drop(second.stdin.take());
+        assert!(first.wait().expect("wait for tmp holder").success());
+        assert!(second.wait().expect("wait for repo holder").success());
+    }
 
     /// Platform-portable tempdir wrapper that canonicalizes its path
     /// (macOS resolves `/tmp` to `/private/tmp`).
