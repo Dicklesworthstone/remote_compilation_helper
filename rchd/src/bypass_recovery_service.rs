@@ -319,6 +319,20 @@ fn assess_probe_facts(
     }
 }
 
+/// Whether the telemetry dimension admits this worker during bypass recovery.
+///
+/// Windows workers run under Git Bash and cannot produce the Linux `/proc`-based
+/// telemetry stream. Their declared OS is already a hard placement fence, while
+/// the capability probe still checks SSH, the exact worker binary, protocol,
+/// toolchain, disk, and load. Treating the expected Windows telemetry gap as a
+/// hard recovery failure would make any temporary bypass permanent. Every other
+/// host remains freshness-gated.
+fn recovery_telemetry_ok(config: &WorkerConfig, observed_fresh: bool) -> bool {
+    observed_fresh
+        || rch_common::declared_os(&config.tags)
+            .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+}
+
 impl RecoveryProber for SshRecoveryProber {
     async fn probe(&self, worker: Arc<WorkerState>) -> RecoveryProbe {
         let config = worker.config.read().await.clone();
@@ -347,7 +361,8 @@ impl RecoveryProber for SshRecoveryProber {
 
         let facts = parse_capability_probe(&stdout);
         let load_per_core = Self::parse_load_per_core(&stdout);
-        let telemetry_ok = self.telemetry_fresh(config.id.as_str()).await;
+        let telemetry_ok =
+            recovery_telemetry_ok(&config, self.telemetry_fresh(config.id.as_str()).await);
         assess_probe_facts(&facts, load_per_core, telemetry_ok, &self.config)
     }
 
@@ -1306,5 +1321,16 @@ mod tests {
         let spec = prober.probe_spec(&worker);
 
         assert_eq!(spec.rch_wkr_path, "/c/Users/jeffr/.local/bin/rch-wkr.exe");
+    }
+
+    #[test]
+    fn recovery_telemetry_gap_is_expected_only_for_declared_windows_workers() {
+        let mut windows = worker_config("wsurf");
+        windows.tags = vec![rch_common::os_tag("windows")];
+        assert!(recovery_telemetry_ok(&windows, false));
+
+        let linux = worker_config("linux-worker");
+        assert!(!recovery_telemetry_ok(&linux, false));
+        assert!(recovery_telemetry_ok(&linux, true));
     }
 }
