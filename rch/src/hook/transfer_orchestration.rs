@@ -335,16 +335,15 @@ pub(super) async fn execute_remote_compilation(
     // overlapping primary projects that share a path dependency take the same
     // remote lock. Source-content and clean-overlay runs already own isolated
     // source roots and do not need this mutable-authority guard.
-    let mutable_source_authority_roots = if exact_dependency_closure_sync
-        && source_content_build_id.is_none()
-    {
-        sync_plan
-            .iter()
-            .map(|entry| entry.remote_root.clone())
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let mutable_source_authority_roots =
+        if exact_dependency_closure_sync && source_content_build_id.is_none() {
+            sync_plan
+                .iter()
+                .map(|entry| entry.remote_root.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
     if let Some(proof_build_id) = source_content_build_id {
         let proof_base = format!(
             "{}/source-content-{}-{}",

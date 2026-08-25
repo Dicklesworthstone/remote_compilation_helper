@@ -151,7 +151,11 @@ fn build_remote_source_authority_lock_cmd(
     let mut nested = format!(
         "sh -c {}",
         shell_escape::escape(
-            format!("printf '%s\\n' {} && cat >/dev/null", shell_escape::escape(ready_marker.into())).into()
+            format!(
+                "printf '%s\\n' {} && cat >/dev/null",
+                shell_escape::escape(ready_marker.into())
+            )
+            .into()
         )
     );
     for path in lock_paths.iter().rev() {
@@ -716,12 +720,9 @@ mod tests {
     ) {
         use std::io::BufRead as _;
 
-        let command = build_remote_source_authority_lock_cmd(
-            "/tmp",
-            &[lock_path.to_string()],
-            marker,
-        )
-        .expect("build source lock command");
+        let command =
+            build_remote_source_authority_lock_cmd("/tmp", &[lock_path.to_string()], marker)
+                .expect("build source lock command");
         let mut child = std::process::Command::new("sh")
             .arg("-lc")
             .arg(command)
@@ -776,7 +777,12 @@ mod tests {
             "SECOND_READY"
         );
         drop(second.stdin.take());
-        assert!(second.wait().expect("wait for second lock holder").success());
+        assert!(
+            second
+                .wait()
+                .expect("wait for second lock holder")
+                .success()
+        );
     }
 
     #[cfg(target_os = "linux")]
