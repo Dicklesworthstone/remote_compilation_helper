@@ -2930,6 +2930,8 @@ fn default_excludes() -> Vec<String> {
         ".parcel-cache/".to_string(),
         // Beads runtime state (local issue DB + lock/temp files); not needed remotely.
         ".beads/".to_string(),
+        // Local diagnostic runs may contain host-specific symlinks and are not build inputs.
+        ".doctor/".to_string(),
         // Coverage reports (generated during tests)
         "coverage/".to_string(),
         ".nyc_output/".to_string(),

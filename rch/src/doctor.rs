@@ -8578,6 +8578,7 @@ exit 0\n"
             all.probe_names_to_run(false),
             vec![
                 "topology",
+                "ownership",
                 "convergence",
                 "pressure",
                 "triage",
@@ -8589,6 +8590,7 @@ exit 0\n"
             all.probe_names_to_run(true),
             vec![
                 "topology",
+                "ownership",
                 "convergence",
                 "pressure",
                 "triage",

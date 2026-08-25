@@ -39,6 +39,7 @@ use super::repo_updater::{
     collect_repo_updater_roots_and_specs, hydrate_repo_updater_auth_context_defaults,
     infer_repo_updater_auth_context_with_env_lookup, repo_updater_command_name,
 };
+use super::ssh::offload_remote_command_transport;
 use super::timing_history::{
     MAX_TIMING_SAMPLES, ProjectTimingData, TimingEstimate, TimingHistory, TimingRecord,
     estimate_timing_for_build, record_build_timing, timing_cache,
@@ -4250,6 +4251,28 @@ async fn test_collect_repo_updater_roots_and_specs_filters_to_git_roots_with_ori
     std::fs::create_dir_all(&without_origin).expect("create without_origin");
     std::fs::create_dir_all(&not_git).expect("create not_git");
 
+    // Make the fixture hermetic. This test needs `not_git` to be genuinely
+    // outside any repository, and it has always *assumed* that a temp dir is —
+    // but never enforced it. rch rewrites TMPDIR into the project directory, so
+    // under rch's own execution the temp dir lands INSIDE this repository's git
+    // tree; git-root discovery then correctly walks up, finds the enclosing
+    // repo, and `not_git` stops looking like a non-repo. Initialising the temp
+    // root gives discovery a boundary to stop at, so the fixture means what it
+    // says wherever TMPDIR happens to point. The boundary repo has no origin, so
+    // it is filtered by the origin rule and never appears in the expectation.
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(temp_dir.path())
+        .arg("init")
+        .arg("-q")
+        .status()
+        .expect("git init should run for the fixture boundary");
+    assert!(
+        status.success(),
+        "git init should succeed for the fixture boundary at {}",
+        temp_dir.path().display()
+    );
+
     for repo in [&with_origin, &duplicate_origin, &without_origin] {
         let status = std::process::Command::new("git")
             .arg("-C")
@@ -4473,6 +4496,23 @@ fn test_build_remote_dependency_preflight_command_separates_checks() {
         command.contains("RCH_DEP_MISSING:"),
         "generated command must emit structured missing marker"
     );
+}
+
+#[test]
+fn test_windows_offload_control_commands_use_stdin_script_transport() {
+    let _guard = test_guard!();
+    let script = "for required in 'C:/rch/app/Cargo.toml'; do test -f \"$required\"; done";
+
+    let mut windows = make_test_worker_config("worker-windows-control-plane");
+    windows.tags.push("os:windows".to_string());
+    let (remote_arg, stdin_payload) = offload_remote_command_transport(&windows, script);
+    assert_eq!(remote_arg, "sh -s");
+    assert_eq!(stdin_payload, Some(script.as_bytes()));
+
+    let posix = make_test_worker_config("worker-posix-control-plane");
+    let (remote_arg, stdin_payload) = offload_remote_command_transport(&posix, script);
+    assert_eq!(remote_arg, script);
+    assert!(stdin_payload.is_none());
 }
 
 #[test]

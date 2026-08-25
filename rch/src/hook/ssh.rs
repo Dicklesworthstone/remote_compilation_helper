@@ -283,7 +283,24 @@ pub(super) async fn run_offload_ssh_command(
     remote_cmd: &str,
     timeout_duration: Duration,
 ) -> anyhow::Result<Output> {
-    run_offload_ssh_command_with_optional_stdin(worker, remote_cmd, None, timeout_duration).await
+    let (remote_arg, stdin_payload) = offload_remote_command_transport(worker, remote_cmd);
+    run_offload_ssh_command_with_optional_stdin(worker, remote_arg, stdin_payload, timeout_duration)
+        .await
+}
+
+/// Windows OpenSSH passes its remote command through an additional shell
+/// boundary, where the nested single quotes produced by `sh -lc` can be
+/// reparsed and truncated. Feed control-plane scripts to `sh -s` instead;
+/// POSIX workers retain the historical argv transport.
+pub(super) fn offload_remote_command_transport<'a>(
+    worker: &WorkerConfig,
+    remote_cmd: &'a str,
+) -> (&'a str, Option<&'a [u8]>) {
+    if crate::transfer::WorkerPlatform::from_worker(worker).is_windows() {
+        ("sh -s", Some(remote_cmd.as_bytes()))
+    } else {
+        (remote_cmd, None)
+    }
 }
 
 /// Execute a hardened control-plane SSH command while streaming a bounded

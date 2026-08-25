@@ -6852,10 +6852,46 @@ mod tests {
         assert!(result.is_err(), "unknown flag must error");
     }
 
+    /// A base directory guaranteed to sit outside the compiled-in default
+    /// topology roots, so a fixture built under it is one the default
+    /// `PathTopologyPolicy` must reject.
+    fn default_topology_free_base() -> std::path::PathBuf {
+        use rch_common::path_topology::{
+            DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT,
+        };
+        let defaults = [
+            std::path::Path::new(DEFAULT_CANONICAL_PROJECT_ROOT),
+            std::path::Path::new(DEFAULT_ALIAS_PROJECT_ROOT),
+        ];
+        let mut candidates = vec![std::env::temp_dir()];
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(std::path::PathBuf::from(home));
+        }
+        candidates.push(std::path::PathBuf::from("/tmp"));
+        candidates
+            .into_iter()
+            .find(|c| {
+                c.is_dir() && !defaults.iter().any(|d| c.starts_with(d))
+            })
+            .expect(
+                "no writable base outside the default topology roots \
+                 (/data/projects, /dp); this test cannot express its contract here",
+            )
+    }
+
     #[test]
     fn cache_warm_project_root_uses_configured_topology() {
         let _guard = test_guard!();
-        let temp = tempfile::TempDir::new().unwrap();
+        // The second assertion below requires a fixture that lives OUTSIDE the
+        // compiled-in default topology (/data/projects and /dp) — that is the
+        // whole point: proving the configured policy is consulted rather than
+        // the default. tempfile honours TMPDIR, and rch rewrites TMPDIR into the
+        // project directory, which on a build host sits under /data/projects. In
+        // that environment the default policy legitimately ACCEPTS the fixture
+        // and the assertion fails for an environmental reason rather than a
+        // behavioural one. Pick a base that cannot collide, and say so loudly if
+        // no such base exists rather than asserting something untrue.
+        let temp = tempfile::TempDir::new_in(default_topology_free_base()).unwrap();
         let canonical_root = temp.path().join("projects");
         let alias_root = temp.path().join("alias");
         let project = canonical_root.join("demo");
