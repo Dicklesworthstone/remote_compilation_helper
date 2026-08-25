@@ -145,12 +145,18 @@ fn delegates_to_shim(path: &Path) -> bool {
     content.contains(".rch/shims/cargo") || content.contains(SHIM_MARKER)
 }
 
-/// Resolve the first `cargo` on `PATH` and classify it.
+/// Resolve the first `cargo` on this process's `PATH` and classify it.
 fn cargo_interception(shim: &Path) -> Interception {
     let Some(path) = std::env::var_os("PATH") else {
         return Interception::None;
     };
-    for entry in std::env::split_paths(&path) {
+    cargo_interception_in(&path, shim)
+}
+
+/// Same, over an explicit search path. Split out so the resolution rules are
+/// testable as a pure function instead of by mutating the process environment.
+fn cargo_interception_in(path: &std::ffi::OsStr, shim: &Path) -> Interception {
+    for entry in std::env::split_paths(path) {
         // POSIX treats an empty PATH entry as "$PWD". Honoring that here would
         // make the verdict depend on the directory rch happens to be run from
         // (a stray ./cargo would be read as the resolved cargo), so skip it —
@@ -949,20 +955,69 @@ mod tests {
     #[test]
     fn empty_path_entries_do_not_resolve_cargo_from_cwd() {
         // A stray ./cargo must not decide the verdict just because PATH has an
-        // empty component. Directly exercises the guard in cargo_interception.
+        // empty component, which POSIX reads as "$PWD".
         let dir = tempfile::tempdir().unwrap();
-        let shim = dir.path().join("shims").join("cargo");
-        std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        let shim_dir = dir.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let shim = shim_dir.join("cargo");
         std::fs::write(&shim, cargo_shim_body(true)).unwrap();
-        // PATH = ":<shimdir>" — leading empty entry, then the real shim dir.
-        let joined = std::env::join_paths([
-            std::path::PathBuf::new(),
-            shim.parent().unwrap().to_path_buf(),
-        ])
+
+        // Leading empty entry, then the shim dir: the shim must still win.
+        let with_empty =
+            std::env::join_paths([std::path::PathBuf::new(), shim_dir.clone()]).unwrap();
+        assert_eq!(
+            cargo_interception_in(&with_empty, &shim),
+            Interception::Direct
+        );
+    }
+
+    #[test]
+    fn first_cargo_on_path_decides_and_a_real_binary_reports_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join("shims");
+        let real_dir = dir.path().join("cargo-bin");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let shim = shim_dir.join("cargo");
+        std::fs::write(&shim, cargo_shim_body(true)).unwrap();
+        // Stand-in for the real multi-MB cargo binary.
+        std::fs::write(real_dir.join("cargo"), vec![0u8; 16 * 1024]).unwrap();
+
+        // Real cargo first => shadowed shim, correctly reported as not intercepted.
+        let real_first =
+            std::env::join_paths([real_dir.clone(), shim_dir.clone()]).unwrap();
+        assert_eq!(cargo_interception_in(&real_first, &shim), Interception::None);
+
+        // Shim first => intercepted.
+        let shim_first = std::env::join_paths([shim_dir, real_dir]).unwrap();
+        assert_eq!(
+            cargo_interception_in(&shim_first, &shim),
+            Interception::Direct
+        );
+    }
+
+    #[test]
+    fn delegating_wrapper_earlier_on_path_is_still_interception() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join("shims");
+        let deleg_dir = dir.path().join("local-bin");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&deleg_dir).unwrap();
+        let shim = shim_dir.join("cargo");
+        std::fs::write(&shim, cargo_shim_body(true)).unwrap();
+        // The real-world ~/.local/bin/cargo that execs the shim. This is the
+        // case the old PATH-order check reported as "not intercepted".
+        std::fs::write(
+            deleg_dir.join("cargo"),
+            b"#!/bin/sh\nSHIM=\"$HOME/.rch/shims/cargo\"\nexec \"$SHIM\" \"$@\"\n",
+        )
         .unwrap();
-        // SAFETY: single-threaded test process mutating its own env.
-        unsafe { std::env::set_var("PATH", &joined) };
-        assert_eq!(cargo_interception(&shim), Interception::Direct);
+
+        let deleg_first = std::env::join_paths([deleg_dir, shim_dir]).unwrap();
+        assert_eq!(
+            cargo_interception_in(&deleg_first, &shim),
+            Interception::Delegated
+        );
     }
 
     #[test]
