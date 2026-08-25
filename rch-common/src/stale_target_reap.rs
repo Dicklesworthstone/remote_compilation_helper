@@ -190,6 +190,15 @@ pub fn reap_loop_body_with_event(
 /// gated on it being at least two segments deep so a bare `/tmp` fallback is
 /// deliberately never scanned (mirrors the `$base` depth guard).
 ///
+/// The tmp base is resolved into `$__tmpscan` — canonicalized with `pwd -P`
+/// exactly like `$__rt`, and empty when it must not be scanned. Canonicalizing
+/// BOTH roots is what makes the string dedup sound: if one root were canonical
+/// and the other not, the same physical directory could appear under two
+/// spellings and be counted (and byte-capped) twice. The depth guard is applied
+/// before AND after resolution, so a `/tmp` fallback that canonicalizes to a
+/// deeper path (macOS `/private/tmp`) still does not become sweepable.
+/// `$__tmpbase` itself remains the `mktemp` location.
+///
 /// `on_guard_exit` is the `sh` fragment run before `exit 0` on every guard
 /// bail-out (e.g. printing an empty metrics line so callers always parse a
 /// result). The `find … > file` + `while read … < file` shape (instead of a
@@ -239,10 +248,13 @@ fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str) -> Stri
          __tmpbase=\"${{TMPDIR:-}}\"; \
          [ -n \"$__tmpbase\" ] && [ -d \"$__tmpbase\" ] || __tmpbase=/data/tmp; \
          [ -d \"$__tmpbase\" ] || __tmpbase=/tmp; \
+         __tmpscan=\"\"; \
+         case \"$__tmpbase\" in /*/*) __tmpscan=$(cd \"$__tmpbase\" 2>/dev/null && pwd -P) || __tmpscan=\"\";; esac; \
+         case \"$__tmpscan\" in /*/*) ;; *) __tmpscan=\"\";; esac; \
          __tmpf=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) || {{ {on_guard_exit}exit 0; }}; \
          find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null > \"$__tmpf\"; \
-         case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf\"; \
-           find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null >> \"$__tmpf\";; esac; \
+         if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf\"; \
+           find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null >> \"$__tmpf\"; fi; \
          {dedup}",
         dedup = dedup_candidate_file("__tmpf")
     )
@@ -289,7 +301,7 @@ pub fn worker_sweep_command(
             format!(
                 "if __tmpf2=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
                    find \"$__rt\" -maxdepth 8 -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null > \"$__tmpf2\"; \
-                   case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf2\";; esac; \
+                   if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf2\"; fi; \
                    {dedup2}\
                    while IFS= read -r d; do {pooled_body} done < \"$__tmpf2\"; \
                    rm -f \"$__tmpf2\"; \
@@ -318,8 +330,8 @@ pub fn worker_sweep_command(
                && __lst=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) \
                && __tmpf3=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
                find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" \\) -prune 2>/dev/null > \"$__tmpf3\"; \
-               case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf3\"; \
-                 find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" \\) -prune 2>/dev/null >> \"$__tmpf3\";; esac; \
+               if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf3\"; \
+                 find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" \\) -prune 2>/dev/null >> \"$__tmpf3\"; fi; \
                {dedup3}\
                : > \"$__lst\"; total_kb=0; \
                while IFS= read -r d; do \
@@ -487,7 +499,7 @@ pub fn enumerate_targets_command(escaped_base: &str) -> String {
     format!(
         "{preamble}\
          find \"$__rt\" -maxdepth 8 -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf\"; \
-         case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf\";; esac; \
+         if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf\"; fi; \
          {dedup}\
          while IFS= read -r d; do \
            [ -d \"$d\" ] || continue; \
@@ -602,11 +614,11 @@ mod tests {
 
         // Job/pid pass reaches the tmp base, not just depth-1 `rch_target_*`.
         assert!(cmd.contains(&format!(
-            "find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\)"
+            "find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\)"
         )));
         // Pooled pass reaches the tmp base too.
         assert!(cmd.contains(&format!(
-            "find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d -name \".rch-target-*-pool-*\""
+            "find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d -name \".rch-target-*-pool-*\""
         )));
         // The legacy depth-1 pass is retained, not replaced.
         assert!(cmd.contains("-maxdepth 1 -type d -name \"rch_target_*\""));
@@ -637,13 +649,31 @@ mod tests {
     /// root, so a bare `/tmp` fallback is never swept wholesale.
     #[test]
     fn tmp_base_passes_keep_shallow_root_guard() {
-        let cmd = worker_sweep_command("/data/projects", 720, Some(10_080), None);
-        for pass in cmd.split("case \"$__tmpbase\" in").skip(1) {
-            assert!(
-                pass.starts_with(" /*/*)"),
-                "tmp-base pass must keep the /*/* depth guard: {pass}"
-            );
-        }
+        let cmd = worker_sweep_command("/data/projects", 720, Some(10_080), Some(1024));
+
+        // The depth guard is applied to the raw tmp base before resolution AND
+        // to the resolved path, so neither a shallow `/tmp` nor a `/tmp` that
+        // canonicalizes deeper (macOS `/private/tmp`) becomes sweepable.
+        assert!(cmd.contains("case \"$__tmpbase\" in /*/*) __tmpscan="));
+        assert!(cmd.contains("case \"$__tmpscan\" in /*/*) ;; *) __tmpscan=\"\";; esac"));
+        // Both roots are canonicalized, which is what makes string dedup sound.
+        assert!(cmd.contains("__rt=$(cd \"$base\" 2>/dev/null && pwd -P)"));
+        assert!(cmd.contains("__tmpscan=$(cd \"$__tmpbase\" 2>/dev/null && pwd -P)"));
+
+        // Every tmp-base scan must sit behind the resolved, guarded variable —
+        // never scan `$__tmpbase` directly, which is only the mktemp location.
+        assert!(
+            !cmd.contains("find \"$__tmpbase\""),
+            "tmp-base scans must use the resolved $__tmpscan, not $__tmpbase"
+        );
+        // ...and each such scan is gated on it being non-empty.
+        let scans = cmd.matches("find \"$__tmpscan\"").count();
+        let gates = cmd.matches("if [ -n \"$__tmpscan\" ]; then").count();
+        assert!(scans >= 4, "expected the job/pid, legacy, pooled and cap scans");
+        assert!(
+            gates >= 3,
+            "every tmp-base scan group must be gated on $__tmpscan being set"
+        );
     }
 
     #[test]
@@ -776,7 +806,7 @@ mod tests {
         assert!(!cmd.contains("sweep-pool"));
         // 6dj11: the legacy tmp-base pass, depth-guarded so /tmp is never swept.
         assert!(cmd.contains(
-            "case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune"
+            "if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune"
         ));
         // Metrics survive the loop: no `find | while` pipe subshell.
         assert!(cmd.contains("done < \"$__tmpf\""));
