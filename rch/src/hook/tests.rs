@@ -44,7 +44,9 @@ use super::timing_history::{
     MAX_TIMING_SAMPLES, ProjectTimingData, TimingEstimate, TimingHistory, TimingRecord,
     estimate_timing_for_build, record_build_timing, timing_cache,
 };
-use super::transfer_orchestration::{source_sync_terminal_summary, wrap_command_with_telemetry};
+use super::transfer_orchestration::{
+    apply_source_sync_integrity_policy, source_sync_terminal_summary, wrap_command_with_telemetry,
+};
 use proptest::prelude::*;
 use rch_common::mock::{
     self, MockConfig, MockRsyncConfig, clear_mock_overrides, set_mock_enabled_override,
@@ -5472,6 +5474,36 @@ async fn test_verify_remote_dependency_manifests_blocks_stale_outcomes_determini
         )
     );
     mock::set_thread_mock_override(None);
+}
+
+#[test]
+fn stale_source_exact_cargo_closure_sync_requires_content_checks() {
+    let _guard = test_guard!();
+
+    for (exact_dependency_closure_sync, source_content_receipt, expected_checksum) in [
+        (false, false, false),
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+    ] {
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/exact-closure-root"),
+            "exact-closure-root".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let configured = apply_source_sync_integrity_policy(
+            pipeline,
+            exact_dependency_closure_sync,
+            source_content_receipt,
+        );
+        let (_, _, _, checksum_transfer) = configured.source_content_filter_policy();
+
+        assert_eq!(
+            checksum_transfer, expected_checksum,
+            "exact Cargo closure and receipt syncs must compare source bytes"
+        );
+    }
 }
 
 #[test]

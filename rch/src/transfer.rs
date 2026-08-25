@@ -8553,6 +8553,75 @@ Total file size: 123 bytes";
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stale_source_checksum_rsync_replaces_equal_metadata_divergent_bytes() {
+        let _guard = test_guard!();
+        let source = tempfile::tempdir().expect("create source fixture");
+        let destination = tempfile::tempdir().expect("create destination fixture");
+        let source_file = source.path().join("lib.rs");
+        let destination_file = destination.path().join("lib.rs");
+        let source_bytes = b"local-new\n";
+        let stale_bytes = b"stale-old\n";
+        assert_eq!(source_bytes.len(), stale_bytes.len());
+        std::fs::write(&source_file, source_bytes).expect("write source bytes");
+        std::fs::write(&destination_file, stale_bytes).expect("write stale destination bytes");
+
+        let timestamp = std::time::SystemTime::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(1_700_000_000))
+            .expect("fixture timestamp");
+        let times = std::fs::FileTimes::new()
+            .set_accessed(timestamp)
+            .set_modified(timestamp);
+        std::fs::File::options()
+            .write(true)
+            .open(&source_file)
+            .expect("open source fixture")
+            .set_times(times)
+            .expect("stamp source fixture");
+        std::fs::File::options()
+            .write(true)
+            .open(&destination_file)
+            .expect("open destination fixture")
+            .set_times(times)
+            .expect("stamp destination fixture");
+
+        let plain = std::process::Command::new("rsync")
+            .arg("-a")
+            .arg(format!("{}/", source.path().display()))
+            .arg(format!("{}/", destination.path().display()))
+            .output()
+            .expect("run ordinary rsync");
+        assert!(
+            plain.status.success(),
+            "ordinary rsync failed: {}",
+            String::from_utf8_lossy(&plain.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&destination_file).expect("read ordinary rsync destination"),
+            stale_bytes,
+            "size-and-mtime quick checks must reproduce the stale-byte failure"
+        );
+
+        let checksum = std::process::Command::new("rsync")
+            .arg("-a")
+            .arg("--checksum")
+            .arg(format!("{}/", source.path().display()))
+            .arg(format!("{}/", destination.path().display()))
+            .output()
+            .expect("run checksum rsync");
+        assert!(
+            checksum.status.success(),
+            "checksum rsync failed: {}",
+            String::from_utf8_lossy(&checksum.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&destination_file).expect("read checksum rsync destination"),
+            source_bytes,
+            "checksum-aware sync must replace stale bytes before remote Cargo"
+        );
+    }
+
     #[test]
     fn clean_overlay_git_command_clears_ambient_repository_selection() {
         let _guard = test_guard!();

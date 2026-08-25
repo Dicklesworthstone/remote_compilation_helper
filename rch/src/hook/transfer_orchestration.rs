@@ -64,6 +64,20 @@ pub(super) fn source_sync_terminal_summary(
     ))
 }
 
+pub(super) fn apply_source_sync_integrity_policy(
+    pipeline: TransferPipeline,
+    exact_dependency_closure_sync: bool,
+    source_content_receipt: bool,
+) -> TransferPipeline {
+    // Exact Cargo closure sync is correctness-authoritative: rsync's default size-and-mtime
+    // quick check can otherwise retain stale dependency bytes with matching metadata.
+    if exact_dependency_closure_sync || source_content_receipt {
+        pipeline.with_sync_checksum(true)
+    } else {
+        pipeline
+    }
+}
+
 pub(super) fn wrap_command_with_telemetry(command: &str, worker_id: &WorkerId) -> String {
     let escaped_worker = shell_escape::escape(worker_id.as_str().into());
     // Use newline instead of semicolon to ensure trailing comments in command
@@ -615,9 +629,11 @@ pub(super) async fn execute_remote_compilation(
                 root_pipeline = root_pipeline.with_remote_cargo_target_dir_name(name.clone());
             }
         }
-        if source_content_receipt {
-            root_pipeline = root_pipeline.with_sync_checksum(true);
-        }
+        root_pipeline = apply_source_sync_integrity_policy(
+            root_pipeline,
+            exact_dependency_closure_sync,
+            source_content_receipt,
+        );
 
         let prepared_source_root = if source_content_receipt {
             Some(
