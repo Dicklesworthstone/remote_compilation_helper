@@ -206,6 +206,28 @@ pub fn reap_loop_body_with_event(
 /// for a deeper stage layout without turning the walk into a full-tree scan.
 const TMPBASE_MAXDEPTH: u32 = 6;
 
+/// Emit an in-place dedup of the candidate list held in `$<var>` that can never
+/// truncate it.
+///
+/// The tmp-base pass can rediscover a dir the `$base` pass already listed (when
+/// the sync root sits under the tmp base), and a duplicate would be counted
+/// twice in the byte-cap pass's `total_kb`, over-evicting warm caches. The
+/// obvious `sort -u F -o F` is safe with GNU sort on a healthy filesystem — but
+/// this sweep runs precisely when a disk is FULL, and a sort that fails after
+/// opening its output would leave the candidate list empty, so gc would reap
+/// nothing exactly when it is needed most. Sorting into a fresh temp and moving
+/// it over only on success keeps the original list intact on any failure; the
+/// cost of a failed dedup is a duplicate entry, which the reap loop already
+/// tolerates via its leading `[ -d "$d" ] || continue`.
+fn dedup_candidate_file(var: &str) -> String {
+    format!(
+        "if __ded=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
+           if sort -u \"${var}\" -o \"$__ded\" 2>/dev/null; then mv -f \"$__ded\" \"${var}\"; \
+           else rm -f \"$__ded\"; fi; \
+         fi; "
+    )
+}
+
 fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str) -> String {
     format!(
         "set -u; \
@@ -221,7 +243,8 @@ fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str) -> Stri
          find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null > \"$__tmpf\"; \
          case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf\"; \
            find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null >> \"$__tmpf\";; esac; \
-         sort -u \"$__tmpf\" -o \"$__tmpf\" 2>/dev/null || true; "
+         {dedup}",
+        dedup = dedup_candidate_file("__tmpf")
     )
 }
 
@@ -262,11 +285,12 @@ pub fn worker_sweep_command(
             let window = window.max(MIN_POOLED_IDLE_MINUTES);
             let pooled_body =
                 reap_loop_body_with_event(window, None, "removed", "freed_kb", Some("pooled-ttl"));
+            let dedup2 = dedup_candidate_file("__tmpf2");
             format!(
                 "if __tmpf2=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
                    find \"$__rt\" -maxdepth 8 -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null > \"$__tmpf2\"; \
                    case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf2\";; esac; \
-                   sort -u \"$__tmpf2\" -o \"$__tmpf2\" 2>/dev/null || true; \
+                   {dedup2}\
                    while IFS= read -r d; do {pooled_body} done < \"$__tmpf2\"; \
                    rm -f \"$__tmpf2\"; \
                  fi; "
@@ -287,6 +311,7 @@ pub fn worker_sweep_command(
     // the TTL passes just removed entries; `sort -n` orders oldest-mtime
     // first; the eviction loop reads from a FILE so the counter mutations
     // survive (no pipe subshell).
+    let dedup3 = dedup_candidate_file("__tmpf3");
     let cap_pass = match max_cache_kb {
         Some(cap_kb) => format!(
             "if [ {cap_kb} -gt 0 ] \
@@ -295,7 +320,7 @@ pub fn worker_sweep_command(
                find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" \\) -prune 2>/dev/null > \"$__tmpf3\"; \
                case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf3\"; \
                  find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" \\) -prune 2>/dev/null >> \"$__tmpf3\";; esac; \
-               sort -u \"$__tmpf3\" -o \"$__tmpf3\" 2>/dev/null || true; \
+               {dedup3}\
                : > \"$__lst\"; total_kb=0; \
                while IFS= read -r d; do \
                  [ -d \"$d\" ] || continue; \
@@ -578,10 +603,26 @@ mod tests {
         // The legacy depth-1 pass is retained, not replaced.
         assert!(cmd.contains("-maxdepth 1 -type d -name \"rch_target_*\""));
         // A base that is also under the tmp base can list a dir twice; dedup
-        // keeps the metrics honest and avoids a second rm on a removed path.
-        assert!(cmd.contains("sort -u \"$__tmpf\" -o \"$__tmpf\""));
-        assert!(cmd.contains("sort -u \"$__tmpf2\" -o \"$__tmpf2\""));
-        assert!(cmd.contains("sort -u \"$__tmpf3\" -o \"$__tmpf3\""));
+        // keeps the byte-cap pass's total_kb honest.
+        for var in ["__tmpf", "__tmpf2", "__tmpf3"] {
+            assert!(
+                cmd.contains(&format!("sort -u \"${var}\" -o \"$__ded\"")),
+                "missing dedup for ${var}"
+            );
+            assert!(
+                cmd.contains(&format!("mv -f \"$__ded\" \"${var}\"")),
+                "dedup for ${var} must move the sorted temp back into place"
+            );
+        }
+        // Dedup must NEVER sort a candidate list onto itself: gc runs on full
+        // disks, and a sort that fails after opening its output would empty the
+        // list exactly when gc is needed most.
+        for var in ["__tmpf", "__tmpf2", "__tmpf3"] {
+            assert!(
+                !cmd.contains(&format!("sort -u \"${var}\" -o \"${var}\"")),
+                "in-place sort of ${var} can truncate the candidate list"
+            );
+        }
     }
 
     /// The tmp-base walk stays behind the same two-segment guard as the sync
