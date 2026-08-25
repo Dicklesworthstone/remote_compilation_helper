@@ -101,25 +101,277 @@ fn installed_shim_version(path: &Path) -> Option<String> {
     })
 }
 
-/// Whether `shim_dir` appears before `~/.cargo/bin` in `PATH` (required for the
-/// shim to actually intercept `cargo`).
-fn shim_dir_precedes_cargo_bin(dir: &Path) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
+/// How `cargo` actually resolves on this box right now.
+///
+/// Comparing raw `PATH` order against `shim_dir` is not sufficient: installers
+/// (and rch's own docs) legitimately place a *delegating* `cargo` earlier on
+/// `PATH` — a tiny script whose only job is to `exec` the canonical shim. That
+/// still intercepts, so reporting "not intercepted" for it is a false alarm
+/// that sends operators off reordering `PATH` for no reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Interception {
+    /// `PATH` resolves straight to the rch shim.
+    Direct,
+    /// `PATH` resolves to a wrapper that delegates to the rch shim.
+    Delegated,
+    /// `PATH` resolves to a real cargo binary — builds run locally.
+    None,
+}
+
+impl Interception {
+    fn intercepts(self) -> bool {
+        matches!(self, Self::Direct | Self::Delegated)
+    }
+}
+
+/// True if `path` is a small text file that hands off to the rch shim.
+///
+/// Deliberately content-based rather than name-based: the delegating wrapper is
+/// written by installers we do not control, so the only reliable signal is that
+/// it references the shim we own.
+fn delegates_to_shim(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
-    let cargo_bin = dirs::home_dir().map(|h| h.join(".cargo").join("bin"));
-    for entry in std::env::split_paths(&path) {
-        if entry == dir {
-            return true;
-        }
-        if let Some(cb) = &cargo_bin
-            && &entry == cb
-        {
-            // Hit ~/.cargo/bin first → the rustup cargo wins.
-            return false;
-        }
+    // A real cargo is megabytes; a delegating shell wrapper is a few hundred
+    // bytes. Bail early so we never slurp a binary.
+    if meta.len() > 8 * 1024 {
+        return false;
     }
-    false
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    content.contains(".rch/shims/cargo") || content.contains(SHIM_MARKER)
+}
+
+/// Resolve the first `cargo` on `PATH` and classify it.
+fn cargo_interception(shim: &Path) -> Interception {
+    let Some(path) = std::env::var_os("PATH") else {
+        return Interception::None;
+    };
+    for entry in std::env::split_paths(&path) {
+        let candidate = entry.join("cargo");
+        if !candidate.is_file() {
+            continue;
+        }
+        // First cargo on PATH decides — everything after it is shadowed.
+        if candidate == shim {
+            return Interception::Direct;
+        }
+        if delegates_to_shim(&candidate) {
+            return Interception::Delegated;
+        }
+        return Interception::None;
+    }
+    Interception::None
+}
+
+// ---------------------------------------------------------------------------
+// Toolchain wrapping
+//
+// The PATH shim only catches PATH lookups. Scripts, Makefiles, build drivers
+// and agents routinely invoke `~/.rustup/toolchains/<tc>/bin/cargo` by ABSOLUTE
+// path (rustup's own `cargo +nightly ...` re-exec does too), which bypasses
+// PATH entirely. Wrapping the toolchain binary itself is the one layer an
+// absolute-path call cannot dodge, so `shim install` does it too.
+//
+// Mechanism, per toolchain:
+//   cargo           -> wrapper script (delegates to the canonical shim)
+//   cargo-rch-real  -> HARDLINK to the original binary (same inode)
+// A hardlink (not a move) keeps the code signature intact, duplicates no bytes,
+// and means `cargo` never stops existing for even an instant. The swap-in is an
+// atomic rename, so a concurrent exec sees either the old or new file, never a
+// missing one.
+// ---------------------------------------------------------------------------
+
+/// Bumped whenever the toolchain wrapper body changes.
+const TOOLCHAIN_WRAP_VERSION: &str = "1";
+
+/// Marker identifying an rch-managed toolchain wrapper (vs. the real binary).
+const TOOLCHAIN_MARKER: &str = "# rch-toolchain-wrap-version:";
+
+/// Filename the original toolchain cargo is preserved under.
+const REAL_CARGO_NAME: &str = "cargo-rch-real";
+
+/// `~/.rustup/toolchains`, honoring `RUSTUP_HOME`.
+fn rustup_toolchains_dir() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("RUSTUP_HOME") {
+        return Some(PathBuf::from(home).join("toolchains"));
+    }
+    dirs::home_dir().map(|h| h.join(".rustup").join("toolchains"))
+}
+
+/// Every installed toolchain's `bin/cargo`, sorted for stable output.
+fn toolchain_cargos() -> Vec<PathBuf> {
+    let Some(root) = rustup_toolchains_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path().join("bin").join("cargo"))
+        .filter(|p| p.is_file())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Render the toolchain wrapper.
+///
+/// `$0` is the toolchain's own `bin/cargo`, so the wrapper can find its sibling
+/// `cargo-rch-real` without hardcoding a toolchain name. Exporting
+/// `RCH_SHIM_REAL_CARGO` preserves *toolchain identity* through any local
+/// fallback — otherwise rch's fallback would silently build with the rustup
+/// default toolchain instead of the one the caller explicitly asked for.
+fn toolchain_wrap_body() -> String {
+    format!(
+        r##"#!/bin/sh
+# rch toolchain cargo wrapper — MANAGED FILE, edit via `rch shim install`.
+{marker} {version}
+#
+# Routes ABSOLUTE-path toolchain cargo calls through the canonical rch shim.
+# Scripts/Makefiles/agents invoking ~/.rustup/toolchains/<tc>/bin/cargo directly
+# bypass PATH; this is the one layer they cannot dodge.
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REAL="$SELF_DIR/{real}"
+SHIM="$HOME/.rch/shims/cargo"
+# Loop-break + fail-open: rch sets RCH_CARGO_WRAPPER_BYPASS=1 on its own local
+# fallback exec. Never block a build if the shim or rch is missing.
+if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ] || [ ! -x "$SHIM" ] || ! command -v rch >/dev/null 2>&1; then
+  exec "$REAL" "$@"
+fi
+# Preserve toolchain identity through any local fallback.
+RCH_SHIM_REAL_CARGO="$REAL"
+export RCH_SHIM_REAL_CARGO
+exec "$SHIM" "$@"
+"##,
+        marker = TOOLCHAIN_MARKER,
+        version = TOOLCHAIN_WRAP_VERSION,
+        real = REAL_CARGO_NAME,
+    )
+}
+
+/// Version recorded in an installed toolchain wrapper, if it is rch-managed.
+fn toolchain_wrap_version(path: &Path) -> Option<String> {
+    // Only ever read small files; a real cargo binary is megabytes.
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > 8 * 1024 {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(TOOLCHAIN_MARKER)
+            .map(|v| v.trim().to_string())
+    })
+}
+
+fn is_toolchain_wrapped(path: &Path) -> bool {
+    toolchain_wrap_version(path).is_some()
+}
+
+/// Outcome of wrapping a single toolchain, for reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapOutcome {
+    Wrapped,
+    Refreshed,
+    AlreadyCurrent,
+}
+
+/// Wrap one toolchain's `cargo`.
+#[cfg(unix)]
+fn wrap_toolchain_cargo(cargo: &Path) -> Result<WrapOutcome> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = cargo
+        .parent()
+        .context("toolchain cargo has no parent directory")?;
+    let real = dir.join(REAL_CARGO_NAME);
+
+    if let Some(v) = toolchain_wrap_version(cargo) {
+        if v == TOOLCHAIN_WRAP_VERSION && real.exists() {
+            return Ok(WrapOutcome::AlreadyCurrent);
+        }
+        // Wrapper present but stale (or its real binary vanished): rewrite the
+        // wrapper in place. `real` is already the original, so do NOT re-link
+        // from `cargo` — that would hardlink the wrapper onto itself.
+        if !real.exists() {
+            anyhow::bail!(
+                "{} is an rch wrapper but {} is missing — cannot recover the real cargo; \
+                 reinstall this toolchain with `rustup toolchain install --force`",
+                cargo.display(),
+                real.display()
+            );
+        }
+        atomic_write(cargo, toolchain_wrap_body().as_bytes())
+            .with_context(|| format!("Failed to refresh wrapper at {}", cargo.display()))?;
+        let mut perms = std::fs::metadata(cargo)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(cargo, perms)?;
+        return Ok(WrapOutcome::Refreshed);
+    }
+
+    // `cargo` is the real binary here. A leftover `cargo-rch-real` means rustup
+    // replaced the toolchain after a previous wrap; drop the stale copy so we
+    // preserve the NEW binary rather than resurrecting the old one.
+    if real.exists() {
+        std::fs::remove_file(&real).with_context(|| {
+            format!("Failed to remove stale real cargo at {}", real.display())
+        })?;
+    }
+    std::fs::hard_link(cargo, &real).with_context(|| {
+        format!(
+            "Failed to hardlink {} -> {}",
+            cargo.display(),
+            real.display()
+        )
+    })?;
+    // Atomic rename over `cargo`; a concurrent exec sees old or new, never gone.
+    if let Err(e) = atomic_write(cargo, toolchain_wrap_body().as_bytes()) {
+        // Roll back so the toolchain is never left without its real cargo.
+        let _ = std::fs::remove_file(&real);
+        return Err(e).with_context(|| format!("Failed to write wrapper at {}", cargo.display()));
+    }
+    let mut perms = std::fs::metadata(cargo)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(cargo, perms)?;
+    Ok(WrapOutcome::Wrapped)
+}
+
+#[cfg(not(unix))]
+fn wrap_toolchain_cargo(_cargo: &Path) -> Result<WrapOutcome> {
+    anyhow::bail!("toolchain wrapping is only supported on Unix")
+}
+
+/// Restore one toolchain's original `cargo`.
+fn unwrap_toolchain_cargo(cargo: &Path) -> Result<bool> {
+    if !is_toolchain_wrapped(cargo) {
+        return Ok(false);
+    }
+    let dir = cargo
+        .parent()
+        .context("toolchain cargo has no parent directory")?;
+    let real = dir.join(REAL_CARGO_NAME);
+    if !real.exists() {
+        anyhow::bail!(
+            "refusing to remove wrapper at {}: {} is missing (no real cargo to restore)",
+            cargo.display(),
+            real.display()
+        );
+    }
+    std::fs::rename(&real, cargo)
+        .with_context(|| format!("Failed to restore real cargo at {}", cargo.display()))?;
+    Ok(true)
+}
+
+/// Wrapped/total counts across all installed toolchains.
+fn toolchain_wrap_counts() -> (usize, usize) {
+    let cargos = toolchain_cargos();
+    let wrapped = cargos.iter().filter(|c| is_toolchain_wrapped(c)).count();
+    (wrapped, cargos.len())
 }
 
 /// Count `rustc`/`cargo` processes running on this box right now (best-effort,
@@ -155,12 +407,20 @@ struct ShimStatus {
     version: Option<String>,
     embedded_version: String,
     up_to_date: bool,
+    /// Kept for compatibility: true when `cargo` resolves to the shim by any
+    /// route (directly or via a delegating wrapper).
     on_path_ahead_of_cargo: bool,
+    /// How `cargo` actually resolves: direct / delegated / none.
+    interception: Interception,
     local_builds_running: Option<usize>,
+    /// Rustup toolchains whose `bin/cargo` is wrapped, and the total installed.
+    toolchains_wrapped: usize,
+    toolchains_total: usize,
 }
 
-/// `rch shim install` — write (or refresh) the canonical cargo shim.
-pub fn shim_install(require_remote: bool, ctx: &OutputContext) -> Result<()> {
+/// `rch shim install` — write (or refresh) the canonical cargo shim, and wrap
+/// the rustup toolchain cargos so absolute-path invocations are caught too.
+pub fn shim_install(require_remote: bool, wrap_toolchains: bool, ctx: &OutputContext) -> Result<()> {
     // bd-wywsj: a WORKER box is the compute — shimming cargo to
     // offload from it is a configuration error, refused loudly.
     if let Ok(config) = crate::config::load_config()
@@ -188,7 +448,28 @@ pub fn shim_install(require_remote: bool, ctx: &OutputContext) -> Result<()> {
         std::fs::set_permissions(&path, perms)?;
     }
 
-    let ahead = shim_dir_precedes_cargo_bin(&shim_dir()?);
+    // Wrap the rustup toolchains too — the PATH shim alone cannot catch an
+    // absolute-path `~/.rustup/toolchains/<tc>/bin/cargo` invocation, which is
+    // how scripts, Makefiles and `cargo +toolchain` re-execs reach cargo.
+    let mut wrapped_now = 0usize;
+    let mut refreshed = 0usize;
+    let mut already = 0usize;
+    let mut wrap_errors: Vec<String> = Vec::new();
+    if wrap_toolchains {
+        for cargo in toolchain_cargos() {
+            match wrap_toolchain_cargo(&cargo) {
+                Ok(WrapOutcome::Wrapped) => wrapped_now += 1,
+                Ok(WrapOutcome::Refreshed) => refreshed += 1,
+                Ok(WrapOutcome::AlreadyCurrent) => already += 1,
+                // One bad toolchain must not abort the rest; report and move on.
+                Err(e) => wrap_errors.push(format!("{}: {e:#}", cargo.display())),
+            }
+        }
+    }
+
+    let interception = cargo_interception(&path);
+    let ahead = interception.intercepts();
+    let (tc_wrapped, tc_total) = toolchain_wrap_counts();
 
     if ctx.is_json() {
         let status = ShimStatus {
@@ -198,7 +479,10 @@ pub fn shim_install(require_remote: bool, ctx: &OutputContext) -> Result<()> {
             embedded_version: SHIM_VERSION.to_string(),
             up_to_date: true,
             on_path_ahead_of_cargo: ahead,
+            interception,
             local_builds_running: local_build_process_count(),
+            toolchains_wrapped: tc_wrapped,
+            toolchains_total: tc_total,
         };
         let _ = ctx.json(&status);
         return Ok(());
@@ -218,19 +502,47 @@ pub fn shim_install(require_remote: bool, ctx: &OutputContext) -> Result<()> {
             "fail-open (offload, but fall back to local under load)"
         }
     );
-    if !ahead {
-        let dir = shim_dir()?;
-        println!(
-            "\n{} The shim is not yet ahead of ~/.cargo/bin on PATH. Add this to your shell rc:",
-            StatusIndicator::Warning.display(style)
-        );
-        println!("    export PATH=\"{}:$PATH\"", dir.display());
-        println!("  then restart your shells (or `hash -r`).");
-    } else {
-        println!(
+    if wrap_toolchains {
+        if tc_total == 0 {
+            println!(
+                "  {} no rustup toolchains found to wrap",
+                StatusIndicator::Info.display(style)
+            );
+        } else {
+            println!(
+                "  {} toolchains: {tc_wrapped}/{tc_total} wrapped ({wrapped_now} new, {refreshed} refreshed, {already} already current)",
+                StatusIndicator::Success.display(style)
+            );
+        }
+        for err in &wrap_errors {
+            println!("  {} {err}", StatusIndicator::Warning.display(style));
+        }
+    }
+
+    match interception {
+        Interception::None => {
+            let dir = shim_dir()?;
+            println!(
+                "\n{} The shim is not yet ahead of ~/.cargo/bin on PATH. Add this to your shell rc:",
+                StatusIndicator::Warning.display(style)
+            );
+            println!("    export PATH=\"{}:$PATH\"", dir.display());
+            println!("  then restart your shells (or `hash -r`).");
+            if tc_wrapped > 0 {
+                println!(
+                    "  {} toolchain wrappers still catch absolute-path cargo calls meanwhile.",
+                    StatusIndicator::Info.display(style)
+                );
+            }
+        }
+        Interception::Direct => println!(
             "  {} PATH already resolves this shim ahead of ~/.cargo/bin.",
             StatusIndicator::Info.display(style)
-        );
+        ),
+        Interception::Delegated => println!(
+            "  {} PATH resolves a wrapper that delegates to this shim — cargo is intercepted.",
+            StatusIndicator::Info.display(style)
+        ),
     }
     Ok(())
 }
@@ -247,8 +559,14 @@ pub fn shim_status(ctx: &OutputContext) -> Result<()> {
         None
     };
     let up_to_date = version.as_deref() == Some(SHIM_VERSION);
-    let ahead = installed && shim_dir_precedes_cargo_bin(&shim_dir()?);
+    let interception = if installed {
+        cargo_interception(&path)
+    } else {
+        Interception::None
+    };
+    let ahead = interception.intercepts();
     let local_builds = local_build_process_count();
+    let (tc_wrapped, tc_total) = toolchain_wrap_counts();
 
     if ctx.is_json() {
         let status = ShimStatus {
@@ -258,7 +576,10 @@ pub fn shim_status(ctx: &OutputContext) -> Result<()> {
             embedded_version: SHIM_VERSION.to_string(),
             up_to_date,
             on_path_ahead_of_cargo: ahead,
+            interception,
             local_builds_running: local_builds,
+            toolchains_wrapped: tc_wrapped,
+            toolchains_total: tc_total,
         };
         let _ = ctx.json(&status);
         return Ok(());
@@ -285,15 +606,35 @@ pub fn shim_status(ctx: &OutputContext) -> Result<()> {
             version.as_deref().unwrap_or("unknown")
         );
     }
-    if ahead {
-        println!(
+    match interception {
+        Interception::Direct => println!(
             "  {} PATH resolves the shim ahead of ~/.cargo/bin",
+            StatusIndicator::Info.display(style)
+        ),
+        Interception::Delegated => println!(
+            "  {} PATH resolves a wrapper that delegates to this shim — cargo IS intercepted",
+            StatusIndicator::Info.display(style)
+        ),
+        Interception::None => println!(
+            "  {} PATH does NOT resolve the shim first — cargo is not being intercepted",
+            StatusIndicator::Warning.display(style)
+        ),
+    }
+    if tc_total == 0 {
+        println!(
+            "  {} no rustup toolchains installed",
+            StatusIndicator::Info.display(style)
+        );
+    } else if tc_wrapped == tc_total {
+        println!(
+            "  {} toolchains: {tc_wrapped}/{tc_total} wrapped (absolute-path cargo is intercepted)",
             StatusIndicator::Info.display(style)
         );
     } else {
         println!(
-            "  {} PATH does NOT resolve the shim first — cargo is not being intercepted",
-            StatusIndicator::Warning.display(style)
+            "  {} toolchains: {tc_wrapped}/{tc_total} wrapped — {} unwrapped toolchain(s) can still build locally via absolute path; run `rch shim install`",
+            StatusIndicator::Warning.display(style),
+            tc_total - tc_wrapped
         );
     }
     if let Some(n) = local_builds {
@@ -304,7 +645,7 @@ pub fn shim_status(ctx: &OutputContext) -> Result<()> {
             );
         } else {
             println!(
-                "  {} {n} local rustc running — builds are compiling on this box (check PATH order / absolute-path `.rustup/.../bin/cargo` invocations)",
+                "  {} {n} local rustc running — builds are compiling on this box (check PATH order / unwrapped toolchains above)",
                 StatusIndicator::Warning.display(style)
             );
         }
@@ -316,18 +657,28 @@ pub fn shim_status(ctx: &OutputContext) -> Result<()> {
 pub fn shim_uninstall(ctx: &OutputContext) -> Result<()> {
     let style = ctx.theme();
     let path = cargo_shim_path()?;
-    if !path.exists() {
-        if !ctx.is_json() {
-            println!(
-                "{} cargo shim not installed; nothing to remove.",
-                StatusIndicator::Info.display(style)
-            );
+
+    // Always restore toolchains, even if the PATH shim is already gone —
+    // otherwise a half-uninstalled box keeps wrappers pointing at a missing
+    // shim. (They fail open, but leaving them is still a surprise.)
+    let mut restored = 0usize;
+    let mut unwrap_errors: Vec<String> = Vec::new();
+    for cargo in toolchain_cargos() {
+        match unwrap_toolchain_cargo(&cargo) {
+            Ok(true) => restored += 1,
+            Ok(false) => {}
+            Err(e) => unwrap_errors.push(format!("{}: {e:#}", cargo.display())),
         }
-        return Ok(());
     }
-    std::fs::remove_file(&path)
-        .with_context(|| format!("Failed to remove cargo shim at {}", path.display()))?;
+
+    let had_shim = path.exists();
+    if had_shim {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("Failed to remove cargo shim at {}", path.display()))?;
+    }
+
     if ctx.is_json() {
+        let (tc_wrapped, tc_total) = toolchain_wrap_counts();
         let status = ShimStatus {
             installed: false,
             path: path.display().to_string(),
@@ -335,15 +686,35 @@ pub fn shim_uninstall(ctx: &OutputContext) -> Result<()> {
             embedded_version: SHIM_VERSION.to_string(),
             up_to_date: false,
             on_path_ahead_of_cargo: false,
+            interception: Interception::None,
             local_builds_running: local_build_process_count(),
+            toolchains_wrapped: tc_wrapped,
+            toolchains_total: tc_total,
         };
         let _ = ctx.json(&status);
-    } else {
+        return Ok(());
+    }
+
+    if had_shim {
         println!(
             "{} Removed cargo shim at {}",
             StatusIndicator::Success.display(style),
             style.highlight(&path.display().to_string())
         );
+    } else {
+        println!(
+            "{} cargo shim not installed; nothing to remove.",
+            StatusIndicator::Info.display(style)
+        );
+    }
+    if restored > 0 {
+        println!(
+            "  {} restored {restored} toolchain cargo binaries",
+            StatusIndicator::Success.display(style)
+        );
+    }
+    for err in &unwrap_errors {
+        println!("  {} {err}", StatusIndicator::Warning.display(style));
     }
     Ok(())
 }
@@ -393,5 +764,146 @@ mod tests {
                 .strip_prefix(SHIM_MARKER)
                 .map(|v| v.trim().to_string())
         })
+    }
+
+    // --- toolchain wrapping -------------------------------------------------
+
+    #[test]
+    fn toolchain_wrapper_is_loop_safe_and_fail_open() {
+        let body = toolchain_wrap_body();
+        // Same loop-break contract rch honors on its own local-fallback exec.
+        assert!(body.contains("RCH_CARGO_WRAPPER_BYPASS"));
+        // Fail open when the shim is absent or rch is not installed.
+        assert!(body.contains(r#"[ ! -x "$SHIM" ]"#));
+        assert!(body.contains("command -v rch"));
+        // Toolchain identity must survive a local fallback, else rch would
+        // rebuild with the rustup default rather than the requested toolchain.
+        assert!(body.contains("RCH_SHIM_REAL_CARGO=\"$REAL\""));
+        assert!(body.contains("export RCH_SHIM_REAL_CARGO"));
+        // Resolves its sibling real binary relative to $0, not a hardcoded path.
+        assert!(body.contains(r#"SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"#));
+        assert!(body.contains(REAL_CARGO_NAME));
+    }
+
+    #[test]
+    fn toolchain_wrapper_version_is_detectable() {
+        let body = toolchain_wrap_body();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("cargo");
+        std::fs::write(&p, &body).unwrap();
+        assert_eq!(
+            toolchain_wrap_version(&p).as_deref(),
+            Some(TOOLCHAIN_WRAP_VERSION)
+        );
+        assert!(is_toolchain_wrapped(&p));
+    }
+
+    #[test]
+    fn a_real_cargo_binary_is_not_mistaken_for_a_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("cargo");
+        // Oversized, non-UTF8 payload: stands in for a real multi-MB binary.
+        std::fs::write(&p, vec![0u8; 16 * 1024]).unwrap();
+        assert!(!is_toolchain_wrapped(&p));
+        assert!(!delegates_to_shim(&p));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrap_then_unwrap_restores_the_original_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cargo = bin.join("cargo");
+        let original = b"#!/bin/sh\necho i-am-the-real-cargo\n";
+        std::fs::write(&cargo, original).unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(wrap_toolchain_cargo(&cargo).unwrap(), WrapOutcome::Wrapped);
+        assert!(is_toolchain_wrapped(&cargo));
+        // The real binary is preserved beside it, byte-for-byte.
+        let real = bin.join(REAL_CARGO_NAME);
+        assert_eq!(std::fs::read(&real).unwrap(), original);
+        // Wrapper must be executable or every build breaks.
+        assert_eq!(
+            std::fs::metadata(&cargo).unwrap().permissions().mode() & 0o111,
+            0o111
+        );
+
+        // Idempotent: a second install is a no-op, not a double-wrap.
+        assert_eq!(
+            wrap_toolchain_cargo(&cargo).unwrap(),
+            WrapOutcome::AlreadyCurrent
+        );
+        assert_eq!(std::fs::read(&real).unwrap(), original);
+
+        assert!(unwrap_toolchain_cargo(&cargo).unwrap());
+        assert_eq!(std::fs::read(&cargo).unwrap(), original);
+        assert!(!real.exists());
+        // Unwrapping an already-plain cargo is a no-op, not an error.
+        assert!(!unwrap_toolchain_cargo(&cargo).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rustup_replacing_a_toolchain_rewraps_the_new_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cargo = bin.join("cargo");
+        std::fs::write(&cargo, b"old-cargo").unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wrap_toolchain_cargo(&cargo).unwrap();
+
+        // rustup overwrites `cargo` with a fresh binary, leaving the stale
+        // `cargo-rch-real` behind. The new binary must win.
+        std::fs::write(&cargo, b"new-cargo-from-rustup").unwrap();
+        assert_eq!(wrap_toolchain_cargo(&cargo).unwrap(), WrapOutcome::Wrapped);
+        assert_eq!(
+            std::fs::read(bin.join(REAL_CARGO_NAME)).unwrap(),
+            b"new-cargo-from-rustup"
+        );
+        assert!(unwrap_toolchain_cargo(&cargo).unwrap());
+        assert_eq!(std::fs::read(&cargo).unwrap(), b"new-cargo-from-rustup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unwrap_refuses_when_the_real_binary_is_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cargo = bin.join("cargo");
+        std::fs::write(&cargo, b"real").unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wrap_toolchain_cargo(&cargo).unwrap();
+        std::fs::remove_file(bin.join(REAL_CARGO_NAME)).unwrap();
+        // Deleting the wrapper here would destroy cargo entirely.
+        assert!(unwrap_toolchain_cargo(&cargo).is_err());
+        assert!(cargo.exists());
+    }
+
+    // --- interception classification ---------------------------------------
+
+    #[test]
+    fn delegating_wrapper_counts_as_interception() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("cargo");
+        std::fs::write(
+            &p,
+            b"#!/bin/sh\nSHIM=\"$HOME/.rch/shims/cargo\"\nexec \"$SHIM\" \"$@\"\n",
+        )
+        .unwrap();
+        assert!(delegates_to_shim(&p));
+    }
+
+    #[test]
+    fn interception_intercepts_predicate() {
+        assert!(Interception::Direct.intercepts());
+        assert!(Interception::Delegated.intercepts());
+        assert!(!Interception::None.intercepts());
     }
 }

@@ -1620,6 +1620,12 @@ enum ShimAction {
         /// queue for a worker and never build locally).
         #[arg(long)]
         allow_local_fallback: bool,
+        /// Leave rustup toolchain cargo binaries untouched. By default they are
+        /// wrapped too, because an absolute-path
+        /// `~/.rustup/toolchains/<tc>/bin/cargo` call bypasses PATH and would
+        /// otherwise build locally. Wrapping is reversible via `shim uninstall`.
+        #[arg(long)]
+        no_toolchains: bool,
     },
     /// Show shim install state, version, PATH order, and local builds
     Status,
@@ -4659,7 +4665,8 @@ fn handle_shim(action: ShimAction, ctx: &OutputContext) -> Result<()> {
     match action {
         ShimAction::Install {
             allow_local_fallback,
-        } => commands::shim_install(!allow_local_fallback, ctx),
+            no_toolchains,
+        } => commands::shim_install(!allow_local_fallback, !no_toolchains, ctx),
         ShimAction::Status => commands::shim_status(ctx),
         ShimAction::Uninstall => commands::shim_uninstall(ctx),
     }
