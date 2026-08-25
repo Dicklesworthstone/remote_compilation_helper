@@ -151,6 +151,13 @@ fn cargo_interception(shim: &Path) -> Interception {
         return Interception::None;
     };
     for entry in std::env::split_paths(&path) {
+        // POSIX treats an empty PATH entry as "$PWD". Honoring that here would
+        // make the verdict depend on the directory rch happens to be run from
+        // (a stray ./cargo would be read as the resolved cargo), so skip it —
+        // a cwd-relative hit is never what this check is meant to report on.
+        if entry.as_os_str().is_empty() {
+            continue;
+        }
         let candidate = entry.join("cargo");
         if !candidate.is_file() {
             continue;
@@ -416,6 +423,11 @@ struct ShimStatus {
     /// Rustup toolchains whose `bin/cargo` is wrapped, and the total installed.
     toolchains_wrapped: usize,
     toolchains_total: usize,
+    /// Per-toolchain failures from the last wrap/unwrap attempt. Without this a
+    /// `--json` consumer sees `wrapped < total` with no way to learn why, which
+    /// matters because this output is meant for agents.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    toolchain_errors: Vec<String>,
 }
 
 /// `rch shim install` — write (or refresh) the canonical cargo shim, and wrap
@@ -483,6 +495,7 @@ pub fn shim_install(require_remote: bool, wrap_toolchains: bool, ctx: &OutputCon
             local_builds_running: local_build_process_count(),
             toolchains_wrapped: tc_wrapped,
             toolchains_total: tc_total,
+            toolchain_errors: wrap_errors.clone(),
         };
         let _ = ctx.json(&status);
         return Ok(());
@@ -580,6 +593,8 @@ pub fn shim_status(ctx: &OutputContext) -> Result<()> {
             local_builds_running: local_builds,
             toolchains_wrapped: tc_wrapped,
             toolchains_total: tc_total,
+            // `status` never mutates, so it has no failures of its own.
+            toolchain_errors: Vec::new(),
         };
         let _ = ctx.json(&status);
         return Ok(());
@@ -690,6 +705,7 @@ pub fn shim_uninstall(ctx: &OutputContext) -> Result<()> {
             local_builds_running: local_build_process_count(),
             toolchains_wrapped: tc_wrapped,
             toolchains_total: tc_total,
+            toolchain_errors: unwrap_errors.clone(),
         };
         let _ = ctx.json(&status);
         return Ok(());
