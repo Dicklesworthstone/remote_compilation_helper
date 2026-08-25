@@ -194,6 +194,18 @@ pub fn reap_loop_body_with_event(
 /// bail-out (e.g. printing an empty metrics line so callers always parse a
 /// result). The `find … > file` + `while read … < file` shape (instead of a
 /// pipe) keeps the caller's loop in the parent shell so counters survive.
+/// Depth to scan under the worker's tmp base for dot-prefixed reap-class dirs.
+///
+/// rch stages pooled/per-job targets at
+/// `<tmpbase>/rch/<project>/<hash>/.rch-target-<worker>-{pool,job,pid}-<key>`,
+/// i.e. THREE levels below the tmp base — outside the sync-root (`$__rt`)
+/// walk that every other pass uses. Before this, only the depth-1
+/// `rch_target_*` legacy pass looked at the tmp base at all, so those trees
+/// were never reaped and grew to 110-129 GB per worker while `rch gc`
+/// truthfully reported "removed 0 dir(s), freed 0 MB". Six leaves headroom
+/// for a deeper stage layout without turning the walk into a full-tree scan.
+const TMPBASE_MAXDEPTH: u32 = 6;
+
 fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str) -> String {
     format!(
         "set -u; \
@@ -207,7 +219,9 @@ fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str) -> Stri
          [ -d \"$__tmpbase\" ] || __tmpbase=/tmp; \
          __tmpf=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) || {{ {on_guard_exit}exit 0; }}; \
          find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null > \"$__tmpf\"; \
-         case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf\";; esac; "
+         case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf\"; \
+           find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null >> \"$__tmpf\";; esac; \
+         sort -u \"$__tmpf\" -o \"$__tmpf\" 2>/dev/null || true; "
     )
 }
 
@@ -251,6 +265,8 @@ pub fn worker_sweep_command(
             format!(
                 "if __tmpf2=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
                    find \"$__rt\" -maxdepth 8 -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null > \"$__tmpf2\"; \
+                   case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf2\";; esac; \
+                   sort -u \"$__tmpf2\" -o \"$__tmpf2\" 2>/dev/null || true; \
                    while IFS= read -r d; do {pooled_body} done < \"$__tmpf2\"; \
                    rm -f \"$__tmpf2\"; \
                  fi; "
@@ -277,7 +293,9 @@ pub fn worker_sweep_command(
                && __lst=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) \
                && __tmpf3=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
                find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" \\) -prune 2>/dev/null > \"$__tmpf3\"; \
-               case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf3\";; esac; \
+               case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf3\"; \
+                 find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" \\) -prune 2>/dev/null >> \"$__tmpf3\";; esac; \
+               sort -u \"$__tmpf3\" -o \"$__tmpf3\" 2>/dev/null || true; \
                : > \"$__lst\"; total_kb=0; \
                while IFS= read -r d; do \
                  [ -d \"$d\" ] || continue; \
@@ -538,6 +556,45 @@ mod tests {
     fn idle_minutes_floor() {
         assert_eq!(idle_minutes_from_hours(0), 60);
         assert_eq!(idle_minutes_from_hours(12), 720);
+    }
+
+    /// Pooled/per-job targets staged under the tmp base
+    /// (`/data/tmp/rch/<project>/<hash>/.rch-target-<worker>-pool-<key>`) sit
+    /// three levels below it and outside the sync-root walk, so before the
+    /// tmp-base pass they were invisible to every discovery pass and grew to
+    /// 110-129 GB per worker while gc reported "removed 0 dir(s)".
+    #[test]
+    fn tmp_base_dot_prefixed_targets_are_discovered() {
+        let cmd = worker_sweep_command("/data/projects", 720, Some(10_080), Some(1024));
+
+        // Job/pid pass reaches the tmp base, not just depth-1 `rch_target_*`.
+        assert!(cmd.contains(&format!(
+            "find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\)"
+        )));
+        // Pooled pass reaches the tmp base too.
+        assert!(cmd.contains(&format!(
+            "find \"$__tmpbase\" -maxdepth {TMPBASE_MAXDEPTH} -type d -name \".rch-target-*-pool-*\""
+        )));
+        // The legacy depth-1 pass is retained, not replaced.
+        assert!(cmd.contains("-maxdepth 1 -type d -name \"rch_target_*\""));
+        // A base that is also under the tmp base can list a dir twice; dedup
+        // keeps the metrics honest and avoids a second rm on a removed path.
+        assert!(cmd.contains("sort -u \"$__tmpf\" -o \"$__tmpf\""));
+        assert!(cmd.contains("sort -u \"$__tmpf2\" -o \"$__tmpf2\""));
+        assert!(cmd.contains("sort -u \"$__tmpf3\" -o \"$__tmpf3\""));
+    }
+
+    /// The tmp-base walk stays behind the same two-segment guard as the sync
+    /// root, so a bare `/tmp` fallback is never swept wholesale.
+    #[test]
+    fn tmp_base_passes_keep_shallow_root_guard() {
+        let cmd = worker_sweep_command("/data/projects", 720, Some(10_080), None);
+        for pass in cmd.split("case \"$__tmpbase\" in").skip(1) {
+            assert!(
+                pass.starts_with(" /*/*)"),
+                "tmp-base pass must keep the /*/* depth guard: {pass}"
+            );
+        }
     }
 
     #[test]
