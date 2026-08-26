@@ -31,7 +31,8 @@ mod workers_setup;
 
 // Re-export daemon commands for backward compatibility
 pub use daemon::{
-    daemon_logs, daemon_reload, daemon_restart, daemon_start, daemon_status, daemon_stop,
+    StopOptions, daemon_logs, daemon_reload, daemon_restart, daemon_start, daemon_status,
+    daemon_stop,
 };
 
 // Re-export hook commands for backward compatibility
@@ -171,7 +172,8 @@ mod tests {
         urlencoding_encode,
     };
     use super::status::{
-        build_diagnose_decision, build_diagnose_slot_estimate, build_dry_run_summary,
+        build_diagnose_decision, build_diagnose_decision_with_config, build_diagnose_slot_estimate,
+        build_dry_run_summary,
     };
     use super::workers::{
         collect_local_capability_warnings, collect_refresh_warnings, has_any_capabilities,
@@ -646,6 +648,7 @@ mod tests {
                 bun_timeout_sec: 600,
                 external_timeout_enabled: true,
                 allow_local_fallback: true,
+                remote_build_jobs: "auto".to_string(),
             },
             transfer: ConfigTransferSection {
                 compression_level: 3,
@@ -787,6 +790,51 @@ mod tests {
         assert!(decision.would_intercept);
         // New format: "Compilation command with confidence 0.95 >= threshold 0.85"
         assert!(decision.reason.contains(">=") || decision.reason.contains("threshold"));
+    }
+
+    #[test]
+    fn diagnose_decision_applies_config_gates_like_the_hook() {
+        // Issue #51: diagnose said "compilation" for `go test` while the hook,
+        // reading the same config, left it local (allowlist gap).
+        let _guard = test_guard!();
+        let go_test = Classification::compilation(CompilationKind::GoTest, 0.95, "go test");
+        let cargo_build =
+            Classification::compilation(CompilationKind::CargoBuild, 0.95, "cargo build");
+
+        let mut config = rch_common::RchConfig::default();
+        assert!(build_diagnose_decision_with_config(&go_test, &config).would_intercept);
+
+        config.execution.allowlist = vec!["cargo".to_string()];
+        let decision = build_diagnose_decision_with_config(&go_test, &config);
+        assert!(!decision.would_intercept);
+        assert!(
+            decision.reason.contains("execution.allowlist"),
+            "reason must name the gate: {}",
+            decision.reason
+        );
+        assert!(build_diagnose_decision_with_config(&cargo_build, &config).would_intercept);
+
+        config.general.force_local = true;
+        let decision = build_diagnose_decision_with_config(&cargo_build, &config);
+        assert!(!decision.would_intercept);
+        assert!(decision.reason.contains("force_local"));
+        config.general.force_local = false;
+
+        config.general.enabled = false;
+        assert!(!build_diagnose_decision_with_config(&cargo_build, &config).would_intercept);
+        config.general.enabled = true;
+
+        // force_remote bypasses the confidence threshold, as in the hook.
+        config.compilation.confidence_threshold = 0.99;
+        assert!(!build_diagnose_decision_with_config(&cargo_build, &config).would_intercept);
+        config.general.force_remote = true;
+        assert!(build_diagnose_decision_with_config(&cargo_build, &config).would_intercept);
+
+        // Non-compilations are untouched by the gates.
+        let not_build = Classification::not_compilation("ls");
+        let decision = build_diagnose_decision_with_config(&not_build, &config);
+        assert!(!decision.would_intercept);
+        assert!(decision.reason.contains("not classified"));
     }
 
     #[test]

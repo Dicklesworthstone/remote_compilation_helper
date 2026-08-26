@@ -570,16 +570,28 @@ fn try_classify_compound_command(cmd: &str) -> Option<Classification> {
         return None;
     }
 
-    // Build the prefix (everything before the last segment, including the final "&&")
-    let prefix = if segments.len() == 1 {
+    if segments.len() == 1 {
         // No prefix, just the command itself
         return None;
-    } else {
-        // Find where the last segment starts in the original command
-        // and take everything before it
-        let last_pos = cmd.rfind(last_segment)?;
-        cmd[..last_pos].to_string()
-    };
+    }
+
+    // Build the prefix: every earlier segment, joined back with " && ".
+    //
+    // Issue #50: earlier segments that are themselves compilations are wrapped
+    // with `rch exec -- ` here, so the hook's `{prefix}rch exec -- {extracted}`
+    // rewrite offloads EVERY build in the chain. Previously only the final
+    // segment was wrapped and `cargo build --release && cargo test` compiled
+    // the first half locally on the dispatcher with no summary line at all.
+    // Segments that do not classify (cd, touch, `go build -o app`, ...)
+    // are re-emitted verbatim.
+    let mut prefix = String::with_capacity(cmd.len() + segments.len() * EXEC_REWRITE_PREFIX.len());
+    for segment in &segments[..segments.len() - 1] {
+        if classify_command_inner(segment, 1).is_compilation {
+            prefix.push_str(EXEC_REWRITE_PREFIX);
+        }
+        prefix.push_str(segment);
+        prefix.push_str(" && ");
+    }
 
     // Return compound classification
     Some(Classification::compound_compilation(
@@ -589,6 +601,40 @@ fn try_classify_compound_command(cmd: &str) -> Option<Classification> {
         prefix,
         last_segment.to_string(),
     ))
+}
+
+/// The rewrite the hook applies to an offloaded segment. Kept here so the
+/// compound classifier and the hook agree byte-for-byte on the wrapped form.
+const EXEC_REWRITE_PREFIX: &str = "rch exec -- ";
+
+/// Segments of an `&&` chain (all but the last) that *look* like a compilation
+/// command but were not classified as one, and therefore stay local when the
+/// chain is rewritten by the hook (issue #50).
+///
+/// Example: `go build -o app ./cmd && cargo test` — `go build -o` emits a
+/// local binary and is never offloaded, so the hook rewrites only `cargo test`;
+/// this returns `["go build -o app ./cmd"]` so the hook can say so instead of
+/// staying silent.
+/// Returns an empty vector for anything that is not a plain `&&` chain.
+pub fn compound_local_compilation_segments(cmd: &str) -> Vec<String> {
+    let trimmed = cmd.trim();
+    if trimmed.len() >= MAX_SPLIT_INPUT_LEN {
+        return Vec::new();
+    }
+    let Some(segments) = split_and_chain(trimmed) else {
+        return Vec::new();
+    };
+    if segments.len() < 2 {
+        return Vec::new();
+    }
+    segments[..segments.len() - 1]
+        .iter()
+        .filter(|segment| {
+            !classify_command_inner(segment, 1).is_compilation
+                && starts_with_compilation_command(normalize_command(segment).as_ref())
+        })
+        .map(|segment| (*segment).to_string())
+        .collect()
 }
 
 /// Benign pager/sink commands that may sit on the right-hand side of a pipe
@@ -6537,6 +6583,79 @@ mod regression_classification {
             },
         ];
         run_cases(&cases);
+    }
+
+    // ------------------------------------------------------------------
+    // 10a. Every compilation segment of an `&&` chain is offloaded (issue #50).
+    //
+    // `cargo build --release && cargo test` used to rewrite only the final
+    // segment; the first build ran locally on the dispatcher with no summary
+    // line. Now every segment that classifies as a compilation is wrapped.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_compound_chain_offloads_every_compilation_segment() {
+        let _guard = test_guard!();
+
+        let result = classify_command("cargo build --release && cargo test");
+        assert!(result.is_compilation, "got: {:?}", result.reason);
+        assert_eq!(result.kind, Some(CompilationKind::CargoTest));
+        assert_eq!(
+            result.command_prefix.as_deref(),
+            Some("rch exec -- cargo build --release && ")
+        );
+        assert_eq!(result.extracted_command.as_deref(), Some("cargo test"));
+
+        // Three segments, non-compilation head: only the builds are wrapped.
+        let result = classify_command("touch marker && cargo build && cargo test --workspace");
+        assert_eq!(
+            result.command_prefix.as_deref(),
+            Some("touch marker && rch exec -- cargo build && ")
+        );
+        assert_eq!(
+            result.extracted_command.as_deref(),
+            Some("cargo test --workspace")
+        );
+
+        // Mixed tool families are each wrapped.
+        let result = classify_command("go vet ./... && cargo check");
+        assert_eq!(
+            result.command_prefix.as_deref(),
+            Some("rch exec -- go vet ./... && ")
+        );
+
+        // Existing contract: a plain `cd` prefix is untouched.
+        let result = classify_command("cd /repo && cargo build");
+        assert_eq!(result.command_prefix.as_deref(), Some("cd /repo && "));
+
+        // A build-looking segment that must stay local is left verbatim ...
+        let result = classify_command("go build -o app ./cmd && cargo test");
+        assert!(result.is_compilation);
+        assert_eq!(
+            result.command_prefix.as_deref(),
+            Some("go build -o app ./cmd && ")
+        );
+        // ... and reported, so the hook can announce it instead of staying silent.
+        assert_eq!(
+            compound_local_compilation_segments("go build -o app ./cmd && cargo test"),
+            vec!["go build -o app ./cmd".to_string()]
+        );
+        assert!(
+            compound_local_compilation_segments("cargo build --release && cargo test").is_empty()
+        );
+        assert!(compound_local_compilation_segments("cd /repo && cargo build").is_empty());
+        assert!(compound_local_compilation_segments("cargo test").is_empty());
+        assert!(
+            compound_local_compilation_segments("bash -c \"cargo build && cargo test\"").is_empty(),
+            "quoted operators are not chain separators"
+        );
+
+        // `;` / `||` chains and a chain whose final segment is not a build stay
+        // declined, and each carries a structure reason the hook prints.
+        assert!(!classify_command("cargo build ; cargo test").is_compilation);
+        assert!(declined_compilation_due_to_structure("cargo build ; cargo test").is_some());
+        assert!(declined_compilation_due_to_structure("cargo build || echo failed").is_some());
+        assert!(declined_compilation_due_to_structure("cargo build && ./run").is_some());
     }
 
     // ------------------------------------------------------------------

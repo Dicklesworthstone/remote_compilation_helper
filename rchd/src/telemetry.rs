@@ -261,11 +261,17 @@ pub struct TelemetryPollerConfig {
     pub poll_interval: Duration,
     pub ssh_timeout: Duration,
     pub skip_after: Duration,
+    /// Circuit-breaker settings used when a poll outcome is fed to the
+    /// worker's authoritative circuit as command-class evidence (issue #48).
+    /// Must match the health monitor's settings so both writers agree on
+    /// thresholds; `rchd` wires both from `[circuit]`.
+    pub circuit: rch_common::CircuitBreakerConfig,
 }
 
 impl Default for TelemetryPollerConfig {
     fn default() -> Self {
         Self {
+            circuit: rch_common::CircuitBreakerConfig::default(),
             poll_interval: Duration::from_secs(30),
             // Telemetry is collected via a fresh SSH connect+auth+exec each cycle.
             // 5s was too tight for trans-continental workers (e.g. Contabo EU VPS
@@ -606,6 +612,7 @@ async fn poll_worker(
                     "Telemetry collected via SSH"
                 );
                 store.ingest(telemetry, TelemetrySource::SshPoll);
+                record_poll_command_outcome(&worker, &worker_id, true, &config.circuit).await;
                 return true;
             }
             Ok(Err(e)) => failures.push(PollAttemptFailure {
@@ -634,7 +641,36 @@ async fn poll_worker(
         "Telemetry poll failed: {}",
         render_poll_failures(&failures)
     );
+    record_poll_command_outcome(&worker, &worker_id, false, &config.circuit).await;
     false
+}
+
+/// Feed a telemetry poll outcome to the worker's authoritative circuit as
+/// command-class evidence (issue #48).
+///
+/// The poll runs a real binary on the worker, so it is the same shape as
+/// dispatched work; the liveness probe (`echo` over a warm session) is not. A
+/// host under fork exhaustion keeps answering the liveness probe while every
+/// poll hard-times-out, and on liveness evidence alone the breaker closed and
+/// re-admitted it. Exhausting every poll attempt is therefore recorded as a
+/// command failure (blocks a half-open close; opens the circuit on its own
+/// threshold), and a successful poll clears that evidence.
+async fn record_poll_command_outcome(
+    worker: &WorkerState,
+    worker_id: &rch_common::WorkerId,
+    success: bool,
+    circuit: &rch_common::CircuitBreakerConfig,
+) {
+    let (previous, new) = worker.record_command_outcome(success, circuit).await;
+    if previous != new {
+        info!(
+            worker = worker_id.as_str(),
+            "Worker circuit state: {:?} -> {:?} (telemetry poll {})",
+            previous,
+            new,
+            if success { "succeeded" } else { "exhausted" }
+        );
+    }
 }
 
 #[cfg(test)]
@@ -837,6 +873,7 @@ mod tests {
             poll_interval: Duration::from_secs(60),
             ssh_timeout: Duration::from_secs(10),
             skip_after: Duration::from_secs(120),
+            ..TelemetryPollerConfig::default()
         };
         assert_eq!(config.poll_interval, Duration::from_secs(60));
         assert_eq!(config.ssh_timeout, Duration::from_secs(10));

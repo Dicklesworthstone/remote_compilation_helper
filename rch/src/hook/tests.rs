@@ -6185,6 +6185,150 @@ async fn test_cargo_test_delegates_to_rch_exec() {
 
 #[tokio::test]
 #[serial(mock_global)]
+async fn test_compound_chain_delegates_every_compilation_segment() {
+    // Issue #50: `cargo build --release && cargo test` must offload BOTH
+    // builds, not only the final segment.
+    let _lock = test_lock().lock().await;
+    let _guard = test_guard!();
+    mock::clear_global_invocations();
+    crate::config::set_test_config_override(Some(rch_common::RchConfig::default()));
+
+    let input = HookInput {
+        tool_name: "Bash".to_string(),
+        tool_input: ToolInput {
+            command: "cargo build --release && cargo test".to_string(),
+            description: None,
+        },
+        session_id: None,
+    };
+
+    let output = process_hook(input).await;
+    crate::config::set_test_config_override(None);
+
+    assert!(output.is_allow());
+    let cmd = delegated_command(&output);
+    assert_eq!(
+        cmd,
+        "rch exec -- cargo build --release && rch exec -- cargo test"
+    );
+}
+
+#[tokio::test]
+#[serial(mock_global)]
+async fn test_hook_leaves_non_allowlisted_tool_local() {
+    // Issue #51: a persisted allowlist that predates Go support keeps `go test`
+    // local. The hook must not rewrite it (the reason line goes to stderr).
+    let _lock = test_lock().lock().await;
+    let _guard = test_guard!();
+    mock::clear_global_invocations();
+    let mut config = rch_common::RchConfig::default();
+    config.execution.allowlist = vec!["cargo".to_string()];
+    assert_eq!(
+        config.execution.missing_builtin_bases().first().copied(),
+        Some("rustc"),
+        "the allowlist gap must be discoverable from config"
+    );
+    assert!(config.execution.missing_builtin_bases().contains(&"go"));
+    crate::config::set_test_config_override(Some(config));
+
+    let input = HookInput {
+        tool_name: "Bash".to_string(),
+        tool_input: ToolInput {
+            command: "go test ./...".to_string(),
+            description: None,
+        },
+        session_id: None,
+    };
+
+    let output = process_hook(input).await;
+    crate::config::set_test_config_override(None);
+
+    assert!(output.is_allow());
+    assert!(
+        !matches!(output, HookOutput::AllowWithModifiedCommand(_)),
+        "non-allowlisted command must be allowed unchanged, got {output:?}"
+    );
+}
+
+#[test]
+fn config_local_policy_matches_hook_semantics() {
+    // Issue #55: one policy for the hook, `rch exec` and the cargo shim.
+    let _guard = test_guard!();
+    let mut config = rch_common::RchConfig::default();
+    assert_eq!(
+        config_local_policy(&config, Some(CompilationKind::CargoBuild)),
+        None
+    );
+    assert_eq!(config_local_policy(&config, None), None);
+
+    config.general.force_local = true;
+    assert_eq!(
+        config_local_policy(&config, Some(CompilationKind::CargoBuild)),
+        Some(ConfigLocalPolicy::ForceLocal)
+    );
+    // Jobs honor force_local too.
+    assert_eq!(
+        config_local_policy(&config, Some(CompilationKind::Job)),
+        Some(ConfigLocalPolicy::ForceLocal)
+    );
+    config.general.force_remote = true;
+    assert_eq!(
+        config_local_policy(&config, Some(CompilationKind::CargoBuild)),
+        Some(ConfigLocalPolicy::ConflictingForceFlags)
+    );
+    config.general.force_local = false;
+    config.general.force_remote = false;
+
+    config.general.enabled = false;
+    assert_eq!(
+        config_local_policy(&config, Some(CompilationKind::CargoBuild)),
+        Some(ConfigLocalPolicy::Disabled)
+    );
+    config.general.enabled = true;
+
+    config.execution.allowlist = vec!["cargo".to_string()];
+    assert_eq!(
+        config_local_policy(&config, Some(CompilationKind::GoTest)),
+        Some(ConfigLocalPolicy::NotAllowlisted("go"))
+    );
+    assert_eq!(
+        config_local_policy(&config, Some(CompilationKind::CargoTest)),
+        None
+    );
+    // Explicit job admission has no allowlist entry and is not gated by it.
+    assert_eq!(
+        config_local_policy(&config, Some(CompilationKind::Job)),
+        None
+    );
+
+    // Explicit config outranks a baked RCH_REQUIRE_REMOTE; the allowlist gate
+    // does not (under strict remote it refuses instead of running locally).
+    assert!(ConfigLocalPolicy::ForceLocal.overrides_require_remote());
+    assert!(ConfigLocalPolicy::Disabled.overrides_require_remote());
+    assert!(ConfigLocalPolicy::ConflictingForceFlags.overrides_require_remote());
+    assert!(!ConfigLocalPolicy::NotAllowlisted("go").overrides_require_remote());
+
+    // Policy refusals are permanent for the invocation, never retryable.
+    for policy in [
+        ConfigLocalPolicy::ForceLocal,
+        ConfigLocalPolicy::Disabled,
+        ConfigLocalPolicy::ConflictingForceFlags,
+        ConfigLocalPolicy::NotAllowlisted("go"),
+    ] {
+        assert!(
+            !remote_required_refusal_is_retryable(&policy.reason()),
+            "{policy:?} must not be retryable"
+        );
+    }
+    assert!(remote_required_refusal_is_retryable("no workers available"));
+    assert_eq!(
+        ConfigLocalPolicy::NotAllowlisted("nix").reason(),
+        "command 'nix' not in execution.allowlist"
+    );
+}
+
+#[tokio::test]
+#[serial(mock_global)]
 async fn test_cargo_test_with_args_delegates_correctly() {
     // Test that cargo test with arguments is delegated correctly
     let _lock = test_lock().lock().await;

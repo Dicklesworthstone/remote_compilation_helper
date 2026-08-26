@@ -192,8 +192,8 @@ pub use path_topology::{
 };
 pub use patterns::{
     Classification, ClassificationDetails, ClassificationTier, CompilationKind, TierDecision,
-    classify_command, classify_command_detailed, declined_compilation_due_to_structure,
-    split_shell_commands,
+    classify_command, classify_command_detailed, compound_local_compilation_segments,
+    declined_compilation_due_to_structure, split_shell_commands,
 };
 pub use protocol::{HookInput, HookOutput, ToolInput};
 pub use queue_contract::{
@@ -240,7 +240,7 @@ pub use types::{
     CompilationTimingBreakdown, DoctorConfig, DoctorWebhookEndpoint, DoctorWebhookFormat,
     DoctorWebhooksConfig, EnvironmentConfig, ExecutionConfig, FairnessConfig, FleetConfig,
     GeneralConfig, MetricsAggregator, OS_TAG_PREFIX, OutputConfig, OutputVisibility,
-    PathTopologyConfig, RchConfig, ReleaseRequest, RequiredRuntime, RetryConfig,
+    PathTopologyConfig, RchConfig, ReleaseRequest, RemoteBuildJobs, RequiredRuntime, RetryConfig,
     SELECTION_RESPONSE_PROTOCOL_VERSION, SavedTimeStats, SelectedWorker, SelectionConfig,
     SelectionDiagnostics, SelectionReason, SelectionRequest, SelectionResponse, SelectionStrategy,
     SelectionWeightConfig, SelfHealingConfig, SelfHealingLogLevel, SelfTestConfig,

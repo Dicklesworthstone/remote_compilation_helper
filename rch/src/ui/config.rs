@@ -457,6 +457,7 @@ mod tests {
                 bun_timeout_sec: 600,
                 external_timeout_enabled: true,
                 allow_local_fallback: true,
+                remote_build_jobs: "auto".to_string(),
             },
             transfer: ConfigTransferSection {
                 compression_level: 6,

@@ -10,7 +10,17 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## [Unreleased]
 
-No unreleased changes yet.
+### Worker-side rustc cap per job (#49)
+
+- **`compilation.remote_build_jobs`** (default `auto`) exports `CARGO_BUILD_JOBS` in the
+  remote build session so one offloaded cargo job no longer forks `nproc` rustc on the
+  worker. `total_slots` bounds concurrent *jobs*; this bounds parallelism *within* a job,
+  which is the axis that was actually exhausting RAM. `auto` is computed on the worker
+  from its live cores and memory as `clamp(ram_gib / 8, 2, min(nproc, 8))`; `off`
+  restores the old behavior; an integer pins a fixed count. Explicit intent always wins:
+  a `CARGO_BUILD_JOBS` already in the worker session (e.g. `/etc/environment`), forwarded
+  through the env allowlist, written inline in the command, a `-j` flag, or a project
+  `.cargo/config.toml` `[build] jobs` are all left untouched. Windows workers are skipped.
 
 ## [v1.0.58] -- 2026-08-24 (release)
 

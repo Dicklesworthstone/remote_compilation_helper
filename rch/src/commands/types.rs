@@ -262,6 +262,8 @@ pub struct ConfigCompilationSection {
     pub bun_timeout_sec: u64,
     pub external_timeout_enabled: bool,
     pub allow_local_fallback: bool,
+    /// `auto`, `off`, or a fixed job count (see `compilation.remote_build_jobs`).
+    pub remote_build_jobs: String,
 }
 
 /// Transfer configuration section.

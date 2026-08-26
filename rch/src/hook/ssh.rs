@@ -677,8 +677,7 @@ pub(super) async fn ensure_worker_projects_topology(
     } else {
         dispatch_closure_roots.to_vec()
     };
-    let repaired =
-        repair_worker_mirror_ownership(worker, reporter, &ownership_scan_roots).await?;
+    let repaired = repair_worker_mirror_ownership(worker, reporter, &ownership_scan_roots).await?;
     if repaired > 0 {
         reporter.summary(&format!(
             "[RCH] repaired ownership drift on {}: {repaired} root-owned entries chowned to {}",
