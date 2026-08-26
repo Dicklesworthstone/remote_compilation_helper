@@ -219,12 +219,17 @@ const HISTORY_SCHEMA: &str = "rch.rabs-gc-history.v1";
 /// Store errors from the aggregate query.
 pub fn next_seq(store: &mut dyn RabsMetadataStore) -> Result<u64, StoreError> {
     let rows = store.query("SELECT COALESCE(MAX(seq), 0) FROM gc_receipts", &[])?;
-    Ok(match rows.first().and_then(|r| r.first()) {
+    let last = match rows.first().and_then(|r| r.first()) {
         // MAX over persisted u64 counts is non-negative by construction;
         // a negative value would be store corruption, clamped to restart.
-        Some(SqlValue::Int(n)) => u64::try_from((*n).max(0)).unwrap_or(1),
-        _ => 1,
-    })
+        Some(SqlValue::Int(n)) => u64::try_from((*n).max(0)).unwrap_or(0),
+        _ => 0,
+    };
+    // The NEXT sequence is one past the last persisted receipt: a fresh
+    // store starts at 1, and every executed run advances by exactly one.
+    // Returning the max itself made the first plan seq 0 and pinned every
+    // later run to the same number once a receipt was recorded.
+    Ok(last.saturating_add(1))
 }
 
 /// Build the engine [`GcWorld`] from operator input. Protections enter as
@@ -1202,12 +1207,19 @@ mod tests {
         let receipt = plan_receipt(&mut ts.store, &world, GcMode::Normal, 50).expect("plan");
         assert!(receipt.truncated);
         assert_eq!(receipt.reclaim_total, 1);
+        // Normal mode admits exactly the three cold committed results as
+        // candidates (see `normal_mode_plans_only_cold_committed_results`);
+        // policy-protected objects keep their own reason code and never
+        // enter the budget pass. Budget 1 therefore truncates the other 2.
         assert!(
             receipt
                 .reason_counts
                 .iter()
-                .any(|rc| rc.reason_code == RC_BUDGET_TRUNCATED && rc.count == 6)
+                .any(|rc| rc.reason_code == RC_BUDGET_TRUNCATED && rc.count == 2),
+            "{:?}",
+            receipt.reason_counts
         );
+        assert_eq!(receipt.protected_total, 6, "4 by policy + 2 by budget");
     }
 
     #[test]
