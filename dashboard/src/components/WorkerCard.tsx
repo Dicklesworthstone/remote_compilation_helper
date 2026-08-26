@@ -43,6 +43,7 @@ export function WorkerCard({ w, onOpen }: Props) {
       </div>
       <div className="whost">
         {w.user ? `${w.user}@` : ""}{w.host ?? "—"}
+        {w.priority != null && <> · pri {w.priority}</>}
       </div>
 
       <div className="metrics">

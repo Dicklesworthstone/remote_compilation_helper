@@ -69,7 +69,7 @@ export function classify(w: Worker, snapshotMs: number): WorkerView {
   let health: HealthLevel = "healthy";
   let healthReason = "healthy";
 
-  if (st === "disabled") {
+  if (st === "disabled" || w.enabled === false) {
     health = "disabled";
     healthReason = "disabled in workers.toml";
   } else if (st === "down" || st === "unreachable" || w.circuit_state === "open") {
@@ -77,7 +77,7 @@ export function classify(w: Worker, snapshotMs: number): WorkerView {
     healthReason = w.circuit_state === "open" ? "circuit breaker open" : `worker ${st || "unreachable"}`;
   } else if (staleSeconds != null && staleSeconds > STALE_CRIT_SECONDS) {
     health = "offline";
-    healthReason = `not seen for ${fmtAge(staleSeconds)}`;
+    healthReason = `not seen for ${Math.round(staleSeconds / 60)}m`;
   } else if (p.state === "critical" || (diskUsedPct != null && diskUsedPct >= 95)) {
     health = "critical";
     healthReason = p.reason ? `pressure: ${p.reason}` : `disk ${diskUsedPct?.toFixed(0)}% full`;
@@ -92,7 +92,7 @@ export function classify(w: Worker, snapshotMs: number): WorkerView {
     healthReason = `${w.consecutive_failures} consecutive failure${w.consecutive_failures === 1 ? "" : "s"}`;
   } else if (loadPerCore != null && loadPerCore >= 2) {
     health = "warn";
-    healthReason = `load ${loadPerCore.toFixed(1)}× cores`;
+    healthReason = `load ${loadPerCore.toFixed(1)}x cores`;
   } else if (w.circuit_state === "half_open") {
     health = "warn";
     healthReason = "circuit half-open (probing)";

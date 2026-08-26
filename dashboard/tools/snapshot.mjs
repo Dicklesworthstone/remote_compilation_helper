@@ -152,9 +152,12 @@ function num(v) {
 }
 
 async function collectDispatcher(host) {
-  const [status, caps, metrics] = await Promise.all([
+  // `rch status` carries runtime state but NOT the static config fields
+  // (tags, priority, enabled) — those only exist in `workers list`.
+  const [status, caps, list, metrics] = await Promise.all([
     rchJson(host, "status", 70),
     rchJson(host, "workers capabilities", 70),
+    rchJson(host, "workers list", 45),
     fetchMetrics(host),
   ]);
 
@@ -162,9 +165,11 @@ async function collectDispatcher(host) {
   const d = status?.daemon?.daemon ?? null;
   const statusWorkers = status?.daemon?.workers ?? [];
   const capsById = new Map((caps?.workers ?? []).map((w) => [w.id, w.capabilities ?? {}]));
+  const cfgById = new Map((list?.workers ?? []).map((w) => [w.id, w]));
 
   const workers = statusWorkers.map((w) => {
     const c = capsById.get(w.id) ?? {};
+    const cfg = cfgById.get(w.id) ?? {};
     return {
       id: w.id,
       host: w.host ?? null,
@@ -203,7 +208,9 @@ async function collectDispatcher(host) {
         zig_version: c.zig_version ?? null,
         projects_root_ok: c.projects_root_ok ?? null,
       },
-      tags: [],
+      tags: Array.isArray(cfg.tags) ? cfg.tags : [],
+      priority: num(cfg.priority),
+      enabled: cfg.enabled !== false,
     };
   });
 
@@ -331,9 +338,12 @@ async function main() {
       prev.slots_by_dispatcher[d.id] = { used: w.used_slots, total: w.total_slots };
       if ((w.total_slots ?? 0) > (prev.total_slots ?? 0)) prev.total_slots = w.total_slots;
       if ((w.used_slots ?? 0) > (prev.used_slots ?? 0)) prev.used_slots = w.used_slots;
-      for (const k of ["speed", "latency_ms", "last_seen_unix", "status", "circuit_state", "last_error"]) {
+      for (const k of ["speed", "latency_ms", "last_seen_unix", "status", "circuit_state", "last_error", "priority"]) {
         if (prev[k] == null && w[k] != null) prev[k] = w[k];
       }
+      if ((prev.tags?.length ?? 0) === 0 && w.tags?.length) prev.tags = w.tags;
+      // A worker disabled anywhere is worth surfacing, so disabled wins.
+      if (w.enabled === false) prev.enabled = false;
       for (const k of Object.keys(w.caps)) if (prev.caps[k] == null && w.caps[k] != null) prev.caps[k] = w.caps[k];
       for (const k of Object.keys(w.pressure)) if (prev.pressure[k] == null && w.pressure[k] != null) prev.pressure[k] = w.pressure[k];
       if (!prev.failure_history.length && w.failure_history.length) prev.failure_history = w.failure_history;

@@ -1,3 +1,5 @@
+import { useId } from "react";
+
 interface Props {
   values: number[];
   /** Draw the area under the line as well as the stroke. */
@@ -11,6 +13,10 @@ interface Props {
  * polyline, and this way the colours are the same CSS tokens as everything else.
  */
 export function Sparkline({ values, filled = true, stroke = "var(--accent)", label }: Props) {
+  // useId, not a hash of the data: two sparklines whose first value and length
+  // happen to match would otherwise share one gradient element. Hooks must run
+  // unconditionally, so this sits above the early return.
+  const id = useId();
   if (values.length < 2) {
     return <div className="empty" style={{ padding: 16 }}>not enough history yet</div>;
   }
@@ -26,7 +32,6 @@ export function Sparkline({ values, filled = true, stroke = "var(--accent)", lab
   });
   const line = pts.map(([x, y], i) => `${i === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`).join(" ");
   const area = `${line} L${w},${h} L0,${h} Z`;
-  const id = `spark-${Math.abs(values[0] * 1000 + values.length).toString(36)}`;
 
   return (
     <svg className="spark" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" role="img"

@@ -38,7 +38,7 @@ export function classifyWorker(w, snapshotMs) {
 
   let health = "healthy";
   let reason = "healthy";
-  if (st === "disabled") { health = "disabled"; reason = "disabled in workers.toml"; }
+  if (st === "disabled" || w.enabled === false) { health = "disabled"; reason = "disabled in workers.toml"; }
   else if (st === "down" || st === "unreachable" || w.circuit_state === "open") {
     health = "offline";
     reason = w.circuit_state === "open" ? "circuit breaker open" : `worker ${st || "unreachable"}`;
@@ -53,7 +53,7 @@ export function classifyWorker(w, snapshotMs) {
     health = "warn"; reason = `${w.consecutive_failures} consecutive failures`;
   } else if (loadPerCore != null && loadPerCore >= 2) {
     health = "warn"; reason = `load ${loadPerCore.toFixed(1)}x cores`;
-  } else if (w.circuit_state === "half_open") { health = "warn"; reason = "circuit half-open"; }
+  } else if (w.circuit_state === "half_open") { health = "warn"; reason = "circuit half-open (probing)"; }
   else if ((w.used_slots ?? 0) > 0) { health = "busy"; reason = `${w.used_slots}/${w.total_slots} slots in use`; }
   else if (w.caps?.projects_root_ok === false) { health = "warn"; reason = "projects root unhealthy"; }
 
@@ -178,6 +178,7 @@ export function buildLlmView(snap, opts = {}) {
       disk_pct: r1(w.diskUsedPct),
       speed: r1(w.speed),
       circuit: w.circuit_state ?? "",
+      tags: (w.tags ?? []).join("|"),
       reason: w.health === "healthy" ? "" : w.reason,
     })),
   };

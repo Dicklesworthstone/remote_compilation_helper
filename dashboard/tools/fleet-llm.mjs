@@ -105,9 +105,14 @@ async function main() {
 
   let envelope;
   try {
-    envelope = args.url
-      ? await (await fetch(args.url, { cache: "no-store" })).json()
-      : JSON.parse(await readFile(args.in, "utf8"));
+    if (args.url) {
+      const res = await fetch(args.url, { cache: "no-store" });
+      // Without this a 404 HTML page becomes an opaque JSON parse error.
+      if (!res.ok) throw new Error(`HTTP ${res.status} from ${args.url}`);
+      envelope = await res.json();
+    } else {
+      envelope = JSON.parse(await readFile(args.in, "utf8"));
+    }
   } catch (e) {
     console.error(`cannot read snapshot: ${e.message}`);
     process.exit(3);

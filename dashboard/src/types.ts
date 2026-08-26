@@ -43,6 +43,9 @@ export interface Worker {
   last_seen_unix: number | null;
   caps: WorkerCaps;
   tags: string[];
+  /** From `rch workers list` — absent in `rch status`. */
+  priority: number | null;
+  enabled: boolean;
   seen_by?: string[];
   /** Slot view per dev machine — rchd derates independently on each. */
   slots_by_dispatcher?: Record<string, { used: number | null; total: number | null }>;

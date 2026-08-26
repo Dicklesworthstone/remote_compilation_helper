@@ -83,7 +83,7 @@ if [ -n "$EXTRA" ]; then
   exit 1
 fi
 PREFIX=$(printf '%s' "$RCH_DASH_PASSPHRASE" | cut -c1-12)
-if grep -rq "$PREFIX" dist 2>/dev/null; then
+if printf '%s' "$RCH_DASH_PASSPHRASE" | cut -c1-12 | grep -rqFf - dist 2>/dev/null; then
   echo "REFUSING TO DEPLOY: the passphrase appears inside dist/." >&2
   exit 1
 fi

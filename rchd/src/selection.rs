@@ -1884,10 +1884,18 @@ impl WorkerSelector {
             }
 
             // Filter by slot availability
+            //
+            // `undersized_but_free` defers the decision to the END of this loop
+            // instead of `continue`ing here. Routing a worker into
+            // `capacity_degraded` at THIS point would skip every check below —
+            // topology preflight, repo convergence, disk/memory pressure and
+            // reliability quarantine — and critical pressure in particular is a
+            // hard exclusion that must not reach even the fail-open lists. A
+            // degraded candidate has to earn its place like any other.
+            let mut undersized_but_free = false;
             let available_slots = worker.available_slots().await;
             if available_slots < request.estimated_cores {
                 if total_slots < request.estimated_cores {
-                    filtered_by_capacity += 1;
                     // `estimated_cores` is an ESTIMATE (see
                     // `estimate_cores_for_command`), not a hard requirement: it
                     // defaults to `compilation.build_slots` and the build's real
@@ -1909,16 +1917,24 @@ impl WorkerSelector {
                     // require a free slot) and is strictly better than running on
                     // the orchestrator, which has no slot accounting at all.
                     if available_slots > 0 {
-                        capacity_degraded.push((worker.clone(), circuit_state));
+                        undersized_but_free = true;
+                    } else {
+                        filtered_by_capacity += 1;
+                        debug!(
+                            "Worker {} excluded: no free slots and total below estimate \
+                             (available={}, total={}, requested={})",
+                            worker_id, available_slots, total_slots, request.estimated_cores
+                        );
+                        continue;
                     }
                 } else {
                     filtered_by_slots += 1;
+                    debug!(
+                        "Worker {} excluded: insufficient free slots (available={}, total={}, requested={})",
+                        worker_id, available_slots, total_slots, request.estimated_cores
+                    );
+                    continue;
                 }
-                debug!(
-                    "Worker {} excluded: insufficient slots (available={}, total={}, requested={})",
-                    worker_id, available_slots, total_slots, request.estimated_cores
-                );
-                continue;
             }
 
             // Filter by load-per-core threshold (bd-3eaa)
@@ -2174,6 +2190,14 @@ impl WorkerSelector {
 
             // Skip workers failing preflight checks (but keep for fail-open)
             if !passes_preflight {
+                // Fail-open is for workers that CAN satisfy the request but look
+                // unhealthy. An undersized one cannot, and before the degraded
+                // path existed the slot filter dropped it here outright — keep
+                // that behaviour rather than promoting it into fail-open.
+                if undersized_but_free {
+                    filtered_by_capacity += 1;
+                    continue;
+                }
                 if has_preferred && preferred_set.contains(worker_id.as_str()) {
                     preferred_without_health.push((worker.clone(), circuit_state));
                 }
@@ -2188,13 +2212,32 @@ impl WorkerSelector {
                     "Worker {} excluded: success_rate {:.2} < min {:.2}",
                     worker_id, success_rate, self.config.min_success_rate
                 );
-                if success_rate >= self.config.affinity.fallback_min_success_rate {
+                // Same reasoning as the preflight branch: an undersized worker
+                // never enters a fail-open list.
+                if !undersized_but_free
+                    && success_rate >= self.config.affinity.fallback_min_success_rate
+                {
                     if has_preferred && preferred_set.contains(worker_id.as_str()) {
                         preferred_without_health.push((worker.clone(), circuit_state));
                     } else {
                         eligible_without_health.push((worker.clone(), circuit_state));
                     }
                 }
+                continue;
+            }
+
+            // Survived every admission check but cannot meet the core
+            // estimate. Count it as capacity-filtered (so diagnostics still say
+            // `insufficient_total_slots`) and hold it as a last-resort
+            // candidate. Deliberately NOT added to `preferred`: an explicit pin
+            // on a too-small worker stays terminal.
+            if undersized_but_free {
+                filtered_by_capacity += 1;
+                debug!(
+                    "Worker {} held as degraded candidate: passes admission but total slots {} < requested {}",
+                    worker_id, total_slots, request.estimated_cores
+                );
+                capacity_degraded.push((worker.clone(), circuit_state));
                 continue;
             }
 
@@ -5901,6 +5944,70 @@ mod tests {
             result.worker.is_some(),
             "a healthy idle worker below the core estimate must be admitted as a \
              degraded candidate instead of silently falling back to local; reason={:?}",
+            result.reason
+        );
+    }
+
+    /// Regression: a degraded (undersized) candidate must still clear EVERY
+    /// admission check. The first version of `capacity_degraded` collected the
+    /// worker at the slot filter, which `continue`s — so it skipped topology
+    /// preflight, repo convergence, disk/memory pressure and reliability
+    /// quarantine. Critical pressure in particular is a hard exclusion that the
+    /// surrounding code deliberately keeps out of even the fail-open lists, and
+    /// a small critically-pressured worker would have been handed out anyway.
+    /// This was live on the fleet: a 1-slot worker sitting at
+    /// `disk_free_below_critical_gb` against `build_slots = 4`.
+    #[tokio::test]
+    async fn test_capacity_degraded_still_honours_critical_pressure() {
+        let pool = WorkerPool::new();
+
+        // Undersized (1 slot vs 4 requested) AND critically pressured.
+        let small_critical = make_worker("small-critical", 1, 90.0);
+        small_critical
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(true),
+                projects_root_checked_at_unix_ms: Some(1_700_000_000_000),
+                ..Default::default()
+            })
+            .await;
+        small_critical
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                state: crate::disk_pressure::PressureState::Critical,
+                confidence: crate::disk_pressure::PressureConfidence::High,
+                reason_code: "disk_free_below_critical_gb".to_string(),
+                policy_rule: "disk_free<=critical_free_gb".to_string(),
+                disk_free_gb: Some(2.0),
+                disk_total_gb: Some(240.0),
+                disk_free_ratio: Some(0.008),
+                disk_io_util_pct: Some(0.0),
+                memory_pressure: Some(10.0),
+                telemetry_age_secs: Some(5),
+                telemetry_fresh: true,
+                evaluated_at_unix_ms: 1_700_000_000_000,
+            })
+            .await;
+        pool.add_worker_state(small_critical).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "degraded-must-respect-pressure".to_string(),
+            command: Some("cargo build --release".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 4,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(
+            result.worker.is_none(),
+            "a critically-pressured worker must never be handed out, even as a \
+             last-resort degraded candidate; reason was {:?}",
             result.reason
         );
     }

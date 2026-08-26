@@ -19,6 +19,12 @@
  *
  * Responses: 200 body | 401 wrong/missing key | 405 wrong method | 500 no snapshot.
  * Errors are single-line text so an agent can branch on them cheaply.
+ *
+ * Cost note: every request runs 600k PBKDF2 iterations (~0.3-0.5s of CPU),
+ * because the key is derived per-request rather than cached. That is what makes
+ * brute force expensive, but it also makes this endpoint a poor thing to leave
+ * open to anonymous traffic — keep the host's own access gate (e.g. Vercel
+ * Deployment Protection) in front of it, and do not poll it in a tight loop.
  */
 
 import { webcrypto as crypto } from "node:crypto";

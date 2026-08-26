@@ -150,7 +150,10 @@ export default function App() {
     setNotice(null);
   }, []);
 
-  const workers: WorkerView[] = useMemo(() => (snap ? classifyAll(snap, now) : []), [snap, now]);
+  // classifyAll deliberately ignores the reader clock (worker staleness is
+  // judged against snapshot time), so this must NOT depend on `now` — it
+  // would recompute every tick for an identical result.
+  const workers: WorkerView[] = useMemo(() => (snap ? classifyAll(snap) : []), [snap]);
   const devs: DispatcherView[] = useMemo(
     () => (snap ? snap.dispatchers.map(classifyDispatcher).sort((a, b) => devRank(a.level) - devRank(b.level) || a.id.localeCompare(b.id)) : []),
     [snap],
