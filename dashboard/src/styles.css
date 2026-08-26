@@ -328,7 +328,9 @@ input { font: inherit; }
 
 .metrics { display: flex; flex-direction: column; gap: 9px; }
 
-.metric { display: grid; grid-template-columns: 42px 1fr auto; align-items: center; gap: 9px; }
+/* 56px fits the longest label ('OFFLOAD') at 10.5px uppercase with
+   letter-spacing; at 42px it collided with the bar. */
+.metric { display: grid; grid-template-columns: 56px 1fr auto; align-items: center; gap: 9px; }
 .metric-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint); font-weight: 650; }
 .metric-value { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); white-space: nowrap; }
 
@@ -426,3 +428,84 @@ input { font: inherit; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
 }
+
+/* ------------------------------------------------- dev machines (v2 schema) */
+
+.pill.dev-offloading { background: var(--ok-dim);   color: var(--ok);   }
+.pill.dev-idle       { background: var(--off-dim);  color: var(--off);  }
+.pill.dev-degraded   { background: var(--warn-dim); color: var(--warn); }
+.pill.dev-local-only,
+.pill.dev-unreachable { background: var(--crit-dim); color: var(--crit); }
+
+.banner.crit {
+  background: var(--crit-dim);
+  border-color: color-mix(in srgb, var(--crit) 45%, transparent);
+  color: var(--crit);
+}
+
+.hint-inline { font-size: 12px; color: var(--text-faint); }
+
+.trend-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.note {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  margin: 0 0 10px;
+  line-height: 1.5;
+}
+.note code {
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+/* remediation hints */
+.hint {
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 11px;
+  margin-bottom: 8px;
+}
+.hint-top { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.hint-msg { font-size: 12.5px; color: var(--text); line-height: 1.45; }
+.hint-action { font-size: 12px; color: var(--accent); margin-top: 5px; font-family: var(--mono); }
+
+/* recent-build list */
+.builds { display: flex; flex-direction: column; gap: 4px; }
+.build-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.build-row:last-child { border-bottom: none; }
+.build-proj {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* probe failure strip */
+.fail-strip { display: flex; gap: 2px; margin-top: 10px; }
+.fail-strip > i {
+  flex: 1;
+  height: 5px;
+  border-radius: 2px;
+  background: var(--off);
+}
+.fail-strip > i.ok  { background: var(--ok); opacity: 0.75; }
+.fail-strip > i.bad { background: var(--crit); }

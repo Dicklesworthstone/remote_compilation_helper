@@ -2,28 +2,37 @@
 /**
  * rch fleet dashboard — snapshot collector.
  *
- * Collects live fleet state from one or more rch dispatchers over SSH, folds it
- * into a single JSON document, encrypts it with AES-256-GCM (key derived from a
- * passphrase via PBKDF2-HMAC-SHA256), and writes `fleet.enc.json`.
+ * Collects live state from every rch DEV MACHINE (dispatcher) over SSH, folds in
+ * the worker pool each one can see, encrypts the result with AES-256-GCM (key
+ * derived from a passphrase via PBKDF2-HMAC-SHA256), and writes an encrypted
+ * envelope.
  *
  * The encryption is NOT decoration. `remote_compilation_helper` is a PUBLIC
  * repository and this payload contains fleet hostnames, IP addresses and
- * hardware inventory. Committing it in clear text would publish the topology of
- * the whole build fleet. Everything that reaches disk here is ciphertext; the
+ * hardware inventory. Everything that reaches disk here is ciphertext; the
  * passphrase never leaves the operator's machine or browser.
+ *
+ * Primary data source is `rch status --json`, which is far richer than the
+ * individual `workers`/`queue` commands:
+ *   - `posture`                     -> is this dev machine actually able to offload
+ *   - `stats.remote_count/local_count` -> is it in fact offloading, or silently local
+ *   - `recent_builds[].location`    -> per-build local-vs-remote with worker id
+ *   - `workers[].used_slots/total_slots` -> the REAL derated slot counts
+ *                                      (`rch workers list` shows only the
+ *                                       CONFIGURED ceiling and hides derating,
+ *                                       which is what hid the 2026-08-26
+ *                                       admission outage)
+ *   - `workers[].pressure_*`        -> disk/mem/io pressure with reason codes
+ *   - `remediation_hints`           -> actionable per-worker advice
  *
  * Usage:
  *   RCH_DASH_PASSPHRASE='<long passphrase>' node tools/snapshot.mjs \
- *       --dispatchers trj,css,ts1,ts2,csd \
+ *       --dispatchers builder-a,builder-b,local \
  *       --out public/data/fleet.enc.json
  *
- * Data sources (all documented `--json` CLI contracts, so this does not depend
- * on scraping human-readable output):
- *   rch workers list --json          -> configured id/host/user/slots/priority/tags
- *   rch workers capabilities --json  -> cpu count, load avg, disk, toolchain versions
- *   rch queue --json                 -> aggregate slots + active/queued builds
- *   rch daemon status --json         -> daemon liveness + uptime
- *   :9100/metrics                    -> per-worker circuit state, last-seen, latency
+ * `--dispatchers` takes ssh targets that RUN rch. Use `local` for the machine
+ * you collect from, so it monitors itself too. Keep your real host list in a
+ * gitignored .env rather than in source.
  */
 
 import { execFile } from "node:child_process";
@@ -31,21 +40,23 @@ import { promisify } from "node:util";
 import { webcrypto as crypto } from "node:crypto";
 import { writeFile, mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { hostname } from "node:os";
 
 const execFileAsync = promisify(execFile);
 
 const PBKDF2_ITERATIONS = 600_000;
-const SCHEMA = "rch.dashboard.snapshot.v1";
-const SSH_TIMEOUT_MS = 60_000;
+const SCHEMA = "rch.dashboard.snapshot.v2";
+const SSH_TIMEOUT_MS = 90_000;
+const MAX_BUFFER = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------- arg parsing
 
 function parseArgs(argv) {
   const args = {
-    dispatchers: ["trj"],
+    dispatchers: ["local"],
     out: "public/data/fleet.enc.json",
-    historyFrom: null,
-    historyMax: 48,
+    historyFile: ".snapshot-history.json",
+    historyMax: 96,
     label: "rch fleet",
   };
   for (let i = 2; i < argv.length; i++) {
@@ -54,12 +65,13 @@ function parseArgs(argv) {
     if (a === "--dispatchers") args.dispatchers = next().split(",").map((s) => s.trim()).filter(Boolean);
     else if (a === "--out") args.out = next();
     else if (a === "--label") args.label = next();
-    else if (a === "--history-from") args.historyFrom = next();
+    else if (a === "--history-file") args.historyFile = next();
     else if (a === "--history-max") args.historyMax = Number(next());
     else if (a === "--help" || a === "-h") {
       console.log(
-        "usage: RCH_DASH_PASSPHRASE=... node tools/snapshot.mjs " +
-          "[--dispatchers a,b,c] [--out path] [--label name] [--history-from plain.json] [--history-max N]",
+        "usage: RCH_DASH_PASSPHRASE=... node tools/snapshot.mjs\n" +
+          "  [--dispatchers a,b,c]  ssh targets; use `local` for this machine\n" +
+          "  [--out path] [--label name] [--history-file path] [--history-max N]",
       );
       process.exit(0);
     } else {
@@ -72,124 +84,118 @@ function parseArgs(argv) {
 
 // ------------------------------------------------------------------ ssh layer
 
-/** Run a command on a dispatcher over SSH. Never throws; returns {ok, stdout}. */
-async function ssh(host, command) {
+const LOCAL_ALIASES = new Set(["local", "localhost", hostname(), hostname().split(".")[0]]);
+
+/**
+ * Run a command on a dispatcher. `local` (or this machine's own hostname) runs
+ * without ssh, so the machine you collect FROM can also be monitored — the macs
+ * are dispatchers too. Never throws; returns {ok, stdout}.
+ */
+async function run(host, command) {
+  const isLocal = LOCAL_ALIASES.has(host);
   try {
-    const { stdout } = await execFileAsync(
-      "ssh",
-      [
-        "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=12",
-        "-o", "StrictHostKeyChecking=accept-new",
-        host,
-        command,
-      ],
-      { timeout: SSH_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 },
-    );
+    const { stdout } = isLocal
+      ? await execFileAsync("bash", ["-lc", command], { timeout: SSH_TIMEOUT_MS, maxBuffer: MAX_BUFFER })
+      : await execFileAsync(
+          "ssh",
+          ["-o", "BatchMode=yes", "-o", "ConnectTimeout=12",
+           "-o", "StrictHostKeyChecking=accept-new", host, command],
+          { timeout: SSH_TIMEOUT_MS, maxBuffer: MAX_BUFFER },
+        );
     return { ok: true, stdout };
   } catch (err) {
-    return { ok: false, stdout: "", error: String(err?.shortMessage || err?.message || err) };
+    // A non-zero exit still yields useful stdout for some rch subcommands.
+    const stdout = err?.stdout ?? "";
+    return { ok: stdout.trim().length > 0, stdout, error: String(err?.shortMessage || err?.message || err) };
   }
 }
 
 /** Run an rch subcommand that emits the standard `{data: ...}` JSON envelope. */
-async function rchJson(host, subcommand) {
-  const cmd =
-    `export PATH="$HOME/.local/bin:$PATH"; timeout 45 rch ${subcommand} --json 2>/dev/null`;
-  const res = await ssh(host, cmd);
-  if (!res.ok || !res.stdout.trim()) return null;
+async function rchJson(host, subcommand, timeoutSec = 60) {
+  const cmd = `export PATH="$HOME/.local/bin:$PATH"; timeout ${timeoutSec} rch ${subcommand} --json 2>/dev/null`;
+  const res = await run(host, cmd);
+  if (!res.stdout.trim()) return null;
   try {
-    const parsed = JSON.parse(res.stdout);
+    // Tolerate leading log noise: take from the first '{' to the last '}'.
+    const s = res.stdout;
+    const start = s.indexOf("{");
+    const end = s.lastIndexOf("}");
+    if (start === -1 || end <= start) return null;
+    const parsed = JSON.parse(s.slice(start, end + 1));
     return parsed?.data ?? parsed;
   } catch {
     return null;
   }
 }
 
-/** Scrape the daemon's Prometheus endpoint for per-worker gauges. */
+/** Scrape the daemon's Prometheus endpoint for probe latency. */
 async function fetchMetrics(host) {
-  const res = await ssh(host, "curl -s --max-time 10 http://127.0.0.1:9100/metrics 2>/dev/null");
-  if (!res.ok || !res.stdout) return {};
-  const out = { circuit: {}, lastSeen: {}, latency: {} };
-  const latSum = {};
-  const latCount = {};
+  const res = await run(host, "curl -s --max-time 10 http://127.0.0.1:9100/metrics 2>/dev/null");
+  const out = { latency: {}, lastSeen: {} };
+  if (!res.stdout) return out;
+  const sum = {}, count = {};
   for (const line of res.stdout.split("\n")) {
-    if (line.startsWith("#") || !line.trim()) continue;
+    if (!line || line[0] === "#") continue;
     let m;
-    if ((m = line.match(/^rch_circuit_state\{worker="([^"]+)"\}\s+(\S+)/))) {
-      out.circuit[m[1]] = Number(m[2]);
-    } else if ((m = line.match(/^rch_worker_last_seen_timestamp\{worker="([^"]+)"\}\s+(\S+)/))) {
-      out.lastSeen[m[1]] = Number(m[2]);
-    } else if ((m = line.match(/^rch_worker_latency_ms_sum\{worker="([^"]+)"\}\s+(\S+)/))) {
-      latSum[m[1]] = Number(m[2]);
-    } else if ((m = line.match(/^rch_worker_latency_ms_count\{worker="([^"]+)"\}\s+(\S+)/))) {
-      latCount[m[1]] = Number(m[2]);
-    }
+    if ((m = line.match(/^rch_worker_latency_ms_sum\{worker="([^"]+)"\}\s+(\S+)/))) sum[m[1]] = Number(m[2]);
+    else if ((m = line.match(/^rch_worker_latency_ms_count\{worker="([^"]+)"\}\s+(\S+)/))) count[m[1]] = Number(m[2]);
+    else if ((m = line.match(/^rch_worker_last_seen_timestamp\{worker="([^"]+)"\}\s+(\S+)/))) out.lastSeen[m[1]] = Number(m[2]);
   }
-  for (const id of Object.keys(latSum)) {
-    if (latCount[id] > 0) out.latency[id] = latSum[id] / latCount[id];
-  }
+  for (const id of Object.keys(sum)) if (count[id] > 0) out.latency[id] = sum[id] / count[id];
   return out;
 }
 
 // ------------------------------------------------------------------ collection
 
+function num(v) {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
 async function collectDispatcher(host) {
-  const [status, queue, list, caps, metrics] = await Promise.all([
-    rchJson(host, "daemon status"),
-    rchJson(host, "queue"),
-    rchJson(host, "workers list"),
-    rchJson(host, "workers capabilities"),
+  const [status, caps, metrics] = await Promise.all([
+    rchJson(host, "status", 70),
+    rchJson(host, "workers capabilities", 70),
     fetchMetrics(host),
   ]);
 
-  const reachable = Boolean(status || queue || list);
-  const configured = list?.workers ?? [];
+  const reachable = Boolean(status);
+  const d = status?.daemon?.daemon ?? null;
+  const statusWorkers = status?.daemon?.workers ?? [];
   const capsById = new Map((caps?.workers ?? []).map((w) => [w.id, w.capabilities ?? {}]));
 
-  // Speed scores need >= 2 ids and are comparatively expensive, so only ask once
-  // we know which workers exist.
-  let speeds = {};
-  const ids = configured.map((w) => w.id).filter(Boolean);
-  if (ids.length >= 2) {
-    const cmp = await rchJson(host, `workers compare ${ids.join(" ")}`);
-    for (const row of cmp?.workers ?? cmp?.comparison ?? []) {
-      if (row?.id) speeds[row.id] = row;
-    }
-  }
-
-  const activeByWorker = new Map();
-  for (const b of queue?.active_builds ?? []) {
-    const wid = b.worker || b.worker_id || b.id;
-    if (!wid) continue;
-    activeByWorker.set(wid, (activeByWorker.get(wid) ?? 0) + 1);
-  }
-
-  const workers = configured.map((w) => {
+  const workers = statusWorkers.map((w) => {
     const c = capsById.get(w.id) ?? {};
-    const circuit = metrics.circuit?.[w.id];
     return {
       id: w.id,
       host: w.host ?? null,
       user: w.user ?? null,
-      tags: w.tags ?? [],
-      total_slots: w.total_slots ?? null,
-      priority: w.priority ?? null,
-      enabled: w.enabled !== false,
-      active_builds: activeByWorker.get(w.id) ?? 0,
-      circuit_state: circuit === undefined ? null : ["closed", "open", "half_open"][circuit] ?? String(circuit),
-      last_seen_unix: metrics.lastSeen?.[w.id] ?? null,
-      latency_ms: metrics.latency?.[w.id] ?? null,
-      speed: speeds[w.id]?.speed_score ?? speeds[w.id]?.speedscore ?? null,
+      status: w.status ?? null,
+      circuit_state: w.circuit_state ?? null,
+      used_slots: num(w.used_slots),
+      total_slots: num(w.total_slots),
+      speed: num(w.speed_score),
+      last_error: w.last_error ?? null,
+      consecutive_failures: num(w.consecutive_failures) ?? 0,
+      // failure_history is oldest-first booleans; keep it for the sparkline.
+      failure_history: Array.isArray(w.failure_history) ? w.failure_history.slice(-20) : [],
+      pressure: {
+        state: w.pressure_state ?? null,
+        reason: w.pressure_reason_code ?? null,
+        disk_free_gb: num(w.pressure_disk_free_gb),
+        disk_total_gb: num(w.pressure_disk_total_gb),
+        disk_io_util_pct: num(w.pressure_disk_io_util_pct),
+        memory_pressure: num(w.pressure_memory_pressure),
+        telemetry_age_secs: num(w.pressure_telemetry_age_secs),
+        telemetry_fresh: w.pressure_telemetry_fresh ?? null,
+      },
+      latency_ms: num(metrics.latency?.[w.id]),
+      last_seen_unix: num(metrics.lastSeen?.[w.id]),
       caps: {
-        num_cpus: c.num_cpus ?? null,
-        load_avg_1: c.load_avg_1 ?? null,
-        load_avg_5: c.load_avg_5 ?? null,
-        load_avg_15: c.load_avg_15 ?? null,
-        disk_free_gb: c.disk_free_gb ?? null,
-        disk_total_gb: c.disk_total_gb ?? null,
-        memory_pressure: c.memory_pressure ?? null,
-        cpu_microarch_level: c.cpu_microarch_level ?? null,
+        num_cpus: num(c.num_cpus),
+        load_avg_1: num(c.load_avg_1),
+        load_avg_5: num(c.load_avg_5),
+        load_avg_15: num(c.load_avg_15),
+        cpu_microarch_level: num(c.cpu_microarch_level),
         rustc_version: c.rustc_version ?? null,
         bun_version: c.bun_version ?? null,
         node_version: c.node_version ?? null,
@@ -197,28 +203,62 @@ async function collectDispatcher(host) {
         zig_version: c.zig_version ?? null,
         projects_root_ok: c.projects_root_ok ?? null,
       },
+      tags: [],
     };
   });
 
+  const stats = status?.daemon?.stats ?? null;
+  const recent = (status?.daemon?.recent_builds ?? []).slice(-25).map((b) => ({
+    project: b.project_id ?? null,
+    command: typeof b.command === "string" ? b.command.slice(0, 120) : null,
+    location: b.location ?? null,          // "Remote" | "Local"
+    worker_id: b.worker_id ?? null,
+    duration_ms: num(b.duration_ms),
+    exit_code: num(b.exit_code),
+    completed_at: b.completed_at ?? null,
+  }));
+
   return {
-    id: host,
+    id: host === "local" ? hostname().split(".")[0] : host,
     reachable,
-    daemon_running: status?.running ?? null,
-    uptime_seconds: status?.uptime_seconds ?? null,
-    queue: queue
+    // The headline dev-machine question: can this box offload at all?
+    posture: status?.posture ?? null,
+    posture_description: status?.posture_description ?? null,
+    daemon: d
       ? {
-          queue_depth: queue.queue_depth ?? 0,
-          workers_total: queue.workers_total ?? null,
-          workers_available: queue.workers_available ?? null,
-          workers_busy: queue.workers_busy ?? null,
-          workers_offline: queue.workers_offline ?? null,
-          workers_healthy: queue.workers_healthy ?? null,
-          slots_total: queue.slots_total ?? null,
-          slots_available: queue.slots_available ?? null,
-          active_builds: queue.active_builds ?? [],
-          queued_builds: queue.queued_builds ?? [],
+          version: d.version ?? null,
+          uptime_secs: num(d.uptime_secs),
+          pid: num(d.pid),
+          workers_total: num(d.workers_total),
+          workers_healthy: num(d.workers_healthy),
+          slots_total: num(d.slots_total),
+          slots_available: num(d.slots_available),
         }
       : null,
+    // Is it ACTUALLY offloading, or silently building local?
+    build_stats: stats
+      ? {
+          total: num(stats.total_builds) ?? 0,
+          remote: num(stats.remote_count) ?? 0,
+          local: num(stats.local_count) ?? 0,
+          success: num(stats.success_count) ?? 0,
+          failure: num(stats.failure_count) ?? 0,
+          avg_duration_ms: num(stats.avg_duration_ms),
+        }
+      : null,
+    saved_time_ms: num(status?.daemon?.saved_time?.time_saved_ms),
+    active_builds: (status?.daemon?.active_builds ?? []).length,
+    queued_builds: (status?.daemon?.queued_builds ?? []).length,
+    recent_builds: recent,
+    issues: (status?.daemon?.issues ?? []).slice(0, 10),
+    alerts: (status?.daemon?.alerts ?? []).slice(0, 10),
+    remediation_hints: (status?.remediation_hints ?? []).slice(0, 12).map((h) => ({
+      worker_id: h.worker_id ?? null,
+      severity: h.severity ?? null,
+      message: typeof h.message === "string" ? h.message.slice(0, 240) : null,
+      suggested_action: typeof h.suggested_action === "string" ? h.suggested_action.slice(0, 240) : null,
+      reason_code: h.reason_code ?? null,
+    })),
     workers,
   };
 }
@@ -229,9 +269,7 @@ async function encrypt(plaintext, passphrase) {
   const enc = new TextEncoder();
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const baseKey = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, [
-    "deriveKey",
-  ]);
+  const baseKey = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
   const key = await crypto.subtle.deriveKey(
     { name: "PBKDF2", salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
     baseKey,
@@ -264,86 +302,104 @@ async function main() {
     process.exit(2);
   }
 
-  console.error(`collecting from ${args.dispatchers.length} dispatcher(s): ${args.dispatchers.join(", ")}`);
-  const dispatchers = [];
-  for (const host of args.dispatchers) {
-    process.stderr.write(`  ${host} ... `);
-    const d = await collectDispatcher(host);
-    dispatchers.push(d);
-    console.error(d.reachable ? `ok (${d.workers.length} workers)` : "UNREACHABLE");
-  }
+  console.error(`collecting from ${args.dispatchers.length} dev machine(s): ${args.dispatchers.join(", ")}`);
+  const settled = await Promise.all(
+    args.dispatchers.map(async (host) => {
+      const d = await collectDispatcher(host);
+      console.error(
+        `  ${host.padEnd(14)} ${d.reachable ? `ok  posture=${d.posture ?? "?"}  workers=${d.workers.length}` : "UNREACHABLE"}`,
+      );
+      return d;
+    }),
+  );
+  const dispatchers = settled;
 
-  // Union the worker view across dispatchers: a worker is "known" if any
-  // dispatcher has it configured. Runtime facts come from the first dispatcher
-  // that actually reported them, so one unreachable box cannot blank the fleet.
+  // Union the worker view. A worker is "known" if any dev machine has it, and
+  // runtime facts come from whichever machine actually reported them, so one
+  // unreachable dispatcher cannot blank the fleet. Slot counts are per-observer
+  // (rchd derates independently), so keep the MAX observed capacity plus the
+  // per-dispatcher detail.
   const merged = new Map();
   for (const d of dispatchers) {
     for (const w of d.workers) {
       const prev = merged.get(w.id);
       if (!prev) {
-        merged.set(w.id, { ...w, seen_by: [d.id] });
+        merged.set(w.id, { ...w, seen_by: [d.id], slots_by_dispatcher: { [d.id]: { used: w.used_slots, total: w.total_slots } } });
         continue;
       }
       prev.seen_by.push(d.id);
-      for (const k of ["circuit_state", "last_seen_unix", "latency_ms", "speed"]) {
+      prev.slots_by_dispatcher[d.id] = { used: w.used_slots, total: w.total_slots };
+      if ((w.total_slots ?? 0) > (prev.total_slots ?? 0)) prev.total_slots = w.total_slots;
+      if ((w.used_slots ?? 0) > (prev.used_slots ?? 0)) prev.used_slots = w.used_slots;
+      for (const k of ["speed", "latency_ms", "last_seen_unix", "status", "circuit_state", "last_error"]) {
         if (prev[k] == null && w[k] != null) prev[k] = w[k];
       }
-      for (const k of Object.keys(w.caps)) {
-        if (prev.caps[k] == null && w.caps[k] != null) prev.caps[k] = w.caps[k];
-      }
-      prev.active_builds = Math.max(prev.active_builds, w.active_builds);
+      for (const k of Object.keys(w.caps)) if (prev.caps[k] == null && w.caps[k] != null) prev.caps[k] = w.caps[k];
+      for (const k of Object.keys(w.pressure)) if (prev.pressure[k] == null && w.pressure[k] != null) prev.pressure[k] = w.pressure[k];
+      if (!prev.failure_history.length && w.failure_history.length) prev.failure_history = w.failure_history;
     }
   }
   const workers = [...merged.values()].sort((a, b) => a.id.localeCompare(b.id));
 
+  const reachable = dispatchers.filter((d) => d.reachable);
   const totals = {
     workers: workers.length,
     slots: workers.reduce((n, w) => n + (w.total_slots ?? 0), 0),
+    slots_used: workers.reduce((n, w) => n + (w.used_slots ?? 0), 0),
     cores: workers.reduce((n, w) => n + (w.caps.num_cpus ?? 0), 0),
-    disk_free_gb: workers.reduce((n, w) => n + (w.caps.disk_free_gb ?? 0), 0),
-    disk_total_gb: workers.reduce((n, w) => n + (w.caps.disk_total_gb ?? 0), 0),
-    dispatchers_reachable: dispatchers.filter((d) => d.reachable).length,
+    disk_free_gb: workers.reduce((n, w) => n + (w.pressure.disk_free_gb ?? 0), 0),
+    disk_total_gb: workers.reduce((n, w) => n + (w.pressure.disk_total_gb ?? 0), 0),
     dispatchers_total: dispatchers.length,
+    dispatchers_reachable: reachable.length,
+    dispatchers_remote_ready: reachable.filter((d) => d.posture === "remote_ready").length,
+    builds_remote: reachable.reduce((n, d) => n + (d.build_stats?.remote ?? 0), 0),
+    builds_local: reachable.reduce((n, d) => n + (d.build_stats?.local ?? 0), 0),
+    active_builds: reachable.reduce((n, d) => n + d.active_builds, 0),
   };
 
-  const snapshot = {
-    schema: SCHEMA,
-    label: args.label,
-    generated_at: new Date().toISOString(),
-    totals,
-    dispatchers,
-    workers,
-    history: [],
-  };
+  const generated_at = new Date().toISOString();
 
-  // Optional rolling history so the UI can draw trends across snapshots.
-  if (args.historyFrom) {
-    try {
-      const prev = JSON.parse(await readFile(args.historyFrom, "utf8"));
-      const points = Array.isArray(prev.history) ? prev.history : [];
-      points.push({
-        t: snapshot.generated_at,
-        slots_total: totals.slots,
-        slots_available: dispatchers.reduce((n, d) => n + (d.queue?.slots_available ?? 0), 0),
-        workers_healthy: dispatchers[0]?.queue?.workers_healthy ?? null,
-        disk_free_gb: Math.round(totals.disk_free_gb),
-      });
-      snapshot.history = points.slice(-args.historyMax);
-    } catch {
-      snapshot.history = [];
-    }
+  // Rolling history. A PLAINTEXT sidecar is what lets successive runs append,
+  // but it must live OUTSIDE `public/` — Vite copies `public/` verbatim into
+  // `dist/`, so a history file kept there would be published unencrypted next
+  // to the ciphertext. It holds only aggregate counters, no hosts or IPs, but
+  // publishing fleet telemetry in the clear defeats the point of encrypting the
+  // snapshot at all. It is embedded INTO the encrypted payload for the UI.
+  let history = [];
+  try {
+    const prev = JSON.parse(await readFile(args.historyFile, "utf8"));
+    if (Array.isArray(prev)) history = prev;
+  } catch {
+    history = [];
   }
+  history.push({
+    t: generated_at,
+    slots_total: totals.slots,
+    slots_used: totals.slots_used,
+    workers: totals.workers,
+    disk_free_gb: Math.round(totals.disk_free_gb),
+    builds_remote: totals.builds_remote,
+    builds_local: totals.builds_local,
+    dispatchers_remote_ready: totals.dispatchers_remote_ready,
+  });
+  history = history.slice(-args.historyMax);
+
+  const snapshot = { schema: SCHEMA, label: args.label, generated_at, totals, dispatchers, workers, history };
 
   const plain = JSON.stringify(snapshot);
   const envelope = await encrypt(plain, passphrase);
   await mkdir(dirname(args.out), { recursive: true });
   await writeFile(args.out, JSON.stringify(envelope, null, 2));
+  await mkdir(dirname(args.historyFile), { recursive: true });
+  await writeFile(args.historyFile, JSON.stringify(history));
 
   console.error(
-    `\nwrote ${args.out}  (${workers.length} workers, ${totals.slots} slots, ` +
-      `${(plain.length / 1024).toFixed(1)}KB plaintext -> ${(JSON.stringify(envelope).length / 1024).toFixed(1)}KB ciphertext)`,
+    `\nwrote ${args.out}\n` +
+      `  ${workers.length} workers · ${totals.slots} slots (${totals.slots_used} used) · ${totals.cores} cores\n` +
+      `  ${totals.dispatchers_remote_ready}/${totals.dispatchers_reachable} dev machines remote-ready · ` +
+      `builds remote ${totals.builds_remote} / local ${totals.builds_local}\n` +
+      `  ${(plain.length / 1024).toFixed(1)}KB plaintext -> ${(JSON.stringify(envelope).length / 1024).toFixed(1)}KB ciphertext`,
   );
-  console.error("payload is AES-256-GCM encrypted; the passphrase is required to read it.");
 }
 
 main().catch((err) => {

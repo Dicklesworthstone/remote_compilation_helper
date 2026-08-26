@@ -30,11 +30,9 @@ function Metric({
 export function WorkerCard({ w, onOpen }: Props) {
   const cores = w.caps.num_cpus;
   const loadPct = w.loadPerCore != null ? Math.min(100, w.loadPerCore * 100) : null;
-  const slotPct =
-    w.total_slots && w.total_slots > 0 ? (w.active_builds / w.total_slots) * 100 : null;
 
   return (
-    <button className="wcard" onClick={() => onOpen(w.id)} aria-label={`Details for ${w.id}`}>
+    <button className="wcard" onClick={() => onOpen(w.id)} aria-label={`Details for worker ${w.id}`}>
       <div className="wcard-top">
         <span className="wname">{w.id}</span>
         <span className={`pill ${w.health}`}>{w.health}</span>
@@ -45,15 +43,14 @@ export function WorkerCard({ w, onOpen }: Props) {
       </div>
       <div className="whost">
         {w.user ? `${w.user}@` : ""}{w.host ?? "—"}
-        {w.priority != null && <> · pri {w.priority}</>}
       </div>
 
       <div className="metrics">
         <Metric
           label="slots"
-          pct={slotPct}
-          cls={w.active_builds > 0 ? "busy" : "off"}
-          valueText={`${w.active_builds}/${w.total_slots ?? "—"}`}
+          pct={w.slotPct}
+          cls={(w.used_slots ?? 0) > 0 ? "busy" : "off"}
+          valueText={`${w.used_slots ?? 0}/${w.total_slots ?? "—"}`}
         />
         <Metric
           label="cpu"
@@ -69,21 +66,20 @@ export function WorkerCard({ w, onOpen }: Props) {
           label="disk"
           pct={w.diskUsedPct}
           cls={utilClass(w.diskUsedPct)}
-          valueText={`${fmtGb(w.caps.disk_free_gb)} free`}
+          valueText={`${fmtGb(w.pressure.disk_free_gb)} free`}
         />
       </div>
 
       {w.health !== "healthy" && (
-        <div style={{ marginTop: 10, fontSize: 12, color: "var(--text-dim)" }}>
-          {w.healthReason}
-        </div>
+        <div style={{ marginTop: 10, fontSize: 12, color: "var(--text-dim)" }}>{w.healthReason}</div>
       )}
 
-      {w.tags.length > 0 && (
+      {(w.tags.length > 0 || w.seen_by) && (
         <div className="tags">
           {w.tags.map((t) => (
             <span key={t} className={`tag${t.startsWith("os:") ? " os" : ""}`}>{t}</span>
           ))}
+          {w.seen_by && <span className="tag">seen by {w.seen_by.length}</span>}
         </div>
       )}
     </button>

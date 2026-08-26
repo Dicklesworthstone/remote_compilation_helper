@@ -88,11 +88,16 @@ export async function decryptEnvelope(env: Envelope, key: CryptoKey): Promise<st
 // ------------------------------------------------------------------- cookie
 
 function cookieAttrs(maxAge: number): string {
-  // `Secure` is correct on GitHub Pages (always https) but would silently drop
-  // the cookie on a plain-http localhost dev server, so only set it when the
-  // page itself is secure.
+  // `Secure` is correct on any real deployment (Vercel and GitHub Pages are
+  // both https) but would silently drop the cookie on a plain-http localhost
+  // dev server, so only set it when the page itself is secure.
   const secure = location.protocol === "https:" ? "; Secure" : "";
-  return `; Max-Age=${maxAge}; Path=${location.pathname}; SameSite=Strict${secure}`;
+  // Scope to the app's base path, NOT `location.pathname`. Using the raw
+  // pathname breaks on any deep link (`/index.html`, a sub-route): the cookie
+  // would be written for that exact path and then be invisible at the app root,
+  // so "stay unlocked" would appear to work and silently fail on return.
+  const base = import.meta.env.BASE_URL || "/";
+  return `; Max-Age=${maxAge}; Path=${base}; SameSite=Strict${secure}`;
 }
 
 export async function persistKey(key: CryptoKey): Promise<void> {

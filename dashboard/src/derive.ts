@@ -1,6 +1,8 @@
-import type { HealthLevel, Snapshot, Worker, WorkerView } from "./types";
+import type {
+  Dispatcher, DispatcherView, DevLevel, HealthLevel, Snapshot, Worker, WorkerView,
+} from "./types";
 
-/** Snapshots older than this are called out loudly — stale data is worse than none. */
+/** Snapshots older than this are called out — stale data is worse than none. */
 export const STALE_WARN_SECONDS = 15 * 60;
 export const STALE_CRIT_SECONDS = 60 * 60;
 
@@ -29,75 +31,126 @@ export function fmtUptime(seconds: number | null): string {
   return `${m}m`;
 }
 
+export function fmtDuration(ms: number | null): string {
+  if (ms == null || !Number.isFinite(ms)) return "—";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.round(ms / 60_000)}m`;
+}
+
 /**
  * Fold raw worker facts into one status.
  *
- * Ordering is deliberate: a disabled or unreachable worker is reported as such
- * even if its last known disk reading was alarming, because "we cannot see it"
- * is the more actionable fact. Disk is checked before load because a full disk
- * takes a worker down hard, whereas high load is usually just work happening.
+ * Order is deliberate. "We cannot reach it" outranks a stale disk reading,
+ * because reachability is the more actionable fact. Disk outranks load: a full
+ * disk takes a worker down hard, while high load is usually just work happening.
  */
 export function classify(w: Worker, nowMs: number): WorkerView {
-  const caps = w.caps;
+  const p = w.pressure;
   const diskUsedPct =
-    caps.disk_total_gb && caps.disk_free_gb != null && caps.disk_total_gb > 0
-      ? ((caps.disk_total_gb - caps.disk_free_gb) / caps.disk_total_gb) * 100
+    p.disk_total_gb && p.disk_free_gb != null && p.disk_total_gb > 0
+      ? ((p.disk_total_gb - p.disk_free_gb) / p.disk_total_gb) * 100
       : null;
   const loadPerCore =
-    caps.load_avg_1 != null && caps.num_cpus ? caps.load_avg_1 / caps.num_cpus : null;
+    w.caps.load_avg_1 != null && w.caps.num_cpus ? w.caps.load_avg_1 / w.caps.num_cpus : null;
   const staleSeconds = w.last_seen_unix != null ? nowMs / 1000 - w.last_seen_unix : null;
+  const slotPct =
+    w.total_slots && w.total_slots > 0 ? ((w.used_slots ?? 0) / w.total_slots) * 100 : null;
 
+  const st = (w.status ?? "").toLowerCase();
   let health: HealthLevel = "healthy";
   let healthReason = "healthy";
 
-  if (!w.enabled) {
+  if (st === "disabled") {
     health = "disabled";
     healthReason = "disabled in workers.toml";
-  } else if (w.circuit_state === "open") {
+  } else if (st === "down" || st === "unreachable" || w.circuit_state === "open") {
     health = "offline";
-    healthReason = "circuit breaker open";
+    healthReason = w.circuit_state === "open" ? "circuit breaker open" : `worker ${st || "unreachable"}`;
   } else if (staleSeconds != null && staleSeconds > STALE_CRIT_SECONDS) {
     health = "offline";
     healthReason = `not seen for ${fmtAge(staleSeconds)}`;
-  } else if (diskUsedPct != null && diskUsedPct >= 95) {
+  } else if (p.state === "critical" || (diskUsedPct != null && diskUsedPct >= 95)) {
     health = "critical";
-    healthReason = `disk ${diskUsedPct.toFixed(0)}% full`;
-  } else if (diskUsedPct != null && diskUsedPct >= 88) {
+    healthReason = p.reason ? `pressure: ${p.reason}` : `disk ${diskUsedPct?.toFixed(0)}% full`;
+  } else if (st === "draining") {
     health = "warn";
-    healthReason = `disk ${diskUsedPct.toFixed(0)}% full`;
+    healthReason = "draining";
+  } else if (p.state === "warning" || (diskUsedPct != null && diskUsedPct >= 88)) {
+    health = "warn";
+    healthReason = p.reason ? `pressure: ${p.reason}` : `disk ${diskUsedPct?.toFixed(0)}% full`;
+  } else if (w.consecutive_failures > 0) {
+    health = "warn";
+    healthReason = `${w.consecutive_failures} consecutive failure${w.consecutive_failures === 1 ? "" : "s"}`;
   } else if (loadPerCore != null && loadPerCore >= 2) {
     health = "warn";
     healthReason = `load ${loadPerCore.toFixed(1)}× cores`;
   } else if (w.circuit_state === "half_open") {
     health = "warn";
     healthReason = "circuit half-open (probing)";
-  } else if (w.active_builds > 0) {
+  } else if ((w.used_slots ?? 0) > 0) {
     health = "busy";
-    healthReason = `${w.active_builds} active build${w.active_builds === 1 ? "" : "s"}`;
-  } else if (caps.projects_root_ok === false) {
+    healthReason = `${w.used_slots}/${w.total_slots} slots in use`;
+  } else if (w.caps.projects_root_ok === false) {
     health = "warn";
     healthReason = "projects root unhealthy";
   }
 
-  return { ...w, health, healthReason, diskUsedPct, loadPerCore, staleSeconds };
+  return { ...w, health, healthReason, diskUsedPct, loadPerCore, staleSeconds, slotPct };
 }
 
 export function classifyAll(snap: Snapshot, nowMs: number): WorkerView[] {
   return snap.workers.map((w) => classify(w, nowMs));
 }
 
-export const HEALTH_ORDER: HealthLevel[] = [
-  "critical",
-  "warn",
-  "offline",
-  "busy",
-  "healthy",
-  "disabled",
-];
+/**
+ * Classify a DEV MACHINE by the question that actually matters: are its builds
+ * going to the worker pool, or is it quietly compiling locally?
+ *
+ * `local-only` is the loud one, and it is why this dashboard exists: a
+ * dispatcher whose workers all fall below its `build_slots` estimate silently
+ * compiles everything on itself while `rch queue`, worker probes and every
+ * other surface still report a healthy fleet.
+ */
+export function classifyDispatcher(d: Dispatcher): DispatcherView {
+  const s = d.build_stats;
+  const counted = s ? s.remote + s.local : 0;
+  const remotePct = counted > 0 ? (s!.remote / counted) * 100 : null;
+
+  let level: DevLevel;
+  let levelReason: string;
+
+  if (!d.reachable) {
+    level = "unreachable";
+    levelReason = "no response from rch";
+  } else if (d.posture && d.posture !== "remote_ready") {
+    level = d.posture.includes("local") ? "local-only" : "degraded";
+    levelReason = d.posture_description ?? d.posture;
+  } else if (remotePct != null && remotePct < 50) {
+    level = "local-only";
+    levelReason = `only ${remotePct.toFixed(0)}% of recent builds went remote`;
+  } else if (counted === 0) {
+    level = "idle";
+    levelReason = "no builds recorded yet";
+  } else {
+    level = "offloading";
+    levelReason = `${remotePct?.toFixed(0)}% of recent builds went to the pool`;
+  }
+
+  return { ...d, level, levelReason, remotePct };
+}
+
+export const HEALTH_ORDER: HealthLevel[] = ["critical", "warn", "offline", "busy", "healthy", "disabled"];
 
 export function healthRank(h: HealthLevel): number {
   const i = HEALTH_ORDER.indexOf(h);
   return i === -1 ? HEALTH_ORDER.length : i;
+}
+
+export const DEV_ORDER: DevLevel[] = ["unreachable", "local-only", "degraded", "offloading", "idle"];
+export function devRank(l: DevLevel): number {
+  const i = DEV_ORDER.indexOf(l);
+  return i === -1 ? DEV_ORDER.length : i;
 }
 
 /** Bar colour class for a 0-100 utilisation value. */

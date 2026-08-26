@@ -14,3 +14,12 @@ public/data/
 
 # TypeScript incremental build state
 *.tsbuildinfo
+
+# Secrets. The repo is PUBLIC — the dashboard passphrase must never be committed.
+# Keep the canonical copy in a secret manager (e.g. Vault secret/rch-fleet-dashboard).
+.env
+.env.*
+!.env.example
+
+# Rolling aggregate history sidecar (plaintext, never published)
+.snapshot-history.json

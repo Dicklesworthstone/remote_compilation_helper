@@ -45,14 +45,17 @@ await page.waitForSelector(".kpis", { timeout: 40000 });
 const kpis = await page.locator(".kpi-value").allInnerTexts();
 check("unlocks with correct passphrase", kpis.length >= 5, kpis.join(" | "));
 
-const cards = await page.locator(".wcard").count();
+const cards = await page.locator(".wcard").count();  // dev machines + workers
 check("worker cards render", cards > 0, `${cards} cards`);
 const names = await page.locator(".wname").allInnerTexts();
 check("worker names present", names.length === cards, names.slice(0, 5).join(", ") + " …");
 
 // bars/meters rendered
+// dev-machine cards carry 2 meters (offload, slots); worker cards carry 3
+// (slots, cpu, disk). Assert every card has at least two rather than guessing
+// a single multiplier for two different card shapes.
 const meters = await page.locator(".bar").count();
-check("metric bars render", meters >= cards * 3, `${meters} bars`);
+check("metric bars render", meters >= cards * 2, `${meters} bars across ${cards} cards`);
 
 // drawer
 await page.locator(".wcard").first().click();
@@ -87,8 +90,16 @@ const after = await page.evaluate(() => document.documentElement.dataset.theme);
 check("theme toggles", before !== after, `${before} -> ${after}`);
 
 // dispatcher section
-check("dispatcher cards render", (await page.locator(".dcard").count()) > 0,
-      `${await page.locator(".dcard").count()} dispatchers`);
+// dev machines render as cards with a dev-* pill
+const devPills = await page.locator('[class*="pill dev-"]').count();
+check("dev machine cards render", devPills > 0, `${devPills} dev machines`);
+// open a dev machine drawer and confirm its offload panel
+await page.locator('[class*="pill dev-"]').first().click();
+await page.waitForSelector(".drawer", { timeout: 15000 });
+const devHeads = await page.locator(".drawer .kv-group h4").allInnerTexts();
+check("dev drawer shows offload posture", devHeads.some((h) => /offload/i.test(h)), devHeads.join(", "));
+await page.keyboard.press("Escape");
+await page.waitForTimeout(300);
 
 // cookie session survives reload
 await page.reload({ waitUntil: "load" });

@@ -16,7 +16,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-DISPATCHERS="${RCH_DASH_DISPATCHERS:-trj,css,csd,ts1,ts2}"
+DISPATCHERS="${RCH_DASH_DISPATCHERS:-local}"
 LABEL="${RCH_DASH_LABEL:-rch fleet}"
 BRANCH="${RCH_DASH_BRANCH:-gh-pages}"
 TARGET_REPO=""
@@ -102,7 +102,9 @@ touch "$WORK/.nojekyll"   # keep Pages from eating /assets/_* paths
 git -C "$WORK" init -q
 git -C "$WORK" checkout -q -b "$BRANCH"
 git -C "$WORK" add -A
-git -C "$WORK" -c user.name="Dicklesworthstone" -c user.email="jeff141421@gmail.com" \
+# Use whatever identity git already has; the deploy branch is disposable.
+git -C "$WORK" -c user.name="${GIT_AUTHOR_NAME:-fleet-dashboard}" \
+    -c user.email="${GIT_AUTHOR_EMAIL:-fleet-dashboard@localhost}" \
     commit -q -m "deploy fleet dashboard $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 git -C "$WORK" push -q --force "$TARGET_REPO" "$BRANCH"
 
