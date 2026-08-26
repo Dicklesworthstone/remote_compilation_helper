@@ -499,7 +499,20 @@ pub(super) async fn execute_remote_compilation(
     ));
 
     // Ensure deterministic remote topology before any repo synchronization.
-    ensure_worker_projects_topology(&worker_config, reporter, topology_policy).await?;
+    // bd-8iwkm/bd-gc0ze: the ownership sweep inside is scoped to this
+    // dispatch's closure remote roots so its cost tracks the trees about to
+    // be written, not the entire multi-GB mirror tree.
+    let ownership_scan_roots: Vec<PathBuf> = sync_plan
+        .iter()
+        .map(|entry| PathBuf::from(entry.remote_root.as_str()))
+        .collect();
+    ensure_worker_projects_topology(
+        &worker_config,
+        reporter,
+        topology_policy,
+        &ownership_scan_roots,
+    )
+    .await?;
 
     // Hold every mutable source authority from before repo convergence and the
     // first rsync until Cargo exits. A sync-only lock is insufficient: another

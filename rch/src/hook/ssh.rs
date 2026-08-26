@@ -468,25 +468,45 @@ fn build_worker_projects_topology_cmd(topology_policy: &PathTopologyPolicy) -> S
 /// policy-conflicting with) the canonical root, which this sweep already
 /// covers. Exit codes: 0 = ok/repaired/check-unavailable (fail-open), 46 =
 /// repair unavailable (sudo missing/refused), 47 = partial repair.
-fn build_worker_ownership_repair_cmd(canonical_root: &Path, ssh_user: &str) -> String {
-    let root = shell_escape::escape(canonical_root.display().to_string().into());
-    let user = shell_escape::escape(ssh_user.into());
+fn build_worker_ownership_repair_cmd(roots: &[PathBuf], ssh_user: &str) -> String {
+    let quoted_roots = roots
+        .iter()
+        .map(|root| shell_escape::escape(root.to_string_lossy().into()))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
-        "set -e; r={root}; u={user}; \
-         if ! b=$(sudo -n find \"$r\" -xdev -user root -print 2>/dev/null | wc -l); then \
-           printf 'RCH_OWNERSHIP_CHECK_UNAVAILABLE\\n' >&2; exit 0; \
+        "set -e; u={user}; \
+         detect_root() {{ \
+           if ! b=$(sudo -n find \"$1\" -xdev -user root -print 2>/dev/null | wc -l); then \
+             printf 'RCH_OWNERSHIP_CHECK_UNAVAILABLE\\n' >&2; exit 0; \
+           fi; \
+           echo $((b + 0)); \
+         }}; \
+         total=0; \
+         for r in {roots}; do \
+           [ -d \"$r\" ] || continue; \
+           total=$((total + $(detect_root \"$r\"))); \
+         done; \
+         if [ \"$total\" -eq 0 ]; then echo RCH_OWNERSHIP_OK; exit 0; fi; \
+         repair_ok=1; \
+         for r in {roots}; do \
+           [ -d \"$r\" ] || continue; \
+           if ! sudo -n find \"$r\" -xdev -user root -exec chown -h \"$u\" {{}} + 2>/dev/null; then \
+             repair_ok=0; \
+           fi; \
+         done; \
+         if [ \"$repair_ok\" -eq 0 ]; then \
+           printf 'RCH_OWNERSHIP_REPAIR_UNAVAILABLE:detected=%s\\n' \"$total\" >&2; exit 46; \
          fi; \
-         b=$((b + 0)); \
-         if [ \"$b\" -eq 0 ]; then echo RCH_OWNERSHIP_OK; exit 0; fi; \
-         if sudo -n find \"$r\" -xdev -user root -exec chown -h \"$u\" {{}} + 2>/dev/null; then \
-           a=$(sudo -n find \"$r\" -xdev -user root -print 2>/dev/null | wc -l || echo 1); \
-           a=$((a + 0)); \
-           if [ \"$a\" -eq 0 ]; then printf 'RCH_OWNERSHIP_REPAIRED:count=%s\\n' \"$b\"; exit 0; fi; \
-           printf 'RCH_OWNERSHIP_PARTIAL:remaining=%s\\n' \"$a\" >&2; exit 47; \
-         fi; \
-         printf 'RCH_OWNERSHIP_REPAIR_UNAVAILABLE:detected=%s\\n' \"$b\" >&2; exit 46",
-        root = root,
+         remaining=0; \
+         for r in {roots}; do \
+           [ -d \"$r\" ] || continue; \
+           remaining=$((remaining + $(detect_root \"$r\"))); \
+         done; \
+         if [ \"$remaining\" -eq 0 ]; then printf 'RCH_OWNERSHIP_REPAIRED:count=%s\\n' \"$total\"; exit 0; fi; \
+         printf 'RCH_OWNERSHIP_PARTIAL:remaining=%s\\n' \"$remaining\" >&2; exit 47",
         user = user,
+        roots = quoted_roots,
     )
 }
 
@@ -594,6 +614,7 @@ pub(super) async fn ensure_worker_projects_topology(
     worker: &WorkerConfig,
     reporter: &HookReporter,
     topology_policy: &PathTopologyPolicy,
+    dispatch_closure_roots: &[PathBuf],
 ) -> anyhow::Result<()> {
     if should_skip_remote_preflight(worker) {
         reporter.verbose("[RCH] topology preflight skipped in mock mode");
@@ -644,8 +665,19 @@ pub(super) async fn ensure_worker_projects_topology(
     // rsync-as-ssh-user fail exit 23 on replace/unlink even when topology is
     // healthy. Repair them before sync so the failure window closes here
     // instead of mid-transfer.
+    // bd-gc0ze follow-up: scope the ownership sweep to THIS dispatch's closure
+    // roots instead of the whole canonical mirror. A global scan walks every
+    // mirrored repo (13GB+ franken_engine mirrors included) on every dispatch,
+    // which blew the fixed SSH budget and failed closed on E104 before any
+    // rsync started. The drift that breaks THIS transfer can only live under
+    // the remote roots THIS transfer writes into.
+    let ownership_scan_roots: Vec<PathBuf> = if dispatch_closure_roots.is_empty() {
+        vec![topology_policy.canonical_root().to_path_buf()]
+    } else {
+        dispatch_closure_roots.to_vec()
+    };
     let repaired =
-        repair_worker_mirror_ownership(worker, reporter, topology_policy.canonical_root()).await?;
+        repair_worker_mirror_ownership(worker, reporter, &ownership_scan_roots).await?;
     if repaired > 0 {
         reporter.summary(&format!(
             "[RCH] repaired ownership drift on {}: {repaired} root-owned entries chowned to {}",
@@ -655,13 +687,15 @@ pub(super) async fn ensure_worker_projects_topology(
     Ok(())
 }
 
-/// bd-8iwkm: detect and repair root-owned entries under the worker's
-/// canonical mirror tree. Returns the number of repaired entries; zero means
-/// either no drift or a fail-open check-unavailable (never blocks dispatch).
+/// bd-8iwkm: detect and repair root-owned entries under the dispatch's closure
+/// roots on the worker's canonical mirror. Returns the number of repaired
+/// entries; zero means either no drift or a fail-open check-unavailable (never
+/// blocks dispatch). Scoped to the closure roots (see caller) so cost tracks
+/// the trees about to be rsynced rather than the entire mirror.
 async fn repair_worker_mirror_ownership(
     worker: &WorkerConfig,
     reporter: &HookReporter,
-    canonical_root: &Path,
+    roots: &[PathBuf],
 ) -> anyhow::Result<u64> {
     if should_skip_remote_preflight(worker) {
         reporter.verbose("[RCH] ownership preflight skipped in mock mode");
@@ -671,19 +705,21 @@ async fn repair_worker_mirror_ownership(
         reporter.verbose("[RCH] ownership preflight skipped for Windows worker");
         return Ok(0);
     }
-    let cmd = build_worker_ownership_repair_cmd(canonical_root, &worker.user);
-    let output = run_offload_ssh_command(worker, &cmd, Duration::from_secs(60)).await?;
+    let cmd = build_worker_ownership_repair_cmd(roots, &worker.user);
+    // bd-gc0ze: closure-scoped sweeps normally finish in seconds; 600s bounds
+    // pathological trees without failing every dispatch the way the old fixed
+    // 60s budget did once mirrors grew past multi-GB.
+    let output = run_offload_ssh_command(worker, &cmd, Duration::from_secs(600)).await?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         anyhow::bail!(
             "worker mirror ownership repair failed on {} (status {:?}): stdout='{}' stderr='{}' — \
-             root-owned entries under {} block rsync-as-{} (bd-8iwkm)",
+             root-owned entries under the dispatch closure block rsync-as-{} (bd-8iwkm)",
             worker.id,
             output.status.code(),
             stdout,
             stderr,
-            canonical_root.display(),
             worker.user
         );
     }
@@ -983,20 +1019,29 @@ mod tests {
     #[test]
     fn test_build_worker_ownership_repair_cmd_scopes_and_never_deletes() {
         let _guard = test_guard!();
-        let command = build_worker_ownership_repair_cmd(Path::new("/data/projects"), "deploy-user");
+        let command = build_worker_ownership_repair_cmd(
+            &[
+                PathBuf::from("/data/projects"),
+                PathBuf::from("/data/projects/franken_node"),
+            ],
+            "deploy-user",
+        );
 
         assert!(
             command.contains("'--user root'") || command.contains("-user root"),
             "sweep must target root-owned entries only: {command}"
         );
         assert!(
-            command.contains("r=/data/projects"),
-            "clean canonical root binds verbatim into the sweep variable: {command}"
+            command.contains("'/data/projects'")
+                && command.contains("'/data/projects/franken_node'"),
+            "every dispatch closure root binds verbatim into the sweep: {command}"
         );
-        let spaced =
-            build_worker_ownership_repair_cmd(Path::new("/data/projects with space"), "deploy u");
+        let spaced = build_worker_ownership_repair_cmd(
+            &[PathBuf::from("/data/projects with space")],
+            "deploy u",
+        );
         assert!(
-            spaced.contains("r='/data/projects with space'") && spaced.contains("u='deploy u'"),
+            spaced.contains("'/data/projects with space'") && spaced.contains("u='deploy u'"),
             "paths or users with shell metacharacters must be single-quote escaped: {spaced}"
         );
         assert!(
