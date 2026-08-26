@@ -307,9 +307,11 @@ fn project_declares_cargo_build_jobs(project_root: &Path) -> bool {
         .iter()
         .map(|rel| project_root.join(rel))
         .filter_map(|path| std::fs::read_to_string(path).ok())
-        .filter_map(|text| text.parse::<toml::Value>().ok())
-        .any(|value| {
-            value
+        // A whole document must go through `from_str::<Table>`: `str::parse::<Value>`
+        // parses a single TOML *value* and rejects any file with a table header.
+        .filter_map(|text| toml::from_str::<toml::Table>(&text).ok())
+        .any(|table| {
+            table
                 .get("build")
                 .and_then(|build| build.get("jobs"))
                 .is_some()
