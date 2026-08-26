@@ -469,6 +469,7 @@ fn build_worker_projects_topology_cmd(topology_policy: &PathTopologyPolicy) -> S
 /// covers. Exit codes: 0 = ok/repaired/check-unavailable (fail-open), 46 =
 /// repair unavailable (sudo missing/refused), 47 = partial repair.
 fn build_worker_ownership_repair_cmd(roots: &[PathBuf], ssh_user: &str) -> String {
+    let quoted_user = shell_escape::escape(ssh_user.into());
     let quoted_roots = roots
         .iter()
         .map(|root| shell_escape::escape(root.to_string_lossy().into()))
@@ -505,7 +506,7 @@ fn build_worker_ownership_repair_cmd(roots: &[PathBuf], ssh_user: &str) -> Strin
          done; \
          if [ \"$remaining\" -eq 0 ]; then printf 'RCH_OWNERSHIP_REPAIRED:count=%s\\n' \"$total\"; exit 0; fi; \
          printf 'RCH_OWNERSHIP_PARTIAL:remaining=%s\\n' \"$remaining\" >&2; exit 47",
-        user = user,
+        user = quoted_user,
         roots = quoted_roots,
     )
 }
