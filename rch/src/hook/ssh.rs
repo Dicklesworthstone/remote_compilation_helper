@@ -706,6 +706,15 @@ async fn repair_worker_mirror_ownership(
         reporter.verbose("[RCH] ownership preflight skipped for Windows worker");
         return Ok(0);
     }
+    // bd-8iwkm/bd-gc0ze: when the SSH user IS root, rsync already runs as
+    // root and root-owned entries cannot block replace/unlink. Counting them
+    // would flag the entire mirror as drift while the repair chown is a
+    // no-op, so the sweep would report RCH_OWNERSHIP_PARTIAL forever and
+    // fail-closed every dispatch on root-login workers.
+    if worker.user == "root" {
+        reporter.verbose("[RCH] ownership preflight skipped for root-login worker");
+        return Ok(0);
+    }
     let cmd = build_worker_ownership_repair_cmd(roots, &worker.user);
     // bd-gc0ze: closure-scoped sweeps normally finish in seconds; 600s bounds
     // pathological trees without failing every dispatch the way the old fixed
@@ -1033,16 +1042,16 @@ mod tests {
             "sweep must target root-owned entries only: {command}"
         );
         assert!(
-            command.contains("'/data/projects'")
-                && command.contains("'/data/projects/franken_node'"),
-            "every dispatch closure root binds verbatim into the sweep: {command}"
+            command.contains("for r in /data/projects /data/projects/franken_node"),
+            "every dispatch closure root binds into the sweep loop: {command}"
         );
         let spaced = build_worker_ownership_repair_cmd(
             &[PathBuf::from("/data/projects with space")],
             "deploy u",
         );
         assert!(
-            spaced.contains("'/data/projects with space'") && spaced.contains("u='deploy u'"),
+            spaced.contains("for r in '/data/projects with space'")
+                && spaced.contains("u='deploy u'"),
             "paths or users with shell metacharacters must be single-quote escaped: {spaced}"
         );
         assert!(
