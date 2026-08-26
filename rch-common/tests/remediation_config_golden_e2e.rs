@@ -81,7 +81,12 @@ fn golden_remediation_config_default_policy() {
                 "reaper_enabled": false,
                 "reaper_idle_hours": 12,
                 "reaper_interval_mins": 120,
-                "remote_base": "/data/projects"
+                "remote_base": "/data/projects",
+                // Pooled `-pool-` dirs are warm caches: a 7-day idle window
+                // (validated >= 24h or 0 = disabled) before the reaper
+                // touches them, and no per-worker byte cap by default.
+                "reaper_pooled_idle_hours": 168,
+                "reaper_max_cache_gb": 0
             },
             "telemetry_freshness": {
                 "max_age_secs": 120

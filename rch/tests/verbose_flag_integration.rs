@@ -35,6 +35,12 @@ fn run_rch_with_config(test_name: &str, args: &[&str]) -> Output {
     let config_home = make_config_home(test_name);
     Command::new(env!("CARGO_BIN_EXE_rch"))
         .args(args)
+        // `RCH_CONFIG_DIR` outranks `XDG_CONFIG_HOME` in `config_dir()` and
+        // operators commonly export it (it is how non-interactive shells
+        // pin the daemon's config). Pin BOTH to the fixture so an
+        // inherited operator value can never leak the host's real worker
+        // inventory into these assertions.
+        .env("RCH_CONFIG_DIR", config_home.join("rch"))
         .env("XDG_CONFIG_HOME", config_home)
         .output()
         .expect("run rch")

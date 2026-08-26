@@ -298,7 +298,12 @@ fn aggregate_verdict(diagnostics: &[ReliabilityDiagnostic]) -> ReliabilityVerdic
     }
 }
 
+/// Serialized in snake_case so `--json` consumers see the same tokens as
+/// `as_str()`, the webhook payload, and `rch_common::errors::reliability::
+/// ReliabilityCategoryKind` (`"topology"`, `"repo_presence"`, ...). Keep
+/// the serde rename and `as_str` in lockstep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum ReliabilityCategory {
     Topology,
     RepoPresence,
