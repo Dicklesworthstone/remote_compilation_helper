@@ -1147,6 +1147,34 @@ mod tests {
         assert!(command.contains("RCH_CLEANUP_RM_FAILURE dir=%s kb=%s"));
     }
 
+    /// Backdate a fixture directory so the sweep's `-mmin +max_age` filter
+    /// (max_age 0 in these tests) deterministically selects it.
+    ///
+    /// A directory created moments before the sweep has age 0, which is
+    /// NOT "older than 0 minutes" under either `find`: BSD rounds
+    /// `(age + 59) / 60` and so needs the entry to be at least one second
+    /// old, GNU truncates and needs a full minute. Fresh fixtures therefore
+    /// only became candidates when the test process happened to be slow,
+    /// which made the tests pass under a loaded full gate and fail when
+    /// run alone.
+    fn age_dir(path: &std::path::Path) {
+        let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 60);
+        std::fs::File::open(path)
+            .expect("open fixture dir")
+            .set_modified(backdated)
+            .expect("backdate fixture dir");
+    }
+
+    /// Write an executable `name` into `dir` so `dir` can be prepended to
+    /// the sweep's PATH (see `run_sweep`).
+    fn write_shim(dir: &std::path::Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let shim = dir.join(name);
+        std::fs::write(&shim, body).expect("write shim");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod shim");
+    }
+
     /// Runs the generated sweep against a scratch tree, optionally with
     /// directories prepended to PATH (for command shims), capturing
     /// stdout, stderr, and exit status.
@@ -1181,6 +1209,7 @@ mod tests {
             .join("gcverify_pool_repo")
             .join(".rch-target-pool-deadbeefcafe");
         std::fs::create_dir_all(pool.join("deps")).expect("pool tree");
+        age_dir(&pool);
         let (stdout, _stderr, code) = run_sweep(base.path(), &[]);
         assert_eq!(code, Some(0));
         assert!(stdout.contains("removed=1"), "{stdout}");
@@ -1189,28 +1218,24 @@ mod tests {
 
     #[test]
     fn cleanup_command_reaps_empty_husk_when_rmdir_succeeds() {
-        use std::os::unix::fs::PermissionsExt;
         let _guard = test_guard!();
         let base = tempfile::tempdir().expect("base");
         // Empty husk: contents were removed by an interfering writer,
         // the directory itself remains (bd-kwvy8's hz2 observation).
-        std::fs::create_dir_all(
-            base.path()
-                .join("gcverify_pool_repo")
-                .join(".rch-target-pool-deadbeefcafe"),
-        )
-        .expect("husk");
+        let husk = base
+            .path()
+            .join("gcverify_pool_repo")
+            .join(".rch-target-pool-deadbeefcafe");
+        std::fs::create_dir_all(&husk).expect("husk");
+        age_dir(&husk);
         // A shim `rm` that refuses -rf models rm failing mid-removal;
         // the sweep must reconcile via rmdir and count the reap.
         let shim_dir = tempfile::tempdir().expect("shim dir");
-        let shim = shim_dir.path().join("rm");
-        std::fs::write(
-            &shim,
+        write_shim(
+            shim_dir.path(),
+            "rm",
             "#!/bin/sh\n[ \"$1\" = \"-rf\" ] && exit 42\nfor real in /usr/bin/rm /bin/rm; do [ -x \"$real\" ] && exec \"$real\" \"$@\"; done\nexit 127\n",
-        )
-        .expect("shim");
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod shim");
+        );
         let (stdout, stderr, code) = run_sweep(base.path(), &[shim_dir.path().to_path_buf()]);
         assert_eq!(code, Some(0));
         assert!(stdout.contains("removed=1"), "{stdout}");
@@ -1224,28 +1249,31 @@ mod tests {
 
     #[test]
     fn cleanup_command_reports_survivor_and_unreapable_husk_as_errors() {
-        use std::os::unix::fs::PermissionsExt;
         let _guard = test_guard!();
         let base = tempfile::tempdir().expect("base");
         let survivor = base.path().join("repo_a").join(".rch-target-pool-survivor");
         std::fs::create_dir_all(survivor.join("nested")).expect("survivor tree");
+        age_dir(&survivor);
         let husk = base.path().join("repo_b").join(".rch-target-pool-husk");
         std::fs::create_dir_all(&husk).expect("husk");
-        // Read-only pool parents make every removal fail (EACCES): the
-        // survivor stays non-empty; the husk's rmdir retry also fails.
-        let repo_a = base.path().join("repo_a");
-        let repo_b = base.path().join("repo_b");
-        // Read-only POOL PARENTS make every removal fail (EACCES): the
-        // survivor stays non-empty; the husk's rmdir retry also fails.
-        std::fs::set_permissions(&repo_a, std::fs::Permissions::from_mode(0o555))
-            .expect("chmod repo_a");
-        std::fs::set_permissions(&repo_b, std::fs::Permissions::from_mode(0o555))
-            .expect("chmod repo_b");
-        let (stdout, stderr, code) = run_sweep(base.path(), &[]);
-        std::fs::set_permissions(&repo_a, std::fs::Permissions::from_mode(0o755))
-            .expect("restore repo_a");
-        std::fs::set_permissions(&repo_b, std::fs::Permissions::from_mode(0o755))
-            .expect("restore repo_b");
+        age_dir(&husk);
+        // Inject the failures through command shims rather than read-only
+        // parents: root ignores directory permissions, so an EACCES-based
+        // fixture reports the wrong verdict on the root-run workers the
+        // gate actually executes on. `rm -rf` refusing leaves the survivor
+        // non-empty (RM_FAILURE via the final branch); `rmdir` refusing
+        // leaves the husk an unreapable empty shell (RM_FAILURE via the
+        // rmdir-retry branch). Both directories must still exist after.
+        let shim_dir = tempfile::tempdir().expect("shim dir");
+        write_shim(
+            shim_dir.path(),
+            "rm",
+            "#!/bin/sh\n[ \"$1\" = \"-rf\" ] && exit 1\nfor real in /usr/bin/rm /bin/rm; do [ -x \"$real\" ] && exec \"$real\" \"$@\"; done\nexit 127\n",
+        );
+        write_shim(shim_dir.path(), "rmdir", "#!/bin/sh\nexit 1\n");
+        let (stdout, stderr, code) = run_sweep(base.path(), &[shim_dir.path().to_path_buf()]);
+        assert!(survivor.join("nested").is_dir(), "survivor must be intact");
+        assert!(husk.is_dir(), "husk must be intact");
         assert_eq!(code, Some(1));
         assert!(stdout.contains("removed=0"), "{stdout}");
         assert!(stdout.contains("remove_errors=2"), "{stdout}");
