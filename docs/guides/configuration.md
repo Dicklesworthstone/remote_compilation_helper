@@ -199,13 +199,13 @@ which layer supplied each value.
 - `RCH_DAEMON_SOCKET` (legacy alias for `RCH_SOCKET_PATH`; the canonical name wins when both are set)
 - `RCH_DAEMON_TIMEOUT_MS` (daemon socket connect/read timeout in milliseconds, `100..=600000`, default `5000`; the select-worker wait keeps `RCH_DAEMON_RESPONSE_TIMEOUT_SECS` / `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS`)
 - `RCH_TRANSFER_ZSTD_LEVEL` (legacy alias for `RCH_COMPRESSION_LEVEL`, lowest precedence)
-
-SSH identities are per worker (`identity_file` in `workers.toml`); there is no
-global `RCH_SSH_KEY` override.
 - `RCH_ENABLE_METRICS`
 - `RCH_TEST_MODE`
 - `RCH_WORKER` (preferred worker override)
 - `RCH_WORKERS` (comma-separated preferred worker override list)
+
+SSH identities are per worker (`identity_file` in `workers.toml`); there is no
+global `RCH_SSH_KEY` override.
 
 ### Hook integration variables
 Used by hook integration scripts (see `docs/extending/integration-hooks.md`):

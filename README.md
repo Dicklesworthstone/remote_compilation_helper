@@ -243,8 +243,8 @@ rch hook install|uninstall|status|test
 rch shim install|status|uninstall      # cargo shim: offload builds started by scripts/Makefiles, not just hooked tool calls
 rch agents list|status|install-hook|uninstall-hook
 rch diagnose "cargo build --release"
-rch admit -- cargo build --release     # preflight: would this command be admitted, and where?
-rch why miss|refusal                   # explain the last non-offload / refusal
+rch admit "cargo build --release"      # read-only preflight: offload / local / queue / defer verdict
+rch why miss|refusal                   # RABS: explain a cache-key miss diff or an index refusal code
 rch exec -- cargo build --release
 rch --robot-triage --json
 rch capabilities --json
