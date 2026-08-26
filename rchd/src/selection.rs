@@ -2321,7 +2321,22 @@ impl WorkerSelector {
         // never meet. Deliberately last-resort: every other candidate list —
         // including the below-health fail-open lists — must be empty first, so
         // this can only turn a guaranteed LOCAL build into a remote one.
-        if eligible.is_empty()
+        //
+        // Three guards keep existing admission contracts intact:
+        //   * `!has_preferred` — an explicit `preferred_workers` pin is an
+        //     allow-set, and "this exact worker is too small" must stay
+        //     terminal rather than quietly running somewhere the caller did
+        //     not ask for.
+        //   * `filtered_by_slots == 0` — if any worker is merely BUSY it can
+        //     still satisfy the request once it drains, so the pool is
+        //     queueable and waiting beats degrading. Only degrade when nothing
+        //     in the fleet could ever fit.
+        //   * `filtered_by_active_project == 0` — the one-job-per-project-per-
+        //     worker guard is a correctness rule, not a capacity hint.
+        if !has_preferred
+            && filtered_by_slots == 0
+            && filtered_by_active_project == 0
+            && eligible.is_empty()
             && preferred.is_empty()
             && eligible_without_health.is_empty()
             && preferred_without_health.is_empty()
