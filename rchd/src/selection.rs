@@ -1764,6 +1764,10 @@ impl WorkerSelector {
         let mut preferred: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
         let mut eligible_without_health: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
         let mut preferred_without_health: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
+        // Workers that cleared every admission check except the slot estimate,
+        // and are structurally too small to *ever* clear it, but do have free
+        // capacity right now. See `capacity_degraded` handling below.
+        let mut capacity_degraded: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
         let mut filtered_by_health = 0usize;
         let mut filtered_by_hard_preflight = 0usize;
         let mut filtered_by_component = 0usize;
@@ -1884,6 +1888,29 @@ impl WorkerSelector {
             if available_slots < request.estimated_cores {
                 if total_slots < request.estimated_cores {
                     filtered_by_capacity += 1;
+                    // `estimated_cores` is an ESTIMATE (see
+                    // `estimate_cores_for_command`), not a hard requirement: it
+                    // defaults to `compilation.build_slots` and the build's real
+                    // parallelism comes from `CARGO_BUILD_JOBS`/`-j`, not from
+                    // rch's slot accounting. A worker whose TOTAL slots are below
+                    // the estimate can never satisfy it, so excluding it outright
+                    // means the request falls back to LOCAL forever rather than
+                    // degrading — and because rchd derates slots per dispatcher
+                    // from live RAM/disk telemetry, a whole fleet can drop under
+                    // the estimate at once.
+                    //
+                    // Observed live 2026-08-26: ts1 and css derated every worker
+                    // to 1-2 slots against `build_slots = 4`, so BOTH silently
+                    // compiled everything locally while reporting a bogus OS-gate
+                    // reason, with 13 healthy idle workers sitting right there.
+                    //
+                    // Keep such a worker as a degraded candidate when it has real
+                    // free capacity now. This never oversubscribes (we still
+                    // require a free slot) and is strictly better than running on
+                    // the orchestrator, which has no slot accounting at all.
+                    if available_slots > 0 {
+                        capacity_degraded.push((worker.clone(), circuit_state));
+                    }
                 } else {
                     filtered_by_slots += 1;
                 }
@@ -2185,7 +2212,30 @@ impl WorkerSelector {
         // Otherwise this surfaces as a generic "all workers busy", and an agent
         // debugging `--target x86_64-pc-windows-msvc` against an all-Linux fleet
         // has nothing to go on.
+        //
+        // The `filtered_by_*_other` guard is load-bearing, not defensive noise.
+        // Without it this branch fires whenever the pool is empty AND *any*
+        // worker was OS-gated, so a single `os = "windows"` worker in an
+        // otherwise all-Linux fleet rewrites every empty-pool diagnosis into
+        // "every candidate declares an `os`" — which is flatly untrue when the
+        // other twelve were dropped for insufficient slots. Observed live
+        // 2026-08-26: ts1 and css admitted zero workers because rchd had
+        // derated every worker below `estimated_cores`, yet both reported
+        // `os_gate_excluded=1 required_os=none` and sent operators chasing a
+        // non-existent OS-tag problem for hours. Claim OS-gate causality only
+        // when the OS gate really is the sole cause; otherwise fall through to
+        // the combined `no_admissible_workers_summary`, which names every
+        // contributing filter.
+        let filtered_by_anything_else = filtered_by_health
+            + filtered_by_hard_preflight
+            + filtered_by_pressure
+            + filtered_by_slots
+            + filtered_by_capacity
+            + filtered_by_active_project
+            + filtered_by_convergence
+            + filtered_by_component;
         if filtered_by_os_gate > 0
+            && filtered_by_anything_else == 0
             && eligible.is_empty()
             && preferred.is_empty()
             && eligible_without_health.is_empty()
@@ -2266,11 +2316,32 @@ impl WorkerSelector {
             return Ok(Vec::new());
         }
 
+        // Degrade rather than fall local when the ONLY thing standing between
+        // this request and a healthy idle worker is an estimate the fleet can
+        // never meet. Deliberately last-resort: every other candidate list —
+        // including the below-health fail-open lists — must be empty first, so
+        // this can only turn a guaranteed LOCAL build into a remote one.
+        if eligible.is_empty()
+            && preferred.is_empty()
+            && eligible_without_health.is_empty()
+            && preferred_without_health.is_empty()
+            && !capacity_degraded.is_empty()
+        {
+            debug!(
+                "No worker can satisfy estimated_cores={}; degrading to {} worker(s) \
+                 with free capacity below the estimate rather than falling back to local",
+                request.estimated_cores,
+                capacity_degraded.len()
+            );
+            metrics::inc_reliability_error("selection", "capacity_degraded_admission");
+            return Ok(capacity_degraded);
+        }
+
         if (filtered_by_active_project > 0 || (filtered_by_capacity > 0 && filtered_by_slots == 0))
             && preferred_without_health.is_empty()
             && eligible_without_health.is_empty()
         {
-            return Err(SelectionReason::NoAdmissibleWorkers(
+            return Err(SelectionReason::NoAdmissibleWorkers(append_os_gate(
                 no_admissible_workers_summary_with_active_project(
                     filtered_by_pressure,
                     filtered_by_slots,
@@ -2279,7 +2350,8 @@ impl WorkerSelector {
                     filtered_by_health,
                     filtered_by_active_project,
                 ),
-            ));
+                filtered_by_os_gate,
+            )));
         }
 
         // Hard preflight failures (for example topology invariants or
@@ -2303,7 +2375,7 @@ impl WorkerSelector {
                 || filtered_by_capacity > 0
                 || filtered_by_health > 0
             {
-                return Err(SelectionReason::NoAdmissibleWorkers(
+                return Err(SelectionReason::NoAdmissibleWorkers(append_os_gate(
                     no_admissible_workers_summary(
                         filtered_by_pressure,
                         filtered_by_slots,
@@ -2311,7 +2383,8 @@ impl WorkerSelector {
                         filtered_by_hard_preflight,
                         filtered_by_health,
                     ),
-                ));
+                    filtered_by_os_gate,
+                )));
             }
 
             // Emit a convergence-specific reason when convergence was the
@@ -3264,6 +3337,24 @@ fn push_reason_code(reason_codes: &mut Vec<String>, reason_code: &'static str) {
     if !reason_codes.iter().any(|existing| existing.eq(reason_code)) {
         reason_codes.push(reason_code.to_string());
     }
+}
+
+/// Append the OS-gate count to a combined admission summary.
+///
+/// The OS gate gets a bespoke, prose-y message when it is the *sole* reason the
+/// pool emptied (see the early return in `filter_eligible_workers`). When it is
+/// only a contributing reason it still has to appear, or an operator reading
+/// `insufficient_total_slots=12` has no way to know a thirteenth worker was
+/// dropped for declaring `os = "windows"`.
+fn append_os_gate(mut summary: String, os_gate: usize) -> String {
+    if os_gate == 0 {
+        return summary;
+    }
+    if !summary.is_empty() {
+        summary.push(',');
+    }
+    summary.push_str(&format!("os_gate_excluded={os_gate}"));
+    summary
 }
 
 fn no_admissible_workers_summary(
@@ -5743,6 +5834,193 @@ mod tests {
             result.reason,
             SelectionReason::NoAdmissibleWorkers(
                 "critical_pressure=1,insufficient_slots=1".to_string()
+            )
+        );
+    }
+
+    /// Regression (live outage 2026-08-26, ts1 + css).
+    ///
+    /// rchd derates worker slots per dispatcher from live RAM/disk telemetry.
+    /// On ts1 that put EVERY worker at 1-2 slots against `build_slots = 4`, so
+    /// `total_slots < estimated_cores` for the whole fleet. The slot filter
+    /// hard-excluded all of them with no fail-open list, the pool came back
+    /// empty, and both orchestrators silently compiled everything LOCALLY while
+    /// thirteen healthy idle workers sat there. `estimated_cores` is an
+    /// estimate, so a too-small worker with real free capacity must still be
+    /// admitted (degraded) rather than dropped.
+    #[tokio::test]
+    async fn test_fleet_derated_below_estimate_degrades_instead_of_falling_local() {
+        let pool = WorkerPool::new();
+        for id in ["derated-a", "derated-b"] {
+            let worker = make_worker(id, 2, 70.0);
+            worker
+                .set_capabilities(rch_common::WorkerCapabilities {
+                    rustc_version: Some("1.87.0".to_string()),
+                    projects_root_ok: Some(true),
+                    projects_root_checked_at_unix_ms: Some(1_700_000_000_000),
+                    disk_free_gb: Some(400.0),
+                    disk_total_gb: Some(900.0),
+                    ..Default::default()
+                })
+                .await;
+            pool.add_worker_state(worker).await;
+        }
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "derated-fleet".to_string(),
+            command: Some("cargo build --release".to_string()),
+            command_priority: CommandPriority::Normal,
+            // Larger than any worker's TOTAL slots — unsatisfiable fleet-wide.
+            estimated_cores: 4,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(
+            result.worker.is_some(),
+            "a healthy idle worker below the core estimate must be admitted as a \
+             degraded candidate instead of silently falling back to local; reason={:?}",
+            result.reason
+        );
+    }
+
+    /// Regression (same outage): the OS-gate early return only checked
+    /// `filtered_by_os_gate > 0`, so a single `os = "windows"` worker rewrote
+    /// EVERY empty-pool diagnosis into "every candidate declares an `os`". That
+    /// false message is what made the ts1/css failure undiagnosable. Here the
+    /// Linux worker is merely busy, so the honest answer is "all workers busy".
+    #[tokio::test]
+    async fn test_os_gate_does_not_hijack_unrelated_admission_failure() {
+        let pool = WorkerPool::new();
+
+        let windows = make_worker_with_os("wsurf", 8, 60.0, Some("windows"));
+        windows
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(true),
+                projects_root_checked_at_unix_ms: Some(1_700_000_000_000),
+                disk_free_gb: Some(400.0),
+                disk_total_gb: Some(900.0),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(windows).await;
+
+        let busy = make_worker("busy-linux", 8, 70.0);
+        busy.set_capabilities(rch_common::WorkerCapabilities {
+            rustc_version: Some("1.87.0".to_string()),
+            projects_root_ok: Some(true),
+            projects_root_checked_at_unix_ms: Some(1_700_000_000_000),
+            disk_free_gb: Some(400.0),
+            disk_total_gb: Some(900.0),
+            ..Default::default()
+        })
+        .await;
+        assert!(busy.reserve_slots(8).await);
+        pool.add_worker_state(busy).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "os-gate-hijack".to_string(),
+            command: Some("cargo build --release".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 4,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        if let SelectionReason::NoAdmissibleWorkers(detail) = &result.reason {
+            assert!(
+                !detail.contains("every candidate declares an `os`"),
+                "OS gate must not claim sole causality when a worker was filtered \
+                 for an unrelated reason; detail={detail}"
+            );
+        }
+        assert_eq!(
+            result.reason,
+            SelectionReason::AllWorkersBusy,
+            "a busy Linux worker plus an OS-gated Windows worker is a busy pool"
+        );
+    }
+
+    /// The flip side of the guard: when the OS gate is only a *contributing*
+    /// reason it must still be reported, or an operator reading
+    /// `critical_pressure=1` cannot tell that another worker was dropped for
+    /// declaring an `os`.
+    #[tokio::test]
+    async fn test_os_gate_is_reported_alongside_other_admission_blockers() {
+        let pool = WorkerPool::new();
+
+        let windows = make_worker_with_os("wsurf", 8, 60.0, Some("windows"));
+        windows
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(true),
+                projects_root_checked_at_unix_ms: Some(1_700_000_000_000),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(windows).await;
+
+        let critical = make_worker("critical-pressure", 8, 80.0);
+        critical
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(true),
+                projects_root_checked_at_unix_ms: Some(1_700_000_000_000),
+                ..Default::default()
+            })
+            .await;
+        critical
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                state: crate::disk_pressure::PressureState::Critical,
+                confidence: crate::disk_pressure::PressureConfidence::High,
+                reason_code: "disk_ratio_below_critical".to_string(),
+                policy_rule: "disk_free_ratio<=critical_free_ratio".to_string(),
+                disk_free_gb: Some(38.0),
+                disk_total_gb: Some(774.0),
+                disk_free_ratio: Some(0.049),
+                disk_io_util_pct: Some(0.0),
+                memory_pressure: Some(15.0),
+                telemetry_age_secs: Some(8),
+                telemetry_fresh: true,
+                evaluated_at_unix_ms: 1_700_000_000_000,
+            })
+            .await;
+        pool.add_worker_state(critical).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "os-gate-plus-pressure".to_string(),
+            command: Some("cargo build --release".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 4,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        assert_eq!(
+            result.reason,
+            SelectionReason::NoAdmissibleWorkers(
+                "critical_pressure=1,os_gate_excluded=1".to_string()
             )
         );
     }
