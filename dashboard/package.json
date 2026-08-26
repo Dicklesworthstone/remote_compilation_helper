@@ -1,0 +1,25 @@
+{
+  "name": "rch-fleet-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Password-gated, client-side-encrypted monitoring dashboard for an rch build fleet.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "snapshot": "node tools/snapshot.mjs",
+    "deploy": "bash scripts/deploy.sh"
+  },
+  "dependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.4",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.7"
+  }
+}
