@@ -1,0 +1,13 @@
+# Build output
+dist/
+node_modules/
+
+# NEVER commit fleet snapshots.
+#
+# This repository is PUBLIC. Even though `tools/snapshot.mjs` only ever writes
+# AES-256-GCM ciphertext, publishing the encrypted fleet inventory into the
+# source tree would pin its salt and ciphertext into git history forever, where
+# a future passphrase compromise would retroactively expose every historical
+# snapshot. The snapshot belongs in the deployed gh-pages artifact, not here.
+public/data/
+*.enc.json

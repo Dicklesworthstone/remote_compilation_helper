@@ -2290,8 +2290,24 @@ async fn handle_select_worker_with_wrapper(
             let selected_worker_id = worker.config.read().await.id.clone();
 
             // Reserve the slots.
+            //
+            // Clamp to what this worker can physically hold. `estimated_cores`
+            // is an estimate derived from `compilation.build_slots`, and
+            // admission may deliberately hand back a worker whose TOTAL slots
+            // are below it (see the `capacity_degraded` path in
+            // `selection.rs`) rather than let the build fall back to local.
+            // Reserving the unclamped estimate on such a worker can never
+            // succeed, so without this clamp the selection loop burns all three
+            // attempts on "race condition" retries and then reports
+            // AllWorkersBusy — a phantom race against a worker that was simply
+            // too small. Observed live on ts1 2026-08-26: repeated
+            // "Failed to reserve 4 slots on hz2" against a 2-slot worker.
             reservation_attempts += 1;
-            if worker.reserve_slots(request.estimated_cores).await {
+            let reserve_slots = {
+                let total = worker.config.read().await.total_slots;
+                request.estimated_cores.min(total.max(1))
+            };
+            if worker.reserve_slots(reserve_slots).await {
                 let (id, host, user, identity_file, declared_os) = {
                     let config = worker.config.read().await;
                     (
@@ -2322,7 +2338,10 @@ async fn handle_select_worker_with_wrapper(
                             "Worker {} lost same-project active-build race for {} after slot reservation",
                             id, request.project
                         );
-                        worker.release_slots(request.estimated_cores).await;
+                        // Must mirror the clamped reservation above, or a
+                        // degraded (too-small) worker leaks slots on every
+                        // lost active-build race until it looks permanently full.
+                        worker.release_slots(reserve_slots).await;
                         excluded_worker_ids.insert(id.as_str().to_string());
                         continue;
                     };
@@ -2379,7 +2398,7 @@ async fn handle_select_worker_with_wrapper(
 
             warn!(
                 "Failed to reserve {} slots on {} (race condition), attempt {}/{}",
-                request.estimated_cores, selected_worker_id, reservation_attempts, MAX_ATTEMPTS
+                reserve_slots, selected_worker_id, reservation_attempts, MAX_ATTEMPTS
             );
 
             if reservation_attempts >= MAX_ATTEMPTS {
