@@ -45,7 +45,15 @@ export function fmtDuration(ms: number | null): string {
  * because reachability is the more actionable fact. Disk outranks load: a full
  * disk takes a worker down hard, while high load is usually just work happening.
  */
-export function classify(w: Worker, nowMs: number): WorkerView {
+/**
+ * @param snapshotMs when the snapshot was TAKEN — not the reader's clock.
+ *
+ * Worker "last seen" must be judged against snapshot time. Using the browser's
+ * clock made every worker in a two-hour-old snapshot report "offline", because
+ * the snapshot's own age was being charged to each worker. Snapshot staleness
+ * is surfaced separately by the header indicator and the stale banner.
+ */
+export function classify(w: Worker, snapshotMs: number): WorkerView {
   const p = w.pressure;
   const diskUsedPct =
     p.disk_total_gb && p.disk_free_gb != null && p.disk_total_gb > 0
@@ -53,7 +61,7 @@ export function classify(w: Worker, nowMs: number): WorkerView {
       : null;
   const loadPerCore =
     w.caps.load_avg_1 != null && w.caps.num_cpus ? w.caps.load_avg_1 / w.caps.num_cpus : null;
-  const staleSeconds = w.last_seen_unix != null ? nowMs / 1000 - w.last_seen_unix : null;
+  const staleSeconds = w.last_seen_unix != null ? snapshotMs / 1000 - w.last_seen_unix : null;
   const slotPct =
     w.total_slots && w.total_slots > 0 ? ((w.used_slots ?? 0) / w.total_slots) * 100 : null;
 
@@ -99,8 +107,10 @@ export function classify(w: Worker, nowMs: number): WorkerView {
   return { ...w, health, healthReason, diskUsedPct, loadPerCore, staleSeconds, slotPct };
 }
 
-export function classifyAll(snap: Snapshot, nowMs: number): WorkerView[] {
-  return snap.workers.map((w) => classify(w, nowMs));
+export function classifyAll(snap: Snapshot, _nowMs?: number): WorkerView[] {
+  // Deliberately ignores the caller's clock — see classify().
+  const snapshotMs = new Date(snap.generated_at).getTime();
+  return snap.workers.map((w) => classify(w, snapshotMs));
 }
 
 /**

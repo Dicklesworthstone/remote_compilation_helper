@@ -23,3 +23,7 @@ public/data/
 
 # Rolling aggregate history sidecar (plaintext, never published)
 .snapshot-history.json
+
+# bundled serverless function output
+.vercel-fn/
+.vercel/

@@ -11,9 +11,13 @@
     "snapshot": "node tools/snapshot.mjs",
     "deploy": "bash scripts/deploy.sh",
     "test:e2e": "node tests/e2e.mjs",
-    "serve:dist": "python3 -m http.server 4174 --directory dist"
+    "serve:dist": "python3 -m http.server 4174 --directory dist",
+    "build:api": "esbuild api/fleet.mjs --bundle --platform=node --format=esm --target=node20 --loader:.json=json --outfile=.vercel-fn/index.mjs",
+    "test:endpoint": "node tests/endpoint.mjs",
+    "llm": "node tools/fleet-llm.mjs"
   },
   "dependencies": {
+    "@toon-format/toon": "^4.1.1",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },

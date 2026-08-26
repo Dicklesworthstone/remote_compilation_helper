@@ -63,6 +63,12 @@ fi
 echo "==> building (base=/ for Vercel root hosting)"
 RCH_DASH_BASE=/ npm run build
 
+echo "==> bundling /api/fleet (LLM endpoint)"
+# The snapshot is imported INTO the bundle, so the function needs no filesystem
+# or network access at runtime. Nothing secret is baked in — only the same
+# ciphertext the browser already downloads; it decrypts with the CALLER's key.
+npm run build:api
+
 # --- refuse to publish anything unencrypted -------------------------------
 if ! grep -q '"ciphertext"' dist/data/fleet.enc.json; then
   echo "REFUSING TO DEPLOY: dist/data/fleet.enc.json is not an encrypted envelope." >&2
@@ -109,9 +115,24 @@ const cfg = { version: 3, routes: [
   { src: "^/assets/(.*)$", headers: { ...sec, "cache-control": "public, max-age=31536000, immutable" },  continue: true },
   { src: "^/(.*)$",        headers: sec, continue: true },
   { handle: "filesystem" },
+  // /api/fleet is a function, not a static file, so it resolves only after
+  // the filesystem pass falls through.
+  { src: "^/api/fleet/?$", dest: "/api/fleet" },
 ]};
 fs.writeFileSync(process.argv[1], JSON.stringify(cfg, null, 2));
 ' "$OUT/.vercel/output/config.json"
+
+# --- serverless function: GET /api/fleet -----------------------------------
+FN="$OUT/.vercel/output/functions/api/fleet.func"
+mkdir -p "$FN"
+cp .vercel-fn/index.mjs "$FN/index.mjs"
+printf '%s\n' \
+  '{' \
+  '  "runtime": "nodejs22.x",' \
+  '  "handler": "index.mjs",' \
+  '  "launcherType": "Nodejs",' \
+  '  "shouldAddHelpers": true' \
+  '}' > "$FN/.vc-config.json"
 
 echo "==> deploying prebuilt bundle to Vercel"
 cd "$OUT"

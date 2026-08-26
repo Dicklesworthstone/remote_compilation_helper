@@ -10,9 +10,11 @@ and that every other surface answers badly:
 2. **Is the worker pool healthy?** — slots really in use (not the configured
    ceiling), disk headroom, CPU load, pressure state, circuit breakers.
 
-It deploys as plain static files to Vercel, GitHub Pages, or any static host.
-There is no server, no database, and no API key — the whole thing is one
-encrypted JSON blob plus a React app that decrypts it in your browser.
+It deploys as static files to Vercel, GitHub Pages, or any static host: one
+encrypted JSON blob plus a React app that decrypts it in your browser. There is
+no database and no stored credential. The optional `/api/fleet` endpoint adds a
+single stateless function for LLM/agent consumers — it holds no secret either
+(see below).
 
 ```
   dev machines ──ssh──▶ tools/snapshot.mjs ──AES-256-GCM──▶ fleet.enc.json
@@ -190,6 +192,93 @@ quietly. Run it from cron on a box you control:
 
 Each run appends to a rolling aggregate history (`.snapshot-history.json`, kept
 outside `public/` so it is never published) which drives the trend sparklines.
+
+---
+
+## LLM / agent endpoint
+
+The dashboard is HTML; an agent should not scrape it. There are two machine
+paths, both emitting the same compact view in **TOON** (default) or JSON.
+
+TOON — [Token-Optimized Object Notation](https://github.com/toon-format/toon),
+the same format `rch -F toon` emits — encodes arrays of objects as one header
+plus rows, so per-worker keys appear once instead of N times:
+
+```
+workers[16]{id,health,used,total,cores,load,disk_free_gb,disk_pct,speed,circuit,reason}:
+  worker-a,warn,0,16,64,7.4,349,61.5,74.9,closed,pressure: disk_io_high
+```
+
+Measured on a real 16-worker fleet: **3.4 KB of TOON vs 10.1 KB of JSON — 66%
+fewer characters** for identical content, distilled from a 276 KB encrypted
+snapshot.
+
+### HTTP
+
+```sh
+BASE=https://your-app.vercel.app
+curl -H "Authorization: Bearer $RCH_DASH_PASSPHRASE" "$BASE/api/fleet"
+curl -H "Authorization: Bearer $RCH_DASH_PASSPHRASE" "$BASE/api/fleet?format=json&view=full"
+```
+
+| Param | Values | Default |
+|---|---|---|
+| `format` | `toon`, `json` | `toon` |
+| `view` | `summary`, `full` | `summary` |
+
+Key via `Authorization: Bearer PASSPHRASE`, `X-Fleet-Key: PASSPHRASE`, or
+`?key=` (last resort — query strings land in logs and shell history).
+
+**The passphrase is the credential *and* the decryption key, and the host never
+stores it.** The function ships only the same ciphertext the browser downloads;
+it derives the AES key from whatever the caller sends, in-request. A wrong
+passphrase fails the GCM auth tag and returns 401. There is no separate API
+token to leak, and no way to get plaintext out of the endpoint without already
+being able to decrypt the published snapshot yourself.
+
+Responses: `200` body · `400` bad `format`/`view` · `401` missing or wrong key ·
+`405` non-GET · `500` no snapshot bundled. Errors are one line of plain text so
+an agent can branch on them cheaply. `Cache-Control: no-store` throughout — a
+cached fleet view that looks live is the exact failure this project exists to
+prevent.
+
+If your host also gates access (Vercel Deployment Protection is on by default),
+the agent needs that host token too — e.g. `vercel curl`, or a
+protection-bypass header.
+
+### Local (no network, no auth dance)
+
+For agents already running on a fleet machine:
+
+```sh
+npm run llm                        # TOON summary
+npm run llm -- --format json       # JSON
+npm run llm -- --view full         # + remediation hints, recent builds, history
+npm run llm -- --url "$BASE/data/fleet.enc.json"
+```
+
+Passphrase resolution: `RCH_DASH_PASSPHRASE`, then `./.env`, then Vault.
+Exit codes: `2` no passphrase, `3` unreadable snapshot, `4` wrong passphrase.
+
+### Shape
+
+```
+schema, label, generated_at, age_seconds, stale
+summary{...}                                one-line fleet health
+problems[]{severity,kind,target,detail}     critical first — act on these
+dev_machines[]{id,level,posture,remote,local,slots_free,...}
+workers[]{id,health,used,total,cores,load,disk_pct,speed,circuit,reason}
+# view=full adds dev_detail[] (remediation hints, recent builds),
+# worker_detail[] and history[]
+```
+
+`problems` is deliberately first and pre-sorted by severity: an agent that reads
+nothing else still gets the actionable set. Worker "last seen" is judged against
+**snapshot** time, not the reader's clock, so an old snapshot reports itself
+stale rather than declaring the whole fleet offline.
+
+Both paths share one distiller (`tools/llm-view.mjs`), so the HTTP and local
+outputs are byte-identical for the same snapshot.
 
 ---
 
