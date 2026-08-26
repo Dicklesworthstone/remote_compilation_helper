@@ -472,7 +472,7 @@ fn build_worker_ownership_repair_cmd(roots: &[PathBuf], ssh_user: &str) -> Strin
     let quoted_user = shell_escape::escape(ssh_user.into());
     let quoted_roots = roots
         .iter()
-        .map(|root| shell_escape::escape(root.to_string_lossy().into()))
+        .map(|root| shell_escape::escape(root.to_string_lossy()))
         .collect::<Vec<_>>()
         .join(" ");
     format!(

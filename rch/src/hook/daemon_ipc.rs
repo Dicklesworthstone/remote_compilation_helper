@@ -25,17 +25,27 @@ pub(crate) async fn restart_admission_is_closed(socket_path: &str) -> anyhow::Re
         }
         .into());
     }
-    let stream = timeout(Duration::from_secs(5), UnixStream::connect(socket_path))
+    let stream = timeout(daemon_io_timeout(), UnixStream::connect(socket_path))
         .await
-        .map_err(|_| anyhow::anyhow!("Daemon connect timed out after 5s"))??;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Daemon connect timed out after {}ms",
+                daemon_io_timeout().as_millis()
+            )
+        })??;
     let (mut reader, mut writer) = stream.into_split();
     writer.write_all(b"GET /restart-admission\n").await?;
     writer.flush().await?;
 
     let mut response = String::new();
-    timeout(Duration::from_secs(5), reader.read_to_string(&mut response))
+    timeout(daemon_io_timeout(), reader.read_to_string(&mut response))
         .await
-        .map_err(|_| anyhow::anyhow!("Restart-admission response timed out after 5s"))??;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Restart-admission response timed out after {}ms",
+                daemon_io_timeout().as_millis()
+            )
+        })??;
     let body = response
         .split_once("\r\n\r\n")
         .or_else(|| response.split_once("\n\n"))
@@ -85,9 +95,14 @@ pub(crate) async fn query_daemon(
     }
 
     // Connect to daemon (with timeout to avoid hanging if socket is stuck)
-    let stream = timeout(Duration::from_secs(5), UnixStream::connect(socket_path))
+    let stream = timeout(daemon_io_timeout(), UnixStream::connect(socket_path))
         .await
-        .map_err(|_| anyhow::anyhow!("Daemon connect timed out after 5s"))??;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Daemon connect timed out after {}ms",
+                daemon_io_timeout().as_millis()
+            )
+        })??;
     let (reader, mut writer) = stream.into_split();
 
     // Build query string
@@ -311,7 +326,7 @@ pub(crate) async fn release_worker(
     // released when the socket disappeared, timed out, or returned an error.
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    let bytes_read = timeout(Duration::from_secs(5), reader.read_line(&mut line))
+    let bytes_read = timeout(daemon_io_timeout(), reader.read_line(&mut line))
         .await
         .map_err(|_| {
             anyhow::anyhow!("daemon response timed out; release was not acknowledged")
@@ -366,7 +381,7 @@ pub(crate) async fn record_build(
     // Read response line with timeout
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    let _ = timeout(Duration::from_secs(5), reader.read_line(&mut line)).await;
+    let _ = timeout(daemon_io_timeout(), reader.read_line(&mut line)).await;
 
     Ok(())
 }
@@ -401,7 +416,7 @@ pub(crate) async fn disable_worker_for_fault(
 
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    let _ = timeout(Duration::from_secs(5), reader.read_line(&mut line)).await;
+    let _ = timeout(daemon_io_timeout(), reader.read_line(&mut line)).await;
 
     Ok(())
 }
@@ -450,6 +465,31 @@ pub(super) fn queue_when_busy_enabled() -> bool {
     queue_when_busy_enabled_from(value.as_deref())
 }
 
+/// Default connect/read timeout for one daemon IPC exchange, in milliseconds.
+const DEFAULT_DAEMON_IO_TIMEOUT_MS: u64 = 5_000;
+/// Bounds accepted for `RCH_DAEMON_TIMEOUT_MS`; anything outside is ignored
+/// so a typo can neither make every hook call fail instantly nor hang it.
+const DAEMON_IO_TIMEOUT_MS_RANGE: std::ops::RangeInclusive<u64> = 100..=600_000;
+
+/// Resolve the daemon socket connect/read timeout from an
+/// `RCH_DAEMON_TIMEOUT_MS` value (issue #57). This is the knob `rch --help`
+/// and `rch capabilities` advertise; it bounds each socket connect and each
+/// response read, while the select-worker *response* wait keeps its own
+/// `RCH_DAEMON_RESPONSE_TIMEOUT_SECS` / `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS`
+/// policy (queued builds legitimately wait far longer than an IPC round trip).
+pub(super) fn daemon_io_timeout_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| DAEMON_IO_TIMEOUT_MS_RANGE.contains(ms))
+        .map_or(
+            Duration::from_millis(DEFAULT_DAEMON_IO_TIMEOUT_MS),
+            Duration::from_millis,
+        )
+}
+
+fn daemon_io_timeout() -> Duration {
+    daemon_io_timeout_from(std::env::var("RCH_DAEMON_TIMEOUT_MS").ok().as_deref())
+}
+
 fn parse_timeout_secs(raw: &str) -> Option<u64> {
     raw.trim().parse::<u64>().ok().filter(|secs| *secs > 0)
 }
@@ -481,4 +521,59 @@ fn daemon_response_timeout(wait_for_worker: bool) -> Duration {
         global_override.as_deref(),
         wait_override.as_deref(),
     )
+}
+
+#[cfg(test)]
+mod daemon_io_timeout_tests {
+    use super::daemon_io_timeout_from;
+    use std::time::Duration;
+
+    #[test]
+    fn unset_or_invalid_falls_back_to_default() {
+        assert_eq!(daemon_io_timeout_from(None), Duration::from_millis(5_000));
+        assert_eq!(
+            daemon_io_timeout_from(Some("")),
+            Duration::from_millis(5_000)
+        );
+        assert_eq!(
+            daemon_io_timeout_from(Some("abc")),
+            Duration::from_millis(5_000)
+        );
+        assert_eq!(
+            daemon_io_timeout_from(Some("-5")),
+            Duration::from_millis(5_000)
+        );
+    }
+
+    #[test]
+    fn out_of_range_values_are_ignored() {
+        assert_eq!(
+            daemon_io_timeout_from(Some("0")),
+            Duration::from_millis(5_000)
+        );
+        assert_eq!(
+            daemon_io_timeout_from(Some("99")),
+            Duration::from_millis(5_000)
+        );
+        assert_eq!(
+            daemon_io_timeout_from(Some("600001")),
+            Duration::from_millis(5_000)
+        );
+    }
+
+    #[test]
+    fn in_range_values_apply() {
+        assert_eq!(
+            daemon_io_timeout_from(Some("100")),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            daemon_io_timeout_from(Some(" 2500 ")),
+            Duration::from_millis(2_500)
+        );
+        assert_eq!(
+            daemon_io_timeout_from(Some("600000")),
+            Duration::from_millis(600_000)
+        );
+    }
 }

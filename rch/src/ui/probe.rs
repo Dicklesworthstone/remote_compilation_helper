@@ -240,7 +240,7 @@ impl<'a> ProbeResultTable<'a> {
     fn render_empty_rich(&self, console: &RchConsole) {
         let info = Icons::info(self.context);
         let content = format!(
-            "{} No workers to probe\n\nAdd workers with: rch workers add <host>",
+            "{} No workers to probe\n\nAdd workers with: rch workers init",
             info
         );
         let panel = Panel::from_text(&content)
@@ -339,7 +339,7 @@ impl<'a> ProbeResultTable<'a> {
             console.print_plain("");
             let info = Icons::info(self.context);
             console.print_plain(&format!("{info} No workers to probe"));
-            console.print_plain("  Add workers with: rch workers add <host>");
+            console.print_plain("  Add workers with: rch workers init");
             return;
         }
 

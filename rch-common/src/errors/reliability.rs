@@ -505,10 +505,10 @@ impl ReliabilityReasonCode {
             Self::WorkersConfigUnreadable => {
                 "Inspect ~/.config/rch/workers.toml for a parse error."
             }
-            Self::NoWorkersConfigured => "Run `rch workers add <host>` to register a worker.",
+            Self::NoWorkersConfigured => "Run `rch workers init` to register a worker.",
             Self::WorkersConfigured => "No action needed.",
             Self::DaemonStatusUnavailable => "Start the daemon with `rch daemon start` and retry.",
-            Self::DaemonHasNoWorkers => "Run `rch workers add <host>` to register a worker.",
+            Self::DaemonHasNoWorkers => "Run `rch workers init` to register a worker.",
             Self::AllWorkersUnhealthy => {
                 "Run `rch workers probe --all` to diagnose worker connectivity."
             }
@@ -762,7 +762,7 @@ impl ReliabilityReasonCode {
                     "cat ~/.config/rch/workers.toml",
                 ],
                 remediation_steps: &[
-                    "rch workers add <hostname>     # interactive prompt for SSH key + slots",
+                    "rch workers init                # interactive wizard: host, SSH key, slots",
                     "rch workers probe --all        # confirm SSH + tools reachable",
                 ],
                 verification_command: "rch doctor --reliability --scope=topology --json",
@@ -772,7 +772,7 @@ impl ReliabilityReasonCode {
                 ),
                 references: &[
                     "AGENTS.md > Architecture > Worker Fleet Management",
-                    "rch workers add --help",
+                    "rch workers init --help",
                 ],
                 authored_at: "2026-05-16",
             }),
@@ -1280,6 +1280,10 @@ mod tests {
         (ReliabilityReasonCode::WorkerMirrorOwnershipDrift, false),
         (
             ReliabilityReasonCode::WorkerMirrorOwnershipCheckUnavailable,
+            false,
+        ),
+        (
+            ReliabilityReasonCode::WorkerMirrorOwnershipUnprobeable,
             false,
         ),
         (ReliabilityReasonCode::MirrorOwnershipNoWorkers, false),

@@ -2565,6 +2565,7 @@ pub async fn run_exec(
             source_content_receipt,
             &result_dirs,
             &layer0_env,
+            config.remediation.pooled_target.reaper_pooled_idle_hours,
         )
         .await;
         let remote_elapsed = remote_start.elapsed();
@@ -3577,6 +3578,7 @@ async fn handle_selection_response(
         false,
         &[],
         &[],
+        config.remediation.pooled_target.reaper_pooled_idle_hours,
     )
     .await;
     let remote_elapsed = remote_start.elapsed();

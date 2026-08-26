@@ -2645,8 +2645,7 @@ pub async fn status_overview(
                     reason_code: "no_workers_configured".into(),
                     severity: "critical".into(),
                     message: "No workers configured; all builds run locally".into(),
-                    suggested_action: "rch workers add <host> or edit ~/.config/rch/workers.toml"
-                        .into(),
+                    suggested_action: "rch workers init or edit ~/.config/rch/workers.toml".into(),
                     worker_id: None,
                 });
             } else if critical_pressure_worker_count(&status.workers) > 0
