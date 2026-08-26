@@ -11,6 +11,11 @@
  * passphrase. A stolen cookie is then scoped to exactly one thing — reading
  * snapshots encrypted under that one salt — and the passphrase itself is not
  * sitting in `document.cookie` for two months.
+ *
+ * Everything crossing the WebCrypto boundary is a plain `ArrayBuffer`. Since
+ * TypeScript 5.7 `Uint8Array` is generic over its backing buffer, and the
+ * `Uint8Array<ArrayBufferLike>` that `atob`/`TextEncoder` produce does not
+ * satisfy `BufferSource`. Converting once here keeps the call sites clean.
  */
 
 export interface Envelope {
@@ -24,32 +29,40 @@ const COOKIE_NAME = "rch_dash_key";
 /** 60 days, as requested. */
 export const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 60;
 
-function b64ToBytes(b64: string): Uint8Array {
+/** base64 -> ArrayBuffer */
+function b64ToBuf(b64: string): ArrayBuffer {
   const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
+  const buf = new ArrayBuffer(bin.length);
+  const view = new Uint8Array(buf);
+  for (let i = 0; i < bin.length; i++) view[i] = bin.charCodeAt(i);
+  return buf;
 }
 
-function bytesToB64(bytes: Uint8Array): string {
+/** ArrayBuffer -> base64 */
+function bufToB64(buf: ArrayBuffer): string {
+  const view = new Uint8Array(buf);
   let s = "";
-  for (const b of bytes) s += String.fromCharCode(b);
+  for (let i = 0; i < view.length; i++) s += String.fromCharCode(view[i]);
   return btoa(s);
+}
+
+/** utf-8 string -> ArrayBuffer */
+function utf8ToBuf(s: string): ArrayBuffer {
+  const encoded = new TextEncoder().encode(s);
+  const buf = new ArrayBuffer(encoded.byteLength);
+  new Uint8Array(buf).set(encoded);
+  return buf;
 }
 
 /** Derive the AES key from a passphrase + the envelope's salt/iterations. */
 export async function deriveKey(passphrase: string, env: Envelope): Promise<CryptoKey> {
-  const base = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(passphrase),
-    "PBKDF2",
-    false,
-    ["deriveKey"],
-  );
+  const base = await crypto.subtle.importKey("raw", utf8ToBuf(passphrase), "PBKDF2", false, [
+    "deriveKey",
+  ]);
   return crypto.subtle.deriveKey(
     {
       name: "PBKDF2",
-      salt: b64ToBytes(env.kdf.salt),
+      salt: b64ToBuf(env.kdf.salt),
       iterations: env.kdf.iterations,
       hash: env.kdf.hash,
     },
@@ -65,9 +78,9 @@ export async function deriveKey(passphrase: string, env: Envelope): Promise<Cryp
 /** Decrypt an envelope. Throws on a wrong key (GCM auth tag failure). */
 export async function decryptEnvelope(env: Envelope, key: CryptoKey): Promise<string> {
   const plain = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: b64ToBytes(env.cipher.iv) },
+    { name: "AES-GCM", iv: b64ToBuf(env.cipher.iv) },
     key,
-    b64ToBytes(env.ciphertext),
+    b64ToBuf(env.ciphertext),
   );
   return new TextDecoder().decode(plain);
 }
@@ -84,8 +97,9 @@ function cookieAttrs(maxAge: number): string {
 
 export async function persistKey(key: CryptoKey): Promise<void> {
   const raw = await crypto.subtle.exportKey("raw", key);
-  const value = bytesToB64(new Uint8Array(raw));
-  document.cookie = `${COOKIE_NAME}=${encodeURIComponent(value)}${cookieAttrs(COOKIE_MAX_AGE_SECONDS)}`;
+  document.cookie =
+    `${COOKIE_NAME}=${encodeURIComponent(bufToB64(raw))}` +
+    cookieAttrs(COOKIE_MAX_AGE_SECONDS);
 }
 
 export function clearKey(): void {
@@ -93,12 +107,10 @@ export function clearKey(): void {
 }
 
 export async function loadPersistedKey(): Promise<CryptoKey | null> {
-  const match = document.cookie
-    .split("; ")
-    .find((c) => c.startsWith(`${COOKIE_NAME}=`));
+  const match = document.cookie.split("; ").find((c) => c.startsWith(`${COOKIE_NAME}=`));
   if (!match) return null;
   try {
-    const raw = b64ToBytes(decodeURIComponent(match.slice(COOKIE_NAME.length + 1)));
+    const raw = b64ToBuf(decodeURIComponent(match.slice(COOKIE_NAME.length + 1)));
     return await crypto.subtle.importKey("raw", raw, { name: "AES-GCM", length: 256 }, true, [
       "decrypt",
     ]);

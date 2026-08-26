@@ -174,9 +174,13 @@ export default function App() {
   const ageSec = (now - new Date(snap.generated_at).getTime()) / 1000;
   const dotClass = ageSec > STALE_CRIT_SECONDS ? "old" : ageSec > STALE_WARN_SECONDS ? "stale" : "live";
 
-  const slotsTotal = snap.dispatchers.reduce((n, d) => n + (d.queue?.slots_total ?? 0), 0);
-  const slotsFree = snap.dispatchers.reduce((n, d) => n + (d.queue?.slots_available ?? 0), 0);
-  const slotsBusy = Math.max(0, slotsTotal - slotsFree);
+  // Slot capacity belongs to the WORKER, not to each dispatcher's view of it.
+  // Summing `queue.slots_total` across dispatchers counts every worker once per
+  // dispatcher — with 3 dispatchers each seeing the same 15 workers that
+  // reported 198 slots for an 80-slot fleet. Use the deduplicated worker union.
+  const slotsTotal = snap.totals.slots;
+  const activeBuilds = workers.reduce((n, w) => n + w.active_builds, 0);
+  const workersBusy = workers.filter((w) => w.active_builds > 0).length;
   const diskUsedPct =
     snap.totals.disk_total_gb > 0
       ? ((snap.totals.disk_total_gb - snap.totals.disk_free_gb) / snap.totals.disk_total_gb) * 100
@@ -233,11 +237,12 @@ export default function App() {
           </div>
         </div>
         <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--busy)" }}>
-          <div className="kpi-label">Slots in use</div>
-          <div className="kpi-value">
-            {slotsBusy}<span className="unit">/ {slotsTotal}</span>
+          <div className="kpi-label">Build slots</div>
+          <div className="kpi-value">{slotsTotal}</div>
+          <div className="kpi-sub">
+            {activeBuilds} active build{activeBuilds === 1 ? "" : "s"} on {workersBusy} worker
+            {workersBusy === 1 ? "" : "s"}
           </div>
-          <div className="kpi-sub">{slotsFree} free across the fleet</div>
         </div>
         <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--accent)" }}>
           <div className="kpi-label">Cores</div>

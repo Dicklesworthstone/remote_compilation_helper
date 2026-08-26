@@ -11,3 +11,6 @@ node_modules/
 # snapshot. The snapshot belongs in the deployed gh-pages artifact, not here.
 public/data/
 *.enc.json
+
+# TypeScript incremental build state
+*.tsbuildinfo

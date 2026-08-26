@@ -9,7 +9,9 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "snapshot": "node tools/snapshot.mjs",
-    "deploy": "bash scripts/deploy.sh"
+    "deploy": "bash scripts/deploy.sh",
+    "test:e2e": "node tests/e2e.mjs",
+    "serve:dist": "python3 -m http.server 4174 --directory dist"
   },
   "dependencies": {
     "react": "^19.2.0",
@@ -19,6 +21,7 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.0.4",
+    "playwright": "^1.62.1",
     "typescript": "^5.9.3",
     "vite": "^7.1.7"
   }
