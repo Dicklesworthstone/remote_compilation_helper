@@ -2079,14 +2079,19 @@ fn apply_env_overrides_inner(
         }
     }
 
-    if let Some(val) = get_env("RCH_SOCKET_PATH") {
-        config.general.socket_path = val;
-        if let Some(ref mut sources) = sources {
-            set_source(
-                sources,
-                "general.socket_path",
-                ConfigValueSource::EnvVar("RCH_SOCKET_PATH".to_string()),
-            );
+    // `RCH_DAEMON_SOCKET` is the long-documented alias of `RCH_SOCKET_PATH`
+    // (issue #57); the canonical name wins when both are set.
+    for var in ["RCH_SOCKET_PATH", "RCH_DAEMON_SOCKET"] {
+        if let Some(val) = get_env(var) {
+            config.general.socket_path = val;
+            if let Some(ref mut sources) = sources {
+                set_source(
+                    sources,
+                    "general.socket_path",
+                    ConfigValueSource::EnvVar(var.to_string()),
+                );
+            }
+            break;
         }
     }
 
@@ -2234,6 +2239,19 @@ fn apply_env_overrides_inner(
                 sources,
                 "transfer.compression_level",
                 ConfigValueSource::EnvVar("RCH_COMPRESSION".to_string()),
+            );
+        }
+    } else if let Some(val) = get_env("RCH_TRANSFER_ZSTD_LEVEL")
+        && let Ok(level) = val.parse()
+    {
+        // Documented legacy wrapper name (issue #57): same knob, lowest
+        // precedence so the canonical names always win.
+        config.transfer.compression_level = level;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "transfer.compression_level",
+                ConfigValueSource::EnvVar("RCH_TRANSFER_ZSTD_LEVEL".to_string()),
             );
         }
     }
@@ -4623,6 +4641,66 @@ extra_field = 123
             &ConfigValueSource::EnvVar("RCH_SOCKET_PATH".to_string())
         );
         info!("PASS: RCH_SOCKET_PATH override applied");
+    }
+
+    #[test]
+    fn test_apply_env_overrides_daemon_socket_alias() {
+        let _guard = test_guard!();
+        // Issue #57: RCH_DAEMON_SOCKET is a real alias; RCH_SOCKET_PATH wins.
+        let mut config = RchConfig::default();
+        let mut sources = default_sources_map();
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert(
+            "RCH_DAEMON_SOCKET".to_string(),
+            "/alias/socket.sock".to_string(),
+        );
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+        assert_eq!(config.general.socket_path, "/alias/socket.sock");
+        assert_eq!(
+            sources.get("general.socket_path"),
+            Some(&ConfigValueSource::EnvVar("RCH_DAEMON_SOCKET".to_string()))
+        );
+
+        env_overrides.insert(
+            "RCH_SOCKET_PATH".to_string(),
+            "/canonical/socket.sock".to_string(),
+        );
+        let mut config = RchConfig::default();
+        let mut sources = default_sources_map();
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+        assert_eq!(config.general.socket_path, "/canonical/socket.sock");
+        assert_eq!(
+            sources.get("general.socket_path"),
+            Some(&ConfigValueSource::EnvVar("RCH_SOCKET_PATH".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_apply_env_overrides_transfer_zstd_level_alias() {
+        let _guard = test_guard!();
+        // Issue #57: RCH_TRANSFER_ZSTD_LEVEL is a real (lowest-precedence) alias.
+        let mut config = RchConfig::default();
+        let mut sources = default_sources_map();
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert("RCH_TRANSFER_ZSTD_LEVEL".to_string(), "11".to_string());
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+        assert_eq!(config.transfer.compression_level, 11);
+        assert_eq!(
+            sources.get("transfer.compression_level"),
+            Some(&ConfigValueSource::EnvVar(
+                "RCH_TRANSFER_ZSTD_LEVEL".to_string()
+            ))
+        );
+
+        env_overrides.insert("RCH_COMPRESSION".to_string(), "7".to_string());
+        let mut config = RchConfig::default();
+        apply_env_overrides_inner(&mut config, None, Some(&env_overrides));
+        assert_eq!(config.transfer.compression_level, 7);
+
+        env_overrides.insert("RCH_COMPRESSION_LEVEL".to_string(), "5".to_string());
+        let mut config = RchConfig::default();
+        apply_env_overrides_inner(&mut config, None, Some(&env_overrides));
+        assert_eq!(config.transfer.compression_level, 5);
     }
 
     #[test]

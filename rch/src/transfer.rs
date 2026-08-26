@@ -207,13 +207,31 @@ const SOURCE_EPHEMERAL_EXCLUDE_PATTERNS: &[&str] =
 
 /// Age floors (minutes) for worker-side runtime state reaped at transfer
 /// start (bd-wfumv). TMPDIR scratch under `.rch-tmp/` goes stale within a
-/// day; durable per-worker Cargo caches (issue #42) and pooled target
-/// stores keep their top-level mtime refreshed by every job that uses them
-/// (`add_cargo_isolation` touches the cache dir), so a three-day floor only
-/// reaps caches whose project has been idle far longer than any active
-/// session — an idle return pays one amortized re-fetch, never a per-job one.
+/// day; durable per-worker Cargo caches (issue #42) keep their top-level
+/// mtime refreshed by every job that uses them (`add_cargo_isolation`
+/// touches the cache dir), so a three-day floor only reaps caches whose
+/// project has been idle far longer than any active session — an idle
+/// return pays one amortized re-fetch, never a per-job one.
+///
+/// Pooled target stores (`.rch-target-*-pool-*`) are NOT on this constant:
+/// their retention is the configured
+/// `[remediation.pooled_target] reaper_pooled_idle_hours` (issue #53), so the
+/// transfer-start janitor, the daemon reaper, `rch gc`, and `rch cache
+/// status` all agree on one lifetime. See
+/// [`TransferPipeline::with_pooled_target_prune_idle_hours`].
 const WORKER_TMP_PRUNE_MAX_AGE_MINS: u64 = 24 * 60;
 const WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS: u64 = 3 * 24 * 60;
+
+/// Minutes after which the transfer-start janitor prunes an idle pooled
+/// target store, from the configured retention hours. `None` disables the
+/// pooled sweep (hours == 0, the same "never" the reaper honours); otherwise
+/// the value is floored at the reaper's own 24 h defence so a misconfigured
+/// short TTL cannot turn warm caches into per-job churn.
+fn pooled_target_prune_max_age_mins(idle_hours: u32) -> Option<u64> {
+    (idle_hours != 0).then(|| {
+        (u64::from(idle_hours) * 60).max(rch_common::stale_target_reap::MIN_POOLED_IDLE_MINUTES)
+    })
+}
 
 /// Shell fragment executed by the remote rsync-path wrapper BEFORE rsync
 /// starts: reaps stale worker-side runtime state so abandoned `.rch-tmp/*`
@@ -224,15 +242,24 @@ const WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS: u64 = 3 * 24 * 60;
 /// match (per-worker Cargo caches additionally refresh their own mtime on
 /// every job via `add_cargo_isolation`). Failures are swallowed — pruning is
 /// opportunistic hygiene and must never fail a transfer.
-fn worker_cache_prune_rsync_path_prefix(escaped_remote_path: &str) -> String {
+fn worker_cache_prune_rsync_path_prefix(
+    escaped_remote_path: &str,
+    pooled_target_idle_hours: u32,
+) -> String {
     let tmp_mins = WORKER_TMP_PRUNE_MAX_AGE_MINS;
     let durable_mins = WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS;
-    format!(
+    let mut prefix = format!(
         "find {p}/.rch-tmp -mindepth 1 -maxdepth 1 ! -name 'rch-cargo-cache-*' -mmin +{tmp_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; \
-         find {p}/.rch-tmp -mindepth 1 -maxdepth 1 -name 'rch-cargo-cache-*' -mmin +{durable_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; \
-         find {p} -mindepth 1 -maxdepth 1 -type d -name '.rch-target-*-pool-*' -mmin +{durable_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; ",
+         find {p}/.rch-tmp -mindepth 1 -maxdepth 1 -name 'rch-cargo-cache-*' -mmin +{durable_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; ",
         p = escaped_remote_path
-    )
+    );
+    if let Some(pooled_mins) = pooled_target_prune_max_age_mins(pooled_target_idle_hours) {
+        prefix.push_str(&format!(
+            "find {p} -mindepth 1 -maxdepth 1 -type d -name '.rch-target-*-pool-*' -mmin +{pooled_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; ",
+            p = escaped_remote_path
+        ));
+    }
+    prefix
 }
 
 /// RAM budgeted per concurrent rustc when `compilation.remote_build_jobs =
@@ -1133,6 +1160,11 @@ pub struct TransferPipeline {
     /// [`Self::with_worker_platform`]. Left at the default, behaviour is
     /// identical to before this field existed.
     worker_platform: WorkerPlatform,
+    /// Idle retention (hours) for pooled target stores pruned by the
+    /// transfer-start janitor; `0` disables that sweep. Mirrors
+    /// `[remediation.pooled_target] reaper_pooled_idle_hours` so every
+    /// surface reports the same lifetime (issue #53).
+    pooled_target_prune_idle_hours: u32,
 }
 
 /// Validate a project hash for safe use in file paths.
@@ -1233,7 +1265,18 @@ impl TransferPipeline {
             sync_checksum: false,
             build_id: None,
             worker_platform: WorkerPlatform::Posix,
+            pooled_target_prune_idle_hours:
+                rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         }
+    }
+
+    /// Set the idle retention (hours) after which the transfer-start janitor
+    /// prunes a pooled target store on the worker (`0` = never). Callers pass
+    /// the configured `[remediation.pooled_target] reaper_pooled_idle_hours`
+    /// so the janitor and the reaper never disagree (issue #53).
+    pub fn with_pooled_target_prune_idle_hours(mut self, hours: u32) -> Self {
+        self.pooled_target_prune_idle_hours = hours;
+        self
     }
 
     /// Set build id for remote execution.
@@ -2549,7 +2592,10 @@ fi",
         // (bd-wfumv) — see worker_cache_prune_rsync_path_prefix.
         cmd.arg("--rsync-path").arg(format!(
             "{}mkdir -p {} && rsync",
-            worker_cache_prune_rsync_path_prefix(escaped_remote_path),
+            worker_cache_prune_rsync_path_prefix(
+                escaped_remote_path,
+                self.pooled_target_prune_idle_hours
+            ),
             escaped_remote_path
         ));
 
@@ -2614,7 +2660,10 @@ fi",
         // (bd-wfumv) — see worker_cache_prune_rsync_path_prefix.
         cmd.arg("--rsync-path").arg(format!(
             "{}mkdir -p {} && rsync",
-            worker_cache_prune_rsync_path_prefix(escaped_remote_path),
+            worker_cache_prune_rsync_path_prefix(
+                escaped_remote_path,
+                self.pooled_target_prune_idle_hours
+            ),
             escaped_remote_path
         ));
 
@@ -6165,7 +6214,14 @@ mod tests {
         assert!(path_val.contains(&format!(
             "-name 'rch-cargo-cache-*' -mmin +{WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS}"
         )));
+        // Issue #53: pooled stores use the CONFIGURED reaper retention (168 h
+        // by default), never the 3-day durable-cache floor.
+        let default_pooled_mins =
+            u64::from(rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS) * 60;
         assert!(path_val.contains(&format!(
+            "-type d -name '.rch-target-*-pool-*' -mmin +{default_pooled_mins}"
+        )));
+        assert!(!path_val.contains(&format!(
             "-type d -name '.rch-target-*-pool-*' -mmin +{WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS}"
         )));
 
@@ -6174,6 +6230,33 @@ mod tests {
             .find(&format!("mkdir -p {root} && rsync"))
             .expect("mkdir && rsync suffix");
         assert!(path_val.find("find ").expect("find prefix") < mkdir_idx);
+    }
+
+    #[test]
+    fn pooled_target_prune_window_follows_configured_retention() {
+        // Issue #53: one authoritative retention. The janitor window is the
+        // configured pooled idle hours (floored at the reaper's 24 h defence),
+        // and hours == 0 removes the pooled sweep entirely.
+        let prefix = worker_cache_prune_rsync_path_prefix("/r/p", 240);
+        assert!(prefix.contains("-name '.rch-target-*-pool-*' -mmin +14400 "));
+
+        let floored = worker_cache_prune_rsync_path_prefix("/r/p", 1);
+        assert!(floored.contains(&format!(
+            "-name '.rch-target-*-pool-*' -mmin +{} ",
+            rch_common::stale_target_reap::MIN_POOLED_IDLE_MINUTES
+        )));
+
+        let disabled = worker_cache_prune_rsync_path_prefix("/r/p", 0);
+        assert!(!disabled.contains(".rch-target-*-pool-*"));
+        // The scratch and durable-cache sweeps are unaffected by the pooled knob.
+        assert!(disabled.contains(&format!(
+            "! -name 'rch-cargo-cache-*' -mmin +{WORKER_TMP_PRUNE_MAX_AGE_MINS}"
+        )));
+        assert!(disabled.contains(&format!(
+            "-name 'rch-cargo-cache-*' -mmin +{WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS}"
+        )));
+        assert_eq!(pooled_target_prune_max_age_mins(0), None);
+        assert_eq!(pooled_target_prune_max_age_mins(168), Some(168 * 60));
     }
 
     #[test]

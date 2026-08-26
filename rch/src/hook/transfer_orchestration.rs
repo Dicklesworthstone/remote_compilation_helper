@@ -208,6 +208,10 @@ pub(super) async fn execute_remote_compilation(
     // Resolved Layer 0 pack env pairs (bd-bqu38), forced onto the remote
     // build regardless of the ambient environment.
     layer0_env: &[(String, String)],
+    // Configured `[remediation.pooled_target] reaper_pooled_idle_hours`
+    // (issue #53): the transfer-start janitor prunes idle pooled target
+    // stores on exactly this window so it never undercuts the reaper.
+    pooled_target_prune_idle_hours: u32,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
     if source_content_receipt && WorkerPlatform::from_worker(&worker_config).is_windows() {
@@ -615,7 +619,8 @@ pub(super) async fn execute_remote_compilation(
         .with_compilation_kind(kind)
         .with_remote_path_override(entry.remote_root.clone())
         .with_worker_platform(WorkerPlatform::from_worker(&worker_config))
-        .with_build_id(build_id);
+        .with_build_id(build_id)
+        .with_pooled_target_prune_idle_hours(pooled_target_prune_idle_hours);
         if let Some(spec) = clean_overlay {
             root_pipeline = root_pipeline
                 .with_sync_include_patterns(clean_overlay_include_patterns(
