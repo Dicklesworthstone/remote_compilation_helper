@@ -640,6 +640,9 @@ button.kv-link:hover .kv-v { color: var(--accent); }
 .fm-dot.off { background: var(--off); }
 .fm-name { font-family: var(--mono); font-size: 12px; font-weight: 650; }
 .fm-sub { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); }
+/* Long ids ellipsize inside fixed-width map nodes instead of overflowing. */
+.fm-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.fm-sub { white-space: nowrap; flex: none; }
 
 .fm-groups { display: grid; gap: 14px; }
 .fm-group { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; background: var(--bg-inset); }
