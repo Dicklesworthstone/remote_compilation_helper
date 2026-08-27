@@ -1,6 +1,6 @@
 import type {
-  Dispatcher, DispatcherView, DispatcherWorkerSlots, DevLevel, HealthLevel,
-  Snapshot, Worker, WorkerSlotPair, WorkerView,
+  BuildTuple, Dispatcher, DispatcherView, DispatcherWorkerSlots, DevLevel, HealthLevel,
+  HintTuple, RecentBuild, RemediationHint, Snapshot, Worker, WorkerSlotPair, WorkerView,
 } from "./types";
 
 /** Snapshots older than this are called out — stale data is worse than none. */
@@ -173,6 +173,50 @@ function expandWorkerSlots(pairs: WorkerSlotPair[] | undefined): DispatcherWorke
 }
 
 /**
+ * Expand the wire form of a dev machine's recent builds.
+ *
+ * The collector ships `[project, command, location, worker_id, duration_ms,
+ * exit_code, completed_at]` rather than an object per build: all seven values
+ * are consumed, but at 121 records on a 10-machine fleet the repeated key names
+ * alone were 10.2KB of a 92.3KB payload. Positions are the contract — keep this
+ * in step with `tools/snapshot.mjs` and the mirror in `tools/llm-view.mjs`.
+ *
+ * Tolerant of a missing or ragged array on purpose: a browser tab can be holding
+ * a snapshot written by an older collector, and a dev machine with no build
+ * history must render "no builds recorded", never crash the drawer.
+ */
+export function expandBuilds(rows: BuildTuple[] | undefined): RecentBuild[] {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((b) => ({
+    // `?? null` throughout, never `|| null`: `duration_ms: 0` and the
+    // all-important `exit_code: 0` (the build SUCCEEDED) are real readings.
+    project: Array.isArray(b) ? (b[0] ?? null) : null,
+    command: Array.isArray(b) ? (b[1] ?? null) : null,
+    location: Array.isArray(b) ? (b[2] ?? null) : null,
+    worker_id: Array.isArray(b) ? (b[3] ?? null) : null,
+    duration_ms: Array.isArray(b) ? (b[4] ?? null) : null,
+    exit_code: Array.isArray(b) ? (b[5] ?? null) : null,
+    completed_at: Array.isArray(b) ? (b[6] ?? null) : null,
+  }));
+}
+
+/**
+ * Expand the wire form of a dev machine's remediation hints:
+ * `[worker_id, severity, message, suggested_action, reason_code]`.
+ * Same reasoning and the same legacy tolerance as `expandBuilds()`.
+ */
+export function expandHints(rows: HintTuple[] | undefined): RemediationHint[] {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((h) => ({
+    worker_id: Array.isArray(h) ? (h[0] ?? null) : null,
+    severity: Array.isArray(h) ? (h[1] ?? null) : null,
+    message: Array.isArray(h) ? (h[2] ?? null) : null,
+    suggested_action: Array.isArray(h) ? (h[3] ?? null) : null,
+    reason_code: Array.isArray(h) ? (h[4] ?? null) : null,
+  }));
+}
+
+/**
  * Classify a DEV MACHINE by the question that actually matters: are its builds
  * going to the worker pool, or is it quietly compiling locally?
  *
@@ -186,10 +230,12 @@ export function classifyDispatcher(d: Dispatcher): DispatcherView {
   // basis for a "is this box offloading right now" verdict: a machine that did
   // 200 local builds last month stays branded local-only through a week of
   // perfect offloading, and one that broke this morning takes weeks to cross
-  // the threshold. `recent_builds` is the actual recent window, so prefer it
-  // and fall back to the lifetime counters only when it is empty.
+  // the threshold. `builds` is the actual recent window, so prefer it and fall
+  // back to the lifetime counters only when it is empty. Every build in the
+  // window counts, not a display slice: the verdict must be measured over what
+  // the collector observed.
   const s = d.build_stats;
-  const recent = d.recent_builds ?? [];
+  const recent = expandBuilds(d.builds);
   const recentCounted = recent.length;
   const recentRemote = recent.filter((b) => (b.location ?? "").toLowerCase() === "remote").length;
 
@@ -229,6 +275,11 @@ export function classifyDispatcher(d: Dispatcher): DispatcherView {
   return {
     ...d,
     workers: expandWorkerSlots(d.worker_slots),
+    // Expanded once here, not per component: the drawer renders these rows and
+    // the card counts the hints, and both must see exactly the objects the
+    // collector used to send.
+    recent_builds: recent,
+    remediation_hints: expandHints(d.hints),
     level, levelReason, remotePct, remoteBasis: basis,
     remoteCounted: recentCounted || lifetimeCounted,
   };

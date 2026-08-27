@@ -3,11 +3,11 @@
  * consumption, and encode it as JSON or TOON.
  *
  * Why a separate view rather than serving the raw snapshot: the snapshot is
- * ~196KB of plaintext, most of it per-worker detail an agent does not need to
- * answer "is my fleet healthy and are my builds offloading?". This view is
- * roughly 2-3KB, leads with PROBLEMS, and uses TOON's tabular arrays so the
- * repeated per-worker keys are emitted once instead of N times (~40% fewer
- * characters than the equivalent JSON).
+ * ~68KB of plaintext on a 10-machine fleet, most of it per-worker and per-build
+ * detail an agent does not need to answer "is my fleet healthy and are my builds
+ * offloading?". This view is roughly 4KB, leads with PROBLEMS, and uses TOON's
+ * tabular arrays so the repeated per-worker keys are emitted once instead of N
+ * times (~65% fewer characters than the equivalent JSON).
  *
  * Health thresholds below intentionally mirror `src/derive.ts`. They are
  * duplicated because that file is TypeScript compiled into the browser bundle
@@ -99,9 +99,15 @@ export function classifyDev(d) {
   // the wrong basis for "is this box offloading now". Prefer the real recent
   // window and fall back to lifetime counters only when it is empty.
   const s = d.build_stats;
-  const recent = d.recent_builds ?? [];
+  // Counted straight off the wire tuples. `location` is the only field this
+  // verdict needs, so expanding all seven into objects first would allocate a
+  // record per build (121 on a 10-machine fleet) purely to read index 2.
+  // Value-identical to `expandBuilds(d.builds).filter(b => b.location …)`.
+  const recent = Array.isArray(d.builds) ? d.builds : [];
   const recentCounted = recent.length;
-  const recentRemote = recent.filter((b) => (b.location ?? "").toLowerCase() === "remote").length;
+  const recentRemote = recent.filter(
+    (b) => (Array.isArray(b) ? (b[B_LOCATION] ?? "") : "").toLowerCase() === "remote",
+  ).length;
 
   const lifetimeCounted = s ? s.remote + s.local : 0;
   const basis = recentCounted > 0 ? "recent" : lifetimeCounted > 0 ? "lifetime" : null;
@@ -125,6 +131,45 @@ export function classifyDev(d) {
   } else if (basis === null) { level = "idle"; reason = "no builds recorded yet"; }
   else { level = "offloading"; reason = `${remotePct.toFixed(0)}% of the ${window} went to the pool`; }
   return { level, reason, remotePct, remoteBasis: basis, remoteCounted: recentCounted || lifetimeCounted };
+}
+
+/**
+ * Wire tuple layouts, mirroring `BuildTuple` / `HintTuple` in src/types.ts.
+ *
+ * The collector ships recent builds and remediation hints positionally — every
+ * value in them is consumed, but the repeated key names were 16.7KB of a 92.3KB
+ * payload. These indices ARE the schema; if you reorder a tuple in
+ * `tools/snapshot.mjs`, change it here and in `expandBuilds()`/`expandHints()`
+ * in src/derive.ts together.
+ */
+const B_PROJECT = 0, B_COMMAND = 1, B_LOCATION = 2, B_WORKER = 3,
+      B_DURATION = 4, B_EXIT = 5, B_COMPLETED = 6;
+const H_WORKER = 0, H_SEVERITY = 1, H_MESSAGE = 2, H_ACTION = 3, H_REASON = 4;
+
+/** Mirror of `expandBuilds()` in src/derive.ts — keep in sync. */
+export function expandBuilds(rows) {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((b) => ({
+    project: Array.isArray(b) ? (b[B_PROJECT] ?? null) : null,
+    command: Array.isArray(b) ? (b[B_COMMAND] ?? null) : null,
+    location: Array.isArray(b) ? (b[B_LOCATION] ?? null) : null,
+    worker_id: Array.isArray(b) ? (b[B_WORKER] ?? null) : null,
+    duration_ms: Array.isArray(b) ? (b[B_DURATION] ?? null) : null,
+    exit_code: Array.isArray(b) ? (b[B_EXIT] ?? null) : null,
+    completed_at: Array.isArray(b) ? (b[B_COMPLETED] ?? null) : null,
+  }));
+}
+
+/** Mirror of `expandHints()` in src/derive.ts — keep in sync. */
+export function expandHints(rows) {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((h) => ({
+    worker_id: Array.isArray(h) ? (h[H_WORKER] ?? null) : null,
+    severity: Array.isArray(h) ? (h[H_SEVERITY] ?? null) : null,
+    message: Array.isArray(h) ? (h[H_MESSAGE] ?? null) : null,
+    suggested_action: Array.isArray(h) ? (h[H_ACTION] ?? null) : null,
+    reason_code: Array.isArray(h) ? (h[H_REASON] ?? null) : null,
+  }));
 }
 
 const SEVERITY = { critical: 0, warn: 1, info: 2 };
@@ -260,13 +305,17 @@ export function buildLlmView(snap, opts = {}) {
       id: d.id,
       reason: d.reason,
       posture_description: d.posture_description ?? "",
-      remediation_hints: (d.remediation_hints ?? []).map((h) => ({
+      remediation_hints: expandHints(d.hints).map((h) => ({
         worker: h.worker_id ?? "",
         severity: h.severity ?? "",
         message: h.message ?? "",
         action: h.suggested_action ?? "",
       })),
-      recent_builds: (d.recent_builds ?? []).slice(-10).map((b) => ({
+      // The browser drawer renders every build the collector sends; this view
+      // is context-budgeted and shows only the newest 10. Note that `classifyDev`
+      // above still counts ALL of them — the offload verdict must be measured
+      // over the whole window, not the slice an agent happens to be shown.
+      recent_builds: expandBuilds(d.builds).slice(-10).map((b) => ({
         project: b.project ?? "",
         location: b.location ?? "",
         worker: b.worker_id ?? "",

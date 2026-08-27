@@ -116,10 +116,32 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
         <h4>Offload posture</h4>
         <dl style={{ margin: 0 }}>
           <Row k="Assessment" v={d.levelReason} />
+          <Row
+            k="Measured window"
+            v={
+              d.remoteBasis === "recent"
+                ? `last ${d.remoteCounted} builds`
+                : d.remoteBasis === "lifetime"
+                  ? "since daemon start"
+                  : "—"
+            }
+          />
           <Row k="rch posture" v={d.posture ?? "—"} />
           <Row k="Description" v={d.posture_description ?? "—"} />
-          <Row k="Builds remote" v={s ? s.remote : "—"} />
-          <Row k="Builds local" v={s ? s.local : "—"} />
+          {(() => {
+            // Counts must match the window the share was measured over.
+            const recent = d.remoteBasis === "recent" ? (d.recent_builds ?? []) : [];
+            const r = recent.length > 0
+              ? recent.filter((b) => (b.location ?? "").toLowerCase() === "remote").length
+              : (s?.remote ?? null);
+            const l = recent.length > 0 ? recent.length - (r ?? 0) : (s?.local ?? null);
+            return (
+              <>
+                <Row k="Builds remote" v={r ?? "—"} />
+                <Row k="Builds local" v={l ?? "—"} />
+              </>
+            );
+          })()}
           <Row k="Remote share" v={d.remotePct != null ? `${d.remotePct.toFixed(0)}%` : "—"} />
           <Row k="Avg build" v={fmtDuration(s?.avg_duration_ms ?? null)} />
           <Row k="Failures" v={s ? s.failure : "—"} />

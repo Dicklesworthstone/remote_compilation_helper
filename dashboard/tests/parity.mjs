@@ -17,7 +17,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { classifyWorker, classifyDev } from "../tools/llm-view.mjs";
+import { classifyWorker, classifyDev, expandBuilds, expandHints } from "../tools/llm-view.mjs";
 
 const dir = await mkdtemp(join(tmpdir(), "rch-parity-"));
 const outfile = join(dir, "derive.mjs");
@@ -123,12 +123,22 @@ const d = (over = {}) => ({
   daemon: { version: "1", uptime_secs: 60, pid: 1, workers_total: 2, workers_healthy: 2,
             slots_total: 10, slots_available: 10 },
   build_stats: { total: 10, remote: 10, local: 0, success: 10, failure: 0, avg_duration_ms: 100 },
-  saved_time_ms: 0, active_builds: 0, queued_builds: 0, recent_builds: [],
-  issues: [], alerts: [], remediation_hints: [],
-  // The wire shape the collector actually emits: `[used, total]` pairs, not a
-  // duplicate worker record per dispatcher. See classifyDispatcher().
+  saved_time_ms: 0, active_builds: 0, queued_builds: 0,
+  // The wire shape the collector actually emits: positional tuples, not objects
+  // — `worker_slots` as `[used, total]`, `builds` as
+  // `[project, command, location, worker_id, duration_ms, exit_code, completed_at]`
+  // and `hints` as `[worker_id, severity, message, suggested_action, reason_code]`.
+  // `issues`/`alerts` are gone entirely: nothing ever read them.
+  builds: [], hints: [],
   collection_errors: [], config_degraded: false, worker_slots: [], ...over,
 });
+
+/** Build a wire build tuple from named parts, so the cases below stay readable. */
+const bt = (o = {}) => [
+  o.project ?? "proj", o.command ?? "cargo build", o.location ?? "Remote",
+  o.worker_id ?? "w1", o.duration_ms ?? 1000, o.exit_code ?? 0,
+  o.completed_at ?? "2026-08-26T11:59:00.000Z",
+];
 
 const devCases = [
   ["offloading", d()],
@@ -138,12 +148,34 @@ const devCases = [
   ["idle (no builds)", d({ build_stats: { total: 0, remote: 0, local: 0, success: 0, failure: 0, avg_duration_ms: null } })],
   ["mostly local", d({ build_stats: { total: 10, remote: 2, local: 8, success: 10, failure: 0, avg_duration_ms: 100 } })],
   ["no build_stats", d({ build_stats: null })],
+  // The RECENT-window basis, which nothing exercised before the builds array
+  // moved to tuples. It is the branch that decides `local-only`, and it reads
+  // `location` out of a fixed tuple position — a misread index would count
+  // every build as local and paint the whole fleet red.
+  ["recent window: all remote", d({ builds: [bt(), bt(), bt()] })],
+  ["recent window: all local", d({ builds: [bt({ location: "Local" }), bt({ location: "Local" })] })],
+  ["recent window: 50/50 (on the threshold)", d({ builds: [bt(), bt({ location: "Local" })] })],
+  ["recent window: 1 of 3 remote", d({ builds: [bt(), bt({ location: "Local" }), bt({ location: "Local" })] })],
+  ["recent window beats lifetime counters", d({
+    builds: [bt({ location: "Local" }), bt({ location: "Local" })],
+    build_stats: { total: 100, remote: 100, local: 0, success: 100, failure: 0, avg_duration_ms: 100 },
+  })],
+  ["recent window with a null location", d({ builds: [bt({ location: null }), bt()] })],
 ];
 
 for (const [name, dev] of devCases) {
   const a = derive.classifyDispatcher(dev);
   const b = classifyDev(dev);
   chk(`dev: ${name}`, a.level === b.level, `derive=${a.level} llm=${b.level}`);
+  // Compare the whole verdict, not just the label. The reason string embeds the
+  // measured percentage AND the window size ("only 33% of the last 3 builds
+  // went remote"), so this is what actually catches a classifier that counts a
+  // different number of builds than the other one.
+  chk(`dev reason: ${name}`, a.levelReason === b.reason, `derive="${a.levelReason}" llm="${b.reason}"`);
+  chk(`dev remotePct: ${name}`, a.remotePct === b.remotePct, `derive=${a.remotePct} llm=${b.remotePct}`);
+  chk(`dev basis: ${name}`,
+    a.remoteBasis === b.remoteBasis && a.remoteCounted === b.remoteCounted,
+    `derive=${a.remoteBasis}/${a.remoteCounted} llm=${b.remoteBasis}/${b.remoteCounted}`);
 }
 
 // ------------------------------------------------- per-dispatcher slot view
@@ -183,6 +215,69 @@ for (const [name, dev] of devCases) {
   delete legacy.worker_slots;
   chk("a pre-projection snapshot renders instead of throwing",
     derive.classifyDispatcher(legacy).workers.length === 0);
+}
+
+// ------------------------------------------------ build + hint tuple expansion
+//
+// `recent_builds[]` and `remediation_hints[]` moved to the wire as positional
+// tuples: every value in them is rendered, but the repeated key names were
+// 16.7KB of a 92.3KB payload. The dev-machine drawer reads the EXPANDED records
+// (`DispatcherView.recent_builds` / `.remediation_hints`), so a wrong index or a
+// dropped element is invisible to the type-checker and shows up only as a
+// mislabelled build row on a live fleet. Assert the expansion element-wise, in
+// both the browser classifier and the LLM one.
+{
+  const builds = [
+    ["rch", "cargo build -p rch", "Remote", "hz3", 12345, 0, "2026-08-26T11:58:00.000Z"],
+    // exit_code 0 and duration_ms 0 are the readings `|| null` would erase:
+    // 0 means the build SUCCEEDED, not "no exit code".
+    ["beads", "cargo test", "Local", null, 0, 0, "2026-08-26T11:59:00.000Z"],
+    ["x", null, null, null, null, 101, null],
+  ];
+  const dv = derive.classifyDispatcher(d({ builds }));
+  chk("build tuples expand one-for-one", dv.recent_builds.length === builds.length,
+    `${dv.recent_builds.length} of ${builds.length}`);
+  chk("build tuples keep order and every field",
+    JSON.stringify(dv.recent_builds) === JSON.stringify(builds.map(
+      ([project, command, location, worker_id, duration_ms, exit_code, completed_at]) =>
+        ({ project, command, location, worker_id, duration_ms, exit_code, completed_at }))),
+    JSON.stringify(dv.recent_builds));
+  chk("build expansion agrees between derive and llm-view",
+    JSON.stringify(dv.recent_builds) === JSON.stringify(expandBuilds(builds)));
+  chk("a zero exit code survives as 0, not null",
+    dv.recent_builds[1].exit_code === 0 && dv.recent_builds[1].duration_ms === 0,
+    `exit=${dv.recent_builds[1].exit_code} ms=${dv.recent_builds[1].duration_ms}`);
+  chk("a failing build keeps its exit code", dv.recent_builds[2].exit_code === 101);
+
+  const hints = [
+    ["hz4", "critical", "disk 96% full", "run sbh reclaim", "disk_free_below_critical_gb"],
+    ["vmi1", "warn", "telemetry stale", null, null],
+  ];
+  const hv = derive.classifyDispatcher(d({ hints }));
+  chk("hint tuples expand one-for-one", hv.remediation_hints.length === hints.length,
+    `${hv.remediation_hints.length} of ${hints.length}`);
+  chk("hint tuples keep order and every field",
+    JSON.stringify(hv.remediation_hints) === JSON.stringify(hints.map(
+      ([worker_id, severity, message, suggested_action, reason_code]) =>
+        ({ worker_id, severity, message, suggested_action, reason_code }))),
+    JSON.stringify(hv.remediation_hints));
+  chk("hint expansion agrees between derive and llm-view",
+    JSON.stringify(hv.remediation_hints) === JSON.stringify(expandHints(hints)));
+  // DevMachineCard prints this count, DevMachineDrawer keys each row off
+  // `worker_id|reason_code|message` — so reason_code has to survive the wire
+  // even though it is never displayed.
+  chk("hint reason_code survives for the drawer's row keys",
+    hv.remediation_hints[0].reason_code === "disk_free_below_critical_gb");
+
+  // A snapshot written before this projection, still cached in a browser tab.
+  const old = d();
+  delete old.builds;
+  delete old.hints;
+  const ov = derive.classifyDispatcher(old);
+  chk("a pre-tuple snapshot renders instead of throwing",
+    ov.recent_builds.length === 0 && ov.remediation_hints.length === 0);
+  chk("...and falls back to the lifetime counters for its verdict",
+    ov.remoteBasis === "lifetime" && ov.level === "offloading", `${ov.remoteBasis}/${ov.level}`);
 }
 
 // The stale-clock regression: classifyAll must ignore the caller's clock.

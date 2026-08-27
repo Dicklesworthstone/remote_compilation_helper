@@ -50,6 +50,7 @@ export interface Worker {
   slots_by_dispatcher?: Record<string, { used: number | null; total: number | null }>;
 }
 
+/** One recent build, as `classifyDispatcher()` hands it to the UI. */
 export interface RecentBuild {
   project: string | null;
   command: string | null;
@@ -61,6 +62,27 @@ export interface RecentBuild {
   completed_at: string | null;
 }
 
+/**
+ * The WIRE form of a `RecentBuild`.
+ *
+ * Positional, not named. All seven values are consumed — the dev-machine drawer
+ * renders six and uses `command` as the row tooltip, and both classifiers count
+ * `location` to decide whether the box is offloading — so none can be dropped.
+ * The key names can: 121 builds on a 10-machine fleet repeated the same 84
+ * characters of `"project":"command":…` 121 times, 10.2KB of a 92.3KB payload.
+ * Expanded by `expandBuilds()` in src/derive.ts.
+ */
+export type BuildTuple = [
+  project: string | null,
+  command: string | null,
+  location: string | null,
+  worker_id: string | null,
+  duration_ms: number | null,
+  exit_code: number | null,
+  completed_at: string | null,
+];
+
+/** One remediation hint, as `classifyDispatcher()` hands it to the UI. */
 export interface RemediationHint {
   worker_id: string | null;
   severity: string | null;
@@ -68,6 +90,18 @@ export interface RemediationHint {
   suggested_action: string | null;
   reason_code: string | null;
 }
+
+/**
+ * The WIRE form of a `RemediationHint` — same reasoning as `BuildTuple`
+ * (66 characters of key names × 99 hints = 6.5KB). Expanded by `expandHints()`.
+ */
+export type HintTuple = [
+  worker_id: string | null,
+  severity: string | null,
+  message: string | null,
+  suggested_action: string | null,
+  reason_code: string | null,
+];
 
 /**
  * One dev machine's OWN derated reading of one worker's slots: `[used, total]`.
@@ -126,10 +160,20 @@ export interface Dispatcher {
   saved_time_ms: number | null;
   active_builds: number;
   queued_builds: number;
-  recent_builds: RecentBuild[];
-  issues: unknown[];
-  alerts: unknown[];
-  remediation_hints: RemediationHint[];
+  /**
+   * Recent builds in wire form. Read them through `DispatcherView.recent_builds`,
+   * which `classifyDispatcher()` expands from these tuples.
+   */
+  builds: BuildTuple[];
+  /**
+   * Remediation hints in wire form. Read them through
+   * `DispatcherView.remediation_hints`.
+   */
+  hints: HintTuple[];
+  // `issues[]` and `alerts[]` are deliberately absent. The collector gathered
+  // both and nothing ever read either one — no component, no derive path, no
+  // LLM view, no test. They cost 8.0KB of a 92.3KB payload (8.7%) on every
+  // 5-minute refresh. Re-add them only together with a consumer.
   /**
    * This machine's own derated slot reading for every worker it can see.
    *
@@ -211,4 +255,8 @@ export interface DispatcherView extends Dispatcher {
    * Slot readings only — every other worker fact lives on `Snapshot.workers`.
    */
   workers: DispatcherWorkerSlots[];
+  /** `Dispatcher.builds` expanded back into records, oldest first. */
+  recent_builds: RecentBuild[];
+  /** `Dispatcher.hints` expanded back into records, in collector order. */
+  remediation_hints: RemediationHint[];
 }

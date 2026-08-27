@@ -132,6 +132,20 @@ check("dev drawer shows this machine's pool view",
   if (found) {
     const buildText = await page.locator(".drawer .builds").innerText();
     check("recent builds show relative age", /ago/.test(buildText), buildText.split("\n")[0]);
+    // Builds travel as positional tuples now. An index shifted by one still
+    // renders text everywhere — `command` lands in the project cell and reads
+    // fine — but a non-numeric value reaches fmtDuration and every duration
+    // collapses to "—". Assert a real duration is on screen.
+    check("recent builds show a real duration", /\d+(\.\d+)?(ms|s|m)\b/.test(buildText),
+      buildText.split("\n").slice(0, 2).join(" / "));
+    // Same trap for `location`: it decides the remote/local pill on every row,
+    // and misreading it paints an offloading fleet as local-only.
+    // innerText is the RENDERED text and the pill is text-transform:uppercase,
+    // so match case-insensitively rather than against the source casing.
+    const pillTexts = await page.locator(".drawer .build-row .pill").allInnerTexts();
+    check("every build row is labelled remote or local",
+      pillTexts.length > 0 && pillTexts.every((t) => /^(remote|local)$/i.test(t.trim())),
+      pillTexts.slice(0, 4).join(", "));
     const workerLink = page.locator(".drawer .build-row .link").first();
     if ((await workerLink.count()) > 0) {
       const linkedId = (await workerLink.innerText()).trim();
@@ -140,6 +154,45 @@ check("dev drawer shows this machine's pool view",
       const wTitle = (await page.locator(".drawer h3").innerText()).trim();
       check("dev drawer cross-links to worker drawer", wTitle === linkedId, `${wTitle} (want ${linkedId})`);
     }
+  }
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+}
+
+// Remediation hints. Like recent builds, these now travel as positional tuples
+// (the key names were 6.5KB of the payload) and are expanded by
+// classifyDispatcher. A wrong index expands silently — every hint would render
+// with a blank message and an "info" pill instead of its real severity — so
+// assert on the TEXT, not just on the panel being present.
+//
+// A genuinely healthy fleet reports no hints at all, which is not a failure;
+// hunt for a machine that has some and only then assert, exactly as the recent
+// builds block above does.
+{
+  const pills = page.locator('[class*="pill dev-"]');
+  const n = await pills.count();
+  let hintText = null;
+  let hintSeverity = null;
+  for (let i = 0; i < n && hintText === null; i++) {
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(150);
+    await pills.nth(i).click();
+    await page.waitForSelector(".drawer", { timeout: 15000 });
+    if ((await page.locator(".drawer .hint").count()) > 0) {
+      hintText = (await page.locator(".drawer .hint .hint-msg").first().innerText()).trim();
+      hintSeverity = (await page.locator(".drawer .hint .hint-top .pill").first().innerText()).trim();
+    }
+  }
+  if (hintText === null) {
+    check("no dev machine reported remediation hints (nothing to expand)", true, `checked ${n} dev machines`);
+  } else {
+    check("remediation hint messages survive the wire projection", hintText.length > 0, hintText.slice(0, 80));
+    // "info" is the fallback the drawer prints when `severity` is missing, so a
+    // panel full of "info" is what a dropped field looks like.
+    check("remediation hint severities survive the wire projection",
+      hintSeverity.length > 0 && hintSeverity !== "info", hintSeverity);
+    const header = await page.locator(".drawer .kv-group h4", { hasText: /Remediation hints/ }).first().innerText();
+    check("hint panel counts the expanded rows", /Remediation hints \(\d+\)/i.test(header), header);
   }
   await page.keyboard.press("Escape");
   await page.waitForTimeout(300);

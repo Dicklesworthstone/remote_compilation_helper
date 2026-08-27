@@ -53,7 +53,7 @@ export function Gate({ onUnlock, error, busy }: Props) {
           {busy ? "Deriving key…" : "Unlock"}
         </button>
 
-        {error && <div className="gate-err">{error}</div>}
+        {error && <div className="gate-err" role="alert">{error}</div>}
 
         <p className="gate-note">
           The payload is AES-256-GCM ciphertext with a PBKDF2-SHA-256 (600k iteration) key.

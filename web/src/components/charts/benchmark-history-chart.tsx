@@ -63,11 +63,19 @@ interface ChartTooltipProps {
 function ChartTooltip({ active, payload, label }: ChartTooltipProps) {
   if (!active || !payload || !label) return null;
 
-  const date = new Date(label);
+  let formattedDate = '';
+  try {
+    const date = new Date(label);
+    if (!isNaN(date.getTime())) {
+      formattedDate = format(date, 'PPpp');
+    }
+  } catch {
+    formattedDate = String(label);
+  }
 
   return (
     <div className="bg-popover border border-border rounded-lg shadow-lg p-3 text-sm">
-      <p className="font-medium text-foreground mb-2">{format(date, 'PPpp')}</p>
+      <p className="font-medium text-foreground mb-2">{formattedDate}</p>
       <div className="space-y-1">
         {payload.map((entry) => (
           <p key={entry.dataKey} className="flex items-center gap-2">
@@ -191,9 +199,14 @@ export function BenchmarkHistoryChart({
   }, [history, dateRange, maxDataPoints]);
 
   const formatXAxis = useCallback((timestamp: number) => {
-    const date = new Date(timestamp);
-    // Shorter format for small screens
-    return format(date, 'MMM d');
+    try {
+      const date = new Date(timestamp);
+      if (isNaN(date.getTime())) return '';
+      // Shorter format for small screens
+      return format(date, 'MMM d');
+    } catch {
+      return '';
+    }
   }, []);
 
   if (isLoading) {

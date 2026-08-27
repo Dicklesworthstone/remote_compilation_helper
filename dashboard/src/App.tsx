@@ -407,11 +407,15 @@ export default function App() {
           <span className="spacer" />
           <span className="hint-inline">boxes that run rch and dispatch builds to the pool</span>
         </div>
-        <div className="grid">
-          {devs.map((d) => (
-            <DevMachineCard key={d.id} d={d} onOpen={setOpenDev} />
-          ))}
-        </div>
+        {devs.length === 0 ? (
+          <div className="empty">No dev machines configured.</div>
+        ) : (
+          <div className="grid">
+            {devs.map((d) => (
+              <DevMachineCard key={d.id} d={d} onOpen={setOpenDev} />
+            ))}
+          </div>
+        )}
       </section>
 
       <WorkersSection

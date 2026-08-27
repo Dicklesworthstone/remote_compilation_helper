@@ -341,15 +341,18 @@ async function collectDispatcher(host) {
   });
 
   const stats = status?.daemon?.stats ?? null;
-  const recent = (status?.daemon?.recent_builds ?? []).slice(-25).map((b) => ({
-    project: b.project_id ?? null,
-    command: typeof b.command === "string" ? b.command.slice(0, 120) : null,
-    location: b.location ?? null,          // "Remote" | "Local"
-    worker_id: b.worker_id ?? null,
-    duration_ms: num(b.duration_ms),
-    exit_code: num(b.exit_code),
-    completed_at: b.completed_at ?? null,
-  }));
+  // Positional, not named — see `builds` in the returned object below. Field
+  // order is the contract: project, command, location, worker, duration,
+  // exit code, completed_at. `src/derive.ts` and `tools/llm-view.mjs` expand it.
+  const recent = (status?.daemon?.recent_builds ?? []).slice(-25).map((b) => [
+    b.project_id ?? null,
+    typeof b.command === "string" ? b.command.slice(0, 120) : null,
+    b.location ?? null,                    // "Remote" | "Local"
+    b.worker_id ?? null,
+    num(b.duration_ms),
+    num(b.exit_code),
+    b.completed_at ?? null,
+  ]);
 
   return {
     id: dispatcherId(host),
@@ -386,16 +389,46 @@ async function collectDispatcher(host) {
     saved_time_ms: num(status?.daemon?.saved_time?.time_saved_ms),
     active_builds: (status?.daemon?.active_builds ?? []).length,
     queued_builds: (status?.daemon?.queued_builds ?? []).length,
-    recent_builds: recent,
-    issues: (status?.daemon?.issues ?? []).slice(0, 10),
-    alerts: (status?.daemon?.alerts ?? []).slice(0, 10),
-    remediation_hints: (status?.remediation_hints ?? []).slice(0, 12).map((h) => ({
-      worker_id: h.worker_id ?? null,
-      severity: h.severity ?? null,
-      message: typeof h.message === "string" ? h.message.slice(0, 240) : null,
-      suggested_action: typeof h.suggested_action === "string" ? h.suggested_action.slice(0, 240) : null,
-      reason_code: h.reason_code ?? null,
-    })),
+    /**
+     * Recent builds as `[project, command, location, worker_id, duration_ms,
+     * exit_code, completed_at]` tuples.
+     *
+     * Every one of those seven values is consumed — the drawer renders six of
+     * them and uses `command` as the row tooltip, and both classifiers count
+     * `location` to decide whether this box is offloading — so nothing can be
+     * dropped. What CAN go is the key names: 121 records on a 10-machine fleet
+     * repeat the same 84 characters of `"project":"command":"location":…`
+     * 121 times, 10.2KB of a 92.3KB payload, for zero information.
+     *
+     * Named `builds`, not `recent_builds`, deliberately. A browser tab holding
+     * the previous bundle would read these arrays through the object accessors
+     * and get `undefined` for `location` on every row — which reads as "0% of
+     * builds went remote" and paints every dev machine red `local-only`. Under
+     * a new key the old bundle simply sees no builds and falls back to the
+     * lifetime counters, which is wrong-but-quiet rather than a fleet-wide
+     * false alarm.
+     */
+    builds: recent,
+    /**
+     * Remediation hints as `[worker_id, severity, message, suggested_action,
+     * reason_code]` tuples, same reasoning as `builds` (66 chars of key names
+     * × 99 records = 6.5KB). All five are consumed: the drawer renders four and
+     * folds `reason_code` into each row's React key.
+     */
+    hints: (status?.remediation_hints ?? []).slice(0, 12).map((h) => [
+      h.worker_id ?? null,
+      h.severity ?? null,
+      typeof h.message === "string" ? h.message.slice(0, 240) : null,
+      typeof h.suggested_action === "string" ? h.suggested_action.slice(0, 240) : null,
+      h.reason_code ?? null,
+    ]),
+    // `daemon.issues[]` and `daemon.alerts[]` used to be collected here and are
+    // NOT emitted any more. Nothing ever read them: no component, no
+    // `src/derive.ts` path, no `tools/llm-view.mjs` view, no test — only the
+    // `unknown[]` declaration in src/types.ts, which is now gone too. They were
+    // 8.0KB of a 92.3KB payload (8.7%), re-downloaded whole every 5 minutes and
+    // discarded unread. If a future panel wants them, re-add them WITH the
+    // consumer, so the payload cost is paid for something that renders.
     workers,
   };
 }
@@ -542,8 +575,8 @@ async function main() {
     return {
       id: dispatcherId(host), reachable: false, collection_errors: [reason], config_degraded: true,
       posture: null, posture_description: null, daemon: null, build_stats: null,
-      saved_time_ms: null, active_builds: 0, queued_builds: 0, recent_builds: [],
-      issues: [], alerts: [], remediation_hints: [], workers: [],
+      saved_time_ms: null, active_builds: 0, queued_builds: 0,
+      builds: [], hints: [], workers: [],
     };
   });
 

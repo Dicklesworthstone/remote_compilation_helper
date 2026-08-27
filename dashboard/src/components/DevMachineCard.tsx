@@ -13,8 +13,17 @@ interface Props {
  */
 export function DevMachineCard({ d, onOpen }: Props) {
   const s = d.build_stats;
-  const counted = s ? s.remote + s.local : 0;
   const remotePct = d.remotePct;
+  // The bar shows the share over the MEASURED window — recent builds when the
+  // machine has any, the lifetime counters otherwise. The R/L label must
+  // describe the same window or the bar and its text contradict each other
+  // (a full green bar over "0R / 200L" for a reformed box).
+  const recent = d.remoteBasis === "recent" ? (d.recent_builds ?? []) : [];
+  const recentRemote = recent.filter((b) => (b.location ?? "").toLowerCase() === "remote").length;
+  const shownRemote = recent.length > 0 ? recentRemote : (s?.remote ?? 0);
+  const shownLocal = recent.length > 0 ? recent.length - recentRemote : (s?.local ?? 0);
+  const shownCounted = recent.length > 0 ? recent.length : (s ? s.remote + s.local : 0);
+  const windowTag = d.remoteBasis === "recent" ? " recent" : "";
   // Bar colour encodes the remote share itself, not the posture: a box pushing
   // 100% of its builds to the pool is doing the right thing even when some
   // workers are pressure-blocked (posture "degraded") — the pill above carries
@@ -51,7 +60,9 @@ export function DevMachineCard({ d, onOpen }: Props) {
             <i className={cls} style={{ width: `${remotePct ?? 0}%` }} />
           </span>
           <span className="metric-value">
-            {counted > 0 ? `${s!.remote}R / ${s!.local}L` : "no builds"}
+            {shownCounted > 0
+              ? `${shownRemote}R / ${shownLocal}L${windowTag}`
+              : "no builds"}
           </span>
         </div>
         <div className="metric">
@@ -89,7 +100,7 @@ export function DevMachineCard({ d, onOpen }: Props) {
         </div>
       )}
 
-      {s && s.avg_duration_ms != null && counted > 0 && (
+      {s && s.avg_duration_ms != null && shownCounted > 0 && (
         <div className="tags">
           <span className="tag">avg {fmtDuration(s.avg_duration_ms)}</span>
           {s.failure > 0 && <span className="tag os">{s.failure} failed</span>}

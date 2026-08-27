@@ -34,7 +34,13 @@ export function Topbar(p: TopbarProps) {
           <span className="auto-in" title="Auto-refresh countdown">· auto ~{p.autoInMin}m</span>
         )}
       </div>
-      <button className="icon-btn" onClick={p.onRefresh} disabled={p.refreshing} aria-busy={p.refreshing}>
+      <button
+        className="icon-btn"
+        onClick={p.onRefresh}
+        disabled={p.refreshing}
+        aria-busy={p.refreshing}
+        title="Refresh snapshot (R)"
+      >
         {p.refreshing ? "Refreshing…" : "Refresh"}
       </button>
       <button
@@ -45,10 +51,12 @@ export function Topbar(p: TopbarProps) {
       >
         Auto
       </button>
-      <button className="icon-btn" onClick={p.onToggleTheme}>
+      <button className="icon-btn" onClick={p.onToggleTheme} title="Toggle color theme (T)">
         {p.theme === "dark" ? "Light" : "Dark"}
       </button>
-      <button className="icon-btn" onClick={p.onLock}>Lock</button>
+      <button className="icon-btn" onClick={p.onLock} title="Lock dashboard and return to gate">
+        Lock
+      </button>
     </header>
   );
 }
