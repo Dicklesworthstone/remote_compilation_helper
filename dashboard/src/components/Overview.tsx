@@ -21,7 +21,7 @@ export function Overview({ snap, counts, hardProblems }: Props) {
   const remotePct = buildsCounted > 0 ? (t.builds_remote / buildsCounted) * 100 : null;
   const diskUsedPct =
     t.disk_total_gb > 0 ? ((t.disk_total_gb - t.disk_free_gb) / t.disk_total_gb) * 100 : null;
-  const last = snap.history[snap.history.length - 1];
+  const last = snap.history.length > 0 ? snap.history[snap.history.length - 1] : null;
   const times = snap.history.map((h) => h.t);
 
   return (
@@ -89,7 +89,7 @@ export function Overview({ snap, counts, hardProblems }: Props) {
         </div>
       </section>
 
-      {snap.history.length > 1 && (
+      {snap.history.length > 1 && last && (
         <section className="section">
           <div className="section-head">
             <h2>Trend</h2>

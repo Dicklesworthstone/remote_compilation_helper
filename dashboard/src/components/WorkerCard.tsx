@@ -89,12 +89,12 @@ export function WorkerCard({ w, onOpen }: Props) {
         <div style={{ marginTop: 10, fontSize: 12, color: "var(--text-dim)" }}>{w.healthReason}</div>
       )}
 
-      {(w.tags.length > 0 || w.seen_by) && (
+      {(w.tags.length > 0 || (w.seen_by && w.seen_by.length > 0)) && (
         <div className="tags">
           {w.tags.map((t) => (
             <span key={t} className={`tag${t.startsWith("os:") ? " os" : ""}`}>{t}</span>
           ))}
-          {w.seen_by && <span className="tag">seen by {w.seen_by.length}</span>}
+          {w.seen_by && w.seen_by.length > 0 && <span className="tag">seen by {w.seen_by.length}</span>}
         </div>
       )}
     </button>

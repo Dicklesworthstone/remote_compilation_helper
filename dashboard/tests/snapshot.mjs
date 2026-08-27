@@ -433,8 +433,8 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
   ];
   // Deep-copy: the collector must not mutate what it was handed, and the
   // literal form below is the oracle we compare against.
-  const literal = JSON.parse(JSON.stringify(input));
-  const { strings, dispatchers } = internSnapshotStrings(JSON.parse(JSON.stringify(input)));
+  const literal = structuredClone(input);
+  const { strings, dispatchers } = internSnapshotStrings(structuredClone(input));
 
   chk("the table holds every distinct non-empty interned string",
     strings.length === new Set(["rch", "cargo build", "hz3", "disk 96% full", "run sbh reclaim",
@@ -449,8 +449,8 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
   // bytes — a table that reshuffled between runs would be a diff nightmare and
   // would make the A/B below meaningless.
   chk("interning is deterministic",
-    JSON.stringify(internSnapshotStrings(JSON.parse(JSON.stringify(input)))) ===
-      JSON.stringify(internSnapshotStrings(JSON.parse(JSON.stringify(input)))));
+    JSON.stringify(internSnapshotStrings(structuredClone(input))) ===
+      JSON.stringify(internSnapshotStrings(structuredClone(input))));
 
   // `location` and `severity` must survive as literal strings. `location` is
   // read positionally off the raw tuple by classifyDev() and `.toLowerCase()`d
@@ -792,7 +792,7 @@ chk("a wrong passphrase fails the GCM tag", wrongRejected);
   // as `main()` would if it re-read the file — must still verify, by falling
   // through to a full derivation. A missing memo may only ever cost time.
   chk("an envelope with no memoised key still verifies",
-    (await threw(() => verifyRoundTrip(JSON.parse(JSON.stringify(envV)), PASS, plain.length))) === null);
+    (await threw(() => verifyRoundTrip(structuredClone(envV), PASS, plain.length))) === null);
 
   // The memo must not let a DIFFERENT passphrase verify. It is keyed on the
   // passphrase too, so this falls through to a derivation and fails the GCM tag.

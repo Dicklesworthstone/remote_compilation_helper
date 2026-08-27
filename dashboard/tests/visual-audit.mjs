@@ -1,19 +1,51 @@
 /* Visual audit driver for the rch dashboard. Reads .env itself; prints nothing secret. */
 import { chromium } from "playwright";
-import { readFileSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { createServer } from "node:http";
+import { readFileSync, mkdirSync, existsSync, createReadStream } from "node:fs";
+import { dirname, join, extname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const env = Object.fromEntries(
-  readFileSync(`${root}/.env`, "utf8").split("\n").filter((l) => l.includes("="))
-    .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim().replace(/^['"]|['"]$/g, "")]),
-);
-const PASS = env.RCH_DASH_PASSPHRASE;
+const dist = join(root, "dist");
+let env = {};
+if (existsSync(`${root}/.env`)) {
+  env = Object.fromEntries(
+    readFileSync(`${root}/.env`, "utf8").split("\n").filter((l) => l.includes("="))
+      .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim().replace(/^['"]|['"]$/g, "")]),
+  );
+}
+const PASS = process.env.RCH_DASH_PASSPHRASE || env.RCH_DASH_PASSPHRASE;
 const PORT = process.env.RCH_DASH_E2E_PORT ?? "4174";
 const BASE = process.env.RCH_DASH_BASE ?? "/remote_compilation_helper/";
 const URL = `http://127.0.0.1:${PORT}${BASE}`;
 mkdirSync("/tmp/dash-audit", { recursive: true });
+
+// Check if server is already responding on PORT, else spawn internal static server
+let staticServer = null;
+try {
+  await fetch(URL, { signal: AbortSignal.timeout(500) });
+} catch {
+  const MIME = {
+    ".html": "text/html",
+    ".js": "application/javascript",
+    ".css": "text/css",
+    ".json": "application/json",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+  };
+  staticServer = createServer((req, res) => {
+    let reqPath = req.url.split("?")[0];
+    if (reqPath.startsWith(BASE)) reqPath = reqPath.slice(BASE.length - 1);
+    let filePath = join(dist, reqPath);
+    if (!existsSync(filePath) || reqPath === "/" || reqPath === "") {
+      filePath = join(dist, "index.html");
+    }
+    const ext = extname(filePath);
+    res.setHeader("Content-Type", MIME[ext] || "application/octet-stream");
+    createReadStream(filePath).pipe(res);
+  });
+  await new Promise((resolve) => staticServer.listen(Number(PORT), "127.0.0.1", resolve));
+}
 
 const browser = await chromium.launch();
 const errors = [];
@@ -132,4 +164,6 @@ if (overflow320 > 0) {
 await s320.close();
 
 await browser.close();
+if (staticServer) staticServer.close();
 console.log("errors:", errors.length ? errors.join(" | ") : "none");
+if (errors.length > 0) process.exit(1);

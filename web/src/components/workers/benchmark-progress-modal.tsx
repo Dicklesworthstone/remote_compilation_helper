@@ -190,7 +190,9 @@ export function BenchmarkProgressModal({
                 <div className="text-center py-4">
                   <CheckCircle className="h-12 w-12 text-emerald-600 dark:text-emerald-400 mx-auto mb-3" />
                   <div className="text-3xl font-bold text-emerald-600 dark:text-emerald-400">
-                    {Math.round(benchmark.result.total)}
+                    {benchmark.result.total != null && Number.isFinite(benchmark.result.total)
+                      ? Math.round(benchmark.result.total)
+                      : '—'}
                   </div>
                   <div className="text-sm text-muted-foreground">New SpeedScore</div>
                 </div>
@@ -342,7 +344,9 @@ function ScoreItem({
   return (
     <div className={cn('flex justify-between p-2 bg-muted/50 rounded', className)}>
       <span className="text-muted-foreground">{label}</span>
-      <span className="font-medium tabular-nums">{Math.round(value)}</span>
+      <span className="font-medium tabular-nums">
+        {value != null && Number.isFinite(value) ? Math.round(value) : '—'}
+      </span>
     </div>
   );
 }

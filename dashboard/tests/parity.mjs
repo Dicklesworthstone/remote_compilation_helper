@@ -291,10 +291,15 @@ for (const [name, dev] of devCases) {
       JSON.stringify({ "dev-1": { used: 1, total: 8 }, "dev-2": { used: 2, total: 4 } }),
     JSON.stringify(views[0].slots_by_dispatcher));
   // Lazily materialised, so it must survive every way a consumer might read it.
+  // Serialise ONCE and read the result back, rather than round-tripping as a
+  // clone: what is under test is exactly what a consumer receives after the
+  // view has been through JSON, so the serialized form is the subject, not an
+  // incidental copy.
+  const serializedView = JSON.stringify(views[0]);
   chk("the lazy slot record survives a spread and JSON round-trip",
     JSON.stringify({ ...views[0] }.slots_by_dispatcher) ===
       JSON.stringify(views[0].slots_by_dispatcher) &&
-    JSON.parse(JSON.stringify(views[0])).slots_by_dispatcher["dev-2"].total === 4);
+    JSON.parse(serializedView).slots_by_dispatcher["dev-2"].total === 4);
   chk("a worker no dispatcher reports keeps both fields absent",
     derive.classifyAll({ ...snapM, workers: [...workers, w({ id: "wd" })] })[3].seen_by === undefined);
   // A snapshot written before the matrix was de-duplicated carries the columns
@@ -482,7 +487,7 @@ for (const [name, dev] of devCases) {
   const wire = {
     schema: "x", label: "l", generated_at: new Date(SNAP_MS).toISOString(),
     totals: {}, workers: [], history: [], strings,
-    dispatchers: [d({ builds: JSON.parse(JSON.stringify(internedBuilds)), hints: JSON.parse(JSON.stringify(internedHints)) })],
+    dispatchers: [d({ builds: structuredClone(internedBuilds), hints: structuredClone(internedHints) })],
   };
   const rehydrated = derive.rehydrateStrings(wire);
   const rv = derive.classifyDispatcher(rehydrated.dispatchers[0]);
