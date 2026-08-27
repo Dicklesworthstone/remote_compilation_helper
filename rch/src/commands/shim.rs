@@ -736,7 +736,22 @@ pub fn shim_status(ctx: &OutputContext) -> Result<()> {
         return Ok(());
     }
 
+    // Surfaced separately from the cargo shim: a box can have a perfect cargo
+    // shim and still leak every `cargo-clippy` call a lint gate makes.
+    let clippy_note = if clippy_installed {
+        None
+    } else {
+        Some(format!(
+            "{} cargo-clippy shim missing — direct `cargo-clippy` calls (lint \
+             gates, CI scripts) will build LOCALLY. Run `rch shim install`.",
+            StatusIndicator::Warning.display(style)
+        ))
+    };
+
     if !installed {
+        if let Some(note) = &clippy_note {
+            println!("  {note}");
+        }
         println!(
             "{} cargo shim not installed. Run `rch shim install`.",
             StatusIndicator::Warning.display(style)
@@ -756,6 +771,13 @@ pub fn shim_status(ctx: &OutputContext) -> Result<()> {
             StatusIndicator::Warning.display(style),
             version.as_deref().unwrap_or("unknown")
         );
+    }
+    match &clippy_note {
+        Some(note) => println!("  {note}"),
+        None => println!(
+            "  {} cargo-clippy shim installed — direct clippy calls offload too",
+            StatusIndicator::Success.display(style)
+        ),
     }
     match interception {
         Interception::Direct => println!(
@@ -920,6 +942,163 @@ mod tests {
         let body = cargo_shim_body(true);
         // The catch-all arm runs the real cargo for everything else.
         assert!(body.contains("*)\n    exec \"$REAL\" \"$@\" ;;"));
+    }
+
+    /// Execute a rendered shim body under `/bin/sh` in a sandbox and report
+    /// whether it offloaded or ran the real cargo.
+    ///
+    /// String assertions cannot tell us what the script actually *does* — and a
+    /// shell syntax error in a generated file would ship silently — so these
+    /// tests run it for real against stub `rch` / `cargo` executables.
+    #[cfg(unix)]
+    fn run_shim(body: &str, name: &str, args: &[&str], env: &[(&str, &str)]) -> String {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rch-shim-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            // Distinguish cases within one process without pulling in rand.
+            args.join("_").replace(['/', '=', '-', ' '], "")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let write_exe = |p: &Path, contents: &str| {
+            let mut f = std::fs::File::create(p).unwrap();
+            f.write_all(contents.as_bytes()).unwrap();
+            let mut perms = std::fs::metadata(p).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(p, perms).unwrap();
+        };
+
+        let shim = dir.join(name);
+        write_exe(&shim, body);
+        // Stubs: each announces which path was taken.
+        write_exe(&dir.join("rch"), "#!/bin/sh\necho OFFLOAD \"$@\"\n");
+        let real = dir.join("real-cargo");
+        write_exe(&real, "#!/bin/sh\necho LOCAL \"$@\"\n");
+
+        let mut cmd = std::process::Command::new(&shim);
+        cmd.args(args)
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+            .env("RCH_SHIM_REAL_CARGO", &real)
+            .env("RCH_SHIM_REAL_CARGO_CLIPPY", &real)
+            .env_remove("RCH_CARGO_WRAPPER_BYPASS")
+            .env_remove("RCH_SHIM_LOCAL_IDE")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "shim exited {:?}; stderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The regression this whole change exists for: a plain
+    /// `--message-format=json` is what scripts, CI and lint gates pass, and
+    /// shim v1 sent every one of them to a LOCAL build.
+    #[cfg(unix)]
+    #[test]
+    fn plain_message_format_json_still_offloads() {
+        let body = cargo_shim_body(true);
+        let out = run_shim(
+            &body,
+            "cargo",
+            &["check", "--message-format=json"],
+            &[],
+        );
+        assert!(out.starts_with("OFFLOAD"), "expected offload, got: {out}");
+    }
+
+    /// rust-analyzer keeps its local build — it is identified by the rendered
+    /// diagnostic formats, not by `--message-format` alone.
+    #[cfg(unix)]
+    #[test]
+    fn rust_analyzer_diagnostic_formats_stay_local() {
+        let body = cargo_shim_body(true);
+        for fmt in [
+            "--message-format=json-diagnostic-rendered-ansi",
+            "--message-format=json-diagnostic-short",
+        ] {
+            let out = run_shim(&body, "cargo", &["check", fmt], &[]);
+            assert!(out.starts_with("LOCAL"), "{fmt} should stay local: {out}");
+        }
+    }
+
+    /// Offloading the inner `cargo check` that `cargo clippy` drives would drop
+    /// the wrapper and silently produce check results instead of lints.
+    #[cfg(unix)]
+    #[test]
+    fn workspace_wrapper_forces_local_so_clippy_lints_survive() {
+        let body = cargo_shim_body(true);
+        let out = run_shim(
+            &body,
+            "cargo",
+            &["check"],
+            &[("RUSTC_WORKSPACE_WRAPPER", "/usr/bin/clippy-driver")],
+        );
+        assert!(out.starts_with("LOCAL"), "expected local, got: {out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_ide_escape_hatch_forces_local() {
+        let body = cargo_shim_body(true);
+        let out = run_shim(&body, "cargo", &["build"], &[("RCH_SHIM_LOCAL_IDE", "1")]);
+        assert!(out.starts_with("LOCAL"), "expected local, got: {out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bypass_still_breaks_the_loop() {
+        let body = cargo_shim_body(true);
+        let out = run_shim(
+            &body,
+            "cargo",
+            &["build"],
+            &[("RCH_CARGO_WRAPPER_BYPASS", "1")],
+        );
+        assert!(out.starts_with("LOCAL"), "expected local, got: {out}");
+    }
+
+    /// A direct `cargo-clippy` call is the leak; it must offload.
+    #[cfg(unix)]
+    #[test]
+    fn direct_cargo_clippy_offloads() {
+        let body = cargo_clippy_shim_body();
+        let out = run_shim(&body, "cargo-clippy", &["--all-targets"], &[]);
+        assert!(out.starts_with("OFFLOAD"), "expected offload, got: {out}");
+        assert!(
+            out.contains("cargo clippy"),
+            "should normalize to `cargo clippy`: {out}"
+        );
+    }
+
+    /// Invoked BY cargo as `cargo-clippy clippy ...` the outer cargo already
+    /// decided; re-entering rch here would double-offload.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_clippy_as_subcommand_passes_through() {
+        let body = cargo_clippy_shim_body();
+        let out = run_shim(&body, "cargo-clippy", &["clippy", "--all-targets"], &[]);
+        assert!(out.starts_with("LOCAL"), "expected passthrough, got: {out}");
+    }
+
+    #[test]
+    fn clippy_shim_carries_the_version_marker() {
+        let body = cargo_clippy_shim_body();
+        assert_eq!(
+            installed_shim_version_from_str(&body).as_deref(),
+            Some(SHIM_VERSION)
+        );
     }
 
     // Test helper mirroring installed_shim_version over an in-memory string.
