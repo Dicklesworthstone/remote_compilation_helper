@@ -23,9 +23,10 @@ import {
 } from "../tools/snapshot.mjs";
 import { expandBuilds, expandHints } from "../tools/llm-view.mjs";
 import {
-  SNAPSHOT_COMPRESSION, compressPlaintext, decompressPlaintext,
+  SNAPSHOT_COMPRESSION, SNAPSHOT_GZIP_LEVEL, compressPlaintext, decompressPlaintext,
   isIdentityCompression, isSupportedCompression,
 } from "../tools/envelope.mjs";
+import { gzipSync } from "node:zlib";
 
 let failures = 0;
 const chk = (name, cond, detail = "") => {
@@ -549,6 +550,126 @@ chk("compression round-trips multi-byte UTF-8 exactly",
 chk("a repetitive payload actually compresses",
   compressPlaintext(unicodeSample).length < Buffer.byteLength(unicodeSample) / 2,
   `${Buffer.byteLength(unicodeSample)}B -> ${compressPlaintext(unicodeSample).length}B`);
+
+// ------------------------------------------------- the deflate level is FIXED
+//
+// `tools/envelope.mjs` pins level 9 and argues, from `node tools/scaling.mjs
+// --gzip-levels`, that it should NOT be adaptive on input size: the whole cost
+// at the live fleet is 0.56ms, and the most generous threshold anyone could
+// defend (~720KB of plaintext, ~145 dispatchers) is a branch that would never
+// execute here. These cases pin both halves of that decision — the value, and
+// the property that makes the value safe to pin.
+//
+// The property: a gzip stream is self-terminating and does not carry its level.
+// zlib writes the level only into the advisory XFL header byte, and only for
+// the extremes — 2 for level 9, 4 for level 1, 0 for everything between — so
+// levels 2..8 are not even distinguishable from each other. No reader is given
+// a level, none can recover one, and none needs to. That is what lets this
+// constant be revisited later without an envelope-format change, and it is
+// worth a test rather than a claim in a comment.
+
+const levelSample = JSON.stringify({
+  schema: "rch.dashboard.snapshot.v2",
+  note: "Worker vmi1293453 — storage pressure ✓ · 39.7 GB free → run `du -sh /tmp/rch-*`",
+  workers: Array.from({ length: 120 }, (_, i) => ({
+    id: `wkr-${String(i).padStart(4, "0")}`,
+    status: ["healthy", "degraded", "draining", "unreachable"][i % 4],
+    slots: [i % 17, 16], disk_free_gb: 220 + ((i * 37) % 1600),
+    rustc: "1.94.0-nightly (a1b2c3d4e 2026-08-01)",
+  })),
+});
+const LEVELS = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+const encodings = new Map(LEVELS.map((lv) => [lv, gzipSync(Buffer.from(levelSample, "utf8"), { level: lv })]));
+
+chk("the shipped deflate level is 9", SNAPSHOT_GZIP_LEVEL === 9, `level=${SNAPSHOT_GZIP_LEVEL}`);
+chk("compressPlaintext emits exactly the shipped level, not something else",
+  compressPlaintext(levelSample).equals(encodings.get(SNAPSHOT_GZIP_LEVEL)));
+
+// Vacuity guard. If every level produced the same bytes, the round-trip checks
+// below would prove nothing at all.
+chk("the levels really do produce different encodings",
+  new Set([...encodings.values()].map((b) => b.toString("base64"))).size >= 4,
+  [...encodings].map(([lv, b]) => `L${lv}=${b.length}B`).join(" "));
+chk("a lower level is never smaller than level 9 on the same input",
+  LEVELS.every((lv) => encodings.get(lv).length >= encodings.get(9).length),
+  `L1=${encodings.get(1).length}B L6=${encodings.get(6).length}B L9=${encodings.get(9).length}B`);
+
+// THE isomorphism proof: the level changes the encoding and cannot change the
+// plaintext. Nine encodings, one output.
+const inflated = LEVELS.map((lv) => decompressPlaintext(encodings.get(lv), SNAPSHOT_COMPRESSION));
+chk("every deflate level inflates to byte-identical plaintext",
+  inflated.every((t) => t === levelSample),
+  `${LEVELS.length} levels -> ${new Set(inflated).size} distinct plaintext`);
+chk("level independence holds for multi-byte UTF-8 too",
+  LEVELS.every((lv) =>
+    decompressPlaintext(gzipSync(Buffer.from(unicodeSample, "utf8"), { level: lv }), SNAPSHOT_COMPRESSION)
+    === unicodeSample));
+
+// The reader is handed a codec NAME and never a level — there is no level field
+// in the envelope, and the header cannot supply one either.
+chk("the envelope carries a codec name and no level",
+  env1.compression === "gzip" && !("level" in env1) && !("level" in env1.cipher),
+  JSON.stringify({ compression: env1.compression, keys: Object.keys(env1) }));
+chk("the gzip header does not identify the level (2..8 are indistinguishable)",
+  new Set([2, 3, 4, 5, 6, 7, 8].map((lv) => encodings.get(lv)[8])).size === 1
+  && encodings.get(9)[8] === 2 && encodings.get(1)[8] === 4,
+  `XFL: L1=${encodings.get(1)[8]} L6=${encodings.get(6)[8]} L9=${encodings.get(9)[8]}`);
+
+// A whole ENVELOPE written at a level the collector does not use must decode
+// through the same reader path, unchanged. This is what "self-describing" has
+// to mean in practice: `compression: "gzip"` is the entire contract, so a future
+// decision to move the level — or make it a function of size — cannot strand a
+// reader or require an envelope-format bump.
+{
+  const offLevelIv = crypto.getRandomValues(new Uint8Array(12));
+  const encKey = await crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: b64ToU8(env1.kdf.salt), iterations: env1.kdf.iterations, hash: env1.kdf.hash },
+    await crypto.subtle.importKey("raw", new TextEncoder().encode(PASS), "PBKDF2", false, ["deriveKey"]),
+    { name: "AES-GCM", length: 256 }, false, ["encrypt"],
+  );
+  const offLevelEnv = {
+    format: env1.format,
+    kdf: { ...env1.kdf },
+    cipher: { name: "AES-GCM", iv: Buffer.from(offLevelIv).toString("base64") },
+    compression: SNAPSHOT_COMPRESSION,
+    ciphertext: Buffer.from(new Uint8Array(await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: offLevelIv }, encKey, encodings.get(1),
+    ))).toString("base64"),
+  };
+  chk("an envelope compressed at level 1 decodes through the normal reader",
+    (await decryptWith(offLevelEnv, key1)) === levelSample,
+    `${encodings.get(1).length}B ciphertext payload vs ${encodings.get(9).length}B at level 9`);
+}
+
+// NO ADAPTIVE RULE SHIPPED. The level must not vary with input size — the
+// decision recorded in tools/envelope.mjs is a fixed 9, and an unremarked change
+// to that would silently alter every published envelope. The large sample below
+// is deliberately built past the ~720KB threshold that WAS considered and
+// rejected (a collector-CPU budget of one 600k PBKDF2, ~55ms, which the fitted
+// cpu ~ B^1.6 puts at ~720KB of plaintext / ~145 dispatchers), so if an adaptive
+// rule is ever introduced at the size that was argued for, this case fires.
+{
+  const tiny = JSON.stringify({ schema: "rch.dashboard.snapshot.v2", dispatchers: [] });
+  let seed = 0x5eed;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) >>> 0) / 4294967296;
+  const big = JSON.stringify(Array.from({ length: 9000 }, (_, i) => ({
+    id: `wkr-${String(i).padStart(5, "0")}`,
+    host: `vmi${Math.floor(rnd() * 9e6)}.example.net`,
+    slots: [Math.floor(rnd() * 64), 64],
+    disk_free_gb: Math.round(rnd() * 1800),
+    msg: "Disk is above the pressure threshold and rchd has derated this worker to zero slots.",
+  })));
+  chk("the sweep's threshold band is actually exercised", Buffer.byteLength(big) > 720_000,
+    `${Buffer.byteLength(big).toLocaleString()}B — past the ~720KB an adaptive rule was argued for`);
+  // XFL 2 is zlib's "maximum compression" marker; it is written for level 9 and
+  // for no other level, so it is a direct read of what the encoder was asked for.
+  chk("the level does not vary with input size — past the rejected threshold, same as 55B",
+    compressPlaintext(tiny)[8] === 2 && compressPlaintext(big)[8] === 2,
+    `XFL tiny=${compressPlaintext(tiny)[8]} (${Buffer.byteLength(tiny)}B) ` +
+    `big=${compressPlaintext(big)[8]} (${Buffer.byteLength(big).toLocaleString()}B)`);
+  chk("the large payload still round-trips exactly",
+    decompressPlaintext(compressPlaintext(big), SNAPSHOT_COMPRESSION) === big);
+}
 
 // VERSION SKEW, backward: an envelope with NO `compression` field is what every
 // snapshot published before this change looks like, and it must still decode.

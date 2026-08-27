@@ -19,7 +19,7 @@
  */
 import { chromium } from "playwright";
 import { createHash, webcrypto as nodeCrypto } from "node:crypto";
-import { gunzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 
 const BASE = process.env.RCH_DASH_BASE ?? "/remote_compilation_helper/";
 const PORT = process.env.RCH_DASH_E2E_PORT ?? "4174";
@@ -130,6 +130,42 @@ check("unlocks with correct passphrase", kpis.length >= 5, kpis.join(" | "));
   // real regression (a JS fallback, a per-chunk copy) can trip it.
   check("browser inflate stays under 5ms", inBrowser.medianMs < 5,
     `min ${inBrowser.minMs.toFixed(3)}ms · median ${inBrowser.medianMs.toFixed(3)}ms per refresh`);
+
+  // ── the deflate LEVEL is invisible to this reader ────────────────────────
+  //
+  // `tools/envelope.mjs` pins level 9 and argues from measurement that it must
+  // not be adaptive on fleet size. The reason that constant is safe to pin —
+  // and revisitable without an envelope-format change — is that the envelope
+  // says only `compression: "gzip"`, and a gzip stream does not carry its level
+  // in any way an inflater consults. Node proves that on its own side; this
+  // proves it where it actually matters, in the engine that renders the app.
+  //
+  // The SAME plaintext is re-compressed at levels 1 and 9 and both are handed to
+  // Chromium's `DecompressionStream("gzip")`. Different bytes in, identical
+  // bytes out, and the browser is never told which is which.
+  {
+    const atLevel = (lv) => gzipSync(nodePlain, { level: lv });
+    const l1 = atLevel(1), l9 = atLevel(9);
+    const levelProbe = await page.evaluate(async ({ a, b }) => {
+      const un64 = (s) => { const bin = atob(s); const u = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
+      const inflate = async (s) => {
+        const st = new Blob([un64(s)]).stream().pipeThrough(new DecompressionStream("gzip"));
+        return new Uint8Array(await new Response(st).arrayBuffer());
+      };
+      const sha = async (u) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", u))]
+        .map((x) => x.toString(16).padStart(2, "0")).join("");
+      const [ua, ub] = [await inflate(a), await inflate(b)];
+      return { a: await sha(ua), b: await sha(ub), bytesA: ua.length, bytesB: ub.length };
+    }, { a: l1.toString("base64"), b: l9.toString("base64") });
+
+    check("level 1 and level 9 are genuinely different encodings",
+      !l1.equals(l9), `${l1.length}B vs ${l9.length}B of the same ${nodePlain.length}B plaintext`);
+    check("the browser inflates both levels to the same plaintext, unaided",
+      levelProbe.a === levelProbe.b && levelProbe.a === nodeDigest
+      && levelProbe.bytesA === nodePlain.length,
+      `L1 -> ${levelProbe.a.slice(0, 16)}… · L9 -> ${levelProbe.b.slice(0, 16)}… · node ${nodeDigest.slice(0, 16)}…`);
+  }
 }
 
 const cards = await page.locator(".wcard").count();  // dev machines + workers

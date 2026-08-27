@@ -46,8 +46,101 @@
  * new correctness surface in front of the only path that renders the dashboard,
  * to save bytes on a file already down to ~12.7KB. deflate's 12-byte edge over
  * gzip is its shorter header; gzip keeps a CRC32 and length trailer for the same
- * price and is the most broadly supported `DecompressionStream` format. Taking
- * gzip at level 9 over level 6 costs 0.27ms of collector CPU for 168 bytes.
+ * price and is the most broadly supported `DecompressionStream` format.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * LEVEL: FIXED AT 9, and deliberately not adaptive.
+ *
+ * This is the one stage in the whole pipeline that is super-linear in its OWN
+ * input — zlib's level-9 match search costs ~n^0.6 per byte — so it is the only
+ * place where "right at today's fleet" and "right at ten times the fleet" could
+ * genuinely differ, and the only reason a fixed constant here needs defending
+ * rather than assuming. `node tools/scaling.mjs --gzip-levels` regenerates every
+ * synthetic row below — the whole point of that mode is that this block never
+ * has to be believed on trust, or kept current by hand, the way the one-line
+ * note it replaced was not. (The `live` row is the real published snapshot and
+ * needs the passphrase, so it is the one number the sweep cannot reproduce; it
+ * is here as the calibration point that says the synthetic n=10 fleet is within
+ * 6% of the real one.)
+ *
+ * Synthetic fleets from `tools/scaling.mjs` (d dispatchers over a shared pool of
+ * 1.6d workers), plus the real published snapshot as the calibration point. Byte
+ * counts are exact and identical run to run; CPU is the median across five runs
+ * of 25 repetitions each, because this host carries an agent swarm and a single
+ * sample of a sub-millisecond stage is mostly scheduler noise. "B/ms" is the
+ * exchange rate: bytes surrendered per millisecond of collector CPU bought by
+ * dropping 9 -> 6.
+ *
+ *   fleet           plaintext   L9 bytes    L9 cpu   L6 costs    L6 saves   B/ms
+ *   live 10x16         52,013      9,554    0.56ms      +156B    -0.19ms     808
+ *   n=10   (16w)       55,041      7,467    0.58ms      +199B    -0.18ms   1,082
+ *   n=25   (40w)      112,132     15,709    2.51ms      +759B    -1.29ms     587
+ *   n=50   (80w)      218,070     31,624    8.37ms    +1,720B    -5.16ms     333
+ *   n=100 (160w)      469,472     72,017   27.71ms    +4,019B   -18.27ms     220
+ *   n=200 (320w)    1,134,502    189,101  122.08ms   +11,504B   -86.24ms     133
+ *   n=500 (800w)    4,388,356    805,946  958.90ms   +52,169B  -777.61ms      67
+ *
+ * The crossover is real and it is in that last column: from n=25 up, the
+ * exchange rate improves roughly nine-fold (587 -> 67), so a bigger fleet gives
+ * up steadily fewer bytes per millisecond saved. (It is not monotone across the first two rows —
+ * at 0.56ms and 0.58ms the CPU delta is smaller than the noise floor of the box
+ * measuring it, which is itself the finding for those rows.) The crossover is
+ * also IRRELEVANT, because both sides stay negligible against what they are
+ * actually competing with:
+ *
+ *   - At the live fleet gzip -9 costs 0.56ms TOTAL. That is 0.07% of the
+ *     collector's 755ms of CPU, 0.02% of its 2.77s wall, and 0.0002% of the
+ *     five-minute cron interval it runs on. Level 6 recovers 0.19ms of it.
+ *     There is no load average at which 0.19ms every five minutes is worth a
+ *     branch, let alone worth 156 bytes.
+ *   - Even at n=500 — fifty times the fleet, 800 workers, far past any plausible
+ *     target — gzip -9 is 959ms against an ssh fan-out of ~32 waves over a
+ *     measured 1.45-1.59s handshake floor at the collector's `--max-parallel 16`.
+ *     Under 2% of the run's wall, on the stage that is 74% of it.
+ *
+ * And the two costs are not paid the same number of times. The collector
+ * compresses ONCE per cron tick. Every open tab re-fetches the artifact on its
+ * own five-minute timer, every reload fetches it again, and `api/fleet.mjs`
+ * bundles the envelope at build time so the bytes are in every serverless cold
+ * start too. Bytes are paid F>=1 times per tick and CPU exactly once, on a
+ * machine the operator already owns, at a duty cycle of 2e-6. When both sides
+ * are this small the tie goes to the side that is paid once: level 9.
+ *
+ * So NO ADAPTIVE RULE. The most generous threshold that could still be argued
+ * for — let gzip cost no more than the ~55ms the collector's single 600k PBKDF2
+ * already costs and which nobody complains about — lands, via the fitted
+ * cpu ~ B^1.6, at roughly 720KB of plaintext: about 145 dispatchers and 230
+ * workers. The fleet is at 10 and 16, and gained two machines in the days before
+ * this was written, so it does move — but not by 14x. That branch would never
+ * have executed, which makes it untested code on the only path that publishes
+ * the dashboard, buying a saving nothing is waiting on. An adaptive rule that
+ * never fires is strictly worse than the comment it replaces.
+ *
+ * If the constraint ever does change — a metered CPU runtime, or a cron interval
+ * short enough for a run to overlap the next — the fallback is level SEVEN, not
+ * the level 6 the first look at this reached for. From n=25 up, level 7 captures
+ * 79-94% of level 6's CPU saving for 34-47% of its byte cost:
+ *
+ *   n=25    L7  -1.02ms /    +256B    vs   L6  -1.29ms /    +759B
+ *   n=100   L7 -15.72ms /  +1,675B    vs   L6 -18.27ms /  +4,019B
+ *   n=500   L7 -714.6ms / +24,526B    vs   L6 -777.6ms / +52,169B
+ *
+ * Other zlib knobs were measured on the same ladder and none dominates the
+ * defaults: `memLevel: 9` buys 0 bytes at the live size and 21 at n=100 while
+ * costing 2.7ms there, and `Z_FILTERED` is 18 bytes WORSE live, better at n=25,
+ * and 6.8ms slower at n=100. There is nothing free left in the encoder.
+ *
+ * NOTHING DOWNSTREAM DEPENDS ON THIS NUMBER, which is what makes it safe to pin.
+ * A gzip stream is self-terminating, and the level is not recoverable from it:
+ * zlib records it only in the advisory XFL header byte (2 for level 9, 4 for
+ * level 1, 0 for every level in between, so 2..8 are indistinguishable), and
+ * every inflater ignores it. `decompressPlaintext`, `api/fleet.mjs`,
+ * `tools/fleet-llm.mjs` and the browser's `DecompressionStream("gzip")` are all
+ * handed a codec NAME and never a level. This constant can therefore be changed
+ * — or made a function of the input — without touching a single reader or the
+ * envelope format. `tests/snapshot.mjs` and `tests/e2e.mjs` pin that property
+ * directly, in Node and in real Chromium, so the claim is checked rather than
+ * asserted here.
  */
 
 import { gzipSync, gunzipSync } from "node:zlib";
@@ -70,9 +163,16 @@ export function isSupportedCompression(compression) {
   return isIdentityCompression(compression) || compression === "gzip";
 }
 
+/**
+ * The deflate level the collector compresses at. Fixed, not a function of input
+ * size — see the LEVEL block above for the measurements that settle it. Exported
+ * so the tests can pin both the value and the fact that no reader can observe it.
+ */
+export const SNAPSHOT_GZIP_LEVEL = 9;
+
 /** Snapshot JSON string -> the bytes that get encrypted. */
 export function compressPlaintext(text) {
-  return gzipSync(Buffer.from(text, "utf8"), { level: 9 });
+  return gzipSync(Buffer.from(text, "utf8"), { level: SNAPSHOT_GZIP_LEVEL });
 }
 
 /**

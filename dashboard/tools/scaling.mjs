@@ -5,6 +5,12 @@
  *     node tools/scaling.mjs                 # 1, 10, 50, 100, 500 dispatchers
  *     node tools/scaling.mjs --n 1,10,100    # pick the ladder
  *     node tools/scaling.mjs --json out.json # machine-readable, for diffing runs
+ *     node tools/scaling.mjs --gzip-levels   # deflate level vs fleet size
+ *
+ * `--gzip-levels` is the follow-up the first run demands: it finds that gzip is
+ * the only stage super-linear in its own input, and that makes the compression
+ * LEVEL the one constant here whose right value could depend on fleet size. See
+ * the block above `gzipLevelSweep()`, and `tools/envelope.mjs` for the verdict.
  *
  * WHY THIS EXISTS
  *
@@ -56,14 +62,17 @@
  * byte-identical fleets and the payload column is exactly reproducible.
  */
 
-import { webcrypto } from "node:crypto";
+import { webcrypto, createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
+import { gzipSync, gunzipSync } from "node:zlib";
 
 import {
   mergeWorkers, computeTotals, projectDispatchers, internSnapshotStrings,
 } from "./snapshot.mjs";
-import { compressPlaintext, decompressPlaintext, SNAPSHOT_COMPRESSION } from "./envelope.mjs";
+import {
+  compressPlaintext, decompressPlaintext, SNAPSHOT_COMPRESSION, SNAPSHOT_GZIP_LEVEL,
+} from "./envelope.mjs";
 import { buildLlmView, encodeView } from "./llm-view.mjs";
 
 // ------------------------------------------------------------------- fleet gen
@@ -328,6 +337,51 @@ const IV = webcrypto.getRandomValues(new Uint8Array(12));
 /** Bytes of a sub-structure, measured the way the wire measures it. */
 const bytesOf = (v) => Buffer.byteLength(JSON.stringify(v ?? null));
 
+/**
+ * The snapshot object exactly as `tools/snapshot.mjs` publishes it, given the
+ * outputs of the four collector stages.
+ *
+ * Factored out of `runOne()` so the gzip-level sweep further down builds the
+ * IDENTICAL payload rather than its own approximation of one — two sweeps that
+ * quietly measured different JSON would produce two tables that disagree, and
+ * the disagreement would be invisible.
+ */
+function assembleSnapshot({ totals, dispatchers, workers, strings }) {
+  return {
+    schema: "rch.dashboard.snapshot.v2",
+    label: "scaling",
+    generated_at: new Date(Date.UTC(2026, 7, 27, 2, 0, 0)).toISOString(),
+    totals,
+    dispatchers,
+    workers,
+    strings,
+    // `historyMax` in tools/snapshot.mjs — a FIXED 96 rows regardless of fleet
+    // size, so this block is a constant in n and belongs in the measurement as
+    // one: it is the floor every other component is compared against.
+    history: Array.from({ length: 96 }, (_, i) => ({
+      t: new Date(Date.UTC(2026, 7, 20) + i * 3e5).toISOString(),
+      slots_total: totals.slots, slots_used: totals.slots_used, workers: totals.workers,
+      disk_free_gb: Math.round(totals.disk_free_gb),
+      builds_remote: totals.builds_remote, builds_local: totals.builds_local,
+      dispatchers_remote_ready: totals.dispatchers_remote_ready,
+    })),
+  };
+}
+
+/**
+ * A synthetic fleet of `n` dispatchers, all the way to the JSON string the
+ * collector would hand to `compressPlaintext()`. Untimed — this is the sweep's
+ * INPUT, not one of its measurements.
+ */
+export function snapshotPlaintext(n) {
+  const { dispatchers } = synthFleet(n);
+  const workers = mergeWorkers(dispatchers);
+  const totals = computeTotals(workers, dispatchers);
+  const { dispatchers: interned, strings } =
+    internSnapshotStrings(projectDispatchers(dispatchers, workers));
+  return JSON.stringify(assembleSnapshot({ totals, dispatchers: interned, workers, strings }));
+}
+
 async function runOne(n, reps, browser) {
   const { dispatchers, pool, observations } = synthFleet(n);
   const stages = {};
@@ -346,25 +400,7 @@ async function runOne(n, reps, browser) {
   stages.intern = timeStage(() => internSnapshotStrings(emitted), { reps });
   const { dispatchers: internedDispatchers, strings } = stages.intern.out;
 
-  const snapshot = {
-    schema: "rch.dashboard.snapshot.v2",
-    label: "scaling",
-    generated_at: new Date(Date.UTC(2026, 7, 27, 2, 0, 0)).toISOString(),
-    totals,
-    dispatchers: internedDispatchers,
-    workers,
-    strings,
-    // `historyMax` in tools/snapshot.mjs — a FIXED 96 rows regardless of fleet
-    // size, so this block is a constant in n and belongs in the measurement as
-    // one: it is the floor every other component is compared against.
-    history: Array.from({ length: 96 }, (_, i) => ({
-      t: new Date(Date.UTC(2026, 7, 20) + i * 3e5).toISOString(),
-      slots_total: totals.slots, slots_used: totals.slots_used, workers: totals.workers,
-      disk_free_gb: Math.round(totals.disk_free_gb),
-      builds_remote: totals.builds_remote, builds_local: totals.builds_local,
-      dispatchers_remote_ready: totals.dispatchers_remote_ready,
-    })),
-  };
+  const snapshot = assembleSnapshot({ totals, dispatchers: internedDispatchers, workers, strings });
 
   stages.stringify = timeStage(() => JSON.stringify(snapshot), { reps });
   const plain = stages.stringify.out;
@@ -636,17 +672,127 @@ function report(runs) {
   console.log();
 }
 
+// -------------------------------------------------------------- gzip levels
+
+/**
+ * `--gzip-levels` — the deflate level sweep that settles `SNAPSHOT_GZIP_LEVEL`.
+ *
+ * The main ladder above found that gzip is the ONLY stage super-linear in its
+ * own input (~n^0.6 per byte). That makes the level the one constant in this
+ * pipeline whose right value could in principle depend on how big the fleet
+ * gets, and the only one where a comment written at one payload size can quietly
+ * stop being true — which is exactly what happened to the note this mode
+ * replaces. So the numbers get a command instead of a paragraph.
+ *
+ * For each fleet size it compresses the SAME plaintext `runOne()` measures at
+ * every level 1..9 and reports, against level 9:
+ *
+ *   bytes    what the reader pays, once per fetch, per tab, per five minutes
+ *   cpu      what the collector pays, once per cron tick
+ *   B/ms     the exchange rate — bytes surrendered per millisecond of CPU bought
+ *
+ * B/ms is the column the decision turns on, because it is the only one that is
+ * scale-free. A LOWER number means a lower level is a better deal.
+ *
+ * Every level is round-tripped through `decompressPlaintext()` and compared by
+ * SHA-256 against the input, so the `iso` column is a real isomorphism check and
+ * not a claim: the level changes the encoding and cannot change the plaintext.
+ * The level-9 row is additionally required to be byte-identical to what
+ * `compressPlaintext()` itself emits, so this table can never end up describing
+ * an encoder the collector does not use.
+ *
+ * Ships no assertions and exits 0 regardless — a measurement tool, not a test.
+ */
+function gzipLevelSweep(ns, reps, levels) {
+  return ns.map((n) => {
+    const text = snapshotPlaintext(n);
+    const buf = Buffer.from(text, "utf8");
+    const digest = createHash("sha256").update(buf).digest("hex");
+    const rows = levels.map((level) => {
+      const timed = timeStage(() => gzipSync(buf, { level }), { reps });
+      const out = timed.out;
+      const back = decompressPlaintext(out, SNAPSHOT_COMPRESSION);
+      return {
+        level,
+        bytes: out.length,
+        cpuMs: timed.cpuMs,
+        cpuMad: timed.cpuMad,
+        wallMs: timed.wallMs,
+        iso: createHash("sha256").update(Buffer.from(back, "utf8")).digest("hex") === digest,
+        // Only meaningful on the shipped level; `null` elsewhere.
+        matchesCollector: level === SNAPSHOT_GZIP_LEVEL
+          ? out.equals(compressPlaintext(text))
+          : null,
+      };
+    });
+    return { n, plaintext: buf.length, digest, rows };
+  });
+}
+
+function reportLevels(sweeps) {
+  console.log(`\nGZIP LEVEL SWEEP — collector cost vs wire cost, per fleet size`);
+  console.log(`shipped level: ${SNAPSHOT_GZIP_LEVEL}  (tools/envelope.mjs SNAPSHOT_GZIP_LEVEL)`);
+  for (const s of sweeps) {
+    const ref = s.rows.find((r) => r.level === SNAPSHOT_GZIP_LEVEL);
+    console.log(
+      `\nn=${s.n}  plaintext ${s.plaintext.toLocaleString()}B  sha256 ${s.digest.slice(0, 12)}` +
+      (ref ? `  ·  L${SNAPSHOT_GZIP_LEVEL} == compressPlaintext(): ${ref.matchesCollector ? "yes" : "NO — SWEEP AND COLLECTOR DISAGREE"}` : ""),
+    );
+    console.log(
+      `  lvl${pad("bytes", 11)}${pad("ratio", 8)}${pad("cpu ms", 10)}${pad("mad%", 7)}` +
+      `${pad(`vs L${SNAPSHOT_GZIP_LEVEL} B`, 11)}${pad("vs cpu", 11)}${pad("B/ms", 8)}  iso`,
+    );
+    for (const r of s.rows) {
+      const db = ref ? r.bytes - ref.bytes : 0;
+      const dc = ref ? r.cpuMs - ref.cpuMs : 0;
+      // Bytes given up per millisecond of collector CPU bought. Undefined for
+      // the reference row and for any level that is worse on BOTH axes.
+      const rate = r.level === SNAPSHOT_GZIP_LEVEL ? "—"
+        : db > 0 && dc < 0 ? (db / -dc).toFixed(0)
+        : db <= 0 && dc <= 0 ? "free"
+        : "worse";
+      console.log(
+        `  ${pad(r.level, 3)}${pad(r.bytes.toLocaleString(), 11)}` +
+        `${pad((s.plaintext / r.bytes).toFixed(2) + "x", 8)}${pad(ms(r.cpuMs), 10)}` +
+        `${pad(r.cpuMs ? ((r.cpuMad / r.cpuMs) * 100).toFixed(0) : "—", 7)}` +
+        `${pad((db > 0 ? "+" : "") + db.toLocaleString(), 11)}` +
+        `${pad((dc > 0 ? "+" : "") + ms(dc) + "ms", 11)}${pad(rate, 8)}  ${r.iso ? "ok" : "FAIL"}`,
+      );
+    }
+  }
+  console.log(
+    `\nB/ms falling as n grows IS the crossover: a bigger fleet gives up fewer bytes\n` +
+    `per millisecond saved. Read it against the absolute cpu column before acting on\n` +
+    `it — the collector compresses once per cron tick, every reader pays the bytes on\n` +
+    `every fetch. tools/envelope.mjs records where that lands.\n`,
+  );
+}
+
 // ------------------------------------------------------------------------ main
 
+const USAGE = [
+  "node tools/scaling.mjs [--n 1,10,50,100,500] [--reps 7] [--json out.json]",
+  "node tools/scaling.mjs --gzip-levels [--n 10,25,50,100] [--levels 1,..,9] [--reps 7] [--json out.json]",
+].join("\n");
+
 function parseArgs(argv) {
-  const out = { ns: [1, 10, 50, 100, 500], reps: 7, json: null };
+  const out = { ns: null, reps: 7, json: null, gzipLevels: false, levels: [1, 2, 3, 4, 5, 6, 7, 8, 9] };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--n") out.ns = argv[++i].split(",").map((s) => Number(s.trim())).filter((x) => x > 0);
     else if (a === "--reps") out.reps = Math.max(3, Number(argv[++i]) || 7);
     else if (a === "--json") out.json = argv[++i];
-    else if (a === "--help" || a === "-h") { console.log("node tools/scaling.mjs [--n 1,10,50,100,500] [--reps 7] [--json out.json]"); process.exit(0); }
+    else if (a === "--gzip-levels") out.gzipLevels = true;
+    else if (a === "--levels") {
+      out.levels = argv[++i].split(",").map((s) => Number(s.trim()))
+        .filter((x) => Number.isInteger(x) && x >= 0 && x <= 9);
+    } else if (a === "--help" || a === "-h") { console.log(USAGE); process.exit(0); }
   }
+  // Different questions want different ladders. The full pipeline run needs the
+  // extremes to fit an exponent at all; the level sweep is a decision about the
+  // sizes this fleet could plausibly reach, so it defaults to those.
+  out.ns ??= out.gzipLevels ? [10, 25, 50, 100] : [1, 10, 50, 100, 500];
+  if (out.gzipLevels && !out.levels.length) out.levels = [1, 2, 3, 4, 5, 6, 7, 8, 9];
   return out;
 }
 
@@ -684,6 +830,24 @@ const RUN_DIRECTLY =
 
 if (RUN_DIRECTLY) {
   const args = parseArgs(process.argv);
+
+  // The level sweep touches no browser code, so it skips the esbuild bundle of
+  // src/derive.ts entirely — it answers a collector-and-wire question in
+  // seconds instead of minutes.
+  if (args.gzipLevels) {
+    const sweeps = gzipLevelSweep(args.ns, args.reps, args.levels);
+    reportLevels(sweeps);
+    if (args.json) {
+      await writeFile(args.json, JSON.stringify({
+        generated_at: new Date().toISOString(),
+        shipped_level: SNAPSHOT_GZIP_LEVEL,
+        sweeps,
+      }, null, 2));
+      console.log(`wrote ${args.json}`);
+    }
+    process.exit(0);
+  }
+
   const browser = await loadBrowserModule();
   const runs = [];
   for (const n of args.ns) {
