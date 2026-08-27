@@ -23,6 +23,7 @@ import { readFile } from "node:fs/promises";
 import { webcrypto as crypto } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
 import { buildLlmView, encodeView } from "./llm-view.mjs";
 import { decompressPlaintext, isSupportedCompression } from "./envelope.mjs";
 
@@ -165,4 +166,17 @@ async function main() {
   process.stdout.write(encodeView(buildLlmView(snap, { view: args.view }), args.format) + "\n");
 }
 
-main().catch((e) => { console.error(e?.message ?? String(e)); process.exit(1); });
+// Only run the CLI when this file IS the program, exactly as tools/snapshot.mjs
+// guards its collector. Without it, `import`ing this module for its exported
+// `decryptToBytes`/`decryptEnvelope` runs main() against the HOST's argv: it
+// resolves the passphrase (which can shell out to `vault kv get` and block for
+// up to 15s), spends a 600k-iteration PBKDF2 decrypting the live snapshot,
+// writes the whole fleet inventory to stdout, and calls process.exit() on any
+// unrecognised flag the host happened to be passing. That makes the exports
+// untestable and turns a stray import into an fleet-inventory disclosure.
+const invokedDirectly =
+  process.argv[1] != null && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (invokedDirectly) {
+  main().catch((e) => { console.error(e?.message ?? String(e)); process.exit(1); });
+}

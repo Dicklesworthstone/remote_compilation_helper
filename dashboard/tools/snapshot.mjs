@@ -801,6 +801,32 @@ export async function existingSalt(outPath) {
 }
 
 /**
+ * Keys `encrypt()` has already derived, so `verifyRoundTrip()` need not spend a
+ * SECOND 600k-iteration PBKDF2 producing one it can simply be handed.
+ *
+ * Measured at 54ms of CPU per collection (51–57ms over nine A/B pairs) — 6% of
+ * the collector's entire CPU budget, and after six optimization passes the
+ * largest removable cost left anywhere in this dashboard. It never showed up in a
+ * V8 CPU profile, which reports this process as 94.9% idle, because
+ * `crypto.subtle.deriveKey` runs on the libuv threadpool and not on the JS
+ * thread; it has to be measured with `process.cpuUsage()` deltas.
+ *
+ * A WeakMap keyed by the envelope OBJECT rather than an extra return value or an
+ * extra parameter, because `encrypt()` is exported and used elsewhere: its
+ * contract stays exactly "plaintext + passphrase -> envelope". An envelope this
+ * map has never seen — one read back from disk, one built by hand in a test —
+ * falls straight through to a full derivation, so a missing entry can only ever
+ * make verification slower, never weaker. Entries die with the envelope.
+ *
+ * The passphrase is held beside the key so that verifying under a DIFFERENT
+ * passphrase than the one that encrypted still fails, exactly as an independent
+ * re-derivation made it fail. That is no new exposure: the collector already
+ * holds the same string in `process.env` and in `main()`'s own const for the
+ * whole life of the process, and this entry is unreachable outside this module.
+ */
+const derivedEncryptionKeys = new WeakMap();
+
+/**
  * Compress, then encrypt.
  *
  * The order is the only one that does anything: ciphertext is incompressible, so
@@ -822,17 +848,76 @@ export async function encrypt(plaintext, passphrase, reusableSalt = null) {
     baseKey,
     { name: "AES-GCM", length: 256 },
     false,
-    ["encrypt"],
+    // `decrypt` as well as `encrypt`, so verifyRoundTrip() can reuse this exact
+    // key instead of spending 51ms deriving an identical one. A usage mask is
+    // WebCrypto bookkeeping, not key material — the same passphrase, salt,
+    // iteration count and hash produce the same 256 bits either way, which
+    // tests/snapshot.mjs proves by encrypting under both masks with a fixed IV
+    // and comparing ciphertexts. The key stays non-extractable and never leaves
+    // this module.
+    ["encrypt", "decrypt"],
   );
   const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, compressPlaintext(plaintext));
   const b64 = (u8) => Buffer.from(u8).toString("base64");
-  return {
+  const envelope = {
     format: "rch.dashboard.enc.v1",
     kdf: { name: "PBKDF2", hash: "SHA-256", iterations: PBKDF2_ITERATIONS, salt: b64(salt) },
     cipher: { name: "AES-GCM", iv: b64(iv) },
     compression: SNAPSHOT_COMPRESSION,
     ciphertext: b64(new Uint8Array(ct)),
   };
+  derivedEncryptionKeys.set(envelope, {
+    key, passphrase, salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256",
+  });
+  return envelope;
+}
+
+/**
+ * The key to verify `envelope` with: the one `encrypt()` just derived when this
+ * is the envelope it produced under this passphrase, and a fresh derivation
+ * otherwise.
+ *
+ * Reusing the key would drop one thing the old unconditional re-derivation
+ * proved implicitly — that the KDF parameters WRITTEN INTO the envelope are the
+ * ones the key actually came from. That is a real bug class and not a
+ * theoretical one: the browser and `api/fleet.mjs` derive from those written
+ * parameters and nothing else, so a salt that failed to round-trip through
+ * base64 would publish a snapshot only this process could open. Re-deriving
+ * caught it by producing a different key and failing the decrypt.
+ *
+ * So it is checked directly instead. A byte comparison costs microseconds rather
+ * than 51ms and it NAMES the mismatch, where the old form surfaced as an
+ * unexplained `OperationError` from AES-GCM.
+ */
+async function roundTripKey(envelope, passphrase, b) {
+  const memo = derivedEncryptionKeys.get(envelope);
+  if (memo && memo.passphrase === passphrase) {
+    const written = b(envelope.kdf.salt);
+    if (written.length !== memo.salt.length || !written.every((v, i) => v === memo.salt[i])) {
+      throw new Error("envelope kdf.salt does not match the salt its key was derived from");
+    }
+    if (envelope.kdf.iterations !== memo.iterations) {
+      throw new Error(
+        `envelope kdf.iterations ${envelope.kdf.iterations} does not match the ${memo.iterations} its key was derived with`,
+      );
+    }
+    if (envelope.kdf.hash !== memo.hash) {
+      throw new Error(
+        `envelope kdf.hash ${envelope.kdf.hash} does not match the ${memo.hash} its key was derived with`,
+      );
+    }
+    return memo.key;
+  }
+  const baseKey = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"],
+  );
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: b(envelope.kdf.salt), iterations: envelope.kdf.iterations, hash: envelope.kdf.hash },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"],
+  );
 }
 
 /**
@@ -841,18 +926,14 @@ export async function encrypt(plaintext, passphrase, reusableSalt = null) {
  * since the plaintext is now gzip'd before encryption, against publishing one
  * that decrypts but does not INFLATE. A compression bug would otherwise reach
  * the browser as an indistinguishable "wrong passphrase".
+ *
+ * Exported so tests can prove, case by case, that every fault this used to
+ * reject it still rejects — see roundTripKey() for the one guarantee that moved
+ * from being implied by a re-derivation to being asserted outright.
  */
-async function verifyRoundTrip(envelope, passphrase, expectedLength) {
-  const enc = new TextEncoder();
+export async function verifyRoundTrip(envelope, passphrase, expectedLength) {
   const b = (s) => new Uint8Array(Buffer.from(s, "base64"));
-  const baseKey = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
-  const key = await crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt: b(envelope.kdf.salt), iterations: envelope.kdf.iterations, hash: envelope.kdf.hash },
-    baseKey,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["decrypt"],
-  );
+  const key = await roundTripKey(envelope, passphrase, b);
   const out = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv: b(envelope.cipher.iv) },
     key,

@@ -17,7 +17,7 @@ import { join } from "node:path";
 import {
   statusRank, circuitRank, pressureIsBetter,
   isLocalDispatcher, dispatcherId,
-  encrypt, existingSalt, internSnapshotStrings,
+  encrypt, verifyRoundTrip, existingSalt, internSnapshotStrings,
   buildProbeScript, splitProbeSections, dispatcherFromProbe, allSettledBounded,
 } from "../tools/snapshot.mjs";
 import { expandBuilds, expandHints } from "../tools/llm-view.mjs";
@@ -535,6 +535,103 @@ const wrongKey = await deriveFrom(env1, "definitely-not-the-passphrase");
 let wrongRejected = false;
 try { await decryptWith(env1, wrongKey); } catch { wrongRejected = true; }
 chk("a wrong passphrase fails the GCM tag", wrongRejected);
+
+// ------------------------------------------------- verifyRoundTrip (pre-publish proof)
+//
+// `verifyRoundTrip()` used to derive its own key with a second 600k-iteration
+// PBKDF2 — 50.5–51.5ms of pure waste per collection, since `encrypt()` had
+// already computed exactly that key. It now reuses it. These cases exist to pin
+// down that NOTHING the old form rejected is accepted by the new one, because a
+// verification that has quietly stopped verifying is worse than no verification
+// at all: it is what stands between a typo and publishing a snapshot the browser
+// cannot open.
+
+// The key-material identity proof for widening the usage mask to
+// ["encrypt","decrypt"]. A usage mask is WebCrypto bookkeeping, not key
+// material: the same passphrase, salt, iteration count and hash must produce the
+// same 256 bits either way. Encrypting identical plaintext under identical IVs
+// and comparing ciphertexts proves it without needing the keys to be extractable.
+{
+  const salt = b64ToU8(env1.kdf.salt);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const body = new TextEncoder().encode("the same bytes under both usage masks");
+  const base = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(PASS), "PBKDF2", false, ["deriveKey"],
+  );
+  const params = { name: "PBKDF2", salt, iterations: 600000, hash: "SHA-256" };
+  const encOnly = await crypto.subtle.deriveKey(params, base, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+  const encDec = await crypto.subtle.deriveKey(params, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  const a = Buffer.from(new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, encOnly, body)));
+  const b = Buffer.from(new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, encDec, body)));
+  chk("widening the key usage mask does not change the key material", a.equals(b),
+    `${a.toString("base64").slice(0, 24)}… == ${b.toString("base64").slice(0, 24)}…`);
+}
+
+{
+  const plain = JSON.stringify({ hello: "verify", pad: "x".repeat(200) });
+  const envV = await encrypt(plain, PASS);
+  const threw = async (fn) => { try { await fn(); return null; } catch (e) { return e.message ?? String(e); } };
+
+  chk("verifyRoundTrip accepts what encrypt() just produced",
+    (await threw(() => verifyRoundTrip(envV, PASS, plain.length))) === null);
+
+  // An envelope the WeakMap has never seen — round-tripped through JSON exactly
+  // as `main()` would if it re-read the file — must still verify, by falling
+  // through to a full derivation. A missing memo may only ever cost time.
+  chk("an envelope with no memoised key still verifies",
+    (await threw(() => verifyRoundTrip(JSON.parse(JSON.stringify(envV)), PASS, plain.length))) === null);
+
+  // The memo must not let a DIFFERENT passphrase verify. It is keyed on the
+  // passphrase too, so this falls through to a derivation and fails the GCM tag.
+  chk("verifyRoundTrip still rejects a wrong passphrase",
+    (await threw(() => verifyRoundTrip(envV, "definitely-not-the-passphrase-at-all", plain.length))) !== null);
+
+  // Payload integrity. Mutated in place and restored so the memo (keyed by
+  // object identity) stays live and these cases cost no derivation.
+  const goodCt = envV.ciphertext;
+  envV.ciphertext = Buffer.from(b64ToU8(goodCt).map((v, i) => (i === 5 ? v ^ 0xff : v))).toString("base64");
+  chk("verifyRoundTrip still rejects a corrupted ciphertext",
+    (await threw(() => verifyRoundTrip(envV, PASS, plain.length))) !== null);
+  envV.ciphertext = goodCt;
+
+  const goodIv = envV.cipher.iv;
+  envV.cipher.iv = Buffer.from(crypto.getRandomValues(new Uint8Array(12))).toString("base64");
+  chk("verifyRoundTrip still rejects a rewritten IV",
+    (await threw(() => verifyRoundTrip(envV, PASS, plain.length))) !== null);
+  envV.cipher.iv = goodIv;
+
+  chk("verifyRoundTrip still rejects a length mismatch",
+    /round-trip length mismatch/.test(await threw(() => verifyRoundTrip(envV, PASS, plain.length + 1)) ?? ""));
+
+  const badCodec = await threw(() => verifyRoundTrip({ ...envV, compression: "brotli" }, PASS, plain.length));
+  chk("verifyRoundTrip still rejects a codec this build cannot inflate",
+    /unsupported snapshot compression: brotli/.test(badCodec ?? ""), String(badCodec));
+
+  // THE case the memo could have hidden, and the reason roundTripKey() asserts
+  // instead of assuming. The browser and api/fleet.mjs derive from the
+  // parameters WRITTEN INTO the envelope and nothing else, so an envelope whose
+  // written salt/iterations/hash disagree with the key it was sealed under is a
+  // snapshot only this process can ever open. Re-deriving used to catch that by
+  // accident; it is now caught on purpose, and named.
+  const goodSalt = envV.kdf.salt;
+  envV.kdf.salt = Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString("base64");
+  chk("verifyRoundTrip rejects an envelope whose written salt is not the one used",
+    /kdf\.salt does not match/.test(await threw(() => verifyRoundTrip(envV, PASS, plain.length)) ?? ""));
+  envV.kdf.salt = goodSalt;
+
+  envV.kdf.iterations = 1000;
+  chk("verifyRoundTrip rejects an envelope whose written iteration count is not the one used",
+    /kdf\.iterations 1000 does not match/.test(await threw(() => verifyRoundTrip(envV, PASS, plain.length)) ?? ""));
+  envV.kdf.iterations = 600000;
+
+  envV.kdf.hash = "SHA-512";
+  chk("verifyRoundTrip rejects an envelope whose written hash is not the one used",
+    /kdf\.hash SHA-512 does not match/.test(await threw(() => verifyRoundTrip(envV, PASS, plain.length)) ?? ""));
+  envV.kdf.hash = "SHA-256";
+
+  chk("the envelope is unchanged after all of that",
+    (await threw(() => verifyRoundTrip(envV, PASS, plain.length))) === null);
+}
 
 // ------------------------------------------------------------- existingSalt
 
