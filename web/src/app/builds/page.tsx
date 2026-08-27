@@ -16,6 +16,16 @@ function formatDuration(ms: number): string {
   return `${(ms / 60000).toFixed(1)}m`;
 }
 
+function formatRelativeTime(dateStr: string): string {
+  try {
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return dateStr;
+    return formatDistanceToNow(d, { addSuffix: true });
+  } catch {
+    return dateStr;
+  }
+}
+
 function BuildsPageSkeleton() {
   return (
     <div className="space-y-6" data-testid="builds-skeleton">
@@ -271,7 +281,7 @@ export default function BuildsPage() {
                       )}
                     </td>
                     <td className="p-3 text-muted-foreground">
-                      {formatDistanceToNow(new Date(build.started_at), { addSuffix: true })}
+                      {formatRelativeTime(build.started_at)}
                     </td>
                   </tr>
                 ))}

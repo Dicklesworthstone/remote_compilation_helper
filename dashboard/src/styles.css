@@ -551,7 +551,7 @@ button.kv-link:hover .kv-v { color: var(--accent); }
 .builds { display: flex; flex-direction: column; gap: 4px; }
 .build-row {
   display: grid;
-  grid-template-columns: auto 1fr auto auto;
+  grid-template-columns: auto minmax(60px, 1fr) auto auto auto;
   gap: 8px;
   align-items: center;
   padding: 5px 0;

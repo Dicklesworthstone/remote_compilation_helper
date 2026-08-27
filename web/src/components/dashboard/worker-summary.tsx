@@ -18,7 +18,9 @@ function groupByStatus(workers: WorkerStatusInfo[]): Record<WorkerStatus, number
   };
 
   for (const worker of workers) {
-    counts[worker.status]++;
+    if (worker?.status && worker.status in counts) {
+      counts[worker.status]++;
+    }
   }
 
   return counts;
