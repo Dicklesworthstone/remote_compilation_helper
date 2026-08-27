@@ -1,7 +1,6 @@
 'use client';
 
 import * as React from 'react';
-import { motion } from 'motion/react';
 import { Info } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Tooltip } from '@/components/ui/tooltip';
@@ -66,12 +65,12 @@ export function ComponentRow({
       {/* Score Bar */}
       <div className="h-4 bg-muted/50 rounded-full overflow-hidden relative">
         {score != null ? (
-          <motion.div
-            className="h-full rounded-full"
-            initial={{ width: 0 }}
-            animate={{ width: `${animatedScore}%` }}
-            transition={{ duration: 0.5, ease: 'easeOut' }}
-            style={{ backgroundColor: getScoreColor(score) }}
+          <div
+            className="h-full w-full rounded-full origin-left transition-transform duration-500 ease-out"
+            style={{
+              transform: `scaleX(${animatedScore / 100})`,
+              backgroundColor: getScoreColor(score),
+            }}
             data-testid={testId ? `${testId}-bar` : undefined}
           />
         ) : (

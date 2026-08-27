@@ -2,7 +2,6 @@
 
 import { useState } from 'react';
 import { Server, AlertCircle, CheckCircle, Clock, Zap, Play } from 'lucide-react';
-import { motion } from 'motion/react';
 import type { WorkerStatusInfo, CircuitState, WorkerStatus, SpeedScoreView } from '@/lib/types';
 import { Button } from '@/components/ui/button';
 import { BenchmarkProgressModal } from './benchmark-progress-modal';
@@ -59,10 +58,7 @@ export function WorkerCard({
   const canBenchmark = worker.status === 'healthy' || worker.status === 'degraded';
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 20 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, scale: 0.95 }}
+    <div
       className="bg-card border border-border rounded-lg p-4 hover:border-primary/50 transition-colors"
       data-testid="worker-card"
       data-worker-id={worker.id}
@@ -106,11 +102,9 @@ export function WorkerCard({
           aria-valuenow={worker.used_slots}
           aria-valuetext={`${worker.used_slots} of ${worker.total_slots} slots used`}
         >
-          <motion.div
-            className="h-full bg-primary rounded-full"
-            initial={{ width: 0 }}
-            animate={{ width: `${slotsUsedPercent}%` }}
-            transition={{ duration: 0.5, ease: 'easeOut' }}
+          <div
+            className="h-full w-full bg-primary rounded-full origin-left transition-transform duration-500 ease-out"
+            style={{ transform: `scaleX(${slotsUsedPercent / 100})` }}
             data-testid="worker-slots-fill"
           />
         </div>
@@ -166,6 +160,6 @@ export function WorkerCard({
           onCompleted={onBenchmarkCompleted}
         />
       )}
-    </motion.div>
+    </div>
   );
 }

@@ -55,12 +55,17 @@ function formatDuration(ms: number): string {
 }
 
 function formatTime(isoString: string): string {
+  if (!isoString) return '—';
+  const tIndex = isoString.indexOf('T');
+  if (tIndex !== -1 && isoString.length >= tIndex + 9) {
+    return isoString.slice(tIndex + 1, tIndex + 9);
+  }
   const date = new Date(isoString);
-  return date.toLocaleTimeString(undefined, {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
+  if (Number.isNaN(date.getTime())) return isoString;
+  const h = String(date.getUTCHours()).padStart(2, '0');
+  const m = String(date.getUTCMinutes()).padStart(2, '0');
+  const s = String(date.getUTCSeconds()).padStart(2, '0');
+  return `${h}:${m}:${s}`;
 }
 
 function truncateCommand(cmd: string, maxLen = 40): string {
@@ -269,9 +274,10 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
           </div>
 
           <div className="flex flex-col gap-1">
-            <label className="text-xs font-medium text-muted-foreground">Date range</label>
+            <span className="text-xs font-medium text-muted-foreground">Date range</span>
             <div className="flex items-center gap-2">
               <input
+                id="build-start-date"
                 type="date"
                 value={startDate}
                 onChange={(event) => {
@@ -283,6 +289,7 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
               />
               <span className="text-xs text-muted-foreground">to</span>
               <input
+                id="build-end-date"
                 type="date"
                 value={endDate}
                 onChange={(event) => {
@@ -297,10 +304,11 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
         </div>
 
         <div className="flex flex-col gap-1 min-w-[220px]">
-          <label className="text-xs font-medium text-muted-foreground">Command search</label>
+          <label htmlFor="build-command-search" className="text-xs font-medium text-muted-foreground">Command search</label>
           <div className="relative">
             <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <input
+              id="build-command-search"
               value={searchQuery}
               onChange={(event) => {
                 setSearchQuery(event.target.value);

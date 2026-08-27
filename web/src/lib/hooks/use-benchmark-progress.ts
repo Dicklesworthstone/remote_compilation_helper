@@ -65,36 +65,23 @@ export function useBenchmarkProgress({
 }: UseBenchmarkProgressOptions) {
   const [state, setState] = useState<BenchmarkState>(initialState);
   const eventSourceRef = useRef<EventSource | null>(null);
-  const eventSourceCleanupRef = useRef<(() => void) | null>(null);
   const isActiveRef = useRef(false);
   const statusRef = useRef(state.status);
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const connectRef = useRef<(() => void) | null>(null);
+
+  const [isListening, setIsListening] = useState(false);
+  const [retryTrigger, setRetryTrigger] = useState(0);
 
   const closeEventSource = useCallback(() => {
-    eventSourceCleanupRef.current?.();
-    eventSourceCleanupRef.current = null;
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
-    }
+    setIsListening(false);
+  }, []);
+
+  const connect = useCallback(() => {
+    setIsListening(true);
   }, []);
 
   useEffect(() => {
     statusRef.current = state.status;
   }, [state.status]);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      isActiveRef.current = false;
-      if (reconnectTimerRef.current) {
-        clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
-      closeEventSource();
-    };
-  }, [closeEventSource]);
 
   const handleBenchmarkQueued = useCallback((data: BenchmarkQueuedEvent['data']) => {
     if (data.worker_id !== workerId) return;
@@ -191,13 +178,8 @@ export function useBenchmarkProgress({
     handleBenchmarkFailed,
   ]);
 
-  // Connect to SSE for the worker
-  const connect = useCallback(() => {
-    if (reconnectTimerRef.current) {
-      clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
-    }
-    closeEventSource();
+  useEffect(() => {
+    if (!isListening) return;
 
     const url = `/api/ws?subscribe=${encodeURIComponent(workerId)}`;
     const eventSource = new EventSource(url);
@@ -206,7 +188,6 @@ export function useBenchmarkProgress({
 
     const handleMessage = (event: MessageEvent) => {
       if (!isActiveRef.current) return;
-
       try {
         const data = JSON.parse(event.data);
         handleEvent(data);
@@ -215,7 +196,6 @@ export function useBenchmarkProgress({
       }
     };
 
-    // Also listen for specific event types
     const handleBenchmarkQueuedEvent = (event: Event) => {
       if (!isActiveRef.current) return;
       try {
@@ -226,17 +206,11 @@ export function useBenchmarkProgress({
       }
     };
 
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
     const handleError = () => {
-      if (eventSourceRef.current !== eventSource) return;
-      // Reconnect after a delay if still active
-      if (
-        isActiveRef.current &&
-        RECONNECTABLE_STATUSES.has(statusRef.current) &&
-        !reconnectTimerRef.current
-      ) {
-        reconnectTimerRef.current = setTimeout(() => {
-          reconnectTimerRef.current = null;
-          if (isActiveRef.current) connectRef.current?.();
+      if (isActiveRef.current && RECONNECTABLE_STATUSES.has(statusRef.current)) {
+        retryTimer = setTimeout(() => {
+          setRetryTrigger((prev) => prev + 1);
         }, 3000);
       }
     };
@@ -244,16 +218,18 @@ export function useBenchmarkProgress({
     eventSource.addEventListener('message', handleMessage);
     eventSource.addEventListener('benchmark_queued', handleBenchmarkQueuedEvent);
     eventSource.onerror = handleError;
-    eventSourceCleanupRef.current = () => {
+
+    return () => {
+      if (retryTimer) clearTimeout(retryTimer);
       eventSource.removeEventListener('message', handleMessage);
       eventSource.removeEventListener('benchmark_queued', handleBenchmarkQueuedEvent);
       eventSource.onerror = null;
+      eventSource.close();
+      if (eventSourceRef.current === eventSource) {
+        eventSourceRef.current = null;
+      }
     };
-  }, [workerId, handleEvent, handleBenchmarkQueued, closeEventSource]);
-
-  useEffect(() => {
-    connectRef.current = connect;
-  }, [connect]);
+  }, [isListening, workerId, retryTrigger, handleEvent, handleBenchmarkQueued]);
 
   /**
    * Trigger a benchmark for the worker.
@@ -325,10 +301,6 @@ export function useBenchmarkProgress({
   const reset = useCallback(() => {
     isActiveRef.current = false;
     statusRef.current = 'idle';
-    if (reconnectTimerRef.current) {
-      clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
-    }
     closeEventSource();
     setState(initialState);
   }, [closeEventSource]);

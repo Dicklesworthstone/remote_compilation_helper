@@ -189,11 +189,20 @@ export function Sidebar() {
           <>
             <motion.div
               data-testid="backdrop"
-              className="fixed inset-0 z-40 bg-black/50 md:hidden"
+              className="fixed inset-0 z-40 bg-black/50 md:hidden cursor-pointer"
+              role="button"
+              tabIndex={0}
+              aria-label="Close navigation"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               onClick={() => setSidebarOpen(false)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ' || e.key === 'Escape') {
+                  e.preventDefault();
+                  setSidebarOpen(false);
+                }
+              }}
             />
             <motion.aside
               id="mobile-sidebar"

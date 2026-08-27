@@ -33,18 +33,18 @@ export interface SpeedScoreDetailPanelProps {
 // Helper Components
 // ============================================================================
 
+function getScoreStyle(s: number): string {
+  if (s >= 90) return 'border-emerald-500/40 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300';
+  if (s >= 70) return 'border-sky-500/40 bg-sky-500/15 text-sky-700 dark:text-sky-300';
+  if (s >= 50) return 'border-amber-500/40 bg-amber-500/15 text-amber-700 dark:text-amber-300';
+  if (s >= 30) return 'border-orange-500/40 bg-orange-500/15 text-orange-700 dark:text-orange-300';
+  return 'border-red-500/40 bg-red-500/15 text-red-700 dark:text-red-300';
+}
+
 /**
  * Total score badge displayed in the panel header.
  */
 function TotalScoreBadge({ score }: { score: number }) {
-  const getScoreStyle = (s: number) => {
-    if (s >= 90) return 'border-emerald-500/40 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300';
-    if (s >= 70) return 'border-sky-500/40 bg-sky-500/15 text-sky-700 dark:text-sky-300';
-    if (s >= 50) return 'border-amber-500/40 bg-amber-500/15 text-amber-700 dark:text-amber-300';
-    if (s >= 30) return 'border-orange-500/40 bg-orange-500/15 text-orange-700 dark:text-orange-300';
-    return 'border-red-500/40 bg-red-500/15 text-red-700 dark:text-red-300';
-  };
-
   return (
     <span
       className={cn(
@@ -315,11 +315,10 @@ export function SpeedScoreDetailPanel({
         {isExpanded && (
           <motion.div
             id={`panel-content-${workerId}`}
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.2, ease: 'easeInOut' }}
-            style={{ overflow: 'hidden' }}
+            initial={{ opacity: 0, scale: 0.99 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.99 }}
+            transition={{ duration: 0.15, ease: 'easeInOut' }}
           >
             <CardContent>
               <ComponentBreakdown speedscore={fullScore} rawResults={rawResults} />
