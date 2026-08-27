@@ -79,6 +79,12 @@ export function WorkersSection(p: WorkersProps) {
             placeholder="Filter by name, host or tag…"
             value={p.query}
             onChange={(e) => p.onQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                p.onQuery("");
+                (e.target as HTMLInputElement).blur();
+              }
+            }}
             aria-label="Filter workers"
           />
           {FILTERS.map((s) => (

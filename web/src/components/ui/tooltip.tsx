@@ -50,6 +50,11 @@ export function Tooltip({ content, children, className, side = 'top' }: TooltipP
       onMouseLeave={hideTooltip}
       onFocus={showTooltip}
       onBlur={hideTooltip}
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') {
+          hideTooltip();
+        }
+      }}
     >
       {children}
       {isVisible && (

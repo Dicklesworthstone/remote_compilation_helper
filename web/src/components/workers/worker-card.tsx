@@ -39,7 +39,10 @@ export function WorkerCard({
   const [benchmarkModalOpen, setBenchmarkModalOpen] = useState(false);
   const status = statusConfig[worker.status];
   const circuit = circuitConfig[worker.circuit_state];
-  const slotsUsedPercent = (worker.used_slots / worker.total_slots) * 100;
+  const slotsUsedPercent =
+    Number.isFinite(worker.total_slots) && worker.total_slots > 0
+      ? Math.min(100, Math.max(0, (worker.used_slots / worker.total_slots) * 100))
+      : 0;
   const StatusIcon = status.icon;
   const speedScore = Number.isFinite(worker.speed_score) ? worker.speed_score : null;
   const previousScore = typeof worker.speed_score_prev === 'number' ? worker.speed_score_prev : null;

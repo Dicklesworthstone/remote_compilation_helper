@@ -45,10 +45,11 @@ export function ComponentRow({
 
   // Animate bar fill on mount
   React.useEffect(() => {
-    if (score != null) {
-      const timer = setTimeout(() => setAnimatedScore(score), 100);
+    if (score != null && Number.isFinite(score)) {
+      const timer = setTimeout(() => setAnimatedScore(Math.min(100, Math.max(0, score))), 100);
       return () => clearTimeout(timer);
     }
+    setAnimatedScore(0);
   }, [score]);
 
   return (
