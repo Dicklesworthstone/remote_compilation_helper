@@ -350,9 +350,10 @@ per machine — because `rchd` derates independently on each.
 ## Testing
 
 ```sh
-npm run build
-npm run serve:dist &
+npm run build                # bakes the Vite base path (RCH_DASH_BASE) into dist/
+npm run serve:dist &         # vite preview on 127.0.0.1:4174, honoring that base
 RCH_DASH_PASSPHRASE='...' npm run test:e2e
+                             # pass RCH_DASH_BASE=/ too if you built with it
 ```
 
 Drives real Chromium against a real encrypted snapshot: gate, wrong-vs-right

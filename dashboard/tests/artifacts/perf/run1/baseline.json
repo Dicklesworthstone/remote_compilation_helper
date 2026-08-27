@@ -1,0 +1,90 @@
+{
+  "scenario_fingerprint": {
+    "host": "macbook m4 pro (arm64, darwin 25.2.0)",
+    "node": "v25.4.0",
+    "run_id": "2026-08-27T00:16:18.634Z"
+  },
+  "S1_browser": {
+    "runs": [
+      {
+        "gate_ms": 88,
+        "unlock_to_kpis_ms": 123
+      },
+      {
+        "gate_ms": 72,
+        "unlock_to_kpis_ms": 118
+      },
+      {
+        "gate_ms": 80,
+        "unlock_to_kpis_ms": 117
+      },
+      {
+        "gate_ms": 77,
+        "unlock_to_kpis_ms": 120
+      },
+      {
+        "gate_ms": 85,
+        "unlock_to_kpis_ms": 110
+      },
+      {
+        "gate_ms": 95,
+        "unlock_to_kpis_ms": 108
+      },
+      {
+        "gate_ms": 74,
+        "unlock_to_kpis_ms": 117
+      },
+      {
+        "gate_ms": 89,
+        "unlock_to_kpis_ms": 116
+      },
+      {
+        "gate_ms": 70,
+        "unlock_to_kpis_ms": 133
+      },
+      {
+        "gate_ms": 71,
+        "unlock_to_kpis_ms": 122
+      },
+      {
+        "gate_ms": 116,
+        "unlock_to_kpis_ms": 112
+      },
+      {
+        "gate_ms": 80,
+        "unlock_to_kpis_ms": 137
+      }
+    ],
+    "gate_ms": {
+      "p50": 80,
+      "p95": 116
+    },
+    "unlock_to_kpis_ms": {
+      "p50": 117,
+      "p95": 137,
+      "note": "includes 600k PBKDF2 deriveKey (webcrypto, security parameter)"
+    }
+  },
+  "S2_node_llm_ms": {
+    "runs": [
+      144,
+      164,
+      193,
+      254,
+      221,
+      212,
+      272,
+      220,
+      211,
+      212,
+      202,
+      192
+    ],
+    "p50": 211,
+    "p95": 272
+  },
+  "S3_dist_bytes": {
+    "index-B4z6dMVO.js": 223382,
+    "index-rZTwC7li.css": 13062
+  }
+}

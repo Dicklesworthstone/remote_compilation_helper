@@ -15,8 +15,12 @@ export function DevMachineCard({ d, onOpen }: Props) {
   const s = d.build_stats;
   const counted = s ? s.remote + s.local : 0;
   const remotePct = d.remotePct;
+  // Bar colour encodes the remote share itself, not the posture: a box pushing
+  // 100% of its builds to the pool is doing the right thing even when some
+  // workers are pressure-blocked (posture "degraded") — the pill above carries
+  // that alarm. Red here means builds are mostly landing locally.
   const cls =
-    d.level === "offloading" ? "ok" : d.level === "idle" ? "off" : d.level === "degraded" ? "warn" : "crit";
+    remotePct == null ? "off" : remotePct < 50 ? "crit" : remotePct < 80 ? "warn" : "ok";
 
   return (
     <button className="wcard" onClick={() => onOpen(d.id)} aria-label={`Details for dev machine ${d.id}`}>

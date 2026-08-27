@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import type { WorkerView } from "../types";
 import { fmtAge, fmtGb } from "../derive";
+import { useDialog } from "./useDialog";
 
 interface Props {
   w: WorkerView | null;
@@ -17,6 +18,7 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
 }
 
 export function WorkerDrawer({ w, onClose }: Props) {
+  const panelRef = useDialog(w != null);
   useEffect(() => {
     if (!w) return;
     const onKey = (e: KeyboardEvent) => {
@@ -34,12 +36,12 @@ export function WorkerDrawer({ w, onClose }: Props) {
   return (
     <>
       <button className="drawer-scrim" onClick={onClose} aria-label="Close details" />
-      <aside className="drawer" role="dialog" aria-modal="true" aria-label={`${w.id} details`}>
+      <aside ref={panelRef} className="drawer" role="dialog" aria-modal="true" aria-label={`${w.id} details`}>
         <div className="drawer-head">
           <h3>{w.id}</h3>
           <span className={`pill ${w.health}`}>{w.health}</span>
           <span style={{ flex: 1 }} />
-          <button className="icon-btn" onClick={onClose}>Esc</button>
+          <button className="icon-btn" onClick={onClose}>Close</button>
         </div>
         <div className="drawer-host">
           {w.user ? `${w.user}@` : ""}{w.host ?? "—"}

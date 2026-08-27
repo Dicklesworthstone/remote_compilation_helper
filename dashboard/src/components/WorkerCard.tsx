@@ -67,7 +67,11 @@ export function WorkerCard({ w, onOpen }: Props) {
           label="disk"
           pct={w.diskUsedPct}
           cls={utilClass(w.diskUsedPct)}
-          valueText={`${fmtGb(w.pressure.disk_free_gb)} free`}
+          valueText={
+            w.diskUsedPct != null
+              ? `${w.diskUsedPct.toFixed(0)}% · ${fmtGb(w.pressure.disk_free_gb)} free`
+              : `${fmtGb(w.pressure.disk_free_gb)} free`
+          }
         />
       </div>
 

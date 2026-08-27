@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import type { DispatcherView } from "../types";
 import { fmtDuration, fmtUptime } from "../derive";
+import { useDialog } from "./useDialog";
 
 interface Props {
   d: DispatcherView | null;
@@ -17,6 +18,7 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
 }
 
 export function DevMachineDrawer({ d, onClose }: Props) {
+  const panelRef = useDialog(d != null);
   useEffect(() => {
     if (!d) return;
     const onKey = (e: KeyboardEvent) => {
@@ -32,12 +34,12 @@ export function DevMachineDrawer({ d, onClose }: Props) {
   return (
     <>
       <button className="drawer-scrim" onClick={onClose} aria-label="Close details" />
-      <aside className="drawer" role="dialog" aria-modal="true" aria-label={`${d.id} dev machine details`}>
+      <aside ref={panelRef} className="drawer" role="dialog" aria-modal="true" aria-label={`${d.id} dev machine details`}>
         <div className="drawer-head">
           <h3>{d.id}</h3>
           <span className={`pill dev-${d.level}`}>{d.level}</span>
           <span style={{ flex: 1 }} />
-          <button className="icon-btn" onClick={onClose}>Esc</button>
+          <button className="icon-btn" onClick={onClose}>Close</button>
         </div>
         <div className="drawer-host">dev machine · dispatches builds to the pool</div>
 

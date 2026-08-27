@@ -77,6 +77,27 @@ if [ ! -f public/data/fleet.enc.json ]; then
   exit 1
 fi
 
+# Derive the Vite base path from the target so asset URLs match where Pages
+# actually serves the site: user/org pages (<user>.github.io) sit at /,
+# project pages at /<repo>/. Without this, any repo not literally named
+# remote_compilation_helper deploys a page whose assets 404.
+case "$TARGET_REPO" in
+  *github.com[:/]*)
+    REPO_PATH="${TARGET_REPO#*github.com[:/]}"
+    PAGES_OWNER="${REPO_PATH%%/*}"
+    PAGES_REPO="${REPO_PATH#*/}"; PAGES_REPO="${PAGES_REPO%.git}"
+    if [ "$PAGES_REPO" = "$PAGES_OWNER.github.io" ]; then
+      export RCH_DASH_BASE="/"
+    else
+      export RCH_DASH_BASE="/$PAGES_REPO/"
+    fi
+    echo "==> vite base: $RCH_DASH_BASE"
+    ;;
+  *)
+    echo "==> non-GitHub target: leaving the Vite base at its configured default" >&2
+    ;;
+esac
+
 echo "==> building"
 npm run build
 

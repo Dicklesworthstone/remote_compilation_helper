@@ -11,11 +11,13 @@
     "snapshot": "node tools/snapshot.mjs",
     "deploy": "bash scripts/deploy.sh",
     "test:e2e": "node tests/e2e.mjs",
-    "serve:dist": "python3 -m http.server 4174 --directory dist",
+    "serve:dist": "vite preview --host 127.0.0.1",
     "build:api": "esbuild api/fleet.mjs --bundle --platform=node --format=esm --target=node20 --loader:.json=json --outfile=.vercel-fn/index.mjs",
     "test:endpoint": "node tests/endpoint.mjs",
     "llm": "node tools/fleet-llm.mjs",
-    "test:llm": "node tests/parity.mjs"
+    "test:llm": "node tests/parity.mjs",
+    "test:visual": "node tests/visual-audit.mjs",
+    "perf": "node tests/perf.mjs"
   },
   "dependencies": {
     "@toon-format/toon": "^4.1.1",

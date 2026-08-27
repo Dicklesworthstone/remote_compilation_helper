@@ -77,6 +77,7 @@ const cases = [
   ["pressure warning flag", w({ pressure: { ...w().pressure, state: "warning", reason: "disk_io_high" } })],
   ["load exactly 2x", w({ caps: { ...w().caps, load_avg_1: 16, num_cpus: 8 } })],
   ["load just under 2x", w({ caps: { ...w().caps, load_avg_1: 15.9, num_cpus: 8 } })],
+  ["one consecutive failure (singular)", w({ consecutive_failures: 1 })],
   ["consecutive failures", w({ consecutive_failures: 3 })],
   ["busy", w({ used_slots: 4 })],
   ["projects root bad", w({ caps: { ...w().caps, projects_root_ok: false } })],

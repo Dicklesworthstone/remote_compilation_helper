@@ -14,7 +14,8 @@
  */
 import { chromium } from "playwright";
 
-const URL = "http://127.0.0.1:4174/";
+const BASE = process.env.RCH_DASH_BASE ?? "/remote_compilation_helper/";
+const URL = `http://127.0.0.1:4174${BASE}`;
 const PASS = process.env.RCH_DASH_PASSPHRASE;
 const browser = await chromium.launch();
 const page = await browser.newPage();

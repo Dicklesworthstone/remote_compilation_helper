@@ -55,6 +55,17 @@ export default function App() {
   const [sort, setSort] = useState<Sort>("health");
   const [openWorker, setOpenWorker] = useState<string | null>(null);
   const [openDev, setOpenDev] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  // Auto-reload the snapshot every 5 minutes — the collector's typical cron
+  // cadence — so a wall-mounted tab tracks the fleet without a hand on Refresh.
+  // Persisted; polling is skipped while the tab is hidden.
+  const [auto, setAuto] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("rch_dash_auto") !== "0";
+    } catch {
+      return true;
+    }
+  });
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 30_000);
@@ -121,27 +132,52 @@ export default function App() {
   );
 
   const refresh = useCallback(async () => {
-    const env = await loadEnvelope();
-    if (!env) return;
-    const key = keyRef.current ?? (await loadPersistedKey());
-    if (!key) {
-      setNotice("Session key unavailable — unlock again to refresh.");
-      setSnap(null);
-      return;
-    }
+    setRefreshing(true);
     try {
-      setSnap(JSON.parse(await decryptEnvelope(env, key)));
-      keyRef.current = key;
-    } catch {
-      // A new snapshot uses a fresh salt, so a key derived from the SAME
-      // passphrase still decrypts it. Failure here means the passphrase itself
-      // changed.
-      setNotice("Snapshot was encrypted with a different passphrase — unlock again.");
-      clearKey();
-      keyRef.current = null;
-      setSnap(null);
+      const env = await loadEnvelope();
+      if (!env) return;
+      const key = keyRef.current ?? (await loadPersistedKey());
+      if (!key) {
+        setNotice("Session key unavailable — unlock again to refresh.");
+        setSnap(null);
+        return;
+      }
+      try {
+        setSnap(JSON.parse(await decryptEnvelope(env, key)));
+        keyRef.current = key;
+      } catch {
+        // A new snapshot uses a fresh salt, so a key derived from the SAME
+        // passphrase still decrypts it. Failure here means the passphrase itself
+        // changed.
+        setNotice("Snapshot was encrypted with a different passphrase — unlock again.");
+        clearKey();
+        keyRef.current = null;
+        setSnap(null);
+      }
+    } finally {
+      setRefreshing(false);
     }
   }, [loadEnvelope]);
+
+  const toggleAuto = useCallback(() => {
+    setAuto((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem("rch_dash_auto", next ? "1" : "0");
+      } catch {
+        /* private mode — the toggle still applies to this session */
+      }
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!snap || !auto) return;
+    const id = setInterval(() => {
+      if (document.visibilityState === "visible") void refresh();
+    }, 5 * 60_000);
+    return () => clearInterval(id);
+  }, [snap, auto, refresh]);
 
   const lock = useCallback(() => {
     clearKey();
@@ -210,7 +246,8 @@ export default function App() {
   const diskUsedPct =
     t.disk_total_gb > 0 ? ((t.disk_total_gb - t.disk_free_gb) / t.disk_total_gb) * 100 : 0;
   const attention = (counts.critical ?? 0) + (counts.warn ?? 0) + (counts.offline ?? 0);
-  const devProblems = devs.filter((d) => d.level === "local-only" || d.level === "unreachable" || d.level === "degraded");
+  const hardProblems = devs.filter((d) => d.level === "local-only" || d.level === "unreachable");
+  const degradedDevs = devs.filter((d) => d.level === "degraded");
   const buildsCounted = t.builds_remote + t.builds_local;
   const remotePct = buildsCounted > 0 ? (t.builds_remote / buildsCounted) * 100 : null;
 
@@ -226,7 +263,22 @@ export default function App() {
           <span className={`dot ${dotClass}`} />
           snapshot {fmtAge(ageSec)}
         </div>
-        <button className="icon-btn" onClick={() => void refresh()}>Refresh</button>
+        <button
+          className="icon-btn"
+          onClick={() => void refresh()}
+          disabled={refreshing}
+          aria-busy={refreshing}
+        >
+          {refreshing ? "Refreshing…" : "Refresh"}
+        </button>
+        <button
+          className="icon-btn"
+          onClick={toggleAuto}
+          aria-pressed={auto}
+          title="Reload the snapshot automatically every 5 minutes"
+        >
+          Auto
+        </button>
         <button className="icon-btn" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
           {theme === "dark" ? "Light" : "Dark"}
         </button>
@@ -242,10 +294,19 @@ export default function App() {
         </div>
       )}
 
-      {devProblems.length > 0 && (
+      {hardProblems.length > 0 && (
         <div className="banner crit">
-          {devProblems.length} dev machine{devProblems.length === 1 ? "" : "s"} not offloading normally:{" "}
-          {devProblems.map((d) => d.id).join(", ")}. Builds there may be running locally.
+          {hardProblems.length} dev machine{hardProblems.length === 1 ? "" : "s"} not offloading:{" "}
+          {hardProblems.map((d) => d.id).join(", ")}. Builds there are running locally, or the box
+          cannot be reached.
+        </div>
+      )}
+
+      {degradedDevs.length > 0 && (
+        <div className="banner">
+          {degradedDevs.length} dev machine{degradedDevs.length === 1 ? "" : "s"} in a degraded
+          posture (partial remote capability — some workers pressure-blocked or unavailable):{" "}
+          {degradedDevs.map((d) => d.id).join(", ")}.
         </div>
       )}
 
@@ -269,7 +330,7 @@ export default function App() {
         </div>
         <div
           className="kpi"
-          style={{ ["--kpi-accent" as string]: devProblems.length > 0 ? "var(--crit)" : "var(--ok)" }}
+          style={{ ["--kpi-accent" as string]: hardProblems.length > 0 ? "var(--crit)" : "var(--ok)" }}
         >
           <div className="kpi-label">Dev machines</div>
           <div className="kpi-value">
@@ -320,14 +381,17 @@ export default function App() {
           <div className="trend-grid">
             <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--busy)" }}>
               <div className="kpi-label">Slots in use</div>
+              <div className="kpi-value">{snap.history[snap.history.length - 1].slots_used}</div>
               <Sparkline values={snap.history.map((h) => h.slots_used)} stroke="var(--busy)" label="slots in use over time" />
             </div>
             <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--ok)" }}>
-              <div className="kpi-label">Disk free (GB)</div>
+              <div className="kpi-label">Disk free</div>
+              <div className="kpi-value">{fmtGb(snap.history[snap.history.length - 1].disk_free_gb)}</div>
               <Sparkline values={snap.history.map((h) => h.disk_free_gb)} stroke="var(--ok)" label="fleet disk free over time" />
             </div>
             <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--accent)" }}>
               <div className="kpi-label">Remote builds</div>
+              <div className="kpi-value">{snap.history[snap.history.length - 1].builds_remote}</div>
               <Sparkline values={snap.history.map((h) => h.builds_remote)} stroke="var(--accent)" label="remote builds over time" />
             </div>
           </div>

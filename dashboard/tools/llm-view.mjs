@@ -50,7 +50,8 @@ export function classifyWorker(w, snapshotMs) {
   else if (p.state === "warning" || (diskUsedPct != null && diskUsedPct >= 88)) {
     health = "warn"; reason = p.reason ? `pressure: ${p.reason}` : `disk ${diskUsedPct?.toFixed(0)}% full`;
   } else if ((w.consecutive_failures ?? 0) > 0) {
-    health = "warn"; reason = `${w.consecutive_failures} consecutive failures`;
+    health = "warn";
+    reason = `${w.consecutive_failures} consecutive failure${w.consecutive_failures === 1 ? "" : "s"}`;
   } else if (loadPerCore != null && loadPerCore >= 2) {
     health = "warn"; reason = `load ${loadPerCore.toFixed(1)}x cores`;
   } else if (w.circuit_state === "half_open") { health = "warn"; reason = "circuit half-open (probing)"; }
