@@ -7,11 +7,14 @@
  *     X-Fleet-Key: <passphrase>
  *     ?key=<passphrase>            (last resort; ends up in logs/history)
  *
- * The passphrase is never stored on the host. It is used only, in-request, to
- * derive the AES key and decrypt the bundled snapshot. A wrong passphrase fails
- * the GCM auth tag and returns 401 — there is no separate credential to leak,
- * and no way to get plaintext out of this endpoint without already being able
- * to decrypt the published snapshot yourself.
+ * The passphrase is never stored on the host — not on disk, and not in memory
+ * beyond the request that carried it. It is used in-request to derive the AES
+ * key and decrypt the bundled snapshot. A wrong passphrase fails the GCM auth
+ * tag and returns 401 — there is no separate credential to leak, and no way to
+ * get plaintext out of this endpoint without already being able to decrypt the
+ * published snapshot yourself. A key that HAS decrypted is held, as a
+ * non-extractable CryptoKey under a keyed hash of the passphrase, for a bounded
+ * window; see the KDF cache block below.
  *
  * Query:
  *   format = toon | json      (default toon — ~65% fewer characters)
@@ -20,14 +23,16 @@
  * Responses: 200 body | 401 wrong/missing key | 405 wrong method | 500 no snapshot.
  * Errors are single-line text so an agent can branch on them cheaply.
  *
- * Cost note: every request runs 600k PBKDF2 iterations (~0.3-0.5s of CPU),
- * because the key is derived per-request rather than cached. That is what makes
- * brute force expensive, but it also makes this endpoint a poor thing to leave
- * open to anonymous traffic — keep the host's own access gate (e.g. Vercel
- * Deployment Protection) in front of it, and do not poll it in a tight loop.
+ * Cost note: a WRONG passphrase always runs the full 600k PBKDF2 iterations
+ * (~80ms of CPU). That is the brute-force cost and it is deliberately not
+ * cached — see the KDF cache block below for exactly which derivations are
+ * reused and why that cannot help a guesser. A *correct* passphrase pays that
+ * price once per process (per 5-minute window); repeats are ~2ms. This is still
+ * a poor thing to leave open to anonymous traffic — keep the host's own access
+ * gate (e.g. Vercel Deployment Protection) in front of it.
  */
 
-import { webcrypto as crypto } from "node:crypto";
+import { webcrypto as crypto, createHmac, randomBytes } from "node:crypto";
 import { buildLlmView, encodeView, contentType } from "../tools/llm-view.mjs";
 // Bundled at build time so the function has no filesystem or network dependency.
 import envelope from "../public/data/fleet.enc.json" with { type: "json" };
@@ -37,17 +42,115 @@ function b64ToBuf(b64) {
   return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
 }
 
-async function decrypt(env, passphrase) {
+/* ─── KDF cache ────────────────────────────────────────────────────────────
+ *
+ * PBKDF2 at 600k iterations was 97.7% of this endpoint's request CPU. It cannot
+ * simply be made cheaper: there is no stored credential here, so "did AES-GCM
+ * authenticate?" IS the auth check, and the iteration count IS the brute-force
+ * cost. The only safe saving is to stop re-deriving a key that has *already
+ * proved itself* against this exact envelope.
+ *
+ * The invariant that keeps brute force expensive:
+ *
+ *   A derivation is inserted ONLY after AES-GCM has authenticated the envelope
+ *   with it. A wrong passphrase therefore never writes an entry, and — because
+ *   an entry can only exist for a passphrase that already decrypted — never
+ *   reads one either. Every wrong guess, first or millionth, near-miss or not,
+ *   runs the full 600k iterations. There is no negative cache and no early
+ *   exit: a miss falls straight through to `deriveKey`.
+ *
+ * Index: HMAC-SHA-256 over the envelope's KDF parameters (salt, iterations,
+ * hash) plus its IV plus the passphrase, under a per-process random secret.
+ *   - The passphrase never appears in the index in plaintext.
+ *   - The secret means the index is not a bare passphrase digest that could be
+ *     ground offline if a heap dump ever escaped, and denies an attacker any
+ *     ability to steer Map-lookup timing by choosing inputs.
+ *   - Binding the salt/iterations/hash makes the entry valid only for the
+ *     parameters that produced it, so a hit returns bit-identical key material
+ *     to what a fresh derivation would have produced. Binding the IV pins it to
+ *     this exact ciphertext framing too.
+ *   - Fields are length-prefixed so no two distinct tuples share a pre-image.
+ *
+ * Bounds: at most KDF_CACHE_MAX entries (LRU eviction) and an absolute TTL from
+ * insertion, not refreshed on use, so key material has a hard lifetime in
+ * memory. Only holders of a valid passphrase can insert, so the size bound is
+ * not attacker-reachable in the first place; it exists so multiple valid
+ * passphrases (e.g. mid-rotation) still cannot grow the map without limit.
+ *
+ * Timing: a correct passphrase does get faster once warm. That leaks nothing —
+ * the response already announces correctness with 200 vs 401. What matters is
+ * that the *wrong* path is untouched, which the invariant above guarantees.
+ */
+const KDF_CACHE_MAX = 8;
+const KDF_CACHE_TTL_MS = 5 * 60_000;
+const KDF_CACHE_SECRET = randomBytes(32);
+/** @type {Map<string, { key: CryptoKey, expiresAt: number }>} insertion order = LRU order */
+const kdfCache = new Map();
+
+function cacheIndex(env, passphrase) {
+  const h = createHmac("sha256", KDF_CACHE_SECRET);
+  for (const part of [env.kdf.salt, String(env.kdf.iterations), env.kdf.hash, env.cipher.iv, passphrase]) {
+    const b = Buffer.from(String(part), "utf8");
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(b.length);
+    h.update(len);
+    h.update(b);
+  }
+  return h.digest("hex");
+}
+
+function cacheGet(index, now) {
+  const hit = kdfCache.get(index);
+  if (!hit) return null;
+  if (hit.expiresAt <= now) {
+    kdfCache.delete(index);
+    return null;
+  }
+  // Refresh LRU recency without extending the absolute TTL.
+  kdfCache.delete(index);
+  kdfCache.set(index, hit);
+  return hit.key;
+}
+
+function cachePut(index, key, now) {
+  kdfCache.delete(index);
+  kdfCache.set(index, { key, expiresAt: now + KDF_CACHE_TTL_MS });
+  // Sweep on write, since a serverless instance may see no timers between
+  // requests: expiry first (an idle process must not hold key material past
+  // its TTL), then LRU eviction so the size bound holds even if nothing aged.
+  for (const [k, v] of kdfCache) if (v.expiresAt <= now) kdfCache.delete(k);
+  while (kdfCache.size > KDF_CACHE_MAX) kdfCache.delete(kdfCache.keys().next().value);
+}
+
+async function deriveKey(env, passphrase) {
   const baseKey = await crypto.subtle.importKey(
     "raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"],
   );
-  const key = await crypto.subtle.deriveKey(
+  return crypto.subtle.deriveKey(
     { name: "PBKDF2", salt: b64ToBuf(env.kdf.salt), iterations: env.kdf.iterations, hash: env.kdf.hash },
     baseKey, { name: "AES-GCM", length: 256 }, false, ["decrypt"],
   );
-  const plain = await crypto.subtle.decrypt(
+}
+
+async function decrypt(env, passphrase) {
+  const now = Date.now();
+  const index = cacheIndex(env, passphrase);
+  const open = (key) => crypto.subtle.decrypt(
     { name: "AES-GCM", iv: b64ToBuf(env.cipher.iv) }, key, b64ToBuf(env.ciphertext),
   );
+
+  let plain;
+  const cached = cacheGet(index, now);
+  if (cached) {
+    // Only reachable for a passphrase that already authenticated this envelope
+    // under these exact KDF parameters, so this cannot fail where a fresh
+    // derivation would have succeeded.
+    plain = await open(cached);
+  } else {
+    const key = await deriveKey(env, passphrase);
+    plain = await open(key); // throws on a wrong passphrase — nothing is cached
+    cachePut(index, key, now);
+  }
   return JSON.parse(new TextDecoder().decode(plain));
 }
 
