@@ -22,6 +22,19 @@ export const STALE_CRIT_SECONDS = 60 * 60;
 
 const r1 = (n) => (typeof n === "number" && Number.isFinite(n) ? Math.round(n * 10) / 10 : null);
 
+/**
+ * Mirror of `fmtAge()` in src/derive.ts with the " ago" suffix dropped. The two
+ * must agree exactly — tests/parity.mjs compares the reason strings verbatim.
+ */
+function fmtAgeBare(seconds) {
+  if (seconds == null || !Number.isFinite(seconds)) return "—";
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  if (s < 86400) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
+}
+
 /** Mirror of `classify()` in src/derive.ts — keep in sync. */
 export function classifyWorker(w, snapshotMs) {
   const p = w.pressure ?? {};
@@ -38,44 +51,80 @@ export function classifyWorker(w, snapshotMs) {
 
   let health = "healthy";
   let reason = "healthy";
-  if (st === "disabled" || w.enabled === false) { health = "disabled"; reason = "disabled in workers.toml"; }
+
+  // A pressure event does not always carry a disk number; falling back to the
+  // percentage unconditionally rendered the literal "disk undefined% full".
+  const pressureReason = (fallback) =>
+    p.reason
+      ? `pressure: ${p.reason}`
+      : diskUsedPct != null
+        ? `disk ${diskUsedPct.toFixed(0)}% full`
+        : fallback;
+
+  if (st === "disabled") { health = "disabled"; reason = "manually disabled"; }
   else if (st === "down" || st === "unreachable" || w.circuit_state === "open") {
     health = "offline";
     reason = w.circuit_state === "open" ? "circuit breaker open" : `worker ${st || "unreachable"}`;
   } else if (staleSeconds != null && staleSeconds > STALE_CRIT_SECONDS) {
     health = "offline"; reason = `not seen for ${Math.round(staleSeconds / 60)}m`;
   } else if (p.state === "critical" || (diskUsedPct != null && diskUsedPct >= 95)) {
-    health = "critical"; reason = p.reason ? `pressure: ${p.reason}` : `disk ${diskUsedPct?.toFixed(0)}% full`;
-  } else if (st === "draining") { health = "warn"; reason = "draining"; }
+    health = "critical"; reason = pressureReason("critical pressure");
+  } else if (st === "draining") { health = "warn"; reason = "draining (finishing current jobs)"; }
+  else if (st === "drained") { health = "warn"; reason = "drained — accepting no new jobs"; }
   else if (p.state === "warning" || (diskUsedPct != null && diskUsedPct >= 88)) {
-    health = "warn"; reason = p.reason ? `pressure: ${p.reason}` : `disk ${diskUsedPct?.toFixed(0)}% full`;
-  } else if ((w.consecutive_failures ?? 0) > 0) {
+    health = "warn"; reason = pressureReason("pressure warning");
+  } else if (p.state === "telemetry_gap") {
+    health = "warn"; reason = p.reason ? `pressure: ${p.reason}` : "no pressure telemetry";
+  } else if (st === "degraded") { health = "warn"; reason = "worker responding slowly"; }
+  else if ((w.consecutive_failures ?? 0) > 0) {
     health = "warn";
     reason = `${w.consecutive_failures} consecutive failure${w.consecutive_failures === 1 ? "" : "s"}`;
   } else if (loadPerCore != null && loadPerCore >= 2) {
     health = "warn"; reason = `load ${loadPerCore.toFixed(1)}x cores`;
   } else if (w.circuit_state === "half_open") { health = "warn"; reason = "circuit half-open (probing)"; }
-  else if ((w.used_slots ?? 0) > 0) { health = "busy"; reason = `${w.used_slots}/${w.total_slots} slots in use`; }
   else if (w.caps?.projects_root_ok === false) { health = "warn"; reason = "projects root unhealthy"; }
+  else if (p.telemetry_fresh === false) {
+    health = "warn";
+    reason = p.telemetry_age_secs != null
+      ? `telemetry ${fmtAgeBare(p.telemetry_age_secs)} old`
+      : "telemetry stale";
+  } else if ((w.used_slots ?? 0) > 0) { health = "busy"; reason = `${w.used_slots}/${w.total_slots} slots in use`; }
 
   return { health, reason, diskUsedPct, loadPerCore };
 }
 
 /** Mirror of `classifyDispatcher()` in src/derive.ts — keep in sync. */
 export function classifyDev(d) {
+  // See src/derive.ts: `build_stats` is cumulative since daemon start, which is
+  // the wrong basis for "is this box offloading now". Prefer the real recent
+  // window and fall back to lifetime counters only when it is empty.
   const s = d.build_stats;
-  const counted = s ? s.remote + s.local : 0;
-  const remotePct = counted > 0 ? (s.remote / counted) * 100 : null;
+  const recent = d.recent_builds ?? [];
+  const recentCounted = recent.length;
+  const recentRemote = recent.filter((b) => (b.location ?? "").toLowerCase() === "remote").length;
+
+  const lifetimeCounted = s ? s.remote + s.local : 0;
+  const basis = recentCounted > 0 ? "recent" : lifetimeCounted > 0 ? "lifetime" : null;
+
+  const remotePct =
+    basis === "recent"
+      ? (recentRemote / recentCounted) * 100
+      : basis === "lifetime"
+        ? (s.remote / lifetimeCounted) * 100
+        : null;
+
+  const window = basis === "recent" ? `last ${recentCounted} builds` : "all builds since daemon start";
+
   let level, reason;
   if (!d.reachable) { level = "unreachable"; reason = "no response from rch"; }
   else if (d.posture && d.posture !== "remote_ready") {
     level = d.posture.includes("local") ? "local-only" : "degraded";
     reason = d.posture_description ?? d.posture;
   } else if (remotePct != null && remotePct < 50) {
-    level = "local-only"; reason = `only ${remotePct.toFixed(0)}% of recent builds went remote`;
-  } else if (counted === 0) { level = "idle"; reason = "no builds recorded yet"; }
-  else { level = "offloading"; reason = `${remotePct.toFixed(0)}% of recent builds went to the pool`; }
-  return { level, reason, remotePct };
+    level = "local-only"; reason = `only ${remotePct.toFixed(0)}% of the ${window} went remote`;
+  } else if (basis === null) { level = "idle"; reason = "no builds recorded yet"; }
+  else { level = "offloading"; reason = `${remotePct.toFixed(0)}% of the ${window} went to the pool`; }
+  return { level, reason, remotePct, remoteBasis: basis, remoteCounted: recentCounted || lifetimeCounted };
 }
 
 const SEVERITY = { critical: 0, warn: 1, info: 2 };
@@ -88,9 +137,14 @@ const SEVERITY = { critical: 0, warn: 1, info: 2 };
 export function buildLlmView(snap, opts = {}) {
   const view = opts.view === "full" ? "full" : "summary";
   const now = opts.now ?? Date.now();
-  const ageSeconds = Math.round((now - new Date(snap.generated_at).getTime()) / 1000);
 
+  // An unparseable `generated_at` yields NaN, and every NaN comparison is
+  // false — so a corrupt snapshot used to report itself as FRESH. Treat an
+  // unreadable timestamp as infinitely stale instead, which is the safe
+  // direction for a monitoring feed.
   const snapshotMs = new Date(snap.generated_at).getTime();
+  const timestampValid = Number.isFinite(snapshotMs);
+  const ageSeconds = timestampValid ? Math.round((now - snapshotMs) / 1000) : Number.POSITIVE_INFINITY;
   const workers = snap.workers.map((w) => ({ ...w, ...classifyWorker(w, snapshotMs) }));
   const devs = snap.dispatchers.map((d) => ({ ...d, ...classifyDev(d) }));
 
@@ -119,7 +173,12 @@ export function buildLlmView(snap, opts = {}) {
       problems.push({ severity: "warn", kind: "worker.warn", target: w.id, detail: w.reason });
     }
   }
-  if (ageSeconds > STALE_CRIT_SECONDS) {
+  if (!timestampValid) {
+    problems.push({
+      severity: "critical", kind: "snapshot.timestamp_unreadable", target: "snapshot",
+      detail: `generated_at is not a valid timestamp (${String(snap.generated_at).slice(0, 40)}); treat this snapshot as untrusted`,
+    });
+  } else if (ageSeconds > STALE_CRIT_SECONDS) {
     problems.push({
       severity: "critical", kind: "snapshot.stale", target: "snapshot",
       detail: `snapshot is ${Math.round(ageSeconds / 60)}m old; re-run the collector`,
@@ -139,8 +198,10 @@ export function buildLlmView(snap, opts = {}) {
     schema: "rch.fleet.llm.v1",
     label: snap.label,
     generated_at: snap.generated_at,
-    age_seconds: ageSeconds,
-    stale: ageSeconds > STALE_CRIT_SECONDS,
+    // null rather than Infinity: JSON has no Infinity and would emit null
+    // anyway, so be explicit that the age is unknown, not zero.
+    age_seconds: timestampValid ? ageSeconds : null,
+    stale: !timestampValid || ageSeconds > STALE_CRIT_SECONDS,
     summary: {
       workers: t.workers ?? workers.length,
       healthy: counts.healthy ?? 0,

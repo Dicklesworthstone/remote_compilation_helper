@@ -38,9 +38,10 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { webcrypto as crypto } from "node:crypto";
-import { writeFile, mkdir, readFile } from "node:fs/promises";
+import { writeFile, mkdir, readFile, rename } from "node:fs/promises";
 import { dirname } from "node:path";
 import { hostname } from "node:os";
+import { pathToFileURL } from "node:url";
 
 const execFileAsync = promisify(execFile);
 
@@ -61,12 +62,30 @@ function parseArgs(argv) {
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
-    const next = () => argv[++i];
+    // A trailing flag used to hand `undefined` to .split() and die with a stack
+    // trace instead of saying which option was missing its value.
+    const next = () => {
+      const v = argv[++i];
+      if (v === undefined) {
+        console.error(`${a} requires a value`);
+        process.exit(2);
+      }
+      return v;
+    };
     if (a === "--dispatchers") args.dispatchers = next().split(",").map((s) => s.trim()).filter(Boolean);
     else if (a === "--out") args.out = next();
     else if (a === "--label") args.label = next();
     else if (a === "--history-file") args.historyFile = next();
-    else if (a === "--history-max") args.historyMax = Number(next());
+    else if (a === "--history-max") {
+      const n = Number(next());
+      // slice(-0) and slice(-NaN) both return the WHOLE array, so a bad value
+      // here silently made history grow without bound.
+      if (!Number.isInteger(n) || n < 1) {
+        console.error("--history-max must be a positive integer");
+        process.exit(2);
+      }
+      args.historyMax = n;
+    }
     else if (a === "--help" || a === "-h") {
       console.log(
         "usage: RCH_DASH_PASSPHRASE=... node tools/snapshot.mjs\n" +
@@ -84,15 +103,34 @@ function parseArgs(argv) {
 
 // ------------------------------------------------------------------ ssh layer
 
-const LOCAL_ALIASES = new Set(["local", "localhost", hostname(), hostname().split(".")[0]]);
+const LOCAL_ALIASES = new Set(
+  ["local", "localhost", hostname(), hostname().split(".")[0]].map((s) => s.toLowerCase()),
+);
+
+/**
+ * Is this dispatcher THIS machine? Compared case-insensitively and with any
+ * `user@` prefix stripped: `os.hostname()` returns the mixed-case name
+ * (`Mac-mini-max`) while the ssh alias people actually write is lowercase, so a
+ * case-sensitive match silently made the local box ssh to itself.
+ */
+export function isLocalDispatcher(host) {
+  const h = String(host).trim().toLowerCase();
+  const at = h.lastIndexOf("@");
+  return LOCAL_ALIASES.has(at === -1 ? h : h.slice(at + 1));
+}
+
+/** Canonical dispatcher id, so `local`, `localhost` and `user@host` don't produce duplicate entries for one machine. */
+export function dispatcherId(host) {
+  return isLocalDispatcher(host) ? hostname().split(".")[0] : String(host).trim();
+}
 
 /**
  * Run a command on a dispatcher. `local` (or this machine's own hostname) runs
  * without ssh, so the machine you collect FROM can also be monitored — the macs
- * are dispatchers too. Never throws; returns {ok, stdout}.
+ * are dispatchers too. Never throws; returns {ok, stdout, error}.
  */
 async function run(host, command) {
-  const isLocal = LOCAL_ALIASES.has(host);
+  const isLocal = isLocalDispatcher(host);
   try {
     const { stdout } = isLocal
       ? await execFileAsync("bash", ["-lc", command], { timeout: SSH_TIMEOUT_MS, maxBuffer: MAX_BUFFER })
@@ -110,29 +148,57 @@ async function run(host, command) {
   }
 }
 
-/** Run an rch subcommand that emits the standard `{data: ...}` JSON envelope. */
+/**
+ * Run an rch subcommand that emits the standard `{data: ...}` JSON envelope.
+ * Returns `{data, error}` — `data` is null on every failure and `error` says
+ * why, so a dead daemon can be told apart from an unreachable host.
+ */
 async function rchJson(host, subcommand, timeoutSec = 60) {
   const cmd = `export PATH="$HOME/.local/bin:$PATH"; timeout ${timeoutSec} rch ${subcommand} --json 2>/dev/null`;
   const res = await run(host, cmd);
-  if (!res.stdout.trim()) return null;
+  if (!res.stdout.trim()) {
+    return { data: null, error: res.error ? `${subcommand}: ${res.error}` : `${subcommand}: no output` };
+  }
+  let parsed;
   try {
     // Tolerate leading log noise: take from the first '{' to the last '}'.
     const s = res.stdout;
     const start = s.indexOf("{");
     const end = s.lastIndexOf("}");
-    if (start === -1 || end <= start) return null;
-    const parsed = JSON.parse(s.slice(start, end + 1));
-    return parsed?.data ?? parsed;
-  } catch {
-    return null;
+    if (start === -1 || end <= start) return { data: null, error: `${subcommand}: no JSON object in output` };
+    parsed = JSON.parse(s.slice(start, end + 1));
+  } catch (err) {
+    return { data: null, error: `${subcommand}: unparseable JSON (${String(err?.message || err).slice(0, 120)})` };
   }
+
+  // The API envelope reports failure in `success`, and omits `data` entirely
+  // when it fails. Returning `parsed?.data ?? parsed` handed back the ERROR
+  // envelope, which is truthy — so an erroring or dead rchd was recorded as a
+  // reachable dispatcher with no posture, and rendered as a benign "idle" box.
+  if (parsed && parsed.success === false) {
+    const e = parsed.error ?? {};
+    const detail = [e.code, e.message].filter(Boolean).join(" ").trim();
+    return { data: null, error: `${subcommand}: ${detail || "rch reported failure"}` };
+  }
+  if (parsed && typeof parsed === "object" && "data" in parsed) {
+    return parsed.data == null
+      ? { data: null, error: `${subcommand}: envelope carried no data` }
+      : { data: parsed.data, error: null };
+  }
+  return { data: parsed ?? null, error: parsed == null ? `${subcommand}: empty payload` : null };
 }
 
 /** Scrape the daemon's Prometheus endpoint for probe latency. */
 async function fetchMetrics(host) {
   const res = await run(host, "curl -s --max-time 10 http://127.0.0.1:9100/metrics 2>/dev/null");
-  const out = { latency: {}, lastSeen: {} };
-  if (!res.stdout) return out;
+  const out = { latency: {}, lastSeen: {}, error: null };
+  if (!res.stdout) {
+    // Worth surfacing: `last_seen_unix` comes only from here, so losing this
+    // endpoint silently disables the "worker has gone dark" rule fleet-wide
+    // and everything keeps rendering green.
+    out.error = `metrics: ${res.error || "no response from 127.0.0.1:9100"}`;
+    return out;
+  }
   const sum = {}, count = {};
   for (const line of res.stdout.split("\n")) {
     if (!line || line[0] === "#") continue;
@@ -152,20 +218,26 @@ function num(v) {
 }
 
 /** Higher = more alarming, so a max() merge keeps the worst observation. */
-function statusRank(s) {
+// The real vocabulary is WorkerStatus in rch-common/src/types.rs:
+// healthy | degraded | unreachable | draining | drained | disabled.
+// `drained` was missing entirely and fell into the default bucket, so a worker
+// that had finished draining and was accepting nothing ranked as merely "busy"
+// and lost every merge against a healthy observation.
+export function statusRank(s) {
   switch ((s ?? "").toLowerCase()) {
     case "healthy": return 0;
-    case "busy": return 1;
-    case "draining": return 2;
-    case "degraded": return 3;
-    case "disabled": return 4;
+    case "busy": return 1;          // not emitted by rch, kept for tolerance
+    case "degraded": return 2;      // responding slowly, but still serving
+    case "draining": return 3;      // finishing current jobs
+    case "drained": return 4;       // idle and accepting nothing
+    case "disabled": return 5;
     case "unreachable":
-    case "down": return 5;
+    case "down": return 6;
     default: return s ? 1 : -1; // unknown label beats "no reading at all"
   }
 }
 
-function circuitRank(c) {
+export function circuitRank(c) {
   switch ((c ?? "").toLowerCase()) {
     case "closed": return 0;
     case "half_open": return 1;
@@ -174,13 +246,17 @@ function circuitRank(c) {
   }
 }
 
-const PRESSURE_RANK = { healthy: 0, warning: 1, critical: 2 };
+// rch emits a fourth state, `telemetry_gap` (rch/src/status_types.rs), which it
+// renders as a warning. Omitting it here ranked it -1 — below healthy — so a
+// dispatcher explicitly reporting "I have no telemetry for this worker" lost
+// the merge to any other dispatcher's stale healthy reading.
+const PRESSURE_RANK = { healthy: 0, telemetry_gap: 1, warning: 2, critical: 3 };
 
 /**
  * Prefer the pressure reading that is (a) more alarming, or (b) equally
  * alarming but fresher. A stale "healthy" must never override a live "critical".
  */
-function pressureIsBetter(next, cur) {
+export function pressureIsBetter(next, cur) {
   if (!next) return false;
   if (!cur) return true;
   const rn = PRESSURE_RANK[(next.state ?? "").toLowerCase()] ?? -1;
@@ -194,14 +270,25 @@ function pressureIsBetter(next, cur) {
 async function collectDispatcher(host) {
   // `rch status` carries runtime state but NOT the static config fields
   // (tags, priority, enabled) — those only exist in `workers list`.
-  const [status, caps, list, metrics] = await Promise.all([
+  const [statusRes, capsRes, listRes, metrics] = await Promise.all([
     rchJson(host, "status", 70),
     rchJson(host, "workers capabilities", 70),
     rchJson(host, "workers list", 45),
     fetchMetrics(host),
   ]);
 
+  const status = statusRes.data;
+  const caps = capsRes.data;
+  const list = listRes.data;
+
+  // Every failure reason, kept rather than collapsed into a bare `false`. SSH
+  // auth failure, a missing `rch` binary and a dead daemon used to be
+  // indistinguishable on screen.
+  const collectionErrors = [statusRes.error, capsRes.error, listRes.error, metrics.error].filter(Boolean);
   const reachable = Boolean(status);
+  // `workers list` failing silently blanks every tag and priority; say so
+  // instead of rendering an untagged fleet as though that were the config.
+  const configDegraded = Boolean(listRes.error);
   const d = status?.daemon?.daemon ?? null;
   const statusWorkers = status?.daemon?.workers ?? [];
   const capsById = new Map((caps?.workers ?? []).map((w) => [w.id, w.capabilities ?? {}]));
@@ -250,7 +337,6 @@ async function collectDispatcher(host) {
       },
       tags: Array.isArray(cfg.tags) ? cfg.tags : [],
       priority: num(cfg.priority),
-      enabled: cfg.enabled !== false,
     };
   });
 
@@ -266,8 +352,12 @@ async function collectDispatcher(host) {
   }));
 
   return {
-    id: host === "local" ? hostname().split(".")[0] : host,
+    id: dispatcherId(host),
     reachable,
+    /** Why collection failed, when it did. Empty on a clean run. */
+    collection_errors: collectionErrors,
+    /** True when `workers list` failed, so tags/priority are missing rather than genuinely unset. */
+    config_degraded: configDegraded,
     // The headline dev-machine question: can this box offload at all?
     posture: status?.posture ?? null,
     posture_description: status?.posture_description ?? null,
@@ -312,9 +402,41 @@ async function collectDispatcher(host) {
 
 // ----------------------------------------------------------------- encryption
 
-async function encrypt(plaintext, passphrase) {
+/**
+ * Read the salt out of an existing envelope so it can be reused.
+ *
+ * The browser's "stay unlocked for 60 days" stores the DERIVED KEY, not the
+ * passphrase (the passphrase is never persisted anywhere). A key derived under
+ * salt A cannot decrypt a payload encrypted under salt B, so minting a fresh
+ * salt on every collection invalidated the saved session on every run — a
+ * wall-mounted tab logged itself out on each cron tick, which is precisely the
+ * case the feature exists for.
+ *
+ * Reusing the salt across snapshots of the SAME deployment is sound: a salt
+ * defeats precomputation across *different* secrets, and this passphrase is a
+ * single high-entropy random string. The IV is still fresh per encryption,
+ * which is the part AES-GCM actually requires to be unique.
+ */
+export async function existingSalt(outPath) {
+  try {
+    const prev = JSON.parse(await readFile(outPath, "utf8"));
+    const b64 = prev?.kdf?.salt;
+    if (typeof b64 !== "string") return null;
+    const salt = new Uint8Array(Buffer.from(b64, "base64"));
+    // Only reuse a salt that matches the KDF we are about to use, so changing
+    // iterations or hash still rotates cleanly.
+    if (salt.length !== 16) return null;
+    if (prev?.kdf?.iterations !== PBKDF2_ITERATIONS) return null;
+    if (prev?.kdf?.hash !== "SHA-256") return null;
+    return salt;
+  } catch {
+    return null;
+  }
+}
+
+export async function encrypt(plaintext, passphrase, reusableSalt = null) {
   const enc = new TextEncoder();
-  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const salt = reusableSalt ?? crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const baseKey = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
   const key = await crypto.subtle.deriveKey(
@@ -334,6 +456,40 @@ async function encrypt(plaintext, passphrase) {
   };
 }
 
+/**
+ * Decrypt what we just encrypted and confirm it round-trips to the same size.
+ * Cheap insurance against publishing a payload the passphrase cannot open.
+ */
+async function verifyRoundTrip(envelope, passphrase, expectedLength) {
+  const enc = new TextEncoder();
+  const b = (s) => new Uint8Array(Buffer.from(s, "base64"));
+  const baseKey = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: b(envelope.kdf.salt), iterations: envelope.kdf.iterations, hash: envelope.kdf.hash },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"],
+  );
+  const out = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: b(envelope.cipher.iv) },
+    key,
+    b(envelope.ciphertext),
+  );
+  const text = new TextDecoder().decode(out);
+  if (text.length !== expectedLength) {
+    throw new Error(`round-trip length mismatch: ${text.length} != ${expectedLength}`);
+  }
+  JSON.parse(text);
+}
+
+/** Write via a temp file in the same directory, then rename — readers never see a partial file. */
+async function writeFileAtomic(path, contents) {
+  const tmp = `${path}.tmp-${process.pid}`;
+  await writeFile(tmp, contents);
+  await rename(tmp, path);
+}
+
 // ----------------------------------------------------------------------- main
 
 async function main() {
@@ -349,17 +505,52 @@ async function main() {
     process.exit(2);
   }
 
-  console.error(`collecting from ${args.dispatchers.length} dev machine(s): ${args.dispatchers.join(", ")}`);
-  const settled = await Promise.all(
-    args.dispatchers.map(async (host) => {
+  // De-duplicate first: `local`, `localhost` and this box's own hostname all
+  // name the same machine, and listing two of them used to double-count
+  // dispatchers, builds and active jobs in the totals.
+  const seenHosts = new Map();
+  for (const host of args.dispatchers) {
+    const id = dispatcherId(host);
+    if (!seenHosts.has(id)) seenHosts.set(id, host);
+    else console.error(`  note: "${host}" is the same machine as "${seenHosts.get(id)}" — collecting once`);
+  }
+  const targets = [...seenHosts.values()];
+
+  console.error(`collecting from ${targets.length} dev machine(s): ${targets.join(", ")}`);
+  // allSettled, not all: this fan-out is the whole snapshot. One dispatcher
+  // returning a shape that throws inside the mapper must not abort collection
+  // for every other machine — that is the opposite of the resilience the merge
+  // below is written for.
+  const settled = await Promise.allSettled(
+    targets.map(async (host) => {
       const d = await collectDispatcher(host);
       console.error(
-        `  ${host.padEnd(14)} ${d.reachable ? `ok  posture=${d.posture ?? "?"}  workers=${d.workers.length}` : "UNREACHABLE"}`,
+        `  ${String(host).padEnd(14)} ${d.reachable ? `ok  posture=${d.posture ?? "?"}  workers=${d.workers.length}` : `UNREACHABLE  ${d.collection_errors[0] ?? ""}`}`,
       );
       return d;
     }),
   );
-  const dispatchers = settled;
+
+  const dispatchers = settled.map((r, i) => {
+    if (r.status === "fulfilled") return r.value;
+    const host = targets[i];
+    const reason = String(r.reason?.message || r.reason || "collector threw");
+    console.error(`  ${String(host).padEnd(14)} FAILED  ${reason}`);
+    // Represent the failure as a real, unreachable dispatcher rather than
+    // dropping it, so a box that stops responding cannot quietly vanish from
+    // the fleet count.
+    return {
+      id: dispatcherId(host), reachable: false, collection_errors: [reason], config_degraded: true,
+      posture: null, posture_description: null, daemon: null, build_stats: null,
+      saved_time_ms: null, active_builds: 0, queued_builds: 0, recent_builds: [],
+      issues: [], alerts: [], remediation_hints: [], workers: [],
+    };
+  });
+
+  if (!dispatchers.some((d) => d.reachable)) {
+    console.error("no dispatcher responded — refusing to publish an all-zero snapshot over good data");
+    process.exit(1);
+  }
 
   // Union the worker view. A worker is "known" if any dev machine has it, and
   // runtime facts come from whichever machine actually reported them, so one
@@ -371,7 +562,20 @@ async function main() {
     for (const w of d.workers) {
       const prev = merged.get(w.id);
       if (!prev) {
-        merged.set(w.id, { ...w, seen_by: [d.id], slots_by_dispatcher: { [d.id]: { used: w.used_slots, total: w.total_slots } } });
+        // Copy the nested objects. A shallow spread aliases `caps`, `pressure`,
+        // `tags` and `failure_history` to the FIRST dispatcher's own records,
+        // and the merge below then mutates them in place — silently rewriting
+        // that dispatcher's private per-worker view with values observed
+        // elsewhere.
+        merged.set(w.id, {
+          ...w,
+          caps: { ...w.caps },
+          pressure: { ...w.pressure },
+          tags: [...(w.tags ?? [])],
+          failure_history: [...(w.failure_history ?? [])],
+          seen_by: [d.id],
+          slots_by_dispatcher: { [d.id]: { used: w.used_slots, total: w.total_slots } },
+        });
         continue;
       }
       prev.seen_by.push(d.id);
@@ -397,29 +601,40 @@ async function main() {
       for (const k of ["speed", "latency_ms", "last_error", "priority"]) {
         if (prev[k] == null && w[k] != null) prev[k] = w[k];
       }
-      if ((prev.tags?.length ?? 0) === 0 && w.tags?.length) prev.tags = w.tags;
-      // A worker disabled anywhere is worth surfacing, so disabled wins.
-      if (w.enabled === false) prev.enabled = false;
+      if ((prev.tags?.length ?? 0) === 0 && w.tags?.length) prev.tags = [...w.tags];
       for (const k of Object.keys(w.caps)) if (prev.caps[k] == null && w.caps[k] != null) prev.caps[k] = w.caps[k];
 
       // Take the pressure block WHOLE from the freshest observer. Merging it
       // field by field could pair disk_free_gb from one dispatcher with
       // disk_total_gb from another and compute a nonsense percentage.
-      if (pressureIsBetter(w.pressure, prev.pressure)) prev.pressure = w.pressure;
+      if (pressureIsBetter(w.pressure, prev.pressure)) prev.pressure = { ...w.pressure };
 
-      if (!prev.failure_history.length && w.failure_history.length) prev.failure_history = w.failure_history;
+      if (!prev.failure_history.length && w.failure_history.length) prev.failure_history = [...w.failure_history];
     }
   }
   const workers = [...merged.values()].sort((a, b) => a.id.localeCompare(b.id));
 
   const reachable = dispatchers.filter((d) => d.reachable);
+
+  // Only count a worker's disk when BOTH halves are present. Summing them
+  // independently let a worker with a total but no free reading add to the
+  // denominator and nothing to the numerator, inflating fleet "disk used %"
+  // with a number no single worker ever reported.
+  const diskWorkers = workers.filter(
+    (w) => w.pressure.disk_free_gb != null && w.pressure.disk_total_gb != null && w.pressure.disk_total_gb > 0,
+  );
+
   const totals = {
     workers: workers.length,
     slots: workers.reduce((n, w) => n + (w.total_slots ?? 0), 0),
-    slots_used: workers.reduce((n, w) => n + (w.used_slots ?? 0), 0),
+    // Per-observer occupancy (each rchd derates and reserves independently), so
+    // this is the worst single observation, never more than capacity.
+    slots_used: workers.reduce((n, w) => n + Math.min(w.used_slots ?? 0, w.total_slots ?? Infinity), 0),
     cores: workers.reduce((n, w) => n + (w.caps.num_cpus ?? 0), 0),
-    disk_free_gb: workers.reduce((n, w) => n + (w.pressure.disk_free_gb ?? 0), 0),
-    disk_total_gb: workers.reduce((n, w) => n + (w.pressure.disk_total_gb ?? 0), 0),
+    disk_free_gb: diskWorkers.reduce((n, w) => n + w.pressure.disk_free_gb, 0),
+    disk_total_gb: diskWorkers.reduce((n, w) => n + w.pressure.disk_total_gb, 0),
+    /** How many workers actually reported usable disk telemetry, so the UI can say "of N" honestly. */
+    disk_reporting_workers: diskWorkers.length,
     dispatchers_total: dispatchers.length,
     dispatchers_reachable: reachable.length,
     dispatchers_remote_ready: reachable.filter((d) => d.posture === "remote_ready").length,
@@ -458,14 +673,27 @@ async function main() {
   const snapshot = { schema: SCHEMA, label: args.label, generated_at, totals, dispatchers, workers, history };
 
   const plain = JSON.stringify(snapshot);
-  const envelope = await encrypt(plain, passphrase);
   await mkdir(dirname(args.out), { recursive: true });
-  await writeFile(args.out, JSON.stringify(envelope, null, 2));
+
+  // Reuse the previous salt so a browser session that saved its derived key
+  // stays valid across snapshots. See existingSalt().
+  const reusedSalt = await existingSalt(args.out);
+  const envelope = await encrypt(plain, passphrase, reusedSalt);
+
+  // Prove the payload decrypts under the passphrase we just used, BEFORE
+  // replacing the live file. A typo'd passphrase otherwise publishes a snapshot
+  // nobody can open, and it is only discovered in the browser as an
+  // indistinguishable "wrong passphrase".
+  await verifyRoundTrip(envelope, passphrase, plain.length);
+
+  // Atomic publish: `public/data/fleet.enc.json` is served while it is being
+  // rewritten, and a plain writeFile hands a browser mid-write truncation.
+  await writeFileAtomic(args.out, JSON.stringify(envelope, null, 2));
   await mkdir(dirname(args.historyFile), { recursive: true });
-  await writeFile(args.historyFile, JSON.stringify(history));
+  await writeFileAtomic(args.historyFile, JSON.stringify(history));
 
   console.error(
-    `\nwrote ${args.out}\n` +
+    `\nwrote ${args.out}${reusedSalt ? " (salt reused — saved browser sessions stay valid)" : " (new salt)"}\n` +
       `  ${workers.length} workers · ${totals.slots} slots (${totals.slots_used} used) · ${totals.cores} cores\n` +
       `  ${totals.dispatchers_remote_ready}/${totals.dispatchers_reachable} dev machines remote-ready · ` +
       `builds remote ${totals.builds_remote} / local ${totals.builds_local}\n` +
@@ -473,7 +701,14 @@ async function main() {
   );
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// Only collect when run as a program. Without this guard, importing any helper
+// for a test would ssh the whole fleet and overwrite the live snapshot.
+const invokedDirectly =
+  process.argv[1] != null && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (invokedDirectly) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

@@ -16,6 +16,8 @@
     "test:endpoint": "node tests/endpoint.mjs",
     "llm": "node tools/fleet-llm.mjs",
     "test:llm": "node tests/parity.mjs",
+    "test:snapshot": "node tests/snapshot.mjs",
+    "test": "node tests/snapshot.mjs && node tests/parity.mjs && npm run build:api --silent && node tests/endpoint.mjs",
     "test:visual": "node tests/visual-audit.mjs",
     "probe": "node tests/render-probe.mjs",
     "perf": "node tests/perf.mjs"

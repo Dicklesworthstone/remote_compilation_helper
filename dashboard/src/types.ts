@@ -45,7 +45,6 @@ export interface Worker {
   tags: string[];
   /** From `rch workers list` — absent in `rch status`. */
   priority: number | null;
-  enabled: boolean;
   seen_by?: string[];
   /** Slot view per dev machine — rchd derates independently on each. */
   slots_by_dispatcher?: Record<string, { used: number | null; total: number | null }>;
@@ -157,4 +156,12 @@ export interface DispatcherView extends Dispatcher {
   level: DevLevel;
   levelReason: string;
   remotePct: number | null;
+  /**
+   * Which window `remotePct` was measured over. "recent" is the last N actual
+   * builds; "lifetime" is the cumulative daemon counters, used only when no
+   * recent builds are recorded. null when there is nothing to measure.
+   */
+  remoteBasis: "recent" | "lifetime" | null;
+  /** How many builds `remotePct` was computed from. */
+  remoteCounted: number;
 }

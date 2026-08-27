@@ -49,7 +49,7 @@ const w = (over = {}) => ({
     state: "healthy", reason: null, disk_free_gb: 500, disk_total_gb: 1000,
     disk_io_util_pct: 0, memory_pressure: 0, telemetry_age_secs: 5, telemetry_fresh: true,
   },
-  latency_ms: 10, last_seen_unix: SNAP_S - 30, priority: 100, enabled: true,
+  latency_ms: 10, last_seen_unix: SNAP_S - 30, priority: 100,
   caps: {
     num_cpus: 8, load_avg_1: 1, load_avg_5: 1, load_avg_15: 1,
     cpu_microarch_level: 3, rustc_version: "1.87.0", bun_version: null,
@@ -62,11 +62,16 @@ const w = (over = {}) => ({
 const cases = [
   ["baseline healthy", w()],
   ["disabled via status", w({ status: "disabled" })],
-  ["disabled via enabled:false", w({ enabled: false })],
   ["status down", w({ status: "down" })],
   ["circuit open", w({ circuit_state: "open" })],
   ["circuit half_open", w({ circuit_state: "half_open" })],
   ["draining", w({ status: "draining" })],
+  // Real WorkerStatus variants (rch-common/src/types.rs) that both classifiers
+  // used to fall through on, rendering a slow or drained worker as healthy.
+  ["degraded (responding slowly)", w({ status: "degraded" })],
+  ["drained (accepting nothing)", w({ status: "drained" })],
+  ["degraded while busy", w({ status: "degraded", used_slots: 4 })],
+  ["drained while busy", w({ status: "drained", used_slots: 2 })],
   ["stale just under 1h", w({ last_seen_unix: SNAP_S - 3599 })],
   ["stale just over 1h", w({ last_seen_unix: SNAP_S - 3601 })],
   ["disk 94.9% (under crit)", w({ pressure: { ...w().pressure, disk_free_gb: 51, disk_total_gb: 1000 } })],
@@ -81,6 +86,21 @@ const cases = [
   ["consecutive failures", w({ consecutive_failures: 3 })],
   ["busy", w({ used_slots: 4 })],
   ["projects root bad", w({ caps: { ...w().caps, projects_root_ok: false } })],
+  // A broken projects root used to be unreachable whenever the worker was busy,
+  // i.e. exactly when a build was running on the broken root.
+  ["projects root bad WHILE busy", w({ used_slots: 4, caps: { ...w().caps, projects_root_ok: false } })],
+  // rch's fourth pressure state. Ranked below healthy in the old merge and
+  // matched by neither classifier, so "I have no telemetry" rendered green.
+  ["pressure telemetry_gap", w({ pressure: { ...w().pressure, state: "telemetry_gap" } })],
+  ["pressure telemetry_gap with reason", w({ pressure: { ...w().pressure, state: "telemetry_gap", reason: "pressure_telemetry_gap" } })],
+  // Pressure events that carry no disk numbers used to render the literal
+  // string "disk undefined% full".
+  ["critical pressure, no disk numbers", w({ pressure: { ...w().pressure, state: "critical", reason: null, disk_free_gb: null, disk_total_gb: null } })],
+  ["warning pressure, no disk numbers", w({ pressure: { ...w().pressure, state: "warning", reason: null, disk_free_gb: null, disk_total_gb: null } })],
+  // Healthy-looking verdict derived from stale readings.
+  ["stale telemetry, otherwise healthy", w({ pressure: { ...w().pressure, telemetry_fresh: false, telemetry_age_secs: 900 } })],
+  ["stale telemetry, no age", w({ pressure: { ...w().pressure, telemetry_fresh: false, telemetry_age_secs: null } })],
+  ["stale telemetry while busy", w({ used_slots: 3, pressure: { ...w().pressure, telemetry_fresh: false, telemetry_age_secs: 120 } })],
   ["no telemetry at all", w({ last_seen_unix: null, caps: { ...w().caps, load_avg_1: null, num_cpus: null },
                              pressure: { ...w().pressure, disk_free_gb: null, disk_total_gb: null } })],
 ];
@@ -89,9 +109,12 @@ for (const [name, worker] of cases) {
   const a = derive.classify(worker, SNAP_MS);
   const b = classifyWorker(worker, SNAP_MS);
   chk(`worker: ${name}`, a.health === b.health, `derive=${a.health} llm=${b.health}`);
-  if (a.health !== "healthy" && a.healthReason !== b.reason) {
-    chk(`worker reason: ${name}`, false, `derive="${a.healthReason}" llm="${b.reason}"`);
-  }
+  // Compare reasons unconditionally. Skipping the healthy case (and only
+  // reporting on mismatch) meant a passing reason check was invisible and
+  // healthy-path drift went unnoticed entirely.
+  chk(`worker reason: ${name}`, a.healthReason === b.reason, `derive="${a.healthReason}" llm="${b.reason}"`);
+  // A reason must never interpolate a missing number into the text.
+  chk(`worker reason well-formed: ${name}`, !/undefined|NaN|null/.test(a.healthReason), `derive="${a.healthReason}"`);
 }
 
 // Dev-machine parity.

@@ -54,8 +54,33 @@ function utf8ToBuf(s: string): ArrayBuffer {
   return buf;
 }
 
+/** Iteration ceiling. The collector writes 600k; anything far above that is a payload trying to hang the browser. */
+const MAX_KDF_ITERATIONS = 5_000_000;
+const ALLOWED_KDF_HASHES = ["SHA-256", "SHA-384", "SHA-512"];
+
+/**
+ * Validate the envelope's KDF parameters before deriving.
+ *
+ * `iterations` and `hash` are read straight out of a fetched file, and PBKDF2
+ * runs for however long it is told. An absurd iteration count is an
+ * indefinite freeze of the main thread with no error and no way out.
+ */
+export function assertUsableEnvelope(env: Envelope): void {
+  if (!env?.ciphertext || typeof env.ciphertext !== "string") throw new Error("envelope has no ciphertext");
+  if (!env?.cipher?.iv || typeof env.cipher.iv !== "string") throw new Error("envelope has no cipher IV");
+  if (!env?.kdf?.salt || typeof env.kdf.salt !== "string") throw new Error("envelope has no KDF salt");
+  const iters = env.kdf.iterations;
+  if (!Number.isInteger(iters) || iters < 1 || iters > MAX_KDF_ITERATIONS) {
+    throw new Error(`envelope KDF iterations out of range: ${String(iters)}`);
+  }
+  if (!ALLOWED_KDF_HASHES.includes(env.kdf.hash)) {
+    throw new Error(`unsupported envelope KDF hash: ${String(env.kdf.hash)}`);
+  }
+}
+
 /** Derive the AES key from a passphrase + the envelope's salt/iterations. */
 export async function deriveKey(passphrase: string, env: Envelope): Promise<CryptoKey> {
+  assertUsableEnvelope(env);
   const base = await crypto.subtle.importKey("raw", utf8ToBuf(passphrase), "PBKDF2", false, [
     "deriveKey",
   ]);

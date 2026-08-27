@@ -61,12 +61,29 @@ function extractKey(req, url) {
 }
 
 export default async function handler(req, res) {
-  const url = new URL(req.url ?? "/", `https://${req.headers?.host ?? "localhost"}`);
-
-  // Never let a CDN or browser cache a decrypted fleet view.
+  // Never let a CDN or browser cache a decrypted fleet view. Set before any
+  // parsing so an early rejection still carries them.
   res.setHeader("Cache-Control", "no-store, max-age=0, must-revalidate");
   res.setHeader("X-Robots-Tag", "noindex, nofollow");
   res.setHeader("X-Content-Type-Options", "nosniff");
+
+  // The Host header is attacker-controlled and only used to satisfy the URL
+  // parser. An empty or malformed one made `new URL` throw before any handler
+  // logic ran, turning a bad request into an opaque 500. Only the path and
+  // query are ever read, so fall back to a fixed base.
+  let url;
+  for (const [target, base] of [
+    [req.url ?? "/", `https://${req.headers?.host || "localhost"}`],
+    [req.url ?? "/", "https://localhost"],
+    ["/", "https://localhost"],
+  ]) {
+    try {
+      url = new URL(target, base);
+      break;
+    } catch {
+      /* try the next, progressively less attacker-influenced, form */
+    }
+  }
 
   if (req.method !== "GET" && req.method !== "HEAD") {
     res.statusCode = 405;

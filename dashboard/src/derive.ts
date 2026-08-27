@@ -22,7 +22,7 @@ export function fmtAge(seconds: number | null): string {
 }
 
 export function fmtUptime(seconds: number | null): string {
-  if (seconds == null) return "—";
+  if (seconds == null || !Number.isFinite(seconds)) return "—";
   const d = Math.floor(seconds / 86400);
   const h = Math.floor((seconds % 86400) / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -69,9 +69,19 @@ export function classify(w: Worker, snapshotMs: number): WorkerView {
   let health: HealthLevel = "healthy";
   let healthReason = "healthy";
 
-  if (st === "disabled" || w.enabled === false) {
+  // A pressure event does not always carry a disk number (memory pressure, or a
+  // telemetry gap). Falling back to the raw percentage unconditionally rendered
+  // the literal string "disk undefined% full" on those workers.
+  const pressureReason = (fallback: string) =>
+    p.reason
+      ? `pressure: ${p.reason}`
+      : diskUsedPct != null
+        ? `disk ${diskUsedPct.toFixed(0)}% full`
+        : fallback;
+
+  if (st === "disabled") {
     health = "disabled";
-    healthReason = "disabled in workers.toml";
+    healthReason = "manually disabled";
   } else if (st === "down" || st === "unreachable" || w.circuit_state === "open") {
     health = "offline";
     healthReason = w.circuit_state === "open" ? "circuit breaker open" : `worker ${st || "unreachable"}`;
@@ -80,13 +90,26 @@ export function classify(w: Worker, snapshotMs: number): WorkerView {
     healthReason = `not seen for ${Math.round(staleSeconds / 60)}m`;
   } else if (p.state === "critical" || (diskUsedPct != null && diskUsedPct >= 95)) {
     health = "critical";
-    healthReason = p.reason ? `pressure: ${p.reason}` : `disk ${diskUsedPct?.toFixed(0)}% full`;
+    healthReason = pressureReason("critical pressure");
   } else if (st === "draining") {
     health = "warn";
-    healthReason = "draining";
+    healthReason = "draining (finishing current jobs)";
+  } else if (st === "drained") {
+    // Terminal state of a drain: idle and accepting nothing. It looks identical
+    // to a healthy idle worker on every other surface, which is the trap.
+    health = "warn";
+    healthReason = "drained — accepting no new jobs";
   } else if (p.state === "warning" || (diskUsedPct != null && diskUsedPct >= 88)) {
     health = "warn";
-    healthReason = p.reason ? `pressure: ${p.reason}` : `disk ${diskUsedPct?.toFixed(0)}% full`;
+    healthReason = pressureReason("pressure warning");
+  } else if (p.state === "telemetry_gap") {
+    // rch's own fourth pressure state. Treating it as healthy meant "I have no
+    // idea how this worker is doing" rendered green.
+    health = "warn";
+    healthReason = p.reason ? `pressure: ${p.reason}` : "no pressure telemetry";
+  } else if (st === "degraded") {
+    health = "warn";
+    healthReason = "worker responding slowly";
   } else if (w.consecutive_failures > 0) {
     health = "warn";
     healthReason = `${w.consecutive_failures} consecutive failure${w.consecutive_failures === 1 ? "" : "s"}`;
@@ -96,12 +119,23 @@ export function classify(w: Worker, snapshotMs: number): WorkerView {
   } else if (w.circuit_state === "half_open") {
     health = "warn";
     healthReason = "circuit half-open (probing)";
+  } else if (w.caps.projects_root_ok === false) {
+    // Must precede the `busy` branch: a busy worker with a broken projects root
+    // is still broken, and this check used to be unreachable whenever a build
+    // was running — exactly when it matters.
+    health = "warn";
+    healthReason = "projects root unhealthy";
+  } else if (p.telemetry_fresh === false) {
+    // Everything above says healthy, but the readings behind that verdict are
+    // stale. Report the uncertainty rather than the conclusion.
+    health = "warn";
+    healthReason =
+      p.telemetry_age_secs != null
+        ? `telemetry ${fmtAge(p.telemetry_age_secs).replace(" ago", "")} old`
+        : "telemetry stale";
   } else if ((w.used_slots ?? 0) > 0) {
     health = "busy";
     healthReason = `${w.used_slots}/${w.total_slots} slots in use`;
-  } else if (w.caps.projects_root_ok === false) {
-    health = "warn";
-    healthReason = "projects root unhealthy";
   }
 
   return { ...w, health, healthReason, diskUsedPct, loadPerCore, staleSeconds, slotPct };
@@ -123,9 +157,29 @@ export function classifyAll(snap: Snapshot, _nowMs?: number): WorkerView[] {
  * other surface still report a healthy fleet.
  */
 export function classifyDispatcher(d: Dispatcher): DispatcherView {
+  // `build_stats` is CUMULATIVE since the daemon started, so it is the wrong
+  // basis for a "is this box offloading right now" verdict: a machine that did
+  // 200 local builds last month stays branded local-only through a week of
+  // perfect offloading, and one that broke this morning takes weeks to cross
+  // the threshold. `recent_builds` is the actual recent window, so prefer it
+  // and fall back to the lifetime counters only when it is empty.
   const s = d.build_stats;
-  const counted = s ? s.remote + s.local : 0;
-  const remotePct = counted > 0 ? (s!.remote / counted) * 100 : null;
+  const recent = d.recent_builds ?? [];
+  const recentCounted = recent.length;
+  const recentRemote = recent.filter((b) => (b.location ?? "").toLowerCase() === "remote").length;
+
+  const lifetimeCounted = s ? s.remote + s.local : 0;
+  const basis: "recent" | "lifetime" | null =
+    recentCounted > 0 ? "recent" : lifetimeCounted > 0 ? "lifetime" : null;
+
+  const remotePct =
+    basis === "recent"
+      ? (recentRemote / recentCounted) * 100
+      : basis === "lifetime"
+        ? (s!.remote / lifetimeCounted) * 100
+        : null;
+
+  const window = basis === "recent" ? `last ${recentCounted} builds` : "all builds since daemon start";
 
   let level: DevLevel;
   let levelReason: string;
@@ -138,19 +192,24 @@ export function classifyDispatcher(d: Dispatcher): DispatcherView {
     levelReason = d.posture_description ?? d.posture;
   } else if (remotePct != null && remotePct < 50) {
     level = "local-only";
-    levelReason = `only ${remotePct.toFixed(0)}% of recent builds went remote`;
-  } else if (counted === 0) {
+    levelReason = `only ${remotePct.toFixed(0)}% of the ${window} went remote`;
+  } else if (basis === null) {
     level = "idle";
     levelReason = "no builds recorded yet";
   } else {
     level = "offloading";
-    levelReason = `${remotePct?.toFixed(0)}% of recent builds went to the pool`;
+    levelReason = `${remotePct!.toFixed(0)}% of the ${window} went to the pool`;
   }
 
-  return { ...d, level, levelReason, remotePct };
+  return { ...d, level, levelReason, remotePct, remoteBasis: basis, remoteCounted: recentCounted || lifetimeCounted };
 }
 
-export const HEALTH_ORDER: HealthLevel[] = ["critical", "warn", "offline", "busy", "healthy", "disabled"];
+/**
+ * Sort order, most urgent first. `offline` outranks `warn`: a worker we cannot
+ * reach at all is a bigger problem than one with a single transient probe
+ * failure. `disabled` sorts last — it is an intended state, not a fault.
+ */
+export const HEALTH_ORDER: HealthLevel[] = ["critical", "offline", "warn", "busy", "healthy", "disabled"];
 
 export function healthRank(h: HealthLevel): number {
   const i = HEALTH_ORDER.indexOf(h);
