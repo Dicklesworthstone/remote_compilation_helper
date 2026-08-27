@@ -670,7 +670,32 @@ async function main() {
   });
   history = history.slice(-args.historyMax);
 
-  const snapshot = { schema: SCHEMA, label: args.label, generated_at, totals, dispatchers, workers, history };
+  // Project the per-dispatcher worker arrays down before they reach the wire.
+  //
+  // Every dispatcher used to ship a FULL copy of every worker it can see: on a
+  // 10-machine fleet that is 142 records, 121.5KB of a 222.8KB payload (54.6%),
+  // re-downloaded whole on every 5-minute refresh. All of it was redundant:
+  //   - every descriptive field (host, user, caps, pressure, tags, latency,
+  //     failure_history, ...) is already in the merged `workers[]` above, folded
+  //     worst-wins across observers;
+  //   - the only genuinely per-dispatcher fact is the derated slot reading, and
+  //     the merge already records that too, as `workers[].slots_by_dispatcher`.
+  // The single surviving consumer of the per-dispatcher array is the dev-machine
+  // drawer, which sums used/total slots and counts the zero-slot workers to
+  // answer "is this box about to go local-only?" — it never reads any other
+  // field. So emit the slot readings alone, positionally: the key names cost
+  // more than the values at 142 repetitions. `classifyDispatcher()` in
+  // src/derive.ts expands them back into `workers` on the DispatcherView the
+  // drawer is handed, so the drawer sees exactly what it saw before.
+  const emittedDispatchers = dispatchers.map(({ workers: seen, ...rest }) => ({
+    ...rest,
+    worker_slots: seen.map((w) => [w.used_slots, w.total_slots]),
+  }));
+
+  const snapshot = {
+    schema: SCHEMA, label: args.label, generated_at, totals,
+    dispatchers: emittedDispatchers, workers, history,
+  };
 
   const plain = JSON.stringify(snapshot);
   await mkdir(dirname(args.out), { recursive: true });

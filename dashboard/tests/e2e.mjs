@@ -106,28 +106,72 @@ await page.locator('[class*="pill dev-"]').first().click();
 await page.waitForSelector(".drawer", { timeout: 15000 });
 const devHeads = await page.locator(".drawer .kv-group h4").allInnerTexts();
 check("dev drawer shows offload posture", devHeads.some((h) => /offload/i.test(h)), devHeads.join(", "));
+check("dev drawer shows this machine's pool view",
+  devHeads.some((h) => /view of the pool/i.test(h)), devHeads.join(", "));
 
 // recent builds: relative ages + cross-link to the worker drawer when the id
-// is a fleet worker
-const buildRows = await page.locator(".drawer .build-row").count();
-check("recent builds listed", buildRows > 0, `${buildRows} rows`);
-if (buildRows > 0) {
-  const buildText = await page.locator(".drawer .builds").innerText();
-  check("recent builds show relative age", /ago/.test(buildText), buildText.split("\n")[0]);
-  const workerLink = page.locator(".drawer .build-row .link").first();
-  if ((await workerLink.count()) > 0) {
-    const linkedId = (await workerLink.innerText()).trim();
-    await workerLink.click();
+// is a fleet worker.
+//
+// Hunt for a machine that HAS builds rather than assuming the first card does.
+// Dev cards sort most-urgent-first, so an unreachable machine leads — and an
+// unreachable machine legitimately has no build history, which turned a correct
+// observation about the fleet into a red suite the moment one box stopped
+// answering. "Some dev machine lists builds" is the invariant about the app.
+{
+  const pills = page.locator('[class*="pill dev-"]');
+  const n = await pills.count();
+  let found = false;
+  for (let i = 0; i < n && !found; i++) {
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(150);
+    await pills.nth(i).click();
     await page.waitForSelector(".drawer", { timeout: 15000 });
-    const wTitle = (await page.locator(".drawer h3").innerText()).trim();
-    check("dev drawer cross-links to worker drawer", wTitle === linkedId, `${wTitle} (want ${linkedId})`);
-    await page.keyboard.press("Escape");
-    await page.waitForTimeout(300);
-  } else {
-    await page.keyboard.press("Escape");
-    await page.waitForTimeout(300);
+    found = (await page.locator(".drawer .build-row").count()) > 0;
   }
-} else {
+  check("recent builds listed on some dev machine", found, `checked ${n} dev machines`);
+  if (found) {
+    const buildText = await page.locator(".drawer .builds").innerText();
+    check("recent builds show relative age", /ago/.test(buildText), buildText.split("\n")[0]);
+    const workerLink = page.locator(".drawer .build-row .link").first();
+    if ((await workerLink.count()) > 0) {
+      const linkedId = (await workerLink.innerText()).trim();
+      await workerLink.click();
+      await page.waitForSelector(".drawer", { timeout: 15000 });
+      const wTitle = (await page.locator(".drawer h3").innerText()).trim();
+      check("dev drawer cross-links to worker drawer", wTitle === linkedId, `${wTitle} (want ${linkedId})`);
+    }
+  }
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+}
+
+// The dispatcher's OWN derated view of the pool. The collector no longer ships
+// a full worker record per dispatcher (it was 54.6% of the payload and every
+// field was already in the merged `workers[]`); it ships `[used, total]` pairs
+// that classifyDispatcher expands back. If that expansion ever breaks, this
+// panel reads "0 workers seen / 0 used / 0 total" on a live fleet and nothing
+// else on the page changes — so assert a real reachable machine reports one.
+{
+  const pills = page.locator('[class*="pill dev-"]');
+  const n = await pills.count();
+  let poolText = null;
+  for (let i = 0; i < n && poolText === null; i++) {
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(150);
+    await pills.nth(i).click();
+    await page.waitForSelector(".drawer", { timeout: 15000 });
+    const group = page.locator(".drawer .kv-group").filter({
+      has: page.locator("h4", { hasText: /view of the pool/i }),
+    });
+    const text = await group.innerText();
+    // An unreachable dev machine legitimately sees nothing; keep looking.
+    if (Number((text.match(/Workers seen\D*(\d+)/) ?? [])[1] ?? 0) > 0) poolText = text;
+  }
+  const flat = (poolText ?? "").replace(/\s+/g, " ").trim();
+  check("a reachable dev machine reports its derated pool view", poolText !== null, flat);
+  check("derated slot totals render", /Derated slots\D*\d+ used \/ \d+ total/.test(poolText ?? ""), flat);
+  // Zero-slot workers are the local-only smoking gun; "none" is the healthy text.
+  check("zero-slot workers are accounted for", /Zero-slot workers\s*(none|\d+ of \d+)/.test(flat), flat);
   await page.keyboard.press("Escape");
   await page.waitForTimeout(300);
 }

@@ -124,7 +124,10 @@ const d = (over = {}) => ({
             slots_total: 10, slots_available: 10 },
   build_stats: { total: 10, remote: 10, local: 0, success: 10, failure: 0, avg_duration_ms: 100 },
   saved_time_ms: 0, active_builds: 0, queued_builds: 0, recent_builds: [],
-  issues: [], alerts: [], remediation_hints: [], workers: [], ...over,
+  issues: [], alerts: [], remediation_hints: [],
+  // The wire shape the collector actually emits: `[used, total]` pairs, not a
+  // duplicate worker record per dispatcher. See classifyDispatcher().
+  collection_errors: [], config_degraded: false, worker_slots: [], ...over,
 });
 
 const devCases = [
@@ -141,6 +144,45 @@ for (const [name, dev] of devCases) {
   const a = derive.classifyDispatcher(dev);
   const b = classifyDev(dev);
   chk(`dev: ${name}`, a.level === b.level, `derive=${a.level} llm=${b.level}`);
+}
+
+// ------------------------------------------------- per-dispatcher slot view
+//
+// The collector stopped duplicating a full worker record per dispatcher (it was
+// 54.6% of the snapshot payload and every field was already in the merged
+// `workers[]`). What survives is the one genuinely per-dispatcher fact — this
+// machine's derated `[used, total]` reading — which classifyDispatcher expands
+// back into `workers` for the dev-machine drawer. The drawer sums those and
+// counts the zero-slot entries to answer "is this box about to go local-only?",
+// so an expansion that dropped or reordered a pair would silently change that
+// verdict.
+{
+  const pairs = [[0, 16], [4, 8], [null, null], [2, 0]];
+  const dv = derive.classifyDispatcher(d({ worker_slots: pairs }));
+  chk("slot pairs expand one-for-one", dv.workers.length === pairs.length, `${dv.workers.length} of ${pairs.length}`);
+  chk("slot pairs keep their order and values",
+    JSON.stringify(dv.workers) ===
+      JSON.stringify(pairs.map(([used, total]) => ({ used_slots: used, total_slots: total }))),
+    JSON.stringify(dv.workers));
+  // The drawer's three numbers, computed exactly as DevMachineDrawer does.
+  const ws = dv.workers;
+  chk("derated totals survive the round trip",
+    ws.reduce((n, x) => n + (x.total_slots ?? 0), 0) === 24 &&
+    ws.reduce((n, x) => n + (x.used_slots ?? 0), 0) === 6,
+    `total=${ws.reduce((n, x) => n + (x.total_slots ?? 0), 0)} used=${ws.reduce((n, x) => n + (x.used_slots ?? 0), 0)}`);
+  // A worker derated to 0 slots is invisible to this machine — the exact
+  // condition the drawer exists to surface, and the one `|| null` instead of
+  // `?? null` in the expander would erase.
+  chk("zero-slot workers stay countable",
+    ws.filter((x) => (x.total_slots ?? 0) === 0).length === 2,
+    `${ws.filter((x) => (x.total_slots ?? 0) === 0).length} of 2`);
+  chk("a dispatcher with no slot view yields no workers",
+    derive.classifyDispatcher(d()).workers.length === 0);
+  // An older snapshot cached in a browser tab has no `worker_slots` at all.
+  const legacy = d();
+  delete legacy.worker_slots;
+  chk("a pre-projection snapshot renders instead of throwing",
+    derive.classifyDispatcher(legacy).workers.length === 0);
 }
 
 // The stale-clock regression: classifyAll must ignore the caller's clock.

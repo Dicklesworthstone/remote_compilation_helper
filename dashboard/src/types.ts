@@ -69,6 +69,23 @@ export interface RemediationHint {
   reason_code: string | null;
 }
 
+/**
+ * One dev machine's OWN derated reading of one worker's slots: `[used, total]`.
+ *
+ * Positional, not named. There is one of these per (dispatcher, worker) pair —
+ * 142 of them on a 10-machine fleet — and at that repetition the key names cost
+ * several times what the numbers do. This replaced a full duplicate `Worker`
+ * record per dispatcher, which was 54.6% of the entire snapshot payload and
+ * carried nothing the merged `workers[]` did not already hold.
+ */
+export type WorkerSlotPair = [used: number | null, total: number | null];
+
+/** A `WorkerSlotPair` expanded by `classifyDispatcher()` for the dev-machine drawer. */
+export interface DispatcherWorkerSlots {
+  used_slots: number | null;
+  total_slots: number | null;
+}
+
 export interface BuildStats {
   total: number;
   remote: number;
@@ -82,6 +99,18 @@ export interface BuildStats {
 export interface Dispatcher {
   id: string;
   reachable: boolean;
+  /**
+   * Why collection failed, when it did — one entry per failing rch subcommand.
+   * Empty on a clean run. Kept rather than collapsed into `reachable: false` so
+   * an ssh auth failure, a missing binary and a dead daemon stay distinguishable.
+   */
+  collection_errors: string[];
+  /**
+   * True when `rch workers list` failed, so `tags` and `priority` are MISSING
+   * rather than genuinely unset. Without it an untagged fleet renders as though
+   * that were the real config.
+   */
+  config_degraded: boolean;
   posture: string | null;
   posture_description: string | null;
   daemon: {
@@ -101,7 +130,19 @@ export interface Dispatcher {
   issues: unknown[];
   alerts: unknown[];
   remediation_hints: RemediationHint[];
-  workers: Worker[];
+  /**
+   * This machine's own derated slot reading for every worker it can see.
+   *
+   * NOT a worker inventory — use the top-level `Snapshot.workers` for that, or
+   * `Worker.slots_by_dispatcher` to go the other way and ask which dev machines
+   * can see a given worker. This exists only because rchd derates each worker
+   * independently on every box, so "how much of the pool can THIS machine
+   * actually reach" is a per-dispatcher fact.
+   *
+   * Read it through `DispatcherView.workers`, which `classifyDispatcher()`
+   * expands from these pairs.
+   */
+  worker_slots: WorkerSlotPair[];
 }
 
 export interface HistoryPoint {
@@ -165,4 +206,9 @@ export interface DispatcherView extends Dispatcher {
   remoteBasis: "recent" | "lifetime" | null;
   /** How many builds `remotePct` was computed from. */
   remoteCounted: number;
+  /**
+   * `worker_slots` expanded into records, one per worker this machine can see.
+   * Slot readings only — every other worker fact lives on `Snapshot.workers`.
+   */
+  workers: DispatcherWorkerSlots[];
 }

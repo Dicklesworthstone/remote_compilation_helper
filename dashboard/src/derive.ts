@@ -1,5 +1,6 @@
 import type {
-  Dispatcher, DispatcherView, DevLevel, HealthLevel, Snapshot, Worker, WorkerView,
+  Dispatcher, DispatcherView, DispatcherWorkerSlots, DevLevel, HealthLevel,
+  Snapshot, Worker, WorkerSlotPair, WorkerView,
 } from "./types";
 
 /** Snapshots older than this are called out — stale data is worse than none. */
@@ -148,6 +149,30 @@ export function classifyAll(snap: Snapshot, _nowMs?: number): WorkerView[] {
 }
 
 /**
+ * Expand the wire form of a dev machine's derated slot view.
+ *
+ * The collector emits `[used, total]` pairs rather than a worker record per
+ * dispatcher: at 142 pairs on a 10-machine fleet the duplicated records were
+ * 54.6% of the whole snapshot and held nothing the merged `Snapshot.workers`
+ * did not already carry. Only the slot readings are per-dispatcher, and the
+ * dev-machine drawer only ever sums them and counts the zeroes.
+ *
+ * Tolerant of a missing or ragged array on purpose: a browser tab can be
+ * holding a snapshot written by an older collector, and a dev machine with no
+ * pool view must render as "0 workers seen", never crash the drawer.
+ */
+function expandWorkerSlots(pairs: WorkerSlotPair[] | undefined): DispatcherWorkerSlots[] {
+  if (!Array.isArray(pairs)) return [];
+  return pairs.map((p) => ({
+    // `?? null` and not `|| null`: 0 used slots and 0 total slots are the two
+    // most interesting readings here — a worker derated to 0 is invisible to
+    // this machine, which is the whole reason the drawer shows this.
+    used_slots: Array.isArray(p) ? (p[0] ?? null) : null,
+    total_slots: Array.isArray(p) ? (p[1] ?? null) : null,
+  }));
+}
+
+/**
  * Classify a DEV MACHINE by the question that actually matters: are its builds
  * going to the worker pool, or is it quietly compiling locally?
  *
@@ -201,7 +226,12 @@ export function classifyDispatcher(d: Dispatcher): DispatcherView {
     levelReason = `${remotePct!.toFixed(0)}% of the ${window} went to the pool`;
   }
 
-  return { ...d, level, levelReason, remotePct, remoteBasis: basis, remoteCounted: recentCounted || lifetimeCounted };
+  return {
+    ...d,
+    workers: expandWorkerSlots(d.worker_slots),
+    level, levelReason, remotePct, remoteBasis: basis,
+    remoteCounted: recentCounted || lifetimeCounted,
+  };
 }
 
 /**
