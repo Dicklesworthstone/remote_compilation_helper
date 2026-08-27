@@ -19,7 +19,7 @@
     "test:snapshot": "node tests/snapshot.mjs",
     "test": "node tests/snapshot.mjs && node tests/parity.mjs && npm run build:api --silent && node tests/endpoint.mjs",
     "test:visual": "node tests/visual-audit.mjs",
-    "test:hover": "node tests/hover-check.mjs",
+    "test:prod": "node tests/prod-check.mjs",
     "probe": "node tests/render-probe.mjs",
     "perf": "node tests/perf.mjs",
     "scaling": "node tools/scaling.mjs"
