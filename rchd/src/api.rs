@@ -2331,7 +2331,12 @@ async fn handle_select_worker_with_wrapper(
                         command.clone(),
                         hook_pid,
                         local_wrapper_id.clone(),
-                        request.estimated_cores,
+                        // MUST be the clamped count we actually reserved:
+                        // `handle_release_worker` releases `state.slots`, so
+                        // recording the raw estimate would over-release on any
+                        // undersized worker and free capacity held by something
+                        // else on that box.
+                        reserve_slots,
                         rch_common::BuildLocation::Remote,
                     ) else {
                         debug!(
@@ -2356,7 +2361,7 @@ async fn handle_select_worker_with_wrapper(
                             "worker_id": id.as_str(),
                             "command": command,
                             "local_wrapper_id": local_wrapper_id.clone(),
-                            "slots": request.estimated_cores,
+                            "slots": reserve_slots,
                         }),
                     );
                     Some(state.id)

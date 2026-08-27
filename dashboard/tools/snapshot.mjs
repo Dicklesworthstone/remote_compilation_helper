@@ -151,6 +151,46 @@ function num(v) {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+/** Higher = more alarming, so a max() merge keeps the worst observation. */
+function statusRank(s) {
+  switch ((s ?? "").toLowerCase()) {
+    case "healthy": return 0;
+    case "busy": return 1;
+    case "draining": return 2;
+    case "degraded": return 3;
+    case "disabled": return 4;
+    case "unreachable":
+    case "down": return 5;
+    default: return s ? 1 : -1; // unknown label beats "no reading at all"
+  }
+}
+
+function circuitRank(c) {
+  switch ((c ?? "").toLowerCase()) {
+    case "closed": return 0;
+    case "half_open": return 1;
+    case "open": return 2;
+    default: return -1;
+  }
+}
+
+const PRESSURE_RANK = { healthy: 0, warning: 1, critical: 2 };
+
+/**
+ * Prefer the pressure reading that is (a) more alarming, or (b) equally
+ * alarming but fresher. A stale "healthy" must never override a live "critical".
+ */
+function pressureIsBetter(next, cur) {
+  if (!next) return false;
+  if (!cur) return true;
+  const rn = PRESSURE_RANK[(next.state ?? "").toLowerCase()] ?? -1;
+  const rc = PRESSURE_RANK[(cur.state ?? "").toLowerCase()] ?? -1;
+  if (rn !== rc) return rn > rc;
+  const an = next.telemetry_age_secs ?? Number.POSITIVE_INFINITY;
+  const ac = cur.telemetry_age_secs ?? Number.POSITIVE_INFINITY;
+  return an < ac;
+}
+
 async function collectDispatcher(host) {
   // `rch status` carries runtime state but NOT the static config fields
   // (tags, priority, enabled) — those only exist in `workers list`.
@@ -338,14 +378,35 @@ async function main() {
       prev.slots_by_dispatcher[d.id] = { used: w.used_slots, total: w.total_slots };
       if ((w.total_slots ?? 0) > (prev.total_slots ?? 0)) prev.total_slots = w.total_slots;
       if ((w.used_slots ?? 0) > (prev.used_slots ?? 0)) prev.used_slots = w.used_slots;
-      for (const k of ["speed", "latency_ms", "last_seen_unix", "status", "circuit_state", "last_error", "priority"]) {
+
+      // WORST-WINS for anything that signals trouble. Dev machines observe the
+      // pool independently and can disagree; taking whichever answered first
+      // would let a benign reading mask an alarming one and hide the exact
+      // thing this dashboard exists to surface.
+      if (statusRank(w.status) > statusRank(prev.status)) prev.status = w.status;
+      if (circuitRank(w.circuit_state) > circuitRank(prev.circuit_state)) {
+        prev.circuit_state = w.circuit_state;
+      }
+      if ((w.consecutive_failures ?? 0) > (prev.consecutive_failures ?? 0)) {
+        prev.consecutive_failures = w.consecutive_failures;
+      }
+      // Seen by ANY dispatcher recently means it is not stale, so keep the most
+      // recent sighting rather than the first one reported.
+      if ((w.last_seen_unix ?? 0) > (prev.last_seen_unix ?? 0)) prev.last_seen_unix = w.last_seen_unix;
+
+      for (const k of ["speed", "latency_ms", "last_error", "priority"]) {
         if (prev[k] == null && w[k] != null) prev[k] = w[k];
       }
       if ((prev.tags?.length ?? 0) === 0 && w.tags?.length) prev.tags = w.tags;
       // A worker disabled anywhere is worth surfacing, so disabled wins.
       if (w.enabled === false) prev.enabled = false;
       for (const k of Object.keys(w.caps)) if (prev.caps[k] == null && w.caps[k] != null) prev.caps[k] = w.caps[k];
-      for (const k of Object.keys(w.pressure)) if (prev.pressure[k] == null && w.pressure[k] != null) prev.pressure[k] = w.pressure[k];
+
+      // Take the pressure block WHOLE from the freshest observer. Merging it
+      // field by field could pair disk_free_gb from one dispatcher with
+      // disk_total_gb from another and compute a nonsense percentage.
+      if (pressureIsBetter(w.pressure, prev.pressure)) prev.pressure = w.pressure;
+
       if (!prev.failure_history.length && w.failure_history.length) prev.failure_history = w.failure_history;
     }
   }

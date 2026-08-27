@@ -11,11 +11,17 @@
  *   npm run build
  *   python3 -m http.server 4174 --directory dist &
  *   RCH_DASH_PASSPHRASE='...' node tests/e2e.mjs
+ *
+ * Set RCH_DASH_E2E_PORT to use a different port. Worth doing whenever anything
+ * else on the box might already be serving 4174: a second server silently loses
+ * the bind and the FIRST one answers, so the suite would happily validate a
+ * stale bundle it did not build and report a pass (or a mystery timeout).
  */
 import { chromium } from "playwright";
 
 const BASE = process.env.RCH_DASH_BASE ?? "/remote_compilation_helper/";
-const URL = `http://127.0.0.1:4174${BASE}`;
+const PORT = process.env.RCH_DASH_E2E_PORT ?? "4174";
+const URL = `http://127.0.0.1:${PORT}${BASE}`;
 const PASS = process.env.RCH_DASH_PASSPHRASE;
 const browser = await chromium.launch();
 const page = await browser.newPage();

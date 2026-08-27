@@ -127,6 +127,14 @@ export function buildLlmView(snap, opts = {}) {
   }
   problems.sort((a, b) => SEVERITY[a.severity] - SEVERITY[b.severity] || a.target.localeCompare(b.target));
 
+  // Bound the list so a large fleet cannot blow an agent's context, but NEVER
+  // drop rows silently — a truncated problem list that looks complete is how a
+  // monitoring tool lies. Severity-sorted, so the cut only ever loses the least
+  // urgent rows, and the count of what was cut is reported.
+  const PROBLEM_CAP = 40;
+  const problemsOmitted = Math.max(0, problems.length - PROBLEM_CAP);
+  const shownProblems = problemsOmitted > 0 ? problems.slice(0, PROBLEM_CAP) : problems;
+
   const out = {
     schema: "rch.fleet.llm.v1",
     label: snap.label,
@@ -153,7 +161,9 @@ export function buildLlmView(snap, opts = {}) {
       offload_pct: buildsCounted > 0 ? r1(((t.builds_remote ?? 0) / buildsCounted) * 100) : null,
       active_builds: t.active_builds ?? 0,
     },
-    problems,
+    problems: shownProblems,
+    problems_total: problems.length,
+    problems_omitted: problemsOmitted,
     dev_machines: devs.map((d) => ({
       id: d.id,
       level: d.level,
