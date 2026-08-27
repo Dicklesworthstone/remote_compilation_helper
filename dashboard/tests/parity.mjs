@@ -280,6 +280,148 @@ for (const [name, dev] of devCases) {
     ov.remoteBasis === "lifetime" && ov.level === "offloading", `${ov.remoteBasis}/${ov.level}`);
 }
 
+// ------------------------------------------------------ snapshot string table
+//
+// Most of the strings left in those tuples repeat across dispatchers — every
+// box reports the same remediation advice about the same shared worker, so 113
+// hints carry 30 distinct messages and 20 distinct suggested actions. The
+// collector folds them into ONE snapshot-level `strings[]` and writes an index
+// in their place (-24,415B, -31.7% of the payload).
+//
+// The expansion now lives in two places that must agree exactly — `internedStr`
+// in src/derive.ts and its mirror in tools/llm-view.mjs — and an index resolved
+// against the wrong table, or a `null` mistaken for entry 0, is invisible to
+// the type checker and shows up only as the wrong text on a live fleet.
+{
+  const strings = ["cargo build -p rch", "disk 96% full", "run sbh reclaim", "hz4", "rch"];
+  //                     0                      1                 2            3     4
+
+  // Interned form and literal form of the SAME data. The interned tuples put an
+  // index in slots 0/1/3 of a build and 0/2/3/4 of a hint; `location` (2) and
+  // `severity` (1) stay literal because they are never interned.
+  const internedBuilds = [
+    [4, 0, "Remote", 3, 12345, 0, "2026-08-26T11:58:00.000Z"],
+    // The null/empty row. `null` must stay null and `""` must stay "": neither
+    // may be read as `strings[0]`, which is what a `|| `-style fallback or a
+    // truthiness test would do.
+    [null, "", "Local", null, 0, 0, "2026-08-26T11:59:00.000Z"],
+  ];
+  const literalBuilds = [
+    ["rch", "cargo build -p rch", "Remote", "hz4", 12345, 0, "2026-08-26T11:58:00.000Z"],
+    [null, "", "Local", null, 0, 0, "2026-08-26T11:59:00.000Z"],
+  ];
+  const internedHints = [
+    [3, "critical", 1, 2, 1],
+    [null, "warn", 1, null, ""],
+  ];
+  const literalHints = [
+    ["hz4", "critical", "disk 96% full", "run sbh reclaim", "disk 96% full"],
+    [null, "warn", "disk 96% full", null, ""],
+  ];
+
+  const iv = derive.classifyDispatcher(d({ builds: internedBuilds, hints: internedHints }), strings);
+  const lv = derive.classifyDispatcher(d({ builds: literalBuilds, hints: literalHints }));
+
+  chk("interned builds expand to the literal records",
+    JSON.stringify(iv.recent_builds) === JSON.stringify(lv.recent_builds),
+    JSON.stringify(iv.recent_builds));
+  chk("interned hints expand to the literal records",
+    JSON.stringify(iv.remediation_hints) === JSON.stringify(lv.remediation_hints),
+    JSON.stringify(iv.remediation_hints));
+  chk("build interning agrees between derive and llm-view",
+    JSON.stringify(iv.recent_builds) === JSON.stringify(expandBuilds(internedBuilds, strings)));
+  chk("hint interning agrees between derive and llm-view",
+    JSON.stringify(iv.remediation_hints) === JSON.stringify(expandHints(internedHints, strings)));
+
+  // The trap this pass was warned about: a missing value must not collapse into
+  // table entry 0. Entry 0 here is "cargo build -p rch", so a `null` project
+  // read as an index would render every unnamed build as that command.
+  chk("a null interned slot stays null, never entry 0",
+    iv.recent_builds[1].project === null && iv.recent_builds[1].worker_id === null &&
+    iv.remediation_hints[1].worker_id === null && iv.remediation_hints[1].suggested_action === null,
+    JSON.stringify([iv.recent_builds[1].project, iv.remediation_hints[1].suggested_action]));
+  chk("an empty interned slot stays the empty string",
+    iv.recent_builds[1].command === "" && iv.remediation_hints[1].reason_code === "",
+    JSON.stringify([iv.recent_builds[1].command, iv.remediation_hints[1].reason_code]));
+  // One index may be referenced from several slots and several dispatchers —
+  // that IS the saving — so resolution must be by value, not consumed.
+  chk("one table entry serves several slots",
+    iv.remediation_hints[0].message === "disk 96% full" &&
+    iv.remediation_hints[0].reason_code === "disk 96% full" &&
+    iv.remediation_hints[1].message === "disk 96% full");
+
+  // Version skew, both directions.
+  //
+  // NEW code + OLD snapshot: no table at all, literal strings in every slot.
+  // `internedStr` dispatches on the wire type, so these pass straight through —
+  // unlike pass 3's key rename, this needs no fallback and loses nothing.
+  const noTable = derive.classifyDispatcher(d({ builds: literalBuilds, hints: literalHints }), undefined);
+  chk("a pre-table snapshot expands unchanged with no table",
+    JSON.stringify(noTable.recent_builds) === JSON.stringify(lv.recent_builds) &&
+    JSON.stringify(noTable.remediation_hints) === JSON.stringify(lv.remediation_hints));
+  // ...and interned tuples with the table MISSING must degrade to empty values,
+  // never to `undefined` rendered as the string "undefined".
+  const lost = derive.classifyDispatcher(d({ builds: internedBuilds, hints: internedHints }));
+  chk("interned tuples with no table degrade to null, not \"undefined\"",
+    lost.recent_builds[0].project === null && lost.remediation_hints[0].message === null,
+    JSON.stringify([lost.recent_builds[0].project, lost.remediation_hints[0].message]));
+  // A truncated or corrupt table must not throw or leak `undefined` either.
+  const short = derive.classifyDispatcher(d({ builds: internedBuilds, hints: internedHints }), ["only-one"]);
+  chk("an out-of-range index yields null rather than undefined",
+    short.recent_builds[0].project === null && short.recent_builds[0].command === "only-one",
+    JSON.stringify([short.recent_builds[0].project, short.recent_builds[0].command]));
+  chk("out-of-range agrees between derive and llm-view",
+    JSON.stringify(short.recent_builds) === JSON.stringify(expandBuilds(internedBuilds, ["only-one"])));
+
+  // `App.tsx` calls `snap.dispatchers.map(classifyDispatcher)`, so the second
+  // argument it actually receives is the element INDEX. A number must never be
+  // mistaken for a table, or every interned slot in the browser would resolve
+  // to null.
+  const mapped = [d({ builds: internedBuilds, hints: internedHints })].map(derive.classifyDispatcher);
+  chk("a .map() index is not mistaken for a string table",
+    JSON.stringify(mapped[0].recent_builds) === JSON.stringify(lost.recent_builds));
+
+  // The browser never resolves indices in `classifyDispatcher` at all:
+  // src/crypto.ts calls `rehydrateStrings()` on the decrypted snapshot, because
+  // the table belongs to the snapshot and `.map(classifyDispatcher)` has no
+  // argument to carry it. The two paths must produce identical records.
+  const wire = {
+    schema: "x", label: "l", generated_at: new Date(SNAP_MS).toISOString(),
+    totals: {}, workers: [], history: [], strings,
+    dispatchers: [d({ builds: JSON.parse(JSON.stringify(internedBuilds)), hints: JSON.parse(JSON.stringify(internedHints)) })],
+  };
+  const rehydrated = derive.rehydrateStrings(wire);
+  const rv = derive.classifyDispatcher(rehydrated.dispatchers[0]);
+  chk("rehydrateStrings matches per-call table resolution",
+    JSON.stringify(rv.recent_builds) === JSON.stringify(iv.recent_builds) &&
+    JSON.stringify(rv.remediation_hints) === JSON.stringify(iv.remediation_hints),
+    JSON.stringify(rv.recent_builds));
+  // Idempotent: the tuples now hold strings, and a second pass must leave them
+  // alone rather than re-reading a string as an index.
+  const twice = derive.classifyDispatcher(derive.rehydrateStrings(rehydrated).dispatchers[0]);
+  chk("rehydrateStrings is idempotent",
+    JSON.stringify(twice.recent_builds) === JSON.stringify(iv.recent_builds) &&
+    JSON.stringify(twice.remediation_hints) === JSON.stringify(iv.remediation_hints));
+  // And it must leave the never-interned slots exactly as they were: `location`
+  // drives the offload verdict through `.toLowerCase()`, and `severity` picks
+  // the alarm colour.
+  chk("rehydrateStrings leaves location and severity untouched",
+    rehydrated.dispatchers[0].builds[0][2] === "Remote" &&
+    rehydrated.dispatchers[0].hints[0][1] === "critical");
+  chk("a snapshot with no table survives rehydration",
+    derive.rehydrateStrings({ dispatchers: [d()] }) != null &&
+    derive.rehydrateStrings({}) != null);
+
+  // The verdict itself must be unaffected: `location` is not interned, so the
+  // offload share is computed from the same values either way.
+  chk("the offload verdict is identical with and without interning",
+    iv.level === lv.level && iv.levelReason === lv.levelReason && iv.remotePct === lv.remotePct,
+    `${iv.level}/${iv.levelReason} vs ${lv.level}/${lv.levelReason}`);
+  chk("classifyDev reads location off the raw tuple regardless of interning",
+    classifyDev(d({ builds: internedBuilds })).remotePct ===
+      classifyDev(d({ builds: literalBuilds })).remotePct);
+}
+
 // The stale-clock regression: classifyAll must ignore the caller's clock.
 const snap = {
   schema: "x", label: "l", generated_at: new Date(SNAP_MS).toISOString(),

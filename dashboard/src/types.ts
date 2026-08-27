@@ -63,6 +63,20 @@ export interface RecentBuild {
 }
 
 /**
+ * One slot of a wire tuple whose string may have been INTERNED.
+ *
+ *   number  index into `Snapshot.strings`
+ *   string  a literal the collector chose not to intern (`""` stays `""`)
+ *   null    genuinely absent
+ *
+ * Only NON-EMPTY strings are ever interned, so neither `null` nor `""` can be
+ * confused with table entry 0. Resolved by `internedStr()` in src/derive.ts and
+ * its mirror in tools/llm-view.mjs; a snapshot written before the table existed
+ * carries plain strings in these slots and passes through untouched.
+ */
+export type InternedString = string | number | null;
+
+/**
  * The WIRE form of a `RecentBuild`.
  *
  * Positional, not named. All seven values are consumed — the dev-machine drawer
@@ -71,12 +85,20 @@ export interface RecentBuild {
  * The key names can: 121 builds on a 10-machine fleet repeated the same 84
  * characters of `"project":"command":…` 121 times, 10.2KB of a 92.3KB payload.
  * Expanded by `expandBuilds()` in src/derive.ts.
+ *
+ * `project`, `command` and `worker_id` are additionally INTERNED into
+ * `Snapshot.strings` — 137 builds carry only 34 distinct projects and 9 distinct
+ * workers. `location` deliberately is NOT: it is the one slot read positionally
+ * off the raw tuple (`classifyDev()` in tools/llm-view.mjs) and four consumers
+ * call `.toLowerCase()` on it, so an index there is a TypeError rather than a
+ * wrong pixel. `completed_at` is not interned either — 137 distinct values in
+ * 137 slots means a table that costs more than the strings it replaces.
  */
 export type BuildTuple = [
-  project: string | null,
-  command: string | null,
+  project: InternedString,
+  command: InternedString,
   location: string | null,
-  worker_id: string | null,
+  worker_id: InternedString,
   duration_ms: number | null,
   exit_code: number | null,
   completed_at: string | null,
@@ -94,13 +116,23 @@ export interface RemediationHint {
 /**
  * The WIRE form of a `RemediationHint` — same reasoning as `BuildTuple`
  * (66 characters of key names × 99 hints = 6.5KB). Expanded by `expandHints()`.
+ *
+ * This is where interning pays best: 113 hints on a 10-machine fleet carry only
+ * 30 distinct messages and 20 distinct suggested actions, because every box
+ * reports the same advice about the same shared worker. The suggested actions
+ * alone were 14.2KB inline and 2.5KB as a table.
+ *
+ * `severity` is deliberately NOT interned. It is the only candidate read as an
+ * alarm LEVEL (`h.severity === "critical"` picks the pill colour), so an index
+ * would silently downgrade a critical hint to a warn pill in any bundle that
+ * predates the table. ~940B is worth paying not to under-report an alarm.
  */
 export type HintTuple = [
-  worker_id: string | null,
+  worker_id: InternedString,
   severity: string | null,
-  message: string | null,
-  suggested_action: string | null,
-  reason_code: string | null,
+  message: InternedString,
+  suggested_action: InternedString,
+  reason_code: InternedString,
 ];
 
 /**
@@ -221,6 +253,20 @@ export interface Snapshot {
   };
   dispatchers: Dispatcher[];
   workers: Worker[];
+  /**
+   * Snapshot-level string table for the interned build/hint tuple slots.
+   *
+   * ONE table for the whole snapshot, not one per array: the duplication is
+   * almost entirely across dispatchers (the same hint text for the same shared
+   * worker on every box), so per-dispatcher tables save only 1,810B against
+   * 24,415B for a global one. Ordered hottest-first so the most repeated
+   * strings get the shortest indices.
+   *
+   * Optional: a snapshot written before the table existed simply has no
+   * `strings`, and every interned slot in it already holds its literal string,
+   * so the expanders are value-identical either way.
+   */
+  strings?: string[];
   history: HistoryPoint[];
 }
 

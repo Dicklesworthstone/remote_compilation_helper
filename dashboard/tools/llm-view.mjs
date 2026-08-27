@@ -102,7 +102,11 @@ export function classifyDev(d) {
   // Counted straight off the wire tuples. `location` is the only field this
   // verdict needs, so expanding all seven into objects first would allocate a
   // record per build (121 on a 10-machine fleet) purely to read index 2.
-  // Value-identical to `expandBuilds(d.builds).filter(b => b.location …)`.
+  // Value-identical to `expandBuilds(d.builds).filter(b => b.location …)` — and
+  // it stays value-identical only because `location` is never interned into the
+  // string table, which is the main reason it is excluded. This function has no
+  // access to `snap.strings`, so an interned `location` would read as a number
+  // here and count every build as local.
   const recent = Array.isArray(d.builds) ? d.builds : [];
   const recentCounted = recent.length;
   const recentRemote = recent.filter(
@@ -138,22 +142,47 @@ export function classifyDev(d) {
  *
  * The collector ships recent builds and remediation hints positionally — every
  * value in them is consumed, but the repeated key names were 16.7KB of a 92.3KB
- * payload. These indices ARE the schema; if you reorder a tuple in
- * `tools/snapshot.mjs`, change it here and in `expandBuilds()`/`expandHints()`
- * in src/derive.ts together.
+ * payload. Most of the surviving strings are then interned into
+ * `snap.strings[]`, so a slot may hold an index instead of the value; see
+ * `internedStr()` below. These indices ARE the schema; if you reorder a tuple
+ * in `tools/snapshot.mjs`, change it here and in `expandBuilds()`/
+ * `expandHints()` in src/derive.ts together.
  */
 const B_PROJECT = 0, B_COMMAND = 1, B_LOCATION = 2, B_WORKER = 3,
       B_DURATION = 4, B_EXIT = 5, B_COMPLETED = 6;
 const H_WORKER = 0, H_SEVERITY = 1, H_MESSAGE = 2, H_ACTION = 3, H_REASON = 4;
 
+/**
+ * Mirror of `internedStr()` in src/derive.ts — keep in sync.
+ *
+ * The collector folds the repeated build/hint strings into one snapshot-level
+ * `strings[]` table and writes an index in their place: 137 builds carry 34
+ * distinct projects, and 113 hints carry 30 distinct messages and 20 distinct
+ * suggested actions, because every dispatcher reports the same advice about the
+ * same shared worker.
+ *
+ * A `number` is an index; anything else is already the value. That dispatch is
+ * what makes an old snapshot (no table, literal strings in these slots) expand
+ * to exactly the same records, with no key rename and nothing lost.
+ *
+ * `B_LOCATION` and `H_SEVERITY` are NOT interned and must never be: `location`
+ * is read straight off the raw tuple by `classifyDev()` below and
+ * `.toLowerCase()`d by four consumers, and `severity` is compared against
+ * "critical" to pick an alarm colour. See tools/snapshot.mjs.
+ */
+function internedStr(v, strings) {
+  if (typeof v === "number") return (Array.isArray(strings) ? strings[v] : undefined) ?? null;
+  return v ?? null;
+}
+
 /** Mirror of `expandBuilds()` in src/derive.ts — keep in sync. */
-export function expandBuilds(rows) {
+export function expandBuilds(rows, strings) {
   if (!Array.isArray(rows)) return [];
   return rows.map((b) => ({
-    project: Array.isArray(b) ? (b[B_PROJECT] ?? null) : null,
-    command: Array.isArray(b) ? (b[B_COMMAND] ?? null) : null,
+    project: Array.isArray(b) ? internedStr(b[B_PROJECT], strings) : null,
+    command: Array.isArray(b) ? internedStr(b[B_COMMAND], strings) : null,
     location: Array.isArray(b) ? (b[B_LOCATION] ?? null) : null,
-    worker_id: Array.isArray(b) ? (b[B_WORKER] ?? null) : null,
+    worker_id: Array.isArray(b) ? internedStr(b[B_WORKER], strings) : null,
     duration_ms: Array.isArray(b) ? (b[B_DURATION] ?? null) : null,
     exit_code: Array.isArray(b) ? (b[B_EXIT] ?? null) : null,
     completed_at: Array.isArray(b) ? (b[B_COMPLETED] ?? null) : null,
@@ -161,14 +190,14 @@ export function expandBuilds(rows) {
 }
 
 /** Mirror of `expandHints()` in src/derive.ts — keep in sync. */
-export function expandHints(rows) {
+export function expandHints(rows, strings) {
   if (!Array.isArray(rows)) return [];
   return rows.map((h) => ({
-    worker_id: Array.isArray(h) ? (h[H_WORKER] ?? null) : null,
+    worker_id: Array.isArray(h) ? internedStr(h[H_WORKER], strings) : null,
     severity: Array.isArray(h) ? (h[H_SEVERITY] ?? null) : null,
-    message: Array.isArray(h) ? (h[H_MESSAGE] ?? null) : null,
-    suggested_action: Array.isArray(h) ? (h[H_ACTION] ?? null) : null,
-    reason_code: Array.isArray(h) ? (h[H_REASON] ?? null) : null,
+    message: Array.isArray(h) ? internedStr(h[H_MESSAGE], strings) : null,
+    suggested_action: Array.isArray(h) ? internedStr(h[H_ACTION], strings) : null,
+    reason_code: Array.isArray(h) ? internedStr(h[H_REASON], strings) : null,
   }));
 }
 
@@ -305,7 +334,7 @@ export function buildLlmView(snap, opts = {}) {
       id: d.id,
       reason: d.reason,
       posture_description: d.posture_description ?? "",
-      remediation_hints: expandHints(d.hints).map((h) => ({
+      remediation_hints: expandHints(d.hints, snap.strings).map((h) => ({
         worker: h.worker_id ?? "",
         severity: h.severity ?? "",
         message: h.message ?? "",
@@ -315,7 +344,7 @@ export function buildLlmView(snap, opts = {}) {
       // is context-budgeted and shows only the newest 10. Note that `classifyDev`
       // above still counts ALL of them — the offload verdict must be measured
       // over the whole window, not the slice an agent happens to be shown.
-      recent_builds: expandBuilds(d.builds).slice(-10).map((b) => ({
+      recent_builds: expandBuilds(d.builds, snap.strings).slice(-10).map((b) => ({
         project: b.project ?? "",
         location: b.location ?? "",
         worker: b.worker_id ?? "",

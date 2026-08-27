@@ -146,6 +146,22 @@ check("dev drawer shows this machine's pool view",
     check("every build row is labelled remote or local",
       pillTexts.length > 0 && pillTexts.every((t) => /^(remote|local)$/i.test(t.trim())),
       pillTexts.slice(0, 4).join(", "));
+    // `project`, `command` and `worker_id` are now INDICES into the snapshot's
+    // string table, resolved by rehydrateStrings() at the transport boundary in
+    // src/crypto.ts. When that resolution fails there is no error and no blank
+    // cell — the raw index renders, so the project column fills with small
+    // integers. That is invisible to every other check here, and to the type
+    // checker, so assert the rendered text is not a bare number.
+    const projTexts = (await page.locator(".drawer .build-row .build-proj").allInnerTexts())
+      .map((t) => t.trim()).filter((t) => t !== "" && t !== "—");
+    check("build project names resolve out of the string table",
+      projTexts.length > 0 && projTexts.some((t) => !/^\d+$/.test(t)),
+      projTexts.slice(0, 4).join(", "));
+    // `command` is only ever the row tooltip, so an unresolved index would
+    // never be visible on screen at all.
+    const cmdTitle = await page.locator(".drawer .build-row .build-proj").first().getAttribute("title");
+    check("build command tooltips resolve out of the string table",
+      cmdTitle == null || !/^\d+$/.test(cmdTitle.trim()), String(cmdTitle).slice(0, 60));
     const workerLink = page.locator(".drawer .build-row .link").first();
     if ((await workerLink.count()) > 0) {
       const linkedId = (await workerLink.innerText()).trim();
@@ -173,6 +189,7 @@ check("dev drawer shows this machine's pool view",
   const n = await pills.count();
   let hintText = null;
   let hintSeverity = null;
+  let hintAction = [];
   for (let i = 0; i < n && hintText === null; i++) {
     await page.keyboard.press("Escape");
     await page.waitForTimeout(150);
@@ -181,12 +198,22 @@ check("dev drawer shows this machine's pool view",
     if ((await page.locator(".drawer .hint").count()) > 0) {
       hintText = (await page.locator(".drawer .hint .hint-msg").first().innerText()).trim();
       hintSeverity = (await page.locator(".drawer .hint .hint-top .pill").first().innerText()).trim();
+      hintAction = (await page.locator(".drawer .hint .hint-action").allInnerTexts()).map((t) => t.trim());
     }
   }
   if (hintText === null) {
     check("no dev machine reported remediation hints (nothing to expand)", true, `checked ${n} dev machines`);
   } else {
     check("remediation hint messages survive the wire projection", hintText.length > 0, hintText.slice(0, 80));
+    // Hint messages and suggested actions are the string table's biggest win —
+    // 113 hints carry 30 distinct messages and 20 distinct actions, because
+    // every dispatcher repeats the same advice about the same shared worker. An
+    // index that fails to resolve renders as a small integer rather than as an
+    // error or a blank, which the length check above would happily accept.
+    check("hint messages resolve out of the string table", !/^\d+$/.test(hintText), hintText.slice(0, 80));
+    check("hint suggested actions resolve out of the string table",
+      hintAction.length === 0 || hintAction.some((t) => !/^→?\s*\d+$/.test(t)),
+      hintAction.slice(0, 2).join(" | ").slice(0, 100));
     // "info" is the fallback the drawer prints when `severity` is missing, so a
     // panel full of "info" is what a dropped field looks like.
     check("remediation hint severities survive the wire projection",

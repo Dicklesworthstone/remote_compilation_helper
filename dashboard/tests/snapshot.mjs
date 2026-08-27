@@ -17,8 +17,9 @@ import { join } from "node:path";
 import {
   statusRank, circuitRank, pressureIsBetter,
   isLocalDispatcher, dispatcherId,
-  encrypt, existingSalt,
+  encrypt, existingSalt, internSnapshotStrings,
 } from "../tools/snapshot.mjs";
+import { expandBuilds, expandHints } from "../tools/llm-view.mjs";
 
 let failures = 0;
 const chk = (name, cond, detail = "") => {
@@ -87,6 +88,99 @@ chk("aliases collapse to one dispatcher id",
   dispatcherId("local") === dispatcherId("localhost") && dispatcherId("localhost") === dispatcherId(short),
   dispatcherId("local"));
 chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
+
+// -------------------------------------------------------- string interning
+
+// The build/hint strings duplicate massively ACROSS dispatchers — every box
+// reports the same remediation advice about the same shared worker — so the
+// collector folds them into one snapshot-level table at serialization time
+// (-24,415B, -31.7% of a 77,095B payload on the live fleet). This is the
+// emitting half; `tests/parity.mjs` proves the two expanders undo it identically.
+{
+  const dev = (builds, hints) => ({ id: "d", builds, hints });
+  const B = (project, command, location, worker) =>
+    [project, command, location, worker, 100, 0, "2026-08-26T11:58:00.000Z"];
+  const H = (worker, severity, message, action, reason) => [worker, severity, message, action, reason];
+
+  const input = [
+    dev([B("rch", "cargo build", "Remote", "hz3")],
+        [H("hz3", "critical", "disk 96% full", "run sbh reclaim", "disk_low")]),
+    // The SAME advice about the SAME worker from a second dispatcher: this
+    // repetition is the entire reason the table exists.
+    dev([B("rch", "cargo build", "Remote", "hz3"), B("beads", "cargo test", "Local", null)],
+        [H("hz3", "critical", "disk 96% full", "run sbh reclaim", "disk_low"),
+         H(null, "warn", "telemetry stale", null, "")]),
+  ];
+  // Deep-copy: the collector must not mutate what it was handed, and the
+  // literal form below is the oracle we compare against.
+  const literal = JSON.parse(JSON.stringify(input));
+  const { strings, dispatchers } = internSnapshotStrings(JSON.parse(JSON.stringify(input)));
+
+  chk("the table holds every distinct non-empty interned string",
+    strings.length === new Set(["rch", "cargo build", "hz3", "disk 96% full", "run sbh reclaim",
+      "disk_low", "beads", "cargo test", "telemetry stale"]).size,
+    `${strings.length}: ${JSON.stringify(strings)}`);
+  chk("the table has no duplicates", new Set(strings).size === strings.length);
+  // Hottest first, so the most repeated strings get the shortest indices —
+  // worth 303B on the live fleet. "hz3" occurs 4 times (two builds, two hints),
+  // more than anything else.
+  chk("the table is ordered hottest-first", strings[0] === "hz3", JSON.stringify(strings.slice(0, 3)));
+  // Ties break on first appearance, so the same input always yields the same
+  // bytes — a table that reshuffled between runs would be a diff nightmare and
+  // would make the A/B below meaningless.
+  chk("interning is deterministic",
+    JSON.stringify(internSnapshotStrings(JSON.parse(JSON.stringify(input)))) ===
+      JSON.stringify(internSnapshotStrings(JSON.parse(JSON.stringify(input)))));
+
+  // `location` and `severity` must survive as literal strings. `location` is
+  // read positionally off the raw tuple by classifyDev() and `.toLowerCase()`d
+  // by four consumers, so an index there is a TypeError in any bundle that
+  // predates the table; `severity` is compared against "critical" to pick an
+  // alarm colour, and an index would silently downgrade it to a warn pill.
+  chk("location is never interned",
+    dispatchers[0].builds[0][2] === "Remote" && dispatchers[1].builds[1][2] === "Local",
+    JSON.stringify([dispatchers[0].builds[0][2], dispatchers[1].builds[1][2]]));
+  chk("severity is never interned",
+    dispatchers[0].hints[0][1] === "critical" && dispatchers[1].hints[1][1] === "warn");
+  // A timestamp never repeats, so a table entry for it costs more than the
+  // string it replaces.
+  chk("completed_at is never interned", typeof dispatchers[0].builds[0][6] === "string");
+  chk("numeric slots are untouched",
+    dispatchers[0].builds[0][4] === 100 && dispatchers[0].builds[0][5] === 0);
+
+  // The trap: a missing value must never become table entry 0.
+  chk("a null slot stays null",
+    dispatchers[1].builds[1][3] === null && dispatchers[1].hints[1][0] === null,
+    JSON.stringify([dispatchers[1].builds[1][3], dispatchers[1].hints[1][0]]));
+  chk("an empty string stays \"\", not an index",
+    dispatchers[1].hints[1][4] === "", JSON.stringify(dispatchers[1].hints[1][4]));
+  chk("every interned slot that had a value is now an index",
+    typeof dispatchers[0].builds[0][0] === "number" &&
+    typeof dispatchers[0].hints[0][2] === "number");
+
+  // The round trip, element-wise, through the same expanders the browser and
+  // the LLM view use.
+  let roundTripped = true;
+  for (let i = 0; i < literal.length; i++) {
+    if (JSON.stringify(expandBuilds(dispatchers[i].builds, strings)) !==
+        JSON.stringify(expandBuilds(literal[i].builds))) roundTripped = false;
+    if (JSON.stringify(expandHints(dispatchers[i].hints, strings)) !==
+        JSON.stringify(expandHints(literal[i].hints))) roundTripped = false;
+  }
+  chk("interning round-trips to the identical records", roundTripped,
+    JSON.stringify(expandHints(dispatchers[1].hints, strings)));
+
+  // It really is smaller — the whole point.
+  const before = JSON.stringify(literal).length;
+  const after = JSON.stringify({ dispatchers, strings }).length;
+  chk("interning shrinks the payload on repeated data", after < before, `${before}B -> ${after}B`);
+
+  // A dispatcher that failed collection has no builds and no hints at all.
+  const empty = internSnapshotStrings([{ id: "x", builds: [], hints: [] }, { id: "y" }]);
+  chk("a dispatcher with no builds or hints yields an empty table",
+    empty.strings.length === 0 && empty.dispatchers.length === 2 &&
+    empty.dispatchers[1].builds.length === 0 && empty.dispatchers[1].hints.length === 0);
+}
 
 // ------------------------------------------------- encryption + session reuse
 

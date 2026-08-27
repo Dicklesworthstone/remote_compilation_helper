@@ -18,6 +18,9 @@
  * satisfy `BufferSource`. Converting once here keeps the call sites clean.
  */
 
+import { rehydrateStrings } from "./derive";
+import type { Snapshot } from "./types";
+
 export interface Envelope {
   format: string;
   kdf: { name: string; hash: string; iterations: number; salt: string };
@@ -100,6 +103,44 @@ export async function deriveKey(passphrase: string, env: Envelope): Promise<Cryp
   );
 }
 
+/**
+ * Undo the snapshot's string-table transport encoding.
+ *
+ * The collector replaces the heavily repeated build/hint strings with indices
+ * into one snapshot-level table (24.4KB of a 77.1KB payload — the same hint
+ * text is reported by all ten dispatchers about the same shared worker). The
+ * table belongs to the SNAPSHOT, but the UI consumes it one dispatcher at a
+ * time via `snap.dispatchers.map(classifyDispatcher)`, which has no argument to
+ * carry it. Undoing the encoding here — the single point every snapshot enters
+ * the app through — means nothing downstream has to know the table exists.
+ *
+ * Costs one extra parse plus one stringify per FETCH (about 0.4ms for a
+ * 10-machine fleet, once per 5-minute refresh) against 24.4KB less to download,
+ * decrypt and authenticate.
+ *
+ * A payload with no table is returned as the untouched original string, so an
+ * older snapshot — or a hand-written one — costs a substring scan and nothing
+ * else. A payload this cannot parse is also returned untouched, so the caller's
+ * own `JSON.parse` reports the real error rather than one from in here.
+ */
+function expandSnapshotStrings(text: string): string {
+  // Fast path. Correctness never rests on this: a message containing the
+  // literal `"strings":[` just falls through to the parse, which decides.
+  if (!text.includes('"strings":[')) return text;
+  try {
+    const snap = JSON.parse(text) as Snapshot;
+    if (!Array.isArray(snap?.strings) || snap.strings.length === 0) return text;
+    // Drop the table once it has been spent. It is 12KB on a 10-machine fleet
+    // and every one of its entries is now sitting in the tuples, so carrying it
+    // into the string the caller re-parses would hand `JSON.parse` 12KB of dead
+    // weight on every refresh — measurably more than the rehydration costs.
+    const { strings: _spent, ...rest } = rehydrateStrings(snap);
+    return JSON.stringify(rest);
+  } catch {
+    return text;
+  }
+}
+
 /** Decrypt an envelope. Throws on a wrong key (GCM auth tag failure). */
 export async function decryptEnvelope(env: Envelope, key: CryptoKey): Promise<string> {
   const plain = await crypto.subtle.decrypt(
@@ -107,7 +148,7 @@ export async function decryptEnvelope(env: Envelope, key: CryptoKey): Promise<st
     key,
     b64ToBuf(env.ciphertext),
   );
-  return new TextDecoder().decode(plain);
+  return expandSnapshotStrings(new TextDecoder().decode(plain));
 }
 
 // ------------------------------------------------------------------- cookie

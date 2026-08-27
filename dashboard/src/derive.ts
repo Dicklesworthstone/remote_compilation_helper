@@ -1,6 +1,7 @@
 import type {
   BuildTuple, Dispatcher, DispatcherView, DispatcherWorkerSlots, DevLevel, HealthLevel,
-  HintTuple, RecentBuild, RemediationHint, Snapshot, Worker, WorkerSlotPair, WorkerView,
+  HintTuple, InternedString, RecentBuild, RemediationHint, Snapshot, Worker, WorkerSlotPair,
+  WorkerView,
 } from "./types";
 
 /** Snapshots older than this are called out — stale data is worse than none. */
@@ -173,6 +174,68 @@ function expandWorkerSlots(pairs: WorkerSlotPair[] | undefined): DispatcherWorke
 }
 
 /**
+ * Which tuple slots carry an interned string. THE schema of the string table —
+ * mirrored by `INTERNED_BUILD_SLOTS`/`INTERNED_HINT_SLOTS` in
+ * `tools/snapshot.mjs` and by the index constants in `tools/llm-view.mjs`.
+ * `builds[2]` (location) and `hints[1]` (severity) are absent on purpose; see
+ * the collector for why.
+ */
+const INTERNED_BUILD_SLOTS = [0, 1, 3] as const;
+const INTERNED_HINT_SLOTS = [0, 2, 3, 4] as const;
+
+/**
+ * Resolve one possibly-interned wire slot against the snapshot's string table.
+ *
+ * A `number` is an index; anything else is already the value. That dispatch is
+ * what makes the change safe in BOTH directions of version skew: a snapshot
+ * written before the table existed carries plain strings in these slots and is
+ * returned untouched, with no key rename and no data loss.
+ *
+ * `?? null` and never `|| null`, and an out-of-range index yields `null` rather
+ * than `undefined`, so a truncated table degrades to "no message" instead of
+ * rendering the string "undefined".
+ */
+function internedStr(v: InternedString | undefined, strings?: readonly string[]): string | null {
+  if (typeof v === "number") return strings?.[v] ?? null;
+  return v ?? null;
+}
+
+/**
+ * Put the interned strings back into a decrypted snapshot, in place.
+ *
+ * Called at the transport boundary (`decryptEnvelope()` in src/crypto.ts)
+ * rather than inside `classifyDispatcher()`, because the table is a property of
+ * the SNAPSHOT and `classifyDispatcher()` is handed one dispatcher at a time —
+ * `App.tsx` calls it as `snap.dispatchers.map(classifyDispatcher)`, so there is
+ * no argument through which the table could reach it. Undoing the encoding once
+ * where the payload arrives keeps every consumer downstream unaware of it.
+ *
+ * Idempotent: a second call finds strings where the indices were and leaves
+ * them alone. A snapshot with no table is returned untouched.
+ */
+export function rehydrateStrings(snap: Snapshot): Snapshot {
+  const strings = snap?.strings;
+  if (!Array.isArray(strings) || strings.length === 0) return snap;
+  const resolve = (v: InternedString): InternedString =>
+    typeof v === "number" ? (strings[v] ?? null) : v;
+  for (const d of snap.dispatchers ?? []) {
+    if (Array.isArray(d?.builds)) {
+      for (const b of d.builds) {
+        if (!Array.isArray(b)) continue;
+        for (const i of INTERNED_BUILD_SLOTS) b[i] = resolve(b[i]);
+      }
+    }
+    if (Array.isArray(d?.hints)) {
+      for (const h of d.hints) {
+        if (!Array.isArray(h)) continue;
+        for (const i of INTERNED_HINT_SLOTS) h[i] = resolve(h[i]);
+      }
+    }
+  }
+  return snap;
+}
+
+/**
  * Expand the wire form of a dev machine's recent builds.
  *
  * The collector ships `[project, command, location, worker_id, duration_ms,
@@ -185,15 +248,16 @@ function expandWorkerSlots(pairs: WorkerSlotPair[] | undefined): DispatcherWorke
  * a snapshot written by an older collector, and a dev machine with no build
  * history must render "no builds recorded", never crash the drawer.
  */
-export function expandBuilds(rows: BuildTuple[] | undefined): RecentBuild[] {
+export function expandBuilds(rows: BuildTuple[] | undefined, strings?: readonly string[]): RecentBuild[] {
   if (!Array.isArray(rows)) return [];
   return rows.map((b) => ({
     // `?? null` throughout, never `|| null`: `duration_ms: 0` and the
     // all-important `exit_code: 0` (the build SUCCEEDED) are real readings.
-    project: Array.isArray(b) ? (b[0] ?? null) : null,
-    command: Array.isArray(b) ? (b[1] ?? null) : null,
+    // Slots 0, 1 and 3 go through `internedStr` — see INTERNED_BUILD_SLOTS.
+    project: Array.isArray(b) ? internedStr(b[0], strings) : null,
+    command: Array.isArray(b) ? internedStr(b[1], strings) : null,
     location: Array.isArray(b) ? (b[2] ?? null) : null,
-    worker_id: Array.isArray(b) ? (b[3] ?? null) : null,
+    worker_id: Array.isArray(b) ? internedStr(b[3], strings) : null,
     duration_ms: Array.isArray(b) ? (b[4] ?? null) : null,
     exit_code: Array.isArray(b) ? (b[5] ?? null) : null,
     completed_at: Array.isArray(b) ? (b[6] ?? null) : null,
@@ -205,14 +269,15 @@ export function expandBuilds(rows: BuildTuple[] | undefined): RecentBuild[] {
  * `[worker_id, severity, message, suggested_action, reason_code]`.
  * Same reasoning and the same legacy tolerance as `expandBuilds()`.
  */
-export function expandHints(rows: HintTuple[] | undefined): RemediationHint[] {
+export function expandHints(rows: HintTuple[] | undefined, strings?: readonly string[]): RemediationHint[] {
   if (!Array.isArray(rows)) return [];
   return rows.map((h) => ({
-    worker_id: Array.isArray(h) ? (h[0] ?? null) : null,
+    // Everything but `severity` is interned — see INTERNED_HINT_SLOTS.
+    worker_id: Array.isArray(h) ? internedStr(h[0], strings) : null,
     severity: Array.isArray(h) ? (h[1] ?? null) : null,
-    message: Array.isArray(h) ? (h[2] ?? null) : null,
-    suggested_action: Array.isArray(h) ? (h[3] ?? null) : null,
-    reason_code: Array.isArray(h) ? (h[4] ?? null) : null,
+    message: Array.isArray(h) ? internedStr(h[2], strings) : null,
+    suggested_action: Array.isArray(h) ? internedStr(h[3], strings) : null,
+    reason_code: Array.isArray(h) ? internedStr(h[4], strings) : null,
   }));
 }
 
@@ -225,7 +290,20 @@ export function expandHints(rows: HintTuple[] | undefined): RemediationHint[] {
  * compiles everything on itself while `rch queue`, worker probes and every
  * other surface still report a healthy fleet.
  */
-export function classifyDispatcher(d: Dispatcher): DispatcherView {
+/**
+ * @param strings the snapshot's string table, when the caller has one.
+ *
+ * Typed `unknown` and guarded rather than `string[]`, because the browser calls
+ * this as `snap.dispatchers.map(classifyDispatcher)` — `Array.prototype.map`
+ * passes the ELEMENT INDEX as the second argument, and a number quietly
+ * standing in for the table would resolve every interned slot to null. The
+ * browser path does not need it (src/crypto.ts rehydrates at the transport
+ * boundary); direct callers such as tools and tests pass it explicitly.
+ */
+export function classifyDispatcher(d: Dispatcher, strings?: unknown): DispatcherView {
+  const table: readonly string[] | undefined = Array.isArray(strings)
+    ? (strings as readonly string[])
+    : undefined;
   // `build_stats` is CUMULATIVE since the daemon started, so it is the wrong
   // basis for a "is this box offloading right now" verdict: a machine that did
   // 200 local builds last month stays branded local-only through a week of
@@ -235,7 +313,7 @@ export function classifyDispatcher(d: Dispatcher): DispatcherView {
   // window counts, not a display slice: the verdict must be measured over what
   // the collector observed.
   const s = d.build_stats;
-  const recent = expandBuilds(d.builds);
+  const recent = expandBuilds(d.builds, table);
   const recentCounted = recent.length;
   const recentRemote = recent.filter((b) => (b.location ?? "").toLowerCase() === "remote").length;
 
@@ -279,7 +357,7 @@ export function classifyDispatcher(d: Dispatcher): DispatcherView {
     // the card counts the hints, and both must see exactly the objects the
     // collector used to send.
     recent_builds: recent,
-    remediation_hints: expandHints(d.hints),
+    remediation_hints: expandHints(d.hints, table),
     level, levelReason, remotePct, remoteBasis: basis,
     remoteCounted: recentCounted || lifetimeCounted,
   };

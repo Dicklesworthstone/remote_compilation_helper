@@ -433,6 +433,105 @@ async function collectDispatcher(host) {
   };
 }
 
+// ------------------------------------------------------------ string interning
+
+/**
+ * Which tuple slots carry an INTERNED string, by position.
+ *
+ * These four lists are the whole schema of the string table. `src/derive.ts`
+ * (`internedStr`/`rehydrateStrings`) and the mirror in `tools/llm-view.mjs`
+ * resolve exactly these positions; `tests/parity.mjs` compares the two and
+ * `tests/snapshot.mjs` pins this table's shape.
+ *
+ * The exclusions are the interesting part — each one is deliberate and was
+ * measured on a live 10-machine snapshot (137 builds, 113 hints, 77,095B):
+ *
+ *   builds[2] `location`   NEVER intern. It is the only tuple slot read
+ *       POSITIONALLY off the raw wire, by `classifyDev()` in tools/llm-view.mjs,
+ *       and four consumers call `.toLowerCase()` on it (derive.ts
+ *       classifyDispatcher, llm-view classifyDev, DevMachineCard,
+ *       DevMachineDrawer). An integer there is a TypeError, not a wrong pixel —
+ *       and a browser tab still holding the previous bundle would take it.
+ *       Worth ~959B; not worth a crash.
+ *   builds[6] `completed_at`  Interning it COSTS bytes: 137 distinct values in
+ *       137 slots, so the table (5,098B) is larger than the inline strings
+ *       (4,961B) before a single index is written. Timestamps do not repeat.
+ *   hints[1]  `severity`   The one candidate whose value is read as an ALARM
+ *       LEVEL (`h.severity === "critical"` picks the pill colour). Under an old
+ *       bundle an index would silently downgrade a critical hint to a warn
+ *       pill, and under-reporting an alarm is the failure this dashboard exists
+ *       to prevent. Costs ~940B of the ~24.4KB saved — cheap insurance.
+ *
+ * Everything else in the two tuples repeats heavily across dispatchers (the
+ * same hint text for the same worker on all 10 boxes) and is display-only or
+ * key material, so an old bundle reading a new snapshot renders a small integer
+ * for at most one refresh interval and every VERDICT stays correct.
+ */
+const INTERNED_BUILD_SLOTS = [0, 1, 3];        // project, command, worker_id
+const INTERNED_HINT_SLOTS = [0, 2, 3, 4];      // worker_id, message, suggested_action, reason_code
+
+/**
+ * Replace repeated tuple strings with indices into ONE snapshot-level table.
+ *
+ * Applied at SERIALIZATION time only — the dispatcher records keep their full
+ * strings all the way through collection and merging, exactly as the worker and
+ * build projections in passes 2-3 do, so nothing upstream has to know about the
+ * table.
+ *
+ * GLOBAL, not per-array, and the choice was measured rather than assumed. Eight
+ * per-field tables came to 51,447B against 51,784B for one global table: 337B
+ * better, which is 0.44% of the payload and 1.3% of the change. It buys that
+ * with eight independent index spaces for `src/derive.ts` and
+ * `tools/llm-view.mjs` to keep in lockstep — the exact drift `tests/parity.mjs`
+ * exists to catch. One table, one index space, 337B. Per-DISPATCHER tables were
+ * never in the running: they save only 1,810B (-2.3%), because the duplication
+ * is almost entirely ACROSS dispatchers — every box reports the same hint for
+ * the same shared worker — and barely exists within one.
+ *
+ * Encoding, and the reason a missing value can never be read as entry 0:
+ *   number  -> index into `strings`
+ *   string  -> a literal that was not interned (an empty string stays "")
+ *   null    -> genuinely absent
+ * Only NON-EMPTY strings are ever interned, so no table index is the
+ * representation of "absent" or "empty", and entry 0 is always a real value.
+ */
+export function internSnapshotStrings(dispatchers) {
+  const count = new Map();
+  const firstAt = new Map();
+  let seq = 0;
+  const scan = (v) => {
+    if (typeof v !== "string" || v === "") return;
+    count.set(v, (count.get(v) ?? 0) + 1);
+    if (!firstAt.has(v)) firstAt.set(v, seq++);
+  };
+  for (const d of dispatchers) {
+    for (const b of d.builds ?? []) for (const i of INTERNED_BUILD_SLOTS) scan(b[i]);
+    for (const h of d.hints ?? []) for (const i of INTERNED_HINT_SLOTS) scan(h[i]);
+  }
+
+  // Hottest string first. The index is written once per OCCURRENCE and the
+  // string once, so putting the most repeated values at the low indices buys a
+  // digit on every occurrence — worth 303B on the live fleet for zero risk.
+  // Ties break on first appearance, so the table is a pure function of the
+  // input and two runs over the same data produce byte-identical output.
+  const strings = [...count.keys()].sort(
+    (a, b) => count.get(b) - count.get(a) || firstAt.get(a) - firstAt.get(b),
+  );
+  const index = new Map(strings.map((s, i) => [s, i]));
+
+  const put = (v) => (typeof v === "string" && v !== "" ? index.get(v) : (v ?? null));
+  const project = (row, slots) => row.map((v, i) => (slots.includes(i) ? put(v) : v));
+
+  return {
+    strings,
+    dispatchers: dispatchers.map((d) => ({
+      ...d,
+      builds: (d.builds ?? []).map((b) => project(b, INTERNED_BUILD_SLOTS)),
+      hints: (d.hints ?? []).map((h) => project(h, INTERNED_HINT_SLOTS)),
+    })),
+  };
+}
+
 // ----------------------------------------------------------------- encryption
 
 /**
@@ -725,9 +824,17 @@ async function main() {
     worker_slots: seen.map((w) => [w.used_slots, w.total_slots]),
   }));
 
+  // Fold the repeated build/hint strings into one snapshot-level table. Hints
+  // and commands duplicate massively across dispatchers — 113 hints on a
+  // 10-machine fleet carry 30 distinct messages and 20 distinct suggested
+  // actions, and every box reports the same advice for the same shared worker.
+  // See internSnapshotStrings() for the field set and why `location`,
+  // `severity` and `completed_at` are excluded from it.
+  const { dispatchers: internedDispatchers, strings } = internSnapshotStrings(emittedDispatchers);
+
   const snapshot = {
     schema: SCHEMA, label: args.label, generated_at, totals,
-    dispatchers: emittedDispatchers, workers, history,
+    dispatchers: internedDispatchers, workers, strings, history,
   };
 
   const plain = JSON.stringify(snapshot);
@@ -755,7 +862,8 @@ async function main() {
       `  ${workers.length} workers · ${totals.slots} slots (${totals.slots_used} used) · ${totals.cores} cores\n` +
       `  ${totals.dispatchers_remote_ready}/${totals.dispatchers_reachable} dev machines remote-ready · ` +
       `builds remote ${totals.builds_remote} / local ${totals.builds_local}\n` +
-      `  ${(plain.length / 1024).toFixed(1)}KB plaintext -> ${(JSON.stringify(envelope).length / 1024).toFixed(1)}KB ciphertext`,
+      `  ${(plain.length / 1024).toFixed(1)}KB plaintext -> ${(JSON.stringify(envelope).length / 1024).toFixed(1)}KB ciphertext` +
+      `  ·  string table ${strings.length} entries`,
   );
 }
 
