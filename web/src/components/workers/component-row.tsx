@@ -49,7 +49,6 @@ export function ComponentRow({
       const timer = setTimeout(() => setAnimatedScore(Math.min(100, Math.max(0, score))), 100);
       return () => clearTimeout(timer);
     }
-    setAnimatedScore(0);
   }, [score]);
 
   return (
