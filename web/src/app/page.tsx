@@ -169,8 +169,8 @@ export default function DashboardPage() {
           <div className="bg-warning/10 border border-warning/30 rounded-lg p-4">
             <h3 className="font-medium text-warning mb-2">Active Issues</h3>
             <ul className="space-y-2">
-              {status.issues.map((issue, idx) => (
-                <li key={idx} className="text-sm">
+              {status.issues.map((issue) => (
+                <li key={`${issue.severity}-${issue.summary}-${issue.remediation ?? ''}`} className="text-sm">
                   <span className={`font-medium ${
                     issue.severity === 'error' ? 'text-error' :
                     issue.severity === 'warning' ? 'text-warning' :

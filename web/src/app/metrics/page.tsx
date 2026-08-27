@@ -153,11 +153,13 @@ function averageHistogram(metrics: Record<string, MetricSample[]>, baseName: str
   return sum / count;
 }
 
+const NUMBER_FORMATTER = new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 });
+
 function formatNumber(value: number | null | undefined): string {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return '—';
   }
-  return new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(value);
+  return NUMBER_FORMATTER.format(value);
 }
 
 function formatPercent(value: number | null | undefined): string {

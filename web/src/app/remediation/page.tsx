@@ -175,8 +175,8 @@ export default function RemediationPage() {
               </p>
             ) : (
               <ul data-testid="incidents-list" className="space-y-1 text-sm">
-                {data.incidents.map((inc, i) => (
-                  <li key={`incident-${i}`} className="text-muted-foreground">
+                {data.incidents.map((inc) => (
+                  <li key={`${inc.reason_code}-${inc.worker_id ?? 'all'}-${inc.event_type}-${inc.age_secs}-${inc.summary}`} className="text-muted-foreground">
                     <span className="font-mono text-xs">{inc.reason_code}</span> {inc.event_type}
                     {inc.worker_id ? ` [${inc.worker_id}]` : ''} — {inc.summary} ({inc.age_secs}s
                     ago)
