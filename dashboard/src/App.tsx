@@ -355,17 +355,17 @@ export default function App() {
     sorted.sort((a, b) => {
       switch (sort) {
         case "name": return a.id.localeCompare(b.id);
-        case "speed": return (b.speed ?? -1) - (a.speed ?? -1);
-        case "disk": return (b.diskUsedPct ?? -1) - (a.diskUsedPct ?? -1);
+        case "speed": return (b.speed ?? -1) - (a.speed ?? -1) || a.id.localeCompare(b.id);
+        case "disk": return (b.diskUsedPct ?? -1) - (a.diskUsedPct ?? -1) || a.id.localeCompare(b.id);
         case "load": {
           const aLoad = a.slotPct ?? (a.loadPerCore != null ? a.loadPerCore * 50 : -1);
           const bLoad = b.slotPct ?? (b.loadPerCore != null ? b.loadPerCore * 50 : -1);
-          return bLoad - aLoad;
+          return bLoad - aLoad || a.id.localeCompare(b.id);
         }
         case "slots": {
           const diff = (b.total_slots ?? -1) - (a.total_slots ?? -1);
           if (diff !== 0) return diff;
-          return (b.used_slots ?? -1) - (a.used_slots ?? -1);
+          return (b.used_slots ?? -1) - (a.used_slots ?? -1) || a.id.localeCompare(b.id);
         }
         default: return healthRank(a.health) - healthRank(b.health) || a.id.localeCompare(b.id);
       }

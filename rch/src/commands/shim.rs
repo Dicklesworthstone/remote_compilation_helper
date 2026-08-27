@@ -13,8 +13,18 @@
 //! The shim is deliberately conservative:
 //! - loop-safe: honors `RCH_CARGO_WRAPPER_BYPASS=1` (rch's own re-exec) → real cargo;
 //! - fail-open: if `rch` is not on `PATH`, run the real cargo unchanged;
-//! - IDE-safe: any `--message-format*` arg (rust-analyzer) → real cargo, local;
+//! - IDE-safe: rust-analyzer's `--message-format=json-diagnostic-{rendered-ansi,short}`
+//!   → real cargo, local. A plain `--message-format=json` (scripts, CI, lint
+//!   gates) still offloads; treating every `--message-format` as an IDE used to
+//!   keep script-driven builds on the dev box silently;
+//! - wrapper-safe: a caller-set `RUSTC_WORKSPACE_WRAPPER` (how `cargo clippy`
+//!   drives its inner `cargo check`) → real cargo, local, so the wrapper is
+//!   never dropped by offloading the inner invocation;
+//! - escape hatch: `RCH_SHIM_LOCAL_IDE=1` forces any single build local;
 //! - only the artifact/test subcommands are offloaded; everything else is local.
+//!
+//! A companion `cargo-clippy` shim catches direct invocations of that binary,
+//! which never pass through `cargo` and so cannot be caught by the cargo shim.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -26,7 +36,11 @@ use crate::ui::theme::StatusIndicator;
 
 /// Bumped whenever the embedded shim body changes so `shim status` can detect a
 /// stale on-disk copy and prompt a reinstall.
-const SHIM_VERSION: &str = "1";
+///
+/// `2` narrowed the `--message-format` bail-out (v1 sent EVERY such build local,
+/// which silently kept script/CI builds on the dev box), added the
+/// `RUSTC_WORKSPACE_WRAPPER` guard, and introduced the `cargo-clippy` shim.
+const SHIM_VERSION: &str = "2";
 
 /// Marker line embedded in the generated shim, used to recognize an rch-managed
 /// file (vs. a hand-rolled or unrelated `cargo` on `PATH`) and read its version.
@@ -43,6 +57,51 @@ fn shim_dir() -> Result<PathBuf> {
 /// Path to the installed cargo shim.
 fn cargo_shim_path() -> Result<PathBuf> {
     Ok(shim_dir()?.join("cargo"))
+}
+
+/// Path to the installed `cargo-clippy` shim.
+fn cargo_clippy_shim_path() -> Result<PathBuf> {
+    Ok(shim_dir()?.join("cargo-clippy"))
+}
+
+/// Render the `cargo-clippy` shim.
+///
+/// The `cargo` shim alone does not catch `cargo clippy`: build scripts, CI and
+/// lint gates routinely invoke the `cargo-clippy` BINARY directly, which
+/// resolves through `PATH` without ever passing through `cargo`. Those builds
+/// then compile locally no matter how correctly `cargo` is shimmed.
+///
+/// Two entry shapes must be told apart:
+///   * `cargo clippy ...` → cargo execs `cargo-clippy clippy ...` (argv[1] is
+///     the literal subcommand). That outer `cargo` was already intercepted, so
+///     re-entering `rch` here would double-offload; pass it straight through.
+///   * `cargo-clippy ...` → invoked directly by a script. This is the leak, and
+///     it is normalized to `cargo clippy ...` and offloaded.
+fn cargo_clippy_shim_body() -> String {
+    format!(
+        r##"#!/bin/sh
+# rch cargo-clippy shim — MANAGED FILE, edit via `rch shim install`.
+{marker} {version}
+#
+# Catches DIRECT `cargo-clippy` invocations (scripts, Makefiles, lint gates)
+# that bypass the `cargo` shim entirely by never going through cargo.
+REAL="${{RCH_SHIM_REAL_CARGO_CLIPPY:-$HOME/.cargo/bin/cargo-clippy}}"
+# Loop-break + fail-open, identical contract to the cargo shim.
+if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ] || [ "${{RCH_SHIM_LOCAL_IDE:-}}" = "1" ] \
+   || ! command -v rch >/dev/null 2>&1 || [ ! -x "$REAL" ]; then
+  exec "$REAL" "$@"
+fi
+# Invoked BY cargo as a subcommand (`cargo-clippy clippy ...`): the outer cargo
+# already made the offload decision, so never re-enter rch here.
+if [ "${{1:-}}" = "clippy" ]; then
+  exec "$REAL" "$@"
+fi
+# Direct invocation — normalize to `cargo clippy` and offload.
+exec rch exec -- cargo clippy "$@"
+"##,
+        marker = SHIM_MARKER,
+        version = SHIM_VERSION,
+    )
 }
 
 /// Render the canonical cargo shim.
@@ -74,9 +133,28 @@ REAL="${{RCH_SHIM_REAL_CARGO:-$HOME/.cargo/bin/cargo}}"
 if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ] || ! command -v rch >/dev/null 2>&1; then
   exec "$REAL" "$@"
 fi
-# Leave IDE/tooling (rust-analyzer) local: it needs streaming JSON + local state.
+# Explicit operator escape hatch: force this one build local.
+if [ "${{RCH_SHIM_LOCAL_IDE:-}}" = "1" ]; then
+  exec "$REAL" "$@"
+fi
+# `cargo clippy` runs as: set RUSTC_WORKSPACE_WRAPPER=clippy-driver, then exec an
+# inner `cargo check`. Offloading that INNER cargo would drop the wrapper and
+# silently return plain check results instead of lints, so it stays local — the
+# OUTER `cargo clippy` is the invocation that offloads. Same for any other
+# caller-chosen rustc wrapper.
+if [ -n "${{RUSTC_WORKSPACE_WRAPPER:-}}" ]; then
+  exec "$REAL" "$@"
+fi
+# rust-analyzer must stay local (streaming JSON + local state). It is identified
+# by its distinctive rendered-ansi/short diagnostic formats. A PLAIN
+# `--message-format=json` is what scripts, CI and build tooling pass, and those
+# must still offload — treating every --message-format as an IDE was the bug
+# that silently kept script-driven builds on the dev box.
 for a in "$@"; do
-  case "$a" in --message-format*) exec "$REAL" "$@" ;; esac
+  case "$a" in
+    --message-format=json-diagnostic-rendered-ansi*|--message-format=json-diagnostic-short*)
+      exec "$REAL" "$@" ;;
+  esac
 done
 case "${{1:-}}" in
   build|b|test|t|check|c|clippy|bench|doc|nextest)
@@ -436,6 +514,10 @@ fn local_build_process_count() -> Option<usize> {
 #[derive(Debug, Serialize)]
 struct ShimStatus {
     installed: bool,
+    /// Whether the companion `cargo-clippy` shim is present. Without it, a
+    /// script invoking the `cargo-clippy` binary directly bypasses offload
+    /// entirely, so agents need to see this separately from `installed`.
+    clippy_shim_installed: bool,
     path: String,
     version: Option<String>,
     embedded_version: String,
@@ -490,6 +572,23 @@ pub fn shim_install(
         std::fs::set_permissions(&path, perms)?;
     }
 
+    // `cargo-clippy` is a separate binary on PATH; a script calling it directly
+    // never touches the cargo shim, so it needs its own.
+    let clippy_path = cargo_clippy_shim_path()?;
+    atomic_write(&clippy_path, cargo_clippy_shim_body().as_bytes()).with_context(|| {
+        format!(
+            "Failed to write cargo-clippy shim to {}",
+            clippy_path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&clippy_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&clippy_path, perms)?;
+    }
+
     // Wrap the rustup toolchains too — the PATH shim alone cannot catch an
     // absolute-path `~/.rustup/toolchains/<tc>/bin/cargo` invocation, which is
     // how scripts, Makefiles and `cargo +toolchain` re-execs reach cargo.
@@ -516,6 +615,9 @@ pub fn shim_install(
     if ctx.is_json() {
         let status = ShimStatus {
             installed: true,
+            clippy_shim_installed: cargo_clippy_shim_path()
+                .map(|p| p.exists())
+                .unwrap_or(false),
             path: path.display().to_string(),
             version: Some(SHIM_VERSION.to_string()),
             embedded_version: SHIM_VERSION.to_string(),
@@ -610,10 +712,14 @@ pub fn shim_status(ctx: &OutputContext) -> Result<()> {
     let ahead = interception.intercepts();
     let local_builds = local_build_process_count();
     let (tc_wrapped, tc_total) = toolchain_wrap_counts();
+    let clippy_installed = cargo_clippy_shim_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
 
     if ctx.is_json() {
         let status = ShimStatus {
             installed,
+            clippy_shim_installed: clippy_installed,
             path: path.display().to_string(),
             version,
             embedded_version: SHIM_VERSION.to_string(),
@@ -722,10 +828,23 @@ pub fn shim_uninstall(ctx: &OutputContext) -> Result<()> {
             .with_context(|| format!("Failed to remove cargo shim at {}", path.display()))?;
     }
 
+    // Remove the companion cargo-clippy shim too; leaving it behind would keep
+    // routing clippy through an rch that the operator just opted out of.
+    let clippy_path = cargo_clippy_shim_path()?;
+    if clippy_path.exists() {
+        std::fs::remove_file(&clippy_path).with_context(|| {
+            format!(
+                "Failed to remove cargo-clippy shim at {}",
+                clippy_path.display()
+            )
+        })?;
+    }
+
     if ctx.is_json() {
         let (tc_wrapped, tc_total) = toolchain_wrap_counts();
         let status = ShimStatus {
             installed: false,
+            clippy_shim_installed: false,
             path: path.display().to_string(),
             version: None,
             embedded_version: SHIM_VERSION.to_string(),

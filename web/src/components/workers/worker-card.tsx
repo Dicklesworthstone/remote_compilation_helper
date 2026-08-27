@@ -175,8 +175,8 @@ export function WorkerCard({
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-1" title={powerRating ? `Power Rating: ${powerRating}` : undefined}>
             <Zap className="w-3.5 h-3.5" />
-            <span>Speed: {worker.speed_score.toFixed(1)}</span>
-            {powerRating && <span className="text-[10px] text-muted-foreground/75 font-mono">({powerRating}p)</span>}
+            <span>Speed: {speedScore != null ? speedScore.toFixed(1) : '—'}</span>
+            {powerRating != null && <span className="text-[10px] text-muted-foreground/75 font-mono">({powerRating}p)</span>}
           </div>
           <div
             className={`flex items-center gap-1 ${circuit.color}`}

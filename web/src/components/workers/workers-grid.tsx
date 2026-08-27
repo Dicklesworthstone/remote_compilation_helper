@@ -41,18 +41,21 @@ export function WorkersGrid({ workers, speedScores }: WorkersGridProps) {
           return (b.used_slots || 0) - (a.used_slots || 0);
         }
         case 'slots-avail': {
-          const aSlots = a.total_slots - a.used_slots;
-          const bSlots = b.total_slots - b.used_slots;
+          const aSlots = (a.total_slots || 0) - (a.used_slots || 0);
+          const bSlots = (b.total_slots || 0) - (b.used_slots || 0);
           if (aSlots !== bSlots) {
             return bSlots - aSlots;
           }
           break;
         }
-        case 'speed':
-          if (a.speed_score !== b.speed_score) {
-            return b.speed_score - a.speed_score;
+        case 'speed': {
+          const aSpeed = Number.isFinite(a.speed_score) ? a.speed_score : -1;
+          const bSpeed = Number.isFinite(b.speed_score) ? b.speed_score : -1;
+          if (aSpeed !== bSpeed) {
+            return bSpeed - aSpeed;
           }
           break;
+        }
         case 'status':
         default:
           if (statusOrder[a.status] !== statusOrder[b.status]) {
