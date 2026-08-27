@@ -74,6 +74,9 @@ interface WorkersProps {
   sort: Sort;
   onSort: (s: Sort) => void;
   onOpen: (id: string) => void;
+  totalFleetSlots?: number;
+  weightedSizing?: boolean;
+  onToggleWeightedSizing?: () => void;
 }
 
 const FILTERS = ["all", "critical", "warn", "offline", "busy", "healthy"] as const;
@@ -111,6 +114,16 @@ export function WorkersSection(p: WorkersProps) {
               {s}{s !== "all" && p.counts[s] ? ` ${p.counts[s]}` : ""}
             </button>
           ))}
+          {p.onToggleWeightedSizing && (
+            <button
+              className="chip"
+              aria-pressed={p.weightedSizing}
+              onClick={p.onToggleWeightedSizing}
+              title="Toggle capacity-weighted dynamic worker card sizing"
+            >
+              ⚡ Weighted
+            </button>
+          )}
           <select
             className="search"
             value={p.sort}
@@ -133,7 +146,13 @@ export function WorkersSection(p: WorkersProps) {
       ) : (
         <div className="grid">
           {p.visible.map((w) => (
-            <WorkerCard key={w.id} w={w} onOpen={p.onOpen} />
+            <WorkerCard
+              key={w.id}
+              w={w}
+              onOpen={p.onOpen}
+              totalFleetSlots={p.totalFleetSlots}
+              weightedSizing={p.weightedSizing}
+            />
           ))}
         </div>
       )}

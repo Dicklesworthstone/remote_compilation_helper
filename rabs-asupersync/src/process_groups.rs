@@ -148,42 +148,48 @@ impl ManagedProcessGroup {
 
     /// Shared construction tail: verify the leader actually leads a
     /// fresh group before handing the handle out.
-    fn verify_group_formation(leader: Child, attribution: Attribution) -> io::Result<Self> {
+    #[allow(unused_mut)]
+    fn verify_group_formation(mut leader: Child, attribution: Attribution) -> io::Result<Self> {
         let pgid = leader.id();
-        let mut group = Self {
-            pgid,
-            leader,
-            members: Vec::new(),
-            attribution,
-        };
         // Fail loudly if the grouping request was not honored: a group we
         // cannot trust would make every later group-signal wrong. A leader
         // that already exited before the probe is fine — wait() surfaces
         // its status; a LIVE leader absent from every /proc pgrp means the
         // platform ignored process_group(0) and cleanup would be a lie.
-        let probe = members_from_proc(pgid);
-        match group.leader.try_wait()? {
-            Some(_) => {}
-            None => {
-                if !probe
-                    .iter()
-                    .any(|m| m.pid == i32::try_from(pgid).unwrap_or(-1))
-                    // Re-check exit before condemning: a leader that
-                    // exited between try_wait and the scan above is a
-                    // zombie our membership filter hides — the group WAS
-                    // honored, and wait_with_output will surface the
-                    // status. Only a STILL-RUNNING leader absent from
-                    // every pgrp means the platform ignored the request.
-                    && group.leader.try_wait()?.is_none()
-                {
-                    return Err(io::Error::other(format!(
-                        "process_group(0) not honored: live leader pid {pgid} not found in any /proc pgrp"
-                    )));
+        #[cfg(target_os = "linux")]
+        let members = {
+            let probe = members_from_proc(pgid);
+            match leader.try_wait()? {
+                Some(_) => {}
+                None => {
+                    if !probe
+                        .iter()
+                        .any(|m| m.pid == i32::try_from(pgid).unwrap_or(-1))
+                        // Re-check exit before condemning: a leader that
+                        // exited between try_wait and the scan above is a
+                        // zombie our membership filter hides — the group WAS
+                        // honored, and wait_with_output will surface the
+                        // status. Only a STILL-RUNNING leader absent from
+                        // every pgrp means the platform ignored the request.
+                        && leader.try_wait()?.is_none()
+                    {
+                        return Err(io::Error::other(format!(
+                            "process_group(0) not honored: live leader pid {pgid} not found in any /proc pgrp"
+                        )));
+                    }
                 }
             }
-        }
-        group.members = probe;
-        Ok(group)
+            probe
+        };
+        #[cfg(not(target_os = "linux"))]
+        let members = members_from_proc(pgid);
+
+        Ok(Self {
+            pgid,
+            leader,
+            members,
+            attribution,
+        })
     }
     /// Group id (== leader pid by construction).
     #[must_use]
@@ -416,6 +422,7 @@ pub fn members_from_proc(_pgid: u32) -> Vec<GroupMember> {
 }
 
 /// Split `/proc/<pid>/stat` into `(comm, fields_after_comm)`.
+#[cfg(any(target_os = "linux", test))]
 fn split_stat_fields(stat: &str) -> Option<(String, &str)> {
     let open = stat.find('(')?;
     let close = stat.rfind(')')?;
@@ -437,6 +444,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn group_membership_covers_descendants() {
         // Fixture: leader shells out and forks two background children;
         // all four pids (sh + 2 sleeps + subshell) must share one pgid.

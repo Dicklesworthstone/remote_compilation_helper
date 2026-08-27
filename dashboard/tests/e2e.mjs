@@ -20,11 +20,23 @@
 import { chromium } from "playwright";
 import { createHash, webcrypto as nodeCrypto } from "node:crypto";
 import { gunzipSync, gzipSync } from "node:zlib";
+import { readFileSync, existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+let env = {};
+if (existsSync(`${root}/.env`)) {
+  env = Object.fromEntries(
+    readFileSync(`${root}/.env`, "utf8").split("\n").filter((l) => l.includes("="))
+      .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim().replace(/^['"]|['"]$/g, "")]),
+  );
+}
 
 const BASE = process.env.RCH_DASH_BASE ?? "/remote_compilation_helper/";
 const PORT = process.env.RCH_DASH_E2E_PORT ?? "4174";
 const URL = `http://127.0.0.1:${PORT}${BASE}`;
-const PASS = process.env.RCH_DASH_PASSPHRASE;
+const PASS = process.env.RCH_DASH_PASSPHRASE || env.RCH_DASH_PASSPHRASE;
 const browser = await chromium.launch();
 const page = await browser.newPage();
 const errors = [];

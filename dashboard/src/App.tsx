@@ -81,6 +81,14 @@ export default function App() {
       return true;
     }
   });
+  // Capacity-weighted dynamic worker sizing mode (powerhouses take prominent grid presence)
+  const [weightedSizing, setWeightedSizing] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("rch_dash_weighted") !== "0";
+    } catch {
+      return true;
+    }
+  });
   const [query, setQuery] = useState(() => readViewPref().query);
   const [statusFilter, setStatusFilter] = useState<HealthLevel | "all">(() => readViewPref().statusFilter);
   const [sort, setSort] = useState<Sort>(() => readViewPref().sort);
@@ -200,6 +208,18 @@ export default function App() {
     setAuto((prev) => !prev);
   }, []);
 
+  const toggleWeightedSizing = useCallback(() => {
+    setWeightedSizing((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem("rch_dash_weighted", next ? "1" : "0");
+      } catch {
+        /* private mode */
+      }
+      return next;
+    });
+  }, []);
+
   // Persistence is an effect on the VALUE, not a side effect inside the
   // updater — updaters must stay pure (they run twice in StrictMode).
   useEffect(() => {
@@ -208,18 +228,19 @@ export default function App() {
     } catch {
       /* private mode — the toggle still applies to this session */
     }
-  }, [auto]);
+  const toggleWeightedSizing = useCallback(() => {
+    setWeightedSizing((prev) => !prev);
+  }, []);
 
-  // refresh lives in a ref so the interval does not re-subscribe (and drift)
-  // every time a refresh lands a new snapshot. Written in an effect, never
-  // during render (concurrent-unsafe).
-  const refreshRef = useRef(refresh);
+  // Persistence is an effect on the VALUE, never a side effect inside the
+  // updater — updaters must stay pure (they run twice in StrictMode).
   useEffect(() => {
-    refreshRef.current = refresh;
-  }, [refresh]);
-
-  // Persist filter/sort in the URL hash so an operator can share a link to a
-  // filtered view. replaceState: no history spam per keystroke.
+    try {
+      localStorage.setItem("rch_dash_weighted", weightedSizing ? "1" : "0");
+    } catch {
+      /* private mode */
+    }
+  }, [weightedSizing]);
   useEffect(() => {
     const h = new URLSearchParams();
     if (query) h.set("q", query);
@@ -335,8 +356,16 @@ export default function App() {
         case "name": return a.id.localeCompare(b.id);
         case "speed": return (b.speed ?? -1) - (a.speed ?? -1);
         case "disk": return (b.diskUsedPct ?? -1) - (a.diskUsedPct ?? -1);
-        case "load": return (b.loadPerCore ?? -1) - (a.loadPerCore ?? -1);
-        case "slots": return (b.total_slots ?? -1) - (a.total_slots ?? -1);
+        case "load": {
+          const aLoad = a.slotPct ?? (a.loadPerCore != null ? a.loadPerCore * 50 : -1);
+          const bLoad = b.slotPct ?? (b.loadPerCore != null ? b.loadPerCore * 50 : -1);
+          return bLoad - aLoad;
+        }
+        case "slots": {
+          const diff = (b.total_slots ?? -1) - (a.total_slots ?? -1);
+          if (diff !== 0) return diff;
+          return (b.used_slots ?? -1) - (a.used_slots ?? -1);
+        }
         default: return healthRank(a.health) - healthRank(b.health) || a.id.localeCompare(b.id);
       }
     });
@@ -452,6 +481,9 @@ export default function App() {
           sort={sort}
           onSort={setSort}
           onOpen={setOpenWorker}
+          totalFleetSlots={snap.totals.slots}
+          weightedSizing={weightedSizing}
+          onToggleWeightedSizing={toggleWeightedSizing}
         />
       </div>
 

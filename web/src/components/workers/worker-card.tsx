@@ -59,20 +59,45 @@ export function WorkerCard({
 
   // Benchmark can only be triggered on healthy or degraded workers
   const canBenchmark = worker.status === 'healthy' || worker.status === 'degraded';
+  const isWorkhorse = worker.total_slots >= 16;
+  const isStandard = worker.total_slots >= 6 && worker.total_slots < 16;
+  const tier = isWorkhorse ? 'Workhorse' : isStandard ? 'Standard' : 'Satellite';
+  const isActivelyCompiling = worker.used_slots > 0;
+  const powerRating = Number.isFinite(worker.speed_score) && worker.total_slots > 0
+    ? Math.round(worker.speed_score * worker.total_slots)
+    : null;
 
   return (
     <div
-      className="bg-card border border-border rounded-lg p-4 hover:border-primary/50 transition-colors"
+      className={`bg-card border rounded-lg p-4 transition-all duration-200 ${
+        isWorkhorse ? 'border-primary/40 bg-card/95 shadow-sm' : 'border-border'
+      } ${
+        isActivelyCompiling ? 'border-l-4 border-l-primary ring-1 ring-primary/20' : ''
+      } hover:border-primary/60`}
       data-testid="worker-card"
       data-worker-id={worker.id}
     >
       <div className="flex items-start justify-between mb-3 gap-4">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-surface-elevated flex items-center justify-center">
-            <Server className="w-5 h-5 text-muted-foreground" />
+          <div className="w-10 h-10 rounded-lg bg-surface-elevated flex items-center justify-center relative">
+            <Server className={`w-5 h-5 ${isWorkhorse ? 'text-primary' : 'text-muted-foreground'}`} />
+            {isWorkhorse && (
+              <span className="absolute -top-1 -right-1 text-xs" title="Workhorse (16+ slots)">⚡</span>
+            )}
           </div>
           <div>
-            <h3 className="font-medium text-foreground">{worker.id}</h3>
+            <div className="flex items-center gap-2">
+              <h3 className="font-medium text-foreground">{worker.id}</h3>
+              <span
+                className={`text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded-full ${
+                  isWorkhorse
+                    ? 'bg-primary/15 text-primary border border-primary/30'
+                    : 'bg-muted text-muted-foreground'
+                }`}
+              >
+                {tier}
+              </span>
+            </div>
             <p className="text-sm text-muted-foreground">{worker.user}@{worker.host}</p>
           </div>
         </div>
@@ -89,14 +114,46 @@ export function WorkerCard({
         </div>
       </div>
 
-      {/* Slots Progress */}
-      <div className="mb-3" data-testid="worker-slots">
-        <div className="flex justify-between text-xs text-muted-foreground mb-1">
-          <span>Slots Used</span>
-          <span>{worker.used_slots} / {worker.total_slots}</span>
+      {/* Discrete Slot Matrix */}
+      {worker.total_slots > 0 && (
+        <div className="mb-3 p-2 bg-surface-elevated/50 border border-border/50 rounded-md">
+          <div className="flex items-center justify-between text-xs text-muted-foreground mb-1.5">
+            <span className="font-mono text-[11px]">
+              {worker.used_slots > 0 ? (
+                <span className="text-primary font-medium flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+                  {worker.used_slots} active build{worker.used_slots === 1 ? '' : 's'}
+                </span>
+              ) : (
+                `${worker.total_slots} slots available`
+              )}
+            </span>
+            <span className="font-mono text-[11px]">
+              {worker.used_slots} / {worker.total_slots} ({Math.round(slotsUsedPercent)}%)
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {Array.from({ length: Math.min(worker.total_slots, 48) }, (_, i) => {
+              const isActive = i < worker.used_slots;
+              return (
+                <div
+                  key={i}
+                  className={`h-2.5 w-2.5 rounded-sm transition-colors ${
+                    isActive
+                      ? 'bg-primary shadow-[0_0_4px_rgba(var(--primary),0.6)]'
+                      : 'bg-muted-foreground/20'
+                  }`}
+                  title={isActive ? `Slot #${i + 1}: Compiling` : `Slot #${i + 1}: Available`}
+                />
+              );
+            })}
+          </div>
         </div>
-        <div
-          className="h-2 bg-surface-elevated rounded-full overflow-hidden"
+      )}
+
+      {/* Slots Progress Bar */}
+      <div className="mb-3" data-testid="worker-slots">
+        <div className="h-1.5 bg-surface-elevated rounded-full overflow-hidden"
           role="progressbar"
           data-testid="worker-slots-bar"
           aria-label="Slots used"
@@ -116,9 +173,10 @@ export function WorkerCard({
       {/* Stats Row */}
       <div className="flex items-center justify-between text-xs text-muted-foreground">
         <div className="flex items-center gap-4">
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1" title={powerRating ? `Power Rating: ${powerRating}` : undefined}>
             <Zap className="w-3.5 h-3.5" />
             <span>Speed: {worker.speed_score.toFixed(1)}</span>
+            {powerRating && <span className="text-[10px] text-muted-foreground/75 font-mono">({powerRating}p)</span>}
           </div>
           <div
             className={`flex items-center gap-1 ${circuit.color}`}

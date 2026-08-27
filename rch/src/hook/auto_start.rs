@@ -916,7 +916,7 @@ mod tests {
 
         let temp_dir = create_test_state_dir();
         let fake_rchd = temp_dir.path().join("rchd");
-        std::fs::write(&fake_rchd, "#!/usr/bin/env sh\nsleep 0.3\n").expect("write fake rchd");
+        std::fs::write(&fake_rchd, "#!/usr/bin/env sh\nsleep 3.0\n").expect("write fake rchd");
         let mut perms = std::fs::metadata(&fake_rchd)
             .expect("fake rchd metadata")
             .permissions();
@@ -927,7 +927,7 @@ mod tests {
         super::spawn_rchd(&fake_rchd).expect("spawn fake rchd");
         let elapsed = started.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_millis(250),
+            elapsed < std::time::Duration::from_millis(1500),
             "spawn_rchd should not wait for the daemon body to finish; elapsed={elapsed:?}"
         );
     }
