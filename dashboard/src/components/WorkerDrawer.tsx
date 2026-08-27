@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { WorkerView } from "../types";
 import { fmtAge, fmtGb } from "../derive";
 import { useDialog } from "./useDialog";
@@ -5,6 +6,8 @@ import { useDialog } from "./useDialog";
 interface Props {
   w: WorkerView | null;
   onClose: () => void;
+  /** Cross-link: open the named dev machine's drawer. */
+  onOpenDev: (id: string) => void;
 }
 
 function Row({ k, v }: { k: string; v: React.ReactNode }) {
@@ -16,13 +19,15 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
   );
 }
 
-export function WorkerDrawer({ w, onClose }: Props) {
+export function WorkerDrawer({ w, onClose, onOpenDev }: Props) {
   const { ref, onCancel, onClick } = useDialog(w != null, onClose);
+  const [copied, setCopied] = useState<string | null>(null);
 
   if (!w) return null;
   const c = w.caps;
   const p = w.pressure;
   const fails = w.failure_history;
+  const sshTarget = w.host ? `ssh ${w.user ? `${w.user}@` : ""}${w.host}` : null;
 
   return (
     <dialog
@@ -39,7 +44,37 @@ export function WorkerDrawer({ w, onClose }: Props) {
           <button className="icon-btn" onClick={onClose}>Close</button>
         </div>
         <div className="drawer-host">
-          {w.user ? `${w.user}@` : ""}{w.host ?? "—"}
+          <span>
+            {w.user ? `${w.user}@` : ""}{w.host ?? "—"}
+          </span>
+          {sshTarget && (
+            <button
+              className="link"
+              onClick={() => {
+                navigator.clipboard
+                  ?.writeText(sshTarget)
+                  .then(() => setCopied("ssh"))
+                  .catch(() => setCopied(null));
+                setTimeout(() => setCopied(null), 1500);
+              }}
+              title="Copy the ssh command"
+            >
+              {copied === "ssh" ? "copied ✓" : "copy ssh"}
+            </button>
+          )}
+          <button
+            className="link"
+            onClick={() => {
+              navigator.clipboard
+                ?.writeText(`rch workers probe ${w.id}`)
+                .then(() => setCopied("probe"))
+                .catch(() => setCopied(null));
+              setTimeout(() => setCopied(null), 1500);
+            }}
+            title="Copy the probe command"
+          >
+            {copied === "probe" ? "copied ✓" : "copy probe"}
+          </button>
         </div>
 
         <div className="kv-group">
@@ -52,6 +87,7 @@ export function WorkerDrawer({ w, onClose }: Props) {
             <Row k="Consecutive failures" v={w.consecutive_failures} />
             <Row k="Last error" v={w.last_error ?? "none"} />
             <Row k="Last seen" v={fmtAge(w.staleSeconds)} />
+            <Row k="Seen by" v={w.seen_by?.length ? w.seen_by.join(", ") : "—"} />
             <Row k="Probe latency" v={w.latency_ms != null ? `${w.latency_ms.toFixed(0)} ms` : "—"} />
             <Row k="SpeedScore" v={w.speed != null ? w.speed.toFixed(1) : "—"} />
           </dl>
@@ -109,11 +145,14 @@ export function WorkerDrawer({ w, onClose }: Props) {
             <p className="note">
               rchd derates slots independently on each dispatcher, so the same worker can look
               different from each box. A worker derated below a dispatcher's <code>build_slots</code>
-              {" "}is invisible to it.
+              {" "}is invisible to it. Click a machine to open it.
             </p>
             <dl style={{ margin: 0 }}>
               {Object.entries(w.slots_by_dispatcher).map(([id, s]) => (
-                <Row key={id} k={id} v={`${s.used ?? 0} / ${s.total ?? "—"}`} />
+                <button key={id} className="kv kv-link" onClick={() => onOpenDev(id)}>
+                  <span className="kv-k">{id}</span>
+                  <span className="kv-v">{s.used ?? 0} / {s.total ?? "—"} ›</span>
+                </button>
               ))}
             </dl>
           </div>

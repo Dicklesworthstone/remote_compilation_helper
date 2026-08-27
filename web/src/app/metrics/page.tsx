@@ -17,7 +17,6 @@ import {
   XCircle,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import { motion } from 'motion/react';
 import { api } from '@/lib/api';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -51,10 +50,8 @@ const toneClasses: Record<MetricTone, string> = {
 
 function MetricCard({ label, value, icon: Icon, hint, sublabel, tone = 'neutral' }: MetricCardProps) {
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 6 }}
-      animate={{ opacity: 1, y: 0 }}
-      className={`rounded-lg border p-4 shadow-sm ${toneClasses[tone]}`}
+    <div
+      className={`rounded-lg border p-4 shadow-sm transition-all duration-200 ${toneClasses[tone]}`}
       data-testid="metric-card"
     >
       <div className="flex items-start justify-between gap-4">
@@ -73,7 +70,7 @@ function MetricCard({ label, value, icon: Icon, hint, sublabel, tone = 'neutral'
         <Icon className="w-4 h-4 text-muted-foreground" />
       </div>
       {sublabel && <p className="mt-2 text-xs text-muted-foreground">{sublabel}</p>}
-    </motion.div>
+    </div>
   );
 }
 
@@ -466,12 +463,11 @@ export default function MetricsPage() {
             disabled={isRefreshing}
             aria-label="Refresh metrics"
           >
-            <motion.div
-              animate={isRefreshing ? { rotate: 360 } : { rotate: 0 }}
-              transition={isRefreshing ? { duration: 1, repeat: Infinity, ease: 'linear' } : {}}
-            >
-              <RefreshCw className="w-5 h-5 text-muted-foreground" />
-            </motion.div>
+            <RefreshCw
+              className={`w-5 h-5 text-muted-foreground transition-transform ${
+                isRefreshing ? 'animate-spin' : ''
+              }`}
+            />
           </Button>
         </div>
       </div>

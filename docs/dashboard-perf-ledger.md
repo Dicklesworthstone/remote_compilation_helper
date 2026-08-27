@@ -70,3 +70,35 @@ Truthful null result: no safe performance increment found beyond what shipped.
 
 Verification per change: `npm run build`, `test:llm` (parity), `test:endpoint`, `test:e2e` (3×),
 `test:visual` (desktop/tablet/mobile screenshots, 0 console errors), `npx react-doctor` (100/100).
+
+---
+
+# Round 2 — feature build (run3)
+
+Baseline after the cross-link / pool-view / sparkline-hover / countdown / hash-state feature
+build (`run3/baseline.json`, probes re-run on desktop, 390px, and 4×-throttled mobile):
+
+| Scenario | run3 |
+|---|---|
+| S1 unlock → KPIs | p50 131 ms-class (unchanged; PBKDF2-dominated) |
+| S3 bundle | 228,526 B JS (71.05 KB gzip, +2.3 KB for all features), 14.1 KB CSS |
+| Typing 7 keys, desktop | 8 ms JS, 11 recalc / 13 layout, **0 long tasks** |
+| Typing 7 keys, 4× mobile | 31–35 ms JS, **0 long tasks** |
+| Load, 4× mobile | long tasks 276 ms — same PBKDF2 + initial-commit signature as run1 |
+| Tick / scroll (both viewports) | **0 long tasks** |
+
+| Round | Hypothesis / lever | Verdict | Evidence |
+|---|---|---|---|
+| R13 | Node llm pipeline regressed or gained hot JS | **rejects** — distill still ~10 ms of ~211 ms | run3 S2, run1 cpuprofile |
+| R14 | Typing got hotter with hover/hash code in the tree | **rejects** — 8 ms desktop / 35 ms throttled-mobile per burst, 0 long tasks | render-probe secondBurst |
+| R15 | `history.replaceState` per keystroke needs debouncing | **rejects** — typing deltas identical to pre-feature; replaceState is synchronous and cheap at this rate | R14 numbers |
+| R16 | Sparkline hover state re-renders the whole grid | **rejects** — state is local to one Sparkline; scoped commit | R14, component structure |
+| R17 | `fleetWorkerIds` Set rebuilt per snapshot is hot | **rejects** — 16 entries, memoized on snapshot change | App.tsx |
+| R18 | Pool-view reduce in DevMachineDrawer is hot | **rejects** — 14-element reduce, memoized | DevMachineDrawer |
+| R19 | +2.3 KB gzip feature code warrants lazy-loading drawers | **rejects** — cross-links must be instant; lazy dialogs would delay the core investigation flow | bundle math |
+| R20 | Load long tasks @4× (276 ms) now have a new owner | **rejects** — same signature as run1: native PBKDF2 + initial React commit; feature code adds none | probe load.longTasks vs run1 |
+| R21 | react-doctor findings from new patterns (hover state, cross-link buttons, clipboard) | **rejects (clean)** — 100/100, no issues | react-doctor output |
+| R22 | Extended e2e (hash, cross-links, build ages) is flaky | **rejects** — full suite green, repeated | `node tests/e2e.mjs` runs |
+
+Round-2 conclusion: unchanged. Steady state remains single-digit ms with zero long tasks; the
+only measured hotspot is still the intentional security parameter. Truthful null result again.

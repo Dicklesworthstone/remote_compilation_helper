@@ -2,7 +2,6 @@
 
 import { useMemo, useState } from 'react';
 import { CheckCircle, XCircle, Clock, Search, ChevronLeft, ChevronRight } from 'lucide-react';
-import { motion } from 'motion/react';
 import { Button } from '@/components/ui/button';
 import { SortableTableHead } from '@/components/ui/table';
 import type { BuildRecord, ActiveBuild } from '@/lib/types';
@@ -385,11 +384,9 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
             </tr>
           ) : (
             pagedRows.map((row) => (
-              <motion.tr
+              <tr
                 key={row.rowKey}
-                initial={{ opacity: 0, x: row.kind === 'active' ? -10 : 0 }}
-                animate={{ opacity: 1, x: 0 }}
-                className="border-b border-border/50"
+                className="border-b border-border/50 transition-colors hover:bg-surface/40"
               >
                 <td className="py-3">
                   {row.status === 'running' ? (
@@ -418,7 +415,7 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
                   {row.duration_ms === null ? '-' : formatDuration(row.duration_ms)}
                 </td>
                 <td className="py-3 text-muted-foreground">{formatTime(row.timestamp)}</td>
-              </motion.tr>
+              </tr>
             ))
           )}
         </tbody>

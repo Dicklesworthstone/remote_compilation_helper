@@ -25,6 +25,12 @@
         // users close via Esc (native cancel event) or the Close button.
         "files": ["src/components/WorkerDrawer.tsx", "src/components/DevMachineDrawer.tsx"],
         "rules": ["react-doctor/no-noninteractive-element-interactions"]
+      },
+      {
+        // Top-level root orchestrator: coordinates crypto derivation,
+        // auto-refresh timer, URL hash routing, global shortcuts, and drawer modals.
+        "files": ["src/App.tsx"],
+        "rules": ["react-doctor/no-giant-component"]
       }
     ]
   }

@@ -400,7 +400,52 @@ input { font: inherit; }
 
 .drawer-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
 .drawer h3 { margin: 0; font-family: var(--mono); font-size: 19px; }
-.drawer-host { font-family: var(--mono); font-size: 12px; color: var(--text-faint); margin-bottom: 20px; }
+.drawer-host {
+  font-family: var(--mono); font-size: 12px; color: var(--text-faint); margin-bottom: 20px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+
+/* inline text link inside drawers (cross-links, copy-ssh) */
+.link {
+  background: none; border: none; padding: 0;
+  color: var(--accent); font-size: 12px;
+  text-decoration: underline dotted; text-underline-offset: 3px;
+}
+.link:hover { color: var(--text); }
+
+/* clickable kv rows (worker drawer -> dev machine) */
+button.kv-link {
+  width: 100%; background: none; border: none;
+  border-bottom: 1px solid var(--border);
+  display: flex; justify-content: space-between; gap: 14px;
+  padding: 6px 0; font-size: 13px; color: inherit; text-align: left;
+}
+button.kv-link:last-of-type { border-bottom: none; }
+button.kv-link:hover .kv-v { color: var(--accent); }
+.kv-k { color: var(--text-dim); }
+.kv-v { font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
+
+/* pool-view alarm under a kv group */
+.warn-note {
+  margin: 8px 0 0; font-size: 12px; color: var(--warn); line-height: 1.45;
+}
+
+/* auto-refresh countdown in the header stamp */
+.auto-in { color: var(--text-faint); }
+
+/* sparkline hover */
+.spark-wrap { position: relative; }
+.spark-tip {
+  position: absolute; bottom: calc(100% + 2px); left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-elev); border: 1px solid var(--border-strong);
+  border-radius: 6px; padding: 2px 7px;
+  font-family: var(--mono); font-size: 11px; color: var(--text);
+  white-space: nowrap; pointer-events: none; z-index: 5;
+}
+
+/* failed build marker in recent-build rows */
+.fail-mark { color: var(--crit); font-weight: 600; }
 
 .kv-group { margin-bottom: 20px; }
 .kv-group h4 {

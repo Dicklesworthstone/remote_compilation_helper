@@ -80,6 +80,7 @@ await page.fill(".search", "hz");
 await page.waitForTimeout(400);
 const filtered = await page.locator(".wcard").count();
 check("search filters", filtered > 0 && filtered < cards, `${filtered} of ${cards}`);
+check("filter persists in URL hash", page.url().includes("q=hz"), page.url());
 await page.fill(".search", "");
 
 // status chip filter
@@ -105,6 +106,48 @@ await page.locator('[class*="pill dev-"]').first().click();
 await page.waitForSelector(".drawer", { timeout: 15000 });
 const devHeads = await page.locator(".drawer .kv-group h4").allInnerTexts();
 check("dev drawer shows offload posture", devHeads.some((h) => /offload/i.test(h)), devHeads.join(", "));
+
+// recent builds: relative ages + cross-link to the worker drawer when the id
+// is a fleet worker
+const buildRows = await page.locator(".drawer .build-row").count();
+check("recent builds listed", buildRows > 0, `${buildRows} rows`);
+if (buildRows > 0) {
+  const buildText = await page.locator(".drawer .builds").innerText();
+  check("recent builds show relative age", /ago/.test(buildText), buildText.split("\n")[0]);
+  const workerLink = page.locator(".drawer .build-row .link").first();
+  if ((await workerLink.count()) > 0) {
+    const linkedId = (await workerLink.innerText()).trim();
+    await workerLink.click();
+    await page.waitForSelector(".drawer", { timeout: 15000 });
+    const wTitle = (await page.locator(".drawer h3").innerText()).trim();
+    check("dev drawer cross-links to worker drawer", wTitle === linkedId, `${wTitle} (want ${linkedId})`);
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+  } else {
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+  }
+} else {
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+}
+
+// worker drawer: slots-per-dev-machine rows cross-link to dev drawers
+const workersSection = page.locator(".section").filter({
+  has: page.locator(".section-head h2", { hasText: /^Workers$/ }),
+});
+await workersSection.locator(".wcard").first().click();
+await page.waitForSelector(".drawer", { timeout: 15000 });
+const seenByText = await page.locator(".drawer").innerText();
+check("worker drawer shows seen-by machines", /Seen by/.test(seenByText));
+const kvLinks = page.locator(".drawer .kv-link");
+if ((await kvLinks.count()) > 0) {
+  const devId = (await kvLinks.first().locator(".kv-k").innerText()).trim();
+  await kvLinks.first().click();
+  await page.waitForSelector(".drawer", { timeout: 15000 });
+  const dTitle = (await page.locator(".drawer h3").innerText()).trim();
+  check("worker drawer cross-links to dev drawer", dTitle === devId, `${dTitle} (want ${devId})`);
+}
 await page.keyboard.press("Escape");
 await page.waitForTimeout(300);
 

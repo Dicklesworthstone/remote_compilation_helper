@@ -3,7 +3,6 @@
 import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import useSWR from 'swr';
 import { Server, RefreshCw } from 'lucide-react';
-import { motion } from 'motion/react';
 import { toast } from 'sonner';
 import { api } from '@/lib/api';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -167,12 +166,11 @@ export default function WorkersPage() {
           title="Refresh"
           aria-label="Refresh workers"
         >
-          <motion.div
-            animate={isValidating ? { rotate: 360 } : { rotate: 0 }}
-            transition={isValidating ? { duration: 1, repeat: Infinity, ease: 'linear' } : {}}
-          >
-            <RefreshCw className="w-5 h-5 text-muted-foreground" />
-          </motion.div>
+          <RefreshCw
+            className={`w-5 h-5 text-muted-foreground transition-transform ${
+              isValidating ? 'animate-spin' : ''
+            }`}
+          />
         </button>
       </div>
 

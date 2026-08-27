@@ -22,6 +22,7 @@ export function Overview({ snap, counts, hardProblems }: Props) {
   const diskUsedPct =
     t.disk_total_gb > 0 ? ((t.disk_total_gb - t.disk_free_gb) / t.disk_total_gb) * 100 : 0;
   const last = snap.history[snap.history.length - 1];
+  const times = snap.history.map((h) => h.t);
 
   return (
     <>
@@ -83,17 +84,33 @@ export function Overview({ snap, counts, hardProblems }: Props) {
             <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--busy)" }}>
               <div className="kpi-label">Slots in use</div>
               <div className="kpi-value">{last.slots_used}</div>
-              <Sparkline values={snap.history.map((h) => h.slots_used)} stroke="var(--busy)" label="slots in use over time" />
+              <Sparkline
+                values={snap.history.map((h) => h.slots_used)}
+                times={times}
+                stroke="var(--busy)"
+                label="slots in use over time"
+              />
             </div>
             <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--ok)" }}>
               <div className="kpi-label">Disk free</div>
               <div className="kpi-value">{fmtGb(last.disk_free_gb)}</div>
-              <Sparkline values={snap.history.map((h) => h.disk_free_gb)} stroke="var(--ok)" label="fleet disk free over time" />
+              <Sparkline
+                values={snap.history.map((h) => h.disk_free_gb)}
+                times={times}
+                format={(n) => fmtGb(n)}
+                stroke="var(--ok)"
+                label="fleet disk free over time"
+              />
             </div>
             <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--accent)" }}>
               <div className="kpi-label">Remote builds</div>
               <div className="kpi-value">{last.builds_remote}</div>
-              <Sparkline values={snap.history.map((h) => h.builds_remote)} stroke="var(--accent)" label="remote builds over time" />
+              <Sparkline
+                values={snap.history.map((h) => h.builds_remote)}
+                times={times}
+                stroke="var(--accent)"
+                label="remote builds over time"
+              />
             </div>
           </div>
         </section>

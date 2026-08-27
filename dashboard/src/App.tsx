@@ -13,17 +13,34 @@ import { DevMachineDrawer } from "./components/DevMachineDrawer";
 import { Overview } from "./components/Overview";
 import { Topbar, WorkersSection, type Sort } from "./components/Topbar";
 
+
 const DATA_URL = `${import.meta.env.BASE_URL}data/fleet.enc.json`;
 
+/** Filter/sort state persists in the URL hash so views are shareable. */
+function readViewPref(): { query: string; statusFilter: HealthLevel | "all"; sort: Sort } {
+  const h = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const FILTERS = ["all", "critical", "warn", "offline", "busy", "healthy"];
+  const SORTS = ["health", "name", "speed", "disk", "load", "slots"];
+  const f = h.get("f");
+  const s = h.get("s");
+  return {
+    query: h.get("q") ?? "",
+    statusFilter: f && FILTERS.includes(f) ? (f as HealthLevel | "all") : "all",
+    sort: s && SORTS.includes(s) ? (s as Sort) : "health",
+  };
+}
 
 function useTheme() {
   const [theme, setTheme] = useState<"dark" | "light">(() => {
     try {
-      return (localStorage.getItem("rch_dash_theme") as "dark" | "light") ?? "dark";
+      const stored = localStorage.getItem("rch_dash_theme") as "dark" | "light" | null;
+      if (stored) return stored;
+      return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
     } catch {
       return "dark";
     }
   });
+
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     try {
@@ -51,15 +68,11 @@ export default function App() {
   // ticking "stay unlocked", because there was no key to decrypt the reload.
   const keyRef = useRef<CryptoKey | null>(null);
 
-  const [query, setQuery] = useState("");
-  const [statusFilter, setStatusFilter] = useState<HealthLevel | "all">("all");
-  const [sort, setSort] = useState<Sort>("health");
   const [openWorker, setOpenWorker] = useState<string | null>(null);
   const [openDev, setOpenDev] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   // Auto-reload the snapshot every 5 minutes — the collector's typical cron
   // cadence — so a wall-mounted tab tracks the fleet without a hand on Refresh.
-  // Persisted; polling is skipped while the tab is hidden.
   const [auto, setAuto] = useState<boolean>(() => {
     try {
       return localStorage.getItem("rch_dash_auto") !== "0";
@@ -67,6 +80,11 @@ export default function App() {
       return true;
     }
   });
+  const [query, setQuery] = useState(() => readViewPref().query);
+  const [statusFilter, setStatusFilter] = useState<HealthLevel | "all">(() => readViewPref().statusFilter);
+  const [sort, setSort] = useState<Sort>(() => readViewPref().sort);
+  // When the current snapshot was decrypted — anchors the auto-refresh countdown.
+  const [snapAt, setSnapAt] = useState<number | null>(null);
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 30_000);
@@ -99,6 +117,7 @@ export default function App() {
       if (!key) return;
       try {
         setSnap(JSON.parse(await decryptEnvelope(env, key)));
+        setSnapAt(Date.now());
         keyRef.current = key;
       } catch {
         // Stale key (snapshot re-encrypted with a new salt, or passphrase
@@ -121,6 +140,7 @@ export default function App() {
         const key = await deriveKey(passphrase, env);
         const plain = await decryptEnvelope(env, key); // throws on a wrong key
         setSnap(JSON.parse(plain));
+        setSnapAt(Date.now());
         keyRef.current = key;
         if (remember) await persistKey(key);
       } catch {
@@ -145,6 +165,7 @@ export default function App() {
       }
       try {
         setSnap(JSON.parse(await decryptEnvelope(env, key)));
+        setSnapAt(Date.now());
         keyRef.current = key;
       } catch {
         // A new snapshot uses a fresh salt, so a key derived from the SAME
@@ -181,6 +202,17 @@ export default function App() {
   useEffect(() => {
     refreshRef.current = refresh;
   }, [refresh]);
+
+  // Persist filter/sort in the URL hash so an operator can share a link to a
+  // filtered view. replaceState: no history spam per keystroke.
+  useEffect(() => {
+    const h = new URLSearchParams();
+    if (query) h.set("q", query);
+    if (statusFilter !== "all") h.set("f", statusFilter);
+    if (sort !== "health") h.set("s", sort);
+    const next = h.toString();
+    history.replaceState(null, "", next ? `#${next}` : location.pathname + location.search);
+  }, [query, statusFilter, sort]);
   const hasSnap = snap != null;
   useEffect(() => {
     if (!hasSnap || !auto) return;
@@ -194,7 +226,61 @@ export default function App() {
     clearKey();
     keyRef.current = null;
     setSnap(null);
+    setSnapAt(null);
     setNotice(null);
+  }, []);
+
+  // Global operator shortcuts when unlocked and drawers are closed:
+  // '/' -> focus worker search, 'r' -> refresh, 't' -> toggle theme, '1'-'6' -> status filters
+  useEffect(() => {
+    if (!snap) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const activeTag = (document.activeElement?.tagName ?? "").toLowerCase();
+      const isInputActive = activeTag === "input" || activeTag === "textarea" || activeTag === "select";
+      if (isInputActive) return;
+      if (openWorker || openDev) return;
+
+      if (e.key === "/") {
+        e.preventDefault();
+        const input = document.getElementById("worker-search-input");
+        if (input) {
+          (input as HTMLInputElement).focus();
+          (input as HTMLInputElement).select();
+        }
+      } else if (e.key === "r" || e.key === "R") {
+        e.preventDefault();
+        void refreshRef.current();
+      } else if (e.key === "t" || e.key === "T") {
+        e.preventDefault();
+        setTheme((prev) => (prev === "dark" ? "light" : "dark"));
+      } else if (e.key === "1") {
+        setStatusFilter("all");
+      } else if (e.key === "2") {
+        setStatusFilter("critical");
+      } else if (e.key === "3") {
+        setStatusFilter("warn");
+      } else if (e.key === "4") {
+        setStatusFilter("offline");
+      } else if (e.key === "5") {
+        setStatusFilter("busy");
+      } else if (e.key === "6") {
+        setStatusFilter("healthy");
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [snap, openWorker, openDev, setTheme]);
+
+  // Cross-links: opening one entity closes the other drawer so the two native
+  // dialogs never stack.
+  const openWorkerFrom = useCallback((id: string) => {
+    setOpenDev(null);
+    setOpenWorker(id);
+  }, []);
+  const openDevFrom = useCallback((id: string) => {
+    setOpenWorker(null);
+    setOpenDev(id);
   }, []);
 
   // classifyAll deliberately ignores the reader clock (worker staleness is
@@ -211,6 +297,10 @@ export default function App() {
     for (const w of workers) c[w.health] = (c[w.health] ?? 0) + 1;
     return c;
   }, [workers]);
+
+  // Worker ids for dev-drawer cross-links. Must live ABOVE the `if (!snap)`
+  // early return — hooks cannot be conditional.
+  const fleetWorkerIds = useMemo(() => new Set(workers.map((w) => w.id)), [workers]);
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -254,6 +344,13 @@ export default function App() {
   const ageSec = (now - new Date(snap.generated_at).getTime()) / 1000;
   const hardProblems = devs.filter((d) => d.level === "local-only" || d.level === "unreachable");
   const degradedDevs = devs.filter((d) => d.level === "degraded");
+  // Minutes until the next auto-refresh, for the header countdown. Anchored to
+  // when the current snapshot was decrypted, so it survives re-unlocks.
+  const autoInMin =
+    auto && snapAt != null
+      ? Math.max(0, Math.ceil((snapAt + 5 * 60_000 - now) / 60_000))
+      : null;
+  const snapshotMs = new Date(snap.generated_at).getTime();
 
   return (
     <div className="shell">
@@ -263,6 +360,7 @@ export default function App() {
         refreshing={refreshing}
         onRefresh={() => void refresh()}
         auto={auto}
+        autoInMin={autoInMin}
         onToggleAuto={toggleAuto}
         theme={theme}
         onToggleTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
@@ -329,8 +427,18 @@ export default function App() {
         <span>decrypted locally · AES-256-GCM</span>
       </footer>
 
-      <WorkerDrawer w={workers.find((w) => w.id === openWorker) ?? null} onClose={() => setOpenWorker(null)} />
-      <DevMachineDrawer d={devs.find((d) => d.id === openDev) ?? null} onClose={() => setOpenDev(null)} />
+      <WorkerDrawer
+        w={workers.find((w) => w.id === openWorker) ?? null}
+        onClose={() => setOpenWorker(null)}
+        onOpenDev={openDevFrom}
+      />
+      <DevMachineDrawer
+        d={devs.find((d) => d.id === openDev) ?? null}
+        snapshotMs={snapshotMs}
+        onClose={() => setOpenDev(null)}
+        onOpenWorker={openWorkerFrom}
+        fleetWorkerIds={fleetWorkerIds}
+      />
     </div>
   );
 }

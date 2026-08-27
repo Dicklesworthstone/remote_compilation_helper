@@ -8,6 +8,8 @@ interface TopbarProps {
   refreshing: boolean;
   onRefresh: () => void;
   auto: boolean;
+  /** Minutes until the next auto-refresh; null when auto is off or no snapshot yet. */
+  autoInMin: number | null;
   onToggleAuto: () => void;
   theme: "dark" | "light";
   onToggleTheme: () => void;
@@ -28,6 +30,9 @@ export function Topbar(p: TopbarProps) {
       <div className="stamp">
         <span className={`dot ${dotClass}`} />
         snapshot {fmtAge(p.ageSec)}
+        {p.autoInMin != null && (
+          <span className="auto-in" title="Auto-refresh countdown">· auto ~{p.autoInMin}m</span>
+        )}
       </div>
       <button className="icon-btn" onClick={p.onRefresh} disabled={p.refreshing} aria-busy={p.refreshing}>
         {p.refreshing ? "Refreshing…" : "Refresh"}
@@ -75,8 +80,9 @@ export function WorkersSection(p: WorkersProps) {
         <span className="spacer" />
         <div className="filters">
           <input
+            id="worker-search-input"
             className="search"
-            placeholder="Filter by name, host or tag…"
+            placeholder="Filter by name, host or tag… (/)"
             value={p.query}
             onChange={(e) => p.onQuery(e.target.value)}
             onKeyDown={(e) => {
