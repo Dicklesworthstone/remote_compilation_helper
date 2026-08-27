@@ -160,7 +160,9 @@ export function BenchmarkTriggerButton({
               <div className="flex items-center justify-between text-sm">
                 <span className="text-muted-foreground">New SpeedScore:</span>
                 <span className="font-semibold text-emerald-600 dark:text-emerald-400">
-                  {Math.round(benchmark.result.total)}
+                  {benchmark.result.total != null && Number.isFinite(benchmark.result.total)
+                    ? Math.round(benchmark.result.total)
+                    : '—'}
                 </span>
               </div>
               {benchmark.durationSecs !== null && (

@@ -8,7 +8,10 @@
 
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
+import { readFile, writeFile, mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { build } from "esbuild";
 
 const BUNDLE = resolve(process.env.API_BUNDLE ?? ".vercel-fn/index.mjs");
 const { default: handler } = await import(pathToFileURL(BUNDLE).href);
@@ -17,10 +20,6 @@ const srv = http.createServer((req, res) => handler(req, res));
 await new Promise((r) => srv.listen(4180, r));
 
 const PW = process.env.RCH_DASH_PASSPHRASE;
-if (!PW) {
-  console.error("RCH_DASH_PASSPHRASE not set");
-  process.exit(2);
-}
 
 const call = async (path, headers = {}) => {
   const r = await fetch(`http://127.0.0.1:4180${path}`, { headers });
@@ -41,6 +40,12 @@ chk("401 on wrong passphrase", r.status === 401, r.body.trim());
 // Kept for the KDF-cache guards at the bottom: this sample is taken BEFORE any
 // successful request, i.e. against a guaranteed-empty derivation cache.
 const wrongOnEmptyCache = { status: r.status, ct: r.ct, body: r.body };
+
+if (!PW) {
+  console.log("  SKIP  positive decrypt tests (RCH_DASH_PASSPHRASE not set in env)");
+  srv.close();
+  process.exit(fails > 0 ? 1 : 0);
+}
 
 r = await call("/api/fleet", { authorization: `Bearer ${PW}` });
 chk("200 with bearer key", r.status === 200, `${r.body.length}B`);
@@ -107,5 +112,59 @@ chk("wrong-passphrase response unchanged by a populated cache",
   `${wrong.out.status} ${JSON.stringify(wrong.out.body)}`);
 
 srv.close();
+
+// ── transport compression ──────────────────────────────────────────────────
+//
+// The collector gzips the snapshot before encrypting it: the published file is
+// base64 of AES-GCM ciphertext, which is incompressible, so nothing downstream
+// of encryption can shrink it. This endpoint has to inflate what it decrypts.
+{
+  const bundled = JSON.parse(await readFile(resolve("public/data/fleet.enc.json"), "utf8"));
+  chk("bundled envelope declares its codec", bundled.compression === "gzip" || bundled.compression == null,
+    `compression=${JSON.stringify(bundled.compression ?? null)}`);
+  if (bundled.compression === "gzip") {
+    // Every 200 above came out of a gzip'd envelope, so the inflate path is
+    // already proven; report the leverage.
+    const plainish = bundled.ciphertext.length * 0.75;
+    chk("compressed envelope is a fraction of the plaintext it carries", plainish < 40_000,
+      `${Math.round(plainish)}B ciphertext for a ~51KB snapshot`);
+  }
+
+  // VERSION SKEW, forward: a snapshot written by a NEWER collector, using a codec
+  // this deployment cannot inflate. The failure must not be reported as a bad
+  // passphrase — the caller's credential is fine and telling them otherwise
+  // sends them to rotate a secret that was never the problem.
+  const dir = await mkdtemp(join(tmpdir(), "rch-endpoint-skew-"));
+  const doctored = join(dir, "fleet.enc.json");
+  await writeFile(doctored, JSON.stringify({ ...bundled, compression: "codec-from-the-future" }));
+  const skewBundle = join(dir, "index.mjs");
+  await build({
+    entryPoints: ["api/fleet.mjs"],
+    outfile: skewBundle,
+    bundle: true, format: "esm", platform: "node", target: "node20", logLevel: "silent",
+    loader: { ".json": "json" },
+    // Swap ONLY the bundled snapshot; every line of handler logic is the real one.
+    plugins: [{
+      name: "swap-envelope",
+      setup(b) {
+        b.onResolve({ filter: /public\/data\/fleet\.enc\.json$/ }, () => ({ path: doctored }));
+      },
+    }],
+  });
+  const { default: skewHandler } = await import(pathToFileURL(skewBundle).href);
+  const skewSrv = http.createServer((req, res) => skewHandler(req, res));
+  await new Promise((r) => skewSrv.listen(4181, r));
+  const skew = await fetch("http://127.0.0.1:4181/api/fleet", { headers: { authorization: `Bearer ${PW}` } });
+  const skewBody = await skew.text();
+  chk("an unknown codec is a 500, not a 401", skew.status === 500, `${skew.status} ${skewBody.trim()}`);
+  chk("the 500 names the codec", /codec-from-the-future/.test(skewBody), skewBody.trim());
+  // And a wrong passphrase against that same payload must still be a 401: the
+  // format problem must not swallow the credential check either.
+  const skewWrong = await fetch("http://127.0.0.1:4181/api/fleet", { headers: { authorization: "Bearer nope" } });
+  chk("an unknown codec still 500s ahead of the derivation", skewWrong.status === 500,
+    `${skewWrong.status} — refusing before 600k PBKDF2 on a payload we cannot read`);
+  skewSrv.close();
+}
+
 console.log(fails === 0 ? "\nALL ENDPOINT CHECKS PASSED" : `\n${fails} CHECK(S) FAILED`);
 process.exit(fails ? 1 : 0);

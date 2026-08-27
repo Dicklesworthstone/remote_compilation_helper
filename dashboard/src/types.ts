@@ -45,8 +45,21 @@ export interface Worker {
   tags: string[];
   /** From `rch workers list` — absent in `rch status`. */
   priority: number | null;
+  /**
+   * Which dev machines can see this worker, in snapshot dispatcher order.
+   *
+   * NOT ON THE WIRE. `classifyAll()` rebuilds it column-wise from
+   * `Dispatcher.pool_slots` — see `projectDispatchers()` in tools/snapshot.mjs
+   * for why the (dispatcher x worker) matrix is transmitted exactly once. It
+   * stays optional because a snapshot written before that change carries it
+   * inline, and `classifyAll()` leaves such a snapshot untouched.
+   */
   seen_by?: string[];
-  /** Slot view per dev machine — rchd derates independently on each. */
+  /**
+   * Slot view per dev machine — rchd derates independently on each. Same
+   * provenance as `seen_by`: rebuilt at classify time, keyed in dispatcher
+   * order, absent from the wire.
+   */
   slots_by_dispatcher?: Record<string, { used: number | null; total: number | null }>;
 }
 
@@ -207,18 +220,38 @@ export interface Dispatcher {
   // LLM view, no test. They cost 8.0KB of a 92.3KB payload (8.7%) on every
   // 5-minute refresh. Re-add them only together with a consumer.
   /**
-   * This machine's own derated slot reading for every worker it can see.
+   * This machine's own derated slot reading for every worker in the fleet, as
+   * ONE ROW of the (dispatcher x worker) matrix, aligned index-for-index to
+   * `Snapshot.workers`.
+   *
+   *   pool_slots[i] = [used, total]   this machine's reading of workers[i]
+   *   pool_slots[i] = null            this machine does not have workers[i]
    *
    * NOT a worker inventory — use the top-level `Snapshot.workers` for that, or
-   * `Worker.slots_by_dispatcher` to go the other way and ask which dev machines
-   * can see a given worker. This exists only because rchd derates each worker
-   * independently on every box, so "how much of the pool can THIS machine
-   * actually reach" is a per-dispatcher fact.
+   * `Worker.slots_by_dispatcher` to go the other way. This exists only because
+   * rchd derates each worker independently on every box, so "how much of the
+   * pool can THIS machine actually reach" is a per-dispatcher fact.
+   *
+   * It is also the ONLY copy of that matrix on the wire, which is what keeps
+   * the payload from growing as the product of both fleet counts three times
+   * over; `projectDispatchers()` in tools/snapshot.mjs has the measurements.
+   * Trailing nulls are trimmed, so the row may be shorter than `workers[]` —
+   * index it defensively.
    *
    * Read it through `DispatcherView.workers`, which `classifyDispatcher()`
-   * expands from these pairs.
+   * expands from this row, skipping the nulls.
    */
-  worker_slots: WorkerSlotPair[];
+  pool_slots: (WorkerSlotPair | null)[];
+  /**
+   * The pre-matrix form of `pool_slots`: dense, and positional against THIS
+   * dispatcher's own worker order rather than the fleet's.
+   *
+   * Only snapshots written before the matrix was de-duplicated carry it. It is
+   * still read, so a browser tab holding an older payload keeps its pool panel;
+   * the collector never writes it again. The two can never be confused because
+   * they are different keys — which is the entire reason for the rename.
+   */
+  worker_slots?: WorkerSlotPair[];
 }
 
 export interface HistoryPoint {

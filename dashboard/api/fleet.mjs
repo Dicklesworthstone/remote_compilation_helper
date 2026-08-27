@@ -20,7 +20,10 @@
  *   format = toon | json      (default toon — ~65% fewer characters)
  *   view   = summary | full   (default summary)
  *
- * Responses: 200 body | 401 wrong/missing key | 405 wrong method | 500 no snapshot.
+ * Responses: 200 body | 401 wrong/missing key | 405 wrong method | 400 bad
+ * format/view | 500 no snapshot, or a snapshot this build cannot decode (an
+ * unknown `compression` codec — a deployment-skew problem, never a credential
+ * one, so it must not masquerade as a 401).
  * Errors are single-line text so an agent can branch on them cheaply.
  *
  * Cost note: a WRONG passphrase always runs the full 600k PBKDF2 iterations
@@ -34,6 +37,7 @@
 
 import { webcrypto as crypto, createHmac, randomBytes } from "node:crypto";
 import { buildLlmView, encodeView, contentType } from "../tools/llm-view.mjs";
+import { decompressPlaintext, isSupportedCompression } from "../tools/envelope.mjs";
 // Bundled at build time so the function has no filesystem or network dependency.
 import envelope from "../public/data/fleet.enc.json" with { type: "json" };
 
@@ -132,26 +136,47 @@ async function deriveKey(env, passphrase) {
   );
 }
 
-async function decrypt(env, passphrase) {
+/**
+ * Authenticate + decrypt, and return the RAW plaintext bytes.
+ *
+ * Deliberately stops at the AES-GCM boundary. The caller treats a throw from
+ * here as "wrong passphrase", which is only true while the only thing that can
+ * throw is the auth tag. Decompression and JSON parsing happen outside, so a
+ * snapshot written by a newer collector — a codec this deployment does not
+ * implement — is reported as a broken payload rather than as a credential
+ * failure. Blaming the caller's passphrase for the publisher's format is exactly
+ * the kind of misdirection that costs an hour.
+ */
+async function decryptToBytes(env, passphrase) {
   const now = Date.now();
   const index = cacheIndex(env, passphrase);
   const open = (key) => crypto.subtle.decrypt(
     { name: "AES-GCM", iv: b64ToBuf(env.cipher.iv) }, key, b64ToBuf(env.ciphertext),
   );
 
-  let plain;
   const cached = cacheGet(index, now);
   if (cached) {
     // Only reachable for a passphrase that already authenticated this envelope
     // under these exact KDF parameters, so this cannot fail where a fresh
     // derivation would have succeeded.
-    plain = await open(cached);
-  } else {
-    const key = await deriveKey(env, passphrase);
-    plain = await open(key); // throws on a wrong passphrase — nothing is cached
-    cachePut(index, key, now);
+    return open(cached);
   }
-  return JSON.parse(new TextDecoder().decode(plain));
+  const key = await deriveKey(env, passphrase);
+  const plain = await open(key); // throws on a wrong passphrase — nothing is cached
+  cachePut(index, key, now);
+  return plain;
+}
+
+/**
+ * Raw plaintext bytes -> snapshot object.
+ *
+ * The collector gzips the snapshot JSON before encrypting it (ciphertext is
+ * incompressible, so this is the only layer where the payload can shrink — see
+ * tools/envelope.mjs). An envelope with no `compression` field predates that and
+ * is plain UTF-8, which `decompressPlaintext` handles as the identity case.
+ */
+function decodeSnapshot(bytes, env) {
+  return JSON.parse(decompressPlaintext(Buffer.from(bytes), env.compression));
 }
 
 function extractKey(req, url) {
@@ -217,12 +242,29 @@ export default async function handler(req, res) {
     return res.end("500 no snapshot bundled with this deployment\n");
   }
 
-  let snap;
+  // A codec this build cannot inflate is a deployment-skew problem, not a
+  // credential one. Answer before the 600k-iteration derivation, so the failure
+  // is both honest and cheap.
+  if (!isSupportedCompression(envelope.compression)) {
+    res.statusCode = 500;
+    return res.end(`500 snapshot uses an unsupported compression: ${String(envelope.compression)}\n`);
+  }
+
+  let plain;
   try {
-    snap = await decrypt(envelope, key);
+    plain = await decryptToBytes(envelope, key);
   } catch {
     res.statusCode = 401;
     return res.end("401 wrong passphrase for this snapshot\n");
+  }
+
+  let snap;
+  try {
+    snap = decodeSnapshot(plain, envelope);
+  } catch (e) {
+    // Authenticated, so the bytes are genuinely ours — they just did not decode.
+    res.statusCode = 500;
+    return res.end(`500 snapshot decrypted but could not be decoded: ${e?.message ?? "unknown error"}\n`);
   }
 
   const body = encodeView(buildLlmView(snap, { view }), format);

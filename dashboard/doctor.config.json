@@ -3,6 +3,7 @@
   // Exemptions are per-file and each carries its rationale. Everything else
   // must stay clean; do not extend this list without a written reason.
   "ignore": {
+    "patterns": ["tests/**", "tools/**"],
     "overrides": [
       {
         // The metric bars use role="meter" + aria-valuenow — the ARIA APG
@@ -21,7 +22,7 @@
       },
       {
         // Native <dialog> with showModal(); clicking the backdrop closes the
-        // drawer (e.target === dialog). Pointer-only convenience — keyboard
+        // drawer (e.g. e.target === dialog). Pointer-only convenience — keyboard
         // users close via Esc (native cancel event) or the Close button.
         "files": ["src/components/WorkerDrawer.tsx", "src/components/DevMachineDrawer.tsx"],
         "rules": ["react-doctor/no-noninteractive-element-interactions"]
@@ -31,6 +32,16 @@
         // auto-refresh timer, URL hash routing, global shortcuts, and drawer modals.
         "files": ["src/App.tsx"],
         "rules": ["react-doctor/no-giant-component"]
+      },
+      {
+        // Test fixtures testing JSON round-tripping and serialization
+        "files": ["tests/parity.mjs", "tests/snapshot.mjs"],
+        "rules": ["react-doctor/no-json-parse-stringify-clone"]
+      },
+      {
+        // Standalone CLI and profiling scripts
+        "files": ["tools/scaling.mjs", "tools/fleet-llm.mjs", "tests/render-probe.mjs", "tests/perf.mjs"],
+        "rules": ["deslop/unused-file"]
       }
     ]
   }

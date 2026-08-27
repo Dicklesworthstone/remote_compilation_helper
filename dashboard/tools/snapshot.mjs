@@ -43,12 +43,31 @@ import { dirname } from "node:path";
 import { hostname } from "node:os";
 import { pathToFileURL } from "node:url";
 
+import { SNAPSHOT_COMPRESSION, compressPlaintext, decompressPlaintext } from "./envelope.mjs";
+
 const execFileAsync = promisify(execFile);
 
 const PBKDF2_ITERATIONS = 600_000;
 const SCHEMA = "rch.dashboard.snapshot.v2";
 const SSH_TIMEOUT_MS = 90_000;
 const MAX_BUFFER = 64 * 1024 * 1024;
+
+/**
+ * How many dispatchers to probe at once.
+ *
+ * The fan-out used to be unbounded AND four-wide per host: every dispatcher
+ * issued `rch status`, `rch workers capabilities`, `rch workers list` and a
+ * curl of the metrics endpoint as four independent `ssh` processes, so a
+ * 10-machine fleet opened 36 simultaneous TCP connections and paid 36 full
+ * key-exchange handshakes — on the COLLECTOR's cpu, which is the machine that
+ * is usually already busy. Each host now needs exactly one connection, so the
+ * count is N, not 4N; this caps N as well so a 60-machine fleet cannot melt the
+ * collector's file-descriptor and process budget.
+ *
+ * 16 is above every fleet this has run against, so today it throttles nothing
+ * and the collection order and output are bit-identical to the unbounded form.
+ */
+const DEFAULT_MAX_PARALLEL = 16;
 
 // ---------------------------------------------------------------- arg parsing
 
@@ -59,6 +78,7 @@ function parseArgs(argv) {
     historyFile: ".snapshot-history.json",
     historyMax: 96,
     label: "rch fleet",
+    maxParallel: DEFAULT_MAX_PARALLEL,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -86,11 +106,20 @@ function parseArgs(argv) {
       }
       args.historyMax = n;
     }
+    else if (a === "--max-parallel") {
+      const n = Number(next());
+      if (!Number.isInteger(n) || n < 1) {
+        console.error("--max-parallel must be a positive integer");
+        process.exit(2);
+      }
+      args.maxParallel = n;
+    }
     else if (a === "--help" || a === "-h") {
       console.log(
         "usage: RCH_DASH_PASSPHRASE=... node tools/snapshot.mjs\n" +
           "  [--dispatchers a,b,c]  ssh targets; use `local` for this machine\n" +
-          "  [--out path] [--label name] [--history-file path] [--history-max N]",
+          "  [--out path] [--label name] [--history-file path] [--history-max N]\n" +
+          `  [--max-parallel N]     dispatchers probed at once (default ${DEFAULT_MAX_PARALLEL})`,
       );
       process.exit(0);
     } else {
@@ -148,14 +177,177 @@ async function run(host, command) {
   }
 }
 
+// --------------------------------------------------------- the combined probe
+
 /**
- * Run an rch subcommand that emits the standard `{data: ...}` JSON envelope.
+ * The four questions asked of every dispatcher, in wire order.
+ *
+ * These used to be FOUR separate `ssh` invocations fired with `Promise.all`,
+ * which meant four TCP connections and four full key-exchange handshakes per
+ * host — 36 of them on a 10-machine fleet, all racing on the collector's own
+ * cpu. They are now one connection per host, and the four commands still run
+ * CONCURRENTLY, on the far side.
+ *
+ * `cmd` is byte-for-byte what each command used to be, including the per-command
+ * `timeout` budget and the `2>/dev/null`. That matters more than it looks:
+ *   - the budgets genuinely differ (70/70/45/10s) and running them serially in
+ *     one shell would let a wedged `rch status` eat the whole run — measured at
+ *     p50 2,955ms/host against 834ms for the parallel form, so the far side
+ *     must fork, not sequence;
+ *   - `timeout(1)` does not exist on a stock macOS, and one dispatcher is a Mac.
+ *     It resolves there only because Homebrew's coreutils is on the default
+ *     non-login ssh PATH. Keeping the command text identical keeps that working
+ *     (and keeps it failing the same recognisable way if Homebrew ever goes).
+ *   - the `export PATH` prefix stays INSIDE each rch section's subshell, so it
+ *     cannot leak into the `curl` section and change which curl runs.
+ */
+const PROBE_SECTIONS = [
+  { key: "s", cmd: rchProbeCommand("status", 70) },
+  { key: "c", cmd: rchProbeCommand("workers capabilities", 70) },
+  { key: "l", cmd: rchProbeCommand("workers list", 45) },
+  { key: "m", cmd: "curl -s --max-time 10 http://127.0.0.1:9100/metrics 2>/dev/null" },
+];
+
+function rchProbeCommand(subcommand, timeoutSec) {
+  return `export PATH="$HOME/.local/bin:$PATH"; timeout ${timeoutSec} rch ${subcommand} --json 2>/dev/null`;
+}
+
+/**
+ * Per-process section marker. Random, because the payload is not ours: a build
+ * command string in `rch status` or a Prometheus label could in principle
+ * contain any fixed sentinel we picked, and a payload that can forge a frame
+ * boundary can move bytes from one section into another. A 16-hex-digit nonce
+ * that only exists inside this process cannot be guessed by the data.
+ */
+const PROBE_NONCE = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
+
+/**
+ * One shell script that answers all four questions over a single connection.
+ *
+ * Shape, and why each piece is the way it is:
+ *
+ *   d=$(mktemp -d ...)     Temp files are what makes CONCURRENT sections
+ *                          possible. Four background jobs cannot share one
+ *                          stdout: `rch status --json` is tens of KB and writes
+ *                          larger than PIPE_BUF are not atomic, so their bytes
+ *                          would interleave and every section would be corrupt.
+ *   if [ -n "$d" ] ... else
+ *                          If `mktemp` fails — a full /data/tmp is a real
+ *                          condition on this fleet — fall back to running the
+ *                          four SEQUENTIALLY in the same connection. Slower, but
+ *                          a slow dispatcher beats one that reports as dead.
+ *   trap '... EXIT'        Removes exactly the four files this script created
+ *                          and its own directory. Nothing else is touched, and
+ *                          nothing is left behind on the host.
+ *   wait $qN; eN=$?        The subcommand's OWN exit status, which is what makes
+ *                          per-section failure reporting possible — see
+ *                          sectionResult(). The four still ran in parallel;
+ *                          waiting for them in order costs nothing.
+ *   cat; echo; echo MARKER Content, then exactly one newline, then the marker on
+ *                          its own line. splitProbeSections() relies on that
+ *                          single added newline to reconstruct each section's
+ *                          bytes EXACTLY, including the empty-output case that
+ *                          the metrics scraper reports as an error.
+ *
+ * Everything here is POSIX sh: the fleet's login shells are a mix of bash and
+ * zsh and ssh runs the command under whichever one the account has.
+ */
+export function buildProbeScript(nonce = PROBE_NONCE) {
+  const files = PROBE_SECTIONS.map((s) => `"$d/${s.key}"`).join(" ");
+  return [
+    `d=$(mktemp -d "\${TMPDIR:-/tmp}/rchdash.XXXXXX" 2>/dev/null)`,
+    `if [ -n "$d" ]; then`,
+    `trap 'rm -f ${files}; rmdir "$d" 2>/dev/null' EXIT`,
+    ...PROBE_SECTIONS.map((s, i) => `{ ${s.cmd}; } > "$d/${s.key}" & q${i}=$!`),
+    ...PROBE_SECTIONS.map((s, i) =>
+      `wait $q${i}; e${i}=$?\ncat "$d/${s.key}"; echo; echo "${nonce}:${s.key}:$e${i}"`),
+    `else`,
+    ...PROBE_SECTIONS.map((s) => `( ${s.cmd} ); e=$?; echo; echo "${nonce}:${s.key}:$e"`),
+    `fi`,
+  ].join("\n");
+}
+
+/**
+ * Split framed probe output back into `key -> {text, rc}`.
+ *
+ * The reconstruction is exact, not approximate. The emitter writes
+ * `<content>\n<marker>\n`; splitting the whole stream on "\n" and re-joining a
+ * section's tokens with "\n" consumes precisely the one newline the emitter
+ * added, so `text` is the original bytes — `""` stays `""`, and a section whose
+ * content already ended in a newline keeps it. That exactness is load-bearing:
+ * `parseMetrics` reports "no response from 127.0.0.1:9100" on a FALSY stdout,
+ * so a stray newline would silently convert a dead metrics endpoint into a
+ * healthy-looking one with no workers in it.
+ *
+ * Bytes before the first marker belong to the first section, which is where ssh
+ * banner noise landed before too — `rch`'s JSON is still located by scanning
+ * from the first `{` to the last `}`.
+ *
+ * First marker for a key wins, so a duplicate frame cannot overwrite a section
+ * that already parsed.
+ */
+export function splitProbeSections(stdout, nonce = PROBE_NONCE) {
+  const out = new Map();
+  const marker = new RegExp(`^${nonce}:([a-z]+):(-?\\d+)$`);
+  let buf = [];
+  for (const line of String(stdout ?? "").split("\n")) {
+    const m = marker.exec(line);
+    if (!m) { buf.push(line); continue; }
+    if (!out.has(m[1])) out.set(m[1], { text: buf.join("\n"), rc: Number(m[2]) });
+    buf = [];
+  }
+  return out;
+}
+
+/**
+ * Turn one section of a probe into the `{stdout, error}` shape the parsers
+ * below expect — the same shape `run()` used to hand them per command.
+ *
+ * This is where the old per-command failure isolation is preserved. The four
+ * questions no longer have four exit statuses from four ssh processes, so the
+ * far side reports each one's own status and it is reconstructed here:
+ *
+ *   section present, exit 0    -> {stdout, error: null}      (as before)
+ *   section present, exit N!=0 -> {stdout, error: "exited N"} — and if stdout is
+ *                                 non-empty the parsers IGNORE the error and use
+ *                                 it, exactly as they did when a non-zero ssh
+ *                                 still carried usable JSON.
+ *   section absent             -> the transport error, or "no output". A section
+ *                                 goes missing only when the connection itself
+ *                                 failed, or the remote shell died before
+ *                                 reaching it — in both cases every section is
+ *                                 missing, which is precisely the old
+ *                                 all-four-ssh-calls-failed case.
+ *
+ * So one failing subcommand degrades exactly one section: `workers list`
+ * returning nothing still leaves `rch status` parsed, the dispatcher reachable,
+ * and `config_degraded` set — see tests/snapshot.mjs.
+ */
+function sectionResult(probe, key) {
+  const sec = probe.sections.get(key);
+  if (sec) return { stdout: sec.text, error: sec.rc === 0 ? null : `exited ${sec.rc}` };
+  return { stdout: "", error: probe.error || null };
+}
+
+/**
+ * Built once, so every dispatcher in a run is asked exactly the same question
+ * under exactly the same nonce — the script is a pure function of
+ * PROBE_SECTIONS and cannot drift between hosts.
+ */
+const PROBE_SCRIPT = buildProbeScript();
+
+/** One connection per dispatcher. Never throws; returns {sections, error}. */
+async function probeDispatcher(host) {
+  const res = await run(host, PROBE_SCRIPT);
+  return { sections: splitProbeSections(res.stdout), error: res.error ?? null };
+}
+
+/**
+ * Parse an rch subcommand's standard `{data: ...}` JSON envelope.
  * Returns `{data, error}` — `data` is null on every failure and `error` says
  * why, so a dead daemon can be told apart from an unreachable host.
  */
-async function rchJson(host, subcommand, timeoutSec = 60) {
-  const cmd = `export PATH="$HOME/.local/bin:$PATH"; timeout ${timeoutSec} rch ${subcommand} --json 2>/dev/null`;
-  const res = await run(host, cmd);
+function parseRchJson(subcommand, res) {
   if (!res.stdout.trim()) {
     return { data: null, error: res.error ? `${subcommand}: ${res.error}` : `${subcommand}: no output` };
   }
@@ -189,8 +381,7 @@ async function rchJson(host, subcommand, timeoutSec = 60) {
 }
 
 /** Scrape the daemon's Prometheus endpoint for probe latency. */
-async function fetchMetrics(host) {
-  const res = await run(host, "curl -s --max-time 10 http://127.0.0.1:9100/metrics 2>/dev/null");
+function parseMetrics(res) {
   const out = { latency: {}, lastSeen: {}, error: null };
   if (!res.stdout) {
     // Worth surfacing: `last_seen_unix` comes only from here, so losing this
@@ -267,15 +458,58 @@ export function pressureIsBetter(next, cur) {
   return an < ac;
 }
 
+/**
+ * `Promise.allSettled` with a ceiling on how many run at once.
+ *
+ * Results are written back BY INDEX, so the returned array is in input order
+ * and carries the same `{status, value}` / `{status, reason}` shape
+ * `Promise.allSettled` returns. That is the isomorphism: with `limit >= n` this
+ * is `Promise.allSettled`, and `dispatchers[]` — which is positional, and which
+ * the string table and every consumer index into — keeps its order at any limit.
+ */
+export async function allSettledBounded(items, limit, fn) {
+  const out = new Array(items.length);
+  const width = Math.max(1, Math.min(limit, items.length));
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      try {
+        out[i] = { status: "fulfilled", value: await fn(items[i], i) };
+      } catch (reason) {
+        out[i] = { status: "rejected", reason };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: width }, worker));
+  return out;
+}
+
+/** One dispatcher, one connection. */
 async function collectDispatcher(host) {
+  return dispatcherFromProbe(host, await probeDispatcher(host));
+}
+
+/**
+ * Build a dispatcher record from an already-collected probe.
+ *
+ * Separate from the ssh call for one reason: this is where per-section failure
+ * isolation lives, and isolation you cannot test is isolation you do not have.
+ * `tests/snapshot.mjs` hands this function hand-framed probe output — one
+ * section failing, the rest healthy — and asserts the surviving sections still
+ * populate, which is the property the four-processes-to-one collapse had to
+ * keep.
+ */
+export function dispatcherFromProbe(host, probe) {
   // `rch status` carries runtime state but NOT the static config fields
-  // (tags, priority, enabled) — those only exist in `workers list`.
-  const [statusRes, capsRes, listRes, metrics] = await Promise.all([
-    rchJson(host, "status", 70),
-    rchJson(host, "workers capabilities", 70),
-    rchJson(host, "workers list", 45),
-    fetchMetrics(host),
-  ]);
+  // (tags, priority, enabled) — those only exist in `workers list`. All four
+  // still run concurrently; they now do it on the far side of ONE connection
+  // instead of four. See PROBE_SECTIONS.
+  const statusRes = parseRchJson("status", sectionResult(probe, "s"));
+  const capsRes = parseRchJson("workers capabilities", sectionResult(probe, "c"));
+  const listRes = parseRchJson("workers list", sectionResult(probe, "l"));
+  const metrics = parseMetrics(sectionResult(probe, "m"));
 
   const status = statusRes.data;
   const caps = capsRes.data;
@@ -433,6 +667,192 @@ async function collectDispatcher(host) {
   };
 }
 
+// -------------------------------------------------------- merge + aggregation
+
+/**
+ * Union the per-dispatcher worker views into ONE fleet-wide worker list.
+ *
+ * A worker is "known" if any dev machine has it, and runtime facts come from
+ * whichever machine actually reported them, so one unreachable dispatcher
+ * cannot blank the fleet. Slot counts are per-observer (rchd derates
+ * independently), so keep the MAX observed capacity here; WHICH observer saw
+ * what is `projectDispatchers()`'s job, not this one's.
+ *
+ * Pure, and exported, so `tools/scaling.mjs` can drive it at fleet sizes that
+ * do not exist yet and `tests/snapshot.mjs` can assert the worst-wins rules
+ * directly. `main()` below is the only production caller.
+ *
+ * Complexity: one Map probe per (dispatcher, worker) OBSERVATION plus one sort
+ * of the distinct workers — linear in the input records, and the input records
+ * are what grow quadratically when both counts scale together.
+ */
+export function mergeWorkers(dispatchers) {
+  const merged = new Map();
+  for (const d of dispatchers) {
+    for (const w of d.workers) {
+      const prev = merged.get(w.id);
+      if (!prev) {
+        // Copy the nested objects. A shallow spread aliases `caps`, `pressure`,
+        // `tags` and `failure_history` to the FIRST dispatcher's own records,
+        // and the merge below then mutates them in place — silently rewriting
+        // that dispatcher's private per-worker view with values observed
+        // elsewhere.
+        merged.set(w.id, {
+          ...w,
+          caps: { ...w.caps },
+          pressure: { ...w.pressure },
+          tags: [...(w.tags ?? [])],
+          failure_history: [...(w.failure_history ?? [])],
+        });
+        continue;
+      }
+      if ((w.total_slots ?? 0) > (prev.total_slots ?? 0)) prev.total_slots = w.total_slots;
+      if ((w.used_slots ?? 0) > (prev.used_slots ?? 0)) prev.used_slots = w.used_slots;
+
+      // WORST-WINS for anything that signals trouble. Dev machines observe the
+      // pool independently and can disagree; taking whichever answered first
+      // would let a benign reading mask an alarming one and hide the exact
+      // thing this dashboard exists to surface.
+      if (statusRank(w.status) > statusRank(prev.status)) prev.status = w.status;
+      if (circuitRank(w.circuit_state) > circuitRank(prev.circuit_state)) {
+        prev.circuit_state = w.circuit_state;
+      }
+      if ((w.consecutive_failures ?? 0) > (prev.consecutive_failures ?? 0)) {
+        prev.consecutive_failures = w.consecutive_failures;
+      }
+      // Seen by ANY dispatcher recently means it is not stale, so keep the most
+      // recent sighting rather than the first one reported.
+      if ((w.last_seen_unix ?? 0) > (prev.last_seen_unix ?? 0)) prev.last_seen_unix = w.last_seen_unix;
+
+      for (const k of ["speed", "latency_ms", "last_error", "priority"]) {
+        if (prev[k] == null && w[k] != null) prev[k] = w[k];
+      }
+      if ((prev.tags?.length ?? 0) === 0 && w.tags?.length) prev.tags = [...w.tags];
+      for (const k of Object.keys(w.caps)) if (prev.caps[k] == null && w.caps[k] != null) prev.caps[k] = w.caps[k];
+
+      // Take the pressure block WHOLE from the freshest observer. Merging it
+      // field by field could pair disk_free_gb from one dispatcher with
+      // disk_total_gb from another and compute a nonsense percentage.
+      if (pressureIsBetter(w.pressure, prev.pressure)) prev.pressure = { ...w.pressure };
+
+      if (!prev.failure_history.length && w.failure_history.length) prev.failure_history = [...w.failure_history];
+    }
+  }
+  return [...merged.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+/**
+ * Fleet-wide aggregates, from the merged workers and the raw dispatchers.
+ *
+ * Pure and exported for the same reason as `mergeWorkers()`. Every KPI on the
+ * overview is one of these numbers, so the arithmetic is worth being able to
+ * test and to profile on its own.
+ */
+export function computeTotals(workers, dispatchers) {
+  const reachable = dispatchers.filter((d) => d.reachable);
+
+  // Only count a worker's disk when BOTH halves are present. Summing them
+  // independently let a worker with a total but no free reading add to the
+  // denominator and nothing to the numerator, inflating fleet "disk used %"
+  // with a number no single worker ever reported.
+  const diskWorkers = workers.filter(
+    (w) => w.pressure.disk_free_gb != null && w.pressure.disk_total_gb != null && w.pressure.disk_total_gb > 0,
+  );
+
+  return {
+    workers: workers.length,
+    slots: workers.reduce((n, w) => n + (w.total_slots ?? 0), 0),
+    // Per-observer occupancy (each rchd derates and reserves independently), so
+    // this is the worst single observation, never more than capacity.
+    slots_used: workers.reduce((n, w) => n + Math.min(w.used_slots ?? 0, w.total_slots ?? Infinity), 0),
+    cores: workers.reduce((n, w) => n + (w.caps.num_cpus ?? 0), 0),
+    disk_free_gb: diskWorkers.reduce((n, w) => n + w.pressure.disk_free_gb, 0),
+    disk_total_gb: diskWorkers.reduce((n, w) => n + w.pressure.disk_total_gb, 0),
+    /** How many workers actually reported usable disk telemetry, so the UI can say "of N" honestly. */
+    disk_reporting_workers: diskWorkers.length,
+    dispatchers_total: dispatchers.length,
+    dispatchers_reachable: reachable.length,
+    dispatchers_remote_ready: reachable.filter((d) => d.posture === "remote_ready").length,
+    builds_remote: reachable.reduce((n, d) => n + (d.build_stats?.remote ?? 0), 0),
+    builds_local: reachable.reduce((n, d) => n + (d.build_stats?.local ?? 0), 0),
+    active_builds: reachable.reduce((n, d) => n + d.active_builds, 0),
+  };
+}
+
+/**
+ * Project the per-dispatcher worker arrays down before they reach the wire.
+ *
+ * Every dispatcher used to ship a FULL copy of every worker it can see: on a
+ * 10-machine fleet that is 142 records, 121.5KB of a 222.8KB payload (54.6%),
+ * re-downloaded whole on every 5-minute refresh. All of it was redundant:
+ * every descriptive field (host, user, caps, pressure, tags, latency,
+ * failure_history, ...) is already in the merged `workers[]`, folded worst-wins
+ * across observers. The only genuinely per-dispatcher fact is the DERATED SLOT
+ * READING, and this is the one place it survives.
+ *
+ * THE (DISPATCHER x WORKER) MATRIX, AND WHY IT IS EMITTED EXACTLY ONCE
+ *
+ * "Every dev machine has its own derated reading of every shared worker" is a
+ * d x w matrix — the only structure in this snapshot whose size is the PRODUCT
+ * of both fleet counts rather than a sum, so it is the term that decides how
+ * this payload behaves as the fleet grows. `tools/scaling.mjs` measured it
+ * fitting n^2.00, and measured the payload carrying THREE separate copies of
+ * it, in three layouts:
+ *
+ *   workers[].slots_by_dispatcher   {"dev-x":{"used":3,"total":14}}  ~31 B/cell
+ *   workers[].seen_by               "dev-x",                         ~11 B/cell
+ *   dispatchers[].worker_slots      [3,14],                           ~8 B/cell
+ *
+ * `seen_by` is exactly `Object.keys(slots_by_dispatcher)` and `worker_slots` is
+ * exactly the same readings transposed, so ~50 bytes per cell were spent
+ * carrying ~8 bytes of information. On a 10-machine fleet that is 6.5KB of a
+ * 59.8KB payload and nobody notices; at 100 dispatchers it is 639KB of 1,001KB
+ * (64%) and at 500 it is 15.7MB of 17.3MB (91%). The quadratic was always
+ * there — the fleet was just too small to feel it.
+ *
+ * So the matrix is emitted ONCE, dispatcher-major, as a row per dev machine
+ * ALIGNED TO `snapshot.workers[]` (which is sorted by id, so the alignment is a
+ * pure function of the snapshot):
+ *
+ *   pool_slots[i] = [used, total]   this machine's reading of workers[i]
+ *   pool_slots[i] = null            this machine does not have workers[i]
+ *
+ * `src/derive.ts` reads a dispatcher's own row directly (`expandPoolSlots`),
+ * and rebuilds each worker's `seen_by` / `slots_by_dispatcher` column-wise in
+ * `classifyAll()`, which is handed the whole snapshot and so can see both axes.
+ * Trailing nulls are trimmed — a short row simply means "nothing after this" —
+ * and every reader indexes defensively, so a ragged row can never be read as a
+ * zero-slot reading.
+ *
+ * NAMED `pool_slots`, NOT `worker_slots`, deliberately, and for the same reason
+ * `builds` is not `recent_builds`: a browser tab still holding the previous
+ * bundle indexes `worker_slots` POSITIONALLY against that dispatcher's own
+ * worker order, and would read this fleet-aligned row as that machine's pool —
+ * counting every `null` as a worker derated to zero slots and reporting a
+ * dev-machine-wide alarm that is not happening. Under a new key the old bundle
+ * sees no pool view at all and renders "0 workers seen", which is
+ * wrong-but-quiet rather than a false alarm.
+ *
+ * @param workers the MERGED, id-sorted worker list — the row index space.
+ */
+export function projectDispatchers(dispatchers, workers) {
+  const indexOfWorker = new Map(workers.map((w, i) => [w.id, i]));
+  return dispatchers.map(({ workers: seen, ...rest }) => {
+    const row = new Array(workers.length).fill(null);
+    for (const w of seen) {
+      const i = indexOfWorker.get(w.id);
+      // `undefined`, not a falsy check: index 0 is a real worker.
+      if (i !== undefined) row[i] = [w.used_slots, w.total_slots];
+    }
+    // Trailing nulls carry nothing. A dispatcher that only has the first few
+    // workers of a large fleet would otherwise pay 5 bytes per absent worker
+    // for the privilege of saying nothing about it.
+    let end = row.length;
+    while (end > 0 && row[end - 1] === null) end--;
+    return { ...rest, pool_slots: end === row.length ? row : row.slice(0, end) };
+  });
+}
+
 // ------------------------------------------------------------ string interning
 
 /**
@@ -566,6 +986,44 @@ export async function existingSalt(outPath) {
   }
 }
 
+/**
+ * Keys `encrypt()` has already derived, so `verifyRoundTrip()` need not spend a
+ * SECOND 600k-iteration PBKDF2 producing one it can simply be handed.
+ *
+ * Measured at 54ms of CPU per collection (51–57ms over nine A/B pairs) — 6% of
+ * the collector's entire CPU budget, and after six optimization passes the
+ * largest removable cost left anywhere in this dashboard. It never showed up in a
+ * V8 CPU profile, which reports this process as 94.9% idle, because
+ * `crypto.subtle.deriveKey` runs on the libuv threadpool and not on the JS
+ * thread; it has to be measured with `process.cpuUsage()` deltas.
+ *
+ * A WeakMap keyed by the envelope OBJECT rather than an extra return value or an
+ * extra parameter, because `encrypt()` is exported and used elsewhere: its
+ * contract stays exactly "plaintext + passphrase -> envelope". An envelope this
+ * map has never seen — one read back from disk, one built by hand in a test —
+ * falls straight through to a full derivation, so a missing entry can only ever
+ * make verification slower, never weaker. Entries die with the envelope.
+ *
+ * The passphrase is held beside the key so that verifying under a DIFFERENT
+ * passphrase than the one that encrypted still fails, exactly as an independent
+ * re-derivation made it fail. That is no new exposure: the collector already
+ * holds the same string in `process.env` and in `main()`'s own const for the
+ * whole life of the process, and this entry is unreachable outside this module.
+ */
+const derivedEncryptionKeys = new WeakMap();
+
+/**
+ * Compress, then encrypt.
+ *
+ * The order is the only one that does anything: ciphertext is incompressible, so
+ * compressing after encryption — or leaving it to the CDN, which only ever sees
+ * ciphertext — buys nothing. See tools/envelope.mjs for the codec comparison and
+ * for why CRIME/BREACH does not reach this pipeline.
+ *
+ * `compression` is written into the envelope so the format describes itself. A
+ * reader that finds no such field must treat the plaintext as uncompressed —
+ * that is exactly what every envelope written before this change is.
+ */
 export async function encrypt(plaintext, passphrase, reusableSalt = null) {
   const enc = new TextEncoder();
   const salt = reusableSalt ?? crypto.getRandomValues(new Uint8Array(16));
@@ -576,39 +1034,98 @@ export async function encrypt(plaintext, passphrase, reusableSalt = null) {
     baseKey,
     { name: "AES-GCM", length: 256 },
     false,
-    ["encrypt"],
+    // `decrypt` as well as `encrypt`, so verifyRoundTrip() can reuse this exact
+    // key instead of spending 51ms deriving an identical one. A usage mask is
+    // WebCrypto bookkeeping, not key material — the same passphrase, salt,
+    // iteration count and hash produce the same 256 bits either way, which
+    // tests/snapshot.mjs proves by encrypting under both masks with a fixed IV
+    // and comparing ciphertexts. The key stays non-extractable and never leaves
+    // this module.
+    ["encrypt", "decrypt"],
   );
-  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(plaintext));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, compressPlaintext(plaintext));
   const b64 = (u8) => Buffer.from(u8).toString("base64");
-  return {
+  const envelope = {
     format: "rch.dashboard.enc.v1",
     kdf: { name: "PBKDF2", hash: "SHA-256", iterations: PBKDF2_ITERATIONS, salt: b64(salt) },
     cipher: { name: "AES-GCM", iv: b64(iv) },
+    compression: SNAPSHOT_COMPRESSION,
     ciphertext: b64(new Uint8Array(ct)),
   };
+  derivedEncryptionKeys.set(envelope, {
+    key, passphrase, salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256",
+  });
+  return envelope;
 }
 
 /**
- * Decrypt what we just encrypted and confirm it round-trips to the same size.
- * Cheap insurance against publishing a payload the passphrase cannot open.
+ * The key to verify `envelope` with: the one `encrypt()` just derived when this
+ * is the envelope it produced under this passphrase, and a fresh derivation
+ * otherwise.
+ *
+ * Reusing the key would drop one thing the old unconditional re-derivation
+ * proved implicitly — that the KDF parameters WRITTEN INTO the envelope are the
+ * ones the key actually came from. That is a real bug class and not a
+ * theoretical one: the browser and `api/fleet.mjs` derive from those written
+ * parameters and nothing else, so a salt that failed to round-trip through
+ * base64 would publish a snapshot only this process could open. Re-deriving
+ * caught it by producing a different key and failing the decrypt.
+ *
+ * So it is checked directly instead. A byte comparison costs microseconds rather
+ * than 51ms and it NAMES the mismatch, where the old form surfaced as an
+ * unexplained `OperationError` from AES-GCM.
  */
-async function verifyRoundTrip(envelope, passphrase, expectedLength) {
-  const enc = new TextEncoder();
-  const b = (s) => new Uint8Array(Buffer.from(s, "base64"));
-  const baseKey = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
-  const key = await crypto.subtle.deriveKey(
+async function roundTripKey(envelope, passphrase, b) {
+  const memo = derivedEncryptionKeys.get(envelope);
+  if (memo && memo.passphrase === passphrase) {
+    const written = b(envelope.kdf.salt);
+    if (written.length !== memo.salt.length || !written.every((v, i) => v === memo.salt[i])) {
+      throw new Error("envelope kdf.salt does not match the salt its key was derived from");
+    }
+    if (envelope.kdf.iterations !== memo.iterations) {
+      throw new Error(
+        `envelope kdf.iterations ${envelope.kdf.iterations} does not match the ${memo.iterations} its key was derived with`,
+      );
+    }
+    if (envelope.kdf.hash !== memo.hash) {
+      throw new Error(
+        `envelope kdf.hash ${envelope.kdf.hash} does not match the ${memo.hash} its key was derived with`,
+      );
+    }
+    return memo.key;
+  }
+  const baseKey = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"],
+  );
+  return crypto.subtle.deriveKey(
     { name: "PBKDF2", salt: b(envelope.kdf.salt), iterations: envelope.kdf.iterations, hash: envelope.kdf.hash },
     baseKey,
     { name: "AES-GCM", length: 256 },
     false,
     ["decrypt"],
   );
+}
+
+/**
+ * Decrypt what we just encrypted and confirm it round-trips to the same size.
+ * Cheap insurance against publishing a payload the passphrase cannot open — and,
+ * since the plaintext is now gzip'd before encryption, against publishing one
+ * that decrypts but does not INFLATE. A compression bug would otherwise reach
+ * the browser as an indistinguishable "wrong passphrase".
+ *
+ * Exported so tests can prove, case by case, that every fault this used to
+ * reject it still rejects — see roundTripKey() for the one guarantee that moved
+ * from being implied by a re-derivation to being asserted outright.
+ */
+export async function verifyRoundTrip(envelope, passphrase, expectedLength) {
+  const b = (s) => new Uint8Array(Buffer.from(s, "base64"));
+  const key = await roundTripKey(envelope, passphrase, b);
   const out = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv: b(envelope.cipher.iv) },
     key,
     b(envelope.ciphertext),
   );
-  const text = new TextDecoder().decode(out);
+  const text = decompressPlaintext(Buffer.from(out), envelope.compression);
   if (text.length !== expectedLength) {
     throw new Error(`round-trip length mismatch: ${text.length} != ${expectedLength}`);
   }
@@ -649,19 +1166,17 @@ async function main() {
   const targets = [...seenHosts.values()];
 
   console.error(`collecting from ${targets.length} dev machine(s): ${targets.join(", ")}`);
-  // allSettled, not all: this fan-out is the whole snapshot. One dispatcher
+  // Settled, not all: this fan-out is the whole snapshot. One dispatcher
   // returning a shape that throws inside the mapper must not abort collection
   // for every other machine — that is the opposite of the resilience the merge
   // below is written for.
-  const settled = await Promise.allSettled(
-    targets.map(async (host) => {
-      const d = await collectDispatcher(host);
-      console.error(
-        `  ${String(host).padEnd(14)} ${d.reachable ? `ok  posture=${d.posture ?? "?"}  workers=${d.workers.length}` : `UNREACHABLE  ${d.collection_errors[0] ?? ""}`}`,
-      );
-      return d;
-    }),
-  );
+  const settled = await allSettledBounded(targets, args.maxParallel, async (host) => {
+    const d = await collectDispatcher(host);
+    console.error(
+      `  ${String(host).padEnd(14)} ${d.reachable ? `ok  posture=${d.posture ?? "?"}  workers=${d.workers.length}` : `UNREACHABLE  ${d.collection_errors[0] ?? ""}`}`,
+    );
+    return d;
+  });
 
   const dispatchers = settled.map((r, i) => {
     if (r.status === "fulfilled") return r.value;
@@ -684,96 +1199,10 @@ async function main() {
     process.exit(1);
   }
 
-  // Union the worker view. A worker is "known" if any dev machine has it, and
-  // runtime facts come from whichever machine actually reported them, so one
-  // unreachable dispatcher cannot blank the fleet. Slot counts are per-observer
-  // (rchd derates independently), so keep the MAX observed capacity plus the
-  // per-dispatcher detail.
-  const merged = new Map();
-  for (const d of dispatchers) {
-    for (const w of d.workers) {
-      const prev = merged.get(w.id);
-      if (!prev) {
-        // Copy the nested objects. A shallow spread aliases `caps`, `pressure`,
-        // `tags` and `failure_history` to the FIRST dispatcher's own records,
-        // and the merge below then mutates them in place — silently rewriting
-        // that dispatcher's private per-worker view with values observed
-        // elsewhere.
-        merged.set(w.id, {
-          ...w,
-          caps: { ...w.caps },
-          pressure: { ...w.pressure },
-          tags: [...(w.tags ?? [])],
-          failure_history: [...(w.failure_history ?? [])],
-          seen_by: [d.id],
-          slots_by_dispatcher: { [d.id]: { used: w.used_slots, total: w.total_slots } },
-        });
-        continue;
-      }
-      prev.seen_by.push(d.id);
-      prev.slots_by_dispatcher[d.id] = { used: w.used_slots, total: w.total_slots };
-      if ((w.total_slots ?? 0) > (prev.total_slots ?? 0)) prev.total_slots = w.total_slots;
-      if ((w.used_slots ?? 0) > (prev.used_slots ?? 0)) prev.used_slots = w.used_slots;
-
-      // WORST-WINS for anything that signals trouble. Dev machines observe the
-      // pool independently and can disagree; taking whichever answered first
-      // would let a benign reading mask an alarming one and hide the exact
-      // thing this dashboard exists to surface.
-      if (statusRank(w.status) > statusRank(prev.status)) prev.status = w.status;
-      if (circuitRank(w.circuit_state) > circuitRank(prev.circuit_state)) {
-        prev.circuit_state = w.circuit_state;
-      }
-      if ((w.consecutive_failures ?? 0) > (prev.consecutive_failures ?? 0)) {
-        prev.consecutive_failures = w.consecutive_failures;
-      }
-      // Seen by ANY dispatcher recently means it is not stale, so keep the most
-      // recent sighting rather than the first one reported.
-      if ((w.last_seen_unix ?? 0) > (prev.last_seen_unix ?? 0)) prev.last_seen_unix = w.last_seen_unix;
-
-      for (const k of ["speed", "latency_ms", "last_error", "priority"]) {
-        if (prev[k] == null && w[k] != null) prev[k] = w[k];
-      }
-      if ((prev.tags?.length ?? 0) === 0 && w.tags?.length) prev.tags = [...w.tags];
-      for (const k of Object.keys(w.caps)) if (prev.caps[k] == null && w.caps[k] != null) prev.caps[k] = w.caps[k];
-
-      // Take the pressure block WHOLE from the freshest observer. Merging it
-      // field by field could pair disk_free_gb from one dispatcher with
-      // disk_total_gb from another and compute a nonsense percentage.
-      if (pressureIsBetter(w.pressure, prev.pressure)) prev.pressure = { ...w.pressure };
-
-      if (!prev.failure_history.length && w.failure_history.length) prev.failure_history = [...w.failure_history];
-    }
-  }
-  const workers = [...merged.values()].sort((a, b) => a.id.localeCompare(b.id));
-
-  const reachable = dispatchers.filter((d) => d.reachable);
-
-  // Only count a worker's disk when BOTH halves are present. Summing them
-  // independently let a worker with a total but no free reading add to the
-  // denominator and nothing to the numerator, inflating fleet "disk used %"
-  // with a number no single worker ever reported.
-  const diskWorkers = workers.filter(
-    (w) => w.pressure.disk_free_gb != null && w.pressure.disk_total_gb != null && w.pressure.disk_total_gb > 0,
-  );
-
-  const totals = {
-    workers: workers.length,
-    slots: workers.reduce((n, w) => n + (w.total_slots ?? 0), 0),
-    // Per-observer occupancy (each rchd derates and reserves independently), so
-    // this is the worst single observation, never more than capacity.
-    slots_used: workers.reduce((n, w) => n + Math.min(w.used_slots ?? 0, w.total_slots ?? Infinity), 0),
-    cores: workers.reduce((n, w) => n + (w.caps.num_cpus ?? 0), 0),
-    disk_free_gb: diskWorkers.reduce((n, w) => n + w.pressure.disk_free_gb, 0),
-    disk_total_gb: diskWorkers.reduce((n, w) => n + w.pressure.disk_total_gb, 0),
-    /** How many workers actually reported usable disk telemetry, so the UI can say "of N" honestly. */
-    disk_reporting_workers: diskWorkers.length,
-    dispatchers_total: dispatchers.length,
-    dispatchers_reachable: reachable.length,
-    dispatchers_remote_ready: reachable.filter((d) => d.posture === "remote_ready").length,
-    builds_remote: reachable.reduce((n, d) => n + (d.build_stats?.remote ?? 0), 0),
-    builds_local: reachable.reduce((n, d) => n + (d.build_stats?.local ?? 0), 0),
-    active_builds: reachable.reduce((n, d) => n + d.active_builds, 0),
-  };
+  // Union the worker view, then aggregate it. Both steps live above as pure
+  // exported functions so they can be tested and profiled without a fleet.
+  const workers = mergeWorkers(dispatchers);
+  const totals = computeTotals(workers, dispatchers);
 
   const generated_at = new Date().toISOString();
 
@@ -802,27 +1231,10 @@ async function main() {
   });
   history = history.slice(-args.historyMax);
 
-  // Project the per-dispatcher worker arrays down before they reach the wire.
-  //
-  // Every dispatcher used to ship a FULL copy of every worker it can see: on a
-  // 10-machine fleet that is 142 records, 121.5KB of a 222.8KB payload (54.6%),
-  // re-downloaded whole on every 5-minute refresh. All of it was redundant:
-  //   - every descriptive field (host, user, caps, pressure, tags, latency,
-  //     failure_history, ...) is already in the merged `workers[]` above, folded
-  //     worst-wins across observers;
-  //   - the only genuinely per-dispatcher fact is the derated slot reading, and
-  //     the merge already records that too, as `workers[].slots_by_dispatcher`.
-  // The single surviving consumer of the per-dispatcher array is the dev-machine
-  // drawer, which sums used/total slots and counts the zero-slot workers to
-  // answer "is this box about to go local-only?" — it never reads any other
-  // field. So emit the slot readings alone, positionally: the key names cost
-  // more than the values at 142 repetitions. `classifyDispatcher()` in
-  // src/derive.ts expands them back into `workers` on the DispatcherView the
-  // drawer is handed, so the drawer sees exactly what it saw before.
-  const emittedDispatchers = dispatchers.map(({ workers: seen, ...rest }) => ({
-    ...rest,
-    worker_slots: seen.map((w) => [w.used_slots, w.total_slots]),
-  }));
+  // Project the per-dispatcher worker arrays down before they reach the wire —
+  // see projectDispatchers() for what survives, and for why the (dispatcher x
+  // worker) slot matrix is emitted exactly once instead of three times.
+  const emittedDispatchers = projectDispatchers(dispatchers, workers);
 
   // Fold the repeated build/hint strings into one snapshot-level table. Hints
   // and commands duplicate massively across dispatchers — 113 hints on a
@@ -862,7 +1274,9 @@ async function main() {
       `  ${workers.length} workers · ${totals.slots} slots (${totals.slots_used} used) · ${totals.cores} cores\n` +
       `  ${totals.dispatchers_remote_ready}/${totals.dispatchers_reachable} dev machines remote-ready · ` +
       `builds remote ${totals.builds_remote} / local ${totals.builds_local}\n` +
-      `  ${(plain.length / 1024).toFixed(1)}KB plaintext -> ${(JSON.stringify(envelope).length / 1024).toFixed(1)}KB ciphertext` +
+      `  ${(Buffer.byteLength(plain) / 1024).toFixed(1)}KB plaintext -> ` +
+      `${(JSON.stringify(envelope).length / 1024).toFixed(1)}KB envelope ` +
+      `(${envelope.compression} ${(Buffer.byteLength(plain) / (envelope.ciphertext.length * 0.75)).toFixed(1)}x)` +
       `  ·  string table ${strings.length} entries`,
   );
 }

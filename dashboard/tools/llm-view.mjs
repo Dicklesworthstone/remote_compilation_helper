@@ -201,6 +201,52 @@ export function expandHints(rows, strings) {
   }));
 }
 
+/**
+ * Mirror of the `seen_by` half of `attachSlotColumns()` in src/derive.ts —
+ * keep in sync.
+ *
+ * `dispatchers[].pool_slots` is one ROW of the (dispatcher x worker) derated
+ * slot matrix, aligned to `snap.workers`. Each worker's `seen_by` is that same
+ * matrix read the other way, by COLUMN. It used to be transmitted alongside the
+ * rows — along with a third copy as `slots_by_dispatcher` — which put three
+ * encodings of one d x w structure on a wire that is re-fetched every five
+ * minutes. Deriving the column here costs one pass and removes the term that
+ * dominates a large fleet's payload; see `projectDispatchers()` in
+ * tools/snapshot.mjs for the measurements.
+ *
+ * Only `seen_by`, not `slots_by_dispatcher`: the browser drawer renders the
+ * per-machine slot table and this view does not, so building a record per CELL
+ * here would be 66ms of pure waste at 500 dispatchers. The browser builds that
+ * one lazily for the same reason.
+ *
+ * Dispatcher-outermost, so the resulting order matches both the collector's
+ * original construction order and `src/derive.ts`. A snapshot that already
+ * carries `seen_by` is left alone: its `worker_slots` are positional against a
+ * different index space and must not be reinterpreted as fleet-aligned rows.
+ *
+ * @returns array of dispatcher-id lists, indexed like `snap.workers`.
+ */
+export function seenByColumns(snap) {
+  const dispatchers = snap?.dispatchers;
+  const workers = snap?.workers;
+  if (!Array.isArray(dispatchers) || !Array.isArray(workers)) return [];
+  if (workers.some((w) => Array.isArray(w?.seen_by))) return [];
+
+  const cols = new Array(workers.length);
+  for (const d of dispatchers) {
+    const row = d?.pool_slots;
+    if (!Array.isArray(row)) continue;
+    const end = Math.min(row.length, workers.length);
+    for (let i = 0; i < end; i++) {
+      // Only a real pair counts as "seen" — a null means this machine has no
+      // such worker, which is not the same fact as "derated to zero".
+      if (!Array.isArray(row[i])) continue;
+      (cols[i] ??= []).push(d.id);
+    }
+  }
+  return cols;
+}
+
 const SEVERITY = { critical: 0, warn: 1, info: 2 };
 
 /**
@@ -352,7 +398,12 @@ export function buildLlmView(snap, opts = {}) {
         exit: b.exit_code ?? null,
       })),
     }));
-    out.worker_detail = workers.map((w) => ({
+    // Built HERE and not beside `workers` above: reading the matrix by column
+    // is O(dispatchers x workers), and `seen_by` is the only thing that needs
+    // it. The summary view — the one an agent polls — must not pay for a
+    // field it does not emit.
+    const cols = seenByColumns(snap);
+    out.worker_detail = workers.map((w, i) => ({
       id: w.id,
       host: w.host ?? "",
       user: w.user ?? "",
@@ -363,7 +414,7 @@ export function buildLlmView(snap, opts = {}) {
       latency_ms: r1(w.latency_ms),
       failures: w.consecutive_failures ?? 0,
       rustc: w.caps?.rustc_version ?? "",
-      seen_by: (w.seen_by ?? []).join("|"),
+      seen_by: (w.seen_by ?? cols[i] ?? []).join("|"),
     }));
     out.history = (snap.history ?? []).slice(-24);
   }

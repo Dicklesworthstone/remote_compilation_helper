@@ -17,7 +17,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { classifyWorker, classifyDev, expandBuilds, expandHints } from "../tools/llm-view.mjs";
+import { classifyWorker, classifyDev, expandBuilds, expandHints, seenByColumns } from "../tools/llm-view.mjs";
 
 const dir = await mkdtemp(join(tmpdir(), "rch-parity-"));
 const outfile = join(dir, "derive.mjs");
@@ -217,6 +217,105 @@ for (const [name, dev] of devCases) {
     derive.classifyDispatcher(legacy).workers.length === 0);
 }
 
+// ------------------------------------ the (dispatcher x worker) slot matrix
+//
+// The slot readings used to be on the wire THREE times — `worker_slots` per
+// dispatcher, plus `seen_by` and `slots_by_dispatcher` per worker — three
+// encodings of one d x w structure, the only thing in the snapshot whose size
+// is the PRODUCT of both fleet counts. `tools/scaling.mjs` measured it at 91%
+// of a 500-dispatcher payload. It is now emitted once, as `pool_slots`: one row
+// per dispatcher, aligned to `Snapshot.workers`, `null` where that machine has
+// no such worker. Everything below is a way that reconstruction could be wrong
+// and produce a WRONG NUMBER rather than an error.
+{
+  // `null` means "this machine has no such worker"; `[0, 0]` means "derated to
+  // zero", which is the alarm the drawer exists to raise. Conflating them is
+  // the central failure mode of the row encoding.
+  const row = [[0, 16], null, [4, 8], null, [2, 0]];
+  const dv = derive.classifyDispatcher(d({ pool_slots: row }));
+  chk("pool_slots drops the nulls rather than expanding them",
+    dv.workers.length === 3, `${dv.workers.length} of 3`);
+  chk("pool_slots keeps order and values across the gaps",
+    JSON.stringify(dv.workers) ===
+      JSON.stringify([{ used_slots: 0, total_slots: 16 }, { used_slots: 4, total_slots: 8 },
+                      { used_slots: 2, total_slots: 0 }]),
+    JSON.stringify(dv.workers));
+  chk("a null is never counted as a zero-slot worker",
+    dv.workers.filter((x) => (x.total_slots ?? 0) === 0).length === 1,
+    `${dv.workers.filter((x) => (x.total_slots ?? 0) === 0).length} of 1`);
+  chk("drawer aggregates match the surviving pairs",
+    dv.workers.reduce((n, x) => n + (x.total_slots ?? 0), 0) === 24 &&
+    dv.workers.reduce((n, x) => n + (x.used_slots ?? 0), 0) === 6);
+  // Trailing nulls are trimmed by the collector, so a dispatcher that sees only
+  // the first workers of a large fleet ships a SHORT row. Reading past its end
+  // must yield "not seen", never a zero reading.
+  chk("a short row is read as absence, not as zeroes",
+    derive.classifyDispatcher(d({ pool_slots: [[1, 2]] })).workers.length === 1);
+  // Both encodings can be in flight at once: a tab holding an older bundle, a
+  // stale published file. `pool_slots` is authoritative when present.
+  chk("pool_slots wins over a legacy worker_slots on the same record",
+    derive.classifyDispatcher(d({ pool_slots: [[9, 9]], worker_slots: [[1, 1], [2, 2]] }))
+      .workers.length === 1);
+}
+
+// `seen_by` is the same matrix read by COLUMN, and the browser and the LLM view
+// derive it independently — the exact shape of drift this file exists to catch.
+{
+  const workers = [w({ id: "wa" }), w({ id: "wb" }), w({ id: "wc" })];
+  const dispatchers = [
+    d({ id: "dev-1", pool_slots: [[1, 8], null, [3, 8]] }),
+    d({ id: "dev-2", pool_slots: [[2, 4], [5, 5]] }),
+  ];
+  const snapM = {
+    schema: "x", label: "l", generated_at: new Date(SNAP_MS).toISOString(),
+    totals: {}, dispatchers, workers, history: [],
+  };
+  const views = derive.classifyAll(snapM);
+  const cols = seenByColumns(snapM);
+  const expected = [["dev-1", "dev-2"], ["dev-2"], ["dev-1"]];
+  for (let i = 0; i < workers.length; i++) {
+    chk(`seen_by column ${i} is read from the rows`,
+      JSON.stringify(views[i].seen_by) === JSON.stringify(expected[i]),
+      JSON.stringify(views[i].seen_by));
+    chk(`seen_by column ${i} agrees between derive and llm-view`,
+      JSON.stringify(views[i].seen_by) === JSON.stringify(cols[i]),
+      `derive=${JSON.stringify(views[i].seen_by)} llm=${JSON.stringify(cols[i])}`);
+  }
+  // Dispatcher order is the contract: the drawer lists machines in it, and the
+  // collector built the old inline copy by iterating dispatchers outermost.
+  chk("slots_by_dispatcher is keyed in dispatcher order",
+    JSON.stringify(Object.keys(views[0].slots_by_dispatcher)) === JSON.stringify(["dev-1", "dev-2"]),
+    JSON.stringify(Object.keys(views[0].slots_by_dispatcher)));
+  chk("slots_by_dispatcher carries the per-observer readings",
+    JSON.stringify(views[0].slots_by_dispatcher) ===
+      JSON.stringify({ "dev-1": { used: 1, total: 8 }, "dev-2": { used: 2, total: 4 } }),
+    JSON.stringify(views[0].slots_by_dispatcher));
+  // Lazily materialised, so it must survive every way a consumer might read it.
+  // Serialise ONCE and read the result back, rather than round-tripping as a
+  // clone: what is under test is exactly what a consumer receives after the
+  // view has been through JSON, so the serialized form is the subject, not an
+  // incidental copy.
+  const serializedView = JSON.stringify(views[0]);
+  chk("the lazy slot record survives a spread and JSON round-trip",
+    JSON.stringify({ ...views[0] }.slots_by_dispatcher) ===
+      JSON.stringify(views[0].slots_by_dispatcher) &&
+    JSON.parse(serializedView).slots_by_dispatcher["dev-2"].total === 4);
+  chk("a worker no dispatcher reports keeps both fields absent",
+    derive.classifyAll({ ...snapM, workers: [...workers, w({ id: "wd" })] })[3].seen_by === undefined);
+  // A snapshot written before the matrix was de-duplicated carries the columns
+  // inline; its `worker_slots` index a DIFFERENT space, so re-deriving them
+  // would attribute readings to the wrong machines. It must be left alone.
+  const legacySnap = {
+    ...snapM,
+    dispatchers: [d({ id: "dev-1", worker_slots: [[1, 8]] })],
+    workers: [w({ id: "wa", seen_by: ["dev-9"], slots_by_dispatcher: { "dev-9": { used: 7, total: 7 } } })],
+  };
+  chk("a legacy snapshot keeps its own seen_by",
+    JSON.stringify(derive.classifyAll(legacySnap)[0].seen_by) === JSON.stringify(["dev-9"]));
+  chk("a legacy snapshot keeps its own slots_by_dispatcher",
+    derive.classifyAll(legacySnap)[0].slots_by_dispatcher["dev-9"].total === 7);
+}
+
 // ------------------------------------------------ build + hint tuple expansion
 //
 // `recent_builds[]` and `remediation_hints[]` moved to the wire as positional
@@ -388,7 +487,7 @@ for (const [name, dev] of devCases) {
   const wire = {
     schema: "x", label: "l", generated_at: new Date(SNAP_MS).toISOString(),
     totals: {}, workers: [], history: [], strings,
-    dispatchers: [d({ builds: JSON.parse(JSON.stringify(internedBuilds)), hints: JSON.parse(JSON.stringify(internedHints)) })],
+    dispatchers: [d({ builds: structuredClone(internedBuilds), hints: structuredClone(internedHints) })],
   };
   const rehydrated = derive.rehydrateStrings(wire);
   const rv = derive.classifyDispatcher(rehydrated.dispatchers[0]);
