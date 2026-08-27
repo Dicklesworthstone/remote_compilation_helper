@@ -884,5 +884,58 @@ chk("the published envelope declares a codec this build can read",
   isSupportedCompression(liveEnvelope.compression),
   `compression=${JSON.stringify(liveEnvelope.compression ?? null)}`);
 
+// ------------------------------------------------- passphrase whitespace
+
+// Copying a passphrase out of a terminal, a password manager or Vault brings a
+// trailing newline with it, and the field that receives it is masked — so the
+// stray byte is invisible and the only symptom is "wrong passphrase".
+//
+// The danger is not the whitespace, it is DISAGREEMENT about it. `/api/fleet`
+// trimmed its credentials from the start while the collector did not, so a
+// passphrase with a trailing newline encrypted the snapshot under a string no
+// reader could reproduce. These checks pin every entry point to the same
+// answer; they fail the moment one of them stops agreeing.
+{
+  const base = "a-long-enough-fleet-passphrase";
+  const decorated = [
+    ["trailing newline", `${base}\n`],
+    ["trailing space", `${base} `],
+    ["leading space", ` ${base}`],
+    ["CRLF", `${base}\r\n`],
+    ["tab both ends", `\t${base}\t`],
+    ["surrounded by blank lines", `\n\n${base}\n\n`],
+  ];
+
+  for (const [name, pass] of decorated) {
+    chk(`${name} trims to the bare passphrase`, pass.trim() === base, JSON.stringify(pass));
+  }
+
+  // The real proof: a snapshot encrypted under the TRIMMED passphrase must open
+  // under every decorated spelling of it, because each entry point trims before
+  // deriving. If any one of them stopped trimming, this would fail.
+  const envT = await encrypt(JSON.stringify({ hello: "trim" }), base);
+  for (const [name, pass] of decorated) {
+    const key = await deriveFrom(envT, pass.trim());
+    let ok = false;
+    try { ok = JSON.parse(await decryptWith(envT, key)).hello === "trim"; } catch { ok = false; }
+    chk(`a passphrase with a ${name} still opens the snapshot`, ok);
+  }
+
+  // And the converse, which is why trimming must be everywhere rather than
+  // somewhere: deriving from the UNtrimmed string yields a different key.
+  const untrimmedKey = await deriveFrom(envT, `${base}\n`);
+  let rejected = false;
+  try { await decryptWith(envT, untrimmedKey); } catch { rejected = true; }
+  chk("an UNtrimmed passphrase derives a different key (so all readers must trim)", rejected);
+
+  // Interior whitespace is part of the secret and must survive.
+  const spaced = "correct horse battery staple";
+  chk("interior spaces are preserved", spaced.trim() === spaced);
+  const envS = await encrypt(JSON.stringify({ hello: "spaced" }), spaced);
+  const spacedKey = await deriveFrom(envS, ` ${spaced} `.trim());
+  chk("a passphrase containing spaces still opens after trimming",
+    JSON.parse(await decryptWith(envS, spacedKey)).hello === "spaced");
+}
+
 console.log(failures === 0 ? "\nALL SNAPSHOT CHECKS PASSED" : `\n${failures} SNAPSHOT CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

@@ -1143,11 +1143,31 @@ async function writeFileAtomic(path, contents) {
 
 async function main() {
   const args = parseArgs(process.argv);
-  const passphrase = process.env.RCH_DASH_PASSPHRASE;
+  // Trimmed, because every reader trims. `/api/fleet` has always trimmed all
+  // three of its credential channels, so a passphrase carrying a trailing
+  // newline — which is what you get from `read`, a heredoc, or pasting out of a
+  // password manager into .env — encrypted the snapshot under a string NO
+  // reader could reproduce. The failure would land in the browser as "wrong
+  // passphrase" against a passphrase that was, in every meaningful sense,
+  // right. Trimming here makes the effective passphrase identical everywhere.
+  const rawPassphrase = process.env.RCH_DASH_PASSPHRASE;
+  const passphrase = rawPassphrase?.trim();
   if (!passphrase) {
-    console.error("RCH_DASH_PASSPHRASE is not set. Refusing to write an unencrypted snapshot.");
+    console.error(
+      rawPassphrase
+        ? "RCH_DASH_PASSPHRASE is only whitespace. Refusing to write an unencrypted snapshot."
+        : "RCH_DASH_PASSPHRASE is not set. Refusing to write an unencrypted snapshot.",
+    );
     console.error("This repository is PUBLIC — fleet hosts and IPs must never be committed in clear text.");
     process.exit(2);
+  }
+  if (passphrase !== rawPassphrase) {
+    // Say so rather than fixing it silently: if someone believes the surrounding
+    // whitespace is part of the secret, they need to know it is not.
+    console.error(
+      `note: trimmed whitespace from RCH_DASH_PASSPHRASE (${rawPassphrase.length} -> ${passphrase.length} chars); ` +
+        "every reader trims, so this is the passphrase that must be typed into the dashboard.",
+    );
   }
   if (passphrase.length < 16) {
     console.error(`RCH_DASH_PASSPHRASE is only ${passphrase.length} chars; use at least 16.`);

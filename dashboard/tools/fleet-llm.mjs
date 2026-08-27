@@ -52,12 +52,27 @@ function parseArgs(argv) {
   return a;
 }
 
+/**
+ * All three sources are trimmed, and a source that yields only whitespace is
+ * treated as absent so resolution falls through to the next one.
+ *
+ * The Vault branch has always trimmed (`vault` prints a trailing newline). The
+ * env and .env branches did not, so the same secret could resolve to two
+ * different strings depending on where it came from — and the one that failed
+ * would report "wrong passphrase" rather than "your .env has a trailing space".
+ * Trimming everywhere makes the effective passphrase identical across the CLI,
+ * the collector, `/api/fleet` and the browser gate.
+ */
 async function resolvePassphrase() {
-  if (process.env.RCH_DASH_PASSPHRASE) return process.env.RCH_DASH_PASSPHRASE;
+  const fromEnv = process.env.RCH_DASH_PASSPHRASE?.trim();
+  if (fromEnv) return fromEnv;
   try {
     const env = await readFile(".env", "utf8");
     const m = env.match(/^RCH_DASH_PASSPHRASE\s*=\s*['"]?([^'"\n]+)['"]?/m);
-    if (m) return m[1];
+    // The capture stops at a quote or newline but keeps interior spaces, so an
+    // unquoted value with a trailing space arrives with it attached.
+    const fromFile = m?.[1]?.trim();
+    if (fromFile) return fromFile;
   } catch { /* no .env — fall through to Vault */ }
   try {
     const { stdout } = await execFileAsync(

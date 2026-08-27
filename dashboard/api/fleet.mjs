@@ -179,9 +179,24 @@ function decodeSnapshot(bytes, env) {
   return JSON.parse(decompressPlaintext(Buffer.from(bytes), env.compression));
 }
 
+/**
+ * The passphrase from whichever channel carries it, trimmed.
+ *
+ * Every channel is trimmed the same way, matching the collector, the CLI and
+ * the browser gate — `curl -H "X-Fleet-Key: $(cat secret)"` and a shell heredoc
+ * both bring a trailing newline, and an untrimmed one would fail the GCM tag
+ * against a passphrase that is otherwise correct.
+ *
+ * An empty channel falls through to the next rather than short-circuiting: a
+ * blank `Authorization: Bearer` used to be returned as "" and shadow a
+ * perfectly good `X-Fleet-Key` further down.
+ */
 function extractKey(req, url) {
   const auth = req.headers?.authorization ?? req.headers?.Authorization;
-  if (typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
+  if (typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) {
+    const bearer = auth.slice(7).trim();
+    if (bearer) return bearer;
+  }
   const hdr = req.headers?.["x-fleet-key"];
   if (typeof hdr === "string" && hdr.trim()) return hdr.trim();
   const q = url.searchParams.get("key");
