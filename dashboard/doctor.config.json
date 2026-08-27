@@ -1,0 +1,31 @@
+{
+  "$schema": "https://react.doctor/schema/config.json",
+  // Exemptions are per-file and each carries its rationale. Everything else
+  // must stay clean; do not extend this list without a written reason.
+  "ignore": {
+    "overrides": [
+      {
+        // The metric bars use role="meter" + aria-valuenow — the ARIA APG
+        // gauge pattern. The native <meter> element cannot express our five
+        // status colours (ok/busy/warn/crit/off) without per-engine
+        // pseudo-element styling, so the div implementation is deliberate.
+        "files": ["src/components/WorkerCard.tsx", "src/components/DevMachineCard.tsx"],
+        "rules": ["react-doctor/prefer-tag-over-role"]
+      },
+      {
+        // Single-purpose lock screen: the passphrase input is the only
+        // interactive element, and keyboard-first entry is the whole
+        // interaction. There is no other content to disorient anyone.
+        "files": ["src/components/Gate.tsx"],
+        "rules": ["react-doctor/no-autofocus"]
+      },
+      {
+        // Native <dialog> with showModal(); clicking the backdrop closes the
+        // drawer (e.target === dialog). Pointer-only convenience — keyboard
+        // users close via Esc (native cancel event) or the Close button.
+        "files": ["src/components/WorkerDrawer.tsx", "src/components/DevMachineDrawer.tsx"],
+        "rules": ["react-doctor/no-noninteractive-element-interactions"]
+      }
+    ]
+  }
+}

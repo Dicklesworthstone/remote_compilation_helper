@@ -41,7 +41,7 @@ await d.keyboard.press("Escape");
 await d.waitForTimeout(250);
 
 // dev machine drawer
-await d.locator(".section").first().locator(".wcard").first().click();
+await d.locator(".section", { hasText: "Dev machines" }).locator(".wcard").first().click();
 await d.waitForSelector(".drawer");
 await d.waitForTimeout(300);
 await d.screenshot({ path: "/tmp/dash-audit/04-dev-drawer.png" });

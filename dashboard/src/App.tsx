@@ -3,19 +3,18 @@ import type { Envelope } from "./crypto";
 import { clearKey, decryptEnvelope, deriveKey, loadPersistedKey, persistKey } from "./crypto";
 import type { DispatcherView, HealthLevel, Snapshot, WorkerView } from "./types";
 import {
-  STALE_CRIT_SECONDS, STALE_WARN_SECONDS, classifyAll, classifyDispatcher,
-  devRank, fmtAge, fmtGb, healthRank,
+  STALE_CRIT_SECONDS, classifyAll, classifyDispatcher,
+  devRank, fmtAge, healthRank,
 } from "./derive";
 import { Gate } from "./components/Gate";
-import { WorkerCard } from "./components/WorkerCard";
 import { WorkerDrawer } from "./components/WorkerDrawer";
 import { DevMachineCard } from "./components/DevMachineCard";
 import { DevMachineDrawer } from "./components/DevMachineDrawer";
-import { Sparkline } from "./components/Sparkline";
+import { Overview } from "./components/Overview";
+import { Topbar, WorkersSection, type Sort } from "./components/Topbar";
 
 const DATA_URL = `${import.meta.env.BASE_URL}data/fleet.enc.json`;
 
-type Sort = "health" | "name" | "speed" | "disk" | "load" | "slots";
 
 function useTheme() {
   const [theme, setTheme] = useState<"dark" | "light">(() => {
@@ -37,7 +36,9 @@ function useTheme() {
 }
 
 export default function App() {
-  const [envelope, setEnvelope] = useState<Envelope | null>(null);
+  // Only read inside callbacks — a ref, not state, so a fresh envelope never
+  // triggers a pointless render.
+  const envelopeRef = useRef<Envelope | null>(null);
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -78,7 +79,7 @@ export default function App() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const env = (await res.json()) as Envelope;
       if (!env?.ciphertext || !env?.kdf?.salt) throw new Error("not an encrypted snapshot");
-      setEnvelope(env);
+      envelopeRef.current = env;
       setNotice(null);
       return env;
     } catch (e) {
@@ -112,7 +113,7 @@ export default function App() {
       setBusy(true);
       setError(null);
       try {
-        const env = envelope ?? (await loadEnvelope());
+        const env = envelopeRef.current ?? (await loadEnvelope());
         if (!env) {
           setError("No snapshot to decrypt yet.");
           return;
@@ -128,7 +129,7 @@ export default function App() {
         setBusy(false);
       }
     },
-    [envelope, loadEnvelope],
+    [loadEnvelope],
   );
 
   const refresh = useCallback(async () => {
@@ -160,24 +161,34 @@ export default function App() {
   }, [loadEnvelope]);
 
   const toggleAuto = useCallback(() => {
-    setAuto((prev) => {
-      const next = !prev;
-      try {
-        localStorage.setItem("rch_dash_auto", next ? "1" : "0");
-      } catch {
-        /* private mode — the toggle still applies to this session */
-      }
-      return next;
-    });
+    setAuto((prev) => !prev);
   }, []);
 
+  // Persistence is an effect on the VALUE, not a side effect inside the
+  // updater — updaters must stay pure (they run twice in StrictMode).
   useEffect(() => {
-    if (!snap || !auto) return;
+    try {
+      localStorage.setItem("rch_dash_auto", auto ? "1" : "0");
+    } catch {
+      /* private mode — the toggle still applies to this session */
+    }
+  }, [auto]);
+
+  // refresh lives in a ref so the interval does not re-subscribe (and drift)
+  // every time a refresh lands a new snapshot. Written in an effect, never
+  // during render (concurrent-unsafe).
+  const refreshRef = useRef(refresh);
+  useEffect(() => {
+    refreshRef.current = refresh;
+  }, [refresh]);
+  const hasSnap = snap != null;
+  useEffect(() => {
+    if (!hasSnap || !auto) return;
     const id = setInterval(() => {
-      if (document.visibilityState === "visible") void refresh();
+      if (document.visibilityState === "visible") void refreshRef.current();
     }, 5 * 60_000);
     return () => clearInterval(id);
-  }, [snap, auto, refresh]);
+  }, [hasSnap, auto]);
 
   const lock = useCallback(() => {
     clearKey();
@@ -240,50 +251,23 @@ export default function App() {
     );
   }
 
-  const t = snap.totals;
   const ageSec = (now - new Date(snap.generated_at).getTime()) / 1000;
-  const dotClass = ageSec > STALE_CRIT_SECONDS ? "old" : ageSec > STALE_WARN_SECONDS ? "stale" : "live";
-  const diskUsedPct =
-    t.disk_total_gb > 0 ? ((t.disk_total_gb - t.disk_free_gb) / t.disk_total_gb) * 100 : 0;
-  const attention = (counts.critical ?? 0) + (counts.warn ?? 0) + (counts.offline ?? 0);
   const hardProblems = devs.filter((d) => d.level === "local-only" || d.level === "unreachable");
   const degradedDevs = devs.filter((d) => d.level === "degraded");
-  const buildsCounted = t.builds_remote + t.builds_local;
-  const remotePct = buildsCounted > 0 ? (t.builds_remote / buildsCounted) * 100 : null;
 
   return (
     <div className="shell">
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">rch</span>
-          <span className="brand-label">{snap.label}</span>
-        </div>
-        <span className="spacer" />
-        <div className="stamp">
-          <span className={`dot ${dotClass}`} />
-          snapshot {fmtAge(ageSec)}
-        </div>
-        <button
-          className="icon-btn"
-          onClick={() => void refresh()}
-          disabled={refreshing}
-          aria-busy={refreshing}
-        >
-          {refreshing ? "Refreshing…" : "Refresh"}
-        </button>
-        <button
-          className="icon-btn"
-          onClick={toggleAuto}
-          aria-pressed={auto}
-          title="Reload the snapshot automatically every 5 minutes"
-        >
-          Auto
-        </button>
-        <button className="icon-btn" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
-          {theme === "dark" ? "Light" : "Dark"}
-        </button>
-        <button className="icon-btn" onClick={lock}>Lock</button>
-      </header>
+      <Topbar
+        label={snap.label}
+        ageSec={ageSec}
+        refreshing={refreshing}
+        onRefresh={() => void refresh()}
+        auto={auto}
+        onToggleAuto={toggleAuto}
+        theme={theme}
+        onToggleTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
+        onLock={lock}
+      />
 
       {notice && <div className="banner">{notice}</div>}
 
@@ -310,53 +294,7 @@ export default function App() {
         </div>
       )}
 
-      <section className="kpis">
-        <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--accent)" }}>
-          <div className="kpi-label">Workers</div>
-          <div className="kpi-value">{t.workers}</div>
-          <div className="kpi-sub">{counts.healthy ?? 0} healthy · {counts.busy ?? 0} busy</div>
-        </div>
-        <div className="kpi" style={{ ["--kpi-accent" as string]: attention > 0 ? "var(--warn)" : "var(--ok)" }}>
-          <div className="kpi-label">Needs attention</div>
-          <div className="kpi-value">{attention}</div>
-          <div className="kpi-sub">
-            {counts.critical ?? 0} critical · {counts.warn ?? 0} warn · {counts.offline ?? 0} offline
-          </div>
-        </div>
-        <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--busy)" }}>
-          <div className="kpi-label">Build slots</div>
-          <div className="kpi-value">{t.slots_used}<span className="unit">/ {t.slots}</span></div>
-          <div className="kpi-sub">{t.active_builds} active build{t.active_builds === 1 ? "" : "s"}</div>
-        </div>
-        <div
-          className="kpi"
-          style={{ ["--kpi-accent" as string]: hardProblems.length > 0 ? "var(--crit)" : "var(--ok)" }}
-        >
-          <div className="kpi-label">Dev machines</div>
-          <div className="kpi-value">
-            {t.dispatchers_remote_ready}<span className="unit">/ {t.dispatchers_reachable}</span>
-          </div>
-          <div className="kpi-sub">remote-ready of {t.dispatchers_total} configured</div>
-        </div>
-        <div
-          className="kpi"
-          style={{ ["--kpi-accent" as string]: remotePct != null && remotePct < 80 ? "var(--warn)" : "var(--ok)" }}
-        >
-          <div className="kpi-label">Builds offloaded</div>
-          <div className="kpi-value">
-            {remotePct != null ? `${remotePct.toFixed(0)}%` : "—"}
-          </div>
-          <div className="kpi-sub">{t.builds_remote} remote · {t.builds_local} local</div>
-        </div>
-        <div
-          className="kpi"
-          style={{ ["--kpi-accent" as string]: diskUsedPct >= 88 ? "var(--warn)" : "var(--ok)" }}
-        >
-          <div className="kpi-label">Disk free</div>
-          <div className="kpi-value">{fmtGb(t.disk_free_gb)}</div>
-          <div className="kpi-sub">{diskUsedPct.toFixed(0)}% of {fmtGb(t.disk_total_gb)} used</div>
-        </div>
-      </section>
+      <Overview snap={snap} counts={counts} hardProblems={hardProblems.length} />
 
       <section className="section">
         <div className="section-head">
@@ -372,82 +310,18 @@ export default function App() {
         </div>
       </section>
 
-      {snap.history.length > 1 && (
-        <section className="section">
-          <div className="section-head">
-            <h2>Trend</h2>
-            <span className="count-pill">{snap.history.length} snapshots</span>
-          </div>
-          <div className="trend-grid">
-            <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--busy)" }}>
-              <div className="kpi-label">Slots in use</div>
-              <div className="kpi-value">{snap.history[snap.history.length - 1].slots_used}</div>
-              <Sparkline values={snap.history.map((h) => h.slots_used)} stroke="var(--busy)" label="slots in use over time" />
-            </div>
-            <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--ok)" }}>
-              <div className="kpi-label">Disk free</div>
-              <div className="kpi-value">{fmtGb(snap.history[snap.history.length - 1].disk_free_gb)}</div>
-              <Sparkline values={snap.history.map((h) => h.disk_free_gb)} stroke="var(--ok)" label="fleet disk free over time" />
-            </div>
-            <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--accent)" }}>
-              <div className="kpi-label">Remote builds</div>
-              <div className="kpi-value">{snap.history[snap.history.length - 1].builds_remote}</div>
-              <Sparkline values={snap.history.map((h) => h.builds_remote)} stroke="var(--accent)" label="remote builds over time" />
-            </div>
-          </div>
-        </section>
-      )}
-
-      <section className="section">
-        <div className="section-head">
-          <h2>Workers</h2>
-          <span className="count-pill">{visible.length} of {workers.length}</span>
-          <span className="spacer" />
-          <div className="filters">
-            <input
-              className="search"
-              placeholder="Filter by name, host or tag…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              aria-label="Filter workers"
-            />
-            {(["all", "critical", "warn", "offline", "busy", "healthy"] as const).map((s) => (
-              <button
-                key={s}
-                className="chip"
-                aria-pressed={statusFilter === s}
-                onClick={() => setStatusFilter(s as HealthLevel | "all")}
-              >
-                {s}{s !== "all" && counts[s] ? ` ${counts[s]}` : ""}
-              </button>
-            ))}
-            <select
-              className="search"
-              value={sort}
-              onChange={(e) => setSort(e.target.value as Sort)}
-              aria-label="Sort workers"
-              style={{ minWidth: 0 }}
-            >
-              <option value="health">sort: health</option>
-              <option value="name">sort: name</option>
-              <option value="speed">sort: speed</option>
-              <option value="slots">sort: slots</option>
-              <option value="disk">sort: disk used</option>
-              <option value="load">sort: load</option>
-            </select>
-          </div>
-        </div>
-
-        {visible.length === 0 ? (
-          <div className="empty">No workers match this filter.</div>
-        ) : (
-          <div className="grid">
-            {visible.map((w) => (
-              <WorkerCard key={w.id} w={w} onOpen={setOpenWorker} />
-            ))}
-          </div>
-        )}
-      </section>
+      <WorkersSection
+        visible={visible}
+        total={workers.length}
+        counts={counts}
+        query={query}
+        onQuery={setQuery}
+        statusFilter={statusFilter}
+        onStatusFilter={setStatusFilter}
+        sort={sort}
+        onSort={setSort}
+        onOpen={setOpenWorker}
+      />
 
       <footer className="footer">
         <span>schema {snap.schema}</span>

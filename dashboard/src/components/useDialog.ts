@@ -1,30 +1,30 @@
 import { useEffect, useRef } from "react";
 
 /**
- * Shared dialog behavior for both drawers: lock body scroll while open, move
- * focus into the panel (its close button) on open, and restore focus to
- * whatever held it before — otherwise keyboard and screen-reader users are
- * dumped back at the top of the page when a drawer closes.
+ * Backs both drawers with a native <dialog>. showModal() provides the focus
+ * trap, Esc handling (fires the dialog's cancel event) and top-layer stacking
+ * natively; this hook only wires imperative open/close to React state and
+ * keeps body scroll locked while open. Focus is restored by the platform when
+ * the dialog closes.
  */
 export function useDialog(open: boolean) {
-  const panelRef = useRef<HTMLElement | null>(null);
-  const restoreRef = useRef<HTMLElement | null>(null);
+  const ref = useRef<HTMLDialogElement | null>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    if (open && !el.open) el.showModal();
+    if (!open && el.open) el.close();
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
-    restoreRef.current = document.activeElement as HTMLElement | null;
-    const prevOverflow = document.body.style.overflow;
+    const prev = document.body.style.overflow;
     document.body.style.overflow = "hidden";
-    // One frame later the panel is mounted and focusable.
-    const raf = requestAnimationFrame(() => {
-      panelRef.current?.querySelector<HTMLElement>("button")?.focus();
-    });
     return () => {
-      cancelAnimationFrame(raf);
-      document.body.style.overflow = prevOverflow;
-      restoreRef.current?.focus();
+      document.body.style.overflow = prev;
     };
   }, [open]);
 
-  return panelRef;
+  return ref;
 }

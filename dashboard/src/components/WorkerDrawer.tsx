@@ -1,4 +1,3 @@
-import { useEffect } from "react";
 import type { WorkerView } from "../types";
 import { fmtAge, fmtGb } from "../derive";
 import { useDialog } from "./useDialog";
@@ -19,14 +18,6 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
 
 export function WorkerDrawer({ w, onClose }: Props) {
   const panelRef = useDialog(w != null);
-  useEffect(() => {
-    if (!w) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [w, onClose]);
 
   if (!w) return null;
   const c = w.caps;
@@ -34,9 +25,15 @@ export function WorkerDrawer({ w, onClose }: Props) {
   const fails = w.failure_history;
 
   return (
-    <>
-      <button className="drawer-scrim" onClick={onClose} aria-label="Close details" />
-      <aside ref={panelRef} className="drawer" role="dialog" aria-modal="true" aria-label={`${w.id} details`}>
+    <dialog
+      ref={panelRef}
+      className="drawer"
+      aria-label={`${w.id} details`}
+      onCancel={() => onClose()}
+      onClick={(e) => {
+        if (e.target === panelRef.current) onClose(); // backdrop click
+      }}
+    >
         <div className="drawer-head">
           <h3>{w.id}</h3>
           <span className={`pill ${w.health}`}>{w.health}</span>
@@ -134,7 +131,6 @@ export function WorkerDrawer({ w, onClose }: Props) {
             <Row k="zig" v={c.zig_version ?? "—"} />
           </dl>
         </div>
-      </aside>
-    </>
+  </dialog>
   );
 }

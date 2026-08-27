@@ -17,6 +17,7 @@
     "llm": "node tools/fleet-llm.mjs",
     "test:llm": "node tests/parity.mjs",
     "test:visual": "node tests/visual-audit.mjs",
+    "probe": "node tests/render-probe.mjs",
     "perf": "node tests/perf.mjs"
   },
   "dependencies": {

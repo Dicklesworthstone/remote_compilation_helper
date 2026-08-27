@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useMemo } from "react";
 import type { DispatcherView } from "../types";
 import { fmtDuration, fmtUptime } from "../derive";
 import { useDialog } from "./useDialog";
@@ -19,22 +19,48 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
 
 export function DevMachineDrawer({ d, onClose }: Props) {
   const panelRef = useDialog(d != null);
-  useEffect(() => {
-    if (!d) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [d, onClose]);
+
+  // Deterministic, index-free list keys: an occurrence counter appended at
+  // data-mapping time keeps identical hints/builds from colliding.
+  const hintRows = useMemo(() => {
+    const seen = new Map<string, number>();
+    return (d?.remediation_hints ?? []).map((h) => {
+      const base = `${h.worker_id ?? ""}|${h.reason_code ?? ""}|${h.message ?? ""}`;
+      const n = (seen.get(base) ?? 0) + 1;
+      seen.set(base, n);
+      return { ...h, key: n === 1 ? base : `${base}|${n}` };
+    });
+  }, [d?.remediation_hints]);
+  const buildRows = useMemo(() => {
+    const seen = new Map<string, number>();
+    return [...(d?.recent_builds ?? [])].reverse().map((b) => {
+      const base = `${b.completed_at ?? ""}|${b.project ?? ""}|${b.worker_id ?? ""}|${b.duration_ms ?? ""}|${b.exit_code ?? ""}`;
+      const n = (seen.get(base) ?? 0) + 1;
+      seen.set(base, n);
+      return {
+        key: n === 1 ? base : `${base}|${n}`,
+        remote: (b.location ?? "").toLowerCase() === "remote",
+        project: b.project,
+        command: b.command,
+        worker_id: b.worker_id,
+        duration_ms: b.duration_ms,
+      };
+    });
+  }, [d?.recent_builds]);
 
   if (!d) return null;
   const s = d.build_stats;
 
   return (
-    <>
-      <button className="drawer-scrim" onClick={onClose} aria-label="Close details" />
-      <aside ref={panelRef} className="drawer" role="dialog" aria-modal="true" aria-label={`${d.id} dev machine details`}>
+    <dialog
+      ref={panelRef}
+      className="drawer"
+      aria-label={`${d.id} dev machine details`}
+      onCancel={() => onClose()}
+      onClick={(e) => {
+        if (e.target === panelRef.current) onClose(); // backdrop click
+      }}
+    >
         <div className="drawer-head">
           <h3>{d.id}</h3>
           <span className={`pill dev-${d.level}`}>{d.level}</span>
@@ -69,11 +95,11 @@ export function DevMachineDrawer({ d, onClose }: Props) {
           </dl>
         </div>
 
-        {d.remediation_hints.length > 0 && (
+        {hintRows.length > 0 && (
           <div className="kv-group">
-            <h4>Remediation hints ({d.remediation_hints.length})</h4>
-            {d.remediation_hints.map((h, i) => (
-              <div key={i} className="hint">
+            <h4>Remediation hints ({hintRows.length})</h4>
+            {hintRows.map((h) => (
+              <div key={h.key} className="hint">
                 <div className="hint-top">
                   <span className={`pill ${h.severity === "critical" ? "critical" : "warn"}`}>
                     {h.severity ?? "info"}
@@ -93,23 +119,19 @@ export function DevMachineDrawer({ d, onClose }: Props) {
             <div className="empty" style={{ padding: 16 }}>no builds recorded</div>
           ) : (
             <div className="builds">
-              {[...d.recent_builds].reverse().map((b, i) => {
-                const remote = (b.location ?? "").toLowerCase() === "remote";
-                return (
-                  <div key={i} className="build-row">
-                    <span className={`pill ${remote ? "healthy" : "warn"}`}>{remote ? "remote" : "local"}</span>
-                    <span className="build-proj" title={b.command ?? undefined}>
-                      {b.project ?? "—"}
-                    </span>
-                    <span className="metric-value">{b.worker_id ?? (remote ? "?" : "—")}</span>
-                    <span className="metric-value">{fmtDuration(b.duration_ms)}</span>
-                  </div>
-                );
-              })}
+              {buildRows.map((b) => (
+                <div key={b.key} className="build-row">
+                  <span className={`pill ${b.remote ? "healthy" : "warn"}`}>{b.remote ? "remote" : "local"}</span>
+                  <span className="build-proj" title={b.command ?? undefined}>
+                    {b.project ?? "—"}
+                  </span>
+                  <span className="metric-value">{b.worker_id ?? (b.remote ? "?" : "—")}</span>
+                  <span className="metric-value">{fmtDuration(b.duration_ms)}</span>
+                </div>
+              ))}
             </div>
           )}
         </div>
-      </aside>
-    </>
+  </dialog>
   );
 }

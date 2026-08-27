@@ -374,23 +374,27 @@ input { font: inherit; }
 .dstat span:first-child { color: var(--text-faint); }
 .dstat span:last-child { font-family: var(--mono); color: var(--text-dim); }
 
-/* ----------------------------------------------------------------- drawer */
-
-.drawer-scrim {
-  position: fixed; inset: 0; background: rgb(0 0 0 / 0.55);
-  backdrop-filter: blur(2px); z-index: 40; border: none; padding: 0;
-  animation: fade 0.16s ease;
-}
-@keyframes fade { from { opacity: 0 } to { opacity: 1 } }
-
 .drawer {
-  position: fixed; top: 0; right: 0; bottom: 0; z-index: 41;
+  position: fixed;
+  inset: 0 0 0 auto;
+  height: 100dvh;
+  max-height: none;
+  max-width: none;
   width: min(460px, 100%);
+  margin: 0;
   background: var(--bg-elev);
+  color: var(--text);
+  border: none;
   border-left: 1px solid var(--border);
   overflow-y: auto;
   padding: 22px clamp(16px, 3vw, 26px) calc(40px + env(safe-area-inset-bottom));
   animation: slide 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+}
+/* Native top-layer backdrop replaces the old scrim button. */
+.drawer::backdrop {
+  background: rgb(0 0 0 / 0.55);
+  backdrop-filter: blur(2px);
+  animation: fade 0.16s ease;
 }
 @keyframes slide { from { transform: translateX(18px); opacity: 0.4 } to { transform: none; opacity: 1 } }
 
