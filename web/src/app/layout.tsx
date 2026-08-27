@@ -17,8 +17,32 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "RCH Dashboard",
-  description: "Remote Compilation Helper - Worker Dashboard",
+  title: "RCH Dashboard — Remote Compilation Helper",
+  description: "Transparent remote compilation offloading fleet dashboard for AI coding agents.",
+  icons: {
+    icon: "/favicon.svg",
+  },
+  openGraph: {
+    title: "RCH Fleet Dashboard — Remote Compilation Helper",
+    description: "Transparent remote compilation offloading fleet dashboard. Real-time compute slots, capacity matrix, and pipeline telemetry for AI coding agents.",
+    url: "https://github.com/Dicklesworthstone/remote_compilation_helper",
+    siteName: "RCH Fleet Dashboard",
+    images: [
+      {
+        url: "/og-image.jpg",
+        width: 1280,
+        height: 720,
+        alt: "RCH Fleet Dashboard Preview",
+      },
+    ],
+    type: "website",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "RCH Fleet Dashboard — Remote Compilation Helper",
+    description: "Transparent remote compilation offloading fleet dashboard for AI coding agents.",
+    images: ["/og-image.jpg"],
+  },
 };
 
 export default function RootLayout({
