@@ -386,10 +386,24 @@ if ((await kvLinks.count()) > 0) {
   await kvLinks.first().click();
   await page.waitForSelector(".drawer", { timeout: 15000 });
   const dTitle = (await page.locator(".drawer h3").innerText()).trim();
-  check("worker drawer cross-links to dev drawer", dTitle === devId, `${dTitle} (want ${devId})`);
+check("worker drawer cross-links to dev drawer", dTitle === devId, `${dTitle} (want ${devId})`);
 }
 await page.keyboard.press("Escape");
 await page.waitForTimeout(300);
+
+// fleet map: bipartite graph with real dispatch edges; a node click opens a drawer
+const mapNodeCount = await page.locator(".fm-node").count();
+check("fleet map nodes render", mapNodeCount > 0, `${mapNodeCount} nodes`);
+const mapEdgeCount = await page.locator(".fm-edge").count();
+check("fleet map edges render", mapEdgeCount > 0, `${mapEdgeCount} edges`);
+const mapWorker = page.locator(".fm-node.worker").first();
+if ((await mapWorker.count()) > 0) {
+  await mapWorker.click();
+  await page.waitForSelector(".drawer", { timeout: 15000 });
+  check("map node opens worker drawer", ((await page.locator(".drawer h3").innerText()) || "").length > 0);
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+}
 
 // cookie session survives reload
 await page.reload({ waitUntil: "load" });

@@ -12,6 +12,7 @@ import { DevMachineCard } from "./components/DevMachineCard";
 import { DevMachineDrawer } from "./components/DevMachineDrawer";
 import { Overview } from "./components/Overview";
 import { Topbar, WorkersSection, type Sort } from "./components/Topbar";
+import { FleetMap } from "./components/FleetMap";
 
 
 const DATA_URL = `${import.meta.env.BASE_URL}data/fleet.enc.json`;
@@ -410,34 +411,49 @@ export default function App() {
 
       <section className="section">
         <div className="section-head">
-          <h2>Dev machines</h2>
-          <span className="count-pill">{devs.length}</span>
+          <h2>Fleet map</h2>
+          <span className="count-pill">{devs.length} ▸ {workers.length}</span>
           <span className="spacer" />
-          <span className="hint-inline">boxes that run rch and dispatch builds to the pool</span>
+          <span className="hint-inline">
+            left: dev machines · right: workers · edges = who builds on what —
+            hover to focus, click for details
+          </span>
         </div>
-        {devs.length === 0 ? (
-          <div className="empty">No dev machines configured.</div>
-        ) : (
-          <div className="grid">
-            {devs.map((d) => (
-              <DevMachineCard key={d.id} d={d} onOpen={setOpenDev} />
-            ))}
-          </div>
-        )}
+        <FleetMap devs={devs} workers={workers} onOpenDev={openDevFrom} onOpenWorker={openWorkerFrom} />
       </section>
 
-      <WorkersSection
-        visible={visible}
-        total={workers.length}
-        counts={counts}
-        query={query}
-        onQuery={setQuery}
-        statusFilter={statusFilter}
-        onStatusFilter={setStatusFilter}
-        sort={sort}
-        onSort={setSort}
-        onOpen={setOpenWorker}
-      />
+      <div className="duo">
+        <section className="section">
+          <div className="section-head">
+            <h2>Dev machines</h2>
+            <span className="count-pill">{devs.length}</span>
+            <span className="spacer" />
+            <span className="hint-inline">boxes that run rch and dispatch builds to the pool</span>
+          </div>
+          {devs.length === 0 ? (
+            <div className="empty">No dev machines configured.</div>
+          ) : (
+            <div className="grid">
+              {devs.map((d) => (
+                <DevMachineCard key={d.id} d={d} onOpen={setOpenDev} />
+              ))}
+            </div>
+          )}
+        </section>
+
+        <WorkersSection
+          visible={visible}
+          total={workers.length}
+          counts={counts}
+          query={query}
+          onQuery={setQuery}
+          statusFilter={statusFilter}
+          onStatusFilter={setStatusFilter}
+          sort={sort}
+          onSort={setSort}
+          onOpen={setOpenWorker}
+        />
+      </div>
 
       <footer className="footer">
         <span>schema {snap.schema}</span>
