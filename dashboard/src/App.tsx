@@ -209,26 +209,6 @@ export default function App() {
   }, []);
 
   const toggleWeightedSizing = useCallback(() => {
-    setWeightedSizing((prev) => {
-      const next = !prev;
-      try {
-        localStorage.setItem("rch_dash_weighted", next ? "1" : "0");
-      } catch {
-        /* private mode */
-      }
-      return next;
-    });
-  }, []);
-
-  // Persistence is an effect on the VALUE, not a side effect inside the
-  // updater — updaters must stay pure (they run twice in StrictMode).
-  useEffect(() => {
-    try {
-      localStorage.setItem("rch_dash_auto", auto ? "1" : "0");
-    } catch {
-      /* private mode — the toggle still applies to this session */
-    }
-  const toggleWeightedSizing = useCallback(() => {
     setWeightedSizing((prev) => !prev);
   }, []);
 
@@ -241,6 +221,18 @@ export default function App() {
       /* private mode */
     }
   }, [weightedSizing]);
+
+  // The auto-refresh preference persists the same way.
+  useEffect(() => {
+    try {
+      localStorage.setItem("rch_dash_auto", auto ? "1" : "0");
+    } catch {
+      /* private mode — the toggle still applies to this session */
+    }
+  }, [auto]);
+
+  // Persist filter/sort in the URL hash so an operator can share a link to a
+  // filtered view. replaceState: no history spam per keystroke.
   useEffect(() => {
     const h = new URLSearchParams();
     if (query) h.set("q", query);
@@ -249,6 +241,15 @@ export default function App() {
     const next = h.toString();
     history.replaceState(null, "", next ? `#${next}` : location.pathname + location.search);
   }, [query, statusFilter, sort]);
+
+  // refresh lives in a ref so the interval does not re-subscribe (and drift)
+  // every time a refresh lands a new snapshot. Written in an effect, never
+  // during render (concurrent-unsafe).
+  const refreshRef = useRef(refresh);
+  useEffect(() => {
+    refreshRef.current = refresh;
+  }, [refresh]);
+
   const hasSnap = snap != null;
   useEffect(() => {
     if (!hasSnap || !auto) return;

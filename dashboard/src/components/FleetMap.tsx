@@ -201,7 +201,9 @@ function BipartiteMap({ devs, workers, orphans, edges, focus, setFocus, onOpenDe
     return () => ro.disconnect();
   }, []);
 
-  const allWorkers = [...workers, ...orphans];
+  // Memoized: `allWorkers` feeds the workerRow map's dependency array, and a
+  // fresh array per render would defeat the memo below.
+  const allWorkers = useMemo(() => [...workers, ...orphans], [workers, orphans]);
   const devHeights = devs.map((d) => hFor(devCap(d)));
   const workerHeights = allWorkers.map((w) => hFor(w.total_slots));
   const devOffs = columnOffsets(devHeights);
@@ -211,9 +213,7 @@ function BipartiteMap({ devs, workers, orphans, edges, focus, setFocus, onOpenDe
     workerOffs[workerOffs.length - 1] ?? NODE_GAP,
   );
   const leftX = COL_W - 10;
-  // Memoized: `allWorkers` feeds the workerRow map's dependency array, and a
-  // fresh array per render would defeat the memo below.
-  const allWorkers = useMemo(() => [...workers, ...orphans], [workers, orphans]);
+  const rightX = width - COL_W + 10;
   // Row lookup by id — O(1) per edge instead of a findIndex per edge.
   const devRow = useMemo(() => new Map(devs.map((d, i) => [d.id, i])), [devs]);
   const workerRow = useMemo(() => new Map(allWorkers.map((w, i) => [w.id, i])), [allWorkers]);

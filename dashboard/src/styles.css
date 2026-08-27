@@ -782,8 +782,8 @@ button.kv-link:hover .kv-v { color: var(--accent); }
 .fm-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .fm-sub { white-space: nowrap; flex: none; }
 
-.fm-groups { display: grid; gap: 14px; }
-.fm-group { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; background: var(--bg-inset); }
+.fm-groups { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+.fm-group { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; background: var(--bg-inset); min-width: 0; }
 .fm-group .fm-node { margin-bottom: 8px; }
 .fm-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .fm-chip {
@@ -819,4 +819,13 @@ button.kv-link:hover .kv-v { color: var(--accent); }
 .fm-legend .sw {
   display: inline-block; width: 18px; height: 4px; border-radius: 2px;
   vertical-align: middle; margin-right: 4px;
+}
+
+/* Grouped-map group headers: the pool summary must shrink, not push the
+   node wider than a 320px phone. */
+.fm-node.static .fm-sub {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
