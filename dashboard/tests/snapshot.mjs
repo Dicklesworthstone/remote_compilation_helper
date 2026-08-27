@@ -19,6 +19,7 @@ import {
   isLocalDispatcher, dispatcherId,
   encrypt, verifyRoundTrip, existingSalt, internSnapshotStrings,
   buildProbeScript, splitProbeSections, dispatcherFromProbe, allSettledBounded,
+  mergeWorkers, computeTotals, projectDispatchers,
 } from "../tools/snapshot.mjs";
 import { expandBuilds, expandHints } from "../tools/llm-view.mjs";
 import {
@@ -314,6 +315,97 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
     mixed[0].status === "fulfilled" && mixed[1].status === "rejected" &&
     mixed[1].reason.message === "boom" && mixed[2].value === 3);
   chk("an empty fleet settles without hanging", (await allSettledBounded([], 4, async () => 1)).length === 0);
+}
+
+// ------------------------------------------- merge, totals, slot projection
+
+// The cross-dispatcher merge and the (dispatcher x worker) slot matrix.
+//
+// `tools/scaling.mjs` measured this pipeline from 1 to 500 dispatchers and
+// found the slot matrix — the only structure whose size is the PRODUCT of both
+// fleet counts — being transmitted THREE times: `worker_slots` per dispatcher
+// plus `seen_by` and `slots_by_dispatcher` per worker, ~50 bytes per cell to
+// carry ~8 bytes of fact. That is 6.5KB of a 10-machine payload and 15.7MB of a
+// 500-machine one (91%). It is now emitted once, as `pool_slots`: one row per
+// dispatcher, aligned index-for-index to the merged `workers[]`, `null` where
+// that machine has no such worker. These cases pin the encoding, because an
+// off-by-one in the alignment attributes one machine's derating to another and
+// still renders perfectly plausible numbers.
+{
+  const mw = (id, used, total, over = {}) => ({
+    id, host: `${id}.h`, user: "root", status: "healthy", circuit_state: "closed",
+    used_slots: used, total_slots: total, speed: 50, last_error: null,
+    consecutive_failures: 0, failure_history: [],
+    pressure: { state: "healthy", reason: null, disk_free_gb: 100, disk_total_gb: 200,
+                disk_io_util_pct: 0, memory_pressure: 0, telemetry_age_secs: 1, telemetry_fresh: true },
+    latency_ms: 5, last_seen_unix: 1000, caps: { num_cpus: 8, load_avg_1: 1 },
+    tags: [], priority: 100, ...over,
+  });
+  const md = (id, workers, over = {}) => ({
+    id, reachable: true, collection_errors: [], config_degraded: false,
+    posture: "remote_ready", posture_description: "ok", daemon: null,
+    build_stats: { total: 2, remote: 2, local: 0, success: 2, failure: 0, avg_duration_ms: 1 },
+    saved_time_ms: 0, active_builds: 1, queued_builds: 0, builds: [], hints: [], workers, ...over,
+  });
+
+  // Three machines, a shared pool, and deliberate disagreement about it.
+  const dispatchers = [
+    md("dev-a", [mw("wb", 1, 8), mw("wa", 0, 16)]),
+    md("dev-b", [mw("wa", 4, 12), mw("wc", 2, 4)]),
+    md("dev-c", [mw("wa", 2, 0)], { reachable: false, posture: null }),
+  ];
+  const workers = mergeWorkers(dispatchers);
+
+  chk("the merge de-duplicates shared workers and sorts by id",
+    workers.map((w) => w.id).join(",") === "wa,wb,wc", workers.map((w) => w.id).join(","));
+  chk("capacity is the MAX any observer reported",
+    workers[0].total_slots === 16, `wa total=${workers[0].total_slots}`);
+  chk("occupancy is the WORST any observer reported",
+    workers[0].used_slots === 4, `wa used=${workers[0].used_slots}`);
+  // The columns are no longer built here — they are read back off the rows in
+  // src/derive.ts. Leaving them behind would put the matrix on the wire twice.
+  chk("the merge no longer materialises the per-worker columns",
+    workers.every((w) => w.seen_by === undefined && w.slots_by_dispatcher === undefined));
+
+  const totals = computeTotals(workers, dispatchers);
+  chk("totals count distinct workers, not observations", totals.workers === 3, `${totals.workers}`);
+  chk("totals sum the merged capacity", totals.slots === 16 + 8 + 4, `${totals.slots}`);
+  chk("totals ignore unreachable dispatchers for build counters",
+    totals.dispatchers_total === 3 && totals.dispatchers_reachable === 2 && totals.active_builds === 2,
+    `${totals.dispatchers_total}/${totals.dispatchers_reachable}/${totals.active_builds}`);
+
+  const emitted = projectDispatchers(dispatchers, workers);
+  chk("each dispatcher emits one row of the matrix",
+    emitted.length === 3 && emitted.every((d) => Array.isArray(d.pool_slots)));
+  // dev-a listed wb BEFORE wa; the row is indexed by the fleet's order, not the
+  // dispatcher's, which is exactly the transposition an off-by-one would break.
+  chk("a row is aligned to the merged worker order, not the reporting order",
+    JSON.stringify(emitted[0].pool_slots) === JSON.stringify([[0, 16], [1, 8]]),
+    JSON.stringify(emitted[0].pool_slots));
+  chk("a worker this machine cannot see is null, never a zero reading",
+    JSON.stringify(emitted[1].pool_slots) === JSON.stringify([[4, 12], null, [2, 4]]),
+    JSON.stringify(emitted[1].pool_slots));
+  // dev-c sees only wa (index 0), so indices 1 and 2 are trailing nulls and
+  // cost nothing. A short row means "nothing after this", never zero slots.
+  chk("trailing nulls are trimmed off the row",
+    JSON.stringify(emitted[2].pool_slots) === JSON.stringify([[2, 0]]),
+    JSON.stringify(emitted[2].pool_slots));
+  chk("a zero-slot derating survives — it is the alarm, not padding",
+    emitted[2].pool_slots[0][1] === 0);
+  chk("the per-dispatcher worker records are gone from the wire",
+    emitted.every((d) => d.workers === undefined));
+  chk("everything else about a dispatcher is untouched",
+    emitted[0].id === "dev-a" && emitted[2].reachable === false && emitted[0].active_builds === 1);
+
+  // The whole point: the matrix appears once. Count the cells in the payload.
+  const cells = emitted.reduce((n, d) => n + d.pool_slots.filter(Array.isArray).length, 0);
+  chk("the matrix is on the wire exactly once — one cell per observation",
+    cells === dispatchers.reduce((n, d) => n + d.workers.length, 0), `${cells} cells`);
+
+  chk("an empty fleet projects without throwing",
+    JSON.stringify(projectDispatchers([], [])) === "[]");
+  chk("a dispatcher reporting a worker nobody merged is skipped, not misaligned",
+    JSON.stringify(projectDispatchers([md("dev-x", [mw("ghost", 1, 1)])], workers)[0].pool_slots) === "[]");
 }
 
 // -------------------------------------------------------- string interning

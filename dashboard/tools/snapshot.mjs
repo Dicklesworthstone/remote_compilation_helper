@@ -667,6 +667,192 @@ export function dispatcherFromProbe(host, probe) {
   };
 }
 
+// -------------------------------------------------------- merge + aggregation
+
+/**
+ * Union the per-dispatcher worker views into ONE fleet-wide worker list.
+ *
+ * A worker is "known" if any dev machine has it, and runtime facts come from
+ * whichever machine actually reported them, so one unreachable dispatcher
+ * cannot blank the fleet. Slot counts are per-observer (rchd derates
+ * independently), so keep the MAX observed capacity here; WHICH observer saw
+ * what is `projectDispatchers()`'s job, not this one's.
+ *
+ * Pure, and exported, so `tools/scaling.mjs` can drive it at fleet sizes that
+ * do not exist yet and `tests/snapshot.mjs` can assert the worst-wins rules
+ * directly. `main()` below is the only production caller.
+ *
+ * Complexity: one Map probe per (dispatcher, worker) OBSERVATION plus one sort
+ * of the distinct workers — linear in the input records, and the input records
+ * are what grow quadratically when both counts scale together.
+ */
+export function mergeWorkers(dispatchers) {
+  const merged = new Map();
+  for (const d of dispatchers) {
+    for (const w of d.workers) {
+      const prev = merged.get(w.id);
+      if (!prev) {
+        // Copy the nested objects. A shallow spread aliases `caps`, `pressure`,
+        // `tags` and `failure_history` to the FIRST dispatcher's own records,
+        // and the merge below then mutates them in place — silently rewriting
+        // that dispatcher's private per-worker view with values observed
+        // elsewhere.
+        merged.set(w.id, {
+          ...w,
+          caps: { ...w.caps },
+          pressure: { ...w.pressure },
+          tags: [...(w.tags ?? [])],
+          failure_history: [...(w.failure_history ?? [])],
+        });
+        continue;
+      }
+      if ((w.total_slots ?? 0) > (prev.total_slots ?? 0)) prev.total_slots = w.total_slots;
+      if ((w.used_slots ?? 0) > (prev.used_slots ?? 0)) prev.used_slots = w.used_slots;
+
+      // WORST-WINS for anything that signals trouble. Dev machines observe the
+      // pool independently and can disagree; taking whichever answered first
+      // would let a benign reading mask an alarming one and hide the exact
+      // thing this dashboard exists to surface.
+      if (statusRank(w.status) > statusRank(prev.status)) prev.status = w.status;
+      if (circuitRank(w.circuit_state) > circuitRank(prev.circuit_state)) {
+        prev.circuit_state = w.circuit_state;
+      }
+      if ((w.consecutive_failures ?? 0) > (prev.consecutive_failures ?? 0)) {
+        prev.consecutive_failures = w.consecutive_failures;
+      }
+      // Seen by ANY dispatcher recently means it is not stale, so keep the most
+      // recent sighting rather than the first one reported.
+      if ((w.last_seen_unix ?? 0) > (prev.last_seen_unix ?? 0)) prev.last_seen_unix = w.last_seen_unix;
+
+      for (const k of ["speed", "latency_ms", "last_error", "priority"]) {
+        if (prev[k] == null && w[k] != null) prev[k] = w[k];
+      }
+      if ((prev.tags?.length ?? 0) === 0 && w.tags?.length) prev.tags = [...w.tags];
+      for (const k of Object.keys(w.caps)) if (prev.caps[k] == null && w.caps[k] != null) prev.caps[k] = w.caps[k];
+
+      // Take the pressure block WHOLE from the freshest observer. Merging it
+      // field by field could pair disk_free_gb from one dispatcher with
+      // disk_total_gb from another and compute a nonsense percentage.
+      if (pressureIsBetter(w.pressure, prev.pressure)) prev.pressure = { ...w.pressure };
+
+      if (!prev.failure_history.length && w.failure_history.length) prev.failure_history = [...w.failure_history];
+    }
+  }
+  return [...merged.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+/**
+ * Fleet-wide aggregates, from the merged workers and the raw dispatchers.
+ *
+ * Pure and exported for the same reason as `mergeWorkers()`. Every KPI on the
+ * overview is one of these numbers, so the arithmetic is worth being able to
+ * test and to profile on its own.
+ */
+export function computeTotals(workers, dispatchers) {
+  const reachable = dispatchers.filter((d) => d.reachable);
+
+  // Only count a worker's disk when BOTH halves are present. Summing them
+  // independently let a worker with a total but no free reading add to the
+  // denominator and nothing to the numerator, inflating fleet "disk used %"
+  // with a number no single worker ever reported.
+  const diskWorkers = workers.filter(
+    (w) => w.pressure.disk_free_gb != null && w.pressure.disk_total_gb != null && w.pressure.disk_total_gb > 0,
+  );
+
+  return {
+    workers: workers.length,
+    slots: workers.reduce((n, w) => n + (w.total_slots ?? 0), 0),
+    // Per-observer occupancy (each rchd derates and reserves independently), so
+    // this is the worst single observation, never more than capacity.
+    slots_used: workers.reduce((n, w) => n + Math.min(w.used_slots ?? 0, w.total_slots ?? Infinity), 0),
+    cores: workers.reduce((n, w) => n + (w.caps.num_cpus ?? 0), 0),
+    disk_free_gb: diskWorkers.reduce((n, w) => n + w.pressure.disk_free_gb, 0),
+    disk_total_gb: diskWorkers.reduce((n, w) => n + w.pressure.disk_total_gb, 0),
+    /** How many workers actually reported usable disk telemetry, so the UI can say "of N" honestly. */
+    disk_reporting_workers: diskWorkers.length,
+    dispatchers_total: dispatchers.length,
+    dispatchers_reachable: reachable.length,
+    dispatchers_remote_ready: reachable.filter((d) => d.posture === "remote_ready").length,
+    builds_remote: reachable.reduce((n, d) => n + (d.build_stats?.remote ?? 0), 0),
+    builds_local: reachable.reduce((n, d) => n + (d.build_stats?.local ?? 0), 0),
+    active_builds: reachable.reduce((n, d) => n + d.active_builds, 0),
+  };
+}
+
+/**
+ * Project the per-dispatcher worker arrays down before they reach the wire.
+ *
+ * Every dispatcher used to ship a FULL copy of every worker it can see: on a
+ * 10-machine fleet that is 142 records, 121.5KB of a 222.8KB payload (54.6%),
+ * re-downloaded whole on every 5-minute refresh. All of it was redundant:
+ * every descriptive field (host, user, caps, pressure, tags, latency,
+ * failure_history, ...) is already in the merged `workers[]`, folded worst-wins
+ * across observers. The only genuinely per-dispatcher fact is the DERATED SLOT
+ * READING, and this is the one place it survives.
+ *
+ * THE (DISPATCHER x WORKER) MATRIX, AND WHY IT IS EMITTED EXACTLY ONCE
+ *
+ * "Every dev machine has its own derated reading of every shared worker" is a
+ * d x w matrix — the only structure in this snapshot whose size is the PRODUCT
+ * of both fleet counts rather than a sum, so it is the term that decides how
+ * this payload behaves as the fleet grows. `tools/scaling.mjs` measured it
+ * fitting n^2.00, and measured the payload carrying THREE separate copies of
+ * it, in three layouts:
+ *
+ *   workers[].slots_by_dispatcher   {"dev-x":{"used":3,"total":14}}  ~31 B/cell
+ *   workers[].seen_by               "dev-x",                         ~11 B/cell
+ *   dispatchers[].worker_slots      [3,14],                           ~8 B/cell
+ *
+ * `seen_by` is exactly `Object.keys(slots_by_dispatcher)` and `worker_slots` is
+ * exactly the same readings transposed, so ~50 bytes per cell were spent
+ * carrying ~8 bytes of information. On a 10-machine fleet that is 6.5KB of a
+ * 59.8KB payload and nobody notices; at 100 dispatchers it is 639KB of 1,001KB
+ * (64%) and at 500 it is 15.7MB of 17.3MB (91%). The quadratic was always
+ * there — the fleet was just too small to feel it.
+ *
+ * So the matrix is emitted ONCE, dispatcher-major, as a row per dev machine
+ * ALIGNED TO `snapshot.workers[]` (which is sorted by id, so the alignment is a
+ * pure function of the snapshot):
+ *
+ *   pool_slots[i] = [used, total]   this machine's reading of workers[i]
+ *   pool_slots[i] = null            this machine does not have workers[i]
+ *
+ * `src/derive.ts` reads a dispatcher's own row directly (`expandPoolSlots`),
+ * and rebuilds each worker's `seen_by` / `slots_by_dispatcher` column-wise in
+ * `classifyAll()`, which is handed the whole snapshot and so can see both axes.
+ * Trailing nulls are trimmed — a short row simply means "nothing after this" —
+ * and every reader indexes defensively, so a ragged row can never be read as a
+ * zero-slot reading.
+ *
+ * NAMED `pool_slots`, NOT `worker_slots`, deliberately, and for the same reason
+ * `builds` is not `recent_builds`: a browser tab still holding the previous
+ * bundle indexes `worker_slots` POSITIONALLY against that dispatcher's own
+ * worker order, and would read this fleet-aligned row as that machine's pool —
+ * counting every `null` as a worker derated to zero slots and reporting a
+ * dev-machine-wide alarm that is not happening. Under a new key the old bundle
+ * sees no pool view at all and renders "0 workers seen", which is
+ * wrong-but-quiet rather than a false alarm.
+ *
+ * @param workers the MERGED, id-sorted worker list — the row index space.
+ */
+export function projectDispatchers(dispatchers, workers) {
+  const indexOfWorker = new Map(workers.map((w, i) => [w.id, i]));
+  return dispatchers.map(({ workers: seen, ...rest }) => {
+    const row = new Array(workers.length).fill(null);
+    for (const w of seen) {
+      const i = indexOfWorker.get(w.id);
+      // `undefined`, not a falsy check: index 0 is a real worker.
+      if (i !== undefined) row[i] = [w.used_slots, w.total_slots];
+    }
+    // Trailing nulls carry nothing. A dispatcher that only has the first few
+    // workers of a large fleet would otherwise pay 5 bytes per absent worker
+    // for the privilege of saying nothing about it.
+    let end = row.length;
+    while (end > 0 && row[end - 1] === null) end--;
+    return { ...rest, pool_slots: end === row.length ? row : row.slice(0, end) };
+  });
+}
+
 // ------------------------------------------------------------ string interning
 
 /**
@@ -1013,96 +1199,10 @@ async function main() {
     process.exit(1);
   }
 
-  // Union the worker view. A worker is "known" if any dev machine has it, and
-  // runtime facts come from whichever machine actually reported them, so one
-  // unreachable dispatcher cannot blank the fleet. Slot counts are per-observer
-  // (rchd derates independently), so keep the MAX observed capacity plus the
-  // per-dispatcher detail.
-  const merged = new Map();
-  for (const d of dispatchers) {
-    for (const w of d.workers) {
-      const prev = merged.get(w.id);
-      if (!prev) {
-        // Copy the nested objects. A shallow spread aliases `caps`, `pressure`,
-        // `tags` and `failure_history` to the FIRST dispatcher's own records,
-        // and the merge below then mutates them in place — silently rewriting
-        // that dispatcher's private per-worker view with values observed
-        // elsewhere.
-        merged.set(w.id, {
-          ...w,
-          caps: { ...w.caps },
-          pressure: { ...w.pressure },
-          tags: [...(w.tags ?? [])],
-          failure_history: [...(w.failure_history ?? [])],
-          seen_by: [d.id],
-          slots_by_dispatcher: { [d.id]: { used: w.used_slots, total: w.total_slots } },
-        });
-        continue;
-      }
-      prev.seen_by.push(d.id);
-      prev.slots_by_dispatcher[d.id] = { used: w.used_slots, total: w.total_slots };
-      if ((w.total_slots ?? 0) > (prev.total_slots ?? 0)) prev.total_slots = w.total_slots;
-      if ((w.used_slots ?? 0) > (prev.used_slots ?? 0)) prev.used_slots = w.used_slots;
-
-      // WORST-WINS for anything that signals trouble. Dev machines observe the
-      // pool independently and can disagree; taking whichever answered first
-      // would let a benign reading mask an alarming one and hide the exact
-      // thing this dashboard exists to surface.
-      if (statusRank(w.status) > statusRank(prev.status)) prev.status = w.status;
-      if (circuitRank(w.circuit_state) > circuitRank(prev.circuit_state)) {
-        prev.circuit_state = w.circuit_state;
-      }
-      if ((w.consecutive_failures ?? 0) > (prev.consecutive_failures ?? 0)) {
-        prev.consecutive_failures = w.consecutive_failures;
-      }
-      // Seen by ANY dispatcher recently means it is not stale, so keep the most
-      // recent sighting rather than the first one reported.
-      if ((w.last_seen_unix ?? 0) > (prev.last_seen_unix ?? 0)) prev.last_seen_unix = w.last_seen_unix;
-
-      for (const k of ["speed", "latency_ms", "last_error", "priority"]) {
-        if (prev[k] == null && w[k] != null) prev[k] = w[k];
-      }
-      if ((prev.tags?.length ?? 0) === 0 && w.tags?.length) prev.tags = [...w.tags];
-      for (const k of Object.keys(w.caps)) if (prev.caps[k] == null && w.caps[k] != null) prev.caps[k] = w.caps[k];
-
-      // Take the pressure block WHOLE from the freshest observer. Merging it
-      // field by field could pair disk_free_gb from one dispatcher with
-      // disk_total_gb from another and compute a nonsense percentage.
-      if (pressureIsBetter(w.pressure, prev.pressure)) prev.pressure = { ...w.pressure };
-
-      if (!prev.failure_history.length && w.failure_history.length) prev.failure_history = [...w.failure_history];
-    }
-  }
-  const workers = [...merged.values()].sort((a, b) => a.id.localeCompare(b.id));
-
-  const reachable = dispatchers.filter((d) => d.reachable);
-
-  // Only count a worker's disk when BOTH halves are present. Summing them
-  // independently let a worker with a total but no free reading add to the
-  // denominator and nothing to the numerator, inflating fleet "disk used %"
-  // with a number no single worker ever reported.
-  const diskWorkers = workers.filter(
-    (w) => w.pressure.disk_free_gb != null && w.pressure.disk_total_gb != null && w.pressure.disk_total_gb > 0,
-  );
-
-  const totals = {
-    workers: workers.length,
-    slots: workers.reduce((n, w) => n + (w.total_slots ?? 0), 0),
-    // Per-observer occupancy (each rchd derates and reserves independently), so
-    // this is the worst single observation, never more than capacity.
-    slots_used: workers.reduce((n, w) => n + Math.min(w.used_slots ?? 0, w.total_slots ?? Infinity), 0),
-    cores: workers.reduce((n, w) => n + (w.caps.num_cpus ?? 0), 0),
-    disk_free_gb: diskWorkers.reduce((n, w) => n + w.pressure.disk_free_gb, 0),
-    disk_total_gb: diskWorkers.reduce((n, w) => n + w.pressure.disk_total_gb, 0),
-    /** How many workers actually reported usable disk telemetry, so the UI can say "of N" honestly. */
-    disk_reporting_workers: diskWorkers.length,
-    dispatchers_total: dispatchers.length,
-    dispatchers_reachable: reachable.length,
-    dispatchers_remote_ready: reachable.filter((d) => d.posture === "remote_ready").length,
-    builds_remote: reachable.reduce((n, d) => n + (d.build_stats?.remote ?? 0), 0),
-    builds_local: reachable.reduce((n, d) => n + (d.build_stats?.local ?? 0), 0),
-    active_builds: reachable.reduce((n, d) => n + d.active_builds, 0),
-  };
+  // Union the worker view, then aggregate it. Both steps live above as pure
+  // exported functions so they can be tested and profiled without a fleet.
+  const workers = mergeWorkers(dispatchers);
+  const totals = computeTotals(workers, dispatchers);
 
   const generated_at = new Date().toISOString();
 
@@ -1131,27 +1231,10 @@ async function main() {
   });
   history = history.slice(-args.historyMax);
 
-  // Project the per-dispatcher worker arrays down before they reach the wire.
-  //
-  // Every dispatcher used to ship a FULL copy of every worker it can see: on a
-  // 10-machine fleet that is 142 records, 121.5KB of a 222.8KB payload (54.6%),
-  // re-downloaded whole on every 5-minute refresh. All of it was redundant:
-  //   - every descriptive field (host, user, caps, pressure, tags, latency,
-  //     failure_history, ...) is already in the merged `workers[]` above, folded
-  //     worst-wins across observers;
-  //   - the only genuinely per-dispatcher fact is the derated slot reading, and
-  //     the merge already records that too, as `workers[].slots_by_dispatcher`.
-  // The single surviving consumer of the per-dispatcher array is the dev-machine
-  // drawer, which sums used/total slots and counts the zero-slot workers to
-  // answer "is this box about to go local-only?" — it never reads any other
-  // field. So emit the slot readings alone, positionally: the key names cost
-  // more than the values at 142 repetitions. `classifyDispatcher()` in
-  // src/derive.ts expands them back into `workers` on the DispatcherView the
-  // drawer is handed, so the drawer sees exactly what it saw before.
-  const emittedDispatchers = dispatchers.map(({ workers: seen, ...rest }) => ({
-    ...rest,
-    worker_slots: seen.map((w) => [w.used_slots, w.total_slots]),
-  }));
+  // Project the per-dispatcher worker arrays down before they reach the wire —
+  // see projectDispatchers() for what survives, and for why the (dispatcher x
+  // worker) slot matrix is emitted exactly once instead of three times.
+  const emittedDispatchers = projectDispatchers(dispatchers, workers);
 
   // Fold the repeated build/hint strings into one snapshot-level table. Hints
   // and commands duplicate massively across dispatchers — 113 hints on a

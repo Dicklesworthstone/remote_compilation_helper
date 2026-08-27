@@ -143,10 +143,93 @@ export function classify(w: Worker, snapshotMs: number): WorkerView {
   return { ...w, health, healthReason, diskUsedPct, loadPerCore, staleSeconds, slotPct };
 }
 
+/**
+ * Give each worker view its `seen_by` / `slots_by_dispatcher`, read off the
+ * wire matrix by COLUMN.
+ *
+ * `Dispatcher.pool_slots` is one ROW of the (dispatcher x worker) derated-slot
+ * matrix, aligned to `snap.workers`. These two per-worker fields are the same
+ * matrix read the other way, and they used to be transmitted alongside the
+ * rows — three encodings of one structure, ~50 bytes per cell to carry ~8 bytes
+ * of fact, on the only thing in this snapshot whose size is the PRODUCT of both
+ * fleet counts. `tools/scaling.mjs` measured that at 91% of a 500-machine
+ * payload. See `projectDispatchers()` in tools/snapshot.mjs.
+ *
+ * ORDER IS THE CONTRACT, and it is preserved exactly. The collector built
+ * `seen_by` by iterating dispatchers outermost; so does this, so the array
+ * order and the object key order are what the old payload carried, element for
+ * element.
+ *
+ * WHY `seen_by` IS EAGER AND `slots_by_dispatcher` IS NOT. Both are columns of
+ * the same matrix, so building both costs one object per CELL: 75ms at 500
+ * dispatchers, of which 66ms is `slots_by_dispatcher` alone. But every card on
+ * screen reads `seen_by.length`, while `slots_by_dispatcher` is read by the
+ * worker drawer, for the ONE worker that is open — usually none. So the array
+ * is built for every worker and the record is built on first touch, cached in
+ * place by replacing the accessor with the value. Enumerable and configurable,
+ * so it survives a spread, `Object.keys`, `Object.entries` and
+ * `JSON.stringify`: nothing downstream can tell it apart from a plain field.
+ *
+ * Mutates the VIEWS, never `snap`: `Snapshot` is React state, and a hook that
+ * rewrites its own input is a re-render hazard. A snapshot that already carries
+ * `seen_by` — one written before the matrix was de-duplicated — is left
+ * completely alone, because its `worker_slots` are positional against a
+ * DIFFERENT index space and deriving columns from them would attribute
+ * readings to the wrong machines.
+ */
+function attachSlotColumns(snap: Snapshot, views: WorkerView[]): void {
+  const dispatchers = snap?.dispatchers;
+  if (!Array.isArray(dispatchers) || dispatchers.length === 0) return;
+  if (views.some((v) => Array.isArray(v.seen_by))) return;
+
+  const seenBy: (string[] | undefined)[] = new Array(views.length);
+  for (const d of dispatchers) {
+    const row = d?.pool_slots;
+    if (!Array.isArray(row)) continue;
+    const end = Math.min(row.length, views.length);
+    for (let i = 0; i < end; i++) {
+      // Only a real `[used, total]` counts as "seen". A null, a hole from a
+      // trimmed row, or anything ragged means this machine said nothing about
+      // this worker — which must never be read as a zero-slot reading, because
+      // zero slots is the alarm this panel exists to raise.
+      if (!Array.isArray(row[i])) continue;
+      (seenBy[i] ??= []).push(d.id);
+    }
+  }
+
+  for (let i = 0; i < views.length; i++) {
+    const ids = seenBy[i];
+    // No dispatcher reported this worker: leave both fields absent rather than
+    // empty, so the card and the drawer hide their panels exactly as they did
+    // when the collector omitted them.
+    if (!ids) continue;
+    const view = views[i];
+    view.seen_by = ids;
+    Object.defineProperty(view, "slots_by_dispatcher", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        const built: Record<string, { used: number | null; total: number | null }> = {};
+        for (const d of dispatchers) {
+          const pair = d?.pool_slots?.[i];
+          if (!Array.isArray(pair)) continue;
+          built[d.id] = { used: pair[0] ?? null, total: pair[1] ?? null };
+        }
+        Object.defineProperty(view, "slots_by_dispatcher", {
+          value: built, writable: true, configurable: true, enumerable: true,
+        });
+        return built;
+      },
+    });
+  }
+}
+
 export function classifyAll(snap: Snapshot, _nowMs?: number): WorkerView[] {
   // Deliberately ignores the caller's clock — see classify().
   const snapshotMs = new Date(snap.generated_at).getTime();
-  return snap.workers.map((w) => classify(w, snapshotMs));
+  const views = snap.workers.map((w) => classify(w, snapshotMs));
+  attachSlotColumns(snap, views);
+  return views;
 }
 
 /**
@@ -158,19 +241,41 @@ export function classifyAll(snap: Snapshot, _nowMs?: number): WorkerView[] {
  * did not already carry. Only the slot readings are per-dispatcher, and the
  * dev-machine drawer only ever sums them and counts the zeroes.
  *
+ * Two wire forms, and the difference is the INDEX SPACE, not the values:
+ *   `pool_slots`   one row of the fleet matrix, aligned to `Snapshot.workers`,
+ *                  with `null` where this machine does not have that worker.
+ *   `worker_slots` the older dense form, positional against this dispatcher's
+ *                  own worker order. Still read so an already-published
+ *                  snapshot keeps its pool panel; never written any more.
+ * Both collapse to the same records here, because the only consumer — the
+ * dev-machine drawer — sums the pairs and counts the zeroes, and neither
+ * answer depends on the order.
+ *
+ * A `null` is DROPPED, never expanded into `{used: null, total: null}`. "This
+ * machine has no such worker" and "this machine has derated it to zero" are
+ * opposite facts, and the second one is the alarm the drawer exists to raise.
+ *
  * Tolerant of a missing or ragged array on purpose: a browser tab can be
  * holding a snapshot written by an older collector, and a dev machine with no
  * pool view must render as "0 workers seen", never crash the drawer.
  */
-function expandWorkerSlots(pairs: WorkerSlotPair[] | undefined): DispatcherWorkerSlots[] {
-  if (!Array.isArray(pairs)) return [];
-  return pairs.map((p) => ({
-    // `?? null` and not `|| null`: 0 used slots and 0 total slots are the two
-    // most interesting readings here — a worker derated to 0 is invisible to
-    // this machine, which is the whole reason the drawer shows this.
-    used_slots: Array.isArray(p) ? (p[0] ?? null) : null,
-    total_slots: Array.isArray(p) ? (p[1] ?? null) : null,
-  }));
+function expandWorkerSlots(d: Dispatcher | undefined): DispatcherWorkerSlots[] {
+  const row: readonly (WorkerSlotPair | null)[] | undefined =
+    (Array.isArray(d?.pool_slots) ? d.pool_slots : undefined) ??
+    (Array.isArray(d?.worker_slots) ? d.worker_slots : undefined);
+  if (!row) return [];
+  const out: DispatcherWorkerSlots[] = [];
+  for (const p of row) {
+    if (!Array.isArray(p)) continue;
+    out.push({
+      // `?? null` and not `|| null`: 0 used slots and 0 total slots are the two
+      // most interesting readings here — a worker derated to 0 is invisible to
+      // this machine, which is the whole reason the drawer shows this.
+      used_slots: p[0] ?? null,
+      total_slots: p[1] ?? null,
+    });
+  }
+  return out;
 }
 
 /**
@@ -352,7 +457,7 @@ export function classifyDispatcher(d: Dispatcher, strings?: unknown): Dispatcher
 
   return {
     ...d,
-    workers: expandWorkerSlots(d.worker_slots),
+    workers: expandWorkerSlots(d),
     // Expanded once here, not per component: the drawer renders these rows and
     // the card counts the hints, and both must see exactly the objects the
     // collector used to send.
