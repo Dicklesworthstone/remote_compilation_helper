@@ -13,7 +13,8 @@ const env = Object.fromEntries(
     .split("\n").filter((l) => l.includes("="))
     .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim().replace(/^['"]|['"]$/g, "")]),
 );
-const URL = `http://127.0.0.1:4174${process.env.RCH_DASH_BASE ?? "/remote_compilation_helper/"}`;
+const PORT = process.env.RCH_DASH_E2E_PORT ?? "4174";
+const URL = `http://127.0.0.1:${PORT}${process.env.RCH_DASH_BASE ?? "/remote_compilation_helper/"}`;
 
 // VIEWPORT env: "390x844" for the mobile pass, default desktop.
 const browser = await chromium.launch();

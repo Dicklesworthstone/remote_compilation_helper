@@ -138,13 +138,19 @@ export default function App() {
           return;
         }
         const key = await deriveKey(passphrase, env);
-        const plain = await decryptEnvelope(env, key); // throws on a wrong key
+        let plain: string;
+        try {
+          plain = await decryptEnvelope(env, key);
+        } catch {
+          setError("Wrong passphrase.");
+          return;
+        }
         setSnap(JSON.parse(plain));
         setSnapAt(Date.now());
         keyRef.current = key;
         if (remember) await persistKey(key);
-      } catch {
-        setError("Wrong passphrase.");
+      } catch (err) {
+        setError((err as Error).message || "Failed to decrypt snapshot.");
       } finally {
         setBusy(false);
       }

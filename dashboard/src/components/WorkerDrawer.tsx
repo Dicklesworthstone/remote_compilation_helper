@@ -20,24 +20,29 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
 }
 
 export function WorkerDrawer({ w, onClose, onOpenDev }: Props) {
-  const { ref, onCancel, onClick } = useDialog(w != null, onClose);
+  const { ref, onCancel, onClick, onKeyDown } = useDialog(w != null, onClose);
   const [copied, setCopied] = useState<string | null>(null);
 
-  if (!w) return null;
-  const c = w.caps;
-  const p = w.pressure;
-  const fails = w.failure_history;
-  const sshTarget = w.host ? `ssh ${w.user ? `${w.user}@` : ""}${w.host}` : null;
+  const c = w?.caps;
+  const p = w?.pressure;
+  const fails = w?.failure_history ?? [];
+  const sshTarget = w?.host ? `ssh ${w.user ? `${w.user}@` : ""}${w.host}` : null;
+
+  // Early return AFTER all hooks: a closed drawer must unmount its <dialog>.
+  // A closed native dialog stays in the DOM (display:none), and tests plus the
+  // padding-click guard assert on its removal — early return keeps them honest.
+  if (!w || !c || !p) return null;
 
   return (
     <dialog
       ref={ref}
       className="drawer"
-      aria-label={`${w.id} details`}
+      aria-label={w ? `${w.id} details` : "Worker details"}
       onCancel={onCancel}
       onClick={onClick}
+      onKeyDown={onKeyDown}
     >
-        <div className="drawer-head">
+          <div className="drawer-head">
           <h3>{w.id}</h3>
           <span className={`pill ${w.health}`}>{w.health}</span>
           <span style={{ flex: 1 }} />
@@ -168,6 +173,6 @@ export function WorkerDrawer({ w, onClose, onOpenDev }: Props) {
             <Row k="zig" v={c.zig_version ?? "—"} />
           </dl>
         </div>
-  </dialog>
+    </dialog>
   );
 }

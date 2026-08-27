@@ -126,6 +126,7 @@ export interface Snapshot {
     cores: number;
     disk_free_gb: number;
     disk_total_gb: number;
+    disk_reporting_workers?: number;
     dispatchers_total: number;
     dispatchers_reachable: number;
     dispatchers_remote_ready: number;

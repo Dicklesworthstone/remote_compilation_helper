@@ -23,7 +23,7 @@ export function DevMachineCard({ d, onOpen }: Props) {
     remotePct == null ? "off" : remotePct < 50 ? "crit" : remotePct < 80 ? "warn" : "ok";
 
   return (
-    <button className="wcard" onClick={() => onOpen(d.id)} aria-label={`Details for dev machine ${d.id}`}>
+    <button className="wcard" onClick={() => onOpen(d.id)} title={`View details for dev machine ${d.id}`}>
       <div className="wcard-top">
         <span className="wname">{d.id}</span>
         <span className={`pill dev-${d.level}`}>{d.level}</span>
@@ -43,9 +43,10 @@ export function DevMachineCard({ d, onOpen }: Props) {
             className="bar"
             role="meter"
             aria-label="share of builds sent to the worker pool"
-            aria-valuenow={remotePct ?? undefined}
+            aria-valuenow={remotePct != null ? Math.round(remotePct) : 0}
             aria-valuemin={0}
             aria-valuemax={100}
+            aria-valuetext={remotePct != null ? `${Math.round(remotePct)}%` : "no builds"}
           >
             <i className={cls} style={{ width: `${remotePct ?? 0}%` }} />
           </span>

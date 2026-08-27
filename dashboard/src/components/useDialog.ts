@@ -51,5 +51,9 @@ export function useDialog(open: boolean, onClose: () => void) {
     if (outside) onCloseRef.current();
   }, []);
 
-  return { ref, onCancel, onClick };
+  const onKeyDown = useCallback((e: React.KeyboardEvent<HTMLDialogElement>) => {
+    if (e.key === "Escape") onCloseRef.current();
+  }, []);
+
+  return { ref, onCancel, onClick, onKeyDown };
 }

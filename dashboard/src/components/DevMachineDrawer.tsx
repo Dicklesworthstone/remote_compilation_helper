@@ -23,7 +23,7 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
 }
 
 export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWorkerIds }: Props) {
-  const { ref, onCancel, onClick } = useDialog(d != null, onClose);
+  const { ref, onCancel, onClick, onKeyDown } = useDialog(d != null, onClose);
   const [copied, setCopied] = useState(false);
 
   // Deterministic, index-free list keys: an occurrence counter appended at
@@ -73,23 +73,28 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
     return { count: ws.length, total, used, zero };
   }, [d?.workers]);
 
+  const s = d?.build_stats;
+
+  // Early return AFTER all hooks: a closed drawer must unmount its <dialog>.
+  // A closed native dialog stays in the DOM (display:none), and tests plus the
+  // padding-click guard assert on its removal — early return keeps them honest.
   if (!d) return null;
-  const s = d.build_stats;
 
   return (
     <dialog
       ref={ref}
       className="drawer"
-      aria-label={`${d.id} dev machine details`}
+      aria-label={d ? `${d.id} dev machine details` : "Dev machine details"}
       onCancel={onCancel}
       onClick={onClick}
+      onKeyDown={onKeyDown}
     >
-      <div className="drawer-head">
-        <h3>{d.id}</h3>
-        <span className={`pill dev-${d.level}`}>{d.level}</span>
-        <span style={{ flex: 1 }} />
-        <button className="icon-btn" onClick={onClose}>Close</button>
-      </div>
+          <div className="drawer-head">
+            <h3>{d.id}</h3>
+            <span className={`pill dev-${d.level}`}>{d.level}</span>
+            <span style={{ flex: 1 }} />
+            <button className="icon-btn" onClick={onClose}>Close</button>
+          </div>
       <div className="drawer-host">
         <span>dev machine · dispatches builds to the pool</span>
         <button
@@ -199,11 +204,11 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
                   {fmtDuration(b.duration_ms)}
                   {b.failed && <span className="fail-mark"> · exit {b.exit}</span>}
                 </span>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
     </dialog>
   );
 }

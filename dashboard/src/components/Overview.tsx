@@ -20,7 +20,7 @@ export function Overview({ snap, counts, hardProblems }: Props) {
   const buildsCounted = t.builds_remote + t.builds_local;
   const remotePct = buildsCounted > 0 ? (t.builds_remote / buildsCounted) * 100 : null;
   const diskUsedPct =
-    t.disk_total_gb > 0 ? ((t.disk_total_gb - t.disk_free_gb) / t.disk_total_gb) * 100 : 0;
+    t.disk_total_gb > 0 ? ((t.disk_total_gb - t.disk_free_gb) / t.disk_total_gb) * 100 : null;
   const last = snap.history[snap.history.length - 1];
   const times = snap.history.map((h) => h.t);
 
@@ -66,11 +66,26 @@ export function Overview({ snap, counts, hardProblems }: Props) {
         </div>
         <div
           className="kpi"
-          style={{ ["--kpi-accent" as string]: diskUsedPct >= 88 ? "var(--warn)" : "var(--ok)" }}
+          style={{
+            ["--kpi-accent" as string]:
+              diskUsedPct == null
+                ? "var(--border)"
+                : diskUsedPct >= 88
+                  ? "var(--warn)"
+                  : "var(--ok)",
+          }}
         >
           <div className="kpi-label">Disk free</div>
-          <div className="kpi-value">{fmtGb(t.disk_free_gb)}</div>
-          <div className="kpi-sub">{diskUsedPct.toFixed(0)}% of {fmtGb(t.disk_total_gb)} used</div>
+          <div className="kpi-value">{t.disk_total_gb > 0 ? fmtGb(t.disk_free_gb) : "—"}</div>
+          <div className="kpi-sub">
+            {diskUsedPct != null
+              ? `${diskUsedPct.toFixed(0)}% of ${fmtGb(t.disk_total_gb)} used${
+                  t.disk_reporting_workers != null && t.disk_reporting_workers < t.workers
+                    ? ` (${t.disk_reporting_workers}/${t.workers} reporting)`
+                    : ""
+                }`
+              : "no disk telemetry"}
+          </div>
         </div>
       </section>
 

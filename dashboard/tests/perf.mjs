@@ -21,8 +21,9 @@ const env = Object.fromEntries(
     .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim().replace(/^['"]|['"]$/g, "")]),
 );
 const PASS = env.RCH_DASH_PASSPHRASE;
+const PORT = process.env.RCH_DASH_E2E_PORT ?? "4174";
 const BASE = process.env.RCH_DASH_BASE ?? "/remote_compilation_helper/";
-const URL = `http://127.0.0.1:4174${BASE}`;
+const URL = `http://127.0.0.1:${PORT}${BASE}`;
 
 const pct = (arr, p) => {
   const s = [...arr].sort((a, b) => a - b);

@@ -16,9 +16,10 @@ function Metric({
         className="bar"
         role="meter"
         aria-label={label}
-        aria-valuenow={pct ?? undefined}
+        aria-valuenow={pct != null ? Math.round(pct) : 0}
         aria-valuemin={0}
         aria-valuemax={100}
+        aria-valuetext={pct != null ? `${Math.round(pct)}%` : "unavailable"}
       >
         <i className={cls} style={{ width: `${Math.min(100, Math.max(0, pct ?? 0))}%` }} />
       </span>
@@ -29,10 +30,19 @@ function Metric({
 
 export function WorkerCard({ w, onOpen }: Props) {
   const cores = w.caps.num_cpus;
-  const loadPct = w.loadPerCore != null ? Math.min(100, w.loadPerCore * 100) : null;
+  // Scale load against 2.0x threshold (warning boundary) so 0->100% represents 0->2.0x load/core
+  const loadBarPct = w.loadPerCore != null ? Math.min(100, Math.max(0, (w.loadPerCore / 2.0) * 100)) : null;
+  const loadCls =
+    w.loadPerCore == null
+      ? "off"
+      : w.loadPerCore >= 2.0
+        ? "warn"
+        : w.loadPerCore >= 1.0
+          ? "busy"
+          : "ok";
 
   return (
-    <button className="wcard" onClick={() => onOpen(w.id)} aria-label={`Details for worker ${w.id}`}>
+    <button className="wcard" onClick={() => onOpen(w.id)} title={`View details for worker ${w.id}`}>
       <div className="wcard-top">
         <span className="wname">{w.id}</span>
         <span className={`pill ${w.health}`}>{w.health}</span>
@@ -55,8 +65,8 @@ export function WorkerCard({ w, onOpen }: Props) {
         />
         <Metric
           label="cpu"
-          pct={loadPct}
-          cls={utilClass(loadPct)}
+          pct={loadBarPct}
+          cls={loadCls}
           valueText={
             w.caps.load_avg_1 != null
               ? `${w.caps.load_avg_1.toFixed(1)}${cores ? ` / ${cores}c` : ""}`
