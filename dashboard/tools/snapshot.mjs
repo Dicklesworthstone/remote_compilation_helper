@@ -43,6 +43,8 @@ import { dirname } from "node:path";
 import { hostname } from "node:os";
 import { pathToFileURL } from "node:url";
 
+import { SNAPSHOT_COMPRESSION, compressPlaintext, decompressPlaintext } from "./envelope.mjs";
+
 const execFileAsync = promisify(execFile);
 
 const PBKDF2_ITERATIONS = 600_000;
@@ -798,6 +800,18 @@ export async function existingSalt(outPath) {
   }
 }
 
+/**
+ * Compress, then encrypt.
+ *
+ * The order is the only one that does anything: ciphertext is incompressible, so
+ * compressing after encryption — or leaving it to the CDN, which only ever sees
+ * ciphertext — buys nothing. See tools/envelope.mjs for the codec comparison and
+ * for why CRIME/BREACH does not reach this pipeline.
+ *
+ * `compression` is written into the envelope so the format describes itself. A
+ * reader that finds no such field must treat the plaintext as uncompressed —
+ * that is exactly what every envelope written before this change is.
+ */
 export async function encrypt(plaintext, passphrase, reusableSalt = null) {
   const enc = new TextEncoder();
   const salt = reusableSalt ?? crypto.getRandomValues(new Uint8Array(16));
@@ -810,19 +824,23 @@ export async function encrypt(plaintext, passphrase, reusableSalt = null) {
     false,
     ["encrypt"],
   );
-  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(plaintext));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, compressPlaintext(plaintext));
   const b64 = (u8) => Buffer.from(u8).toString("base64");
   return {
     format: "rch.dashboard.enc.v1",
     kdf: { name: "PBKDF2", hash: "SHA-256", iterations: PBKDF2_ITERATIONS, salt: b64(salt) },
     cipher: { name: "AES-GCM", iv: b64(iv) },
+    compression: SNAPSHOT_COMPRESSION,
     ciphertext: b64(new Uint8Array(ct)),
   };
 }
 
 /**
  * Decrypt what we just encrypted and confirm it round-trips to the same size.
- * Cheap insurance against publishing a payload the passphrase cannot open.
+ * Cheap insurance against publishing a payload the passphrase cannot open — and,
+ * since the plaintext is now gzip'd before encryption, against publishing one
+ * that decrypts but does not INFLATE. A compression bug would otherwise reach
+ * the browser as an indistinguishable "wrong passphrase".
  */
 async function verifyRoundTrip(envelope, passphrase, expectedLength) {
   const enc = new TextEncoder();
@@ -840,7 +858,7 @@ async function verifyRoundTrip(envelope, passphrase, expectedLength) {
     key,
     b(envelope.ciphertext),
   );
-  const text = new TextDecoder().decode(out);
+  const text = decompressPlaintext(Buffer.from(out), envelope.compression);
   if (text.length !== expectedLength) {
     throw new Error(`round-trip length mismatch: ${text.length} != ${expectedLength}`);
   }
@@ -1092,7 +1110,9 @@ async function main() {
       `  ${workers.length} workers · ${totals.slots} slots (${totals.slots_used} used) · ${totals.cores} cores\n` +
       `  ${totals.dispatchers_remote_ready}/${totals.dispatchers_reachable} dev machines remote-ready · ` +
       `builds remote ${totals.builds_remote} / local ${totals.builds_local}\n` +
-      `  ${(plain.length / 1024).toFixed(1)}KB plaintext -> ${(JSON.stringify(envelope).length / 1024).toFixed(1)}KB ciphertext` +
+      `  ${(Buffer.byteLength(plain) / 1024).toFixed(1)}KB plaintext -> ` +
+      `${(JSON.stringify(envelope).length / 1024).toFixed(1)}KB envelope ` +
+      `(${envelope.compression} ${(Buffer.byteLength(plain) / (envelope.ciphertext.length * 0.75)).toFixed(1)}x)` +
       `  ·  string table ${strings.length} entries`,
   );
 }

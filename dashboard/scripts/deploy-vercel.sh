@@ -74,6 +74,18 @@ if ! grep -q '"ciphertext"' dist/data/fleet.enc.json; then
   echo "REFUSING TO DEPLOY: dist/data/fleet.enc.json is not an encrypted envelope." >&2
   exit 1
 fi
+# The snapshot plaintext is gzip'd before encryption (ciphertext is
+# incompressible, so this is the only layer that shrinks the wire). App, API
+# function and payload all ship together here, so a reload always gets code that
+# can inflate. A tab left OPEN across this deploy cannot: it holds the old
+# JavaScript, decrypts the new snapshot fine (the salt is reused, so its saved
+# key still authenticates) and then fails to parse the deflated bytes — which
+# App.tsx reads as a passphrase change, clearing the saved session.
+if grep -q '"compression"' dist/data/fleet.enc.json; then
+  echo "==> note: this snapshot is compressed. Any dashboard tab left open on a" >&2
+  echo "    pre-compression build will drop its saved session and ask to unlock" >&2
+  echo "    again. Reload those tabs once after this deploy." >&2
+fi
 # Vite copies public/ verbatim, so anything that lands there ships. Only the
 # ciphertext is allowed out.
 EXTRA=$(find dist/data -type f ! -name 'fleet.enc.json' | head -5)

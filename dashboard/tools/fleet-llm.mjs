@@ -24,6 +24,7 @@ import { webcrypto as crypto } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { buildLlmView, encodeView } from "./llm-view.mjs";
+import { decompressPlaintext, isSupportedCompression } from "./envelope.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -80,7 +81,16 @@ function b64ToBuf(b64) {
   return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
 }
 
-export async function decryptEnvelope(env, passphrase) {
+/**
+ * Authenticate + decrypt, returning the RAW plaintext bytes.
+ *
+ * Stops at the AES-GCM boundary on purpose: the caller reports a throw from here
+ * as "wrong passphrase", and that is only accurate while the auth tag is the
+ * only thing that can fail. Inflating and parsing happen separately so a
+ * snapshot written by a newer collector is not blamed on the operator's
+ * passphrase.
+ */
+export async function decryptToBytes(env, passphrase) {
   const baseKey = await crypto.subtle.importKey(
     "raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"],
   );
@@ -88,10 +98,20 @@ export async function decryptEnvelope(env, passphrase) {
     { name: "PBKDF2", salt: b64ToBuf(env.kdf.salt), iterations: env.kdf.iterations, hash: env.kdf.hash },
     baseKey, { name: "AES-GCM", length: 256 }, false, ["decrypt"],
   );
-  const plain = await crypto.subtle.decrypt(
+  return crypto.subtle.decrypt(
     { name: "AES-GCM", iv: b64ToBuf(env.cipher.iv) }, key, b64ToBuf(env.ciphertext),
   );
-  return JSON.parse(new TextDecoder().decode(plain));
+}
+
+/**
+ * Decrypt and decode. The collector gzips the snapshot JSON before encrypting it
+ * — ciphertext is incompressible, so that is the only layer where this payload
+ * can shrink (see tools/envelope.mjs). An envelope with no `compression` field
+ * predates that and is plain UTF-8.
+ */
+export async function decryptEnvelope(env, passphrase) {
+  const plain = await decryptToBytes(env, passphrase);
+  return JSON.parse(decompressPlaintext(Buffer.from(plain), env.compression));
 }
 
 async function main() {
@@ -118,13 +138,28 @@ async function main() {
     process.exit(3);
   }
   if (!envelope?.ciphertext) { console.error("not an encrypted snapshot envelope"); process.exit(3); }
+  // Skew guard: a codec this build cannot inflate is an unreadable snapshot
+  // (exit 3), not a bad passphrase (exit 4). Checked before the 600k-iteration
+  // derivation so the wrong answer is never even computed.
+  if (!isSupportedCompression(envelope.compression)) {
+    console.error(`cannot read snapshot: unsupported compression ${String(envelope.compression)} — update this tool`);
+    process.exit(3);
+  }
 
-  let snap;
+  let plain;
   try {
-    snap = await decryptEnvelope(envelope, passphrase);
+    plain = await decryptToBytes(envelope, passphrase);
   } catch {
     console.error("decryption failed — wrong passphrase for this snapshot");
     process.exit(4);
+  }
+
+  let snap;
+  try {
+    snap = JSON.parse(decompressPlaintext(Buffer.from(plain), envelope.compression));
+  } catch (e) {
+    console.error(`cannot read snapshot: decrypted but could not decode — ${e?.message ?? "unknown error"}`);
+    process.exit(3);
   }
 
   process.stdout.write(encodeView(buildLlmView(snap, { view: args.view }), args.format) + "\n");

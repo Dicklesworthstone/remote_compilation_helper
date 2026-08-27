@@ -21,6 +21,10 @@ import {
   buildProbeScript, splitProbeSections, dispatcherFromProbe, allSettledBounded,
 } from "../tools/snapshot.mjs";
 import { expandBuilds, expandHints } from "../tools/llm-view.mjs";
+import {
+  SNAPSHOT_COMPRESSION, compressPlaintext, decompressPlaintext,
+  isIdentityCompression, isSupportedCompression,
+} from "../tools/envelope.mjs";
 
 let failures = 0;
 const chk = (name, cond, detail = "") => {
@@ -423,13 +427,79 @@ async function decryptWith(env, key) {
   const out = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv: b64ToU8(env.cipher.iv) }, key, b64ToU8(env.ciphertext),
   );
-  return new TextDecoder().decode(out);
+  return decompressPlaintext(Buffer.from(out), env.compression);
 }
 
 const env1 = await encrypt(JSON.stringify({ hello: "fleet" }), PASS);
 const key1 = await deriveFrom(env1, PASS);
 chk("envelope round-trips", JSON.parse(await decryptWith(env1, key1)).hello === "fleet");
 chk("envelope declares its KDF", env1.kdf.iterations === 600000 && env1.kdf.hash === "SHA-256");
+
+// -------------------------------------------------------- transport compression
+
+// The published file is base64 of AES-GCM ciphertext. Ciphertext is
+// incompressible by construction, so gzip at the CDN or in the browser's
+// transfer decoding can do nothing for it and base64 adds 33% on top. The
+// plaintext, before encryption, is the only layer where this payload shrinks.
+chk("the envelope names its compression codec", env1.compression === SNAPSHOT_COMPRESSION,
+  String(env1.compression));
+
+// Multi-byte UTF-8 is the failure this pins: gzip works on BYTES, and a
+// round-trip that split or re-decoded them anywhere would corrupt exactly the
+// hint text and hostnames the fleet actually emits (— · → ✓ all appear in
+// remediation hints).
+const unicodeSample = JSON.stringify({
+  msg: "Worker vmi1293453 — storage pressure ✓ · 39.7 GB free → run `du -sh /tmp/rch-*`",
+  repeated: Array.from({ length: 40 }, () => "the same hint about the same shared worker"),
+});
+chk("compression round-trips multi-byte UTF-8 exactly",
+  decompressPlaintext(compressPlaintext(unicodeSample), SNAPSHOT_COMPRESSION) === unicodeSample);
+chk("a repetitive payload actually compresses",
+  compressPlaintext(unicodeSample).length < Buffer.byteLength(unicodeSample) / 2,
+  `${Buffer.byteLength(unicodeSample)}B -> ${compressPlaintext(unicodeSample).length}B`);
+
+// VERSION SKEW, backward: an envelope with NO `compression` field is what every
+// snapshot published before this change looks like, and it must still decode.
+// Built by hand rather than by asking encrypt() for it, because encrypt() no
+// longer has a way to emit one — which is the point.
+{
+  const legacyPlain = JSON.stringify({ hello: "legacy", note: "written before compression existed" });
+  const legacyIv = crypto.getRandomValues(new Uint8Array(12));
+  const encKey = await crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: b64ToU8(env1.kdf.salt), iterations: env1.kdf.iterations, hash: env1.kdf.hash },
+    await crypto.subtle.importKey("raw", new TextEncoder().encode(PASS), "PBKDF2", false, ["deriveKey"]),
+    { name: "AES-GCM", length: 256 }, false, ["encrypt"],
+  );
+  const legacyCt = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: legacyIv }, encKey, new TextEncoder().encode(legacyPlain),
+  );
+  const legacyEnv = {
+    format: env1.format,
+    kdf: { ...env1.kdf },
+    cipher: { name: "AES-GCM", iv: Buffer.from(legacyIv).toString("base64") },
+    ciphertext: Buffer.from(new Uint8Array(legacyCt)).toString("base64"),
+  };
+  chk("an envelope with no compression field is uncompressed", !("compression" in legacyEnv));
+  chk("a pre-compression envelope still decodes",
+    (await decryptWith(legacyEnv, key1)) === legacyPlain);
+  chk("an explicit compression:none also decodes",
+    (await decryptWith({ ...legacyEnv, compression: "none" }, key1)) === legacyPlain);
+}
+
+// VERSION SKEW, forward: a codec this build does not implement must be a NAMED
+// failure. Silently handing gzip bytes to TextDecoder would produce mojibake
+// that JSON.parse rejects with a message about the data, blaming the payload
+// for a version problem — or, worse in some shape, parses into nonsense.
+chk("an unknown codec is rejected by name", !isSupportedCompression("brotli"));
+let codecErr = null;
+try { decompressPlaintext(Buffer.from("x"), "brotli"); } catch (e) { codecErr = e.message; }
+chk("an unknown codec throws a named error", /unsupported snapshot compression: brotli/.test(codecErr ?? ""),
+  String(codecErr));
+chk("absent, empty and none are all the identity codec",
+  isIdentityCompression(undefined) && isIdentityCompression(null)
+  && isIdentityCompression("") && isIdentityCompression("none") && isIdentityCompression("identity"));
+chk("gzip is supported and is not the identity codec",
+  isSupportedCompression("gzip") && !isIdentityCompression("gzip"));
 
 // THE regression this suite exists for.
 //
@@ -497,6 +567,12 @@ chk("the published file is an envelope, not plaintext",
   liveEnvelope.format === "rch.dashboard.enc.v1" && typeof liveEnvelope.ciphertext === "string");
 chk("the published envelope exposes no fleet fields",
   !("workers" in liveEnvelope) && !("dispatchers" in liveEnvelope) && !("totals" in liveEnvelope));
+// Self-describing transport: whatever the collector applied, a reader must be
+// able to name it. An envelope that arrived here with a codec this build cannot
+// inflate is a deployment that will 401/mojibake in production.
+chk("the published envelope declares a codec this build can read",
+  isSupportedCompression(liveEnvelope.compression),
+  `compression=${JSON.stringify(liveEnvelope.compression ?? null)}`);
 
 console.log(failures === 0 ? "\nALL SNAPSHOT CHECKS PASSED" : `\n${failures} SNAPSHOT CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

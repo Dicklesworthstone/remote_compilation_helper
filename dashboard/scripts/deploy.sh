@@ -113,6 +113,21 @@ if ! grep -q '"ciphertext"' dist/data/fleet.enc.json; then
   exit 1
 fi
 
+# The snapshot plaintext is gzip'd before encryption (ciphertext is
+# incompressible, so this is the only layer that shrinks the wire). The app and
+# the payload are deployed together here, so a reload always gets a bundle that
+# can inflate. A tab left OPEN across this deploy cannot: it holds the old
+# JavaScript, re-fetches the snapshot every 5 minutes, decrypts it fine (the salt
+# is reused, so its saved key still authenticates) and then fails to parse the
+# deflated bytes. App.tsx reads that as a passphrase change, so it clears the
+# saved session and asks for the passphrase again. It is loud and a reload fixes
+# it, but say so rather than letting a wall-mounted dashboard surprise someone.
+if grep -q '"compression"' dist/data/fleet.enc.json; then
+  echo "==> note: this snapshot is compressed. Any dashboard tab left open on a" >&2
+  echo "    pre-compression build will drop its saved session and ask to unlock" >&2
+  echo "    again. Reload those tabs once after this deploy." >&2
+fi
+
 echo "==> publishing dist/ to $BRANCH on $TARGET_REPO"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

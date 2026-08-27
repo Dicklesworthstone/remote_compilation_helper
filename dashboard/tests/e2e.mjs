@@ -18,6 +18,8 @@
  * stale bundle it did not build and report a pass (or a mystery timeout).
  */
 import { chromium } from "playwright";
+import { createHash, webcrypto as nodeCrypto } from "node:crypto";
+import { gunzipSync } from "node:zlib";
 
 const BASE = process.env.RCH_DASH_BASE ?? "/remote_compilation_helper/";
 const PORT = process.env.RCH_DASH_E2E_PORT ?? "4174";
@@ -51,6 +53,84 @@ await page.click("button.btn");
 await page.waitForSelector(".kpis", { timeout: 40000 });
 const kpis = await page.locator(".kpi-value").allInnerTexts();
 check("unlocks with correct passphrase", kpis.length >= 5, kpis.join(" | "));
+
+// ── transport compression ──────────────────────────────────────────────────
+//
+// The snapshot is gzip'd BEFORE it is encrypted, because the published file is
+// base64 of AES-GCM ciphertext and ciphertext is incompressible — gzip at the
+// CDN, at the origin, or in the browser's transfer decoding can do nothing for
+// it. That puts an inflate step on the only path that renders this app, using
+// `DecompressionStream`, which every check above already depends on: if it were
+// broken, `.kpis` would never have appeared.
+//
+// This block proves the stronger property those checks cannot: that the bytes
+// the browser produces are IDENTICAL to what Node compressed, not merely
+// parseable. A codec mismatch that happened to inflate to valid-looking JSON
+// would pass every rendering assertion in this file. It runs its own decrypt
+// (independent of the app's code path) and compares SHA-256 against Node's.
+{
+  const envUrl = new global.URL("data/fleet.enc.json", URL).href;
+  const envelope = await (await fetch(envUrl)).json();
+  const b64ToBuf = (b64) => { const b = Buffer.from(b64, "base64"); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); };
+  const nodeKey = await nodeCrypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: b64ToBuf(envelope.kdf.salt), iterations: envelope.kdf.iterations, hash: envelope.kdf.hash },
+    await nodeCrypto.subtle.importKey("raw", new TextEncoder().encode(PASS), "PBKDF2", false, ["deriveKey"]),
+    { name: "AES-GCM", length: 256 }, false, ["decrypt"],
+  );
+  let nodePlain = Buffer.from(await nodeCrypto.subtle.decrypt(
+    { name: "AES-GCM", iv: b64ToBuf(envelope.cipher.iv) }, nodeKey, b64ToBuf(envelope.ciphertext)));
+  const compressed = nodePlain.length;
+  if (envelope.compression === "gzip") nodePlain = gunzipSync(nodePlain);
+  const nodeDigest = createHash("sha256").update(nodePlain).digest("hex");
+
+  const inBrowser = await page.evaluate(async ({ envUrl, pass }) => {
+    const env = await (await fetch(envUrl, { cache: "no-store" })).json();
+    const b64 = (s) => { const bin = atob(s); const b = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i); return b.buffer; };
+    const key = await crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt: b64(env.kdf.salt), iterations: env.kdf.iterations, hash: env.kdf.hash },
+      await crypto.subtle.importKey("raw", new TextEncoder().encode(pass), "PBKDF2", false, ["deriveKey"]),
+      { name: "AES-GCM", length: 256 }, false, ["decrypt"],
+    );
+    const cipherBytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64(env.cipher.iv) }, key, b64(env.ciphertext));
+
+    const inflate = async () => {
+      if (!env.compression || env.compression === "none") return new Uint8Array(cipherBytes);
+      const s = new Blob([cipherBytes]).stream().pipeThrough(new DecompressionStream(env.compression));
+      return new Uint8Array(await new Response(s).arrayBuffer());
+    };
+    // Warm, then time: this is the CPU the change adds to every 5-minute refresh
+    // in the browser, and it is the number that has to be paid against the bytes.
+    for (let i = 0; i < 3; i++) await inflate();
+    const samples = [];
+    for (let i = 0; i < 15; i++) { const t = performance.now(); await inflate(); samples.push(performance.now() - t); }
+    samples.sort((a, b) => a - b);
+
+    const out = await inflate();
+    const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", out))]
+      .map((x) => x.toString(16).padStart(2, "0")).join("");
+    return {
+      hasDecompressionStream: typeof DecompressionStream !== "undefined",
+      compression: env.compression ?? null,
+      bytes: out.length,
+      digest,
+      minMs: samples[0],
+      medianMs: samples[Math.floor(samples.length / 2)],
+    };
+  }, { envUrl, pass: PASS });
+
+  check("browser exposes DecompressionStream", inBrowser.hasDecompressionStream);
+  check("browser inflates to byte-identical plaintext", inBrowser.digest === nodeDigest,
+    `${inBrowser.bytes}B sha256 ${inBrowser.digest.slice(0, 16)}… (node ${nodeDigest.slice(0, 16)}…)`);
+  check("compression is declared in the envelope", inBrowser.compression !== undefined,
+    `compression=${JSON.stringify(inBrowser.compression)} · ` +
+    `${compressed}B on the wire -> ${inBrowser.bytes}B plaintext ` +
+    `(${(inBrowser.bytes / compressed).toFixed(2)}x)`);
+  // Not a threshold anybody should tune — a ceiling loose enough that only a
+  // real regression (a JS fallback, a per-chunk copy) can trip it.
+  check("browser inflate stays under 5ms", inBrowser.medianMs < 5,
+    `min ${inBrowser.minMs.toFixed(3)}ms · median ${inBrowser.medianMs.toFixed(3)}ms per refresh`);
+}
 
 const cards = await page.locator(".wcard").count();  // dev machines + workers
 check("worker cards render", cards > 0, `${cards} cards`);

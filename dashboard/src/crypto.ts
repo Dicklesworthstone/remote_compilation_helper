@@ -7,6 +7,11 @@
  * indistinguishable from random bytes, which is what makes it safe to host the
  * fleet inventory on a PUBLIC GitHub Pages site.
  *
+ * The plaintext is gzip'd before it is encrypted, and the envelope names the
+ * codec in `compression`. That order is the only one that helps: ciphertext is
+ * incompressible, so nothing downstream of `encrypt` — CDN, origin, or transfer
+ * encoding — can shrink this file. See `inflate()` below.
+ *
  * Session persistence deliberately stores the DERIVED KEY, never the
  * passphrase. A stolen cookie is then scoped to exactly one thing — reading
  * snapshots encrypted under that one salt — and the passphrase itself is not
@@ -25,6 +30,12 @@ export interface Envelope {
   format: string;
   kdf: { name: string; hash: string; iterations: number; salt: string };
   cipher: { name: string; iv: string };
+  /**
+   * Codec applied to the plaintext BEFORE encryption. Absent means none — every
+   * envelope written before compression existed is plain UTF-8 JSON and must
+   * keep opening without a special case.
+   */
+  compression?: string | null;
   ciphertext: string;
 }
 
@@ -62,6 +73,20 @@ const MAX_KDF_ITERATIONS = 5_000_000;
 const ALLOWED_KDF_HASHES = ["SHA-256", "SHA-384", "SHA-512"];
 
 /**
+ * Absent / "none" mean the ciphertext is UTF-8 JSON, which is what every
+ * envelope published before compression existed is. Keeping the identity case
+ * inside the same table is what makes an old bundle-vs-new-payload mismatch a
+ * NAMED error rather than a `JSON.parse` accident on mojibake.
+ */
+function isIdentityCompression(c: string | null | undefined): boolean {
+  return c == null || c === "" || c === "none" || c === "identity";
+}
+
+function isSupportedCompression(c: string | null | undefined): boolean {
+  return isIdentityCompression(c) || c === "gzip";
+}
+
+/**
  * Validate the envelope's KDF parameters before deriving.
  *
  * `iterations` and `hash` are read straight out of a fetched file, and PBKDF2
@@ -78,6 +103,14 @@ export function assertUsableEnvelope(env: Envelope): void {
   }
   if (!ALLOWED_KDF_HASHES.includes(env.kdf.hash)) {
     throw new Error(`unsupported envelope KDF hash: ${String(env.kdf.hash)}`);
+  }
+  // Reject a codec this build cannot inflate BEFORE spending 600k PBKDF2
+  // iterations on it. The gate then reports the real problem instead of
+  // charging the operator 400ms to be told nothing useful.
+  if (!isSupportedCompression(env.compression)) {
+    throw new Error(
+      `this snapshot is compressed with "${String(env.compression)}", which this page cannot read — reload to pick up the current app`,
+    );
   }
 }
 
@@ -141,14 +174,54 @@ function expandSnapshotStrings(text: string): string {
   }
 }
 
+/**
+ * Undo the collector's transport compression.
+ *
+ * The published file is base64 of AES-GCM ciphertext, so gzip at the CDN, at the
+ * origin, or in the browser's transfer decoding can do NOTHING for it —
+ * ciphertext is incompressible by construction and base64 then adds 33% on top.
+ * Compressing the plaintext before encryption is the only layer that shrinks
+ * what actually crosses the wire, and this snapshot deflates about 5.4x.
+ *
+ * `DecompressionStream` is the browser's native gzip, and the reason the codec
+ * is gzip rather than the ~19% smaller brotli: no browser exposes a brotli
+ * decoder to script, so brotli would mean shipping a JS/WASM one in front of the
+ * only path that renders this app. Support is Chrome/Edge 80+, Firefox 113+,
+ * Safari 16.4+ — a superset of everything that runs the ES2022 bundle Vite
+ * emits, except Safari 15.0–16.3, which is why the absence check below exists
+ * and says what to do rather than throwing an undefined-constructor TypeError.
+ */
+async function inflate(bytes: ArrayBuffer, compression: string): Promise<string> {
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error(
+      `this browser cannot decompress the snapshot (no DecompressionStream) — needs Safari 16.4+, Firefox 113+, or Chrome 80+`,
+    );
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(compression as "gzip"));
+  // Response.text() decodes UTF-8 as it drains the stream, so the decompressed
+  // bytes are never materialised as a second copy.
+  return new Response(stream).text();
+}
+
 /** Decrypt an envelope. Throws on a wrong key (GCM auth tag failure). */
 export async function decryptEnvelope(env: Envelope, key: CryptoKey): Promise<string> {
+  // Checked here as well as in assertUsableEnvelope: a restored session key goes
+  // straight here without ever calling deriveKey, so this is the only guard on
+  // the "stay unlocked for 60 days" path.
+  if (!isSupportedCompression(env.compression)) {
+    throw new Error(
+      `this snapshot is compressed with "${String(env.compression)}", which this page cannot read — reload to pick up the current app`,
+    );
+  }
   const plain = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv: b64ToBuf(env.cipher.iv) },
     key,
     b64ToBuf(env.ciphertext),
   );
-  return expandSnapshotStrings(new TextDecoder().decode(plain));
+  const text = isIdentityCompression(env.compression)
+    ? new TextDecoder().decode(plain)
+    : await inflate(plain, env.compression as string);
+  return expandSnapshotStrings(text);
 }
 
 // ------------------------------------------------------------------- cookie
