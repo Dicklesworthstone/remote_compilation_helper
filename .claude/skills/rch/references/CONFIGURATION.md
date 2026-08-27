@@ -104,11 +104,9 @@ Common overrides:
 |----------|---------|
 | `RCH_PROFILE` | Base profile (`dev`, `prod`, `test`) |
 | `RCH_LOG_LEVEL` | Logging level override |
-| `RCH_DAEMON_SOCKET` | Daemon socket override (CLI layer) |
-| `RCH_SOCKET_PATH` | Socket override (config layer) |
-| `RCH_DAEMON_TIMEOUT_MS` | Daemon IPC timeout |
-| `RCH_SSH_KEY` | Default SSH key path |
-| `RCH_TRANSFER_ZSTD_LEVEL` | Transfer compression level |
+| `RCH_SOCKET_PATH` | Daemon socket override (`RCH_DAEMON_SOCKET` is a legacy alias) |
+| `RCH_DAEMON_TIMEOUT_MS` | Daemon socket connect/read timeout in ms (100-600000, default 5000) |
+| `RCH_COMPRESSION_LEVEL` | Transfer compression level (`RCH_COMPRESSION`, `RCH_TRANSFER_ZSTD_LEVEL` are legacy aliases) |
 | `RCH_ENV_ALLOWLIST` | Forwarded env vars for remote execution |
 | `RCH_VISIBILITY` / `RCH_VERBOSE` / `RCH_QUIET` | Hook/CLI visibility controls |
 | `RCH_OUTPUT_FORMAT` / `TOON_DEFAULT_FORMAT` | Machine output format |

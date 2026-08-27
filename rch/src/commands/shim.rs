@@ -340,9 +340,8 @@ fn wrap_toolchain_cargo(cargo: &Path) -> Result<WrapOutcome> {
     // replaced the toolchain after a previous wrap; drop the stale copy so we
     // preserve the NEW binary rather than resurrecting the old one.
     if real.exists() {
-        std::fs::remove_file(&real).with_context(|| {
-            format!("Failed to remove stale real cargo at {}", real.display())
-        })?;
+        std::fs::remove_file(&real)
+            .with_context(|| format!("Failed to remove stale real cargo at {}", real.display()))?;
     }
     std::fs::hard_link(cargo, &real).with_context(|| {
         format!(
@@ -459,7 +458,11 @@ struct ShimStatus {
 
 /// `rch shim install` — write (or refresh) the canonical cargo shim, and wrap
 /// the rustup toolchain cargos so absolute-path invocations are caught too.
-pub fn shim_install(require_remote: bool, wrap_toolchains: bool, ctx: &OutputContext) -> Result<()> {
+pub fn shim_install(
+    require_remote: bool,
+    wrap_toolchains: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
     // bd-wywsj: a WORKER box is the compute — shimming cargo to
     // offload from it is a configuration error, refused loudly.
     if let Ok(config) = crate::config::load_config()
@@ -984,9 +987,11 @@ mod tests {
         std::fs::write(real_dir.join("cargo"), vec![0u8; 16 * 1024]).unwrap();
 
         // Real cargo first => shadowed shim, correctly reported as not intercepted.
-        let real_first =
-            std::env::join_paths([real_dir.clone(), shim_dir.clone()]).unwrap();
-        assert_eq!(cargo_interception_in(&real_first, &shim), Interception::None);
+        let real_first = std::env::join_paths([real_dir.clone(), shim_dir.clone()]).unwrap();
+        assert_eq!(
+            cargo_interception_in(&real_first, &shim),
+            Interception::None
+        );
 
         // Shim first => intercepted.
         let shim_first = std::env::join_paths([shim_dir, real_dir]).unwrap();

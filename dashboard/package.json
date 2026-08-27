@@ -1,0 +1,38 @@
+{
+  "name": "rch-fleet-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Password-gated, client-side-encrypted monitoring dashboard for an rch build fleet.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "snapshot": "node tools/snapshot.mjs",
+    "deploy": "bash scripts/deploy.sh",
+    "test:e2e": "node tests/e2e.mjs",
+    "serve:dist": "vite preview --host 127.0.0.1",
+    "build:api": "esbuild api/fleet.mjs --bundle --platform=node --format=esm --target=node20 --loader:.json=json --outfile=.vercel-fn/index.mjs",
+    "test:endpoint": "node tests/endpoint.mjs",
+    "llm": "node tools/fleet-llm.mjs",
+    "test:llm": "node tests/parity.mjs",
+    "test:snapshot": "node tests/snapshot.mjs",
+    "test": "node tests/snapshot.mjs && node tests/parity.mjs && npm run build:api --silent && node tests/endpoint.mjs",
+    "test:visual": "node tests/visual-audit.mjs",
+    "probe": "node tests/render-probe.mjs",
+    "perf": "node tests/perf.mjs"
+  },
+  "dependencies": {
+    "@toon-format/toon": "^4.1.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.4",
+    "playwright": "^1.62.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.7"
+  }
+}

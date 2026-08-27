@@ -3,7 +3,6 @@
 import { useState } from 'react';
 import useSWR from 'swr';
 import { History, RefreshCw, CheckCircle, XCircle, Clock } from 'lucide-react';
-import { motion } from 'motion/react';
 import { formatDistanceToNow } from 'date-fns';
 import { api } from '@/lib/api';
 import { TableSkeleton } from '@/components/builds';
@@ -15,6 +14,16 @@ function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
   return `${(ms / 60000).toFixed(1)}m`;
+}
+
+function formatRelativeTime(dateStr: string): string {
+  try {
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return dateStr;
+    return formatDistanceToNow(d, { addSuffix: true });
+  } catch {
+    return dateStr;
+  }
 }
 
 function BuildsPageSkeleton() {
@@ -136,12 +145,11 @@ export default function BuildsPage() {
           title="Refresh"
           aria-label="Refresh build history"
         >
-          <motion.div
-            animate={isValidating ? { rotate: 360 } : { rotate: 0 }}
-            transition={isValidating ? { duration: 1, repeat: Infinity, ease: 'linear' } : {}}
-          >
-            <RefreshCw className="w-5 h-5 text-muted-foreground" />
-          </motion.div>
+          <RefreshCw
+            className={`w-5 h-5 text-muted-foreground transition-transform ${
+              isValidating ? 'animate-spin' : ''
+            }`}
+          />
         </button>
       </div>
 
@@ -177,11 +185,9 @@ export default function BuildsPage() {
           <h2 className="text-lg font-semibold mb-3">Active Builds</h2>
           <div className="bg-surface border border-border rounded-lg divide-y divide-border">
             {active_builds.map((build) => (
-              <motion.div
+              <div
                 key={build.id}
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="p-4 flex items-center justify-between"
+                className="p-4 flex items-center justify-between transition-opacity duration-200"
                 data-testid="active-build"
                 data-build-id={build.id}
               >
@@ -195,7 +201,7 @@ export default function BuildsPage() {
                 <div className="text-sm text-muted-foreground">
                   on {build.worker_id}
                 </div>
-              </motion.div>
+              </div>
             ))}
           </div>
         </div>
@@ -207,11 +213,9 @@ export default function BuildsPage() {
           <h2 className="text-lg font-semibold mb-3">Queued Builds</h2>
           <div className="bg-surface border border-border rounded-lg divide-y divide-border">
             {queued_builds.map((build) => (
-              <motion.div
+              <div
                 key={build.id}
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="p-4 flex items-center justify-between"
+                className="p-4 flex items-center justify-between transition-opacity duration-200"
                 data-testid="queued-build"
                 data-queue-id={build.id}
               >
@@ -226,7 +230,7 @@ export default function BuildsPage() {
                   <div className="font-mono">{build.wait_time}</div>
                   <div className="text-xs">pos {build.position}</div>
                 </div>
-              </motion.div>
+              </div>
             ))}
           </div>
         </div>
@@ -277,7 +281,7 @@ export default function BuildsPage() {
                       )}
                     </td>
                     <td className="p-3 text-muted-foreground">
-                      {formatDistanceToNow(new Date(build.started_at), { addSuffix: true })}
+                      {formatRelativeTime(build.started_at)}
                     </td>
                   </tr>
                 ))}

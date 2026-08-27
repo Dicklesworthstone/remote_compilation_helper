@@ -47,6 +47,9 @@ fn run_hook_with_stdin(test_name: &str, stdin_bytes: &[u8]) -> std::process::Out
     let config_home = fresh_config_home(test_name);
     let mut child = Command::new(env!("CARGO_BIN_EXE_rch"))
         .env("RCH_HOOK_MODE", "1")
+        // `RCH_CONFIG_DIR` outranks `XDG_CONFIG_HOME`; pin both so an
+        // operator-exported value cannot pull in the host's real config.
+        .env("RCH_CONFIG_DIR", config_home.join("rch"))
         .env("XDG_CONFIG_HOME", &config_home)
         // Silence the global daemon socket so the hook doesn't try to
         // talk to a daemon. Hook mode still proceeds; failure modes

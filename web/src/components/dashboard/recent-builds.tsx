@@ -19,6 +19,16 @@ function formatDuration(ms: number): string {
   return `${minutes}m ${remainingSeconds}s`;
 }
 
+function formatRelativeTime(dateStr: string): string {
+  try {
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return dateStr;
+    return formatDistanceToNow(d, { addSuffix: true });
+  } catch {
+    return dateStr;
+  }
+}
+
 export function RecentBuilds({ builds, limit = 5 }: RecentBuildsProps) {
   const displayBuilds = builds.slice(0, limit);
 
@@ -53,7 +63,7 @@ export function RecentBuilds({ builds, limit = 5 }: RecentBuildsProps) {
                 <div className="flex items-center gap-3 text-muted-foreground">
                   <span className="font-mono">{formatDuration(build.duration_ms)}</span>
                   <span className="text-xs">
-                    {formatDistanceToNow(new Date(build.started_at), { addSuffix: true })}
+                    {formatRelativeTime(build.started_at)}
                   </span>
                 </div>
               </div>

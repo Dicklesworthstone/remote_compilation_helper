@@ -202,7 +202,7 @@
       "category": "config",
       "message": "Path dependency violates canonical-root topology policy",
       "remediation": [
-        "Ensure all path dependencies are under the canonical root (/data/projects)",
+        "Ensure all path dependencies are under the configured canonical root (path_topology.canonical_root, default /data/projects)",
         "Check that paths resolve within allowed topology prefixes",
         "Review the PathTopologyPolicy configuration"
       ],
@@ -250,7 +250,7 @@
       "category": "config",
       "message": "Dependency closure entered fail-open state due to unverifiable data",
       "remediation": [
-        "Transfer will proceed with project root only (fail-open semantics)",
+        "The transfer will proceed with project root only (fail-open semantics)",
         "Check path dependency graph health to restore full closure",
         "Review the fail-open reason in structured diagnostics output"
       ],
@@ -552,9 +552,9 @@
       "category": "worker",
       "message": "Worker disk usage is critically high",
       "remediation": [
-        "Clean up old builds: rch cache clean --worker <id>",
-        "Check disk usage: df -h on worker",
-        "Remove unused toolchains or build artifacts"
+        "Worker disk usage is above 95% — builds will not be scheduled here",
+        "Clean up old build caches: rch cache clean --worker <id>",
+        "Check disk usage on worker: ssh <worker> df -h"
       ],
       "doc_url": "https://rch.dev/docs/disk-pressure"
     },
@@ -562,11 +562,11 @@
       "code": "RCH-E211",
       "number": 211,
       "category": "worker",
-      "message": "Worker disk usage exceeded warning threshold",
+      "message": "Worker disk usage has exceeded warning threshold",
       "remediation": [
-        "Monitor disk usage trend for further degradation",
-        "Schedule proactive cleanup of old build artifacts",
-        "Review disk pressure thresholds in daemon configuration"
+        "Worker disk usage is above 80% — scheduling priority reduced",
+        "Consider cleaning old caches: rch cache clean --worker <id>",
+        "Monitor disk usage trend to prevent critical state"
       ],
       "doc_url": "https://rch.dev/docs/disk-pressure"
     },
@@ -574,11 +574,11 @@
       "code": "RCH-E212",
       "number": 212,
       "category": "worker",
-      "message": "Worker disk telemetry is stale or missing",
+      "message": "Worker disk pressure telemetry is stale or missing",
       "remediation": [
+        "Worker disk telemetry is stale — pressure assessment is unreliable",
         "Check worker health: rch workers probe <id>",
-        "Verify SSH connectivity to the worker",
-        "Review telemetry polling interval in daemon configuration"
+        "Verify telemetry collection is running on the worker"
       ],
       "doc_url": "https://rch.dev/docs/disk-pressure"
     },
@@ -586,11 +586,11 @@
       "code": "RCH-E213",
       "number": 213,
       "category": "worker",
-      "message": "Worker disk I/O utilization is too high",
+      "message": "Worker disk I/O utilization is too high for scheduling",
       "remediation": [
-        "Wait for I/O-heavy operations to complete",
-        "Check for concurrent builds saturating disk bandwidth",
-        "Review I/O scheduling and worker slot limits"
+        "Worker disk I/O is saturated — builds may experience latency",
+        "Wait for current I/O-heavy operations to complete",
+        "Check for stuck or runaway processes: rch workers probe <id>"
       ],
       "doc_url": "https://rch.dev/docs/disk-pressure"
     },
@@ -598,11 +598,11 @@
       "code": "RCH-E214",
       "number": 214,
       "category": "worker",
-      "message": "Worker memory pressure exceeds threshold",
+      "message": "Worker memory pressure exceeds scheduling threshold",
       "remediation": [
-        "Review worker slot count — fewer concurrent builds reduces memory pressure",
-        "Check for memory leaks in long-running builds",
-        "Increase worker memory or reduce max_concurrent_builds"
+        "Worker memory pressure is high — scheduling priority reduced",
+        "Check for memory leaks or over-committed builds on the worker",
+        "Review worker slot count to prevent over-scheduling"
       ],
       "doc_url": "https://rch.dev/docs/disk-pressure"
     },
@@ -612,9 +612,9 @@
       "category": "worker",
       "message": "Disk reclaim operation failed on worker",
       "remediation": [
-        "Check worker filesystem health",
-        "Verify permissions on build artifact directories",
-        "Review reclaim policy configuration in daemon settings"
+        "Disk space reclaim operation failed on the worker",
+        "Check worker filesystem health and permissions",
+        "Inspect both root and temp usage: ssh <worker> 'df -h / /tmp'"
       ],
       "doc_url": "https://rch.dev/docs/disk-pressure"
     },
@@ -622,11 +622,11 @@
       "code": "RCH-E216",
       "number": 216,
       "category": "worker",
-      "message": "Insufficient disk headroom for build",
+      "message": "Insufficient disk headroom for build reservation",
       "remediation": [
-        "Try a different worker with more available headroom",
-        "Clean up build artifacts: rch cache clean --worker <id>",
-        "Review headroom requirements for the current build profile"
+        "Estimated build disk requirement exceeds available free space",
+        "Try a different worker with more headroom",
+        "Clean up old build artifacts to free space"
       ],
       "doc_url": "https://rch.dev/docs/disk-pressure"
     },
@@ -634,11 +634,11 @@
       "code": "RCH-E217",
       "number": 217,
       "category": "worker",
-      "message": "Active build protection prevented disk reclaim",
+      "message": "Active build protection prevented reclaim operation",
       "remediation": [
-        "Wait for in-progress builds to complete before reclaiming",
-        "Review active build list with rch status",
-        "Consider cancelling lower-priority builds if disk is critical"
+        "Active build artifacts were protected from reclaim",
+        "Wait for current builds to complete before retrying reclaim",
+        "Only idle cache entries are eligible for eviction"
       ],
       "doc_url": "https://rch.dev/docs/disk-pressure"
     },
@@ -763,14 +763,26 @@
       "doc_url": "https://rch.dev/docs/builds"
     },
     {
+      "code": "RCH-E329",
+      "number": 329,
+      "category": "build",
+      "message": "Cargo workspace inheritance failed under remote topology",
+      "remediation": [
+        "Verify dependency workspace metadata roots are synced",
+        "Isolate remote sync roots from unrelated outer Cargo workspaces",
+        "Check path dependency manifests for workspace-inherited fields"
+      ],
+      "doc_url": "https://rch.dev/docs/builds"
+    },
+    {
       "code": "RCH-E310",
       "number": 310,
       "category": "build",
-      "message": "Process triage adapter is unavailable",
+      "message": "Process triage adapter is unavailable or not installed",
       "remediation": [
-        "Ensure the process triage adapter binary is installed on the worker",
-        "Check adapter path configuration in daemon settings",
-        "Verify the adapter process is running: rch workers probe <id>"
+        "Ensure the process triage adapter binary is installed",
+        "Check PATH includes the adapter binary location",
+        "Verify the adapter version is compatible with this RCH version"
       ],
       "doc_url": "https://rch.dev/docs/process-triage"
     },
@@ -778,11 +790,11 @@
       "code": "RCH-E311",
       "number": 311,
       "category": "build",
-      "message": "Process detector could not classify with confidence",
+      "message": "Process detector could not classify with sufficient confidence",
       "remediation": [
-        "Review the process list manually on the worker",
-        "Lower the confidence threshold if appropriate",
-        "Add process signatures to the detector knowledge base"
+        "Process classification was inconclusive — no action taken",
+        "Review the process list manually for suspicious entries",
+        "Adjust detector confidence threshold if false negatives are common"
       ],
       "doc_url": "https://rch.dev/docs/process-triage"
     },
@@ -792,9 +804,9 @@
       "category": "build",
       "message": "Process triage action violates safe-action policy",
       "remediation": [
-        "Use a lower-risk action class or request explicit approval",
-        "Review the safe-action policy boundaries in configuration",
-        "Escalate to operator if the action is genuinely needed"
+        "The requested action is blocked by safe-action policy",
+        "Review the escalation level required for this action class",
+        "Use a lower-risk action class or request manual approval"
       ],
       "doc_url": "https://rch.dev/docs/process-triage"
     },
@@ -804,9 +816,9 @@
       "category": "build",
       "message": "Transport error communicating with process triage adapter",
       "remediation": [
-        "Verify the adapter process is running on the worker",
-        "Check IPC socket or pipe connectivity to the adapter",
-        "Restart the adapter and retry the operation"
+        "Communication with the process triage adapter failed",
+        "Verify the adapter process is running and responsive",
+        "Check for socket/pipe errors in adapter logs"
       ],
       "doc_url": "https://rch.dev/docs/process-triage"
     },
@@ -816,9 +828,9 @@
       "category": "build",
       "message": "Process triage executor encountered a runtime error",
       "remediation": [
+        "The process triage executor encountered a runtime error",
         "Check adapter logs for detailed error output",
-        "Verify worker OS compatibility with triage actions",
-        "Review executor permissions and capabilities"
+        "Verify the target process is still running"
       ],
       "doc_url": "https://rch.dev/docs/process-triage"
     },
@@ -828,9 +840,9 @@
       "category": "build",
       "message": "Process triage operation timed out",
       "remediation": [
-        "Increase timeout in ProcessTriageTimeoutPolicy configuration",
-        "Check worker load — triage may be slow under heavy I/O",
-        "Retry the operation after worker load decreases"
+        "Process triage operation exceeded the configured timeout",
+        "Increase timeout in ProcessTriageTimeoutPolicy if needed",
+        "Check for adapter hangs or system-level resource contention"
       ],
       "doc_url": "https://rch.dev/docs/process-triage"
     },
@@ -838,11 +850,11 @@
       "code": "RCH-E316",
       "number": 316,
       "category": "build",
-      "message": "Process triage returned partial results",
+      "message": "Process triage returned partial or incomplete results",
       "remediation": [
-        "Retry failed actions individually",
-        "Review which actions succeeded vs. failed in the result",
-        "Check adapter logs for root cause of partial failures"
+        "Not all requested triage actions completed successfully",
+        "Review the partial result for which actions succeeded",
+        "Retry failed actions individually for better diagnostics"
       ],
       "doc_url": "https://rch.dev/docs/process-triage"
     },
@@ -852,11 +864,83 @@
       "category": "build",
       "message": "Invalid process triage request",
       "remediation": [
-        "Validate the request against the contract schema",
-        "Check that all required fields are populated",
-        "Review the process triage API contract documentation"
+        "The process triage request is malformed or missing required fields",
+        "Validate request against the ProcessTriage contract schema",
+        "Check the contract schema version compatibility"
       ],
       "doc_url": "https://rch.dev/docs/process-triage"
+    },
+    {
+      "code": "RCH-E320",
+      "number": 320,
+      "category": "build",
+      "message": "Graceful cancel signal dispatched",
+      "remediation": [
+        "Graceful cancellation signal (SIGTERM) was sent to the build process",
+        "The build should terminate within the grace period",
+        "Use force cancel if the process does not respond"
+      ],
+      "doc_url": "https://rch.dev/docs/cancellation"
+    },
+    {
+      "code": "RCH-E321",
+      "number": 321,
+      "category": "build",
+      "message": "Escalated to forced kill after timeout",
+      "remediation": [
+        "Build did not respond to graceful cancel within the grace period",
+        "SIGKILL was sent to forcefully terminate the process",
+        "Check worker for orphaned processes if this occurs frequently"
+      ],
+      "doc_url": "https://rch.dev/docs/cancellation"
+    },
+    {
+      "code": "RCH-E322",
+      "number": 322,
+      "category": "build",
+      "message": "Failed to kill remote process via SSH",
+      "remediation": [
+        "SSH kill command to the remote worker failed",
+        "Verify SSH connectivity to the worker",
+        "Check that the remote process PID is still valid"
+      ],
+      "doc_url": "https://rch.dev/docs/cancellation"
+    },
+    {
+      "code": "RCH-E323",
+      "number": 323,
+      "category": "build",
+      "message": "Post-cancel cleanup encountered errors",
+      "remediation": [
+        "Post-cancellation cleanup did not complete successfully",
+        "Check worker disk space and permissions",
+        "Verify remote working directory state manually"
+      ],
+      "doc_url": "https://rch.dev/docs/cancellation"
+    },
+    {
+      "code": "RCH-E324",
+      "number": 324,
+      "category": "build",
+      "message": "Slots not properly released after cancel",
+      "remediation": [
+        "Worker slots were not properly released after cancellation",
+        "Check worker slot accounting for inconsistencies",
+        "Restart the daemon if slot leak persists"
+      ],
+      "doc_url": "https://rch.dev/docs/cancellation"
+    },
+    {
+      "code": "RCH-E325",
+      "number": 325,
+      "category": "build",
+      "message": "Cancellation exceeded policy time budget",
+      "remediation": [
+        "Cancellation did not complete within the policy time budget",
+        "The build may still be running on the worker",
+        "Consider increasing cancellation timeouts or force-cancelling"
+      ],
+      "doc_url": "https://rch.dev/docs/cancellation"
     },
     {
       "code": "RCH-E400",
@@ -900,7 +984,7 @@
       "category": "transfer",
       "message": "Destination path error",
       "remediation": [
-        "Check remote directory permissions",
+        "Check remote directory permissions and ownership",
         "Verify remote_base_dir is valid",
         "Ensure sufficient disk space on worker"
       ],
@@ -924,9 +1008,9 @@
       "category": "transfer",
       "message": "Permission denied during file transfer",
       "remediation": [
-        "Check file ownership on worker",
+        "Check ownership of /data/projects/<repo> on the worker",
         "Verify SSH user has write permissions",
-        "Review umask settings"
+        "Repair drift if needed: sudo chown -R <ssh-user>:<ssh-user> /data/projects/<repo>"
       ],
       "doc_url": "https://rch.dev/docs/sync"
     },
@@ -975,6 +1059,66 @@
         "Verify rsync version compatibility",
         "Check SSH protocol settings",
         "Review transfer configuration"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E410",
+      "number": 410,
+      "category": "transfer",
+      "message": "Remote dependency preflight found a missing required path",
+      "remediation": [
+        "Inspect the dependency preflight evidence for the missing remote path",
+        "Ensure every dependency root in the closure is synced to the worker",
+        "Verify Cargo.toml and required source entrypoints exist on the worker"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E411",
+      "number": 411,
+      "category": "transfer",
+      "message": "Remote dependency preflight found a stale dependency root",
+      "remediation": [
+        "Rerun after a successful sync of all dependency roots",
+        "Check whether transfer estimation skipped a dependency root",
+        "Inspect dependency preflight evidence for the stale root"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E412",
+      "number": 412,
+      "category": "transfer",
+      "message": "Remote dependency preflight could not verify dependency state",
+      "remediation": [
+        "Inspect sync and SSH logs for the dependency preflight probe",
+        "Retry after worker connectivity and shell probes are healthy",
+        "Use verbose output to view the full dependency preflight report"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E413",
+      "number": 413,
+      "category": "transfer",
+      "message": "Remote dependency preflight blocked a topology policy violation",
+      "remediation": [
+        "Move path dependencies under the configured canonical project root",
+        "Use /data/projects or /dp topology aliases consistently",
+        "Inspect the dependency closure policy diagnostics before retrying"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E414",
+      "number": 414,
+      "category": "transfer",
+      "message": "Remote dependency preflight planning timed out",
+      "remediation": [
+        "Retry after system load decreases",
+        "Inspect cargo metadata latency for the workspace",
+        "Increase planner timeout only after ruling out dependency graph issues"
       ],
       "doc_url": "https://rch.dev/docs/sync"
     },

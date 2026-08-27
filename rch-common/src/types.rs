@@ -1796,6 +1796,27 @@ pub struct CircuitBreakerConfig {
     /// Max concurrent probes in half-open.
     #[serde(default = "default_circuit_half_open_max_probes")]
     pub half_open_max_probes: u32,
+    /// Consecutive *command-class* failures to open the circuit.
+    ///
+    /// Command-class evidence is an operation of the same shape as dispatched
+    /// work — a remote binary that must run to completion (the telemetry poll,
+    /// or a health probe whose session connected but whose command never
+    /// finished). It is tracked separately from the plain liveness probe
+    /// because a host under fork exhaustion or swap thrash keeps answering
+    /// `echo` over a warm connection while every real command times out;
+    /// interleaved liveness successes would otherwise keep resetting
+    /// `failure_threshold` and the breaker would never trip.
+    #[serde(default = "default_circuit_command_failure_threshold")]
+    pub command_failure_threshold: u32,
+    /// Upper bound (seconds) for the open cooldown after repeated reopens.
+    ///
+    /// Each Open -> HalfOpen -> Open cycle without an intervening Closed
+    /// doubles the cooldown (`open_cooldown_secs`, x2, x4, ...) up to this
+    /// cap, so a flapping worker converges to Open instead of being
+    /// re-admitted every cooldown. Set equal to `open_cooldown_secs` to
+    /// disable the backoff.
+    #[serde(default = "default_circuit_open_cooldown_max_secs")]
+    pub open_cooldown_max_secs: u64,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -1807,7 +1828,25 @@ impl Default for CircuitBreakerConfig {
             window_secs: default_circuit_window_secs(),
             open_cooldown_secs: default_circuit_open_cooldown_secs(),
             half_open_max_probes: default_circuit_half_open_max_probes(),
+            command_failure_threshold: default_circuit_command_failure_threshold(),
+            open_cooldown_max_secs: default_circuit_open_cooldown_max_secs(),
         }
+    }
+}
+
+impl CircuitBreakerConfig {
+    /// Effective cooldown (ms) for the given reopen streak, with exponential
+    /// backoff capped at `open_cooldown_max_secs`. `reopen_streak` counts
+    /// Open transitions since the circuit last closed (1 = first open).
+    pub fn cooldown_ms_for_streak(&self, reopen_streak: u32) -> u64 {
+        let base_ms = self.open_cooldown_secs.saturating_mul(1000);
+        let cap_ms = self
+            .open_cooldown_max_secs
+            .saturating_mul(1000)
+            .max(base_ms);
+        // Exponent bounded so the shift cannot overflow; the cap clamps anyway.
+        let exponent = reopen_streak.saturating_sub(1).min(16);
+        base_ms.saturating_mul(1u64 << exponent).min(cap_ms)
     }
 }
 
@@ -1833,6 +1872,14 @@ pub struct CircuitStats {
     last_state_change: u64,
     /// Current active probes in half-open state.
     active_probes: u32,
+    /// Consecutive command-class failures (telemetry poll exhaustion, probe
+    /// sessions that connected but never completed). Reset only by a
+    /// command-class success or a circuit close — NOT by a liveness success,
+    /// which is the whole point (see `CircuitBreakerConfig::command_failure_threshold`).
+    consecutive_command_failures: u32,
+    /// Number of Open transitions since the circuit last closed. Drives the
+    /// cooldown backoff; 0 while Closed-since-recovery.
+    reopen_streak: u32,
     /// Recent health check results (true=success, false=failure).
     /// Used for history visualization in status display.
     recent_results: Vec<bool>,
@@ -1853,8 +1900,27 @@ impl CircuitStats {
             opened_at: None,
             last_state_change: Self::now_millis(),
             active_probes: 0,
+            consecutive_command_failures: 0,
+            reopen_streak: 0,
             recent_results: Vec::with_capacity(CIRCUIT_HISTORY_SIZE),
         }
+    }
+
+    /// Consecutive command-class failures observed since the last
+    /// command-class success (or circuit close).
+    pub fn consecutive_command_failures(&self) -> u32 {
+        self.consecutive_command_failures
+    }
+
+    /// Open transitions since the circuit last closed (0 when it has not
+    /// opened since recovery). Exposed for diagnostics.
+    pub fn reopen_streak(&self) -> u32 {
+        self.reopen_streak
+    }
+
+    /// Cooldown currently in force (ms), including reopen backoff.
+    fn effective_cooldown_ms(&self, config: &CircuitBreakerConfig) -> u64 {
+        config.cooldown_ms_for_streak(self.reopen_streak.max(1))
     }
 
     /// Get the current circuit state.
@@ -1962,7 +2028,7 @@ impl CircuitStats {
         }
 
         let now = Self::now_millis();
-        let cooldown_ms = config.open_cooldown_secs * 1000;
+        let cooldown_ms = self.effective_cooldown_ms(config);
 
         if let Some(opened_at) = self.opened_at {
             now.saturating_sub(opened_at) >= cooldown_ms
@@ -1973,14 +2039,19 @@ impl CircuitStats {
 
     /// Check if the circuit should close.
     ///
-    /// Returns true if in half-open state and consecutive successes
-    /// meet or exceed the success threshold.
+    /// Returns true if in half-open state, consecutive successes meet or
+    /// exceed the success threshold, AND no command-class failure is
+    /// outstanding. A worker whose last real command timed out is not
+    /// recovered no matter how many liveness probes it answers; it stays
+    /// HalfOpen (degraded, probe-limited) until a command-class success
+    /// clears the evidence.
     pub fn should_close(&self, config: &CircuitBreakerConfig) -> bool {
         if self.state != CircuitState::HalfOpen {
             return false;
         }
 
         self.consecutive_successes >= config.success_threshold
+            && self.consecutive_command_failures == 0
     }
 
     /// Check if a probe request can be made in half-open state.
@@ -2013,6 +2084,9 @@ impl CircuitStats {
             self.last_state_change = Self::now_millis();
             self.consecutive_successes = 0;
             self.active_probes = 0;
+            // Every open without an intervening close lengthens the next
+            // cooldown (see `CircuitBreakerConfig::cooldown_ms_for_streak`).
+            self.reopen_streak = self.reopen_streak.saturating_add(1);
         }
     }
 
@@ -2035,6 +2109,8 @@ impl CircuitStats {
             self.consecutive_failures = 0;
             self.consecutive_successes = 0;
             self.active_probes = 0;
+            self.consecutive_command_failures = 0;
+            self.reopen_streak = 0;
             // Reset the window on close, INCLUDING the recent-results history
             // that error_rate() now reads. Otherwise a freshly-recovered circuit
             // would still compute a high error rate from the pre-failure samples
@@ -2074,7 +2150,7 @@ impl CircuitStats {
         }
 
         let now = Self::now_millis();
-        let cooldown_ms = config.open_cooldown_secs * 1000;
+        let cooldown_ms = self.effective_cooldown_ms(config);
 
         if let Some(opened_at) = self.opened_at {
             let elapsed_ms = now.saturating_sub(opened_at);
@@ -2163,6 +2239,58 @@ impl CircuitStats {
 
         self.state
     }
+
+    /// Drive the circuit through a single *command-class* outcome and return
+    /// the resulting [`CircuitState`].
+    ///
+    /// Command-class evidence comes from an operation of the same shape as
+    /// dispatched work: a remote binary that must run to completion (the
+    /// telemetry poll, or a health probe whose SSH session connected but whose
+    /// command never finished). It is the signal the plain liveness probe
+    /// cannot provide — a host under fork exhaustion or swap thrash keeps
+    /// answering `echo` over a warm connection while every real command hangs,
+    /// and on that evidence alone the breaker would happily re-admit it.
+    ///
+    /// Behaviour:
+    /// - **Success**: clears the outstanding command-failure count and then
+    ///   counts as an ordinary healthy outcome (may advance Open -> HalfOpen ->
+    ///   Closed exactly like a liveness success).
+    /// - **Failure**: increments the command-failure count and records a plain
+    ///   failure. The circuit opens when either the ordinary open condition or
+    ///   `command_failure_threshold` is met. In HalfOpen a command failure
+    ///   ALWAYS reopens — there is no transient exemption, because "connected
+    ///   but the command did not complete" is precisely the condition the
+    ///   half-open trial exists to detect. While any command failure is
+    ///   outstanding, [`Self::should_close`] refuses to close on liveness
+    ///   successes alone.
+    pub fn apply_command_outcome(
+        &mut self,
+        success: bool,
+        config: &CircuitBreakerConfig,
+    ) -> CircuitState {
+        if success {
+            self.consecutive_command_failures = 0;
+            return self.apply_health_outcome(true, false, config);
+        }
+
+        self.consecutive_command_failures = self.consecutive_command_failures.saturating_add(1);
+        let was_half_open = self.state == CircuitState::HalfOpen;
+        self.record_failure();
+        let threshold = config.command_failure_threshold.max(1);
+        if was_half_open
+            || self.should_open(config)
+            || (self.state == CircuitState::Closed
+                && self.consecutive_command_failures >= threshold)
+        {
+            self.open();
+        }
+
+        if self.state == CircuitState::Open && self.should_half_open(config) {
+            self.half_open();
+        }
+
+        self.state
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2221,6 +2349,109 @@ pub struct CompilationConfig {
     /// unconditionally.
     #[serde(default = "default_allow_local_fallback")]
     pub allow_local_fallback: bool,
+    /// Per-job rustc parallelism cap applied on the WORKER (issue #49).
+    ///
+    /// `total_slots` bounds concurrent *jobs* per worker, but cargo defaults
+    /// `-j` to the worker's `nproc`, so one offloaded `cargo test --workspace`
+    /// forks `nproc` rustc regardless of slots and can swap-thrash a
+    /// RAM-light box. This policy injects `CARGO_BUILD_JOBS` into the remote
+    /// build environment; see [`RemoteBuildJobs`] for the modes. It never
+    /// overrides a `CARGO_BUILD_JOBS` the worker session already carries, an
+    /// inline `CARGO_BUILD_JOBS=N` or `-j N` in the command, or a project
+    /// `.cargo/config.toml` `[build] jobs` — explicit intent always wins.
+    #[serde(default)]
+    pub remote_build_jobs: RemoteBuildJobs,
+}
+
+/// How rch derives the `CARGO_BUILD_JOBS` it injects into a remote build.
+///
+/// - `auto` (default): computed on the worker from its live `nproc` and
+///   total RAM as `clamp(ram_gib / 8, 2, min(nproc, 8))` — budgeting roughly
+///   8 GiB of RAM per concurrent rustc leaves headroom for two to three
+///   concurrent jobs at a realistic per-rustc peak of ~3 GiB.
+/// - `off`: inject nothing (historical behavior; cargo uses `nproc`).
+/// - `<n>`: inject a fixed job count fleet-wide.
+///
+/// In every mode an explicitly set `CARGO_BUILD_JOBS` on the worker (for
+/// example from `/etc/environment`) or in the command is left untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RemoteBuildJobs {
+    /// Derive from the worker's cores and RAM at execution time.
+    #[default]
+    Auto,
+    /// Do not inject `CARGO_BUILD_JOBS`.
+    Off,
+    /// Inject a fixed job count (must be >= 1).
+    Fixed(u32),
+}
+
+impl RemoteBuildJobs {
+    /// Parse the config/CLI spelling: `auto`, `off`, or a positive integer.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let trimmed = value.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "off" | "none" | "disabled" => Ok(Self::Off),
+            _ => match trimmed.parse::<u32>() {
+                Ok(0) => Err(
+                    "remote_build_jobs must be >= 1 (cargo rejects `-j 0`); use `off` to disable"
+                        .to_string(),
+                ),
+                Ok(n) => Ok(Self::Fixed(n)),
+                Err(_) => Err(format!(
+                    "'{trimmed}' is not a valid remote_build_jobs value (expected `auto`, `off`, or a positive integer)"
+                )),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteBuildJobs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Off => f.write_str("off"),
+            Self::Fixed(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+impl std::str::FromStr for RemoteBuildJobs {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for RemoteBuildJobs {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Off => serializer.serialize_str("off"),
+            Self::Fixed(n) => serializer.serialize_u32(*n),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteBuildJobs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Count(u64),
+            Spelling(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Count(n) => {
+                let n = u32::try_from(n).map_err(|_| {
+                    serde::de::Error::custom(format!("remote_build_jobs {n} is out of range"))
+                })?;
+                Self::parse(&n.to_string()).map_err(serde::de::Error::custom)
+            }
+            Raw::Spelling(s) => Self::parse(&s).map_err(serde::de::Error::custom),
+        }
+    }
 }
 
 impl Default for CompilationConfig {
@@ -2237,6 +2468,7 @@ impl Default for CompilationConfig {
             bun_timeout_sec: default_bun_timeout(),
             external_timeout_enabled: default_external_timeout_enabled(),
             allow_local_fallback: default_allow_local_fallback(),
+            remote_build_jobs: RemoteBuildJobs::default(),
         }
     }
 }
@@ -2584,34 +2816,47 @@ impl TransferConfig {
 
 /// Default allowlist of commands that can be executed remotely.
 /// Aligned with the classifier's supported CompilationKind values.
+/// Command bases of every compilation kind rch knows how to offload.
+///
+/// This is the built-in `execution.allowlist`. It is also what a persisted,
+/// explicit allowlist is compared against: a config file written before a tool
+/// family was added (Go, Nix, TypeScript, ...) silently keeps that family local,
+/// and the only symptom is a `[RCH] local (... not in execution.allowlist)` line
+/// (issue #51). `ExecutionConfig::missing_builtin_bases` surfaces the gap.
+#[rustfmt::skip]
+pub const BUILTIN_EXECUTION_BASES: &[&str] = &[
+    // Rust
+    "cargo",
+    "rustc",
+    // cargo-nextest
+    "nextest",
+    // C/C++
+    "gcc",
+    "g++",
+    "clang",
+    "clang++",
+    "cc",
+    "c++",
+    // Build systems
+    "make",
+    "cmake",
+    "ninja",
+    "meson",
+    // Bun
+    "bun",
+    // Nix (covers both `nix build` and the legacy `nix-build`)
+    "nix",
+    // Go
+    "go",
+    // TypeScript (covers both `tsc` and `npx tsc`; command_base is "tsc")
+    "tsc",
+];
+
 fn default_execution_allowlist() -> Vec<String> {
-    vec![
-        // Rust
-        "cargo".to_string(),
-        "rustc".to_string(),
-        // cargo-nextest
-        "nextest".to_string(),
-        // C/C++
-        "gcc".to_string(),
-        "g++".to_string(),
-        "clang".to_string(),
-        "clang++".to_string(),
-        "cc".to_string(),
-        "c++".to_string(),
-        // Build systems
-        "make".to_string(),
-        "cmake".to_string(),
-        "ninja".to_string(),
-        "meson".to_string(),
-        // Bun
-        "bun".to_string(),
-        // Nix (covers both `nix build` and the legacy `nix-build`)
-        "nix".to_string(),
-        // Go
-        "go".to_string(),
-        // TypeScript (covers both `tsc` and `npx tsc`; command_base is "tsc")
-        "tsc".to_string(),
-    ]
+    BUILTIN_EXECUTION_BASES
+        .iter()
+        .map(|base| (*base).to_string())
+        .collect()
 }
 
 /// Execution allowlist configuration for remote builds (bd-785w).
@@ -2646,6 +2891,19 @@ impl ExecutionConfig {
         self.allowlist
             .iter()
             .any(|allowed| allowed.eq_ignore_ascii_case(command_base))
+    }
+
+    /// Built-in compilation tool bases that this allowlist does NOT admit.
+    ///
+    /// Empty for the default allowlist. Non-empty means some command family rch
+    /// classifies as compilation will always fall open to local execution on
+    /// this box — usually because the config file predates that family.
+    pub fn missing_builtin_bases(&self) -> Vec<&'static str> {
+        BUILTIN_EXECUTION_BASES
+            .iter()
+            .copied()
+            .filter(|base| !self.is_allowed(base))
+            .collect()
     }
 }
 
@@ -2835,6 +3093,15 @@ fn default_circuit_open_cooldown_secs() -> u64 {
 
 fn default_circuit_half_open_max_probes() -> u32 {
     1
+}
+
+fn default_circuit_command_failure_threshold() -> u32 {
+    2
+}
+
+fn default_circuit_open_cooldown_max_secs() -> u64 {
+    // 30s base doubled four times: 30, 60, 120, 240, 480.
+    480
 }
 
 fn default_true() -> bool {
@@ -3690,9 +3957,13 @@ retry_max = 2
             window_secs: 120,
             open_cooldown_secs: 45,
             half_open_max_probes: 2,
+            command_failure_threshold: 4,
+            open_cooldown_max_secs: 900,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: CircuitBreakerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.command_failure_threshold, 4);
+        assert_eq!(parsed.open_cooldown_max_secs, 900);
         assert_eq!(parsed.failure_threshold, 5);
         assert_eq!(parsed.success_threshold, 3);
         assert_eq!(parsed.error_rate_threshold, 0.75);
@@ -4536,6 +4807,144 @@ retry_max = 2
         );
     }
 
+    /// Issue #48 regression: a worker whose liveness probe (`echo` over a warm
+    /// session) keeps succeeding while every real command times out must NOT
+    /// be re-admitted. Liveness successes alone cannot close a half-open
+    /// circuit while command-class evidence is outstanding.
+    #[test]
+    fn test_command_failure_blocks_half_open_close_on_liveness_successes() {
+        let _guard = test_guard!();
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            success_threshold: 2,
+            open_cooldown_secs: 0,
+            command_failure_threshold: 2,
+            ..Default::default()
+        };
+        let mut stats = CircuitStats::new();
+        stats.open();
+        stats.half_open();
+
+        // The half-open trial: a real command hangs on the worker.
+        assert_eq!(
+            stats.apply_command_outcome(false, &config),
+            CircuitState::HalfOpen,
+            "cooldown 0: reopen then immediately half-open again"
+        );
+        assert_eq!(stats.consecutive_command_failures(), 1);
+
+        // Liveness keeps answering — many times over.
+        for _ in 0..10 {
+            assert_eq!(
+                stats.apply_health_outcome(true, false, &config),
+                CircuitState::HalfOpen,
+                "liveness successes must not close the circuit while a command failure is outstanding"
+            );
+        }
+
+        // Only a command-class success clears the evidence and recovers.
+        assert_eq!(
+            stats.apply_command_outcome(true, &config),
+            CircuitState::Closed
+        );
+        assert_eq!(stats.consecutive_command_failures(), 0);
+        assert_eq!(stats.reopen_streak(), 0);
+    }
+
+    /// Issue #48: interleaved liveness successes reset `failure_threshold`, so
+    /// command failures need their own threshold to open a Closed circuit.
+    #[test]
+    fn test_command_failures_open_closed_circuit_despite_liveness_successes() {
+        let _guard = test_guard!();
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            command_failure_threshold: 2,
+            open_cooldown_secs: 300,
+            ..Default::default()
+        };
+        let mut stats = CircuitStats::new();
+
+        assert_eq!(
+            stats.apply_command_outcome(false, &config),
+            CircuitState::Closed
+        );
+        // Two liveness successes in between: consecutive_failures is reset...
+        stats.apply_health_outcome(true, false, &config);
+        stats.apply_health_outcome(true, false, &config);
+        assert_eq!(stats.consecutive_failures(), 0);
+        // ...but the command-failure count is not, and the second one opens.
+        assert_eq!(
+            stats.apply_command_outcome(false, &config),
+            CircuitState::Open
+        );
+        assert_eq!(stats.reopen_streak(), 1);
+    }
+
+    /// A command failure in HalfOpen always reopens: "connected but the
+    /// command never completed" is exactly what the trial exists to detect,
+    /// so there is no transient exemption on this channel.
+    #[test]
+    fn test_command_failure_in_half_open_always_reopens() {
+        let _guard = test_guard!();
+        let config = CircuitBreakerConfig {
+            open_cooldown_secs: 300,
+            ..Default::default()
+        };
+        let mut stats = CircuitStats::new();
+        stats.open();
+        stats.half_open();
+        assert_eq!(
+            stats.apply_command_outcome(false, &config),
+            CircuitState::Open
+        );
+        assert_eq!(stats.reopen_streak(), 2);
+    }
+
+    /// Repeated Open -> HalfOpen -> Open cycles lengthen the cooldown
+    /// (exponential, capped) so a flapping worker converges to Open instead of
+    /// being re-admitted on every base cooldown.
+    #[test]
+    fn test_reopen_streak_backs_off_cooldown_until_cap() {
+        let _guard = test_guard!();
+        let config = CircuitBreakerConfig {
+            open_cooldown_secs: 30,
+            open_cooldown_max_secs: 100,
+            ..Default::default()
+        };
+        assert_eq!(config.cooldown_ms_for_streak(0), 30_000);
+        assert_eq!(config.cooldown_ms_for_streak(1), 30_000);
+        assert_eq!(config.cooldown_ms_for_streak(2), 60_000);
+        assert_eq!(config.cooldown_ms_for_streak(3), 100_000, "capped");
+        assert_eq!(config.cooldown_ms_for_streak(40), 100_000, "no overflow");
+
+        // A cap below the base never shortens the base cooldown.
+        let inverted = CircuitBreakerConfig {
+            open_cooldown_secs: 30,
+            open_cooldown_max_secs: 5,
+            ..Default::default()
+        };
+        assert_eq!(inverted.cooldown_ms_for_streak(3), 30_000);
+
+        // The streak is observable through recovery_remaining_secs: after two
+        // opens the remaining cooldown exceeds the base.
+        let mut stats = CircuitStats::new();
+        stats.open();
+        stats.half_open();
+        stats.open();
+        assert_eq!(stats.reopen_streak(), 2);
+        let remaining = stats.recovery_remaining_secs(&config).unwrap();
+        assert!(
+            remaining > 30 && remaining <= 60,
+            "second open should wait ~60s, got {remaining}"
+        );
+
+        // Closing resets the streak, so the next open starts from the base.
+        stats.close();
+        assert_eq!(stats.reopen_streak(), 0);
+        stats.open();
+        assert!(stats.recovery_remaining_secs(&config).unwrap() <= 30);
+    }
+
     #[test]
     fn test_circuit_stats_success_resets_consecutive_failures() {
         let _guard = test_guard!();
@@ -5030,6 +5439,56 @@ retry_max = 2
     }
 
     // CompilationConfig timeout tests
+
+    #[test]
+    fn test_remote_build_jobs_parse_display_and_serde() {
+        let _guard = test_guard!();
+        assert_eq!(RemoteBuildJobs::default(), RemoteBuildJobs::Auto);
+        for (spelling, expected) in [
+            ("auto", RemoteBuildJobs::Auto),
+            (" AUTO ", RemoteBuildJobs::Auto),
+            ("off", RemoteBuildJobs::Off),
+            ("none", RemoteBuildJobs::Off),
+            ("4", RemoteBuildJobs::Fixed(4)),
+        ] {
+            assert_eq!(
+                RemoteBuildJobs::parse(spelling).unwrap(),
+                expected,
+                "{spelling}"
+            );
+        }
+        assert!(RemoteBuildJobs::parse("0").is_err(), "cargo rejects -j 0");
+        assert!(RemoteBuildJobs::parse("many").is_err());
+        assert_eq!(RemoteBuildJobs::Fixed(4).to_string(), "4");
+        assert_eq!(RemoteBuildJobs::Off.to_string(), "off");
+
+        // TOML accepts both the string spellings and a bare integer, and an
+        // absent key keeps the default.
+        #[derive(Deserialize)]
+        struct Wrap {
+            compilation: CompilationConfig,
+        }
+        let parsed: Wrap = toml::from_str("[compilation]\nremote_build_jobs = \"off\"\n").unwrap();
+        assert_eq!(parsed.compilation.remote_build_jobs, RemoteBuildJobs::Off);
+        let parsed: Wrap = toml::from_str("[compilation]\nremote_build_jobs = 6\n").unwrap();
+        assert_eq!(
+            parsed.compilation.remote_build_jobs,
+            RemoteBuildJobs::Fixed(6)
+        );
+        let parsed: Wrap = toml::from_str("[compilation]\nbuild_slots = 4\n").unwrap();
+        assert_eq!(parsed.compilation.remote_build_jobs, RemoteBuildJobs::Auto);
+        assert!(toml::from_str::<Wrap>("[compilation]\nremote_build_jobs = 0\n").is_err());
+
+        // Serialization round-trips through the same spellings.
+        let json = serde_json::to_string(&RemoteBuildJobs::Fixed(3)).unwrap();
+        assert_eq!(json, "3");
+        assert_eq!(
+            serde_json::to_string(&RemoteBuildJobs::Auto).unwrap(),
+            "\"auto\""
+        );
+        let back: RemoteBuildJobs = serde_json::from_str("\"auto\"").unwrap();
+        assert_eq!(back, RemoteBuildJobs::Auto);
+    }
 
     #[test]
     fn test_compilation_config_default_timeouts() {

@@ -109,7 +109,7 @@ impl<'a> WorkerTable<'a> {
     fn render_empty_rich(&self, console: &RchConsole) {
         let info = Icons::info(self.context);
         let content = format!(
-            "{} No workers configured\n\nAdd workers with: rch workers add <host>",
+            "{} No workers configured\n\nAdd workers with: rch workers init",
             info
         );
         let panel = Panel::from_text(&content)
@@ -181,7 +181,7 @@ impl<'a> WorkerTable<'a> {
             console.print_plain("");
             let info = Icons::info(self.context);
             console.print_plain(&format!("{info} No workers configured"));
-            console.print_plain("  Add workers with: rch workers add <host>");
+            console.print_plain("  Add workers with: rch workers init");
             return;
         }
 

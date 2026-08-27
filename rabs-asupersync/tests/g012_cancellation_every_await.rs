@@ -47,6 +47,7 @@ use asupersync::lab::instrumented_future::{
     InstrumentedFuture, InstrumentedPollResult,
 };
 use asupersync::lab::runtime::run_async_under_lab_with_config;
+use asupersync::runtime::yield_now;
 use parking_lot::Mutex;
 use rabs_asupersync::obligations::{ObligationKind, ObligationSet};
 use std::sync::Arc;
@@ -60,6 +61,12 @@ const STAGES: usize = 3;
 /// AFTER the runner finished driving (or dropped) the future.
 #[derive(Debug, Default)]
 struct FlowWitness {
+    /// The flow body was polled at least once: `SubsystemFlow` was
+    /// constructed and its CLEANUP obligations were OPENED. This is
+    /// distinct from reaching a stage — the first stage boundary is
+    /// awaited BEFORE `advance()` runs, so a flow cancelled at its
+    /// second poll has opened obligations but reached no stage.
+    opened: bool,
     /// Stages actually reached (1-based).
     stages_reached: Vec<usize>,
     /// Cleanup obligations were resolved by NORMAL completion.
@@ -70,8 +77,15 @@ struct FlowWitness {
 
 impl FlowWitness {
     /// The flow STARTED (body polled at least once: obligations opened).
+    ///
+    /// Keyed on `opened`, not on `stages_reached`: the instrumented
+    /// wrapper counts an await point BEFORE polling the inner future,
+    /// so injection at point N tears down a flow that was polled N-1
+    /// times. At N == 2 that flow constructed (obligations opened) and
+    /// parked on its first stage boundary without ever advancing — its
+    /// drop-resolution is the backstop doing its job, not a phantom.
     fn started(&self) -> bool {
-        !self.stages_reached.is_empty()
+        self.opened
     }
 
     fn closed_cleanly(&self) -> bool {
@@ -94,6 +108,7 @@ impl SubsystemFlow {
         let mut obligations = ObligationSet::default();
         obligations.open(ObligationKind::SandboxCleanup);
         obligations.open(ObligationKind::ProcessGroupDrain);
+        witness.lock().opened = true;
         Self {
             witness,
             obligations,
@@ -365,25 +380,56 @@ fn g012_shutdown_race_matrix_is_seed_deterministic_and_discriminating() {
     // (bounded cleanup is reproducible); different seed MUST produce a
     // different one (the matrix has discriminating power — a vacuous
     // always-equal check would hide scheduler-dependent leaks).
+    //
+    // The seed reaches the lab ONLY through its ready-task pick
+    // (`pop_for_worker(worker_hint, rng_value, ..)`): it chooses among
+    // tasks that are runnable AT THE SAME STEP. A single task with
+    // synchronous checkpoints never offers that choice, so its
+    // certificate is legitimately seed-invariant and proves nothing.
+    // The matrix therefore runs FLOWS concurrent subsystem-shaped
+    // flows that each yield at every stage boundary, so the seeded
+    // interleaving of their cleanup/resolution events is what the
+    // certificate captures.
+    const FLOWS: usize = 4;
     let certificates_for = |seed: u64| {
-        let (_, report) = run_async_under_lab_with_config(
+        let (closed, report) = run_async_under_lab_with_config(
             LabConfig::new(seed)
                 .worker_count(4)
                 .entropy_seed(seed.rotate_left(17))
                 .max_steps(100_000),
             |cx: Cx| async move {
-                let mut obligations = ObligationSet::default();
-                obligations.open(ObligationKind::DiagnosticStream);
-                obligations.open(ObligationKind::ProcessGroupDrain);
-                for _ in 0..STAGES {
-                    let _ = cx.checkpoint();
+                let mut handles = Vec::with_capacity(FLOWS);
+                for _ in 0..FLOWS {
+                    let handle = cx
+                        .spawn(|child: Cx| async move {
+                            let mut obligations = ObligationSet::default();
+                            obligations.open(ObligationKind::DiagnosticStream);
+                            obligations.open(ObligationKind::ProcessGroupDrain);
+                            for _ in 0..STAGES {
+                                let _ = child.checkpoint();
+                                yield_now().await;
+                            }
+                            let _ = child.checkpoint();
+                            let _ = obligations.resolve(ObligationKind::DiagnosticStream);
+                            let _ = obligations.resolve(ObligationKind::ProcessGroupDrain);
+                            obligations.may_close_region().expect("clean close");
+                        })
+                        .expect("lab Cx must be able to spawn concurrent flows");
+                    handles.push(handle);
                 }
-                let _ = cx.checkpoint();
-                let _ = obligations.resolve(ObligationKind::DiagnosticStream);
-                let _ = obligations.resolve(ObligationKind::ProcessGroupDrain);
-                obligations.may_close_region().expect("clean close");
+                let mut closed = 0usize;
+                for handle in &mut handles {
+                    handle
+                        .join(&cx)
+                        .await
+                        .expect("every concurrent flow completes");
+                    closed += 1;
+                }
+                closed
             },
         );
+        assert_eq!(closed, FLOWS, "every concurrent flow closed cleanly");
+        assert!(report.quiescent, "lab runtime reached quiescence");
         (
             report.trace_certificate.event_hash,
             report.trace_certificate.schedule_hash,

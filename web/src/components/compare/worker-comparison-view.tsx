@@ -90,10 +90,10 @@ export function WorkerComparisonView({
   }, [selectedIds]);
 
   // Filter selected workers from the full list
-  const selectedWorkers = useMemo(
-    () => workers.filter((w) => selectedIds.includes(w.id)),
-    [workers, selectedIds]
-  );
+  const selectedWorkers = useMemo(() => {
+    const idSet = new Set(selectedIds);
+    return workers.filter((w) => idSet.has(w.id));
+  }, [workers, selectedIds]);
 
   return (
     <div className="space-y-6">

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://react.doctor/schema/config.json",
+  "ignore": {
+    "overrides": [
+      {
+        "files": [
+          "src/components/ui/badge.tsx",
+          "src/components/ui/button.tsx",
+          "src/components/ui/error-state.tsx",
+          "src/components/workers/speed-score-badge.tsx"
+        ],
+        "rules": ["react-doctor/only-export-components"]
+      },
+      {
+        "files": ["src/app/api/ws/route.ts"],
+        "rules": ["react-doctor/nextjs-no-side-effect-in-get-handler"]
+      },
+      {
+        "files": [
+          "src/components/charts/benchmark-history-chart.tsx",
+          "src/components/compare/comparison-radar.tsx"
+        ],
+        "rules": ["react-doctor/prefer-dynamic-import"]
+      },
+      {
+        "files": [
+          "src/components/dashboard/build-stats.tsx",
+          "src/components/dashboard/daemon-status.tsx",
+          "src/components/dashboard/index.ts",
+          "src/components/dashboard/recent-builds.tsx",
+          "src/components/dashboard/worker-summary.tsx",
+          "src/lib/hooks/index.ts",
+          "src/lib/hooks/use-status.ts"
+        ],
+        "rules": ["deslop/unused-file"]
+      },
+      {
+        "files": [
+          "src/components/workers/worker-card-skeleton.tsx",
+          "src/lib/hooks/use-speedscore-history.ts"
+        ],
+        "rules": ["deslop/unused-export"]
+      },
+      {
+        "files": [
+          "src/app/builds/page.tsx",
+          "src/app/metrics/page.tsx",
+          "src/app/workers/page.tsx",
+          "src/components/builds/build-history-table.tsx",
+          "src/components/layout/header.tsx",
+          "src/components/layout/sidebar.tsx",
+          "src/components/stats/stat-card.tsx",
+          "src/components/workers/benchmark-progress-modal.tsx",
+          "src/components/workers/benchmark-trigger-button.tsx",
+          "src/components/workers/speed-score-detail-panel.tsx"
+        ],
+        "rules": ["react-doctor/use-lazy-motion"]
+      },
+      {
+        "files": ["package.json"],
+        "rules": ["react-doctor/require-reduced-motion"]
+      },
+      {
+        "files": [
+          "src/app/metrics/page.tsx",
+          "src/components/builds/build-history-table.tsx"
+        ],
+        "rules": ["react-doctor/no-giant-component"]
+      },
+      {
+        "files": [
+          "src/components/compare/worker-comparison-view.tsx"
+        ],
+        "rules": ["react-doctor/no-effect-event-handler"]
+      }
+    ]
+  }
+}

@@ -1,6 +1,5 @@
 'use client';
 
-import { motion } from 'motion/react';
 import type { LucideIcon } from 'lucide-react';
 
 interface StatCardProps {
@@ -15,10 +14,8 @@ interface StatCardProps {
 
 export function StatCard({ label, value, icon: Icon, trend }: StatCardProps) {
   return (
-    <motion.div
-      initial={{ opacity: 0, scale: 0.95 }}
-      animate={{ opacity: 1, scale: 1 }}
-      className="bg-card border border-border rounded-lg p-4"
+    <div
+      className="bg-card border border-border rounded-lg p-4 transition-colors duration-200"
       data-testid="stat-card"
     >
       <div className="flex items-center justify-between mb-2">
@@ -35,6 +32,6 @@ export function StatCard({ label, value, icon: Icon, trend }: StatCardProps) {
           </span>
         )}
       </div>
-    </motion.div>
+    </div>
   );
 }

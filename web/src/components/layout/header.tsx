@@ -1,7 +1,6 @@
 'use client';
 
 import { RefreshCw, Circle } from 'lucide-react';
-import { motion } from 'motion/react';
 import type { DaemonStatusInfo } from '@/lib/types';
 
 interface HeaderProps {
@@ -41,12 +40,11 @@ export function Header({ daemon, onRefresh, isRefreshing }: HeaderProps) {
           title="Refresh data"
           aria-label="Refresh dashboard data"
         >
-          <motion.div
-            animate={isRefreshing ? { rotate: 360 } : { rotate: 0 }}
-            transition={isRefreshing ? { duration: 1, repeat: Infinity, ease: 'linear' } : {}}
-          >
-            <RefreshCw className="w-5 h-5 text-muted-foreground" />
-          </motion.div>
+          <RefreshCw
+            className={`w-5 h-5 text-muted-foreground transition-transform ${
+              isRefreshing ? 'animate-spin' : ''
+            }`}
+          />
         </button>
       </div>
     </header>

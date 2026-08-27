@@ -133,9 +133,10 @@ export function WorkerSelector({
         >
           {workers.length === 0 ? (
             <div className="px-3 py-2 text-sm text-muted-foreground">No workers available</div>
-          ) : (
-            workers.map((worker) => {
-              const isSelected = selectedIds.includes(worker.id);
+          ) : (() => {
+            const selectedSet = new Set(selectedIds);
+            return workers.map((worker) => {
+              const isSelected = selectedSet.has(worker.id);
               const isDisabled = !isSelected && isAtMax;
 
               return (
@@ -173,8 +174,8 @@ export function WorkerSelector({
                   </div>
                 </button>
               );
-            })
-          )}
+            });
+          })()}
 
           {isAtMax && (
             <div className="px-3 py-2 text-xs text-muted-foreground border-t border-border mt-1">

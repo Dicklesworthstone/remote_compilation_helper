@@ -81,6 +81,12 @@ fn setup_fleet_env(harness: &mut TestHarness, worker_count: usize) -> HarnessRes
         "XDG_CONFIG_HOME".to_string(),
         config_home.to_string_lossy().to_string(),
     );
+    // `RCH_CONFIG_DIR` outranks `XDG_CONFIG_HOME`; pin both so an
+    // operator-exported value cannot pull in the host's real config.
+    harness.config.env_vars.insert(
+        "RCH_CONFIG_DIR".to_string(),
+        config_home.join("rch").to_string_lossy().to_string(),
+    );
     harness.config.env_vars.insert(
         "XDG_DATA_HOME".to_string(),
         data_home.to_string_lossy().to_string(),

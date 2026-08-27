@@ -91,9 +91,10 @@ export function BenchmarkTriggerButton({
   return (
     <AnimatePresence mode="wait">
       <motion.div
-        initial={{ opacity: 0, height: 0 }}
-        animate={{ opacity: 1, height: 'auto' }}
-        exit={{ opacity: 0, height: 0 }}
+        initial={{ opacity: 0, scale: 0.98, y: -4 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.98, y: -4 }}
+        transition={{ duration: 0.2 }}
         className="w-full"
         data-testid="benchmark-progress-panel"
       >

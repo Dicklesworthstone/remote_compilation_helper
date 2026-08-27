@@ -298,7 +298,12 @@ fn aggregate_verdict(diagnostics: &[ReliabilityDiagnostic]) -> ReliabilityVerdic
     }
 }
 
+/// Serialized in snake_case so `--json` consumers see the same tokens as
+/// `as_str()`, the webhook payload, and `rch_common::errors::reliability::
+/// ReliabilityCategoryKind` (`"topology"`, `"repo_presence"`, ...). Keep
+/// the serde rename and `as_str` in lockstep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum ReliabilityCategory {
     Topology,
     RepoPresence,
@@ -2078,7 +2083,7 @@ fn reliability_topology_diagnostics(
                     "No workers are configured, so all builds will run locally",
                     ReliabilityReasonCode::NoWorkersConfigured,
                 )
-                .with_remediation("rch workers add <host>", "rch workers list --json"),
+                .with_remediation("rch workers init", "rch workers list --json"),
             );
         } else {
             let worker_ids = workers
@@ -6163,7 +6168,7 @@ mod tests {
             "crit",
             ReliabilityReasonCode::NoWorkersConfigured,
         )
-        .with_remediation("rch workers add <host>", "v");
+        .with_remediation("rch workers init", "v");
         let pass = diag(
             ReliabilitySeverity::Pass,
             ReliabilityReasonCode::StatusSurfaceAvailable,
@@ -6422,7 +6427,7 @@ mod tests {
             remediation_step(
                 2,
                 ReliabilityReasonCode::NoWorkersConfigured,
-                "rch workers add <host>",
+                "rch workers init",
             ),
         ];
         let mut response = response_with_plan(ReliabilityDoctorMode::DryRun, true, plan);
@@ -6444,7 +6449,7 @@ mod tests {
         // The manual step is always Manual and carries the operator command.
         let manual = &response.remediation_outcomes[1];
         assert_eq!(manual.status, RemediationOutcomeStatus::Manual);
-        assert_eq!(manual.command, "rch workers add <host>");
+        assert_eq!(manual.command, "rch workers init");
     }
 
     #[test]

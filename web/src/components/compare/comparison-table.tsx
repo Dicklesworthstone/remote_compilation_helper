@@ -13,9 +13,9 @@ interface ComparisonTableProps {
 }
 
 const metadataRows: { label: string; getValue: (w: WorkerStatusInfo) => string }[] = [
-  { label: 'Slots', getValue: (w) => `${w.used_slots}/${w.total_slots}` },
-  { label: 'Status', getValue: (w) => w.status },
-  { label: 'Circuit', getValue: (w) => w.circuit_state.replace('_', ' ') },
+  { label: 'Slots', getValue: (w) => `${w.used_slots ?? 0}/${w.total_slots ?? '—'}` },
+  { label: 'Status', getValue: (w) => w.status ?? '—' },
+  { label: 'Circuit', getValue: (w) => (w.circuit_state ? w.circuit_state.replace('_', ' ') : '—') },
 ];
 
 function getScoreColor(score: number, best: number): string {

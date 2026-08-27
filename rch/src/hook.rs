@@ -679,6 +679,7 @@ fn local_fallback_command_for_policy(
 /// so wrappers can back off; permanent ones keep [`EXIT_BUILD_ERROR`] (rch#31).
 fn remote_required_refusal_is_retryable(reason: &str) -> bool {
     !matches!(reason, "non-compilation command" | "config unavailable")
+        && !ConfigLocalPolicy::is_policy_reason(reason)
 }
 
 fn remote_required_refusal_summary(reason: &str) -> String {
@@ -694,6 +695,92 @@ fn remote_required_refusal_summary(reason: &str) -> String {
         format!("[RCH] remote required; refusing local fallback ({reason}) — retryable")
     } else {
         format!("[RCH] remote required; refusing local fallback ({reason})")
+    }
+}
+
+/// A config-driven reason to run locally instead of offloading.
+///
+/// Issue #55: `general.enabled`, `general.force_local` and
+/// `execution.allowlist` used to be consulted only by the Claude Code hook.
+/// `rch exec` ignored them, and the cargo shim always execs `rch exec`, so on
+/// a shim-only box (Codex, scripts, CI) `force_local = true` did nothing and on
+/// a hook box the shim offloaded a command the hook had just allowed locally.
+/// One policy, evaluated identically by every interceptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigLocalPolicy {
+    /// `general.enabled = false`.
+    Disabled,
+    /// `general.force_local = true`.
+    ForceLocal,
+    /// Both force flags set — validation rejects this; fail safe (local).
+    ConflictingForceFlags,
+    /// The classified command's base is not in `execution.allowlist`.
+    NotAllowlisted(&'static str),
+}
+
+impl ConfigLocalPolicy {
+    const DISABLED_REASON: &'static str = "rch disabled (general.enabled=false)";
+    const FORCE_LOCAL_REASON: &'static str = "force_local";
+    const CONFLICT_REASON: &'static str = "invalid config: force_local+force_remote";
+    const NOT_ALLOWLISTED_SUFFIX: &'static str = "not in execution.allowlist";
+
+    /// Human-readable reason, in the `[RCH] local (<reason>)` vocabulary.
+    pub(crate) fn reason(self) -> String {
+        match self {
+            Self::Disabled => Self::DISABLED_REASON.to_string(),
+            Self::ForceLocal => Self::FORCE_LOCAL_REASON.to_string(),
+            Self::ConflictingForceFlags => Self::CONFLICT_REASON.to_string(),
+            Self::NotAllowlisted(base) => {
+                format!("command '{base}' {}", Self::NOT_ALLOWLISTED_SUFFIX)
+            }
+        }
+    }
+
+    /// Whether this policy is an explicit operator instruction that outranks a
+    /// `RCH_REQUIRE_REMOTE=1` baked into a generic interceptor (the shim).
+    ///
+    /// `RCH_REQUIRE_REMOTE` exists to stop *silent* local fallback. A
+    /// configured, announced `force_local` is neither silent nor a fallback.
+    /// The allowlist is different: it is a capability gate, and under a strict
+    /// remote policy a non-allowlisted command is refused rather than run.
+    pub(crate) fn overrides_require_remote(self) -> bool {
+        !matches!(self, Self::NotAllowlisted(_))
+    }
+
+    /// Whether `reason` was produced by [`Self::reason`]. Policy refusals are
+    /// permanent for the invocation, never retryable.
+    fn is_policy_reason(reason: &str) -> bool {
+        matches!(
+            reason,
+            Self::DISABLED_REASON | Self::FORCE_LOCAL_REASON | Self::CONFLICT_REASON
+        ) || (reason.starts_with("command '") && reason.ends_with(Self::NOT_ALLOWLISTED_SUFFIX))
+    }
+}
+
+/// Evaluate the config-driven local policy for a command of `kind`.
+///
+/// Returns `None` when config permits offload. Explicit job admission
+/// (`rch exec --job`) bypasses the allowlist — there is no allowlist entry for
+/// an arbitrary job — but still honors `enabled` / `force_local`.
+pub(crate) fn config_local_policy(
+    config: &rch_common::RchConfig,
+    kind: Option<CompilationKind>,
+) -> Option<ConfigLocalPolicy> {
+    if !config.general.enabled {
+        return Some(ConfigLocalPolicy::Disabled);
+    }
+    if config.general.force_local && config.general.force_remote {
+        return Some(ConfigLocalPolicy::ConflictingForceFlags);
+    }
+    if config.general.force_local {
+        return Some(ConfigLocalPolicy::ForceLocal);
+    }
+    match kind {
+        Some(CompilationKind::Job) | None => None,
+        Some(kind) => {
+            let base = kind.command_base();
+            (!config.execution.is_allowed(base)).then_some(ConfigLocalPolicy::NotAllowlisted(base))
+        }
     }
 }
 
@@ -2048,6 +2135,29 @@ pub async fn run_exec(
         }
     };
 
+    // Issue #55: honor the same config knobs the hook honors, so
+    // `general.force_local` / `general.enabled` / `execution.allowlist` mean the
+    // same thing whether a build arrives via the hook, the cargo shim, or an
+    // explicit `rch exec`. Explicit config outranks the shim's baked
+    // RCH_REQUIRE_REMOTE=1, but never a mode whose guarantee cannot be met by
+    // a local run (clean overlay, source-content receipt).
+    if let Some(policy) = config_local_policy(&config, classification.kind) {
+        let reporter = HookReporter::new(config.output.visibility);
+        let reason = policy.reason();
+        let refuse_local = if policy.overrides_require_remote() {
+            clean_overlay || source_content_receipt
+        } else {
+            require_remote || role_requires_remote(config.general.role)
+        };
+        if policy.overrides_require_remote() && require_remote && !refuse_local {
+            warn!("RCH_REQUIRE_REMOTE is set but config says {reason}; running locally per config");
+        }
+        if !refuse_local {
+            reporter.summary(&format!("[RCH] local ({reason})"));
+        }
+        exit_with_local_fallback(&command, &reporter, &reason, refuse_local);
+    }
+
     // bd-wywsj: a dispatcher box defaults offloadable builds to
     // fail-closed + queue — box policy, not a per-call env. Explicit
     // env (even RCH_REQUIRE_REMOTE=0) remains the per-call override.
@@ -2455,6 +2565,7 @@ pub async fn run_exec(
             source_content_receipt,
             &result_dirs,
             &layer0_env,
+            config.remediation.pooled_target.reaper_pooled_idle_hours,
         )
         .await;
         let remote_elapsed = remote_start.elapsed();
@@ -3243,9 +3354,20 @@ async fn process_hook(input: HookInput) -> HookOutput {
         // fallback (a silent rustc/cc storm). Only loads config on this rare
         // path to avoid touching the hot non-compilation path.
         if let Some(structure_reason) = declined_compilation_due_to_structure(command) {
-            let force_remote = load_config()
+            let config = load_config().ok();
+            let force_remote = config
+                .as_ref()
                 .map(|cfg| cfg.general.force_remote)
                 .unwrap_or(false);
+            // Issue #50: `cargo build ; cargo test` and `cargo build || ...`
+            // compile locally. That is deliberate, but it must be VISIBLE —
+            // a build the agent believes was offloaded is the exact failure
+            // the `[RCH]` summary contract exists to prevent.
+            let visibility = config
+                .as_ref()
+                .map(|cfg| cfg.output.visibility)
+                .unwrap_or(OutputVisibility::Summary);
+            HookReporter::new(visibility).summary(&format!("[RCH] local ({structure_reason})"));
             if force_remote {
                 warn!(
                     "⚠️ RCH: declined to offload compilation command due to shell structure \
@@ -3340,7 +3462,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
                 command_base
             );
             reporter.summary(&format!(
-                "[RCH] local (command '{}' not in allowlist)",
+                "[RCH] local (command '{}' not in execution.allowlist)",
                 command_base
             ));
             return HookOutput::allow();
@@ -3370,7 +3492,14 @@ async fn process_hook(input: HookInput) -> HookOutput {
         &classification.command_prefix,
         &classification.extracted_command,
     ) {
-        // Compound command: preserve prefix, wrap only the compilation part
+        // Compound command: the classifier has already wrapped every earlier
+        // compilation segment inside `prefix` (issue #50); wrap the final one.
+        // Build-looking segments it could NOT offload stay local — say so.
+        for segment in rch_common::compound_local_compilation_segments(command) {
+            reporter.summary(&format!(
+                "[RCH] local (compound segment not offloadable: '{segment}')"
+            ));
+        }
         format!("{}rch exec -- {}", prefix, extracted)
     } else {
         // Simple command: wrap the entire command
@@ -3449,6 +3578,7 @@ async fn handle_selection_response(
         false,
         &[],
         &[],
+        config.remediation.pooled_target.reaper_pooled_idle_hours,
     )
     .await;
     let remote_elapsed = remote_start.elapsed();

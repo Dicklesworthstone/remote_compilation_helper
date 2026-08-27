@@ -18,7 +18,7 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root";
+const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root";
 
 fn print_file_validation(
     label: &str,
@@ -131,6 +131,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 bun_timeout_sec: config.compilation.bun_timeout_sec,
                 external_timeout_enabled: config.compilation.external_timeout_enabled,
                 allow_local_fallback: config.compilation.allow_local_fallback,
+                remote_build_jobs: config.compilation.remote_build_jobs.to_string(),
             },
             transfer: ConfigTransferSection {
                 compression_level: config.transfer.compression_level,
@@ -336,6 +337,15 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         format_with_source(
             "compilation.allow_local_fallback",
             &style.value(&config.compilation.allow_local_fallback.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("remote_build_jobs"),
+        format_with_source(
+            "compilation.remote_build_jobs",
+            &style.value(&config.compilation.remote_build_jobs.to_string()),
             &value_sources
         )
     );
@@ -718,6 +728,12 @@ pub(super) fn collect_value_sources(
         &mut values,
         "compilation.allow_local_fallback",
         config.compilation.allow_local_fallback.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "compilation.remote_build_jobs",
+        config.compilation.remote_build_jobs.to_string(),
         sources,
     );
     push_value_source(
@@ -1122,6 +1138,16 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
         "compilation.allow_local_fallback" => {
             config.compilation.allow_local_fallback = parse_bool(value, key)?;
         }
+        "compilation.remote_build_jobs" => {
+            config.compilation.remote_build_jobs = rch_common::RemoteBuildJobs::parse(value)
+                .map_err(|reason| ConfigError::InvalidValue {
+                    field: key.to_string(),
+                    reason,
+                    suggestion:
+                        "Use `auto` (derive from worker cores/RAM), `off`, or a positive job count"
+                            .to_string(),
+                })?;
+        }
         "transfer.compression_level" => {
             let level = parse_u32(value, key)?;
             if level > 19 {
@@ -1284,6 +1310,10 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
         "compilation.allow_local_fallback" => {
             config.compilation.allow_local_fallback = defaults.compilation.allow_local_fallback;
             config.compilation.allow_local_fallback.to_string()
+        }
+        "compilation.remote_build_jobs" => {
+            config.compilation.remote_build_jobs = defaults.compilation.remote_build_jobs;
+            config.compilation.remote_build_jobs.to_string()
         }
         "transfer.compression_level" => {
             config.transfer.compression_level = defaults.transfer.compression_level;
@@ -1478,6 +1508,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                         "bun_timeout_sec": config.compilation.bun_timeout_sec,
                         "external_timeout_enabled": config.compilation.external_timeout_enabled,
                         "allow_local_fallback": config.compilation.allow_local_fallback,
+                        "remote_build_jobs": config.compilation.remote_build_jobs,
                     },
                     "transfer": {
                         "compression_level": config.transfer.compression_level,
@@ -2006,6 +2037,12 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
         config.compilation.allow_local_fallback,
         defaults.compilation.allow_local_fallback,
         "compilation.allow_local_fallback"
+    );
+    diff_field!(
+        "compilation.remote_build_jobs",
+        config.compilation.remote_build_jobs,
+        defaults.compilation.remote_build_jobs,
+        "compilation.remote_build_jobs"
     );
 
     // Transfer section

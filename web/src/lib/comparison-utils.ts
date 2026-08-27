@@ -86,7 +86,8 @@ export function filterWorkersByStatus(
   workers: WorkerStatusInfo[],
   statuses: WorkerStatusInfo['status'][]
 ): WorkerStatusInfo[] {
-  return workers.filter((w) => statuses.includes(w.status));
+  const statusSet = new Set(statuses);
+  return workers.filter((w) => statusSet.has(w.status));
 }
 
 /**

@@ -455,10 +455,331 @@ pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
     Ok(())
 }
 
+/// How `rch daemon stop|restart` treats in-flight work (issue #54).
+///
+/// The daemon refuses `POST /shutdown` while admission is open or builds are
+/// active/queued (`shutdown_blocked`), so a stop must first raise the
+/// admission barrier and then either wait for the work to finish (`drain`) or
+/// deliberately interrupt it (`force`). Neither happens implicitly: `yes`
+/// only skips the interactive confirmation, it never authorises interrupting
+/// someone else's build.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StopOptions {
+    /// Skip the interactive confirmation prompt.
+    pub yes: bool,
+    /// Close admission and wait for active/queued builds to finish first.
+    pub drain: bool,
+    /// Upper bound for `drain`, in seconds (0 = no waiting, just close
+    /// admission and re-check once).
+    pub drain_timeout_secs: u64,
+    /// Interrupt active builds (after the drain window, if `drain` is set).
+    pub force: bool,
+}
+
+/// In-flight work the daemon reported when asked about admission.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DaemonWorkload {
+    active_build_ids: Vec<u64>,
+    queued_build_ids: Vec<u64>,
+    client_lease_ids: Vec<String>,
+    client_lease_scan_error: Option<String>,
+}
+
+impl DaemonWorkload {
+    fn from_admission(response: RestartAdmissionResponse) -> Self {
+        Self {
+            active_build_ids: response.active_build_ids,
+            queued_build_ids: response.queued_build_ids,
+            client_lease_ids: response.client_lease_ids,
+            client_lease_scan_error: response.client_lease_scan_error,
+        }
+    }
+
+    /// True when stopping now interrupts nothing. A lease-scan failure counts
+    /// as busy: the zero-state proof is unprovable, so fail closed.
+    fn is_idle(&self) -> bool {
+        self.active_build_ids.is_empty()
+            && self.queued_build_ids.is_empty()
+            && self.client_lease_ids.is_empty()
+            && self.client_lease_scan_error.is_none()
+    }
+
+    fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.active_build_ids.is_empty() {
+            parts.push(format!("active builds {:?}", self.active_build_ids));
+        }
+        if !self.queued_build_ids.is_empty() {
+            parts.push(format!("queued builds {:?}", self.queued_build_ids));
+        }
+        if !self.client_lease_ids.is_empty() {
+            parts.push(format!("client leases {:?}", self.client_lease_ids));
+        }
+        if let Some(error) = &self.client_lease_scan_error {
+            parts.push(format!("lease scan failed: {error}"));
+        }
+        if parts.is_empty() {
+            "idle".to_string()
+        } else {
+            parts.join("; ")
+        }
+    }
+}
+
+/// What a stop/restart should do given the daemon's workload and the flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopDecision {
+    /// Nothing in flight: shut down now.
+    Proceed,
+    /// Close admission and wait for the workload to finish.
+    Drain,
+    /// Interrupt the in-flight work (operator asked for `--force`).
+    Interrupt,
+    /// Refuse: work is in flight and neither `--drain` nor `--force` was given.
+    Refuse,
+}
+
+fn decide_stop_action(workload: &DaemonWorkload, opts: &StopOptions) -> StopDecision {
+    if workload.is_idle() {
+        StopDecision::Proceed
+    } else if opts.drain {
+        StopDecision::Drain
+    } else if opts.force {
+        StopDecision::Interrupt
+    } else {
+        StopDecision::Refuse
+    }
+}
+
+/// Outcome of the drain wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DrainOutcome {
+    Drained,
+    TimedOut(DaemonWorkload),
+}
+
+/// Response to `POST /shutdown`: either `shutting_down` or `shutdown_blocked`
+/// with the work that blocked it.
+#[derive(Debug, Deserialize)]
+struct ShutdownApiResponse {
+    status: String,
+    #[serde(default)]
+    active_build_ids: Vec<u64>,
+    #[serde(default)]
+    queued_build_ids: Vec<u64>,
+}
+
+fn parse_admission_response(response: &str) -> Result<RestartAdmissionResponse> {
+    let body = extract_json_body(response).context("admission response was missing JSON")?;
+    serde_json::from_str(body).context("admission response was malformed")
+}
+
+/// Raise the admission barrier (stop the daemon accepting new builds) and
+/// return the workload it reported.
+async fn close_admission() -> Result<DaemonWorkload> {
+    let response = send_daemon_command("POST /restart-admission\n")
+        .await
+        .context("daemon did not acknowledge the admission barrier")?;
+    Ok(DaemonWorkload::from_admission(parse_admission_response(
+        &response,
+    )?))
+}
+
+/// Snapshot the workload without touching the barrier.
+async fn fetch_workload() -> Result<DaemonWorkload> {
+    let response = send_daemon_command("GET /restart-admission\n")
+        .await
+        .context("daemon did not answer the admission status query")?;
+    Ok(DaemonWorkload::from_admission(parse_admission_response(
+        &response,
+    )?))
+}
+
+/// Reopen admission after a refused/aborted stop. A closed barrier makes the
+/// daemon refuse every worker selection, so every failure path must call
+/// this; best-effort, the caller's own error still surfaces.
+async fn release_admission() {
+    if let Err(error) = send_daemon_command("POST /restart-admission/release\n").await {
+        tracing::warn!(
+            "failed to release the admission barrier after an aborted stop: {error}; \
+             worker selection may refuse builds until `POST /restart-admission/release` succeeds"
+        );
+    }
+}
+
+/// Wait (admission already closed) until the daemon is idle or the timeout
+/// elapses. Polls once per second; the barrier is left closed on success and
+/// released on timeout.
+async fn drain_until_idle(
+    timeout: std::time::Duration,
+    ctx: &OutputContext,
+) -> Result<DrainOutcome> {
+    let started = std::time::Instant::now();
+    let mut last_report: Option<String> = None;
+    loop {
+        let workload = fetch_workload().await?;
+        if workload.is_idle() {
+            return Ok(DrainOutcome::Drained);
+        }
+        if started.elapsed() >= timeout {
+            release_admission().await;
+            return Ok(DrainOutcome::TimedOut(workload));
+        }
+        if !ctx.is_json() {
+            let report = workload.describe();
+            if last_report.as_deref() != Some(report.as_str()) {
+                println!(
+                    "  {} draining: waiting for {} ({}s left)",
+                    StatusIndicator::Info.display(ctx.theme()),
+                    report,
+                    timeout.saturating_sub(started.elapsed()).as_secs()
+                );
+                last_report = Some(report);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// Emit a refusal in the active output mode and return the error that makes
+/// the process exit non-zero. In JSON mode the structured error is printed
+/// here (with the blocking ids in `details`) and the process exits directly,
+/// so the top-level handler cannot re-render it as an internal-state error.
+fn refuse_stop(
+    command: &str,
+    code: ErrorCode,
+    message: &str,
+    workload: &DaemonWorkload,
+    remediation: &[&str],
+    ctx: &OutputContext,
+) -> anyhow::Error {
+    let details = workload.describe();
+    if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::<()>::err(
+            command,
+            ApiError::new(code, message)
+                .with_details(details)
+                .with_context(
+                    "active_build_ids",
+                    serde_json::to_string(&workload.active_build_ids).unwrap_or_default(),
+                )
+                .with_context(
+                    "queued_build_ids",
+                    serde_json::to_string(&workload.queued_build_ids).unwrap_or_default(),
+                )
+                .with_remediation(remediation.iter().copied()),
+        ));
+        std::process::exit(1);
+    }
+    // Text mode: the message itself is carried by the returned error (the
+    // top-level handler prints it); only the evidence and remediation go here.
+    let style = ctx.theme();
+    println!("  {} {}", style.key("In flight"), details);
+    for step in remediation {
+        println!(
+            "  {} {}",
+            StatusIndicator::Info.display(style),
+            style.highlight(step)
+        );
+    }
+    anyhow::anyhow!("{message}: {details}")
+}
+
+/// Ask the running daemon for its PID via `GET /status`.
+async fn daemon_pid() -> Option<u32> {
+    let response = send_daemon_command("GET /status\n").await.ok()?;
+    let json = extract_json_body(&response)?;
+    serde_json::from_str::<crate::status_types::DaemonFullStatusResponse>(json)
+        .ok()
+        .map(|status| status.daemon.pid)
+}
+
+/// Interrupt in-flight builds by terminating the daemon process. The socket
+/// API refuses to shut down while builds are active by design, so a forced
+/// stop has to go through the OS — but to the daemon's own PID, never a
+/// name match that could hit an unrelated process.
+async fn terminate_daemon_process(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let output = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output()
+            .await
+            .context("failed to run kill")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "kill -TERM {pid} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        anyhow::bail!("forced stop is not supported on this platform; use --drain");
+    }
+}
+
+/// Whether a process with this PID still exists (signal 0 probe).
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Wait up to ~`attempts` x 100ms for the daemon socket to disappear.
+async fn wait_for_socket_gone(socket_path: &Path, attempts: u32) -> bool {
+    for _ in 0..attempts {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if !socket_path.exists() {
+            return true;
+        }
+    }
+    false
+}
+
+fn report_stopped(
+    command: &str,
+    action: &str,
+    socket_path_str: &str,
+    how: &str,
+    ctx: &OutputContext,
+) {
+    if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok(
+            command,
+            DaemonActionResponse {
+                action: action.to_string(),
+                success: true,
+                socket_path: socket_path_str.to_string(),
+                message: Some(how.to_string()),
+            },
+        ));
+    } else {
+        println!(
+            "{}",
+            StatusIndicator::Success.with_label(ctx.theme(), "Daemon stopped.")
+        );
+    }
+}
+
 /// Stop the daemon.
 ///
-/// If `skip_confirm` is false and there are active builds, prompts for confirmation.
-pub async fn daemon_stop(skip_confirm: bool, ctx: &OutputContext) -> Result<()> {
+/// Raises the admission barrier, then shuts down only when nothing is in
+/// flight — or after `--drain` waited for it, or when `--force` explicitly
+/// authorised interrupting it. `-y` alone never interrupts a build.
+pub async fn daemon_stop(opts: StopOptions, ctx: &OutputContext) -> Result<()> {
     use dialoguer::Confirm;
 
     let style = ctx.theme();
@@ -486,167 +807,325 @@ pub async fn daemon_stop(skip_confirm: bool, ctx: &OutputContext) -> Result<()> 
         return Ok(());
     }
 
-    // Check for active builds and prompt for confirmation
-    if !skip_confirm
-        && !ctx.is_json()
-        && let Ok(response) = send_daemon_command("GET /status\n").await
-        && let Some(json) = extract_json_body(&response)
-        && let Ok(status) =
-            serde_json::from_str::<crate::status_types::DaemonFullStatusResponse>(json)
-    {
-        let active_count = status.active_builds.len();
-        if active_count > 0 {
+    // Raise the admission barrier first: /shutdown is refused while admission
+    // is open, and closing it is what stops new builds landing mid-stop.
+    let workload = match close_admission().await {
+        Ok(workload) => workload,
+        Err(error) => {
+            // No usable API (stale socket, wedged daemon). Fall back to the
+            // legacy process-level stop rather than leaving a stale socket.
+            return stop_unresponsive_daemon(socket_path, &socket_path_str, error, ctx).await;
+        }
+    };
+
+    let mut decision = decide_stop_action(&workload, &opts);
+    if decision == StopDecision::Drain {
+        if !ctx.is_json() {
             println!(
-                "{} {} active build(s) will be interrupted.",
-                StatusIndicator::Warning.display(style),
-                style.highlight(&active_count.to_string())
+                "{} Admission closed; draining {} (timeout {}s)...",
+                StatusIndicator::Info.display(style),
+                workload.describe(),
+                opts.drain_timeout_secs
             );
-            let confirmed = Confirm::new()
-                .with_prompt("Stop the daemon anyway?")
-                .default(false)
-                .interact()?;
-            if !confirmed {
-                println!("{} Aborted.", StatusIndicator::Info.display(style));
-                return Ok(());
+        }
+        match drain_until_idle(std::time::Duration::from_secs(opts.drain_timeout_secs), ctx).await?
+        {
+            DrainOutcome::Drained => decision = StopDecision::Proceed,
+            DrainOutcome::TimedOut(remaining) => {
+                if opts.force {
+                    // Barrier was released by the timeout path; close it
+                    // again so nothing new lands while we interrupt.
+                    let _ = close_admission().await;
+                    decision = StopDecision::Interrupt;
+                } else {
+                    return Err(refuse_stop(
+                        "daemon stop",
+                        ErrorCode::CancelTimeoutExceeded,
+                        &format!(
+                            "drain timed out after {}s; daemon left running with admission reopened",
+                            opts.drain_timeout_secs
+                        ),
+                        &remaining,
+                        &[
+                            "rch daemon stop --drain --drain-timeout <more seconds>",
+                            "rch daemon stop --force   # interrupts the listed builds",
+                        ],
+                        ctx,
+                    ));
+                }
             }
         }
+    }
+
+    match decision {
+        StopDecision::Refuse => {
+            release_admission().await;
+            return Err(refuse_stop(
+                "daemon stop",
+                ErrorCode::WorkerAtCapacity,
+                "refusing to stop: builds are in flight (pass --drain to wait or --force to interrupt)",
+                &workload,
+                &[
+                    "rch daemon stop --drain [--drain-timeout N]",
+                    "rch daemon stop --force",
+                ],
+                ctx,
+            ));
+        }
+        StopDecision::Interrupt => {
+            if !opts.yes && !ctx.is_json() {
+                println!(
+                    "{} {} will be interrupted.",
+                    StatusIndicator::Warning.display(style),
+                    style.highlight(&workload.describe())
+                );
+                let confirmed = Confirm::new()
+                    .with_prompt("Stop the daemon anyway?")
+                    .default(false)
+                    .interact()?;
+                if !confirmed {
+                    release_admission().await;
+                    println!("{} Aborted.", StatusIndicator::Info.display(style));
+                    return Ok(());
+                }
+            }
+            if !ctx.is_json() {
+                println!("Stopping RCH daemon (interrupting in-flight builds)...");
+            }
+            let Some(pid) = daemon_pid().await else {
+                release_admission().await;
+                anyhow::bail!("could not determine the daemon PID for a forced stop");
+            };
+            if let Err(error) = terminate_daemon_process(pid).await {
+                release_admission().await;
+                return Err(error);
+            }
+            let socket_gone = wait_for_socket_gone(socket_path, 100).await;
+            // A daemon that died without its shutdown path (no signal handler
+            // engaged) leaves the socket file behind; treat a dead PID with a
+            // lingering socket as stopped and clear the stale socket.
+            if socket_gone || !process_alive(pid) {
+                if !socket_gone {
+                    let _ = tokio::fs::remove_file(socket_path).await;
+                }
+                report_stopped(
+                    "daemon stop",
+                    "stop",
+                    &socket_path_str,
+                    "Daemon stopped (forced; in-flight builds interrupted)",
+                    ctx,
+                );
+                return Ok(());
+            }
+            release_admission().await;
+            anyhow::bail!("sent SIGTERM to daemon pid {pid} but it is still running");
+        }
+        StopDecision::Proceed => {}
+        StopDecision::Drain => unreachable!("drain resolves to Proceed or Interrupt above"),
     }
 
     if !ctx.is_json() {
         println!("Stopping RCH daemon...");
     }
 
-    // Try graceful shutdown via socket
-    match send_daemon_command("POST /shutdown\n").await {
-        Ok(_) => {
-            // Wait for socket to disappear
-            for _ in 0..10 {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if !socket_path.exists() {
-                    if ctx.is_json() {
-                        let _ = ctx.json(&ApiResponse::ok(
-                            "daemon stop",
-                            DaemonActionResponse {
-                                action: "stop".to_string(),
-                                success: true,
-                                socket_path: socket_path_str.clone(),
-                                message: Some("Daemon stopped".to_string()),
-                            },
-                        ));
-                    } else {
-                        println!(
-                            "{}",
-                            StatusIndicator::Success.with_label(style, "Daemon stopped.")
-                        );
-                    }
-                    return Ok(());
-                }
-            }
-            if ctx.is_json() {
-                let _ = ctx.json(&ApiResponse::ok(
-                    "daemon stop",
-                    DaemonActionResponse {
-                        action: "stop".to_string(),
-                        success: false,
-                        socket_path: socket_path_str.clone(),
-                        message: Some("Daemon may still be shutting down".to_string()),
-                    },
-                ));
-            } else {
-                println!(
-                    "{} Daemon may still be shutting down...",
-                    StatusIndicator::Warning.display(style)
-                );
-            }
+    let response = match send_daemon_command("POST /shutdown\n").await {
+        Ok(response) => response,
+        Err(error) => {
+            return stop_unresponsive_daemon(socket_path, &socket_path_str, error, ctx).await;
         }
-        Err(_) => {
+    };
+    let parsed = extract_json_body(&response)
+        .and_then(|json| serde_json::from_str::<ShutdownApiResponse>(json).ok());
+    match parsed {
+        Some(shutdown) if shutdown.status == "shutdown_blocked" => {
+            // A build was admitted between our barrier and the shutdown (or
+            // the barrier is not ours). Report exactly what blocked it.
+            release_admission().await;
+            let blocked = DaemonWorkload {
+                active_build_ids: shutdown.active_build_ids,
+                queued_build_ids: shutdown.queued_build_ids,
+                ..Default::default()
+            };
+            return Err(refuse_stop(
+                "daemon stop",
+                ErrorCode::WorkerAtCapacity,
+                "daemon refused to shut down: builds are in flight",
+                &blocked,
+                &[
+                    "rch daemon stop --drain [--drain-timeout N]",
+                    "rch daemon stop --force",
+                ],
+                ctx,
+            ));
+        }
+        _ => {}
+    }
+
+    if wait_for_socket_gone(socket_path, 50).await {
+        report_stopped(
+            "daemon stop",
+            "stop",
+            &socket_path_str,
+            "Daemon stopped",
+            ctx,
+        );
+        return Ok(());
+    }
+
+    if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok(
+            "daemon stop",
+            DaemonActionResponse {
+                action: "stop".to_string(),
+                success: false,
+                socket_path: socket_path_str.clone(),
+                message: Some(
+                    "Daemon acknowledged shutdown but its socket is still present".to_string(),
+                ),
+            },
+        ));
+    } else {
+        println!(
+            "{} Daemon acknowledged shutdown but may still be shutting down...",
+            StatusIndicator::Warning.display(style)
+        );
+    }
+    Ok(())
+}
+
+/// Legacy stop for a daemon that no longer answers its socket: terminate by
+/// process name and clear the stale socket. Only reached when the API is
+/// unusable, so there is no workload to protect.
+async fn stop_unresponsive_daemon(
+    socket_path: &Path,
+    socket_path_str: &str,
+    api_error: anyhow::Error,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let style = ctx.theme();
+    if !ctx.is_json() {
+        println!(
+            "{} Daemon did not answer its socket ({api_error:#}).",
+            StatusIndicator::Warning.display(style)
+        );
+        println!("Attempting to find and kill daemon process...");
+    }
+
+    let output = Command::new("pkill").arg("-f").arg("rchd").output().await;
+    match output {
+        Ok(o) if o.status.success() => {
+            // Remove stale socket
+            let _ = tokio::fs::remove_file(socket_path).await;
+            report_stopped(
+                "daemon stop",
+                "stop",
+                socket_path_str,
+                "Daemon stopped via pkill",
+                ctx,
+            );
+            Ok(())
+        }
+        _ => {
             if ctx.is_json() {
                 let _ = ctx.json(&ApiResponse::<()>::err(
                     "daemon stop",
-                    ApiError::internal("Could not send shutdown command"),
+                    ApiError::internal("Could not stop daemon"),
                 ));
             } else {
                 println!(
-                    "{} Could not send shutdown command.",
-                    StatusIndicator::Warning.display(style)
+                    "{} Could not stop daemon. You may need to kill it manually.",
+                    StatusIndicator::Error.display(style)
                 );
-                println!("Attempting to find and kill daemon process...");
+                println!(
+                    "  {} Try: {}",
+                    StatusIndicator::Info.display(style),
+                    style.highlight("pkill -9 rchd")
+                );
             }
-
-            // Try pkill
-            let output = Command::new("pkill").arg("-f").arg("rchd").output().await;
-
-            match output {
-                Ok(o) if o.status.success() => {
-                    // Remove stale socket
-                    let _ = tokio::fs::remove_file(socket_path).await;
-                    if ctx.is_json() {
-                        let _ = ctx.json(&ApiResponse::ok(
-                            "daemon stop",
-                            DaemonActionResponse {
-                                action: "stop".to_string(),
-                                success: true,
-                                socket_path: socket_path_str.clone(),
-                                message: Some("Daemon stopped via pkill".to_string()),
-                            },
-                        ));
-                    } else {
-                        println!(
-                            "{}",
-                            StatusIndicator::Success.with_label(style, "Daemon stopped.")
-                        );
-                    }
-                }
-                _ => {
-                    if ctx.is_json() {
-                        let _ = ctx.json(&ApiResponse::<()>::err(
-                            "daemon stop",
-                            ApiError::internal("Could not stop daemon"),
-                        ));
-                    } else {
-                        println!(
-                            "{} Could not stop daemon. You may need to kill it manually.",
-                            StatusIndicator::Error.display(style)
-                        );
-                        println!(
-                            "  {} Try: {}",
-                            StatusIndicator::Info.display(style),
-                            style.highlight("pkill -9 rchd")
-                        );
-                    }
-                }
-            }
+            Ok(())
         }
     }
-
-    Ok(())
 }
 
 /// Restart the daemon.
 ///
-/// If `skip_confirm` is false and there are active builds, prompts for confirmation.
-pub async fn daemon_restart(skip_confirm: bool, ctx: &OutputContext) -> Result<()> {
+/// Same in-flight contract as [`daemon_stop`]: refuse while builds are in
+/// flight unless `--drain` waits them out or `--force` interrupts them.
+pub async fn daemon_restart(opts: StopOptions, ctx: &OutputContext) -> Result<()> {
     use dialoguer::Confirm;
 
     let style = ctx.theme();
-
-    // Check for active builds and prompt for confirmation before restarting
     let socket_path_str = configured_socket_path()?;
     let socket_path = Path::new(&socket_path_str);
-    if !skip_confirm
-        && !ctx.is_json()
-        && socket_path.exists()
-        && let Ok(response) = send_daemon_command("GET /status\n").await
-        && let Some(json) = extract_json_body(&response)
-        && let Ok(status) =
-            serde_json::from_str::<crate::status_types::DaemonFullStatusResponse>(json)
+
+    // Establish the in-flight contract while the daemon is still reachable.
+    // `admission_proven` records that the barrier is closed AND the daemon
+    // was proven idle, which is the precondition `require_restart_admission`
+    // otherwise establishes (it cannot be re-run after a drain: the barrier
+    // is already closed, so it would refuse and release it).
+    let mut interrupting = false;
+    let mut admission_proven = false;
+    if socket_path.exists()
+        && let Ok(workload) = fetch_workload().await
     {
-        let active_count = status.active_builds.len();
-        if active_count > 0 {
+        match decide_stop_action(&workload, &opts) {
+            StopDecision::Proceed => {}
+            StopDecision::Drain => {
+                close_admission().await?;
+                if !ctx.is_json() {
+                    println!(
+                        "{} Admission closed; draining {} (timeout {}s)...",
+                        StatusIndicator::Info.display(style),
+                        workload.describe(),
+                        opts.drain_timeout_secs
+                    );
+                }
+                match drain_until_idle(std::time::Duration::from_secs(opts.drain_timeout_secs), ctx)
+                    .await?
+                {
+                    DrainOutcome::Drained => admission_proven = true,
+                    DrainOutcome::TimedOut(remaining) => {
+                        if opts.force {
+                            interrupting = true;
+                        } else {
+                            return Err(refuse_stop(
+                                "daemon restart",
+                                ErrorCode::CancelTimeoutExceeded,
+                                &format!(
+                                    "drain timed out after {}s; daemon left running with admission reopened",
+                                    opts.drain_timeout_secs
+                                ),
+                                &remaining,
+                                &[
+                                    "rch daemon restart --drain --drain-timeout <more seconds>",
+                                    "rch daemon restart --force   # interrupts the listed builds",
+                                ],
+                                ctx,
+                            ));
+                        }
+                    }
+                }
+            }
+            StopDecision::Interrupt => interrupting = true,
+            StopDecision::Refuse => {
+                return Err(refuse_stop(
+                    "daemon restart",
+                    ErrorCode::WorkerAtCapacity,
+                    "refusing to restart: builds are in flight (pass --drain to wait or --force to interrupt)",
+                    &workload,
+                    &[
+                        "rch daemon restart --drain [--drain-timeout N]",
+                        "rch daemon restart --force",
+                    ],
+                    ctx,
+                ));
+            }
+        }
+        if interrupting && !opts.yes && !ctx.is_json() {
             println!(
-                "{} {} active build(s) will be interrupted.",
+                "{} {} will be interrupted.",
                 StatusIndicator::Warning.display(style),
-                style.highlight(&active_count.to_string())
+                style.highlight(&workload.describe())
             );
             let confirmed = Confirm::new()
                 .with_prompt("Restart the daemon anyway?")
@@ -659,7 +1138,7 @@ pub async fn daemon_restart(skip_confirm: bool, ctx: &OutputContext) -> Result<(
         }
     }
 
-    if socket_path.exists() {
+    if socket_path.exists() && !interrupting && !admission_proven {
         require_restart_admission().await?;
     }
 
@@ -730,7 +1209,16 @@ pub async fn daemon_restart(skip_confirm: bool, ctx: &OutputContext) -> Result<(
 
     // Manual path: user-launched daemon (no unit) and macOS launchd hosts.
     // Pass true for skip_confirm since we already prompted above.
-    daemon_stop(true, ctx).await?;
+    daemon_stop(
+        StopOptions {
+            yes: true,
+            drain: false,
+            drain_timeout_secs: 0,
+            force: interrupting,
+        },
+        ctx,
+    )
+    .await?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     daemon_start(ctx).await?;
     Ok(())
@@ -1069,6 +1557,102 @@ mod tests {
             SystemdUnitScope::System.systemctl_scope_args().is_empty(),
             "system-scope restart must use the default (system) systemd manager"
         );
+    }
+
+    fn busy_workload() -> DaemonWorkload {
+        DaemonWorkload {
+            active_build_ids: vec![41, 42],
+            queued_build_ids: vec![43],
+            client_lease_ids: Vec::new(),
+            client_lease_scan_error: None,
+        }
+    }
+
+    /// Issue #54: `-y` alone must never interrupt in-flight builds.
+    #[test]
+    fn stop_with_yes_alone_refuses_while_builds_are_in_flight() {
+        let _guard = test_guard!();
+        let opts = StopOptions {
+            yes: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_stop_action(&busy_workload(), &opts),
+            StopDecision::Refuse
+        );
+        assert_eq!(
+            decide_stop_action(&DaemonWorkload::default(), &opts),
+            StopDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn stop_drain_takes_precedence_over_force_and_force_alone_interrupts() {
+        let _guard = test_guard!();
+        let both = StopOptions {
+            drain: true,
+            force: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_stop_action(&busy_workload(), &both),
+            StopDecision::Drain
+        );
+        let force = StopOptions {
+            force: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_stop_action(&busy_workload(), &force),
+            StopDecision::Interrupt
+        );
+    }
+
+    /// A failed lease scan makes idleness unprovable, so it must count as busy.
+    #[test]
+    fn workload_with_lease_scan_error_is_not_idle() {
+        let _guard = test_guard!();
+        let workload = DaemonWorkload {
+            client_lease_scan_error: Some("permission denied".to_string()),
+            ..Default::default()
+        };
+        assert!(!workload.is_idle());
+        assert!(workload.describe().contains("lease scan failed"));
+        let leases = DaemonWorkload {
+            client_lease_ids: vec!["lease-1".to_string()],
+            ..Default::default()
+        };
+        assert!(!leases.is_idle());
+        assert_eq!(DaemonWorkload::default().describe(), "idle");
+    }
+
+    #[test]
+    fn shutdown_blocked_response_parses_blocking_ids() {
+        let _guard = test_guard!();
+        let response = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"shutdown_blocked\",\"admission_closed\":true,\"active_build_ids\":[7],\"queued_build_ids\":[8,9]}\n";
+        let json = extract_json_body(response).unwrap().trim();
+        let parsed: ShutdownApiResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.status, "shutdown_blocked");
+        assert_eq!(parsed.active_build_ids, vec![7]);
+        assert_eq!(parsed.queued_build_ids, vec![8, 9]);
+
+        let ok = "HTTP/1.0 200 OK\r\n\r\n{\"status\":\"shutting_down\"}\n";
+        let parsed: ShutdownApiResponse =
+            serde_json::from_str(extract_json_body(ok).unwrap().trim()).unwrap();
+        assert_eq!(parsed.status, "shutting_down");
+        assert!(parsed.active_build_ids.is_empty());
+    }
+
+    #[test]
+    fn admission_response_maps_to_workload() {
+        let _guard = test_guard!();
+        let response = "HTTP/1.0 200 OK\r\n\r\n{\"admission_closed\":true,\"restart_permitted\":false,\"active_build_ids\":[1],\"queued_build_ids\":[],\"client_lease_ids\":[\"l1\"]}\n";
+        let admission = parse_admission_response(response).unwrap();
+        assert!(!admission.restart_permitted);
+        let workload = DaemonWorkload::from_admission(admission);
+        assert_eq!(workload.active_build_ids, vec![1]);
+        assert_eq!(workload.client_lease_ids, vec!["l1".to_string()]);
+        assert!(!workload.is_idle());
     }
 
     #[cfg(not(target_os = "linux"))]

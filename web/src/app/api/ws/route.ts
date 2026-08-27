@@ -3,6 +3,7 @@ import { type NextRequest } from 'next/server';
 import { getSocketPath } from '@/lib/rchd-client';
 
 export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 // Heartbeat interval in milliseconds (30 seconds)
 const HEARTBEAT_INTERVAL_MS = 30_000;

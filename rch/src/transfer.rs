@@ -12,9 +12,9 @@ use rch_common::ssh_utils::{
     shell_escape_value,
 };
 use rch_common::{
-    ColorMode, CommandResult, CompilationKind, PathTopologyPolicy, RetryConfig, ToolchainInfo,
-    TransferConfig, WorkerConfig, normalize_project_path_with_policy, wrap_command_with_color,
-    wrap_command_with_toolchain,
+    ColorMode, CommandResult, CompilationKind, PathTopologyPolicy, RemoteBuildJobs, RetryConfig,
+    ToolchainInfo, TransferConfig, WorkerConfig, normalize_project_path_with_policy,
+    wrap_command_with_color, wrap_command_with_toolchain,
 };
 #[cfg(unix)]
 use rch_common::{SshClient, SshOptions};
@@ -207,13 +207,31 @@ const SOURCE_EPHEMERAL_EXCLUDE_PATTERNS: &[&str] =
 
 /// Age floors (minutes) for worker-side runtime state reaped at transfer
 /// start (bd-wfumv). TMPDIR scratch under `.rch-tmp/` goes stale within a
-/// day; durable per-worker Cargo caches (issue #42) and pooled target
-/// stores keep their top-level mtime refreshed by every job that uses them
-/// (`add_cargo_isolation` touches the cache dir), so a three-day floor only
-/// reaps caches whose project has been idle far longer than any active
-/// session — an idle return pays one amortized re-fetch, never a per-job one.
+/// day; durable per-worker Cargo caches (issue #42) keep their top-level
+/// mtime refreshed by every job that uses them (`add_cargo_isolation`
+/// touches the cache dir), so a three-day floor only reaps caches whose
+/// project has been idle far longer than any active session — an idle
+/// return pays one amortized re-fetch, never a per-job one.
+///
+/// Pooled target stores (`.rch-target-*-pool-*`) are NOT on this constant:
+/// their retention is the configured
+/// `[remediation.pooled_target] reaper_pooled_idle_hours` (issue #53), so the
+/// transfer-start janitor, the daemon reaper, `rch gc`, and `rch cache
+/// status` all agree on one lifetime. See
+/// [`TransferPipeline::with_pooled_target_prune_idle_hours`].
 const WORKER_TMP_PRUNE_MAX_AGE_MINS: u64 = 24 * 60;
 const WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS: u64 = 3 * 24 * 60;
+
+/// Minutes after which the transfer-start janitor prunes an idle pooled
+/// target store, from the configured retention hours. `None` disables the
+/// pooled sweep (hours == 0, the same "never" the reaper honours); otherwise
+/// the value is floored at the reaper's own 24 h defence so a misconfigured
+/// short TTL cannot turn warm caches into per-job churn.
+fn pooled_target_prune_max_age_mins(idle_hours: u32) -> Option<u64> {
+    (idle_hours != 0).then(|| {
+        (u64::from(idle_hours) * 60).max(rch_common::stale_target_reap::MIN_POOLED_IDLE_MINUTES)
+    })
+}
 
 /// Shell fragment executed by the remote rsync-path wrapper BEFORE rsync
 /// starts: reaps stale worker-side runtime state so abandoned `.rch-tmp/*`
@@ -224,15 +242,107 @@ const WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS: u64 = 3 * 24 * 60;
 /// match (per-worker Cargo caches additionally refresh their own mtime on
 /// every job via `add_cargo_isolation`). Failures are swallowed — pruning is
 /// opportunistic hygiene and must never fail a transfer.
-fn worker_cache_prune_rsync_path_prefix(escaped_remote_path: &str) -> String {
+fn worker_cache_prune_rsync_path_prefix(
+    escaped_remote_path: &str,
+    pooled_target_idle_hours: u32,
+) -> String {
     let tmp_mins = WORKER_TMP_PRUNE_MAX_AGE_MINS;
     let durable_mins = WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS;
-    format!(
+    let mut prefix = format!(
         "find {p}/.rch-tmp -mindepth 1 -maxdepth 1 ! -name 'rch-cargo-cache-*' -mmin +{tmp_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; \
-         find {p}/.rch-tmp -mindepth 1 -maxdepth 1 -name 'rch-cargo-cache-*' -mmin +{durable_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; \
-         find {p} -mindepth 1 -maxdepth 1 -type d -name '.rch-target-*-pool-*' -mmin +{durable_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; ",
+         find {p}/.rch-tmp -mindepth 1 -maxdepth 1 -name 'rch-cargo-cache-*' -mmin +{durable_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; ",
         p = escaped_remote_path
-    )
+    );
+    if let Some(pooled_mins) = pooled_target_prune_max_age_mins(pooled_target_idle_hours) {
+        prefix.push_str(&format!(
+            "find {p} -mindepth 1 -maxdepth 1 -type d -name '.rch-target-*-pool-*' -mmin +{pooled_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; ",
+            p = escaped_remote_path
+        ));
+    }
+    prefix
+}
+
+/// RAM budgeted per concurrent rustc when `compilation.remote_build_jobs =
+/// "auto"` derives `CARGO_BUILD_JOBS` on the worker (issue #49). A large
+/// crate's rustc peaks around 3 GiB, so 8 GiB per job leaves headroom for two
+/// to three concurrent rch jobs on the same box before it starts paging.
+const REMOTE_BUILD_JOBS_GIB_PER_JOB: u64 = 8;
+/// Floor for the derived job count: below two, cargo loses pipelining
+/// between codegen units and the build serialises for no memory benefit.
+const REMOTE_BUILD_JOBS_AUTO_MIN: u64 = 2;
+/// Ceiling for the derived job count. Above eight jobs per rch job the
+/// worker's slot accounting, not per-job parallelism, is the right lever.
+const REMOTE_BUILD_JOBS_AUTO_MAX: u64 = 8;
+/// Linux total-memory source for the derived job count.
+const LINUX_MEMINFO_PATH: &str = "/proc/meminfo";
+
+/// POSIX `sh` fragment (dash-safe, trailing `; `) that exports
+/// `CARGO_BUILD_JOBS` in the remote session according to `policy`, unless the
+/// session already carries one (issue #49).
+///
+/// The fragment runs in the OUTER `sh -s` script, before the `sh -lc` that
+/// executes the build, so:
+/// - a worker-side `CARGO_BUILD_JOBS` (pam `/etc/environment`) is already
+///   visible and wins via the `-z` guard;
+/// - a value forwarded through the env allowlist or written inline in the
+///   command (`CARGO_BUILD_JOBS=N cargo …`) sits on the inner command line and
+///   overrides the exported default by ordinary shell precedence;
+/// - a `-j N` flag beats the env var by cargo's own precedence.
+///
+/// `auto` computes `clamp(mem_gib / 8, 2, min(nproc, 8))` from live worker
+/// facts. Every probe is fail-open: if either cores or memory cannot be read
+/// as a number the fragment exports nothing and cargo keeps its `nproc`
+/// default. `meminfo_path` is the Linux `/proc/meminfo` location (overridable
+/// for tests); macOS falls back to `sysctl hw.memsize`.
+fn remote_build_jobs_fragment(policy: RemoteBuildJobs, meminfo_path: &str) -> String {
+    match policy {
+        RemoteBuildJobs::Off => String::new(),
+        RemoteBuildJobs::Fixed(n) => format!(
+            "if [ -z \"${{CARGO_BUILD_JOBS:-}}\" ]; then CARGO_BUILD_JOBS={n}; export CARGO_BUILD_JOBS; fi; "
+        ),
+        RemoteBuildJobs::Auto => {
+            let escaped_meminfo = escape(Cow::from(meminfo_path));
+            format!(
+                "if [ -z \"${{CARGO_BUILD_JOBS:-}}\" ]; then \
+__rch_c=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null); \
+__rch_m=$(awk '/^MemTotal:/ {{ print int($2 / 1048576) }}' {escaped_meminfo} 2>/dev/null); \
+[ -n \"$__rch_m\" ] || __rch_m=$(sysctl -n hw.memsize 2>/dev/null | awk '{{ print int($1 / 1073741824) }}'); \
+case \"$__rch_c\" in ''|*[!0-9]*) __rch_c=;; esac; \
+case \"$__rch_m\" in ''|*[!0-9]*) __rch_m=;; esac; \
+if [ -n \"$__rch_c\" ] && [ -n \"$__rch_m\" ]; then \
+__rch_j=$((__rch_m / {gib})); \
+if [ \"$__rch_j\" -lt {min} ]; then __rch_j={min}; fi; \
+__rch_x=$__rch_c; if [ \"$__rch_x\" -gt {max} ]; then __rch_x={max}; fi; \
+if [ \"$__rch_j\" -gt \"$__rch_x\" ]; then __rch_j=$__rch_x; fi; \
+CARGO_BUILD_JOBS=$__rch_j; export CARGO_BUILD_JOBS; \
+fi; fi; ",
+                gib = REMOTE_BUILD_JOBS_GIB_PER_JOB,
+                min = REMOTE_BUILD_JOBS_AUTO_MIN,
+                max = REMOTE_BUILD_JOBS_AUTO_MAX,
+            )
+        }
+    }
+}
+
+/// Whether the project pins cargo's parallelism itself via `[build] jobs` in
+/// `.cargo/config.toml` (or legacy `.cargo/config`). An env `CARGO_BUILD_JOBS`
+/// outranks that file in cargo's precedence, so rch must not inject one over a
+/// project that made an explicit choice. Unreadable or unparsable files count
+/// as "not declared": the injected cap is a safety default, not a contract.
+fn project_declares_cargo_build_jobs(project_root: &Path) -> bool {
+    [".cargo/config.toml", ".cargo/config"]
+        .iter()
+        .map(|rel| project_root.join(rel))
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        // A whole document must go through `from_str::<Table>`: `str::parse::<Value>`
+        // parses a single TOML *value* and rejects any file with a table header.
+        .filter_map(|text| toml::from_str::<toml::Table>(&text).ok())
+        .any(|table| {
+            table
+                .get("build")
+                .and_then(|build| build.get("jobs"))
+                .is_some()
+        })
 }
 
 const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str = ".rch-target";
@@ -1050,6 +1160,11 @@ pub struct TransferPipeline {
     /// [`Self::with_worker_platform`]. Left at the default, behaviour is
     /// identical to before this field existed.
     worker_platform: WorkerPlatform,
+    /// Idle retention (hours) for pooled target stores pruned by the
+    /// transfer-start janitor; `0` disables that sweep. Mirrors
+    /// `[remediation.pooled_target] reaper_pooled_idle_hours` so every
+    /// surface reports the same lifetime (issue #53).
+    pooled_target_prune_idle_hours: u32,
 }
 
 /// Validate a project hash for safe use in file paths.
@@ -1150,7 +1265,18 @@ impl TransferPipeline {
             sync_checksum: false,
             build_id: None,
             worker_platform: WorkerPlatform::Posix,
+            pooled_target_prune_idle_hours:
+                rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         }
+    }
+
+    /// Set the idle retention (hours) after which the transfer-start janitor
+    /// prunes a pooled target store on the worker (`0` = never). Callers pass
+    /// the configured `[remediation.pooled_target] reaper_pooled_idle_hours`
+    /// so the janitor and the reaper never disagree (issue #53).
+    pub fn with_pooled_target_prune_idle_hours(mut self, hours: u32) -> Self {
+        self.pooled_target_prune_idle_hours = hours;
+        self
     }
 
     /// Set build id for remote execution.
@@ -2139,14 +2265,40 @@ fi",
             timeout_wrapped_command
         };
 
+        // Per-job rustc cap (issue #49). Exported in the outer session so
+        // explicit worker/command/project settings all still win; see
+        // `remote_build_jobs_fragment`. Windows workers run Git's sh without
+        // nproc/meminfo/sysctl and are skipped.
+        let build_jobs_fragment = self.remote_build_jobs_fragment();
+
         format!(
-            "export LC_ALL=C; touch {} && cd {} && {}{}{}",
+            "export LC_ALL=C; {}touch {} && cd {} && {}{}{}",
+            build_jobs_fragment,
             escaped_remote_path,
             escaped_remote_path,
             self.node_modules_bootstrap(),
             ensure_dirs_command,
             execution_command
         )
+    }
+
+    /// The `CARGO_BUILD_JOBS` fragment for this pipeline's worker and project,
+    /// or empty when the policy is `off`, the worker is Windows, or the project
+    /// pins `[build] jobs` itself.
+    fn remote_build_jobs_fragment(&self) -> String {
+        let policy = self.compilation_config.remote_build_jobs;
+        if policy == RemoteBuildJobs::Off || self.worker_platform.is_windows() {
+            return String::new();
+        }
+        if project_declares_cargo_build_jobs(&self.project_root) {
+            debug!(
+                "Not injecting CARGO_BUILD_JOBS: {} declares [build] jobs in .cargo/config",
+                self.project_root.display()
+            );
+            return String::new();
+        }
+        debug!("Remote build jobs policy: {policy} (CARGO_BUILD_JOBS exported unless already set)");
+        remote_build_jobs_fragment(policy, LINUX_MEMINFO_PATH)
     }
 
     /// Provision `node_modules` on the worker for TypeScript kinds.
@@ -2440,7 +2592,10 @@ fi",
         // (bd-wfumv) — see worker_cache_prune_rsync_path_prefix.
         cmd.arg("--rsync-path").arg(format!(
             "{}mkdir -p {} && rsync",
-            worker_cache_prune_rsync_path_prefix(escaped_remote_path),
+            worker_cache_prune_rsync_path_prefix(
+                escaped_remote_path,
+                self.pooled_target_prune_idle_hours
+            ),
             escaped_remote_path
         ));
 
@@ -2505,7 +2660,10 @@ fi",
         // (bd-wfumv) — see worker_cache_prune_rsync_path_prefix.
         cmd.arg("--rsync-path").arg(format!(
             "{}mkdir -p {} && rsync",
-            worker_cache_prune_rsync_path_prefix(escaped_remote_path),
+            worker_cache_prune_rsync_path_prefix(
+                escaped_remote_path,
+                self.pooled_target_prune_idle_hours
+            ),
             escaped_remote_path
         ));
 
@@ -6056,7 +6214,14 @@ mod tests {
         assert!(path_val.contains(&format!(
             "-name 'rch-cargo-cache-*' -mmin +{WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS}"
         )));
+        // Issue #53: pooled stores use the CONFIGURED reaper retention (168 h
+        // by default), never the 3-day durable-cache floor.
+        let default_pooled_mins =
+            u64::from(rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS) * 60;
         assert!(path_val.contains(&format!(
+            "-type d -name '.rch-target-*-pool-*' -mmin +{default_pooled_mins}"
+        )));
+        assert!(!path_val.contains(&format!(
             "-type d -name '.rch-target-*-pool-*' -mmin +{WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS}"
         )));
 
@@ -6065,6 +6230,33 @@ mod tests {
             .find(&format!("mkdir -p {root} && rsync"))
             .expect("mkdir && rsync suffix");
         assert!(path_val.find("find ").expect("find prefix") < mkdir_idx);
+    }
+
+    #[test]
+    fn pooled_target_prune_window_follows_configured_retention() {
+        // Issue #53: one authoritative retention. The janitor window is the
+        // configured pooled idle hours (floored at the reaper's 24 h defence),
+        // and hours == 0 removes the pooled sweep entirely.
+        let prefix = worker_cache_prune_rsync_path_prefix("/r/p", 240);
+        assert!(prefix.contains("-name '.rch-target-*-pool-*' -mmin +14400 "));
+
+        let floored = worker_cache_prune_rsync_path_prefix("/r/p", 1);
+        assert!(floored.contains(&format!(
+            "-name '.rch-target-*-pool-*' -mmin +{} ",
+            rch_common::stale_target_reap::MIN_POOLED_IDLE_MINUTES
+        )));
+
+        let disabled = worker_cache_prune_rsync_path_prefix("/r/p", 0);
+        assert!(!disabled.contains(".rch-target-*-pool-*"));
+        // The scratch and durable-cache sweeps are unaffected by the pooled knob.
+        assert!(disabled.contains(&format!(
+            "! -name 'rch-cargo-cache-*' -mmin +{WORKER_TMP_PRUNE_MAX_AGE_MINS}"
+        )));
+        assert!(disabled.contains(&format!(
+            "-name 'rch-cargo-cache-*' -mmin +{WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS}"
+        )));
+        assert_eq!(pooled_target_prune_max_age_mins(0), None);
+        assert_eq!(pooled_target_prune_max_age_mins(168), Some(168 * 60));
     }
 
     #[test]
@@ -6551,6 +6743,208 @@ mod tests {
         assert!(
             !command.contains("/root/cass-ft-target"),
             "host-absolute target-dir must NOT be forwarded: {command}"
+        );
+    }
+
+    // ---- issue #49: per-job CARGO_BUILD_JOBS cap on the worker ----
+
+    fn jobs_pipeline(project_root: PathBuf, policy: RemoteBuildJobs) -> TransferPipeline {
+        let compilation = rch_common::CompilationConfig {
+            remote_build_jobs: policy,
+            ..Default::default()
+        };
+        TransferPipeline::new(
+            project_root,
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_compilation_config(compilation)
+    }
+
+    const JOBS_GUARD: &str = "if [ -z \"${CARGO_BUILD_JOBS:-}\" ]; then";
+
+    #[test]
+    fn test_remote_build_jobs_auto_is_default_and_exported_before_cd() {
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pipeline = jobs_pipeline(temp.path().to_path_buf(), RemoteBuildJobs::default());
+        let command = pipeline.build_remote_command("cargo test --workspace", None);
+        assert!(
+            command.contains(JOBS_GUARD),
+            "auto policy must guard on an unset CARGO_BUILD_JOBS: {command}"
+        );
+        assert!(
+            command.contains("CARGO_BUILD_JOBS=$__rch_j; export CARGO_BUILD_JOBS;"),
+            "auto policy must export the derived count: {command}"
+        );
+        // The export must precede the `cd` into the project so the inner
+        // `sh -lc` inherits it.
+        let export_at = command.find("export CARGO_BUILD_JOBS").unwrap();
+        let cd_at = command.find("&& cd ").unwrap();
+        assert!(export_at < cd_at, "export must precede cd: {command}");
+    }
+
+    #[test]
+    fn test_remote_build_jobs_off_injects_nothing() {
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pipeline = jobs_pipeline(temp.path().to_path_buf(), RemoteBuildJobs::Off);
+        let command = pipeline.build_remote_command("cargo build", None);
+        assert!(
+            !command.contains("CARGO_BUILD_JOBS"),
+            "off policy must not mention CARGO_BUILD_JOBS: {command}"
+        );
+    }
+
+    #[test]
+    fn test_remote_build_jobs_fixed_exports_literal_but_stays_guarded() {
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pipeline = jobs_pipeline(temp.path().to_path_buf(), RemoteBuildJobs::Fixed(3));
+        let command = pipeline.build_remote_command("cargo build", None);
+        assert!(
+            command.contains(&format!(
+                "{JOBS_GUARD} CARGO_BUILD_JOBS=3; export CARGO_BUILD_JOBS; fi; "
+            )),
+            "fixed policy must export the literal under the unset guard: {command}"
+        );
+        assert!(
+            !command.contains("__rch_j"),
+            "fixed policy must not probe: {command}"
+        );
+    }
+
+    #[test]
+    fn test_remote_build_jobs_skipped_on_windows_workers() {
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pipeline = jobs_pipeline(temp.path().to_path_buf(), RemoteBuildJobs::Auto)
+            .with_worker_platform(WorkerPlatform::Windows);
+        let command = pipeline.build_remote_command("cargo build", None);
+        assert!(
+            !command.contains("CARGO_BUILD_JOBS"),
+            "Windows workers have no nproc/meminfo/sysctl; must skip: {command}"
+        );
+    }
+
+    #[test]
+    fn test_remote_build_jobs_respects_project_cargo_config_jobs() {
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join(".cargo")).unwrap();
+        std::fs::write(
+            temp.path().join(".cargo/config.toml"),
+            "[build]\njobs = 2\ntarget-dir = \"target\"\n",
+        )
+        .unwrap();
+        let pipeline = jobs_pipeline(temp.path().to_path_buf(), RemoteBuildJobs::Auto);
+        let command = pipeline.build_remote_command("cargo build", None);
+        assert!(
+            !command.contains("CARGO_BUILD_JOBS"),
+            "env CARGO_BUILD_JOBS outranks [build] jobs in cargo, so a project that pins jobs must be left alone: {command}"
+        );
+
+        // A config without `jobs` (target-dir only) does not suppress it.
+        std::fs::write(
+            temp.path().join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"target\"\n",
+        )
+        .unwrap();
+        let command = pipeline.build_remote_command("cargo build", None);
+        assert!(command.contains("CARGO_BUILD_JOBS"), "{command}");
+    }
+
+    /// Run the auto fragment under a real POSIX `sh` with fake `nproc` and a
+    /// fake meminfo, and return what `CARGO_BUILD_JOBS` ends up as
+    /// (`unset` when nothing was exported). `preset` seeds the variable the
+    /// way a worker's `/etc/environment` would.
+    #[cfg(unix)]
+    fn run_auto_fragment(
+        nproc_out: &str,
+        mem_total_kb: Option<u64>,
+        preset: Option<&str>,
+    ) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // Fake nproc; fake sysctl that always fails so only the meminfo path
+        // supplies memory (keeps the test identical on macOS and Linux).
+        for (name, body) in [
+            (
+                "nproc",
+                format!("#!/bin/sh\nprintf '%s\\n' '{nproc_out}'\n"),
+            ),
+            ("sysctl", "#!/bin/sh\nexit 1\n".to_string()),
+        ] {
+            let path = bin.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let meminfo = temp.path().join("meminfo");
+        if let Some(kb) = mem_total_kb {
+            std::fs::write(
+                &meminfo,
+                format!("MemTotal:       {kb} kB\nMemFree: 1 kB\n"),
+            )
+            .unwrap();
+        }
+        let fragment = remote_build_jobs_fragment(
+            RemoteBuildJobs::Auto,
+            meminfo.to_str().expect("utf8 tempdir"),
+        );
+        let script = format!("{fragment}printf '%s' \"${{CARGO_BUILD_JOBS:-unset}}\"");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        if let Some(value) = preset {
+            cmd.env("CARGO_BUILD_JOBS", value);
+        }
+        let output = cmd.output().expect("run sh");
+        assert!(
+            output.status.success(),
+            "fragment must never fail the session: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remote_build_jobs_auto_formula_under_real_sh() {
+        let _guard = test_guard!();
+        const GIB_KB: u64 = 1024 * 1024;
+        // (nproc, MemTotal GiB, expected) — clamp(mem/8, 2, min(nproc, 8)).
+        let cases = [
+            ("16", 30, "3"),  // RAM-light 16-thread box: 30/8 = 3
+            ("16", 58, "7"),  // 58/8 = 7
+            ("6", 15, "2"),   // 15/8 = 1 -> floor 2
+            ("64", 251, "8"), // 251/8 = 31 -> ceiling 8
+            ("4", 251, "4"),  // ceiling also bounded by nproc
+            ("1", 4, "1"),    // floor never exceeds nproc
+        ];
+        for (nproc, gib, expected) in cases {
+            let got = run_auto_fragment(nproc, Some(gib * GIB_KB), None);
+            assert_eq!(got, expected, "nproc={nproc} mem={gib}GiB");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remote_build_jobs_auto_never_overrides_and_fails_open() {
+        let _guard = test_guard!();
+        const GIB_KB: u64 = 1024 * 1024;
+        // Worker-side value (e.g. /etc/environment) wins untouched.
+        assert_eq!(run_auto_fragment("16", Some(30 * GIB_KB), Some("5")), "5");
+        // No readable memory fact -> export nothing, cargo keeps its default.
+        assert_eq!(run_auto_fragment("16", None, None), "unset");
+        // Garbage nproc -> export nothing.
+        assert_eq!(
+            run_auto_fragment("not-a-number", Some(30 * GIB_KB), None),
+            "unset"
         );
     }
 

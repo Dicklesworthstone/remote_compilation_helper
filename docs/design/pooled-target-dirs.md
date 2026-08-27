@@ -1,9 +1,9 @@
 # Design: Tier-1 Pooled Target Directories
 
-**Status:** Draft / Proposal
+**Status:** Implemented (pooled target dirs are the default remote target shape; this document is the design rationale)
 **Author:** (research agent)
 **Date:** 2026-06-01
-**Scope:** `rch` orchestrator + `rch-wkr`/`rchd` worker side. Design only — no implementation.
+**Scope:** `rch` orchestrator + `rch-wkr`/`rchd` worker side. Originally written as a design-only proposal; the implementation now lives in `rch/src/transfer.rs`, `rch-common/src/stale_target_reap.rs`, and `rch-common/src/remediation_config.rs` (`[remediation.pooled_target]`).
 
 ---
 

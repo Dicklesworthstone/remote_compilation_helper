@@ -123,6 +123,15 @@ pub struct HealthCheckResult {
     /// a transient failure during half-open recovery does not reopen the circuit
     /// or restart its cooldown. See [`CircuitStats::apply_health_outcome`].
     pub transient: bool,
+    /// Whether an (unhealthy) result is *command-class* evidence: the SSH
+    /// session reached the worker but the probe command never completed
+    /// (timed out, or the child could not be waited on). This is the
+    /// fork-exhaustion / swap-thrash signature — the host accepts connections
+    /// but cannot run anything — and is fed to the circuit through
+    /// [`CircuitStats::apply_command_outcome`], which blocks a half-open close
+    /// and trips the breaker on its own threshold. Always `false` for healthy
+    /// results and for connect-stage failures.
+    pub command_failure: bool,
     /// Timestamp of the check.
     #[allow(dead_code)] // May be used for monitoring metrics
     pub checked_at: Instant,
@@ -135,6 +144,7 @@ impl HealthCheckResult {
             response_time_ms,
             error: None,
             transient: false,
+            command_failure: false,
             checked_at: Instant::now(),
         }
     }
@@ -145,6 +155,7 @@ impl HealthCheckResult {
             response_time_ms: 0,
             error: Some(error),
             transient: false,
+            command_failure: false,
             checked_at: Instant::now(),
         }
     }
@@ -157,6 +168,22 @@ impl HealthCheckResult {
             response_time_ms: 0,
             error: Some(error),
             transient: true,
+            command_failure: false,
+            checked_at: Instant::now(),
+        }
+    }
+
+    /// Construct a failure result for a probe whose session connected but
+    /// whose command did not complete (see [`Self::command_failure`]).
+    /// `transient` is preserved for diagnostics; the circuit engine ignores it
+    /// for command-class evidence.
+    fn command_failure(error: String, transient: bool) -> Self {
+        Self {
+            healthy: false,
+            response_time_ms: 0,
+            error: Some(error),
+            transient,
+            command_failure: true,
             checked_at: Instant::now(),
         }
     }
@@ -241,6 +268,33 @@ impl WorkerHealth {
             self.circuit
                 .apply_health_outcome(healthy, transient, &config.circuit);
 
+        self.current_status =
+            derive_worker_status(new_circuit_state, healthy, response_time_ms, config);
+
+        if prior_circuit_state != new_circuit_state {
+            info!(
+                "Worker {} circuit state: {:?} -> {:?}",
+                worker_id, prior_circuit_state, new_circuit_state
+            );
+        }
+    }
+
+    /// Replace this diagnostic circuit with a snapshot of the authoritative
+    /// `WorkerState.circuit` and recompute the worker status from it. Used by
+    /// the health-monitor loop instead of [`Self::observe`] because the
+    /// authoritative circuit also receives command-class evidence from the
+    /// telemetry poller; copying keeps the two in lockstep by construction.
+    pub fn mirror(
+        &mut self,
+        authoritative: CircuitStats,
+        healthy: bool,
+        response_time_ms: u64,
+        config: &HealthConfig,
+        worker_id: &str,
+    ) {
+        let prior_circuit_state = self.circuit.state();
+        let new_circuit_state = authoritative.state();
+        self.circuit = authoritative;
         self.current_status =
             derive_worker_status(new_circuit_state, healthy, response_time_ms, config);
 
@@ -429,9 +483,18 @@ impl HealthMonitor {
                     // selection and a recovered worker rejoin. The old code drove
                     // only the ephemeral WorkerHealth.circuit below, which
                     // selection never consulted.
-                    let (previous_circuit_state, new_circuit_state) = worker
-                        .record_health_check(result.healthy, result.transient, &config.circuit)
-                        .await;
+                    //
+                    // A probe that connected but whose command never completed
+                    // is command-class evidence (issue #48): it must block a
+                    // half-open close and trip the breaker on its own threshold
+                    // even when interleaved liveness probes succeed.
+                    let (previous_circuit_state, new_circuit_state) = if result.command_failure {
+                        worker.record_command_outcome(false, &config.circuit).await
+                    } else {
+                        worker
+                            .record_health_check(result.healthy, result.transient, &config.circuit)
+                            .await
+                    };
 
                     if result.healthy {
                         worker.set_last_latency_ms(Some(result.response_time_ms));
@@ -453,11 +516,17 @@ impl HealthMonitor {
                     // Mirror the same outcome into the diagnostic WorkerHealth so
                     // get_health()/all_health_states()/the status panel keep
                     // reporting a circuit consistent with the authoritative one.
+                    //
+                    // Mirror by COPYING the authoritative stats rather than by
+                    // replaying the outcome: the authoritative circuit is also
+                    // advanced by command-class evidence from the telemetry
+                    // poller, which this loop never sees, so a replay would
+                    // drift.
                     let mut states = health_states.write().await;
                     let health = states.entry(worker_id.clone()).or_default();
-                    health.observe(
+                    health.mirror(
+                        worker.circuit_stats().await,
                         result.healthy,
-                        result.transient,
                         result.response_time_ms,
                         &config,
                         &worker_id,
@@ -698,16 +767,57 @@ async fn check_worker_health(
     // latency signal for a failed check.
     let _ = start;
     match last_error {
+        // "Connected, but the command never completed" is command-class
+        // evidence regardless of whether the transport error text looks
+        // retryable: three consecutive command-stage timeouts over an
+        // established session is the signature of a host that cannot fork,
+        // not of a network blip. See `HealthCheckResult::command_failure`.
+        Some(err) if err.stage == ProbeStage::Command => {
+            HealthCheckResult::command_failure(err.message, err.retryable)
+        }
         Some(err) if err.retryable => HealthCheckResult::transient_failure(err.message),
         Some(err) => HealthCheckResult::failure(err.message),
         None => HealthCheckResult::failure("Health check failed (no result)".to_string()),
     }
 }
 
+/// Which stage of a health probe failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeStage {
+    /// The SSH session could not be established (connect/auth/resolution).
+    Connect,
+    /// The session was established but the probe command did not complete
+    /// successfully (timed out, wait failed, or ran with the wrong output).
+    Command,
+}
+
 /// Classified failure from a single health-probe attempt.
 struct HealthProbeError {
     message: String,
     retryable: bool,
+    stage: ProbeStage,
+}
+
+/// Classify a pooled-transport error by stage. The pool multiplexes over a
+/// warm ControlMaster, so a connection-level fault surfaces as a retryable
+/// transport error that is NOT a command timeout (stale control socket,
+/// connection refused/reset, resolution); anything else — including a
+/// "timed out" on the established master — means the session was up and the
+/// command did not finish.
+fn pooled_error_stage(message: &str, retryable: bool) -> ProbeStage {
+    let lower = message.to_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") || lower.contains("command") {
+        // A timeout on the established master, or a spawned command that
+        // could not be waited on, is a command that did not complete.
+        ProbeStage::Command
+    } else if retryable {
+        // Stale control socket, reset/refused connection, resolution blip.
+        ProbeStage::Connect
+    } else {
+        // Non-retryable and not command-shaped: auth / host-key / key-file
+        // problems, all of which prevent a session from being established.
+        ProbeStage::Connect
+    }
 }
 
 /// Perform ONE health-probe attempt (connect + `echo health_check`) against a
@@ -732,9 +842,12 @@ async fn probe_health_once(
             Ok(result) => classify_health_output(&result),
             Err(e) => {
                 let retryable = is_retryable_transport_error(&e);
+                let message = format!("Health probe failed: {}", e);
+                let stage = pooled_error_stage(&message, retryable);
                 Err(HealthProbeError {
-                    message: format!("Health probe failed: {}", e),
+                    message,
                     retryable,
+                    stage,
                 })
             }
         };
@@ -754,6 +867,7 @@ async fn probe_health_once(
                 Err(HealthProbeError {
                     message: format!("Command failed: {}", e),
                     retryable,
+                    stage: ProbeStage::Command,
                 })
             }
         },
@@ -762,6 +876,7 @@ async fn probe_health_once(
             Err(HealthProbeError {
                 message: format!("Connection failed: {}", e),
                 retryable,
+                stage: ProbeStage::Connect,
             })
         }
     }
@@ -781,6 +896,7 @@ fn classify_health_output(result: &rch_common::CommandResult) -> Result<(), Heal
                 result.stdout.trim()
             ),
             retryable: false,
+            stage: ProbeStage::Command,
         })
     }
 }

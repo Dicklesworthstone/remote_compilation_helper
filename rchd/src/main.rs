@@ -839,7 +839,14 @@ async fn main() -> Result<()> {
     };
 
     // Start health monitor with alert manager integration
-    let health_config = health::HealthConfig::default();
+    // The health monitor and the telemetry poller both write the authoritative
+    // worker circuit; they must share the operator's `[circuit]` settings
+    // (previously the monitor silently used built-in defaults, so the
+    // configured thresholds only ever reached the selector's read side).
+    let health_config = health::HealthConfig {
+        circuit: rch_config.circuit.clone(),
+        ..health::HealthConfig::default()
+    };
     let health_monitor = health::HealthMonitor::new(worker_pool.clone(), health_config)
         .with_status_panel(worker_status_panel.clone())
         .with_alert_manager(alert_manager.clone())
@@ -851,7 +858,10 @@ async fn main() -> Result<()> {
     let telemetry_poller = TelemetryPoller::new(
         worker_pool.clone(),
         telemetry_store.clone(),
-        TelemetryPollerConfig::default(),
+        TelemetryPollerConfig {
+            circuit: rch_config.circuit.clone(),
+            ..TelemetryPollerConfig::default()
+        },
     )
     .with_ssh_pool(ssh_pool.clone());
     let _telemetry_handle = telemetry_poller.start();

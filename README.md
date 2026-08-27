@@ -224,20 +224,27 @@ Global flags:
 
 ```bash
 rch daemon start|stop|restart|status|logs|reload
-rch workers list|capabilities|probe|benchmark|drain|enable|disable
+rch workers list|capabilities|probe|benchmark|compare|drain|enable|disable
+rch workers init|discover|setup|deploy-binary|sync-toolchain
 rch status [--workers] [--jobs]
 rch check
 rch queue [--watch|--follow]
 rch cancel <id> | --all
+rch gc [--dry-run] [--workers <id>...]          # reap stale remote target dirs
+rch cache warm|clean|status [--workers <id>...] # remote source/target caches
 rch rabs gc plan|run|history [--cas-root DIR] [--mode normal|emergency]
+rch rabs worker|doctor|inventory|reconcile
 ```
 
 ### Hook + Agent Integration
 
 ```bash
 rch hook install|uninstall|status|test
+rch shim install|status|uninstall      # cargo shim: offload builds started by scripts/Makefiles, not just hooked tool calls
 rch agents list|status|install-hook|uninstall-hook
 rch diagnose "cargo build --release"
+rch admit "cargo build --release"      # read-only preflight: offload / local / queue / defer verdict
+rch why miss|refusal                   # RABS: explain a cache-key miss diff or an index refusal code
 rch exec -- cargo build --release
 rch --robot-triage --json
 rch capabilities --json
@@ -267,8 +274,11 @@ job's own exit status. Paths must be repository-relative; conflicts with
 
 ```bash
 rch config show|get|set|reset|init|validate|lint|doctor|edit|diff|export
-rch doctor [--fix] [--dry-run]
-rch doctor --reliability [--check-schemas] [--json]
+rch doctor [--fix] [--dry-run] [--install-deps]
+rch doctor --reliability [--check-schemas] [--scope <scope>] [--strict|--lenient] [--json]
+rch doctor --reliability --watch [--watch-interval N] [--transitions-only]
+rch doctor --runbook RCH-Rnnn | --runbook-list
+rch error explain <RCH-Ennn|RCH-Innn|RCH-Rnnn> | list [--category <name>]
 rch self-test [--worker <id>|--all]
 rch self-test status
 rch self-test history --limit 10
@@ -371,7 +381,7 @@ external_timeout_enabled = true
 
 [transfer]
 compression_level = 3
-remote_base = "/tmp/rch"
+remote_base = "/data/tmp/rch"
 # Optional per-attempt source-sync cap. When unset, the default is payload-aware:
 # 30 seconds plus one second per MiB, capped at one hour.
 # sync_timeout_ms = 120000

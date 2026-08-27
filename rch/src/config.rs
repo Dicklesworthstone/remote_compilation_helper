@@ -653,6 +653,7 @@ struct PartialCompilationConfig {
     bun_timeout_sec: Option<u64>,
     external_timeout_enabled: Option<bool>,
     allow_local_fallback: Option<bool>,
+    remote_build_jobs: Option<rch_common::RemoteBuildJobs>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -997,6 +998,21 @@ pub fn validate_rch_config_file(path: &Path) -> FileValidation {
         );
     }
 
+    // Issue #51: an explicit allowlist REPLACES the built-in one, so a config
+    // file written before a tool family was added (go, nix, tsc, ...) keeps
+    // that family local forever, and the only trace is a summary line the
+    // hook prints on stderr. Say so where operators look.
+    if !config.execution.allowlist.is_empty() {
+        let missing = config.execution.missing_builtin_bases();
+        if !missing.is_empty() {
+            validation.warn(format!(
+                "execution.allowlist omits built-in compilation tools ({}); those commands will \
+                 always run locally — add them to [execution] allowlist to offload them",
+                missing.join(", ")
+            ));
+        }
+    }
+
     if !is_valid_log_level(&config.general.log_level) {
         validation.error(
             "general.log_level must be one of: trace, debug, info, warn, error, off".to_string(),
@@ -1260,6 +1276,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "compilation.bun_timeout_sec",
         "compilation.external_timeout_enabled",
         "compilation.allow_local_fallback",
+        "compilation.remote_build_jobs",
         "transfer.compression_level",
         "transfer.exclude_patterns",
         "transfer.sync_timeout_ms",
@@ -1369,6 +1386,10 @@ fn apply_layer(
     if let Some(allow_local_fallback) = layer.compilation.allow_local_fallback {
         config.compilation.allow_local_fallback = allow_local_fallback;
         set_source(sources, "compilation.allow_local_fallback", source.clone());
+    }
+    if let Some(remote_build_jobs) = layer.compilation.remote_build_jobs {
+        config.compilation.remote_build_jobs = remote_build_jobs;
+        set_source(sources, "compilation.remote_build_jobs", source.clone());
     }
 
     if let Some(compression) = layer.transfer.compression_level {
@@ -1759,6 +1780,9 @@ fn merge_compilation(
     if overlay.allow_local_fallback != default.allow_local_fallback {
         base.allow_local_fallback = overlay.allow_local_fallback;
     }
+    if overlay.remote_build_jobs != default.remote_build_jobs {
+        base.remote_build_jobs = overlay.remote_build_jobs;
+    }
 }
 
 /// Merge TransferConfig fields.
@@ -2055,14 +2079,19 @@ fn apply_env_overrides_inner(
         }
     }
 
-    if let Some(val) = get_env("RCH_SOCKET_PATH") {
-        config.general.socket_path = val;
-        if let Some(ref mut sources) = sources {
-            set_source(
-                sources,
-                "general.socket_path",
-                ConfigValueSource::EnvVar("RCH_SOCKET_PATH".to_string()),
-            );
+    // `RCH_DAEMON_SOCKET` is the long-documented alias of `RCH_SOCKET_PATH`
+    // (issue #57); the canonical name wins when both are set.
+    for var in ["RCH_SOCKET_PATH", "RCH_DAEMON_SOCKET"] {
+        if let Some(val) = get_env(var) {
+            config.general.socket_path = val;
+            if let Some(ref mut sources) = sources {
+                set_source(
+                    sources,
+                    "general.socket_path",
+                    ConfigValueSource::EnvVar(var.to_string()),
+                );
+            }
+            break;
         }
     }
 
@@ -2210,6 +2239,19 @@ fn apply_env_overrides_inner(
                 sources,
                 "transfer.compression_level",
                 ConfigValueSource::EnvVar("RCH_COMPRESSION".to_string()),
+            );
+        }
+    } else if let Some(val) = get_env("RCH_TRANSFER_ZSTD_LEVEL")
+        && let Ok(level) = val.parse()
+    {
+        // Documented legacy wrapper name (issue #57): same knob, lowest
+        // precedence so the canonical names always win.
+        config.transfer.compression_level = level;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "transfer.compression_level",
+                ConfigValueSource::EnvVar("RCH_TRANSFER_ZSTD_LEVEL".to_string()),
             );
         }
     }
@@ -2928,6 +2970,48 @@ tags = ["rust"]
                 .any(|e| e.contains("confidence_threshold"))
         );
         info!("TEST PASS: test_validate_threshold_range");
+    }
+
+    #[test]
+    fn test_validate_warns_when_execution_allowlist_omits_builtin_tools() {
+        // Issue #51: a persisted allowlist silently pins newer tool families
+        // (go, nix, tsc) to local execution; validation must say so.
+        let _guard = test_guard!();
+        let mut file = NamedTempFile::new().expect("create temp file");
+        std::io::Write::write_all(
+            file.as_file_mut(),
+            b"[execution]\nallowlist = [\"cargo\", \"rustc\"]\n",
+        )
+        .expect("write config");
+        let result = validate_rch_config_file(file.path());
+        let warning = result
+            .warnings
+            .iter()
+            .find(|w| w.contains("execution.allowlist omits"))
+            .expect("allowlist gap must be reported as a warning");
+        assert!(warning.contains("go"), "{warning}");
+        assert!(warning.contains("nix"), "{warning}");
+        assert!(!warning.contains("cargo,"), "{warning}");
+
+        // The built-in allowlist has no gap, and an empty allowlist is the
+        // documented "local only" switch, not a gap.
+        let mut file = NamedTempFile::new().expect("create temp file");
+        std::io::Write::write_all(file.as_file_mut(), b"[execution]\nallowlist = []\n")
+            .expect("write config");
+        let result = validate_rch_config_file(file.path());
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("execution.allowlist omits")),
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            rch_common::ExecutionConfig::default()
+                .missing_builtin_bases()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4557,6 +4641,66 @@ extra_field = 123
             &ConfigValueSource::EnvVar("RCH_SOCKET_PATH".to_string())
         );
         info!("PASS: RCH_SOCKET_PATH override applied");
+    }
+
+    #[test]
+    fn test_apply_env_overrides_daemon_socket_alias() {
+        let _guard = test_guard!();
+        // Issue #57: RCH_DAEMON_SOCKET is a real alias; RCH_SOCKET_PATH wins.
+        let mut config = RchConfig::default();
+        let mut sources = default_sources_map();
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert(
+            "RCH_DAEMON_SOCKET".to_string(),
+            "/alias/socket.sock".to_string(),
+        );
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+        assert_eq!(config.general.socket_path, "/alias/socket.sock");
+        assert_eq!(
+            sources.get("general.socket_path"),
+            Some(&ConfigValueSource::EnvVar("RCH_DAEMON_SOCKET".to_string()))
+        );
+
+        env_overrides.insert(
+            "RCH_SOCKET_PATH".to_string(),
+            "/canonical/socket.sock".to_string(),
+        );
+        let mut config = RchConfig::default();
+        let mut sources = default_sources_map();
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+        assert_eq!(config.general.socket_path, "/canonical/socket.sock");
+        assert_eq!(
+            sources.get("general.socket_path"),
+            Some(&ConfigValueSource::EnvVar("RCH_SOCKET_PATH".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_apply_env_overrides_transfer_zstd_level_alias() {
+        let _guard = test_guard!();
+        // Issue #57: RCH_TRANSFER_ZSTD_LEVEL is a real (lowest-precedence) alias.
+        let mut config = RchConfig::default();
+        let mut sources = default_sources_map();
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert("RCH_TRANSFER_ZSTD_LEVEL".to_string(), "11".to_string());
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+        assert_eq!(config.transfer.compression_level, 11);
+        assert_eq!(
+            sources.get("transfer.compression_level"),
+            Some(&ConfigValueSource::EnvVar(
+                "RCH_TRANSFER_ZSTD_LEVEL".to_string()
+            ))
+        );
+
+        env_overrides.insert("RCH_COMPRESSION".to_string(), "7".to_string());
+        let mut config = RchConfig::default();
+        apply_env_overrides_inner(&mut config, None, Some(&env_overrides));
+        assert_eq!(config.transfer.compression_level, 7);
+
+        env_overrides.insert("RCH_COMPRESSION_LEVEL".to_string(), "5".to_string());
+        let mut config = RchConfig::default();
+        apply_env_overrides_inner(&mut config, None, Some(&env_overrides));
+        assert_eq!(config.transfer.compression_level, 5);
     }
 
     #[test]

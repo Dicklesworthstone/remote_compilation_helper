@@ -75,6 +75,35 @@ pub(super) fn build_diagnose_decision(
     }
 }
 
+/// Intercept decision that also applies the config gates the hook checks
+/// before rewriting (`general.enabled`, `force_local`/`force_remote`,
+/// `execution.allowlist`).
+///
+/// Issue #51: `rch diagnose` used to report "would intercept" purely from the
+/// classifier, while the hook — reading the same config — left `go test` local
+/// because `go` was missing from a persisted `execution.allowlist`. The two
+/// surfaces must agree, or the diagnose verdict is not a diagnosis.
+pub(super) fn build_diagnose_decision_with_config(
+    classification: &rch_common::Classification,
+    config: &rch_common::RchConfig,
+) -> DiagnoseDecision {
+    if classification.is_compilation
+        && let Some(policy) = crate::hook::config_local_policy(config, classification.kind)
+    {
+        return DiagnoseDecision {
+            would_intercept: false,
+            reason: format!("Would run locally: {}", policy.reason()),
+        };
+    }
+    // force_remote bypasses the confidence threshold exactly as the hook does.
+    let threshold = if config.general.force_remote {
+        0.0
+    } else {
+        config.compilation.confidence_threshold
+    };
+    build_diagnose_decision(classification, threshold)
+}
+
 pub(super) fn build_diagnose_slot_estimate(
     kind: Option<rch_common::CompilationKind>,
     command: &str,
@@ -356,7 +385,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
         .map(|s| s.source.clone())
         .unwrap_or_else(|| "default".to_string());
 
-    let decision = build_diagnose_decision(&details.classification, threshold);
+    let decision = build_diagnose_decision_with_config(&details.classification, &config);
     let would_intercept = decision.would_intercept;
 
     debug!(
@@ -2616,8 +2645,7 @@ pub async fn status_overview(
                     reason_code: "no_workers_configured".into(),
                     severity: "critical".into(),
                     message: "No workers configured; all builds run locally".into(),
-                    suggested_action: "rch workers add <host> or edit ~/.config/rch/workers.toml"
-                        .into(),
+                    suggested_action: "rch workers init or edit ~/.config/rch/workers.toml".into(),
                     worker_id: None,
                 });
             } else if critical_pressure_worker_count(&status.workers) > 0

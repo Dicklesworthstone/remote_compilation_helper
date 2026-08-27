@@ -1,7 +1,6 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { AnimatePresence } from 'motion/react';
 import type { SpeedScoreView, WorkerStatusInfo } from '@/lib/types';
 import { WorkerCard } from './worker-card';
 
@@ -79,15 +78,13 @@ export function WorkersGrid({ workers, speedScores }: WorkersGridProps) {
         </label>
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        <AnimatePresence mode="popLayout">
-          {sortedWorkers.map((worker) => (
-            <WorkerCard
-              key={worker.id}
-              worker={worker}
-              speedScoreView={speedScores?.get(worker.id) ?? null}
-            />
-          ))}
-        </AnimatePresence>
+        {sortedWorkers.map((worker) => (
+          <WorkerCard
+            key={worker.id}
+            worker={worker}
+            speedScoreView={speedScores?.get(worker.id) ?? null}
+          />
+        ))}
       </div>
     </div>
   );

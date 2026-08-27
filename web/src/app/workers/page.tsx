@@ -1,9 +1,8 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import useSWR from 'swr';
 import { Server, RefreshCw } from 'lucide-react';
-import { motion } from 'motion/react';
 import { toast } from 'sonner';
 import { api } from '@/lib/api';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -65,14 +64,14 @@ export default function WorkersPage() {
     [workers, effectiveSelectedWorkerId]
   );
   const speedScoresMap = useMemo(() => {
-    if (!speedScores?.workers) {
-      return new Map<string, NonNullable<SpeedScoreListResponse['workers'][number]['speedscore']>>();
+    const map = new Map<string, NonNullable<SpeedScoreListResponse['workers'][number]['speedscore']>>();
+    if (!speedScores?.workers) return map;
+    for (const entry of speedScores.workers) {
+      if (entry.speedscore) {
+        map.set(entry.worker_id, entry.speedscore);
+      }
     }
-    return new Map(
-      speedScores.workers
-        .filter((entry) => entry.speedscore)
-        .map((entry) => [entry.worker_id, entry.speedscore!])
-    );
+    return map;
   }, [speedScores]);
   const historyQuery = useSpeedScoreHistoryPage(effectiveSelectedWorkerId, {
     limit: 200,
@@ -167,12 +166,11 @@ export default function WorkersPage() {
           title="Refresh"
           aria-label="Refresh workers"
         >
-          <motion.div
-            animate={isValidating ? { rotate: 360 } : { rotate: 0 }}
-            transition={isValidating ? { duration: 1, repeat: Infinity, ease: 'linear' } : {}}
-          >
-            <RefreshCw className="w-5 h-5 text-muted-foreground" />
-          </motion.div>
+          <RefreshCw
+            className={`w-5 h-5 text-muted-foreground transition-transform ${
+              isValidating ? 'animate-spin' : ''
+            }`}
+          />
         </button>
       </div>
 
@@ -259,11 +257,13 @@ export default function WorkersPage() {
           </section>
 
           <section className="space-y-4">
-            <WorkerComparisonView
-              workers={workers}
-              speedScores={speedScoresMap}
-              onViewDetails={handleSelectWorker}
-            />
+            <Suspense fallback={<div className="h-48 animate-pulse bg-muted/30 rounded-lg" />}>
+              <WorkerComparisonView
+                workers={workers}
+                speedScores={speedScoresMap}
+                onViewDetails={handleSelectWorker}
+              />
+            </Suspense>
           </section>
         </>
       )}

@@ -669,7 +669,10 @@ mod tests {
         // ...and each such scan is gated on it being non-empty.
         let scans = cmd.matches("find \"$__tmpscan\"").count();
         let gates = cmd.matches("if [ -n \"$__tmpscan\" ]; then").count();
-        assert!(scans >= 4, "expected the job/pid, legacy, pooled and cap scans");
+        assert!(
+            scans >= 4,
+            "expected the job/pid, legacy, pooled and cap scans"
+        );
         assert!(
             gates >= 3,
             "every tmp-base scan group must be gated on $__tmpscan being set"
@@ -891,7 +894,12 @@ mod tests {
             }
         }
 
-        let cmd = worker_sweep_command(base.to_str().unwrap(), 60, Some(MIN_POOLED_IDLE_MINUTES), None);
+        let cmd = worker_sweep_command(
+            base.to_str().unwrap(),
+            60,
+            Some(MIN_POOLED_IDLE_MINUTES),
+            None,
+        );
         let out = Command::new("sh")
             .arg("-c")
             .arg(&cmd)
@@ -914,7 +922,10 @@ mod tests {
             !stale_pool.exists(),
             "stale pool under the TMP BASE must be reaped (the regression this fixes)"
         );
-        assert!(!stale_job.exists(), "stale job dir under $base must be reaped");
+        assert!(
+            !stale_job.exists(),
+            "stale job dir under $base must be reaped"
+        );
         assert!(active_pool.exists(), "recently-touched pool must survive");
         assert!(active_job.exists(), "recently-touched job dir must survive");
 
@@ -1022,7 +1033,12 @@ mod tests {
             return;
         }
 
-        let cmd = worker_sweep_command(base.to_str().unwrap(), 60, Some(MIN_POOLED_IDLE_MINUTES), None);
+        let cmd = worker_sweep_command(
+            base.to_str().unwrap(),
+            60,
+            Some(MIN_POOLED_IDLE_MINUTES),
+            None,
+        );
         let out = Command::new("sh")
             .arg("-c")
             .arg(&cmd)

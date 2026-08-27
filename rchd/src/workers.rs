@@ -772,6 +772,22 @@ impl WorkerState {
         (previous, new)
     }
 
+    /// Drive the authoritative circuit through a single *command-class*
+    /// outcome (see [`CircuitStats::apply_command_outcome`]): an operation of
+    /// the same shape as dispatched work — the telemetry poll, or a health
+    /// probe whose session connected but whose command never completed.
+    /// Returns `(previous_state, new_state)` like [`Self::record_health_check`].
+    pub async fn record_command_outcome(
+        &self,
+        success: bool,
+        config: &CircuitBreakerConfig,
+    ) -> (CircuitState, CircuitState) {
+        let mut circuit = self.circuit.write().await;
+        let previous = circuit.state();
+        let new = circuit.apply_command_outcome(success, config);
+        (previous, new)
+    }
+
     /// Record a failed operation for circuit breaker.
     pub async fn record_failure(&self, error_msg: Option<String>) {
         let mut circuit = self.circuit.write().await;

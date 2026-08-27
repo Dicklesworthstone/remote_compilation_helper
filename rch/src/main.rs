@@ -79,8 +79,7 @@ ENVIRONMENT VARIABLES:
     RCH_LOG_LEVEL         Logging level: trace, debug, info, warn, error, off
     RCH_LOG_FORMAT        Log format: pretty, json, compact
     RCH_SOCKET_PATH       Path to daemon Unix socket
-    RCH_DAEMON_TIMEOUT_MS Timeout for daemon communication (default: 5000)
-    RCH_SSH_KEY           Path to SSH private key for worker connections
+    RCH_DAEMON_TIMEOUT_MS Daemon socket connect/read timeout in ms, 100-600000 (default: 5000)
     RCH_SSH_SERVER_ALIVE_INTERVAL_SECS  SSH keepalive interval (ServerAliveInterval)
     RCH_SSH_CONTROL_PERSIST_SECS        SSH ControlPersist idle seconds (0 disables persistence)
     RCH_COMPRESSION_LEVEL Compression level 1-22 (default: 3)
@@ -661,6 +660,12 @@ INSTALL LOCATIONS:
         action: CompletionsAction,
     },
 
+    /// Explain and list RCH-Ennn / RCH-Innn / RCH-Rnnn error, info, and reason codes
+    Error {
+        #[command(subcommand)]
+        sub: ErrorSubcommand,
+    },
+
     /// Run comprehensive diagnostics and optionally auto-fix issues
     #[command(after_help = r#"EXAMPLES:
     rch doctor              # Run all diagnostic checks
@@ -679,12 +684,6 @@ CHECKS PERFORMED:
     Hooks           - Claude Code hook installed
     Workers         - Connectivity (with --verbose)
     Reliability     - topology, repo convergence, disk pressure, process debt"#)]
-    /// Look up RCH-Ennn / RCH-Rnnn error and reason codes (operator ergonomics)
-    Error {
-        #[command(subcommand)]
-        sub: ErrorSubcommand,
-    },
-
     Doctor {
         /// Attempt to fix safe issues (e.g., key permissions)
         #[arg(long)]
@@ -1093,7 +1092,7 @@ enum ErrorSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// List every known code in both namespaces (RCH-Ennn + RCH-Rnnn).
+    /// List every known code across all three namespaces (RCH-Ennn errors, RCH-Innn info, RCH-Rnnn reliability).
     List {
         /// Filter to a single category (snake_case; e.g. `disk_pressure`,
         /// `worker`, `topology`). Empty = all categories.
@@ -1127,17 +1126,35 @@ enum SelfTestAction {
 enum DaemonAction {
     /// Start the daemon
     Start,
-    /// Stop the daemon (prompts for confirmation if builds are active)
+    /// Stop the daemon (refuses while builds are in flight unless --drain or --force)
     Stop {
-        /// Skip confirmation prompt
+        /// Skip confirmation prompt (does NOT authorise interrupting builds; see --force)
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Close admission and wait for in-flight builds to finish before stopping
+        #[arg(long)]
+        drain: bool,
+        /// Maximum seconds to wait when draining
+        #[arg(long, default_value = "300", requires = "drain")]
+        drain_timeout: u64,
+        /// Interrupt in-flight builds (after the drain window, if --drain is set)
+        #[arg(long)]
+        force: bool,
     },
-    /// Restart the daemon (prompts for confirmation if builds are active)
+    /// Restart the daemon (refuses while builds are in flight unless --drain or --force)
     Restart {
-        /// Skip confirmation prompt
+        /// Skip confirmation prompt (does NOT authorise interrupting builds; see --force)
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Close admission and wait for in-flight builds to finish before restarting
+        #[arg(long)]
+        drain: bool,
+        /// Maximum seconds to wait when draining
+        #[arg(long, default_value = "300", requires = "drain")]
+        drain_timeout: u64,
+        /// Interrupt in-flight builds (after the drain window, if --drain is set)
+        #[arg(long)]
+        force: bool,
     },
     /// Show daemon status
     Status,
@@ -2305,7 +2322,27 @@ fn top_level_machine_output_requested(args: &[OsString]) -> bool {
     false
 }
 
+/// Build the error for a `--workers` filter naming an id that is not in
+/// `workers.toml` (issue #58). A typo in a worker id is user input, not
+/// internal state, so it surfaces as `RCH-E008` (`ConfigInvalidWorker`,
+/// category `config`) rather than `RCH-E504`; JSON consumers that branch on
+/// `category` must not escalate it as a daemon bug.
+fn unknown_worker_filter_error(missing: &[&str], configured: &str) -> anyhow::Error {
+    ApiError::from_code(ErrorCode::ConfigInvalidWorker)
+        .with_details(format!(
+            "unknown worker id(s) in --workers filter: {}; configured workers: {}",
+            missing.join(", "),
+            configured
+        ))
+        .into()
+}
+
 fn top_level_api_error(error: &anyhow::Error) -> ApiError {
+    // A typed `ApiError` anywhere in the chain already carries the right
+    // code and category; never downgrade it to a string-sniffed guess.
+    if let Some(api_error) = error.chain().find_map(|e| e.downcast_ref::<ApiError>()) {
+        return api_error.clone();
+    }
     let details = format!("{error:#}");
     let code = if details.contains("TOML parse error")
         || details.contains("Invalid TOML syntax")
@@ -3070,7 +3107,7 @@ fn env_var_capabilities() -> Vec<EnvVarCapability> {
         },
         EnvVarCapability {
             name: "RCH_DAEMON_TIMEOUT_MS".to_string(),
-            effect: "Override daemon communication timeout in milliseconds.".to_string(),
+            effect: "Override the daemon socket connect/read timeout in milliseconds (100-600000; default 5000).".to_string(),
         },
         EnvVarCapability {
             name: "RCH_MOCK_SSH".to_string(),
@@ -3622,11 +3659,39 @@ async fn handle_daemon(action: DaemonAction, ctx: &OutputContext) -> Result<()> 
         DaemonAction::Start => {
             commands::daemon_start(ctx).await?;
         }
-        DaemonAction::Stop { yes } => {
-            commands::daemon_stop(yes, ctx).await?;
+        DaemonAction::Stop {
+            yes,
+            drain,
+            drain_timeout,
+            force,
+        } => {
+            commands::daemon_stop(
+                commands::StopOptions {
+                    yes,
+                    drain,
+                    drain_timeout_secs: drain_timeout,
+                    force,
+                },
+                ctx,
+            )
+            .await?;
         }
-        DaemonAction::Restart { yes } => {
-            commands::daemon_restart(yes, ctx).await?;
+        DaemonAction::Restart {
+            yes,
+            drain,
+            drain_timeout,
+            force,
+        } => {
+            commands::daemon_restart(
+                commands::StopOptions {
+                    yes,
+                    drain,
+                    drain_timeout_secs: drain_timeout,
+                    force,
+                },
+                ctx,
+            )
+            .await?;
         }
         DaemonAction::Status => {
             commands::daemon_status(ctx).await?;
@@ -3972,7 +4037,7 @@ fn selected_reap_workers(worker_filter: &[String]) -> Result<Vec<rch_common::Wor
     let all_workers = commands::load_workers_from_config()
         .map_err(|e| anyhow::anyhow!("load workers config: {e}"))?;
     if all_workers.is_empty() {
-        anyhow::bail!("no workers configured; run `rch workers add <host>` first");
+        anyhow::bail!("no workers configured; run `rch workers init` first");
     }
     if worker_filter.is_empty() {
         return Ok(all_workers);
@@ -3985,11 +4050,10 @@ fn selected_reap_workers(worker_filter: &[String]) -> Result<Vec<rch_common::Wor
         .filter(|id| !known_ids.contains(*id))
         .collect();
     if !missing.is_empty() {
-        anyhow::bail!(
-            "unknown worker id(s) in --workers filter: {}; configured workers: {}",
-            missing.join(", "),
-            known_ids.into_iter().collect::<Vec<_>>().join(", "),
-        );
+        return Err(unknown_worker_filter_error(
+            &missing,
+            &known_ids.into_iter().collect::<Vec<_>>().join(", "),
+        ));
     }
     Ok(all_workers
         .into_iter()
@@ -4135,6 +4199,13 @@ async fn handle_cache_status(worker_filter: Vec<String>, ctx: &OutputContext) ->
         "remote_base": base,
         "idle_hours": idle_hours,
         "pooled_idle_hours": pooled_idle_hours,
+        // Issue #53: the transfer-start janitor prunes pooled stores under
+        // the SAME window on the next dispatch of that project, so "pooled
+        // (kept)" below is exactly as durable as it claims.
+        "pooled_janitor": {
+            "prunes_on_dispatch": pooled_idle_hours != 0,
+            "idle_hours": pooled_idle_hours,
+        },
         "workers": worker_reports,
     });
 
@@ -4142,13 +4213,30 @@ async fn handle_cache_status(worker_filter: Vec<String>, ctx: &OutputContext) ->
         ctx.json(&ApiResponse::ok("cache status", data))?;
     } else {
         println!(
-            "Remote target dirs (idle window: {idle_hours}h, pooled: {}, base: {base})\n",
+            "Remote target dirs (idle window: {idle_hours}h, pooled: {}, base: {base})",
             if pooled_idle_hours == 0 {
                 "never".to_string()
             } else {
                 format!("{pooled_idle_hours}h")
             }
         );
+        if pooled_idle_hours == 0 {
+            println!(
+                "  {}\n",
+                style.muted(
+                    "pooled stores are never pruned (reaper_pooled_idle_hours = 0); \
+                     the transfer-start janitor skips them too"
+                )
+            );
+        } else {
+            println!(
+                "  {}\n",
+                style.muted(&format!(
+                    "pooled stores idle > {pooled_idle_hours}h are also pruned by the \
+                     transfer-start janitor on the next dispatch of their project"
+                ))
+            );
+        }
         for report in data["workers"].as_array().into_iter().flatten() {
             let id = report["id"].as_str().unwrap_or("?");
             if report["ok"].as_bool() != Some(true) {
@@ -4433,7 +4521,7 @@ async fn handle_cache_warm(
     let all_workers = commands::load_workers_from_config()
         .map_err(|e| anyhow::anyhow!("load workers config: {e}"))?;
     if all_workers.is_empty() {
-        anyhow::bail!("no workers configured; run `rch workers add <host>` first");
+        anyhow::bail!("no workers configured; run `rch workers init` first");
     }
     // Filter by --workers flag if supplied. A filter that names no
     // existing worker is a configuration error — fail fast so the
@@ -4453,11 +4541,10 @@ async fn handle_cache_warm(
         if !missing.is_empty() {
             // Show the actual configured worker list (not the post-filter
             // empty set) so the operator can spot a typo or stale id.
-            anyhow::bail!(
-                "unknown worker id(s) in --workers filter: {}; configured workers: {}",
-                missing.join(", "),
-                ctx_worker_ids(&all_workers)
-            );
+            return Err(unknown_worker_filter_error(
+                &missing,
+                &ctx_worker_ids(&all_workers),
+            ));
         }
         all_workers
             .into_iter()
@@ -4506,7 +4593,13 @@ async fn handle_cache_warm(
             project_hash.clone(),
             transfer_config.clone(),
         )
-        .with_worker_platform(transfer::WorkerPlatform::from_worker(worker));
+        .with_worker_platform(transfer::WorkerPlatform::from_worker(worker))
+        .with_pooled_target_prune_idle_hours(
+            rch_config
+                .remediation
+                .pooled_target
+                .reaper_pooled_idle_hours,
+        );
         let started = std::time::Instant::now();
         match pipeline.sync_to_remote(worker).await {
             Ok(sync_result) => {
@@ -5855,7 +5948,7 @@ mod tests {
         let cli = Cli::try_parse_from(["rch", "daemon", "stop"]).unwrap();
         match cli.command {
             Some(Commands::Daemon {
-                action: DaemonAction::Stop { yes },
+                action: DaemonAction::Stop { yes, .. },
             }) => {
                 assert!(!yes, "yes should default to false");
             }
@@ -5869,7 +5962,7 @@ mod tests {
         let cli = Cli::try_parse_from(["rch", "daemon", "stop", "--yes"]).unwrap();
         match cli.command {
             Some(Commands::Daemon {
-                action: DaemonAction::Stop { yes },
+                action: DaemonAction::Stop { yes, .. },
             }) => {
                 assert!(yes, "yes should be true");
             }
@@ -5883,7 +5976,7 @@ mod tests {
         let cli = Cli::try_parse_from(["rch", "daemon", "restart"]).unwrap();
         match cli.command {
             Some(Commands::Daemon {
-                action: DaemonAction::Restart { yes },
+                action: DaemonAction::Restart { yes, .. },
             }) => {
                 assert!(!yes, "yes should default to false");
             }
@@ -5897,7 +5990,7 @@ mod tests {
         let cli = Cli::try_parse_from(["rch", "daemon", "restart", "-y"]).unwrap();
         match cli.command {
             Some(Commands::Daemon {
-                action: DaemonAction::Restart { yes },
+                action: DaemonAction::Restart { yes, .. },
             }) => {
                 assert!(yes, "yes should be true with -y flag");
             }
@@ -6877,9 +6970,7 @@ mod tests {
         candidates.push(std::path::PathBuf::from("/tmp"));
         candidates
             .into_iter()
-            .find(|c| {
-                c.is_dir() && !defaults.iter().any(|d| c.starts_with(d))
-            })
+            .find(|c| c.is_dir() && !defaults.iter().any(|d| c.starts_with(d)))
             .expect(
                 "no writable base outside the default topology roots \
                  (/data/projects, /dp); this test cannot express its contract here",
@@ -8583,6 +8674,22 @@ mod tests {
             api_error.details.as_deref(),
             Some("Failed to parse SpeedScore list response: invalid type: string \"healthy\"")
         );
+    }
+
+    #[test]
+    fn top_level_api_error_keeps_typed_config_invalid_worker_code() {
+        let _guard = test_guard!();
+        // Issue #58: an unknown `--workers` id is a config/usage error, not
+        // RCH-E504, even when wrapped in further anyhow context.
+        let error = unknown_worker_filter_error(&["nonexistent-worker"], "alpha, beta")
+            .context("rch gc --dry-run");
+        let api_error = top_level_api_error(&error);
+
+        assert_eq!(api_error.code, ErrorCode::ConfigInvalidWorker.code_string());
+        assert_ne!(api_error.code, ErrorCode::InternalStateError.code_string());
+        let rendered = format!("{api_error}");
+        assert!(rendered.contains("nonexistent-worker"), "{rendered}");
+        assert!(rendered.contains("alpha, beta"), "{rendered}");
     }
 
     #[test]
