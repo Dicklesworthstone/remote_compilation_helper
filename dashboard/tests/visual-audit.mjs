@@ -1,8 +1,10 @@
 /* Visual audit driver for the rch dashboard. Reads .env itself; prints nothing secret. */
 import { chromium } from "playwright";
 import { readFileSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = "/Users/jemanuel/projects/remote_compilation_helper/dashboard";
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const env = Object.fromEntries(
   readFileSync(`${root}/.env`, "utf8").split("\n").filter((l) => l.includes("="))
     .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim().replace(/^['"]|['"]$/g, "")]),
@@ -32,15 +34,26 @@ await d.waitForSelector(".kpis", { timeout: 40000 });
 await d.waitForTimeout(500);
 await d.screenshot({ path: "/tmp/dash-audit/02-desktop-full.png", fullPage: true });
 
-// drawer (worker)
-await d.locator(".grid .wcard").first().click();
+// worker drawer: "Workers" must anchor to the section HEADING — the dev-machine
+// cards also contain the substring "workers" ("13/14 workers · up 2h").
+const workersSection = d.locator(".section").filter({
+  has: d.locator(".section-head h2", { hasText: /^Workers$/ }),
+});
+await workersSection.locator(".wcard").first().click();
 await d.waitForSelector(".drawer");
 await d.waitForTimeout(300);
 await d.screenshot({ path: "/tmp/dash-audit/03-worker-drawer.png" });
-await d.keyboard.press("Escape");
-await d.waitForTimeout(250);
+
+// regression: a click on the drawer's own padding must NOT close it
+await d.locator(".drawer").click({ position: { x: 8, y: 320 } });
+await d.waitForTimeout(200);
+if ((await d.locator(".drawer").count()) === 0) {
+  throw new Error("drawer closed on padding click (backdrop-click guard regressed)");
+}
 
 // dev machine drawer
+await d.keyboard.press("Escape");
+await d.waitForTimeout(250);
 await d.locator(".section", { hasText: "Dev machines" }).locator(".wcard").first().click();
 await d.waitForSelector(".drawer");
 await d.waitForTimeout(300);
@@ -83,9 +96,10 @@ const overflow = await m.evaluate(() =>
 console.log(`mobile horizontal overflow px: ${overflow}`);
 
 // mobile worker drawer
-await m.locator(".section:not(:first-of-type)").filter({ hasText: "Workers" }).locator(".wcard").first().click();
-const hasDrawer = await m.locator(".drawer").count();
-if (!hasDrawer) await m.locator(".wcard").nth(2).click();
+const mobileWorkers = m.locator(".section").filter({
+  has: m.locator(".section-head h2", { hasText: /^Workers$/ }),
+});
+await mobileWorkers.locator(".wcard").first().click();
 await m.waitForSelector(".drawer");
 await m.waitForTimeout(300);
 await m.screenshot({ path: "/tmp/dash-audit/10-mobile-drawer.png" });

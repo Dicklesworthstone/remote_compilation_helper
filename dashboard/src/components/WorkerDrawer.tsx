@@ -17,7 +17,7 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
 }
 
 export function WorkerDrawer({ w, onClose }: Props) {
-  const panelRef = useDialog(w != null);
+  const { ref, onCancel, onClick } = useDialog(w != null, onClose);
 
   if (!w) return null;
   const c = w.caps;
@@ -26,13 +26,11 @@ export function WorkerDrawer({ w, onClose }: Props) {
 
   return (
     <dialog
-      ref={panelRef}
+      ref={ref}
       className="drawer"
       aria-label={`${w.id} details`}
-      onCancel={() => onClose()}
-      onClick={(e) => {
-        if (e.target === panelRef.current) onClose(); // backdrop click
-      }}
+      onCancel={onCancel}
+      onClick={onClick}
     >
         <div className="drawer-head">
           <h3>{w.id}</h3>

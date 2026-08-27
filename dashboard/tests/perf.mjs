@@ -2,14 +2,16 @@
  * S1: browser navigate -> .kpis visible (decrypt+first render), N runs, p50/p95.
  * S2: `node tools/fleet-llm.mjs` wall time, N runs (p50/p95) + one --cpu-prof run.
  * S3: dist asset bytes.
- * Usage: node .perf-baseline.mjs <outDir> [--browser-only|--node-only]
+ * Usage: node tests/perf.mjs [outDir] [--browser-only|--node-only]
+ * Env: RCH_DASH_BASE must match the base the served dist was built with.
  */
 import { chromium } from "playwright";
 import { readFileSync, mkdirSync, writeFileSync, statSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = "/Users/jemanuel/projects/remote_compilation_helper/dashboard";
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = process.argv[2] ?? `tests/artifacts/perf/run-${Date.now()}`;
 const mode = process.argv[3] ?? "";
 mkdirSync(outDir, { recursive: true });
@@ -19,7 +21,8 @@ const env = Object.fromEntries(
     .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim().replace(/^['"]|['"]$/g, "")]),
 );
 const PASS = env.RCH_DASH_PASSPHRASE;
-const URL = "http://127.0.0.1:4174/remote_compilation_helper/";
+const BASE = process.env.RCH_DASH_BASE ?? "/remote_compilation_helper/";
+const URL = `http://127.0.0.1:4174${BASE}`;
 
 const pct = (arr, p) => {
   const s = [...arr].sort((a, b) => a - b);

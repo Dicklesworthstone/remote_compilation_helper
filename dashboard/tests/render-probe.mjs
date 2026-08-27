@@ -5,9 +5,11 @@
  */
 import { chromium } from "playwright";
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const env = Object.fromEntries(
-  readFileSync("/Users/jemanuel/projects/remote_compilation_helper/dashboard/.env", "utf8")
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", ".env"), "utf8")
     .split("\n").filter((l) => l.includes("="))
     .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim().replace(/^['"]|['"]$/g, "")]),
 );
@@ -47,7 +49,6 @@ const out = {
 };
 
 // a) typing
-let m0 = await metrics();
 await page.click(".search");
 for (const ch of "vmill112") { await page.type(".search", ch, { delay: 120 }); }
 await page.waitForTimeout(300);

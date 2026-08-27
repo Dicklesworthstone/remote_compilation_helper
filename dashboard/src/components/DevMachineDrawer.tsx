@@ -18,7 +18,7 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
 }
 
 export function DevMachineDrawer({ d, onClose }: Props) {
-  const panelRef = useDialog(d != null);
+  const { ref, onCancel, onClick } = useDialog(d != null, onClose);
 
   // Deterministic, index-free list keys: an occurrence counter appended at
   // data-mapping time keeps identical hints/builds from colliding.
@@ -53,13 +53,11 @@ export function DevMachineDrawer({ d, onClose }: Props) {
 
   return (
     <dialog
-      ref={panelRef}
+      ref={ref}
       className="drawer"
       aria-label={`${d.id} dev machine details`}
-      onCancel={() => onClose()}
-      onClick={(e) => {
-        if (e.target === panelRef.current) onClose(); // backdrop click
-      }}
+      onCancel={onCancel}
+      onClick={onClick}
     >
         <div className="drawer-head">
           <h3>{d.id}</h3>
