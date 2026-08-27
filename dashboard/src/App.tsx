@@ -141,8 +141,16 @@ export default function App() {
         let plain: string;
         try {
           plain = await decryptEnvelope(env, key);
-        } catch {
-          setError("Wrong passphrase.");
+        } catch (err) {
+          // WebCrypto reports a GCM auth failure as OperationError — that is
+          // the wrong passphrase. Any other throw (e.g. assertUsableEnvelope's
+          // invalid-envelope errors) is a payload defect and deserves its real
+          // message instead of a misleading accusation.
+          setError(
+            err instanceof Error && err.name === "OperationError"
+              ? "Wrong passphrase."
+              : `Could not decrypt this snapshot: ${err instanceof Error ? err.message : "unknown error"}`,
+          );
           return;
         }
         setSnap(JSON.parse(plain));
