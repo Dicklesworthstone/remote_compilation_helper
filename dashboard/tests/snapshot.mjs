@@ -18,6 +18,7 @@ import {
   statusRank, circuitRank, pressureIsBetter,
   isLocalDispatcher, dispatcherId,
   encrypt, existingSalt, internSnapshotStrings,
+  buildProbeScript, splitProbeSections, dispatcherFromProbe, allSettledBounded,
 } from "../tools/snapshot.mjs";
 import { expandBuilds, expandHints } from "../tools/llm-view.mjs";
 
@@ -88,6 +89,228 @@ chk("aliases collapse to one dispatcher id",
   dispatcherId("local") === dispatcherId("localhost") && dispatcherId("localhost") === dispatcherId(short),
   dispatcherId("local"));
 chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
+
+// ------------------------------------------------------------ the ssh probe
+
+// The collector used to ask each dispatcher four questions over four separate
+// `ssh` processes — 36 TCP connections and 36 key exchanges on a 10-machine
+// fleet, all paid on the collector's own cpu. It now asks all four over ONE
+// connection, with the four commands still running concurrently on the far
+// side and their outputs framed apart. Everything below pins a property that
+// collapse had to preserve.
+{
+  const script = buildProbeScript("0123456789abcdef");
+
+  // The per-command budgets genuinely differ, and a combined invocation that
+  // shared one budget would let a wedged `rch status` eat `workers list`'s.
+  chk("status keeps its own 70s budget", script.includes("timeout 70 rch status --json"));
+  chk("capabilities keeps its own 70s budget", script.includes("timeout 70 rch workers capabilities --json"));
+  chk("workers list keeps its own 45s budget", script.includes("timeout 45 rch workers list --json"));
+  chk("metrics keeps its own 10s budget", script.includes("curl -s --max-time 10 http://127.0.0.1:9100/metrics"));
+
+  // `timeout(1)` is absent from a stock macOS and one dispatcher is a Mac; it
+  // resolves there only via Homebrew on the default non-login ssh PATH. Keeping
+  // the command text byte-identical is what keeps that working.
+  chk("every rch section still exports ~/.local/bin onto PATH",
+    (script.match(/export PATH="\$HOME\/\.local\/bin:\$PATH"/g) ?? []).length === 6,
+    `${(script.match(/export PATH/g) ?? []).length} occurrences (3 parallel + 3 sequential)`);
+  // ...but only inside the rch sections. Leaking it into the curl section could
+  // change which curl runs on a host that has one in ~/.local/bin.
+  chk("the metrics section does not inherit the rch PATH export",
+    script.split("\n").filter((l) => l.includes("curl -s --max-time 10")).every((l) => !l.includes("export PATH")));
+
+  chk("each rch section still discards its own stderr",
+    (script.match(/2>\/dev\/null/g) ?? []).length >= 8);
+
+  // Concurrency on the far side is the whole point: run them serially in one
+  // shell and the per-host wall becomes the SUM of four commands.
+  chk("the four sections run concurrently on the dispatcher",
+    (script.match(/> "\$d\/[sclm]" & q\d=\$!/g) ?? []).length === 4);
+  chk("each section's own exit status is captured",
+    (script.match(/wait \$q\d; e\d=\$\?/g) ?? []).length === 4);
+
+  // A full /data/tmp is a live condition on this fleet. Losing mktemp must cost
+  // parallelism, not the whole dispatcher.
+  chk("a failed mktemp falls back to sequential collection over the same connection",
+    script.includes('if [ -n "$d" ]; then') && script.includes("\nelse\n") && script.trimEnd().endsWith("\nfi"));
+
+  // Cleanup names exactly the four files this script created, inside the
+  // directory it created. Nothing else on a production host is touched.
+  chk("cleanup removes only this script's own files",
+    script.includes(`trap 'rm -f "$d/s" "$d/c" "$d/l" "$d/m"; rmdir "$d" 2>/dev/null' EXIT`));
+  chk("the temp dir honours the host's own TMPDIR",
+    script.includes('mktemp -d "${TMPDIR:-/tmp}/rchdash.XXXXXX"'));
+}
+
+// Framing has to be byte-exact, not approximately right. `parseMetrics` reports
+// a dead endpoint on a FALSY stdout, so a single stray newline would turn "the
+// metrics endpoint is gone" into "the endpoint is fine and has no workers" —
+// which silently disables the worker-has-gone-dark rule fleet-wide.
+{
+  const N = "0123456789abcdef";
+  const emit = (parts) => parts.map(([k, text, rc = 0]) => `${text}\n${N}:${k}:${rc}\n`).join("");
+
+  const sec = splitProbeSections(emit([
+    ["s", "{\"a\":1}\n"], ["c", ""], ["l", "no-trailing-newline", 1], ["m", "x\n\ny\n"],
+  ]), N);
+  chk("a section that ended in a newline keeps exactly one", sec.get("s").text === "{\"a\":1}\n");
+  chk("an empty section stays empty, not a newline", sec.get("c").text === "");
+  chk("a section without a trailing newline does not gain one", sec.get("l").text === "no-trailing-newline");
+  chk("interior blank lines survive", sec.get("m").text === "x\n\ny\n");
+  chk("each section carries its own exit status",
+    sec.get("s").rc === 0 && sec.get("l").rc === 1);
+
+  // ssh banner noise used to land in front of each command's JSON and was
+  // tolerated by the first-`{`-to-last-`}` scan; it still is.
+  const noisy = splitProbeSections("motd line\n" + emit([["s", "{\"a\":1}"]]), N);
+  chk("noise before the first marker stays with the first section",
+    noisy.get("s").text === "motd line\n{\"a\":1}");
+
+  // The payload is not ours — a build command string could in principle contain
+  // anything. The marker is a per-process random nonce, and a second frame for
+  // a key that already parsed is ignored rather than allowed to replace it.
+  chk("a duplicate frame cannot overwrite a section",
+    splitProbeSections(emit([["s", "first"], ["s", "second"]]), N).get("s").text === "first");
+  chk("a foreign nonce claims nothing",
+    splitProbeSections(emit([["s", "x"]]), "ffffffffffffffff").size === 0);
+}
+
+// ------------------------------------------- per-section failure isolation
+
+// THE property this pass had to keep. Before the collapse each question was its
+// own ssh process, so `workers list` dying blanked tags and priority and set
+// `config_degraded` while `rch status` — and therefore the whole dispatcher —
+// carried on. One combined invocation must not turn one failing subcommand into
+// a dead dispatcher.
+{
+  const N = "0123456789abcdef";
+  const emit = (parts) => parts.map(([k, text, rc = 0]) => `${text}\n${N}:${k}:${rc}\n`).join("");
+  const probe = (parts, error = null) => ({ sections: splitProbeSections(emit(parts), N), error });
+
+  const STATUS = JSON.stringify({
+    api_version: "1.0", success: true,
+    data: {
+      posture: "remote_ready", posture_description: "offloading",
+      remediation_hints: [{ worker_id: "hz3", severity: "critical", message: "disk", suggested_action: "reclaim", reason_code: "disk_low" }],
+      daemon: {
+        daemon: { version: "1.0.57", uptime_secs: 42, pid: 7, workers_total: 1, workers_healthy: 1, slots_total: 16, slots_available: 15 },
+        workers: [{ id: "hz3", host: "hz3", status: "healthy", used_slots: 1, total_slots: 16, speed_score: 9 }],
+        stats: { total_builds: 3, remote_count: 3, local_count: 0, success_count: 3, failure_count: 0, avg_duration_ms: 10 },
+        recent_builds: [{ project_id: "rch", command: "cargo build", location: "Remote", worker_id: "hz3", duration_ms: 5, exit_code: 0, completed_at: "t" }],
+        active_builds: [1], queued_builds: [], saved_time: { time_saved_ms: 99 },
+      },
+    },
+  });
+  const CAPS = JSON.stringify({ success: true, data: { workers: [{ id: "hz3", capabilities: { num_cpus: 64, rustc_version: "1.90" } }] } });
+  const LIST = JSON.stringify({ success: true, data: { workers: [{ id: "hz3", tags: ["big"], priority: 120 }] } });
+  const MET = 'rch_worker_latency_ms_sum{worker="hz3"} 200\nrch_worker_latency_ms_count{worker="hz3"} 4\nrch_worker_last_seen_timestamp{worker="hz3"} 1787800000\n';
+
+  const healthy = dispatcherFromProbe("hz3-dev", probe([["s", STATUS], ["c", CAPS], ["l", LIST], ["m", MET]]));
+  chk("a clean probe reports no collection errors", healthy.collection_errors.length === 0);
+  chk("a clean probe is not config-degraded", healthy.config_degraded === false);
+  chk("a clean probe fills every section",
+    healthy.posture === "remote_ready" && healthy.workers[0].tags[0] === "big" &&
+    healthy.workers[0].caps.num_cpus === 64 && healthy.workers[0].latency_ms === 50);
+
+  // ONE section fails, exactly as `rch workers list` exiting non-zero used to.
+  const listDead = dispatcherFromProbe("hz3-dev", probe([["s", STATUS], ["c", CAPS], ["l", "", 1], ["m", MET]]));
+  chk("a failed `workers list` still leaves the dispatcher reachable", listDead.reachable === true);
+  chk("a failed `workers list` still yields status, caps and metrics",
+    listDead.posture === "remote_ready" && listDead.workers[0].caps.num_cpus === 64 &&
+    listDead.workers[0].latency_ms === 50 && listDead.builds.length === 1);
+  chk("a failed `workers list` sets config_degraded", listDead.config_degraded === true);
+  chk("a failed `workers list` blanks only tags and priority",
+    listDead.workers[0].tags.length === 0 && listDead.workers[0].priority === null);
+  chk("a failed section yields exactly one, named, per-section reason",
+    listDead.collection_errors.length === 1 && listDead.collection_errors[0] === "workers list: exited 1",
+    JSON.stringify(listDead.collection_errors));
+
+  // The other three sections, each failing alone.
+  const capsDead = dispatcherFromProbe("hz3-dev", probe([["s", STATUS], ["c", "", 127], ["l", LIST], ["m", MET]]));
+  chk("a failed `workers capabilities` costs only caps",
+    capsDead.reachable && capsDead.workers[0].tags[0] === "big" && capsDead.workers[0].caps.num_cpus === null &&
+    capsDead.config_degraded === false && capsDead.collection_errors[0] === "workers capabilities: exited 127");
+
+  const metDead = dispatcherFromProbe("hz3-dev", probe([["s", STATUS], ["c", CAPS], ["l", LIST], ["m", "", 7]]));
+  chk("a failed metrics scrape costs only latency and last-seen",
+    metDead.reachable && metDead.workers[0].latency_ms === null && metDead.workers[0].last_seen_unix === null &&
+    metDead.workers[0].caps.num_cpus === 64 && metDead.collection_errors[0] === "metrics: exited 7");
+  // A metrics endpoint that answers with nothing but exits 0 must still be
+  // called out — losing it silently disables the gone-dark rule.
+  const metEmpty = dispatcherFromProbe("hz3-dev", probe([["s", STATUS], ["c", CAPS], ["l", LIST], ["m", ""]]));
+  chk("an empty-but-successful metrics scrape is still reported",
+    metEmpty.collection_errors[0] === "metrics: no response from 127.0.0.1:9100");
+
+  // Only `rch status` failing takes the dispatcher down, which is what it did
+  // before: `reachable` is defined as "status parsed".
+  const statusDead = dispatcherFromProbe("hz3-dev", probe([["s", "", 1], ["c", CAPS], ["l", LIST], ["m", MET]]));
+  chk("only a failed `rch status` makes a dispatcher unreachable",
+    statusDead.reachable === false && statusDead.workers.length === 0 &&
+    statusDead.collection_errors[0] === "status: exited 1");
+
+  // A subcommand that exits non-zero but still printed usable JSON was parsed
+  // before — some rch subcommands do exactly that — and still is.
+  const noisyExit = dispatcherFromProbe("hz3-dev", probe([["s", STATUS, 3], ["c", CAPS], ["l", LIST], ["m", MET]]));
+  chk("a non-zero exit that still printed JSON is used, not discarded",
+    noisyExit.reachable === true && noisyExit.collection_errors.length === 0);
+
+  // Transport failure: no frames at all. Every section must still name itself,
+  // exactly as four dead ssh calls each named themselves before.
+  const dead = dispatcherFromProbe("hz3-dev", { sections: new Map(), error: "ssh: connect to host hz3-dev port 22: No route to host" });
+  chk("an unreachable host reports all four sections by name",
+    dead.collection_errors.length === 4 &&
+    dead.collection_errors.every((e) => e.includes("No route to host")) &&
+    dead.collection_errors[0].startsWith("status:") &&
+    dead.collection_errors[1].startsWith("workers capabilities:") &&
+    dead.collection_errors[2].startsWith("workers list:") &&
+    dead.collection_errors[3].startsWith("metrics:"),
+    JSON.stringify(dead.collection_errors.map((e) => e.split(":")[0])));
+
+  // rch's own error envelope, which is not a transport failure at all.
+  const rchFailed = dispatcherFromProbe("hz3-dev", probe([
+    ["s", JSON.stringify({ success: false, error: { code: "E_DAEMON", message: "not running" } })],
+    ["c", CAPS], ["l", LIST], ["m", MET],
+  ]));
+  chk("an rch error envelope is reported as such, not as an unreachable host",
+    rchFailed.reachable === false && rchFailed.collection_errors[0] === "status: E_DAEMON not running");
+}
+
+// ---------------------------------------------------------- bounded fan-out
+
+// The fan-out is now one connection per dispatcher instead of four, but it was
+// also unbounded. The cap must not change what comes back or in what order:
+// `dispatchers[]` is positional and the string table indexes into it.
+{
+  const items = [1, 2, 3, 4, 5, 6, 7];
+  const slow = async (n) => { await new Promise((r) => setTimeout(r, (8 - n) * 5)); return n * 10; };
+
+  const unbounded = await allSettledBounded(items, 99, slow);
+  const bounded = await allSettledBounded(items, 2, slow);
+  chk("a limit at or above the fleet size is plain Promise.allSettled",
+    JSON.stringify(unbounded) === JSON.stringify(items.map((n) => ({ status: "fulfilled", value: n * 10 }))));
+  chk("results stay in INPUT order regardless of completion order",
+    JSON.stringify(bounded) === JSON.stringify(unbounded));
+
+  // Never more than `limit` in flight — this is the whole point of the cap.
+  let live = 0, peak = 0;
+  await allSettledBounded(items, 3, async () => {
+    peak = Math.max(peak, ++live);
+    await new Promise((r) => setTimeout(r, 5));
+    live--;
+  });
+  chk("the limit is actually enforced", peak === 3, `peak=${peak}`);
+
+  // One dispatcher whose mapper throws must not abort the others — the reason
+  // this was allSettled and not all.
+  const mixed = await allSettledBounded([1, 2, 3], 2, async (n) => {
+    if (n === 2) throw new Error("boom");
+    return n;
+  });
+  chk("a thrown mapper is isolated to its own slot",
+    mixed[0].status === "fulfilled" && mixed[1].status === "rejected" &&
+    mixed[1].reason.message === "boom" && mixed[2].value === 3);
+  chk("an empty fleet settles without hanging", (await allSettledBounded([], 4, async () => 1)).length === 0);
+}
 
 // -------------------------------------------------------- string interning
 

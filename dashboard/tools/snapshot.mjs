@@ -50,6 +50,23 @@ const SCHEMA = "rch.dashboard.snapshot.v2";
 const SSH_TIMEOUT_MS = 90_000;
 const MAX_BUFFER = 64 * 1024 * 1024;
 
+/**
+ * How many dispatchers to probe at once.
+ *
+ * The fan-out used to be unbounded AND four-wide per host: every dispatcher
+ * issued `rch status`, `rch workers capabilities`, `rch workers list` and a
+ * curl of the metrics endpoint as four independent `ssh` processes, so a
+ * 10-machine fleet opened 36 simultaneous TCP connections and paid 36 full
+ * key-exchange handshakes — on the COLLECTOR's cpu, which is the machine that
+ * is usually already busy. Each host now needs exactly one connection, so the
+ * count is N, not 4N; this caps N as well so a 60-machine fleet cannot melt the
+ * collector's file-descriptor and process budget.
+ *
+ * 16 is above every fleet this has run against, so today it throttles nothing
+ * and the collection order and output are bit-identical to the unbounded form.
+ */
+const DEFAULT_MAX_PARALLEL = 16;
+
 // ---------------------------------------------------------------- arg parsing
 
 function parseArgs(argv) {
@@ -59,6 +76,7 @@ function parseArgs(argv) {
     historyFile: ".snapshot-history.json",
     historyMax: 96,
     label: "rch fleet",
+    maxParallel: DEFAULT_MAX_PARALLEL,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -86,11 +104,20 @@ function parseArgs(argv) {
       }
       args.historyMax = n;
     }
+    else if (a === "--max-parallel") {
+      const n = Number(next());
+      if (!Number.isInteger(n) || n < 1) {
+        console.error("--max-parallel must be a positive integer");
+        process.exit(2);
+      }
+      args.maxParallel = n;
+    }
     else if (a === "--help" || a === "-h") {
       console.log(
         "usage: RCH_DASH_PASSPHRASE=... node tools/snapshot.mjs\n" +
           "  [--dispatchers a,b,c]  ssh targets; use `local` for this machine\n" +
-          "  [--out path] [--label name] [--history-file path] [--history-max N]",
+          "  [--out path] [--label name] [--history-file path] [--history-max N]\n" +
+          `  [--max-parallel N]     dispatchers probed at once (default ${DEFAULT_MAX_PARALLEL})`,
       );
       process.exit(0);
     } else {
@@ -148,14 +175,177 @@ async function run(host, command) {
   }
 }
 
+// --------------------------------------------------------- the combined probe
+
 /**
- * Run an rch subcommand that emits the standard `{data: ...}` JSON envelope.
+ * The four questions asked of every dispatcher, in wire order.
+ *
+ * These used to be FOUR separate `ssh` invocations fired with `Promise.all`,
+ * which meant four TCP connections and four full key-exchange handshakes per
+ * host — 36 of them on a 10-machine fleet, all racing on the collector's own
+ * cpu. They are now one connection per host, and the four commands still run
+ * CONCURRENTLY, on the far side.
+ *
+ * `cmd` is byte-for-byte what each command used to be, including the per-command
+ * `timeout` budget and the `2>/dev/null`. That matters more than it looks:
+ *   - the budgets genuinely differ (70/70/45/10s) and running them serially in
+ *     one shell would let a wedged `rch status` eat the whole run — measured at
+ *     p50 2,955ms/host against 834ms for the parallel form, so the far side
+ *     must fork, not sequence;
+ *   - `timeout(1)` does not exist on a stock macOS, and one dispatcher is a Mac.
+ *     It resolves there only because Homebrew's coreutils is on the default
+ *     non-login ssh PATH. Keeping the command text identical keeps that working
+ *     (and keeps it failing the same recognisable way if Homebrew ever goes).
+ *   - the `export PATH` prefix stays INSIDE each rch section's subshell, so it
+ *     cannot leak into the `curl` section and change which curl runs.
+ */
+const PROBE_SECTIONS = [
+  { key: "s", cmd: rchProbeCommand("status", 70) },
+  { key: "c", cmd: rchProbeCommand("workers capabilities", 70) },
+  { key: "l", cmd: rchProbeCommand("workers list", 45) },
+  { key: "m", cmd: "curl -s --max-time 10 http://127.0.0.1:9100/metrics 2>/dev/null" },
+];
+
+function rchProbeCommand(subcommand, timeoutSec) {
+  return `export PATH="$HOME/.local/bin:$PATH"; timeout ${timeoutSec} rch ${subcommand} --json 2>/dev/null`;
+}
+
+/**
+ * Per-process section marker. Random, because the payload is not ours: a build
+ * command string in `rch status` or a Prometheus label could in principle
+ * contain any fixed sentinel we picked, and a payload that can forge a frame
+ * boundary can move bytes from one section into another. A 16-hex-digit nonce
+ * that only exists inside this process cannot be guessed by the data.
+ */
+const PROBE_NONCE = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
+
+/**
+ * One shell script that answers all four questions over a single connection.
+ *
+ * Shape, and why each piece is the way it is:
+ *
+ *   d=$(mktemp -d ...)     Temp files are what makes CONCURRENT sections
+ *                          possible. Four background jobs cannot share one
+ *                          stdout: `rch status --json` is tens of KB and writes
+ *                          larger than PIPE_BUF are not atomic, so their bytes
+ *                          would interleave and every section would be corrupt.
+ *   if [ -n "$d" ] ... else
+ *                          If `mktemp` fails — a full /data/tmp is a real
+ *                          condition on this fleet — fall back to running the
+ *                          four SEQUENTIALLY in the same connection. Slower, but
+ *                          a slow dispatcher beats one that reports as dead.
+ *   trap '... EXIT'        Removes exactly the four files this script created
+ *                          and its own directory. Nothing else is touched, and
+ *                          nothing is left behind on the host.
+ *   wait $qN; eN=$?        The subcommand's OWN exit status, which is what makes
+ *                          per-section failure reporting possible — see
+ *                          sectionResult(). The four still ran in parallel;
+ *                          waiting for them in order costs nothing.
+ *   cat; echo; echo MARKER Content, then exactly one newline, then the marker on
+ *                          its own line. splitProbeSections() relies on that
+ *                          single added newline to reconstruct each section's
+ *                          bytes EXACTLY, including the empty-output case that
+ *                          the metrics scraper reports as an error.
+ *
+ * Everything here is POSIX sh: the fleet's login shells are a mix of bash and
+ * zsh and ssh runs the command under whichever one the account has.
+ */
+export function buildProbeScript(nonce = PROBE_NONCE) {
+  const files = PROBE_SECTIONS.map((s) => `"$d/${s.key}"`).join(" ");
+  return [
+    `d=$(mktemp -d "\${TMPDIR:-/tmp}/rchdash.XXXXXX" 2>/dev/null)`,
+    `if [ -n "$d" ]; then`,
+    `trap 'rm -f ${files}; rmdir "$d" 2>/dev/null' EXIT`,
+    ...PROBE_SECTIONS.map((s, i) => `{ ${s.cmd}; } > "$d/${s.key}" & q${i}=$!`),
+    ...PROBE_SECTIONS.map((s, i) =>
+      `wait $q${i}; e${i}=$?\ncat "$d/${s.key}"; echo; echo "${nonce}:${s.key}:$e${i}"`),
+    `else`,
+    ...PROBE_SECTIONS.map((s) => `( ${s.cmd} ); e=$?; echo; echo "${nonce}:${s.key}:$e"`),
+    `fi`,
+  ].join("\n");
+}
+
+/**
+ * Split framed probe output back into `key -> {text, rc}`.
+ *
+ * The reconstruction is exact, not approximate. The emitter writes
+ * `<content>\n<marker>\n`; splitting the whole stream on "\n" and re-joining a
+ * section's tokens with "\n" consumes precisely the one newline the emitter
+ * added, so `text` is the original bytes — `""` stays `""`, and a section whose
+ * content already ended in a newline keeps it. That exactness is load-bearing:
+ * `parseMetrics` reports "no response from 127.0.0.1:9100" on a FALSY stdout,
+ * so a stray newline would silently convert a dead metrics endpoint into a
+ * healthy-looking one with no workers in it.
+ *
+ * Bytes before the first marker belong to the first section, which is where ssh
+ * banner noise landed before too — `rch`'s JSON is still located by scanning
+ * from the first `{` to the last `}`.
+ *
+ * First marker for a key wins, so a duplicate frame cannot overwrite a section
+ * that already parsed.
+ */
+export function splitProbeSections(stdout, nonce = PROBE_NONCE) {
+  const out = new Map();
+  const marker = new RegExp(`^${nonce}:([a-z]+):(-?\\d+)$`);
+  let buf = [];
+  for (const line of String(stdout ?? "").split("\n")) {
+    const m = marker.exec(line);
+    if (!m) { buf.push(line); continue; }
+    if (!out.has(m[1])) out.set(m[1], { text: buf.join("\n"), rc: Number(m[2]) });
+    buf = [];
+  }
+  return out;
+}
+
+/**
+ * Turn one section of a probe into the `{stdout, error}` shape the parsers
+ * below expect — the same shape `run()` used to hand them per command.
+ *
+ * This is where the old per-command failure isolation is preserved. The four
+ * questions no longer have four exit statuses from four ssh processes, so the
+ * far side reports each one's own status and it is reconstructed here:
+ *
+ *   section present, exit 0    -> {stdout, error: null}      (as before)
+ *   section present, exit N!=0 -> {stdout, error: "exited N"} — and if stdout is
+ *                                 non-empty the parsers IGNORE the error and use
+ *                                 it, exactly as they did when a non-zero ssh
+ *                                 still carried usable JSON.
+ *   section absent             -> the transport error, or "no output". A section
+ *                                 goes missing only when the connection itself
+ *                                 failed, or the remote shell died before
+ *                                 reaching it — in both cases every section is
+ *                                 missing, which is precisely the old
+ *                                 all-four-ssh-calls-failed case.
+ *
+ * So one failing subcommand degrades exactly one section: `workers list`
+ * returning nothing still leaves `rch status` parsed, the dispatcher reachable,
+ * and `config_degraded` set — see tests/snapshot.mjs.
+ */
+function sectionResult(probe, key) {
+  const sec = probe.sections.get(key);
+  if (sec) return { stdout: sec.text, error: sec.rc === 0 ? null : `exited ${sec.rc}` };
+  return { stdout: "", error: probe.error || null };
+}
+
+/**
+ * Built once, so every dispatcher in a run is asked exactly the same question
+ * under exactly the same nonce — the script is a pure function of
+ * PROBE_SECTIONS and cannot drift between hosts.
+ */
+const PROBE_SCRIPT = buildProbeScript();
+
+/** One connection per dispatcher. Never throws; returns {sections, error}. */
+async function probeDispatcher(host) {
+  const res = await run(host, PROBE_SCRIPT);
+  return { sections: splitProbeSections(res.stdout), error: res.error ?? null };
+}
+
+/**
+ * Parse an rch subcommand's standard `{data: ...}` JSON envelope.
  * Returns `{data, error}` — `data` is null on every failure and `error` says
  * why, so a dead daemon can be told apart from an unreachable host.
  */
-async function rchJson(host, subcommand, timeoutSec = 60) {
-  const cmd = `export PATH="$HOME/.local/bin:$PATH"; timeout ${timeoutSec} rch ${subcommand} --json 2>/dev/null`;
-  const res = await run(host, cmd);
+function parseRchJson(subcommand, res) {
   if (!res.stdout.trim()) {
     return { data: null, error: res.error ? `${subcommand}: ${res.error}` : `${subcommand}: no output` };
   }
@@ -189,8 +379,7 @@ async function rchJson(host, subcommand, timeoutSec = 60) {
 }
 
 /** Scrape the daemon's Prometheus endpoint for probe latency. */
-async function fetchMetrics(host) {
-  const res = await run(host, "curl -s --max-time 10 http://127.0.0.1:9100/metrics 2>/dev/null");
+function parseMetrics(res) {
   const out = { latency: {}, lastSeen: {}, error: null };
   if (!res.stdout) {
     // Worth surfacing: `last_seen_unix` comes only from here, so losing this
@@ -267,15 +456,58 @@ export function pressureIsBetter(next, cur) {
   return an < ac;
 }
 
+/**
+ * `Promise.allSettled` with a ceiling on how many run at once.
+ *
+ * Results are written back BY INDEX, so the returned array is in input order
+ * and carries the same `{status, value}` / `{status, reason}` shape
+ * `Promise.allSettled` returns. That is the isomorphism: with `limit >= n` this
+ * is `Promise.allSettled`, and `dispatchers[]` — which is positional, and which
+ * the string table and every consumer index into — keeps its order at any limit.
+ */
+export async function allSettledBounded(items, limit, fn) {
+  const out = new Array(items.length);
+  const width = Math.max(1, Math.min(limit, items.length));
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      try {
+        out[i] = { status: "fulfilled", value: await fn(items[i], i) };
+      } catch (reason) {
+        out[i] = { status: "rejected", reason };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: width }, worker));
+  return out;
+}
+
+/** One dispatcher, one connection. */
 async function collectDispatcher(host) {
+  return dispatcherFromProbe(host, await probeDispatcher(host));
+}
+
+/**
+ * Build a dispatcher record from an already-collected probe.
+ *
+ * Separate from the ssh call for one reason: this is where per-section failure
+ * isolation lives, and isolation you cannot test is isolation you do not have.
+ * `tests/snapshot.mjs` hands this function hand-framed probe output — one
+ * section failing, the rest healthy — and asserts the surviving sections still
+ * populate, which is the property the four-processes-to-one collapse had to
+ * keep.
+ */
+export function dispatcherFromProbe(host, probe) {
   // `rch status` carries runtime state but NOT the static config fields
-  // (tags, priority, enabled) — those only exist in `workers list`.
-  const [statusRes, capsRes, listRes, metrics] = await Promise.all([
-    rchJson(host, "status", 70),
-    rchJson(host, "workers capabilities", 70),
-    rchJson(host, "workers list", 45),
-    fetchMetrics(host),
-  ]);
+  // (tags, priority, enabled) — those only exist in `workers list`. All four
+  // still run concurrently; they now do it on the far side of ONE connection
+  // instead of four. See PROBE_SECTIONS.
+  const statusRes = parseRchJson("status", sectionResult(probe, "s"));
+  const capsRes = parseRchJson("workers capabilities", sectionResult(probe, "c"));
+  const listRes = parseRchJson("workers list", sectionResult(probe, "l"));
+  const metrics = parseMetrics(sectionResult(probe, "m"));
 
   const status = statusRes.data;
   const caps = capsRes.data;
@@ -649,19 +881,17 @@ async function main() {
   const targets = [...seenHosts.values()];
 
   console.error(`collecting from ${targets.length} dev machine(s): ${targets.join(", ")}`);
-  // allSettled, not all: this fan-out is the whole snapshot. One dispatcher
+  // Settled, not all: this fan-out is the whole snapshot. One dispatcher
   // returning a shape that throws inside the mapper must not abort collection
   // for every other machine — that is the opposite of the resilience the merge
   // below is written for.
-  const settled = await Promise.allSettled(
-    targets.map(async (host) => {
-      const d = await collectDispatcher(host);
-      console.error(
-        `  ${String(host).padEnd(14)} ${d.reachable ? `ok  posture=${d.posture ?? "?"}  workers=${d.workers.length}` : `UNREACHABLE  ${d.collection_errors[0] ?? ""}`}`,
-      );
-      return d;
-    }),
-  );
+  const settled = await allSettledBounded(targets, args.maxParallel, async (host) => {
+    const d = await collectDispatcher(host);
+    console.error(
+      `  ${String(host).padEnd(14)} ${d.reachable ? `ok  posture=${d.posture ?? "?"}  workers=${d.workers.length}` : `UNREACHABLE  ${d.collection_errors[0] ?? ""}`}`,
+    );
+    return d;
+  });
 
   const dispatchers = settled.map((r, i) => {
     if (r.status === "fulfilled") return r.value;
