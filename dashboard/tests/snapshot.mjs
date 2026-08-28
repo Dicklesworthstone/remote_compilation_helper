@@ -117,9 +117,14 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
   // `timeout(1)` is absent from a stock macOS and one dispatcher is a Mac; it
   // resolves there only via Homebrew on the default non-login ssh PATH. Keeping
   // the command text byte-identical is what keeps that working.
+  // The three dev-machine self-checks keep their own, shorter budgets: doctor
+  // runs ~34 local checks (no worker probes) and the other two are sub-second.
+  chk("doctor keeps its own 40s budget", script.includes("timeout 40 rch doctor --json"));
+  chk("shim status keeps its own 20s budget", script.includes("timeout 20 rch shim status --json"));
+  chk("hook status keeps its own 20s budget", script.includes("timeout 20 rch hook status --json"));
   chk("every rch section still exports ~/.local/bin onto PATH",
-    (script.match(/export PATH="\$HOME\/\.local\/bin:\$PATH"/g) ?? []).length === 6,
-    `${(script.match(/export PATH/g) ?? []).length} occurrences (3 parallel + 3 sequential)`);
+    (script.match(/export PATH="\$HOME\/\.local\/bin:\$PATH"/g) ?? []).length === 12,
+    `${(script.match(/export PATH/g) ?? []).length} occurrences (6 parallel + 6 sequential)`);
   // ...but only inside the rch sections. Leaking it into the curl section could
   // change which curl runs on a host that has one in ~/.local/bin.
   chk("the metrics section does not inherit the rch PATH export",
@@ -130,8 +135,8 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
 
   // Concurrency on the far side is the whole point: run them serially in one
   // shell and the per-host wall becomes the SUM of four commands.
-  chk("the four sections run concurrently on the dispatcher",
-    (script.match(/> "\$d\/[sclm]" & q\d=\$!/g) ?? []).length === 4);
+  chk("all seven sections run concurrently on the dispatcher",
+    (script.match(/> "\$d\/[sclmdhk]" & q\d=\$!/g) ?? []).length === 7);
   chk("each section's own exit status is captured",
     (script.match(/wait \$q\d; e\d=\$\?/g) ?? []).length === 4);
 
@@ -191,7 +196,16 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
 {
   const N = "0123456789abcdef";
   const emit = (parts) => parts.map(([k, text, rc = 0]) => `${text}\n${N}:${k}:${rc}\n`).join("");
-  const probe = (parts, error = null) => ({ sections: splitProbeSections(emit(parts), N), error });
+  // Sections the caller did not mention are filled with a healthy answer, so
+  // every "exactly one section fails" case below keeps meaning exactly that
+  // after the probe grew from four sections to seven. Pass `["d", "", 1]` (or
+  // omit via `absent`) to make one of the new ones fail.
+  const DEFAULTS = () => [["d", DOC], ["h", SHIM], ["k", HOOK]];
+  const probe = (parts, error = null, { absent = [] } = {}) => {
+    const have = new Set(parts.map((p) => p[0]));
+    const all = [...parts, ...DEFAULTS().filter(([k]) => !have.has(k) && !absent.includes(k))];
+    return { sections: splitProbeSections(emit(all), N), error };
+  };
 
   const STATUS = JSON.stringify({
     api_version: "1.0", success: true,
@@ -210,6 +224,22 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
   const CAPS = JSON.stringify({ success: true, data: { workers: [{ id: "hz3", capabilities: { num_cpus: 64, rustc_version: "1.90" } }] } });
   const LIST = JSON.stringify({ success: true, data: { workers: [{ id: "hz3", tags: ["big"], priority: 120 }] } });
   const MET = 'rch_worker_latency_ms_sum{worker="hz3"} 200\nrch_worker_latency_ms_count{worker="hz3"} 4\nrch_worker_last_seen_timestamp{worker="hz3"} 1787800000\n';
+  // The three dev-machine self-checks, shaped exactly as rch 1.0.60 prints them.
+  const DOC = JSON.stringify({ success: true, data: {
+    summary: { total: 3, passed: 2, warnings: 1, failed: 0 },
+    checks: [
+      { name: "rsync", status: "pass", message: "installed", fixable: false },
+      { name: "claude_code_hook", status: "pass", message: "Claude Code PreToolUse hook is installed", fixable: true },
+      { name: "ssh_config", status: "warn", message: "No SSH config file", fixable: false },
+    ],
+  } });
+  const SHIM = JSON.stringify({ success: true, data: {
+    installed: true, up_to_date: true, on_path_ahead_of_cargo: true, interception: "direct",
+    local_builds_running: 2, toolchains_wrapped: 3, toolchains_total: 3,
+  } });
+  const HOOK = JSON.stringify({ success: true, data: { agents: [
+    { agent: "ClaudeCode", status: "Installed" }, { agent: "CodexCli", status: "Not installed" },
+  ] } });
 
   const healthy = dispatcherFromProbe("hz3-dev", probe([["s", STATUS], ["c", CAPS], ["l", LIST], ["m", MET]]));
   chk("a clean probe reports no collection errors", healthy.collection_errors.length === 0);
