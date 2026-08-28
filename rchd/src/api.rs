@@ -1039,8 +1039,10 @@ pub async fn handle_connection(
         }
         Ok(ApiRequest::Reload) => {
             metrics::inc_requests("reload");
-            // Perform reload using the reload module
-            let result = reload::reload_workers(&ctx.pool, None, true).await;
+            // Reload from the file the daemon was launched with, never from a
+            // freshly resolved default (bd-xqg58).
+            let result =
+                reload::reload_workers(&ctx.pool, ctx.workers_config_path.as_deref(), true).await;
             match result {
                 Ok(reload_result) => {
                     let response = serde_json::json!({
@@ -3759,6 +3761,7 @@ mod tests {
             queue_timeout_secs: 300,
             bypass_store: None,
             admin_disable_store: None,
+            workers_config_path: None,
             admission_barrier: Arc::new(tokio::sync::RwLock::new(false)),
         }
     }
@@ -4000,6 +4003,54 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("GET /events").unwrap();
         assert!(matches!(req, ApiRequest::Events), "expected events request");
+    }
+
+    /// Regression for bd-xqg58: the socket `reload` must read the file the
+    /// daemon was launched with (`--workers-config`), not whatever the
+    /// default config-dir resolution picks at reload time. On macOS those
+    /// can be two different files, and edits to the running one were
+    /// silently ignored.
+    #[tokio::test]
+    async fn test_reload_uses_launch_time_workers_config_path() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workers_path = dir.path().join("launch-workers.toml");
+        std::fs::write(
+            &workers_path,
+            "[[workers]]\nid = \"reload-launch-path-w1\"\nhost = \"127.0.0.1\"\ntotal_slots = 2\n",
+        )
+        .expect("write workers.toml");
+
+        let pool = WorkerPool::new();
+        let mut ctx = make_test_context(pool.clone());
+        ctx.workers_config_path = Some(workers_path);
+
+        let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let server_task = tokio::spawn(handle_connection(server, ctx, shutdown_tx));
+
+        let (reader, mut writer) = client.into_split();
+        writer
+            .write_all(b"POST /reload\n")
+            .await
+            .expect("send reload");
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read response");
+        server_task.await.expect("join").expect("handle_connection");
+
+        let response: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("reload response is JSON");
+        assert_eq!(response["success"], true, "response: {response}");
+        assert_eq!(response["added"], 1, "response: {response}");
+        assert!(
+            pool.get(&WorkerId::new("reload-launch-path-w1"))
+                .await
+                .is_some(),
+            "worker from the launch-time workers.toml must be in the pool"
+        );
     }
 
     #[test]

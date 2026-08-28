@@ -982,6 +982,7 @@ mod tests {
             queue_timeout_secs: 300,
             bypass_store: None,
             admin_disable_store: None,
+            workers_config_path: None,
             admission_barrier: Arc::new(tokio::sync::RwLock::new(false)),
         }
     }

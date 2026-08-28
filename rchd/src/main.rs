@@ -163,6 +163,14 @@ pub struct DaemonContext {
     /// and the cpu-capability-fault quarantine survive daemon restarts (startup
     /// re-applies surviving records to the pool). `None` in test contexts.
     pub admin_disable_store: Option<Arc<tokio::sync::Mutex<AdminDisableStore>>>,
+    /// The `--workers-config` path the daemon was launched with, if any. The
+    /// socket `reload` handler must load from here — resolving the config dir
+    /// afresh can pick a different file (bd-xqg58: a macOS daemon launched
+    /// with the legacy Application Support path reloaded `~/.config/rch`
+    /// instead, so edits to the file it was actually running from were
+    /// silently ignored). `None` means "resolve the default", exactly as at
+    /// startup.
+    pub workers_config_path: Option<std::path::PathBuf>,
     /// Stops new worker selection while a restart remediator proves quiescence.
     /// This is shared with the socket API so check-and-close admission occurs
     /// in the daemon rather than in a racy CLI preflight.
@@ -804,6 +812,7 @@ async fn main() -> Result<()> {
         queue_timeout_secs: daemon_config.queue.timeout_secs,
         bypass_store: Some(bypass_store.clone()),
         admin_disable_store: Some(admin_disable_store.clone()),
+        workers_config_path: cli.workers_config.clone(),
         admission_barrier: Arc::new(RwLock::new(false)),
     };
 
@@ -1435,6 +1444,7 @@ mod tests {
             queue_timeout_secs: 300,
             bypass_store: None,
             admin_disable_store: None,
+            workers_config_path: None,
             admission_barrier: Arc::new(RwLock::new(false)),
         };
 
@@ -1488,6 +1498,7 @@ mod tests {
             queue_timeout_secs: 300,
             bypass_store: None,
             admin_disable_store: None,
+            workers_config_path: None,
             admission_barrier: Arc::new(RwLock::new(false)),
         };
 
@@ -1543,6 +1554,7 @@ mod tests {
             queue_timeout_secs: 300,
             bypass_store: None,
             admin_disable_store: None,
+            workers_config_path: None,
             admission_barrier: Arc::new(RwLock::new(false)),
         };
 
@@ -1581,6 +1593,7 @@ mod tests {
             queue_timeout_secs: 300,
             bypass_store: None,
             admin_disable_store: None,
+            workers_config_path: None,
             admission_barrier: Arc::new(RwLock::new(false)),
         };
 
@@ -1638,6 +1651,7 @@ mod tests {
             queue_timeout_secs: 300,
             bypass_store: None,
             admin_disable_store: None,
+            workers_config_path: None,
             admission_barrier: Arc::new(RwLock::new(false)),
         };
 
@@ -1693,6 +1707,7 @@ mod tests {
             queue_timeout_secs: 300,
             bypass_store: None,
             admin_disable_store: None,
+            workers_config_path: None,
             admission_barrier: Arc::new(RwLock::new(false)),
         };
 
