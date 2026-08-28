@@ -409,7 +409,6 @@ export default function App() {
 
   const ageSec = (now - new Date(snap.generated_at).getTime()) / 1000;
   const hardProblems = devs.filter((d) => d.level === "local-only" || d.level === "unreachable");
-  const degradedDevs = devs.filter((d) => d.level === "degraded");
   // Minutes until the next auto-refresh, for the header countdown. Anchored to
   // when the current snapshot was decrypted, so it survives re-unlocks.
   const autoInMin =
@@ -450,15 +449,17 @@ export default function App() {
         </div>
       )}
 
-      {degradedDevs.length > 0 && (
-        <div className="banner">
-          {degradedDevs.length} dev machine{degradedDevs.length === 1 ? "" : "s"} in a degraded
-          posture (partial remote capability — some workers pressure-blocked or unavailable):{" "}
-          {degradedDevs.map((d) => d.id).join(", ")}.
-        </div>
-      )}
-
       <Overview snap={snap} counts={counts} hardProblems={hardProblems.length} />
+
+      <Problems
+        problems={derived.problems}
+        nextActions={derived.next_actions}
+        snapshotMs={snapshotMs}
+        devIds={devIds}
+        workerIds={fleetWorkerIds}
+        onOpenDev={openDevFrom}
+        onOpenWorker={openWorkerFrom}
+      />
 
       <section className="section">
         <div className="section-head">
