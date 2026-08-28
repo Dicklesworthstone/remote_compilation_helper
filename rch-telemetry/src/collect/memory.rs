@@ -304,6 +304,47 @@ impl MemoryTelemetry {
         }
     }
 
+    /// Build memory telemetry on Windows from CIM counters:
+    /// `Win32_OperatingSystem.TotalVisibleMemorySize` / `FreePhysicalMemory`
+    /// (kB) and the summed `Win32_PageFileUsage.AllocatedBaseSize` /
+    /// `CurrentUsage` (MB). Windows exposes no buffers/cached/dirty/writeback
+    /// counters through these interfaces; they are reported as zero rather
+    /// than fabricated. Normalized through [`MemoryInfo`] so the pressure
+    /// score is computed by the same formula Linux and macOS workers use.
+    pub fn from_windows_counters(
+        total_kb: u64,
+        free_kb: u64,
+        pagefile_total_mb: u64,
+        pagefile_used_mb: u64,
+    ) -> Self {
+        let swap_total_kb = pagefile_total_mb.saturating_mul(1024);
+        let swap_used_kb = pagefile_used_mb.saturating_mul(1024).min(swap_total_kb);
+        let info = MemoryInfo {
+            total_kb,
+            free_kb,
+            available_kb: free_kb,
+            buffers_kb: 0,
+            cached_kb: 0,
+            swap_total_kb,
+            swap_free_kb: swap_total_kb - swap_used_kb,
+            dirty_kb: 0,
+            writeback_kb: 0,
+        };
+
+        let telemetry = Self::from_info(&info, None);
+
+        debug!(
+            total_gb = %telemetry.total_gb,
+            available_gb = %telemetry.available_gb,
+            used_pct = %telemetry.used_percent,
+            pressure = %telemetry.pressure_score,
+            swap_gb = %telemetry.swap_used_gb,
+            "Memory telemetry collected (windows)"
+        );
+
+        telemetry
+    }
+
     /// Collect memory telemetry on macOS without `/proc`.
     ///
     /// Sources: `sysctl hw.memsize` (total RAM), `vm_stat` (page counts for
@@ -924,6 +965,30 @@ Pages purgeable:                          25000.\n";
         assert_eq!(used_zero, 0);
 
         assert!(parse_darwin_swapusage_kb("").is_none());
+    }
+
+    #[test]
+    fn test_from_windows_counters_normalizes_units() {
+        // 16 GiB total, 10 GiB free, 26330 MB pagefile with 646 MB in use —
+        // the figures a real Win32 CIM query returned on the fleet's Surface.
+        let mem = MemoryTelemetry::from_windows_counters(16_353_432, 10_111_800, 26_330, 646);
+        assert!((mem.total_gb - 15.596).abs() < 0.01);
+        assert!((mem.available_gb - 9.643).abs() < 0.01);
+        assert!((mem.used_percent - 38.17).abs() < 0.1);
+        assert!((mem.swap_used_gb - 0.631).abs() < 0.01);
+        assert!(mem.dirty_mb.abs() < f64::EPSILON);
+        assert!(mem.psi.is_none());
+        assert!((0.0..=100.0).contains(&mem.pressure_score));
+    }
+
+    #[test]
+    fn test_from_windows_counters_tolerates_no_pagefile_and_overuse() {
+        let none = MemoryTelemetry::from_windows_counters(8_000_000, 4_000_000, 0, 0);
+        assert!(none.swap_used_gb.abs() < f64::EPSILON);
+        // CurrentUsage can momentarily exceed AllocatedBaseSize while the
+        // pagefile grows; usage is capped at the allocation, never negative.
+        let over = MemoryTelemetry::from_windows_counters(8_000_000, 4_000_000, 1_024, 2_048);
+        assert!((over.swap_used_gb - 1.0).abs() < 1e-9);
     }
 
     #[cfg(target_os = "macos")]

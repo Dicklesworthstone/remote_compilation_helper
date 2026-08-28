@@ -52,6 +52,12 @@ pub fn collect_telemetry(
     if cfg!(target_os = "macos") {
         return collect_telemetry_darwin(worker_id);
     }
+    // Same failure mode on Windows (bd-jdcxd): no /proc, so the first read
+    // exited 1 and rchd's telemetry poller re-opened the worker circuit on
+    // every cycle, leaving Windows workers permanently "unreachable".
+    if cfg!(target_os = "windows") {
+        return collect_telemetry_windows(worker_id);
+    }
 
     let start = Instant::now();
 
@@ -125,8 +131,171 @@ fn collect_telemetry_darwin(worker_id: String) -> Result<WorkerTelemetry> {
     ))
 }
 
+/// One PowerShell/CIM round trip that yields every figure the Windows
+/// collectors need, printed as a single whitespace-separated line:
+///
+/// ```text
+/// <cpu load %> <total RAM kB> <free RAM kB> <pagefile MB> <pagefile used MB> <process count>
+/// ```
+///
+/// Spawning PowerShell costs ~1-2s on a laptop, so everything is gathered in
+/// a single invocation. Nulls (no pagefile, no load counter) are cast to zero
+/// inside the script so the line always has six numeric fields.
+const WINDOWS_CIM_SAMPLE_SCRIPT: &str = "\
+$c=[double]((Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average); \
+$o=Get-CimInstance Win32_OperatingSystem; \
+$p=@(Get-CimInstance Win32_PageFileUsage); \
+$a=[uint64](($p | Measure-Object -Property AllocatedBaseSize -Sum).Sum); \
+$u=[uint64](($p | Measure-Object -Property CurrentUsage -Sum).Sum); \
+\"$c $($o.TotalVisibleMemorySize) $($o.FreePhysicalMemory) $a $u $(@(Get-Process).Count)\"";
+
+/// Parsed output of [`WINDOWS_CIM_SAMPLE_SCRIPT`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowsSystemSample {
+    pub cpu_load_percent: f64,
+    pub total_memory_kb: u64,
+    pub free_memory_kb: u64,
+    pub pagefile_total_mb: u64,
+    pub pagefile_used_mb: u64,
+    pub process_count: u32,
+}
+
+impl WindowsSystemSample {
+    /// Parse the six-field sample line. Any missing or non-numeric field
+    /// yields `None` so a malformed shell response is a visible failure, not a
+    /// zeroed snapshot the pressure policy would mistake for an idle host.
+    pub fn parse(line: &str) -> Option<Self> {
+        let mut parts = line.split_whitespace();
+        let cpu_load_percent = parts.next()?.parse::<f64>().ok()?;
+        let total_memory_kb = parts.next()?.parse::<u64>().ok()?;
+        let free_memory_kb = parts.next()?.parse::<u64>().ok()?;
+        let pagefile_total_mb = parts.next()?.parse::<u64>().ok()?;
+        let pagefile_used_mb = parts.next()?.parse::<u64>().ok()?;
+        let process_count = parts.next()?.parse::<u32>().ok()?;
+        if parts.next().is_some() || total_memory_kb == 0 {
+            return None;
+        }
+        Some(Self {
+            cpu_load_percent,
+            total_memory_kb,
+            free_memory_kb,
+            pagefile_total_mb,
+            pagefile_used_mb,
+            process_count,
+        })
+    }
+}
+
+/// Run the CIM sample script through the first PowerShell that exists
+/// (Windows PowerShell 5.1 ships with every supported Windows; `pwsh` is the
+/// optional newer install).
+fn windows_cim_sample_output() -> Result<String> {
+    let mut last_spawn_error = None;
+    for program in ["powershell", "pwsh"] {
+        match std::process::Command::new(program)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                WINDOWS_CIM_SAMPLE_SCRIPT,
+            ])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+            Ok(output) => {
+                anyhow::bail!(
+                    "{program} CIM sample exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Err(e) => last_spawn_error = Some(e),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no PowerShell binary available for the Windows telemetry sample: {last_spawn_error:?}"
+    ))
+}
+
+/// Windows snapshot: CPU load and memory from a single CIM query; disk IO and
+/// network stay `None` exactly as on Darwin.
+fn collect_telemetry_windows(worker_id: String) -> Result<WorkerTelemetry> {
+    let start = Instant::now();
+
+    let raw = windows_cim_sample_output()?;
+    let sample = WindowsSystemSample::parse(&raw)
+        .ok_or_else(|| anyhow::anyhow!("unparseable Windows CIM sample line: {:?}", raw.trim()))?;
+
+    let cpu = cpu::collect_windows(sample.cpu_load_percent, sample.process_count);
+    let memory = MemoryTelemetry::from_windows_counters(
+        sample.total_memory_kb,
+        sample.free_memory_kb,
+        sample.pagefile_total_mb,
+        sample.pagefile_used_mb,
+    );
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    Ok(WorkerTelemetry::new(
+        worker_id,
+        cpu,
+        memory,
+        None,
+        None,
+        duration_ms,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::WindowsSystemSample;
+
+    #[test]
+    fn windows_sample_parses_real_cim_line() {
+        let sample = WindowsSystemSample::parse("1 16353432 10111800 26330 646 287\r\n")
+            .expect("real CIM output must parse");
+        assert_eq!(
+            sample,
+            WindowsSystemSample {
+                cpu_load_percent: 1.0,
+                total_memory_kb: 16_353_432,
+                free_memory_kb: 10_111_800,
+                pagefile_total_mb: 26_330,
+                pagefile_used_mb: 646,
+                process_count: 287,
+            }
+        );
+    }
+
+    #[test]
+    fn windows_sample_rejects_malformed_lines() {
+        assert!(WindowsSystemSample::parse("").is_none());
+        assert!(WindowsSystemSample::parse("1 16353432 10111800 26330 646").is_none());
+        assert!(WindowsSystemSample::parse("1 16353432 10111800 26330 646 287 extra").is_none());
+        assert!(WindowsSystemSample::parse("nan? 16353432 10111800 26330 646 287").is_none());
+        // Zero total RAM can only be a broken query, never a real host.
+        assert!(WindowsSystemSample::parse("1 0 0 0 0 287").is_none());
+    }
+
+    /// Regression for bd-jdcxd: on Windows the telemetry snapshot must
+    /// succeed (previously the /proc/stat read exited 1 on every daemon poll
+    /// and rchd re-opened the worker circuit, leaving Windows workers
+    /// permanently "unreachable").
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn collect_telemetry_succeeds_on_windows() {
+        let telemetry = super::collect_telemetry(0, true, true, "test-worker".to_string())
+            .expect("telemetry collection must succeed on Windows");
+        assert_eq!(telemetry.worker_id, "test-worker");
+        assert!(telemetry.cpu.num_cores >= 1);
+        assert!(telemetry.memory.total_gb > 0.0);
+        assert!(telemetry.disk.is_none());
+        assert!(telemetry.network.is_none());
+        telemetry.to_json().expect("snapshot should serialize");
+    }
+
     /// Regression for issue #39: on macOS the telemetry snapshot must succeed
     /// (previously the first /proc read aborted the whole collection and
     /// `rch-wkr telemetry` exited 1 on every daemon poll, leaving macOS

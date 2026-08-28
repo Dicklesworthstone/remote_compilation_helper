@@ -517,6 +517,49 @@ pub fn collect_darwin() -> Result<CpuTelemetry, CpuError> {
     Ok(telemetry)
 }
 
+/// Build CPU telemetry on Windows from a CIM `Win32_Processor.LoadPercentage`
+/// sample (0-100, averaged across sockets) and the live process count.
+///
+/// Windows keeps no Unix-style 1/5/15-minute load averages. The daemon's
+/// pressure policy and the operator status views are written against the
+/// `LoadAverage` shape, so the instantaneous load is projected onto it
+/// (`load% / 100 * cores`, the same normalization `collect_darwin` applies in
+/// reverse) rather than reporting fabricated history: all three windows carry
+/// the same instantaneous figure. `running_processes` has no cheap Windows
+/// equivalent and is reported as zero.
+pub fn collect_windows(load_percent: f64, total_processes: u32) -> CpuTelemetry {
+    let num_cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
+
+    let overall_percent = load_percent.clamp(0.0, 100.0);
+    let instantaneous_load = overall_percent / 100.0 * f64::from(num_cores);
+
+    let telemetry = CpuTelemetry {
+        timestamp: Utc::now(),
+        overall_percent,
+        per_core_percent: Vec::new(),
+        num_cores,
+        load_average: LoadAverage {
+            one_min: instantaneous_load,
+            five_min: instantaneous_load,
+            fifteen_min: instantaneous_load,
+            running_processes: 0,
+            total_processes,
+        },
+        psi: None,
+    };
+
+    debug!(
+        overall_percent = %telemetry.overall_percent,
+        num_cores = %telemetry.num_cores,
+        total_processes = %total_processes,
+        "CPU telemetry collected (windows)"
+    );
+
+    telemetry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,6 +1145,27 @@ ctxt 1234567"#;
         // Garbage is rejected, not zero-filled.
         assert!(parse_darwin_loadavg("").is_none());
         assert!(parse_darwin_loadavg("{ one two three }").is_none());
+    }
+
+    #[test]
+    fn test_collect_windows_projects_load_percent_onto_load_average() {
+        let cpu = collect_windows(50.0, 321);
+        assert!(cpu.num_cores >= 1);
+        assert!((cpu.overall_percent - 50.0).abs() < f64::EPSILON);
+        let expected_load = 0.5 * f64::from(cpu.num_cores);
+        assert!((cpu.load_average.one_min - expected_load).abs() < 1e-9);
+        assert!((cpu.load_average.five_min - expected_load).abs() < 1e-9);
+        assert!((cpu.load_average.fifteen_min - expected_load).abs() < 1e-9);
+        assert_eq!(cpu.load_average.total_processes, 321);
+        assert_eq!(cpu.load_average.running_processes, 0);
+        assert!(cpu.per_core_percent.is_empty());
+        assert!(cpu.psi.is_none());
+    }
+
+    #[test]
+    fn test_collect_windows_clamps_out_of_range_load() {
+        assert!((collect_windows(250.0, 0).overall_percent - 100.0).abs() < f64::EPSILON);
+        assert!(collect_windows(-5.0, 0).overall_percent.abs() < f64::EPSILON);
     }
 
     #[cfg(target_os = "macos")]
