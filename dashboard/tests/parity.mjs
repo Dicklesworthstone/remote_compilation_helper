@@ -17,7 +17,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { classifyWorker, classifyDev, expandBuilds, expandHints, seenByColumns } from "../tools/llm-view.mjs";
+import {
+  classifyWorker, classifyDev, expandBuilds, expandHints, seenByColumns,
+  expandAlerts, expandIssues, expandActive, expandQueued, buildLlmView, UnknownTarget,
+} from "../tools/llm-view.mjs";
+import { buildProblems, PROBLEM_KINDS } from "../src/problems.js";
 
 const dir = await mkdtemp(join(tmpdir(), "rch-parity-"));
 const outfile = join(dir, "derive.mjs");

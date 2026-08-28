@@ -32,13 +32,36 @@ const check = (name, ok, detail = "") => {
 
 await page.goto(url, { waitUntil: "load" });
 await page.waitForSelector(".gate-card", { timeout: 30000 });
-check("gate renders on production", true);
+check("gate renders on production",
+  (await page.locator(".gate-card").count()) === 1 && (await page.locator("#pp").count()) === 1 &&
+  (await page.locator(".kpis").count()) === 0);
 
 await page.fill("#pp", env.RCH_DASH_PASSPHRASE);
 await page.click("button.btn");
 await page.waitForSelector(".kpis", { timeout: 40000 });
 const kpis = await page.locator(".kpi-value").allInnerTexts();
 check("unlocks against the live envelope", kpis.length >= 5, kpis.slice(0, 3).join(" | "));
+
+await page.waitForSelector('section[aria-label="Problems"]', { timeout: 15000 });
+const problemRows = await page.locator("table.problems tbody tr").count();
+const allClear = await page.locator('section[aria-label="Problems"] .empty.ok').count();
+check("problems panel renders rows or an explicit all-clear", problemRows > 0 || allClear === 1,
+  `${problemRows} rows, ${allClear} all-clear`);
+
+// The agent endpoint on the same deployment, with the same passphrase: help
+// needs no key, problems needs one and must agree with the page.
+const api = new URL("/api/fleet", url);
+const help = await fetch(`${api}?view=help&format=json`);
+check("/api/fleet?view=help answers without a key", help.status === 200 &&
+  Object.keys((await help.json()).params ?? {}).includes("target"), String(help.status));
+const probs = await fetch(`${api}?view=problems&format=json`, { headers: { authorization: `Bearer ${env.RCH_DASH_PASSPHRASE}` } });
+const probsBody = probs.status === 200 ? await probs.json() : null;
+check("/api/fleet?view=problems decrypts with the fleet passphrase",
+  probs.status === 200 && probsBody?.schema === "rch.fleet.llm.v2", String(probs.status));
+if (probsBody) {
+  check("the page and the endpoint show the same number of problems",
+    probsBody.problems_total === problemRows, `page ${problemRows} vs api ${probsBody.problems_total}`);
+}
 
 await page.waitForSelector(".fm-node", { timeout: 15000 });
 const nodes = await page.locator(".fm-node").count();
