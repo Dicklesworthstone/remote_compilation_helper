@@ -632,9 +632,27 @@ chk(
 
   const kinds = new Map(api.problems.map((p) => [`${p.kind} ${p.target}`, p]));
   const has = (k) => kinds.has(k);
-  chk("a missing Claude Code hook is critical with the install command",
-    has("dev.hook_missing dev-a") && kinds.get("dev.hook_missing dev-a").action === "rch hook install" &&
-    kinds.get("dev.hook_missing dev-a").on === "dev-a");
+  // dev-a's shim is installed and first on PATH, so cargo is still intercepted:
+  // a missing hook there is a warning about non-cargo commands, not "nothing
+  // is intercepted".
+  chk("a missing Claude Code hook with a working shim is a WARNING with the install command",
+    has("dev.hook_missing dev-a") && kinds.get("dev.hook_missing dev-a").severity === "warn" &&
+    kinds.get("dev.hook_missing dev-a").action === "rch hook install" &&
+    kinds.get("dev.hook_missing dev-a").on === "dev-a" && /shim still intercepts cargo/.test(kinds.get("dev.hook_missing dev-a").detail));
+  {
+    const noShim = buildLlmView({
+      ...snapFx,
+      dispatchers: [{ ...snapFx.dispatchers[0], shim: { ...snapFx.dispatchers[0].shim, installed: false } }],
+    }, { view: "problems", now: SNAP_MS });
+    const hm = noShim.problems.find((p) => p.kind === "dev.hook_missing");
+    chk("a missing hook with NO working shim is critical", hm && hm.severity === "critical" && /nothing is intercepted/.test(hm.detail));
+    const shadowed = buildLlmView({
+      ...snapFx,
+      dispatchers: [{ ...snapFx.dispatchers[0], shim: { ...snapFx.dispatchers[0].shim, on_path: false } }],
+    }, { view: "problems", now: SNAP_MS });
+    chk("a shadowed shim does not count as coverage",
+      shadowed.problems.find((p) => p.kind === "dev.hook_missing")?.severity === "critical");
+  }
   chk("compiles outside rch are critical", has("dev.unmanaged_local_builds dev-a") &&
     kinds.get("dev.unmanaged_local_builds dev-a").detail.startsWith("2 compiler processes"));
   chk("a stale shim is a warning", has("dev.shim_stale dev-a") && kinds.get("dev.shim_stale dev-a").action === "rch shim install");
@@ -680,6 +698,46 @@ chk(
   const one = buildLlmView({ ...snapFx, dispatchers: [snapFx.dispatchers[0]] }, { view: "problems", now: SNAP_MS });
   chk("a lone degraded machine keeps its own dev.degraded row",
     one.problems.some((p) => p.kind === "dev.degraded" && p.target === "dev-a") && !one.problems.some((p) => p.kind === "fleet.degraded"));
+  // Two machines degraded for DIFFERENT reasons are two problems, not one.
+  const differ = buildLlmView({
+    ...snapFx,
+    dispatchers: [snapFx.dispatchers[0], { ...snapFx.dispatchers[1], posture_description: "something else entirely" }, snapFx.dispatchers[2]],
+  }, { view: "problems", now: SNAP_MS });
+  chk("degraded machines with different reasons are not collapsed",
+    !differ.problems.some((p) => p.kind === "fleet.degraded") &&
+    differ.problems.filter((p) => p.kind === "dev.degraded").length === 2);
+  // A pool whose only trouble is warn-level (high load) cannot explain a
+  // degraded posture, so the machines keep their own rows and the fleet row
+  // does not blame the loaded worker.
+  const onlyWarn = buildLlmView({
+    ...snapFx,
+    workers: [w({ id: "w1", caps: { ...w().caps, load_avg_1: 40, num_cpus: 8 } }), w({ id: "w2" })],
+    // No hints or issues about w1 anywhere, so the row has no advice to carry.
+    dispatchers: snapFx.dispatchers.map((d) => ({ ...d, hints: [], issues: [], alerts: [] })),
+  }, { view: "problems", now: SNAP_MS });
+  chk("warn-level workers are never named as a fleet root cause",
+    !onlyWarn.problems.some((p) => p.kind === "fleet.degraded") &&
+    onlyWarn.problems.some((p) => p.kind === "worker.warn" && p.target === "w1"));
+  // A worker warning with no advice names no machine to run nothing on.
+  const w1warn = onlyWarn.problems.find((p) => p.kind === "worker.warn" && p.target === "w1");
+  chk("a row with no action has no `on`", w1warn && w1warn.action === "" && w1warn.on === "");
+  // Target scoping matches whole ids inside the fleet row, never substrings.
+  const hz = buildLlmView({
+    ...snapFx,
+    workers: [w({ id: "hz1", status: "unreachable" }), w({ id: "hz10" })],
+    dispatchers: snapFx.dispatchers.map((d) => ({ ...d, hints: [], issues: [], alerts: [] })),
+  }, { view: "problems", target: "hz10", now: SNAP_MS });
+  chk("scoping to hz10 does not pull in the fleet row that names hz1",
+    !hz.problems.some((p) => p.kind === "fleet.degraded"), JSON.stringify(hz.problems.map((p) => p.kind)));
+  // An rch-side failure (not ssh) on an unreachable machine is a daemon or
+  // doctor question ON THAT BOX, never an ssh check from the collector.
+  const rchDown = buildLlmView({
+    ...snapFx,
+    dispatchers: [{ ...snapFx.dispatchers[2], collection_errors: ["status: RCH-E400 Daemon not accepting connections"] }],
+  }, { view: "problems", now: SNAP_MS });
+  const un = rchDown.problems.find((p) => p.kind === "dev.unreachable");
+  chk("a dead daemon on a reachable host is 'rch daemon start' on that box",
+    un && un.action === "rch daemon start" && un.on === "dev-c", JSON.stringify(un));
 
   // Targeting.
   const diag = buildLlmView(snapFx, { view: "diagnose", target: "W1", now: SNAP_MS });

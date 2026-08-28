@@ -1,5 +1,6 @@
 import type { DispatcherView } from "../types";
 import { fmtDuration, fmtUptime } from "../derive";
+import { isHookDead, isStalledBuild } from "../problems";
 
 interface Props {
   d: DispatcherView;
@@ -108,7 +109,7 @@ export function DevMachineCard({ d, onOpen }: Props) {
         d.shim?.on_path === false ||
         (d.shim?.local_builds_running ?? 0) > 0 ||
         (d.doctor?.failed ?? 0) > 0 ||
-        d.active_records.some((b) => b.hook_alive === false || (b.heartbeat_stale && b.progress_stale))) && (
+        d.active_records.some((b) => isHookDead(b) || isStalledBuild(b))) && (
         <div className="card-flags">
           {d.hook?.claude_code === false && <span className="pill critical">hook missing</span>}
           {d.shim?.installed === false && <span className="pill warn">shim missing</span>}
@@ -119,10 +120,8 @@ export function DevMachineCard({ d, onOpen }: Props) {
             <span className="pill critical">{d.shim!.local_builds_running} compiling outside rch</span>
           )}
           {(d.doctor?.failed ?? 0) > 0 && <span className="pill critical">doctor: {d.doctor!.failed} failed</span>}
-          {d.active_records.some((b) => b.hook_alive === false) && <span className="pill critical">build hook dead</span>}
-          {d.active_records.some((b) => b.hook_alive !== false && b.heartbeat_stale && b.progress_stale) && (
-            <span className="pill warn">build stalled</span>
-          )}
+          {d.active_records.some(isHookDead) && <span className="pill critical">build hook dead</span>}
+          {d.active_records.some(isStalledBuild) && <span className="pill warn">build stalled</span>}
         </div>
       )}
 

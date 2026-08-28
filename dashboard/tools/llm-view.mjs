@@ -17,7 +17,7 @@
  */
 
 import { encode as toonEncode } from "@toon-format/toon";
-import { buildProblems, PROBLEM_KINDS } from "../src/problems.js";
+import { buildProblems, PROBLEM_KINDS, isHookDead, isStalledBuild } from "../src/problems.js";
 
 export const STALE_CRIT_SECONDS = 60 * 60;
 
@@ -381,8 +381,14 @@ function resolveTarget(snap, target) {
 function problemTouches(p, id) {
   const lc = id.toLowerCase();
   const t = p.target.toLowerCase();
-  return t === lc || t.startsWith(`${lc}:`) || p.on.toLowerCase() === lc ||
-    (p.kind === "fleet.degraded" && p.detail.toLowerCase().includes(lc));
+  if (t === lc || t.startsWith(`${lc}:`) || p.on.toLowerCase() === lc) return true;
+  // The fleet row names its root-cause workers in prose: "fix hz1, hz3". Match
+  // the id as a whole token, so `hz1` does not claim `hz10`'s row.
+  if (p.kind === "fleet.degraded") {
+    const named = (p.detail.split("— fix ")[1] ?? "").split(",").map((x) => x.trim().toLowerCase());
+    return named.includes(lc);
+  }
+  return false;
 }
 
 /**
@@ -575,7 +581,7 @@ export function buildLlmView(snap, opts = {}) {
       id: b.id ?? "", project: b.project ?? "", worker: b.worker_id ?? "", phase: b.phase ?? "",
       age_s: b.build_age_secs ?? null, heartbeat_age_s: b.heartbeat_age_secs ?? null,
       progress_age_s: b.progress_age_secs ?? null, hook_alive: b.hook_alive ?? null,
-      stalled: b.heartbeat_stale === true && b.progress_stale === true, slots: b.slots ?? null,
+      hook_dead: isHookDead(b), stalled: isStalledBuild(b), slots: b.slots ?? null,
       command: b.command ?? "",
     })),
     queued_builds: (d.queued_records ?? []).map((q) => ({

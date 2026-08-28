@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import type { DispatcherView } from "../types";
 import { fmtAge, fmtDuration, fmtUptime } from "../derive";
+import { isHookDead, isStalledBuild } from "../problems";
 import { useDialog } from "./useDialog";
 
 interface Props {
@@ -264,11 +265,13 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
           <h4>Builds in flight ({d.active_records.length} active · {d.queued_records.length} queued)</h4>
           <div className="builds">
             {d.active_records.map((b, i) => {
-              const stalled = b.hook_alive === false || (b.heartbeat_stale === true && b.progress_stale === true);
+              // Same rules as the problem list and the card — see src/problems.js.
+              const dead = isHookDead(b);
+              const stalled = isStalledBuild(b);
               return (
                 <div key={`${b.id ?? ""}|${i}`} className="build-row" title={b.command ?? undefined}>
-                  <span className={`pill ${b.hook_alive === false ? "critical" : stalled ? "warn" : "busy"}`}>
-                    {b.hook_alive === false ? "hook dead" : stalled ? "stalled" : b.phase ?? "active"}
+                  <span className={`pill ${dead ? "critical" : stalled ? "warn" : "busy"}`}>
+                    {dead ? "hook dead" : stalled ? "stalled" : b.phase ?? "active"}
                   </span>
                   <span className="build-proj">{b.project ?? "—"}</span>
                   {b.worker_id && fleetWorkerIds.has(b.worker_id) ? (

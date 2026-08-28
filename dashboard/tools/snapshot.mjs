@@ -202,7 +202,8 @@ export function describeExecError(err) {
 // --------------------------------------------------------- the combined probe
 
 /**
- * The four questions asked of every dispatcher, in wire order.
+ * The seven questions asked of every dispatcher, in wire order (four about the
+ * pool as this box sees it, three about the box itself).
  *
  * These used to be FOUR separate `ssh` invocations fired with `Promise.all`,
  * which meant four TCP connections and four full key-exchange handshakes per
@@ -258,7 +259,7 @@ function rchProbeCommand(subcommand, timeoutSec) {
 const PROBE_NONCE = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
 
 /**
- * One shell script that answers all four questions over a single connection.
+ * One shell script that answers all seven questions over a single connection.
  *
  * Shape, and why each piece is the way it is:
  *
@@ -762,7 +763,9 @@ export function dispatcherFromProbe(host, probe) {
         // The one that matters for transparent offload: Claude Code's
         // PreToolUse hook. `true`/`false`/`null` (agent not listed).
         claude_code: (() => {
-          const a = hookAgents.find((x) => String(x.agent ?? "").toLowerCase() === "claudecode");
+          // "ClaudeCode" today; tolerate "Claude Code" / "claude-code" if the
+          // label ever changes, since a miss here reads as "unknown", not "fine".
+          const a = hookAgents.find((x) => String(x.agent ?? "").toLowerCase().replace(/[^a-z]/g, "") === "claudecode");
           return a ? /^installed$/i.test(String(a.status ?? "")) : null;
         })(),
         // Every agent rch knows about: [agent, installed]

@@ -21,8 +21,9 @@
 
   Why 1200 s: every refresh is currently a Vercel deployment (the snapshot
   ships inside the static bundle) and Vercel's Hobby tier caps deployments at
-  100/day; 20 min = 72/day. Publishing the blob without a deploy (bd-04ifk)
-  is what unlocks a shorter tick.
+  100/day; 20 min = 72/day. On a Pro team (6,000/day) StartInterval 300 is
+  safe. Publishing the blob without a deploy (bd-04ifk) is what unlocks a
+  shorter tick on Hobby.
 
   RunAtLoad is false on purpose: a login must not trigger an immediate deploy
   from a machine that may not have network yet. The script refuses to publish

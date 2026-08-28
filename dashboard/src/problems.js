@@ -70,7 +70,7 @@ export const PROBLEM_KINDS = {
   },
   "dev.hook_missing": {
     severity: "critical",
-    meaning: "Claude Code's PreToolUse hook is NOT installed on this dev machine, so nothing is intercepted and every agent build there runs locally.",
+    meaning: "Claude Code's PreToolUse hook is NOT installed on this dev machine. Critical when no working cargo shim is installed either (nothing is intercepted); warn when the shim still covers cargo (only bun/gcc/make/nix builds from agents run locally).",
     fix: "`rch hook install` on the box.",
   },
   "dev.shim_missing": {
@@ -85,7 +85,7 @@ export const PROBLEM_KINDS = {
   },
   "dev.unmanaged_local_builds": {
     severity: "critical",
-    meaning: "Compiler processes are running on this dev machine RIGHT NOW with no rch ancestor — builds the hook/shim never saw. This is the 'silently burning local cores' failure.",
+    meaning: "Compiler processes are running on this dev machine RIGHT NOW with no rch ancestor — builds the hook/shim never saw. This is the 'silently burning local cores' failure. Linux dev machines only: rch's detector reads /proc, so a macOS box always reports 0 and this kind never fires there.",
     fix: "`rch shim status --json` on the box to list them; check the hook and shim rows for the same machine.",
   },
   "dev.daemon_version_skew": {
@@ -141,6 +141,30 @@ export const PROBLEM_KINDS = {
 };
 
 const s = (v) => (v == null ? "" : String(v));
+
+/**
+ * The stall rules, in ONE place. The dev-machine card, the drawer, the
+ * diagnose view and the problem list all ask these, and a build the agent is
+ * told is stalled must be the build the card flags.
+ */
+export function isHookDead(b) {
+  return b?.hook_alive === false;
+}
+export function isStalledBuild(b) {
+  if (!b || isHookDead(b)) return false;
+  if (b.heartbeat_stale === true && b.progress_stale === true) return true;
+  return b.progress_stale === true && (b.build_age_secs ?? 0) > 1800 && (b.confidence ?? 0) >= 0.5;
+}
+
+/** Is anything on this box intercepting cargo without the hook? */
+function shimCovers(d) {
+  return d?.shim?.installed === true && d.shim.on_path !== false;
+}
+
+/** Does an ssh/transport failure explain an unreachable machine, or did rch itself fail? */
+function isTransportError(msg) {
+  return /(^|[\s:])ssh[:\s]|command failed: ssh|route to host|connection refused|connection reset|connection timed out|timed out|permission denied|host key|killed by/i.test(msg);
+}
 
 function row(severity, kind, target, detail, extra = {}) {
   return {
@@ -253,7 +277,14 @@ export function buildProblems({ workers, devs, snapshotValid = true, ageSeconds 
   }
 
   // --- workers --------------------------------------------------------------
-  const sickWorkers = workers.filter((w) => w.health === "critical" || w.health === "offline" || w.health === "warn");
+  // The workers that can actually put a dev machine into a degraded posture:
+  // rch derives that posture from workers it counts as unhealthy or
+  // pressure-blocked, never from a mere warning (high load, a half-open
+  // circuit). Blaming warn-level workers for a fleet-wide symptom sends an
+  // agent to fix the wrong box.
+  const rootCauseWorkers = workers.filter((w) =>
+    w.health === "critical" || w.health === "offline" ||
+    (w.status && !["healthy", "busy"].includes(String(w.status).toLowerCase())));
   for (const w of workers) {
     if (w.health !== "critical" && w.health !== "offline" && w.health !== "warn") continue;
     const advice = adviceFor.get(w.id);
@@ -263,6 +294,7 @@ export function buildProblems({ workers, devs, snapshotValid = true, ageSeconds 
     if (w.pressure?.confidence && w.pressure.confidence !== "high" && w.health !== "offline") {
       detail += ` (${w.pressure.confidence} confidence)`;
     }
+    const action = advice?.action ?? (w.health === "offline" ? `rch workers probe ${w.id}` : "");
     problems.push(row(
       w.health === "warn" ? "warn" : "critical",
       `worker.${w.health}`,
@@ -270,23 +302,27 @@ export function buildProblems({ workers, devs, snapshotValid = true, ageSeconds 
       detail,
       {
         since: sinceFor.get(w.id),
-        action: advice?.action ?? (w.health === "offline" ? `rch workers probe ${w.id}` : ""),
-        on: advice?.on ?? (reachable[0]?.id ?? ""),
+        action,
+        // `on` names a machine only when there is something to run there.
+        on: action ? (advice?.on ?? reachable[0]?.id ?? "") : "",
       },
     ));
   }
 
   // --- dev machines ---------------------------------------------------------
   const degraded = reachable.filter((d) => d.level === "degraded");
-  // One root cause, not N: when several machines are degraded and the pool
-  // itself has sick workers, the machines are SYMPTOMS. Emit a single
-  // fleet-level row naming the workers to fix, instead of one warning per
-  // machine that all say the same thing.
-  const collapseDegraded = degraded.length >= 2 && sickWorkers.length > 0;
+  // One root cause, not N: when several machines are degraded FOR THE SAME
+  // REASON and the pool itself has workers that can cause it, the machines are
+  // SYMPTOMS. Emit a single fleet-level row naming the workers to fix, instead
+  // of one warning per machine that all say the same thing. Machines degraded
+  // for different reasons keep their own rows — collapsing those would hide a
+  // distinct fault behind a generic one.
+  const sameReason = degraded.length >= 2 && degraded.every((d) => dReason(d) === dReason(degraded[0]));
+  const collapseDegraded = sameReason && rootCauseWorkers.length > 0;
   if (collapseDegraded) {
     problems.push(row("warn", "fleet.degraded", "fleet",
       `${degraded.length} of ${reachable.length} dev machines see partial remote capability; ` +
-      `root cause is worker-side — fix ${sickWorkers.map((w) => w.id).join(", ")}`,
+      `root cause is worker-side — fix ${rootCauseWorkers.map((w) => w.id).join(", ")}`,
       { action: "", on: "" }));
   }
 
@@ -294,9 +330,12 @@ export function buildProblems({ workers, devs, snapshotValid = true, ageSeconds 
     const errs = Array.isArray(d.collection_errors) ? d.collection_errors : [];
     if (d.level === "unreachable") {
       const first = errs[0] ?? "";
-      const transport = /ssh|route to host|connection|timed out|permission denied/i.test(first);
+      const transport = isTransportError(first);
+      // rch answered but rchd did not -> start it; anything else on the box is
+      // a doctor question, not a guess.
+      const daemonDown = /daemon|not running|socket|E_DAEMON/i.test(first);
       problems.push(row("critical", "dev.unreachable", d.id, dReason(d), {
-        action: transport ? `ssh ${d.id} true` : "rch daemon start",
+        action: transport ? `ssh ${d.id} true` : daemonDown ? "rch daemon start" : "rch doctor",
         on: transport ? "collector" : d.id,
       }));
       continue;
@@ -308,8 +347,15 @@ export function buildProblems({ workers, devs, snapshotValid = true, ageSeconds 
     }
 
     if (d.hook && d.hook.claude_code === false) {
-      problems.push(row("critical", "dev.hook_missing", d.id,
-        "Claude Code PreToolUse hook is not installed — nothing is intercepted on this box",
+      // Without the hook, only the cargo shim can intercept. If the shim is
+      // installed and first on PATH, cargo is still covered and only non-cargo
+      // commands (bun test, gcc, make, nix) run locally: a warning. With no
+      // working shim either, nothing is intercepted: critical.
+      const covered = shimCovers(d);
+      problems.push(row(covered ? "warn" : "critical", "dev.hook_missing", d.id,
+        covered
+          ? "Claude Code PreToolUse hook is not installed — the cargo shim still intercepts cargo, but bun/gcc/make/nix builds from agents run locally"
+          : "Claude Code PreToolUse hook is not installed and no working cargo shim — nothing is intercepted on this box",
         { action: "rch hook install", on: d.id }));
     }
     if (d.shim) {
@@ -352,14 +398,11 @@ export function buildProblems({ workers, devs, snapshotValid = true, ageSeconds 
     for (const b of d.active_records ?? []) {
       const who = `${b.project ?? "?"} on ${b.worker_id ?? "?"}`;
       const held = b.slots != null ? `${b.slots} slots held` : "slots held";
-      if (b.hook_alive === false) {
+      if (isHookDead(b)) {
         problems.push(row("critical", "build.hook_dead", `${d.id}:${b.id ?? b.project ?? "?"}`,
           `${who}: dispatching hook process is gone after ${fmtSecs(b.build_age_secs)}; ${held} until cancelled`,
           { since: b.started_at, action: b.id ? `rch cancel ${b.id}` : "rch queue --json", on: d.id }));
-      } else if (
-        (b.heartbeat_stale === true && b.progress_stale === true) ||
-        (b.progress_stale === true && (b.build_age_secs ?? 0) > 1800 && (b.confidence ?? 0) >= 0.5)
-      ) {
+      } else if (isStalledBuild(b)) {
         problems.push(row("warn", "build.stalled", `${d.id}:${b.id ?? b.project ?? "?"}`,
           `${who}: no heartbeat for ${fmtSecs(b.heartbeat_age_secs)}, no progress for ${fmtSecs(b.progress_age_secs)}` +
           ` (phase ${b.phase ?? "?"}, age ${fmtSecs(b.build_age_secs)}); cancel with: rch cancel ${b.id ?? "<id>"}`,

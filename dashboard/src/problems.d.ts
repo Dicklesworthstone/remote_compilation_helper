@@ -53,6 +53,12 @@ export type ProblemDev = Dispatcher & {
 
 export function fleetVersion(devs: readonly Pick<Dispatcher, "id" | "reachable" | "daemon">[]): FleetVersion;
 
+/** The stall rules, shared by the card, the drawer, the diagnose view and the problem list. */
+export function isHookDead(b: Pick<ActiveBuild, "hook_alive"> | null | undefined): boolean;
+export function isStalledBuild(
+  b: Pick<ActiveBuild, "hook_alive" | "heartbeat_stale" | "progress_stale" | "build_age_secs" | "confidence"> | null | undefined,
+): boolean;
+
 export function buildProblems(input: {
   workers: readonly ProblemWorker[];
   devs: readonly ProblemDev[];

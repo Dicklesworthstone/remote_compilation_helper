@@ -206,9 +206,11 @@ launchctl kickstart -k gui/$(id -u)/com.local.rch-dashboard-refresh   # run one 
 Why 20 minutes and not 2: collection itself takes 2–4 s, but every refresh is
 currently a Vercel *deployment* (the snapshot ships inside the static bundle and
 `/api/fleet` imports it at build time), and Vercel's Hobby tier caps deployments
-at 100/day. Publishing the blob without a deploy is tracked as `bd-04ifk`; until
-then the browser's 5-minute poll and the endpoint see whatever the last tick
-published, and the header's snapshot age tells you exactly how old that is.
+at 100/day (Pro allows 6,000/day — on Pro, `StartInterval` 300 is safe and the
+only thing standing between you and 5-minute freshness). Publishing the blob
+without a deploy is tracked as `bd-04ifk`; until then the browser's 5-minute
+poll and the endpoint see whatever the last tick published, and the header's
+snapshot age tells you exactly how old that is.
 
 Each run appends to a rolling aggregate history (`.snapshot-history.json`, kept
 outside `public/` so it is never published) which drives the trend sparklines.
@@ -316,8 +318,8 @@ fix, are served by `?view=help`:
 
 | kind | severity | means |
 |---|---|---|
-| `dev.hook_missing` | critical | Claude Code's PreToolUse hook is not installed — nothing is intercepted on that box |
-| `dev.unmanaged_local_builds` | critical | compiler processes running **right now** with no rch ancestor (`rch shim status`) |
+| `dev.hook_missing` | critical / warn | Claude Code's PreToolUse hook is not installed. Critical when no working cargo shim is on the box either (nothing is intercepted); warn when the shim still covers cargo (bun/gcc/make/nix builds from agents run locally) |
+| `dev.unmanaged_local_builds` | critical | compiler processes running **right now** with no rch ancestor (`rch shim status`). Linux dev machines only — rch's detector reads `/proc`, so a macOS box always reports 0 |
 | `dev.local-only` / `dev.unreachable` | critical | posture local, or the collector could not get `rch status` (the detail says whether ssh, rch or rchd failed) |
 | `dev.doctor_failed` / `dev.doctor_warnings` | critical / warn | `rch doctor` findings on the dev machine, with `rch doctor --fix` when fixable |
 | `dev.shim_missing` / `dev.shim_stale` | warn | cargo shim absent, out of date, or shadowed on PATH |
