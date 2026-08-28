@@ -41,36 +41,103 @@ chk("401 on wrong passphrase", r.status === 401, r.body.trim());
 // successful request, i.e. against a guaranteed-empty derivation cache.
 const wrongOnEmptyCache = { status: r.status, ct: r.ct, body: r.body };
 
+// The contract is readable WITHOUT the key: an agent holding only the URL
+// must be able to learn the parameters and problem kinds before it has a
+// credential. It carries no fleet data.
+r = await call("/api/fleet?view=help&format=json");
+chk("help answers 200 without a key", r.status === 200 && r.ct.includes("application/json"), String(r.status));
+{
+  const help = r.status === 200 ? JSON.parse(r.body) : {};
+  chk("help documents view, target and format",
+    ["view", "target", "format"].every((k) => typeof help.params?.[k] === "string"));
+  chk("help lists the problem kinds with a fix for each",
+    Array.isArray(help.kinds) && help.kinds.length > 10 && help.kinds.every((k) => k.kind && k.severity && k.fix));
+  chk("help leaks no fleet data", !/vmi\d|hz\d|\d+\.\d+\.\d+\.\d+/.test(r.body));
+}
+r = await call("/api/fleet?view=diagnose");
+chk("diagnose without a target is a 400 that says so, before auth",
+  r.status === 400 && /target/.test(r.body), r.body.trim());
+
 if (!PW) {
-  console.log("  SKIP  positive decrypt tests (RCH_DASH_PASSPHRASE not set in env)");
+  // A 2-assertion green run is not a passing endpoint suite. Say so loudly and
+  // fail, unless the caller has explicitly accepted the reduced run.
+  if (process.env.RCH_DASH_ALLOW_SKIP === "1") {
+    console.log("  SKIP  positive decrypt tests (RCH_DASH_PASSPHRASE not set; RCH_DASH_ALLOW_SKIP=1)");
+    srv.close();
+    process.exit(fails > 0 ? 1 : 0);
+  }
+  console.log("  FAIL  RCH_DASH_PASSPHRASE is not set: the decrypt, view and target checks did not run.");
+  console.log("        Set it (or RCH_DASH_ALLOW_SKIP=1 to accept the reduced run).");
   srv.close();
-  process.exit(fails > 0 ? 1 : 0);
+  process.exit(1);
 }
 
 r = await call("/api/fleet", { authorization: `Bearer ${PW}` });
 chk("200 with bearer key", r.status === 200, `${r.body.length}B`);
-chk("defaults to TOON", r.body.startsWith("schema: rch.fleet.llm.v1"), r.body.split("\n")[0]);
+chk("defaults to TOON", r.body.startsWith("schema: rch.fleet.llm.v2"), r.body.split("\n")[0]);
 chk("uses tabular arrays", /problems\[\d+\]\{/.test(r.body) && /workers\[\d+\]\{/.test(r.body));
 const toonLen = r.body.length;
 
 r = await call("/api/fleet?format=json", { "x-fleet-key": PW });
 chk("json via X-Fleet-Key header", r.status === 200 && r.ct.includes("application/json"));
 const parsed = JSON.parse(r.body);
-chk("json parses with schema", parsed.schema === "rch.fleet.llm.v1", `${parsed.summary.workers} workers`);
-chk("problems ranked critical-first",
-  parsed.problems.length === 0 || parsed.problems[0].severity === "critical",
+chk("json parses with schema", parsed.schema === "rch.fleet.llm.v2", `${parsed.summary.workers} workers`);
+// Every row, not just the first: a critical after a warn anywhere is a sort bug.
+const SEV = { critical: 0, warn: 1, info: 2 };
+chk("problems are severity-sorted throughout",
+  parsed.problems.every((p, i, a) => i === 0 || SEV[a[i - 1].severity] <= SEV[p.severity]),
   `${parsed.problems.length} problems`);
+chk("every problem row has the seven string columns",
+  parsed.problems.every((p) => ["severity", "kind", "target", "detail", "since", "action", "on"].every((k) => typeof p[k] === "string")));
+chk("summary carries verdict, next_actions and the fleet version",
+  typeof parsed.verdict === "string" && Array.isArray(parsed.next_actions) && typeof parsed.summary.daemon_version === "string");
+chk("dev rows say hook/shim/doctor state and the measured offload share",
+  parsed.dev_machines.every((d) => "hook" in d && "shim" in d && "doctor" in d && "offload_pct" in d && "local_now" in d));
 chk("TOON is smaller than JSON", toonLen < r.body.length,
   `${toonLen}B vs ${r.body.length}B (${(100 - (toonLen / r.body.length) * 100).toFixed(0)}% smaller)`);
 
 r = await call(`/api/fleet?view=full&key=${encodeURIComponent(PW)}`);
 chk("view=full via ?key", r.status === 200 && r.body.includes("worker_detail"), `${r.body.length}B`);
 
+r = await call("/api/fleet?view=problems&format=json", { authorization: `Bearer ${PW}` });
+{
+  const p = JSON.parse(r.body);
+  chk("view=problems carries problems and next_actions and nothing per-row",
+    r.status === 200 && Array.isArray(p.problems) && Array.isArray(p.next_actions) && !("workers" in p) && !("dev_machines" in p));
+  chk("view=problems agrees with the summary view", p.problems_total === parsed.problems_total);
+  // Target the first dev machine the summary listed.
+  const dev = parsed.dev_machines[0]?.id;
+  const worker = parsed.workers[0]?.id;
+  if (dev) {
+    const t = await call(`/api/fleet?view=diagnose&target=${encodeURIComponent(dev.toUpperCase())}&format=json`, { authorization: `Bearer ${PW}` });
+    const tj = t.status === 200 ? JSON.parse(t.body) : {};
+    chk("diagnose resolves a dev machine case-insensitively",
+      t.status === 200 && tj.target?.type === "dev_machine" && tj.target?.id === dev && tj.dev_machine?.id === dev && "detail" in tj, t.body.slice(0, 120));
+    chk("diagnose scopes problems to the target",
+      (tj.problems ?? []).every((x) => x.target === dev || x.target.startsWith(`${dev}:`) || x.on === dev || x.kind === "fleet.degraded" || x.kind.startsWith("snapshot.")));
+    const s = await call(`/api/fleet?target=${encodeURIComponent(dev)}&format=json`, { authorization: `Bearer ${PW}` });
+    const sj = JSON.parse(s.body);
+    chk("summary with a target filters the per-row lists",
+      s.status === 200 && sj.dev_machines.length === 1 && sj.workers.length === 0);
+  }
+  if (worker) {
+    const t = await call(`/api/fleet?view=diagnose&target=${encodeURIComponent(worker)}&format=json`, { authorization: `Bearer ${PW}` });
+    const tj = t.status === 200 ? JSON.parse(t.body) : {};
+    chk("diagnose on a worker carries its per-machine slot view and what others say about it",
+      t.status === 200 && tj.target?.type === "worker" && typeof tj.detail?.slots_by_dev === "string" &&
+      Array.isArray(tj.hints_about) && Array.isArray(tj.alerts_about), t.body.slice(0, 120));
+  }
+}
+
+r = await call("/api/fleet?target=no-such-machine", { authorization: `Bearer ${PW}` });
+chk("404 on an unknown target, listing the known ids",
+  r.status === 404 && /dev machines:/.test(r.body) && /workers:/.test(r.body), r.body.trim().slice(0, 160));
+
 r = await call("/api/fleet?format=xml", { authorization: `Bearer ${PW}` });
-chk("400 on bad format", r.status === 400, r.body.trim());
+chk("400 on bad format, pointing at help", r.status === 400 && /view=help/.test(r.body), r.body.trim());
 
 r = await call("/api/fleet?view=nonsense", { authorization: `Bearer ${PW}` });
-chk("400 on bad view", r.status === 400, r.body.trim());
+chk("400 on bad view, pointing at help", r.status === 400 && /view=help/.test(r.body), r.body.trim());
 
 // ── KDF-cache guards ───────────────────────────────────────────────────────
 // This endpoint stores no secret: 600k-iteration PBKDF2 is BOTH the auth check
@@ -120,7 +187,9 @@ srv.close();
 // of encryption can shrink it. This endpoint has to inflate what it decrypts.
 {
   const bundled = JSON.parse(await readFile(resolve("public/data/fleet.enc.json"), "utf8"));
-  chk("bundled envelope declares its codec", bundled.compression === "gzip" || bundled.compression == null,
+  // The collector has written gzip since pass 6; an envelope with no codec
+  // field is a pre-compression artifact and must not pass as "declared".
+  chk("bundled envelope declares its codec", bundled.compression === "gzip",
     `compression=${JSON.stringify(bundled.compression ?? null)}`);
   if (bundled.compression === "gzip") {
     // Every 200 above came out of a gzip'd envelope, so the inflate path is
