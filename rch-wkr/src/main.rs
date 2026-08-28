@@ -368,14 +368,14 @@ fn print_system_info() {
     } else {
         println!("bun: not installed");
     }
-    if let Ok(output) = Command::new("node").args(["--version"]).output() {
+    if let Ok(output) = runtime_command("node").args(["--version"]).output() {
         if output.status.success() {
             println!("node: {}", String::from_utf8_lossy(&output.stdout).trim());
         }
     } else {
         println!("node: not installed");
     }
-    if let Ok(output) = Command::new("npm").args(["--version"]).output() {
+    if let Ok(output) = runtime_command("npm").args(["--version"]).output() {
         if output.status.success() {
             println!("npm: {}", String::from_utf8_lossy(&output.stdout).trim());
         }
@@ -435,7 +435,7 @@ fn probe_capabilities() -> WorkerCapabilities {
     }
 
     // Probe node version
-    if let Ok(output) = Command::new("node").args(["--version"]).output()
+    if let Ok(output) = runtime_command("node").args(["--version"]).output()
         && output.status.success()
     {
         let version = String::from_utf8_lossy(&output.stdout);
@@ -443,7 +443,7 @@ fn probe_capabilities() -> WorkerCapabilities {
     }
 
     // Probe npm version
-    if let Ok(output) = Command::new("npm").args(["--version"]).output()
+    if let Ok(output) = runtime_command("npm").args(["--version"]).output()
         && output.status.success()
     {
         let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -587,6 +587,21 @@ fn probe_rustup_inventory() -> (Vec<String>, Vec<String>, Vec<String>) {
     (toolchains, components, warnings)
 }
 
+/// Build a command for a runtime tool, resolving it through the same
+/// PATH-plus-well-known-locations search used for `rustup`.
+///
+/// A bare `Command::new("npm")` cannot start npm on Windows: the installer
+/// ships `npm.cmd`, and `CreateProcess` will not resolve a bare name to a
+/// batch shim. Resolving first turns "npm: unknown" on Windows workers into a
+/// real version string, and is a no-op on POSIX where the bare name is found
+/// on PATH anyway.
+fn runtime_command(name: &str) -> std::process::Command {
+    match resolve_tool_binary(name) {
+        Some(resolved) => std::process::Command::new(resolved.path),
+        None => std::process::Command::new(name),
+    }
+}
+
 /// Resolve a tool binary by name without relying solely on the caller's PATH.
 ///
 /// Systemd system services inherit a minimal default PATH that does not
@@ -610,6 +625,22 @@ struct ResolvedTool {
     from_path_lookup: bool,
 }
 
+/// File names a tool may have on this platform, most canonical first.
+///
+/// POSIX has exactly one: the bare name. Windows has up to three: the bare
+/// name, `name.exe`, and the `name.cmd` batch shim used by npm and friends.
+fn tool_name_candidates(name: &str) -> Vec<String> {
+    let mut names = vec![name.to_string()];
+    if !std::env::consts::EXE_SUFFIX.is_empty() {
+        names.push(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    }
+    if cfg!(target_os = "windows") {
+        names.push(format!("{name}.cmd"));
+        names.push(format!("{name}.bat"));
+    }
+    names
+}
+
 fn resolve_tool_binary_in(
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
@@ -619,15 +650,10 @@ fn resolve_tool_binary_in(
 
     // Windows installs `rustup.exe`; a bare-name lookup never matches it and
     // the whole rustup inventory silently vanishes (bd-jdcxd). Try the
-    // platform executable suffix alongside the bare name everywhere.
-    let names: Vec<String> = if std::env::consts::EXE_SUFFIX.is_empty() {
-        vec![name.to_string()]
-    } else {
-        vec![
-            name.to_string(),
-            format!("{name}{}", std::env::consts::EXE_SUFFIX),
-        ]
-    };
+    // platform executable suffix alongside the bare name everywhere, plus the
+    // batch shims Node ships on Windows: npm has no `.exe` at all, only
+    // `npm.cmd`, so a bare/`.exe`-only search reports npm as missing.
+    let names: Vec<String> = tool_name_candidates(name);
 
     if let Some(paths) = path_var {
         for dir in std::env::split_paths(paths) {
@@ -1256,6 +1282,27 @@ mod tests {
             "rch-wkr-resolver-absent-selftest-7f3a9c",
         );
         assert!(resolved.is_none(), "unexpected resolution: {resolved:?}");
+    }
+
+    /// Windows workers reported `npm: unknown` because npm has no `.exe` at
+    /// all -- the installer only ships `npm.cmd`, which a bare/`.exe` search
+    /// never matches.
+    #[test]
+    fn test_tool_name_candidates_cover_platform_shims() {
+        let names = tool_name_candidates("npm");
+        assert_eq!(names[0], "npm", "bare name stays the first candidate");
+        if cfg!(target_os = "windows") {
+            assert!(
+                names.iter().any(|n| n == "npm.exe"),
+                "windows must try the exe suffix: {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n == "npm.cmd"),
+                "windows must try the npm batch shim: {names:?}"
+            );
+        } else {
+            assert_eq!(names, vec!["npm".to_string()], "posix has one name");
+        }
     }
 
     /// Regression for bd-jdcxd: Windows ships `rustup.exe`, so a bare-name

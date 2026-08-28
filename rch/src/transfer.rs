@@ -364,6 +364,22 @@ const FORCED_MANAGED_ENV_KEYS: &[&str] = &[
     "GOMODCACHE",
     "GOPATH",
 ];
+/// Remote loop-break. A command we are *already* executing on a worker must
+/// compile there — it must never re-enter the offload path and try to hand the
+/// work to yet another machine.
+///
+/// The worker's own `cargo` is shim-wrapped (`rch shim install` self-heals onto
+/// every host), so without this the worker's shim sees the caller's fail-closed
+/// intent (`RCH_REQUIRE_REMOTE`) and tries to offload again. On a pure worker
+/// — no workers of its own — that refuses local fallback and the job dies with
+/// exit 103; on a dispatcher it "succeeds" by bouncing the build to a third
+/// host, paying a second sync for no reason.
+///
+/// This mirrors the local-fallback loop-break in [`crate::hook`], which sets the
+/// same variable on rch's own local re-exec. The shim checks it before anything
+/// else, so it short-circuits regardless of how the remote-required intent
+/// reached the worker.
+const REMOTE_LOOP_BREAK_ENV: (&str, &str) = ("RCH_CARGO_WRAPPER_BYPASS", "1");
 const CONFIG_EXCLUDE_REWRITES: &[(&str, &str)] = &[
     ("core.*", "core.[0-9]*"),
     (".core.*", ".core.[0-9]*"),
@@ -1652,6 +1668,22 @@ impl TransferPipeline {
             }
             parts.push(self.format_env_assignment(key, &escaped, true));
             applied.push(key.to_string());
+        }
+
+        // Remote loop-break (see REMOTE_LOOP_BREAK_ENV): stop the worker's own
+        // cargo shim from offloading the job onward. Injected unconditionally
+        // and last-wins over a forwarded value, because a caller that exported
+        // RCH_CARGO_WRAPPER_BYPASS=0 locally must not be able to re-arm the
+        // shim on the worker and reintroduce the bounce.
+        {
+            let (key, value) = REMOTE_LOOP_BREAK_ENV;
+            if let Some(escaped) = shell_escape_value(value) {
+                let assignment_prefix = format!("{key}=");
+                parts.retain(|part| !part.starts_with(&assignment_prefix));
+                applied.retain(|applied_key| applied_key != key);
+                parts.push(self.format_env_assignment(key, &escaped, false));
+                applied.push(key.to_string());
+            }
         }
 
         // Layer 0 configuration pack (bd-bqu38): explicit config-resolved
@@ -6499,6 +6531,72 @@ mod tests {
         // Test Clone
         let cloned = result.clone();
         assert_eq!(cloned.bytes_transferred, result.bytes_transferred);
+    }
+
+    /// A job already running on a worker must compile there, never offload
+    /// onward. Without the loop-break the worker's own cargo shim re-offloads:
+    /// a pure worker refuses local fallback (exit 103), a dispatcher bounces
+    /// the build to a third host. See REMOTE_LOOP_BREAK_ENV.
+    #[test]
+    fn test_remote_env_plan_injects_loop_break() {
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        );
+
+        let prefix = pipeline.build_env_prefix();
+        assert!(
+            prefix.prefix.contains("RCH_CARGO_WRAPPER_BYPASS=1"),
+            "remote command must carry the loop-break, got: {}",
+            prefix.prefix
+        );
+        assert!(
+            prefix
+                .applied
+                .iter()
+                .any(|k| k == "RCH_CARGO_WRAPPER_BYPASS"),
+            "loop-break should be reported as applied"
+        );
+    }
+
+    /// A caller that exports the bypass OFF locally must not be able to re-arm
+    /// the worker's shim and reintroduce the bounce.
+    #[test]
+    fn test_remote_loop_break_overrides_forwarded_value() {
+        let mut overrides = HashMap::new();
+        overrides.insert("RCH_CARGO_WRAPPER_BYPASS".to_string(), "0".to_string());
+
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_env_allowlist(vec!["RCH_CARGO_WRAPPER_BYPASS".to_string()])
+        .with_env_overrides(overrides);
+
+        let prefix = pipeline.build_env_prefix();
+        assert!(
+            prefix.prefix.contains("RCH_CARGO_WRAPPER_BYPASS=1"),
+            "loop-break must win over a forwarded value, got: {}",
+            prefix.prefix
+        );
+        assert!(
+            !prefix.prefix.contains("RCH_CARGO_WRAPPER_BYPASS=0"),
+            "the disabling value must not survive, got: {}",
+            prefix.prefix
+        );
+        assert_eq!(
+            prefix
+                .applied
+                .iter()
+                .filter(|k| *k == "RCH_CARGO_WRAPPER_BYPASS")
+                .count(),
+            1,
+            "loop-break must be assigned exactly once"
+        );
     }
 
     #[test]
