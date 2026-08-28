@@ -171,9 +171,19 @@ export function fleetVersion(devs) {
   }
   let modal = null;
   let best = -1;
-  // Ties break on the LOWER version string so a half-rolled fleet flags the
-  // machines that have NOT been updated yet, not the ones that have.
-  for (const [v, n] of [...counts.entries()].sort((a, b) => b[1] - a[1] || (a[0] > b[0] ? 1 : -1))) {
+  // Ties break on the HIGHER version so a half-rolled fleet flags the machines
+  // that have NOT been updated yet, never the ones that have. Compared as
+  // numeric segments: "1.0.60" is newer than "1.0.9", whatever string order says.
+  const seg = (v) => String(v).split(/[.\-+]/).map((x) => (Number.isFinite(Number(x)) ? Number(x) : 0));
+  const newer = (a, b) => {
+    const sa = seg(a), sb = seg(b);
+    for (let i = 0; i < Math.max(sa.length, sb.length); i++) {
+      const d = (sa[i] ?? 0) - (sb[i] ?? 0);
+      if (d !== 0) return d;
+    }
+    return 0;
+  };
+  for (const [v, n] of [...counts.entries()].sort((a, b) => b[1] - a[1] || newer(b[0], a[0]))) {
     if (n > best) { modal = v; best = n; }
   }
   const off = devs
