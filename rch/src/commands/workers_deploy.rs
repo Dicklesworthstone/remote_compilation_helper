@@ -107,6 +107,52 @@ pub async fn workers_deploy_binary(
         return Ok(());
     }
 
+    // The deployed artifact is THIS host's rch-wkr binary, so it can only run
+    // on workers with the same OS. Deploying across platforms bricks the
+    // worker's agent (a Linux ELF was once pushed over a Windows worker's
+    // .exe, taking it out of the fleet until someone noticed — bd-jdcxd).
+    // Unlabelled workers are the historical Linux fleet.
+    let local_os = std::env::consts::OS;
+    let (target_workers, os_mismatched): (Vec<&WorkerConfig>, Vec<&WorkerConfig>) =
+        target_workers.into_iter().partition(|w| {
+            worker_os_matches_local(rch_common::types::declared_os(&w.tags).as_deref(), local_os)
+        });
+
+    let mut results: Vec<DeployResult> = Vec::new();
+    for worker in &os_mismatched {
+        let worker_os =
+            rch_common::types::declared_os(&worker.tags).unwrap_or_else(|| "linux".to_string());
+        if !ctx.is_json() {
+            println!(
+                "{} Skipping {}: worker os '{}' does not match this host's binary platform '{}'. \
+                 Deploy from a matching host or build rch-wkr on the worker itself.",
+                StatusIndicator::Warning.display(style),
+                style.highlight(worker.id.as_str()),
+                worker_os,
+                local_os,
+            );
+        }
+        results.push(DeployResult {
+            worker_id: worker.id.to_string(),
+            success: false,
+            deployed: false,
+            local_version: String::new(),
+            remote_version: None,
+            error: Some(format!(
+                "os mismatch: worker os '{worker_os}', local binary platform '{local_os}'"
+            )),
+        });
+    }
+    if target_workers.is_empty() {
+        if ctx.is_json() {
+            let _ = ctx.json(&ApiResponse::ok(
+                "workers deploy-binary",
+                serde_json::json!({ "local_version": null, "results": results }),
+            ));
+        }
+        return Ok(());
+    }
+
     // Find local binary
     let local_binary = find_local_binary("rch-wkr")?;
     let local_version = get_binary_version(&local_binary).await?;
@@ -122,8 +168,6 @@ pub async fn workers_deploy_binary(
     }
 
     // Deploy to each worker
-    let mut results: Vec<DeployResult> = Vec::new();
-
     for worker in target_workers {
         let result =
             deploy_binary_to_worker(worker, &local_binary, &local_version, force, dry_run, ctx)
@@ -148,6 +192,15 @@ pub async fn workers_deploy_binary(
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+/// Whether a worker's declared OS can run a binary built on `local_os`
+/// (`std::env::consts::OS` values). Workers with no declared OS are the
+/// historical unlabelled Linux fleet.
+fn worker_os_matches_local(declared_os: Option<&str>, local_os: &str) -> bool {
+    declared_os
+        .unwrap_or("linux")
+        .eq_ignore_ascii_case(local_os)
+}
 
 /// Find local binary path.
 pub(super) fn find_local_binary(name: &str) -> Result<PathBuf> {
@@ -498,6 +551,20 @@ struct DeployResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard for the wsurf incident (bd-jdcxd): a deploy must
+    /// never push this host's binary to a worker with a different OS, and
+    /// unlabelled workers are the historical Linux fleet.
+    #[test]
+    fn deploy_refuses_cross_os_workers() {
+        assert!(worker_os_matches_local(None, "linux"));
+        assert!(worker_os_matches_local(Some("linux"), "linux"));
+        assert!(worker_os_matches_local(Some("Windows"), "windows"));
+        assert!(!worker_os_matches_local(Some("windows"), "linux"));
+        assert!(!worker_os_matches_local(Some("linux"), "windows"));
+        // A macOS host must not push its darwin binary at the Linux fleet.
+        assert!(!worker_os_matches_local(None, "macos"));
+    }
 
     #[test]
     fn remote_deploy_shell_commands_quote_paths() {
