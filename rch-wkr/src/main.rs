@@ -617,31 +617,45 @@ fn resolve_tool_binary_in(
 ) -> Option<ResolvedTool> {
     use std::path::PathBuf;
 
+    // Windows installs `rustup.exe`; a bare-name lookup never matches it and
+    // the whole rustup inventory silently vanishes (bd-jdcxd). Try the
+    // platform executable suffix alongside the bare name everywhere.
+    let names: Vec<String> = if std::env::consts::EXE_SUFFIX.is_empty() {
+        vec![name.to_string()]
+    } else {
+        vec![
+            name.to_string(),
+            format!("{name}{}", std::env::consts::EXE_SUFFIX),
+        ]
+    };
+
     if let Some(paths) = path_var {
         for dir in std::env::split_paths(paths) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(ResolvedTool {
-                    path: candidate,
-                    from_path_lookup: true,
-                });
+            for candidate in names.iter().map(|n| dir.join(n)) {
+                if candidate.is_file() {
+                    return Some(ResolvedTool {
+                        path: candidate,
+                        from_path_lookup: true,
+                    });
+                }
             }
         }
     }
-    let mut fallbacks: Vec<PathBuf> = Vec::new();
+    let mut fallback_dirs: Vec<PathBuf> = Vec::new();
     if let Some(home) = home
         && !home.is_empty()
     {
         let home = PathBuf::from(home);
-        fallbacks.push(home.join(".cargo").join("bin").join(name));
-        fallbacks.push(home.join(".local").join("bin").join(name));
+        fallback_dirs.push(home.join(".cargo").join("bin"));
+        fallback_dirs.push(home.join(".local").join("bin"));
     }
     // Canonical locations for service contexts where HOME may be /root or
     // unset regardless of which user provisioned the toolchain.
-    fallbacks.push(PathBuf::from("/root/.cargo/bin").join(name));
-    fallbacks.push(PathBuf::from("/usr/local/bin").join(name));
-    fallbacks
+    fallback_dirs.push(PathBuf::from("/root/.cargo/bin"));
+    fallback_dirs.push(PathBuf::from("/usr/local/bin"));
+    fallback_dirs
         .into_iter()
+        .flat_map(|dir| names.iter().map(move |n| dir.join(n)).collect::<Vec<_>>())
         .find(|p| p.is_file())
         .map(|path| ResolvedTool {
             path,
@@ -1214,6 +1228,48 @@ mod tests {
             "rch-wkr-resolver-absent-selftest-7f3a9c",
         );
         assert!(resolved.is_none(), "unexpected resolution: {resolved:?}");
+    }
+
+    /// Regression for bd-jdcxd: Windows ships `rustup.exe`, so a bare-name
+    /// lookup found nothing and the whole rustup inventory silently vanished
+    /// (the dispatcher then reported every component as missing).
+    #[test]
+    fn test_resolve_tool_binary_accepts_platform_exe_suffix() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = dir
+            .path()
+            .join(format!("selftest-suffixed{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&tool, b"#!/bin/sh\n").expect("write tool");
+        let path_var =
+            std::env::join_paths(std::iter::once(dir.path().to_path_buf())).expect("join paths");
+        let resolved = resolve_tool_binary_in(
+            Some(&path_var),
+            Some("/nonexistent-home".as_ref()),
+            "selftest-suffixed",
+        )
+        .expect("tool should resolve with the platform executable suffix");
+        assert!(resolved.from_path_lookup);
+        assert_eq!(resolved.path, tool);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_resolve_tool_binary_bare_name_still_wins_on_windows() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bare = dir.path().join("selftest-both");
+        let exe = dir.path().join("selftest-both.exe");
+        std::fs::write(&bare, b"").expect("write bare");
+        std::fs::write(&exe, b"").expect("write exe");
+        let path_var =
+            std::env::join_paths(std::iter::once(dir.path().to_path_buf())).expect("join paths");
+        let resolved = resolve_tool_binary_in(Some(&path_var), None, "selftest-both")
+            .expect("tool should resolve");
+        assert_eq!(
+            resolved.path, bare,
+            "bare name is checked before the .exe form"
+        );
     }
 
     #[test]
