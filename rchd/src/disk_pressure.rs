@@ -612,8 +612,10 @@ mod tests {
         assert_eq!(critical.state, PressureState::Critical);
         assert_eq!(critical.reason_code, "disk_free_below_critical_gb");
 
+        // 20G free of 300G is 6.7% — above the 5% critical ratio, so only the
+        // absolute warning threshold can fire here.
         let warning =
-            evaluate_pressure_policy(&test_capabilities(20.0, 500.0), Some(&telemetry), &cfg);
+            evaluate_pressure_policy(&test_capabilities(20.0, 300.0), Some(&telemetry), &cfg);
         assert_eq!(warning.state, PressureState::Warning);
         assert_eq!(warning.reason_code, "disk_free_below_warning_gb");
 
