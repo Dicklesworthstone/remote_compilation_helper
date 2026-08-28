@@ -829,3 +829,33 @@ button.kv-link:hover .kv-v { color: var(--accent); }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* problems panel — the agent endpoint's rows, rendered for a human */
+.count-pill.crit { background: var(--crit-dim); color: var(--crit); }
+.count-pill.warn { background: var(--warn-dim); color: var(--warn); }
+.count-pill.ok   { background: var(--ok-dim);   color: var(--ok);   }
+.empty.ok { color: var(--ok); }
+.problems-scroll { overflow-x: auto; }
+.problems { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.problems th {
+  text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-faint); padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap;
+}
+.problems td { padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.problems tr.prob-critical td:first-child { box-shadow: inset 3px 0 0 var(--crit); }
+.problems tr.prob-warn td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+.problems .mono { font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+.problems .prob-detail { min-width: 220px; max-width: 520px; overflow-wrap: anywhere; }
+.problems .prob-action { min-width: 180px; max-width: 420px; }
+.problems .prob-action code {
+  font-family: var(--mono); font-size: 11.5px; color: var(--accent); overflow-wrap: anywhere; white-space: pre-wrap;
+}
+.next-actions { margin-top: 12px; font-size: 12.5px; }
+.next-actions summary { cursor: pointer; color: var(--text-dim); }
+.next-actions ul { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-direction: column; gap: 6px; }
+.next-actions li { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.next-actions li code { font-family: var(--mono); font-size: 11.5px; color: var(--accent); overflow-wrap: anywhere; }
+.next-actions .mono { font-family: var(--mono); font-size: 12px; }
+.card-flags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.card-flags .pill.critical, .card-flags .pill.warn { text-transform: none; letter-spacing: 0; }
+.stall-mark { color: var(--warn); font-weight: 600; }

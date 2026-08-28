@@ -13,6 +13,8 @@ import { DevMachineDrawer } from "./components/DevMachineDrawer";
 import { Overview } from "./components/Overview";
 import { Topbar, WorkersSection, type Sort } from "./components/Topbar";
 import { FleetMap } from "./components/FleetMap";
+import { Problems } from "./components/Problems";
+import { buildProblems } from "./problems";
 
 
 const DATA_URL = `${import.meta.env.BASE_URL}data/fleet.enc.json`;
@@ -338,6 +340,25 @@ export default function App() {
   // Worker ids for dev-drawer cross-links. Must live ABOVE the `if (!snap)`
   // early return — hooks cannot be conditional.
   const fleetWorkerIds = useMemo(() => new Set(workers.map((w) => w.id)), [workers]);
+  const devIds = useMemo(() => new Set(devs.map((d) => d.id)), [devs]);
+
+  // The problem list is derived by the SAME module `/api/fleet` uses, so an
+  // operator and an agent looking at the same snapshot see the same rows.
+  // Snapshot age is judged here against the reader's clock (it is about THIS
+  // feed, not about any worker), so this does depend on `now` — at 30s ticks
+  // that is a handful of allocations, not a render cost.
+  const derived = useMemo(() => {
+    if (!snap) return { problems: [], next_actions: [] };
+    const snapshotMs = new Date(snap.generated_at).getTime();
+    const valid = Number.isFinite(snapshotMs);
+    return buildProblems({
+      workers,
+      devs,
+      snapshotValid: valid,
+      ageSeconds: valid ? (now - snapshotMs) / 1000 : 0,
+      staleAfter: STALE_CRIT_SECONDS,
+    });
+  }, [snap, workers, devs, now]);
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
