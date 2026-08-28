@@ -635,6 +635,9 @@ export function dispatcherFromProbe(host, probe) {
 
   const stats = status?.daemon?.stats ?? null;
   const str = (v, max = 240) => (typeof v === "string" ? v.slice(0, max) : null);
+  // Only real records: an older daemon (and one test fixture) puts bare
+  // numbers in these arrays, and a row of fourteen nulls is not an alert.
+  const objs = (arr, max) => (Array.isArray(arr) ? arr : []).filter((x) => x && typeof x === "object").slice(0, max);
   // Positional, not named — see `builds` in the returned object below. Field
   // order is the contract: project, command, location, worker, duration,
   // exit code, completed_at. `src/derive.ts` and `tools/llm-view.mjs` expand it.
@@ -662,14 +665,14 @@ export function dispatcherFromProbe(host, probe) {
   // whether it is still active. This is what lets a worker problem say
   // "offline since 18:39" instead of just "offline". Tuples:
   //   [kind, severity, worker_id, message, first_seen, last_seen, state]
-  const alerts = (status?.daemon?.alerts ?? []).slice(0, 20).map((a) => [
+  const alerts = objs(status?.daemon?.alerts, 20).map((a) => [
     a.kind ?? null, a.severity ?? null, a.worker_id ?? null, str(a.message, 200),
     a.first_seen ?? a.created_at ?? null, a.last_seen ?? null, a.state ?? null,
   ]);
 
   // `daemon.issues[]`: the daemon's own diagnosis WITH the command it wants run
   // (`remediation`). Tuples: [severity, summary, remediation]
-  const issues = (status?.daemon?.issues ?? []).slice(0, 20).map((i) => [
+  const issues = objs(status?.daemon?.issues, 20).map((i) => [
     i.severity ?? null, str(i.summary, 200), str(i.remediation, 200),
   ]);
 
@@ -678,7 +681,7 @@ export function dispatcherFromProbe(host, probe) {
   //   [id, project, worker, command, started_at, heartbeat_age_secs,
   //    progress_age_secs, phase, hook_alive, heartbeat_stale, progress_stale,
   //    confidence, slots, build_age_secs]
-  const active = (status?.daemon?.active_builds ?? []).slice(0, 40).map((b) => [
+  const active = objs(status?.daemon?.active_builds, 40).map((b) => [
     b.id != null ? String(b.id) : null,
     b.project_id ?? null,
     b.worker_id ?? null,
@@ -696,7 +699,7 @@ export function dispatcherFromProbe(host, probe) {
   ]);
 
   // Queued builds: [id, project, command, position, slots_needed, wait_time]
-  const queued = (status?.daemon?.queued_builds ?? []).slice(0, 40).map((q) => [
+  const queued = objs(status?.daemon?.queued_builds, 40).map((q) => [
     q.id != null ? String(q.id) : null, q.project_id ?? null, str(q.command, 120),
     num(q.position), num(q.slots_needed), str(q.wait_time, 40),
   ]);

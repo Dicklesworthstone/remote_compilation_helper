@@ -138,7 +138,7 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
   chk("all seven sections run concurrently on the dispatcher",
     (script.match(/> "\$d\/[sclmdhk]" & q\d=\$!/g) ?? []).length === 7);
   chk("each section's own exit status is captured",
-    (script.match(/wait \$q\d; e\d=\$\?/g) ?? []).length === 4);
+    (script.match(/wait \$q\d; e\d=\$\?/g) ?? []).length === 7);
 
   // A full /data/tmp is a live condition on this fleet. Losing mktemp must cost
   // parallelism, not the whole dispatcher.
@@ -148,7 +148,7 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
   // Cleanup names exactly the four files this script created, inside the
   // directory it created. Nothing else on a production host is touched.
   chk("cleanup removes only this script's own files",
-    script.includes(`trap 'rm -f "$d/s" "$d/c" "$d/l" "$d/m"; rmdir "$d" 2>/dev/null' EXIT`));
+    script.includes(`trap 'rm -f "$d/s" "$d/c" "$d/l" "$d/m" "$d/d" "$d/h" "$d/k"; rmdir "$d" 2>/dev/null' EXIT`));
   chk("the temp dir honours the host's own TMPDIR",
     script.includes('mktemp -d "${TMPDIR:-/tmp}/rchdash.XXXXXX"'));
 }
