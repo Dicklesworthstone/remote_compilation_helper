@@ -67,7 +67,12 @@ export function Overview({ snap, counts, hardProblems }: Props) {
           <div className="kpi-value">
             {remotePct != null ? `${remotePct.toFixed(0)}%` : "—"}
           </div>
-          <div className="kpi-sub">{t.builds_remote} remote · {t.builds_local} local</div>
+          <div className="kpi-sub">
+            {t.builds_remote} remote · {t.builds_local} local
+            {(t.local_builds_running ?? 0) > 0 && (
+              <span style={{ color: "var(--crit)" }}> · {t.local_builds_running} compiling outside rch now</span>
+            )}
+          </div>
         </div>
         <div
           className="kpi"
