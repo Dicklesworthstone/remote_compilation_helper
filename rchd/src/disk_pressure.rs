@@ -317,6 +317,7 @@ pub fn evaluate_pressure_policy(
         } else if telemetry_fresh {
             classify_with_fresh_telemetry(
                 disk_free_gb.unwrap_or_default(),
+                disk_total_gb.unwrap_or_default(),
                 disk_free_ratio.unwrap_or_default(),
                 disk_io_util_pct,
                 memory_pressure,
@@ -325,6 +326,7 @@ pub fn evaluate_pressure_policy(
         } else {
             classify_without_fresh_telemetry(
                 disk_free_gb.unwrap_or_default(),
+                disk_total_gb.unwrap_or_default(),
                 disk_free_ratio.unwrap_or_default(),
                 config,
             )
@@ -346,14 +348,27 @@ pub fn evaluate_pressure_policy(
     }
 }
 
+/// Whether the absolute free-GB thresholds are meaningful for this
+/// filesystem. A mount whose TOTAL size is in the same ballpark as the
+/// thresholds (e.g. a half-of-RAM tmpfs /tmp reported as the worst mount)
+/// can never satisfy `free > warning_free_gb`, so the absolute rules would
+/// pin it at warning/critical forever even when it is nearly empty. Such
+/// small filesystems are judged by the ratio rules alone; anything at least
+/// twice the warning threshold gets the full rule set.
+fn absolute_gb_thresholds_apply(disk_total_gb: f64, config: &DiskPressurePolicyConfig) -> bool {
+    disk_total_gb >= 2.0 * config.warning_free_gb
+}
+
 fn classify_with_fresh_telemetry(
     disk_free_gb: f64,
+    disk_total_gb: f64,
     disk_free_ratio: f64,
     disk_io_util_pct: Option<f64>,
     memory_pressure: Option<f64>,
     config: &DiskPressurePolicyConfig,
 ) -> (PressureState, PressureConfidence, String, String) {
-    if disk_free_gb <= config.critical_free_gb {
+    let absolute_gb = absolute_gb_thresholds_apply(disk_total_gb, config);
+    if absolute_gb && disk_free_gb <= config.critical_free_gb {
         return (
             PressureState::Critical,
             PressureConfidence::High,
@@ -371,7 +386,8 @@ fn classify_with_fresh_telemetry(
     }
     if disk_io_util_pct
         .map(|util| {
-            util >= config.critical_disk_io_util_pct && disk_free_gb <= config.warning_free_gb
+            util >= config.critical_disk_io_util_pct
+                && (!absolute_gb || disk_free_gb <= config.warning_free_gb)
         })
         .unwrap_or(false)
     {
@@ -394,7 +410,7 @@ fn classify_with_fresh_telemetry(
         );
     }
 
-    if disk_free_gb <= config.warning_free_gb {
+    if absolute_gb && disk_free_gb <= config.warning_free_gb {
         return (
             PressureState::Warning,
             PressureConfidence::High,
@@ -443,10 +459,14 @@ fn classify_with_fresh_telemetry(
 
 fn classify_without_fresh_telemetry(
     disk_free_gb: f64,
+    disk_total_gb: f64,
     disk_free_ratio: f64,
     config: &DiskPressurePolicyConfig,
 ) -> (PressureState, PressureConfidence, String, String) {
-    if disk_free_gb <= config.critical_free_gb || disk_free_ratio <= config.critical_free_ratio {
+    let absolute_gb = absolute_gb_thresholds_apply(disk_total_gb, config);
+    if (absolute_gb && disk_free_gb <= config.critical_free_gb)
+        || disk_free_ratio <= config.critical_free_ratio
+    {
         return (
             PressureState::Critical,
             PressureConfidence::Medium,
@@ -454,7 +474,9 @@ fn classify_without_fresh_telemetry(
             "disk_threshold_breach_without_telemetry".to_string(),
         );
     }
-    if disk_free_gb <= config.warning_free_gb || disk_free_ratio <= config.warning_free_ratio {
+    if (absolute_gb && disk_free_gb <= config.warning_free_gb)
+        || disk_free_ratio <= config.warning_free_ratio
+    {
         return (
             PressureState::Warning,
             PressureConfidence::Medium,
@@ -539,6 +561,70 @@ mod tests {
         let mut received = ReceivedTelemetry::new(telemetry, TelemetrySource::SshPoll);
         received.received_at = Utc::now() - ChronoDuration::seconds(age_secs);
         received
+    }
+
+    /// A nearly-empty small filesystem (a half-of-RAM tmpfs /tmp reported as
+    /// the worst mount) must not trip the absolute free-GB thresholds it can
+    /// never satisfy — ratio rules govern small mounts.
+    #[test]
+    fn small_tmpfs_nearly_empty_is_healthy_with_fresh_telemetry() {
+        let caps = test_capabilities(15.9, 16.0);
+        let telemetry = test_received_telemetry(30.0, 40.0, 5);
+        let cfg = DiskPressurePolicyConfig::default();
+        let assessment = evaluate_pressure_policy(&caps, Some(&telemetry), &cfg);
+        assert_eq!(assessment.state, PressureState::Healthy);
+        assert_eq!(assessment.reason_code, "pressure_healthy");
+    }
+
+    #[test]
+    fn small_tmpfs_nearly_empty_is_gap_not_warning_without_telemetry() {
+        let caps = test_capabilities(15.9, 16.0);
+        let cfg = DiskPressurePolicyConfig::default();
+        let assessment = evaluate_pressure_policy(&caps, None, &cfg);
+        assert_eq!(assessment.state, PressureState::TelemetryGap);
+        assert_eq!(assessment.reason_code, "telemetry_unavailable");
+    }
+
+    /// bd-lvbax regression: a genuinely full small /tmp must still go
+    /// critical (via the ratio rule) — the size gate must not fail open.
+    #[test]
+    fn small_tmpfs_actually_full_is_critical_by_ratio() {
+        let caps = test_capabilities(0.1, 3.8);
+        let telemetry = test_received_telemetry(30.0, 40.0, 5);
+        let cfg = DiskPressurePolicyConfig::default();
+        let assessment = evaluate_pressure_policy(&caps, Some(&telemetry), &cfg);
+        assert_eq!(assessment.state, PressureState::Critical);
+        assert_eq!(assessment.reason_code, "disk_ratio_below_critical");
+
+        let stale = evaluate_pressure_policy(&caps, None, &cfg);
+        assert_eq!(stale.state, PressureState::Critical);
+        assert_eq!(stale.reason_code, "disk_critical_without_fresh_telemetry");
+    }
+
+    /// Large disks keep the absolute free-GB rules unchanged.
+    #[test]
+    fn large_disk_absolute_gb_thresholds_still_fire() {
+        let cfg = DiskPressurePolicyConfig::default();
+        let telemetry = test_received_telemetry(30.0, 40.0, 5);
+
+        let critical =
+            evaluate_pressure_policy(&test_capabilities(8.0, 500.0), Some(&telemetry), &cfg);
+        assert_eq!(critical.state, PressureState::Critical);
+        assert_eq!(critical.reason_code, "disk_free_below_critical_gb");
+
+        let warning =
+            evaluate_pressure_policy(&test_capabilities(20.0, 500.0), Some(&telemetry), &cfg);
+        assert_eq!(warning.state, PressureState::Warning);
+        assert_eq!(warning.reason_code, "disk_free_below_warning_gb");
+
+        // Boundary: exactly 2x warning_free_gb counts as large.
+        let boundary = evaluate_pressure_policy(
+            &test_capabilities(20.0, 2.0 * cfg.warning_free_gb),
+            Some(&telemetry),
+            &cfg,
+        );
+        assert_eq!(boundary.state, PressureState::Warning);
+        assert_eq!(boundary.reason_code, "disk_free_below_warning_gb");
     }
 
     #[test]

@@ -929,20 +929,48 @@ fn probe_load_average() -> Option<(f64, f64, f64)> {
 /// true in practice: vmi1149989's /tmp tmpfs hit 100% while / was healthy,
 /// breaking scp/mktemp for every build on that worker while pressure scoring
 /// stayed green. Pressure reporting must see the tightest mount a build can
-/// actually touch, so sample all candidates and report the minimum free.
+/// actually touch, so sample all candidates and report the fullest one.
+///
+/// "Fullest" is judged by free RATIO, not absolute free GB. A half-of-RAM
+/// tmpfs /tmp (a few GB, nearly empty) has less absolute free space than any
+/// healthy data disk, so a minimum-free-GB rule reported it on almost every
+/// Linux worker and pinned the daemon's absolute-GB pressure thresholds at
+/// warning/critical fleet-wide while the real disks were fine — and, worse,
+/// hid those real disks when they actually filled. Ratio keeps the bd-lvbax
+/// guarantee (a truly full /tmp has the lowest ratio and still wins) without
+/// letting an empty small mount shadow the disk that matters.
 fn probe_disk_space() -> Option<(f64, f64)> {
     use std::path::Path;
     let (canonical, alias) = resolved_topology_roots();
     let mut worst: Option<(f64, f64)> = None;
     for path in [canonical.as_path(), alias.as_path(), Path::new("/tmp")] {
-        if let Some((free_gb, total_gb)) = probe_disk_space_for(path) {
-            worst = match worst {
-                Some((worst_free, _)) if worst_free <= free_gb => worst,
-                _ => Some((free_gb, total_gb)),
-            };
+        if let Some(sample) = probe_disk_space_for(path) {
+            worst = Some(match worst {
+                Some(current) => fuller_disk_sample(current, sample),
+                None => sample,
+            });
         }
     }
     worst
+}
+
+/// Pick the fuller of two `(free_gb, total_gb)` disk samples by free ratio.
+/// Ties keep the incumbent. A degenerate zero-total sample never wins over a
+/// real reading (its ratio is treated as fully free), but is still reported
+/// when it is the only sample rather than inventing a healthy disk.
+fn fuller_disk_sample(current: (f64, f64), candidate: (f64, f64)) -> (f64, f64) {
+    let ratio = |(free_gb, total_gb): (f64, f64)| {
+        if total_gb > 0.0 {
+            (free_gb / total_gb).clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    };
+    if ratio(candidate) < ratio(current) {
+        candidate
+    } else {
+        current
+    }
 }
 
 fn probe_disk_space_for(path: &std::path::Path) -> Option<(f64, f64)> {
@@ -1270,6 +1298,44 @@ mod tests {
             resolved.path, bare,
             "bare name is checked before the .exe form"
         );
+    }
+
+    /// The worst-disk pick is by free RATIO: a nearly-empty half-of-RAM
+    /// tmpfs /tmp must not shadow a filling data disk (fleet-wide false
+    /// warnings), while a truly full /tmp must still win (bd-lvbax).
+    #[test]
+    fn test_fuller_disk_sample_prefers_lower_free_ratio() {
+        let _guard = test_guard!();
+        // omarchy-shaped: root 151G/237G free (64%) vs /tmp tmpfs 15.9G/16G
+        // free (99%). The root disk is the meaningful sample.
+        let root = (151.0, 237.0);
+        let tmpfs = (15.9, 16.0);
+        assert_eq!(fuller_disk_sample(root, tmpfs), root);
+        assert_eq!(fuller_disk_sample(tmpfs, root), root);
+
+        // bd-lvbax-shaped: /tmp tmpfs 100% full while root is healthy — the
+        // full tmpfs must win so pressure goes critical.
+        let full_tmpfs = (0.0, 3.8);
+        assert_eq!(fuller_disk_sample(root, full_tmpfs), full_tmpfs);
+
+        // hz1-shaped: root at 91% used (8.9% free) vs /tmp at 69% free — the
+        // real disk must not be hidden by the roomier tmpfs.
+        let tight_root = (20.0, 225.0);
+        let roomy_tmpfs = (11.0, 16.0);
+        assert_eq!(fuller_disk_sample(roomy_tmpfs, tight_root), tight_root);
+    }
+
+    #[test]
+    fn test_fuller_disk_sample_zero_total_never_beats_real_reading() {
+        let _guard = test_guard!();
+        let real = (5.0, 100.0);
+        let degenerate = (0.0, 0.0);
+        assert_eq!(fuller_disk_sample(real, degenerate), real);
+        assert_eq!(fuller_disk_sample(degenerate, real), real);
+        // Ties keep the incumbent.
+        let a = (10.0, 100.0);
+        let b = (20.0, 200.0);
+        assert_eq!(fuller_disk_sample(a, b), a);
     }
 
     #[test]

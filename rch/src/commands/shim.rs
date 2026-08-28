@@ -40,7 +40,14 @@ use crate::ui::theme::StatusIndicator;
 /// `2` narrowed the `--message-format` bail-out (v1 sent EVERY such build local,
 /// which silently kept script/CI builds on the dev box), added the
 /// `RUSTC_WORKSPACE_WRAPPER` guard, and introduced the `cargo-clippy` shim.
-const SHIM_VERSION: &str = "2";
+///
+/// `3` caps parallelism on every LOCAL fallback path (`exec_local`). Local builds
+/// skip rch's slot accounting entirely, so nothing bounded their `-j`: a repo's
+/// own `.cargo/config.toml` outranks `~/.cargo/config.toml`, and one setting
+/// `jobs = -1` (= nproc-1) produced 127 concurrent rustc on a 128-thread host,
+/// each forking a ~1GB `rust-lld` — 202GB of linkers, RAM and swap exhausted,
+/// and the box wedged at 100% disk utilization for hours.
+const SHIM_VERSION: &str = "3";
 
 /// Marker line embedded in the generated shim, used to recognize an rch-managed
 /// file (vs. a hand-rolled or unrelated `cargo` on `PATH`) and read its version.
@@ -86,15 +93,28 @@ fn cargo_clippy_shim_body() -> String {
 # Catches DIRECT `cargo-clippy` invocations (scripts, Makefiles, lint gates)
 # that bypass the `cargo` shim entirely by never going through cargo.
 REAL="${{RCH_SHIM_REAL_CARGO_CLIPPY:-$HOME/.cargo/bin/cargo-clippy}}"
+# Cap parallelism on every LOCAL fallback. Local builds never reach rch's slot
+# accounting, so nothing else bounds them — and a repo's own .cargo/config.toml
+# outranks ~/.cargo/config.toml, so a committed `jobs = -1` (= nproc-1) wins over
+# any global default. CARGO_BUILD_JOBS outranks every config file, so setting it
+# here is the only reliable cap. An explicitly-set CARGO_BUILD_JOBS always wins;
+# tune the default with RCH_LOCAL_MAX_JOBS.
+exec_local() {{
+  if [ -z "${{CARGO_BUILD_JOBS:-}}" ]; then
+    CARGO_BUILD_JOBS="${{RCH_LOCAL_MAX_JOBS:-8}}"
+    export CARGO_BUILD_JOBS
+  fi
+  exec "$REAL" "$@"
+}}
 # Loop-break + fail-open, identical contract to the cargo shim.
 if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ] || [ "${{RCH_SHIM_LOCAL_IDE:-}}" = "1" ] \
    || ! command -v rch >/dev/null 2>&1 || [ ! -x "$REAL" ]; then
-  exec "$REAL" "$@"
+  exec_local "$@"
 fi
 # Invoked BY cargo as a subcommand (`cargo-clippy clippy ...`): the outer cargo
 # already made the offload decision, so never re-enter rch here.
 if [ "${{1:-}}" = "clippy" ]; then
-  exec "$REAL" "$@"
+  exec_local "$@"
 fi
 # Direct invocation — normalize to `cargo clippy` and offload.
 exec rch exec -- cargo clippy "$@"
@@ -128,14 +148,27 @@ fn cargo_shim_body(require_remote: bool) -> String {
 # Code) that runs `cargo build|test|check|...` is routed through `rch exec` to
 # the worker fleet instead of compiling locally on this box. See `rch shim`.
 REAL="${{RCH_SHIM_REAL_CARGO:-$HOME/.cargo/bin/cargo}}"
+# Cap parallelism on every LOCAL fallback. Local builds never reach rch's slot
+# accounting, so nothing else bounds them — and a repo's own .cargo/config.toml
+# outranks ~/.cargo/config.toml, so a committed `jobs = -1` (= nproc-1) wins over
+# any global default. CARGO_BUILD_JOBS outranks every config file, so setting it
+# here is the only reliable cap. An explicitly-set CARGO_BUILD_JOBS always wins;
+# tune the default with RCH_LOCAL_MAX_JOBS.
+exec_local() {{
+  if [ -z "${{CARGO_BUILD_JOBS:-}}" ]; then
+    CARGO_BUILD_JOBS="${{RCH_LOCAL_MAX_JOBS:-8}}"
+    export CARGO_BUILD_JOBS
+  fi
+  exec "$REAL" "$@"
+}}
 # Loop-break: rch sets RCH_CARGO_WRAPPER_BYPASS=1 on its own local-fallback exec.
 # Also fail open if rch is unavailable — never block a build.
 if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ] || ! command -v rch >/dev/null 2>&1; then
-  exec "$REAL" "$@"
+  exec_local "$@"
 fi
 # Explicit operator escape hatch: force this one build local.
 if [ "${{RCH_SHIM_LOCAL_IDE:-}}" = "1" ]; then
-  exec "$REAL" "$@"
+  exec_local "$@"
 fi
 # `cargo clippy` runs as: set RUSTC_WORKSPACE_WRAPPER=clippy-driver, then exec an
 # inner `cargo check`. Offloading that INNER cargo would drop the wrapper and
@@ -143,7 +176,7 @@ fi
 # OUTER `cargo clippy` is the invocation that offloads. Same for any other
 # caller-chosen rustc wrapper.
 if [ -n "${{RUSTC_WORKSPACE_WRAPPER:-}}" ]; then
-  exec "$REAL" "$@"
+  exec_local "$@"
 fi
 # rust-analyzer must stay local (streaming JSON + local state). It is identified
 # by its distinctive rendered-ansi/short diagnostic formats. A PLAIN
@@ -153,14 +186,14 @@ fi
 for a in "$@"; do
   case "$a" in
     --message-format=json-diagnostic-rendered-ansi*|--message-format=json-diagnostic-short*)
-      exec "$REAL" "$@" ;;
+      exec_local "$@" ;;
   esac
 done
 case "${{1:-}}" in
   build|b|test|t|check|c|clippy|bench|doc|nextest)
     {offload} ;;
   *)
-    exec "$REAL" "$@" ;;
+    exec_local "$@" ;;
 esac
 "##,
         marker = SHIM_MARKER,
@@ -286,7 +319,7 @@ fn cargo_interception_in(path: &std::ffi::OsStr, shim: &Path) -> Interception {
 /// `RCH_SHIM_REAL_CARGO` export) and differ only in a comment, so they
 /// legitimately share a version and `install` leaves them alone. Bump this the
 /// moment the body changes semantically, which will also converge those hosts.
-const TOOLCHAIN_WRAP_VERSION: &str = "1";
+const TOOLCHAIN_WRAP_VERSION: &str = "2";
 
 /// Marker identifying an rch-managed toolchain wrapper (vs. the real binary).
 const TOOLCHAIN_MARKER: &str = "# rch-toolchain-wrap-version:";
@@ -338,10 +371,19 @@ fn toolchain_wrap_body() -> String {
 SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REAL="$SELF_DIR/{real}"
 SHIM="$HOME/.rch/shims/cargo"
+# Same local-parallelism cap as the cargo shim: this path runs the real toolchain
+# cargo directly, so it must not inherit an unbounded `-j` from a repo config.
+exec_local() {{
+  if [ -z "${{CARGO_BUILD_JOBS:-}}" ]; then
+    CARGO_BUILD_JOBS="${{RCH_LOCAL_MAX_JOBS:-8}}"
+    export CARGO_BUILD_JOBS
+  fi
+  exec "$REAL" "$@"
+}}
 # Loop-break + fail-open: rch sets RCH_CARGO_WRAPPER_BYPASS=1 on its own local
 # fallback exec. Never block a build if the shim or rch is missing.
 if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ] || [ ! -x "$SHIM" ] || ! command -v rch >/dev/null 2>&1; then
-  exec "$REAL" "$@"
+  exec_local "$@"
 fi
 # Preserve toolchain identity through any local fallback.
 RCH_SHIM_REAL_CARGO="$REAL"
@@ -941,7 +983,7 @@ mod tests {
     fn shim_only_offloads_build_subcommands() {
         let body = cargo_shim_body(true);
         // The catch-all arm runs the real cargo for everything else.
-        assert!(body.contains("*)\n    exec \"$REAL\" \"$@\" ;;"));
+        assert!(body.contains("*)\n    exec_local \"$@\" ;;"));
     }
 
     /// Execute a rendered shim body under `/bin/sh` in a sandbox and report
@@ -976,9 +1018,18 @@ mod tests {
         let shim = dir.join(name);
         write_exe(&shim, body);
         // Stubs: each announces which path was taken.
-        write_exe(&dir.join("rch"), "#!/bin/sh\necho OFFLOAD \"$@\"\n");
+        // Each stub also reports the resolved job cap, so tests can prove the
+        // local-parallelism guard fires on local paths and NOT on offload.
+        // Existing assertions use starts_with(), so the suffix is safe.
+        write_exe(
+            &dir.join("rch"),
+            "#!/bin/sh\necho OFFLOAD \"$@\" jobs=${CARGO_BUILD_JOBS:-unset}\n",
+        );
         let real = dir.join("real-cargo");
-        write_exe(&real, "#!/bin/sh\necho LOCAL \"$@\"\n");
+        write_exe(
+            &real,
+            "#!/bin/sh\necho LOCAL \"$@\" jobs=${CARGO_BUILD_JOBS:-unset}\n",
+        );
 
         let mut cmd = std::process::Command::new(&shim);
         cmd.args(args)
@@ -987,7 +1038,11 @@ mod tests {
             .env("RCH_SHIM_REAL_CARGO_CLIPPY", &real)
             .env_remove("RCH_CARGO_WRAPPER_BYPASS")
             .env_remove("RCH_SHIM_LOCAL_IDE")
-            .env_remove("RUSTC_WORKSPACE_WRAPPER");
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            // Hosts set CARGO_BUILD_JOBS in /etc/environment; inheriting it
+            // would make these assertions depend on where the suite runs.
+            .env_remove("CARGO_BUILD_JOBS")
+            .env_remove("RCH_LOCAL_MAX_JOBS");
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -1009,12 +1064,7 @@ mod tests {
     #[test]
     fn plain_message_format_json_still_offloads() {
         let body = cargo_shim_body(true);
-        let out = run_shim(
-            &body,
-            "cargo",
-            &["check", "--message-format=json"],
-            &[],
-        );
+        let out = run_shim(&body, "cargo", &["check", "--message-format=json"], &[]);
         assert!(out.starts_with("OFFLOAD"), "expected offload, got: {out}");
     }
 
@@ -1046,6 +1096,97 @@ mod tests {
             &[("RUSTC_WORKSPACE_WRAPPER", "/usr/bin/clippy-driver")],
         );
         assert!(out.starts_with("LOCAL"), "expected local, got: {out}");
+    }
+
+    /// The trj meltdown of 2026-08-28: a repo `.cargo/config.toml` carrying
+    /// `jobs = -1` outranks `~/.cargo/config.toml`, so a bypassed local build
+    /// ran 127-wide on a 128-thread host and held 202GB of `rust-lld`. Every
+    /// local fallback must cap `-j`; CARGO_BUILD_JOBS outranks all config files.
+    #[cfg(unix)]
+    #[test]
+    fn local_fallbacks_cap_parallelism() {
+        let body = cargo_shim_body(true);
+        for (args, env) in [
+            (vec!["build"], vec![("RCH_CARGO_WRAPPER_BYPASS", "1")]),
+            (vec!["build"], vec![("RCH_SHIM_LOCAL_IDE", "1")]),
+            (
+                vec!["check"],
+                vec![("RUSTC_WORKSPACE_WRAPPER", "/usr/bin/clippy-driver")],
+            ),
+            (
+                vec!["check", "--message-format=json-diagnostic-short"],
+                vec![],
+            ),
+            // Non-build subcommands fall through the catch-all arm; `cargo run`
+            // compiles just as much as `cargo build`.
+            (vec!["run"], vec![]),
+        ] {
+            let out = run_shim(&body, "cargo", &args, &env);
+            assert!(out.starts_with("LOCAL"), "{args:?} should be local: {out}");
+            assert!(
+                out.ends_with("jobs=8"),
+                "{args:?} must cap local parallelism, got: {out}"
+            );
+        }
+    }
+
+    /// The cap must NOT leak onto the offload path — workers do their own slot
+    /// accounting and capping them at 8 would throttle the whole fleet.
+    #[cfg(unix)]
+    #[test]
+    fn offload_path_is_not_capped() {
+        let body = cargo_shim_body(true);
+        let out = run_shim(&body, "cargo", &["build"], &[]);
+        assert!(out.starts_with("OFFLOAD"), "expected offload, got: {out}");
+        assert!(
+            out.ends_with("jobs=unset"),
+            "offload must not inherit the local cap, got: {out}"
+        );
+    }
+
+    /// An explicit CARGO_BUILD_JOBS is the operator's call and always wins;
+    /// RCH_LOCAL_MAX_JOBS retunes the default without editing the shim.
+    #[cfg(unix)]
+    #[test]
+    fn explicit_job_settings_win_over_the_default_cap() {
+        let body = cargo_shim_body(true);
+        let out = run_shim(
+            &body,
+            "cargo",
+            &["build"],
+            &[
+                ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+                ("CARGO_BUILD_JOBS", "64"),
+            ],
+        );
+        assert!(out.ends_with("jobs=64"), "explicit value must win: {out}");
+
+        let out = run_shim(
+            &body,
+            "cargo",
+            &["build"],
+            &[
+                ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+                ("RCH_LOCAL_MAX_JOBS", "16"),
+            ],
+        );
+        assert!(out.ends_with("jobs=16"), "override must apply: {out}");
+    }
+
+    /// The clippy shim has the same two local paths and the same obligation.
+    #[cfg(unix)]
+    #[test]
+    fn clippy_shim_local_paths_cap_parallelism() {
+        let body = cargo_clippy_shim_body();
+        for (args, env) in [
+            (vec!["--version"], vec![("RCH_CARGO_WRAPPER_BYPASS", "1")]),
+            // Invoked BY cargo as a subcommand: outer cargo already decided.
+            (vec!["clippy", "--workspace"], vec![]),
+        ] {
+            let out = run_shim(&body, "cargo-clippy", &args, &env);
+            assert!(out.starts_with("LOCAL"), "{args:?} should be local: {out}");
+            assert!(out.ends_with("jobs=8"), "{args:?} must cap: {out}");
+        }
     }
 
     #[cfg(unix)]
