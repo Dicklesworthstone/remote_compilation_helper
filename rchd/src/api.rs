@@ -4012,7 +4012,7 @@ mod tests {
     /// silently ignored.
     #[tokio::test]
     async fn test_reload_uses_launch_time_workers_config_path() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let _guard = test_guard!();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4031,18 +4031,25 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::channel(1);
         let server_task = tokio::spawn(handle_connection(server, ctx, shutdown_tx));
 
-        let (reader, mut writer) = client.into_split();
+        let (mut reader, mut writer) = client.into_split();
         writer
             .write_all(b"POST /reload\n")
             .await
             .expect("send reload");
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.expect("read response");
+        let mut raw = String::new();
+        reader
+            .read_to_string(&mut raw)
+            .await
+            .expect("read response");
         server_task.await.expect("join").expect("handle_connection");
 
+        // Replies are framed as HTTP/1.0: status line, headers, blank line, body.
+        let body = raw
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or(&raw);
         let response: serde_json::Value =
-            serde_json::from_str(line.trim()).expect("reload response is JSON");
+            serde_json::from_str(body.trim()).expect("reload response body is JSON");
         assert_eq!(response["success"], true, "response: {response}");
         assert_eq!(response["added"], 1, "response: {response}");
         assert!(
