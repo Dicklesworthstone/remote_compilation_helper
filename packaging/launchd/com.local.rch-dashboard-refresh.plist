@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  rch fleet dashboard — refresh schedule (macOS launchd).
+
+  Runs dashboard/scripts/deploy-vercel.sh every StartInterval seconds:
+  collect from every dev machine over ssh (2-4 s), encrypt, build, deploy.
+  This is the ONLY thing that keeps https://<project>.vercel.app current; if
+  it stops, the page and /api/fleet keep serving the last snapshot and the
+  header's snapshot-age badge turns amber at 15 min, red at 60.
+
+  Install (from the dashboard/ directory):
+    sed "s#__DASHBOARD_DIR__#$PWD#g; s#__HOME__#$HOME#g" \
+      ../packaging/launchd/com.local.rch-dashboard-refresh.plist \
+      > ~/Library/LaunchAgents/com.local.rch-dashboard-refresh.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.rch-dashboard-refresh.plist
+    launchctl kickstart -k gui/$(id -u)/com.local.rch-dashboard-refresh
+
+  Check:   launchctl list | grep rch-dashboard ; tail ~/Library/Logs/rch-dashboard-refresh.log
+  Remove:  launchctl bootout gui/$(id -u)/com.local.rch-dashboard-refresh
+
+  Why 1200 s: every refresh is currently a Vercel deployment (the snapshot
+  ships inside the static bundle) and Vercel's Hobby tier caps deployments at
+  100/day; 20 min = 72/day. Publishing the blob without a deploy (bd-04ifk)
+  is what unlocks a shorter tick.
+
+  RunAtLoad is false on purpose: a login must not trigger an immediate deploy
+  from a machine that may not have network yet. The script refuses to publish
+  an all-zero snapshot when no dev machine answers, so a sleeping laptop
+  cannot overwrite good data with an empty fleet.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.local.rch-dashboard-refresh</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__DASHBOARD_DIR__/scripts/deploy-vercel.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__DASHBOARD_DIR__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/.bun/bin:__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>1200</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/rch-dashboard-refresh.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/rch-dashboard-refresh.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

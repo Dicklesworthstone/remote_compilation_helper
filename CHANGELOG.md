@@ -10,6 +10,55 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## [Unreleased]
 
+### Fleet dashboard: problems with actions, agent diagnose views, dev-machine self-checks
+
+The `dashboard/` fleet console (Vite/React, encrypted static snapshot, deployed to
+Vercel; first landed 2026-08-26 in `6865d09`…`e8ec3a7` without a changelog entry)
+now leverages what the daemon already knew and collects three things it did not:
+
+- **Collector** (`dashboard/tools/snapshot.mjs`): three new probe sections on the same
+  single ssh connection — `rch doctor --json`, `rch shim status --json`,
+  `rch hook status --json` — so a dev machine with **no Claude Code hook**, a stale or
+  shadowed cargo shim, or **compiler processes running outside rch right now** is a
+  named problem instead of a grey "idle" card. `daemon.alerts[]` and `daemon.issues[]`
+  are kept again (they had been dropped as unread), along with active builds **with the
+  daemon's stall detectors**, queued builds, repo convergence, test counters, and
+  per-worker pressure confidence / policy rule / circuit recovery / bypass code.
+  Remediation hints are capped worst-first, not daemon-order-first. An unreachable
+  machine's detail is the ssh/rch error line, not the 2 KB probe script.
+- **Problems** (`dashboard/src/problems.js`): one module derives the problem list for the
+  page and for `/api/fleet`, so they cannot disagree. Every row carries `action` (the
+  command), `on` (where to run it) and `since` (from the daemon's alert lifecycle);
+  `next_actions[]` folds them into distinct commands per machine. N identical
+  "dev machine degraded" rows caused by the same sick workers collapse into one
+  `fleet.degraded` row naming the workers. New kinds: `dev.hook_missing`,
+  `dev.unmanaged_local_builds`, `dev.shim_missing/stale`, `dev.doctor_failed/warnings`,
+  `dev.daemon_version_skew`, `dev.collection_error`, `worker.convergence_drift`,
+  `build.hook_dead`, `build.stalled`.
+- **Agent endpoint** (`GET /api/fleet`, `npm run llm`): schema `rch.fleet.llm.v2`;
+  `view=problems` (cheapest poll), `view=diagnose&target=<machine|worker>` (everything
+  about one entity, incl. its per-dev-machine derated slot readings and what every other
+  box says about it), `view=help` (the contract and problem-kind catalogue, no key
+  needed), `target=` filtering on every view, `404` listing the known ids, `400`s that
+  point at `?view=help`. Dev-machine rows now say `offload_pct`+`basis`, `hook`, `shim`,
+  `doctor`, `local_now`; the summary carries `verdict`, `hooks_missing`,
+  `local_builds_running`, `daemon_version`, `version_skew`.
+- **Page**: a Problems panel (same rows, copyable actions, cross-links) replaces the two
+  banners; dev-machine cards flag hook/shim/local-compile/doctor/stalled-build state and
+  the drawer shows interception state, builds in flight with stall flags, and daemon
+  alerts/issues.
+- **Tests**: probe fixtures cover all seven sections and each failing alone; parity now
+  proves the browser and endpoint paths emit byte-identical problem rows; endpoint tests
+  cover help/problems/diagnose/target/404 and **fail** rather than silently passing two
+  assertions when the passphrase is absent; four hardcoded-`true` checks in e2e/prod are
+  real assertions; prod-check also hits `/api/fleet` and compares its problem count to
+  the page's.
+- **Ops**: the launchd refresh agent is checked in at `packaging/launchd/` with the real
+  cadence (20 min, bounded by Vercel's deploy quota) documented instead of the README's
+  10-minute crontab. Follow-ups filed: `bd-04ifk` (publish the blob without a deploy),
+  `bd-2f5ms` (authenticated remote rchd API for live cross-machine diagnosis),
+  `bd-oxdl1` (retire or wire in `web/`).
+
 ### Worker-side rustc cap per job (#49)
 
 - **`compilation.remote_build_jobs`** (default `auto`) exports `CARGO_BUILD_JOBS` in the

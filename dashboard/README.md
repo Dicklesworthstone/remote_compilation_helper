@@ -184,11 +184,31 @@ repo without a typed confirmation.
 
 Both scripts are local. A monitoring dashboard that silently stops refreshing is
 worse than no dashboard, and scheduled CI is exactly the thing that stops
-quietly. Run it from cron on a box you control:
+quietly. Run it on a schedule from a box you control.
+
+**macOS (launchd)** — the checked-in agent runs `deploy-vercel.sh` every 20
+minutes and logs to `~/Library/Logs/rch-dashboard-refresh.log`:
 
 ```sh
-*/10 * * * * cd /path/to/dashboard && ./scripts/deploy-vercel.sh >/dev/null 2>&1
+sed "s#__DASHBOARD_DIR__#$PWD#g; s#__HOME__#$HOME#g" \
+  ../packaging/launchd/com.local.rch-dashboard-refresh.plist \
+  > ~/Library/LaunchAgents/com.local.rch-dashboard-refresh.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.rch-dashboard-refresh.plist
+launchctl kickstart -k gui/$(id -u)/com.local.rch-dashboard-refresh   # run one now
 ```
+
+**Linux (cron)**:
+
+```sh
+*/20 * * * * cd /path/to/dashboard && ./scripts/deploy-vercel.sh >>"$HOME/rch-dashboard-refresh.log" 2>&1
+```
+
+Why 20 minutes and not 2: collection itself takes 2–4 s, but every refresh is
+currently a Vercel *deployment* (the snapshot ships inside the static bundle and
+`/api/fleet` imports it at build time), and Vercel's Hobby tier caps deployments
+at 100/day. Publishing the blob without a deploy is tracked as `bd-04ifk`; until
+then the browser's 5-minute poll and the endpoint see whatever the last tick
+published, and the header's snapshot age tells you exactly how old that is.
 
 Each run appends to a rolling aggregate history (`.snapshot-history.json`, kept
 outside `public/` so it is never published) which drives the trend sparklines.
@@ -217,14 +237,17 @@ snapshot.
 
 ```sh
 BASE=https://your-app.vercel.app
-curl -H "Authorization: Bearer $RCH_DASH_PASSPHRASE" "$BASE/api/fleet"
+curl "$BASE/api/fleet?view=help"                              # the contract — needs no key
+curl -H "Authorization: Bearer $RCH_DASH_PASSPHRASE" "$BASE/api/fleet?view=problems"
+curl -H "Authorization: Bearer $RCH_DASH_PASSPHRASE" "$BASE/api/fleet?view=diagnose&target=hz1"
 curl -H "Authorization: Bearer $RCH_DASH_PASSPHRASE" "$BASE/api/fleet?format=json&view=full"
 ```
 
 | Param | Values | Default |
 |---|---|---|
+| `view` | `summary` (overview + problems + per-machine/worker rows) · `problems` (problems + next actions only — the cheapest poll) · `full` (+ hints, recent builds, worker detail, history) · `diagnose` (everything about ONE target) · `help` (the contract, no key needed) | `summary` |
+| `target` | a dev machine id or worker id; filters any view, required by `diagnose`. A box that is both (dispatches *and* takes builds) returns both halves; `dev:hz1` / `worker:hz1` picks one. Unknown id → `404` listing the known ids | — |
 | `format` | `toon`, `json` | `toon` |
-| `view` | `summary`, `full` | `summary` |
 
 Key via `Authorization: Bearer PASSPHRASE`, `X-Fleet-Key: PASSPHRASE`, or
 `?key=` (last resort — query strings land in logs and shell history).
@@ -236,9 +259,10 @@ passphrase fails the GCM auth tag and returns 401. There is no separate API
 token to leak, and no way to get plaintext out of the endpoint without already
 being able to decrypt the published snapshot yourself.
 
-Responses: `200` body · `400` bad `format`/`view` · `401` missing or wrong key ·
-`405` non-GET · `500` no snapshot bundled. Errors are one line of plain text so
-an agent can branch on them cheaply. `Cache-Control: no-store` throughout — a
+Responses: `200` body · `400` bad `format`/`view`, or `diagnose` without a
+`target` · `401` missing or wrong key · `404` unknown `target` (the body lists
+every known id) · `405` non-GET · `500` no snapshot bundled. Errors are one
+line of plain text that names the fix, so an agent can branch on them cheaply. `Cache-Control: no-store` throughout — a
 cached fleet view that looks live is the exact failure this project exists to
 prevent.
 
@@ -251,34 +275,70 @@ protection-bypass header.
 For agents already running on a fleet machine:
 
 ```sh
-npm run llm                        # TOON summary
-npm run llm -- --format json       # JSON
-npm run llm -- --view full         # + remediation hints, recent builds, history
+npm run llm -- --view help                       # the contract; no passphrase needed
+npm run llm -- --view problems                   # problems + next actions (cheapest)
+npm run llm -- --view diagnose --target hz1      # everything about one machine or worker
+npm run llm -- --target css                      # summary filtered to one entity
+npm run llm -- --format json --view full
 npm run llm -- --url "$BASE/data/fleet.enc.json"
 ```
 
 Passphrase resolution: `RCH_DASH_PASSPHRASE`, then `./.env`, then Vault.
-Exit codes: `2` no passphrase, `3` unreadable snapshot, `4` wrong passphrase.
+Exit codes: `2` no passphrase, `3` unreadable snapshot, `4` wrong passphrase,
+`5` unknown target (stderr lists the known ids).
 
 ### Shape
 
 ```
 schema, label, generated_at, age_seconds, stale
-summary{...}                                one-line fleet health
-problems[]{severity,kind,target,detail}     critical first — act on these
-dev_machines[]{id,level,posture,remote,local,slots_free,...}
-workers[]{id,health,used,total,cores,load,disk_pct,speed,circuit,reason}
-# view=full adds dev_detail[] (remediation hints, recent builds),
-# worker_detail[] and history[]
+verdict                                     one line: "N critical problems — read problems[]" / "fleet healthy"
+summary{...}                                fleet health, incl. hooks_missing, local_builds_running,
+                                            daemon_version, version_skew, problems_critical/warn
+problems[]{severity,kind,target,detail,since,action,on}
+                                            critical first — act on these
+next_actions[]{severity,on,run,fixes}       the problems folded into distinct commands, per machine
+dev_machines[]{id,level,posture,offload_pct,basis,remote_builds,local_builds,
+               local_now,hook,shim,doctor,workers_healthy,...,version,uptime_h}
+workers[]{id,health,used,total,cores,load,disk_free_gb,disk_pct,speed,circuit,tags,reason}
+# view=full adds dev_detail[] (hints, alerts, issues, active/queued builds
+# with stall detectors, hook/shim/doctor, convergence, recent builds),
+# worker_detail[] (pressure confidence/rule, recovery, bypass, probe history,
+# per-dev-machine slot readings) and history[]
+# view=diagnose&target=X adds the target's detail, its pool as seen from that
+# box (dev machine) or what every dev machine says about it (worker)
 ```
 
-`problems` is deliberately first and pre-sorted by severity: an agent that reads
-nothing else still gets the actionable set. Worker "last seen" is judged against
-**snapshot** time, not the reader's clock, so an old snapshot reports itself
-stale rather than declaring the whole fleet offline.
+Every `problems[]` row carries **`action`** (the command to run) and **`on`**
+(where to run it: a dev machine id, `collector` for the box that publishes the
+dashboard, or empty when informational), and `since` when the daemon's own
+alert lifecycle knows when it started. The kinds it can emit, with meaning and
+fix, are served by `?view=help`:
 
-Both paths share one distiller (`tools/llm-view.mjs`), so the HTTP and local
-outputs are byte-identical for the same snapshot.
+| kind | severity | means |
+|---|---|---|
+| `dev.hook_missing` | critical | Claude Code's PreToolUse hook is not installed — nothing is intercepted on that box |
+| `dev.unmanaged_local_builds` | critical | compiler processes running **right now** with no rch ancestor (`rch shim status`) |
+| `dev.local-only` / `dev.unreachable` | critical | posture local, or the collector could not get `rch status` (the detail says whether ssh, rch or rchd failed) |
+| `dev.doctor_failed` / `dev.doctor_warnings` | critical / warn | `rch doctor` findings on the dev machine, with `rch doctor --fix` when fixable |
+| `dev.shim_missing` / `dev.shim_stale` | warn | cargo shim absent, out of date, or shadowed on PATH |
+| `dev.daemon_version_skew` | warn | this box runs a different rch than the fleet |
+| `dev.collection_error` | warn | one probe failed; those columns are **unknown, not fine** |
+| `dev.degraded` | warn | partial remote capability for a reason not shared fleet-wide |
+| `fleet.degraded` | warn | ≥2 dev machines degraded by the **same** sick workers — one root cause, listed once, naming the workers to fix (replaces N identical per-machine rows) |
+| `worker.offline` / `worker.critical` / `worker.warn` | critical / critical / warn | as before, now with `since`, circuit recovery countdown, bypass code, pressure confidence, and rch's own suggested action |
+| `worker.convergence_drift` | warn | worker missing repos a dev machine's builds need |
+| `build.hook_dead` / `build.stalled` | critical / warn | an active build whose dispatching hook is gone (slots leak until `rch cancel <id>`), or that has stopped heartbeating and progressing |
+| `snapshot.stale` / `snapshot.timestamp_unreadable` | critical | this feed itself |
+
+Worker "last seen" is judged against **snapshot** time, not the reader's
+clock, so an old snapshot reports itself stale rather than declaring the whole
+fleet offline.
+
+The browser's **Problems** panel and both agent paths are fed by one module
+(`src/problems.js`) on top of one distiller (`tools/llm-view.mjs`), so the HTTP
+output, the local CLI and the page cannot disagree about what is broken or what
+fixes it; `npm run test:llm` proves the browser and endpoint paths emit
+byte-identical rows.
 
 ---
 
@@ -337,9 +397,18 @@ human-readable output:
 
 | Source | Provides |
 |---|---|
-| `rch status --json` | posture, daemon, derated slots, pressure, circuit state, recent builds, remote/local counts, remediation hints |
+| `rch status --json` | posture, daemon, derated slots, pressure (state, reason, confidence, policy rule), circuit state + recovery countdown, bypass records, recent builds, remote/local counts, remediation hints, **alerts** (with first-seen), **issues** (with the daemon's remediation command), **active builds with stall detectors**, queued builds, repo convergence, test counters |
 | `rch workers capabilities --json` | cores, load average, toolchain versions |
+| `rch workers list --json` | tags, priority (static config) |
 | `:9100/metrics` | probe latency, last-seen timestamps |
+| `rch doctor --json` | the dev machine's own self-checks: hook wired, daemon socket up, config valid, SSH keys — only non-passing checks are shipped |
+| `rch shim status --json` | cargo shim installed / current / first on PATH, and **compiler processes running outside rch right now** |
+| `rch hook status --json` | PreToolUse hook install state per agent (Claude Code, Codex, Gemini, Continue) |
+
+All seven run concurrently on the far side of **one** ssh connection per dev
+machine (~2–4 s for the whole fleet). A probe that does not answer — an older
+`rch` without `shim status`, say — is reported as *unknown* for that machine
+(`dev.collection_error`), never as fine.
 
 Facts are unioned across dev machines, so one unreachable box cannot blank the
 fleet view. Each worker records which machines can see it, and its slot counts
@@ -366,13 +435,22 @@ reported 198 build slots for an 80-slot fleet.
 ```
 dashboard/
   tools/snapshot.mjs        collector + encryptor (Node, no dependencies)
+  tools/llm-view.mjs        the agent views (summary/problems/full/diagnose/help)
+  tools/fleet-llm.mjs       local CLI over the same views (npm run llm)
+  api/fleet.mjs             GET /api/fleet — the same views over HTTP
+  src/problems.js           problem + next-action derivation, shared by page and endpoint
   scripts/deploy-vercel.sh  build + prebuilt deploy to Vercel
   scripts/deploy.sh         build + deploy to GitHub Pages
+  ../packaging/launchd/     the macOS refresh schedule (20-minute deploy tick)
+  tests/snapshot.mjs        collector units (probe framing, section isolation, merge)
+  tests/parity.mjs          browser vs endpoint classifiers + problem rows must agree
+  tests/endpoint.mjs        /api/fleet against the real bundle and live snapshot
   tests/e2e.mjs             browser end-to-end smoke test
+  tests/prod-check.mjs      the deployed URL: gate, unlock, map, problems, endpoint
   src/crypto.ts             PBKDF2 + AES-GCM + cookie session
   src/derive.ts             health + posture classification
   src/App.tsx               layout, filtering, sorting
-  src/components/           Gate, WorkerCard/Drawer, DevMachineCard/Drawer, Sparkline
+  src/components/           Gate, Problems, WorkerCard/Drawer, DevMachineCard/Drawer, Sparkline
   src/styles.css            design tokens (dark + light)
 ```
 
