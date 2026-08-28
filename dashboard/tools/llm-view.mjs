@@ -355,12 +355,21 @@ export function helpView() {
   };
 }
 
-/** Case-insensitive id match against dev machines first, then workers. */
+/**
+ * Case-insensitive id match. A box can be BOTH a dev machine and a worker
+ * (hz1 dispatches builds and takes them), so a bare id that matches both
+ * resolves to `both` and the diagnose view carries both halves; `dev:hz1` /
+ * `worker:hz1` pick one.
+ */
 function resolveTarget(snap, target) {
-  const want = String(target).trim().toLowerCase();
-  const dev = snap.dispatchers.find((d) => String(d.id).toLowerCase() === want);
+  let want = String(target).trim().toLowerCase();
+  let only = null;
+  const m = /^(dev|dev_machine|machine|worker):(.+)$/.exec(want);
+  if (m) { only = m[1] === "worker" ? "worker" : "dev_machine"; want = m[2].trim(); }
+  const dev = only === "worker" ? null : snap.dispatchers.find((d) => String(d.id).toLowerCase() === want);
+  const w = only === "dev_machine" ? null : snap.workers.find((x) => String(x.id).toLowerCase() === want);
+  if (dev && w) return { type: "both", id: dev.id, worker_id: w.id };
   if (dev) return { type: "dev_machine", id: dev.id };
-  const w = snap.workers.find((x) => String(x.id).toLowerCase() === want);
   if (w) return { type: "worker", id: w.id };
   throw new UnknownTarget(target, {
     dev_machines: snap.dispatchers.map((d) => d.id),
@@ -537,8 +546,10 @@ export function buildLlmView(snap, opts = {}) {
     reason: w.health === "healthy" ? "" : w.reason,
   });
 
-  const shownDevs = target?.type === "dev_machine" ? devs.filter((d) => d.id === target.id) : target ? [] : devs;
-  const shownWorkers = target?.type === "worker" ? workers.filter((w) => w.id === target.id) : target ? [] : workers;
+  const wantDev = target && target.type !== "worker";
+  const wantWorker = target && target.type !== "dev_machine";
+  const shownDevs = !target ? devs : wantDev ? devs.filter((d) => d.id === target.id) : [];
+  const shownWorkers = !target ? workers : wantWorker ? workers.filter((w) => w.id === (target.worker_id ?? target.id)) : [];
   const cols = seenByColumns(snap);
   const colIndex = new Map(workers.map((w, i) => [w.id, i]));
 
@@ -634,8 +645,9 @@ export function buildLlmView(snap, opts = {}) {
 
   if (view === "diagnose") {
     // Everything about one entity, plus what the rest of the fleet says about
-    // it. Nothing an agent would have to make a second call for.
-    if (target.type === "dev_machine") {
+    // it. Nothing an agent would have to make a second call for. A box that
+    // is both a dev machine and a worker gets both halves.
+    if (wantDev) {
       const d = devs.find((x) => x.id === target.id);
       out.dev_machine = devRow(d);
       out.detail = devDetail(d);
