@@ -173,8 +173,30 @@ async function run(host, command) {
   } catch (err) {
     // A non-zero exit still yields useful stdout for some rch subcommands.
     const stdout = err?.stdout ?? "";
-    return { ok: stdout.trim().length > 0, stdout, error: String(err?.shortMessage || err?.message || err) };
+    return { ok: stdout.trim().length > 0, stdout, error: describeExecError(err) };
   }
+}
+
+/**
+ * One line that says what went wrong, not the command that went wrong.
+ *
+ * `execFile`'s message is "Command failed: ssh <host> <the entire probe
+ * script>\n<stderr>", so surfacing it verbatim put ~2KB of shell into every
+ * unreachable machine's problem row and buried the one useful line —
+ * "ssh: connect to host 10.10.10.1 port 22: Connection refused" — at the end.
+ * ssh and rch both put the reason on stderr's last non-empty line; fall back
+ * to the exit/signal code, then to the first line of the message with the
+ * script stripped.
+ */
+export function describeExecError(err) {
+  const stderrLines = String(err?.stderr ?? "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const last = stderrLines[stderrLines.length - 1];
+  if (last) return last.slice(0, 200);
+  if (err?.killed || err?.signal) return `killed by ${err.signal ?? "timeout"} after ${SSH_TIMEOUT_MS / 1000}s`;
+  if (typeof err?.code === "number") return `exited ${err.code}`;
+  const msg = String(err?.shortMessage || err?.message || err).split(/\r?\n/)[0];
+  // "Command failed: ssh -o ... host d=$(mktemp" -> "Command failed: ssh host"
+  return msg.replace(/\s+d=\$\(mktemp[\s\S]*$/, "").replace(/-o \S+=\S+\s+/g, "").slice(0, 200);
 }
 
 // --------------------------------------------------------- the combined probe
