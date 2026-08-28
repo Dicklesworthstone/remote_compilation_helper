@@ -52,7 +52,12 @@ export function Overview({ snap, counts, hardProblems }: Props) {
           <div className="kpi-value">
             {t.dispatchers_remote_ready}<span className="unit">/ {t.dispatchers_reachable}</span>
           </div>
-          <div className="kpi-sub">remote-ready of {t.dispatchers_total} configured</div>
+          <div className="kpi-sub">
+            remote-ready of {t.dispatchers_total} configured
+            {(t.dispatchers_hook_missing ?? 0) > 0 && (
+              <span style={{ color: "var(--crit)" }}> · {t.dispatchers_hook_missing} hook missing</span>
+            )}
+          </div>
         </div>
         <div
           className="kpi"

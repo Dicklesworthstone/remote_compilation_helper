@@ -161,6 +161,185 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
       </div>
 
       <div className="kv-group">
+        <h4>Interception on this box</h4>
+        <p className="note">
+          Three ways a dev machine quietly stops offloading while every worker looks fine: no
+          hook, no shim, or compiles started outside both. <code>unknown</code> means the probe
+          did not answer — not that it is fine.
+        </p>
+        <dl style={{ margin: 0 }}>
+          <Row
+            k="Claude Code hook"
+            v={
+              d.hook
+                ? d.hook.claude_code === true
+                  ? "installed"
+                  : d.hook.claude_code === false
+                    ? <span className="fail-mark">NOT INSTALLED — run rch hook install</span>
+                    : "unknown"
+                : "unknown (probe did not answer)"
+            }
+          />
+          {d.hook && d.hook.agents.length > 0 && (
+            <Row
+              k="Other agents"
+              v={d.hook.agents
+                .filter(([a]) => a !== "ClaudeCode")
+                .map(([a, ok]) => `${a}: ${ok ? "installed" : "missing"}`)
+                .join(" · ")}
+            />
+          )}
+          <Row
+            k="cargo shim"
+            v={
+              d.shim
+                ? d.shim.installed === false
+                  ? <span className="fail-mark">not installed — run rch shim install</span>
+                  : d.shim.installed === true
+                    ? `installed${d.shim.up_to_date === false ? " · OUT OF DATE" : ""}${d.shim.on_path === false ? " · SHADOWED on PATH" : ""}` +
+                      `${d.shim.interception ? ` · ${d.shim.interception}` : ""}` +
+                      `${d.shim.toolchains_wrapped != null && d.shim.toolchains_total != null ? ` · ${d.shim.toolchains_wrapped}/${d.shim.toolchains_total} toolchains wrapped` : ""}`
+                    : "unknown"
+                : "unknown (probe did not answer)"
+            }
+          />
+          <Row
+            k="Compiles outside rch"
+            v={
+              d.shim?.local_builds_running == null
+                ? "unknown"
+                : d.shim.local_builds_running > 0
+                  ? <span className="fail-mark">{d.shim.local_builds_running} running right now</span>
+                  : "none"
+            }
+          />
+          <Row
+            k="rch doctor"
+            v={
+              d.doctor
+                ? d.doctor.failed > 0
+                  ? <span className="fail-mark">{d.doctor.failed} failed · {d.doctor.warnings} warnings · {d.doctor.passed}/{d.doctor.total} passed</span>
+                  : d.doctor.warnings > 0
+                    ? `${d.doctor.warnings} warning${d.doctor.warnings === 1 ? "" : "s"} · ${d.doctor.passed}/${d.doctor.total} passed`
+                    : `${d.doctor.passed}/${d.doctor.total} passed`
+                : "unknown (probe did not answer)"
+            }
+          />
+          {d.doctor && d.doctor.failing.length > 0 && (
+            <Row
+              k="Doctor findings"
+              v={
+                <span>
+                  {d.doctor.failing.map((c, i) => (
+                    <span key={`${c[0]}|${i}`} style={{ display: "block" }}>
+                      <span className={c[1] === "fail" ? "fail-mark" : undefined}>{c[0]}</span>
+                      {c[2] ? ` — ${c[2]}` : ""}
+                      {c[3] ? " (fixable: rch doctor --fix)" : ""}
+                    </span>
+                  ))}
+                </span>
+              }
+            />
+          )}
+          {d.collection_errors.length > 0 && (
+            <Row
+              k="Probe errors"
+              v={<span className="fail-mark">{d.collection_errors.join(" · ")}</span>}
+            />
+          )}
+          {d.convergence && d.convergence.status && d.convergence.status !== "unknown" && (
+            <Row
+              k="Repo convergence"
+              v={`${d.convergence.status} · ${d.convergence.ready} ready · ${d.convergence.drifting} drifting · ${d.convergence.failed} failed`}
+            />
+          )}
+          {d.tests && d.tests.runs > 0 && (
+            <Row k="Test runs (lifetime)" v={`${d.tests.runs} · ${d.tests.passed} passed · ${d.tests.failed} failed · ${d.tests.build_errors} build errors`} />
+          )}
+        </dl>
+      </div>
+
+      {(d.active_records.length > 0 || d.queued_records.length > 0) && (
+        <div className="kv-group">
+          <h4>Builds in flight ({d.active_records.length} active · {d.queued_records.length} queued)</h4>
+          <div className="builds">
+            {d.active_records.map((b, i) => {
+              const stalled = b.hook_alive === false || (b.heartbeat_stale === true && b.progress_stale === true);
+              return (
+                <div key={`${b.id ?? ""}|${i}`} className="build-row" title={b.command ?? undefined}>
+                  <span className={`pill ${b.hook_alive === false ? "critical" : stalled ? "warn" : "busy"}`}>
+                    {b.hook_alive === false ? "hook dead" : stalled ? "stalled" : b.phase ?? "active"}
+                  </span>
+                  <span className="build-proj">{b.project ?? "—"}</span>
+                  {b.worker_id && fleetWorkerIds.has(b.worker_id) ? (
+                    <button className="link" onClick={() => onOpenWorker(b.worker_id as string)} title={`Open worker ${b.worker_id}`}>
+                      {b.worker_id}
+                    </button>
+                  ) : (
+                    <span className="metric-value">{b.worker_id ?? "—"}</span>
+                  )}
+                  <span className="metric-value" title="build age / since last progress (snapshot time)">
+                    {b.build_age_secs != null ? fmtAge(b.build_age_secs).replace(" ago", "") : "—"}
+                    {b.progress_age_secs != null && b.progress_age_secs > 120 && (
+                      <span className="stall-mark"> · no progress {fmtAge(b.progress_age_secs).replace(" ago", "")}</span>
+                    )}
+                  </span>
+                  <span className="metric-value">{b.slots != null ? `${b.slots} slots` : ""}{b.id ? ` · #${b.id}` : ""}</span>
+                </div>
+              );
+            })}
+            {d.queued_records.map((q, i) => (
+              <div key={`q|${q.id ?? ""}|${i}`} className="build-row" title={q.command ?? undefined}>
+                <span className="pill warn">queued #{q.position ?? "?"}</span>
+                <span className="build-proj">{q.project ?? "—"}</span>
+                <span className="metric-value">needs {q.slots_needed ?? "?"} slots</span>
+                <span className="metric-value">waiting {q.wait_time ?? "—"}</span>
+                <span className="metric-value">{q.id ? `#${q.id}` : ""}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {(d.alert_records.length > 0 || d.issue_records.length > 0) && (
+        <div className="kv-group">
+          <h4>Daemon alerts & issues ({d.alert_records.length + d.issue_records.length})</h4>
+          {d.alert_records.map((a, i) => {
+            const sinceMs = a.first_seen ? Date.parse(a.first_seen) : NaN;
+            return (
+              <div key={`a|${a.kind ?? ""}|${a.worker_id ?? ""}|${i}`} className="hint">
+                <div className="hint-top">
+                  <span className={`pill ${a.severity === "critical" || a.severity === "error" ? "critical" : "warn"}`}>
+                    {a.kind ?? a.severity ?? "alert"}
+                  </span>
+                  {a.worker_id && fleetWorkerIds.has(a.worker_id) ? (
+                    <button className="link" onClick={() => onOpenWorker(a.worker_id as string)}>{a.worker_id}</button>
+                  ) : (
+                    a.worker_id && <span className="metric-value">{a.worker_id}</span>
+                  )}
+                  <span className="metric-value">
+                    {a.state ?? ""}{Number.isFinite(sinceMs) ? ` · since ${fmtAge((snapshotMs - sinceMs) / 1000)}` : ""}
+                  </span>
+                </div>
+                <div className="hint-msg">{a.message}</div>
+              </div>
+            );
+          })}
+          {d.issue_records.map((it, i) => (
+            <div key={`i|${it.summary ?? ""}|${i}`} className="hint">
+              <div className="hint-top">
+                <span className={`pill ${it.severity === "critical" || it.severity === "error" ? "critical" : "warn"}`}>
+                  {it.severity ?? "issue"}
+                </span>
+              </div>
+              <div className="hint-msg">{it.summary}</div>
+              {it.remediation && <div className="hint-action">→ {it.remediation}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="kv-group">
         <h4>This machine's view of the pool</h4>
         <p className="note">
           rchd derates every worker from live RAM/disk telemetry, independently on each

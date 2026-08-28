@@ -100,6 +100,32 @@ export function DevMachineCard({ d, onOpen }: Props) {
         </div>
       )}
 
+      {/* Interception flags: the three ways a box quietly goes local. Only
+          shown when KNOWN bad — an unanswered probe is unknown, not a flag. */}
+      {(d.hook?.claude_code === false ||
+        d.shim?.installed === false ||
+        d.shim?.up_to_date === false ||
+        d.shim?.on_path === false ||
+        (d.shim?.local_builds_running ?? 0) > 0 ||
+        (d.doctor?.failed ?? 0) > 0 ||
+        d.active_records.some((b) => b.hook_alive === false || (b.heartbeat_stale && b.progress_stale))) && (
+        <div className="card-flags">
+          {d.hook?.claude_code === false && <span className="pill critical">hook missing</span>}
+          {d.shim?.installed === false && <span className="pill warn">shim missing</span>}
+          {d.shim?.installed === true && (d.shim.up_to_date === false || d.shim.on_path === false) && (
+            <span className="pill warn">shim stale</span>
+          )}
+          {(d.shim?.local_builds_running ?? 0) > 0 && (
+            <span className="pill critical">{d.shim!.local_builds_running} compiling outside rch</span>
+          )}
+          {(d.doctor?.failed ?? 0) > 0 && <span className="pill critical">doctor: {d.doctor!.failed} failed</span>}
+          {d.active_records.some((b) => b.hook_alive === false) && <span className="pill critical">build hook dead</span>}
+          {d.active_records.some((b) => b.hook_alive !== false && b.heartbeat_stale && b.progress_stale) && (
+            <span className="pill warn">build stalled</span>
+          )}
+        </div>
+      )}
+
       {s && s.avg_duration_ms != null && shownCounted > 0 && (
         <div className="tags">
           <span className="tag">avg {fmtDuration(s.avg_duration_ms)}</span>
