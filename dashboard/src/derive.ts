@@ -1,6 +1,8 @@
 import type {
+  ActiveBuild, ActiveBuildTuple, Alert, AlertTuple,
   BuildTuple, Dispatcher, DispatcherView, DispatcherWorkerSlots, DevLevel, HealthLevel,
-  HintTuple, InternedString, RecentBuild, RemediationHint, Snapshot, Worker, WorkerSlotPair,
+  HintTuple, InternedString, Issue, IssueTuple, QueuedBuild, QueuedBuildTuple,
+  RecentBuild, RemediationHint, Snapshot, Worker, WorkerSlotPair,
   WorkerView,
 } from "./types";
 
@@ -387,6 +389,67 @@ export function expandHints(rows: HintTuple[] | undefined, strings?: readonly st
 }
 
 /**
+ * Expanders for the tuples re-added alongside `alerts`/`issues` and the
+ * detailed active/queued build lists. None of these slots are interned. All
+ * four tolerate a snapshot that predates them (`undefined` -> `[]`) and a
+ * ragged row (`?? null`, never `|| null`, so `0` and `false` survive).
+ * Mirrored in tools/llm-view.mjs; tests/parity.mjs compares the two.
+ */
+export function expandAlerts(rows: AlertTuple[] | undefined): Alert[] {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((a) => ({
+    kind: Array.isArray(a) ? (a[0] ?? null) : null,
+    severity: Array.isArray(a) ? (a[1] ?? null) : null,
+    worker_id: Array.isArray(a) ? (a[2] ?? null) : null,
+    message: Array.isArray(a) ? (a[3] ?? null) : null,
+    first_seen: Array.isArray(a) ? (a[4] ?? null) : null,
+    last_seen: Array.isArray(a) ? (a[5] ?? null) : null,
+    state: Array.isArray(a) ? (a[6] ?? null) : null,
+  }));
+}
+
+export function expandIssues(rows: IssueTuple[] | undefined): Issue[] {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((i) => ({
+    severity: Array.isArray(i) ? (i[0] ?? null) : null,
+    summary: Array.isArray(i) ? (i[1] ?? null) : null,
+    remediation: Array.isArray(i) ? (i[2] ?? null) : null,
+  }));
+}
+
+export function expandActive(rows: ActiveBuildTuple[] | undefined): ActiveBuild[] {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((b) => ({
+    id: Array.isArray(b) ? (b[0] ?? null) : null,
+    project: Array.isArray(b) ? (b[1] ?? null) : null,
+    worker_id: Array.isArray(b) ? (b[2] ?? null) : null,
+    command: Array.isArray(b) ? (b[3] ?? null) : null,
+    started_at: Array.isArray(b) ? (b[4] ?? null) : null,
+    heartbeat_age_secs: Array.isArray(b) ? (b[5] ?? null) : null,
+    progress_age_secs: Array.isArray(b) ? (b[6] ?? null) : null,
+    phase: Array.isArray(b) ? (b[7] ?? null) : null,
+    hook_alive: Array.isArray(b) ? (b[8] ?? null) : null,
+    heartbeat_stale: Array.isArray(b) ? (b[9] ?? null) : null,
+    progress_stale: Array.isArray(b) ? (b[10] ?? null) : null,
+    confidence: Array.isArray(b) ? (b[11] ?? null) : null,
+    slots: Array.isArray(b) ? (b[12] ?? null) : null,
+    build_age_secs: Array.isArray(b) ? (b[13] ?? null) : null,
+  }));
+}
+
+export function expandQueued(rows: QueuedBuildTuple[] | undefined): QueuedBuild[] {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((q) => ({
+    id: Array.isArray(q) ? (q[0] ?? null) : null,
+    project: Array.isArray(q) ? (q[1] ?? null) : null,
+    command: Array.isArray(q) ? (q[2] ?? null) : null,
+    position: Array.isArray(q) ? (q[3] ?? null) : null,
+    slots_needed: Array.isArray(q) ? (q[4] ?? null) : null,
+    wait_time: Array.isArray(q) ? (q[5] ?? null) : null,
+  }));
+}
+
+/**
  * Classify a DEV MACHINE by the question that actually matters: are its builds
  * going to the worker pool, or is it quietly compiling locally?
  *
@@ -440,7 +503,10 @@ export function classifyDispatcher(d: Dispatcher, strings?: unknown): Dispatcher
 
   if (!d.reachable) {
     level = "unreachable";
-    levelReason = "no response from rch";
+    // Say WHICH failure: an ssh refusal, a missing binary and a dead daemon
+    // used to collapse into one string, and they have three different fixes.
+    const first = Array.isArray(d.collection_errors) ? d.collection_errors[0] : undefined;
+    levelReason = first ? `no response from rch — ${first}` : "no response from rch";
   } else if (d.posture && d.posture !== "remote_ready") {
     level = d.posture.includes("local") ? "local-only" : "degraded";
     levelReason = d.posture_description ?? d.posture;
@@ -463,6 +529,10 @@ export function classifyDispatcher(d: Dispatcher, strings?: unknown): Dispatcher
     // collector used to send.
     recent_builds: recent,
     remediation_hints: expandHints(d.hints, table),
+    alert_records: expandAlerts(d.alerts),
+    issue_records: expandIssues(d.issues),
+    active_records: expandActive(d.active),
+    queued_records: expandQueued(d.queued),
     level, levelReason, remotePct, remoteBasis: basis,
     remoteCounted: recentCounted || lifetimeCounted,
   };

@@ -206,6 +206,20 @@ const PROBE_SECTIONS = [
   { key: "c", cmd: rchProbeCommand("workers capabilities", 70) },
   { key: "l", cmd: rchProbeCommand("workers list", 45) },
   { key: "m", cmd: "curl -s --max-time 10 http://127.0.0.1:9100/metrics 2>/dev/null" },
+  // The three questions `rch status` cannot answer about the DEV MACHINE
+  // itself. Each is a distinct way a box quietly stops offloading while every
+  // worker looks fine:
+  //   doctor      -> is the hook wired, is the daemon socket up, config valid,
+  //                  SSH keys sane (34 checks, ~1.5s, no worker probes)
+  //   shim status -> is the cargo shim installed/current/first on PATH, and
+  //                  how many compiler processes are running OUTSIDE rch right
+  //                  now (`local_builds_running` — the "silently burning local
+  //                  cores" detector, which nothing else surfaces)
+  //   hook status -> per-agent PreToolUse hook install state (Claude Code,
+  //                  Codex, Gemini, Continue), ~40ms
+  { key: "d", cmd: rchProbeCommand("doctor", 40) },
+  { key: "h", cmd: rchProbeCommand("shim status", 20) },
+  { key: "k", cmd: rchProbeCommand("hook status", 20) },
 ];
 
 function rchProbeCommand(subcommand, timeoutSec) {
@@ -510,6 +524,9 @@ export function dispatcherFromProbe(host, probe) {
   const capsRes = parseRchJson("workers capabilities", sectionResult(probe, "c"));
   const listRes = parseRchJson("workers list", sectionResult(probe, "l"));
   const metrics = parseMetrics(sectionResult(probe, "m"));
+  const doctorRes = parseRchJson("doctor", sectionResult(probe, "d"));
+  const shimRes = parseRchJson("shim status", sectionResult(probe, "h"));
+  const hookRes = parseRchJson("hook status", sectionResult(probe, "k"));
 
   const status = statusRes.data;
   const caps = capsRes.data;
@@ -517,8 +534,13 @@ export function dispatcherFromProbe(host, probe) {
 
   // Every failure reason, kept rather than collapsed into a bare `false`. SSH
   // auth failure, a missing `rch` binary and a dead daemon used to be
-  // indistinguishable on screen.
-  const collectionErrors = [statusRes.error, capsRes.error, listRes.error, metrics.error].filter(Boolean);
+  // indistinguishable on screen. The three dev-machine probes are listed too:
+  // an `rch` too old to know `shim status` must show up as "shim state
+  // unknown", never as "shim fine".
+  const collectionErrors = [
+    statusRes.error, capsRes.error, listRes.error, metrics.error,
+    doctorRes.error, shimRes.error, hookRes.error,
+  ].filter(Boolean);
   const reachable = Boolean(status);
   // `workers list` failing silently blanks every tag and priority; say so
   // instead of rendering an untagged fleet as though that were the config.
@@ -542,11 +564,26 @@ export function dispatcherFromProbe(host, probe) {
       speed: num(w.speed_score),
       last_error: w.last_error ?? null,
       consecutive_failures: num(w.consecutive_failures) ?? 0,
+      // Seconds until the circuit breaker retries this worker — the answer to
+      // "when will it come back on its own" that an open circuit otherwise hides.
+      recovery_in_secs: num(w.recovery_in_secs),
+      // rch's own admission-bypass record: a stable `RCH-Innn` reason for why
+      // this worker is being skipped, when the daemon has one.
+      bypass: w.bypass && typeof w.bypass === "object"
+        ? [w.bypass.reason_code ?? w.bypass.failure_class ?? null, w.bypass.host ?? null]
+            .filter(Boolean).join(" ") || null
+        : null,
       // failure_history is oldest-first booleans; keep it for the sparkline.
       failure_history: Array.isArray(w.failure_history) ? w.failure_history.slice(-20) : [],
       pressure: {
         state: w.pressure_state ?? null,
         reason: w.pressure_reason_code ?? null,
+        // How sure the daemon is, and which policy rule fired. A "critical"
+        // reached at LOW confidence from stale telemetry is a different fact
+        // from one measured a second ago, and the fix differs (refresh
+        // telemetry vs reclaim disk).
+        confidence: w.pressure_confidence ?? null,
+        policy_rule: w.pressure_policy_rule ?? null,
         disk_free_gb: num(w.pressure_disk_free_gb),
         disk_total_gb: num(w.pressure_disk_total_gb),
         disk_io_util_pct: num(w.pressure_disk_io_util_pct),
@@ -575,18 +612,140 @@ export function dispatcherFromProbe(host, probe) {
   });
 
   const stats = status?.daemon?.stats ?? null;
+  const str = (v, max = 240) => (typeof v === "string" ? v.slice(0, max) : null);
   // Positional, not named — see `builds` in the returned object below. Field
   // order is the contract: project, command, location, worker, duration,
   // exit code, completed_at. `src/derive.ts` and `tools/llm-view.mjs` expand it.
   const recent = (status?.daemon?.recent_builds ?? []).slice(-25).map((b) => [
     b.project_id ?? null,
-    typeof b.command === "string" ? b.command.slice(0, 120) : null,
+    str(b.command, 120),
     b.location ?? null,                    // "Remote" | "Local"
     b.worker_id ?? null,
     num(b.duration_ms),
     num(b.exit_code),
     b.completed_at ?? null,
   ]);
+
+  // Hints are capped for the wire, so the cap must keep the WORST ones. A
+  // plain `.slice(0, 12)` kept the first twelve in daemon order, which on a box
+  // with many warnings could cut every critical hint.
+  const HINT_RANK = { critical: 0, error: 0, warning: 1, warn: 1, info: 2 };
+  const hintRank = (h) => HINT_RANK[String(h?.severity ?? "").toLowerCase()] ?? 3;
+  const hints = [...(status?.remediation_hints ?? [])]
+    .sort((a, b) => hintRank(a) - hintRank(b))
+    .slice(0, 12)
+    .map((h) => [h.worker_id ?? null, h.severity ?? null, str(h.message), str(h.suggested_action), h.reason_code ?? null]);
+
+  // `daemon.alerts[]`: rch's own alert lifecycle — kind, when it FIRST fired,
+  // whether it is still active. This is what lets a worker problem say
+  // "offline since 18:39" instead of just "offline". Tuples:
+  //   [kind, severity, worker_id, message, first_seen, last_seen, state]
+  const alerts = (status?.daemon?.alerts ?? []).slice(0, 20).map((a) => [
+    a.kind ?? null, a.severity ?? null, a.worker_id ?? null, str(a.message, 200),
+    a.first_seen ?? a.created_at ?? null, a.last_seen ?? null, a.state ?? null,
+  ]);
+
+  // `daemon.issues[]`: the daemon's own diagnosis WITH the command it wants run
+  // (`remediation`). Tuples: [severity, summary, remediation]
+  const issues = (status?.daemon?.issues ?? []).slice(0, 20).map((i) => [
+    i.severity ?? null, str(i.summary, 200), str(i.remediation, 200),
+  ]);
+
+  // Active builds with the daemon's stall detectors. A count alone hid every
+  // hung build. Tuples:
+  //   [id, project, worker, command, started_at, heartbeat_age_secs,
+  //    progress_age_secs, phase, hook_alive, heartbeat_stale, progress_stale,
+  //    confidence, slots, build_age_secs]
+  const active = (status?.daemon?.active_builds ?? []).slice(0, 40).map((b) => [
+    b.id != null ? String(b.id) : null,
+    b.project_id ?? null,
+    b.worker_id ?? null,
+    str(b.command, 120),
+    b.started_at ?? null,
+    num(b.heartbeat_age_secs),
+    num(b.progress_age_secs),
+    b.heartbeat_phase ?? null,
+    typeof b.detector_hook_alive === "boolean" ? b.detector_hook_alive : null,
+    typeof b.detector_heartbeat_stale === "boolean" ? b.detector_heartbeat_stale : null,
+    typeof b.detector_progress_stale === "boolean" ? b.detector_progress_stale : null,
+    num(b.detector_confidence),
+    num(b.slots) ?? num(b.detector_slots_owned),
+    num(b.detector_build_age_secs),
+  ]);
+
+  // Queued builds: [id, project, command, position, slots_needed, wait_time]
+  const queued = (status?.daemon?.queued_builds ?? []).slice(0, 40).map((q) => [
+    q.id != null ? String(q.id) : null, q.project_id ?? null, str(q.command, 120),
+    num(q.position), num(q.slots_needed), str(q.wait_time, 40),
+  ]);
+
+  // Repo convergence: which workers are missing repos this box's builds need.
+  const conv = status?.convergence ?? null;
+  const convergence = conv
+    ? {
+        status: conv.status ?? null,
+        ready: num(conv.summary?.ready) ?? 0,
+        drifting: num(conv.summary?.drifting) ?? 0,
+        converging: num(conv.summary?.converging) ?? 0,
+        failed: num(conv.summary?.failed) ?? 0,
+        stale: num(conv.summary?.stale) ?? 0,
+        // Only the workers that are NOT ready: [worker_id, drift_state, missing_repo_count]
+        workers: (conv.workers ?? [])
+          .filter((w) => w && String(w.drift_state ?? "").toLowerCase() !== "ready")
+          .slice(0, 20)
+          .map((w) => [w.worker_id ?? null, w.drift_state ?? null, (w.missing_repos ?? []).length]),
+      }
+    : null;
+
+  // Dev-machine self-checks. `null` means the probe did not answer (old rch,
+  // command missing) — every consumer must treat null as "unknown", never as
+  // "fine".
+  const doc = doctorRes.data;
+  const doctor = doc
+    ? {
+        total: num(doc.summary?.total) ?? 0,
+        passed: num(doc.summary?.passed) ?? 0,
+        warnings: num(doc.summary?.warnings) ?? 0,
+        failed: num(doc.summary?.failed) ?? 0,
+        // Only the checks that did not pass: [name, status, message, fixable]
+        failing: (doc.checks ?? [])
+          .filter((c) => c && String(c.status ?? "").toLowerCase() !== "pass")
+          .slice(0, 20)
+          .map((c) => [c.name ?? null, c.status ?? null, str(c.message, 200), c.fixable === true]),
+      }
+    : null;
+
+  const sh = shimRes.data;
+  const shim = sh
+    ? {
+        installed: typeof sh.installed === "boolean" ? sh.installed : null,
+        up_to_date: typeof sh.up_to_date === "boolean" ? sh.up_to_date : null,
+        on_path: typeof sh.on_path_ahead_of_cargo === "boolean" ? sh.on_path_ahead_of_cargo : null,
+        interception: sh.interception ?? null,
+        // Compiler processes running RIGHT NOW with no rch ancestor — builds
+        // the hook/shim did not see. Linux-only in rch; macOS reports 0.
+        local_builds_running: num(sh.local_builds_running),
+        toolchains_wrapped: num(sh.toolchains_wrapped),
+        toolchains_total: num(sh.toolchains_total),
+      }
+    : null;
+
+  const hk = hookRes.data;
+  const hookAgents = Array.isArray(hk?.agents) ? hk.agents : null;
+  const hook = hookAgents
+    ? {
+        // The one that matters for transparent offload: Claude Code's
+        // PreToolUse hook. `true`/`false`/`null` (agent not listed).
+        claude_code: (() => {
+          const a = hookAgents.find((x) => String(x.agent ?? "").toLowerCase() === "claudecode");
+          return a ? /^installed$/i.test(String(a.status ?? "")) : null;
+        })(),
+        // Every agent rch knows about: [agent, installed]
+        agents: hookAgents.map((a) => [a.agent ?? null, /^installed$/i.test(String(a.status ?? ""))]),
+      }
+    : null;
+
+  const ts = status?.daemon?.test_stats ?? null;
 
   return {
     id: dispatcherId(host),
@@ -649,20 +808,33 @@ export function dispatcherFromProbe(host, probe) {
      * × 99 records = 6.5KB). All five are consumed: the drawer renders four and
      * folds `reason_code` into each row's React key.
      */
-    hints: (status?.remediation_hints ?? []).slice(0, 12).map((h) => [
-      h.worker_id ?? null,
-      h.severity ?? null,
-      typeof h.message === "string" ? h.message.slice(0, 240) : null,
-      typeof h.suggested_action === "string" ? h.suggested_action.slice(0, 240) : null,
-      h.reason_code ?? null,
-    ]),
-    // `daemon.issues[]` and `daemon.alerts[]` used to be collected here and are
-    // NOT emitted any more. Nothing ever read them: no component, no
-    // `src/derive.ts` path, no `tools/llm-view.mjs` view, no test — only the
-    // `unknown[]` declaration in src/types.ts, which is now gone too. They were
-    // 8.0KB of a 92.3KB payload (8.7%), re-downloaded whole every 5 minutes and
-    // discarded unread. If a future panel wants them, re-add them WITH the
-    // consumer, so the payload cost is paid for something that renders.
+    hints,
+    /**
+     * `daemon.alerts[]` and `daemon.issues[]`, previously dropped as unread
+     * bytes. They now have consumers: `src/problems.js` folds an alert's
+     * `first_seen` into the matching worker problem as `since`, and an issue's
+     * `remediation` becomes that problem's `action` when no hint carries one.
+     * Both tuples are small (≤20 rows) and gzip folds the cross-dispatcher
+     * repetition, so the wire cost is a few hundred bytes.
+     */
+    alerts,
+    issues,
+    /** Active builds WITH stall detectors — see `active` above. `active_builds` stays as the count. */
+    active,
+    queued,
+    convergence,
+    /** Dev-machine self-checks: null = probe did not answer, never "fine". */
+    doctor,
+    shim,
+    hook,
+    tests: ts
+      ? {
+          runs: num(ts.total_runs) ?? 0,
+          passed: num(ts.passed_runs) ?? 0,
+          failed: num(ts.failed_runs) ?? 0,
+          build_errors: num(ts.build_error_runs) ?? 0,
+        }
+      : null,
     workers,
   };
 }
@@ -724,9 +896,11 @@ export function mergeWorkers(dispatchers) {
       // recent sighting rather than the first one reported.
       if ((w.last_seen_unix ?? 0) > (prev.last_seen_unix ?? 0)) prev.last_seen_unix = w.last_seen_unix;
 
-      for (const k of ["speed", "latency_ms", "last_error", "priority"]) {
+      for (const k of ["speed", "latency_ms", "last_error", "priority", "bypass"]) {
         if (prev[k] == null && w[k] != null) prev[k] = w[k];
       }
+      // Longest wait wins: "comes back in 4 minutes" is the pessimistic answer.
+      if ((w.recovery_in_secs ?? -1) > (prev.recovery_in_secs ?? -1)) prev.recovery_in_secs = w.recovery_in_secs;
       if ((prev.tags?.length ?? 0) === 0 && w.tags?.length) prev.tags = [...w.tags];
       for (const k of Object.keys(w.caps)) if (prev.caps[k] == null && w.caps[k] != null) prev.caps[k] = w.caps[k];
 
@@ -776,6 +950,11 @@ export function computeTotals(workers, dispatchers) {
     builds_remote: reachable.reduce((n, d) => n + (d.build_stats?.remote ?? 0), 0),
     builds_local: reachable.reduce((n, d) => n + (d.build_stats?.local ?? 0), 0),
     active_builds: reachable.reduce((n, d) => n + d.active_builds, 0),
+    // Compiler processes running outside rch across the fleet, right now.
+    // The headline "silently building locally" number — zero is the goal.
+    local_builds_running: reachable.reduce((n, d) => n + (d.shim?.local_builds_running ?? 0), 0),
+    // Dev machines whose Claude Code hook is known to be MISSING (null = unknown, not counted).
+    dispatchers_hook_missing: reachable.filter((d) => d.hook?.claude_code === false).length,
   };
 }
 
@@ -1210,7 +1389,8 @@ async function main() {
       id: dispatcherId(host), reachable: false, collection_errors: [reason], config_degraded: true,
       posture: null, posture_description: null, daemon: null, build_stats: null,
       saved_time_ms: null, active_builds: 0, queued_builds: 0,
-      builds: [], hints: [], workers: [],
+      builds: [], hints: [], alerts: [], issues: [], active: [], queued: [],
+      convergence: null, doctor: null, shim: null, hook: null, tests: null, workers: [],
     };
   });
 

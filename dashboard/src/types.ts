@@ -17,6 +17,10 @@ export interface WorkerCaps {
 export interface WorkerPressure {
   state: string | null;
   reason: string | null;
+  /** rchd's confidence in `state` ("high" | "medium" | "low"), when reported. */
+  confidence?: string | null;
+  /** Which pressure policy rule fired, when reported. */
+  policy_rule?: string | null;
   disk_free_gb: number | null;
   disk_total_gb: number | null;
   disk_io_util_pct: number | null;
@@ -37,6 +41,10 @@ export interface Worker {
   speed: number | null;
   last_error: string | null;
   consecutive_failures: number;
+  /** Seconds until the circuit breaker retries this worker, when it is open. */
+  recovery_in_secs?: number | null;
+  /** rch's admission-bypass reason (`RCH-Innn ...`) when the daemon is skipping this worker. */
+  bypass?: string | null;
   failure_history: boolean[];
   pressure: WorkerPressure;
   latency_ms: number | null;
@@ -148,6 +156,95 @@ export type HintTuple = [
   reason_code: InternedString,
 ];
 
+/** Wire form of an rchd alert. Not interned; ≤20 per dispatcher. */
+export type AlertTuple = [
+  kind: string | null,
+  severity: string | null,
+  worker_id: string | null,
+  message: string | null,
+  first_seen: string | null,
+  last_seen: string | null,
+  state: string | null,
+];
+
+export interface Alert {
+  kind: string | null;
+  severity: string | null;
+  worker_id: string | null;
+  message: string | null;
+  first_seen: string | null;
+  last_seen: string | null;
+  state: string | null;
+}
+
+/** Wire form of an rchd issue: `[severity, summary, remediation]`. */
+export type IssueTuple = [severity: string | null, summary: string | null, remediation: string | null];
+
+export interface Issue {
+  severity: string | null;
+  summary: string | null;
+  remediation: string | null;
+}
+
+/**
+ * Wire form of an active build with rchd's stall detectors:
+ * `[id, project, worker, command, started_at, heartbeat_age_secs,
+ *   progress_age_secs, phase, hook_alive, heartbeat_stale, progress_stale,
+ *   confidence, slots, build_age_secs]`.
+ */
+export type ActiveBuildTuple = [
+  id: string | null,
+  project: string | null,
+  worker_id: string | null,
+  command: string | null,
+  started_at: string | null,
+  heartbeat_age_secs: number | null,
+  progress_age_secs: number | null,
+  phase: string | null,
+  hook_alive: boolean | null,
+  heartbeat_stale: boolean | null,
+  progress_stale: boolean | null,
+  confidence: number | null,
+  slots: number | null,
+  build_age_secs: number | null,
+];
+
+export interface ActiveBuild {
+  id: string | null;
+  project: string | null;
+  worker_id: string | null;
+  command: string | null;
+  started_at: string | null;
+  heartbeat_age_secs: number | null;
+  progress_age_secs: number | null;
+  phase: string | null;
+  hook_alive: boolean | null;
+  heartbeat_stale: boolean | null;
+  progress_stale: boolean | null;
+  confidence: number | null;
+  slots: number | null;
+  build_age_secs: number | null;
+}
+
+/** Wire form of a queued build: `[id, project, command, position, slots_needed, wait_time]`. */
+export type QueuedBuildTuple = [
+  id: string | null,
+  project: string | null,
+  command: string | null,
+  position: number | null,
+  slots_needed: number | null,
+  wait_time: string | null,
+];
+
+export interface QueuedBuild {
+  id: string | null;
+  project: string | null;
+  command: string | null;
+  position: number | null;
+  slots_needed: number | null;
+  wait_time: string | null;
+}
+
 /**
  * One dev machine's OWN derated reading of one worker's slots: `[used, total]`.
  *
@@ -215,10 +312,62 @@ export interface Dispatcher {
    * `DispatcherView.remediation_hints`.
    */
   hints: HintTuple[];
-  // `issues[]` and `alerts[]` are deliberately absent. The collector gathered
-  // both and nothing ever read either one — no component, no derive path, no
-  // LLM view, no test. They cost 8.0KB of a 92.3KB payload (8.7%) on every
-  // 5-minute refresh. Re-add them only together with a consumer.
+  /**
+   * rchd's alert lifecycle, `[kind, severity, worker_id, message, first_seen,
+   * last_seen, state]`. Consumed by `src/problems.js` (a worker problem's
+   * `since`) and the dev-machine drawer. Optional: snapshots written before
+   * these were re-added carry none.
+   */
+  alerts?: AlertTuple[];
+  /** rchd's own diagnoses with the command it wants run: `[severity, summary, remediation]`. */
+  issues?: IssueTuple[];
+  /** Active builds with the daemon's stall detectors — see `ActiveBuildTuple`. */
+  active?: ActiveBuildTuple[];
+  /** Queued builds: `[id, project, command, position, slots_needed, wait_time]`. */
+  queued?: QueuedBuildTuple[];
+  /** Repo convergence as this box sees it; `workers` lists only the NOT-ready ones. */
+  convergence?: {
+    status: string | null;
+    ready: number;
+    drifting: number;
+    converging: number;
+    failed: number;
+    stale: number;
+    workers: [worker_id: string | null, drift_state: string | null, missing_repos: number][];
+  } | null;
+  /**
+   * `rch doctor` on this box. `null` means the probe did not answer (old
+   * `rch`, missing command) — UNKNOWN, never "fine". `failing` lists only the
+   * checks that did not pass: `[name, status, message, fixable]`.
+   */
+  doctor?: {
+    total: number;
+    passed: number;
+    warnings: number;
+    failed: number;
+    failing: [name: string | null, status: string | null, message: string | null, fixable: boolean][];
+  } | null;
+  /**
+   * `rch shim status`: is the cargo shim installed, current and first on PATH,
+   * and how many compiler processes are running OUTSIDE rch right now. The
+   * latter is the "silently burning local cores" detector. `null` = unknown.
+   */
+  shim?: {
+    installed: boolean | null;
+    up_to_date: boolean | null;
+    on_path: boolean | null;
+    interception: string | null;
+    local_builds_running: number | null;
+    toolchains_wrapped: number | null;
+    toolchains_total: number | null;
+  } | null;
+  /** `rch hook status`: is the PreToolUse hook installed, per agent. `null` = unknown. */
+  hook?: {
+    claude_code: boolean | null;
+    agents: [agent: string | null, installed: boolean][];
+  } | null;
+  /** Lifetime test-run counters from the daemon, when reported. */
+  tests?: { runs: number; passed: number; failed: number; build_errors: number } | null;
   /**
    * This machine's own derated slot reading for every worker in the fleet, as
    * ONE ROW of the (dispatcher x worker) matrix, aligned index-for-index to
@@ -283,6 +432,10 @@ export interface Snapshot {
     builds_remote: number;
     builds_local: number;
     active_builds: number;
+    /** Compiler processes running outside rch across the fleet right now (absent on old snapshots). */
+    local_builds_running?: number;
+    /** Dev machines whose Claude Code hook is known to be missing (absent on old snapshots). */
+    dispatchers_hook_missing?: number;
   };
   dispatchers: Dispatcher[];
   workers: Worker[];
@@ -338,4 +491,12 @@ export interface DispatcherView extends Dispatcher {
   recent_builds: RecentBuild[];
   /** `Dispatcher.hints` expanded back into records, in collector order. */
   remediation_hints: RemediationHint[];
+  /** `Dispatcher.alerts` expanded; empty on snapshots that carry none. */
+  alert_records: Alert[];
+  /** `Dispatcher.issues` expanded; empty on snapshots that carry none. */
+  issue_records: Issue[];
+  /** `Dispatcher.active` expanded; empty on snapshots that carry none. */
+  active_records: ActiveBuild[];
+  /** `Dispatcher.queued` expanded; empty on snapshots that carry none. */
+  queued_records: QueuedBuild[];
 }

@@ -5,18 +5,24 @@
  * This is the LOCAL path: an agent already running on a fleet machine has the
  * passphrase (env, .env, or Vault) and does not need to go over the network or
  * negotiate deployment-protection tokens. For the HTTP path see
- * `api/fleet.mjs` (`GET /api/fleet`).
+ * `api/fleet.mjs` (`GET /api/fleet`). Both emit byte-identical output for the
+ * same snapshot, view and target.
  *
  * Usage:
- *   node tools/fleet-llm.mjs                      # summary, TOON
- *   node tools/fleet-llm.mjs --format json        # summary, JSON
- *   node tools/fleet-llm.mjs --view full          # everything
+ *   node tools/fleet-llm.mjs                            # summary, TOON
+ *   node tools/fleet-llm.mjs --view problems            # just problems + next_actions (cheapest)
+ *   node tools/fleet-llm.mjs --view diagnose --target hz1
+ *                                                       # everything about ONE machine or worker
+ *   node tools/fleet-llm.mjs --target css               # summary filtered to one entity
+ *   node tools/fleet-llm.mjs --view help                # the contract; needs no passphrase
+ *   node tools/fleet-llm.mjs --format json --view full
  *   node tools/fleet-llm.mjs --in path/to.enc.json
  *   node tools/fleet-llm.mjs --url https://host/data/fleet.enc.json
  *
  * Passphrase resolution order: RCH_DASH_PASSPHRASE -> ./.env -> Vault
  * (secret/rch-fleet-dashboard). Exits non-zero with a one-line reason on stderr
- * so a calling agent can branch on it.
+ * so a calling agent can branch on it:
+ *   2 no passphrase · 3 unreadable snapshot · 4 wrong passphrase · 5 unknown target
  */
 
 import { readFile } from "node:fs/promises";
@@ -24,31 +30,42 @@ import { webcrypto as crypto } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
-import { buildLlmView, encodeView } from "./llm-view.mjs";
+import { buildLlmView, encodeView, helpView, UnknownTarget, VIEWS, FORMATS } from "./llm-view.mjs";
 import { decompressPlaintext, isSupportedCompression } from "./envelope.mjs";
 
 const execFileAsync = promisify(execFile);
 
 function parseArgs(argv) {
-  const a = { format: "toon", view: "summary", in: "public/data/fleet.enc.json", url: null };
+  const a = { format: "toon", view: "summary", target: null, in: "public/data/fleet.enc.json", url: null };
   for (let i = 2; i < argv.length; i++) {
     const k = argv[i];
-    const next = () => argv[++i];
+    const next = () => {
+      const v = argv[++i];
+      if (v === undefined) { console.error(`${k} requires a value`); process.exit(2); }
+      return v;
+    };
     if (k === "--format" || k === "-F") a.format = next();
     else if (k === "--view") a.view = next();
+    else if (k === "--target" || k === "-t") a.target = next();
     else if (k === "--in") a.in = next();
     else if (k === "--url") a.url = next();
     else if (k === "--json") a.format = "json";
     else if (k === "--help" || k === "-h") {
       console.log(
-        "usage: node tools/fleet-llm.mjs [--format toon|json] [--view summary|full]\n" +
-          "                               [--in <file>] [--url <https://.../fleet.enc.json>]",
+        "usage: node tools/fleet-llm.mjs [--view summary|problems|full|diagnose|help]\n" +
+          "                               [--target <dev machine id | worker id>]\n" +
+          "                               [--format toon|json] [--in <file>] [--url <https://.../fleet.enc.json>]\n" +
+          "  --view help prints the full contract (problem kinds, columns, exit codes) and needs no passphrase.",
       );
       process.exit(0);
-    } else { console.error(`unknown argument: ${k}`); process.exit(2); }
+    } else { console.error(`unknown argument: ${k} (try --help)`); process.exit(2); }
   }
-  if (!["toon", "json"].includes(a.format)) { console.error("--format must be toon or json"); process.exit(2); }
-  if (!["summary", "full"].includes(a.view)) { console.error("--view must be summary or full"); process.exit(2); }
+  if (!FORMATS.includes(a.format)) { console.error(`--format must be one of ${FORMATS.join("|")}`); process.exit(2); }
+  if (!VIEWS.includes(a.view)) { console.error(`--view must be one of ${VIEWS.join("|")}`); process.exit(2); }
+  if (a.view === "diagnose" && !a.target) {
+    console.error("--view diagnose needs --target <dev machine id | worker id>; --view summary lists the ids");
+    process.exit(2);
+  }
   return a;
 }
 
@@ -133,6 +150,12 @@ export async function decryptEnvelope(env, passphrase) {
 async function main() {
   const args = parseArgs(process.argv);
 
+  // The contract needs no secret and no snapshot.
+  if (args.view === "help") {
+    process.stdout.write(encodeView(helpView(), args.format) + "\n");
+    return;
+  }
+
   const passphrase = await resolvePassphrase();
   if (!passphrase) {
     console.error("no passphrase: set RCH_DASH_PASSPHRASE, add .env, or unseal Vault");
@@ -178,7 +201,19 @@ async function main() {
     process.exit(3);
   }
 
-  process.stdout.write(encodeView(buildLlmView(snap, { view: args.view }), args.format) + "\n");
+  let view;
+  try {
+    view = buildLlmView(snap, { view: args.view, target: args.target });
+  } catch (e) {
+    if (e instanceof UnknownTarget) {
+      console.error(
+        `unknown target "${e.target}"; dev machines: ${e.known.dev_machines.join(",")}; workers: ${e.known.workers.join(",")}`,
+      );
+      process.exit(5);
+    }
+    throw e;
+  }
+  process.stdout.write(encodeView(view, args.format) + "\n");
 }
 
 // Only run the CLI when this file IS the program, exactly as tools/snapshot.mjs

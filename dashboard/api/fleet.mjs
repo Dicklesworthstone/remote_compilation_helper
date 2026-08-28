@@ -17,13 +17,18 @@
  * window; see the KDF cache block below.
  *
  * Query:
- *   format = toon | json      (default toon — ~65% fewer characters)
- *   view   = summary | full   (default summary)
+ *   format = toon | json                       (default toon — ~65% fewer characters)
+ *   view   = summary | problems | full | diagnose | help   (default summary)
+ *   target = <dev machine id | worker id>       filters to one entity; required by diagnose
  *
- * Responses: 200 body | 401 wrong/missing key | 405 wrong method | 400 bad
- * format/view | 500 no snapshot, or a snapshot this build cannot decode (an
- * unknown `compression` codec — a deployment-skew problem, never a credential
- * one, so it must not masquerade as a 401).
+ * `view=help` needs no key: it is the contract (params, problem kinds, what
+ * `on`/`action` mean) and carries no fleet data.
+ *
+ * Responses: 200 body | 401 wrong/missing key | 404 unknown target (body lists
+ * the known ids) | 405 wrong method | 400 bad format/view/target | 500 no
+ * snapshot, or a snapshot this build cannot decode (an unknown `compression`
+ * codec — a deployment-skew problem, never a credential one, so it must not
+ * masquerade as a 401).
  * Errors are single-line text so an agent can branch on them cheaply.
  *
  * Cost note: a WRONG passphrase always runs the full 600k PBKDF2 iterations
@@ -36,7 +41,9 @@
  */
 
 import { webcrypto as crypto, createHmac, randomBytes } from "node:crypto";
-import { buildLlmView, encodeView, contentType } from "../tools/llm-view.mjs";
+import {
+  buildLlmView, encodeView, contentType, helpView, UnknownTarget, VIEWS, FORMATS,
+} from "../tools/llm-view.mjs";
 import { decompressPlaintext, isSupportedCompression } from "../tools/envelope.mjs";
 // Bundled at build time so the function has no filesystem or network dependency.
 import envelope from "../public/data/fleet.enc.json" with { type: "json" };
@@ -236,20 +243,34 @@ export default async function handler(req, res) {
 
   const format = (url.searchParams.get("format") ?? "toon").toLowerCase();
   const view = (url.searchParams.get("view") ?? "summary").toLowerCase();
-  if (!["toon", "json"].includes(format)) {
+  const target = (url.searchParams.get("target") ?? "").trim() || null;
+  if (!FORMATS.includes(format)) {
     res.statusCode = 400;
-    return res.end("400 format must be toon or json\n");
+    return res.end(`400 format must be one of ${FORMATS.join("|")}; see ?view=help\n`);
   }
-  if (!["summary", "full"].includes(view)) {
+  if (!VIEWS.includes(view)) {
     res.statusCode = 400;
-    return res.end("400 view must be summary or full\n");
+    return res.end(`400 view must be one of ${VIEWS.join("|")}; see ?view=help\n`);
+  }
+
+  // The help view carries no fleet data — it is the contract, and an agent
+  // holding only the URL must be able to read it before it has the key.
+  if (view === "help") {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", contentType(format));
+    if (req.method === "HEAD") return res.end();
+    return res.end(encodeView(helpView(), format) + "\n");
+  }
+  if (view === "diagnose" && !target) {
+    res.statusCode = 400;
+    return res.end("400 view=diagnose needs target=<dev machine id | worker id>; ?view=summary lists the ids\n");
   }
 
   const key = extractKey(req, url);
   if (!key) {
     res.statusCode = 401;
     res.setHeader("WWW-Authenticate", 'Bearer realm="rch-fleet"');
-    return res.end("401 supply the fleet passphrase via Authorization: Bearer <passphrase>\n");
+    return res.end("401 supply the fleet passphrase via Authorization: Bearer <passphrase>; ?view=help needs no key\n");
   }
 
   if (!envelope?.ciphertext) {
@@ -282,7 +303,22 @@ export default async function handler(req, res) {
     return res.end(`500 snapshot decrypted but could not be decoded: ${e?.message ?? "unknown error"}\n`);
   }
 
-  const body = encodeView(buildLlmView(snap, { view }), format);
+  let viewObj;
+  try {
+    viewObj = buildLlmView(snap, { view, target });
+  } catch (e) {
+    if (e instanceof UnknownTarget) {
+      // Name the ids that WOULD have worked: an agent that guessed wrong
+      // should not need a second round-trip to find the right spelling.
+      res.statusCode = 404;
+      return res.end(
+        `404 unknown target "${e.target}"; dev machines: ${e.known.dev_machines.join(",")}; ` +
+        `workers: ${e.known.workers.join(",")}\n`,
+      );
+    }
+    throw e;
+  }
+  const body = encodeView(viewObj, format);
   res.statusCode = 200;
   res.setHeader("Content-Type", contentType(format));
   if (req.method === "HEAD") return res.end();
