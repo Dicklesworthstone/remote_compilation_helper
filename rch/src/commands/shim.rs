@@ -997,12 +997,18 @@ mod tests {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
+        // Sandboxes MUST be unique per invocation. Keying on (name, pid, args)
+        // alone collides whenever two tests exercise the same argv -- and since
+        // tests run in parallel threads of ONE process, the loser has its stub
+        // `real-cargo` deleted mid-run and fails with ENOENT/exit 127.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "rch-shim-test-{}-{}-{}",
+            "rch-shim-test-{}-{}-{}-{}",
             name,
             std::process::id(),
-            // Distinguish cases within one process without pulling in rand.
-            args.join("_").replace(['/', '=', '-', ' '], "")
+            args.join("_").replace(['/', '=', '-', ' '], ""),
+            seq
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
