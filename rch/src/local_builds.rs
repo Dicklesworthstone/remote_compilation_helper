@@ -272,17 +272,30 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn live_scan_finds_real_cargo_and_respects_bypass_env() {
-        // Spawn the REAL cargo binary (`--version` exits in tens of
-        // millis) with the bypass marker stripped: an unmanaged cargo
-        // process the detector must catch. NOTE: copies of binaries are
-        // not usable here — this box refuses to exec untrusted copies
-        // (exit 1 before main) — so we use the genuine toolchain cargo.
+        // Spawn the REAL cargo binary and hold it ALIVE across the scan.
+        // `--version` exits in tens of millis, so polling for it raced a
+        // process that was usually already gone — that lost ~2 of every 3
+        // runs on a loaded worker. `login` instead blocks reading a token
+        // from an open, never-written stdin pipe, so the process is
+        // deterministically observable. CARGO_HOME points at a throwaway
+        // dir, so no token could reach the real one. NOTE: copies of
+        // binaries are not usable here — this box refuses to exec
+        // untrusted copies (exit 1 before main) — so we use the genuine
+        // toolchain cargo.
         let real_cargo = std::env::var("CARGO")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("cargo"));
+        let cargo_home =
+            std::env::temp_dir().join(format!("rch-livescan-{}", std::process::id()));
+        std::fs::create_dir_all(&cargo_home).expect("throwaway CARGO_HOME");
+
         let spawn = |managed: bool| {
             let mut cmd = std::process::Command::new(&real_cargo);
-            cmd.arg("--version");
+            cmd.arg("login")
+                .env("CARGO_HOME", &cargo_home)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
             if managed {
                 cmd.env(MANAGED_BYPASS_ENV, "1");
             } else {
@@ -294,42 +307,46 @@ mod tests {
             cmd.spawn().expect("spawn real cargo")
         };
 
-        // Unmanaged: poll-scan until seen (--version exits quickly, so
-        // retry within a bounded window instead of a fixed sleep).
+        // Wait for the child to be visible in /proc as a cargo process, so
+        // the assertions exercise the detector rather than process startup.
+        let await_observable = |pid: i32| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if read_comm(&Path::new("/proc").join(pid.to_string()))
+                    .is_some_and(|comm| is_compiler_comm(&comm))
+                {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            false
+        };
+
+        // Unmanaged → must be caught. Reap before asserting so a failure
+        // cannot leak the blocked child.
         let mut child = spawn(false);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let mut seen = false;
-        while std::time::Instant::now() < deadline {
-            if scan_local_builds()
-                .iter()
-                .any(|b| b.pid == child.id() as i32)
-            {
-                seen = true;
-                break;
-            }
-            if child
-                .try_wait()
-                .expect("poll child")
-                .is_some_and(|status| !status.success())
-            {
-                break; // exited with failure — no point retrying
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        assert!(seen, "unmanaged real cargo must be detected while alive");
+        let pid = child.id() as i32;
+        let observable = await_observable(pid);
+        let seen = observable && scan_local_builds().iter().any(|b| b.pid == pid);
         let _ = child.kill();
         let _ = child.wait();
+        assert!(observable, "real cargo never became observable in /proc");
+        assert!(seen, "unmanaged real cargo must be detected while alive");
 
-        // Managed via bypass env → excluded. Absence is stable even
-        // after exit, so a single scan after a settle delay suffices.
+        // Managed via bypass env → excluded, though it is equally alive.
         let mut managed = spawn(true);
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let managed_pid = managed.id() as i32;
+        let managed_observable = await_observable(managed_pid);
         let found = scan_local_builds();
-        assert!(
-            !found.iter().any(|b| b.pid == managed.id() as i32),
-            "bypass-env process must NOT be flagged: {found:?}"
-        );
+        let excluded = !found.iter().any(|b| b.pid == managed_pid);
         let _ = managed.kill();
         let _ = managed.wait();
+        assert!(
+            managed_observable,
+            "managed cargo never became observable in /proc"
+        );
+        assert!(excluded, "bypass-env process must NOT be flagged: {found:?}");
+
+        let _ = std::fs::remove_dir_all(&cargo_home);
     }
 }
