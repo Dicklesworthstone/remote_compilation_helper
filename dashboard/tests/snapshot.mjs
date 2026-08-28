@@ -293,14 +293,19 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
   // Transport failure: no frames at all. Every section must still name itself,
   // exactly as four dead ssh calls each named themselves before.
   const dead = dispatcherFromProbe("hz3-dev", { sections: new Map(), error: "ssh: connect to host hz3-dev port 22: No route to host" });
-  chk("an unreachable host reports all four sections by name",
-    dead.collection_errors.length === 4 &&
+  chk("an unreachable host reports all seven sections by name",
+    dead.collection_errors.length === 7 &&
     dead.collection_errors.every((e) => e.includes("No route to host")) &&
     dead.collection_errors[0].startsWith("status:") &&
     dead.collection_errors[1].startsWith("workers capabilities:") &&
     dead.collection_errors[2].startsWith("workers list:") &&
-    dead.collection_errors[3].startsWith("metrics:"),
+    dead.collection_errors[3].startsWith("metrics:") &&
+    dead.collection_errors[4].startsWith("doctor:") &&
+    dead.collection_errors[5].startsWith("shim status:") &&
+    dead.collection_errors[6].startsWith("hook status:"),
     JSON.stringify(dead.collection_errors.map((e) => e.split(":")[0])));
+  chk("an unreachable host has UNKNOWN self-checks, not healthy ones",
+    dead.doctor === null && dead.shim === null && dead.hook === null);
 
   // rch's own error envelope, which is not a transport failure at all.
   const rchFailed = dispatcherFromProbe("hz3-dev", probe([
