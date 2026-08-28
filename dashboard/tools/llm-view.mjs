@@ -338,7 +338,7 @@ export function helpView() {
     auth: "Authorization: Bearer <passphrase> (or X-Fleet-Key header, or ?key=). The passphrase is the AES key; a wrong one is a 401.",
     params: {
       view: "summary (default: overview + problems + per-machine/worker rows) | problems (just problems + next_actions, cheapest poll) | full (+ hints, recent builds, worker detail, history) | diagnose (requires target: everything about ONE machine or worker) | help",
-      target: "a dev machine id or worker id. Filters summary/full/problems to that entity; required by diagnose. Unknown id -> 404 listing the known ids.",
+      target: "a dev machine id or worker id. Filters summary/full/problems to that entity; required by diagnose. A box that is both (it dispatches AND takes builds) resolves to both halves; prefix `dev:` or `worker:` to pick one. Unknown id -> 404 listing the known ids.",
       format: "toon (default, ~65% fewer characters) | json",
     },
     freshness: "generated_at is when the snapshot was TAKEN; age_seconds is against the server clock; stale:true past 1h. The collector republishes on a schedule (see README); do not expect sub-minute data.",
@@ -662,10 +662,13 @@ export function buildLlmView(snap, opts = {}) {
         }
       }
       out.pool_as_seen_here = pool;
-    } else {
-      const w = workers.find((x) => x.id === target.id);
+    }
+    if (wantWorker) {
+      const w = workers.find((x) => x.id === (target.worker_id ?? target.id));
       out.worker = workerRow(w);
-      out.detail = workerDetail(w);
+      // `detail` is the worker's when the target is only a worker; beside a
+      // dev-machine half it is named so neither shadows the other.
+      out[wantDev ? "worker_detail" : "detail"] = workerDetail(w);
       out.hints_about = devs.flatMap((d) => (d.remediation_hints ?? [])
         .filter((h) => h.worker_id === w.id)
         .map((h) => ({ from: d.id, severity: h.severity ?? "", message: h.message ?? "", action: h.suggested_action ?? "" })));

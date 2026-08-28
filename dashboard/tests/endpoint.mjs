@@ -106,8 +106,22 @@ r = await call("/api/fleet?view=problems&format=json", { authorization: `Bearer 
     r.status === 200 && Array.isArray(p.problems) && Array.isArray(p.next_actions) && !("workers" in p) && !("dev_machines" in p));
   chk("view=problems agrees with the summary view", p.problems_total === parsed.problems_total);
   // Target the first dev machine the summary listed.
+  const devIds = new Set(parsed.dev_machines.map((d) => d.id));
   const dev = parsed.dev_machines[0]?.id;
-  const worker = parsed.workers[0]?.id;
+  // A worker that is NOT also a dev machine, so the worker-only shape is exercised.
+  const worker = parsed.workers.find((w) => !devIds.has(w.id))?.id;
+  // A box that is both, when the fleet has one.
+  const both = parsed.workers.find((w) => devIds.has(w.id))?.id;
+  if (both) {
+    const t = await call(`/api/fleet?view=diagnose&target=${encodeURIComponent(both)}&format=json`, { authorization: `Bearer ${PW}` });
+    const tj = t.status === 200 ? JSON.parse(t.body) : {};
+    chk("a box that is both dev machine and worker diagnoses as both halves",
+      t.status === 200 && tj.target?.type === "both" && "dev_machine" in tj && "worker" in tj && "worker_detail" in tj, t.body.slice(0, 120));
+    const w = await call(`/api/fleet?view=diagnose&target=worker:${encodeURIComponent(both)}&format=json`, { authorization: `Bearer ${PW}` });
+    const wj = w.status === 200 ? JSON.parse(w.body) : {};
+    chk("the worker: prefix picks the worker half alone",
+      w.status === 200 && wj.target?.type === "worker" && !("dev_machine" in wj) && "detail" in wj, w.body.slice(0, 120));
+  }
   if (dev) {
     const t = await call(`/api/fleet?view=diagnose&target=${encodeURIComponent(dev.toUpperCase())}&format=json`, { authorization: `Bearer ${PW}` });
     const tj = t.status === 200 ? JSON.parse(t.body) : {};
