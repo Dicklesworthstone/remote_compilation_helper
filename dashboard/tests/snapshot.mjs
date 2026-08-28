@@ -18,7 +18,7 @@ import {
   statusRank, circuitRank, pressureIsBetter,
   isLocalDispatcher, dispatcherId,
   encrypt, verifyRoundTrip, existingSalt, internSnapshotStrings,
-  buildProbeScript, splitProbeSections, dispatcherFromProbe, allSettledBounded,
+  buildProbeScript, splitProbeSections, dispatcherFromProbe, allSettledBounded, describeExecError,
   mergeWorkers, computeTotals, projectDispatchers,
 } from "../tools/snapshot.mjs";
 import { expandBuilds, expandHints } from "../tools/llm-view.mjs";
@@ -314,6 +314,132 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
   ]));
   chk("an rch error envelope is reported as such, not as an unreachable host",
     rchFailed.reachable === false && rchFailed.collection_errors[0] === "status: E_DAEMON not running");
+
+  // ---- the three dev-machine self-checks ---------------------------------
+  // What they parse to on a clean probe...
+  chk("doctor: summary and only the NON-passing checks survive",
+    healthy.doctor.total === 3 && healthy.doctor.passed === 2 && healthy.doctor.warnings === 1 &&
+    healthy.doctor.failed === 0 && healthy.doctor.failing.length === 1 &&
+    healthy.doctor.failing[0][0] === "ssh_config" && healthy.doctor.failing[0][1] === "warn" &&
+    healthy.doctor.failing[0][3] === false,
+    JSON.stringify(healthy.doctor));
+  chk("shim: install/current/path state and the unmanaged-build count survive",
+    healthy.shim.installed === true && healthy.shim.up_to_date === true && healthy.shim.on_path === true &&
+    healthy.shim.interception === "direct" && healthy.shim.local_builds_running === 2 &&
+    healthy.shim.toolchains_wrapped === 3 && healthy.shim.toolchains_total === 3,
+    JSON.stringify(healthy.shim));
+  chk("hook: Claude Code's install state is lifted out, every agent is kept",
+    healthy.hook.claude_code === true && healthy.hook.agents.length === 2 &&
+    healthy.hook.agents[1][0] === "CodexCli" && healthy.hook.agents[1][1] === false,
+    JSON.stringify(healthy.hook));
+  // ...and what a missing hook looks like, since that is the alarm.
+  const noHook = dispatcherFromProbe("hz3-dev", probe([
+    ["s", STATUS], ["c", CAPS], ["l", LIST], ["m", MET],
+    ["k", JSON.stringify({ success: true, data: { agents: [{ agent: "ClaudeCode", status: "Not installed" }] } })],
+  ]));
+  chk("hook: 'Not installed' is false, never null", noHook.hook.claude_code === false);
+
+  // Each self-check failing ALONE costs only itself, names itself, and leaves
+  // the dispatcher reachable — the same isolation the original four have.
+  const docDead = dispatcherFromProbe("hz3-dev", probe([["s", STATUS], ["c", CAPS], ["l", LIST], ["m", MET], ["d", "", 1]]));
+  chk("a failed `doctor` is unknown (null), named, and costs nothing else",
+    docDead.reachable === true && docDead.doctor === null && docDead.shim !== null && docDead.hook !== null &&
+    docDead.collection_errors.length === 1 && docDead.collection_errors[0] === "doctor: exited 1",
+    JSON.stringify(docDead.collection_errors));
+  const shimDead = dispatcherFromProbe("hz3-dev", probe([["s", STATUS], ["c", CAPS], ["l", LIST], ["m", MET], ["h", "", 2]]));
+  chk("a failed `shim status` is unknown (null), named, and costs nothing else",
+    shimDead.reachable === true && shimDead.shim === null && shimDead.doctor !== null &&
+    shimDead.collection_errors.length === 1 && shimDead.collection_errors[0] === "shim status: exited 2");
+  const hookDead = dispatcherFromProbe("hz3-dev", probe([["s", STATUS], ["c", CAPS], ["l", LIST], ["m", MET], ["k", "", 2]]));
+  chk("a failed `hook status` is unknown (null), named, and costs nothing else",
+    hookDead.reachable === true && hookDead.hook === null && hookDead.shim !== null &&
+    hookDead.collection_errors.length === 1 && hookDead.collection_errors[0] === "hook status: exited 2");
+  // An rch too old to have the subcommand prints nothing at all: still unknown,
+  // still named — never silently "fine".
+  const oldRch = dispatcherFromProbe("hz3-dev", probe([["s", STATUS], ["c", CAPS], ["l", LIST], ["m", MET]], null, { absent: ["d", "h", "k"] }));
+  chk("an rch without the self-check subcommands reports all three as unknown",
+    oldRch.reachable === true && oldRch.doctor === null && oldRch.shim === null && oldRch.hook === null &&
+    oldRch.collection_errors.length === 3 &&
+    oldRch.collection_errors[0] === "doctor: no output" &&
+    oldRch.collection_errors[1] === "shim status: no output" &&
+    oldRch.collection_errors[2] === "hook status: no output",
+    JSON.stringify(oldRch.collection_errors));
+
+  // ---- the daemon facts that used to be thrown away ----------------------
+  const RICH = JSON.stringify({ success: true, data: {
+    posture: "degraded", posture_description: "partial",
+    remediation_hints: [
+      { worker_id: "a", severity: "warning", message: "warn first in daemon order", suggested_action: "x", reason_code: "r1" },
+      { worker_id: "b", severity: "critical", message: "critical second", suggested_action: "y", reason_code: "r2" },
+    ],
+    convergence: { status: "drifting", workers: [
+      { worker_id: "hz3", drift_state: "ready", missing_repos: [] },
+      { worker_id: "hz4", drift_state: "drifting", missing_repos: ["a", "b"] },
+    ], summary: { total_workers: 2, ready: 1, drifting: 1, converging: 0, failed: 0, stale: 0 } },
+    daemon: {
+      daemon: { version: "1.0.60", uptime_secs: 1, pid: 1, workers_total: 1, workers_healthy: 1, slots_total: 1, slots_available: 1 },
+      workers: [{ id: "hz3", status: "unreachable", circuit_state: "open", used_slots: 0, total_slots: 0,
+                  recovery_in_secs: 240, pressure_state: "critical", pressure_confidence: "low",
+                  pressure_policy_rule: "disk_threshold_breach_without_telemetry",
+                  bypass: { reason_code: "RCH-I004", host: "10.0.0.1" } }],
+      stats: {}, recent_builds: [],
+      active_builds: [{ id: 42, project_id: "p", worker_id: "hz3", command: "cargo test", started_at: "t0",
+                        heartbeat_age_secs: 4, progress_age_secs: 394, heartbeat_phase: "sync_up", slots: 8,
+                        detector_hook_alive: false, detector_heartbeat_stale: false, detector_progress_stale: true,
+                        detector_confidence: 0.25, detector_build_age_secs: 395 }],
+      queued_builds: [{ id: 43, project_id: "q", command: "cargo build", position: 1, slots_needed: 4, wait_time: "2m" }],
+      alerts: [{ kind: "worker_offline", severity: "error", worker_id: "hz3", message: "down",
+                 first_seen: "t1", last_seen: "t2", state: "active" }],
+      issues: [{ severity: "error", summary: "Worker 'hz3' is unreachable", remediation: "rch workers probe hz3" }],
+      test_stats: { total_runs: 10, passed_runs: 7, failed_runs: 2, build_error_runs: 1 },
+    },
+  } });
+  const rich = dispatcherFromProbe("hz3-dev", probe([["s", RICH], ["c", CAPS], ["l", LIST], ["m", MET]]));
+  chk("hints are capped worst-first, not daemon-order-first",
+    rich.hints[0][1] === "critical" && rich.hints[1][1] === "warning", JSON.stringify(rich.hints.map((h) => h[1])));
+  chk("alerts survive as [kind, severity, worker, message, first_seen, last_seen, state]",
+    JSON.stringify(rich.alerts) === JSON.stringify([["worker_offline", "error", "hz3", "down", "t1", "t2", "active"]]),
+    JSON.stringify(rich.alerts));
+  chk("issues survive as [severity, summary, remediation]",
+    JSON.stringify(rich.issues) === JSON.stringify([["error", "Worker 'hz3' is unreachable", "rch workers probe hz3"]]));
+  chk("active builds carry the stall detectors, with the id as a string",
+    JSON.stringify(rich.active) === JSON.stringify([["42", "p", "hz3", "cargo test", "t0", 4, 394, "sync_up", false, false, true, 0.25, 8, 395]]),
+    JSON.stringify(rich.active));
+  chk("the active count is still emitted for old bundles", rich.active_builds === 1 && rich.queued_builds === 1);
+  chk("queued builds survive as [id, project, command, position, slots_needed, wait_time]",
+    JSON.stringify(rich.queued) === JSON.stringify([["43", "q", "cargo build", 1, 4, "2m"]]));
+  chk("convergence keeps the summary and only the NOT-ready workers",
+    rich.convergence.status === "drifting" && rich.convergence.ready === 1 && rich.convergence.drifting === 1 &&
+    JSON.stringify(rich.convergence.workers) === JSON.stringify([["hz4", "drifting", 2]]),
+    JSON.stringify(rich.convergence));
+  chk("test counters survive", JSON.stringify(rich.tests) === JSON.stringify({ runs: 10, passed: 7, failed: 2, build_errors: 1 }));
+  chk("per-worker recovery, bypass, pressure confidence and policy rule survive",
+    rich.workers[0].recovery_in_secs === 240 && rich.workers[0].bypass === "RCH-I004 10.0.0.1" &&
+    rich.workers[0].pressure.confidence === "low" &&
+    rich.workers[0].pressure.policy_rule === "disk_threshold_breach_without_telemetry",
+    JSON.stringify(rich.workers[0]));
+  chk("a status with none of the new arrays yields empty arrays, not undefined",
+    Array.isArray(healthy.alerts) && healthy.alerts.length === 0 && Array.isArray(healthy.active) &&
+    healthy.active.length === 0 && healthy.convergence === null && healthy.tests === null);
+}
+
+// ------------------------------------------------- exec error descriptions
+{
+  const script = "d=$(mktemp -d \"${TMPDIR:-/tmp}/rchdash.XXXXXX\" 2>/dev/null)\nif [ -n \"$d\" ]; then\n...";
+  const sshRefused = {
+    message: `Command failed: ssh -o BatchMode=yes -o ConnectTimeout=12 trj ${script}\nssh: connect to host 10.10.10.1 port 22: Connection refused\r\n`,
+    stderr: "ssh: connect to host 10.10.10.1 port 22: Connection refused\r\n", code: 255,
+  };
+  chk("an ssh failure is described by its stderr line, not the probe script",
+    describeExecError(sshRefused) === "ssh: connect to host 10.10.10.1 port 22: Connection refused",
+    describeExecError(sshRefused));
+  chk("a silent non-zero exit is described by its code",
+    describeExecError({ message: `Command failed: ssh x ${script}`, stderr: "", code: 3 }) === "exited 3");
+  chk("a timeout is described as such",
+    /killed by .* after 90s/.test(describeExecError({ message: "x", stderr: "", killed: true, signal: "SIGTERM" })));
+  chk("with nothing else to go on, the script is stripped from the message",
+    describeExecError({ message: `Command failed: ssh -o BatchMode=yes trj ${script}` }) === "Command failed: ssh trj",
+    describeExecError({ message: `Command failed: ssh -o BatchMode=yes trj ${script}` }));
 }
 
 // ---------------------------------------------------------- bounded fan-out

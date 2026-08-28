@@ -417,18 +417,34 @@ if ((await mapWorker.count()) > 0) {
   await page.waitForTimeout(300);
 }
 
-// cookie session survives reload
+// problems panel: the agent endpoint's rows, rendered — either a table of
+// rows or the explicit "no problems" state, never nothing.
+await page.waitForSelector('section[aria-label="Problems"]', { timeout: 15000 });
+const problemRows = await page.locator("table.problems tbody tr").count();
+const noProblems = await page.locator('section[aria-label="Problems"] .empty.ok').count();
+check("problems panel renders rows or an explicit all-clear",
+  problemRows > 0 || noProblems === 1, `${problemRows} rows, ${noProblems} all-clear`);
+if (problemRows > 0) {
+  const firstSev = (await page.locator("table.problems tbody tr").first().locator(".pill").innerText()).trim().toLowerCase();
+  check("problems are severity-sorted (first row is the worst)",
+    firstSev === "critical" || (await page.locator("table.problems tr.prob-critical").count()) === 0, firstSev);
+}
+
+// cookie session survives reload: the KPIs are back and the gate is NOT.
 await page.reload({ waitUntil: "load" });
 await page.waitForSelector(".kpis", { timeout: 30000 });
-check("cookie session survives reload", true);
+check("cookie session survives reload",
+  (await page.locator(".gate-card").count()) === 0 && (await page.locator(".kpi-value").count()) > 0);
 
-// lock clears it
+// lock clears it: gate back, nothing decrypted on screen.
 await page.locator("button.icon-btn", { hasText: "Lock" }).click();
 await page.waitForSelector(".gate-card", { timeout: 15000 });
-check("Lock returns to gate", true);
+check("Lock returns to gate",
+  (await page.locator(".kpis").count()) === 0 && (await page.locator(".gate-card").count()) === 1);
 await page.reload({ waitUntil: "load" });
 await page.waitForSelector(".gate-card", { timeout: 20000 });
-check("stays locked after Lock + reload", true);
+check("stays locked after Lock + reload",
+  (await page.locator(".kpis").count()) === 0 && (await page.locator(".gate-card").count()) === 1);
 
 // mobile viewport
 await page.setViewportSize({ width: 390, height: 844 });
