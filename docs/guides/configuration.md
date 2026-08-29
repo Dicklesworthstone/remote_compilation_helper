@@ -140,7 +140,8 @@ a Tailscale tailnet and is **off** unless `bind` is set.
   Tailscale's ranges (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`); anything else is
   refused at startup — the payload carries worker hosts and IPs.
 - `token` (string, optional) — bearer token required on `/status`,
-  `/workers/capabilities`, `/workers/config`. Sent as
+  `/workers/capabilities`, `/workers/config`,
+  `/repo-convergence/status[?worker=<id>]`. Sent as
   `Authorization: Bearer <token>` or `X-Rch-Token: <token>`.
 - `token_file` (string, optional) — file holding the token (trimmed, `~`
   expanded). Wins over `token`. Keep it `0600`.

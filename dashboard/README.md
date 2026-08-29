@@ -254,7 +254,8 @@ same treatment).
 `rchd` can serve its full `/status` JSON over TCP on the tailnet (`[api]
 bind = "tailscale"` in `config.toml`, bearer token — see
 `docs/guides/configuration.md`). A dispatcher written as `name=100.x.y.z:9101`
-in `RCH_DASH_DISPATCHERS` is asked over HTTP: four small GETs, no ssh key
+in `RCH_DASH_DISPATCHERS` is asked over HTTP: five small GETs (status,
+capabilities, config, metrics, repo convergence), no ssh key
 exchange, sub-second, with `RCH_DASH_API_TOKEN` as the bearer. What the API
 cannot answer — `rch doctor`, `rch shim status`, `rch hook status`, which are
 dev-machine-local CLI checks — still comes over ssh, but only every 15 minutes

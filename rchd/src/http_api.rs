@@ -428,7 +428,7 @@ async fn api_convergence_handler(
 ) -> Response {
     let worker = q
         .get("worker")
-        .map(str::trim)
+        .map(|w| w.trim())
         .filter(|w| !w.is_empty())
         .map(rch_common::WorkerId::new);
     Json(crate::api::handle_repo_convergence_status(&state.ctx, worker.as_ref()).await)
