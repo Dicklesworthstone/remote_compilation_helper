@@ -102,6 +102,39 @@ now leverages what the daemon already knew and collects three things it did not:
   `bd-2f5ms` (authenticated remote rchd API for live cross-machine diagnosis),
   `bd-oxdl1` (retire or wire in `web/`).
 
+## [v1.0.60] -- 2026-08-28 (release)
+
+### Local shim fallbacks capped (shim v3)
+
+- Every local-exec path in the generated shims (`cargo`, `cargo-clippy`, the toolchain
+  wrapper) now routes through `exec_local`, which sets `CARGO_BUILD_JOBS` when it is not
+  already set — the one lever that outranks a repo's own `.cargo/config.toml`. A committed
+  `jobs = -1` on a 128-thread box had meant 127 concurrent `rustc`, each forking a ~1 GB
+  `rust-lld`, exhausting RAM and swap while `rch shim status` reported every toolchain
+  wrapped. Default cap 8; `RCH_LOCAL_MAX_JOBS` overrides; an explicit `CARGO_BUILD_JOBS`
+  always wins; the offload path stays uncapped (workers do their own slot accounting).
+  `SHIM_VERSION` 2 → 3, `TOOLCHAIN_WRAP_VERSION` 1 → 2 — run `rch shim install` after
+  upgrading.
+- Disk-pressure policy adapts to small tmpfs mounts.
+- Windows worker telemetry parses CIM samples for CPU/memory; `rch-wkr` resolves
+  rustup/tool binaries with the `.exe` suffix (bd-jdcxd).
+- Socket `reload` honours the launch-time `--workers-config` path (bd-xqg58).
+
+## [v1.0.59] -- 2026-08-27 (release)
+
+### Shim offload leaks fixed (shim v2)
+
+- The cargo shim no longer sends every `--message-format` build local — only
+  rust-analyzer's rendered-diagnostic formats stay local — and `cargo-clippy` is shimmed so
+  direct invocations offload. A `RUSTC_WORKSPACE_WRAPPER` guard keeps `cargo clippy`
+  producing lints. `SHIM_VERSION` → 2; run `rch shim install` after upgrading.
+
+## [v1.0.58] -- 2026-08-24 (release)
+
+278 commits since v1.0.57. Two themes: **RABS**, a new build-sidecar subsystem that lands
+in full, and **job mode**, which opens rch's remote-execution rails to work that is not a
+compilation.
+
 ### Worker-side rustc cap per job (#49)
 
 - **`compilation.remote_build_jobs`** (default `auto`) exports `CARGO_BUILD_JOBS` in the
@@ -113,12 +146,7 @@ now leverages what the daemon already knew and collects three things it did not:
   a `CARGO_BUILD_JOBS` already in the worker session (e.g. `/etc/environment`), forwarded
   through the env allowlist, written inline in the command, a `-j` flag, or a project
   `.cargo/config.toml` `[build] jobs` are all left untouched. Windows workers are skipped.
-
-## [v1.0.58] -- 2026-08-24 (release)
-
-278 commits since v1.0.57. Two themes: **RABS**, a new build-sidecar subsystem that lands
-in full, and **job mode**, which opens rch's remote-execution rails to work that is not a
-compilation.
+  (Commit `cf040af0`, in the v1.0.58 tag; previously mis-filed under Unreleased.)
 
 (v1.0.57 shipped as a GitHub release on 2026-08-15 without a changelog entry; this section
 covers v1.0.57..v1.0.58 only.)
