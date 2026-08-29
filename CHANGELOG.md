@@ -10,6 +10,8 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## [Unreleased]
 
+## [v1.0.61] -- 2026-08-29 (release)
+
 ### Tailnet status API, 2-minute fleet snapshots, `web/` retired
 
 Three changes that turn the fleet dashboard from a 20-minute-old picture into a
@@ -49,8 +51,7 @@ right now.
   `RCH_DASHBOARD_URL`) and prints the agent endpoint. `RCH-E900/E901` now mean "no
   dashboard URL configured" / "not an http(s) URL". Dependabot watches
   `/dashboard` instead of `/web`; the remediation e2e checks the dashboard's
-  problems module. The `web/` directory itself is unreferenced and awaits
-  deletion.
+  problems module. The `web/` directory is removed from the tree.
 
 ### Fleet dashboard: problems with actions, agent diagnose views, dev-machine self-checks
 

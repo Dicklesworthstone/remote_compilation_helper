@@ -631,7 +631,7 @@ Operational recommendations:
 - Designed around SSH-based Linux worker environments.
 - Tooling assumptions are strongest for Rust and selected build/test commands.
 - Remote performance gains depend on network + worker capacity + project shape.
-- Web dashboard workflows require the `/web` stack and its runtime dependencies.
+- The fleet dashboard (`dashboard/`) needs Node and a static host (Vercel/Pages); its live path needs a Vercel Blob store and `rchd`'s `[api]` listener on a tailnet.
 
 ---
 
