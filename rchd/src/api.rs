@@ -659,7 +659,7 @@ pub struct RepoConvergenceRepairResponse {
 /// while errors serialize using the unified ApiError format from rch-common.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
-enum ApiResponse<T: Serialize> {
+pub(crate) enum ApiResponse<T: Serialize> {
     Ok(T),
     Error(ApiError),
 }
@@ -3534,7 +3534,10 @@ fn build_convergence_worker_view(
 }
 
 /// Handle GET /repo-convergence/status — full convergence dashboard.
-async fn handle_repo_convergence_status(
+///
+/// `pub(crate)` because the tailnet API (`http_api.rs`) serves the same body
+/// on `GET /repo-convergence/status`.
+pub(crate) async fn handle_repo_convergence_status(
     ctx: &DaemonContext,
     worker_id: Option<&WorkerId>,
 ) -> ApiResponse<RepoConvergenceStatusResponse> {

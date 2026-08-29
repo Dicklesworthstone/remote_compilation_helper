@@ -417,6 +417,24 @@ async fn api_workers_config_handler(State(state): State<Arc<ApiState>>) -> Respo
     Json(json!({ "workers": rows })).into_response()
 }
 
+/// `GET /repo-convergence/status[?worker=<id>]` — the same body as the
+/// socket's `/repo-convergence/status`: which workers are missing repos this
+/// dispatcher's builds depend on. `rch status --json` folds this into its
+/// `convergence` field; the fleet collector does the same over the API so
+/// `worker.convergence_drift` is raised whichever transport served the box.
+async fn api_convergence_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let worker = q
+        .get("worker")
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(rch_common::WorkerId::new);
+    Json(crate::api::handle_repo_convergence_status(&state.ctx, worker.as_ref()).await)
+        .into_response()
+}
+
 /// The tailnet API router: token-gated status routes merged with the
 /// unauthenticated observability routes.
 pub fn create_api_router(api_state: ApiState, http_state: HttpState) -> Router {
@@ -425,6 +443,7 @@ pub fn create_api_router(api_state: ApiState, http_state: HttpState) -> Router {
         .route("/status", get(api_status_handler))
         .route("/workers/capabilities", get(api_capabilities_handler))
         .route("/workers/config", get(api_workers_config_handler))
+        .route("/repo-convergence/status", get(api_convergence_handler))
         .route_layer(middleware::from_fn_with_state(
             shared.clone(),
             require_token,
@@ -1321,7 +1340,12 @@ mod tests {
             b.body(Body::empty()).unwrap()
         };
 
-        for uri in ["/status", "/workers/capabilities", "/workers/config"] {
+        for uri in [
+            "/status",
+            "/workers/capabilities",
+            "/workers/config",
+            "/repo-convergence/status",
+        ] {
             let r = router.clone().oneshot(get(uri, None)).await.unwrap();
             assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{uri} without token");
             assert!(r.headers().contains_key(header::WWW_AUTHENTICATE));
@@ -1429,6 +1453,7 @@ mod tests {
 
         let caps = body_json(
             router
+                .clone()
                 .oneshot(
                     Request::builder()
                         .uri("/workers/capabilities")
@@ -1440,6 +1465,43 @@ mod tests {
         )
         .await;
         assert_eq!(caps["workers"][0]["id"], "w1");
+
+        // `/repo-convergence/status` carries the socket's body: a fleet with no
+        // convergence data is "unknown" (never "healthy"), and asking about a
+        // worker the service has not tracked yields the explicit "stale" view.
+        let conv = body_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/repo-convergence/status")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        for key in ["status", "workers", "summary", "recent_outcomes"] {
+            assert!(conv.get(key).is_some(), "convergence missing {key}");
+        }
+        assert_eq!(conv["status"], "unknown");
+        assert_eq!(conv["summary"]["total_workers"], 0);
+        let one = body_json(
+            router
+                .oneshot(
+                    Request::builder()
+                        .uri("/repo-convergence/status?worker=w1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(one["workers"][0]["worker_id"], "w1");
+        assert_eq!(one["workers"][0]["drift_state"], "stale");
+        assert_eq!(one["summary"]["stale"], 1);
     }
 
     #[tokio::test]
