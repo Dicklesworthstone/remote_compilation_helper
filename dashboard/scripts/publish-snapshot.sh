@@ -58,15 +58,25 @@ if ! grep -q '"ciphertext"' "$OUT"; then
 fi
 
 START=$(date +%s)
-URL=$(vercel blob put "$OUT" \
+# Capture the CLI's whole output first: with `set -o pipefail` a failing
+# `vercel … | grep` inside $(…) would exit the script before anything could be
+# printed, and the error text — which is the only useful thing on failure —
+# would have been swallowed by the grep.
+if ! PUT_OUT=$(vercel blob put "$OUT" \
   --pathname fleet.enc.json \
   --access public \
   --allow-overwrite \
   --cache-control-max-age 60 \
   --content-type application/json \
-  --rw-token "$BLOB_READ_WRITE_TOKEN" 2>&1 | grep -o 'https://[^ ]*fleet\.enc\.json' | head -1)
-if [ -z "$URL" ]; then
+  --rw-token "$BLOB_READ_WRITE_TOKEN" 2>&1); then
+  printf '%s\n' "$PUT_OUT" >&2
   echo "blob upload failed" >&2
+  exit 1
+fi
+URL=$(printf '%s\n' "$PUT_OUT" | grep -o 'https://[^ ]*fleet\.enc\.json' | head -1 || true)
+if [ -z "$URL" ]; then
+  printf '%s\n' "$PUT_OUT" >&2
+  echo "blob upload did not report a URL" >&2
   exit 1
 fi
 if [ -n "${RCH_DASH_DATA_URL:-}" ] && [ "$URL" != "$RCH_DASH_DATA_URL" ]; then
