@@ -115,6 +115,70 @@ struct Cli {
     /// Disable hot-reload of configuration files
     #[arg(long)]
     no_hot_reload: bool,
+
+    /// Serve the status API over TCP for the tailnet: "tailscale",
+    /// "tailscale:PORT", or "IP:PORT". Overrides `[api] bind` in config.toml.
+    #[arg(long)]
+    api_bind: Option<String>,
+
+    /// File holding the bearer token for the status API. Overrides
+    /// `[api] token_file` in config.toml.
+    #[arg(long)]
+    api_token_file: Option<String>,
+}
+
+/// A minimal `DaemonContext` for unit tests in other modules (the tailnet API
+/// router tests in `http_api`). Mirrors `api::tests::make_test_context`.
+#[cfg(test)]
+pub(crate) fn test_daemon_context(pool: workers::WorkerPool) -> DaemonContext {
+    use chrono::Duration as ChronoDuration;
+    let self_test_history = Arc::new(self_test::SelfTestHistory::new(
+        self_test::DEFAULT_RUN_CAPACITY,
+        self_test::DEFAULT_RESULT_CAPACITY,
+    ));
+    let self_test_service = Arc::new(SelfTestService::new(
+        pool.clone(),
+        rch_common::SelfTestConfig::default(),
+        self_test_history,
+    ));
+    let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+    let events = EventBus::new(16);
+    let (scheduler, benchmark_trigger) = benchmark_scheduler::BenchmarkScheduler::new(
+        benchmark_scheduler::SchedulerConfig::default(),
+        pool.clone(),
+        telemetry.clone(),
+        events.clone(),
+    );
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(Arc::new(scheduler).run());
+    }
+    DaemonContext {
+        pool,
+        worker_selector: Arc::new(WorkerSelector::new()),
+        history: Arc::new(BuildHistory::new(100)),
+        telemetry,
+        benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
+        benchmark_trigger,
+        repo_convergence: Arc::new(repo_convergence::RepoConvergenceService::new(
+            events.clone(),
+        )),
+        cancellation: Arc::new(cancellation::CancellationOrchestrator::new(
+            cancellation::CancellationConfig::default(),
+            events.clone(),
+        )),
+        events,
+        self_test: self_test_service,
+        alert_manager: Arc::new(alerts::AlertManager::new(alerts::AlertConfig::default())),
+        started_at: Instant::now(),
+        socket_path: "/tmp/test.sock".to_string(),
+        version: "0.1.0-test",
+        pid: 1234,
+        queue_timeout_secs: 300,
+        bypass_store: None,
+        admin_disable_store: None,
+        workers_config_path: None,
+        admission_barrier: Arc::new(tokio::sync::RwLock::new(false)),
+    }
 }
 
 /// Shared daemon context passed to all API handlers.
@@ -960,6 +1024,34 @@ async fn main() -> Result<()> {
     } else {
         info!("HTTP metrics endpoint disabled (port 0)");
         None
+    };
+
+    // Tailnet status API (bd-2f5ms): the socket's /status over TCP for agents
+    // and the fleet dashboard on other machines. Off unless configured. A bad
+    // [api] section is logged with its fix and the daemon carries on — a
+    // dashboard knob must never stop builds.
+    let _api_handle = {
+        let api_http_state = http_api::HttpState {
+            pool: worker_pool.clone(),
+            version: env!("CARGO_PKG_VERSION"),
+            started_at: context.started_at,
+            pid: context.pid,
+        };
+        match http_api::start_api_server(
+            &rch_config.api,
+            cli.api_bind.as_deref(),
+            cli.api_token_file.as_deref(),
+            context.clone(),
+            api_http_state,
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(reason) => {
+                error!("Tailnet status API not started: {}", reason);
+                None
+            }
+        }
     };
 
     let commit_hash = rch_common::build_commit().map(|value| value.to_string());

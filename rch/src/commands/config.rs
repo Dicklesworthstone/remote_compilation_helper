@@ -18,7 +18,7 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root";
+const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
 
 fn print_file_validation(
     label: &str,
@@ -1198,6 +1198,36 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
         "path_topology.alias_root" => {
             config.path_topology.alias_root = Some(parse_topology_root(value, key)?);
         }
+        // Tailnet status API (bd-2f5ms) and the dashboard URL `rch web` opens.
+        "api.bind" => {
+            config.api.bind = value.trim().trim_matches(|c| c == '"').to_string();
+        }
+        "api.token" => {
+            let t = value.trim().trim_matches(|c| c == '"').to_string();
+            config.api.token = if t.is_empty() { None } else { Some(t) };
+        }
+        "api.token_file" => {
+            let t = value.trim().trim_matches(|c| c == '"').to_string();
+            config.api.token_file = if t.is_empty() { None } else { Some(t) };
+        }
+        "api.no_token" => {
+            config.api.no_token = parse_bool(value, key)?;
+        }
+        "api.allow_any_addr" => {
+            config.api.allow_any_addr = parse_bool(value, key)?;
+        }
+        "dashboard.url" => {
+            let u = value.trim().trim_matches(|c| c == '"').to_string();
+            if !u.is_empty() && !(u.starts_with("http://") || u.starts_with("https://")) {
+                return Err(ConfigError::InvalidValue {
+                    field: key.to_string(),
+                    reason: format!("{u:?} is not an http(s) URL"),
+                    suggestion: "Use the full URL, e.g. https://rch-fleet.vercel.app".to_string(),
+                }
+                .into());
+            }
+            config.dashboard.url = if u.is_empty() { None } else { Some(u) };
+        }
         _ => {
             return Err(ConfigError::InvalidValue {
                 field: key.to_string(),
@@ -1343,6 +1373,30 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
         "path_topology.alias_root" => {
             config.path_topology.alias_root = None;
             rch_common::path_topology::DEFAULT_ALIAS_PROJECT_ROOT.to_string()
+        }
+        "api.bind" => {
+            config.api.bind = String::new();
+            "(off)".to_string()
+        }
+        "api.token" => {
+            config.api.token = None;
+            "(none)".to_string()
+        }
+        "api.token_file" => {
+            config.api.token_file = None;
+            "(none)".to_string()
+        }
+        "api.no_token" => {
+            config.api.no_token = false;
+            "false".to_string()
+        }
+        "api.allow_any_addr" => {
+            config.api.allow_any_addr = false;
+            "false".to_string()
+        }
+        "dashboard.url" => {
+            config.dashboard.url = None;
+            "(none)".to_string()
         }
         _ => {
             return Err(ConfigError::InvalidValue {

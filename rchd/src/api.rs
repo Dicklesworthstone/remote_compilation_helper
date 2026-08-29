@@ -3212,7 +3212,9 @@ fn build_remediation_view(
     assemble(&inputs, now_ms)
 }
 
-async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
+/// Full daemon status — the socket `/status` body. Also served over TCP by the
+/// tailnet API (`http_api::create_api_router`), so it is crate-visible.
+pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
     let workers = ctx.pool.all_workers().await;
 
     // Current temporary-bypass records, persisted across daemon restarts. The

@@ -285,8 +285,7 @@ mod tests {
         let real_cargo = std::env::var("CARGO")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("cargo"));
-        let cargo_home =
-            std::env::temp_dir().join(format!("rch-livescan-{}", std::process::id()));
+        let cargo_home = std::env::temp_dir().join(format!("rch-livescan-{}", std::process::id()));
         std::fs::create_dir_all(&cargo_home).expect("throwaway CARGO_HOME");
 
         let spawn = |managed: bool| {
@@ -345,7 +344,10 @@ mod tests {
             managed_observable,
             "managed cargo never became observable in /proc"
         );
-        assert!(excluded, "bypass-env process must NOT be flagged: {found:?}");
+        assert!(
+            excluded,
+            "bypass-env process must NOT be flagged: {found:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&cargo_home);
     }

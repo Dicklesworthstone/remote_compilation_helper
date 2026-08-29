@@ -1082,6 +1082,56 @@ pub struct RchConfig {
     /// injected as CARGO_PROFILE_* env vars into remote cargo builds.
     #[serde(default)]
     pub layer0: Layer0Config,
+    /// Daemon status API over TCP for other machines on the tailnet
+    /// (`[api]`, bd-2f5ms). Off unless `bind` is set.
+    #[serde(default)]
+    pub api: ApiConfig,
+    /// Where the fleet dashboard lives (`[dashboard]`), for `rch web`.
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
+}
+
+/// Daemon status API over TCP (`[api]`).
+///
+/// rchd's rich state (`/status`, `/workers/capabilities`) lives on a `0600`
+/// Unix socket, which only the local user can read. This section opens the
+/// same JSON on a TCP listener so agents and the fleet dashboard on OTHER
+/// machines can ask a dispatcher "why are you local-only right now?" without
+/// ssh. It is meant for a tailnet: the bind address must be loopback or a
+/// Tailscale address (100.64.0.0/10, fd7a:115c:a1e0::/48) unless
+/// `allow_any_addr` is set, and every status route requires the bearer token
+/// unless `token` is unset AND `no_token` is explicitly true.
+///
+/// ```toml
+/// [api]
+/// bind = "tailscale"       # or "tailscale:9101", "100.68.51.94:9101", "127.0.0.1:9101"
+/// token = "…"              # or token_file = "~/.config/rch/api.token"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ApiConfig {
+    /// Where to listen. `"tailscale"` resolves this machine's Tailscale IPv4
+    /// at startup (default port 9101); `"tailscale:PORT"`, `"IP:PORT"` or
+    /// `"[v6]:PORT"` are taken literally. Unset (empty) = API off.
+    pub bind: String,
+    /// Bearer token required on `/status` and `/workers/capabilities`.
+    pub token: Option<String>,
+    /// File holding the bearer token (trimmed). Takes precedence over `token`.
+    pub token_file: Option<String>,
+    /// Serve the status routes with NO token. Only honoured when no token is
+    /// configured; must be set explicitly so an empty token is never an
+    /// accidental open door.
+    pub no_token: bool,
+    /// Permit a bind address outside loopback and the Tailscale ranges.
+    pub allow_any_addr: bool,
+}
+
+/// Where the fleet dashboard is served (`[dashboard]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DashboardConfig {
+    /// URL `rch web` opens, e.g. `https://rch-fleet.vercel.app`.
+    pub url: Option<String>,
 }
 
 /// Doctor reliability subsystem configuration.

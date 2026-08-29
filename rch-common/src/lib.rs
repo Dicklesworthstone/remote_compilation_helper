@@ -233,13 +233,13 @@ pub use transfer_hardening::{
     FirstFailure, RetryDecision, RsyncFailureClass, classify_rsync_outcome, is_ephemeral_path,
 };
 pub use types::{
-    AffinityConfig, BoxRole, BuildCancellationMetadata, BuildCancellationWorkerHealth,
+    AffinityConfig, ApiConfig, BoxRole, BuildCancellationMetadata, BuildCancellationWorkerHealth,
     BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation, BuildRecord, BuildStats,
     CircuitBreakerConfig, CircuitState, CircuitStats, ColorMode, CommandPriority,
     CommandTimingBreakdown, CompilationConfig, CompilationMetrics, CompilationTimer,
-    CompilationTimingBreakdown, DoctorConfig, DoctorWebhookEndpoint, DoctorWebhookFormat,
-    DoctorWebhooksConfig, EnvironmentConfig, ExecutionConfig, FairnessConfig, FleetConfig,
-    GeneralConfig, MetricsAggregator, OS_TAG_PREFIX, OutputConfig, OutputVisibility,
+    CompilationTimingBreakdown, DashboardConfig, DoctorConfig, DoctorWebhookEndpoint,
+    DoctorWebhookFormat, DoctorWebhooksConfig, EnvironmentConfig, ExecutionConfig, FairnessConfig,
+    FleetConfig, GeneralConfig, MetricsAggregator, OS_TAG_PREFIX, OutputConfig, OutputVisibility,
     PathTopologyConfig, RchConfig, ReleaseRequest, RemoteBuildJobs, RequiredRuntime, RetryConfig,
     SELECTION_RESPONSE_PROTOCOL_VERSION, SavedTimeStats, SelectedWorker, SelectionConfig,
     SelectionDiagnostics, SelectionReason, SelectionRequest, SelectionResponse, SelectionStrategy,
