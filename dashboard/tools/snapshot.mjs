@@ -673,13 +673,26 @@ export function sectionsFromApi(r, selfChecks) {
     return null;
   };
 
+  // Repo convergence over the API (rchd >= 1.0.62 serves the socket's
+  // /repo-convergence/status on the tailnet listener). `null` means UNKNOWN —
+  // an older rchd 404s, and the reason lands in `errors.v` so the record can
+  // say why the column is blank instead of rendering "no drift".
+  let conv = null;
+  if ("conv" in r) {
+    const body = parsed("v", r.conv);
+    if (body && typeof body === "object" && body.summary && Array.isArray(body.workers)) {
+      conv = body;
+    } else if (body) {
+      errors.v = "not a convergence body";
+    }
+  }
   const full = parsed("s", r.status);
   if (full) {
     const [posture, posture_description] = postureFromDaemonStatus(full);
     sections.set("s", {
       text: JSON.stringify({ success: true, data: {
         posture, posture_description, daemon: full,
-        convergence: selfChecks?.convergence ?? null,
+        convergence: conv,
         remediation_hints: hintsFromIssues(full.issues),
       } }),
       rc: 0,
@@ -732,11 +745,12 @@ async function collectDispatcher(spec, opts = {}) {
     return d;
   }
   const token = opts.apiToken ?? null;
-  const [status, caps, config, metrics] = await Promise.all([
+  const [status, caps, config, metrics, conv] = await Promise.all([
     fetchApi(api, "/status", token),
     fetchApi(api, "/workers/capabilities", token),
     fetchApi(api, "/workers/config", token),
     fetchApi(api, "/metrics", null),
+    fetchApi(api, "/repo-convergence/status", token),
   ]);
   // The API is the fast path, not the only path. A /status that is not a 200
   // carrying a daemon record — wrong token, old rchd, a proxy's HTML, a
@@ -757,7 +771,12 @@ async function collectDispatcher(spec, opts = {}) {
     return d;
   }
   const self = await selfChecksFor(host, opts);
-  const d = dispatcherFromProbe(host, sectionsFromApi({ status, caps, config, metrics }, self));
+  const secs = sectionsFromApi({ status, caps, config, metrics, conv }, self);
+  const d = dispatcherFromProbe(host, secs);
+  // The convergence GET is not one of the seven probe sections, so its
+  // failure reason has to be surfaced here: a 404 (old rchd) or refusal means
+  // the convergence column for this box is UNKNOWN, never "no drift".
+  if (secs.errors.v) d.collection_errors.push(`repo-convergence: ${secs.errors.v}`);
   d.transport = "api";
   d.selfchecks_at = self?.at ?? null;
   return d;

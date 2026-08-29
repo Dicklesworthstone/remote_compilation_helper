@@ -478,6 +478,10 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
     caps: ok({ workers: [{ id: "hz3", capabilities: { num_cpus: 64 } }] }),
     config: ok({ workers: [{ id: "hz3", tags: ["big"], priority: 120, status: "healthy" }] }),
     metrics: ok('rch_worker_last_seen_timestamp{worker="hz3"} 1787800000\n'),
+    conv: ok({ status: "converging", workers: [
+      { worker_id: "hz3", drift_state: "ready", missing_repos: [] },
+      { worker_id: "hz4", drift_state: "drifting", missing_repos: ["a", "b"] },
+    ], summary: { total_workers: 2, ready: 1, drifting: 1, converging: 0, failed: 0, stale: 0 }, recent_outcomes: [] }),
   };
   const self = { at: "2026-08-29T00:00:00.000Z", sections: {
     d: { text: JSON.stringify({ success: true, data: { summary: { total: 1, passed: 1, warnings: 0, failed: 0 }, checks: [] } }), rc: 0 },
@@ -517,6 +521,24 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
   const junk = sectionsFromApi({ ...api, caps: ok("<html>oops</html>") }, self);
   chk("non-JSON capabilities is an absent section named 'not JSON'",
     !junk.sections.has("c") && junk.errors.c === "not JSON");
+  // Convergence rides the API: the same shape `rch status --json` folds in,
+  // so worker.convergence_drift fires on API-collected boxes too.
+  chk("the API path carries repo convergence (summary and NOT-ready workers only)",
+    viaApi.convergence?.status === "converging" && viaApi.convergence.ready === 1 &&
+    viaApi.convergence.drifting === 1 &&
+    JSON.stringify(viaApi.convergence.workers) === JSON.stringify([["hz4", "drifting", 2]]),
+    JSON.stringify(viaApi.convergence));
+  // An rchd too old to serve the route (404) leaves convergence UNKNOWN with
+  // the reason in errors.v — collectDispatcher turns that into a named
+  // collection error, never a silent "no drift".
+  const noConv = sectionsFromApi({ ...api, conv: { ok: false, status: 404, text: "" } }, self);
+  chk("a 404 convergence GET is null convergence with an HTTP reason",
+    noConv.errors.v === "HTTP 404" &&
+    dispatcherFromProbe("hz3-dev", noConv).convergence === null);
+  const badConv = sectionsFromApi({ ...api, conv: ok({ error: { code: "E1" } }) }, self);
+  chk("a non-convergence body is null convergence, named",
+    badConv.errors.v === "not a convergence body" &&
+    dispatcherFromProbe("hz3-dev", badConv).convergence === null);
 }
 
 // ------------------------------------------------- exec error descriptions
