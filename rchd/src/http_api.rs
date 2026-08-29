@@ -184,7 +184,7 @@ use axum::{
 };
 use rch_common::ApiConfig;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// Default port for the tailnet API when `bind = "tailscale"` names none.
 pub const DEFAULT_API_PORT: u16 = 9101;
@@ -278,7 +278,6 @@ pub fn resolve_api_bind(spec: &str) -> Result<Option<SocketAddr>, String> {
     if let Ok(ip) = spec.parse::<IpAddr>() {
         return Ok(Some(SocketAddr::from((ip, DEFAULT_API_PORT))));
     }
-    let _ = Ipv6Addr::UNSPECIFIED; // keep the v6 import honest when the parse arm above changes
     Err(format!(
         "[api] bind {spec:?} is not \"tailscale\", \"tailscale:PORT\", \"IP:PORT\" or \"IP\""
     ))
@@ -453,28 +452,103 @@ pub async fn start_api_server(
     if let Some(f) = token_file_override {
         cfg.token_file = Some(f.to_string());
     }
-    let Some(addr) = resolve_api_bind(&cfg.bind)? else {
+    if cfg.bind.trim().is_empty() {
         return Ok(None);
-    };
-    check_bind_addr(addr, cfg.allow_any_addr)?;
+    }
+    // Token problems are configuration errors: refuse now, at startup, where
+    // the operator is looking.
     let token = resolve_api_token(&cfg)?;
+    let allow_any = cfg.allow_any_addr;
 
+    match resolve_api_bind(&cfg.bind) {
+        Ok(Some(addr)) => {
+            check_bind_addr(addr, allow_any)?;
+            let listener = bind_api_listener(addr, token.is_some()).await?;
+            let router = create_api_router(ApiState { ctx, token }, http_state);
+            Ok(Some(tokio::spawn(async move {
+                axum::serve(listener, router).await
+            })))
+        }
+        Ok(None) => Ok(None),
+        // `bind = "tailscale"` and no tailnet address YET: at boot rchd can
+        // come up before tailscaled has one. That is not a configuration
+        // error, so do not give up — keep trying in the background and serve
+        // as soon as the address appears. Any other failure is definite.
+        Err(e) if is_tailscale_pending(&e) => {
+            tracing::warn!(
+                "Tailnet status API: {e}; retrying every {}s for up to {} attempts",
+                TAILSCALE_RETRY_SECS,
+                TAILSCALE_RETRY_ATTEMPTS
+            );
+            let spec = cfg.bind.clone();
+            Ok(Some(tokio::spawn(async move {
+                for attempt in 1..=TAILSCALE_RETRY_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_secs(TAILSCALE_RETRY_SECS)).await;
+                    let addr = match resolve_api_bind(&spec) {
+                        Ok(Some(addr)) => addr,
+                        Ok(None) => return Ok(()),
+                        Err(e) if is_tailscale_pending(&e) => {
+                            tracing::debug!("Tailnet status API: attempt {attempt}: {e}");
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!("Tailnet status API not started: {e}");
+                            return Ok(());
+                        }
+                    };
+                    if let Err(e) = check_bind_addr(addr, allow_any) {
+                        tracing::error!("Tailnet status API not started: {e}");
+                        return Ok(());
+                    }
+                    match bind_api_listener(addr, token.is_some()).await {
+                        Ok(listener) => {
+                            let router = create_api_router(ApiState { ctx, token }, http_state);
+                            return axum::serve(listener, router).await;
+                        }
+                        Err(e) => {
+                            tracing::error!("Tailnet status API not started: {e}");
+                            return Ok(());
+                        }
+                    }
+                }
+                tracing::error!(
+                    "Tailnet status API not started: no Tailscale IPv4 address appeared in {} attempts; \
+                     restart rchd once tailscaled is up, or set an explicit [api] bind",
+                    TAILSCALE_RETRY_ATTEMPTS
+                );
+                Ok(())
+            })))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// How the boot-time race with tailscaled is waited out: 15 s × 40 = 10 min.
+const TAILSCALE_RETRY_SECS: u64 = 15;
+const TAILSCALE_RETRY_ATTEMPTS: u32 = 40;
+
+/// The one `resolve_api_bind` failure that is worth waiting on.
+fn is_tailscale_pending(err: &str) -> bool {
+    err.contains("no Tailscale IPv4 address")
+}
+
+async fn bind_api_listener(
+    addr: SocketAddr,
+    token_required: bool,
+) -> Result<tokio::net::TcpListener, String> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("[api] cannot bind {addr}: {e}"))?;
     tracing::info!(
         "Tailnet status API listening on {} ({})",
         addr,
-        if token.is_some() {
+        if token_required {
             "bearer token required"
         } else {
             "NO token — no_token = true"
         }
     );
-    let router = create_api_router(ApiState { ctx, token }, http_state);
-    Ok(Some(tokio::spawn(async move {
-        axum::serve(listener, router).await
-    })))
+    Ok(listener)
 }
 
 #[cfg(test)]
