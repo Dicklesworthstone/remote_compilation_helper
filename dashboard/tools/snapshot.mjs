@@ -79,6 +79,11 @@ function parseArgs(argv) {
     historyMax: 96,
     label: "rch fleet",
     maxParallel: DEFAULT_MAX_PARALLEL,
+    // rchd tailnet API (bd-2f5ms): bearer token, and how long the ssh-only
+    // self-checks (doctor / shim / hook) may be reused between ticks.
+    apiToken: null,
+    selfcheckMaxAge: 900,
+    selfcheckCache: ".selfcheck-cache.json",
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -114,10 +119,26 @@ function parseArgs(argv) {
       }
       args.maxParallel = n;
     }
+    else if (a === "--api-token") args.apiToken = next();
+    else if (a === "--selfcheck-max-age") {
+      const n = Number(next());
+      if (!Number.isInteger(n) || n < 0) {
+        console.error("--selfcheck-max-age must be a non-negative integer (seconds)");
+        process.exit(2);
+      }
+      args.selfcheckMaxAge = n;
+    }
+    else if (a === "--selfcheck-cache") args.selfcheckCache = next();
     else if (a === "--help" || a === "-h") {
       console.log(
         "usage: RCH_DASH_PASSPHRASE=... node tools/snapshot.mjs\n" +
-          "  [--dispatchers a,b,c]  ssh targets; use `local` for this machine\n" +
+          "  [--dispatchers a,b=100.x.y.z:9101,c]\n" +
+          "                         dev machines. `name` = probe over ssh; `name=host:port` = ask\n" +
+          "                         rchd's tailnet status API (config [api]) and ssh only for the\n" +
+          "                         doctor/shim/hook self-checks. Use `local` for this machine\n" +
+          "  [--api-token T]        bearer token for the API (or RCH_DASH_API_TOKEN)\n" +
+          "  [--selfcheck-max-age S] reuse ssh self-checks this old, in seconds (default 900)\n" +
+          "  [--selfcheck-cache path] where they are kept (default .selfcheck-cache.json)\n" +
           "  [--out path] [--label name] [--history-file path] [--history-max N]\n" +
           `  [--max-parallel N]     dispatchers probed at once (default ${DEFAULT_MAX_PARALLEL})`,
       );
@@ -289,20 +310,24 @@ const PROBE_NONCE = Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toStr
  * Everything here is POSIX sh: the fleet's login shells are a mix of bash and
  * zsh and ssh runs the command under whichever one the account has.
  */
-export function buildProbeScript(nonce = PROBE_NONCE) {
-  const files = PROBE_SECTIONS.map((s) => `"$d/${s.key}"`).join(" ");
+export function buildProbeScript(nonce = PROBE_NONCE, sections = PROBE_SECTIONS) {
+  const files = sections.map((s) => `"$d/${s.key}"`).join(" ");
   return [
     `d=$(mktemp -d "\${TMPDIR:-/tmp}/rchdash.XXXXXX" 2>/dev/null)`,
     `if [ -n "$d" ]; then`,
     `trap 'rm -f ${files}; rmdir "$d" 2>/dev/null' EXIT`,
-    ...PROBE_SECTIONS.map((s, i) => `{ ${s.cmd}; } > "$d/${s.key}" & q${i}=$!`),
-    ...PROBE_SECTIONS.map((s, i) =>
+    ...sections.map((s, i) => `{ ${s.cmd}; } > "$d/${s.key}" & q${i}=$!`),
+    ...sections.map((s, i) =>
       `wait $q${i}; e${i}=$?\ncat "$d/${s.key}"; echo; echo "${nonce}:${s.key}:$e${i}"`),
     `else`,
-    ...PROBE_SECTIONS.map((s) => `( ${s.cmd} ); e=$?; echo; echo "${nonce}:${s.key}:$e"`),
+    ...sections.map((s) => `( ${s.cmd} ); e=$?; echo; echo "${nonce}:${s.key}:$e"`),
     `fi`,
   ].join("\n");
 }
+
+/** The ssh-only self-checks: what rchd's API cannot answer about the dev machine itself. */
+const SELFCHECK_SECTIONS = PROBE_SECTIONS.filter((s) => ["d", "h", "k"].includes(s.key));
+const SELFCHECK_SCRIPT = buildProbeScript(PROBE_NONCE, SELFCHECK_SECTIONS);
 
 /**
  * Split framed probe output back into `key -> {text, rc}`.
@@ -523,9 +548,202 @@ export async function allSettledBounded(items, limit, fn) {
   return out;
 }
 
-/** One dispatcher, one connection. */
-async function collectDispatcher(host) {
-  return dispatcherFromProbe(host, await probeDispatcher(host));
+// ------------------------------------------ tailnet API transport (bd-2f5ms)
+//
+// rchd can serve its `/status` over TCP on the tailnet (`[api] bind =
+// "tailscale"` in config.toml, bearer token). A dispatcher written as
+// `name=host:port` is asked over HTTP instead of ssh: four small GETs, no key
+// exchange, sub-second, so the collector can run every couple of minutes
+// instead of every twenty. What the API cannot answer — `rch doctor`,
+// `rch shim status`, `rch hook status`, which are dev-machine-local CLI
+// checks — still comes over ssh, but only every `--selfcheck-max-age` seconds,
+// cached in a plaintext sidecar OUTSIDE public/ (it holds check names and
+// messages, never hosts or IPs).
+//
+// If the API does not answer (down, wrong token, old rchd), the collector
+// falls back to the full ssh probe for that machine and records why, so a
+// half-rolled fleet keeps reporting instead of going dark.
+
+/**
+ * `name` -> ssh (the original transport). `name=host:port` (or `name=http://…`)
+ * -> rchd's tailnet API. The name is still the ssh target for self-checks and
+ * for the fallback.
+ */
+export function parseDispatcherSpec(spec) {
+  const s = String(spec).trim();
+  const eq = s.indexOf("=");
+  if (eq === -1) return { host: s, api: null };
+  const host = s.slice(0, eq).trim();
+  let api = s.slice(eq + 1).trim();
+  if (api && !/^https?:\/\//i.test(api)) api = `http://${api}`;
+  return { host, api: api ? api.replace(/\/+$/, "") : null };
+}
+
+const API_TIMEOUT_MS = 15_000;
+
+async function fetchApi(base, path, token) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), API_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${base}${path}`, {
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+      signal: ctl.signal,
+      cache: "no-store",
+    });
+    const text = await res.text();
+    return { ok: res.ok, status: res.status, text };
+  } catch (e) {
+    const reason = e?.name === "AbortError" ? `timed out after ${API_TIMEOUT_MS / 1000}s` : String(e?.cause?.message || e?.message || e);
+    return { ok: false, status: 0, text: "", error: reason };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Mirror of `SystemPosture::from_status` in rch/src/status_types.rs, which
+ * the CLI computes from the daemon's status and the API does not carry.
+ * Returns `[posture, description]` with the CLI's exact strings, so the
+ * dashboard's dev-machine verdict is the same whichever transport served it.
+ */
+export function postureFromDaemonStatus(full) {
+  const d = full?.daemon ?? {};
+  const workers = Array.isArray(full?.workers) ? full.workers : [];
+  const admissible = workers.filter((w) => w?.status === "healthy" && w?.pressure_state !== "critical").length;
+  const critical = workers.filter((w) => w?.pressure_state === "critical").length;
+  const total = num(d.workers_total) ?? 0;
+  const healthy = num(d.workers_healthy) ?? 0;
+  if (total === 0 || healthy === 0 || (workers.length > 0 && admissible === 0)) {
+    return ["local_only", "No admissible remote workers available; builds cannot run remotely"];
+  }
+  if (healthy < total || critical > 0) {
+    return ["degraded", "Some workers unavailable or pressure-blocked, partial remote capability"];
+  }
+  return ["remote_ready", "All workers healthy, remote compilation available"];
+}
+
+/**
+ * Remediation hints for the API path. The CLI's hint generator
+ * (`generate_worker_remediations`) lives in the `rch` binary and is not
+ * served over HTTP; the daemon's own `issues[]` carry the same worker, a
+ * summary and the command it wants run, so they become the hints. Their
+ * `reason_code` is `daemon_issue` so a reader can tell the two sources apart.
+ */
+export function hintsFromIssues(issues) {
+  return (Array.isArray(issues) ? issues : [])
+    .filter((i) => i && typeof i === "object")
+    .map((i) => {
+      const m = /Worker '([^']+)'/.exec(String(i.summary ?? ""));
+      const sev = String(i.severity ?? "").toLowerCase();
+      return {
+        worker_id: m ? m[1] : null,
+        severity: sev === "error" || sev === "critical" ? "critical" : sev === "warning" || sev === "warn" ? "warning" : "info",
+        message: i.summary ?? null,
+        suggested_action: i.remediation ?? null,
+        reason_code: "daemon_issue",
+      };
+    });
+}
+
+/**
+ * Turn the API responses into the `sections` map the ssh probe produces, so
+ * `dispatcherFromProbe` stays the ONE parser for both transports. Each
+ * section is re-wrapped in the `{success, data}` envelope the CLI prints;
+ * an API response that is not JSON becomes a failed section, named.
+ */
+export function sectionsFromApi(r, selfChecks) {
+  const sections = new Map();
+  const parsed = (res) => {
+    if (!res?.ok) return null;
+    try { return JSON.parse(res.text); } catch { return null; }
+  };
+  const failed = (res) => ({ text: "", rc: res?.status && res.status !== 200 ? res.status : 1 });
+
+  const full = parsed(r.status);
+  if (full) {
+    const [posture, posture_description] = postureFromDaemonStatus(full);
+    sections.set("s", {
+      text: JSON.stringify({ success: true, data: {
+        posture, posture_description, daemon: full,
+        convergence: selfChecks?.convergence ?? null,
+        remediation_hints: hintsFromIssues(full.issues),
+      } }),
+      rc: 0,
+    });
+  } else {
+    sections.set("s", failed(r.status));
+  }
+  const caps = parsed(r.caps);
+  sections.set("c", caps ? { text: JSON.stringify({ success: true, data: caps }), rc: 0 } : failed(r.caps));
+  const cfg = parsed(r.config);
+  sections.set("l", cfg ? { text: JSON.stringify({ success: true, data: { workers: cfg.workers ?? [] } }), rc: 0 } : failed(r.config));
+  sections.set("m", r.metrics?.ok ? { text: r.metrics.text, rc: 0 } : failed(r.metrics));
+  for (const key of ["d", "h", "k"]) {
+    const sec = selfChecks?.sections?.[key];
+    if (sec && typeof sec.text === "string") sections.set(key, { text: sec.text, rc: sec.rc ?? 0 });
+  }
+  return sections;
+}
+
+/**
+ * The ssh-only self-checks for one machine, from the cache when fresh enough,
+ * otherwise re-probed and cached. A failed ssh leaves the cache entry alone
+ * (a stale answer beats none) and the caller sees the missing sections as
+ * "no output" — unknown, never fine.
+ */
+async function selfChecksFor(host, opts) {
+  const cache = opts?.cache ?? {};
+  const maxAgeMs = (opts?.selfcheckMaxAge ?? 900) * 1000;
+  const entry = cache[host];
+  if (entry && Number.isFinite(Date.parse(entry.at)) && Date.now() - Date.parse(entry.at) < maxAgeMs) {
+    return entry;
+  }
+  const res = await run(host, SELFCHECK_SCRIPT);
+  const split = splitProbeSections(res.stdout);
+  if (split.size === 0) return entry ?? null;
+  const fresh = { at: new Date().toISOString(), sections: {} };
+  for (const key of ["d", "h", "k"]) {
+    const sec = split.get(key);
+    if (sec) fresh.sections[key] = { text: sec.text, rc: sec.rc };
+  }
+  cache[host] = fresh;
+  return fresh;
+}
+
+/** One dispatcher: the tailnet API when it has one and answers, ssh otherwise. */
+async function collectDispatcher(spec, opts = {}) {
+  const { host, api } = parseDispatcherSpec(spec);
+  if (!api) {
+    const d = dispatcherFromProbe(host, await probeDispatcher(host));
+    d.transport = "ssh";
+    return d;
+  }
+  const token = opts.apiToken ?? null;
+  const [status, caps, config, metrics] = await Promise.all([
+    fetchApi(api, "/status", token),
+    fetchApi(api, "/workers/capabilities", token),
+    fetchApi(api, "/workers/config", token),
+    fetchApi(api, "/metrics", null),
+  ]);
+  if (!status.ok) {
+    // The API is the fast path, not the only path. Fall back to the full ssh
+    // probe and say why, so a machine with an old rchd or a wrong token still
+    // reports — with the reason on its record instead of silently.
+    const d = dispatcherFromProbe(host, await probeDispatcher(host));
+    d.transport = "ssh";
+    d.collection_errors.push(
+      `api ${api}/status: ${status.status ? `HTTP ${status.status}` : status.error ?? "no response"} — fell back to ssh`,
+    );
+    return d;
+  }
+  const self = await selfChecksFor(host, opts);
+  const d = dispatcherFromProbe(host, {
+    sections: sectionsFromApi({ status, caps, config, metrics }, self),
+    error: null,
+  });
+  d.transport = "api";
+  d.selfchecks_at = self?.at ?? null;
+  return d;
 }
 
 /**
@@ -1385,29 +1603,53 @@ async function main() {
   // name the same machine, and listing two of them used to double-count
   // dispatchers, builds and active jobs in the totals.
   const seenHosts = new Map();
-  for (const host of args.dispatchers) {
-    const id = dispatcherId(host);
-    if (!seenHosts.has(id)) seenHosts.set(id, host);
-    else console.error(`  note: "${host}" is the same machine as "${seenHosts.get(id)}" — collecting once`);
+  for (const spec of args.dispatchers) {
+    const id = dispatcherId(parseDispatcherSpec(spec).host);
+    if (!seenHosts.has(id)) seenHosts.set(id, spec);
+    else console.error(`  note: "${spec}" is the same machine as "${seenHosts.get(id)}" — collecting once`);
   }
   const targets = [...seenHosts.values()];
 
-  console.error(`collecting from ${targets.length} dev machine(s): ${targets.join(", ")}`);
+  // Tailnet API options (bd-2f5ms). The self-check cache is a plaintext
+  // sidecar like the history file: outside public/, never published, and
+  // holding only doctor/shim/hook output — check names and messages, no
+  // hosts or IPs.
+  const opts = {
+    apiToken: args.apiToken?.trim() || process.env.RCH_DASH_API_TOKEN?.trim() || null,
+    selfcheckMaxAge: args.selfcheckMaxAge,
+    cache: {},
+  };
+  try {
+    const prev = JSON.parse(await readFile(args.selfcheckCache, "utf8"));
+    if (prev && typeof prev === "object" && !Array.isArray(prev)) opts.cache = prev;
+  } catch {
+    opts.cache = {};
+  }
+  const viaApi = targets.filter((t) => parseDispatcherSpec(t).api).length;
+  if (viaApi > 0 && !opts.apiToken) {
+    console.error("  note: dispatchers name an rchd API but no token is set (--api-token / RCH_DASH_API_TOKEN); expect 401s and ssh fallback unless [api] no_token is on");
+  }
+
+  console.error(
+    `collecting from ${targets.length} dev machine(s) (${viaApi} via rchd API, ${targets.length - viaApi} via ssh): ` +
+      targets.map((t) => parseDispatcherSpec(t).host).join(", "),
+  );
   // Settled, not all: this fan-out is the whole snapshot. One dispatcher
   // returning a shape that throws inside the mapper must not abort collection
   // for every other machine — that is the opposite of the resilience the merge
   // below is written for.
-  const settled = await allSettledBounded(targets, args.maxParallel, async (host) => {
-    const d = await collectDispatcher(host);
+  const settled = await allSettledBounded(targets, args.maxParallel, async (spec) => {
+    const host = parseDispatcherSpec(spec).host;
+    const d = await collectDispatcher(spec, opts);
     console.error(
-      `  ${String(host).padEnd(14)} ${d.reachable ? `ok  posture=${d.posture ?? "?"}  workers=${d.workers.length}` : `UNREACHABLE  ${d.collection_errors[0] ?? ""}`}`,
+      `  ${String(host).padEnd(14)} ${d.reachable ? `ok  ${d.transport.padEnd(3)} posture=${d.posture ?? "?"}  workers=${d.workers.length}` : `UNREACHABLE  ${d.collection_errors[0] ?? ""}`}`,
     );
     return d;
   });
 
   const dispatchers = settled.map((r, i) => {
     if (r.status === "fulfilled") return r.value;
-    const host = targets[i];
+    const host = parseDispatcherSpec(targets[i]).host;
     const reason = String(r.reason?.message || r.reason || "collector threw");
     console.error(`  ${String(host).padEnd(14)} FAILED  ${reason}`);
     // Represent the failure as a real, unreachable dispatcher rather than
@@ -1415,12 +1657,24 @@ async function main() {
     // the fleet count.
     return {
       id: dispatcherId(host), reachable: false, collection_errors: [reason], config_degraded: true,
+      transport: parseDispatcherSpec(targets[i]).api ? "api" : "ssh",
       posture: null, posture_description: null, daemon: null, build_stats: null,
       saved_time_ms: null, active_builds: 0, queued_builds: 0,
       builds: [], hints: [], alerts: [], issues: [], active: [], queued: [],
       convergence: null, doctor: null, shim: null, hook: null, tests: null, workers: [],
     };
   });
+
+  // Persist the self-check cache whatever happens below: a probe that ran is
+  // worth keeping even if this snapshot is refused.
+  if (viaApi > 0) {
+    try {
+      await mkdir(dirname(args.selfcheckCache), { recursive: true });
+      await writeFileAtomic(args.selfcheckCache, JSON.stringify(opts.cache));
+    } catch (e) {
+      console.error(`  note: could not write ${args.selfcheckCache}: ${e?.message ?? e}`);
+    }
+  }
 
   if (!dispatchers.some((d) => d.reachable)) {
     console.error("no dispatcher responded — refusing to publish an all-zero snapshot over good data");

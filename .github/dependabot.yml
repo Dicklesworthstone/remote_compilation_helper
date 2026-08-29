@@ -37,9 +37,10 @@ updates:
       - dependency-name: "*"
         update-types: ["version-update:semver-prerelease"]
 
-  # npm dependencies (web dashboard)
+  # npm dependencies (fleet dashboard). The old /web Next.js app is retired;
+  # dashboard/ is the only JS surface that ships.
   - package-ecosystem: "npm"
-    directory: "/web"
+    directory: "/dashboard"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -49,4 +50,4 @@ updates:
       production:
         dependency-type: "production"
     commit-message:
-      prefix: "deps(web)"
+      prefix: "deps(dashboard)"

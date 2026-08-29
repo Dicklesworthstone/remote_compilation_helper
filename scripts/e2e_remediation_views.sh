@@ -152,13 +152,16 @@ else
 fi
 
 # --- web_surface --------------------------------------------------------------
-route_ts="$PROJECT_ROOT/web/src/app/api/remediation/route.ts"
-page_tsx="$PROJECT_ROOT/web/src/app/remediation/page.tsx"
-sidebar="$PROJECT_ROOT/web/src/components/layout/sidebar.tsx"
-if [[ -f "$route_ts" && -f "$page_tsx" ]] && grep -q "'/remediation'" "$sidebar" 2>/dev/null; then
-    emit "web_surface" "assert" "pass" "web:/remediation" "" "0" "route.ts + page.tsx + sidebar nav present"
+# The remediation view now ships in dashboard/ (the old web/ Next.js app is
+# retired): the problems module every surface renders from, the endpoint that
+# serves it to agents, and the panel that shows it to humans.
+problems_js="$PROJECT_ROOT/dashboard/src/problems.js"
+llm_view="$PROJECT_ROOT/dashboard/tools/llm-view.mjs"
+panel="$PROJECT_ROOT/dashboard/src/components/Problems.tsx"
+if [[ -f "$problems_js" && -f "$panel" ]] && grep -q '"problems"' "$llm_view" 2>/dev/null; then
+    emit "web_surface" "assert" "pass" "dashboard:problems" "" "0" "problems.js + llm-view problems view + Problems panel present"
 else
-    emit "web_surface" "assert" "fail" "web:/remediation" "web_surface_missing" "0" "missing web remediation route/page/nav"
+    emit "web_surface" "assert" "fail" "dashboard:problems" "web_surface_missing" "0" "missing dashboard problems module/view/panel"
 fi
 
 # Mirror the suite log so run_all_e2e.sh collects it regardless of target dir.

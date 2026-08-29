@@ -126,6 +126,50 @@ canonical_root = "/Users/me/Projects"
 alias_root = "/Users/me/p"
 ```
 
+### `[api]` — daemon status API over the tailnet
+
+`rchd`'s rich state (`/status`, `/workers/capabilities`) lives on a `0600` Unix
+socket that only the local user can read. This section serves the same JSON on
+a TCP listener so agents and the fleet dashboard on *other* machines can ask a
+dispatcher "why are you local-only right now?" without ssh. It is designed for
+a Tailscale tailnet and is **off** unless `bind` is set.
+
+- `bind` (string, default `""` = off) — `"tailscale"` resolves this machine's
+  Tailscale IPv4 at daemon start (port 9101); `"tailscale:PORT"`, `"IP:PORT"`
+  or `"[v6]:PORT"` are taken literally. The address must be loopback or inside
+  Tailscale's ranges (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`); anything else is
+  refused at startup — the payload carries worker hosts and IPs.
+- `token` (string, optional) — bearer token required on `/status`,
+  `/workers/capabilities`, `/workers/config`. Sent as
+  `Authorization: Bearer <token>` or `X-Rch-Token: <token>`.
+- `token_file` (string, optional) — file holding the token (trimmed, `~`
+  expanded). Wins over `token`. Keep it `0600`.
+- `no_token` (bool, default `false`) — serve the status routes with no token.
+  Honoured only when no token is configured and must be set explicitly, so an
+  empty token is never an accidental open door.
+- `allow_any_addr` (bool, default `false`) — permit a bind outside loopback and
+  the Tailscale ranges. You almost never want this.
+
+`/health`, `/ready`, `/metrics` and `/budget` are served on the same listener
+without a token, exactly as on loopback `:9100`. A bad `[api]` section is
+logged with its fix and the daemon keeps running without the API — a dashboard
+knob must never stop builds. CLI overrides: `rchd --api-bind`,
+`rchd --api-token-file`. Set from the CLI:
+
+```bash
+head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' > ~/.config/rch/api.token
+chmod 600 ~/.config/rch/api.token
+rch config set api.bind tailscale
+rch config set api.token_file ~/.config/rch/api.token
+# then restart rchd; verify from another tailnet box:
+curl -H "Authorization: Bearer $(cat ~/.config/rch/api.token)" http://100.x.y.z:9101/status | jq .daemon
+```
+
+### `[dashboard]`
+- `url` (string, optional) — where the fleet dashboard is served, e.g.
+  `https://rch-fleet.vercel.app`. `rch web` opens it (`--url` and
+  `RCH_DASHBOARD_URL` override). Agents use `<url>/api/fleet?view=help`.
+
 ## Workers Config (`workers.toml`)
 
 Location: `~/.config/rch/workers.toml`
@@ -220,9 +264,9 @@ Used by hook integration scripts (see `docs/extending/integration-hooks.md`):
 - `RCH_AVAILABLE_WORKERS`
 - `RCH_TEST_HOOK`
 
-### Web dashboard
+### Fleet dashboard
 
-- `RCH_API_URL`
+- `RCH_DASHBOARD_URL` — the URL `rch web` opens (overrides `[dashboard] url`).
 
 ### Installer / setup helpers
 

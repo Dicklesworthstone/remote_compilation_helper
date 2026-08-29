@@ -19,6 +19,7 @@ import {
   isLocalDispatcher, dispatcherId,
   encrypt, verifyRoundTrip, existingSalt, internSnapshotStrings,
   buildProbeScript, splitProbeSections, dispatcherFromProbe, allSettledBounded, describeExecError,
+  parseDispatcherSpec, postureFromDaemonStatus, hintsFromIssues, sectionsFromApi,
   mergeWorkers, computeTotals, projectDispatchers,
 } from "../tools/snapshot.mjs";
 import { expandBuilds, expandHints } from "../tools/llm-view.mjs";
@@ -421,6 +422,91 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
   chk("a status with none of the new arrays yields empty arrays, not undefined",
     Array.isArray(healthy.alerts) && healthy.alerts.length === 0 && Array.isArray(healthy.active) &&
     healthy.active.length === 0 && healthy.convergence === null && healthy.tests === null);
+}
+
+// ------------------------------------------ tailnet API transport (bd-2f5ms)
+{
+  // Spec parsing: ssh by name, API by `name=host:port`.
+  chk("a bare name is ssh", JSON.stringify(parseDispatcherSpec("css")) === JSON.stringify({ host: "css", api: null }));
+  chk("name=host:port is the API, http-prefixed and unslashed",
+    JSON.stringify(parseDispatcherSpec(" css = 100.90.148.85:9101/ ")) ===
+      JSON.stringify({ host: "css", api: "http://100.90.148.85:9101" }));
+  chk("an explicit scheme is kept",
+    parseDispatcherSpec("hz1=https://hz1.tail:9101").api === "https://hz1.tail:9101");
+  chk("the local machine can be an API target too",
+    parseDispatcherSpec("local=127.0.0.1:9101").host === "local");
+
+  // Posture: the CLI's rule (rch/src/status_types.rs SystemPosture::from_status), verbatim.
+  const status = (over = {}, workers = []) => ({ daemon: { workers_total: 2, workers_healthy: 2, ...over }, workers });
+  const w = (status, pressure = null) => ({ status, pressure_state: pressure });
+  chk("no workers -> local_only", postureFromDaemonStatus(status({ workers_total: 0, workers_healthy: 0 }))[0] === "local_only");
+  chk("none healthy -> local_only", postureFromDaemonStatus(status({ workers_healthy: 0 }))[0] === "local_only");
+  chk("all critical pressure -> local_only (no admissible worker)",
+    postureFromDaemonStatus(status({}, [w("healthy", "critical"), w("healthy", "critical")]))[0] === "local_only");
+  chk("one unhealthy -> degraded", postureFromDaemonStatus(status({ workers_healthy: 1 }, [w("healthy"), w("unreachable")]))[0] === "degraded");
+  chk("one critical among healthy -> degraded",
+    postureFromDaemonStatus(status({}, [w("healthy", "critical"), w("healthy")]))[0] === "degraded");
+  chk("all healthy -> remote_ready, with the CLI's description",
+    JSON.stringify(postureFromDaemonStatus(status({}, [w("healthy"), w("healthy")]))) ===
+      JSON.stringify(["remote_ready", "All workers healthy, remote compilation available"]));
+  chk("the degraded description is the CLI's exact string",
+    postureFromDaemonStatus(status({ workers_healthy: 1 }))[1] === "Some workers unavailable or pressure-blocked, partial remote capability");
+
+  // Hints from issues.
+  const hints = hintsFromIssues([
+    { severity: "error", summary: "Worker 'wsurf' is unreachable", remediation: "rch workers probe wsurf" },
+    { severity: "warning", summary: "Operating at reduced capacity", remediation: null },
+    7,
+  ]);
+  chk("issues become hints with the worker parsed out and severities mapped",
+    hints.length === 2 && hints[0].worker_id === "wsurf" && hints[0].severity === "critical" &&
+    hints[0].suggested_action === "rch workers probe wsurf" && hints[0].reason_code === "daemon_issue" &&
+    hints[1].worker_id === null && hints[1].severity === "warning",
+    JSON.stringify(hints));
+
+  // The whole API path through the ONE parser.
+  const FULL = {
+    daemon: { version: "1.0.61", uptime_secs: 5, pid: 9, workers_total: 1, workers_healthy: 1, slots_total: 8, slots_available: 8 },
+    workers: [{ id: "hz3", host: "h", user: "u", status: "healthy", circuit_state: "closed", used_slots: 0, total_slots: 8, speed_score: 50 }],
+    stats: { total_builds: 1, remote_count: 1, local_count: 0, success_count: 1, failure_count: 0, avg_duration_ms: 1 },
+    recent_builds: [], active_builds: [], queued_builds: [], alerts: [],
+    issues: [{ severity: "error", summary: "Worker 'hz3' is unreachable", remediation: "rch workers probe hz3" }],
+  };
+  const ok = (obj) => ({ ok: true, status: 200, text: typeof obj === "string" ? obj : JSON.stringify(obj) });
+  const api = {
+    status: ok(FULL),
+    caps: ok({ workers: [{ id: "hz3", capabilities: { num_cpus: 64 } }] }),
+    config: ok({ workers: [{ id: "hz3", tags: ["big"], priority: 120, status: "healthy" }] }),
+    metrics: ok('rch_worker_last_seen_timestamp{worker="hz3"} 1787800000\n'),
+  };
+  const self = { at: "2026-08-29T00:00:00.000Z", sections: {
+    d: { text: JSON.stringify({ success: true, data: { summary: { total: 1, passed: 1, warnings: 0, failed: 0 }, checks: [] } }), rc: 0 },
+    h: { text: JSON.stringify({ success: true, data: { installed: true, up_to_date: true, on_path_ahead_of_cargo: true, local_builds_running: 0 } }), rc: 0 },
+    k: { text: JSON.stringify({ success: true, data: { agents: [{ agent: "ClaudeCode", status: "Installed" }] } }), rc: 0 },
+  } };
+  const viaApi = dispatcherFromProbe("hz3-dev", { sections: sectionsFromApi(api, self), error: null });
+  chk("the API path yields a reachable dispatcher with posture, workers, tags, metrics and self-checks",
+    viaApi.reachable && viaApi.posture === "remote_ready" && viaApi.workers[0].tags[0] === "big" &&
+    viaApi.workers[0].caps.num_cpus === 64 && viaApi.workers[0].last_seen_unix === 1787800000 &&
+    viaApi.doctor.passed === 1 && viaApi.shim.installed === true && viaApi.hook.claude_code === true &&
+    viaApi.collection_errors.length === 0,
+    JSON.stringify(viaApi.collection_errors));
+  chk("the API path's hints come from the daemon's issues",
+    viaApi.hints.length === 1 && viaApi.hints[0][0] === "hz3" && viaApi.hints[0][4] === "daemon_issue");
+  chk("the API path carries the daemon version and build stats like ssh does",
+    viaApi.daemon.version === "1.0.61" && viaApi.build_stats.remote === 1);
+  // No self-checks cached yet: unknown, named, never fine.
+  const noSelf = dispatcherFromProbe("hz3-dev", { sections: sectionsFromApi(api, null), error: null });
+  chk("missing self-checks are unknown and named",
+    noSelf.reachable && noSelf.doctor === null && noSelf.shim === null && noSelf.hook === null &&
+    noSelf.collection_errors.length === 3 && noSelf.collection_errors[0] === "doctor: no output");
+  // A 401 on /status is a failed status section with the HTTP code as rc.
+  const denied = sectionsFromApi({ ...api, status: { ok: false, status: 401, text: "401 supply the token\n" } }, self);
+  chk("a refused /status is a failed section carrying the HTTP status",
+    denied.get("s").rc === 401 && denied.get("s").text === "");
+  // Non-JSON where JSON was expected is a failed section, not a crash.
+  const junk = sectionsFromApi({ ...api, caps: ok("<html>oops</html>") }, self);
+  chk("non-JSON capabilities is a failed section", junk.get("c").rc === 1);
 }
 
 // ------------------------------------------------- exec error descriptions

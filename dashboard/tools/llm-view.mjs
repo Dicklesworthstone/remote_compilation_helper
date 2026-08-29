@@ -528,6 +528,8 @@ export function buildLlmView(snap, opts = {}) {
         : d.shim.installed === true ? "ok" : "?"
       : "",
     doctor: d.doctor ? `${d.doctor.passed}/${d.doctor.total}` : "",
+    // How this row was collected: `api` (rchd tailnet API, live) or `ssh`.
+    via: d.transport ?? "",
     workers_healthy: d.daemon?.workers_healthy ?? null,
     workers_total: d.daemon?.workers_total ?? null,
     slots_free: d.daemon?.slots_available ?? null,

@@ -3467,8 +3467,9 @@ Remediation workflows (machine-readable list under `remediation_workflows`):
 
 Dashboards and metrics:
   rch dashboard                          # interactive TUI (press 'R' for remediation)
-  rch web                                # web dashboard incl. /remediation route
-  rchd serves Prometheus metrics (rch_remediation_* families) at its /metrics endpoint.
+  rch web --no-open                      # fleet dashboard URL + its agent endpoint (/api/fleet?view=help)
+  rchd serves Prometheus metrics (rch_remediation_* families) at its /metrics endpoint,
+  and, with [api] bind set, its full /status JSON on the tailnet (see configuration guide).
 "#
 }
 
@@ -7599,29 +7600,34 @@ mod tests {
         let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "web"]).unwrap();
         match cli.command {
-            Some(Commands::Web {
-                port,
-                no_open,
-                prod,
-            }) => {
-                assert_eq!(port, 3000);
+            Some(Commands::Web { url, no_open }) => {
+                assert!(url.is_none());
                 assert!(!no_open);
-                assert!(!prod);
             }
             _ => fail_expected("Expected web command"),
         }
     }
 
     #[test]
-    fn cli_parses_web_custom_port() {
+    fn cli_parses_web_url_and_no_open() {
         let _guard = test_guard!();
-        let cli = Cli::try_parse_from(["rch", "web", "--port", "3001"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["rch", "web", "--url", "https://x.example", "--no-open"]).unwrap();
         match cli.command {
-            Some(Commands::Web { port, .. }) => {
-                assert_eq!(port, 3001);
+            Some(Commands::Web { url, no_open }) => {
+                assert_eq!(url.as_deref(), Some("https://x.example"));
+                assert!(no_open);
             }
             _ => fail_expected("Expected web command"),
         }
+    }
+
+    #[test]
+    fn cli_rejects_the_retired_web_port_flag() {
+        let _guard = test_guard!();
+        // The Next.js dev-server flags are gone with the server they drove.
+        assert!(Cli::try_parse_from(["rch", "web", "--port", "3001"]).is_err());
+        assert!(Cli::try_parse_from(["rch", "web", "--prod"]).is_err());
     }
 
     #[test]
@@ -8081,12 +8087,19 @@ mod tests {
             "https://flag"
         );
         // Blank means "not set here", so the next source wins.
-        assert_eq!(f("  ", "https://env", "https://cfg").unwrap(), "https://env");
+        assert_eq!(
+            f("  ", "https://env", "https://cfg").unwrap(),
+            "https://env"
+        );
         assert_eq!(f("", "", "https://cfg").unwrap(), "https://cfg");
         // Trimmed, as every reader trims.
         assert_eq!(
-            resolve_dashboard_url_from(Some("  https://rch-fleet.vercel.app \n".into()), None, None)
-                .unwrap(),
+            resolve_dashboard_url_from(
+                Some("  https://rch-fleet.vercel.app \n".into()),
+                None,
+                None
+            )
+            .unwrap(),
             "https://rch-fleet.vercel.app"
         );
     }
@@ -8105,10 +8118,15 @@ mod tests {
     fn resolve_dashboard_url_without_any_source_explains_how_to_set_one() {
         let _guard = test_guard!();
         let err = resolve_dashboard_url_from(Some("   ".into()), None, None).unwrap_err();
-        let msg = format!("{err:?}");
+        // The `rch config set dashboard.url …` guidance lives in the miette
+        // help text, which anyhow's Debug does not render; assert the variant
+        // (whose help carries it) rather than the flattened string.
         assert!(
-            msg.contains("dashboard.url"),
-            "should point at `rch config set dashboard.url`: {msg}"
+            matches!(
+                err.downcast_ref::<error::WebError>(),
+                Some(error::WebError::NoDashboardUrl)
+            ),
+            "expected WebError::NoDashboardUrl, got {err:?}"
         );
     }
 

@@ -287,6 +287,14 @@ export interface Dispatcher {
    * that were the real config.
    */
   config_degraded: boolean;
+  /**
+   * How this machine was collected: `api` = rchd's tailnet status API,
+   * `ssh` = the `rch … --json` probe (also the fallback when the API did not
+   * answer — then `collection_errors` says why). Absent on older snapshots.
+   */
+  transport?: "api" | "ssh";
+  /** When the ssh self-checks (doctor/shim/hook) behind an API-collected record were taken. */
+  selfchecks_at?: string | null;
   posture: string | null;
   posture_description: string | null;
   daemon: {

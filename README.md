@@ -478,6 +478,12 @@ RCH exposes observability through daemon APIs and metrics:
 - OpenTelemetry tracing integration
 - telemetry-backed worker SpeedScore history
 - queue/build history, active alerts, cancellation metadata in status APIs
+- an opt-in **tailnet status API** (`[api] bind = "tailscale"`): the daemon's
+  full `/status` JSON over TCP, bearer-token gated, bound only to loopback or
+  Tailscale addresses — so agents on other machines can ask a dispatcher "why
+  are you local-only right now?" without ssh
+- the **fleet dashboard** under `dashboard/` (encrypted static console + an
+  agent endpoint `GET /api/fleet?view=problems|diagnose|help`); `rch web` opens it
 
 Quick checks:
 

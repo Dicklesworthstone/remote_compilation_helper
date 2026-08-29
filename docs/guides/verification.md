@@ -32,13 +32,18 @@ rch dashboard
 
 This shows live worker status, active builds, and recent history.
 
-### Web Dashboard
+### Fleet Dashboard
 
 ```bash
-rch web
+rch config set dashboard.url https://rch-fleet.vercel.app   # once
+rch web                                                      # opens it
+rch web --no-open                                            # just print the URLs
 ```
 
-Then open `http://localhost:3000` in your browser.
+The dashboard is the encrypted static console under `dashboard/` (see
+`dashboard/README.md`). Agents should read `<url>/api/fleet?view=help`. For live
+per-machine state without the snapshot lag, enable the daemon's tailnet API
+(`[api]` in the configuration guide) and query `http://<tailscale-ip>:9101/status`.
 
 ### CLI Watch Loop
 
