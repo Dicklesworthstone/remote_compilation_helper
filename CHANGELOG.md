@@ -35,6 +35,7 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v1.0.62`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.62) | Release | 2026-08-29 | Convergence over the tailnet API: `GET /repo-convergence/status` token-gated on `:9101`; the dashboard collector folds it in so `worker.convergence_drift` fires on API-collected boxes |
 | [`v1.0.61`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.61) | Release | 2026-08-29 | rchd tailnet status API (`[api]`); dashboard publishes 2-min snapshots to Vercel Blob over that API; problems/diagnose agent views; `web/` retired |
 | [`v1.0.60`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.60) | Release | 2026-08-28 | Shim v3: every local shim fallback capped via `CARGO_BUILD_JOBS`; Windows CIM telemetry; socket reload honours `--workers-config` |
 | [`v1.0.59`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.59) | Release | 2026-08-27 | Shim v2: `--message-format` no longer forces local; `cargo-clippy` shimmed; `RUSTC_WORKSPACE_WRAPPER` guard |
@@ -104,6 +105,38 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 ---
 
 ## [Unreleased]
+
+## [v1.0.62] -- 2026-08-29 (release)
+
+The one route the tailnet API was still missing. `rch status --json` folds repo-convergence
+into its output, but a dashboard collector asking over HTTP got `/status` without it — so
+API-collected machines could never raise `worker.convergence_drift`, and a worker quietly
+missing repos looked healthy from the fleet view (bead
+[`bd-ngln7`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl)).
+
+**Delivered capability**
+
+- `GET /repo-convergence/status[?worker=<id>]` on the rchd tailnet API (`[api]` listener,
+  `:9101`), token-gated like `/status`, serving the exact body the Unix socket serves.
+- The dashboard collector (`dashboard/tools/snapshot.mjs`) issues it as a fifth GET and folds
+  the answer into the synthesized status section, so `worker.convergence_drift` problem rows
+  fire identically on API-collected and ssh-collected machines. An rchd too old to serve the
+  route (404) leaves the convergence column UNKNOWN with a named `repo-convergence: HTTP 404`
+  collection error — never a silent "no drift".
+
+**Closed workstreams**
+
+- [`bd-ngln7`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl)
+  — serve `/repo-convergence/status` on the rchd tailnet API.
+
+**Representative commits**
+
+- [`af2e77a9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/af2e77a963a170374058a5df47599075da3fa496)
+  — the route, its token gate, and the router tests.
+- [`2418b69d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2418b69dd1317fd9e9239d81440f2584e01d6a45)
+  — the collector's fifth GET with the 404-means-unknown fallback and tests.
+- [`5c2ac121`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5c2ac1210649bae27fcf8b286554487fa2a9372e)
+  — compile fix and route documentation.
 
 ## [v1.0.61] -- 2026-08-29 (release)
 
@@ -1782,7 +1815,8 @@ First tagged version. Marks the project's initial functional milestone after 9 d
 - Everything below `v1.0.16` in the reference block uses compare links; newer versions link
   straight to their release or tag page in the timeline.
 
-[Unreleased]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.61...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.62...HEAD
+[v1.0.62]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.61...v1.0.62
 [v1.0.16]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.15...v1.0.16
 [v1.0.15]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.14...v1.0.15
 [v1.0.14]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.13...v1.0.14
