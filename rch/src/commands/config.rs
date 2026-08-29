@@ -552,6 +552,82 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         )
     );
 
+    // Tailnet status API (bd-2f5ms). The token value is never printed.
+    println!("\n{}", style.highlight("[api]"));
+    println!(
+        "  {} = {}",
+        style.key("bind"),
+        format_with_source(
+            "api.bind",
+            &style.value(&format!("\"{}\"", config.api.bind)),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("token"),
+        format_with_source(
+            "api.token",
+            &style.value(
+                if config
+                    .api
+                    .token
+                    .as_deref()
+                    .is_some_and(|t| !t.trim().is_empty())
+                {
+                    "(set)"
+                } else {
+                    "(none)"
+                }
+            ),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("token_file"),
+        format_with_source(
+            "api.token_file",
+            &style.value(&format!(
+                "\"{}\"",
+                config.api.token_file.as_deref().unwrap_or("")
+            )),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("no_token"),
+        format_with_source(
+            "api.no_token",
+            &style.value(&config.api.no_token.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("allow_any_addr"),
+        format_with_source(
+            "api.allow_any_addr",
+            &style.value(&config.api.allow_any_addr.to_string()),
+            &value_sources
+        )
+    );
+
+    println!("\n{}", style.highlight("[dashboard]"));
+    println!(
+        "  {} = {}",
+        style.key("url"),
+        format_with_source(
+            "dashboard.url",
+            &style.value(&format!(
+                "\"{}\"",
+                config.dashboard.url.as_deref().unwrap_or("")
+            )),
+            &value_sources
+        )
+    );
+
     // Show config file locations
     println!(
         "\n{}",
@@ -862,6 +938,49 @@ pub(super) fn collect_value_sources(
         &mut values,
         "path_topology.alias_root",
         alias_root_effective,
+        sources,
+    );
+
+    // Tailnet status API and dashboard URL (bd-2f5ms). The token itself is
+    // never echoed: `config get api.token` reports only whether one is set.
+    push_value_source(&mut values, "api.bind", config.api.bind.clone(), sources);
+    push_value_source(
+        &mut values,
+        "api.token",
+        if config
+            .api
+            .token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
+        {
+            "(set)".to_string()
+        } else {
+            String::new()
+        },
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "api.token_file",
+        config.api.token_file.clone().unwrap_or_default(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "api.no_token",
+        config.api.no_token.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "api.allow_any_addr",
+        config.api.allow_any_addr.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "dashboard.url",
+        config.dashboard.url.clone().unwrap_or_default(),
         sources,
     );
 

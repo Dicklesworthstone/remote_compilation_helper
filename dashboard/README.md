@@ -115,8 +115,13 @@ npm run dev               # http://localhost:5173
 
 ```sh
 RCH_DASH_PASSPHRASE='<32+ random chars>'
-RCH_DASH_DISPATCHERS='builder-a,builder-b,local'
+# `name` = probe over ssh; `name=tailscale-ip:9101` = ask rchd's tailnet API
+# (fast; see "How machines are collected" below)
+RCH_DASH_DISPATCHERS='builder-a=100.64.1.2:9101,builder-b=100.64.1.3:9101,local=100.64.1.1:9101'
+RCH_DASH_API_TOKEN='<the [api] token every rchd was configured with>'
 RCH_DASH_LABEL='my rch fleet'
+# after the blob store exists (see "Two ticks" below):
+RCH_DASH_DATA_URL='https://<store>.public.blob.vercel-storage.com/fleet.enc.json'
 ```
 
 Quote every value. `set -a; . ./.env` word-splits unquoted values and will
@@ -180,40 +185,80 @@ scripts/deploy.sh --repo git@github.com:<you>/<private-dash>.git
 Prefer a **private** repo's Pages site. The script refuses to target a public
 repo without a typed confirmation.
 
-### Neither is a CI job — on purpose
+### Two ticks: publish the snapshot (fast), deploy the app (slow)
 
-Both scripts are local. A monitoring dashboard that silently stops refreshing is
-worse than no dashboard, and scheduled CI is exactly the thing that stops
-quietly. Run it on a schedule from a box you control.
+Freshness and code ship on different schedules:
 
-**macOS (launchd)** — the checked-in agent runs `deploy-vercel.sh` every 20
-minutes and logs to `~/Library/Logs/rch-dashboard-refresh.log`:
+| Tick | Script | What it does | Cadence |
+|---|---|---|---|
+| **publish** | `scripts/publish-snapshot.sh` | collect (1–3 s over the tailnet API), encrypt, upload the ciphertext to **Vercel Blob**. No deploy. | every **120 s** |
+| **deploy** | `scripts/deploy-vercel.sh` | build the app + `/api/fleet` function and deploy them (with a bundled fallback snapshot) | hourly, or when code changed |
+
+The app and `/api/fleet` fetch the blob at runtime (`RCH_DASH_DATA_URL`; the
+blob's CDN cache is 60 s), so a change on the fleet is visible within about
+three minutes, and a deploy is no longer what makes data fresh. If the blob is
+unreachable both fall back to the deploy-time copy **and say so** (a banner in
+the app; `X-Rch-Snapshot-Source: bundled-fallback` on the endpoint).
+
+One-time setup for the blob (needs a Vercel Blob store connected to the project):
 
 ```sh
-sed "s#__DASHBOARD_DIR__#$PWD#g; s#__HOME__#$HOME#g" \
-  ../packaging/launchd/com.local.rch-dashboard-refresh.plist \
-  > ~/Library/LaunchAgents/com.local.rch-dashboard-refresh.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.rch-dashboard-refresh.plist
-launchctl kickstart -k gui/$(id -u)/com.local.rch-dashboard-refresh   # run one now
+vercel link --yes --project rch-fleet
+vercel blob create-store rch-fleet-blob --access public \
+  --environment production --environment preview --environment development --yes
+vercel env pull .env.vercel --environment production --yes     # BLOB_READ_WRITE_TOKEN
+scripts/publish-snapshot.sh                                    # prints the blob URL
+echo "RCH_DASH_DATA_URL='https://<store>.public.blob.vercel-storage.com/fleet.enc.json'" >> .env
+printf '%s' "$URL" | vercel env add RCH_DASH_DATA_URL production --yes   # the function reads it
+scripts/deploy-vercel.sh                                       # bakes VITE_RCH_DASH_DATA_URL into the app
+```
+
+Neither tick is a CI job, on purpose: a monitoring dashboard that silently stops
+refreshing is worse than no dashboard, and scheduled CI is exactly the thing
+that stops quietly. Run both from a box you control.
+
+**macOS (launchd)** — two checked-in agents, logging to
+`~/Library/Logs/rch-dashboard-{publish,refresh}.log`:
+
+```sh
+for a in publish refresh; do
+  sed "s#__DASHBOARD_DIR__#$PWD#g; s#__HOME__#$HOME#g" \
+    ../packaging/launchd/com.local.rch-dashboard-$a.plist \
+    > ~/Library/LaunchAgents/com.local.rch-dashboard-$a.plist
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.rch-dashboard-$a.plist
+done
+launchctl kickstart -k gui/$(id -u)/com.local.rch-dashboard-publish   # run one now
 ```
 
 **Linux (cron)**:
 
 ```sh
-*/20 * * * * cd /path/to/dashboard && ./scripts/deploy-vercel.sh >>"$HOME/rch-dashboard-refresh.log" 2>&1
+*/2  * * * * cd /path/to/dashboard && ./scripts/publish-snapshot.sh >>"$HOME/rch-dashboard-publish.log" 2>&1
+0    * * * * cd /path/to/dashboard && ./scripts/deploy-vercel.sh   >>"$HOME/rch-dashboard-refresh.log" 2>&1
 ```
 
-Why 20 minutes and not 2: collection itself takes 2–4 s, but every refresh is
-currently a Vercel *deployment* (the snapshot ships inside the static bundle and
-`/api/fleet` imports it at build time), and Vercel's Hobby tier caps deployments
-at 100/day (Pro allows 6,000/day — on Pro, `StartInterval` 300 is safe and the
-only thing standing between you and 5-minute freshness). Publishing the blob
-without a deploy is tracked as `bd-04ifk`; until then the browser's 5-minute
-poll and the endpoint see whatever the last tick published, and the header's
-snapshot age tells you exactly how old that is.
+Without a blob store the deploy tick alone still works (the app is then
+static-only and every refresh is a deployment — Vercel's Hobby tier caps those
+at 100/day, so keep that tick at 20 minutes or more).
 
-Each run appends to a rolling aggregate history (`.snapshot-history.json`, kept
-outside `public/` so it is never published) which drives the trend sparklines.
+Each publish appends to a rolling aggregate history (`.snapshot-history.json`,
+kept outside `public/` so it is never published) which drives the trend
+sparklines, and refreshes the ssh self-check cache (`.selfcheck-cache.json`,
+same treatment).
+
+### How machines are collected: the tailnet API, with ssh behind it
+
+`rchd` can serve its full `/status` JSON over TCP on the tailnet (`[api]
+bind = "tailscale"` in `config.toml`, bearer token — see
+`docs/guides/configuration.md`). A dispatcher written as `name=100.x.y.z:9101`
+in `RCH_DASH_DISPATCHERS` is asked over HTTP: four small GETs, no ssh key
+exchange, sub-second, with `RCH_DASH_API_TOKEN` as the bearer. What the API
+cannot answer — `rch doctor`, `rch shim status`, `rch hook status`, which are
+dev-machine-local CLI checks — still comes over ssh, but only every 15 minutes
+(`--selfcheck-max-age`), cached locally. A machine whose API does not answer
+(old `rchd`, wrong token) falls back to the full ssh probe for that tick, and
+its record says so (`dev.collection_error`, and `via: ssh` in the agent view's
+dev-machine rows). Plain `name` entries are ssh-only, as before.
 
 ---
 
@@ -441,9 +486,10 @@ dashboard/
   tools/fleet-llm.mjs       local CLI over the same views (npm run llm)
   api/fleet.mjs             GET /api/fleet — the same views over HTTP
   src/problems.js           problem + next-action derivation, shared by page and endpoint
-  scripts/deploy-vercel.sh  build + prebuilt deploy to Vercel
+  scripts/publish-snapshot.sh  collect + upload the ciphertext to Vercel Blob (the 2-minute tick)
+  scripts/deploy-vercel.sh  build + prebuilt deploy to Vercel (the hourly / on-change tick)
   scripts/deploy.sh         build + deploy to GitHub Pages
-  ../packaging/launchd/     the macOS refresh schedule (20-minute deploy tick)
+  ../packaging/launchd/     the macOS schedules for both ticks
   tests/snapshot.mjs        collector units (probe framing, section isolation, merge)
   tests/parity.mjs          browser vs endpoint classifiers + problem rows must agree
   tests/endpoint.mjs        /api/fleet against the real bundle and live snapshot

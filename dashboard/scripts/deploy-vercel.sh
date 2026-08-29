@@ -60,8 +60,11 @@ if [ ! -f public/data/fleet.enc.json ]; then
   exit 1
 fi
 
-echo "==> building (base=/ for Vercel root hosting)"
-RCH_DASH_BASE=/ npm run build
+echo "==> building (base=/ for Vercel root hosting; live snapshot: ${RCH_DASH_DATA_URL:-none, static only})"
+# VITE_RCH_DASH_DATA_URL is the Blob URL `scripts/publish-snapshot.sh` writes
+# to; the app fetches it first and falls back to the bundled copy. Empty keeps
+# the app static-only (GitHub Pages, no blob store).
+RCH_DASH_BASE=/ VITE_RCH_DASH_DATA_URL="${RCH_DASH_DATA_URL:-}" npm run build
 
 echo "==> bundling /api/fleet (LLM endpoint)"
 # The snapshot is imported INTO the bundle, so the function needs no filesystem
@@ -119,7 +122,7 @@ const sec = {
   "strict-transport-security": "max-age=63072000; includeSubDomains; preload",
   "content-security-policy":
     "default-src '"'"'self'"'"'; script-src '"'"'self'"'"'; style-src '"'"'self'"'"' '"'"'unsafe-inline'"'"'; " +
-    "img-src '"'"'self'"'"' data:; connect-src '"'"'self'"'"'; font-src '"'"'self'"'"'; object-src '"'"'none'"'"'; " +
+    "img-src '"'"'self'"'"' data:; connect-src '"'"'self'"'"' https://*.public.blob.vercel-storage.com; font-src '"'"'self'"'"'; object-src '"'"'none'"'"'; " +
     "base-uri '"'"'none'"'"'; form-action '"'"'none'"'"'; frame-ancestors '"'"'none'"'"'",
 };
 const cfg = { version: 3, routes: [

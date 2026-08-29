@@ -263,7 +263,7 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
       {(d.active_records.length > 0 || d.queued_records.length > 0) && (
         <div className="kv-group">
           <h4>Builds in flight ({d.active_records.length} active · {d.queued_records.length} queued)</h4>
-          <div className="builds">
+          <div className="builds inflight">
             {d.active_records.map((b, i) => {
               // Same rules as the problem list and the card — see src/problems.js.
               const dead = isHookDead(b);
@@ -385,7 +385,7 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
         {buildRows.length === 0 ? (
           <div className="empty" style={{ padding: 16 }}>no builds recorded</div>
         ) : (
-          <div className="builds">
+          <div className="builds recent">
             {buildRows.map((b) => (
               <div key={b.key} className="build-row">
                 <span className={`pill ${b.remote ? "healthy" : "warn"}`}>{b.remote ? "remote" : "local"}</span>

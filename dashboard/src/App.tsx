@@ -17,7 +17,15 @@ import { Problems } from "./components/Problems";
 import { buildProblems } from "./problems";
 
 
-const DATA_URL = `${import.meta.env.BASE_URL}data/fleet.enc.json`;
+/** The snapshot baked into this deployment — the fallback, and the only source when no live URL is configured. */
+const STATIC_DATA_URL = `${import.meta.env.BASE_URL}data/fleet.enc.json`;
+/**
+ * The live snapshot (Vercel Blob), republished by `scripts/publish-snapshot.sh`
+ * every couple of minutes without a deploy. Baked in at build time from
+ * `VITE_RCH_DASH_DATA_URL`; empty means "static only" (GitHub Pages, local dev).
+ */
+const LIVE_DATA_URL: string | null =
+  (import.meta.env.VITE_RCH_DASH_DATA_URL as string | undefined)?.trim() || null;
 
 /** Filter/sort state persists in the URL hash so views are shareable. */
 function readViewPref(): { query: string; statusFilter: HealthLevel | "all"; sort: Sort } {
@@ -103,11 +111,35 @@ export default function App() {
   }, []);
 
   const loadEnvelope = useCallback(async (): Promise<Envelope | null> => {
-    try {
-      const res = await fetch(`${DATA_URL}?t=${Date.now()}`, { cache: "no-store" });
+    const fetchEnvelope = async (url: string): Promise<Envelope> => {
+      const res = await fetch(`${url}?t=${Date.now()}`, { cache: "no-store" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const env = (await res.json()) as Envelope;
       if (!env?.ciphertext || !env?.kdf?.salt) throw new Error("not an encrypted snapshot");
+      return env;
+    };
+    // Live first, static second. A live fetch that fails must not blank the
+    // page — the deploy-time copy is old but real — but it must SAY it fell
+    // back, because a stale view that looks live is the failure this
+    // dashboard exists to prevent.
+    try {
+      if (LIVE_DATA_URL) {
+        try {
+          const env = await fetchEnvelope(LIVE_DATA_URL);
+          envelopeRef.current = env;
+          setNotice(null);
+          return env;
+        } catch (liveErr) {
+          const env = await fetchEnvelope(STATIC_DATA_URL);
+          envelopeRef.current = env;
+          setNotice(
+            `Live snapshot unavailable (${String((liveErr as Error).message)}) — showing the copy ` +
+              `baked into this deployment. Check the publish job (scripts/publish-snapshot.sh).`,
+          );
+          return env;
+        }
+      }
+      const env = await fetchEnvelope(STATIC_DATA_URL);
       envelopeRef.current = env;
       setNotice(null);
       return env;

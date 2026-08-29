@@ -19,11 +19,12 @@
   Check:   launchctl list | grep rch-dashboard ; tail ~/Library/Logs/rch-dashboard-refresh.log
   Remove:  launchctl bootout gui/$(id -u)/com.local.rch-dashboard-refresh
 
-  Why 1200 s: every refresh is currently a Vercel deployment (the snapshot
-  ships inside the static bundle) and Vercel's Hobby tier caps deployments at
-  100/day; 20 min = 72/day. On a Pro team (6,000/day) StartInterval 300 is
-  safe. Publishing the blob without a deploy (bd-04ifk) is what unlocks a
-  shorter tick on Hobby.
+  Why 3600 s: this agent DEPLOYS (a Vercel deployment each run) and only
+  needs to refresh the bundled fallback snapshot and ship code changes. Live
+  freshness comes from com.local.rch-dashboard-publish, which uploads the
+  ciphertext to Vercel Blob every 120 s with no deploy (bd-04ifk); the app
+  and /api/fleet fetch that blob at runtime. Vercel's Hobby tier caps
+  deployments at 100/day; hourly is 24.
 
   RunAtLoad is false on purpose: a login must not trigger an immediate deploy
   from a machine that may not have network yet. The script refuses to publish
@@ -49,7 +50,7 @@
     <string>__HOME__</string>
   </dict>
   <key>StartInterval</key>
-  <integer>1200</integer>
+  <integer>3600</integer>
   <key>RunAtLoad</key>
   <false/>
   <key>StandardOutPath</key>

@@ -254,11 +254,13 @@ check("dev drawer shows this machine's pool view",
     await page.waitForTimeout(150);
     await pills.nth(i).click();
     await page.waitForSelector(".drawer", { timeout: 15000 });
-    found = (await page.locator(".drawer .build-row").count()) > 0;
+    found = (await page.locator(".drawer .builds.recent .build-row").count()) > 0;
   }
   check("recent builds listed on some dev machine", found, `checked ${n} dev machines`);
   if (found) {
-    const buildText = await page.locator(".drawer .builds").innerText();
+    // `.builds.recent`, not `.builds`: the drawer also lists builds IN FLIGHT
+    // (`.builds.inflight`) above the recent ones, and those carry no "ago".
+    const buildText = await page.locator(".drawer .builds.recent").innerText();
     check("recent builds show relative age", /ago/.test(buildText), buildText.split("\n")[0]);
     // Builds travel as positional tuples now. An index shifted by one still
     // renders text everywhere — `command` lands in the project cell and reads
@@ -270,7 +272,7 @@ check("dev drawer shows this machine's pool view",
     // and misreading it paints an offloading fleet as local-only.
     // innerText is the RENDERED text and the pill is text-transform:uppercase,
     // so match case-insensitively rather than against the source casing.
-    const pillTexts = await page.locator(".drawer .build-row .pill").allInnerTexts();
+    const pillTexts = await page.locator(".drawer .builds.recent .build-row .pill").allInnerTexts();
     check("every build row is labelled remote or local",
       pillTexts.length > 0 && pillTexts.every((t) => /^(remote|local)$/i.test(t.trim())),
       pillTexts.slice(0, 4).join(", "));
@@ -280,17 +282,17 @@ check("dev drawer shows this machine's pool view",
     // cell — the raw index renders, so the project column fills with small
     // integers. That is invisible to every other check here, and to the type
     // checker, so assert the rendered text is not a bare number.
-    const projTexts = (await page.locator(".drawer .build-row .build-proj").allInnerTexts())
+    const projTexts = (await page.locator(".drawer .builds.recent .build-row .build-proj").allInnerTexts())
       .map((t) => t.trim()).filter((t) => t !== "" && t !== "—");
     check("build project names resolve out of the string table",
       projTexts.length > 0 && projTexts.some((t) => !/^\d+$/.test(t)),
       projTexts.slice(0, 4).join(", "));
     // `command` is only ever the row tooltip, so an unresolved index would
     // never be visible on screen at all.
-    const cmdTitle = await page.locator(".drawer .build-row .build-proj").first().getAttribute("title");
+    const cmdTitle = await page.locator(".drawer .builds.recent .build-row .build-proj").first().getAttribute("title");
     check("build command tooltips resolve out of the string table",
       cmdTitle == null || !/^\d+$/.test(cmdTitle.trim()), String(cmdTitle).slice(0, 60));
-    const workerLink = page.locator(".drawer .build-row .link").first();
+    const workerLink = page.locator(".drawer .builds.recent .build-row .link").first();
     if ((await workerLink.count()) > 0) {
       const linkedId = (await workerLink.innerText()).trim();
       await workerLink.click();

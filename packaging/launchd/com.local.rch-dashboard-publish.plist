@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  rch fleet dashboard — snapshot publish tick (macOS launchd).
+
+  Runs dashboard/scripts/publish-snapshot.sh every StartInterval seconds:
+  ask every dev machine's rchd over the tailnet API (sub-second), ssh only
+  for the doctor/shim/hook self-checks every 15 minutes, encrypt, upload the
+  ciphertext to Vercel Blob. NO deploy — the app and /api/fleet fetch the
+  blob at runtime, so this is what keeps https://<project>.vercel.app and the
+  agent endpoint current. Code changes still ship via
+  com.local.rch-dashboard-refresh (deploy-vercel.sh), which now only needs to
+  run when the app itself changed.
+
+  Install (from the dashboard/ directory):
+    sed "s#__DASHBOARD_DIR__#$PWD#g; s#__HOME__#$HOME#g" \
+      ../packaging/launchd/com.local.rch-dashboard-publish.plist \
+      > ~/Library/LaunchAgents/com.local.rch-dashboard-publish.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.rch-dashboard-publish.plist
+    launchctl kickstart -k gui/$(id -u)/com.local.rch-dashboard-publish
+
+  Check:   tail ~/Library/Logs/rch-dashboard-publish.log
+  Remove:  launchctl bootout gui/$(id -u)/com.local.rch-dashboard-publish
+
+  Needs dashboard/.env (passphrase, dispatcher list with `name=ip:9101`
+  entries, RCH_DASH_API_TOKEN) and dashboard/.env.vercel
+  (BLOB_READ_WRITE_TOKEN from `vercel env pull`). 120 s is the tick; the
+  collector itself takes 1-3 s and the blob's CDN cache is 60 s, so a
+  browser or agent sees a change within about three minutes of it happening.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.local.rch-dashboard-publish</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__DASHBOARD_DIR__/scripts/publish-snapshot.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__DASHBOARD_DIR__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/.bun/bin:__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>120</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/rch-dashboard-publish.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/rch-dashboard-publish.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

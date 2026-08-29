@@ -36,3 +36,6 @@ tests/artifacts/
 
 # ssh self-check cache for the API transport (plaintext, never published)
 .selfcheck-cache.json
+.vercel
+.env*
+.env.vercel

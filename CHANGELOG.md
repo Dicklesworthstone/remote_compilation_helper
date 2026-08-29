@@ -10,6 +10,48 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## [Unreleased]
 
+### Tailnet status API, 2-minute fleet snapshots, `web/` retired
+
+Three changes that turn the fleet dashboard from a 20-minute-old picture into a
+live one and let agents on any tailnet machine ask a dispatcher what is wrong
+right now.
+
+- **`rchd` tailnet status API** (`[api]` in `config.toml`, bd-2f5ms). The daemon's
+  full `/status` JSON — the same body the `0600` Unix socket serves — plus
+  `/workers/capabilities` and a new `/workers/config` (static tags/priority/slots)
+  over TCP, bearer-token gated (`Authorization: Bearer` or `X-Rch-Token`,
+  constant-time compare). `bind = "tailscale"` resolves the machine's Tailscale
+  IPv4 at startup (port 9101); the bind address must be loopback or inside
+  Tailscale's ranges (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) unless
+  `allow_any_addr = true`, and the daemon refuses to start the API without a token
+  unless `no_token = true` is explicit. `/health`, `/ready`, `/metrics`, `/budget`
+  stay open on that listener too. A bad `[api]` section is logged with its fix and
+  the daemon runs on without the API. CLI: `rchd --api-bind`, `--api-token-file`;
+  `rch config set|get|show` know `api.*` (the token value is never echoed).
+- **Collector over the API** (`dashboard/tools/snapshot.mjs`, bd-04ifk). A
+  dispatcher written `name=100.x.y.z:9101` is asked over HTTP (four GETs, ~1 s for
+  the whole fleet) instead of ssh; posture is derived by the CLI's exact rule and
+  hints come from the daemon's `issues[]`. The dev-machine-local self-checks
+  (`rch doctor`, `shim status`, `hook status`) still go over ssh, but only every 15
+  minutes, cached. An API that does not answer falls back to the full ssh probe
+  for that machine and says so. Dev-machine rows carry `via: api|ssh`.
+- **Publish without a deploy.** `dashboard/scripts/publish-snapshot.sh` collects and
+  uploads only the ciphertext to a Vercel Blob store every 120 s
+  (`packaging/launchd/com.local.rch-dashboard-publish.plist`); the app and
+  `/api/fleet` fetch it at runtime (`RCH_DASH_DATA_URL` / `VITE_RCH_DASH_DATA_URL`)
+  and fall back to the deploy-time copy **saying so** (banner;
+  `X-Rch-Snapshot-Source` header). `deploy-vercel.sh` now only ships code, hourly.
+  The `/api/fleet` KDF cache no longer binds the ciphertext IV, so it survives the
+  snapshot rotating under the same salt. Measured: fleet change → visible in ≤3 min
+  (was 20–40).
+- **`web/` retired** (bd-oxdl1). `rch web` no longer spawns a Next.js dev server
+  nobody's installed `rch` could find; it opens `[dashboard] url` (or `--url`,
+  `RCH_DASHBOARD_URL`) and prints the agent endpoint. `RCH-E900/E901` now mean "no
+  dashboard URL configured" / "not an http(s) URL". Dependabot watches
+  `/dashboard` instead of `/web`; the remediation e2e checks the dashboard's
+  problems module. The `web/` directory itself is unreferenced and awaits
+  deletion.
+
 ### Fleet dashboard: problems with actions, agent diagnose views, dev-machine self-checks
 
 The `dashboard/` fleet console (Vite/React, encrypted static snapshot, deployed to

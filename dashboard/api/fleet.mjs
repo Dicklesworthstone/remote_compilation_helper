@@ -45,8 +45,53 @@ import {
   buildLlmView, encodeView, contentType, helpView, UnknownTarget, VIEWS, FORMATS,
 } from "../tools/llm-view.mjs";
 import { decompressPlaintext, isSupportedCompression } from "../tools/envelope.mjs";
-// Bundled at build time so the function has no filesystem or network dependency.
-import envelope from "../public/data/fleet.enc.json" with { type: "json" };
+// The snapshot baked into this deployment: the fallback, and the only source
+// when no live URL is configured. Bundled so the function needs no filesystem.
+import bundledEnvelope from "../public/data/fleet.enc.json" with { type: "json" };
+
+/* ─── Live snapshot ────────────────────────────────────────────────────────
+ *
+ * `scripts/publish-snapshot.sh` uploads a fresh ciphertext to Vercel Blob every
+ * couple of minutes WITHOUT a deploy, so this function must not answer from the
+ * copy it was built with. When `RCH_DASH_DATA_URL` (project env) names the
+ * blob, each request fetches it — ~16KB, `no-store` — and falls back to the
+ * bundled envelope only if that fails, saying so in a response header
+ * (`X-Rch-Snapshot-Source: live | bundled-fallback | bundled`). A short in-
+ * process memo keeps a burst of agent polls from re-fetching the same bytes.
+ */
+// Read per request, not at import: the tests point it at a local server, at a
+// dead port, and at nothing, all in one process.
+const liveUrl = () => (process.env.RCH_DASH_DATA_URL ?? "").trim() || null;
+const LIVE_MEMO_MS = 5_000;
+const LIVE_TIMEOUT_MS = 8_000;
+let liveMemo = { at: 0, url: null, envelope: null };
+
+async function currentEnvelope() {
+  const url = liveUrl();
+  if (!url) return { envelope: bundledEnvelope, source: "bundled" };
+  const now = Date.now();
+  if (liveMemo.envelope && liveMemo.url === url && now - liveMemo.at < LIVE_MEMO_MS) {
+    return { envelope: liveMemo.envelope, source: "live" };
+  }
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), LIVE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${url}?t=${now}`, { cache: "no-store", signal: ctl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const env = await res.json();
+    if (!env?.ciphertext || !env?.kdf?.salt) throw new Error("not an encrypted envelope");
+    liveMemo = { at: now, url, envelope: env };
+    return { envelope: env, source: "live" };
+  } catch (e) {
+    return {
+      envelope: bundledEnvelope,
+      source: "bundled-fallback",
+      reason: String(e?.name === "AbortError" ? `timed out after ${LIVE_TIMEOUT_MS / 1000}s` : e?.message ?? e),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function b64ToBuf(b64) {
   const b = Buffer.from(b64, "base64");
@@ -71,15 +116,16 @@ function b64ToBuf(b64) {
  *   exit: a miss falls straight through to `deriveKey`.
  *
  * Index: HMAC-SHA-256 over the envelope's KDF parameters (salt, iterations,
- * hash) plus its IV plus the passphrase, under a per-process random secret.
+ * hash) plus the passphrase, under a per-process random secret. The IV is
+ * not in it — see `cacheIndex` — so the cache survives the live snapshot
+ * rotating every couple of minutes under the same salt.
  *   - The passphrase never appears in the index in plaintext.
  *   - The secret means the index is not a bare passphrase digest that could be
  *     ground offline if a heap dump ever escaped, and denies an attacker any
  *     ability to steer Map-lookup timing by choosing inputs.
  *   - Binding the salt/iterations/hash makes the entry valid only for the
  *     parameters that produced it, so a hit returns bit-identical key material
- *     to what a fresh derivation would have produced. Binding the IV pins it to
- *     this exact ciphertext framing too.
+ *     to what a fresh derivation would have produced.
  *   - Fields are length-prefixed so no two distinct tuples share a pre-image.
  *
  * Bounds: at most KDF_CACHE_MAX entries (LRU eviction) and an absolute TTL from
@@ -100,7 +146,13 @@ const kdfCache = new Map();
 
 function cacheIndex(env, passphrase) {
   const h = createHmac("sha256", KDF_CACHE_SECRET);
-  for (const part of [env.kdf.salt, String(env.kdf.iterations), env.kdf.hash, env.cipher.iv, passphrase]) {
+  // Salt, iterations, hash and passphrase are the whole input to PBKDF2; the
+  // IV is not (it only parameterises AES-GCM), so it is deliberately NOT part
+  // of the index. The collector reuses the salt across snapshots, so a key
+  // that opened the previous snapshot opens the next one — with the live blob
+  // rotating every couple of minutes, binding the IV would have thrown the
+  // cache away on every rotation and paid 600k iterations per poll.
+  for (const part of [env.kdf.salt, String(env.kdf.iterations), env.kdf.hash, passphrase]) {
     const b = Buffer.from(String(part), "utf8");
     const len = Buffer.alloc(4);
     len.writeUInt32BE(b.length);
@@ -273,6 +325,9 @@ export default async function handler(req, res) {
     return res.end("401 supply the fleet passphrase via Authorization: Bearer <passphrase>; ?view=help needs no key\n");
   }
 
+  const { envelope, source, reason } = await currentEnvelope();
+  res.setHeader("X-Rch-Snapshot-Source", source);
+  if (reason) res.setHeader("X-Rch-Snapshot-Fallback-Reason", String(reason).slice(0, 200));
   if (!envelope?.ciphertext) {
     res.statusCode = 500;
     return res.end("500 no snapshot bundled with this deployment\n");

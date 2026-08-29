@@ -192,7 +192,8 @@ chk("wrong-passphrase response unchanged by a populated cache",
   && wrong.out.body === wrongOnEmptyCache.body,
   `${wrong.out.status} ${JSON.stringify(wrong.out.body)}`);
 
-srv.close();
+// The main server stays up: the live-snapshot checks below drive it with the
+// env var pointed at different places. It closes after the skew section.
 
 // ── transport compression ──────────────────────────────────────────────────
 //
@@ -213,10 +214,46 @@ srv.close();
       `${Math.round(plainish)}B ciphertext for a ~51KB snapshot`);
   }
 
+  // ── live snapshot (Vercel Blob) ──────────────────────────────────────────
+  //
+  // With RCH_DASH_DATA_URL set the function must serve THAT envelope, not the
+  // one it was built with, and must fall back — saying so — when it cannot.
+  {
+    const saved = process.env.RCH_DASH_DATA_URL;
+    const blobSrv = http.createServer((req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(bundled));
+    });
+    await new Promise((r) => blobSrv.listen(4182, r));
+    process.env.RCH_DASH_DATA_URL = "http://127.0.0.1:4182/fleet.enc.json";
+    let r = await call("/api/fleet?view=problems&format=json", { authorization: `Bearer ${PW}` });
+    const liveSrc = (await fetch("http://127.0.0.1:4180/api/fleet?view=problems", { headers: { authorization: `Bearer ${PW}` } })).headers.get("x-rch-snapshot-source");
+    chk("with RCH_DASH_DATA_URL set, the function serves the live envelope",
+      r.status === 200 && liveSrc === "live", `source=${liveSrc}`);
+    blobSrv.close();
+    // Dead blob: fall back to the bundled copy and name the reason in a header.
+    process.env.RCH_DASH_DATA_URL = "http://127.0.0.1:4183/fleet.enc.json";
+    await new Promise((res) => setTimeout(res, 50));
+    const fb = await fetch("http://127.0.0.1:4180/api/fleet?view=problems", { headers: { authorization: `Bearer ${PW}` } });
+    chk("an unreachable live URL falls back to the bundled envelope and says so",
+      fb.status === 200 && fb.headers.get("x-rch-snapshot-source") === "bundled-fallback" &&
+        (fb.headers.get("x-rch-snapshot-fallback-reason") ?? "").length > 0,
+      `source=${fb.headers.get("x-rch-snapshot-source")} reason=${fb.headers.get("x-rch-snapshot-fallback-reason")}`);
+    if (saved === undefined) delete process.env.RCH_DASH_DATA_URL; else process.env.RCH_DASH_DATA_URL = saved;
+    const plain = await fetch("http://127.0.0.1:4180/api/fleet?view=problems", { headers: { authorization: `Bearer ${PW}` } });
+    chk("with no live URL the source is the bundled envelope",
+      saved !== undefined || plain.headers.get("x-rch-snapshot-source") === "bundled", plain.headers.get("x-rch-snapshot-source"));
+  }
+
   // VERSION SKEW, forward: a snapshot written by a NEWER collector, using a codec
   // this deployment cannot inflate. The failure must not be reported as a bad
   // passphrase — the caller's credential is fine and telling them otherwise
   // sends them to rotate a secret that was never the problem.
+  //
+  // The skew bundle carries a doctored BUNDLED envelope, so the live URL must
+  // be out of the way or the function would (correctly) serve the live one.
+  const savedLive = process.env.RCH_DASH_DATA_URL;
+  delete process.env.RCH_DASH_DATA_URL;
   const dir = await mkdtemp(join(tmpdir(), "rch-endpoint-skew-"));
   const doctored = join(dir, "fleet.enc.json");
   await writeFile(doctored, JSON.stringify({ ...bundled, compression: "codec-from-the-future" }));
@@ -247,7 +284,9 @@ srv.close();
   chk("an unknown codec still 500s ahead of the derivation", skewWrong.status === 500,
     `${skewWrong.status} — refusing before 600k PBKDF2 on a payload we cannot read`);
   skewSrv.close();
+  if (savedLive !== undefined) process.env.RCH_DASH_DATA_URL = savedLive;
 }
+srv.close();
 
 console.log(fails === 0 ? "\nALL ENDPOINT CHECKS PASSED" : `\n${fails} CHECK(S) FAILED`);
 process.exit(fails ? 1 : 0);

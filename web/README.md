@@ -1,3 +1,9 @@
+> **Retired (2026-08-28).** Nothing in rch references this app any more: `rch web`
+> opens the fleet dashboard under `../dashboard/` (encrypted static console + the
+> `/api/fleet` agent endpoint), which supersedes every page here, and the
+> Dependabot entry and remediation e2e now point at `dashboard/`. This directory
+> is kept only until its deletion is approved (bead `bd-oxdl1`); do not build on it.
+
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
 ## Getting Started
