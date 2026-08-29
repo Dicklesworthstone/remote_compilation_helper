@@ -17,11 +17,14 @@ single stateless function for LLM/agent consumers — it holds no secret either
 (see below).
 
 ```
-  dev machines ──ssh──▶ tools/snapshot.mjs ──AES-256-GCM──▶ fleet.enc.json
+  dev machines ──rchd tailnet API (ssh for self-checks)──▶ tools/snapshot.mjs
   (boxes running rch)                                             │
-                                                          static hosting
+                                                           AES-256-GCM
+                                                                  │
+                                              Vercel Blob (every 2 min) + static fallback
                                                                   │
                                        browser: PBKDF2(passphrase) ─▶ decrypt ─▶ UI
+                                       agents:  GET /api/fleet?view=problems
 ```
 
 ---
