@@ -998,30 +998,24 @@ Controls:
         color_blind: tui::ColorBlindMode,
     },
 
-    /// Launch the web-based dashboard in your browser
+    /// Open the fleet dashboard in your browser
     #[command(after_help = r#"EXAMPLES:
-    rch web                           # Start dev server and open browser
-    rch web --port 3001               # Use custom port
-    rch web --no-open                 # Don't open browser automatically
-    rch web --prod                    # Serve production build
+    rch web                           # Open the configured dashboard URL
+    rch web --no-open                 # Just print the URL (and the agent endpoint)
+    rch web --url https://x.vercel.app
+    rch config set dashboard.url https://rch-fleet.vercel.app
 
-The web dashboard provides a modern browser-based interface for:
-  - Viewing worker status and slot utilization
-  - Monitoring active and recent builds
-  - Viewing system issues and metrics
-  - Real-time updates via polling"#)]
+The fleet dashboard is the encrypted static console under dashboard/ (see
+dashboard/README.md). URL resolution: --url, then RCH_DASHBOARD_URL, then
+[dashboard] url in config.toml. Agents should use <url>/api/fleet?view=help."#)]
     Web {
-        /// Port to run the web server on (default: 3000)
-        #[arg(long, default_value = "3000")]
-        port: u16,
+        /// Dashboard URL (overrides RCH_DASHBOARD_URL and [dashboard] url)
+        #[arg(long)]
+        url: Option<String>,
 
-        /// Don't automatically open the browser
+        /// Don't open the browser; just print the URLs
         #[arg(long)]
         no_open: bool,
-
-        /// Serve production build instead of dev server
-        #[arg(long)]
-        prod: bool,
     },
 
     /// List RCH capabilities for machine discovery
@@ -2281,11 +2275,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 };
                 tui::run_tui(config).await
             }
-            Commands::Web {
-                port,
-                no_open,
-                prod,
-            } => handle_web(port, no_open, prod, &ctx).await,
+            Commands::Web { url, no_open } => handle_web(url, no_open, &ctx),
             Commands::Capabilities => handle_capabilities_command(&ctx),
             Commands::RobotDocs { action } => handle_robot_docs(action, &ctx),
             Commands::Error { sub } => handle_error_explain(sub, &ctx),
@@ -5322,117 +5312,61 @@ async fn handle_fleet(action: FleetAction, ctx: &OutputContext) -> Result<()> {
     }
 }
 
-/// Handle web dashboard command
-async fn handle_web(port: u16, no_open: bool, prod: bool, ctx: &OutputContext) -> Result<()> {
-    use std::process::{Command, Stdio};
+/// `rch web`: open (or print) the fleet dashboard.
+///
+/// The dashboard is the encrypted static console under `dashboard/`, deployed
+/// as a static site (see `dashboard/README.md`); `rch web` used to spawn the
+/// retired `web/` Next.js dev server from a source checkout, which no
+/// installed `rch` could ever find. Now it resolves the URL and opens it.
+fn handle_web(url: Option<String>, no_open: bool, ctx: &OutputContext) -> Result<()> {
+    let url = resolve_dashboard_url(url)?;
+    let api = format!("{}/api/fleet?view=help", url.trim_end_matches('/'));
 
-    // Find the web directory relative to the rch binary or use compile-time path
-    let web_dir = find_web_directory()?;
-
-    ctx.info(&format!("Starting web dashboard on port {}...", port));
-
-    // Check if bun is available
-    let bun_check = Command::new("bun")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    let port_str = port.to_string();
-    let use_bun = bun_check.is_ok();
-    let mut server_command = if use_bun {
-        Command::new("bun")
+    if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok(
+            "web",
+            serde_json::json!({
+                "url": url,
+                "agent_endpoint": api,
+                "opened": !no_open,
+            }),
+        ));
     } else {
-        // Fall back to npm
-        Command::new("npm")
-    };
-    let cmd_name = if use_bun { "bun" } else { "npm" };
-    if prod {
-        server_command.args(["run", "start", "--", "-p", &port_str]);
-    } else {
-        server_command.args(["run", "dev", "--", "-p", &port_str]);
+        ctx.info(&format!("Fleet dashboard: {url}"));
+        ctx.info(&format!("Agent endpoint:  {api}   (help needs no key)"));
     }
-
-    let url = format!("http://localhost:{}", port);
-    ctx.info(&format!("Dashboard available at: {}", url));
-
-    // Open browser unless disabled
     if !no_open {
-        ctx.info("Opening browser...");
-        // Give the server a moment to start
-        let url_clone = url.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            let _ = open_browser(&url_clone);
-        });
+        open_browser(&url)?;
     }
-
-    ctx.info("Press Ctrl+C to stop the server");
-
-    // Run the web server
-    let status = server_command
-        .current_dir(&web_dir)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| error::WebError::ServerStartFailed {
-            reason: format!("failed to execute {}: {}", cmd_name, e),
-        })?;
-
-    if !status.success() {
-        return Err(error::WebError::ServerExitedWithError {
-            exit_code: status.code(),
-        }
-        .into());
-    }
-
     Ok(())
 }
 
-/// Find the web directory
-fn find_web_directory() -> Result<PathBuf> {
-    // Try relative to current directory first
-    let cwd = std::env::current_dir()?;
-    let web_in_cwd = cwd.join("web");
-    if web_in_cwd.exists() && web_in_cwd.join("package.json").exists() {
-        return Ok(web_in_cwd);
+/// `--url`, then `RCH_DASHBOARD_URL`, then `[dashboard] url` in config.toml.
+fn resolve_dashboard_url(flag: Option<String>) -> Result<String> {
+    resolve_dashboard_url_from(
+        flag,
+        std::env::var("RCH_DASHBOARD_URL").ok(),
+        config::load_config().ok().and_then(|c| c.dashboard.url),
+    )
+}
+
+/// The pure precedence rule behind `resolve_dashboard_url`, with every source
+/// injected so tests never depend on this machine's environment or config.
+/// A blank value at any level means "not set here", not "set to nothing".
+fn resolve_dashboard_url_from(
+    flag: Option<String>,
+    env: Option<String>,
+    configured: Option<String>,
+) -> Result<String> {
+    let present = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let candidate = present(flag)
+        .or_else(|| present(env))
+        .or_else(|| present(configured));
+    match candidate {
+        Some(u) if u.starts_with("http://") || u.starts_with("https://") => Ok(u),
+        Some(u) => Err(error::WebError::InvalidDashboardUrl { url: u }.into()),
+        None => Err(error::WebError::NoDashboardUrl.into()),
     }
-
-    // Try relative to the executable
-    if let Ok(exe_path) = std::env::current_exe()
-        && let Some(exe_dir) = exe_path.parent()
-    {
-        // Check sibling web directory
-        let web_sibling = exe_dir.join("web");
-        if web_sibling.exists() && web_sibling.join("package.json").exists() {
-            return Ok(web_sibling);
-        }
-
-        // Check parent's web directory (for dev builds)
-        if let Some(parent) = exe_dir.parent() {
-            let web_parent = parent.join("web");
-            if web_parent.exists() && web_parent.join("package.json").exists() {
-                return Ok(web_parent);
-            }
-        }
-    }
-
-    // Try common installation paths
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let common_paths = [
-        home.join(".local/share/rch/web"),
-        home.join(".rch/web"),
-        PathBuf::from("/usr/local/share/rch/web"),
-        PathBuf::from("/usr/share/rch/web"),
-    ];
-
-    for path in common_paths {
-        if path.exists() && path.join("package.json").exists() {
-            return Ok(path);
-        }
-    }
-
-    Err(error::WebError::DashboardNotFound.into())
 }
 
 /// Open a URL in the default browser
@@ -8133,28 +8067,49 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // find_web_directory Tests
+    // resolve_dashboard_url Tests
     // -------------------------------------------------------------------------
 
     #[test]
-    fn find_web_directory_error_message_is_helpful() {
+    fn resolve_dashboard_url_precedence_is_flag_env_config() {
         let _guard = test_guard!();
-        let temp_dir = std::env::temp_dir().join("rch_test_no_web");
-        let _ = std::fs::create_dir_all(&temp_dir);
-        let original_dir = std::env::current_dir().unwrap();
+        let f = |a: &str, b: &str, c: &str| {
+            resolve_dashboard_url_from(Some(a.into()), Some(b.into()), Some(c.into()))
+        };
+        assert_eq!(
+            f("https://flag", "https://env", "https://cfg").unwrap(),
+            "https://flag"
+        );
+        // Blank means "not set here", so the next source wins.
+        assert_eq!(f("  ", "https://env", "https://cfg").unwrap(), "https://env");
+        assert_eq!(f("", "", "https://cfg").unwrap(), "https://cfg");
+        // Trimmed, as every reader trims.
+        assert_eq!(
+            resolve_dashboard_url_from(Some("  https://rch-fleet.vercel.app \n".into()), None, None)
+                .unwrap(),
+            "https://rch-fleet.vercel.app"
+        );
+    }
 
-        let _ = std::env::set_current_dir(&temp_dir);
-        let result = find_web_directory();
-        let _ = std::env::set_current_dir(&original_dir);
+    #[test]
+    fn resolve_dashboard_url_rejects_non_http_and_names_the_value() {
+        let _guard = test_guard!();
+        let err = resolve_dashboard_url_from(Some("rch-fleet.vercel.app".into()), None, None)
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("rch-fleet.vercel.app"), "{msg}");
+        assert!(msg.contains("http"), "{msg}");
+    }
 
-        if let Err(e) = result {
-            let msg = e.to_string();
-            assert!(
-                msg.contains("Web dashboard directory not found"),
-                "Error message should indicate dashboard not found: {msg}"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&temp_dir);
+    #[test]
+    fn resolve_dashboard_url_without_any_source_explains_how_to_set_one() {
+        let _guard = test_guard!();
+        let err = resolve_dashboard_url_from(Some("   ".into()), None, None).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("dashboard.url"),
+            "should point at `rch config set dashboard.url`: {msg}"
+        );
     }
 
     // -------------------------------------------------------------------------

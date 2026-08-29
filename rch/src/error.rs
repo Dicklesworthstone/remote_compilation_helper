@@ -1369,37 +1369,26 @@ pub enum FleetError {
 /// Error code range: RCH-E900 to RCH-E905
 #[derive(Error, Diagnostic, Debug)]
 pub enum WebError {
-    /// Web dashboard directory not found.
-    #[error("Web dashboard directory not found")]
+    /// No dashboard URL is configured anywhere `rch web` looks.
+    #[error("No dashboard URL configured")]
     #[diagnostic(
         code("RCH-E900"),
         help(
-            "Expected to find the web dashboard at one of:\n  \
-            - ./web\n  \
-            - ~/.local/share/rch/web\n  \
-            - /usr/local/share/rch/web\n\n\
-            If you installed from source, run 'rch web' from the project root."
+            "Tell rch where the fleet dashboard is served:\n  \
+            rch config set dashboard.url https://rch-fleet.vercel.app\n\
+            or pass --url, or set RCH_DASHBOARD_URL. The dashboard itself is the static \
+            console under dashboard/ (see dashboard/README.md for deploying it)."
         )
     )]
-    DashboardNotFound,
+    NoDashboardUrl,
 
-    /// Web server exited with error.
-    #[error("Web server exited with error (exit code: {exit_code:?})")]
+    /// The configured dashboard URL is not an http(s) URL.
+    #[error("Dashboard URL {url:?} is not an http(s) URL")]
     #[diagnostic(
         code("RCH-E901"),
-        help(
-            "Check the server logs for details. The web server may have encountered a startup error."
-        )
+        help("Use the full URL including the scheme, e.g. https://rch-fleet.vercel.app")
     )]
-    ServerExitedWithError { exit_code: Option<i32> },
-
-    /// Web server failed to start.
-    #[error("Failed to start web server: {reason}")]
-    #[diagnostic(
-        code("RCH-E902"),
-        help("Ensure bun or npm is installed and the web dependencies are available")
-    )]
-    ServerStartFailed { reason: String },
+    InvalidDashboardUrl { url: String },
 }
 
 // =============================================================================
