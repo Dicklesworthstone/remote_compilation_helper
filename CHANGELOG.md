@@ -1,10 +1,105 @@
 # Changelog
 
-All notable changes to **rch** (Remote Compilation Helper) are documented here.
+This is a synthesized, agent-facing changelog for the full history of **rch** (Remote
+Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`), the
+worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
+dashboard (`dashboard/`).
 
-Changes are organized by version and grouped by landed capability rather than raw diff order. Tags that correspond to actual [GitHub Releases](https://github.com/Dicklesworthstone/remote_compilation_helper/releases) are marked with **(release)**; other versions are git-tag-only.
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v1.0.61` (2026-08-29).
+
+This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
+on representative commits), version tags (`git for-each-ref`), GitHub release metadata
+(`gh release list`/`view` — a **release** is a published GitHub Release; **tag only** means
+no release was ever published for the tag; one **draft** was never published), and the
+checked-in issue tracker (`.beads/issues.jsonl`, queried with `jq`). Where sources
+disagreed, git history won. Two tags have no successor number (`v1.0.32`, `v1.0.48` were
+never cut) and one orphan tag (`rch-local-superseded-20260710`) lives only on local backup
+branches.
+
+This document is intentionally organized by landed capabilities, not raw diff order: each
+version has a short narrative, the capabilities it delivered, the tracker workstreams it
+closed, and the commits an agent should inspect first. Commit links go to the GitHub commit
+page; workstream links go to the tracker file (search it for the id).
+
+Sections for `v1.0.16` and earlier are inherited from the previous changelog and were
+re-checked against the tag spine; nine of their commit links (in the `v1.0.16`, `v1.0.2` and
+`v1.0.1` sections) point at commits that no longer exist in this repository's rewritten
+history. They are kept as-is because the descriptions were verified against the tag ranges,
+but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## Version Timeline
+
+`Kind` distinguishes a published GitHub Release from a plain git tag. Dates are tag dates.
+
+| Version | Kind | Date | Summary |
+|---------|------|------|---------|
+| [`v1.0.61`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.61) | Release | 2026-08-29 | rchd tailnet status API (`[api]`); dashboard publishes 2-min snapshots to Vercel Blob over that API; problems/diagnose agent views; `web/` retired |
+| [`v1.0.60`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.60) | Release | 2026-08-28 | Shim v3: every local shim fallback capped via `CARGO_BUILD_JOBS`; Windows CIM telemetry; socket reload honours `--workers-config` |
+| [`v1.0.59`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.59) | Release | 2026-08-27 | Shim v2: `--message-format` no longer forces local; `cargo-clippy` shimmed; `RUSTC_WORKSPACE_WRAPPER` guard |
+| [`v1.0.58`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v1.0.58) | Tag | 2026-08-26 | RABS lands in full; job mode (`rch exec --job`); `remote_build_jobs` cap (#49) — no GitHub Release |
+| [`v1.0.57`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.57) | Release | 2026-08-15 | 547 commits: RABS born (10 crates, 513-bead plan) and hits a live shadow-mode spine; fleet role policy, durable disables, SIGILL quarantine, macOS telemetry (#39–#43) |
+| [`v1.0.56`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.56) | Release | 2026-08-05 | Configurable canonical project root (GH #38) and related fixes |
+| [`v1.0.55`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v1.0.55) | Tag | 2026-08-02 | Concurrent stderr drain fixes a latent Windows-transfer deadlock; Windows-worker docs genericized |
+| [`v1.0.54`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v1.0.54) | Tag | 2026-08-02 | First Windows worker platform: tar-over-ssh transport, `C:/rch`, `declared_os` wire field |
+| [`v1.0.53`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.53) | Release | 2026-08-02 | Host-OS worker admission gate (`os` in workers.toml); local fix branch reconciled; refusal legibility (#30–#35); component-level capability probing |
+| [`v1.0.52`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.52) | Release | 2026-07-23 | `rch shim install\|status\|uninstall` — the canonical cargo offload wrapper |
+| [`v1.0.51`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.51) | Release | 2026-07-22 | Bypass↔telemetry stranding deadlock that silently dropped the whole fleet |
+| [`v1.0.50`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v1.0.50) | Draft | 2026-07-17 | Fail-closed clean-overlay remote proofs for shared working trees — release drafted, never published |
+| [`v1.0.49`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.49) | Release | 2026-07-15 | Go/TypeScript/Nix build offload (#26, #29); `RCH-E415` fail-closed cargo path-dep materialization |
+| [`v1.0.47`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.47) | Release | 2026-07-02 | Shared `SshPool` + unified circuit breaker end false worker DOWN flaps; artifacts default to `/data/tmp/rch` |
+| [`v1.0.46`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.46) | Release | 2026-06-25 | Release-asset-completeness CI gate made installability-based; cosign-tolerance fix validated |
+| [`v1.0.45`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.45) | Release | 2026-06-25 | Session-history-remediation program closes (epics 7/10/16); piped/backgrounded cargo offloads (#24); hook.rs de-monolithized |
+| [`v1.0.44`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.44) | Release | 2026-06-24 | Local fleet hotfix: cosign-tolerant self-update for the cosign-less worker fleet |
+| [`v1.0.43`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.43) | Release | 2026-06-19 | Per-project `preferred_workers` routing via `.rch/config.toml` |
+| [`v1.0.42`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.42) | Release | 2026-06-18 | 190 commits: remediation program launches (bypass/socket recovery, placement controls, redaction); circuit window + priority (#21); target-dir reuse (#19) |
+| [`v1.0.41`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.41) | Release | 2026-06-08 | Autonomous worker-side stale-target reaper (default off) |
+| [`v1.0.40`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.40) | Release | 2026-06-08 | `rch exec` reaps the whole test process group at the runtime cap |
+| [`v1.0.39`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.39) | Release | 2026-06-08 | Stale-target reaper works when the canonical root is a symlink |
+| [`v1.0.38`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.38) | Release | 2026-06-08 | Stale-target reaper sweeps every project under the canonical root |
+| [`v1.0.37`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.37) | Release | 2026-06-02 | rchd single-instance enforcement via systemd cgroup detection |
+| [`v1.0.36`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.36) | Release | 2026-06-02 | Finite SSH `ControlPersist` stops control-master leaks |
+| [`v1.0.35`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.35) | Release | 2026-05-30 | Stale-target reaper no longer reaps a just-created sibling |
+| [`v1.0.34`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.34) | Release | 2026-05-30 | Reap abandoned per-job remote target directories (worker disk hygiene) |
+| [`v1.0.33`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.33) | Release | 2026-05-29 | Kills the systemd restart storm + log flood; unblocks a release pipeline broken since v1.0.29 |
+| [`v1.0.31`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.31) | Release | 2026-05-26 | Telemetry re-poll cadence tuned (`skip_after` 60→30 s) to close the last freshness flap |
+| [`v1.0.30`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.30) | Release | 2026-05-26 | Telemetry poller retry + timeout + INFO summary; 8/8 workers, 0 failures |
+| [`v1.0.29`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.29) | Release | 2026-05-26 | Fixes permit starvation from v1.0.28's semaphore that collapsed telemetry to 1/9 workers |
+| [`v1.0.28`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.28) | Release | 2026-05-26 | Telemetry poller drops its long-held config lock; bounded concurrent SSH polls |
+| [`v1.0.27`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.27) | Release | 2026-05-25 | 57 commits: worker-topology aliasing, reliability pipeline, `RCH_*_INJECT_*` registry, `doctor --runbook`, `workers benchmark/compare` |
+| [`v1.0.26`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.26) | Release | 2026-05-14 | `upgrade` alias for the release helper |
+| [`v1.0.25`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.25) | Release | 2026-05-14 | Dependency and release maintenance (FrankenTUI/rich_rust/TOON from current checkouts) |
+| [`v1.0.24`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.24) | Release | 2026-04-29 | `rch fleet deploy` prefers the installed `rch-wkr` over stale dev-target builds |
+| [`v1.0.23`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.23) | Release | 2026-04-29 | Atomic replace everywhere: doctor survives broken pipes; fleet SCP and install.sh stage-then-rename |
+| [`v1.0.22`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.22) | Release | 2026-04-29 | Daemon socket requests get connect/IO timeouts + half-close; release CI concurrency per-tag |
+| [`v1.0.21`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.21) | Release | 2026-04-29 | Streaming artifact retrieval regains rsync `--safe-links` |
+| [`v1.0.20`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.20) | Release | 2026-04-29 | `CARGO_TARGET_DIR` round-trips through remote exec; `[path_topology]` TOML/CLI wiring (#10); installer survives `/tmp/rch` collisions |
+| [`v1.0.19`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.19) | Release | 2026-04-23 | 40-commit audit sweep: fleet lock, alert lifecycle, config diagnostics, self-test timeout, probe error codes, ~25 concurrency/safety fixes |
+| [`v1.0.18`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v1.0.18) | Tag | 2026-04-16 | Diagnose + path-topology bug fixes |
+| [`v1.0.17`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.17) | Release | 2026-04-01 | Maintenance |
+| [`v1.0.16`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.16) | Release | 2026-03-24 | Worker scheduling safety; configurable path topology; hook system expansion |
+| [`v1.0.15`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v1.0.15) | Tag | 2026-03-24 | Version bump |
+| [`v1.0.14`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v1.0.14) | Tag | 2026-03-24 | Pre-v1.0.16 maintenance |
+| [`v1.0.13`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.13) | Release | 2026-03-18 | Release bump |
+| [`v1.0.12`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.12) | Release | 2026-03-18 | Worker selection/scheduling, remote process lifecycle, compilation config |
+| [`v1.0.11`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.11) | Release | 2026-03-17 | 99 commits: reliability subsystem (bd-vvmd), unified status/posture, FrankenTUI migration, classification + shell safety |
+| [`v1.0.10`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.10) | Release | 2026-02-14 | Daemon and test hardening |
+| [`v1.0.9`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v1.0.9) | Tag | 2026-02-14 | Version bump |
+| [`v1.0.8`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.8) | Release | 2026-02-05 | Command classification fix |
+| [`v1.0.7`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.7) | Release | 2026-02-04 | Installer robustness overhaul; fleet/worker deployment; SSH path handling |
+| [`v1.0.6`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.6) | Release | 2026-02-02 | CI and release workflow fixes |
+| [`v1.0.5`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v1.0.5) | Tag | 2026-02-02 | Hook safety: safe-merge hook installation |
+| [`v1.0.4`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.4) | Release | 2026-02-02 | Version bump |
+| [`v1.0.3`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.3) | Release | 2026-02-02 | Version bump |
+| [`v1.0.2`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.2) | Release | 2026-02-02 | Transparent command interception; adaptive transfer compression; hook performance |
+| [`v1.0.1`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.1) | Release | 2026-02-01 | Daemon robustness; cross-platform compatibility; refactoring |
+| [`v1.0.0`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.0) | Release | 2026-01-29 | 1.0: fleet management, installer resilience, CLI modularization, update system |
+| [`v0.1.64`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v0.1.64) | Tag | 2026-02-01 | Pre-1.0 tag on the same history as v1.0.1 |
+| [`v0.1.3`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v0.1.3) | Release | 2026-01-28 | TUI enhancements & fleet deployment |
+| [`v0.1.2`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v0.1.2) | Release | 2026-01-27 | Test coverage & stability improvements |
+| [`v0.1.1`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v0.1.1) | Tag | 2026-01-26 | Daemon health monitoring, hot reload, selection logic, `/status` API |
+| [`v0.1.0`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v0.1.0) | Tag | 2026-01-25 | Workspace scaffold: `rch`, `rchd`, `rch-wkr`, `rch-common`, `rch-telemetry` |
 
 ---
 
@@ -56,7 +151,7 @@ right now.
 ### Fleet dashboard: problems with actions, agent diagnose views, dev-machine self-checks
 
 The `dashboard/` fleet console (Vite/React, encrypted static snapshot, deployed to
-Vercel; first landed 2026-08-26 in `6865d09`…`e8ec3a7` without a changelog entry)
+Vercel; first landed 2026-08-26 in [`6865d09`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6865d09)…[`e8ec3a7`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e8ec3a7) without a changelog entry)
 now leverages what the daemon already knew and collects three things it did not:
 
 - **Collector** (`dashboard/tools/snapshot.mjs`): three new probe sections on the same
@@ -129,7 +224,11 @@ now leverages what the daemon already knew and collects three things it did not:
   direct invocations offload. A `RUSTC_WORKSPACE_WRAPPER` guard keeps `cargo clippy`
   producing lints. `SHIM_VERSION` → 2; run `rch shim install` after upgrading.
 
-## [v1.0.58] -- 2026-08-24 (release)
+## [v1.0.58] -- 2026-08-26 (tag only)
+
+No GitHub Release exists for this tag: the installer and the fleet's nightly updater kept
+serving v1.0.57 until v1.0.59 was published. The tag is dated 2026-08-26 (this section was
+originally headed 2026-08-24, the date the notes were written).
 
 278 commits since v1.0.57. Two themes: **RABS**, a new build-sidecar subsystem that lands
 in full, and **job mode**, which opens rch's remote-execution rails to work that is not a
@@ -146,7 +245,7 @@ compilation.
   a `CARGO_BUILD_JOBS` already in the worker session (e.g. `/etc/environment`), forwarded
   through the env allowlist, written inline in the command, a `-j` flag, or a project
   `.cargo/config.toml` `[build] jobs` are all left untouched. Windows workers are skipped.
-  (Commit `cf040af0`, in the v1.0.58 tag; previously mis-filed under Unreleased.)
+  (Commit [`cf040af0`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/cf040af0), in the v1.0.58 tag; previously mis-filed under Unreleased.)
 
 (v1.0.57 shipped as a GitHub release on 2026-08-15 without a changelog entry; this section
 covers v1.0.57..v1.0.58 only.)
@@ -206,6 +305,139 @@ and `rabsd`. All RABS crates are `publish = false`.
 
 ---
 
+## [v1.0.57] -- 2026-08-15 (release)
+
+547 non-merge commits, 2026-08-05 → 2026-08-15 (release published 2026-08-15, tagged commit
+[`7013f4cf`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7013f4cf)).
+Two stories run in this window and they barely touch: (1) **RABS is born** — every crate in
+the "Remote Artifact Build Sidecar" workspace (`rabs-protocol`, `rabs-key`, `rabs-cas`,
+`rabs-sandbox`, `rabs-scheduler`, `rabs-asupersync`, `rabs-action`, `rabs-replay`, `rabs-wrap`,
+`rabs-wkr`, `rabsd`) has zero commits before this range and a working shadow-mode spine by
+the end of it; (2) **rch/rchd keep shipping independently** — fleet-role policy, durable
+admin-disable state, CPU-capability quarantine, target-dir bloat reaping, and a batch of
+release-blocking fixes landed the same week, none of it RABS. The GitHub Release notes for
+v1.0.57 mention only the second story: RABS was still shadow-only. (v1.0.58, 278 commits
+later, is where RABS lands in full.)
+
+### RABS genesis — the master plan becomes a 513-bead epic graph and ten crates
+
+Before 2026-08-06 the repo has no `rabs-*` crate; `COMPREHENSIVE_MASTER_PLAN_FOR_RABS_ASUPERSYNC_NATIVE.md`
+(v1.6) is checked in the same day the workspace is scaffolded and immediately turned into a
+full bead graph — Epics A through T (`remote_compilation_helper-rabs-root-4pidu.19` through
+`.38`), 510 beads in one commit, corrected by a same-day "fresh-eyes audit." The next three
+days (~330 commits) build the epics as pure libraries with no daemon wiring yet.
+
+#### Delivered capability
+
+- Ten new crates in the Cargo workspace plus the `rabsd` daemon binary, none of which existed at v1.0.56.
+- `rabs-protocol`: five schema-version registries, a 23-family stable reason-code registry, a shared redaction/data-classification library, byte-preserving path/argv/env wire types, and requested→resolved snapshot-lineage sealing.
+- `rabs-key`: declared-invocation-output derivation, a Layer-0 configuration pack with exact toolchain/capability detection, and the first `rch why`/DAG-browser explainability scaffolding.
+- `rabs-cas`: schema-v13 durable content store with provisional-ancestor closures, adoption-edge tracking, ZSTD compression-policy tiers, and commit-ack gating on CAS + metadata durability.
+- `rabs-sandbox`: canonical pseudo-file/locale/timezone/device allowlists, immutable read-only source-snapshot mounts, and deterministic OUT_DIR/incremental/temp/home path remapping validated by a cross-worktree acceptance harness.
+
+#### Closed workstreams
+
+- [`remote_compilation_helper-rabs-root-4pidu.19`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) RABS Epic A: repository and architecture foundation
+- [`remote_compilation_helper-rabs-root-4pidu.22`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) RABS Epic D: canonical execroot and path handling (65 commits, the busiest epic in the range)
+- [`remote_compilation_helper-rabs-root-4pidu.26`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) RABS Epic H: durable CAS and metadata
+
+#### Representative commits
+
+- [`9ff533b9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9ff533b9) scaffolds rabs-protocol, rabs-key, rabs-action, and rabs-cas in one commit — the birth of the workspace
+- [`0d0e2546`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0d0e2546) writes 510 beads in a single commit, turning the master plan into a tracked epic graph
+- [`b12a8de6`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b12a8de6) adds the RABS Asupersync-native accelerated build sidecar master plan
+- [`fea5d926`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/fea5d926) rabs-sandbox D009: a deterministic epoch makes Cargo's mtime-based fingerprint worktree-invariant, root-caused live via `cargo -vv` on hz2
+
+### The bridge-plan pivot and the S1–S8 spine — RABS goes live in shadow mode
+
+By 2026-08-10 the epic-by-epic build was producing correct libraries but no running system.
+`RABS_BRIDGE_PLAN.md` records a same-day "reality check" and replaces epic-order execution
+with a spine-first plan: get one real, live, end-to-end path working before finishing any
+more epics. Milestones S1 through S8 landed in under 36 hours (08-10 to 08-11).
+
+#### Delivered capability
+
+- S1: `rabsd` boots a real `rabs-asupersync` runtime island (not a mock) on csd and hz2.
+- S2: `rabs-wrap`, a tiny `RUSTC_WRAPPER` binary with a breaker-gated daemon consult, meeting an enforced 8.4 ms end-to-end p95 overhead gate.
+- S3: a live UDS server in the rabsd edge region (with a same-day fix for concurrent daemons colliding on the default socket path).
+- S4: a shadow decision plane over real production build traffic — computes real Epic-F action keys and emits pass-through "would-have-hit" evidence without altering any build output.
+- S5: `rabs-wkr` worker session with orchestrated canonical execution, proven live on hz2.
+- S6: the coordinator role boots in-process with leases/arbiter/singleflight mounted and leader/follower degraded-mode acceptance.
+- S7: `rabsd doctor`, capability-gated fleet deploy scripts, and packaging/CI.
+- S8: fault-injection chaos slice plus a compressed 24-hour shadow soak, both green.
+- Post-spine hardening (08-12): rabsd refuses a cache hit whose materialized outputs differ from the caller's real work.
+
+#### Closed workstreams
+
+- [`bd-c7331`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) S1: rabsd binary + real Asupersync runtime island (M2 keystone)
+- [`bd-gj6vd`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) S2: rabs-wrap tiny wrapper binary (real RUSTC_WRAPPER)
+- [`bd-vyhr0`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) S3: UDS server in the rabsd edge region
+- [`bd-w94g8`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) S4: shadow decision plane over production traffic
+- [`bd-085cm`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) S5: rabs-wkr skeleton — real ATP session + orchestrated canonical execution
+- [`bd-z360j`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) S6: coordinator role boots in-process
+- [`bd-n8qt3`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) S7: packaging + fleet provisioning of rabs binaries
+- [`bd-rb754`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) S8: spine chaos slice — fault injection + 24h shadow soak
+
+#### Representative commits
+
+- [`28ea3f8a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/28ea3f8a) RABS bridge plan: spine-first gap closure from the 2026-08-10 reality check
+- [`151ad102`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/151ad102) S1 — rabsd boots the real asupersync runtime island
+- [`aae09051`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/aae09051) S2 — the tiny RUSTC_WRAPPER binary with breaker-gated daemon consult
+- [`8047e569`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8047e569) S3 — UDS edge server goes live
+- [`15ea763b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/15ea763b) S4 — shadow decision plane over live traffic
+- [`42b50f31`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/42b50f31) rabsd refuses a cache hit whose outputs differ from the caller's actual work
+
+### Fleet reliability hardening — role policy, durable disable state, and target-dir bloat
+
+Running in parallel with the early RABS scaffolding (08-06 to 08-09), rch/rchd picked up a
+batch of operational fixes aimed at the worker fleet, independent of RABS entirely.
+
+#### Delivered capability
+
+- `general.role = dispatcher|worker|hybrid`: box-level fail-closed queueing policy replaces the old per-call `RCH_REQUIRE_REMOTE` env var.
+- `AdminDisableStore` persists worker admin-disable state across `rchd` restarts (a restart used to silently re-enable a worker an operator had disabled).
+- CPU-capability (SIGILL) fault detection: workers that fault on unsupported instructions are auto-quarantined instead of surfacing as false build failures; `rch-wkr` probes and reports the x86-64 microarch level (v1..v4) with a soft pre-v3 selection penalty.
+- `rch cache status` and `rch gc [--dry-run]`: agent-facing on-demand reap surfaces, backed by an optional per-worker byte-cap LRU eviction policy and a long-TTL pooled-dir reaper for "immortal pool corpses" — the fix for target-dir bloat silently consuming worker disk.
+- `rchd`'s restart-admission barrier no longer wedges permanently when a dead wrapper process holds a lease.
+- macOS: `rch`/`rchd` prefer an existing `~/.config/rch/config.toml` over the `ProjectDirs`-derived `~/Library/Application Support/...` path.
+
+#### Closed workstreams
+
+- [`bd-wywsj`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) general.role = dispatcher|worker|hybrid — box-level fail-closed/queue policy
+- [`bd-8zxz7`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) cpu-capability-fault quarantine not durable across rchd restarts (ovh-b incident)
+- [`bd-68hon`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) auto-detect & handle worker CPU-capability (SIGILL) faults
+- [`bd-9fgeu`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) macOS: rch+rchd silently ignore the documented ~/.config/rch/config.toml
+- [`bd-8e1mx`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) rchd restart-admission barrier permanently wedged by dead-wrapper job leases
+
+#### Representative commits
+
+- [`89a26e1a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/89a26e1a) `BoxRole` dispatcher/worker/hybrid for fleet machine identity
+- [`2ae4a338`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2ae4a338) durable `AdminDisableStore`, rehydrated across rchd restarts
+- [`a89ee345`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a89ee345) optional per-worker byte-cap LRU for stale target reaping
+- [`ab5befee`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ab5befee) prefer existing XDG `~/.config/rch` over ProjectDirs on macOS
+- [`310f8b8d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/310f8b8d) unwedge the restart-admission barrier from dead-wrapper leases
+
+### Release-week fix batch — the issues named in the v1.0.57 release notes
+
+Every "Added"/"Fixed" line in the GitHub Release comes from a concentrated 2026-08-14 push,
+three days after the RABS spine was declared complete and shadow-only.
+
+#### Delivered capability
+
+- macOS-native telemetry (GH #39): `rch-telemetry` collects real CPU/memory via `host_processor_info`/`vm_stat`/`sysctl` instead of returning zeros from a missing `/proc`.
+- SpeedScore persistence (GH #40): `rchd` persists a worker's SpeedScore before marking its benchmark done, so a crash/restart mid-cycle no longer discards a fresh benchmark; unknown telemetry age logs as `-1` instead of `u64::MAX`.
+- Durable per-worker cargo git-dep cache (GH #42): the hook keeps a per-worker `CARGO_HOME` across jobs so git dependencies are fetched once per worker, not once per job.
+- Stable-toolchain pin fix (GH #43): `rch` no longer stamps a stable rustc commit date onto rustup as if it were a nightly.
+- `min_free_gb` probe timeout fails closed: capability probes on loaded hosts get a 25 s budget so a timed-out disk-floor probe can no longer silently admit jobs below the configured floor.
+
+#### Representative commits
+
+- [`d64190db`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d64190db) collect real CPU/memory on macOS without /proc (#39)
+- [`cddbcae1`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/cddbcae1) persist SpeedScore before treating a benchmark as done (#40)
+- [`9f985350`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9f985350) keep a durable per-worker CARGO_HOME across jobs (#42)
+- [`c5a237a1`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c5a237a1) never stamp a stable rustc commit date onto rustup (#43)
+- [`b23cecad`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b23cecad) give loaded-host capability probes a 25 s budget
+
 ## [v1.0.56] -- 2026-08-04 (release)
 
 First published release since v1.0.53; v1.0.54 and v1.0.55 were git-tag-only
@@ -236,6 +468,114 @@ here as binaries for the first time.
 - Lockfile pruned of unused entries; benchmark/test formatting cleaned up.
 
 ---
+
+## [v1.0.55] -- 2026-08-02 (tag only)
+
+Two-commit follow-up to the just-shipped Windows worker platform. The Windows tar-over-ssh
+transport piped the mirror process's stderr (local `tar` on sync, remote `ssh` on retrieve)
+but never drained it — a chatty `tar` (concurrent writes, locked files, permission noise)
+could fill the ~64 KB pipe, block the process, starve the stdout pump, and hang the whole
+transfer; it is now drained concurrently via a spawned sink task. Paired with a docs pass
+that generalizes the Windows-worker setup guide (`C:/rch` tar-over-ssh transport, v1
+limitations) for use outside the original fleet.
+
+- [`d629beee`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d629beee) fixes a latent deadlock in Windows transfers — rare in practice, but a hang with no timeout
+- [`3c26f428`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3c26f428) genericizes the Windows-worker skill docs for other fleets
+
+## [v1.0.54] -- 2026-08-02 (tag only)
+
+Ships the first Windows worker platform. Remote compilation had assumed a POSIX worker
+everywhere (rsync, `/data/tmp/rch`, `timeout(1)`); this threads a
+`WorkerPlatform::{Posix, Windows}` through the transfer pipeline without touching POSIX
+defaults. `SelectedWorker.declared_os` (serde-default) carries the operator-declared OS from
+the daemon so old hooks stay compatible; Windows workers sync/retrieve via tar-over-ssh under
+`C:/rch` (accepting both `C:/` and `C:\` as absolute overrides), skip the POSIX `timeout(1)`
+wrapper and the `setsid`/pgid watchdog (which would otherwise hang SSH until timeout on a
+successful Windows build), and disable streaming progress.
+
+- [`27d95e5b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/27d95e5b) the platform threading itself — wire field, transfer pipeline, orchestration
+- [`277848f6`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/277848f6) locks drive-path parsing and the pgid-watchdog skip so the Windows path can't regress to Unix assumptions
+- [`d1dc306a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d1dc306a) fills the new `declared_os` fixture field so the suite compiles under the wire change
+
+## [v1.0.53] -- 2026-08-02 (release)
+
+21 commits, but not a single linear line of work: the merge commit [`9f52da57`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9f52da57) ("integrate
+origin/main with local RCH fixes as remote supersets") reconciled two histories that had
+independently diverged from v1.0.52 — an 11-commit local fix branch dated 2026-05-15 →
+2026-07-25, and 5 commits that origin/main had advanced in the same window — and the OS-gate
+feature landed on top of that reconciliation. Author dates on 11 of the 21 commits therefore
+predate the nominal window; they only reached `main` on 2026-07-29.
+
+### Host-OS worker admission gate
+
+Cross-platform fleets had no way to keep a command that needs a specific host OS (a
+`*-pc-windows-msvc` build needing the MSVC toolchain, `*-apple-*` needing the macOS SDK)
+from being routed to a worker structurally incapable of producing that artifact.
+
+#### Delivered capability
+
+- Opt-in `os` field in `workers.toml` (`linux | darwin | windows`) that makes a worker **exclusive**: admissible only for commands requiring that OS; a worker declaring nothing admits exactly as before.
+- Requirement derived from the command's `--target` triple (`*-pc-windows-msvc` → windows, `*-apple-*` → darwin; `*-pc-windows-gnu`/wasm stay unconstrained), reusing the existing `SelectionRequest::command` field so the gate holds across mixed `rch`/`rchd` versions in one fleet.
+- Gate enforced in three independent places (`WorkerSelector::get_eligible_workers`, `try_fallback`, `build_selection_diagnostics`) so `rch status` reports the exclusion as `os.declared_mismatch` instead of disagreeing with the scheduler; no admissible worker falls back to local rather than dispatching to a host that can't build it.
+- Corrected `WORKERS.md`/`workers-template.toml`, which had documented a `required_tags` gate that never existed in source (tags are descriptive only).
+- Repaired a `main` compile break the merge reconciliation had introduced (`ErrorCode::BuildCargoWorkspaceInheritance` missing a `description()` arm; a dead closure in `status.rs`).
+
+#### Representative commits
+
+- [`974ac383`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/974ac383) the OS-gate feature itself, gated in three places for consistency
+- [`08b2fcf9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/08b2fcf9) restores workspace-inheritance error handling the merge reconciliation had dropped
+- [`a4f7e8bc`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a4f7e8bc) repairs the resulting `main` compile break
+- [`ef21509c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ef21509c) documents the gate and retracts the phantom `required_tags` claim
+
+### Local fixes branch reconciled: path-topology, worker pins, fleet pressure, transfer stalls
+
+An 11-commit local branch (2026-05-15 → 2026-07-25) covering path-dependency workspace
+sync, worker-pin selection, fleet-pressure visibility, and transfer-stall bounding had
+drifted from `origin/main` by roughly 488 upstream commits before [`9f52da57`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9f52da57) reconciled the
+two "best of both," explicitly keeping local intent where remote had not yet absorbed it.
+
+#### Delivered capability
+
+- Policy-normalized absolute path dependencies allowed through path-topology; path-dependency workspace sync roots isolated per project; synced-manifest path attributes rewritten and workspace-inherited path dependencies synced.
+- `rch status` surfaces pressure-blocked fleet state instead of hiding it.
+- `preferred_workers` is an authoritative pin — both `WorkerSelector` and the legacy selection path return `NoMatchingWorkers` rather than silently substituting a different eligible worker.
+- Artifact transfer stalls bounded; the remote-required non-compilation refusal gets its own error code.
+- Remote sync topology and manifest rewriting driven from `PathTopologyPolicy`/config instead of hardcoded `/dp → /data/projects` and `/tmp/rch-sync` constants; a `replace_sources()` pass that had been corrupting non-path manifest metadata was dropped for the targeted rewriter; floating rust channels (`stable`/`beta`/`nightly`) matched by family instead of exact version, so a plain-`nightly` project stops being refused by every worker on a different nightly date.
+
+#### Representative commits
+
+- [`4f7931e0`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4f7931e0) isolates path-dependency workspace sync roots
+- [`6fea0b34`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6fea0b34) makes worker pins authoritative instead of a soft hint
+- [`ac84dd29`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ac84dd29) bounds artifact transfer stalls
+- [`e3bbabdb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e3bbabdb) drives remote sync from configuration, drops the corrupting source-rewrite pass
+- [`8daea511`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8daea511) matches floating rust channels by family, not exact date/version
+
+Three of these commits carry bracketed tracker refs (`[br-bd-3bhcb]`, `[br-bd-17c65.10.19]`,
+`[br-bd-17c65.10.17.1.3]`) that do not resolve to any record in the current
+`.beads/issues.jsonl`; they are quoted from the commit messages, not linked.
+
+### Upstream fleet-refusal legibility and capability probing
+
+While the local branch above was in flight, `origin/main` independently shipped a self-audit
+batch fix (issues #30–#35) for refusal legibility plus per-toolchain capability probing,
+merged into the same reconciliation.
+
+#### Delivered capability
+
+- Refusals route through `summary_critical()` (always-on stderr) instead of the default-silent `summary()`, so an `rc=1` refusal is no longer indistinguishable from a crashed toolchain; retryable refusals get exit code 103 versus exit 1 for permanent ones.
+- Stale worker-side `target/` residue is no longer re-pulled onto the local project root when a custom `CARGO_TARGET_DIR` is in play (previously a spurious E309 on otherwise-complete builds).
+- The capability probe records installed rustup **components** per toolchain, not just toolchains/targets — a worker missing `clippy`/`rustfmt` for the pinned nightly used to report healthy and get routed lint work it silently failed.
+
+#### Closed workstreams
+
+- [`bd-vc61a`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) Capability probe records toolchains/targets but not COMPONENTS
+- [`bd-u9mo8`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) `rch shim install|status|uninstall` (canonical cargo wrapper) — closure recorded; the feature shipped in v1.0.52
+
+#### Representative commits
+
+- [`10198772`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/10198772) refusal-legibility and stale-target-pull batch fix (rch#30–35)
+- [`85398183`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/85398183) per-toolchain COMPONENTS probing (bd-vc61a)
+- [`9318f5c7`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9318f5c7) files bd-68hon (worker CPU-capability SIGILL auto-handling), root-caused live against the Ivy Bridge `ovh-b` worker; closed later, in v1.0.57
 
 ## [v1.0.52] -- 2026-07-23 (release)
 
@@ -327,7 +667,11 @@ here as binaries for the first time.
 
 ---
 
-## [v1.0.50] -- 2026-07-17 (release)
+## [v1.0.50] -- 2026-07-17 (draft release — never published)
+
+`gh release view v1.0.50` reports `isDraft: true` with no publish date: the tag exists and
+the notes below describe what it carries, but nothing was ever served from it; installers
+skipped from v1.0.49 to v1.0.51.
 
 ### Added
 
@@ -353,6 +697,208 @@ here as binaries for the first time.
   Unix-domain socket paths below the platform limit.
 
 ---
+
+## [v1.0.49] -- 2026-07-15 (release)
+
+### Polyglot offload: Go, TypeScript, and Nix join the fleet
+
+Through v1.0.47, rch only offloaded Cargo/rustc (plus gcc/bun/node). Agent swarms running
+`go build`, `go test`, `tsc`, or `nix build` got zero interception — every one of those ran
+locally, so a dispatch box could carry a load average over 100 while dozens of Rust-only
+worker slots sat idle. This wave adds real classification and worker capability gating for
+three more toolchains, plus a correctness fix for cross-repo Cargo path dependencies that
+could otherwise silently desync a remote build. Landed via PR #29.
+
+#### Delivered capability
+
+- New `CompilationKind::{GoBuild, GoTest, GoVet, Tsc}` — the `workers.toml` `tags = ["bun","go","rust"]` entries had implied Go/TS offload worked since day one; `required_tags` was never read anywhere, so it never did.
+- Nix build/test routing: `nix build`, legacy `nix-build`, `nix flake check`, and non-interactive `nix develop -c` / `nix shell -c` are classified and routed only to workers that probe a real `nix` binary with a populated `/nix/store`; interactive/mutating Nix subcommands fall back to local.
+- `node_modules` is provisioned worker-side for `tsc` instead of rsynced (macOS-native `.node` binaries would be unusable on a Linux worker).
+- The PreToolUse hook stopped attaching an ambient rustup toolchain to non-Rust dispatches (a `go build` was carrying `nightly-2026-07-11` along for the ride).
+- `fix(cargo): materialize every local path closure` — derives a manifest-only materialization closure (normal/build/dev/target/optional/workspace-inherited/patch/transitive path deps) separate from the active cargo-metadata execution DAG, and fails closed with a new `RCH-E415` (with actionable evidence) instead of silently syncing only the primary root.
+- Installer: an active system-level `rchd.service` is treated as authoritative on worker hosts, so Easy Mode no longer installs a redundant user-level daemon that nightly updates could resurrect alongside root's (issue #28).
+
+#### Representative commits
+
+- [`1213f4ef`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1213f4ef) `feat(classifier): offload Go and TypeScript builds` — new compilation kinds + capability gating
+- [`c6fe8dee`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c6fe8dee) `feat(offload): route Nix builds to nix-capable workers` (#26)
+- [`325a7503`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/325a7503) probe + require a real nix (binary + populated /nix/store)
+- [`167d5117`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/167d5117) materialize every local path closure — new `RCH-E415` fail-closed path
+- [`a17ec093`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a17ec093) installer avoids a duplicate user daemon on worker hosts (#28)
+
+There is no `v1.0.48` tag: the sequence goes straight from v1.0.47 to v1.0.49.
+
+## [v1.0.47] -- 2026-07-02 (release)
+
+Two-commit release shipping one large, deliberately atomic fix:
+[`facb7b2d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/facb7b2d)
+`feat(rchd): self-healing worker circuits + SSH connection reuse; managed build-artifact dirs`.
+A fleet audit found the periodic daemon subsystems (health, telemetry, capability probe,
+cache-cleanup, stale-target-reap, reclaim, toolchain probe) each opening fresh SSH sessions,
+and the resulting handshake flood (~72/min) was itself making healthy workers look
+unreachable and tripping their circuit breakers. The fix threads one shared `SshPool` (warm
+`ControlMaster`, bounded `ControlPersist`) through every subsystem, collapsing that to ~12
+warm masters; unifies the two circuit-breaker stores into one source of truth via
+`CircuitStats::apply_health_outcome` so `enable()` and a successful benchmark actually
+reset/promote state, half-open recovery needs exactly `success_threshold` clean probes, and a
+transient half-open failure no longer reopens the circuit; and defaults the remote
+build-artifact prefix (`CARGO_TARGET_DIR`/`TMPDIR`/Go caches) to the managed `/data/tmp/rch`
+zone instead of leaking into unscanned paths (root cause of a 241 GB `/root/cass-ft-target`
+filling a worker). The second commit
+([`0c22f427`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0c22f427))
+files the Nix-offload design bead that lands in v1.0.49.
+
+The orphan tag `rch-local-superseded-20260710` (2026-07-09) sits only on local backup
+branches and is not an ancestor of any release: an abandoned parallel-agent branch that
+reimplemented the same SSH-pool + circuit-breaker idea already shipped in [`facb7b2d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/facb7b2d).
+
+## [v1.0.46] -- 2026-06-25 (release)
+
+Small CI-hardening release closing the trailing edge of the session-history-remediation
+program. [`bfa76f3b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/bfa76f3b)
+and [`71727d57`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/71727d57)
+add a release-asset-completeness gate plus a linux-musl row to the test-release matrix, then
+rework the gate to be installability/platform-based rather than a brittle file-count check
+(`bd-qb0if`). [`90ff452a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/90ff452a)
+closes `bd-o0lxa`, confirming the cosign-tolerance self-update fix (PR #25) was
+independently validated.
+
+## [v1.0.45] -- 2026-06-25 (release)
+
+### Session-history-remediation program: closeout (epics 7, 10, 16 + root)
+
+`bd-session-history-remediation-ocv9i` — "RCH session-history remediation program from
+complete history analysis" — was the dominant epic across v1.0.42 and v1.0.45, built from a
+full audit of real agent session logs. This release closes its remaining P0/P1 sub-epics:
+OS/arch-aware fleet update with release-provenance verification (epic 7), capacity-queue
+semantics under multi-agent load (epic 10), and cross-cutting fault-injection/release gates
+via a real-fleet smoke/soak profile (epic 16) — then closes the root program itself.
+
+#### Delivered capability
+
+- Release-provenance verification + deploy audit: a fleet-deploy enforcement gate, so a worker binary that doesn't match the expected release provenance is refused rather than silently deployed.
+- `rch self-test --smoke --load` real-fleet profile: `DesiredVsLiveFleet`, `ProofModeRefusal`, `cargo_canary`/`artifact_retrieval`/`queue_attach_cancel`, disk/inode admission, and capabilities smoke scenarios — each built against a mock-SSH executor and then proven live against the real fleet, fixing two daemon canary bugs only the live run surfaced.
+- Multi-agent storm-control E2E foundation, proven live on a 12-worker fleet (epic 10.4) — validates queue-when-busy and job-reattach semantics under real concurrent load.
+- A CI/release validation-matrix gate with close-reason evidence audit (epic 16.5).
+- rch#23 fleet-packaging fixes: workspace deps switched from absolute `/dp` paths to crates.io, a linux-x86_64 prebuilt fallback (musl → gnu) for the installer, and a clean-checkout CI guard.
+- Cosign-tolerant signature verification lands on `main` via PR #25 — the same fix v1.0.44 had already fleet-deployed off a divergent branch.
+- Hook classifier: cargo/rustc wrapped in a benign pipe, redirect, background `&`, or `bash -c "..."` was previously rejected by the Tier-1 structural filter and run locally — since those are the dominant agent invocation forms, `force_remote=true` orchestrators were silently defeated, producing exactly the local rustc storms rch exists to prevent (issue #24). `classify_command` now handles both safely at depth 0.
+- `zcecy.14` (hook hot-path de-monolithization) closes: `hook.rs` down to 1992 lines via five submodule extractions.
+
+#### Closed workstreams
+
+- [`bd-session-history-remediation-ocv9i`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) RCH session-history remediation program — root closed COMPLETE
+- [`bd-session-history-remediation-ocv9i.7`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) P0: OS/arch-aware fleet update and worker binary validation
+- [`bd-session-history-remediation-ocv9i.10`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) P1: Capacity queue semantics and job reattach
+- [`bd-session-history-remediation-ocv9i.16`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) P0: Cross-cutting validation fault injection and release gates
+- [`remote_compilation_helper-zcecy`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) Epic: rch hook hot-path — performance + reliability hardening
+
+#### Representative commits
+
+- [`06aad61c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/06aad61c) closes epics 7/16 and the root program
+- [`c4ed7bba`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c4ed7bba) enforce release-provenance gate + deploy audit in fleet deploy
+- [`a1c6ec38`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a1c6ec38) wire `rch self-test --smoke --load` live storm-control
+- [`8d6e3fe1`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8d6e3fe1) use crates.io deps instead of absolute /dp paths (rch#23)
+- [`a5757a48`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a5757a48) closes `zcecy.14` — hook.rs de-monolithized to 1992 lines
+- [`8ceeb066`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8ceeb066) offload cargo/rustc when wrapped in benign pipe/redirect/bg/bash -c (#24)
+
+## [v1.0.44] -- 2026-06-24 (release)
+
+Fleet hotfix built off v1.0.43 (the deployed baseline) plus two cherry-picked `main` fixes,
+built locally because GitHub Actions was gridlocked (50+ hour queue). Headline: `rch update`
+no longer hard-fails on hosts without `cosign`
+([`d67e6022`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d67e6022)) —
+signature verification degrades to a warning (checksum stays enforced) when a release ships
+a sigstore bundle but `cosign` isn't installed, unblocking self-update across the cosign-less
+worker fleet. Also cherry-picks a stalled-Cargo-git-fetch classifier
+([`41405976`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/41405976))
+and a bound on piggyback telemetry collection so a finished build's optional telemetry run
+can no longer keep it looking "active." Only aarch64-darwin and x86_64-linux-gnu assets were
+built; the same cosign fix later landed formally on `main` via PR #25 in v1.0.45.
+
+## [v1.0.43] -- 2026-06-19 (release)
+
+Single-commit release:
+[`141ae56b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/141ae56b)
+`feat(routing): source preferred_workers from project .rch/config.toml` — per-project
+worker-preference routing, built directly on v1.0.42.
+
+## [v1.0.42] -- 2026-06-18 (release)
+
+The largest release in this span — 190 commits over ten days (2026-06-08 → 2026-06-18),
+dominated by two epics: the session-history-remediation program's opening wave, and a
+parallel hook-hot-path de-monolithization effort.
+
+### Session-history-remediation program: launch (epics 1, 3, 5, 17)
+
+The epic `bd-session-history-remediation-ocv9i` was scoped directly from a review of real
+agent session logs, targeting the failure modes showing up in the wild: workers stuck in a
+manual-recovery bypass state, hooks that couldn't self-heal a dead daemon socket,
+silently-ignored placement env vars, and unredacted secrets in proof output.
+
+#### Delivered capability
+
+- Bypass recovery service: a probe/backoff/canary auto-rejoin loop so a worker temporarily bypassed for a failure no longer needs a manual `rch workers enable` to recover (epic 1.3).
+- Hook socket-failure recovery: structured incidents plus autostart hardening when the daemon socket is unreachable (epic 3.1).
+- Agent-facing proof handoff output format (epic 5.4), and a canonical placement-controls registry (`rch-common/src/placement.rs`) resolving `RCH_WORKER`, `RCH_FORCE_REMOTE`/`RCH_REQUIRE_REMOTE`, `RCH_QUEUE_WHEN_BUSY`, `RCH_VISIBILITY` and their aliases into a `PlacementPlan` that never silently drops an unrecognized or superseded knob — fixing a previously **silently-ignored `RCH_FORCE_REMOTE`** (epic 13.5).
+- Central remediation config schema + default policy, wired into `init`/`doctor`/`lint`/`diff`/`export` rollout, with E2E golden-test coverage (epic 17.1–17.3).
+- `redact_secrets` wired into every remediation output surface plus shell E2E leak guards (`bd-53ga7`).
+- `rch sync --force` — an agent-safe force-resync command (`bd-apg5l`).
+- `rch capabilities` webhook notifications fire on reliability-verdict transitions.
+
+#### Closed workstreams
+
+- [`bd-session-history-remediation-ocv9i.1`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) P0: Temporary bypass and auto-rejoin worker lifecycle
+- [`bd-session-history-remediation-ocv9i.3`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) P0: Hook daemon doctor mutual self-healing
+- [`bd-session-history-remediation-ocv9i.5`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) P0: Proof mode and deferred proof queue
+- [`bd-session-history-remediation-ocv9i.13.5`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) First-class placement queue and visibility controls for agents
+- [`bd-session-history-remediation-ocv9i.17`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) P1: Config defaults installer and upgrade rollout
+
+#### Representative commits
+
+- [`e333c8fe`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e333c8fe) bypass recovery service — probe/backoff/canary auto-rejoin loop
+- [`0320b32d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0320b32d) hook socket-failure recovery incidents + autostart hardening
+- [`9b332c31`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9b332c31) central remediation config schema + default policy
+- [`d3c6272b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d3c6272b) redact secrets at free-text output surfaces
+- [`70ac75a2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/70ac75a2) wire remediation config into init/doctor/lint/diff/export rollout
+
+### Hook hot-path de-monolithization (epic zcecy.14)
+
+`remote_compilation_helper-zcecy` began carving `rch/src/hook.rs` into focused submodules
+(29 commits reference `zcecy` in this range). This release extracts the SSH command runner,
+command-parsing, formatting, and repo-updater pre-sync subsystems; the effort completes in
+v1.0.45.
+
+#### Representative commits
+
+- [`3d9c24d5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3d9c24d5) extract hook::ssh submodule + rename to run_offload_ssh_command
+- [`2b880d07`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2b880d07) extract hook::command_parsing submodule
+- [`5b4fcb04`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5b4fcb04) extract hook::formatting submodule — hook.rs now ≤ 2000 lines
+- [`9dff82aa`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9dff82aa) extract repo_updater pre-sync subsystem from hook.rs
+
+### Fleet reliability and scheduler correctness
+
+A cluster of independent fixes targeting worker dispatch and connection health, several from
+a dedicated fleet audit.
+
+#### Delivered capability
+
+- Self-healing circuit window + first-class worker priority (#21): `CircuitStats::error_rate()` computes over a bounded recent-results window instead of unbounded lifetime counters, and `close()` clears `recent_results` — fixes long-uptime daemons silently dropping healthy workers from dispatch (the recurring "not enough free build slots" flapping). Priority becomes a first-class selection input.
+- `SshPool` validates connection liveness on borrow instead of trusting a possibly-dead pooled connection.
+- Remote target-dir reuse + narrowed sync-back (#19): the remote cargo target-dir name is a stable key derived from `(project_root, toolchain, target)` instead of unique-per-invocation, so builds stop cold-recompiling the full dependency graph and leaving GBs of throwaway per-job target dirs; sync-back fails loud on missing artifacts.
+- Watchdog stdio detach (#20): a successful build releases its SSH session immediately instead of holding it open.
+- Fleet deploy guards against OS/arch binary mismatch, so a mismatched worker binary is refused rather than bricking the target.
+- `cache_gc` staging walk never follows symlinks; `rch-wkr` status messages use a non-panicking stderr write.
+- Hot-path performance budgets + regression suite (epic 16.7).
+- CI nightly toolchain pin bumped 2025-11-01 → 2026-06-06 (#22), fixing an `ftui-widgets` E0658 that had blocked all builds/releases off `main`.
+
+#### Representative commits
+
+- [`11877499`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/11877499) self-healing circuit window + first-class worker priority (#21)
+- [`48488480`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/48488480) reuse remote target dirs, narrow sync-back, fail loud on missing artifacts (#19)
+- [`8fdff510`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8fdff510) detach watchdog timer stdio so successful builds release the SSH session (#20)
+- [`2f74d98f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2f74d98f) SshPool validates connection liveness on borrow
+- [`69a7ac24`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/69a7ac24) bump pinned nightly 2025-11-01 → 2026-06-06 (#22)
 
 ## [v1.0.41] -- 2026-06-08 (release)
 
@@ -519,7 +1065,118 @@ here as binaries for the first time.
 
 ---
 
-## [v1.0.25] -- 2026-05-14
+## [v1.0.33] -- 2026-05-29 (release)
+
+### Restart-storm eradication and release-pipeline unblocking
+
+A systemd interaction bug had been silently restart-storming rchd on four Linux controllers
+(28k–34k restarts observed) while flooding the Mac controller's log capture at 2.1 GB/day,
+and in parallel the GitHub Actions release workflow had been failing for three consecutive
+tag attempts (v1.0.29–v1.0.31 all 24h-timed-out). This version fixes both the daemon-level
+bug and the CI pipeline that ships it.
+
+#### Delivered capability
+
+- `rchd::bind_daemon_socket` waits for the current socket owner to free it under systemd (`INVOCATION_ID` set) instead of exiting 1 and triggering `Restart=always` storms; standalone invocations keep fail-fast behavior.
+- `rch::doctor::spawn_rchd` self-heal prefers `systemctl --user start rchd.service` (idempotent) over nohup-spawning a competing detached daemon that could permanently seize the socket.
+- Telemetry poller's per-worker SSH connect/disconnect lines demoted from INFO to `debug!`, plus a log retention cap (`RCH_LOG_MAX_FILES`, default 7) — ends the 8.3M-line/day log flood.
+- `sd_notify` (`Type=notify` readiness, `READY=1` + `STATUS=`) so `systemctl status` shows why a waiting rchd looks idle; `wait_for_socket` probes for a live listener instead of stat-ing the path.
+- CI: pinned `RUSTUP_TOOLCHAIN` (the "can't find crate for `core`" failure that had silently broken every release build since v1.0.29), patched `/dp/` path deps on SIP-protected macOS runners, and dropped the broken Windows build and the runner-starved macOS x86_64 job from `publish.needs`.
+
+#### Representative commits
+
+- [`23c2e40e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/23c2e40e) systemd wait-for-owner + prefer `systemctl start` over nohup-spawn; INFO→debug log demotion + retention cap
+- [`96aeb2cb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/96aeb2cb) retry on transient bind errors; testable `bind_daemon_socket_with_mode` split
+- [`31ab11e3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/31ab11e3) `sd_notify` readiness + `wait_for_socket` probes a live listener
+- [`9349e275`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9349e275) pin `RUSTUP_TOOLCHAIN` — fixes the stdlib-shadowing bug behind three timed-out releases
+- [`e3b45d4d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e3b45d4d) drop the broken Windows build and runner-starved macOS x86_64 from `publish.needs`
+
+There is no `v1.0.32` tag.
+
+## [v1.0.31] -- 2026-05-26 (release)
+
+One-commit tuning fix closing the telemetry-poller saga (see v1.0.28–v1.0.30): v1.0.30 made
+every poll cycle refresh all workers, but freshness reads still dipped because
+`skip_after=60s` plus a 30 s tick pushed the effective re-poll interval to ~90 s — exactly
+the pressure layer's telemetry-stale threshold, so workers raced in and out of "fresh".
+[`848e0539`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/848e0539)
+drops `skip_after` to 30 s (effective ~60 s re-poll).
+
+## [v1.0.30] -- 2026-05-26 (release)
+
+One-commit fix making the telemetry poller resilient to SSH contention: fleet telemetry
+freshness fluctuated because concurrent SSH load from other daemon subsystems caused
+intermittent re-poll failures.
+[`3e483741`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3e483741)
+adds a one-shot retry with backoff per poll attempt, a per-cycle INFO-level "refreshed N/M"
+summary, and `MissedTickBehavior::Skip` so a long cycle cannot fire a burst of back-to-back
+cycles. Validated 8/8 workers refreshed with 0 failures over ~4.5 minutes.
+
+## [v1.0.29] -- 2026-05-26 (release)
+
+One-commit fix for permit starvation introduced by v1.0.28's semaphore: a poll whose SSH
+hung past the (not-always-honored) `ssh_timeout` held its concurrency permit indefinitely;
+on a 9-worker fleet ~4 stuck polls exhausted all 4 permits and silently collapsed freshness
+to 1/9 workers.
+[`f1d07625`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f1d07625)
+wraps each poll in a hard `tokio::time::timeout(ssh_timeout + 5s)` and raises
+`MAX_CONCURRENT_TELEMETRY_POLLS` 4 → 16.
+
+## [v1.0.28] -- 2026-05-26 (release)
+
+One-commit fix for the telemetry poller starving worker selection: the poller held a
+`worker.config` read-lock across the entire SSH round-trip and fanned out one unbounded poll
+per worker per tick, producing multi-second "worker_selection latency exceeded panic
+threshold" stalls (5–20 s against a 50 ms budget).
+[`ab23b1ef`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ab23b1ef)
+snapshots the worker config and releases the lock before SSH work, and bounds concurrent SSH
+polls with a 4-permit semaphore.
+
+## [v1.0.27] -- 2026-05-25 (release)
+
+### Fleet-reliability hardening and worker-topology correctness
+
+57 commits (2026-05-15 → 05-19) closing three parallel workstreams: canonical
+worker-filesystem-topology validation, the reliability/telemetry reporting pipeline that
+later fed the v1.0.28–v1.0.31 poller fixes, and a security-hardening pass across
+shell-command construction sites. Also delivers the `RCH_*_INJECT_*` test-fixture registry
+and two new `rch doctor`/`rch workers` subcommands.
+
+#### Delivered capability
+
+- `path_topology` alias verification widened to accept `AliasSubtreeSymlinkVerified` (alias points at a subtree of the canonical root) and `AliasDirectoryEntryVerified` (alias is a real directory containing symlinks into the canonical root), plus hook fail-closed behavior and a worker-probe refactor.
+- `rch doctor --runbook <code>` and `--runbook-list`: static Markdown incident runbooks per `RCH-Rnnn` reliability code.
+- `rch workers benchmark [WORKER_ID] [--all] [--force]` and `rch workers compare`, completing the SpeedScore display/management commands.
+- `RCH_*_INJECT_*` env-var registry (`rch-common/src/testing/injection.rs`): one source of truth for debug/test injection variables, so a typo becomes a compile error instead of a silent no-op.
+- Reliability-pipeline correctness: admission verdicts wired into pressure debt, side-effect-free reliability scoring, command exits excluded from worker circuit health, selector-rejection diagnostics surfaced, affinity fallback requires slots, rchd reports only assignable free slots.
+- Remediation-reporting fixes: correct `telemetry_gap` fix strings across `rch check`/`rch status`/RCH-R104 (issue #16 — none of the three prior directives actually refreshed telemetry).
+- Security hardening across worker-deploy shell commands, hook settings mutation, queue-display/test-log paths, topology/transfer/selector diagnostics quoting, rsync filter escaping, and catch-all-artifact source guards.
+- Update/lock hardening: tokenized lock-file parsing; the lock file is only removed on `Drop` if its body still matches what the guard wrote.
+- Docs: `SKILL.md`/`HOOKS.md`/`TROUBLESHOOTING.md`/`WORKERS.md` rewritten around `rch doctor` as the entry point; `diagnose-rch.sh` removed.
+
+#### Closed workstreams
+
+- [`remote_compilation_helper-62u24.13`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) Test fixtures foundation: `RCH_*_INJECT_*` registry + `rch debug` + request_id propagation
+- [`remote_compilation_helper-62u24.20`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) `rch doctor --runbook <code>`: Markdown runbook generation
+- [`remote_compilation_helper-ifq7s`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) `rch workers benchmark <id>` + `rch workers compare`
+- [`remote_compilation_helper-28o9b`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) Hook topology preflight diagnostics name exact alias paths
+
+#### Representative commits
+
+- [`c98b0afd`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c98b0afd) path-topology alias-subtree/alias-directory verification + hook fail-closed
+- [`a934d75e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a934d75e) `RCH_*_INJECT_*` env-var registry
+- [`e7eaa647`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e7eaa647) `rch doctor --runbook`/`--runbook-list`
+- [`078ae817`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/078ae817) `rch workers benchmark`/`compare`
+- [`9e298bf7`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9e298bf7) fix `telemetry_gap` remediation strings (#16)
+- [`aaa8a6cd`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/aaa8a6cd) skill docs rewritten around `rch doctor`
+
+## [v1.0.26] -- 2026-05-14 (release)
+
+Same-day one-commit follow-up to v1.0.25:
+[`25848a02`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/25848a02)
+adds an `upgrade` alias for the release/upgrade helper.
+
+## [v1.0.25] -- 2026-05-14 (release)
 
 ### Dependency and release maintenance
 
@@ -541,7 +1198,101 @@ here as binaries for the first time.
 
 ---
 
-## [v1.0.18] -- 2026-04-16 **(release)**
+## [v1.0.24] -- 2026-04-29 (release)
+
+Single-commit release.
+[`ce4b0029`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ce4b0029)
+fixes `find_local_binary()` in `rch/src/fleet/mod.rs` so `rch fleet deploy` prefers a
+properly installed `rch-wkr` (resolved via `which`, home dir, or the current-exe directory)
+over whatever happens to sit in a dev `target/{release,debug}` or `CARGO_TARGET_DIR`, so a
+stale or mismatched dev build no longer gets pushed to fleet workers. The commit also
+carries an incidental `.beads/issues.jsonl` id-format normalization — a tracker-sync side
+effect, not a product change.
+
+## [v1.0.23] -- 2026-04-29 (release)
+
+Three-commit release closing out the day's deploy-hardening push.
+
+- [`8fdd6d06`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8fdd6d06) `rch doctor` no longer panics on a broken pipe: stdout writes go through a `write_stdout` wrapper so piping the report into `head` is normal Unix behavior instead of a crash.
+- [`72bcbfd3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/72bcbfd3) `copy_binary_via_scp` uploads to a per-deploy staging path and renames into place instead of SCP-ing straight onto `~/.local/bin/rch-wkr` — a direct overwrite could fail or corrupt the binary while the worker was executing it.
+- [`bca70f48`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/bca70f48) `install.sh` installs binaries via `install -m 755` into `${dest}.tmp.$$` then `mv -f`, so re-running the installer against a live `rchd`/`rch-wkr` doesn't `ETXTBSY` or truncate a running executable.
+
+## [v1.0.22] -- 2026-04-29 (release)
+
+- [`83606e72`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/83606e72) `send_daemon_command` gains a 3 s connect timeout and 10 s I/O timeout plus explicit half-close around the daemon Unix-socket protocol, so a CLI invocation can no longer hang indefinitely if `rchd` never responds.
+- [`17eaeacc`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/17eaeacc) release workflow concurrency group scoped per-tag instead of one global `release` group (a stale queued run for one tag could block every subsequent release); the `cargo publish -p rch-common` step checks crates.io directly for an already-published version.
+- [`8a036ead`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8a036ead) version bump.
+
+## [v1.0.21] -- 2026-04-29 (release)
+
+Two commits: a version bump plus
+[`f71aa7d3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f71aa7d3),
+which adds `--safe-links` to the new `build_retrieve_streaming_command()` rsync invocation so
+streamed artifact retrieval preserves the symlink-safety semantics the streaming path had
+dropped relative to the non-streaming command.
+
+## [v1.0.20] -- 2026-04-29 (release)
+
+### CARGO_TARGET_DIR round-tripping and installer resilience
+
+Two problems surfaced from real remote-build usage: `rch exec` silently dropped custom Cargo
+target directories when running builds on a worker, and the installer had a hardcoded
+`/tmp/rch` runtime directory that could collide with a stale non-directory left behind by
+another tool.
+
+#### Delivered capability
+
+- `rch exec` maps a local `--target-dir`/`CARGO_TARGET_DIR` to a worker-scoped `.rch-target`, strips the local target-dir setting before shipping the command remotely, and syncs `.rch-target` back to the requested local path on completion — so two projects with different target dirs no longer clobber each other's artifacts on the same worker.
+- `[path_topology]` TOML config is wired end-to-end: `PartialRchConfig` gained the field (serde had silently dropped the whole section), `apply_layer` merges it, and `rch config get/show/validate` recognize the keys (closes #10). Two follow-ups make empty-string handling consistent (`RCH_CANONICAL_PROJECT_ROOT=""` is "unset" in `rch config get/show` and in `merge_config`).
+- `install.sh` accepts a custom runtime directory and recovers instead of aborting when `/tmp/rch` already exists as a non-directory.
+
+#### Representative commits
+
+- [`13bc7498`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/13bc7498) CARGO_TARGET_DIR sync: worker-scoped `.rch-target` mapping, strip-then-restore around remote exec
+- [`41eb319c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/41eb319c) gates the target-dir sync on cargo command kind
+- [`62a823d2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/62a823d2) wires `path_topology` through the TOML parser and `rch config` (closes #10)
+- [`ada30198`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ada30198) / [`87ed33a4`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/87ed33a4) empty-string audit gap on the CLI-read and config-merge sides
+- [`be12fde1`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/be12fde1) installer survives a `/tmp/rch` path collision
+
+## [v1.0.19] -- 2026-04-23 (release)
+
+### Audit-pass hardening sweep
+
+40 commits, almost entirely from a self-directed correctness/safety audit plus five
+new-capability beads closed the same evening (2026-04-22). The audit fixes share a pattern —
+subtle concurrency races, unsafe string/byte slicing, permissive matchers, and resource
+leaks that had shipped quietly and would only surface under load or on specific platforms.
+The fleet-lock bug was traced to "Worker self-test failed" errors recurring across 30+
+concurrent-agent sessions.
+
+#### Delivered capability
+
+- Structured error codes on worker probes: `WorkerProbeResult` gained `error_code` mapped from the RCH-Exxx catalog, plumbed through the probe path and surfaced in summaries, plus an interactive-TTY hint when `rch` is invoked bare.
+- Per-fleet cooperative lock: `rch fleet {deploy,rollback,drain}` take a per-fleet lock, closing a race where two concurrent invocations (e.g. separate agent panes) could interleave systemd unit writes, binary swaps, and drain/undrain sequencing.
+- Alert lifecycle + cleared-retention window: circuit-breaker alerts that self-heal no longer stay pinned on `rch status` indefinitely.
+- Config diagnostics + `identity_file` env expansion: `rch workers list`/config validation aggregate missing-key diagnostics and expand env vars in `identity_file`, so a typo'd key path is caught at config time instead of at first probe failure.
+- Self-test outer timeout budget: `rch self-test --all` enforces a real per-worker total timeout; previously a worker failing 3 retries could consume `3 × timeout + 2 × retry_delay` before being classified as timed out.
+- Concurrency and resource-leak fixes: atomic rate-limit check+insert in `BenchmarkQueue::enqueue`; `kill_on_drop` + concurrent pipe drain on every timeout-wrapped subprocess spawn (fixing a >64 KB `cargo metadata` deadlock and a leaked-child bug); single `write_all` per line for concurrent O_APPEND JSONL writers; `O_CREAT|O_EXCL` lock acquisition for the update lock; `saturating_duration_since` replacing `Instant::now() - window` to stop a fresh-boot panic.
+- Safety/correctness: shell-safe argv reassembly via `shell_words::join` for `rch exec -- …`; reject unsafe worker IDs and shell-escape IDs in remote commands; refuse slot reservations on draining/drained/disabled workers; clamp Rolling `batch_size`/AllAtOnce parallelism to avoid divide-by-zero; anchored/basename matchers replace three permissive substring matchers; no byte-indexed string slicing in display/parse paths; anchored `cleanup_old_backups` prefix matching; whole-disk vs partition classification across Linux naming schemes; true-median on even-length latency samples and a benchmark-score scaling no-op.
+
+#### Closed workstreams
+
+- [`remote_compilation_helper-5z2wa`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) rch fleet deploy: per-fleet cooperative lock
+- [`remote_compilation_helper-3ogaz`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) rch status: auto-clear or grey-out stale circuit-breaker alerts
+- [`remote_compilation_helper-hke4t`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) rch config validate: check identity_file existence + permissions
+- [`remote_compilation_helper-nhrjr`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) RCH-E100 doesn't distinguish key-missing from host-down from auth-refused
+- [`remote_compilation_helper-nuuqt`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl) rch self-test: enforce upper-bound timeout per worker
+
+#### Representative commits
+
+- [`894d13fd`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/894d13fd) per-fleet cooperative lock for deploy/rollback/drain
+- [`9cb7f6d6`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9cb7f6d6) alert lifecycle states + cleared-retention window
+- [`1ae6af4f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1ae6af4f) structured RCH-Exxx `error_code` on worker probes
+- [`3087a4e4`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3087a4e4) `rch self-test --all` gets a real outer per-worker timeout
+- [`81467ba8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/81467ba8) `kill_on_drop` + concurrent pipe drain on every timeout-wrapped subprocess spawn
+- [`dfefbfeb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/dfefbfeb) anchored/basename equality replaces three permissive substring matchers
+
+## [v1.0.18] -- 2026-04-16 (tag only)
 
 ### Diagnose + path topology bug fixes
 
@@ -557,7 +1308,7 @@ here as binaries for the first time.
 
 ---
 
-## [v1.0.17] -- 2026-04-11
+## [v1.0.17] -- 2026-04-01 (release)
 
 Nightly toolchain verification release. Unpins the nightly toolchain to the
 rolling latest, forwards `CARGO_TARGET_DIR` through delegated commands,
@@ -1014,7 +1765,24 @@ First tagged version. Marks the project's initial functional milestone after 9 d
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.16...HEAD
+## Notes for Agents
+
+- Start with the [Version Timeline](#version-timeline) for chronology and the release-vs-tag
+  distinction; the installer and the fleet's nightly updater only ever serve **Releases**.
+- Jump into a version section for what actually landed: `Delivered capability` names the
+  behavior, `Closed workstreams` gives the intent (search `.beads/issues.jsonl` for the id),
+  `Representative commits` are the diffs to read first.
+- The two subsystems most worth knowing before touching code: the reliability/remediation
+  stack (`v1.0.11` → `v1.0.45`, epics `bd-vvmd` and `bd-session-history-remediation-ocv9i`)
+  and RABS (`v1.0.57` → `v1.0.58`, epics `remote_compilation_helper-rabs-root-4pidu.*`).
+- Shim versions matter operationally: shim v2 (`v1.0.59`) and v3 (`v1.0.60`) both require
+  `rch shim install` after upgrading; `rch shim status` reports staleness.
+- Three tags are not what they look like: `v1.0.50` is an unpublished draft, `v1.0.58` has no
+  release at all, and `v1.0.32`/`v1.0.48` were never cut.
+- Everything below `v1.0.16` in the reference block uses compare links; newer versions link
+  straight to their release or tag page in the timeline.
+
+[Unreleased]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.61...HEAD
 [v1.0.16]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.15...v1.0.16
 [v1.0.15]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.14...v1.0.15
 [v1.0.14]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.13...v1.0.14
@@ -1037,3 +1805,46 @@ First tagged version. Marks the project's initial functional milestone after 9 d
 [v0.1.2]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v0.1.1...v0.1.2
 [v0.1.1]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v0.1.0...v0.1.1
 [v0.1.0]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/294d89af219328d429cbb6370fb7f2b448d87300...v0.1.0
+[v1.0.17]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.16...v1.0.17
+[v1.0.18]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.17...v1.0.18
+[v1.0.19]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.18...v1.0.19
+[v1.0.20]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.19...v1.0.20
+[v1.0.21]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.20...v1.0.21
+[v1.0.22]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.21...v1.0.22
+[v1.0.23]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.22...v1.0.23
+[v1.0.24]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.23...v1.0.24
+[v1.0.25]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.24...v1.0.25
+[v1.0.26]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.25...v1.0.26
+[v1.0.27]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.26...v1.0.27
+[v1.0.28]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.27...v1.0.28
+[v1.0.29]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.28...v1.0.29
+[v1.0.30]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.29...v1.0.30
+[v1.0.31]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.30...v1.0.31
+[v1.0.33]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.31...v1.0.33
+[v1.0.34]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.33...v1.0.34
+[v1.0.35]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.34...v1.0.35
+[v1.0.36]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.35...v1.0.36
+[v1.0.37]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.36...v1.0.37
+[v1.0.38]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.37...v1.0.38
+[v1.0.39]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.38...v1.0.39
+[v1.0.40]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.39...v1.0.40
+[v1.0.41]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.40...v1.0.41
+[v1.0.42]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.41...v1.0.42
+[v1.0.43]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.42...v1.0.43
+[v1.0.44]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.43...v1.0.44
+[v1.0.45]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.44...v1.0.45
+[v1.0.46]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.45...v1.0.46
+[v1.0.47]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.46...v1.0.47
+[v1.0.49]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.47...v1.0.49
+[v1.0.50]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.49...v1.0.50
+[v1.0.51]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.50...v1.0.51
+[v1.0.52]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.51...v1.0.52
+[v1.0.53]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.52...v1.0.53
+[v1.0.54]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.53...v1.0.54
+[v1.0.55]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.54...v1.0.55
+[v1.0.56]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.55...v1.0.56
+[v1.0.57]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.56...v1.0.57
+[v1.0.58]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.57...v1.0.58
+[v1.0.59]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.58...v1.0.59
+[v1.0.60]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.59...v1.0.60
+[v1.0.61]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.60...v1.0.61
