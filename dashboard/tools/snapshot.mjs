@@ -388,7 +388,9 @@ export function splitProbeSections(stdout, nonce = PROBE_NONCE) {
 function sectionResult(probe, key) {
   const sec = probe.sections.get(key);
   if (sec) return { stdout: sec.text, error: sec.rc === 0 ? null : `exited ${sec.rc}` };
-  return { stdout: "", error: probe.error || null };
+  // A per-section reason (the API transport records one per failed GET —
+  // "HTTP 401", "timed out after 15s") beats the connection-wide one.
+  return { stdout: "", error: probe.errors?.[key] ?? probe.error ?? null };
 }
 
 /**
@@ -653,13 +655,25 @@ export function hintsFromIssues(issues) {
  */
 export function sectionsFromApi(r, selfChecks) {
   const sections = new Map();
-  const parsed = (res) => {
-    if (!res?.ok) return null;
-    try { return JSON.parse(res.text); } catch { return null; }
+  // Why a GET did not become a section, per key, in the words the record will
+  // show: "HTTP 401", "timed out after 15s", "not JSON". A failed section is
+  // left ABSENT so `sectionResult` reports this reason instead of "exited N".
+  const errors = {};
+  const why = (res) => {
+    if (!res) return "no response";
+    if (res.error) return res.error;
+    if (!res.ok) return `HTTP ${res.status}`;
+    return "not JSON";
   };
-  const failed = (res) => ({ text: "", rc: res?.status && res.status !== 200 ? res.status : 1 });
+  const parsed = (key, res) => {
+    if (res?.ok) {
+      try { return JSON.parse(res.text); } catch { /* fall through */ }
+    }
+    errors[key] = why(res);
+    return null;
+  };
 
-  const full = parsed(r.status);
+  const full = parsed("s", r.status);
   if (full) {
     const [posture, posture_description] = postureFromDaemonStatus(full);
     sections.set("s", {
@@ -670,19 +684,18 @@ export function sectionsFromApi(r, selfChecks) {
       } }),
       rc: 0,
     });
-  } else {
-    sections.set("s", failed(r.status));
   }
-  const caps = parsed(r.caps);
-  sections.set("c", caps ? { text: JSON.stringify({ success: true, data: caps }), rc: 0 } : failed(r.caps));
-  const cfg = parsed(r.config);
-  sections.set("l", cfg ? { text: JSON.stringify({ success: true, data: { workers: cfg.workers ?? [] } }), rc: 0 } : failed(r.config));
-  sections.set("m", r.metrics?.ok ? { text: r.metrics.text, rc: 0 } : failed(r.metrics));
+  const caps = parsed("c", r.caps);
+  if (caps) sections.set("c", { text: JSON.stringify({ success: true, data: caps }), rc: 0 });
+  const cfg = parsed("l", r.config);
+  if (cfg) sections.set("l", { text: JSON.stringify({ success: true, data: { workers: cfg.workers ?? [] } }), rc: 0 });
+  if (r.metrics?.ok) sections.set("m", { text: r.metrics.text, rc: 0 });
+  else errors.m = why(r.metrics);
   for (const key of ["d", "h", "k"]) {
     const sec = selfChecks?.sections?.[key];
     if (sec && typeof sec.text === "string") sections.set(key, { text: sec.text, rc: sec.rc ?? 0 });
   }
-  return sections;
+  return { sections, error: null, errors };
 }
 
 /**
@@ -725,22 +738,26 @@ async function collectDispatcher(spec, opts = {}) {
     fetchApi(api, "/workers/config", token),
     fetchApi(api, "/metrics", null),
   ]);
-  if (!status.ok) {
-    // The API is the fast path, not the only path. Fall back to the full ssh
-    // probe and say why, so a machine with an old rchd or a wrong token still
-    // reports — with the reason on its record instead of silently.
+  // The API is the fast path, not the only path. A /status that is not a 200
+  // carrying a daemon record — wrong token, old rchd, a proxy's HTML, a
+  // truncated body — means the full ssh probe for this tick, with the reason
+  // on the record, so a half-rolled fleet keeps reporting instead of going
+  // dark or showing a machine as unreachable that ssh can still see.
+  let statusBody = null;
+  if (status.ok) {
+    try { statusBody = JSON.parse(status.text); } catch { statusBody = null; }
+  }
+  if (!statusBody || typeof statusBody !== "object" || !statusBody.daemon) {
+    const reason = !status.ok
+      ? (status.status ? `HTTP ${status.status}` : status.error ?? "no response")
+      : "200 but not a daemon status body";
     const d = dispatcherFromProbe(host, await probeDispatcher(host));
     d.transport = "ssh";
-    d.collection_errors.push(
-      `api ${api}/status: ${status.status ? `HTTP ${status.status}` : status.error ?? "no response"} — fell back to ssh`,
-    );
+    d.collection_errors.push(`api ${api}/status: ${reason} — fell back to ssh`);
     return d;
   }
   const self = await selfChecksFor(host, opts);
-  const d = dispatcherFromProbe(host, {
-    sections: sectionsFromApi({ status, caps, config, metrics }, self),
-    error: null,
-  });
+  const d = dispatcherFromProbe(host, sectionsFromApi({ status, caps, config, metrics }, self));
   d.transport = "api";
   d.selfchecks_at = self?.at ?? null;
   return d;

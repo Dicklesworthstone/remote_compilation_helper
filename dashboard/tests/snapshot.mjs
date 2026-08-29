@@ -484,7 +484,7 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
     h: { text: JSON.stringify({ success: true, data: { installed: true, up_to_date: true, on_path_ahead_of_cargo: true, local_builds_running: 0 } }), rc: 0 },
     k: { text: JSON.stringify({ success: true, data: { agents: [{ agent: "ClaudeCode", status: "Installed" }] } }), rc: 0 },
   } };
-  const viaApi = dispatcherFromProbe("hz3-dev", { sections: sectionsFromApi(api, self), error: null });
+  const viaApi = dispatcherFromProbe("hz3-dev", sectionsFromApi(api, self));
   chk("the API path yields a reachable dispatcher with posture, workers, tags, metrics and self-checks",
     viaApi.reachable && viaApi.posture === "remote_ready" && viaApi.workers[0].tags[0] === "big" &&
     viaApi.workers[0].caps.num_cpus === 64 && viaApi.workers[0].last_seen_unix === 1787800000 &&
@@ -496,17 +496,27 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
   chk("the API path carries the daemon version and build stats like ssh does",
     viaApi.daemon.version === "1.0.61" && viaApi.build_stats.remote === 1);
   // No self-checks cached yet: unknown, named, never fine.
-  const noSelf = dispatcherFromProbe("hz3-dev", { sections: sectionsFromApi(api, null), error: null });
+  const noSelf = dispatcherFromProbe("hz3-dev", sectionsFromApi(api, null));
   chk("missing self-checks are unknown and named",
     noSelf.reachable && noSelf.doctor === null && noSelf.shim === null && noSelf.hook === null &&
     noSelf.collection_errors.length === 3 && noSelf.collection_errors[0] === "doctor: no output");
-  // A 401 on /status is a failed status section with the HTTP code as rc.
-  const denied = sectionsFromApi({ ...api, status: { ok: false, status: 401, text: "401 supply the token\n" } }, self);
-  chk("a refused /status is a failed section carrying the HTTP status",
-    denied.get("s").rc === 401 && denied.get("s").text === "");
+  // A failed GET leaves its section ABSENT and records WHY, in the words the
+  // record shows — never "exited 401".
+  const denied = sectionsFromApi({ ...api, caps: { ok: false, status: 401, text: "401 supply the token\n" } }, self);
+  chk("a refused GET is an absent section with an HTTP reason",
+    !denied.sections.has("c") && denied.errors.c === "HTTP 401");
+  const deniedDev = dispatcherFromProbe("hz3-dev", denied);
+  chk("...and the record names it by section and status",
+    deniedDev.reachable && deniedDev.workers[0].caps.num_cpus === null &&
+    deniedDev.collection_errors.length === 1 && deniedDev.collection_errors[0] === "workers capabilities: HTTP 401",
+    JSON.stringify(deniedDev.collection_errors));
+  const timedOut = sectionsFromApi({ ...api, metrics: { ok: false, status: 0, text: "", error: "timed out after 15s" } }, self);
+  chk("a transport failure carries its reason",
+    dispatcherFromProbe("hz3-dev", timedOut).collection_errors[0] === "metrics: timed out after 15s");
   // Non-JSON where JSON was expected is a failed section, not a crash.
   const junk = sectionsFromApi({ ...api, caps: ok("<html>oops</html>") }, self);
-  chk("non-JSON capabilities is a failed section", junk.get("c").rc === 1);
+  chk("non-JSON capabilities is an absent section named 'not JSON'",
+    !junk.sections.has("c") && junk.errors.c === "not JSON");
 }
 
 // ------------------------------------------------- exec error descriptions
