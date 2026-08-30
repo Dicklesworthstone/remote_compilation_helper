@@ -3208,10 +3208,12 @@ use cargo_target_dir::{
 };
 
 // The remote artifact-pattern selection cluster (which files travel back from a
-// worker, keyed on `CompilationKind`) lives in the `artifact_patterns` submodule.
-// `get_artifact_patterns` / `get_custom_target_artifact_patterns` /
-// `kind_produces_transferable_artifacts` have no non-test caller in `hook` itself —
-// they are consumed by the sibling `transfer_orchestration`
+// worker, keyed on `CompilationKind` plus the command's cargo `--profile`
+// selection, and the zero-build-output sync-back detector) lives in the
+// `artifact_patterns` submodule. `get_artifact_patterns` /
+// `get_custom_target_artifact_patterns` /
+// `kind_produces_transferable_artifacts` have no non-test caller in `hook`
+// itself — they are consumed by the sibling `transfer_orchestration`
 // (`execute_remote_compilation`), which imports them directly, so nothing is
 // re-exported into the non-test hook namespace here.
 mod artifact_patterns;

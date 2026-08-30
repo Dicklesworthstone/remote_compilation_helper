@@ -194,6 +194,9 @@ pub enum ErrorCode {
     BuildIncrementalError,
     /// Build artifact not found
     BuildArtifactMissing,
+    /// Remote build succeeded but the artifact sync-back matched zero build
+    /// outputs — local artifacts may be STALE (bd-mpbav)
+    BuildArtifactSyncEmpty,
     /// Cargo workspace inheritance failed under remote topology
     BuildCargoWorkspaceInheritance,
 
@@ -366,6 +369,9 @@ impl ErrorCode {
             Self::BuildEnvError => 307,
             Self::BuildIncrementalError => 308,
             Self::BuildArtifactMissing => 309,
+            // 326 (past the cancellation block E320-E325): codes occupy free
+            // slots of the E300-E399 range, not contiguous positions.
+            Self::BuildArtifactSyncEmpty => 326,
             Self::BuildCargoWorkspaceInheritance => 329,
 
             // Process Triage (310-319)
@@ -538,6 +544,9 @@ impl ErrorCode {
             Self::BuildEnvError => "Build environment setup failed",
             Self::BuildIncrementalError => "Incremental build state is corrupted",
             Self::BuildArtifactMissing => "Build artifact not found",
+            Self::BuildArtifactSyncEmpty => {
+                "Remote build succeeded but no build outputs were synced back"
+            }
             Self::BuildCargoWorkspaceInheritance => {
                 "Cargo workspace inheritance failed under remote topology"
             }
@@ -930,6 +939,11 @@ impl ErrorCode {
                 "Check artifact path configuration",
                 "Review build output for artifact location",
             ],
+            Self::BuildArtifactSyncEmpty => &[
+                "Treat the local build as INCOMPLETE: local binaries may be stale",
+                "Re-run the build (or build locally) before trusting any binary",
+                "Check that the cargo profile's output directory matches the artifact patterns",
+            ],
             Self::BuildCargoWorkspaceInheritance => &[
                 "Verify dependency workspace metadata roots are synced",
                 "Isolate remote sync roots from unrelated outer Cargo workspaces",
@@ -1273,6 +1287,7 @@ impl ErrorCode {
             Self::BuildEnvError,
             Self::BuildIncrementalError,
             Self::BuildArtifactMissing,
+            Self::BuildArtifactSyncEmpty,
             Self::BuildCargoWorkspaceInheritance,
             // Process Triage
             Self::ProcessTriageAdapterUnavailable,
@@ -1671,6 +1686,25 @@ mod tests {
         assert_eq!(
             ErrorCode::BuildCargoWorkspaceInheritance.category(),
             ErrorCategory::Build
+        );
+    }
+
+    /// Contract test: artifact-sync-emptiness build error code is stable.
+    #[test]
+    fn test_build_artifact_sync_empty_error_code_stable() {
+        assert_eq!(ErrorCode::BuildArtifactSyncEmpty.code_number(), 326);
+        assert_eq!(
+            ErrorCode::BuildArtifactSyncEmpty.category(),
+            ErrorCategory::Build
+        );
+        assert_eq!(ErrorCode::BuildArtifactSyncEmpty.code_string(), "RCH-E326");
+        // Remediation must name the stale-local-artifact hazard.
+        assert!(
+            ErrorCode::BuildArtifactSyncEmpty
+                .remediation()
+                .iter()
+                .any(|step| step.to_lowercase().contains("stale")),
+            "RCH-E326 remediation must warn about stale local artifacts"
         );
     }
 

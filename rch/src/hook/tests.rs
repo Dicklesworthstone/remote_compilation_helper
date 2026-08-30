@@ -3,8 +3,9 @@ use super::*;
 // keep them `pub(super)`; they are test-only so they are imported here rather
 // than re-exported into the non-test hook namespace).
 use super::artifact_patterns::{
-    get_artifact_patterns, get_custom_target_artifact_patterns, get_project_artifact_patterns,
-    kind_produces_transferable_artifacts,
+    expected_output_glob_list, get_artifact_patterns, get_custom_target_artifact_patterns,
+    get_project_artifact_patterns, kind_produces_transferable_artifacts,
+    sync_back_verified_zero_build_outputs,
 };
 use super::cargo_target_dir::{
     extract_cargo_target_dir_from_command_tokens, feature_set_for_command,
@@ -15,8 +16,8 @@ use super::cargo_target_dir::{
     target_triple_for_command,
 };
 use super::command_parsing::{
-    has_exact_flag, has_ignored_only_flag, is_filtered_test_command, parse_jobs_flag,
-    parse_test_threads,
+    cargo_custom_profile_output_dir, has_exact_flag, has_ignored_only_flag,
+    is_filtered_test_command, parse_jobs_flag, parse_test_threads,
 };
 use super::daemon_ipc::{
     DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS, DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS,
@@ -3689,10 +3690,10 @@ fn test_job_kind_pipeline_contract() {
     );
     // Jobs have no artifact contract in this phase: nothing is synced back and
     // a sync-back miss can never fail the invocation.
-    assert!(get_artifact_patterns(Some(CompilationKind::Job)).is_empty());
-    assert!(get_project_artifact_patterns(Some(CompilationKind::Job), false).is_empty());
-    assert!(get_project_artifact_patterns(Some(CompilationKind::Job), true).is_empty());
-    assert!(get_custom_target_artifact_patterns(Some(CompilationKind::Job)).is_empty());
+    assert!(get_artifact_patterns(Some(CompilationKind::Job), None).is_empty());
+    assert!(get_project_artifact_patterns(Some(CompilationKind::Job), None, false).is_empty());
+    assert!(get_project_artifact_patterns(Some(CompilationKind::Job), None, true).is_empty());
+    assert!(get_custom_target_artifact_patterns(Some(CompilationKind::Job), None).is_empty());
     assert!(!kind_produces_transferable_artifacts(Some(
         CompilationKind::Job
     )));
@@ -6796,10 +6797,10 @@ fn test_cargo_nextest_classification() {
 fn test_artifact_patterns_for_test_commands() {
     let _guard = test_guard!();
     // Verify test commands use minimal artifact patterns
-    let test_patterns = get_artifact_patterns(Some(CompilationKind::CargoTest));
-    let check_patterns = get_artifact_patterns(Some(CompilationKind::CargoCheck));
-    let clippy_patterns = get_artifact_patterns(Some(CompilationKind::CargoClippy));
-    let build_patterns = get_artifact_patterns(Some(CompilationKind::CargoBuild));
+    let test_patterns = get_artifact_patterns(Some(CompilationKind::CargoTest), None);
+    let check_patterns = get_artifact_patterns(Some(CompilationKind::CargoCheck), None);
+    let clippy_patterns = get_artifact_patterns(Some(CompilationKind::CargoClippy), None);
+    let build_patterns = get_artifact_patterns(Some(CompilationKind::CargoBuild), None);
 
     // Test patterns should be smaller (more targeted)
     // They should include coverage/results but not full target/
@@ -6838,7 +6839,7 @@ fn test_artifact_patterns_for_test_commands() {
 #[test]
 fn test_custom_target_artifact_patterns_for_cargo_test_are_skipped() {
     let _guard = test_guard!();
-    let patterns = get_custom_target_artifact_patterns(Some(CompilationKind::CargoTest));
+    let patterns = get_custom_target_artifact_patterns(Some(CompilationKind::CargoTest), None);
 
     assert!(
         patterns.is_empty(),
@@ -6851,11 +6852,11 @@ fn test_custom_target_artifact_patterns_for_diagnostic_commands_are_skipped() {
     let _guard = test_guard!();
 
     assert!(
-        get_custom_target_artifact_patterns(Some(CompilationKind::CargoCheck)).is_empty(),
+        get_custom_target_artifact_patterns(Some(CompilationKind::CargoCheck), None).is_empty(),
         "cargo check output is streamed; do not sync a custom target dir"
     );
     assert!(
-        get_custom_target_artifact_patterns(Some(CompilationKind::CargoClippy)).is_empty(),
+        get_custom_target_artifact_patterns(Some(CompilationKind::CargoClippy), None).is_empty(),
         "cargo clippy output is streamed; do not sync a custom target dir"
     );
 }
@@ -6874,15 +6875,15 @@ fn test_project_artifact_patterns_drop_target_prefixed_globs_under_custom_target
         CompilationKind::Rustc,
         CompilationKind::CargoZigbuild,
     ] {
-        let with_custom = get_project_artifact_patterns(Some(kind), true);
+        let with_custom = get_project_artifact_patterns(Some(kind), None, true);
         assert!(
             with_custom.is_empty(),
             "{kind:?}: all project-root patterns are target/-prefixed and must drop under a custom target sync, got {with_custom:?}"
         );
         // Without a custom target dir the behavior is unchanged (full patterns).
         assert_eq!(
-            get_project_artifact_patterns(Some(kind), false),
-            get_artifact_patterns(Some(kind)),
+            get_project_artifact_patterns(Some(kind), None, false),
+            get_artifact_patterns(Some(kind), None),
             "{kind:?}: project-root patterns must be unchanged without a custom target sync"
         );
     }
@@ -6895,7 +6896,7 @@ fn test_project_artifact_patterns_keep_non_target_reports_under_custom_target_sy
     // rch#30: non-`target/` project-root artifacts (tarpaulin/junit/cobertura,
     // C/C++ outputs, bun coverage) still land at the project root regardless of
     // CARGO_TARGET_DIR, so they must survive the custom-target-sync filter.
-    let test_patterns = get_project_artifact_patterns(Some(CompilationKind::CargoTest), true);
+    let test_patterns = get_project_artifact_patterns(Some(CompilationKind::CargoTest), None, true);
     assert!(
         test_patterns.iter().all(|p| !p.starts_with("target/")),
         "no target/-prefixed patterns should remain: {test_patterns:?}"
@@ -6909,8 +6910,8 @@ fn test_project_artifact_patterns_keep_non_target_reports_under_custom_target_sy
 
     // C/C++ builds have no target/ patterns at all, so nothing is filtered.
     assert_eq!(
-        get_project_artifact_patterns(Some(CompilationKind::Gcc), true),
-        get_artifact_patterns(Some(CompilationKind::Gcc)),
+        get_project_artifact_patterns(Some(CompilationKind::Gcc), None, true),
+        get_artifact_patterns(Some(CompilationKind::Gcc), None),
         "C/C++ project-root outputs are unaffected by a custom cargo target dir"
     );
 }
@@ -6918,7 +6919,7 @@ fn test_project_artifact_patterns_keep_non_target_reports_under_custom_target_sy
 #[test]
 fn test_custom_target_artifact_patterns_for_nextest_are_target_relative() {
     let _guard = test_guard!();
-    let patterns = get_custom_target_artifact_patterns(Some(CompilationKind::CargoNextest));
+    let patterns = get_custom_target_artifact_patterns(Some(CompilationKind::CargoNextest), None);
 
     assert!(
         !patterns.iter().any(|p| p == "**"),
@@ -6942,7 +6943,7 @@ fn test_custom_target_artifact_patterns_for_build_commands_capture_outputs_only(
         CompilationKind::CargoDoc,
         CompilationKind::Rustc,
     ] {
-        let patterns = get_custom_target_artifact_patterns(Some(kind));
+        let patterns = get_custom_target_artifact_patterns(Some(kind), None);
 
         // No longer the firehose: must NOT sync the entire per-job target dir.
         assert!(
@@ -6994,13 +6995,337 @@ fn test_custom_target_artifact_patterns_for_build_commands_capture_outputs_only(
 }
 
 #[test]
+fn test_custom_profile_output_dir_extraction() {
+    // bd-mpbav: only CUSTOM profiles yield an output dir — cargo maps the
+    // built-ins onto the already-covered dirs (dev/test → debug,
+    // release/bench → release; verified against cargo 1.93).
+    assert_eq!(
+        cargo_custom_profile_output_dir("cargo build --profile release-perf"),
+        Some("release-perf".to_string())
+    );
+    assert_eq!(
+        cargo_custom_profile_output_dir("cargo build --profile=thin-lto"),
+        Some("thin-lto".to_string())
+    );
+    assert_eq!(
+        cargo_custom_profile_output_dir(
+            "cargo build --package mycrate --profile release-perf --example app"
+        ),
+        Some("release-perf".to_string())
+    );
+    // Built-in profile names and the plain flags: nothing new to cover.
+    assert_eq!(cargo_custom_profile_output_dir("cargo build"), None);
+    assert_eq!(
+        cargo_custom_profile_output_dir("cargo build --release"),
+        None
+    );
+    assert_eq!(cargo_custom_profile_output_dir("cargo build -r"), None);
+    assert_eq!(
+        cargo_custom_profile_output_dir("cargo build --profile dev"),
+        None
+    );
+    assert_eq!(
+        cargo_custom_profile_output_dir("cargo build --profile test"),
+        None
+    );
+    assert_eq!(
+        cargo_custom_profile_output_dir("cargo build --profile release"),
+        None
+    );
+    assert_eq!(
+        cargo_custom_profile_output_dir("cargo build --profile bench"),
+        None
+    );
+    // After `--` the args belong to the test binary, not cargo.
+    assert_eq!(
+        cargo_custom_profile_output_dir("cargo test -- --profile release-perf"),
+        None
+    );
+    // Path-like or glob-like values never become rsync patterns.
+    assert_eq!(
+        cargo_custom_profile_output_dir("cargo build --profile ../../etc"),
+        None
+    );
+    assert_eq!(
+        cargo_custom_profile_output_dir("cargo build --profile 'a*b'"),
+        None
+    );
+    // A trailing `--profile` with no value is malformed, not a profile.
+    assert_eq!(
+        cargo_custom_profile_output_dir("cargo build --profile"),
+        None
+    );
+}
+
+#[test]
+fn test_custom_profile_globs_in_default_root_patterns() {
+    // bd-mpbav layer A: `--profile release-perf` must add its output globs to
+    // the default-root (project-root) pattern set for the build/doc kinds —
+    // including the triple-aware form for `--target <triple>` builds.
+    let plain = get_artifact_patterns(Some(CompilationKind::CargoBuild), None);
+    let custom = get_artifact_patterns(
+        Some(CompilationKind::CargoBuild),
+        Some("cargo build --profile release-perf"),
+    );
+    assert_eq!(custom.len(), plain.len() + 2, "exactly two new globs");
+    assert!(
+        custom.iter().any(|p| p == "target/release-perf/**"),
+        "custom profile output glob missing: {custom:?}"
+    );
+    assert!(
+        custom.iter().any(|p| p == "target/*/release-perf/**"),
+        "custom profile triple-aware glob missing: {custom:?}"
+    );
+    // The built-in coverage is unchanged.
+    for needle in [
+        "target/debug/**",
+        "target/release/**",
+        "target/*/release/**",
+    ] {
+        assert!(
+            custom.iter().any(|p| p == needle),
+            "built-in glob {needle} must be retained: {custom:?}"
+        );
+    }
+
+    // Built-in profiles and plain flags add NOTHING (no duplicate globs).
+    for command in [
+        "cargo build",
+        "cargo build --release",
+        "cargo build -r",
+        "cargo build --profile dev",
+        "cargo build --profile test",
+        "cargo build --profile release",
+        "cargo build --profile bench",
+    ] {
+        assert_eq!(
+            get_artifact_patterns(Some(CompilationKind::CargoBuild), Some(command)),
+            plain,
+            "{command}: built-in profile output dirs are already covered; expected no new globs"
+        );
+    }
+
+    // Zigbuild with a custom profile: both plain and triple-aware forms.
+    let zig = get_artifact_patterns(
+        Some(CompilationKind::CargoZigbuild),
+        Some("cargo zigbuild --profile release-perf --target aarch64-unknown-linux-gnu"),
+    );
+    assert!(zig.iter().any(|p| p == "target/release-perf/**"), "{zig:?}");
+    assert!(
+        zig.iter().any(|p| p == "target/*/release-perf/**"),
+        "{zig:?}"
+    );
+
+    // Test/diagnostic kinds keep their narrow streaming allowlist: no profile
+    // globs even when a profile is named.
+    let test_patterns = get_artifact_patterns(
+        Some(CompilationKind::CargoTest),
+        Some("cargo test --profile release-perf"),
+    );
+    assert!(
+        !test_patterns.iter().any(|p| p.contains("release-perf")),
+        "streaming kinds must not gain target globs: {test_patterns:?}"
+    );
+}
+
+#[test]
+fn test_custom_profile_globs_in_custom_target_patterns() {
+    // bd-mpbav layer A, custom-CARGO_TARGET_DIR variant: the profile's output
+    // globs are rebased onto the target-dir sync root and its cache trees get
+    // BOTH the plain and the triple-nested exclude forms.
+    let patterns = get_custom_target_artifact_patterns(
+        Some(CompilationKind::CargoBuild),
+        Some("cargo build --profile release-perf"),
+    );
+    let (excludes, includes): (Vec<&String>, Vec<&String>) =
+        patterns.iter().partition(|p| p.starts_with("- "));
+
+    assert!(
+        includes.iter().any(|p| p.as_str() == "release-perf/**"),
+        "rebased profile include missing: {patterns:?}"
+    );
+    assert!(
+        includes.iter().any(|p| p.as_str() == "*/release-perf/**"),
+        "rebased triple-aware profile include missing: {patterns:?}"
+    );
+    for exclude in [
+        "- release-perf/incremental/",
+        "- release-perf/.fingerprint/",
+        "- release-perf/build/",
+        "- */release-perf/incremental/",
+        "- */release-perf/.fingerprint/",
+        "- */release-perf/build/",
+    ] {
+        assert!(
+            excludes.iter().any(|p| p.as_str() == exclude),
+            "profile cache exclude {exclude} missing: {patterns:?}"
+        );
+    }
+    // Excludes must be emitted BEFORE the includes (rsync first-match-wins).
+    let first_include = patterns
+        .iter()
+        .position(|p| !p.starts_with("- "))
+        .expect("at least one include");
+    let last_exclude = patterns
+        .iter()
+        .rposition(|p| p.starts_with("- "))
+        .expect("at least one exclude");
+    assert!(
+        last_exclude < first_include,
+        "all excludes must precede the includes: {patterns:?}"
+    );
+
+    // Built-in profile names: identical to the no-flag pattern set.
+    assert_eq!(
+        get_custom_target_artifact_patterns(
+            Some(CompilationKind::CargoBuild),
+            Some("cargo build --profile bench")
+        ),
+        get_custom_target_artifact_patterns(Some(CompilationKind::CargoBuild), None),
+        "--profile bench maps to target/release/ — no extra patterns"
+    );
+}
+
+#[test]
+fn test_sync_back_zero_output_detection() {
+    // bd-mpbav layer B: classify a retrieved-file manifest from a SUCCESSFUL
+    // sync-back. The observed bug signature: only loose target-root metadata
+    // came back while the real binary stayed on the worker.
+    let metadata_only = vec![".rustc_info.json".to_string(), "CACHEDIR.TAG".to_string()];
+    let with_binary = vec![
+        ".rustc_info.json".to_string(),
+        "CACHEDIR.TAG".to_string(),
+        "release-perf/examples/fmd_perf_harness".to_string(),
+    ];
+    let kind = Some(CompilationKind::CargoBuild);
+
+    // The complete manifest with ONLY non-output files is the hazard.
+    assert!(
+        sync_back_verified_zero_build_outputs(&metadata_only, Some(2), kind, true),
+        "metadata-only manifest must be classified as a zero-output failure"
+    );
+    // A manifest containing a real output binary is a success.
+    assert!(
+        !sync_back_verified_zero_build_outputs(&with_binary, Some(3), kind, true),
+        "a manifest containing the output binary must NOT fail"
+    );
+    // Up-to-date no-op rebuild: outputs present as verified-up-to-date (`.f`)
+    // manifest entries — must NOT fail.
+    assert!(
+        !sync_back_verified_zero_build_outputs(
+            &[
+                ".rustc_info.json".to_string(),
+                "release-perf/examples/fmd_perf_harness".to_string()
+            ],
+            Some(2),
+            kind,
+            true
+        ),
+        "up-to-date outputs in the manifest must NOT fail"
+    );
+    // Cache trees do not count as outputs: a manifest of only cache state
+    // still fires.
+    assert!(
+        sync_back_verified_zero_build_outputs(
+            &["debug/incremental/session.bin".to_string()],
+            Some(1),
+            kind,
+            true
+        ),
+        "cache-only manifest must be classified as a zero-output failure"
+    );
+
+    // Fail-open guards: no firing without POSITIVE proof.
+    // Unknown matched count (stats unparseable) proves nothing.
+    assert!(!sync_back_verified_zero_build_outputs(
+        &metadata_only,
+        None,
+        kind,
+        true
+    ));
+    // Zero matched files at all (e.g. `cargo build --help` produced nothing).
+    assert!(!sync_back_verified_zero_build_outputs(
+        &[],
+        Some(0),
+        kind,
+        true
+    ));
+    // Incomplete manifest (fewer entries than rsync matched): outputs may
+    // exist unlisted (e.g. a worker rsync that does not itemize up-to-date
+    // files) — never fire on incomplete evidence.
+    assert!(!sync_back_verified_zero_build_outputs(
+        &metadata_only,
+        Some(4),
+        kind,
+        true
+    ));
+    // Kinds without an enumerable output contract never fire (their zero-output
+    // runs can be legitimate: direct rustc writes outside target/, C/C++ has
+    // -fsyntax-only-style forms).
+    for non_enumerable in [
+        CompilationKind::Rustc,
+        CompilationKind::Gcc,
+        CompilationKind::Make,
+        CompilationKind::CargoTest,
+    ] {
+        assert!(
+            !sync_back_verified_zero_build_outputs(
+                &metadata_only,
+                Some(2),
+                Some(non_enumerable),
+                true
+            ),
+            "{non_enumerable:?} has no enumerable output contract"
+        );
+    }
+    assert!(!sync_back_verified_zero_build_outputs(
+        &metadata_only,
+        Some(2),
+        None,
+        true
+    ));
+
+    // Project-root basis: paths are target/-prefixed; the same metadata-only
+    // manifest (with the prefix) fires, and cache trees under target/ do not
+    // rescue it.
+    let root_metadata_only = vec![
+        "target/.rustc_info.json".to_string(),
+        "target/CACHEDIR.TAG".to_string(),
+    ];
+    assert!(sync_back_verified_zero_build_outputs(
+        &root_metadata_only,
+        Some(2),
+        kind,
+        false
+    ));
+    assert!(!sync_back_verified_zero_build_outputs(
+        &[
+            "target/.rustc_info.json".to_string(),
+            "target/debug/my_app".to_string()
+        ],
+        Some(2),
+        kind,
+        false
+    ));
+    assert!(sync_back_verified_zero_build_outputs(
+        &[
+            "target/.rustc_info.json".to_string(),
+            "target/debug/incremental/foo.bin".to_string()
+        ],
+        Some(2),
+        kind,
+        false
+    ));
+}
+
+#[test]
 fn test_custom_target_patterns_match_a_binary_but_not_cache() {
     // Verify against a realistic remote target layout that the output globs
     // match the final binary under `<profile>/` while the exclude rules drop
     // the cache trees. Mirrors how the rsync filter chain evaluates them:
     // an explicit `- <pat>` exclude wins over a later `debug/**` include.
     let _guard = test_guard!();
-    let patterns = get_custom_target_artifact_patterns(Some(CompilationKind::CargoBuild));
+    let patterns = get_custom_target_artifact_patterns(Some(CompilationKind::CargoBuild), None);
 
     let (excludes, includes): (Vec<&String>, Vec<&String>) =
         patterns.iter().partition(|p| p.starts_with("- "));
@@ -7071,6 +7396,35 @@ fn test_custom_target_patterns_match_a_binary_but_not_cache() {
     );
 }
 
+#[test]
+fn test_expected_output_glob_list_drops_excludes_and_metadata() {
+    // The RCH-E326 failure message must name real output locations only:
+    // `- ` exclude rules and the loose target-root metadata files are noise
+    // a caller cannot act on.
+    let patterns = get_custom_target_artifact_patterns(
+        Some(CompilationKind::CargoBuild),
+        Some("cargo build --profile release-perf"),
+    );
+    let expected = expected_output_glob_list(&patterns);
+    assert!(
+        !expected.is_empty(),
+        "expected list must retain the output globs: {expected:?}"
+    );
+    assert!(
+        expected.iter().all(|p| !p.starts_with("- ")),
+        "no exclude rules in the expected list: {expected:?}"
+    );
+    for metadata in [".rustc_info.json", "CACHEDIR.TAG"] {
+        assert!(
+            !expected.iter().any(|p| p == metadata),
+            "metadata file {metadata} must not be listed as an expected output"
+        );
+    }
+    assert!(
+        expected.iter().any(|p| p == "release-perf/**"),
+        "the custom profile glob must be named: {expected:?}"
+    );
+}
 // =========================================================================
 // Test filtering and special flags tests (bead remote_compilation_helper-ya16)
 // =========================================================================

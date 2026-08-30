@@ -3654,9 +3654,18 @@ fi",
         // --stats is required so parse_rsync_bytes/parse_rsync_files can read transfer
         // counts from stdout; without it rsync produces no output and the parsers
         // return 0, causing a false "No artifacts retrieved" warning.
+        // --info=name2 + --out-format itemize EVERY matched regular file —
+        // transferred (`>f…`) AND verified up-to-date (`.f`) — which is what the
+        // zero-build-output detector (bd-mpbav) reads to prove a sync-back that
+        // matched only non-output files left the local artifacts stale. name2
+        // (the modern form of -vv's unchanged-file listing) is what surfaces the
+        // `.f` lines; without it an up-to-date no-op rebuild would look
+        // indistinguishable from a zero-output miss.
         cmd.arg("-az");
         add_portable_rsync_archive_args(&mut cmd);
         cmd.arg("--stats")
+            .arg("--info=name2")
+            .arg("--out-format=%i %n")
             .arg("--safe-links")
             .arg("-e")
             .arg(ssh_command);
@@ -3752,6 +3761,10 @@ fi",
         add_portable_rsync_archive_args(&mut cmd);
         cmd.arg("--info=progress2")
             .arg("--info=stats2")
+            // name2 + itemized out-format feed the zero-build-output detector
+            // (bd-mpbav); see build_retrieve_command for the rationale.
+            .arg("--info=name2")
+            .arg("--out-format=%i %n")
             .arg("--safe-links")
             .arg("-e")
             .arg(ssh_command);
@@ -3875,12 +3888,9 @@ fi",
         if let Some(home) = dirs::home_dir() {
             home.join(".ssh").join("rch")
         } else if let Some(runtime_dir) = dirs::runtime_dir() {
-            runtime_dir.join("rch-ssh")
+            runtime_dir.join("rch")
         } else {
-            // Include username in fallback path to prevent cross-user conflicts
-            let username = std::env::var("USER")
-                .or_else(|_| std::env::var("LOGNAME"))
-                .unwrap_or_else(|_| "unknown".to_string());
+            let username = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
             std::env::temp_dir().join(format!("rch-ssh-{}", username))
         }
     }
@@ -3888,11 +3898,13 @@ fi",
     /// Retrieve build artifacts from the remote worker.
     ///
     /// Uses retry logic with exponential backoff for transient network errors.
+    /// Returns the transfer [`SyncResult`] plus the per-file manifest the
+    /// zero-build-output detector consumes (bd-mpbav); see [`ArtifactRetrieval`].
     pub async fn retrieve_artifacts(
         &self,
         worker: &WorkerConfig,
         artifact_patterns: &[String],
-    ) -> Result<SyncResult> {
+    ) -> Result<ArtifactRetrieval> {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
 
@@ -3912,17 +3924,19 @@ fi",
                 async move { rsync.retrieve_artifacts(&src, &dest, &pats).await }
             })
             .await?;
-            return Ok(SyncResult {
+            return Ok(ArtifactRetrieval::from_stats(SyncResult {
                 bytes_transferred: result.bytes_transferred,
                 files_transferred: result.files_transferred,
                 duration_ms: result.duration_ms,
-            });
+            }));
         }
 
         // Windows worker: pull artifacts via tar-over-ssh (no rsync). Gated on
         // platform, so linux/darwin never reach this. Bounded by `command_timeout`
         // (the tar transport has no timeout of its own); on expiry the future
-        // drops and the `kill_on_drop` children are reaped.
+        // drops and the `kill_on_drop` children are reaped. The tar transport
+        // has no per-file manifest, so the retrieval carries no manifest and
+        // the zero-output detector declines to fire (fail-open).
         if self.worker_platform.is_windows() {
             let timeout = self.ssh_options.command_timeout;
             return match tokio::time::timeout(
@@ -3931,7 +3945,7 @@ fi",
             )
             .await
             {
-                Ok(result) => result,
+                Ok(result) => result.map(ArtifactRetrieval::from_stats),
                 Err(_) => Err(anyhow::anyhow!(
                     "windows tar artifact retrieve from {} timed out after {:?}",
                     worker.id,
@@ -4002,11 +4016,14 @@ fi",
             bytes_transferred
         );
 
-        Ok(SyncResult {
-            bytes_transferred,
-            files_transferred,
-            duration_ms: duration.as_millis() as u64,
-        })
+        Ok(ArtifactRetrieval::from_rsync_output(
+            SyncResult {
+                bytes_transferred,
+                files_transferred,
+                duration_ms: duration.as_millis() as u64,
+            },
+            &stdout,
+        ))
     }
 
     /// Build the rsync command that pulls one declared job result directory.
@@ -4156,7 +4173,10 @@ fi",
             // pattern-based plumbing the mock artifact path uses so mock-based
             // tests cover the call wiring end to end.
             let patterns = [format!("{}/**", rel.display())];
-            return self.retrieve_artifacts(worker, &patterns).await;
+            return self
+                .retrieve_artifacts(worker, &patterns)
+                .await
+                .map(|retrieval| retrieval.stats);
         }
 
         let escaped_remote_path = escape(Cow::from(&remote_path));
@@ -4222,13 +4242,17 @@ fi",
             duration_ms,
         })
     }
+
     /// Retrieve build artifacts with streaming progress output.
+    ///
+    /// Returns the same manifest-carrying result as [`Self::retrieve_artifacts`]
+    /// (bd-mpbav); only the progress reporting differs.
     pub async fn retrieve_artifacts_streaming<F>(
         &self,
         worker: &WorkerConfig,
         artifact_patterns: &[String],
         mut on_line: F,
-    ) -> Result<SyncResult>
+    ) -> Result<ArtifactRetrieval>
     where
         F: FnMut(&str),
     {
@@ -4244,11 +4268,11 @@ fi",
                     artifact_patterns,
                 )
                 .await?;
-            return Ok(SyncResult {
+            return Ok(ArtifactRetrieval::from_stats(SyncResult {
                 bytes_transferred: result.bytes_transferred,
                 files_transferred: result.files_transferred,
                 duration_ms: result.duration_ms,
-            });
+            }));
         }
 
         info!(
@@ -4295,11 +4319,14 @@ fi",
             .into());
         }
 
-        Ok(SyncResult {
-            bytes_transferred: parse_rsync_bytes(&output),
-            files_transferred: parse_rsync_files(&output),
-            duration_ms,
-        })
+        Ok(ArtifactRetrieval::from_rsync_output(
+            SyncResult {
+                bytes_transferred: parse_rsync_bytes(&output),
+                files_transferred: parse_rsync_files(&output),
+                duration_ms,
+            },
+            &output,
+        ))
     }
 
     /// Clean up remote project directory.
@@ -4484,6 +4511,116 @@ pub struct SyncResult {
     pub files_transferred: u32,
     /// Duration in milliseconds.
     pub duration_ms: u64,
+}
+
+/// Result of an artifact sync-back, extending the raw [`SyncResult`] counts
+/// with the per-file evidence the zero-build-output detector needs (bd-mpbav).
+///
+/// - `manifest_regular_files` lists every REGULAR FILE rsync had in its
+///   matched file list — transferred items (`>f…`) AND verified-up-to-date
+///   items (`.f`), parsed from the retrieval's `--out-format='%i %n'` +
+///   `--info=name2` output. Including up-to-date items is what lets the
+///   detector distinguish "outputs already current locally" (a legitimate
+///   no-op rebuild) from "outputs never matched" (the stale-local hazard).
+/// - `matched_regular_files` is the regular-file count from rsync's `--stats`
+///   `Number of files: N (reg: R, dir: D)` line, `None` when unparseable. It
+///   is the completeness cross-check: if the manifest lists fewer files than
+///   rsync matched, the manifest is incomplete and the detector must decline
+///   to fire (fail-open).
+///
+/// Transports that cannot produce a manifest (mock rsync, the Windows
+/// tar-over-ssh path) return an empty manifest with `matched_regular_files:
+/// None`, which the detector treats as "no proof" and never fires on.
+#[derive(Debug, Clone)]
+pub struct ArtifactRetrieval {
+    /// Transfer counts (bytes/files/duration), as historically returned.
+    pub stats: SyncResult,
+    /// Every matched regular file, transferred or verified up-to-date.
+    pub manifest_regular_files: Vec<String>,
+    /// Regular-file count from `--stats`, when parseable.
+    pub matched_regular_files: Option<u32>,
+}
+
+impl ArtifactRetrieval {
+    /// A manifest-less retrieval (mock transport, Windows tar path).
+    fn from_stats(stats: SyncResult) -> Self {
+        Self {
+            stats,
+            manifest_regular_files: Vec::new(),
+            matched_regular_files: None,
+        }
+    }
+
+    /// A real rsync retrieval: parse the manifest and matched-file count out
+    /// of the captured rsync stdout.
+    fn from_rsync_output(stats: SyncResult, output: &str) -> Self {
+        Self {
+            stats,
+            manifest_regular_files: parse_rsync_itemized_regular_files(output),
+            matched_regular_files: parse_rsync_matched_regular_files(output),
+        }
+    }
+}
+
+/// Parse the itemized per-file manifest out of rsync output produced with
+/// `--info=name2 --out-format='%i %n'` (the flags `build_retrieve_command` /
+/// `build_retrieve_streaming_command` pass).
+///
+/// Recognized lines look like:
+///
+/// ```text
+/// >f++++++++++ release-perf/mybin          (transferred regular file)
+/// .f           release-perf/mybin          (matched, already up-to-date)
+/// cd++++++++++ release-perf/               (directory — skipped)
+/// ```
+///
+/// The item code is `<update-flag><item-type><flags…>` followed by whitespace
+/// and the relative path; only regular files (`f` as the second byte) are
+/// returned, directories and symlinks are skipped. The item string contains
+/// no spaces, so everything after the first space run is the path (paths may
+/// themselves contain spaces).
+fn parse_rsync_itemized_regular_files(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let bytes = line.as_bytes();
+            // Need at least a 2-byte item code, a separator, and a name.
+            if bytes.len() < 4 {
+                return None;
+            }
+            // First byte: the update flag (`>` received, `<` sent, `c` created,
+            // `.` unchanged, `h` hardlinked, `*` special). Second byte: item
+            // type — only `f` (regular file) belongs in the manifest.
+            let update_flag = matches!(bytes[0], b'<' | b'>' | b'c' | b'.' | b'h' | b'*');
+            if !update_flag || bytes[1] != b'f' {
+                return None;
+            }
+            // The separator must sit past the item code itself.
+            let separator = line.find(' ').filter(|pos| *pos >= 2)?;
+            let name = line[separator..].trim_start();
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// Parse the regular-file count from rsync `--stats` output
+/// (`Number of files: 7 (reg: 4, dir: 3)`). This counts every regular file in
+/// the matched file list — transferred AND up-to-date — unlike
+/// [`parse_rsync_files`], which counts only transferred files. Returns `None`
+/// when the stats line is missing or malformed.
+fn parse_rsync_matched_regular_files(output: &str) -> Option<u32> {
+    output.lines().find_map(|line| {
+        let rest = line.strip_prefix("Number of files:")?;
+        // The first whitespace-delimited token after "(reg:" is the regular-
+        // file count; strip thousands commas before parsing.
+        let count = rest
+            .split("(reg:")
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .replace(',', "");
+        count.parse().ok()
+    })
 }
 
 /// Estimate of transfer size from rsync dry-run (bd-3hho).
@@ -5600,6 +5737,102 @@ mod tests {
         // No structured stats: still return 0, even if "sent" appears.
         let output = "file1.txt\nfile2.txt\nsent 100 bytes";
         assert_eq!(parse_rsync_files(output), 0);
+    }
+
+    #[test]
+    fn test_parse_rsync_itemized_regular_files_transfer_run() {
+        let _guard = test_guard!();
+        // Captured shape of a real `rsync -az --stats --info=name2
+        // --out-format='%i %n'` run that transferred everything (bd-mpbav).
+        let output = "\
+sending incremental file list
+.d..t....... ./
+>f++++++++++ .rustc_info.json
+>f++++++++++ CACHEDIR.TAG
+cd++++++++++ release-perf/
+>f++++++++++ release-perf/mybin
+cd++++++++++ release-perf/deps/
+>f++++++++++ release-perf/deps/lib.rlib
+
+Number of files: 7 (reg: 4, dir: 3)
+Number of regular files transferred: 4
+";
+        let files = parse_rsync_itemized_regular_files(output);
+        // Directories (`d` item type) are excluded; regular files kept in order.
+        assert_eq!(
+            files,
+            vec![
+                ".rustc_info.json".to_string(),
+                "CACHEDIR.TAG".to_string(),
+                "release-perf/mybin".to_string(),
+                "release-perf/deps/lib.rlib".to_string(),
+            ]
+        );
+        assert_eq!(parse_rsync_matched_regular_files(output), Some(4));
+    }
+
+    #[test]
+    fn test_parse_rsync_itemized_regular_files_uptodate_run() {
+        let _guard = test_guard!();
+        // The repeat run: nothing transfers, every matched file is listed as
+        // up-to-date (`.f` padded items). These entries are exactly what keeps
+        // an already-current no-op rebuild from being misread as a zero-output
+        // miss by the bd-mpbav gate.
+        let output = "\
+.d           ./
+.f           .rustc_info.json
+.f           CACHEDIR.TAG
+.d           release-perf/
+.f           release-perf/mybin
+.d           release-perf/deps/
+.f           release-perf/deps/lib.rlib
+
+Number of files: 7 (reg: 4, dir: 3)
+Number of regular files transferred: 0
+";
+        let files = parse_rsync_itemized_regular_files(output);
+        assert_eq!(
+            files,
+            vec![
+                ".rustc_info.json".to_string(),
+                "CACHEDIR.TAG".to_string(),
+                "release-perf/mybin".to_string(),
+                "release-perf/deps/lib.rlib".to_string(),
+            ]
+        );
+        assert_eq!(parse_rsync_matched_regular_files(output), Some(4));
+    }
+
+    #[test]
+    fn test_parse_rsync_itemized_regular_files_rejects_noise() {
+        let _guard = test_guard!();
+        // Non-itemized noise (progress lines, stats text, sender chatter,
+        // filenames that merely look like flags) must never enter the manifest.
+        let output = "\
+          1,234    99%    0.00kB/s    0:00:00
+[sender] showing file release-perf/mybin because of pattern release-perf/**
+total: matches=0  hash_hits=0  false_alarms=0 data=54
+Number of files transferred: 42
+--pretend-not-a-file
+";
+        assert!(parse_rsync_itemized_regular_files(output).is_empty());
+        // No stats "Number of files:" line here: matched count is unknown.
+        assert_eq!(parse_rsync_matched_regular_files(output), None);
+    }
+
+    #[test]
+    fn test_parse_rsync_matched_regular_files_comma_forms() {
+        let _guard = test_guard!();
+        assert_eq!(
+            parse_rsync_matched_regular_files("Number of files: 28,779 (reg: 20,000, dir: 8,779)"),
+            Some(20_000)
+        );
+        // "Number of files transferred:" must NOT satisfy the prefix match.
+        assert_eq!(
+            parse_rsync_matched_regular_files("Number of files transferred: 42"),
+            None
+        );
+        assert_eq!(parse_rsync_matched_regular_files(""), None);
     }
 
     #[test]

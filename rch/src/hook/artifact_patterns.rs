@@ -4,9 +4,10 @@
 //! worker after a remote build, extracted from `hook.rs` per bead
 //! `remote_compilation_helper-zcecy.14`:
 //!
-//! - [`get_artifact_patterns`] maps a [`CompilationKind`] to the rsync
-//!   include-pattern list for the default project-root sync-back (full `target/`
-//!   outputs for builds, a narrow allowlist for test/diagnostic kinds).
+//! - [`get_artifact_patterns`] maps a [`CompilationKind`] (plus the command
+//!   string, for its `--profile` selection) to the rsync include-pattern list
+//!   for the default project-root sync-back (full `target/` outputs for
+//!   builds, a narrow allowlist for test/diagnostic kinds).
 //! - [`get_custom_target_artifact_patterns`] is the variant used when the build
 //!   wrote into a custom `CARGO_TARGET_DIR` (the sync root IS the remote target
 //!   dir): it rebases the same output globs onto the target-dir root and prefixes
@@ -16,15 +17,24 @@
 //!   *required* local artifact, so the transfer pipeline can treat a failed
 //!   artifact sync-back as a build failure (vs. a benign warning for streaming
 //!   test/diagnostic kinds).
+//! - [`sync_back_verified_zero_build_outputs`] is the bd-mpbav loud-failure
+//!   gate: it classifies the per-file manifest of a SUCCESSFUL sync-back to
+//!   detect the case where rsync matched only non-output files (loose target
+//!   metadata, cache trees) and zero real build outputs — the signature of a
+//!   silent stale-local-binary hazard (see also the RCH-E326 failure arm in
+//!   `transfer_orchestration`).
 //!
 //! It reaches its support layer from the parent via `use super::*`: the
 //! `CompilationKind` enum and the `default_*_artifact_patterns` builders (which
-//! live in `crate::transfer` and are imported into `hook`). The three classifier
-//! fns are `pub(super)` — consumed by the sibling `transfer_orchestration`
-//! (`execute_remote_compilation`) which imports them directly, and by the hook
-//! test suite which imports them into `hook::tests`. `CARGO_TARGET_CACHE_EXCLUDES`
-//! is used only within this module and stays private.
+//! live in `crate::transfer` and are imported into `hook`), plus the cargo
+//! profile analyzer [`cargo_custom_profile_output_dir`] from the sibling
+//! `command_parsing` submodule. The classifier fns are `pub(super)` — consumed
+//! by the sibling `transfer_orchestration` (`execute_remote_compilation`)
+//! which imports them directly, and by the hook test suite which imports them
+//! into `hook::tests`. `CARGO_TARGET_CACHE_EXCLUDES` is used only within this
+//! module and stays private.
 
+use super::command_parsing::cargo_custom_profile_output_dir;
 use super::*;
 
 /// Get artifact patterns based on compilation kind.
@@ -33,8 +43,20 @@ use super::*;
 /// streamed and the full target/ directory is not needed. This significantly
 /// reduces artifact transfer time for commands that do not produce runnable
 /// build artifacts.
-pub(super) fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String> {
-    match kind {
+///
+/// `command` (the exact command string being offloaded) selects cargo
+/// profile-aware output globs: a custom `--profile <name>` writes to
+/// `target/<name>/` — a directory none of the built-in `debug`/`release` globs
+/// cover — so the matching `target/<name>/**` and `target/*/<name>/**` (the
+/// second form covers `--target <triple>` builds, which write one level
+/// deeper) are appended for the rust-artifact kinds (bd-mpbav). Built-in
+/// profiles (`dev`/`test` → `debug`, `release`/`bench` → `release`) and a bare
+/// `--release`/`-r` need no new globs, so nothing is appended for them.
+pub(super) fn get_artifact_patterns(
+    kind: Option<CompilationKind>,
+    command: Option<&str>,
+) -> Vec<String> {
+    let mut patterns = match kind {
         Some(CompilationKind::BunTest) | Some(CompilationKind::BunTypecheck) => {
             default_bun_artifact_patterns()
         }
@@ -78,14 +100,42 @@ pub(super) fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String
         // `_` rust catch-all would drag a stale worker-side `target/**` home.
         Some(CompilationKind::Job) => Vec::new(),
         _ => default_rust_artifact_patterns(),
+    };
+    // Custom cargo profile outputs (bd-mpbav): `cargo build --profile P` with P
+    // not built-in writes to target/P/, which the plain debug/release globs
+    // miss entirely — the sync-back would return only loose target metadata
+    // while the real binary stayed on the worker, leaving the local artifact
+    // silently STALE. Append the profile's own globs for exactly the kinds
+    // whose patterns are the cargo target/-rooted rust outputs.
+    if rust_kind_targets_cargo_output_tree(kind)
+        && let Some(profile_dir) = command.and_then(cargo_custom_profile_output_dir)
+    {
+        patterns.push(format!("target/{profile_dir}/**"));
+        // `cargo build --target <triple> --profile P` writes one level deeper:
+        // target/<triple>/P/ (mirrors the triple-aware forms the default and
+        // zigbuild builders already carry for debug/release).
+        patterns.push(format!("target/*/{profile_dir}/**"));
     }
+    patterns
 }
 
-/// Artifact patterns for the sync-back that lands in the LOCAL project root
-/// (as opposed to a forwarded custom `CARGO_TARGET_DIR`).
-///
-/// When a custom-target sync is active (`custom_target_sync == true`) the build's
-/// `target/` outputs are retrieved *exclusively* by the custom-target phase into
+/// Whether this kind's artifact patterns are the cargo `target/`-rooted rust
+/// output globs — i.e. the kinds for which a custom `--profile` changes the
+/// output directory. This covers the explicit build/doc/rustc/zigbuild arms
+/// AND the unclassified (`None`) rust catch-all; test/diagnostic kinds use the
+/// narrow streaming allowlist (no full target/ sync, so no profile globs), and
+/// non-rust kinds never write into a cargo target dir.
+fn rust_kind_targets_cargo_output_tree(kind: Option<CompilationKind>) -> bool {
+    matches!(
+        kind,
+        Some(
+            CompilationKind::CargoBuild
+                | CompilationKind::CargoDoc
+                | CompilationKind::CargoZigbuild
+                | CompilationKind::Rustc
+        ) | None
+    )
+}
 /// the forwarded `CARGO_TARGET_DIR` (via [`get_custom_target_artifact_patterns`]).
 /// The project-root phase must therefore NOT carry any `target/`-prefixed
 /// patterns: the remote build never writes into `<remote project>/target/` under
@@ -104,9 +154,10 @@ pub(super) fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String
 /// `target/`-prefixed) the caller skips the project-root retrieval entirely.
 pub(super) fn get_project_artifact_patterns(
     kind: Option<CompilationKind>,
+    command: Option<&str>,
     custom_target_sync: bool,
 ) -> Vec<String> {
-    let patterns = get_artifact_patterns(kind);
+    let patterns = get_artifact_patterns(kind, command);
     if custom_target_sync {
         patterns
             .into_iter()
@@ -115,6 +166,27 @@ pub(super) fn get_project_artifact_patterns(
     } else {
         patterns
     }
+}
+
+/// The include globs of one phase's pattern list, shaped for the RCH-E326
+/// failure message (bd-mpbav): `- ` exclude rules and the two loose
+/// target-root metadata files are dropped so the message names only real
+/// output locations the sync-back was expected to match.
+pub(super) fn expected_output_glob_list(patterns: &[String]) -> Vec<String> {
+    patterns
+        .iter()
+        .filter(|p| {
+            !p.starts_with("- ")
+                && !matches!(
+                    p.as_str(),
+                    ".rustc_info.json"
+                        | "CACHEDIR.TAG"
+                        | "target/.rustc_info.json"
+                        | "target/CACHEDIR.TAG"
+                )
+        })
+        .cloned()
+        .collect()
 }
 
 /// Rsync filter entries that, prefixed onto an artifact pattern list, are emitted
@@ -139,7 +211,28 @@ const CARGO_TARGET_CACHE_EXCLUDES: &[&str] = &[
     "- *.d",
 ];
 
-pub(super) fn get_custom_target_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String> {
+/// Cache-exclude entries for one custom cargo profile output dir, rebased onto
+/// the custom-target sync root (`<dir>` is the profile's output-directory name,
+/// e.g. `release-perf`). Mirrors [`CARGO_TARGET_CACHE_EXCLUDES`]'s per-profile
+/// entries, in both the plain (`<profile>/incremental/`) and the triple-nested
+/// (`*/<profile>/incremental/`) forms, so a custom-profile include can never
+/// drag its per-job cache trees home (bd-mpbav).
+fn custom_profile_cache_excludes(profile_dir: &str) -> Vec<String> {
+    [
+        format!("- {profile_dir}/incremental/"),
+        format!("- {profile_dir}/.fingerprint/"),
+        format!("- {profile_dir}/build/"),
+        format!("- */{profile_dir}/incremental/"),
+        format!("- */{profile_dir}/.fingerprint/"),
+        format!("- */{profile_dir}/build/"),
+    ]
+    .to_vec()
+}
+
+pub(super) fn get_custom_target_artifact_patterns(
+    kind: Option<CompilationKind>,
+    command: Option<&str>,
+) -> Vec<String> {
     match kind {
         Some(CompilationKind::CargoTest)
         | Some(CompilationKind::CargoCheck)
@@ -151,7 +244,7 @@ pub(super) fn get_custom_target_artifact_patterns(kind: Option<CompilationKind>)
         Some(CompilationKind::CargoNextest) | Some(CompilationKind::CargoBench) => {
             // Test/bench artifacts are already a narrow allowlist; just rebase them
             // onto the target-dir root (the sync root IS the remote target dir).
-            get_artifact_patterns(kind)
+            get_artifact_patterns(kind, command)
                 .into_iter()
                 .map(|pattern| {
                     pattern
@@ -184,7 +277,12 @@ pub(super) fn get_custom_target_artifact_patterns(kind: Option<CompilationKind>)
                 .iter()
                 .map(|s| (*s).to_string()),
             );
-            patterns.extend(get_artifact_patterns(kind).into_iter().map(|pattern| {
+            // A custom profile under zigbuild writes to <triple>/<profile>/:
+            // its cache trees need the same triple-aware excludes.
+            if let Some(profile_dir) = command.and_then(cargo_custom_profile_output_dir) {
+                patterns.extend(custom_profile_cache_excludes(&profile_dir));
+            }
+            patterns.extend(get_artifact_patterns(kind, command).into_iter().map(|pattern| {
                 pattern
                     .strip_prefix("target/")
                     .unwrap_or(pattern.as_str())
@@ -224,7 +322,14 @@ pub(super) fn get_custom_target_artifact_patterns(kind: Option<CompilationKind>)
                 .iter()
                 .map(|s| (*s).to_string()),
             );
-            patterns.extend(get_artifact_patterns(kind).into_iter().map(|pattern| {
+            // Custom-profile builds (bd-mpbav) write to `<profile>/` (or
+            // `<triple>/<profile>/`), so their cache trees need the same
+            // treatment as debug/release above — emitted BEFORE the profile's
+            // output includes.
+            if let Some(profile_dir) = command.and_then(cargo_custom_profile_output_dir) {
+                patterns.extend(custom_profile_cache_excludes(&profile_dir));
+            }
+            patterns.extend(get_artifact_patterns(kind, command).into_iter().map(|pattern| {
                 pattern
                     .strip_prefix("target/")
                     .unwrap_or(pattern.as_str())
@@ -284,4 +389,133 @@ pub(super) fn kind_produces_transferable_artifacts(kind: Option<CompilationKind>
         // continue-on-warning behavior.
         None => false,
     }
+}
+
+/// Whether a single file from a sync-back manifest represents a build OUTPUT
+/// (a final binary, library, or doc file the local build needs), as opposed to
+/// cargo's loose target-root metadata or per-job cache state.
+///
+/// The manifest paths are relative to the sync root: the remote project root
+/// for the default-root phase (paths `target/…`) or the remote target dir
+/// itself for a custom-`CARGO_TARGET_DIR` phase (`custom_target_sync = true`,
+/// paths already below `target/`).
+///
+/// Policy (bd-mpbav), mirroring the include/exclude set the phases emit:
+/// - The two loose target-root files the include list names explicitly —
+///   `.rustc_info.json` and `CACHEDIR.TAG` — are metadata, not outputs: a
+///   path with no directory component below the sync root is never an output.
+///   (This is exactly the zero-output signature observed in the wild: "4
+///   files, 660 bytes" of metadata while the real binary stayed on the worker.)
+/// - Cargo per-job cache trees — any path through `incremental/`,
+///   `.fingerprint/`, or `build/` — are not outputs (they mirror
+///   [`CARGO_TARGET_CACHE_EXCLUDES`]; the default-root phase has no such
+///   excludes, so they can appear in its manifest and must not masquerade as
+///   outputs).
+/// - Dependency `.d` files are not outputs (they mirror the `- *.d` exclude).
+/// - Everything else under a subdirectory of the sync root is an output: a
+///   successful `cargo build`/`doc`/`zigbuild` always materializes at least
+///   one file under `<profile>/` (or `<triple>/<profile>/`, or `doc/`).
+fn retrieved_path_is_build_output(path: &str, custom_target_sync: bool) -> bool {
+    let rel = if custom_target_sync {
+        path
+    } else {
+        path.strip_prefix("target/").unwrap_or(path)
+    };
+    let components: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+    // Root-level files (".rustc_info.json", "CACHEDIR.TAG") are metadata.
+    if components.len() < 2 {
+        return false;
+    }
+    // Cargo per-job cache trees never count as outputs.
+    if components
+        .iter()
+        .any(|c| matches!(*c, "incremental" | ".fingerprint" | "build"))
+    {
+        return false;
+    }
+    // Dependency files mirror the `- *.d` exclude: cache, not output.
+    !rel.ends_with(".d")
+}
+
+/// Whether a kind has an ENUMERABLE build-output contract: a successful
+/// remote build of this kind provably materializes files at known locations
+/// under the cargo target tree, so a sync-back that matched zero outputs is
+/// provably a stale-local-artifact hazard, not a legitimate no-output run.
+///
+/// This is deliberately narrower than [`kind_produces_transferable_artifacts`]:
+/// the zero-output LOUD FAILURE (RCH-E326) applies only where the contract is
+/// enumerable. Direct `rustc` invocations write next to the source (or to
+/// `-o`), not into `target/<profile>/`, and the C/C++/build-system kinds admit
+/// compiler forms that legitimately produce no output file (e.g.
+/// `gcc -fsyntax-only`, or a `make` target that only prints) — failing those
+/// on a zero-output sync would break real builds. For those kinds a
+/// zero-output sync-back keeps the legacy warn-only treatment.
+pub(super) fn kind_has_enumerable_output_contract(kind: Option<CompilationKind>) -> bool {
+    matches!(
+        kind,
+        Some(
+            CompilationKind::CargoBuild
+                | CompilationKind::CargoDoc
+                | CompilationKind::CargoZigbuild
+        )
+    )
+}
+
+/// The bd-mpbav loud-failure gate: did a sync-back that SUCCEEDED (rsync exit
+/// 0) nonetheless match ZERO build outputs for a kind whose output contract is
+/// enumerable? Such a result means the artifacts the caller expects were never
+/// in rsync's file list — typically because the output directory (e.g. a
+/// custom cargo profile's `target/<profile>/`) is not covered by the include
+/// patterns — so the LOCAL artifacts may be silently STALE even though the
+/// remote build "succeeded". The caller must fail the build loudly
+/// (RCH-E326) instead of surfacing the remote's exit 0.
+///
+/// Inputs:
+/// - `manifest`: every REGULAR FILE rsync had in its matched file list — both
+///   transferred items (`>f…`) and verified-up-to-date items (`.f`), parsed
+///   from the retrieval's `--out-format='%i %n'` + `--info=name2` output.
+///   Including up-to-date items is what keeps an already-current no-op
+///   rebuild (nothing to transfer, everything current) from being misread as
+///   a failure.
+/// - `matched_regular_files`: the regular-file count from rsync's `--stats`
+///   "Number of files: N (reg: R, dir: D)" line, when parseable.
+///
+/// Firing requires POSITIVE knowledge, mirroring the repo's fail-open
+/// philosophy — each guard below declines to fire when the evidence is
+/// incomplete rather than risking a false build failure:
+/// - kind must have an enumerable output contract (see
+///   [`kind_has_enumerable_output_contract`]);
+/// - `matched_regular_files` must be known AND nonzero — an rsync that matched
+///   literally nothing is reported as a warning only (the classifier admits
+///   no-output invocations like `cargo build --help`), and an unparseable
+///   count proves nothing;
+/// - the manifest must ACCOUNT FOR every matched regular file
+///   (`manifest.len() >= matched_regular_files`) — if the parser saw fewer
+///   files than rsync matched (e.g. a worker rsync that does not itemize
+///   up-to-date files), outputs may exist unlisted and the gate must not
+///   fire;
+/// - and no manifest path may classify as a build output (see
+///   [`retrieved_path_is_build_output`]).
+pub(super) fn sync_back_verified_zero_build_outputs(
+    manifest: &[String],
+    matched_regular_files: Option<u32>,
+    kind: Option<CompilationKind>,
+    custom_target_sync: bool,
+) -> bool {
+    if !kind_has_enumerable_output_contract(kind) {
+        return false;
+    }
+    // Both counters must be known before zero-outputs can be PROVEN.
+    let Some(matched) = matched_regular_files else {
+        return false;
+    };
+    if matched == 0 {
+        return false;
+    }
+    if manifest.len() < matched as usize {
+        return false;
+    }
+    !manifest
+        .iter()
+        .any(|path| retrieved_path_is_build_output(path, custom_target_sync))
 }

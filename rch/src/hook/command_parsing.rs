@@ -231,6 +231,72 @@ pub(super) fn has_exact_flag(command: &str) -> bool {
     tokenize_command(command).iter().any(|t| t == "--exact")
 }
 
+/// Resolve the output-directory name cargo will use for the `--profile <name>`
+/// this command selects — but only when it differs from the two directories
+/// the default artifact globs already cover (`debug/`, `release/`).
+///
+/// cargo maps a profile to its output directory via the profile's *dir name*
+/// (cargo `Profile::dir_name`): the built-in `dev` and `test` profiles write
+/// to `target/debug/`, the built-in `release` and `bench` profiles write to
+/// `target/release/`, and every CUSTOM profile writes to
+/// `target/<profile-name>/`. (Verified empirically against cargo 1.93:
+/// `--profile test` leaves no `test/` directory, and `--profile bench` leaves
+/// no `bench/` directory — both reuse the covered dirs.) So:
+///
+/// - `cargo build`, `--release`, `-r`, `--profile dev|test|release|bench`
+///   → `None` (output dir already covered by `target/{debug,release}/**`).
+/// - `--profile release-perf` (any custom name) → `Some("release-perf")`.
+///
+/// Without this, a custom-profile remote build syncs back only the loose
+/// target-root metadata files (`.rustc_info.json`, `CACHEDIR.TAG`) while the
+/// real binary stays on the worker — the local binary silently goes STALE
+/// even though the build "succeeded" (bd-mpbav).
+///
+/// Only tokens BEFORE a bare `--` are considered: after `--`, arguments go to
+/// the test/bench binary, not cargo (e.g. `cargo test -- --profile x` must
+/// not be misread as a cargo profile). The value is validated as a plain
+/// profile name (`[A-Za-z0-9._-]+`) because it is interpolated into rsync
+/// include/exclude patterns — anything path-like or glob-like is rejected
+/// (cargo itself would reject it too).
+pub(super) fn cargo_custom_profile_output_dir(command: &str) -> Option<String> {
+    let tokens = tokenize_command(command);
+    let mut iter = tokens.iter().peekable();
+    while let Some(token) = iter.next() {
+        // End of cargo's own arguments: everything past `--` belongs to the
+        // executed test/bench binary, never to cargo.
+        if token == "--" {
+            break;
+        }
+        let value = if token == "--profile" {
+            // `--profile <name>`: the profile name is the next token.
+            iter.next().cloned()?
+        } else if let Some(name) = token.strip_prefix("--profile=") {
+            // `--profile=<name>` single-token form.
+            name.to_string()
+        } else {
+            continue;
+        };
+        // Built-in profiles reuse the already-covered dirs (see doc comment):
+        // dev/test → debug, release/bench → release.
+        if matches!(value.as_str(), "dev" | "test" | "release" | "bench") {
+            return None;
+        }
+        // A custom profile name doubles as the output directory name. Restrict
+        // to cargo's profile-name charset so the value can never smuggle a
+        // path traversal or rsync wildcard into the artifact patterns.
+        let is_plain_profile_name = !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        return if is_plain_profile_name {
+            Some(value)
+        } else {
+            None
+        };
+    }
+    None
+}
+
 pub(crate) fn estimate_cores_for_command(
     kind: Option<CompilationKind>,
     command: &str,

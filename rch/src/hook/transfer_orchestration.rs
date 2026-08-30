@@ -22,8 +22,8 @@
 //! are private to this module.
 
 use super::artifact_patterns::{
-    get_custom_target_artifact_patterns, get_project_artifact_patterns,
-    kind_produces_transferable_artifacts,
+    expected_output_glob_list, get_custom_target_artifact_patterns, get_project_artifact_patterns,
+    kind_produces_transferable_artifacts, sync_back_verified_zero_build_outputs,
 };
 use super::cargo_target_dir::{
     cargo_target_env_allowlist, cargo_target_env_overrides, remote_cargo_pooled_target_dir_name,
@@ -1118,6 +1118,16 @@ pub(super) async fn execute_remote_compilation(
 
     let mut artifacts_result: Option<SyncResult> = None;
     let mut artifacts_failed = false;
+    // Per-file evidence from the phase that carries the build's `target/`
+    // outputs, for the zero-build-output loud-failure gate (bd-mpbav): the
+    // matched-file manifest and the rsync-reported matched regular-file count.
+    // `custom_target_basis` records which path basis the manifest uses (paths
+    // relative to the remote target dir vs `target/`-prefixed project-root
+    // paths); `expected_output_patterns` feeds the failure message.
+    let mut retrieval_manifest: Vec<String> = Vec::new();
+    let mut retrieval_matched_regular: Option<u32> = None;
+    let mut retrieval_custom_target_basis = false;
+    let mut expected_output_patterns: Vec<String> = Vec::new();
     // Step 3: Retrieve artifacts
     if result.success() {
         if let Some(loop_ref) = heartbeat_loop.as_ref() {
@@ -1135,8 +1145,11 @@ pub(super) async fn execute_remote_compilation(
         // custom target dir exists to protect, and a failed stale-residue pull
         // spuriously fails an otherwise-complete build (rch#30). For cargo
         // build/doc/rustc the filtered list is empty, so the phase is skipped.
-        let artifact_patterns =
-            get_project_artifact_patterns(kind, forwarded_cargo_target_dir.is_some());
+        let artifact_patterns = get_project_artifact_patterns(
+            kind,
+            Some(command),
+            forwarded_cargo_target_dir.is_some(),
+        );
         if !artifact_patterns.is_empty() {
             info!("Retrieving build artifacts...");
             reporter.verbose("[RCH] artifacts: retrieving...");
@@ -1172,26 +1185,35 @@ pub(super) async fn execute_remote_compilation(
                 Ok(artifact_result) => {
                     info!(
                         "Artifacts retrieved: {} files, {} bytes in {}ms",
-                        artifact_result.files_transferred,
-                        artifact_result.bytes_transferred,
-                        artifact_result.duration_ms
+                        artifact_result.stats.files_transferred,
+                        artifact_result.stats.bytes_transferred,
+                        artifact_result.stats.duration_ms
                     );
                     reporter.verbose(&format!(
                         "[RCH] artifacts done: {} files, {} bytes in {}ms",
-                        artifact_result.files_transferred,
-                        artifact_result.bytes_transferred,
-                        artifact_result.duration_ms
+                        artifact_result.stats.files_transferred,
+                        artifact_result.stats.bytes_transferred,
+                        artifact_result.stats.duration_ms
                     ));
                     if let Some(progress) = &mut download_progress {
                         progress.apply_summary(
-                            artifact_result.bytes_transferred,
-                            artifact_result.files_transferred,
+                            artifact_result.stats.bytes_transferred,
+                            artifact_result.stats.files_transferred,
                         );
                         progress.finish();
                     }
+                    // Default-root basis: this phase carries the `target/`
+                    // outputs whenever no custom target dir is forwarded, so
+                    // its manifest is the zero-output gate's evidence.
+                    if forwarded_cargo_target_dir.is_none() {
+                        retrieval_manifest = artifact_result.manifest_regular_files;
+                        retrieval_matched_regular = artifact_result.matched_regular_files;
+                        retrieval_custom_target_basis = false;
+                        expected_output_patterns = expected_output_glob_list(&artifact_patterns);
+                    }
                     artifacts_result = Some(match artifacts_result.take() {
-                        Some(existing) => merge_sync_result(&existing, &artifact_result),
-                        None => artifact_result,
+                        Some(existing) => merge_sync_result(&existing, &artifact_result.stats),
+                        None => artifact_result.stats,
                     });
                 }
                 Err(e) => {
@@ -1242,7 +1264,7 @@ pub(super) async fn execute_remote_compilation(
 
         if let Some(local_target_dir) = forwarded_cargo_target_dir.as_ref() {
             let remote_target_path = pipeline.remote_cargo_target_dir();
-            let custom_patterns = get_custom_target_artifact_patterns(kind);
+            let custom_patterns = get_custom_target_artifact_patterns(kind, Some(command));
             if custom_patterns.is_empty() {
                 reporter.verbose(&format!(
                     "[RCH] custom target dir sync skipped for {} after command with no target artifacts",
@@ -1298,28 +1320,37 @@ pub(super) async fn execute_remote_compilation(
                     Ok(target_result) => {
                         info!(
                             "Custom CARGO_TARGET_DIR artifacts retrieved: {} files, {} bytes in {}ms",
-                            target_result.files_transferred,
-                            target_result.bytes_transferred,
-                            target_result.duration_ms
+                            target_result.stats.files_transferred,
+                            target_result.stats.bytes_transferred,
+                            target_result.stats.duration_ms
                         );
                         reporter.verbose(&format!(
                             "[RCH] custom target dir sync done: {} -> {} ({} files, {} bytes in {}ms)",
                             remote_target_path,
                             local_target_dir.display(),
-                            target_result.files_transferred,
-                            target_result.bytes_transferred,
-                            target_result.duration_ms
+                            target_result.stats.files_transferred,
+                            target_result.stats.bytes_transferred,
+                            target_result.stats.duration_ms
                         ));
                         if let Some(progress) = &mut target_progress {
                             progress.apply_summary(
-                                target_result.bytes_transferred,
-                                target_result.files_transferred,
+                                target_result.stats.bytes_transferred,
+                                target_result.stats.files_transferred,
                             );
                             progress.finish();
                         }
+                        // The custom-target phase exclusively carries the
+                        // build's `target/` outputs under a forwarded
+                        // CARGO_TARGET_DIR, so its manifest is the
+                        // zero-output gate's evidence (paths relative to the
+                        // target-dir sync root).
+                        retrieval_manifest = target_result.manifest_regular_files;
+                        retrieval_matched_regular = target_result.matched_regular_files;
+                        retrieval_custom_target_basis = true;
+                        expected_output_patterns = expected_output_glob_list(&custom_patterns);
                         artifacts_result = Some(match artifacts_result.take() {
-                            Some(existing) => merge_sync_result(&existing, &target_result),
-                            None => target_result,
+                            Some(existing) => merge_sync_result(&existing, &target_result.stats),
+                            None => target_result.stats,
                         });
                     }
                     Err(e) => {
@@ -1526,6 +1557,53 @@ pub(super) async fn execute_remote_compilation(
         warn!(
             "Artifact transfer failed after a successful remote compile on {} [{}]; \
              returning exit {} so the caller knows the local build is incomplete",
+            worker_config.id,
+            code.code_string(),
+            EXIT_ARTIFACT_TRANSFER_FAILED
+        );
+        EXIT_ARTIFACT_TRANSFER_FAILED
+    } else if result.success()
+        && !artifacts_failed
+        && sync_back_verified_zero_build_outputs(
+            &retrieval_manifest,
+            retrieval_matched_regular,
+            kind,
+            retrieval_custom_target_basis,
+        )
+    {
+        // bd-mpbav loud failure, layer B: the sync-back SUCCEEDED (unlike the
+        // issue-#19 arm above) yet matched ZERO build outputs — every matched
+        // file was loose target metadata or cache state. The classic cause is
+        // an output directory the include patterns don't cover (a custom
+        // cargo profile's `target/<profile>/` before layer A added its globs,
+        // or any future pattern gap): the remote binary exists, rsync happily
+        // pulls 4 metadata files, exits 0, and the LOCAL artifact silently
+        // stays the previous build's. Surfacing exit 0 here would let an
+        // agent benchmark or ship a stale binary. Same class of loud-fatal
+        // treatment as issue #19 Fix 1, with its own error code so the two
+        // hazards are distinguishable in logs (E326 vs E309).
+        let code = ErrorCode::BuildArtifactSyncEmpty;
+        let expected = expected_output_patterns.join(", ");
+        // stderr, not just `warn!`: this MUST reach the operator/agent even
+        // when tracing is silenced. stderr is the diagnostics stream (AGENTS.md).
+        eprintln!(
+            "[RCH] {} remote compile on {} SUCCEEDED but the artifact sync-back \
+             matched ZERO build outputs ({} of {} matched file(s): {}) — the local \
+             build is INCOMPLETE and any existing local artifacts may be STALE. \
+             Expected outputs under: {}. Treating as a build failure \
+             (exit {EXIT_ARTIFACT_TRANSFER_FAILED}); re-run to retry the sync, or \
+             build locally before trusting any binary.",
+            code.code_string(),
+            worker_config.id,
+            retrieval_manifest.len(),
+            retrieval_matched_regular.unwrap_or(0),
+            retrieval_manifest.join(", "),
+            expected,
+        );
+        warn!(
+            "Artifact sync-back matched zero build outputs after a successful remote \
+             compile on {} [{}]; returning exit {} so the caller knows local \
+             artifacts may be stale",
             worker_config.id,
             code.code_string(),
             EXIT_ARTIFACT_TRANSFER_FAILED

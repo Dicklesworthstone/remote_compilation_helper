@@ -106,6 +106,36 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## [Unreleased]
 
+### Custom cargo profiles sync their outputs; silent zero-output sync-backs fail loudly
+
+Remote builds that write to a CUSTOM cargo profile directory (`cargo build --profile
+release-perf` → `target/release-perf/`) reported success while syncing back only the
+loose target-root metadata files (`.rustc_info.json`, `CACHEDIR.TAG`) — the actual
+binary stayed on the worker and the LOCAL artifact silently remained the previous
+build's. Observed across a 30-pass optimization session on franken_markdown
+(`--profile release-perf --example fmd_perf_harness`: "4 files, 660 bytes" retrieved,
+stale binary benchmarked unknowingly; every session had to md5-verify freshness or
+fall back to `RCH_SHIM_LOCAL_IDE=1`). Two layers fix it (bead
+[`bd-mpbav`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl)):
+
+- **Profile-aware artifact patterns.** `--profile <name>` is extracted from the cargo
+  command during pattern selection; custom profile names (whose output dir is
+  `target/<name>/`, unlike `dev`/`test`→`debug` and `release`/`bench`→`release`)
+  now add `target/<name>/**` plus the `--target <triple>` form
+  `target/*/<name>/**` to the default-root sync, and the rebased
+  `<name>/**` / `*/<name>/**` includes plus plain and triple-nested cache excludes
+  to the custom-`CARGO_TARGET_DIR` sync.
+- **Zero-build-output detection (RCH-E326).** Artifact retrievals now itemize every
+  matched regular file (`--info=name2 --out-format='%i %n'`, transferred AND
+  verified-up-to-date). For kinds with an enumerable output contract
+  (`cargo build`/`doc`/`zigbuild`), a sync-back that succeeded yet matched zero
+  build outputs — every matched file loose metadata or cache state — fails the
+  build with `RCH-E326` (exit 102) naming the stale-local-artifact hazard and the
+  expected output dirs, instead of surfacing the remote's exit 0. Up-to-date
+  no-op rebuilds are recognized (their outputs appear as verified-current
+  manifest entries) and never fire; evidence-incomplete manifests (older worker
+  rsyncs, mock/Windows transports) fail open.
+
 ## [v1.0.62] -- 2026-08-29 (release)
 
 The one route the tailnet API was still missing. `rch status --json` folds repo-convergence
