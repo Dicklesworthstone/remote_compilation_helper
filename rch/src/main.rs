@@ -623,6 +623,21 @@ locally on this box. The shim sits on PATH ahead of ~/.cargo/bin and routes
 offloadable cargo subcommands through `rch exec`. It is loop-safe, fails open if
 rch is unavailable, and leaves rust-analyzer (`--message-format`) builds local.
 
+Local fallbacks (RCH_SHIM_LOCAL_IDE=1, wrapper bypass, IDE diagnostics) resolve
+a WORKING real cargo in tiers, first executable wins:
+  1. $RCH_REAL_CARGO                        explicit operator override
+  2. $RCH_SHIM_REAL_CARGO                   set by the rch toolchain wrapper
+  3. <active-toolchain>/bin/cargo-rch-real  active toolchain discovered via
+                                           `rustc --print sysroot` (honors
+                                           RUSTUP_TOOLCHAIN / rust-toolchain.toml)
+  4. ~/.cargo/bin/cargo                     the stock rustup proxy
+Tier 3 is what saves a host whose toolchain cargo was renamed to cargo-rch-real:
+the rustup proxy cannot dispatch there ("cargo component not applicable"), which
+is what broke RCH_SHIM_LOCAL_IDE=1 before shim v4. A resolved cargo-rch-real
+gets its bin dir prepended to PATH so the build's rustc/clippy-driver come from
+the same toolchain (repo -Z flags need it). If no tier succeeds the shim exits
+127 naming RCH_REAL_CARGO and `rch shim uninstall` as the fixes.
+
 Install ONLY on dispatcher boxes (that offload OUT). NEVER on a worker box: a
 worker runs cargo via rch-wkr to execute offloaded builds, and the shim would
 re-offload/loop."#)]

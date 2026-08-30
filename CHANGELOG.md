@@ -106,6 +106,46 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## [Unreleased]
 
+
+### Shim v4: `RCH_SHIM_LOCAL_IDE=1` resolves a WORKING real cargo (tiered), fixing nightly-renamed-cargo hosts
+
+The documented local-build escape hatch was dead exactly when it was needed. On a
+host whose active toolchain cargo was renamed to `cargo-rch-real` (rch toolchain
+wrapping, or a rustup update over it), the rustup proxy at `~/.cargo/bin/cargo`
+cannot dispatch — rustup answers `the 'cargo' binary, normally provided by the
+'cargo' component, is not applicable to the '<toolchain>' toolchain` — and the
+shim's local fallback hardcoded exactly that proxy. So when remote offload
+failed and the operator asked for a local build (`RCH_SHIM_LOCAL_IDE=1 cargo
+build --release -p rch`), the escape hatch itself died (2026-08-30 fleet rollout
+of `943b8e29` on a nightly-default dispatcher; the working manual workaround was
+`RCH_CARGO_WRAPPER_BYPASS=1 ~/.rustup/toolchains/<tc>/bin/cargo-rch-real` with
+the toolchain bin prepended to PATH — which is precisely what the shim now does
+by itself). Bead
+[`bd-73gdn`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl):
+- **Tiered real-cargo resolution** in every local path of the cargo shim
+  (`RCH_SHIM_LOCAL_IDE=1`, wrapper bypass, IDE diagnostics, the catch-all arm),
+  first executable wins: `$RCH_REAL_CARGO` (new explicit operator override) →
+  `$RCH_SHIM_REAL_CARGO` (the toolchain-wrapper handoff, preserving toolchain
+  identity) → `<active-toolchain>/bin/cargo-rch-real` where the active toolchain
+  is discovered via `rustc --print sysroot` (honors `RUSTUP_TOOLCHAIN` and
+  `rust-toolchain.toml`, i.e. the toolchain the build would actually use) → the
+  stock `~/.cargo/bin/cargo` proxy, correct wherever nothing was renamed.
+- **Toolchain-bin PATH prepend**: when the resolved real cargo is a renamed
+  `cargo-rch-real`, its directory is prepended to `PATH` so the build's rustc /
+  clippy-driver resolve from the SAME toolchain — a repo `.cargo/config.toml`
+  with `-Z` flags (e.g. `-Z threads=4`) needs nightly rustc even when the rustup
+  default is stable. The rch toolchain wrapper's own local fallback gets the same
+  prepend (wrap version 3).
+- **Loud failure with a named fix**: when every tier comes up empty the shim now
+  exits 127 listing what it tried and naming `RCH_REAL_CARGO` and
+  `rch shim uninstall` as the remedies, instead of exec'ing a proxy that errors.
+- **Agent-facing docs**: the tier order is now printed by `rch shim install`,
+  carried in `rch shim --help`, and embedded as a comment block in the generated
+  shim itself, so an agent hitting a broken local fallback can debug it in place.
+- Everything else is preserved verbatim: offload routing, the fail-open /
+  loop-break contract, the local `CARGO_BUILD_JOBS` cap, rust-analyzer handling.
+  Hosts where nothing was renamed resolve tier 4 exactly as v3 did.
+
 ### Custom cargo profiles sync their outputs; silent zero-output sync-backs fail loudly
 
 Remote builds that write to a CUSTOM cargo profile directory (`cargo build --profile

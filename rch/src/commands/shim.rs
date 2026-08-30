@@ -20,7 +20,9 @@
 //! - wrapper-safe: a caller-set `RUSTC_WORKSPACE_WRAPPER` (how `cargo clippy`
 //!   drives its inner `cargo check`) → real cargo, local, so the wrapper is
 //!   never dropped by offloading the inner invocation;
-//! - escape hatch: `RCH_SHIM_LOCAL_IDE=1` forces any single build local;
+//! - escape hatch: `RCH_SHIM_LOCAL_IDE=1` forces any single build local, with
+//!   the real cargo resolved in tiers (`resolve_real` in the generated body)
+//!   so a renamed toolchain cargo still works;
 //! - only the artifact/test subcommands are offloaded; everything else is local.
 //!
 //! A companion `cargo-clippy` shim catches direct invocations of that binary,
@@ -47,7 +49,21 @@ use crate::ui::theme::StatusIndicator;
 /// `jobs = -1` (= nproc-1) produced 127 concurrent rustc on a 128-thread host,
 /// each forking a ~1GB `rust-lld` — 202GB of linkers, RAM and swap exhausted,
 /// and the box wedged at 100% disk utilization for hours.
-const SHIM_VERSION: &str = "3";
+///
+/// `4` makes every local fallback resolve a WORKING real cargo instead of
+/// hardcoding `$HOME/.cargo/bin/cargo` (the rustup proxy). On a host whose
+/// active toolchain cargo was renamed to `cargo-rch-real` (rch toolchain
+/// wrapping, or a rustup update over it), that proxy cannot dispatch — rustup
+/// answers "the 'cargo' binary ... is not applicable to the '<toolchain>'
+/// toolchain" — so `RCH_SHIM_LOCAL_IDE=1`, the escape hatch for exactly that
+/// moment, died instead (2026-08-30 fleet rollout of 943b8e29 on a
+/// nightly-default dispatcher). Resolution order, first executable wins:
+/// `$RCH_REAL_CARGO` → `$RCH_SHIM_REAL_CARGO` (toolchain wrapper handoff) →
+/// `<active toolchain>/bin/cargo-rch-real` (discovered via
+/// `rustc --print sysroot`) → `$HOME/.cargo/bin/cargo`; a resolved
+/// `cargo-rch-real` gets its bin dir prepended to PATH so the build's rustc /
+/// clippy-driver come from the same toolchain (repo `-Z` flags need it).
+const SHIM_VERSION: &str = "4";
 
 /// Marker line embedded in the generated shim, used to recognize an rch-managed
 /// file (vs. a hand-rolled or unrelated `cargo` on `PATH`) and read its version.
@@ -147,7 +163,49 @@ fn cargo_shim_body(require_remote: bool) -> String {
 # Harness-agnostic build offload: any agent (codex/scripts/CI, not only Claude
 # Code) that runs `cargo build|test|check|...` is routed through `rch exec` to
 # the worker fleet instead of compiling locally on this box. See `rch shim`.
-REAL="${{RCH_SHIM_REAL_CARGO:-$HOME/.cargo/bin/cargo}}"
+# Every LOCAL path (RCH_SHIM_LOCAL_IDE=1, wrapper bypass, IDE diagnostics, the
+# catch-all arm) must exec a WORKING real cargo. On hosts where the active
+# toolchain's cargo was renamed to `cargo-rch-real` (rch toolchain wrapping, or
+# a rustup update over it), the rustup proxy at ~/.cargo/bin/cargo can no
+# longer dispatch — rustup answers "the 'cargo' binary ... is not applicable
+# to the '<toolchain>' toolchain" — so a single hardcoded fallback dies exactly
+# when the escape hatch is needed most. The real cargo is resolved in tiers,
+# first executable wins:
+#   1. $RCH_REAL_CARGO       explicit operator override;
+#   2. $RCH_SHIM_REAL_CARGO  set by the rch toolchain wrapper (preserves the
+#                            caller's toolchain identity through the handoff);
+#   3. <active-toolchain>/bin/cargo-rch-real, the active toolchain discovered
+#                            via `rustc --print sysroot` (honors RUSTUP_TOOLCHAIN
+#                            and rust-toolchain.toml, i.e. the toolchain this
+#                            build would actually use);
+#   4. $HOME/.cargo/bin/cargo — the stock rustup proxy, correct wherever rch
+#                            never renamed anything.
+resolve_real() {{
+  if [ -n "${{RCH_REAL_CARGO:-}}" ] && [ -x "$RCH_REAL_CARGO" ]; then
+    REAL="$RCH_REAL_CARGO"
+    return 0
+  fi
+  if [ -n "${{RCH_SHIM_REAL_CARGO:-}}" ] && [ -x "$RCH_SHIM_REAL_CARGO" ]; then
+    REAL="$RCH_SHIM_REAL_CARGO"
+    return 0
+  fi
+  if command -v rustc >/dev/null 2>&1; then
+    sysroot=$(rustc --print sysroot 2>/dev/null)
+    if [ -n "$sysroot" ] && [ -x "$sysroot/bin/cargo-rch-real" ]; then
+      REAL="$sysroot/bin/cargo-rch-real"
+      return 0
+    fi
+  fi
+  if [ -x "$HOME/.cargo/bin/cargo" ]; then
+    REAL="$HOME/.cargo/bin/cargo"
+    return 0
+  fi
+  echo "rch shim: no working real cargo found for local execution" >&2
+  echo "  tried: \$RCH_REAL_CARGO, \$RCH_SHIM_REAL_CARGO, <active toolchain>/bin/cargo-rch-real, \$HOME/.cargo/bin/cargo" >&2
+  echo "  fix: set RCH_REAL_CARGO=/path/to/real/cargo (e.g. \$HOME/.rustup/toolchains/<tc>/bin/cargo-rch-real)" >&2
+  echo "       or restore the stock layout with: rch shim uninstall" >&2
+  exit 127
+}}
 # Cap parallelism on every LOCAL fallback. Local builds never reach rch's slot
 # accounting, so nothing else bounds them — and a repo's own .cargo/config.toml
 # outranks ~/.cargo/config.toml, so a committed `jobs = -1` (= nproc-1) wins over
@@ -155,6 +213,17 @@ REAL="${{RCH_SHIM_REAL_CARGO:-$HOME/.cargo/bin/cargo}}"
 # here is the only reliable cap. An explicitly-set CARGO_BUILD_JOBS always wins;
 # tune the default with RCH_LOCAL_MAX_JOBS.
 exec_local() {{
+  resolve_real
+  # A renamed toolchain cargo runs with its own bin dir FIRST on PATH, or the
+  # build's rustc/clippy-driver resolve through the rustup proxy's default
+  # toolchain instead of the one being built with (breaks -Z flags in a repo's
+  # .cargo/config.toml when default != requested toolchain).
+  case "$REAL" in
+    */cargo-rch-real)
+      PATH="${{REAL%/*}}:$PATH"
+      export PATH
+      ;;
+  esac
   if [ -z "${{CARGO_BUILD_JOBS:-}}" ]; then
     CARGO_BUILD_JOBS="${{RCH_LOCAL_MAX_JOBS:-8}}"
     export CARGO_BUILD_JOBS
@@ -319,7 +388,12 @@ fn cargo_interception_in(path: &std::ffi::OsStr, shim: &Path) -> Interception {
 /// `RCH_SHIM_REAL_CARGO` export) and differ only in a comment, so they
 /// legitimately share a version and `install` leaves them alone. Bump this the
 /// moment the body changes semantically, which will also converge those hosts.
-const TOOLCHAIN_WRAP_VERSION: &str = "2";
+///
+/// `3` prepends the toolchain's own bin dir to PATH in the wrapper's local
+/// fallback, so a bypassed build resolves rustc/clippy-driver from THAT
+/// toolchain instead of the rustup proxy's default — mirroring the tiered
+/// resolution of shim v4 (same 2026-08-30 nightly-renamed-cargo incident).
+const TOOLCHAIN_WRAP_VERSION: &str = "3";
 
 /// Marker identifying an rch-managed toolchain wrapper (vs. the real binary).
 const TOOLCHAIN_MARKER: &str = "# rch-toolchain-wrap-version:";
@@ -378,6 +452,11 @@ exec_local() {{
     CARGO_BUILD_JOBS="${{RCH_LOCAL_MAX_JOBS:-8}}"
     export CARGO_BUILD_JOBS
   fi
+  # The real cargo is a toolchain binary: its children (rustc, clippy-driver,
+  # rust-lld) must resolve from THIS toolchain's bin, not from whatever the
+  # rustup proxy default happens to be — same rule as the shim's local fallback.
+  PATH="$SELF_DIR:$PATH"
+  export PATH
   exec "$REAL" "$@"
 }}
 # Loop-break + fail-open: rch sets RCH_CARGO_WRAPPER_BYPASS=1 on its own local
@@ -689,6 +768,9 @@ pub fn shim_install(
             "fail-open (offload, but fall back to local under load)"
         }
     );
+    println!(
+        "  local fallback resolves real cargo: $RCH_REAL_CARGO → $RCH_SHIM_REAL_CARGO → <active toolchain>/bin/cargo-rch-real → ~/.cargo/bin/cargo"
+    );
     if wrap_toolchains {
         if tc_total == 0 {
             println!(
@@ -993,14 +1075,28 @@ mod tests {
     /// shell syntax error in a generated file would ship silently — so these
     /// tests run it for real against stub `rch` / `cargo` executables.
     #[cfg(unix)]
-    fn run_shim(body: &str, name: &str, args: &[&str], env: &[(&str, &str)]) -> String {
+    fn write_exe(p: &Path, contents: &str) {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
+        let mut f = std::fs::File::create(p).unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        let mut perms = std::fs::metadata(p).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(p, perms).unwrap();
+    }
 
-        // Sandboxes MUST be unique per invocation. Keying on (name, pid, args)
-        // alone collides whenever two tests exercise the same argv -- and since
-        // tests run in parallel threads of ONE process, the loser has its stub
-        // `real-cargo` deleted mid-run and fails with ENOENT/exit 127.
+    /// Create a unique sandbox carrying the shim plus the standard stubs
+    /// (`rch` announces OFFLOAD, `real-cargo` announces LOCAL and the job cap),
+    /// and return its dir. Tests needing more elaborate hosts (fake toolchains,
+    /// a broken rustup proxy, a stub `rustc` for sysroot discovery) add their
+    /// own stubs before [`exec_shim`].
+    ///
+    /// Sandboxes MUST be unique per invocation. Keying on (name, pid, args)
+    /// alone collides whenever two tests exercise the same argv -- and since
+    /// tests run in parallel threads of ONE process, the loser has its stub
+    /// `real-cargo` deleted mid-run and fails with ENOENT/exit 127.
+    #[cfg(unix)]
+    fn shim_sandbox(body: &str, name: &str, args: &[&str]) -> PathBuf {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
@@ -1013,16 +1109,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let write_exe = |p: &Path, contents: &str| {
-            let mut f = std::fs::File::create(p).unwrap();
-            f.write_all(contents.as_bytes()).unwrap();
-            let mut perms = std::fs::metadata(p).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(p, perms).unwrap();
-        };
-
-        let shim = dir.join(name);
-        write_exe(&shim, body);
+        write_exe(&dir.join(name), body);
         // Stubs: each announces which path was taken.
         // Each stub also reports the resolved job cap, so tests can prove the
         // local-parallelism guard fires on local paths and NOT on offload.
@@ -1031,28 +1118,61 @@ mod tests {
             &dir.join("rch"),
             "#!/bin/sh\necho OFFLOAD \"$@\" jobs=${CARGO_BUILD_JOBS:-unset}\n",
         );
-        let real = dir.join("real-cargo");
         write_exe(
-            &real,
+            &dir.join("real-cargo"),
             "#!/bin/sh\necho LOCAL \"$@\" jobs=${CARGO_BUILD_JOBS:-unset}\n",
         );
+        dir
+    }
 
-        let mut cmd = std::process::Command::new(&shim);
+    /// Run the sandboxed shim. `home` overrides $HOME so tier-4 resolution
+    /// (`$HOME/.cargo/bin/cargo`) can be aimed at a stub instead of the real
+    /// host layout. Hermetic: RCH_* hints and job knobs are scrubbed unless a
+    /// test sets them via `env` (set-but-empty disables a tier).
+    #[cfg(unix)]
+    fn exec_shim(
+        dir: &Path,
+        name: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        home: Option<&Path>,
+    ) -> std::process::Output {
+        let mut cmd = std::process::Command::new(dir.join(name));
         cmd.args(args)
             .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
-            .env("RCH_SHIM_REAL_CARGO", &real)
-            .env("RCH_SHIM_REAL_CARGO_CLIPPY", &real)
             .env_remove("RCH_CARGO_WRAPPER_BYPASS")
             .env_remove("RCH_SHIM_LOCAL_IDE")
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("RCH_REAL_CARGO")
+            .env_remove("RCH_SHIM_REAL_CARGO")
+            .env_remove("RCH_SHIM_REAL_CARGO_CLIPPY")
             // Hosts set CARGO_BUILD_JOBS in /etc/environment; inheriting it
             // would make these assertions depend on where the suite runs.
             .env_remove("CARGO_BUILD_JOBS")
             .env_remove("RCH_LOCAL_MAX_JOBS");
+        if let Some(h) = home {
+            cmd.env("HOME", h);
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let out = cmd.output().unwrap();
+        cmd.output().unwrap()
+    }
+
+    /// Execute a rendered shim body under `/bin/sh` in a sandbox with the
+    /// standard stub real-cargo pre-registered as both RCH_SHIM_REAL_CARGO
+    /// targets (the toolchain-wrapper handoff), assert success, and return
+    /// trimmed stdout.
+    #[cfg(unix)]
+    fn run_shim(body: &str, name: &str, args: &[&str], env: &[(&str, &str)]) -> String {
+        let dir = shim_sandbox(body, name, args);
+        let real = dir.join("real-cargo");
+        let mut full: Vec<(&str, &str)> = vec![
+            ("RCH_SHIM_REAL_CARGO", real.to_str().unwrap()),
+            ("RCH_SHIM_REAL_CARGO_CLIPPY", real.to_str().unwrap()),
+        ];
+        full.extend_from_slice(env);
+        let out = exec_shim(&dir, name, args, &full, None);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             out.status.success(),
@@ -1203,6 +1323,335 @@ mod tests {
         assert!(out.starts_with("LOCAL"), "expected local, got: {out}");
     }
 
+    // --- tiered real-cargo resolution (shim v4) -----------------------------
+
+    /// The v3 shim body as shipped in v1.0.60/v1.0.61, kept verbatim as the
+    /// regression fixture for the 2026-08-30 nightly-renamed-cargo incident:
+    /// its local fallback hardcoded `$HOME/.cargo/bin/cargo` — the rustup
+    /// proxy — which cannot dispatch once the active toolchain's cargo was
+    /// renamed to `cargo-rch-real`, so `RCH_SHIM_LOCAL_IDE=1` died with
+    /// rustup's "not applicable" error exactly when the escape hatch was
+    /// needed most.
+    const V3_SHIM_BODY: &str = r#"#!/bin/sh
+# rch cargo shim — MANAGED FILE, edit via `rch shim install`.
+# rch-shim-version: 3
+#
+# Harness-agnostic build offload: any agent (codex/scripts/CI, not only Claude
+# Code) that runs `cargo build|test|check|...` is routed through `rch exec` to
+# the worker fleet instead of compiling locally on this box. See `rch shim`.
+REAL="${RCH_SHIM_REAL_CARGO:-$HOME/.cargo/bin/cargo}"
+# Cap parallelism on every LOCAL fallback. Local builds never reach rch's slot
+# accounting, so nothing else bounds them — and a repo's own .cargo/config.toml
+# outranks ~/.cargo/config.toml, so a committed `jobs = -1` (= nproc-1) wins over
+# any global default. CARGO_BUILD_JOBS outranks every config file, so setting it
+# here is the only reliable cap. An explicitly-set CARGO_BUILD_JOBS always wins;
+# tune the default with RCH_LOCAL_MAX_JOBS.
+exec_local() {
+  if [ -z "${CARGO_BUILD_JOBS:-}" ]; then
+    CARGO_BUILD_JOBS="${RCH_LOCAL_MAX_JOBS:-8}"
+    export CARGO_BUILD_JOBS
+  fi
+  exec "$REAL" "$@"
+}
+# Loop-break: rch sets RCH_CARGO_WRAPPER_BYPASS=1 on its own local-fallback exec.
+# Also fail open if rch is unavailable — never block a build.
+if [ "${RCH_CARGO_WRAPPER_BYPASS:-}" = "1" ] || ! command -v rch >/dev/null 2>&1; then
+  exec_local "$@"
+fi
+# Explicit operator escape hatch: force this one build local.
+if [ "${RCH_SHIM_LOCAL_IDE:-}" = "1" ]; then
+  exec_local "$@"
+fi
+# `cargo clippy` runs as: set RUSTC_WORKSPACE_WRAPPER=clippy-driver, then exec an
+# inner `cargo check`. Offloading that INNER cargo would drop the wrapper and
+# silently return plain check results instead of lints, so it stays local — the
+# OUTER `cargo clippy` is the invocation that offloads. Same for any other
+# caller-chosen rustc wrapper.
+if [ -n "${RUSTC_WORKSPACE_WRAPPER:-}" ]; then
+  exec_local "$@"
+fi
+# rust-analyzer must stay local (streaming JSON + local state). It is identified
+# by its distinctive rendered-ansi/short diagnostic formats. A PLAIN
+# `--message-format=json` is what scripts, CI and build tooling pass, and those
+# must still offload — treating every --message-format as an IDE was the bug
+# that silently kept script-driven builds on the dev box.
+for a in "$@"; do
+  case "$a" in
+    --message-format=json-diagnostic-rendered-ansi*|--message-format=json-diagnostic-short*)
+      exec_local "$@" ;;
+  esac
+done
+case "${1:-}" in
+  build|b|test|t|check|c|clippy|bench|doc|nextest)
+    exec env RCH_REQUIRE_REMOTE=1 RCH_QUEUE_WHEN_BUSY=1 rch exec -- cargo "$@" ;;
+  *)
+    exec_local "$@" ;;
+esac
+"#;
+
+    #[test]
+    fn shim_body_documents_tiered_real_cargo_resolution() {
+        let body = cargo_shim_body(true);
+        for needle in [
+            "resolve_real",
+            "RCH_REAL_CARGO",
+            "RCH_SHIM_REAL_CARGO",
+            "cargo-rch-real",
+            "rustc --print sysroot",
+            "rch shim uninstall",
+        ] {
+            assert!(body.contains(needle), "shim body must carry {needle}");
+        }
+    }
+
+    /// Tier 1: an explicit RCH_REAL_CARGO outranks every other candidate —
+    /// the operator's one-word escape on a broken host.
+    #[cfg(unix)]
+    #[test]
+    fn real_cargo_tier1_explicit_env_override_wins() {
+        let dir = shim_sandbox(&cargo_shim_body(true), "cargo", &["build"]);
+        let over = dir.join("override-cargo");
+        write_exe(
+            &over,
+            "#!/bin/sh\necho OVERRIDE \"$@\" jobs=${CARGO_BUILD_JOBS:-unset}\n",
+        );
+        let out = exec_shim(
+            &dir,
+            "cargo",
+            &["build"],
+            &[
+                ("RCH_SHIM_LOCAL_IDE", "1"),
+                ("RCH_REAL_CARGO", over.to_str().unwrap()),
+                // The wrapper-handoff hint also works — the override must win.
+                (
+                    "RCH_SHIM_REAL_CARGO",
+                    dir.join("real-cargo").to_str().unwrap(),
+                ),
+            ],
+            None,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.starts_with("OVERRIDE"), "tier 1 must win: {stdout}");
+    }
+
+    /// Tier 2: the toolchain wrapper's RCH_SHIM_REAL_CARGO handoff beats the
+    /// plain proxy even when the proxy works — toolchain identity rules.
+    #[cfg(unix)]
+    #[test]
+    fn real_cargo_tier2_wrapper_handoff_beats_plain_proxy() {
+        let dir = shim_sandbox(&cargo_shim_body(true), "cargo", &["build"]);
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".cargo").join("bin")).unwrap();
+        write_exe(
+            &home.join(".cargo").join("bin").join("cargo"),
+            "#!/bin/sh\necho PROXY \"$@\"\n",
+        );
+        let out = exec_shim(
+            &dir,
+            "cargo",
+            &["build"],
+            &[
+                ("RCH_SHIM_LOCAL_IDE", "1"),
+                (
+                    "RCH_SHIM_REAL_CARGO",
+                    dir.join("real-cargo").to_str().unwrap(),
+                ),
+            ],
+            Some(&home),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.starts_with("LOCAL"),
+            "tier 2 must beat the plain proxy: {stdout}"
+        );
+    }
+
+    /// Tier 3: no env hints — the shim discovers `cargo-rch-real` in the
+    /// ACTIVE toolchain via `rustc --print sysroot` and prepends that bin dir
+    /// to PATH so the build's rustc/clippy resolve from the same toolchain.
+    #[cfg(unix)]
+    #[test]
+    fn real_cargo_tier3_sysroot_discovery_and_path_prepend() {
+        let dir = shim_sandbox(&cargo_shim_body(true), "cargo", &["build"]);
+        let tc = dir.join("fake-tc");
+        std::fs::create_dir_all(tc.join("bin")).unwrap();
+        write_exe(
+            &tc.join("bin").join("cargo-rch-real"),
+            "#!/bin/sh\necho TC-REAL \"$@\" jobs=${CARGO_BUILD_JOBS:-unset} first=${PATH%%:*}\n",
+        );
+        // Stub rustc answers `--print sysroot` with the fake toolchain root.
+        write_exe(
+            &dir.join("rustc"),
+            &format!("#!/bin/sh\necho {}\n", tc.display()),
+        );
+        // A working plain proxy must NOT be reached when tier 3 hits.
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".cargo").join("bin")).unwrap();
+        write_exe(
+            &home.join(".cargo").join("bin").join("cargo"),
+            "#!/bin/sh\necho PROXY \"$@\"\n",
+        );
+        let out = exec_shim(
+            &dir,
+            "cargo",
+            &["build"],
+            &[("RCH_SHIM_LOCAL_IDE", "1"), ("RCH_SHIM_REAL_CARGO", "")],
+            Some(&home),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.starts_with("TC-REAL"),
+            "tier 3 must resolve the renamed real cargo: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("first={}", tc.join("bin").display())),
+            "tier 3 must prepend the toolchain bin to PATH: {stdout}"
+        );
+    }
+
+    /// Tier 4: nothing renamed — the stock `~/.cargo/bin/cargo` proxy is used
+    /// as-is, with the local-parallelism cap intact (stable-host behavior).
+    #[cfg(unix)]
+    #[test]
+    fn real_cargo_tier4_plain_proxy_when_nothing_renamed() {
+        let dir = shim_sandbox(&cargo_shim_body(true), "cargo", &["build"]);
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".cargo").join("bin")).unwrap();
+        write_exe(
+            &home.join(".cargo").join("bin").join("cargo"),
+            "#!/bin/sh\necho PROXY \"$@\" jobs=${CARGO_BUILD_JOBS:-unset}\n",
+        );
+        // rustc exists but its toolchain holds no renamed real cargo.
+        write_exe(
+            &dir.join("rustc"),
+            &format!("#!/bin/sh\necho {}\n", dir.join("no-tc").display()),
+        );
+        let out = exec_shim(
+            &dir,
+            "cargo",
+            &["build"],
+            &[("RCH_SHIM_LOCAL_IDE", "1"), ("RCH_SHIM_REAL_CARGO", "")],
+            Some(&home),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(
+            stdout.starts_with("PROXY"),
+            "tier 4 must use the plain proxy: {stdout}"
+        );
+        assert!(
+            stdout.ends_with("jobs=8"),
+            "tier 4 keeps the local cap: {stdout}"
+        );
+    }
+
+    /// Every tier empty: fail loudly with an error naming the escape hatches
+    /// and exit 127 (the command-not-found class), never a silent hang.
+    #[cfg(unix)]
+    #[test]
+    fn real_cargo_resolution_failure_names_the_fix() {
+        let dir = shim_sandbox(&cargo_shim_body(true), "cargo", &["build"]);
+        let home = dir.join("home"); // no .cargo/bin here
+        std::fs::create_dir_all(&home).unwrap();
+        write_exe(
+            &dir.join("rustc"),
+            &format!("#!/bin/sh\necho {}\n", dir.join("no-tc").display()),
+        );
+        let out = exec_shim(
+            &dir,
+            "cargo",
+            &["build"],
+            &[("RCH_SHIM_LOCAL_IDE", "1"), ("RCH_SHIM_REAL_CARGO", "")],
+            Some(&home),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(out.status.code(), Some(127));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("RCH_REAL_CARGO"),
+            "must name the env override: {stderr}"
+        );
+        assert!(
+            stderr.contains("rch shim uninstall"),
+            "must name the recovery path: {stderr}"
+        );
+    }
+
+    /// THE incident (2026-08-30 fleet rollout of 943b8e29): nightly-default
+    /// dispatcher, the active toolchain's bin holds ONLY `cargo-rch-real`
+    /// (no `cargo`), so the rustup proxy fails to dispatch. The sandbox
+    /// mirrors that host exactly; v3 must die with the proxy's error while v4
+    /// resolves the renamed real cargo and puts its bin dir first on PATH.
+    #[cfg(unix)]
+    #[test]
+    fn nightly_renamed_cargo_local_ide_v3_broke_v4_works() {
+        for (label, body) in [("v3", V3_SHIM_BODY), ("v4", cargo_shim_body(true).as_str())] {
+            let dir = shim_sandbox(body, "cargo", &["build"]);
+            let tc = dir.join("nightly-tc");
+            std::fs::create_dir_all(tc.join("bin")).unwrap();
+            write_exe(
+                &tc.join("bin").join("cargo-rch-real"),
+                "#!/bin/sh\necho TC-REAL \"$@\" first=${PATH%%:*}\n",
+            );
+            write_exe(
+                &dir.join("rustc"),
+                &format!("#!/bin/sh\necho {}\n", tc.display()),
+            );
+            let home = dir.join("home");
+            std::fs::create_dir_all(home.join(".cargo").join("bin")).unwrap();
+            // The rustup proxy, failing exactly as rustup does on this host.
+            write_exe(
+                &home.join(".cargo").join("bin").join("cargo"),
+                &concat!(
+                    "#!/bin/sh\n",
+                    "echo \"error: the 'cargo' binary, normally provided by the 'cargo' component, is not applicable to the 'nightly' toolchain\" >&2\n",
+                    "exit 1\n"
+                ),
+            );
+            let out = exec_shim(
+                &dir,
+                "cargo",
+                &["build"],
+                &[("RCH_SHIM_LOCAL_IDE", "1"), ("RCH_SHIM_REAL_CARGO", "")],
+                Some(&home),
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let _ = std::fs::remove_dir_all(&dir);
+            if label == "v3" {
+                assert_eq!(
+                    out.status.code(),
+                    Some(1),
+                    "v3 must die with the proxy's error, stderr: {stderr}"
+                );
+                assert!(
+                    stderr.contains("not applicable"),
+                    "v3 proxies straight into the broken rustup dispatch: {stderr}"
+                );
+            } else {
+                assert!(
+                    out.status.success(),
+                    "v4 must build locally via cargo-rch-real, stderr: {stderr}"
+                );
+                assert!(
+                    stdout.starts_with("TC-REAL"),
+                    "v4 must resolve the renamed real cargo: {stdout}"
+                );
+                assert!(
+                    stdout.contains(&format!("first={}", tc.join("bin").display())),
+                    "v4 must prepend the toolchain bin so children get nightly rustc: {stdout}"
+                );
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn bypass_still_breaks_the_loop() {
@@ -1274,6 +1723,48 @@ mod tests {
         // Resolves its sibling real binary relative to $0, not a hardcoded path.
         assert!(body.contains(r#"SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"#));
         assert!(body.contains(REAL_CARGO_NAME));
+        // Its own local fallback must put the toolchain bin FIRST on PATH so
+        // the bypassed build's rustc/clippy-driver come from THAT toolchain
+        // (mirrors the shim's tiered resolution).
+        assert!(body.contains(r#"PATH="$SELF_DIR:$PATH""#));
+    }
+
+    /// Executed for real: a bypassed toolchain-wrapper build runs the sibling
+    /// real cargo with the toolchain's bin dir leading PATH.
+    #[cfg(unix)]
+    #[test]
+    fn toolchain_wrapper_local_fallback_prepends_its_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_exe(&bin.join("cargo"), &toolchain_wrap_body());
+        write_exe(
+            &bin.join(REAL_CARGO_NAME),
+            "#!/bin/sh\necho TC-REAL \"$@\" jobs=${CARGO_BUILD_JOBS:-unset} first=${PATH%%:*}\n",
+        );
+        let out = std::process::Command::new(bin.join("cargo"))
+            .arg("build")
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+            .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+            .env_remove("CARGO_BUILD_JOBS")
+            .env_remove("RCH_LOCAL_MAX_JOBS")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(
+            stdout.starts_with("TC-REAL"),
+            "must exec the real cargo: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("first={}", bin.display())),
+            "toolchain bin must lead PATH for child rustc: {stdout}"
+        );
+        assert!(stdout.contains("jobs=8"), "local cap must hold: {stdout}");
     }
 
     #[test]
