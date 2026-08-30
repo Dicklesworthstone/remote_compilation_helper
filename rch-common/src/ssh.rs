@@ -5,7 +5,7 @@
 //!
 //! This module is only available on Unix platforms (requires openssh crate).
 
-use crate::types::{WorkerConfig, WorkerId};
+use crate::types::{WorkerConfig, WorkerId, declared_os};
 use anyhow::{Context, Result};
 use openssh::{ControlPersist, KnownHosts, Session, SessionBuilder, Stdio};
 use std::collections::HashMap;
@@ -642,6 +642,35 @@ impl SshClient {
     }
 }
 
+/// Derive the per-worker [`SshOptions`] a pool hands to each pooled
+/// [`SshClient`].
+///
+/// POLICY — Windows workers never get ControlMaster multiplexing. Windows
+/// OpenSSH has no ControlMaster support: a pooled (multiplexed) session
+/// appears to connect, then every command over it hangs and dies at the
+/// command stage ("Failed to wait for command completion"), so each pooled
+/// probe fails deterministically and the daemon marks the worker permanently
+/// unreachable even though fresh one-shot SSH to the same host succeeds
+/// (2026-08-30 incident: worker `wsurf`, `os = "windows"` — healthy via
+/// `rch workers probe` fresh connections, "unreachable" via every pooled
+/// health check). Applying the override HERE — the single place pooled
+/// clients are constructed from the pool's global options — fixes every pool
+/// consumer (daemon shared build/telemetry pool, dedicated health pool) at
+/// once. [`SshClient::connect`]'s ControlMaster-failure retry cannot catch
+/// this class: the mux connect does not fail, the commands do.
+///
+/// `control_persist_idle` needs no separate neutralization: it is consulted
+/// only when `control_master` is true (see [`control_persist_mode`]), so it
+/// is inert once mux is disabled and is left verbatim. Non-Windows workers
+/// get the pool options verbatim in full.
+fn pooled_client_options(pool_options: &SshOptions, config: &WorkerConfig) -> SshOptions {
+    let mut options = pool_options.clone();
+    if declared_os(&config.tags).as_deref() == Some("windows") {
+        options.control_master = false;
+    }
+    options
+}
+
 /// Connection pool for managing multiple SSH connections.
 pub struct SshPool {
     /// Pool of active connections.
@@ -725,7 +754,7 @@ impl SshPool {
 
                 let replacement = Arc::new(RwLock::new(SshClient::new(
                     config.clone(),
-                    self.options.clone(),
+                    pooled_client_options(&self.options, config),
                 )));
                 let replaced = {
                     let mut connections = self.connections.write().await;
@@ -753,7 +782,7 @@ impl SshPool {
 
             let new_client = Arc::new(RwLock::new(SshClient::new(
                 config.clone(),
-                self.options.clone(),
+                pooled_client_options(&self.options, config),
             )));
             let inserted = {
                 let mut connections = self.connections.write().await;
@@ -823,7 +852,10 @@ impl SshPool {
     /// The per-command timeout is applied via a temporary [`SshOptions`] override
     /// on the pooled client so it does not disturb the pool's shared default
     /// (e.g. a long build vs. a short health probe). The connect timeout and
-    /// control-master/persist settings come from the pool's options.
+    /// control-master/persist settings come from the pool's options — except
+    /// that Windows workers are ALWAYS non-mux (see [`pooled_client_options`]):
+    /// Windows OpenSSH cannot multiplex, so a pooled mux session hangs at the
+    /// command stage.
     pub async fn run_with_timeout(
         &self,
         config: &WorkerConfig,
@@ -1018,6 +1050,147 @@ mod tests {
             control_persist_mode(true, Some(Duration::from_secs(60))),
             ControlPersistMode::IdleFor(NonZeroUsize::new(60).unwrap()),
             "pool mux options must keep a warm master for a bounded idle window"
+        );
+    }
+
+    // ======================================================================
+    // Windows workers never get pooled ControlMaster (bd-wgbx9)
+    // ======================================================================
+
+    fn windows_worker_config(id: &str) -> WorkerConfig {
+        let mut config = worker_config(id, "100.68.2.11", "jeffr", "~/.ssh/surfacebookje_key");
+        config.tags = vec!["rust".to_string(), crate::types::os_tag("windows")];
+        config
+    }
+
+    #[test]
+    fn test_pooled_options_disable_control_master_for_windows_workers() {
+        // Regression (bd-wgbx9): Windows OpenSSH has no ControlMaster — a
+        // pooled mux session hangs at the command stage ("Failed to wait for
+        // command completion") and the worker is falsely marked unreachable
+        // while fresh one-shot SSH succeeds. Whatever the pool's global
+        // options say, a Windows worker's pooled client must be non-mux.
+        let _guard = test_guard!();
+        let pool_mux = SshOptions {
+            control_master: true,
+            control_persist_idle: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        let config = windows_worker_config("wsurf");
+
+        let effective = pooled_client_options(&pool_mux, &config);
+        assert!(
+            !effective.control_master,
+            "a Windows worker must never get a pooled ControlMaster"
+        );
+        // The override must be surgical: everything else stays verbatim.
+        // control_persist_idle is left as-is because it is inert once mux is
+        // off (control_persist_mode only reads it when control_master is true).
+        assert_eq!(effective.connect_timeout, pool_mux.connect_timeout);
+        assert_eq!(effective.command_timeout, pool_mux.command_timeout);
+        assert_eq!(
+            effective.server_alive_interval,
+            pool_mux.server_alive_interval
+        );
+        assert_eq!(
+            effective.control_persist_idle,
+            pool_mux.control_persist_idle
+        );
+        assert_eq!(effective.known_hosts, pool_mux.known_hosts);
+
+        // A pool that already disabled mux stays disabled.
+        let pool_plain = SshOptions {
+            control_master: false,
+            ..pool_mux
+        };
+        assert!(!pooled_client_options(&pool_plain, &config).control_master);
+
+        // declared_os normalizes case: `os = "Windows"` in workers.toml is the
+        // same reserved tag and must disable mux too.
+        let mut mixed_case = windows_worker_config("wsurf-2");
+        mixed_case.tags = vec![crate::types::os_tag("Windows")];
+        assert!(!pooled_client_options(&pool_mux, &mixed_case).control_master);
+    }
+
+    #[test]
+    fn test_pooled_options_keep_pool_options_verbatim_for_non_windows_workers() {
+        // Linux/unlabelled workers keep the pool's options VERBATIM — the
+        // override must not degrade warm-master reuse for the rest of the
+        // fleet, under either a mux or a hypothetical non-mux pool.
+        let _guard = test_guard!();
+        let pool_mux = SshOptions {
+            control_master: true,
+            control_persist_idle: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        let linux = worker_config("contabo-a", "1.2.3.4", "root", "~/.ssh/id_rsa");
+        let unlabelled = worker_config("contabo-b", "1.2.3.5", "root", "~/.ssh/id_rsa");
+
+        for config in [&linux, &unlabelled] {
+            let effective = pooled_client_options(&pool_mux, config);
+            assert!(
+                effective.control_master,
+                "non-Windows workers keep the pool's mux setting"
+            );
+            assert_eq!(
+                effective.control_persist_idle,
+                pool_mux.control_persist_idle
+            );
+        }
+
+        let pool_plain = SshOptions {
+            control_master: false,
+            ..pool_mux
+        };
+        for config in [&linux, &unlabelled] {
+            assert!(!pooled_client_options(&pool_plain, config).control_master);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pool_entry_for_windows_worker_is_never_mux() {
+        // End-to-end at the pool layer: the daemon's health pool and shared
+        // build/telemetry pool both construct per-worker clients via
+        // get_or_create_client_entry with pool-global mux options — the
+        // Windows entry must come out non-mux. Uses the entry-creation path
+        // (like the other pool tests) so no live SSH host is needed.
+        let _guard = test_guard!();
+        let pool = SshPool::new(SshOptions {
+            control_master: true,
+            control_persist_idle: Some(Duration::from_secs(60)),
+            ..Default::default()
+        });
+        let config = windows_worker_config("wsurf");
+
+        let entry = pool.get_or_create_client_entry(&config).await;
+        let guard = entry.read().await;
+        assert!(
+            !guard.options.control_master,
+            "pooled entry for a Windows worker must be non-mux"
+        );
+        // The inert companion setting is untouched, proving the override was
+        // surgical rather than a blanket options reset.
+        assert_eq!(
+            guard.options.control_persist_idle,
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pool_entry_for_linux_worker_keeps_mux() {
+        let _guard = test_guard!();
+        let pool = SshPool::new(SshOptions {
+            control_master: true,
+            control_persist_idle: Some(Duration::from_secs(60)),
+            ..Default::default()
+        });
+        let config = worker_config("contabo-a", "1.2.3.4", "root", "~/.ssh/id_rsa");
+
+        let entry = pool.get_or_create_client_entry(&config).await;
+        let guard = entry.read().await;
+        assert!(
+            guard.options.control_master,
+            "pooled entry for a Linux worker must keep the pool's mux setting"
         );
     }
 

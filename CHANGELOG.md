@@ -146,6 +146,38 @@ by itself). Bead
   loop-break contract, the local `CARGO_BUILD_JOBS` cap, rust-analyzer handling.
   Hosts where nothing was renamed resolve tier 4 exactly as v3 did.
 
+### Windows workers: pooled SSH never uses ControlMaster (wsurf permanently "unreachable")
+
+The daemon's SSH pools (shared build/telemetry pool AND the dedicated health
+pool) forced ControlMaster multiplexing for every worker — but Windows
+OpenSSH has no ControlMaster support. On the Windows worker (`os = "windows"`)
+a pooled session appears to connect and then every command over it hangs and
+dies at the command stage, so each pooled health probe failed
+deterministically with `Failed to wait for command completion` and the daemon
+marked the worker permanently unreachable — while fresh one-shot SSH to the
+same host worked fine (`rch workers probe` healthy, `rch check` degraded
+15/16; 2026-08-30 incident on worker `wsurf`). Linux workers only ever hit
+the same signature transiently and recovered via retries/circuit. Bead
+[`bd-wgbx9`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl):
+
+- **Pool-layer override** in `rch_common::SshPool`: a single helper
+  (`pooled_client_options`) derives each pooled client's options and forces
+  `control_master = false` whenever the worker's declared OS is `windows`
+  (the reserved `os:windows` tag from `os = "windows"` in `workers.toml`,
+  case-normalized). Both per-worker client construction sites in
+  `get_or_create_client_entry` route through it, so every pool consumer
+  (health, telemetry, cache cleanup, reclaim, stale-target reap, toolchain
+  preflight) is fixed at once. `SshClient::connect`'s existing
+  ControlMaster-failure retry could not catch this class — the mux connect
+  succeeds; the commands hang.
+- **`control_persist_idle` is NOT separately neutralized**: it is consulted
+  only when `control_master` is true (`control_persist_mode`), so it is inert
+  once mux is off and is left verbatim. Non-Windows workers keep the pool's
+  options verbatim in full — warm-master reuse for the rest of the fleet is
+  unchanged.
+- Unit tests cover windows/linux × pool-mux/pool-non-mux at both the helper
+  and the pool-entry layer (plus `os = "Windows"` case normalization).
+
 ### Custom cargo profiles sync their outputs; silent zero-output sync-backs fail loudly
 
 Remote builds that write to a CUSTOM cargo profile directory (`cargo build --profile
