@@ -1710,6 +1710,70 @@ impl WorkerSelector {
         request: &SelectionRequest,
         excluded_worker_ids: &HashSet<String>,
     ) -> Result<Vec<(Arc<WorkerState>, CircuitState)>, SelectionReason> {
+        self.get_eligible_workers_with_refresh(pool, request, excluded_worker_ids, true)
+            .await
+    }
+
+    /// One-shot stale-inventory recovery for the rustup-component gate
+    /// (issue #63(b)): when component filtering is about to exclude EVERY
+    /// candidate, live-probe the excluded workers' capabilities once
+    /// (`rch-wkr capabilities`, the same probe the periodic health loop
+    /// runs), store the fresh snapshots, and — if any worker now has the
+    /// component — re-run admission once. Returns whether a re-run is
+    /// warranted.
+    async fn refresh_component_capabilities(
+        &self,
+        request: &SelectionRequest,
+        component_excluded: &[Arc<WorkerState>],
+    ) -> bool {
+        // Probe only over the daemon's shared SSH pool (production always sets
+        // one; see main.rs `set_ssh_pool`). A pool-less selector — unit tests,
+        // ad-hoc embedding — keeps the previous fail-immediately behavior
+        // instead of spawning throwaway SSH sessions per excluded worker.
+        if self.ssh_pool.is_none() {
+            return false;
+        }
+        let mut handles = Vec::with_capacity(component_excluded.len());
+        for worker in component_excluded {
+            let worker = Arc::clone(worker);
+            let ssh_pool = self.ssh_pool.clone();
+            handles.push(tokio::spawn(async move {
+                let capabilities = crate::health::probe_worker_capabilities(
+                    &worker,
+                    TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT,
+                    ssh_pool.as_ref(),
+                )
+                .await?;
+                worker.set_capabilities(capabilities.clone()).await;
+                Some((worker, capabilities))
+            }));
+        }
+
+        let mut any_recovered = false;
+        for handle in handles {
+            let Ok(Some((worker, capabilities))) = handle.await else {
+                continue;
+            };
+            if rustup_component_capability_mismatch(request, &capabilities).is_none() {
+                let worker_id = worker.config.read().await.id.clone();
+                info!(
+                    "Worker {} capability inventory was stale: live probe shows the required \
+                     rustup component installed; re-running admission (issue #63)",
+                    worker_id
+                );
+                any_recovered = true;
+            }
+        }
+        any_recovered
+    }
+
+    async fn get_eligible_workers_with_refresh(
+        &self,
+        pool: &WorkerPool,
+        request: &SelectionRequest,
+        excluded_worker_ids: &HashSet<String>,
+        allow_component_refresh: bool,
+    ) -> Result<Vec<(Arc<WorkerState>, CircuitState)>, SelectionReason> {
         // Clear per-round admission verdict cache (bd-vvmd.4.4).
         if let Some(ref gate) = self.admission_gate {
             gate.begin_round().await;
@@ -1771,6 +1835,9 @@ impl WorkerSelector {
         let mut filtered_by_health = 0usize;
         let mut filtered_by_hard_preflight = 0usize;
         let mut filtered_by_component = 0usize;
+        // Workers excluded ONLY by the rustup-component gate, kept for the
+        // one-shot stale-inventory capability refresh (issue #63(b)).
+        let mut component_excluded: Vec<Arc<WorkerState>> = Vec::new();
         let mut filtered_by_convergence = 0usize;
         let mut filtered_by_pressure = 0usize;
         let mut filtered_by_os_gate = 0usize;
@@ -1859,6 +1926,7 @@ impl WorkerSelector {
                 metrics::inc_reliability_error("selection", "toolchain_component_missing");
                 filtered_by_hard_preflight += 1;
                 filtered_by_component += 1;
+                component_excluded.push(Arc::clone(&worker));
                 continue;
             }
             if let Some(reason) =
@@ -2424,6 +2492,26 @@ impl WorkerSelector {
                 filtered_by_hard_preflight
             );
             if filtered_by_component > 0 {
+                // Issue #63(b): before declaring the whole fleet missing a
+                // component, live-probe the excluded workers' capability
+                // inventories ONCE — a stale snapshot (e.g. a component
+                // installed after the last periodic poll) otherwise
+                // fail-closes every worker and silently pushes an explicitly
+                // remote request into a local build.
+                if allow_component_refresh
+                    && !component_excluded.is_empty()
+                    && self
+                        .refresh_component_capabilities(request, &component_excluded)
+                        .await
+                {
+                    return Box::pin(self.get_eligible_workers_with_refresh(
+                        pool,
+                        request,
+                        excluded_worker_ids,
+                        false,
+                    ))
+                    .await;
+                }
                 return Err(SelectionReason::NoAdmissibleWorkers(format!(
                     "missing_toolchain_component={filtered_by_component}"
                 )));
@@ -3633,16 +3721,61 @@ fn direct_cargo_fmt_check(command: &str) -> bool {
         && tokens[subcommand_index + 1..].contains(&"--check")
 }
 
+/// The rustup toolchain the command itself pins: an env-style
+/// `RUSTUP_TOOLCHAIN=<name>` assignment token (bare or behind `env`) or a
+/// `cargo +<name>` selector. Rustup gives the env assignment precedence over
+/// a project's rust-toolchain.toml, so for capability gating the command's
+/// own pin is authoritative when present (issue #63).
+fn toolchain_from_command_text(command: &str) -> Option<String> {
+    let mut prev_is_cargo = false;
+    for raw in command.split_whitespace() {
+        let token = raw.trim_matches(['\'', '"']);
+        if let Some(value) = token.strip_prefix("RUSTUP_TOOLCHAIN=") {
+            let value = value.trim_matches(['\'', '"']);
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+        if prev_is_cargo
+            && let Some(value) = token.strip_prefix('+')
+            && !value.is_empty()
+        {
+            return Some(value.to_string());
+        }
+        prev_is_cargo = token == "cargo"
+            || token
+                .rsplit_once('/')
+                .is_some_and(|(_, name)| name == "cargo");
+    }
+    None
+}
+
+/// The toolchain governing `request`'s component requirements: the command's
+/// own `RUSTUP_TOOLCHAIN=`/`+<tc>` pin first (rustup precedence), then the
+/// request-carried project toolchain. Issue #63: `rch exec --job` requests
+/// used to carry NO toolchain at all, and the previous fail-closed `<unknown>`
+/// branch excluded EVERY worker (`missing_toolchain_component=14`) although
+/// the pinned clippy was installed fleet-wide — followed by a silent local
+/// build.
+fn required_component_toolchain(request: &SelectionRequest) -> Option<String> {
+    request
+        .command
+        .as_deref()
+        .and_then(toolchain_from_command_text)
+        .or_else(|| {
+            request
+                .toolchain
+                .as_ref()
+                .map(ToolchainInfo::rustup_toolchain)
+        })
+}
+
 fn rustup_component_capability_mismatch(
     request: &SelectionRequest,
     capabilities: &WorkerCapabilities,
 ) -> Option<String> {
     let component = required_rustup_component(request)?;
-    let Some(toolchain) = request
-        .toolchain
-        .as_ref()
-        .map(ToolchainInfo::rustup_toolchain)
-    else {
+    let Some(toolchain) = required_component_toolchain(request) else {
         return Some(format!(
             "capability_missing:rustup_component:<unknown>:{component}"
         ));
@@ -5101,6 +5234,86 @@ mod tests {
         assert_eq!(
             rustup_component_capability_mismatch(&clippy, &capabilities).as_deref(),
             Some("capability_missing:rustup_component:nightly-2026-07-05:clippy")
+        );
+    }
+
+    /// Issue #63(a): when the request carries no toolchain (the `--job` rail),
+    /// the component gate must derive it from the command's own
+    /// `RUSTUP_TOOLCHAIN=` env prefix (or `cargo +<tc>` selector) instead of
+    /// fail-closing every worker as `<unknown>`.
+    #[test]
+    fn component_gate_derives_toolchain_from_command_env_prefix() {
+        // The exact command shape from issue #63 — request.toolchain is None.
+        let mut request = pinned_component_request(
+            "frankensearch",
+            "env RCH_CARGO_WRAPPER_BYPASS=1 RUSTUP_TOOLCHAIN=nightly-2026-08-25 \
+             CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-target cargo clippy \
+             --workspace --all-targets --locked -- -D warnings",
+        );
+        request.toolchain = None;
+
+        assert_eq!(
+            toolchain_from_command_text(request.command.as_deref().unwrap()).as_deref(),
+            Some("nightly-2026-08-25")
+        );
+        assert_eq!(
+            required_component_toolchain(&request).as_deref(),
+            Some("nightly-2026-08-25")
+        );
+
+        let with_clippy = WorkerCapabilities {
+            rustup_components: vec![
+                "nightly-2026-08-25-x86_64-unknown-linux-gnu:clippy".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(
+            rustup_component_capability_mismatch(&request, &with_clippy).is_none(),
+            "a worker with the pinned clippy installed must be admissible"
+        );
+
+        let without_clippy = WorkerCapabilities::default();
+        assert_eq!(
+            rustup_component_capability_mismatch(&request, &without_clippy).as_deref(),
+            Some("capability_missing:rustup_component:nightly-2026-08-25:clippy"),
+            "the derived toolchain (never <unknown>) names the mismatch"
+        );
+
+        // The command's own pin outranks the request toolchain (rustup env
+        // precedence): the gate checks what the remote cargo will actually use.
+        let mut pinned_both = pinned_component_request(
+            "frankensearch",
+            "env RUSTUP_TOOLCHAIN=nightly-2026-08-25 cargo clippy --workspace",
+        );
+        assert!(pinned_both.toolchain.is_some());
+        assert_eq!(
+            required_component_toolchain(&pinned_both).as_deref(),
+            Some("nightly-2026-08-25")
+        );
+        // Without a command pin, the request toolchain still governs.
+        pinned_both.command = Some("cargo clippy --workspace".to_string());
+        assert_eq!(
+            required_component_toolchain(&pinned_both).as_deref(),
+            Some("nightly-2026-07-05")
+        );
+
+        // `cargo +<tc>` selector form.
+        assert_eq!(
+            toolchain_from_command_text("cargo +nightly-2026-08-25 clippy --workspace").as_deref(),
+            Some("nightly-2026-08-25")
+        );
+        // A `+` token that does not follow cargo is not a selector.
+        assert_eq!(
+            toolchain_from_command_text("cargo build --features +weird"),
+            None
+        );
+
+        // Completely underived toolchain still fails closed as before.
+        let mut unknown = pinned_component_request("proj", "cargo clippy --workspace");
+        unknown.toolchain = None;
+        assert_eq!(
+            rustup_component_capability_mismatch(&unknown, &with_clippy).as_deref(),
+            Some("capability_missing:rustup_component:<unknown>:clippy")
         );
     }
 
