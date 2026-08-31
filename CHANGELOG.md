@@ -178,6 +178,58 @@ the same signature transiently and recovered via retries/circuit. Bead
 - Unit tests cover windows/linux × pool-mux/pool-non-mux at both the helper
   and the pool-entry layer (plus `os = "Windows"` case normalization).
 
+### Windows workers: command execution dispatches to the system `ssh` binary
+
+The Windows ControlMaster fix above stopped pooled Windows clients from
+spending a warm master on a slave that never replies, but the underlying
+command-execute path was still broken: the `openssh` crate 0.11.6 cannot
+execute commands on Windows OpenSSH at all. The connect step uses a
+different channel and works; the execute step does not — the slave never
+completes the command channel, so every command hangs at the
+`Failed to wait for command completion` boundary regardless of mux,
+keepalive, or persist settings (2026-08-30 fleet diagnostic, 6/6 option
+combinations all 12-second timeouts; see
+`/Users/jemanuel/projects/wsurf-openssh-diag/FINDINGS.md`). The pool-side
+override (`bd-wgbx9`) is correct but the daemon never gets there for
+Windows workers — `Failed to wait for command completion` fires first.
+The worker `wsurf` (the only Windows box) has been permanently marked
+unreachable ever since, hidden by the persistent bypass state. Bead
+[`bd-nfusx`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl):
+
+- **System-ssh fallback at execute time** in `rch_common::ssh`: three
+  helpers (`prefers_system_ssh`, `system_ssh_argv`, `system_ssh_execute`)
+  plus a dispatch at the top of `SshClient::execute_with_timeout`. When
+  `declared_os(&config.tags) == Some("windows")`, the dispatch spawns the
+  system `ssh` binary directly via `tokio::process::Command` with
+  `BatchMode=yes`, `ConnectTimeout=8`, `StrictHostKeyChecking=accept-new`,
+  `-i <identity_file>`, the configured `ServerAliveInterval` (omitted at
+  `0`), and `kill_on_drop(true)` so a timeout cannot leak an ssh child.
+  Output is read concurrently off stdout / stderr with the same
+  `MAX_OUTPUT_SIZE` cap the openssh-crate path enforces, and the result
+  is a `CommandResult` with the same shape callers already consume.
+  Linux / unlabelled workers keep the openssh-crate path verbatim —
+  the dispatch key is identical to the one `pooled_client_options` uses,
+  so the two Windows fallbacks cannot diverge on which workers they
+  apply to.
+- **Argv builder** is pure and testable. Identity file is tilde-expanded
+  via `shellexpand::tilde` (the same call site as the openssh crate
+  path), `WorkerConfig` has no port field so the argv has no `-p` flag
+  (non-default ports travel as `host:port`), and the destination is
+  `user@host`. The argv is `ssh -i <key> -o BatchMode=yes -o
+  ConnectTimeout=8 -o StrictHostKeyChecking=accept-new [-o
+  ServerAliveInterval=N] user@host command` — the same proven
+  fleet-preflight arg set used by `rch/src/fleet/ssh.rs::SshExecutor`.
+- **Unit tests** cover the dispatch key for `os:windows`, `os:Windows`
+  (case normalization), `os:linux`, and an unlabelled worker; the argv
+  builder for default keepalive, zero keepalive (omitted flag), long
+  keepalive preserved verbatim, and tilde-expanded identity file; and a
+  lockstep check that the dispatch key matches `pooled_client_options`.
+- **Persistent bypass state is doing its job** (avoiding wasted probes
+  on a known-bad worker) but will hide this fix until reset. After
+  rolling out the new build, run `rch status --json | jq '.bypass'` and
+  clear the wsurf bypass entry so the daemon re-evaluates against the
+  new execute path.
+
 ### Custom cargo profiles sync their outputs; silent zero-output sync-backs fail loudly
 
 Remote builds that write to a CUSTOM cargo profile directory (`cargo build --profile

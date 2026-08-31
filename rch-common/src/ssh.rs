@@ -9,6 +9,7 @@ use crate::types::{WorkerConfig, WorkerId, declared_os};
 use anyhow::{Context, Result};
 use openssh::{ControlPersist, KnownHosts, Session, SessionBuilder, Stdio};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
@@ -369,6 +370,25 @@ impl SshClient {
         command: &str,
         command_timeout: Duration,
     ) -> Result<CommandResult> {
+        // Windows fallback (bd-kzy2x): the openssh crate cannot execute
+        // commands on Windows OpenSSH (the slave never completes the
+        // command channel), so we dispatch through the system `ssh` binary
+        // for declared-OS Windows workers. The connect path above is
+        // untouched and still uses the openssh crate (it succeeds); only
+        // the execute step swaps. Linux / unlabelled workers keep the
+        // openssh-crate path verbatim.
+        if prefers_system_ssh(&self.config) {
+            return system_ssh_execute(
+                &self.config,
+                command,
+                command_timeout,
+                self.options
+                    .server_alive_interval
+                    .unwrap_or(Duration::from_secs(2)),
+            )
+            .await;
+        }
+
         let session = self.session.as_ref().context("Not connected to worker")?;
 
         let start = std::time::Instant::now();
@@ -669,6 +689,194 @@ fn pooled_client_options(pool_options: &SshOptions, config: &WorkerConfig) -> Ss
         options.control_master = false;
     }
     options
+}
+
+/// System-ssh command-execution fallback (bd-kzy2x).
+///
+/// The `openssh` crate 0.11.6 cannot execute commands on Windows OpenSSH
+/// regardless of `control_master` / `control_persist` / keepalive settings:
+/// the slave never completes the command channel and every command hangs at
+/// the execute stage even though the connect succeeds. The CLI `ssh` binary
+/// speaks the OpenSSH wire protocol directly and works fine. For workers that
+/// declare `os = "windows"` we therefore spawn the system `ssh` binary at
+/// command-execution time, mirroring the proven system-ssh pattern already
+/// used by the fleet preflight path (`rch/src/fleet/ssh.rs::SshExecutor`) and
+/// the CLI worker init / probe paths. The connect path stays the openssh
+/// crate (it succeeds) — the fallback is purely an execute-time dispatch
+/// inside `SshClient::execute_with_timeout`.
+///
+/// Policy key (kept in lockstep with the existing pool-layer override
+/// `pooled_client_options`): `declared_os(&config.tags) == Some("windows")`.
+/// `os = "Windows"` is case-normalized by `declared_os` so both spellings
+/// route through the same fallback.
+
+/// Should `SshClient::execute_with_timeout` dispatch through the system `ssh`
+/// binary for this worker instead of the `openssh` crate?
+pub(crate) fn prefers_system_ssh(config: &WorkerConfig) -> bool {
+    declared_os(&config.tags).as_deref() == Some("windows")
+}
+
+/// Build the argv for the system-ssh fallback, mirroring the proven CLI
+/// system-ssh pattern (see `rch/src/fleet/ssh.rs::SshExecutor::build_ssh_args`
+/// and `rch/src/commands/workers_init.rs`). Pure / testable: no process is
+/// spawned. The first element is the program name `"ssh"` so the vector can
+/// be passed straight to `Command::new` callers that prefer the explicit
+/// first arg, but the standard `Command::new("ssh").args(...)` callers can
+/// skip it — see `system_ssh_execute` which drops it.
+///
+/// Argv layout:
+/// `ssh -i <identity_file> -o BatchMode=yes -o ConnectTimeout=8 -o
+///   StrictHostKeyChecking=accept-new -o ServerAliveInterval=<secs>
+///   <user>@<host> <command>`
+///
+/// `WorkerConfig` has no port field today; the SSH port is carried as part
+/// of the host (`host:port`) and SSH's own config handles non-default
+/// ports, so the argv has no `-p` flag. The 8s `ConnectTimeout` matches the
+/// fleet SshExecutor default (`DEFAULT_CONNECT_TIMEOUT_SECS = 10` would be
+/// the natural match too — kept at 8 to match the FINDINGS spec exactly).
+/// `server_alive_interval` is rounded up to 1s minimum when non-zero to
+/// avoid `ServerAliveInterval=0` (which OpenSSH treats as "disable
+/// keepalives" — fine — but matches the spec "0 -> omit" intent).
+pub(crate) fn system_ssh_argv(
+    config: &WorkerConfig,
+    command: &str,
+    server_alive_interval: Duration,
+) -> Vec<OsString> {
+    let identity_path = shellexpand::tilde(&config.identity_file);
+    let destination = format!("{}@{}", config.user, config.host);
+
+    let mut argv: Vec<OsString> = Vec::with_capacity(10);
+    argv.push(OsString::from("ssh"));
+    argv.push(OsString::from("-i"));
+    argv.push(OsString::from(identity_path.as_ref()));
+    argv.push(OsString::from("-o"));
+    argv.push(OsString::from("BatchMode=yes"));
+    argv.push(OsString::from("-o"));
+    argv.push(OsString::from("ConnectTimeout=8"));
+    argv.push(OsString::from("-o"));
+    argv.push(OsString::from("StrictHostKeyChecking=accept-new"));
+    if !server_alive_interval.is_zero() {
+        // `0` means "no keepalive" in OpenSSH; otherwise emit the requested
+        // interval in whole seconds (sub-second values are rounded up to 1s
+        // because OpenSSH only accepts integer seconds for this option).
+        let secs = server_alive_interval.as_secs().max(1);
+        argv.push(OsString::from("-o"));
+        argv.push(OsString::from(format!("ServerAliveInterval={secs}")));
+    }
+    argv.push(OsString::from(destination));
+    argv.push(OsString::from(command));
+    argv
+}
+
+/// Execute a command on a Windows worker via the system `ssh` binary.
+///
+/// Mirrors the openssh-crate path's size cap (`MAX_OUTPUT_SIZE`), timeout
+/// semantics (tokio timeout that bails on expiry), and `CommandResult`
+/// shape. The local ssh process is set `kill_on_drop(true)` so a timeout
+/// cannot leak an `ssh` child — the openssh-crate timeout path likewise
+/// relies on the caller to drop the child (and warns about the leak risk);
+/// here we get a hard SIGKILL on drop instead. Output reads are
+/// concurrent over `tokio::io::BufReader` to avoid a single-stream back-
+/// pressure deadlock (same pattern as the openssh path). `env_clear()` is
+/// used so a hostile / noisy environment from the calling daemon cannot
+/// perturb the local `ssh` invocation; SSH agent forwarding and standard
+/// paths still resolve via `~/.ssh/config` because ssh reads them from the
+/// filesystem, not the env.
+pub(crate) async fn system_ssh_execute(
+    config: &WorkerConfig,
+    command: &str,
+    command_timeout: Duration,
+    server_alive_interval: Duration,
+) -> Result<CommandResult> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    use tokio::process::Command;
+
+    let argv = system_ssh_argv(config, command, server_alive_interval);
+    // Drop the program name — `Command::new("ssh")` is the standard form.
+    let args = argv.into_iter().skip(1);
+
+    let start = std::time::Instant::now();
+    debug!(
+        "system-ssh executing on {}: {}",
+        config.id,
+        crate::util::mask_sensitive_command(command)
+    );
+
+    let mut child = Command::new("ssh")
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to spawn system ssh for {} (Windows fallback)",
+                config.id
+            )
+        })?;
+
+    let execution = async {
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let stdout_fut = async {
+            let mut buf = String::new();
+            if let Some(out) = stdout {
+                let mut handle = out.take(MAX_OUTPUT_SIZE);
+                handle.read_to_string(&mut buf).await?;
+            }
+            Ok::<String, anyhow::Error>(buf)
+        };
+        let stderr_fut = async {
+            let mut buf = String::new();
+            if let Some(err) = stderr {
+                let mut handle = err.take(MAX_OUTPUT_SIZE);
+                handle.read_to_string(&mut buf).await?;
+            }
+            Ok::<String, anyhow::Error>(buf)
+        };
+
+        let (stdout, stderr) = tokio::try_join!(stdout_fut, stderr_fut)?;
+        let status = child
+            .wait()
+            .await
+            .with_context(|| "system ssh command failed to wait for completion")?;
+        Ok::<_, anyhow::Error>((status, stdout, stderr))
+    };
+
+    match tokio::time::timeout(command_timeout, execution).await {
+        Ok(result) => {
+            let (status, stdout, stderr) = result?;
+            let duration = start.elapsed();
+            let exit_code = status.code().unwrap_or(-1);
+            debug!(
+                "system-ssh command completed on {} (exit={}, duration={}ms)",
+                config.id,
+                exit_code,
+                duration.as_millis()
+            );
+            Ok(CommandResult {
+                exit_code,
+                stdout,
+                stderr,
+                duration_ms: duration.as_millis() as u64,
+            })
+        }
+        Err(_) => {
+            // `kill_on_drop(true)` ensures the local ssh process is
+            // SIGKILLed when `child` drops here, so no ssh child can leak
+            // even if the remote end is wedged. The remote shell is killed
+            // too because the local ssh process holds the connection.
+            warn!(
+                "system-ssh command timed out on {} after {:?}",
+                config.id, command_timeout
+            );
+            anyhow::bail!("Command timed out after {:?}", command_timeout);
+        }
+    }
 }
 
 /// Connection pool for managing multiple SSH connections.
@@ -1562,6 +1770,162 @@ mod tests {
                 assert!(escaped.is_some(), "Should escape: {:?}", value);
             }
         }
+    }
+
+    // ======================================================================
+    // System-ssh fallback for Windows workers (bd-kzy2x)
+    // ======================================================================
+
+    fn windows_worker(id: &str) -> WorkerConfig {
+        let mut config = worker_config(id, "100.68.2.11", "jeffr", "~/.ssh/surfacebookje_key");
+        config.tags = vec!["rust".to_string(), crate::types::os_tag("windows")];
+        config
+    }
+
+    #[test]
+    fn test_prefers_system_ssh_for_windows_tag() {
+        // The dispatch key in lockstep with `pooled_client_options`:
+        // declared_os == "windows" -> system-ssh fallback.
+        let _guard = test_guard!();
+        let cfg = windows_worker("wsurf");
+        assert!(prefers_system_ssh(&cfg));
+    }
+
+    #[test]
+    fn test_prefers_system_ssh_case_normalized() {
+        // declared_os lower-cases the tag's OS, so `os = "Windows"` (mixed
+        // case) and `os = "WINDOWS"` (all caps) both route to the fallback.
+        let _guard = test_guard!();
+        let mut cfg = windows_worker("wsurf-mixed");
+        cfg.tags = vec![crate::types::os_tag("Windows")];
+        assert!(prefers_system_ssh(&cfg));
+
+        let mut upper = windows_worker("wsurf-upper");
+        upper.tags = vec![crate::types::os_tag("WINDOWS")];
+        assert!(prefers_system_ssh(&upper));
+    }
+
+    #[test]
+    fn test_prefers_system_ssh_false_for_linux() {
+        // `os:linux` and unlabelled workers do NOT trigger the fallback —
+        // they keep the openssh-crate path verbatim.
+        let _guard = test_guard!();
+        let mut linux = worker_config("contabo-a", "1.2.3.4", "root", "~/.ssh/id_rsa");
+        linux.tags = vec!["rust".to_string(), crate::types::os_tag("linux")];
+        assert!(!prefers_system_ssh(&linux));
+
+        let unlabelled = worker_config("contabo-b", "1.2.3.5", "root", "~/.ssh/id_rsa");
+        assert!(!prefers_system_ssh(&unlabelled));
+    }
+
+    #[test]
+    fn test_system_ssh_argv_basic_windows() {
+        // Baseline Windows worker (no port today — WorkerConfig has no
+        // `port` field; non-default ports travel as `host:port`). The argv
+        // ends with the destination then the command, never has a `-p`
+        // flag, and carries the keepalive when non-zero.
+        let _guard = test_guard!();
+        let cfg = windows_worker("wsurf");
+        let argv = system_ssh_argv(&cfg, "uname -a", Duration::from_secs(2));
+        let s: Vec<String> = argv
+            .iter()
+            .map(|o| o.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(s[0], "ssh", "argv[0] is the program name");
+        assert_eq!(s[1], "-i");
+        // shellexpand::tilde expands `~`; on this machine it goes to a
+        // $HOME-anchored path, so the suffix is the right invariant.
+        assert!(
+            s[2].ends_with(".ssh/surfacebookje_key"),
+            "identity file is the tilde-expanded path: {}",
+            s[2]
+        );
+        // Pair -o/value: BatchMode=yes, ConnectTimeout=8,
+        // StrictHostKeyChecking=accept-new, ServerAliveInterval=2.
+        assert!(s.contains(&"-o".to_string()));
+        assert!(s.contains(&"BatchMode=yes".to_string()));
+        assert!(s.contains(&"ConnectTimeout=8".to_string()));
+        assert!(s.contains(&"StrictHostKeyChecking=accept-new".to_string()));
+        assert!(s.contains(&"ServerAliveInterval=2".to_string()));
+        // No -p flag — WorkerConfig has no port.
+        assert!(!s.iter().any(|arg| arg == "-p"));
+        // destination is `user@host` then the command.
+        assert!(s.contains(&"jeffr@100.68.2.11".to_string()));
+        assert_eq!(s[s.len() - 1], "uname -a", "command is the last argv");
+    }
+
+    #[test]
+    fn test_system_ssh_argv_zero_server_alive_omits_keepalive() {
+        // `server_alive_interval = 0` must NOT emit `-o ServerAliveInterval=0`
+        // (which OpenSSH treats as "disable keepalives" — fine, but the spec
+        // calls for omitting the flag entirely at 0).
+        let _guard = test_guard!();
+        let cfg = windows_worker("wsurf");
+        let argv = system_ssh_argv(&cfg, "echo hi", Duration::from_secs(0));
+        let s: Vec<String> = argv
+            .iter()
+            .map(|o| o.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !s.iter().any(|a| a.starts_with("ServerAliveInterval=")),
+            "no ServerAliveInterval flag when interval is 0; got {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn test_system_ssh_argv_long_keepalive_preserved() {
+        // Non-default keepalive values must be preserved verbatim (no
+        // truncation, no off-by-one). Use 60s — the same value the openssh
+        // pool applies for warm masters.
+        let _guard = test_guard!();
+        let cfg = windows_worker("wsurf");
+        let argv = system_ssh_argv(&cfg, "true", Duration::from_secs(60));
+        let s: Vec<String> = argv
+            .iter()
+            .map(|o| o.to_string_lossy().into_owned())
+            .collect();
+        assert!(s.contains(&"ServerAliveInterval=60".to_string()));
+    }
+
+    #[test]
+    fn test_system_ssh_argv_uses_tilde_expanded_identity() {
+        // `shellexpand::tilde` is invoked on the identity_file path so an
+        // operator can write `~/.ssh/foo` in workers.toml and have ssh
+        // see the expanded path. Compare the raw `~`-prefixed form is
+        // NOT in the argv.
+        let _guard = test_guard!();
+        let mut cfg = windows_worker("wsurf");
+        cfg.identity_file = "~/.ssh/operator_key".to_string();
+        let argv = system_ssh_argv(&cfg, "true", Duration::from_secs(2));
+        let s: Vec<String> = argv
+            .iter()
+            .map(|o| o.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !s.contains(&"~/.ssh/operator_key".to_string()),
+            "identity file must be tilde-expanded, got {:?}",
+            s
+        );
+        assert!(
+            s.contains(&"~/.ssh/operator_key".to_string())
+                || s.iter().any(|a| a.ends_with(".ssh/operator_key")),
+            "tilde-expanded path appears in argv: {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn test_dispatch_helper_matches_declared_os_key() {
+        // The dispatch key MUST be the same one `pooled_client_options` uses
+        // so the two Windows fallbacks (no ControlMaster on the pool side,
+        // system-ssh on the execute side) cannot diverge on which workers
+        // they apply to.
+        let _guard = test_guard!();
+        let cfg = windows_worker("wsurf");
+        assert_eq!(declared_os(&cfg.tags).as_deref(), Some("windows"));
+        assert!(prefers_system_ssh(&cfg));
     }
 }
 
