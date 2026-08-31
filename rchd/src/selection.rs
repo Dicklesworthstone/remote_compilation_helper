@@ -2393,18 +2393,26 @@ impl WorkerSelector {
             // worker. If several workers were requested, one busy requested
             // worker is enough to make waiting useful.
             //
-            // bd-uw4d8: this branch MUST come before the unconditional
-            // NoMatchingWorkers return below — the bd-iupei allow-set
-            // enforcement landed above it and made it unreachable, so a pinned
+            // bd-uw4d8: this branch MUST come before the specific-refusal
+            // fall-through below — the bd-iupei allow-set enforcement once
+            // returned an unconditional NoMatchingWorkers here, so a pinned
             // busy worker refused no_free_slots and fell local even with
             // RCH_QUEUE_WHEN_BUSY=1 explicitly set (observed live 2026-08-09:
             // vmi1227854 saturated 8/8, second pinned build told to set the
             // env it already had).
             return Ok(Vec::new());
         }
-        if has_preferred {
-            return Err(SelectionReason::NoMatchingWorkers);
-        }
+        // GH#47 contract: with an explicit preferred-worker allow-set, the
+        // SPECIFIC refusal reasons (health, capacity, active-project
+        // exclusion, toolchain/version mismatch, pressure, convergence) win
+        // over the generic NoMatchingWorkers. Refusal reasons are diagnostics:
+        // an unconditional `has_preferred` return here hid WHY the requested
+        // worker was refused ("no matching workers" for a worker that exists
+        // and was filtered for a concrete cause). Fall through to the same
+        // reason ladder the automatic path uses; NoMatchingWorkers remains
+        // only for a requested worker that is genuinely absent from the pool
+        // (the `!matched_preferred_worker` return above) or refused for a
+        // cause no specific branch names (e.g. an open circuit).
         if !eligible.is_empty() {
             return Ok(eligible);
         }
@@ -5915,10 +5923,14 @@ mod tests {
         .await;
         pool.add_worker_state(pressure_critical).await;
 
+        // A floating `nightly` channel deliberately matches ANY worker nightly
+        // (see test_toolchain_capability_mismatch_for_floating_channels), so
+        // the mismatch row must come from a worker on a different CHANNEL for
+        // the golden to keep exercising the toolchain.version_mismatch deny.
         let toolchain_mismatch = make_worker("toolchain-mismatch", 4, 55.0);
         prepare_fixture_worker(
             &toolchain_mismatch,
-            Some("rustc 1.95.0-nightly (fixture 2026-03-01)"),
+            Some("rustc 1.95.0 (fixture 2026-03-01)"),
             PressureState::Healthy,
             "pressure.ok",
         )

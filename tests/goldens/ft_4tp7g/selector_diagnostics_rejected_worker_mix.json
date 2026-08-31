@@ -162,7 +162,7 @@
         "estimated_cores": 2,
         "active_project_excluded": false,
         "final_decision": "deny",
-        "final_reason": "rustc_version_mismatch:local=1.97.0-nightly:worker=1.95.0-nightly",
+        "final_reason": "rustc_channel_mismatch:local=nightly:worker=1.95.0",
         "reason_codes": [
           "toolchain.version_mismatch"
         ]

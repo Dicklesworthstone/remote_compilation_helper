@@ -691,24 +691,24 @@ fn pooled_client_options(pool_options: &SshOptions, config: &WorkerConfig) -> Ss
     options
 }
 
-/// System-ssh command-execution fallback (bd-kzy2x).
-///
-/// The `openssh` crate 0.11.6 cannot execute commands on Windows OpenSSH
-/// regardless of `control_master` / `control_persist` / keepalive settings:
-/// the slave never completes the command channel and every command hangs at
-/// the execute stage even though the connect succeeds. The CLI `ssh` binary
-/// speaks the OpenSSH wire protocol directly and works fine. For workers that
-/// declare `os = "windows"` we therefore spawn the system `ssh` binary at
-/// command-execution time, mirroring the proven system-ssh pattern already
-/// used by the fleet preflight path (`rch/src/fleet/ssh.rs::SshExecutor`) and
-/// the CLI worker init / probe paths. The connect path stays the openssh
-/// crate (it succeeds) — the fallback is purely an execute-time dispatch
-/// inside `SshClient::execute_with_timeout`.
-///
-/// Policy key (kept in lockstep with the existing pool-layer override
-/// `pooled_client_options`): `declared_os(&config.tags) == Some("windows")`.
-/// `os = "Windows"` is case-normalized by `declared_os` so both spellings
-/// route through the same fallback.
+// System-ssh command-execution fallback (bd-kzy2x).
+//
+// The `openssh` crate 0.11.6 cannot execute commands on Windows OpenSSH
+// regardless of `control_master` / `control_persist` / keepalive settings:
+// the slave never completes the command channel and every command hangs at
+// the execute stage even though the connect succeeds. The CLI `ssh` binary
+// speaks the OpenSSH wire protocol directly and works fine. For workers that
+// declare `os = "windows"` we therefore spawn the system `ssh` binary at
+// command-execution time, mirroring the proven system-ssh pattern already
+// used by the fleet preflight path (`rch/src/fleet/ssh.rs::SshExecutor`) and
+// the CLI worker init / probe paths. The connect path stays the openssh
+// crate (it succeeds) — the fallback is purely an execute-time dispatch
+// inside `SshClient::execute_with_timeout`.
+//
+// Policy key (kept in lockstep with the existing pool-layer override
+// `pooled_client_options`): `declared_os(&config.tags) == Some("windows")`.
+// `os = "Windows"` is case-normalized by `declared_os` so both spellings
+// route through the same fallback.
 
 /// Should `SshClient::execute_with_timeout` dispatch through the system `ssh`
 /// binary for this worker instead of the `openssh` crate?

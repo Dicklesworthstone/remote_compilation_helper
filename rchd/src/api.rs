@@ -4986,8 +4986,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_select_worker_preferred() {
+        // An explicit `preferred_workers` request is an allow-set (d174384):
+        // a requested worker that exists is selected over any other candidate,
+        // and a requested worker absent from the pool is refused rather than
+        // silently replaced by an unrelated worker.
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
+        pool.add_worker(make_test_worker("worker2", 8)).await;
 
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
@@ -5008,6 +5013,27 @@ mod tests {
             .unwrap();
         let worker = response.worker.unwrap();
         assert_eq!(worker.id.as_str(), "worker2");
+
+        // A requested worker that is not in the pool never escapes the
+        // allow-set: the selection refuses with NoMatchingWorkers instead of
+        // handing back worker1.
+        let absent_request = SelectionRequest {
+            job_mode: false,
+            project: "test-absent".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("no-such-worker")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+        let refusal = handle_select_worker(&ctx, absent_request, false, None)
+            .await
+            .unwrap();
+        assert!(refusal.worker.is_none());
+        assert_eq!(refusal.reason, SelectionReason::NoMatchingWorkers);
     }
 
     // =========================================================================
