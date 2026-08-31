@@ -245,6 +245,7 @@ fn pooled_target_prune_max_age_mins(idle_hours: u32) -> Option<u64> {
 fn worker_cache_prune_rsync_path_prefix(
     escaped_remote_path: &str,
     pooled_target_idle_hours: u32,
+    escaped_stable_pool_parent: Option<&str>,
 ) -> String {
     let tmp_mins = WORKER_TMP_PRUNE_MAX_AGE_MINS;
     let durable_mins = WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS;
@@ -258,8 +259,120 @@ fn worker_cache_prune_rsync_path_prefix(
             "find {p} -mindepth 1 -maxdepth 1 -type d -name '.rch-target-*-pool-*' -mmin +{pooled_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; ",
             p = escaped_remote_path
         ));
+        // Issue #60: a clean-overlay run relocates its pooled target store to a
+        // stable parent OUTSIDE the (nonce-unique, teardown-reaped) remote
+        // root. Sweep that parent on the same configured retention so
+        // relocated pools age out exactly like in-root ones.
+        if let Some(pool_parent) = escaped_stable_pool_parent
+            && pool_parent != escaped_remote_path
+        {
+            prefix.push_str(&format!(
+                "find {pool_parent} -mindepth 1 -maxdepth 1 -type d -name '.rch-target-*-pool-*' -mmin +{pooled_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; ",
+            ));
+        }
     }
     prefix
+}
+
+/// Wall-clock budget for the whole post-timeout remote group-kill attempt
+/// (issue #62): SSH connect + kill + up-to-10s verification loop.
+const REMOTE_TIMEOUT_KILL_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Outcome of the best-effort remote process-group kill issued when the
+/// client-side SSH command timeout expires (issue #62).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteTimeoutCleanup {
+    /// The recorded remote process group is verified dead (killed now, or
+    /// already gone), so the project's Cargo build-directory lock is free.
+    Verified,
+    /// No pgid was recorded on the worker — the watchdog-tracked command never
+    /// started a process group, so there is nothing to orphan.
+    NothingRecorded,
+    /// This execution records no remote pgid (no build id, or a Windows
+    /// worker): cleanup cannot be attempted.
+    NotAttempted,
+    /// The kill could not be confirmed — the remote group may still be alive,
+    /// holding the project's Cargo build-directory lock. Callers should treat
+    /// the worker's project lock as suspect (see hook quarantine handling).
+    Unverified,
+}
+
+impl std::fmt::Display for RemoteTimeoutCleanup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::Verified => "remote process group verified dead",
+            Self::NothingRecorded => "no remote process group was recorded",
+            Self::NotAttempted => "remote cleanup not attempted",
+            Self::Unverified => "remote process group NOT verified dead",
+        };
+        f.write_str(text)
+    }
+}
+
+/// Typed client-side command-timeout error (the RCH-E104 surface, issue #62).
+///
+/// The `Display` text MUST keep the `SSH command timed out after` prefix: the
+/// hook's fail-closed classifier (`is_ssh_command_timeout_error`) matches on
+/// it. The structured `cleanup` field lets the hook additionally quarantine
+/// the worker when the orphaned remote group could not be verified dead.
+#[derive(Debug)]
+pub struct SshCommandTimedOut {
+    /// The client-side command timeout that expired.
+    pub timeout: std::time::Duration,
+    /// Outcome of the best-effort remote process-group kill.
+    pub cleanup: RemoteTimeoutCleanup,
+    /// Human-readable detail for logs/summaries.
+    pub detail: String,
+}
+
+impl std::fmt::Display for SshCommandTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SSH command timed out after {:?}; {} ({})",
+            self.timeout, self.cleanup, self.detail
+        )
+    }
+}
+
+impl std::error::Error for SshCommandTimedOut {}
+
+/// POSIX `sh` script that SIGKILLs the process group recorded in `pgid_file`
+/// and verifies it is gone (issue #62). Emits exactly one
+/// `RCH_E104_KILL=<verdict>` marker line on stdout and always exits 0 so a
+/// non-zero exit means the CHANNEL failed, not the probe.
+///
+/// Group kill is `kill -KILL -PGID` with NO `--`: dash's kill builtin
+/// mishandles `kill -KILL -- -PGID` (same constraint as the in-session
+/// watchdog and the daemon kill path in `rchd::cancellation`).
+pub(crate) fn remote_timeout_kill_script(pgid_file: &str) -> String {
+    let escaped_file = escape(Cow::from(pgid_file));
+    format!(
+        "f={escaped_file}\n\
+         if [ ! -r \"$f\" ]; then echo RCH_E104_KILL=no_pgid_file; exit 0; fi\n\
+         p=$(cat \"$f\" 2>/dev/null)\n\
+         case \"$p\" in ''|*[!0-9]*) echo RCH_E104_KILL=no_pgid_file; exit 0;; esac\n\
+         kill -KILL -\"$p\" 2>/dev/null\n\
+         i=0\n\
+         while [ \"$i\" -lt 10 ]; do\n\
+         if kill -0 -\"$p\" 2>/dev/null; then sleep 1; i=$((i+1)); else echo RCH_E104_KILL=verified_dead; exit 0; fi\n\
+         done\n\
+         echo RCH_E104_KILL=still_alive\n"
+    )
+}
+
+/// Parse the `RCH_E104_KILL=<verdict>` marker from the kill probe's stdout.
+/// `None` means the probe produced no verdict (treated as unverified).
+pub(crate) fn parse_remote_timeout_kill_output(stdout: &str) -> Option<RemoteTimeoutCleanup> {
+    for line in stdout.lines().rev() {
+        match line.trim() {
+            "RCH_E104_KILL=verified_dead" => return Some(RemoteTimeoutCleanup::Verified),
+            "RCH_E104_KILL=no_pgid_file" => return Some(RemoteTimeoutCleanup::NothingRecorded),
+            "RCH_E104_KILL=still_alive" => return Some(RemoteTimeoutCleanup::Unverified),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// RAM budgeted per concurrent rustc when `compilation.remote_build_jobs =
@@ -1163,6 +1276,15 @@ pub struct TransferPipeline {
     /// in the same synchronized project from contending on Cargo's artifact
     /// directory lock.
     remote_cargo_target_dir_name: String,
+    /// Optional ABSOLUTE remote Cargo target directory override (issue #60).
+    ///
+    /// When set, the remote `CARGO_TARGET_DIR` uses this exact path instead of
+    /// `<remote_path>/<remote_cargo_target_dir_name>`. Clean-overlay runs hash
+    /// a per-command job nonce into their remote root (an overlap-safety
+    /// invariant) and reap that root at teardown, so a pooled target dir placed
+    /// UNDER it can never be reused across jobs. This override relocates the
+    /// pooled store to a stable per-project path OUTSIDE the throwaway root.
+    remote_cargo_target_dir_override: Option<String>,
     /// Optional include-only patterns for sync-to-remote uploads.
     sync_include_patterns: Option<Vec<String>>,
     /// Whether sync-to-remote should delete extraneous files remotely.
@@ -1276,6 +1398,7 @@ impl TransferPipeline {
             estimated_transfer_bytes: None,
             remote_path_override: None,
             remote_cargo_target_dir_name: DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME.to_string(),
+            remote_cargo_target_dir_override: None,
             sync_include_patterns: None,
             sync_delete: true,
             sync_checksum: false,
@@ -1483,12 +1606,59 @@ impl TransferPipeline {
         self
     }
 
+    /// Set an ABSOLUTE remote Cargo target directory that outlives the
+    /// per-command remote root (issue #60).
+    ///
+    /// Used by clean-overlay runs: their remote project root embeds a
+    /// per-command job nonce and is reaped at teardown, so the pooled
+    /// `.rch-target-…-pool-…` store must live OUTSIDE it to be reusable.
+    /// The path must be absolute (POSIX or Windows drive-letter); invalid
+    /// values are ignored so callers fail closed to the derived per-root
+    /// default rather than producing surprising remote paths.
+    pub fn with_remote_cargo_target_dir_override(mut self, path: impl Into<String>) -> Self {
+        let path = path.into();
+        let trimmed = path.trim();
+        if trimmed.is_empty()
+            || (!trimmed.starts_with('/') && !is_windows_drive_abs_path(trimmed))
+            || trimmed.contains('\n')
+            || trimmed.contains('\r')
+            || trimmed.contains('\0')
+            || trimmed
+                .split(['/', '\\'])
+                .any(|segment| segment == "." || segment == "..")
+        {
+            warn!(
+                "Ignoring invalid remote Cargo target directory override: {:?}",
+                path
+            );
+            return self;
+        }
+
+        self.remote_cargo_target_dir_override = Some(trimmed.trim_end_matches('/').to_string());
+        self
+    }
+
     fn remote_cargo_target_dir_for_remote_path(&self, remote_path: &str) -> String {
+        if let Some(override_path) = &self.remote_cargo_target_dir_override {
+            return override_path.clone();
+        }
         format!(
             "{}/{}",
             remote_path.trim_end_matches('/'),
             self.remote_cargo_target_dir_name
         )
+    }
+
+    /// Parent directory of the pooled target-dir override, shell-escaped, for
+    /// the transfer-start janitor's pooled sweep. `None` when no override is
+    /// set (the sweep then covers `<remote_path>` as before).
+    fn escaped_pooled_target_override_parent(&self) -> Option<String> {
+        let override_path = self.remote_cargo_target_dir_override.as_deref()?;
+        let (parent, _basename) = override_path.rsplit_once('/')?;
+        if parent.is_empty() {
+            return None;
+        }
+        Some(escape(Cow::from(parent.to_string())).to_string())
     }
 
     fn env_value(&self, key: &str) -> Option<String> {
@@ -2626,7 +2796,8 @@ fi",
             "{}mkdir -p {} && rsync",
             worker_cache_prune_rsync_path_prefix(
                 escaped_remote_path,
-                self.pooled_target_prune_idle_hours
+                self.pooled_target_prune_idle_hours,
+                self.escaped_pooled_target_override_parent().as_deref()
             ),
             escaped_remote_path
         ));
@@ -2694,7 +2865,8 @@ fi",
             "{}mkdir -p {} && rsync",
             worker_cache_prune_rsync_path_prefix(
                 escaped_remote_path,
-                self.pooled_target_prune_idle_hours
+                self.pooled_target_prune_idle_hours,
+                self.escaped_pooled_target_override_parent().as_deref()
             ),
             escaped_remote_path
         ));
@@ -3426,6 +3598,112 @@ fi",
         }
     }
 
+    /// Best-effort SIGKILL + verification of the remote process group after a
+    /// client-side command timeout (issue #62). Uses the pgid recorded by the
+    /// in-session watchdog (`<run-dir>/<build_id>.pgid`) — the SAME group the
+    /// daemon's stuck-detector kills — over a fresh short-lived SSH channel.
+    ///
+    /// Returns the cleanup verdict plus a human-readable detail. Never fails:
+    /// any channel/probe error degrades to `Unverified` so callers can flag
+    /// the worker's project lock as suspect instead of silently re-admitting
+    /// the next job onto a held lock.
+    #[cfg(unix)]
+    async fn kill_remote_process_group_after_timeout(
+        &self,
+        worker: &WorkerConfig,
+    ) -> (RemoteTimeoutCleanup, String) {
+        if self.worker_platform.is_windows() {
+            return (
+                RemoteTimeoutCleanup::NotAttempted,
+                "windows workers record no remote pgid".to_string(),
+            );
+        }
+        let Some(build_id) = self.build_id else {
+            return (
+                RemoteTimeoutCleanup::NotAttempted,
+                "no build id: no remote pgid recorded".to_string(),
+            );
+        };
+        if use_mock_transport(worker) {
+            return (
+                RemoteTimeoutCleanup::NotAttempted,
+                "mock transport: no remote process group".to_string(),
+            );
+        }
+
+        let pgid_file = Self::remote_pgid_file_path_for_root(&self.remote_path(), build_id);
+        let script = remote_timeout_kill_script(&pgid_file);
+
+        let destination = format!("{}@{}", worker.user, worker.host);
+        let identity_file = shellexpand::tilde(&worker.identity_file);
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-o").arg("BatchMode=yes");
+        cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+        cmd.arg("-o").arg(format!(
+            "ConnectTimeout={}",
+            self.ssh_options.connect_timeout.as_secs().max(1)
+        ));
+        cmd.arg("-i").arg(identity_file.as_ref());
+        cmd.arg(&destination).arg("sh").arg("-s");
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let attempt = async {
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| format!("failed to spawn kill ssh: {e}"))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(script.as_bytes())
+                    .await
+                    .map_err(|e| format!("failed to write kill script: {e}"))?;
+                drop(stdin);
+            }
+            let output = child
+                .wait_with_output()
+                .await
+                .map_err(|e| format!("failed to await kill ssh: {e}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "kill channel exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        };
+
+        match tokio::time::timeout(REMOTE_TIMEOUT_KILL_BUDGET, attempt).await {
+            Ok(Ok(stdout)) => match parse_remote_timeout_kill_output(&stdout) {
+                Some(RemoteTimeoutCleanup::Verified) => (
+                    RemoteTimeoutCleanup::Verified,
+                    "remote process group SIGKILLed and verified dead".to_string(),
+                ),
+                Some(RemoteTimeoutCleanup::NothingRecorded) => (
+                    RemoteTimeoutCleanup::NothingRecorded,
+                    "no remote pgid file: the tracked command never started a group".to_string(),
+                ),
+                Some(RemoteTimeoutCleanup::Unverified) | Some(RemoteTimeoutCleanup::NotAttempted) => (
+                    RemoteTimeoutCleanup::Unverified,
+                    "remote process group still alive after SIGKILL".to_string(),
+                ),
+                None => (
+                    RemoteTimeoutCleanup::Unverified,
+                    format!("kill probe produced no verdict: {}", stdout.trim()),
+                ),
+            },
+            Ok(Err(reason)) => (RemoteTimeoutCleanup::Unverified, reason),
+            Err(_) => (
+                RemoteTimeoutCleanup::Unverified,
+                format!(
+                    "kill probe exceeded {}s budget",
+                    REMOTE_TIMEOUT_KILL_BUDGET.as_secs()
+                ),
+            ),
+        }
+    }
+
     #[cfg(unix)]
     async fn execute_over_ssh_streaming<F, G>(
         &self,
@@ -3574,9 +3852,26 @@ fi",
         {
             Ok(status) => status?,
             Err(_) => {
-                // Best-effort: kill local ssh process so the remote command is terminated.
+                // Best-effort: kill local ssh process first so the channel is closed.
                 let _ = child.kill().await;
-                anyhow::bail!("SSH command timed out after {:?}", command_timeout);
+                // Issue #62: killing the LOCAL ssh does NOT stop the remote
+                // cargo — the orphan keeps building and retains the project's
+                // Cargo build-directory lock, deadlocking the next job that
+                // selects this worker. Before surfacing E104, SIGKILL the
+                // recorded remote process group over a fresh SSH channel (the
+                // same group the in-session watchdog and the daemon kill path
+                // target) and verify it is gone.
+                let (cleanup, detail) = self.kill_remote_process_group_after_timeout(worker).await;
+                warn!(
+                    "SSH command timed out after {:?} on {}; remote cleanup: {} ({})",
+                    command_timeout, worker.id, cleanup, detail
+                );
+                return Err(SshCommandTimedOut {
+                    timeout: command_timeout,
+                    cleanup,
+                    detail,
+                }
+                .into());
             }
         };
 
@@ -6502,16 +6797,16 @@ Number of files transferred: 42
         // Issue #53: one authoritative retention. The janitor window is the
         // configured pooled idle hours (floored at the reaper's 24 h defence),
         // and hours == 0 removes the pooled sweep entirely.
-        let prefix = worker_cache_prune_rsync_path_prefix("/r/p", 240);
+        let prefix = worker_cache_prune_rsync_path_prefix("/r/p", 240, None);
         assert!(prefix.contains("-name '.rch-target-*-pool-*' -mmin +14400 "));
 
-        let floored = worker_cache_prune_rsync_path_prefix("/r/p", 1);
+        let floored = worker_cache_prune_rsync_path_prefix("/r/p", 1, None);
         assert!(floored.contains(&format!(
             "-name '.rch-target-*-pool-*' -mmin +{} ",
             rch_common::stale_target_reap::MIN_POOLED_IDLE_MINUTES
         )));
 
-        let disabled = worker_cache_prune_rsync_path_prefix("/r/p", 0);
+        let disabled = worker_cache_prune_rsync_path_prefix("/r/p", 0, None);
         assert!(!disabled.contains(".rch-target-*-pool-*"));
         // The scratch and durable-cache sweeps are unaffected by the pooled knob.
         assert!(disabled.contains(&format!(
@@ -7384,6 +7679,263 @@ Number of files transferred: 42
         assert_eq!(
             pipeline.remote_cargo_target_dir(),
             format!("{}/.rch-target", pipeline.remote_path())
+        );
+    }
+
+    /// Issue #60 regression: a pooled target-dir override must be STABLE
+    /// across per-command (job-nonce-unique) remote roots, so consecutive
+    /// clean-overlay gates reuse one warm cache instead of cold-building
+    /// under each throwaway root.
+    #[test]
+    fn pooled_target_dir_override_is_stable_across_per_command_roots() {
+        let _guard = test_guard!();
+        let stable_pool = "/data/tmp/rch/project/.rch-target-w1-pool-0123456789abcdef";
+        let make_pipeline = |per_command_root: &str| {
+            let mut overrides = HashMap::new();
+            overrides.insert(
+                "CARGO_TARGET_DIR".to_string(),
+                "/home/user/project/target".to_string(),
+            );
+            TransferPipeline::new(
+                PathBuf::from("/tmp/project"),
+                "project".to_string(),
+                "hash".to_string(),
+                TransferConfig::default(),
+            )
+            .with_env_allowlist(vec!["CARGO_TARGET_DIR".to_string()])
+            .with_env_overrides(overrides)
+            .with_remote_path_override(per_command_root.to_string())
+            .with_remote_cargo_target_dir_name(".rch-target-w1-pool-0123456789abcdef")
+            .with_remote_cargo_target_dir_override(stable_pool)
+        };
+
+        // Two different job nonces => two different per-command remote roots.
+        let a = make_pipeline("/data/tmp/rch/project/aaaa1111aaaa1111");
+        let b = make_pipeline("/data/tmp/rch/project/bbbb2222bbbb2222");
+
+        assert_eq!(a.remote_cargo_target_dir(), stable_pool);
+        assert_eq!(b.remote_cargo_target_dir(), stable_pool);
+        // The pooled store must live OUTSIDE both throwaway roots (the
+        // teardown reaper removes each root wholesale).
+        assert!(!stable_pool.starts_with(&a.remote_path()));
+        assert!(!stable_pool.starts_with(&b.remote_path()));
+
+        // The remote CARGO_TARGET_DIR injection must use the stable path.
+        let command = a.build_remote_command("cargo test --no-run", None);
+        assert!(
+            command.contains(&managed_assignment("CARGO_TARGET_DIR", stable_pool)),
+            "override must drive the injected CARGO_TARGET_DIR: {command}"
+        );
+    }
+
+    /// Issue #60: the transfer-start janitor must sweep the relocated pool's
+    /// stable parent on the configured pooled retention, in addition to the
+    /// per-command remote root.
+    #[test]
+    fn pooled_override_parent_joins_transfer_start_janitor_sweep() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override("/data/tmp/rch/project/aaaa1111aaaa1111")
+        .with_remote_cargo_target_dir_override("/data/tmp/rch/project/.rch-target-w1-pool-abc123");
+
+        let parent = pipeline
+            .escaped_pooled_target_override_parent()
+            .expect("override parent");
+        let prefix = worker_cache_prune_rsync_path_prefix(
+            "/data/tmp/rch/project/aaaa1111aaaa1111",
+            168,
+            Some(&parent),
+        );
+        assert!(
+            prefix.contains(&format!(
+                "find {parent} -mindepth 1 -maxdepth 1 -type d -name '.rch-target-*-pool-*'"
+            )),
+            "stable pool parent must be swept: {prefix}"
+        );
+        // Same parent as the remote path adds no duplicate sweep.
+        let dup = worker_cache_prune_rsync_path_prefix("/r/p", 168, Some("/r/p"));
+        assert_eq!(dup.matches(".rch-target-*-pool-*").count(), 1);
+        // Disabled retention disables the parent sweep too.
+        let disabled = worker_cache_prune_rsync_path_prefix("/r/p", 0, Some(&parent));
+        assert!(!disabled.contains(".rch-target-*-pool-*"));
+    }
+
+    #[test]
+    fn invalid_pooled_target_dir_override_is_ignored() {
+        let _guard = test_guard!();
+        let base = || {
+            TransferPipeline::new(
+                PathBuf::from("/tmp/project"),
+                "project".to_string(),
+                "hash".to_string(),
+                TransferConfig::default(),
+            )
+        };
+        for bad in [
+            "",
+            "relative/pool",
+            "/data/tmp/../etc/pool",
+            "/data/tmp/rch/.",
+            "/data\ntmp/pool",
+        ] {
+            let pipeline = base().with_remote_cargo_target_dir_override(bad);
+            assert_eq!(
+                pipeline.remote_cargo_target_dir(),
+                format!("{}/.rch-target", pipeline.remote_path()),
+                "invalid override {bad:?} must fall back to the derived default"
+            );
+        }
+        // Windows drive-letter absolute paths are accepted (Windows workers).
+        let windows = base().with_remote_cargo_target_dir_override("C:/rch/project/.rch-target-p");
+        assert_eq!(windows.remote_cargo_target_dir(), "C:/rch/project/.rch-target-p");
+    }
+
+    /// Issue #62: the post-timeout kill script must target the recorded pgid
+    /// with a dash-safe group SIGKILL (no `--`), verify death, and emit exactly
+    /// one machine-readable verdict marker.
+    #[test]
+    fn remote_timeout_kill_script_shape_and_parse() {
+        let script = remote_timeout_kill_script("/tmp/rch-run/proj-abc/42.pgid");
+        assert!(script.contains("/tmp/rch-run/proj-abc/42.pgid"));
+        // Group kill with NO `--` (dash's kill builtin mishandles it).
+        assert!(script.contains("kill -KILL -\"$p\""));
+        assert!(!script.contains("kill -KILL -- "));
+        // Verification loop + all three verdicts.
+        assert!(script.contains("kill -0 -\"$p\""));
+        assert!(script.contains("RCH_E104_KILL=verified_dead"));
+        assert!(script.contains("RCH_E104_KILL=no_pgid_file"));
+        assert!(script.contains("RCH_E104_KILL=still_alive"));
+
+        assert_eq!(
+            parse_remote_timeout_kill_output("noise\nRCH_E104_KILL=verified_dead\n"),
+            Some(RemoteTimeoutCleanup::Verified)
+        );
+        assert_eq!(
+            parse_remote_timeout_kill_output("RCH_E104_KILL=no_pgid_file"),
+            Some(RemoteTimeoutCleanup::NothingRecorded)
+        );
+        assert_eq!(
+            parse_remote_timeout_kill_output("RCH_E104_KILL=still_alive"),
+            Some(RemoteTimeoutCleanup::Unverified)
+        );
+        assert_eq!(parse_remote_timeout_kill_output("garbage"), None);
+    }
+
+    /// Issue #62: the typed timeout error must keep the exact message prefix
+    /// the hook's fail-closed classifier matches on.
+    #[test]
+    fn ssh_command_timed_out_error_keeps_classifier_prefix() {
+        let err = SshCommandTimedOut {
+            timeout: std::time::Duration::from_secs(1800),
+            cleanup: RemoteTimeoutCleanup::Unverified,
+            detail: "kill probe timed out".to_string(),
+        };
+        let text = err.to_string();
+        assert!(text.starts_with("SSH command timed out after"));
+        assert!(text.contains("NOT verified dead"));
+        // Downcast through an anyhow chain (how the hook consumes it).
+        let any: anyhow::Error = err.into();
+        let found = any
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<SshCommandTimedOut>())
+            .expect("typed timeout error must be downcastable");
+        assert_eq!(found.cleanup, RemoteTimeoutCleanup::Unverified);
+    }
+
+    /// Functional proof for issue #62: the kill script reaps a real,
+    /// TERM-ignoring process group recorded via its pgid file and reports
+    /// `verified_dead`; a missing pgid file reports `no_pgid_file`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_timeout_kill_script_reaps_process_group() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        if !Command::new("sh")
+            .arg("-c")
+            .arg("command -v setsid")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("setsid unavailable; skipping functional kill-script test");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("rch-e104-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pgf = dir.join("job.pgid");
+        let _ = std::fs::remove_file(&pgf);
+
+        // A session with a TERM-ignoring member, pgid recorded like the
+        // production watchdog records it. `setsid -f` double-forks so the
+        // session leader reparents to init: on the worker the killed group is
+        // reaped by its (surviving or init) parent, and without `-f` the TEST
+        // process would be the parent, leaving unreaped zombies that keep
+        // `kill -0 -PGID` succeeding and falsely reporting `still_alive`.
+        let inner = "echo $$ > \"$1\"; trap '' TERM; while true; do sleep 1; done";
+        let mut child = Command::new("setsid")
+            .arg("-f")
+            .arg("sh")
+            .arg("-c")
+            .arg(inner)
+            .arg("rch-e104-victim")
+            .arg(pgf.to_str().unwrap())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // The forked launcher exits immediately; reap it so no zombie remains.
+        let _ = child.wait();
+
+        let start = Instant::now();
+        while !pgf.exists() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(pgf.exists(), "victim should have recorded its pgid");
+        let pgid = std::fs::read_to_string(&pgf).unwrap().trim().to_string();
+        assert!(pgid.parse::<i64>().unwrap() > 1, "recorded a real pgid");
+
+        let script = remote_timeout_kill_script(pgf.to_str().unwrap());
+        let output = Command::new("sh").arg("-c").arg(&script).output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        // Safety net regardless of assertions.
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -KILL -- -{pgid} 2>/dev/null"))
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(
+            parse_remote_timeout_kill_output(&stdout),
+            Some(RemoteTimeoutCleanup::Verified),
+            "kill script must verify the group dead: {stdout}"
+        );
+        let group_alive = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -0 -- -{pgid} 2>/dev/null"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!group_alive, "process group {pgid} must be reaped");
+
+        // Missing pgid file => NothingRecorded verdict.
+        let _ = std::fs::remove_file(&pgf);
+        let script = remote_timeout_kill_script(pgf.to_str().unwrap());
+        let output = Command::new("sh").arg("-c").arg(&script).output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            parse_remote_timeout_kill_output(&stdout),
+            Some(RemoteTimeoutCleanup::NothingRecorded),
+            "missing pgid file must report no_pgid_file: {stdout}"
         );
     }
 

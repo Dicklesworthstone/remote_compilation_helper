@@ -113,6 +113,24 @@ fn clean_overlay_remote_project_hash(
     hasher.finalize().to_hex()[..16].to_string()
 }
 
+/// The STABLE absolute location for a clean-overlay run's pooled Cargo target
+/// store (issue #60): a sibling of the per-command overlay roots under
+/// `<remote_base>/<project_id>/`, never inside them. The per-command root
+/// embeds a job nonce and is reaped at teardown; the pooled store must
+/// survive both to stay warm across gates.
+fn clean_overlay_stable_pooled_target_dir(
+    remote_base: &str,
+    project_id: &str,
+    pooled_dir_name: &str,
+) -> String {
+    format!(
+        "{}/{}/{}",
+        remote_base.trim_end_matches('/'),
+        project_id,
+        pooled_dir_name
+    )
+}
+
 async fn send_telemetry(
     socket_path: &str,
     source: TelemetrySource,
@@ -590,6 +608,30 @@ pub(super) async fn execute_remote_compilation(
             name
         }
     });
+    // Issue #60: a clean-overlay run hashes a per-command job nonce into its
+    // remote root (a deliberate overlap-safety invariant) and reaps that root
+    // wholesale at teardown, so a pooled target dir placed UNDER it can never
+    // be reused — every clean-overlay gate was a cold build. Relocate the
+    // pooled store to a STABLE per-project sibling path outside the throwaway
+    // root, keeping the `.rch-target-…-pool-…` basename so the pool-janitor /
+    // sbh GC conventions (and Cargo's own CACHEDIR.TAG) still apply. Cargo's
+    // target-dir flock serializes overlapping jobs sharing the pool.
+    let pooled_target_dir_override = if clean_overlay.is_some() && !target_reuse_disabled() {
+        remote_cargo_target_dir_name_override.as_ref().map(|name| {
+            let base = if worker_is_windows {
+                crate::transfer::WINDOWS_DEFAULT_REMOTE_BASE
+            } else {
+                transfer_config.remote_base.trim_end_matches('/')
+            };
+            let stable = clean_overlay_stable_pooled_target_dir(base, &project_id, name);
+            reporter.verbose(&format!(
+                "[RCH] clean-overlay pooled target relocated outside per-command root: {stable}"
+            ));
+            stable
+        })
+    } else {
+        None
+    };
     let mut primary_pipeline: Option<TransferPipeline> = None;
     let mut aggregate_sync_result: Option<SyncResult> = None;
     let mut prepared_source_roots: Vec<PreparedSourceContentRoot> = Vec::new();
@@ -645,6 +687,10 @@ pub(super) async fn execute_remote_compilation(
             }
             if let Some(name) = remote_cargo_target_dir_name_override.as_ref() {
                 root_pipeline = root_pipeline.with_remote_cargo_target_dir_name(name.clone());
+            }
+            if let Some(stable_pool) = pooled_target_dir_override.as_ref() {
+                root_pipeline =
+                    root_pipeline.with_remote_cargo_target_dir_override(stable_pool.clone());
             }
         }
         root_pipeline = apply_source_sync_integrity_policy(
@@ -1690,6 +1736,48 @@ mod tests {
                 fixed_nonce,
             ),
             "the dirty overlay fingerprint must be part of the remote-root identity"
+        );
+    }
+
+    /// Issue #60 regression: the pooled target store must resolve to the SAME
+    /// absolute path for two clean-overlay executions whose remote roots
+    /// differ only by job nonce — and that path must sit OUTSIDE both
+    /// (teardown-reaped) roots, while keeping the `.rch-target-…-pool-…`
+    /// naming GC conventions rely on.
+    #[test]
+    fn clean_overlay_pooled_target_dir_is_stable_across_job_nonces() {
+        use super::clean_overlay_stable_pooled_target_dir;
+
+        let base_commit = "0123456789abcdef0123456789abcdef01234567";
+        let fingerprint = "same-overlay-fingerprint";
+        let hash_a =
+            clean_overlay_remote_project_hash(base_commit, fingerprint, uuid::Uuid::from_u128(10));
+        let hash_b =
+            clean_overlay_remote_project_hash(base_commit, fingerprint, uuid::Uuid::from_u128(11));
+        assert_ne!(hash_a, hash_b, "job nonces must keep remote roots distinct");
+
+        let remote_base = "/data/tmp/rch";
+        let project_id = "myproject";
+        let root_a = format!("{remote_base}/{project_id}/{hash_a}");
+        let root_b = format!("{remote_base}/{project_id}/{hash_b}");
+
+        let pooled_name = ".rch-target-w1-pool-0123456789abcdef0123456789abcdef";
+        let pool_a = clean_overlay_stable_pooled_target_dir(remote_base, project_id, pooled_name);
+        let pool_b = clean_overlay_stable_pooled_target_dir(remote_base, project_id, pooled_name);
+
+        assert_eq!(pool_a, pool_b, "pool location must not vary with the job nonce");
+        assert!(
+            !pool_a.starts_with(&root_a) && !pool_a.starts_with(&root_b),
+            "pool must live outside every per-command root: {pool_a}"
+        );
+        assert!(
+            pool_a.contains("/.rch-target-") && pool_a.contains("-pool-"),
+            "pool must keep the GC-recognized .rch-target-…-pool-… naming: {pool_a}"
+        );
+        // Trailing-slash remote_base normalizes identically.
+        assert_eq!(
+            clean_overlay_stable_pooled_target_dir("/data/tmp/rch/", project_id, pooled_name),
+            pool_a
         );
     }
 }
