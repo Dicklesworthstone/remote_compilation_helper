@@ -1,5 +1,16 @@
 # RCH Operations
 
+## Contents
+
+- [Baseline Runbook](#baseline-runbook)
+- [Worker Fleet Lifecycle](#worker-fleet-lifecycle)
+- [Fleet Deploy/Rollback](#fleet-deployrollback)
+- [Path-Dependency and Multi-Repo Notes](#path-dependency-and-multi-repo-notes)
+- [Transfer Stability (Rsync/Artifact Churn)](#transfer-stability-rsyncartifact-churn)
+- [Queue and Cancellation Operations](#queue-and-cancellation-operations)
+- [Anti-Patterns](#anti-patterns)
+- [Debug Command Pack](#debug-command-pack)
+
 ## Baseline Runbook
 
 Use this sequence for most production incidents.
@@ -33,11 +44,12 @@ rch hook test
 ### 4) Validate offload path directly
 
 ```bash
-rch diagnose "cargo check --workspace --all-targets"
-rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_<name> cargo check --workspace --all-targets
+rch diagnose --dry-run "cargo check --workspace --all-targets"
+rch admit "cargo check --workspace --all-targets"
+RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=verbose rch exec -- cargo check --workspace --all-targets
 ```
 
-If step 4 succeeds, RCH infrastructure is healthy and remaining failures are project/toolchain specific.
+If step 4 prints `[RCH] remote <worker> (...)`, RCH infrastructure is healthy and remaining failures are project/toolchain specific (or interception-side: `rch shim status`, hook). A refusal line names what is missing.
 
 ### 5) If workers show storage pressure, inspect the right filesystem
 
@@ -48,21 +60,26 @@ ssh ubuntu@<host> 'df -h / /tmp'
 ssh ubuntu@<host> 'free -h && cat /proc/pressure/memory && cat /proc/pressure/io'
 ```
 
-Then inspect the usual large artifact surfaces:
+Then let rch enumerate and reap what it owns (pooled `.rch-target-*-pool-*`
+dirs, per-job dirs, tmp-base strays) before touching anything by hand:
 
 ```bash
-ssh ubuntu@<host> 'du -sh /tmp/rch-* /tmp/rch_target_* 2>/dev/null | sort -h'
-ssh ubuntu@<host> 'find /data/projects -maxdepth 2 -type d \( -name "target_rch_*" -o -name "target_*" -o -name "target-*" -o -name target \) -exec du -sh {} + 2>/dev/null | sort -h | tail -n 20'
+rch status --remediation                   # "Disk Pressure … tightest free-disk ratio"
+rch cache status --workers <id>            # read-only per-dir verdicts
+rch gc --dry-run --workers <id>            # what the sweep would remove
+rch gc --workers <id>                      # remove (pass --workers; sweeping all can hang — open bug)
 ```
 
-Before removing anything, verify the candidate is inactive:
+Only for legacy/foreign trees rch doesn't own:
 
 ```bash
-ssh ubuntu@<host> 'sudo lsof +D /tmp/rch_target_<name>'
-ssh ubuntu@<host> 'sudo lsof +D /data/projects/<repo>/target_rch_<name>'
+ssh ubuntu@<host> 'du -sh /tmp/rch-* /tmp/rch_target_* /data/tmp/rch/* 2>/dev/null | sort -h'
+ssh ubuntu@<host> 'find /data/projects -maxdepth 3 -type d \( -name ".rch-target-*" -o -name "target_rch_*" -o -name "target_*" -o -name target \) -exec du -sh {} + 2>/dev/null | sort -h | tail -n 20'
+ssh ubuntu@<host> 'sudo lsof +D <candidate>'      # must be empty
+rch --json queue | jq -r '.data.active_builds[]?.project_id'   # must not name that project
 ```
 
-Only treat empty `lsof` results as a low-risk stale-artifact cleanup signal.
+Only treat empty `lsof` + no active build as a low-risk cleanup signal — and it still needs explicit user authorization. Full guide: `DISK_AND_PRESSURE.md`.
 
 ### 6) If `rch exec` fails at sync time, verify remote mirror ownership
 
@@ -105,9 +122,11 @@ rch workers setup --all
 ```bash
 rch workers list --speedscore
 rch workers capabilities --refresh
-rch workers benchmark
+rch workers benchmark --all --force
+rch workers compare <id> <id>
+rch status --fleet                     # desired vs live (bypassed / disabled / unreachable / missing)
 rch workers drain <worker> -y
-rch workers enable <worker>
+rch workers enable <worker>            # also clears a temporary-bypass record
 rch workers disable <worker> --reason "maintenance" --drain -y
 ```
 
@@ -146,13 +165,19 @@ Recommended checks:
 
 ```bash
 rch diagnose --dry-run "cargo test --workspace"
-rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_<name> cargo test --workspace --no-fail-fast
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo test --workspace --no-fail-fast
+rch sync --worker <id> --project .             # preview stale-cache resync; --force applies
 ```
 
-If remote path dependencies are missing:
+If remote path dependencies are missing or stale (`RCH-E410..E414`):
 
 - Ensure required sibling repos exist on worker hosts under canonical project roots.
+- `rch sync --force --worker <id>` to invalidate a stale worker cache for the closure.
 - Re-run `rch workers setup --all` and then retry the `rch exec -- ...` command.
+
+While a closure build runs, rch holds `flock`s on every mutable closure root on
+the worker until Cargo exits; a second agent's build on a shared sibling waits
+(`[RCH] waiting for N remote source-authority lock(s)`), it is not hung.
 
 ---
 
@@ -178,10 +203,12 @@ rch daemon reload
 rch config show --sources
 ```
 
-Operational note:
+Operational notes:
 
-- If you need a manual target dir for Rust builds, prefer `/tmp/rch_target_<name>`.
-- If the working tree itself cannot sync because the remote canonical mirror is broken, either repair ownership on the worker or temporarily build from a clean directory under `/data/projects`, not `/tmp`, because RCH canonical-root normalization expects `/data/projects`.
+- Don't hand-pick remote target dirs: `CARGO_TARGET_DIR` (and `TMPDIR`, Go caches) are rewritten on the worker to managed pooled paths under the project mirror regardless of what you pass. `RCH_DISABLE_TARGET_REUSE=1` only switches pooled → per-job.
+- If the working tree itself cannot sync because the remote canonical mirror is broken, either repair ownership on the worker (§6 above; a fleet-wide `rch doctor --reliability --scope ownership` probe exists on main only) or temporarily build from a clean directory under the canonical root (`/data/projects`), not `/tmp`.
+- For builds that must not see other agents' uncommitted edits, use `rch exec --base HEAD --clean-overlay …` (`EXEC_MODES.md`).
+- Payload caps (`transfer skipped`): `[transfer] max_transfer_mb` / `max_transfer_time_ms`; per-attempt upload budget `RCH_SYNC_TIMEOUT_MS`.
 
 ---
 
@@ -208,7 +235,12 @@ Use cancellation when builds are wedged or backlog pressure is starving high-pri
 | Ignore queue pressure | Can cascade into timeouts and local fallback | Monitor `rch queue --watch` and cancel stale builds |
 | Apply broad/destructive worker cleanup | Risks collateral damage | Prefer targeted fixes + `workers setup`/`fleet` commands |
 | Assume `/tmp` pressure and `/` pressure are the same problem | They often are not; fixing the wrong one wastes time | Check `df -h / /tmp` and inspect the matching artifact surface |
-| Delete large build dirs without checking for open files | Risks breaking active remote builds | Run `sudo lsof +D <dir>` first and only clean inactive candidates |
+| Delete large build dirs without checking for open files | Risks breaking active remote builds | `rch gc --dry-run --workers <id>` first; manual `rm` only after `lsof` and `rch queue` are clear |
+| Chain cargo commands in a shell string (`rch exec -- bash -lc "cargo a && cargo b"`) | Refused with `RCH-E301`; rch can't bind the output path | Separate `rch exec -- cargo …` invocations |
+| `rch daemon restart -y` while `rch queue` shows active builds | It interrupts them (`-y` only skips the warning); the daemon may answer `shutdown_blocked` | Wait for 0 active builds or `rch cancel` first |
+| Uninstall the shim because a build exited 103 | 103 means the *fleet* had nothing admissible | `rch status --remediation`, fix, retry |
+| Prefix `RCH_ENABLED=0` inside an agent command to "go local" | The hook rewrites it anyway | `.rch/config.toml` `force_local = true` + `RCH_CARGO_WRAPPER_BYPASS=1` (`SHIM.md`) |
+| Hand-tune `priority`/`total_slots` | Inverts capacity silently | Benchmark, verify scores differ, then set (`SKILL.md`) |
 
 ---
 
@@ -217,7 +249,13 @@ Use cancellation when builds are wedged or backlog pressure is starving high-pri
 ```bash
 RCH_LOG_LEVEL=debug rch diagnose "cargo build --release"
 RCH_LOG_LEVEL=debug rch check
+rch status --remediation
+rch --json status --fleet > /tmp/rch-fleet.json
 rch doctor --json > /tmp/rch-doctor.json
+rch doctor --reliability --scope all --json > /tmp/rch-reliability.json
 rch --json workers probe --all > /tmp/rch-workers-probe.json
+rch shim status --json
 rch daemon logs -n 200
+rch error explain <RCH-Exxx|RCH-Innn>
+rch doctor --runbook RCH-R006            # authored runbook for the reason code you saw
 ```

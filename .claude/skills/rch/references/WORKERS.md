@@ -33,10 +33,16 @@ This performs the standard bootstrap path (binary/toolchain setup, validation) f
 
 ```bash
 rch workers list --speedscore
-rch workers probe --all
+rch workers probe --all                 # component matrix + probe_warnings (PATH-fallback resolutions, failed sub-probes)
 rch workers capabilities --refresh
+rch workers compare <id> <id>...        # side-by-side SpeedScore data
+rch status --fleet                      # desired vs live: eligible / bypassed / disabled / unreachable / missing
 rch check
 ```
+
+Alternative to `discover`: `rch workers init [-y]` writes `workers.toml` from
+detected defaults. There is no `rch workers add|remove`; edit the file
+(`rch config edit --workers`) and re-run `rch config validate`.
 
 ---
 
@@ -75,12 +81,26 @@ rch workers disable <worker> --reason "maintenance" --drain -y
 rch workers enable <worker>
 ```
 
-State model:
+State model (operator-visible):
 
 - `HEALTHY`: accepting jobs
 - `DRAINING`: finishing active jobs, no new jobs
 - `DRAINED`: idle and not accepting jobs
-- `DISABLED`: explicitly offline from scheduler
+- `DISABLED`: explicitly offline from scheduler (**admin-disabled**; never probed)
+
+Daemon-side lifecycle on top of that:
+
+- **Temporary bypass** — a worker that hit a transient failure is quarantined
+  with a durable bypass record; `rch status --fleet` shows it as `bypassed`,
+  selection reports it as unreachable, and requested-worker refusals cite
+  `RCH-I009`. It **auto-rejoins** after `required_consecutive_passes` (2)
+  fully-healthy probes across every hard dimension (ssh, worker binary,
+  protocol, toolchain, disk ≥ 5 GB, load, telemetry) followed by a passing
+  canary build; one failing dimension resets the streak. Backoff 30 s → 900 s.
+- `rch workers enable <id>` deletes the persisted bypass record, so an operator
+  re-enable survives a daemon restart; a restart never silently un-bypasses.
+- Circuit breaker (`[circuit]`: 3 failures / 60 s window / 30 s cooldown /
+  1 half-open probe) is separate and self-clears.
 
 ---
 
@@ -103,12 +123,29 @@ rch workers deploy-binary --all --dry-run
 ## Fleet-Level Rollout Commands
 
 ```bash
-rch fleet status
+rch fleet status [--watch]
+rch fleet verify
 rch fleet deploy --verify
 rch fleet deploy --canary 25 --canary-wait 60 --verify
+rch fleet deploy --worker <id> --verify
 rch fleet rollback --verify
 rch fleet history --limit 20
+rch fleet drain [--all|<worker>] [--timeout 120] -y
+rch fleet doctor --reliability [--scope topology,pressure] [--workers a,b]   # --fix needs --fleet-confirm
 ```
+
+There is no `rch fleet enable`; re-enable with `rch workers enable <id>`.
+`rch fleet status` probes with a fixed 10 s SSH budget and can mark a loaded but
+healthy worker `Unreachable` (open bug `bd-rch-fleet-status-timeout-vs-unreachable-flhrk`);
+cross-check with `rch workers probe <id>` (default SSH options: 10 s connect,
+300 s command) before acting.
+
+Release packaging changed in v1.0.58: cargo-dist is gone; binaries ship as
+split profiles (`wrapper-release` for `rch`/`rabs-wrap`, `daemon-release` for
+`rchd`/`rch-wkr`) with sha256 sidecars, and `install.sh` never downgrades
+(`enforce_no_downgrade`). Cross-platform: a pre-deploy OS/arch guard refuses to
+push a darwin `rch-wkr` onto a linux worker (`RCH-E705`; bug `6h54q` closed) —
+it refuses, it does not cross-build.
 
 ---
 
@@ -165,7 +202,7 @@ POSIX `sh` and `cargo.exe` both accept that form) and syncs over **tar-over-ssh*
 not rsync. Every bit of this is gated on the worker's declared `os = "windows"`,
 so the Linux/macOS fleet paths stay byte-identical.
 
-One-time setup on the Windows box (rch 1.0.54+):
+One-time setup on the Windows box (the `os` gate shipped in v1.0.53; the Windows tar-over-ssh transport in v1.0.56 — run 1.0.56+):
 
 1. Install Git for Windows, the Rust toolchain(s) you build with, and the MSVC
    build tools (so `link.exe` exists for `*-pc-windows-msvc`).
@@ -235,6 +272,16 @@ rch --json workers probe --all
 
 If probes fail:
 
-1. Verify `identity_file` exists and permissions are restrictive.
+1. Verify `identity_file` exists and permissions are restrictive (`rch config doctor` flags missing keys).
 2. Verify worker host reachability and SSH service.
 3. Re-run `rch workers setup <worker>` after connectivity is restored.
+
+If **every** worker is rejected with `RCH-E205 missing clippy, rustfmt` while
+`ssh <host> cargo --version` works: the worker's `rchd`/`rch-wkr` runs as root
+under systemd with a PATH lacking `~/.cargo/bin`. Since commit `82b1033`
+(2026-08-23, **not in the 1.0.58 release** — needs a main build on the worker)
+the worker resolves `rustup`/`rustc` beyond the caller PATH
+(`~/.cargo/bin`, `~/.local/bin`, `/root/.cargo/bin`, `/usr/local/bin`) and
+reports the fallback in `probe_warnings`; a 1.0.58 `rch-wkr` lacks this, so until a main build is deployed put rustup on the dispatch user's non-login PATH (`/root/.zshenv`, see `provision-new-machine`), or deploy a main build with
+`rch fleet deploy --worker <id> --verify`. For root-dispatch VPS workers also
+see `provision-new-machine` (root needs zsh + `/root/.zshenv` + rustup).

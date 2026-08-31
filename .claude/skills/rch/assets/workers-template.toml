@@ -10,8 +10,8 @@ id = "primary"                           # Unique identifier
 host = "192.168.1.100"                   # IP or hostname
 user = "ubuntu"                          # SSH username
 identity_file = "~/.ssh/id_ed25519"      # Path to SSH private key
-total_slots = 16                         # Max concurrent jobs (usually CPU cores)
-priority = 100                           # Higher = preferred (default: 50)
+total_slots = 16                         # Max concurrent jobs (default: 8) — derive from SpeedScore + cores, never guess
+priority = 100                           # Higher = preferred (default: 100) — set ∝ measured SpeedScore
 tags = ["rust", "bun", "fast"]           # Descriptive labels only (see Tips)
 # os = "linux"                           # Hard gate — omit unless cross-platform
 # enabled = true                         # Set to false to disable temporarily
@@ -37,15 +37,16 @@ tags = ["rust", "bun", "fast"]           # Descriptive labels only (see Tips)
 # tags = ["bun", "typescript"]
 
 # Example: Windows worker for MSVC targets
-# `os` is a HARD admission gate and makes the worker EXCLUSIVE: it only receives
-# commands that require that OS (e.g. --target x86_64-pc-windows-msvc). An
-# ordinary `cargo check` is never scheduled here. Omit `os` for a normal worker.
+# `os` is a HARD admission gate and makes the worker EXCLUSIVE: it will only
+# receive commands that require that OS (e.g. --target x86_64-pc-windows-msvc).
+# An ordinary `cargo check` will never be scheduled here. Omit `os` entirely
+# for a normal worker that should remain a candidate for any job.
 #
 # NOTE: an rchd older than the OS-gate release silently IGNORES this key and
-# leaves the worker unfenced. Upgrade the daemon before adding the worker.
+# treats the worker as unfenced. Upgrade the fleet before adding the worker.
 # [[workers]]
 # id = "windows-builder"
-# host = "192.168.1.127"
+# host = "100.68.2.11"
 # user = "builder"
 # identity_file = "~/.ssh/windows_key"
 # total_slots = 4
@@ -54,8 +55,11 @@ tags = ["rust", "bun", "fast"]           # Descriptive labels only (see Tips)
 # tags = ["rust"]
 
 # Tips:
-# - total_slots: Match to CPU cores. Leave 1-2 for system overhead.
-# - priority: Range 1-100. Equal slots? Higher priority wins.
+# - total_slots: derive from cores AND a persisted SpeedScore (see SKILL.md);
+#         ~1-2x physical cores is the usual range; lower it on boxes that swap or
+#         hit disk pressure. Never guess.
+# - priority: any u32 (default 100; no enforced cap). Higher wins among equally
+#         eligible workers. Set it ∝ measured SpeedScore, not by hand.
 # - tags: DESCRIPTIVE ONLY. Nothing in rch matches on them; they do not gate
 #         scheduling. Runtime capability (rust/go/bun) is probed, not tagged.
 # - os:   The one hard gate. Only set it on a genuinely cross-platform worker.
@@ -63,4 +67,6 @@ tags = ["rust", "bun", "fast"]           # Descriptive labels only (see Tips)
 #
 # Test your configuration:
 #   rch config validate
+#   rch config doctor
 #   rch workers probe --all
+#   rch workers setup --all
