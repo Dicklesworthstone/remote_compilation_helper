@@ -1609,7 +1609,7 @@ esac
             // The rustup proxy, failing exactly as rustup does on this host.
             write_exe(
                 &home.join(".cargo").join("bin").join("cargo"),
-                &concat!(
+                concat!(
                     "#!/bin/sh\n",
                     "echo \"error: the 'cargo' binary, normally provided by the 'cargo' component, is not applicable to the 'nightly' toolchain\" >&2\n",
                     "exit 1\n"
