@@ -262,6 +262,57 @@ fn remote_pipeline_failure_summary(worker_id: &WorkerId) -> String {
     )
 }
 
+/// Issue #62: extract the typed SSH-timeout error when its post-timeout remote
+/// process-group kill could NOT be verified. `None` for every other failure —
+/// including timeouts whose cleanup was verified or had nothing to kill.
+fn ssh_timeout_with_unverified_cleanup(
+    error: &anyhow::Error,
+) -> Option<&crate::transfer::SshCommandTimedOut> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::transfer::SshCommandTimedOut>())
+        .filter(|timeout| timeout.cleanup == crate::transfer::RemoteTimeoutCleanup::Unverified)
+}
+
+/// Issue #62: after an E104 SSH-timeout failure whose remote cleanup could not
+/// be verified, quarantine the worker at the daemon (the same
+/// `POST /workers/{id}/disable` mechanism as the SIGILL CPU-fault path). The
+/// orphaned remote cargo may still hold the project's Cargo build-directory
+/// lock; without this flag the next job is immediately re-admitted onto the
+/// held lock and blocks on `Blocking waiting for file lock on build directory`.
+async fn quarantine_worker_on_unverified_timeout_cleanup(
+    error: &anyhow::Error,
+    socket_path: &str,
+    worker_id: &WorkerId,
+    reporter: &HookReporter,
+) {
+    let Some(timeout_err) = ssh_timeout_with_unverified_cleanup(error) else {
+        return;
+    };
+    warn!(
+        "E104 timeout on {} left an unverified remote process group ({}); quarantining worker",
+        worker_id, timeout_err.detail
+    );
+    reporter.summary_critical(&format!(
+        "[RCH] worker {} flagged for quarantine [{}]: E104 cleanup unverified ({}) — possible orphan holding the project's Cargo target lock",
+        worker_id,
+        ErrorCode::SshTimeout.code_string(),
+        timeout_err.detail
+    ));
+    if let Err(error) = disable_worker_for_fault(
+        socket_path,
+        worker_id,
+        "e104-timeout-orphan-unverified: remote build process group not verified dead after client timeout; possible orphan holding the project's Cargo target lock",
+    )
+    .await
+    {
+        warn!(
+            "Failed to quarantine worker {} after unverified E104 cleanup: {}",
+            worker_id, error
+        );
+    }
+}
+
 /// Run the hook, reading from stdin and writing to stdout.
 ///
 /// **Fail-open contract**: this function MUST return `Ok(())` for every
@@ -479,6 +530,33 @@ fn env_flag_enabled(value: &str) -> bool {
         value.to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+/// The rustup toolchain explicitly requested inside a delegated command: an
+/// env-style `RUSTUP_TOOLCHAIN=<name>` assignment token (bare or behind
+/// `env`) or a `cargo +<name>` selector (issue #63). Returns the first match.
+fn rustup_toolchain_from_command_tokens(tokens: &[String]) -> Option<String> {
+    let mut prev_is_cargo = false;
+    for token in tokens {
+        let token = token.trim_matches(['\'', '"']);
+        if let Some(value) = token.strip_prefix("RUSTUP_TOOLCHAIN=") {
+            let value = value.trim_matches(['\'', '"']);
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+        if prev_is_cargo
+            && let Some(value) = token.strip_prefix('+')
+            && !value.is_empty()
+        {
+            return Some(value.to_string());
+        }
+        prev_is_cargo = token == "cargo"
+            || token
+                .rsplit_once('/')
+                .is_some_and(|(_, name)| name == "cargo");
+    }
+    None
 }
 
 fn exec_requires_remote() -> bool {
@@ -881,6 +959,20 @@ fn max_remote_attempts() -> u32 {
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .map(|value| value.max(1))
         .unwrap_or(DEFAULT_MAX_REMOTE_ATTEMPTS)
+}
+
+/// Issue #63(c): whether an exhausted remote admission must surface a typed
+/// remote-required refusal instead of silently starting a local build.
+///
+/// An explicit `rch exec --job` invocation requested the remote job rail; a
+/// silent local compile violates that boundary exactly like a strict-remote
+/// violation (the same class the #61 fix closed), so job admission counts as
+/// strict-remote once every remote option is exhausted. The refusal exits
+/// with the retryable [`EXIT_REMOTE_REQUIRED_REFUSED`] code and a `refused`
+/// envelope, so wrappers can back off and retry rather than misreading a
+/// local build's exit status as the remote result.
+fn strict_remote_for_exhausted_admission(require_remote: bool, job_admission: bool) -> bool {
+    require_remote || job_admission
 }
 
 /// Terminal local-fallback for a remote FAILURE, gated so a failed remote build
@@ -2212,14 +2304,32 @@ pub async fn run_exec(
         clean_overlay_spec.as_ref(),
         uuid::Uuid::new_v4(),
     );
+    // Issue #63: `--job` bypasses classification (kind = Job), so the request
+    // used to carry NO toolchain even for a delegated `cargo clippy` — and the
+    // daemon's clippy component gate then fail-closed EVERY worker as
+    // `capability_missing:rustup_component:<unknown>:clippy` and the build
+    // silently ran locally. Derive the toolchain for Rust-shaped job commands
+    // exactly like the classified rail does.
+    let job_needs_rust_toolchain = job
+        && matches!(
+            required_runtime_for_kind(classify_command(&command).kind),
+            RequiredRuntime::Rust
+        );
     let needs_rust_toolchain = clean_overlay_fmt_check
         || matches!(
             required_runtime_for_kind(classification.kind),
             RequiredRuntime::Rust
-        );
+        )
+        || job_needs_rust_toolchain;
     let toolchain = if needs_rust_toolchain {
         if let (Some(root), Some(spec)) = (project_root.as_deref(), clean_overlay_spec.as_ref()) {
             detect_clean_overlay_toolchain(root, spec).await?
+        } else if let Some(name) = rustup_toolchain_from_command_tokens(&command_parts) {
+            // An explicit `RUSTUP_TOOLCHAIN=…` / `cargo +…` in the delegated
+            // command outranks the ambient project toolchain (rustup's own
+            // precedence), so preflight and the component gate must check the
+            // toolchain the remote cargo will actually use (issue #63).
+            parse_channel_string(&name).ok()
         } else {
             project_root
                 .as_ref()
@@ -2435,14 +2545,20 @@ pub async fn run_exec(
                     now_unix_ms(),
                 ));
             }
-            let reason = requested_refusal
+            let mut reason = requested_refusal
                 .map(|refusal| refusal.summary)
                 .unwrap_or_else(|| response.reason.to_string());
+            // Issue #63(c): an explicit --job admission with no admissible
+            // worker refuses (typed, retryable) instead of silently
+            // compiling locally on the orchestrator.
+            if job && !require_remote {
+                reason = format!("job admission exhausted: {reason}");
+            }
             exit_with_gated_local_fallback(
                 &command,
                 &reporter,
                 &reason,
-                require_remote,
+                strict_remote_for_exhausted_admission(require_remote, job),
                 allow_local_fallback,
             );
         };
@@ -2921,6 +3037,16 @@ pub async fn run_exec(
                         "Remote execution failed on {} with SSH timeout; refusing local fallback: {}",
                         worker.id, e
                     );
+                    // Issue #62: an unverified post-timeout cleanup means the
+                    // orphaned remote group may still hold the project's Cargo
+                    // target lock — quarantine the worker before exiting.
+                    quarantine_worker_on_unverified_timeout_cleanup(
+                        &e,
+                        &config.general.socket_path,
+                        &worker.id,
+                        &reporter,
+                    )
+                    .await;
                     // Fail-closed refusal: the line explaining the non-zero exit must
                     // reach the agent even at stock visibility (rch#31).
                     reporter.summary_critical(&remote_pipeline_failure_summary(&worker.id));
@@ -3061,16 +3187,21 @@ pub async fn run_exec(
                 std::process::exit(code);
             }
             RemoteFaultExhaustAction::GatedLocalFallback { reason } => {
+                // Issue #63(c): --job admission counts as strict-remote here.
+                let strict_remote = strict_remote_for_exhausted_admission(require_remote, job);
                 warn!(
                     "Remote build failed on all {} tried worker(s); {}",
                     tried_workers.len(),
-                    if allow_local_fallback && !require_remote {
+                    if allow_local_fallback && !strict_remote {
                         "falling back to local"
                     } else {
                         "refusing local fallback"
                     }
                 );
-                let reason = format!("{reason}; remote retries exhausted");
+                let mut reason = format!("{reason}; remote retries exhausted");
+                if job && !require_remote {
+                    reason = format!("job admission exhausted: {reason}");
+                }
                 if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal() {
                     warn!(
                         "Failed to persist acknowledged durable lease terminal state: {}",
@@ -3081,7 +3212,7 @@ pub async fn run_exec(
                     &command,
                     &reporter,
                     &reason,
-                    require_remote,
+                    strict_remote,
                     allow_local_fallback,
                 );
             }
@@ -3850,6 +3981,16 @@ async fn handle_selection_response(
                     "Remote execution pipeline failed on {} with SSH timeout; refusing local fallback: {}",
                     worker.id, e
                 );
+                // Issue #62: quarantine the worker when the post-timeout
+                // remote cleanup could not be verified (possible orphan
+                // holding the project's Cargo target lock).
+                quarantine_worker_on_unverified_timeout_cleanup(
+                    &e,
+                    &config.general.socket_path,
+                    &worker.id,
+                    reporter,
+                )
+                .await;
                 reporter.summary_critical(&remote_pipeline_failure_summary(&worker.id));
                 return HookOutput::allow_with_modified_command(format!(
                     "exit {}",

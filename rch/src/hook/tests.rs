@@ -10148,3 +10148,99 @@ fn test_structured_log_output_per_tier() {
             .any(|t| t.tier == 4 && t.decision == TierDecision::Reject)
     );
 }
+
+/// Issue #63: `--job` commands must yield the toolchain the remote cargo will
+/// actually use — an explicit env-style `RUSTUP_TOOLCHAIN=` assignment or a
+/// `cargo +<tc>` selector — so the daemon's component gate never sees
+/// `<unknown>` for a pinned clippy run.
+#[test]
+fn rustup_toolchain_from_command_tokens_parses_env_prefix_and_selector() {
+    let tokens = |cmd: &str| -> Vec<String> { cmd.split_whitespace().map(String::from).collect() };
+
+    // The exact shape from issue #63.
+    assert_eq!(
+        rustup_toolchain_from_command_tokens(&tokens(
+            "env RCH_CARGO_WRAPPER_BYPASS=1 RUSTUP_TOOLCHAIN=nightly-2026-08-25 \
+             CARGO_TARGET_DIR=/data/p/.rch-target cargo clippy --workspace -- -D warnings"
+        )),
+        Some("nightly-2026-08-25".to_string())
+    );
+    // Bare env-assignment prefix (no `env`).
+    assert_eq!(
+        rustup_toolchain_from_command_tokens(&tokens("RUSTUP_TOOLCHAIN=stable cargo clippy")),
+        Some("stable".to_string())
+    );
+    // `cargo +<tc>` selector, including a path-qualified cargo.
+    assert_eq!(
+        rustup_toolchain_from_command_tokens(&tokens("cargo +nightly-2026-08-25 clippy")),
+        Some("nightly-2026-08-25".to_string())
+    );
+    assert_eq!(
+        rustup_toolchain_from_command_tokens(&tokens("/usr/bin/cargo +beta build")),
+        Some("beta".to_string())
+    );
+    // A `+`-prefixed token NOT following cargo is an argument, not a selector.
+    assert_eq!(
+        rustup_toolchain_from_command_tokens(&tokens("cargo build --features +weird")),
+        None
+    );
+    assert_eq!(
+        rustup_toolchain_from_command_tokens(&tokens("go build ./...")),
+        None
+    );
+    // Empty assignment is ignored.
+    assert_eq!(
+        rustup_toolchain_from_command_tokens(&tokens("RUSTUP_TOOLCHAIN= cargo clippy")),
+        None
+    );
+}
+
+/// Issue #63(c): explicit `--job` admission counts as strict-remote once
+/// remote options are exhausted — the refusal must be typed (retryable exit
+/// code + `refused` envelope), never a silent local build.
+#[test]
+fn job_admission_exhausted_is_a_typed_retryable_refusal() {
+    assert!(strict_remote_for_exhausted_admission(false, true));
+    assert!(strict_remote_for_exhausted_admission(true, false));
+    assert!(strict_remote_for_exhausted_admission(true, true));
+    assert!(!strict_remote_for_exhausted_admission(false, false));
+
+    // The job-refusal reason routes through the retryable refusal lane.
+    let reason = "job admission exhausted: no admissible workers: missing_toolchain_component=14";
+    assert!(remote_required_refusal_is_retryable(reason));
+    let summary = remote_required_refusal_summary(reason);
+    assert!(summary.contains("refusing local fallback"));
+    assert!(summary.contains("retryable"));
+}
+
+/// Issue #62: only an SSH timeout whose post-timeout remote group-kill is
+/// UNVERIFIED triggers the worker quarantine; verified/no-op cleanups and
+/// unrelated errors never do.
+#[test]
+fn ssh_timeout_unverified_cleanup_detection() {
+    use crate::transfer::{RemoteTimeoutCleanup, SshCommandTimedOut};
+
+    let unverified: anyhow::Error = SshCommandTimedOut {
+        timeout: std::time::Duration::from_secs(1800),
+        cleanup: RemoteTimeoutCleanup::Unverified,
+        detail: "kill probe timed out".to_string(),
+    }
+    .into();
+    // Also through an added context layer, as the pipeline surfaces it.
+    let unverified = unverified.context("remote execution failed");
+    assert!(ssh_timeout_with_unverified_cleanup(&unverified).is_some());
+    // The fail-closed classifier still recognizes the typed error text.
+    assert!(is_ssh_command_timeout_error(&unverified));
+
+    let verified: anyhow::Error = SshCommandTimedOut {
+        timeout: std::time::Duration::from_secs(1800),
+        cleanup: RemoteTimeoutCleanup::Verified,
+        detail: "remote process group SIGKILLed and verified dead".to_string(),
+    }
+    .into();
+    assert!(ssh_timeout_with_unverified_cleanup(&verified).is_none());
+    assert!(is_ssh_command_timeout_error(&verified));
+
+    let unrelated = anyhow::anyhow!("some other failure");
+    assert!(ssh_timeout_with_unverified_cleanup(&unrelated).is_none());
+}
