@@ -9411,6 +9411,159 @@ Total file size: 123 bytes";
         );
     }
 
+    #[cfg(unix)]
+    fn test_silence_policy(millis: u64) -> SyncSilencePolicy {
+        SyncSilencePolicy {
+            limit: std::time::Duration::from_millis(millis),
+            worker_id: "stall-worker".to_string(),
+            phase: "source_sync",
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_streaming_silence_timeout_aborts_stalled_stream() {
+        // Issue #59: a child that produces NO output for the silence window is
+        // a dead channel, and must be aborted long before the wall-clock cap.
+        let _guard = test_guard!();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let policy = test_silence_policy(100);
+        let start = std::time::Instant::now();
+
+        let err = run_command_streaming(
+            cmd,
+            "stalled_source_sync",
+            std::time::Duration::from_secs(30),
+            Some(&policy),
+            |_| {},
+        )
+        .await
+        .expect_err("a silent child must be aborted by the silence timeout");
+
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "silence abort must not wait for the wall-clock cap"
+        );
+        let stall = find_source_sync_stall(&err)
+            .expect("silence abort must surface the typed SourceSyncStalled");
+        assert_eq!(stall.worker_id, "stall-worker");
+        assert_eq!(stall.phase, "source_sync");
+        assert_eq!(stall.silence, std::time::Duration::from_millis(100));
+        // The stall must never be mistakable for the E104 fail-closed surface.
+        let text = err.to_string();
+        assert!(!text.contains("SSH command timed out after"));
+        assert!(!text.contains("Command timed out after"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_streaming_silence_timeout_allows_slow_but_progressing_stream() {
+        // Issue #59: a transfer that keeps producing output — however slowly
+        // relative to its total duration — must NOT trip the silence timeout,
+        // even when the whole run takes several silence windows.
+        let _guard = test_guard!();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("i=0; while [ $i -lt 6 ]; do echo tick$i; i=$((i+1)); sleep 0.15; done");
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let policy = test_silence_policy(600);
+
+        let (output, _) = run_command_streaming(
+            cmd,
+            "progressing_source_sync",
+            std::time::Duration::from_secs(30),
+            Some(&policy),
+            |_| {},
+        )
+        .await
+        .expect("slow-but-progressing stream must complete (total > silence window)");
+        assert!(output.contains("tick5"), "all output captured: {output}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_streaming_splits_progress_segments_on_carriage_returns() {
+        // rsync --info=progress2 refreshes its progress line with bare `\r`
+        // and no `\n` until a step completes; each refresh must count as a
+        // forward-progress event for the silence detector and the heartbeat.
+        let _guard = test_guard!();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf 'one\\rtwo\\rthree\\n'");
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_in = std::sync::Arc::clone(&seen);
+
+        let (output, _) = run_command_streaming(
+            cmd,
+            "cr_segment_split",
+            std::time::Duration::from_secs(10),
+            None,
+            move |line| seen_in.lock().unwrap().push(line.to_string()),
+        )
+        .await
+        .expect("segmented stream completes");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["one".to_string(), "two".to_string(), "three".to_string()],
+            "each \\r-refresh must be delivered as its own progress event"
+        );
+        assert!(output.contains("three"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_streaming_with_retry_does_not_retry_source_sync_stall() {
+        // Issue #59: a silence stall fails over to ANOTHER worker (hook side);
+        // re-running the same dead channel would burn another full silence
+        // window per configured attempt. The typed error must survive the
+        // retry wrapper for the hook's downcast.
+        let _guard = test_guard!();
+        let retry_config = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            jitter_factor: 0.0,
+            total_timeout_ms: 60_000,
+        };
+        let policy = test_silence_policy(100);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+
+        let err = run_command_streaming_with_retry(
+            &retry_config,
+            "stalled_source_sync_retry",
+            Some(std::time::Duration::from_secs(30)),
+            Some(&policy),
+            move || {
+                calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut cmd = Command::new("sleep");
+                cmd.arg("5");
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+                cmd
+            },
+            |_| {},
+        )
+        .await
+        .expect_err("stalled sync must fail without in-place retries");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a silence stall must NOT be retried on the same worker"
+        );
+        let stall = find_source_sync_stall(&err)
+            .expect("typed stall must survive the retry wrapper for hook failover");
+        assert_eq!(stall.worker_id, "stall-worker");
+        assert_eq!(stall.phase, "source_sync");
+    }
+
     #[test]
     fn test_streaming_error_is_retryable_reads_syncfailed_stderr() {
         // The whole point of the streaming classifier: TransferError::SyncFailed's

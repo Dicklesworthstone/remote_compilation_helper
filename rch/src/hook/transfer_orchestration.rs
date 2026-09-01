@@ -36,7 +36,7 @@ use super::dependency_closure::{
     workspace_metadata_sync_patterns,
 };
 use super::formatting::{cache_hit, detect_target_label, emit_job_banner, render_compile_summary};
-use super::progress_reporting::{BuildHeartbeatLoop, mark_heartbeat_progress};
+use super::progress_reporting::{BuildHeartbeatLoop, BuildHeartbeatSnapshot, mark_heartbeat_progress};
 use super::remote_result::RemoteExecutionResult;
 use super::repo_updater::maybe_sync_repo_set_with_repo_updater;
 use super::source_fidelity::{
@@ -647,6 +647,13 @@ pub(super) async fn execute_remote_compilation(
     } else {
         None
     };
+    // Issue #59: the streaming sync path is used for every non-Windows worker
+    // (not only when the rich progress UI is enabled) so rsync's output feeds
+    // BOTH the silence-based stall detector inside the transfer layer and the
+    // build heartbeat here — a live sync stays observably alive to the daemon
+    // while the phase is still `sync_up`.
+    let sync_streaming = !worker_is_windows;
+    let sync_heartbeat_state = heartbeat_loop.as_ref().map(BuildHeartbeatLoop::shared_state);
     let mut root_outcomes: Vec<(SyncClosurePlanEntry, SyncRootOutcome)> = Vec::new();
     for entry in &sync_plan {
         let mut root_pipeline = TransferPipeline::new(
@@ -793,10 +800,14 @@ pub(super) async fn execute_remote_compilation(
             let result = if spec.is_base_only() {
                 base_result
             } else {
-                let overlay_result = if let Some(progress) = &mut upload_progress {
+                let overlay_result = if sync_streaming {
                     root_pipeline
                         .sync_to_remote_streaming(&worker_config, |line| {
-                            progress.update_from_line(line);
+                            sync_progress_line(
+                                upload_progress.as_mut(),
+                                sync_heartbeat_state.as_ref(),
+                                line,
+                            );
                         })
                         .await?
                 } else {
@@ -806,10 +817,14 @@ pub(super) async fn execute_remote_compilation(
             };
             spec.verify_overlay_unchanged(&entry.local_root)?;
             Ok(result)
-        } else if let Some(progress) = &mut upload_progress {
+        } else if sync_streaming {
             root_pipeline
                 .sync_to_remote_streaming(&worker_config, |line| {
-                    progress.update_from_line(line);
+                    sync_progress_line(
+                        upload_progress.as_mut(),
+                        sync_heartbeat_state.as_ref(),
+                        line,
+                    );
                 })
                 .await
         } else {
