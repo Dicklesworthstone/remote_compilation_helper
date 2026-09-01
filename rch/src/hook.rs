@@ -3073,17 +3073,54 @@ pub async fn run_exec(
                     std::process::exit(EXIT_BUILD_ERROR);
                 }
 
-                // Generic pipeline failure — retry on a different worker first.
-                warn!(
-                    "Remote execution failed on {}: {}; will retry on another worker if available",
-                    worker.id, e
-                );
-                RetryableRemoteFault {
-                    log_reason: "remote execution failed".to_string(),
-                    failed_worker: worker.id.clone(),
-                    on_exhaust: RemoteFaultExhaustAction::GatedLocalFallback {
-                        reason: "remote execution failed".to_string(),
-                    },
+                // Issue #59: a silence-detected source-sync stall is a typed
+                // worker-path fault naming the phase and worker. The
+                // reservation was already released above (release_worker runs
+                // unconditionally); falling through to the capacity-aware
+                // retry re-enters selection EXCLUDING this worker
+                // (tried_workers), mirroring the E104 failover semantics
+                // instead of dying inside the sync leg or falling straight to
+                // local.
+                if let Some(stall) = crate::transfer::find_source_sync_stall(&e) {
+                    warn!(
+                        "Source sync stalled on {} (phase {}, no output for {}s); failing over to another worker",
+                        worker.id,
+                        stall.phase,
+                        stall.silence.as_secs()
+                    );
+                    reporter.summary(&format!(
+                        "[RCH] source sync stalled on {} (phase {}, no output for {}s); retrying on another worker",
+                        worker.id,
+                        stall.phase,
+                        stall.silence.as_secs()
+                    ));
+                    RetryableRemoteFault {
+                        log_reason: format!(
+                            "source sync stalled (phase {}, {}s silence)",
+                            stall.phase,
+                            stall.silence.as_secs()
+                        ),
+                        failed_worker: worker.id.clone(),
+                        on_exhaust: RemoteFaultExhaustAction::GatedLocalFallback {
+                            reason: format!(
+                                "source sync stalled on {} (phase {})",
+                                worker.id, stall.phase
+                            ),
+                        },
+                    }
+                } else {
+                    // Generic pipeline failure — retry on a different worker first.
+                    warn!(
+                        "Remote execution failed on {}: {}; will retry on another worker if available",
+                        worker.id, e
+                    );
+                    RetryableRemoteFault {
+                        log_reason: "remote execution failed".to_string(),
+                        failed_worker: worker.id.clone(),
+                        on_exhaust: RemoteFaultExhaustAction::GatedLocalFallback {
+                            reason: "remote execution failed".to_string(),
+                        },
+                    }
                 }
             }
         };
@@ -4003,7 +4040,19 @@ async fn handle_selection_response(
                 "Remote execution pipeline failed: {}, falling back to local",
                 e
             );
-            reporter.summary("[RCH] local (remote pipeline failed)");
+            // Issue #59: name the stalled phase and worker instead of the
+            // generic line, so a silent sync stall is attributable from the
+            // one summary line hook mode emits.
+            if let Some(stall) = crate::transfer::find_source_sync_stall(&e) {
+                reporter.summary(&format!(
+                    "[RCH] local (source sync stalled on {} — phase {}, no output for {}s)",
+                    worker.id,
+                    stall.phase,
+                    stall.silence.as_secs()
+                ));
+            } else {
+                reporter.summary("[RCH] local (remote pipeline failed)");
+            }
             HookOutput::allow()
         }
     }

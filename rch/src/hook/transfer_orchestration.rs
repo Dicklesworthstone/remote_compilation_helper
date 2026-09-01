@@ -64,6 +64,25 @@ pub(super) fn source_sync_terminal_summary(
     ))
 }
 
+/// Per-segment callback for the streaming source sync (issue #59): forwards
+/// rsync output to the rich progress UI (when enabled) and marks
+/// build-heartbeat forward progress so the daemon can distinguish a live
+/// transfer from a stalled one while the build phase is still `sync_up`.
+/// Every rsync output segment — including bare-`\r` `--info=progress2`
+/// refreshes — counts as forward progress.
+pub(super) fn sync_progress_line(
+    progress: Option<&mut TransferProgress>,
+    heartbeat_state: Option<&Arc<Mutex<BuildHeartbeatSnapshot>>>,
+    line: &str,
+) {
+    if let Some(progress) = progress {
+        progress.update_from_line(line);
+    }
+    if let Some(state) = heartbeat_state {
+        mark_heartbeat_progress(state);
+    }
+}
+
 pub(super) fn apply_source_sync_integrity_policy(
     pipeline: TransferPipeline,
     exact_dependency_closure_sync: bool,
