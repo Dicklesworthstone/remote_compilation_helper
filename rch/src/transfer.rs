@@ -5344,6 +5344,11 @@ fn source_transfer_error_detail(err: &anyhow::Error) -> String {
 /// `on_line` is re-invoked from scratch on every attempt (rsync restarts from
 /// the beginning). All call sites use it purely for progress/heartbeat display,
 /// which tolerates repetition; do not route side-effecting work through it.
+///
+/// `silence` (issue #59) applies per attempt; a silence-detected stall is
+/// returned immediately WITHOUT further attempts (see
+/// `streaming_error_is_retryable`) and keeps its typed [`SourceSyncStalled`]
+/// for the hook's worker-failover downcast.
 async fn run_command_streaming_with_retry<F>(
     config: &RetryConfig,
     operation_name: &str,
