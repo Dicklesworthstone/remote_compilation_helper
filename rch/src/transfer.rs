@@ -5080,10 +5080,54 @@ fn parse_rsync_total_files(output: &str) -> Option<u32> {
     None
 }
 
+/// Pump a child stream into the segment channel, splitting on BOTH `\n` and
+/// `\r`.
+///
+/// rsync's `--info=progress2` refreshes a single progress line with bare
+/// carriage returns and writes a newline only at step boundaries, so a
+/// newline-only reader can observe NOTHING for the entire duration of a large
+/// transfer. Splitting on `\r` turns every progress refresh into a
+/// forward-progress event — exactly what the silence-based stall detector
+/// (issue #59) and the sync heartbeat need to distinguish "large but moving"
+/// from "dead". Empty segments (e.g. the gap inside `\r\n`) are dropped.
+async fn pump_stream_segments<R>(stream: R, tx: tokio::sync::mpsc::Sender<String>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stream);
+    let mut pending: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        for &byte in &chunk[..read] {
+            if byte == b'\n' || byte == b'\r' {
+                if !pending.is_empty() {
+                    let segment = String::from_utf8_lossy(&pending).into_owned();
+                    pending.clear();
+                    if tx.send(segment).await.is_err() {
+                        return;
+                    }
+                }
+            } else {
+                pending.push(byte);
+            }
+        }
+    }
+    if !pending.is_empty() {
+        let _ = tx
+            .send(String::from_utf8_lossy(&pending).into_owned())
+            .await;
+    }
+}
+
 async fn run_command_streaming<F>(
     mut cmd: Command,
     operation_name: &str,
     operation_timeout: std::time::Duration,
+    silence: Option<&SyncSilencePolicy>,
     mut on_line: F,
 ) -> Result<(String, u64)>
 where
@@ -5096,41 +5140,43 @@ where
     let stdout = child.stdout.take().context("Failed to capture stdout")?;
     let stderr = child.stderr.take().context("Failed to capture stderr")?;
 
-    // Use a channel to aggregate lines from both streams
+    // Use a channel to aggregate segments from both streams
     // Capacity 100 ensures we don't consume too much memory if on_line is slow,
     // but allows some buffering.
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
     let tx_stderr = tx.clone();
-
     let tx_stdout = tx.clone();
 
-    // Spawn task for stdout
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            if tx_stdout.send(line).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Spawn task for stderr
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            if tx_stderr.send(line).await.is_err() {
-                break;
-            }
-        }
-    });
+    tokio::spawn(pump_stream_segments(stdout, tx_stdout));
+    tokio::spawn(pump_stream_segments(stderr, tx_stderr));
 
     // Drop the original tx so rx will close when both tasks are done
     drop(tx);
 
+    // Distinguishes "streams closed and child exited" from "silence window
+    // expired with the child still running" inside the wall-clock guard.
+    enum StreamEnd {
+        Completed(std::process::ExitStatus),
+        Silent,
+    }
+
+    let effective_silence = silence.filter(|policy| !policy.limit.is_zero());
     let mut combined = String::new();
     const MAX_RSYNC_OUTPUT: usize = 10 * 1024 * 1024;
-    let status = match tokio::time::timeout(operation_timeout, async {
-        while let Some(text) = rx.recv().await {
+    let stream_end = match tokio::time::timeout(operation_timeout, async {
+        loop {
+            let received = match effective_silence {
+                Some(policy) => match tokio::time::timeout(policy.limit, rx.recv()).await {
+                    Ok(received) => received,
+                    // Issue #59: no output from either stream for the whole
+                    // silence window — a dead channel or wedged rsync, not a
+                    // large-but-progressing transfer (progress2 refreshes
+                    // count as segments).
+                    Err(_) => return Ok(StreamEnd::Silent),
+                },
+                None => rx.recv().await,
+            };
+            let Some(text) = received else { break };
             on_line(&text);
             if combined.len() < MAX_RSYNC_OUTPUT {
                 combined.push_str(&text);
@@ -5141,11 +5187,15 @@ where
             }
         }
 
-        child.wait().await.context("Failed to wait on rsync")
+        child
+            .wait()
+            .await
+            .context("Failed to wait on rsync")
+            .map(StreamEnd::Completed)
     })
     .await
     {
-        Ok(status) => status?,
+        Ok(end) => end?,
         Err(_) => {
             let _ = child.kill().await;
             anyhow::bail!(
@@ -5153,6 +5203,24 @@ where
                 operation_name,
                 operation_timeout.as_millis()
             );
+        }
+    };
+    let status = match stream_end {
+        StreamEnd::Completed(status) => status,
+        StreamEnd::Silent => {
+            let policy = effective_silence.expect("silent stream end requires a silence policy");
+            let _ = child.kill().await;
+            return Err(SourceSyncStalled {
+                worker_id: policy.worker_id.clone(),
+                phase: policy.phase,
+                silence: policy.limit,
+                detail: format!(
+                    "{operation_name}: no rsync output for {}s (wall-clock cap {}s)",
+                    policy.limit.as_secs(),
+                    operation_timeout.as_secs()
+                ),
+            }
+            .into());
         }
     };
     if !status.success() {
@@ -5210,10 +5278,25 @@ fn detect_partial_transfer(output: &str) -> Option<&'static str> {
 /// classifier for everything else (spawn I/O errors, the streaming-timeout
 /// `bail!`, etc.).
 fn streaming_error_is_retryable(err: &anyhow::Error) -> bool {
+    // Issue #59: a silence-detected stall is never retried IN PLACE. Retrying
+    // on the same worker re-runs the same dead channel for another full
+    // silence window each attempt; the failover contract is release the
+    // reservation and re-enter selection excluding this worker (hook side).
+    if find_source_sync_stall(err).is_some() {
+        return false;
+    }
     if let Some(TransferError::SyncFailed { stderr, .. }) = err.downcast_ref::<TransferError>() {
         return is_retryable_transport_error_text(stderr);
     }
     is_retryable_transport_error(err)
+}
+
+/// Extract the typed source-sync stall (issue #59) from anywhere in an error's
+/// context chain.
+pub fn find_source_sync_stall(error: &anyhow::Error) -> Option<&SourceSyncStalled> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<SourceSyncStalled>())
 }
 
 fn source_transfer_error_detail(err: &anyhow::Error) -> String {
