@@ -1594,6 +1594,19 @@ impl TransferPipeline {
         self.transfer_config.sync_timeout_for_payload(payload_bytes)
     }
 
+    /// Silence policy for the streaming source sync (issue #59): abort when
+    /// rsync emits no output at all for the configured window. `None` when the
+    /// operator disabled silence detection (`source_sync_silence_timeout_secs
+    /// = 0`).
+    fn source_sync_silence_policy(&self, worker: &WorkerConfig) -> Option<SyncSilencePolicy> {
+        let secs = self.transfer_config.source_sync_silence_timeout_secs;
+        (secs > 0).then(|| SyncSilencePolicy {
+            limit: std::time::Duration::from_secs(secs),
+            worker_id: worker.id.to_string(),
+            phase: "source_sync",
+        })
+    }
+
     /// Override the remote project path used for sync and command execution.
     ///
     /// Intended for canonical multi-repo layouts where the remote path must
@@ -4647,6 +4660,7 @@ fi",
         let (output, duration_ms) = run_command_streaming_with_retry(
             &retry_config,
             "retrieve_artifacts_streaming",
+            None,
             None,
             build_cmd,
             |line| {
@@ -9381,6 +9395,7 @@ Total file size: 123 bytes";
             cmd,
             "test_streaming_rsync",
             std::time::Duration::from_millis(25),
+            None,
             |_| {},
         )
         .await
@@ -9456,6 +9471,7 @@ Total file size: 123 bytes";
             &retry_config,
             "transient_streaming_rsync",
             None,
+            None,
             move || {
                 calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut cmd = Command::new("sh");
@@ -9504,6 +9520,7 @@ Total file size: 123 bytes";
             &retry_config,
             "fatal_streaming_rsync",
             None,
+            None,
             move || {
                 calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut cmd = Command::new("sh");
@@ -9542,6 +9559,7 @@ Total file size: 123 bytes";
         let (out, _ms) = run_command_streaming_with_retry(
             &retry_config,
             "recovering_streaming_rsync",
+            None,
             None,
             move || {
                 let n = calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -9586,6 +9604,7 @@ Total file size: 123 bytes";
             &retry_config,
             "ordinary_source_streaming",
             Some(std::time::Duration::from_millis(200)),
+            None,
             move || {
                 let call = calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut command = Command::new("sh");
@@ -9623,6 +9642,7 @@ Total file size: 123 bytes";
             &retry_config,
             "ordinary_source_streaming",
             Some(std::time::Duration::from_millis(100)),
+            None,
             move || {
                 calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut command = Command::new("sh");
