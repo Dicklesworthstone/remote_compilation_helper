@@ -3366,6 +3366,41 @@ fi",
         })
     }
 
+    /// Mock-transport source sync shared by the streaming and non-streaming
+    /// paths, WITH the same retry behavior as a real transfer so mock-based
+    /// tests observe identical attempt histories (TransferAttemptsExhausted)
+    /// regardless of which sync path the orchestration chooses.
+    async fn mock_sync_to_remote_with_retries(
+        &self,
+        destination: &str,
+        effective_excludes: &[String],
+    ) -> Result<SyncResult> {
+        // Create MockRsync ONCE and share via Arc so failure counters persist across retries
+        let rsync = std::sync::Arc::new(MockRsync::new(MockRsyncConfig::from_env()));
+        let project_root_str = self.project_root.display().to_string();
+        let retry_config = self.transfer_config.retry.clone();
+        let attempt_timeout = self.source_sync_attempt_timeout(effective_excludes);
+        let (result, _attempts) = run_source_transfer_attempts(
+            &retry_config,
+            attempt_timeout,
+            "mock_sync_to_remote",
+            |_attempt| {
+                let rsync = rsync.clone();
+                let project_root = project_root_str.clone();
+                let dest = destination.to_string();
+                let excludes = effective_excludes.to_vec();
+                async move { rsync.sync_to_remote(&project_root, &dest, &excludes).await }
+            },
+        )
+        .await
+        .map_err(anyhow::Error::new)?;
+        Ok(SyncResult {
+            bytes_transferred: result.bytes_transferred,
+            files_transferred: result.files_transferred,
+            duration_ms: result.duration_ms,
+        })
+    }
+
     pub async fn sync_to_remote(&self, worker: &WorkerConfig) -> Result<SyncResult> {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
@@ -3375,31 +3410,9 @@ fi",
         let effective_excludes = self.get_effective_excludes();
 
         if use_mock_transport(worker) {
-            // Mock path also uses retry logic for consistent behavior
-            // Create MockRsync ONCE and share via Arc so failure counters persist across retries
-            let rsync = std::sync::Arc::new(MockRsync::new(MockRsyncConfig::from_env()));
-            let project_root_str = self.project_root.display().to_string();
-            let retry_config = self.transfer_config.retry.clone();
-            let attempt_timeout = self.source_sync_attempt_timeout(&effective_excludes);
-            let (result, _attempts) = run_source_transfer_attempts(
-                &retry_config,
-                attempt_timeout,
-                "mock_sync_to_remote",
-                |_attempt| {
-                    let rsync = rsync.clone();
-                    let project_root = project_root_str.clone();
-                    let dest = destination.clone();
-                    let excludes = effective_excludes.clone();
-                    async move { rsync.sync_to_remote(&project_root, &dest, &excludes).await }
-                },
-            )
-            .await
-            .map_err(anyhow::Error::new)?;
-            return Ok(SyncResult {
-                bytes_transferred: result.bytes_transferred,
-                files_transferred: result.files_transferred,
-                duration_ms: result.duration_ms,
-            });
+            return self
+                .mock_sync_to_remote_with_retries(&destination, &effective_excludes)
+                .await;
         }
 
         // A Windows worker has no rsync; use tar-over-ssh instead. Gated on the
@@ -3525,19 +3538,12 @@ fi",
         let effective_excludes = self.get_effective_excludes();
 
         if use_mock_transport(worker) {
-            let rsync = MockRsync::new(MockRsyncConfig::from_env());
-            let result = rsync
-                .sync_to_remote(
-                    &self.project_root.display().to_string(),
-                    &destination,
-                    &effective_excludes,
-                )
-                .await?;
-            return Ok(SyncResult {
-                bytes_transferred: result.bytes_transferred,
-                files_transferred: result.files_transferred,
-                duration_ms: result.duration_ms,
-            });
+            // Same retry-aware mock path as sync_to_remote: since issue #59
+            // routed every non-Windows sync through the streaming variant,
+            // mock-based tests must see identical attempt histories here.
+            return self
+                .mock_sync_to_remote_with_retries(&destination, &effective_excludes)
+                .await;
         }
 
         info!(

@@ -3204,7 +3204,9 @@ fn test_sync_progress_line_marks_heartbeat_progress() {
     // bump the build-heartbeat forward-progress counter (with or without the
     // rich progress UI attached), so the daemon sees a live `sync_up` phase.
     let _guard = test_guard!();
-    let state = Arc::new(Mutex::new(
+    // Fully qualified: this test module imports tokio's Mutex, but the
+    // heartbeat snapshot lives behind std::sync::Mutex.
+    let state = std::sync::Arc::new(std::sync::Mutex::new(
         super::progress_reporting::BuildHeartbeatSnapshot::new(),
     ));
     let before = state.lock().unwrap().progress_counter();
