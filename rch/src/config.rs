@@ -662,6 +662,7 @@ struct PartialTransferConfig {
     exclude_patterns: Option<Vec<String>>,
     remote_base: Option<String>,
     sync_timeout_ms: Option<u64>,
+    source_sync_silence_timeout_secs: Option<u64>,
     ssh_server_alive_interval_secs: Option<u64>,
     ssh_control_persist_secs: Option<u64>,
     // Transfer optimization (bd-3hho)
@@ -1280,6 +1281,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "transfer.compression_level",
         "transfer.exclude_patterns",
         "transfer.sync_timeout_ms",
+        "transfer.source_sync_silence_timeout_secs",
         "environment.allowlist",
         "circuit.failure_threshold",
         "circuit.success_threshold",
@@ -1425,6 +1427,17 @@ fn apply_layer(
                 TransferConfig::MAX_SYNC_TIMEOUT_MS
             );
         }
+    }
+
+    // Issue #59: silence-based source-sync stall timeout. 0 disables, so any
+    // u64 is valid and no range gate applies.
+    if let Some(silence_secs) = layer.transfer.source_sync_silence_timeout_secs {
+        config.transfer.source_sync_silence_timeout_secs = silence_secs;
+        set_source(
+            sources,
+            "transfer.source_sync_silence_timeout_secs",
+            source.clone(),
+        );
     }
 
     if let Some(interval) = layer.transfer.ssh_server_alive_interval_secs {
@@ -1824,6 +1837,9 @@ fn merge_transfer(
         base.sync_timeout_ms = overlay
             .sync_timeout_ms
             .filter(|value| rch_common::TransferConfig::valid_sync_timeout_ms(*value));
+    }
+    if overlay.source_sync_silence_timeout_secs != default.source_sync_silence_timeout_secs {
+        base.source_sync_silence_timeout_secs = overlay.source_sync_silence_timeout_secs;
     }
     // Transfer optimization (bd-3hho)
     if overlay.max_transfer_mb != default.max_transfer_mb {
@@ -2683,6 +2699,10 @@ compression_level = 3
 # Optional per-attempt source-sync timeout in milliseconds.
 # Unset uses the payload-aware default (30s + 1s/MiB, capped at 1h).
 # sync_timeout_ms = 120000
+# Abort a source sync after this many seconds with NO rsync output at all
+# (dead channel / wedged rsync); a progressing transfer is never affected.
+# 0 disables. Default: 120.
+# source_sync_silence_timeout_secs = 120
 # Patterns to exclude from transfer (replaces defaults if modified)
 exclude_patterns = [
 {exclude_lines}]

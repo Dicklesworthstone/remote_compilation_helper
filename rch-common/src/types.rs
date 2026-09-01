@@ -2680,6 +2680,19 @@ pub struct TransferConfig {
     /// payload size (30 seconds plus one second per MiB, capped at one hour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_timeout_ms: Option<u64>,
+    /// Silence-based stall timeout for source synchronization, in seconds
+    /// (issue #59).
+    ///
+    /// Aborts a source sync when rsync emits NO output at all — no progress
+    /// refresh, no stats, no itemized line — for this long. This is deliberately
+    /// far tighter than the wall-clock `sync_timeout_ms` cap (which scales with
+    /// payload size up to an hour): a large first-time sync keeps refreshing its
+    /// progress line and is never killed, while a dead channel or wedged rsync
+    /// is detected within this window instead of holding the reservation until
+    /// the wall-clock cap. On a stall the hook releases the worker and re-enters
+    /// selection excluding it. `0` disables silence detection.
+    #[serde(default = "default_source_sync_silence_timeout_secs")]
+    pub source_sync_silence_timeout_secs: u64,
     /// Retry policy for transient network errors during transfer.
     #[serde(default)]
     pub retry: RetryConfig,
@@ -2769,6 +2782,7 @@ impl Default for TransferConfig {
             ssh_control_persist_secs: None,
             remote_base: default_remote_base(),
             sync_timeout_ms: None,
+            source_sync_silence_timeout_secs: default_source_sync_silence_timeout_secs(),
             retry: RetryConfig::default(),
             verify_artifacts: false,
             verify_max_size_bytes: default_verify_max_size(),
@@ -3063,6 +3077,14 @@ impl RetryConfig {
         }
         elapsed.as_millis() < self.total_timeout_ms as u128
     }
+}
+
+/// Default source-sync silence timeout (issue #59): two minutes without a
+/// single byte of rsync output means a dead channel or wedged rsync, not a
+/// large transfer (progress2 refreshes its line continuously while bytes
+/// flow, and each refresh counts as forward progress).
+fn default_source_sync_silence_timeout_secs() -> u64 {
+    120
 }
 
 /// Default remote base path for project transfers.
