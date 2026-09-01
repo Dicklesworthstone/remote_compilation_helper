@@ -3555,10 +3555,17 @@ fi",
 
         let retry_config = self.effective_rsync_retry_config();
         let attempt_timeout = self.source_sync_attempt_timeout(&effective_excludes);
+        // Issue #59: silence-based stall detection rides alongside the
+        // wall-clock attempt timeout. Every rsync output segment (including
+        // bare-`\r` progress2 refreshes) counts as forward progress, so a
+        // large-but-moving transfer is never killed while a dead channel is
+        // detected within the silence window instead of the 1-hour cap.
+        let silence_policy = self.source_sync_silence_policy(worker);
         let (output, duration_ms) = run_command_streaming_with_retry(
             &retry_config,
             "sync_to_remote_streaming",
             Some(attempt_timeout),
+            silence_policy.as_ref(),
             build_cmd,
             |line| {
                 on_line(line);
@@ -5327,6 +5334,7 @@ async fn run_command_streaming_with_retry<F>(
     config: &RetryConfig,
     operation_name: &str,
     source_attempt_timeout: Option<std::time::Duration>,
+    silence: Option<&SyncSilencePolicy>,
     build_command: impl Fn() -> Command,
     mut on_line: F,
 ) -> Result<(String, u64)>
@@ -5376,7 +5384,9 @@ where
         });
 
         let cmd = build_command();
-        match run_command_streaming(cmd, operation_name, attempt_timeout, &mut on_line).await {
+        match run_command_streaming(cmd, operation_name, attempt_timeout, silence, &mut on_line)
+            .await
+        {
             Ok(result) => {
                 if source_attempt_timeout.is_some() {
                     source_attempts.push(TransferAttemptDiagnostic {
@@ -5414,6 +5424,16 @@ where
                         attempt + 1,
                         err
                     );
+                    // Issue #59: a silence-detected stall must stay
+                    // DOWNCASTABLE for the hook's failover arm (release the
+                    // reservation, reselect excluding this worker), so it is
+                    // returned as-is instead of being flattened into
+                    // TransferAttemptsExhausted's string-only history. The
+                    // stall aborts on its first attempt by design, so no
+                    // multi-attempt history is lost.
+                    if find_source_sync_stall(&err).is_some() {
+                        return Err(err);
+                    }
                     if source_attempt_timeout.is_some() {
                         return Err(anyhow::Error::new(TransferAttemptsExhausted {
                             attempts: source_attempts,
