@@ -385,6 +385,9 @@ remote_base = "/data/tmp/rch"
 # Optional per-attempt source-sync cap. When unset, the default is payload-aware:
 # 30 seconds plus one second per MiB, capped at one hour.
 # sync_timeout_ms = 120000
+# Abort a source sync after this many seconds of NO rsync output (dead channel /
+# wedged rsync); a progressing transfer is never affected. 0 disables.
+# source_sync_silence_timeout_secs = 120
 adaptive_compression = true
 verify_artifacts = false
 max_transfer_mb = 2048

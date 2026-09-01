@@ -337,6 +337,55 @@ impl std::fmt::Display for SshCommandTimedOut {
 
 impl std::error::Error for SshCommandTimedOut {}
 
+/// Typed source-sync stall error (issue #59): the transfer produced NO output
+/// at all — no rsync progress refresh, stats, or itemized line — for the
+/// configured silence window. Deliberately distinct from the wall-clock
+/// attempt timeout: silence means a dead channel or wedged rsync, so the hook
+/// releases the worker's reservation and re-enters selection EXCLUDING this
+/// worker instead of waiting out a cap that scales to an hour.
+///
+/// The `Display` text must NEVER contain `SSH command timed out after` or
+/// `Command timed out after`: those phrases route into the E104 fail-closed
+/// classifier (`is_ssh_command_timeout_error`), and a stalled sync is a
+/// worker-path fault that must stay eligible for failover to another worker.
+#[derive(Debug, Clone)]
+pub struct SourceSyncStalled {
+    /// The worker whose sync stalled.
+    pub worker_id: String,
+    /// The transfer phase that stalled (currently always `source_sync`).
+    pub phase: &'static str,
+    /// The silence window that expired.
+    pub silence: std::time::Duration,
+    /// Human-readable detail for logs/summaries.
+    pub detail: String,
+}
+
+impl std::fmt::Display for SourceSyncStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "source sync stalled on worker {}: no forward progress for {}s (phase {}; {})",
+            self.worker_id,
+            self.silence.as_secs(),
+            self.phase,
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for SourceSyncStalled {}
+
+/// Silence policy for a streaming transfer (issue #59): abort the attempt when
+/// the child emits nothing on stdout OR stderr for `limit`. Carried alongside
+/// the wall-clock attempt timeout so the resulting [`SourceSyncStalled`] can
+/// name the worker and phase that stalled.
+#[derive(Debug, Clone)]
+pub(crate) struct SyncSilencePolicy {
+    pub(crate) limit: std::time::Duration,
+    pub(crate) worker_id: String,
+    pub(crate) phase: &'static str,
+}
+
 /// POSIX `sh` script that SIGKILLs the process group recorded in `pgid_file`
 /// and verifies it is gone (issue #62). Emits exactly one
 /// `RCH_E104_KILL=<verdict>` marker line on stdout and always exits 0 so a

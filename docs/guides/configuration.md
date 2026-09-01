@@ -70,6 +70,14 @@ Sections and fields:
   one hour. Each retry receives this full timeout and resumes the same partial
   immutable-base upload. This setting does not affect remote Cargo execution or
   artifact-return timeouts.
+- `source_sync_silence_timeout_secs` (u64, default `120`) — Abort a source sync
+  after this many seconds with no rsync output at all (no progress refresh,
+  stats, or itemized line). This detects a dead channel or wedged rsync far
+  faster than the wall-clock `sync_timeout_ms` cap, while a large but
+  progressing transfer is never affected: every `--info=progress2` refresh
+  counts as forward progress. On a stall, the hook releases the worker's
+  reservation and retries the build on another admissible worker. `0` disables
+  silence detection.
 
 ### `[circuit]`
 - `failure_threshold` (u32, default `3`) — Consecutive failures to open.
