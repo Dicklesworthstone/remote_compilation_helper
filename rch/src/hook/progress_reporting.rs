@@ -29,7 +29,15 @@ pub(super) struct BuildHeartbeatSnapshot {
 }
 
 impl BuildHeartbeatSnapshot {
-    fn new() -> Self {
+    /// Monotonic forward-progress counter carried by every heartbeat send.
+    /// Exposed for tests asserting that streaming callbacks (sync upload,
+    /// remote execution, artifact retrieval) actually mark progress.
+    #[cfg(test)]
+    pub(super) fn progress_counter(&self) -> u64 {
+        self.progress_counter
+    }
+
+    pub(super) fn new() -> Self {
         Self {
             phase: BuildHeartbeatPhase::SyncUp,
             detail: Some("build_started".to_string()),

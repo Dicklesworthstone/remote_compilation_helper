@@ -3171,6 +3171,59 @@ fn test_remote_pipeline_failure_policy_non_timeout_allows_existing_fallback() {
 }
 
 #[test]
+fn test_source_sync_stall_is_not_misclassified_as_ssh_timeout() {
+    // Issue #59: the stall must route into the worker-failover retry arm, so
+    // it must never match the E104 fail-closed classifier, and the typed
+    // error must stay downcastable through added context.
+    let _guard = test_guard!();
+    let error: anyhow::Error = crate::transfer::SourceSyncStalled {
+        worker_id: "hz4".to_string(),
+        phase: "source_sync",
+        silence: std::time::Duration::from_secs(120),
+        detail: "sync_to_remote_streaming: no rsync output for 120s (wall-clock cap 3600s)"
+            .to_string(),
+    }
+    .into();
+    let error = error.context("remote execution failed");
+
+    assert_eq!(
+        classify_remote_pipeline_failure(&error),
+        RemotePipelineFailurePolicy::AllowLocalFallback,
+        "a sync stall fails over to another worker; it must not fail closed"
+    );
+    let stall = crate::transfer::find_source_sync_stall(&error)
+        .expect("typed stall must survive context wrapping for the failover downcast");
+    assert_eq!(stall.worker_id, "hz4");
+    assert_eq!(stall.phase, "source_sync");
+    assert_eq!(stall.silence.as_secs(), 120);
+}
+
+#[test]
+fn test_sync_progress_line_marks_heartbeat_progress() {
+    // Issue #59: every rsync output segment observed during source sync must
+    // bump the build-heartbeat forward-progress counter (with or without the
+    // rich progress UI attached), so the daemon sees a live `sync_up` phase.
+    let _guard = test_guard!();
+    let state = Arc::new(Mutex::new(
+        super::progress_reporting::BuildHeartbeatSnapshot::new(),
+    ));
+    let before = state.lock().unwrap().progress_counter();
+
+    super::transfer_orchestration::sync_progress_line(None, Some(&state), "  1,234,567  42%");
+    super::transfer_orchestration::sync_progress_line(None, Some(&state), "  2,345,678  71%");
+
+    let after = state.lock().unwrap().progress_counter();
+    assert_eq!(
+        after,
+        before + 2,
+        "each sync output segment must count as heartbeat forward progress"
+    );
+
+    // No heartbeat state attached: must be a no-op, not a panic.
+    super::transfer_orchestration::sync_progress_line(None, None, "stats line");
+}
+
+#[test]
 fn test_is_toolchain_failure_basic() {
     let _guard = test_guard!();
     // Should detect toolchain issues
