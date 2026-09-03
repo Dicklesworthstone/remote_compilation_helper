@@ -385,6 +385,20 @@ pub struct PooledTargetConfig {
     /// disables. Over budget, the sweep evicts oldest-idle-first among dirs
     /// past the short idle window until back under (bead 6dj11).
     pub reaper_max_cache_gb: u32,
+    /// Where pooled Cargo target stores are PLACED on the worker (issue #64).
+    ///
+    /// Unset (the default) keeps today's behavior: the pooled store lives
+    /// inside the project mirror, i.e. under the worker's canonical project
+    /// root, on whatever filesystem holds it. Set to an absolute path to move
+    /// every pooled store to `<store_base>/<project_id>/.rch-target-…-pool-…`,
+    /// which is how a worker with a small root disk keeps multi-GB warm pools
+    /// on a larger volume.
+    ///
+    /// Distinct from [`Self::remote_base`], which is where the reaper *scans*;
+    /// when this is set the reaper scans both. Ignored for Windows workers,
+    /// which keep their drive-letter build base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_base: Option<String>,
 }
 
 impl Default for PooledTargetConfig {
@@ -397,6 +411,7 @@ impl Default for PooledTargetConfig {
             remote_base: DEFAULT_POOLED_REMOTE_BASE.to_string(),
             reaper_pooled_idle_hours: DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
             reaper_max_cache_gb: DEFAULT_POOLED_REAPER_MAX_CACHE_GB,
+            store_base: None,
         }
     }
 }
@@ -706,6 +721,24 @@ impl RemediationConfig {
             &self.pooled_target.remote_base,
             &mut issues,
         );
+        if let Some(store_base) = self.pooled_target.store_base.as_deref() {
+            check_managed_path(
+                "remediation.pooled_target.store_base",
+                store_base,
+                &mut issues,
+            );
+            // The value is embedded in remote shell commands (sweep/enumerate)
+            // and in CARGO_TARGET_DIR, so hold it to the same shape as every
+            // other reap base: absolute, no traversal, at least two levels.
+            if !crate::stale_target_reap::is_safe_reap_base(store_base) {
+                issues.push(RemediationIssue::error(
+                    "remediation.pooled_target.store_base",
+                    format!(
+                        "{store_base:?} is not a usable pooled-store base (absolute, no `..`, at least two levels deep)"
+                    ),
+                ));
+            }
+        }
         if self.pooled_target.reaper_pooled_idle_hours != 0
             && self.pooled_target.reaper_pooled_idle_hours < 24
         {
@@ -794,6 +827,7 @@ impl RemediationConfig {
         out.proof.store_path = out.proof.store_path.as_deref().map(redact_path);
         out.incident_ledger.path = out.incident_ledger.path.as_deref().map(redact_path);
         out.pooled_target.remote_base = redact_path(&out.pooled_target.remote_base);
+        out.pooled_target.store_base = out.pooled_target.store_base.as_deref().map(redact_path);
         out
     }
 

@@ -2682,6 +2682,7 @@ pub async fn run_exec(
             &result_dirs,
             &layer0_env,
             config.remediation.pooled_target.reaper_pooled_idle_hours,
+            config.remediation.pooled_target.store_base.as_deref(),
         )
         .await;
         let remote_elapsed = remote_start.elapsed();
@@ -3749,6 +3750,7 @@ async fn handle_selection_response(
         &[],
         &[],
         config.remediation.pooled_target.reaper_pooled_idle_hours,
+        config.remediation.pooled_target.store_base.as_deref(),
     )
     .await;
     let remote_elapsed = remote_start.elapsed();

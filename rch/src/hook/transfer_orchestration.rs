@@ -134,12 +134,18 @@ fn clean_overlay_remote_project_hash(
     hasher.finalize().to_hex()[..16].to_string()
 }
 
-/// The STABLE absolute location for a clean-overlay run's pooled Cargo target
-/// store (issue #60): a sibling of the per-command overlay roots under
-/// `<remote_base>/<project_id>/`, never inside them. The per-command root
-/// embeds a job nonce and is reaped at teardown; the pooled store must
-/// survive both to stay warm across gates.
-fn clean_overlay_stable_pooled_target_dir(
+/// The STABLE absolute location of a pooled Cargo target store under an
+/// explicit base: `<base>/<project_id>/<pooled dir name>`.
+///
+/// Used for two things. Issue #60: a clean-overlay run's remote root embeds a
+/// per-command job nonce and is reaped at teardown, so its pooled store must
+/// live in a sibling path that survives. Issue #64:
+/// `[remediation.pooled_target] store_base` relocates every build's pooled
+/// store off the filesystem holding the project mirror. Either way the
+/// `.rch-target-…-pool-…` basename is preserved so the pool-janitor / sbh GC
+/// conventions (and Cargo's own CACHEDIR.TAG) still apply, and Cargo's
+/// target-dir flock serializes overlapping jobs sharing the pool.
+fn stable_pooled_target_dir(
     remote_base: &str,
     project_id: &str,
     pooled_dir_name: &str,
@@ -251,6 +257,9 @@ pub(super) async fn execute_remote_compilation(
     // (issue #53): the transfer-start janitor prunes idle pooled target
     // stores on exactly this window so it never undercuts the reaper.
     pooled_target_prune_idle_hours: u32,
+    // Configured `[remediation.pooled_target] store_base` (issue #64):
+    // `None` keeps pooled stores inside the project mirror.
+    pooled_target_store_base: Option<&str>,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
     if source_content_receipt && WorkerPlatform::from_worker(&worker_config).is_windows() {
@@ -629,29 +638,47 @@ pub(super) async fn execute_remote_compilation(
             name
         }
     });
+    // Where the pooled store is PLACED on the worker.
+    //
+    // Default (both `None` arms below): inside the synced project mirror, i.e.
+    // under the worker's canonical project root — unchanged behavior.
+    //
+    // Issue #64: `[remediation.pooled_target] store_base`, when configured,
+    // moves every build's pooled store to `<store_base>/<project_id>/<name>`,
+    // which is how a worker whose canonical root sits on a small disk keeps
+    // multi-GB warm pools on a larger volume. Windows workers keep their
+    // drive-letter build base: a Unix store base is not a valid path there.
+    //
     // Issue #60: a clean-overlay run hashes a per-command job nonce into its
     // remote root (a deliberate overlap-safety invariant) and reaps that root
     // wholesale at teardown, so a pooled target dir placed UNDER it can never
-    // be reused — every clean-overlay gate was a cold build. Relocate the
-    // pooled store to a STABLE per-project sibling path outside the throwaway
-    // root, keeping the `.rch-target-…-pool-…` basename so the pool-janitor /
-    // sbh GC conventions (and Cargo's own CACHEDIR.TAG) still apply. Cargo's
-    // target-dir flock serializes overlapping jobs sharing the pool.
-    let pooled_target_dir_override = if clean_overlay.is_some() && !target_reuse_disabled() {
-        remote_cargo_target_dir_name_override.as_ref().map(|name| {
-            let base = if worker_is_windows {
-                crate::transfer::WINDOWS_DEFAULT_REMOTE_BASE
-            } else {
-                transfer_config.remote_base.trim_end_matches('/')
-            };
-            let stable = clean_overlay_stable_pooled_target_dir(base, &project_id, name);
-            reporter.verbose(&format!(
-                "[RCH] clean-overlay pooled target relocated outside per-command root: {stable}"
-            ));
-            stable
-        })
+    // be reused — every clean-overlay gate was a cold build. Absent a
+    // `store_base`, such runs relocate the pool under `[transfer] remote_base`
+    // instead, which is where their roots already live.
+    let pooled_store_base = if worker_is_windows {
+        clean_overlay
+            .is_some()
+            .then_some(crate::transfer::WINDOWS_DEFAULT_REMOTE_BASE)
     } else {
+        pooled_target_store_base
+            .map(|base| base.trim_end_matches('/'))
+            .or_else(|| {
+                clean_overlay
+                    .is_some()
+                    .then(|| transfer_config.remote_base.trim_end_matches('/'))
+            })
+    };
+    let pooled_target_dir_override = if target_reuse_disabled() {
         None
+    } else {
+        pooled_store_base.zip(remote_cargo_target_dir_name_override.as_ref())
+            .map(|(base, name)| {
+                let stable = stable_pooled_target_dir(base, &project_id, name);
+                reporter.verbose(&format!(
+                    "[RCH] pooled target store placed outside the project mirror: {stable}"
+                ));
+                stable
+            })
     };
     let mut primary_pipeline: Option<TransferPipeline> = None;
     let mut aggregate_sync_result: Option<SyncResult> = None;
@@ -1784,7 +1811,7 @@ mod tests {
     /// naming GC conventions rely on.
     #[test]
     fn clean_overlay_pooled_target_dir_is_stable_across_job_nonces() {
-        use super::clean_overlay_stable_pooled_target_dir;
+        use super::stable_pooled_target_dir;
 
         let base_commit = "0123456789abcdef0123456789abcdef01234567";
         let fingerprint = "same-overlay-fingerprint";
@@ -1800,8 +1827,8 @@ mod tests {
         let root_b = format!("{remote_base}/{project_id}/{hash_b}");
 
         let pooled_name = ".rch-target-w1-pool-0123456789abcdef0123456789abcdef";
-        let pool_a = clean_overlay_stable_pooled_target_dir(remote_base, project_id, pooled_name);
-        let pool_b = clean_overlay_stable_pooled_target_dir(remote_base, project_id, pooled_name);
+        let pool_a = stable_pooled_target_dir(remote_base, project_id, pooled_name);
+        let pool_b = stable_pooled_target_dir(remote_base, project_id, pooled_name);
 
         assert_eq!(
             pool_a, pool_b,
@@ -1817,7 +1844,7 @@ mod tests {
         );
         // Trailing-slash remote_base normalizes identically.
         assert_eq!(
-            clean_overlay_stable_pooled_target_dir("/data/tmp/rch/", project_id, pooled_name),
+            stable_pooled_target_dir("/data/tmp/rch/", project_id, pooled_name),
             pool_a
         );
     }

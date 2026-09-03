@@ -5936,6 +5936,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         &[],
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
+        None,
     )
     .await;
 
@@ -6052,6 +6053,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         &[],
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
+        None,
     )
     .await;
 
@@ -6156,6 +6158,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &[],
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
+        None,
     )
     .await;
 
@@ -6183,6 +6186,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &[],
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
+        None,
     )
     .await;
 
