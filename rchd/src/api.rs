@@ -4670,8 +4670,14 @@ mod tests {
 
         let blocked = scan_client_leases(&dir).unwrap();
         assert_eq!(blocked.len(), 1, "only the fresh lease blocks: {blocked:?}");
-        assert!(!dir.join("done-old.json").exists(), "stale non-blocker reaped");
-        assert!(dir.join("done-recent.json").exists(), "recent non-blocker kept");
+        assert!(
+            !dir.join("done-old.json").exists(),
+            "stale non-blocker reaped"
+        );
+        assert!(
+            dir.join("done-recent.json").exists(),
+            "recent non-blocker kept"
+        );
         assert!(dir.join("fresh.json").exists(), "blocker kept");
         assert!(dir.join("README.txt").exists(), "non-json untouched");
         let _ = std::fs::remove_dir_all(&dir);

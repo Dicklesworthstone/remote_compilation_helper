@@ -3759,7 +3759,8 @@ fi",
                     RemoteTimeoutCleanup::NothingRecorded,
                     "no remote pgid file: the tracked command never started a group".to_string(),
                 ),
-                Some(RemoteTimeoutCleanup::Unverified) | Some(RemoteTimeoutCleanup::NotAttempted) => (
+                Some(RemoteTimeoutCleanup::Unverified)
+                | Some(RemoteTimeoutCleanup::NotAttempted) => (
                     RemoteTimeoutCleanup::Unverified,
                     "remote process group still alive after SIGKILL".to_string(),
                 ),
@@ -7969,7 +7970,10 @@ Number of files transferred: 42
         }
         // Windows drive-letter absolute paths are accepted (Windows workers).
         let windows = base().with_remote_cargo_target_dir_override("C:/rch/project/.rch-target-p");
-        assert_eq!(windows.remote_cargo_target_dir(), "C:/rch/project/.rch-target-p");
+        assert_eq!(
+            windows.remote_cargo_target_dir(),
+            "C:/rch/project/.rch-target-p"
+        );
     }
 
     /// Issue #62: the post-timeout kill script must target the recorded pgid

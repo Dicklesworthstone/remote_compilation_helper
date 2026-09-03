@@ -36,7 +36,9 @@ use super::dependency_closure::{
     workspace_metadata_sync_patterns,
 };
 use super::formatting::{cache_hit, detect_target_label, emit_job_banner, render_compile_summary};
-use super::progress_reporting::{BuildHeartbeatLoop, BuildHeartbeatSnapshot, mark_heartbeat_progress};
+use super::progress_reporting::{
+    BuildHeartbeatLoop, BuildHeartbeatSnapshot, mark_heartbeat_progress,
+};
 use super::remote_result::RemoteExecutionResult;
 use super::repo_updater::maybe_sync_repo_set_with_repo_updater;
 use super::source_fidelity::{
@@ -672,7 +674,9 @@ pub(super) async fn execute_remote_compilation(
     // build heartbeat here — a live sync stays observably alive to the daemon
     // while the phase is still `sync_up`.
     let sync_streaming = !worker_is_windows;
-    let sync_heartbeat_state = heartbeat_loop.as_ref().map(BuildHeartbeatLoop::shared_state);
+    let sync_heartbeat_state = heartbeat_loop
+        .as_ref()
+        .map(BuildHeartbeatLoop::shared_state);
     let mut root_outcomes: Vec<(SyncClosurePlanEntry, SyncRootOutcome)> = Vec::new();
     for entry in &sync_plan {
         let mut root_pipeline = TransferPipeline::new(
@@ -1799,7 +1803,10 @@ mod tests {
         let pool_a = clean_overlay_stable_pooled_target_dir(remote_base, project_id, pooled_name);
         let pool_b = clean_overlay_stable_pooled_target_dir(remote_base, project_id, pooled_name);
 
-        assert_eq!(pool_a, pool_b, "pool location must not vary with the job nonce");
+        assert_eq!(
+            pool_a, pool_b,
+            "pool location must not vary with the job nonce"
+        );
         assert!(
             !pool_a.starts_with(&root_a) && !pool_a.starts_with(&root_b),
             "pool must live outside every per-command root: {pool_a}"
