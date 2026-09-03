@@ -320,8 +320,9 @@ impl StaleTargetReaper {
     /// De-duplicated, so the common `store_base == remote_base` case sweeps
     /// once.
     fn scan_bases(&self) -> Vec<String> {
-        let mut bases = vec![self.config.remote_base.clone()];
-        if let Some(store_base) = self.config.store_base.clone()
+        let normalize = |base: &str| base.trim_end_matches('/').to_string();
+        let mut bases = vec![normalize(&self.config.remote_base)];
+        if let Some(store_base) = self.config.store_base.as_deref().map(normalize)
             && !bases.contains(&store_base)
         {
             bases.push(store_base);
@@ -785,5 +786,37 @@ mod tests {
         assert_eq!(stats.workers_skipped, 1);
         assert_eq!(stats.workers_swept, 0);
         assert_eq!(stats.errors, 0);
+    }
+
+    /// Issue #64: pooled stores placed off the mirror tree must still be
+    /// swept, so the reaper walks `store_base` in addition to `remote_base` —
+    /// and sweeps once when the two coincide.
+    #[test]
+    fn scan_bases_cover_the_pooled_store_base() {
+        let reaper = |store_base: Option<&str>| {
+            StaleTargetReaper::new(
+                WorkerPool::new(),
+                StaleTargetReapConfig {
+                    remote_base: "/data/projects".to_string(),
+                    store_base: store_base.map(str::to_string),
+                    ..StaleTargetReapConfig::default()
+                },
+            )
+            .scan_bases()
+        };
+
+        assert_eq!(reaper(None), vec!["/data/projects".to_string()]);
+        assert_eq!(
+            reaper(Some("/bigdisk/rch-pools")),
+            vec![
+                "/data/projects".to_string(),
+                "/bigdisk/rch-pools".to_string()
+            ]
+        );
+        assert_eq!(
+            reaper(Some("/data/projects")),
+            vec!["/data/projects".to_string()],
+            "a store_base equal to remote_base must not sweep twice"
+        );
     }
 }

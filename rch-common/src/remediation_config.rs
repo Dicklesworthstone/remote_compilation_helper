@@ -395,8 +395,10 @@ pub struct PooledTargetConfig {
     /// on a larger volume.
     ///
     /// Distinct from [`Self::remote_base`], which is where the reaper *scans*;
-    /// when this is set the reaper scans both. Ignored for Windows workers,
-    /// which keep their drive-letter build base.
+    /// when this is set the reaper scans both, and
+    /// [`Self::reaper_max_cache_gb`] then applies per scan root rather than
+    /// per worker. Ignored for Windows workers, which keep their drive-letter
+    /// build base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_base: Option<String>,
 }
@@ -1043,6 +1045,66 @@ mod tests {
     use crate::bypass_record::{AutoRejoinCriteria, BypassBackoff};
     use crate::disk_pressure_report::PressureThresholds;
     use crate::log_retention::LogRetentionPolicy;
+
+    /// Issue #64: the pooled store base is opt-in — an unset value keeps
+    /// today's in-mirror placement, and a set value must survive a TOML
+    /// round-trip under its documented key.
+    #[test]
+    fn pooled_store_base_is_opt_in_and_round_trips() {
+        assert_eq!(RemediationConfig::default().pooled_target.store_base, None);
+
+        let parsed: RemediationConfig = toml::from_str(
+            r#"
+            [pooled_target]
+            store_base = "/bigdisk/rch-pools"
+            "#,
+        )
+        .expect("parse pooled_target.store_base");
+        assert_eq!(
+            parsed.pooled_target.store_base.as_deref(),
+            Some("/bigdisk/rch-pools")
+        );
+        assert!(
+            parsed
+                .validate()
+                .iter()
+                .all(|issue| issue.field != "remediation.pooled_target.store_base"),
+            "an absolute, managed store_base must validate cleanly"
+        );
+
+        let round_trip: RemediationConfig =
+            toml::from_str(&toml::to_string(&parsed).expect("serialize")).expect("reparse");
+        assert_eq!(
+            round_trip.pooled_target.store_base,
+            parsed.pooled_target.store_base
+        );
+
+        // Unset stays absent from the serialized form, so existing configs are
+        // not rewritten with a null placement.
+        let default_toml =
+            toml::to_string(&RemediationConfig::default()).expect("serialize default");
+        assert!(
+            !default_toml.contains("store_base"),
+            "an unset store_base must not be emitted: {default_toml}"
+        );
+    }
+
+    /// The value is embedded in remote shell commands and in
+    /// `CARGO_TARGET_DIR`, so an unsafe base is a hard config error.
+    #[test]
+    fn unsafe_pooled_store_base_is_rejected() {
+        for bad in ["relative/path", "/", "/tmp/../etc", "/toplevel"] {
+            let mut config = RemediationConfig::default();
+            config.pooled_target.store_base = Some(bad.to_string());
+            assert!(
+                config
+                    .validate()
+                    .iter()
+                    .any(|issue| issue.field == "remediation.pooled_target.store_base"),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
 
     #[test]
     fn default_construction_matches_documented_values() {

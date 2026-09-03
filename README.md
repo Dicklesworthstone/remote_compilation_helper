@@ -381,6 +381,12 @@ external_timeout_enabled = true
 
 [transfer]
 compression_level = 3
+# Staging base for the transfer paths that do NOT mirror the client's layout:
+# `--clean-overlay` roots, Windows workers, and `rch cache warm`. An ordinary
+# `rch exec` mirrors the project under the worker's `[path_topology]
+# canonical_root` instead, with the pooled Cargo target store inside that
+# mirror — see `[remediation.pooled_target] store_base` below to place those
+# stores on another filesystem.
 remote_base = "/data/tmp/rch"
 # Optional per-attempt source-sync cap. When unset, the default is payload-aware:
 # 30 seconds plus one second per MiB, capped at one hour.
@@ -391,6 +397,20 @@ remote_base = "/data/tmp/rch"
 adaptive_compression = true
 verify_artifacts = false
 max_transfer_mb = 2048
+
+[remediation.pooled_target]
+# Where pooled Cargo target stores are PLACED on the worker. Unset (the
+# default) keeps them inside the project mirror, i.e. under the canonical
+# root, on whatever filesystem holds it. Set an absolute path to move every
+# pooled store to <store_base>/<project_id>/.rch-target-<worker>-pool-<key>,
+# which is how a worker with a small root disk keeps multi-GB warm pools on a
+# larger volume. `rch gc`, `rch cache status`, and the daemon sweep scan this
+# root in addition to `remote_base` (with `reaper_max_cache_gb` applying per
+# scan root). Ignored for Windows workers.
+# store_base = "/bigdisk/rch-pools"
+#
+# Where the reaper SCANS for stale target dirs (not a placement setting).
+# remote_base = "/data/projects"
 
 [selection]
 strategy = "balanced"

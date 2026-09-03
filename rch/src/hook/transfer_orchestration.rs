@@ -175,11 +175,7 @@ fn pooled_store_base_for<'a>(
         .or_else(|| clean_overlay.then(|| transfer_remote_base.trim_end_matches('/')))
 }
 
-fn stable_pooled_target_dir(
-    remote_base: &str,
-    project_id: &str,
-    pooled_dir_name: &str,
-) -> String {
+fn stable_pooled_target_dir(remote_base: &str, project_id: &str, pooled_dir_name: &str) -> String {
     format!(
         "{}/{}/{}",
         remote_base.trim_end_matches('/'),
@@ -677,7 +673,8 @@ pub(super) async fn execute_remote_compilation(
     let pooled_target_dir_override = if target_reuse_disabled() {
         None
     } else {
-        pooled_store_base.zip(remote_cargo_target_dir_name_override.as_ref())
+        pooled_store_base
+            .zip(remote_cargo_target_dir_name_override.as_ref())
             .map(|(base, name)| {
                 let stable = stable_pooled_target_dir(base, &project_id, name);
                 reporter.verbose(&format!(
@@ -1860,6 +1857,8 @@ mod tests {
     /// setting is written.
     #[test]
     fn pooled_store_stays_in_the_mirror_without_a_store_base() {
+        use super::pooled_store_base_for;
+
         assert_eq!(
             pooled_store_base_for(false, None, false, "/data/tmp/rch"),
             None
@@ -1870,6 +1869,8 @@ mod tests {
     /// clean-overlay runs, and outranks `[transfer] remote_base`.
     #[test]
     fn store_base_governs_ordinary_and_clean_overlay_builds() {
+        use super::pooled_store_base_for;
+
         assert_eq!(
             pooled_store_base_for(false, Some("/bigdisk/rch-pools"), false, "/data/tmp/rch"),
             Some("/bigdisk/rch-pools")
@@ -1893,6 +1894,8 @@ mod tests {
     /// still relocates its pool under `[transfer] remote_base`.
     #[test]
     fn clean_overlay_without_store_base_uses_transfer_remote_base() {
+        use super::pooled_store_base_for;
+
         assert_eq!(
             pooled_store_base_for(false, None, true, "/data/tmp/rch/"),
             Some("/data/tmp/rch")
@@ -1903,6 +1906,8 @@ mod tests {
     /// keeps its drive-letter build base.
     #[test]
     fn windows_workers_ignore_the_unix_store_base() {
+        use super::pooled_store_base_for;
+
         assert_eq!(
             pooled_store_base_for(true, Some("/bigdisk/rch-pools"), false, "/data/tmp/rch"),
             None
@@ -1917,10 +1922,15 @@ mod tests {
     /// and is per-project, so two repos cannot collide.
     #[test]
     fn store_base_pooled_paths_are_per_project_and_gc_recognized() {
+        use super::stable_pooled_target_dir;
+
         let name = ".rch-target-w1-pool-0123456789abcdef0123456789abcdef";
         let a = stable_pooled_target_dir("/bigdisk/rch-pools", "repo-a", name);
         let b = stable_pooled_target_dir("/bigdisk/rch-pools", "repo-b", name);
-        assert_eq!(a, "/bigdisk/rch-pools/repo-a/{name}".replace("{name}", name));
+        assert_eq!(
+            a,
+            "/bigdisk/rch-pools/repo-a/{name}".replace("{name}", name)
+        );
         assert_ne!(a, b);
         assert!(a.contains("/.rch-target-") && a.contains("-pool-"));
     }

@@ -38,10 +38,17 @@ pipeline via `with_remote_cargo_target_dir_name(...)`
 ([`hook.rs:6073-6075`](../../rch/src/hook.rs)). The pipeline then forces the
 worker build's `CARGO_TARGET_DIR` to `<remote_path>/<that-name>`.
 
-The remote project path itself is `<remote_base>/<project_id>/<project_hash>`,
-or an explicit topology override like `/data/projects/<repo>`
-([`rch/src/transfer.rs:926-931`, `583-608`](../../rch/src/transfer.rs)). So in
-practice the on-disk layout per worker is:
+The remote project path for an ordinary `rch exec` is the project mirror under
+the worker's canonical root — `/data/projects/<repo>` by default — because every
+sync-plan entry carries a remote-root override derived from `[path_topology]`
+(`rch/src/hook/dependency_closure.rs`, `map_sync_root_to_remote_root`). The
+`<remote_base>/<project_id>/<project_hash>` form is the fallback used when no
+override is set: `--clean-overlay` roots, Windows workers, and `rch cache warm`
+([`rch/src/transfer.rs`](../../rch/src/transfer.rs), `remote_path()`). Issue #64
+covers the consequence — pooled stores land on whatever filesystem holds the
+canonical root — and adds `[remediation.pooled_target] store_base` to place them
+elsewhere (unset = the layout below, unchanged). So in practice the on-disk
+layout per worker is:
 
 ```text
 /data/projects/<repo>/

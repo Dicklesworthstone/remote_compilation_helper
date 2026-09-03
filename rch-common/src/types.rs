@@ -2669,8 +2669,16 @@ pub struct TransferConfig {
     /// - `0` disables persistence (`ControlPersist=no`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_control_persist_secs: Option<u64>,
-    /// Remote base directory for project sync and build execution.
-    /// Must be an absolute path. Defaults to /tmp/rch.
+    /// Staging base on the worker for the transfer paths that do NOT mirror
+    /// the client's project layout: `--clean-overlay` roots, Windows workers,
+    /// and `rch cache warm`. Must be an absolute path; defaults to
+    /// [`default_remote_base`] (`/data/tmp/rch`).
+    ///
+    /// An ordinary `rch exec` does not use this: it mirrors the project under
+    /// the worker's canonical root (`[path_topology] canonical_root`), and the
+    /// pooled Cargo target store rides along inside that mirror. To move
+    /// pooled stores onto another filesystem, set
+    /// `[remediation.pooled_target] store_base` (issue #64).
     #[serde(default = "default_remote_base")]
     pub remote_base: String,
     /// Per-attempt timeout for source synchronization, in milliseconds.

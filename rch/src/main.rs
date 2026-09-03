@@ -4085,8 +4085,14 @@ fn reap_surface_config() -> Result<(Vec<String>, u32, u32, u32)> {
     // the mirror tree, so the reap surfaces must walk that root too or `rch
     // gc` / `rch cache status` would silently miss the largest stores on the
     // worker.
-    let mut bases = vec![base];
-    if let Some(store_base) = rch_config.remediation.pooled_target.store_base.clone() {
+    let mut bases = vec![base.trim_end_matches('/').to_string()];
+    if let Some(store_base) = rch_config
+        .remediation
+        .pooled_target
+        .store_base
+        .as_deref()
+        .map(|base| base.trim_end_matches('/').to_string())
+    {
         if !rch_common::stale_target_reap::is_safe_reap_base(&store_base) {
             anyhow::bail!(
                 "configured remediation.pooled_target.store_base {store_base:?} fails the reap \
@@ -4349,7 +4355,9 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
     let pooled_idle_secs = pooled_idle_minutes.map(|m| m * 60);
     // Byte-cap eviction runs only in the REAL sweep; the dry-run reports TTL
     // verdicts and does not simulate cap eviction (it depends on live totals
-    // at sweep time).
+    // at sweep time). With a pooled `store_base` configured (issue #64) the
+    // cap applies per scan root, since each root is swept by its own script
+    // run with its own running total.
     let max_cache_kb = (max_cache_gb != 0).then(|| u64::from(max_cache_gb) * 1024 * 1024);
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4392,20 +4400,19 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
                 None => {
                     any_ok = true;
                     let mut seen = std::collections::HashSet::new();
-                    let would_reap: Vec<serde_json::Value> =
-                        reap::parse_target_entries(&stdout)
-                            .into_iter()
-                            .filter(|e| seen.insert(e.path.clone()))
-                            .filter(|e| {
-                                let age = now_unix.saturating_sub(e.newest_mtime_unix);
-                                if e.is_pooled() {
-                                    pooled_idle_secs.is_some_and(|w| age >= w)
-                                } else {
-                                    age >= idle_secs
-                                }
-                            })
-                            .map(|e| serde_json::json!({ "path": e.path, "kb": e.kb }))
-                            .collect();
+                    let would_reap: Vec<serde_json::Value> = reap::parse_target_entries(&stdout)
+                        .into_iter()
+                        .filter(|e| seen.insert(e.path.clone()))
+                        .filter(|e| {
+                            let age = now_unix.saturating_sub(e.newest_mtime_unix);
+                            if e.is_pooled() {
+                                pooled_idle_secs.is_some_and(|w| age >= w)
+                            } else {
+                                age >= idle_secs
+                            }
+                        })
+                        .map(|e| serde_json::json!({ "path": e.path, "kb": e.kb }))
+                        .collect();
                     let would_free_kb: u64 =
                         would_reap.iter().filter_map(|e| e["kb"].as_u64()).sum();
                     serde_json::json!({
@@ -4443,23 +4450,27 @@ async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContex
                                 // Per-removal audit entries (RCH_REAP_RM
                                 // lines) and failed removals (RCH_REAP_ERR,
                                 // bd-kwvy8).
-                                events.extend(reap::parse_reap_events(&result.stdout).into_iter().map(
-                                    |e| {
-                                        serde_json::json!({
-                                            "path": e.path,
-                                            "kb": e.kb,
-                                            "trigger": e.trigger,
-                                        })
-                                    },
-                                ));
+                                events.extend(
+                                    reap::parse_reap_events(&result.stdout)
+                                        .into_iter()
+                                        .map(|e| {
+                                            serde_json::json!({
+                                                "path": e.path,
+                                                "kb": e.kb,
+                                                "trigger": e.trigger,
+                                            })
+                                        }),
+                                );
                                 rm_errors.extend(
-                                    reap::parse_reap_errors(&result.stdout).into_iter().map(|e| {
-                                        serde_json::json!({
-                                            "path": e.path,
-                                            "trigger": e.trigger,
-                                            "message": e.message,
-                                        })
-                                    }),
+                                    reap::parse_reap_errors(&result.stdout)
+                                        .into_iter()
+                                        .map(|e| {
+                                            serde_json::json!({
+                                                "path": e.path,
+                                                "trigger": e.trigger,
+                                                "message": e.message,
+                                            })
+                                        }),
                                 );
                             }
                             None => {
