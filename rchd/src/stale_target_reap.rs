@@ -217,11 +217,12 @@ impl StaleTargetReaper {
             }
             // Validate the base once up-front; a bad base disables the whole sweep
             // rather than risking an unsafe embedded path.
-            if !stale_target_reap::is_safe_reap_base(&reaper.config.remote_base) {
-                warn!(
-                    "Worker stale-target reaper disabled: unsafe remote_base {:?}",
-                    reaper.config.remote_base
-                );
+            if let Some(unsafe_base) = reaper
+                .scan_bases()
+                .into_iter()
+                .find(|base| !stale_target_reap::is_safe_reap_base(base))
+            {
+                warn!("Worker stale-target reaper disabled: unsafe reap base {unsafe_base:?}");
                 return;
             }
             info!(
@@ -314,6 +315,20 @@ impl StaleTargetReaper {
         true
     }
 
+    /// Every root this sweep must walk: the repo mirror tree, plus the pooled
+    /// `store_base` when pooled stores are placed off that tree (issue #64).
+    /// De-duplicated, so the common `store_base == remote_base` case sweeps
+    /// once.
+    fn scan_bases(&self) -> Vec<String> {
+        let mut bases = vec![self.config.remote_base.clone()];
+        if let Some(store_base) = self.config.store_base.clone()
+            && !bases.contains(&store_base)
+        {
+            bases.push(store_base);
+        }
+        bases
+    }
+
     /// Run the sweep script on a single worker and return its metrics.
     async fn sweep_worker(
         &self,
@@ -324,57 +339,75 @@ impl StaleTargetReaper {
         let config = worker_state.config.read().await.clone();
         let worker_id = config.id.clone();
 
-        // `remote_base` was validated once in `start()`, but re-check defensively:
-        // config can be hot-reloaded between cycles.
-        if !stale_target_reap::is_safe_reap_base(&self.config.remote_base) {
-            anyhow::bail!("unsafe remote_base {:?}", self.config.remote_base);
-        }
-        let cmd = build_sweep_command(
-            &self.config.remote_base,
-            idle_minutes,
-            pooled_idle_minutes_from_hours(self.config.pooled_idle_hours),
-            max_cache_kb_from_gb(self.config.max_cache_gb),
-        );
+        let mut metrics = ReapMetrics::default();
+        for base in self.scan_bases() {
+            // Bases were validated once in `start()`, but re-check
+            // defensively: config can be hot-reloaded between cycles.
+            if !stale_target_reap::is_safe_reap_base(&base) {
+                anyhow::bail!("unsafe reap base {base:?}");
+            }
+            let cmd = build_sweep_command(
+                &base,
+                idle_minutes,
+                pooled_idle_minutes_from_hours(self.config.pooled_idle_hours),
+                max_cache_kb_from_gb(self.config.max_cache_gb),
+            );
 
-        debug!(worker = %worker_id, idle_minutes, "Starting stale-target sweep");
+            debug!(worker = %worker_id, idle_minutes, base = %base, "Starting stale-target sweep");
 
-        let result = self.run_remote(&config, &cmd).await;
-        let result = result?;
-        ensure_sweep_command_success(&result)?;
+            let result = self.run_remote(&config, &cmd).await;
+            let result = result?;
+            ensure_sweep_command_success(&result)?;
 
-        let metrics = parse_reap_metrics(&result.stdout).unwrap_or_default();
-        // Per-removal audit trail (bead 6dj11): one info line per reaped dir
-        // with size and the policy that removed it, so any deletion can be
-        // reconstructed from the daemon log alone.
-        for event in stale_target_reap::parse_reap_events(&result.stdout) {
-            info!(
+            let base_metrics = parse_reap_metrics(&result.stdout).unwrap_or_default();
+            metrics.removed += base_metrics.removed;
+            metrics.freed_bytes += base_metrics.freed_bytes;
+            log_reap_audit(&worker_id, &result.stdout);
+            debug!(
                 worker = %worker_id,
-                kb = event.kb,
-                trigger = %event.trigger,
-                path = %event.path,
-                "Reaped remote target dir"
+                base = %base,
+                removed = base_metrics.removed,
+                freed_bytes = base_metrics.freed_bytes,
+                exit = result.exit_code,
+                "Stale-target sweep finished for base"
             );
         }
-        // Failed removals surface at warn (bd-kwvy8): a half-removed dir with
-        // an unincremented counter was undiagnosable while rm was silenced.
-        for error in stale_target_reap::parse_reap_errors(&result.stdout) {
-            warn!(
-                worker = %worker_id,
-                trigger = %error.trigger,
-                path = %error.path,
-                "Remote target dir removal FAILED: {}",
-                error.message
-            );
-        }
+
         debug!(
             worker = %worker_id,
             removed = metrics.removed,
             freed_bytes = metrics.freed_bytes,
             duration_ms = start.elapsed().as_millis() as u64,
-            exit = result.exit_code,
             "Stale-target sweep finished"
         );
         Ok(metrics)
+    }
+}
+
+/// Emit the per-removal audit trail from one sweep's stdout.
+///
+/// Bead 6dj11: one info line per reaped dir with size and the policy that
+/// removed it, so any deletion can be reconstructed from the daemon log alone.
+/// bd-kwvy8: failed removals surface at warn — a half-removed dir with an
+/// unincremented counter was undiagnosable while `rm` was silenced.
+fn log_reap_audit(worker_id: &WorkerId, stdout: &str) {
+    for event in stale_target_reap::parse_reap_events(stdout) {
+        info!(
+            worker = %worker_id,
+            kb = event.kb,
+            trigger = %event.trigger,
+            path = %event.path,
+            "Reaped remote target dir"
+        );
+    }
+    for error in stale_target_reap::parse_reap_errors(stdout) {
+        warn!(
+            worker = %worker_id,
+            trigger = %error.trigger,
+            path = %error.path,
+            "Remote target dir removal FAILED: {}",
+            error.message
+        );
     }
 }
 

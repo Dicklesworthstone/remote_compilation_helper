@@ -171,6 +171,13 @@ pub struct StaleTargetReapConfig {
     /// until back under (bead 6dj11).
     #[serde(default = "default_worker_reap_max_cache_gb")]
     pub max_cache_gb: u32,
+
+    /// Where pooled target stores are PLACED on the worker (issue #64). When
+    /// set, the sweep walks this root in addition to [`Self::remote_base`],
+    /// since warm pools then live off the repo mirror tree. Unset keeps
+    /// today's single-root sweep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_base: Option<String>,
 }
 
 fn default_worker_reap_pooled_idle_hours() -> u32 {
@@ -217,6 +224,7 @@ impl Default for StaleTargetReapConfig {
             remote_base: default_reaper_remote_base(),
             pooled_idle_hours: default_worker_reap_pooled_idle_hours(),
             max_cache_gb: default_worker_reap_max_cache_gb(),
+            store_base: None,
         }
     }
 }
@@ -271,6 +279,7 @@ impl StaleTargetReapConfig {
             remote_base: rem.pooled_target.remote_base.clone(),
             pooled_idle_hours: rem.pooled_target.reaper_pooled_idle_hours,
             max_cache_gb: rem.pooled_target.reaper_max_cache_gb,
+            store_base: rem.pooled_target.store_base.clone(),
         }
     }
 }
@@ -730,6 +739,7 @@ mod tests {
         assert_eq!(from_cfg.interval_mins, runtime.interval_mins);
         assert_eq!(from_cfg.idle_hours, runtime.idle_hours);
         assert_eq!(from_cfg.remote_base, runtime.remote_base);
+        assert_eq!(from_cfg.store_base, runtime.store_base);
     }
 
     #[test]
