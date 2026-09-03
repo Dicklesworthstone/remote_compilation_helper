@@ -3387,6 +3387,14 @@ use cargo_target_dir::{
 // re-exported into the non-test hook namespace here.
 mod artifact_patterns;
 
+// The retrieved-artifact executable-typing gate (GitHub #65) lives in the
+// `artifact_triple` submodule: it types the files a successful sync-back placed
+// in the local target tree against the triple the caller's build was for, so an
+// unpinned offload to a foreign-platform worker can never leave an unrunnable
+// binary behind a green existence check. Its entry points are consumed by the
+// sibling `transfer_orchestration`, which imports them directly.
+mod artifact_triple;
+
 // The daemon selection-response wire-deserialization cluster (the `*Wire` DTOs,
 // their `From` conversions into the `rch_common` domain types, and the
 // protocol-version-checked parse entry point) lives in the `selection_response`

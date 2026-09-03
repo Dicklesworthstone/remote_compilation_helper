@@ -25,8 +25,10 @@ use super::artifact_patterns::{
     expected_output_glob_list, get_custom_target_artifact_patterns, get_project_artifact_patterns,
     kind_produces_transferable_artifacts, sync_back_verified_zero_build_outputs,
 };
+use super::artifact_triple::{describe_findings, foreign_target_artifacts};
 use super::cargo_target_dir::{
-    cargo_target_env_allowlist, cargo_target_env_overrides, remote_cargo_pooled_target_dir_name,
+    cargo_target_env_allowlist, cargo_target_env_overrides, default_host_target_triple,
+    explicit_target_triple_for_command, remote_cargo_pooled_target_dir_name,
     remote_cargo_target_dir_name, stale_target_reap_idle_hours, target_reuse_disabled,
 };
 use super::daemon_ipc::urlencoding_encode;
@@ -1242,6 +1244,9 @@ pub(super) async fn execute_remote_compilation(
     let mut retrieval_matched_regular: Option<u32> = None;
     let mut retrieval_custom_target_basis = false;
     let mut expected_output_patterns: Vec<String> = Vec::new();
+    // Local directory the retrieval manifest's paths are relative to, so the
+    // #65 executable-typing gate can open the files that were actually placed.
+    let mut retrieval_local_base: Option<PathBuf> = None;
     // Step 3: Retrieve artifacts
     if result.success() {
         if let Some(loop_ref) = heartbeat_loop.as_ref() {
@@ -1324,6 +1329,7 @@ pub(super) async fn execute_remote_compilation(
                         retrieval_matched_regular = artifact_result.matched_regular_files;
                         retrieval_custom_target_basis = false;
                         expected_output_patterns = expected_output_glob_list(&artifact_patterns);
+                        retrieval_local_base = Some(project_root.clone());
                     }
                     artifacts_result = Some(match artifacts_result.take() {
                         Some(existing) => merge_sync_result(&existing, &artifact_result.stats),
@@ -1462,6 +1468,7 @@ pub(super) async fn execute_remote_compilation(
                         retrieval_matched_regular = target_result.matched_regular_files;
                         retrieval_custom_target_basis = true;
                         expected_output_patterns = expected_output_glob_list(&custom_patterns);
+                        retrieval_local_base = Some(local_target_dir.clone());
                         artifacts_result = Some(match artifacts_result.take() {
                             Some(existing) => merge_sync_result(&existing, &target_result.stats),
                             None => target_result.stats,
@@ -1621,6 +1628,29 @@ pub(super) async fn execute_remote_compilation(
         loop_ref.finish(BuildHeartbeatPhase::Finalize, detail).await;
     }
 
+    // GitHub #65: a worker is chosen for capacity, not platform, so an
+    // UNPINNED build dispatched to a foreign-OS worker returns executables the
+    // caller's host cannot exec. rsync reports success, the executable bit is
+    // set, and the mismatch only surfaces as `exec format error` — possibly
+    // hours later, after intervening gates have consumed the artifact. Type the
+    // retrieved outputs against the triple the caller's build was actually for.
+    // Evidence-only: an unrecognized triple, an unreadable file, or unknown
+    // magic yields no findings and never fails a build.
+    let pinned_triple = explicit_target_triple_for_command(command);
+    let expected_triple = pinned_triple
+        .clone()
+        .unwrap_or_else(default_host_target_triple);
+    let foreign_artifacts = match retrieval_local_base.as_ref() {
+        Some(base) if result.success() && !artifacts_failed => foreign_target_artifacts(
+            base,
+            &retrieval_manifest,
+            retrieval_custom_target_basis,
+            &expected_triple,
+            pinned_triple.as_deref(),
+        ),
+        _ => Vec::new(),
+    };
+
     // Loud, fatal sync-back failure (issue #19 Fix 1). A remote compile that
     // SUCCEEDED but whose artifacts never came back leaves the local build
     // incomplete — no binary/lib where the agent expects one. Reporting exit 0
@@ -1718,6 +1748,43 @@ pub(super) async fn execute_remote_compilation(
             "Artifact sync-back matched zero build outputs after a successful remote \
              compile on {} [{}]; returning exit {} so the caller knows local \
              artifacts may be stale",
+            worker_config.id,
+            code.code_string(),
+            EXIT_ARTIFACT_TRANSFER_FAILED
+        );
+        EXIT_ARTIFACT_TRANSFER_FAILED
+    } else if !foreign_artifacts.is_empty() {
+        // GitHub #65 loud failure: the sync-back succeeded, but at least one
+        // retrieved executable is a container this host cannot run. Surfacing
+        // exit 0 would publish an unrunnable binary into a shared target
+        // directory where every later existence/executable-bit check stays
+        // green. rsync has already overwritten the local artifact by this
+        // point, so the recovery instruction is explicit: rebuild.
+        let code = ErrorCode::BuildArtifactForeignTarget;
+        // stderr, not just `warn!`: this MUST reach the operator/agent even
+        // when tracing is silenced. stderr is the diagnostics stream (AGENTS.md).
+        eprintln!(
+            "[RCH] {} remote compile on {} SUCCEEDED but returned executables for the \
+             WRONG PLATFORM: this build targets {} and the retrieved artifact(s) are \
+             {}. Offending file(s): {}. The local target directory now holds \
+             unrunnable binaries. Treating as a build failure \
+             (exit {EXIT_ARTIFACT_TRANSFER_FAILED}); rebuild for this host, pin the \
+             build with `--target {}`, or restrict this project to a same-platform \
+             worker (set RCH_WORKER, or declare `os = \"<name>\"` for the worker in \
+             workers.toml).",
+            code.code_string(),
+            worker_config.id,
+            expected_triple,
+            foreign_artifacts
+                .first()
+                .map_or("of another platform", |f| f.found.label()),
+            describe_findings(&foreign_artifacts),
+            expected_triple,
+        );
+        warn!(
+            "Retrieved artifacts do not match the requesting host's target triple {} \
+             after a successful remote compile on {} [{}]; returning exit {}",
+            expected_triple,
             worker_config.id,
             code.code_string(),
             EXIT_ARTIFACT_TRANSFER_FAILED

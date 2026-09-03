@@ -227,21 +227,29 @@ pub(super) fn target_reuse_disabled_from_value(value: Option<String>) -> bool {
 /// pooled-dir cache DIMENSION — a cross-compile must not share a host build's
 /// pool — so a stable, host-correct fallback matters.
 pub(super) fn target_triple_for_command(command: &str) -> String {
+    explicit_target_triple_for_command(command).unwrap_or_else(default_host_target_triple)
+}
+
+/// The explicit `--target <triple>` / `--target=<triple>` this command pins, if
+/// any. `None` means the build is UNPINNED and therefore targets the host that
+/// runs it — which, on an offloaded build, is the worker rather than the caller
+/// (GitHub #65).
+pub(super) fn explicit_target_triple_for_command(command: &str) -> Option<String> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     let mut iter = tokens.iter();
     while let Some(token) = iter.next() {
         if let Some(value) = token.strip_prefix("--target=") {
             if !value.is_empty() {
-                return value.to_string();
+                return Some(value.to_string());
             }
         } else if *token == "--target"
             && let Some(value) = iter.next()
             && !value.is_empty()
         {
-            return (*value).to_string();
+            return Some((*value).to_string());
         }
     }
-    default_host_target_triple()
+    None
 }
 
 /// Best-effort host target triple, assembled from compile-time `std::env::consts`.
@@ -250,7 +258,7 @@ pub(super) fn target_triple_for_command(command: &str) -> String {
 /// disambiguate pools), so an approximate-but-stable value is acceptable — it just
 /// needs to be the SAME across invocations on the same host and DIFFERENT across
 /// architectures/OSes.
-fn default_host_target_triple() -> String {
+pub(super) fn default_host_target_triple() -> String {
     let arch = std::env::consts::ARCH; // e.g. "x86_64", "aarch64"
     match std::env::consts::OS {
         "linux" => format!("{arch}-unknown-linux-gnu"),

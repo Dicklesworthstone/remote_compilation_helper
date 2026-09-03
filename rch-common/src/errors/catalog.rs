@@ -197,6 +197,9 @@ pub enum ErrorCode {
     /// Remote build succeeded but the artifact sync-back matched zero build
     /// outputs — local artifacts may be STALE (bd-mpbav)
     BuildArtifactSyncEmpty,
+    /// Remote build succeeded but returned executables for a different target
+    /// triple than the requesting host expects (GitHub #65)
+    BuildArtifactForeignTarget,
     /// Cargo workspace inheritance failed under remote topology
     BuildCargoWorkspaceInheritance,
 
@@ -372,6 +375,7 @@ impl ErrorCode {
             // 326 (past the cancellation block E320-E325): codes occupy free
             // slots of the E300-E399 range, not contiguous positions.
             Self::BuildArtifactSyncEmpty => 326,
+            Self::BuildArtifactForeignTarget => 327,
             Self::BuildCargoWorkspaceInheritance => 329,
 
             // Process Triage (310-319)
@@ -546,6 +550,9 @@ impl ErrorCode {
             Self::BuildArtifactMissing => "Build artifact not found",
             Self::BuildArtifactSyncEmpty => {
                 "Remote build succeeded but no build outputs were synced back"
+            }
+            Self::BuildArtifactForeignTarget => {
+                "Retrieved build artifacts target a different platform than this host"
             }
             Self::BuildCargoWorkspaceInheritance => {
                 "Cargo workspace inheritance failed under remote topology"
@@ -944,6 +951,11 @@ impl ErrorCode {
                 "Re-run the build (or build locally) before trusting any binary",
                 "Check that the cargo profile's output directory matches the artifact patterns",
             ],
+            Self::BuildArtifactForeignTarget => &[
+                "Treat the local target directory as POISONED: rebuild for this host",
+                "Pin the build to an explicit --target so the output triple is unambiguous",
+                "Restrict the project to a same-platform worker (RCH_WORKER, or a worker `os` declaration)",
+            ],
             Self::BuildCargoWorkspaceInheritance => &[
                 "Verify dependency workspace metadata roots are synced",
                 "Isolate remote sync roots from unrelated outer Cargo workspaces",
@@ -1288,6 +1300,7 @@ impl ErrorCode {
             Self::BuildIncrementalError,
             Self::BuildArtifactMissing,
             Self::BuildArtifactSyncEmpty,
+            Self::BuildArtifactForeignTarget,
             Self::BuildCargoWorkspaceInheritance,
             // Process Triage
             Self::ProcessTriageAdapterUnavailable,
@@ -1705,6 +1718,28 @@ mod tests {
                 .iter()
                 .any(|step| step.to_lowercase().contains("stale")),
             "RCH-E326 remediation must warn about stale local artifacts"
+        );
+    }
+
+    /// Contract test: the foreign-target artifact build error code is stable.
+    #[test]
+    fn test_build_artifact_foreign_target_error_code_stable() {
+        assert_eq!(ErrorCode::BuildArtifactForeignTarget.code_number(), 327);
+        assert_eq!(
+            ErrorCode::BuildArtifactForeignTarget.category(),
+            ErrorCategory::Build
+        );
+        assert_eq!(
+            ErrorCode::BuildArtifactForeignTarget.code_string(),
+            "RCH-E327"
+        );
+        // Remediation must tell the operator the local tree needs a rebuild.
+        assert!(
+            ErrorCode::BuildArtifactForeignTarget
+                .remediation()
+                .iter()
+                .any(|step| step.to_lowercase().contains("rebuild")),
+            "RCH-E327 remediation must tell the operator to rebuild for this host"
         );
     }
 
