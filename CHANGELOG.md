@@ -35,6 +35,7 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v1.0.63`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.63) | Release | 2026-09-03 | rchd daemon can no longer be wedged by the durable-lease scan: syscall liveness, lease reaping, scan off the runtime threads |
 | [`v1.0.62`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.62) | Release | 2026-08-29 | Convergence over the tailnet API: `GET /repo-convergence/status` token-gated on `:9101`; the dashboard collector folds it in so `worker.convergence_drift` fires on API-collected boxes |
 | [`v1.0.61`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.61) | Release | 2026-08-29 | rchd tailnet status API (`[api]`); dashboard publishes 2-min snapshots to Vercel Blob over that API; problems/diagnose agent views; `web/` retired |
 | [`v1.0.60`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.60) | Release | 2026-08-28 | Shim v3: every local shim fallback capped via `CARGO_BUILD_JOBS`; Windows CIM telemetry; socket reload honours `--workers-config` |
@@ -105,6 +106,35 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 ---
 
 ## [Unreleased]
+
+## [v1.0.63] -- 2026-09-03 (release)
+
+A production daemon wedge, root-caused from a live sample. Every hook admission scans the
+durable job-lease directory (`~/.local/state/rch/job-leases`); nothing ever reaped those
+files, and once ~18k had accumulated the scan — which forked `/bin/kill -0` per stale lease,
+synchronously, on the tokio runtime threads — monopolized every worker thread. The daemon
+sat at 9% CPU, alive but unable to accept a socket connection (clients saw RCH-I010
+"daemon socket refused"), and each wedge invited the CLI autostart to spawn replacement
+daemons whose takeovers SIGTERMed in-flight builds (the churn filed as `bd-mhv3x`).
+
+**Delivered capability**
+
+- `is_process_alive` is a direct `kill(pid, 0)` syscall via `nix` (the crate forbids
+  `unsafe_code`); `EPERM` counts as alive — the conservative direction for lease blocking.
+- The lease scan reaps files that no longer block restart once their heartbeat is over an
+  hour old, so the directory stays bounded by live work, not by history.
+- Both async callers run the scan via `spawn_blocking`, so even a pathological directory can
+  slow admissions but can never starve the accept loop again.
+
+**Closed workstreams**
+
+- [`bd-daspu`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl)
+  — the wedge itself (P0), with the thread-sample evidence recorded on the bead.
+
+**Representative commits**
+
+- [`7b4a1972`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7b4a1972fa3e759aba167fb7d80ca4f24e43fe7c)
+  — the fix and its reap/liveness tests.
 
 
 ### Shim v4: `RCH_SHIM_LOCAL_IDE=1` resolves a WORKING real cargo (tiered), fixing nightly-renamed-cargo hosts
@@ -1969,7 +1999,8 @@ First tagged version. Marks the project's initial functional milestone after 9 d
 - Everything below `v1.0.16` in the reference block uses compare links; newer versions link
   straight to their release or tag page in the timeline.
 
-[Unreleased]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.62...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.63...HEAD
+[v1.0.63]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.62...v1.0.63
 [v1.0.62]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.61...v1.0.62
 [v1.0.16]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.15...v1.0.16
 [v1.0.15]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.14...v1.0.15
