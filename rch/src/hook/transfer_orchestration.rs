@@ -145,6 +145,36 @@ fn clean_overlay_remote_project_hash(
 /// `.rch-target-…-pool-…` basename is preserved so the pool-janitor / sbh GC
 /// conventions (and Cargo's own CACHEDIR.TAG) still apply, and Cargo's
 /// target-dir flock serializes overlapping jobs sharing the pool.
+/// Where a build's pooled Cargo target store is PLACED on the worker, or
+/// `None` to keep it inside the synced project mirror (the default: under the
+/// worker's canonical project root, on whatever filesystem holds it).
+///
+/// Issue #64: `[remediation.pooled_target] store_base`, when configured, moves
+/// every build's pooled store to `<store_base>/<project_id>/<name>` — how a
+/// worker whose canonical root sits on a small disk keeps multi-GB warm pools
+/// on a larger volume. Windows workers keep their drive-letter build base: a
+/// Unix store base is not a valid path there.
+///
+/// Issue #60: a clean-overlay run hashes a per-command job nonce into its
+/// remote root (a deliberate overlap-safety invariant) and reaps that root
+/// wholesale at teardown, so a pooled store placed UNDER it could never be
+/// reused. Absent a `store_base`, those runs relocate the pool under
+/// `[transfer] remote_base`, where their roots already live.
+fn pooled_store_base_for<'a>(
+    worker_is_windows: bool,
+    store_base: Option<&'a str>,
+    clean_overlay: bool,
+    transfer_remote_base: &'a str,
+) -> Option<&'a str> {
+    if worker_is_windows {
+        return clean_overlay.then_some(crate::transfer::WINDOWS_DEFAULT_REMOTE_BASE);
+    }
+    store_base
+        .map(|base| base.trim_end_matches('/'))
+        .filter(|base| !base.is_empty())
+        .or_else(|| clean_overlay.then(|| transfer_remote_base.trim_end_matches('/')))
+}
+
 fn stable_pooled_target_dir(
     remote_base: &str,
     project_id: &str,
@@ -638,36 +668,12 @@ pub(super) async fn execute_remote_compilation(
             name
         }
     });
-    // Where the pooled store is PLACED on the worker.
-    //
-    // Default (both `None` arms below): inside the synced project mirror, i.e.
-    // under the worker's canonical project root — unchanged behavior.
-    //
-    // Issue #64: `[remediation.pooled_target] store_base`, when configured,
-    // moves every build's pooled store to `<store_base>/<project_id>/<name>`,
-    // which is how a worker whose canonical root sits on a small disk keeps
-    // multi-GB warm pools on a larger volume. Windows workers keep their
-    // drive-letter build base: a Unix store base is not a valid path there.
-    //
-    // Issue #60: a clean-overlay run hashes a per-command job nonce into its
-    // remote root (a deliberate overlap-safety invariant) and reaps that root
-    // wholesale at teardown, so a pooled target dir placed UNDER it can never
-    // be reused — every clean-overlay gate was a cold build. Absent a
-    // `store_base`, such runs relocate the pool under `[transfer] remote_base`
-    // instead, which is where their roots already live.
-    let pooled_store_base = if worker_is_windows {
-        clean_overlay
-            .is_some()
-            .then_some(crate::transfer::WINDOWS_DEFAULT_REMOTE_BASE)
-    } else {
-        pooled_target_store_base
-            .map(|base| base.trim_end_matches('/'))
-            .or_else(|| {
-                clean_overlay
-                    .is_some()
-                    .then(|| transfer_config.remote_base.trim_end_matches('/'))
-            })
-    };
+    let pooled_store_base = pooled_store_base_for(
+        worker_is_windows,
+        pooled_target_store_base,
+        clean_overlay.is_some(),
+        &transfer_config.remote_base,
+    );
     let pooled_target_dir_override = if target_reuse_disabled() {
         None
     } else {
@@ -1847,5 +1853,75 @@ mod tests {
             stable_pooled_target_dir("/data/tmp/rch/", project_id, pooled_name),
             pool_a
         );
+    }
+
+    /// Issue #64: the default (no `store_base`, no clean overlay) keeps the
+    /// pooled store inside the project mirror — nobody's paths move until the
+    /// setting is written.
+    #[test]
+    fn pooled_store_stays_in_the_mirror_without_a_store_base() {
+        assert_eq!(
+            pooled_store_base_for(false, None, false, "/data/tmp/rch"),
+            None
+        );
+    }
+
+    /// Issue #64: a configured `store_base` governs EVERY build, not just
+    /// clean-overlay runs, and outranks `[transfer] remote_base`.
+    #[test]
+    fn store_base_governs_ordinary_and_clean_overlay_builds() {
+        assert_eq!(
+            pooled_store_base_for(false, Some("/bigdisk/rch-pools"), false, "/data/tmp/rch"),
+            Some("/bigdisk/rch-pools")
+        );
+        assert_eq!(
+            pooled_store_base_for(false, Some("/bigdisk/rch-pools"), true, "/data/tmp/rch"),
+            Some("/bigdisk/rch-pools")
+        );
+        // Trailing slashes normalize, and an empty value is treated as unset.
+        assert_eq!(
+            pooled_store_base_for(false, Some("/bigdisk/rch-pools/"), false, "/data/tmp/rch"),
+            Some("/bigdisk/rch-pools")
+        );
+        assert_eq!(
+            pooled_store_base_for(false, Some(""), false, "/data/tmp/rch"),
+            None
+        );
+    }
+
+    /// Issue #60 stays intact: without a `store_base`, a clean-overlay run
+    /// still relocates its pool under `[transfer] remote_base`.
+    #[test]
+    fn clean_overlay_without_store_base_uses_transfer_remote_base() {
+        assert_eq!(
+            pooled_store_base_for(false, None, true, "/data/tmp/rch/"),
+            Some("/data/tmp/rch")
+        );
+    }
+
+    /// A Unix `store_base` is not a valid path on a Windows worker, which
+    /// keeps its drive-letter build base.
+    #[test]
+    fn windows_workers_ignore_the_unix_store_base() {
+        assert_eq!(
+            pooled_store_base_for(true, Some("/bigdisk/rch-pools"), false, "/data/tmp/rch"),
+            None
+        );
+        assert_eq!(
+            pooled_store_base_for(true, Some("/bigdisk/rch-pools"), true, "/data/tmp/rch"),
+            Some(crate::transfer::WINDOWS_DEFAULT_REMOTE_BASE)
+        );
+    }
+
+    /// The pooled path under a `store_base` keeps the GC-recognized basename
+    /// and is per-project, so two repos cannot collide.
+    #[test]
+    fn store_base_pooled_paths_are_per_project_and_gc_recognized() {
+        let name = ".rch-target-w1-pool-0123456789abcdef0123456789abcdef";
+        let a = stable_pooled_target_dir("/bigdisk/rch-pools", "repo-a", name);
+        let b = stable_pooled_target_dir("/bigdisk/rch-pools", "repo-b", name);
+        assert_eq!(a, "/bigdisk/rch-pools/repo-a/{name}".replace("{name}", name));
+        assert_ne!(a, b);
+        assert!(a.contains("/.rch-target-") && a.contains("-pool-"));
     }
 }
