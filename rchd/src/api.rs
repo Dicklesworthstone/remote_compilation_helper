@@ -2981,8 +2981,16 @@ fn is_process_alive(pid: u32) -> bool {
     // every runtime thread and wedged the daemon socket (bd-daspu).
     #[cfg(unix)]
     {
-        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+            Ok(()) => true,
+            // EPERM: the process exists but is not ours to signal — alive,
+            // which is also the conservative direction for lease blocking.
+            Err(nix::errno::Errno::EPERM) => true,
+            Err(_) => false,
+        }
     }
     #[cfg(not(unix))]
     {
