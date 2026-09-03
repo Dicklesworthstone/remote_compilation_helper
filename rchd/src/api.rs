@@ -2591,7 +2591,12 @@ async fn handle_restart_admission(ctx: &DaemonContext, close: bool) -> RestartAd
         .into_iter()
         .map(|build| build.id)
         .collect();
-    let client_lease_scan = nonterminal_client_lease_ids();
+    // spawn_blocking: the scan does filesystem I/O and per-lease liveness
+    // syscalls; inline on a runtime thread it starved the accept loop when the
+    // lease directory grew large (bd-daspu).
+    let client_lease_scan = tokio::task::spawn_blocking(nonterminal_client_lease_ids)
+        .await
+        .unwrap_or_else(|error| Err(anyhow!("lease scan task failed: {error}")));
     let (client_lease_ids, client_lease_scan_error) = match client_lease_scan {
         Ok(ids) => (ids, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
@@ -2629,7 +2634,12 @@ async fn restart_admission_status(ctx: &DaemonContext) -> RestartAdmissionRespon
         .into_iter()
         .map(|build| build.id)
         .collect();
-    let client_lease_scan = nonterminal_client_lease_ids();
+    // spawn_blocking: the scan does filesystem I/O and per-lease liveness
+    // syscalls; inline on a runtime thread it starved the accept loop when the
+    // lease directory grew large (bd-daspu).
+    let client_lease_scan = tokio::task::spawn_blocking(nonterminal_client_lease_ids)
+        .await
+        .unwrap_or_else(|error| Err(anyhow!("lease scan task failed: {error}")));
     let (client_lease_ids, client_lease_scan_error) = match client_lease_scan {
         Ok(ids) => (ids, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
@@ -2649,8 +2659,13 @@ async fn restart_admission_status(ctx: &DaemonContext) -> RestartAdmissionRespon
 /// restart cannot claim a zero-state snapshot when durable evidence is
 /// unreadable.
 fn nonterminal_client_lease_ids() -> Result<Vec<String>> {
-    let lease_dir = default_job_lease_directory();
-    let entries = match std::fs::read_dir(&lease_dir) {
+    scan_client_leases(&default_job_lease_directory())
+}
+
+/// The scan behind [`nonterminal_client_lease_ids`], parameterized on the
+/// directory so tests exercise it against a temp dir without env games.
+fn scan_client_leases(lease_dir: &std::path::Path) -> Result<Vec<String>> {
+    let entries = match std::fs::read_dir(lease_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(anyhow!("cannot inspect {}: {error}", lease_dir.display())),
@@ -2674,11 +2689,24 @@ fn nonterminal_client_lease_ids() -> Result<Vec<String>> {
             .map_err(|error| anyhow!("cannot parse {}: {error}", entry.path().display()))?;
         if lease_blocks_restart(&lease, now_unix_ms, || is_process_alive(lease.wrapper_pid)) {
             blocked.push(lease.identity.local_wrapper_id);
+        } else if now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= LEASE_REAP_RETENTION_MS {
+            // Reap the file: it no longer blocks restart (terminal+acked, or
+            // provably dead and stale) and its last heartbeat is over the
+            // retention window, so it is pure history. Nothing else ever
+            // removed these — 18k of them accumulated in days and made every
+            // admission re-scan (and re-probe) all of them (bd-daspu). Best
+            // effort: a remove that fails just means we scan it again.
+            let _ = std::fs::remove_file(entry.path());
         }
     }
     blocked.sort();
     Ok(blocked)
 }
+
+/// How long a non-blocking lease is kept after its last heartbeat before the
+/// scan reaps its file. Long enough for post-mortem inspection of a just
+/// finished job; short enough that the directory stays bounded.
+const LEASE_REAP_RETENTION_MS: u64 = 60 * 60 * 1000;
 
 /// Heartbeat age past which a lease whose wrapper PID is provably dead is
 /// treated as abandoned for restart-admission purposes. Wrappers heartbeat
@@ -2946,14 +2974,25 @@ fn is_process_alive(pid: u32) -> bool {
         return false;
     }
 
-    // `kill -0` performs error checking without sending a signal.
-    // Exit status 0 means the process exists and is signalable.
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    // Signal 0 performs error checking without sending a signal: the process
+    // exists (0) or errors. EPERM still means "exists". This MUST be a direct
+    // syscall, not a forked `/bin/kill` — the lease scan calls it once per
+    // stale lease, and with thousands of leaked leases the forks monopolized
+    // every runtime thread and wedged the daemon socket (bd-daspu).
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
 }
 
 /// Handle a build cancellation request.
@@ -4593,6 +4632,50 @@ mod tests {
         );
         lease.admit(42, "worker1".to_string(), heartbeat_unix_ms);
         lease
+    }
+
+    #[test]
+    fn scan_reaps_only_nonblocking_stale_leases_and_reports_blockers() {
+        let dir = std::env::temp_dir().join(format!("rch-lease-scan-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        let write = |name: &str, lease: &DurableJobLease| {
+            std::fs::write(dir.join(name), serde_json::to_vec(lease).unwrap()).unwrap();
+        };
+
+        // Blocking: fresh heartbeat — must be reported, never reaped.
+        let fresh = make_test_lease(now, 1);
+        write("fresh.json", &fresh);
+        // Non-blocking and past retention: terminal + acknowledged, ancient
+        // heartbeat — must be reaped.
+        let mut done = make_test_lease(now - LEASE_REAP_RETENTION_MS - 1, 1);
+        done.acknowledge_terminal(now - LEASE_REAP_RETENTION_MS - 1);
+        write("done-old.json", &done);
+        // Non-blocking but INSIDE retention: terminal + acknowledged, recent
+        // heartbeat — kept for post-mortem, not reaped, not reported.
+        let mut recent = make_test_lease(now - 1000, 1);
+        recent.acknowledge_terminal(now - 1000);
+        write("done-recent.json", &recent);
+        // Not a lease: never touched.
+        std::fs::write(dir.join("README.txt"), b"not a lease").unwrap();
+
+        let blocked = scan_client_leases(&dir).unwrap();
+        assert_eq!(blocked.len(), 1, "only the fresh lease blocks: {blocked:?}");
+        assert!(!dir.join("done-old.json").exists(), "stale non-blocker reaped");
+        assert!(dir.join("done-recent.json").exists(), "recent non-blocker kept");
+        assert!(dir.join("fresh.json").exists(), "blocker kept");
+        assert!(dir.join("README.txt").exists(), "non-json untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_process_alive_uses_the_syscall_truthfully() {
+        // Our own PID is alive; PID 0 is defined dead; a PID from the far end
+        // of the space is almost certainly dead (and if recycled, "alive" is
+        // the conservative, still-correct answer for lease blocking).
+        assert!(is_process_alive(std::process::id()));
+        assert!(!is_process_alive(0));
     }
 
     #[test]

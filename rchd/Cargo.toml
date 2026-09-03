@@ -30,6 +30,9 @@ chrono = { workspace = true }
 shell-escape = "0.1.5"
 
 [target.'cfg(unix)'.dependencies]
+# Direct kill(pid, 0) syscall for lease liveness checks — forking /bin/kill
+# per stale lease wedged the whole runtime at scale (bd-daspu).
+libc = "0.2"
 openssh = { workspace = true }
 humantime = { workspace = true }
 tokio-cron-scheduler = { workspace = true }
