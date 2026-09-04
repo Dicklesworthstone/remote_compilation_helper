@@ -294,11 +294,15 @@ pub(super) fn foreign_target_artifacts(
         if inspected >= MAX_FILES_INSPECTED || findings.len() >= MAX_FINDINGS_REPORTED {
             break;
         }
-        let Some(rel) = in_scope_output_path(path, custom_target_sync, pinned_triple) else {
+        if in_scope_output_path(path, custom_target_sync, pinned_triple).is_none() {
             continue;
-        };
+        }
         inspected += 1;
-        let full = local_base.join(rel);
+        // The manifest path is relative to the retrieval sync root, which is
+        // exactly what `local_base` names — the project root for the
+        // default-root phase (so the path keeps its `target/` prefix) or the
+        // local target dir for a forwarded `CARGO_TARGET_DIR`.
+        let full = local_base.join(path);
         let Some(found) = read_binary_format(&full) else {
             continue;
         };

@@ -23,7 +23,8 @@
 
 use super::artifact_patterns::{
     expected_output_glob_list, get_custom_target_artifact_patterns, get_project_artifact_patterns,
-    kind_produces_transferable_artifacts, sync_back_verified_zero_build_outputs,
+    kind_has_enumerable_output_contract, kind_produces_transferable_artifacts,
+    sync_back_verified_zero_build_outputs,
 };
 use super::artifact_triple::{describe_findings, foreign_target_artifacts};
 use super::cargo_target_dir::{
@@ -245,6 +246,29 @@ async fn send_test_run(socket_path: &str, record: &TestRunRecord) -> anyhow::Res
 
     Ok(())
 }
+
+/// Environment opt-out for the retrieved-artifact typing gate (GitHub #65).
+///
+/// An operator who deliberately wants a foreign-platform artifact in the local
+/// target tree — cross-build staging, a container image assembled from a Linux
+/// worker's output on a macOS controller — sets `RCH_ALLOW_FOREIGN_ARTIFACTS=1`
+/// and gets the pre-#65 behaviour back for that invocation. Any value other
+/// than empty / `0` / `false` / `no` / `off` (case-insensitive) opts out.
+fn foreign_artifact_gate_disabled() -> bool {
+    foreign_artifact_gate_disabled_from_value(std::env::var(RCH_ALLOW_FOREIGN_ARTIFACTS_ENV).ok())
+}
+
+/// Pure predicate behind [`foreign_artifact_gate_disabled`], with the env value
+/// injected so it is unit-testable under `#![forbid(unsafe_code)]`.
+pub(super) fn foreign_artifact_gate_disabled_from_value(value: Option<String>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        !value.is_empty() && value != "0" && value != "false" && value != "no" && value != "off"
+    })
+}
+
+/// Environment variable name for [`foreign_artifact_gate_disabled`].
+pub(super) const RCH_ALLOW_FOREIGN_ARTIFACTS_ENV: &str = "RCH_ALLOW_FOREIGN_ARTIFACTS";
 
 /// Execute a compilation command on a remote worker.
 ///
@@ -1640,14 +1664,27 @@ pub(super) async fn execute_remote_compilation(
     let expected_triple = pinned_triple
         .clone()
         .unwrap_or_else(default_host_target_triple);
+    // Only the kinds whose contract is "materialize the caller's runnable
+    // outputs under the cargo target tree" are typed. Test/bench/coverage kinds
+    // retrieve reports and instrumented trees whose binaries are the WORKER's
+    // by design (`target/llvm-cov-target/…`), and unclassified commands prove
+    // nothing about what they wrote — matching the zero-output gate's
+    // deliberately narrow scope.
     let foreign_artifacts = match retrieval_local_base.as_ref() {
-        Some(base) if result.success() && !artifacts_failed => foreign_target_artifacts(
-            base,
-            &retrieval_manifest,
-            retrieval_custom_target_basis,
-            &expected_triple,
-            pinned_triple.as_deref(),
-        ),
+        Some(base)
+            if result.success()
+                && !artifacts_failed
+                && kind_has_enumerable_output_contract(kind)
+                && !foreign_artifact_gate_disabled() =>
+        {
+            foreign_target_artifacts(
+                base,
+                &retrieval_manifest,
+                retrieval_custom_target_basis,
+                &expected_triple,
+                pinned_triple.as_deref(),
+            )
+        }
         _ => Vec::new(),
     };
 
@@ -1771,7 +1808,8 @@ pub(super) async fn execute_remote_compilation(
              (exit {EXIT_ARTIFACT_TRANSFER_FAILED}); rebuild for this host, pin the \
              build with `--target {}`, or restrict this project to a same-platform \
              worker (set RCH_WORKER, or declare `os = \"<name>\"` for the worker in \
-             workers.toml).",
+             workers.toml). Set {RCH_ALLOW_FOREIGN_ARTIFACTS_ENV}=1 to accept \
+             foreign-platform artifacts deliberately.",
             code.code_string(),
             worker_config.id,
             expected_triple,
@@ -1827,6 +1865,26 @@ pub(super) async fn execute_remote_compilation(
 #[cfg(test)]
 mod tests {
     use super::clean_overlay_remote_project_hash;
+    use super::foreign_artifact_gate_disabled_from_value;
+
+    #[test]
+    fn foreign_artifact_gate_is_on_unless_explicitly_disabled() {
+        // Absent or falsey: the gate stays armed.
+        assert!(!foreign_artifact_gate_disabled_from_value(None));
+        for value in ["", "  ", "0", "false", "FALSE", "no", "off", "Off"] {
+            assert!(
+                !foreign_artifact_gate_disabled_from_value(Some(value.to_string())),
+                "{value:?} must not disable the foreign-artifact gate"
+            );
+        }
+        // Any other value is an explicit opt-out.
+        for value in ["1", "true", "yes", "on", "please"] {
+            assert!(
+                foreign_artifact_gate_disabled_from_value(Some(value.to_string())),
+                "{value:?} must disable the foreign-artifact gate"
+            );
+        }
+    }
 
     #[test]
     fn clean_overlay_concurrent_jobs_use_distinct_remote_roots() {
