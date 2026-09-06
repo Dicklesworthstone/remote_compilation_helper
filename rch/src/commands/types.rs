@@ -283,6 +283,9 @@ pub struct ConfigTransferSection {
     pub bwlimit_kbps: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_bandwidth_bps: Option<u64>,
+    /// Explicit rsync binary (issue #66); unset lets rch resolve one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rsync_bin: Option<String>,
     // Adaptive compression (bd-243w)
     pub adaptive_compression: bool,
     pub min_compression_level: u32,

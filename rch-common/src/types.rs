@@ -2744,6 +2744,17 @@ pub struct TransferConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bwlimit_kbps: Option<u64>,
 
+    /// Explicit rsync binary for every local transfer (issue #66).
+    ///
+    /// Unset (the default) lets rch pick: the PATH `rsync` when it is a
+    /// modern (3.1+) rsync, otherwise a modern rsync from the well-known
+    /// Homebrew/MacPorts locations, otherwise the PATH binary driven with the
+    /// openrsync/2.6.9-compatible argv. Set this to force one binary
+    /// (`~` is expanded; a bare name is looked up on PATH). The
+    /// `RCH_RSYNC_BIN` environment variable overrides this setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rsync_bin: Option<String>,
+
     /// Estimated link bandwidth in bytes per second.
     ///
     /// Used for transfer time estimation when `max_transfer_time_ms` is set.
@@ -2798,6 +2809,7 @@ impl Default for TransferConfig {
             max_transfer_mb: None,
             max_transfer_time_ms: None,
             bwlimit_kbps: None,
+            rsync_bin: None,
             estimated_bandwidth_bps: None,
             // Adaptive compression (bd-243w)
             adaptive_compression: false,

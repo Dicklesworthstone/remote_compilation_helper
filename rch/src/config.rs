@@ -670,6 +670,8 @@ struct PartialTransferConfig {
     max_transfer_time_ms: Option<u64>,
     bwlimit_kbps: Option<u64>,
     estimated_bandwidth_bps: Option<u64>,
+    // Explicit rsync binary (issue #66)
+    rsync_bin: Option<String>,
     // Adaptive compression (bd-243w)
     adaptive_compression: Option<bool>,
     min_compression_level: Option<u32>,
@@ -1282,6 +1284,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "transfer.exclude_patterns",
         "transfer.sync_timeout_ms",
         "transfer.source_sync_silence_timeout_secs",
+        "transfer.rsync_bin",
         "environment.allowlist",
         "circuit.failure_threshold",
         "circuit.success_threshold",
@@ -1468,6 +1471,12 @@ fn apply_layer(
     if let Some(bandwidth) = layer.transfer.estimated_bandwidth_bps {
         config.transfer.estimated_bandwidth_bps = Some(bandwidth);
         set_source(sources, "transfer.estimated_bandwidth_bps", source.clone());
+    }
+    // Explicit rsync binary (issue #66). An empty string means "unset".
+    if let Some(rsync_bin) = &layer.transfer.rsync_bin {
+        let trimmed = rsync_bin.trim();
+        config.transfer.rsync_bin = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        set_source(sources, "transfer.rsync_bin", source.clone());
     }
     // Adaptive compression (bd-243w)
     if let Some(adaptive) = layer.transfer.adaptive_compression {
@@ -1853,6 +1862,9 @@ fn merge_transfer(
     }
     if overlay.estimated_bandwidth_bps != default.estimated_bandwidth_bps {
         base.estimated_bandwidth_bps = overlay.estimated_bandwidth_bps;
+    }
+    if overlay.rsync_bin != default.rsync_bin {
+        base.rsync_bin = overlay.rsync_bin.clone();
     }
     // Adaptive compression (bd-243w)
     if overlay.adaptive_compression != default.adaptive_compression {
@@ -2703,6 +2715,10 @@ compression_level = 3
 # (dead channel / wedged rsync); a progressing transfer is never affected.
 # 0 disables. Default: 120.
 # source_sync_silence_timeout_secs = 120
+# Explicit rsync binary. Unset lets rch pick: the PATH rsync when it is
+# rsync 3.1+, else a Homebrew/MacPorts rsync 3.x, else the PATH binary in
+# openrsync/2.6.9-compatible mode. RCH_RSYNC_BIN overrides this.
+# rsync_bin = "/opt/homebrew/bin/rsync"
 # Patterns to exclude from transfer (replaces defaults if modified)
 exclude_patterns = [
 {exclude_lines}]

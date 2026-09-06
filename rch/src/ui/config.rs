@@ -468,6 +468,7 @@ mod tests {
                 sync_timeout_ms: None,
                 bwlimit_kbps: None,
                 estimated_bandwidth_bps: None,
+                rsync_bin: None,
                 adaptive_compression: true,
                 min_compression_level: 1,
                 max_compression_level: 9,

@@ -69,6 +69,7 @@ pub mod remote_compilation;
 #[cfg(unix)]
 pub mod remote_verification;
 pub mod repo_updater_contract;
+pub mod rsync_flavor;
 pub mod schema_versions;
 #[cfg(unix)]
 pub mod ssh;

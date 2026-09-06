@@ -143,6 +143,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 max_transfer_time_ms: config.transfer.max_transfer_time_ms,
                 bwlimit_kbps: config.transfer.bwlimit_kbps,
                 estimated_bandwidth_bps: config.transfer.estimated_bandwidth_bps,
+                rsync_bin: config.transfer.rsync_bin.clone(),
                 // Adaptive compression (bd-243w)
                 adaptive_compression: config.transfer.adaptive_compression,
                 min_compression_level: config.transfer.min_compression_level,

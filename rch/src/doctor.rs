@@ -16,6 +16,7 @@ use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::Result;
 use directories::ProjectDirs;
+use rch_common::rsync_flavor::{ResolvedRsync, RsyncFlavor, RsyncResolveError, resolve_rsync};
 use rch_common::{ApiResponse, ReliabilityReasonCode};
 use rch_telemetry::TelemetryStorage;
 use serde::{Deserialize, Serialize};
@@ -2835,7 +2836,20 @@ fn reliability_helper_compatibility_diagnostics() -> Vec<ReliabilityDiagnostic> 
     ]
     .into_iter()
     .map(|(cmd, description, missing_severity)| {
-        if which(cmd).is_ok() {
+        // rsync is resolved the way the transfer pipeline resolves it (issue
+        // #66): a modern binary in a well-known location beats a legacy PATH
+        // one, and the flavour is what decides the argv.
+        let rsync = (cmd == "rsync").then(|| {
+            let configured = crate::config::load_config()
+                .ok()
+                .and_then(|config| config.transfer.rsync_bin);
+            resolve_rsync(configured.as_deref())
+        });
+        let available = match &rsync {
+            Some(resolution) => resolution.is_ok(),
+            None => which(cmd).is_ok(),
+        };
+        if available {
             let mut diagnostic = ReliabilityDiagnostic::new(
                 ReliabilityCategory::HelperCompatibility,
                 cmd,
@@ -2843,8 +2857,12 @@ fn reliability_helper_compatibility_diagnostics() -> Vec<ReliabilityDiagnostic> 
                 format!("{cmd} is available for {description}"),
                 ReliabilityReasonCode::HelperAvailable,
             );
-            if let Some(version) = command_version(cmd) {
-                diagnostic = diagnostic.with_details(version);
+            let details = match &rsync {
+                Some(Ok(resolved)) => Some(resolved.describe()),
+                _ => command_version(cmd),
+            };
+            if let Some(details) = details {
+                diagnostic = diagnostic.with_details(details);
             }
             diagnostic
         } else {
@@ -3717,8 +3735,14 @@ fn check_prerequisites(
         println!();
     }
 
-    // Check rsync
-    let rsync_result = check_command_exists("rsync", "File synchronization");
+    // Check rsync (issue #66): presence is not enough — a stock macOS
+    // `/usr/bin/rsync` is openrsync, which rejects the rsync 3.x flags rch
+    // prefers. Resolve exactly the way the transfer pipeline does and gate on
+    // the probed flavour.
+    let configured_rsync_bin = crate::config::load_config()
+        .ok()
+        .and_then(|config| config.transfer.rsync_bin);
+    let rsync_result = classify_rsync_check(resolve_rsync(configured_rsync_bin.as_deref()));
     print_check_result(&rsync_result, ctx);
     checks.push(rsync_result);
 
@@ -3745,6 +3769,120 @@ fn check_prerequisites(
     if !ctx.is_json() {
         println!();
     }
+}
+
+/// Platform-specific way to get a modern (3.x) rsync.
+fn modern_rsync_install_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "brew install rsync (rch prefers /opt/homebrew/bin/rsync over the stock openrsync automatically)"
+    } else {
+        "install rsync 3.x with your package manager (e.g. apt install rsync)"
+    }
+}
+
+/// Turn an rsync resolution into the `prerequisites/rsync` doctor check.
+///
+/// - modern rsync (3.1+): pass, details name the binary and flavour;
+/// - openrsync / rsync 2.6.9: pass in compatibility mode, with the exact
+///   remedy as the hint (the compatibility argv works but loses zstd
+///   compression, cumulative progress, and the zero-build-output proof);
+/// - unrecognized `--version` banner: warning (rch assumes the 3.x argv);
+/// - older than 2.6.9, missing, misconfigured, or unable to run: fail.
+fn classify_rsync_check(resolution: Result<ResolvedRsync, RsyncResolveError>) -> CheckResult {
+    let result = |status: CheckStatus,
+                  message: String,
+                  details: Option<String>,
+                  suggestion: Option<String>| {
+        CheckResult {
+            category: "prerequisites".to_string(),
+            name: "rsync".to_string(),
+            status,
+            message,
+            details,
+            suggestion,
+            fixable: false,
+            fix_applied: false,
+            fix_message: None,
+        }
+    };
+    let resolved = match resolution {
+        Ok(resolved) => resolved,
+        Err(error @ RsyncResolveError::NotFound) => {
+            return result(
+                CheckStatus::Fail,
+                "File synchronization not found".to_string(),
+                Some(error.to_string()),
+                Some(format!("Install rsync: {}", modern_rsync_install_hint())),
+            );
+        }
+        Err(error @ RsyncResolveError::OverrideMissing { origin, .. }) => {
+            return result(
+                CheckStatus::Fail,
+                "configured rsync binary is not executable".to_string(),
+                Some(error.to_string()),
+                Some(format!(
+                    "Fix or unset {origin} so rch can pick a binary; to get a modern rsync: {}",
+                    modern_rsync_install_hint()
+                )),
+            );
+        }
+        Err(error @ RsyncResolveError::ProbeFailed { .. }) => {
+            return result(
+                CheckStatus::Fail,
+                "rsync is present but `rsync --version` failed".to_string(),
+                Some(error.to_string()),
+                Some(format!("Reinstall rsync: {}", modern_rsync_install_hint())),
+            );
+        }
+    };
+
+    let flavor = resolved.flavor;
+    let capabilities = resolved.capabilities();
+    let details = if resolved.version_line.is_empty() {
+        resolved.describe()
+    } else {
+        format!("{} — {}", resolved.describe(), resolved.version_line)
+    };
+    if flavor == RsyncFlavor::Unknown {
+        return result(
+            CheckStatus::Warning,
+            "rsync flavour could not be determined from `rsync --version`".to_string(),
+            Some(details),
+            Some(format!(
+                "rch will use the rsync 3.x argv; if transfers fail with `unrecognized option`, \
+                 set [transfer] rsync_bin (or RCH_RSYNC_BIN) to a modern rsync: {}",
+                modern_rsync_install_hint()
+            )),
+        );
+    }
+    if !flavor.is_supported() {
+        let (major, minor, patch) = rch_common::rsync_flavor::MIN_SUPPORTED_RSYNC;
+        return result(
+            CheckStatus::Fail,
+            format!("{flavor} is too old (rch needs rsync {major}.{minor}.{patch} or newer)"),
+            Some(details),
+            Some(format!("Upgrade rsync: {}", modern_rsync_install_hint())),
+        );
+    }
+    if capabilities.is_compatibility_mode() {
+        return result(
+            CheckStatus::Pass,
+            format!("File synchronization is installed ({flavor}, compatibility mode)"),
+            Some(details),
+            Some(format!(
+                "{flavor} rejects `--info=*`, `--compress-choice=zstd` and `--append-verify`; rch \
+                 drives it with `--progress --stats -vv` and zlib compression, and the \
+                 zero-build-output detector fails open. For zstd transfers and full diagnostics: {}",
+                modern_rsync_install_hint()
+            )),
+        );
+    }
+    result(
+        CheckStatus::Pass,
+        "File synchronization is installed".to_string(),
+        Some(details),
+        None,
+    )
 }
 
 fn check_command_exists(cmd: &str, description: &str) -> CheckResult {
@@ -7369,6 +7507,154 @@ mod tests {
     // =========================================================================
     // DoctorResponse Structure Tests
     // =========================================================================
+
+    // =========================================================================
+    // rsync prerequisite classification (issue #66)
+    // =========================================================================
+
+    fn resolved_rsync_fixture(flavor: RsyncFlavor, path: &str) -> ResolvedRsync {
+        ResolvedRsync {
+            path: PathBuf::from(path),
+            flavor,
+            version_line: "banner".to_string(),
+            source: rch_common::rsync_flavor::RsyncSource::Path,
+            shadowed: None,
+        }
+    }
+
+    #[test]
+    fn rsync_check_passes_cleanly_on_modern_rsync() {
+        let check = classify_rsync_check(Ok(resolved_rsync_fixture(
+            RsyncFlavor::Rsync {
+                major: 3,
+                minor: 4,
+                patch: 1,
+            },
+            "/opt/homebrew/bin/rsync",
+        )));
+        assert_eq!(check.category, "prerequisites");
+        assert_eq!(check.name, "rsync");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(check.suggestion.is_none(), "{:?}", check.suggestion);
+        let details = check.details.expect("details");
+        assert!(details.contains("rsync 3.4.1"), "{details}");
+        assert!(details.contains("/opt/homebrew/bin/rsync"), "{details}");
+        assert!(!check.fixable);
+    }
+
+    #[test]
+    fn rsync_check_reports_shadowed_path_binary() {
+        let mut resolved = resolved_rsync_fixture(
+            RsyncFlavor::Rsync {
+                major: 3,
+                minor: 4,
+                patch: 1,
+            },
+            "/opt/homebrew/bin/rsync",
+        );
+        resolved.source = rch_common::rsync_flavor::RsyncSource::PreferredLocation;
+        resolved.shadowed = Some(rch_common::rsync_flavor::ShadowedRsync {
+            path: PathBuf::from("/usr/bin/rsync"),
+            flavor: RsyncFlavor::OpenRsync { protocol: Some(29) },
+        });
+        let check = classify_rsync_check(Ok(resolved));
+        assert_eq!(check.status, CheckStatus::Pass);
+        let details = check.details.expect("details");
+        assert!(
+            details.contains("PATH rsync is openrsync (protocol 29) at /usr/bin/rsync"),
+            "{details}"
+        );
+    }
+
+    #[test]
+    fn rsync_check_passes_openrsync_in_compatibility_mode_with_remedy() {
+        let check = classify_rsync_check(Ok(resolved_rsync_fixture(
+            RsyncFlavor::OpenRsync { protocol: Some(29) },
+            "/usr/bin/rsync",
+        )));
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(
+            check.message.contains("compatibility mode"),
+            "{}",
+            check.message
+        );
+        assert!(
+            check.message.contains("openrsync (protocol 29)"),
+            "{}",
+            check.message
+        );
+        let suggestion = check.suggestion.expect("remedy hint");
+        assert!(
+            suggestion.contains("--progress --stats -vv"),
+            "{suggestion}"
+        );
+        assert!(suggestion.contains("install"), "{suggestion}");
+        if cfg!(target_os = "macos") {
+            assert!(suggestion.contains("brew install rsync"), "{suggestion}");
+        }
+    }
+
+    #[test]
+    fn rsync_check_warns_on_unrecognized_banner() {
+        let check = classify_rsync_check(Ok(resolved_rsync_fixture(
+            RsyncFlavor::Unknown,
+            "/usr/local/bin/rsync",
+        )));
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert!(
+            check.message.contains("could not be determined"),
+            "{}",
+            check.message
+        );
+        let suggestion = check.suggestion.expect("hint");
+        assert!(suggestion.contains("rsync_bin"), "{suggestion}");
+    }
+
+    #[test]
+    fn rsync_check_fails_on_too_old_rsync() {
+        let check = classify_rsync_check(Ok(resolved_rsync_fixture(
+            RsyncFlavor::Rsync {
+                major: 2,
+                minor: 5,
+                patch: 7,
+            },
+            "/usr/bin/rsync",
+        )));
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("too old"), "{}", check.message);
+        assert!(check.message.contains("2.6.9"), "{}", check.message);
+    }
+
+    #[test]
+    fn rsync_check_fails_when_missing_or_misconfigured() {
+        let missing = classify_rsync_check(Err(RsyncResolveError::NotFound));
+        assert_eq!(missing.status, CheckStatus::Fail);
+        assert_eq!(missing.message, "File synchronization not found");
+        assert!(missing.suggestion.expect("hint").contains("Install rsync"));
+
+        let bad_override = classify_rsync_check(Err(RsyncResolveError::OverrideMissing {
+            origin: rch_common::rsync_flavor::RsyncSource::Config,
+            path: PathBuf::from("/nonexistent/rsync"),
+        }));
+        assert_eq!(bad_override.status, CheckStatus::Fail);
+        assert!(
+            bad_override.message.contains("configured rsync"),
+            "{}",
+            bad_override.message
+        );
+        let hint = bad_override.suggestion.expect("hint");
+        assert!(hint.contains("[transfer] rsync_bin"), "{hint}");
+        let details = bad_override.details.expect("details");
+        assert!(details.contains("/nonexistent/rsync"), "{details}");
+
+        let broken = classify_rsync_check(Err(RsyncResolveError::ProbeFailed {
+            path: PathBuf::from("/usr/bin/rsync"),
+            reason: "timed out after 5s".to_string(),
+        }));
+        assert_eq!(broken.status, CheckStatus::Fail);
+        assert!(broken.message.contains("--version"), "{}", broken.message);
+        assert!(broken.details.expect("details").contains("timed out"));
+    }
 
     #[test]
     fn test_doctor_response_serialization() {

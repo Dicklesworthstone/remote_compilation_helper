@@ -447,7 +447,12 @@ fn parse_details(details: &str) -> Option<(Option<u32>, Option<u32>)> {
 
     for part in cleaned.split(',') {
         let part = part.trim();
-        if let Some(rest) = part.strip_prefix("to-chk=") {
+        // `to-chk=` is rsync 3.1+ (`--info=progress2`); `to-check=` is the
+        // pre-3.1 / openrsync `--progress` spelling (issue #66).
+        if let Some(rest) = part
+            .strip_prefix("to-chk=")
+            .or_else(|| part.strip_prefix("to-check="))
+        {
             let mut iter = rest.split('/');
             let remaining = iter.next()?.trim().parse::<u32>().ok()?;
             let total = iter.next()?.trim().parse::<u32>().ok()?;
@@ -678,6 +683,18 @@ mod tests {
         assert_eq!(sample.percent, Some(12));
         assert_eq!(sample.files_total, Some(20));
         assert_eq!(sample.files_done, Some(10));
+    }
+
+    #[test]
+    fn parse_progress_line_openrsync_per_file_shape() {
+        // Captured from stock macOS openrsync `--progress` (issue #66): the
+        // pre-3.1 spelling uses `xfer#` / `to-check=` and an `HH:MM:SS` ETA.
+        let line = "11 100% 381.83KB/s 00:00:00 (xfer#1, to-check=1/4)";
+        let sample = parse_progress_line(line).expect("parse");
+        assert_eq!(sample.bytes, 11);
+        assert_eq!(sample.percent, Some(100));
+        assert_eq!(sample.files_total, Some(4));
+        assert_eq!(sample.files_done, Some(3));
     }
 
     #[test]

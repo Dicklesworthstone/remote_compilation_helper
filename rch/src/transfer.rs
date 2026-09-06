@@ -7,6 +7,7 @@ use crate::error::TransferError;
 use anyhow::{Context, Result};
 use glob::Pattern;
 use rch_common::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
+use rch_common::rsync_flavor::{ResolvedRsync, RsyncCapabilities, RsyncFlavor, RsyncSource};
 use rch_common::ssh_utils::{
     EnvPrefix, is_retryable_transport_error, is_retryable_transport_error_text, is_valid_env_key,
     shell_escape_value,
@@ -1352,6 +1353,10 @@ pub struct TransferPipeline {
     /// `[remediation.pooled_target] reaper_pooled_idle_hours` so every
     /// surface reports the same lifetime (issue #53).
     pooled_target_prune_idle_hours: u32,
+    /// Pinned rsync binary + flavour (issue #66). `None` resolves lazily via
+    /// [`rch_common::rsync_flavor::resolve_rsync_cached`] using
+    /// `transfer_config.rsync_bin`; tests pin a flavour to assert argv.
+    rsync_override: Option<ResolvedRsync>,
 }
 
 /// Validate a project hash for safe use in file paths.
@@ -1455,7 +1460,73 @@ impl TransferPipeline {
             worker_platform: WorkerPlatform::Posix,
             pooled_target_prune_idle_hours:
                 rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
+            rsync_override: None,
         }
+    }
+
+    /// Pin the rsync binary and flavour instead of probing (issue #66).
+    #[must_use]
+    #[allow(dead_code)] // Argv tests pin flavours; embedders may pin a binary.
+    pub fn with_rsync(mut self, resolved: ResolvedRsync) -> Self {
+        self.rsync_override = Some(resolved);
+        self
+    }
+
+    /// The rsync binary this pipeline execs, with its probed flavour.
+    ///
+    /// Resolution failures are not fatal here: the builders must still hand
+    /// back a `Command`, so a missing binary degrades to a bare `rsync` (or
+    /// the configured override) with the modern argv, and the spawn error
+    /// names the program. `rch doctor` reports the same failure with the
+    /// exact remedy.
+    fn resolved_rsync(&self) -> ResolvedRsync {
+        if let Some(resolved) = &self.rsync_override {
+            return resolved.clone();
+        }
+        let configured = self.transfer_config.rsync_bin.as_deref();
+        match rch_common::rsync_flavor::resolve_rsync_cached(configured) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                warn!(
+                    "rsync resolution failed ({error}); falling back to PATH rsync with the \
+                     rsync 3.x argv — run `rch doctor` for the remedy"
+                );
+                ResolvedRsync {
+                    path: PathBuf::from(configured.unwrap_or("rsync")),
+                    flavor: RsyncFlavor::Unknown,
+                    version_line: String::new(),
+                    source: if configured.is_some() {
+                        RsyncSource::Config
+                    } else {
+                        RsyncSource::Path
+                    },
+                    shadowed: None,
+                }
+            }
+        }
+    }
+
+    /// A `Command` for the resolved rsync binary (C locale for stable output
+    /// parsing) plus the argv capabilities the caller must honour.
+    fn rsync_command(&self) -> (Command, RsyncCapabilities) {
+        let resolved = self.resolved_rsync();
+        let capabilities = resolved.capabilities();
+        if capabilities.is_compatibility_mode() {
+            debug!(
+                rsync = %resolved.describe(),
+                "driving rsync with the openrsync/2.6.9-compatible argv (issue #66)"
+            );
+        }
+        let mut cmd = Command::new(&resolved.path);
+        // Force C locale for consistent output parsing
+        cmd.env("LC_ALL", "C");
+        (cmd, capabilities)
+    }
+
+    /// Append `--compress-choice=zstd --compress-level=N` (or the legacy
+    /// zlib-capped `--compress-level`) for the transfer's compression level.
+    fn append_compression_args(&self, cmd: &mut Command, capabilities: &RsyncCapabilities) {
+        cmd.args(capabilities.compression_args(self.compression_level_for_transfer()));
     }
 
     /// Set the idle retention (hours) after which the transfer-start janitor
@@ -2082,9 +2153,10 @@ impl TransferPipeline {
             "rch-source-content-enumeration-{}",
             uuid::Uuid::new_v4()
         ));
-        let mut cmd = Command::new("rsync");
-        cmd.env("LC_ALL", "C");
-        cmd.arg("-arni").arg("--out-format=%i\t%n").arg("--no-motd");
+        let (mut cmd, capabilities) = self.rsync_command();
+        cmd.arg("-arni")
+            .arg("--out-format=%i\t%n")
+            .args(capabilities.no_motd_args());
         add_portable_rsync_archive_args(&mut cmd);
         self.append_sync_filter_args(&mut cmd, &effective_excludes);
         cmd.arg(format!("{}/", self.project_root.display()))
@@ -2170,13 +2242,12 @@ impl TransferPipeline {
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
         let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
 
-        let mut cmd = Command::new("rsync");
-        cmd.env("LC_ALL", "C");
+        let (mut cmd, capabilities) = self.rsync_command();
         cmd.arg("-azn")
             .arg("--checksum")
             .arg("--itemize-changes")
             .arg("--out-format=%i\t%n")
-            .arg("--no-motd")
+            .args(capabilities.no_motd_args())
             .arg("-e")
             .arg(ssh_command)
             .arg("--rsync-path")
@@ -2697,8 +2768,7 @@ fi",
         let effective_excludes = self.get_effective_excludes();
         let start = std::time::Instant::now();
 
-        let mut cmd = Command::new("rsync");
-        cmd.env("LC_ALL", "C");
+        let (mut cmd, _capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
@@ -2827,9 +2897,7 @@ fi",
         escaped_remote_path: &str,
         effective_excludes: &[String],
     ) -> Command {
-        let mut cmd = Command::new("rsync");
-        // Force C locale for consistent output parsing
-        cmd.env("LC_ALL", "C");
+        let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
@@ -2866,12 +2934,9 @@ fi",
 
         self.append_sync_filter_args(&mut cmd, effective_excludes);
 
-        // Add zstd compression if available (rsync 3.2.3+)
-        let compression_level = self.compression_level_for_transfer();
-        if compression_level > 0 {
-            cmd.arg("--compress-choice=zstd");
-            cmd.arg(format!("--compress-level={}", compression_level));
-        }
+        // zstd compression where the binary supports it (rsync 3.2+); zlib
+        // via `-z` otherwise (issue #66).
+        self.append_compression_args(&mut cmd, &capabilities);
 
         // Add bandwidth limit if configured (bd-3hho)
         if let Some(bwlimit) = self.transfer_config.bwlimit_kbps
@@ -2896,9 +2961,7 @@ fi",
         escaped_remote_path: &str,
         effective_excludes: &[String],
     ) -> Command {
-        let mut cmd = Command::new("rsync");
-        // Force C locale for consistent output parsing
-        cmd.env("LC_ALL", "C");
+        let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
@@ -2906,10 +2969,12 @@ fi",
 
         cmd.arg("-az"); // Archive mode + compression
         add_portable_rsync_archive_args(&mut cmd);
+        // `--info=progress2 --info=stats2` on rsync 3.1+; `--progress --stats`
+        // on openrsync / 2.6.9, which reject every `--info=` value (issue #66).
         cmd.arg("--partial")
             .arg("--partial-dir=.rch-partial")
-            .arg("--info=progress2")
-            .arg("--info=stats2")
+            .args(capabilities.progress_args())
+            .args(capabilities.stats_args())
             .arg("-e")
             .arg(ssh_command);
 
@@ -2935,12 +3000,9 @@ fi",
 
         self.append_sync_filter_args(&mut cmd, effective_excludes);
 
-        // Add zstd compression if available (rsync 3.2.3+)
-        let compression_level = self.compression_level_for_transfer();
-        if compression_level > 0 {
-            cmd.arg("--compress-choice=zstd");
-            cmd.arg(format!("--compress-level={}", compression_level));
-        }
+        // zstd compression where the binary supports it (rsync 3.2+); zlib
+        // via `-z` otherwise (issue #66).
+        self.append_compression_args(&mut cmd, &capabilities);
 
         // Add bandwidth limit if configured (bd-3hho)
         if let Some(bwlimit) = self.transfer_config.bwlimit_kbps
@@ -3045,6 +3107,9 @@ fi",
             path = escaped_remote_path,
             archive = escaped_remote_archive
         );
+        let resolved_rsync = self.resolved_rsync();
+        let rsync_path = resolved_rsync.path.clone();
+        let resume_args = resolved_rsync.capabilities().resume_args();
         let start = std::time::Instant::now();
         let (((), attempts), duration_ms) = {
             let result = run_source_transfer_attempts(
@@ -3057,14 +3122,18 @@ fi",
                     let extraction_script = extraction_script.clone();
                     let archive_path = archive_path.clone();
                     let escaped_remote_path = escaped_remote_path.clone();
+                    let rsync_path = rsync_path.clone();
                     async move {
-                        let mut rsync = Command::new("rsync");
+                        let mut rsync = Command::new(&rsync_path);
                         rsync
+                            .env("LC_ALL", "C")
                             .arg("-a")
                             .arg("--no-owner")
                             .arg("--no-group")
-                            .arg("--partial")
-                            .arg("--append-verify")
+                            // `--partial --append-verify` on rsync 3.x; bare
+                            // `--partial` (delta-resumed) on openrsync/2.6.9,
+                            // which rejects `--append-verify` (issue #66).
+                            .args(resume_args)
                             .arg("-e")
                             .arg(ssh_command)
                             .arg("--rsync-path")
@@ -4013,9 +4082,7 @@ fi",
         escaped_remote_path: &str,
         artifact_patterns: &[String],
     ) -> Command {
-        let mut cmd = Command::new("rsync");
-        // Force C locale for consistent output parsing
-        cmd.env("LC_ALL", "C");
+        let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
@@ -4031,22 +4098,19 @@ fi",
         // matched only non-output files left the local artifacts stale. name2
         // (the modern form of -vv's unchanged-file listing) is what surfaces the
         // `.f` lines; without it an up-to-date no-op rebuild would look
-        // indistinguishable from a zero-output miss.
+        // indistinguishable from a zero-output miss. On openrsync / rsync 2.6.9
+        // the `-vv` spelling is used instead (issue #66).
         cmd.arg("-az");
         add_portable_rsync_archive_args(&mut cmd);
         cmd.arg("--stats")
-            .arg("--info=name2")
+            .args(capabilities.name_listing_args())
             .arg("--out-format=%i %n")
             .arg("--safe-links")
             .arg("-e")
             .arg(ssh_command);
 
-        // Add zstd compression
-        let compression_level = self.compression_level_for_transfer();
-        if compression_level > 0 {
-            cmd.arg("--compress-choice=zstd");
-            cmd.arg(format!("--compress-level={}", compression_level));
-        }
+        // Add zstd compression (zlib on a legacy binary; issue #66)
+        self.append_compression_args(&mut cmd, &capabilities);
 
         // Add bandwidth limit if configured (bd-3hho)
         if let Some(bwlimit) = self.transfer_config.bwlimit_kbps
@@ -4119,9 +4183,7 @@ fi",
         escaped_remote_path: &str,
         artifact_patterns: &[String],
     ) -> Command {
-        let mut cmd = Command::new("rsync");
-        // Force C locale for consistent output parsing
-        cmd.env("LC_ALL", "C");
+        let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
@@ -4130,22 +4192,20 @@ fi",
 
         cmd.arg("-az");
         add_portable_rsync_archive_args(&mut cmd);
-        cmd.arg("--info=progress2")
-            .arg("--info=stats2")
+        // Flavour-specific spellings of progress / stats / per-file listing
+        // (issue #66); see RsyncCapabilities for the mapping.
+        cmd.args(capabilities.progress_args())
+            .args(capabilities.stats_args())
             // name2 + itemized out-format feed the zero-build-output detector
             // (bd-mpbav); see build_retrieve_command for the rationale.
-            .arg("--info=name2")
+            .args(capabilities.name_listing_args())
             .arg("--out-format=%i %n")
             .arg("--safe-links")
             .arg("-e")
             .arg(ssh_command);
 
-        // Add zstd compression
-        let compression_level = self.compression_level_for_transfer();
-        if compression_level > 0 {
-            cmd.arg("--compress-choice=zstd");
-            cmd.arg(format!("--compress-level={}", compression_level));
-        }
+        // Add zstd compression (zlib on a legacy binary; issue #66)
+        self.append_compression_args(&mut cmd, &capabilities);
 
         // Add bandwidth limit if configured (bd-3hho)
         if let Some(bwlimit) = self.transfer_config.bwlimit_kbps
@@ -4409,9 +4469,7 @@ fi",
         escaped_remote_path: &str,
         rel: &Path,
     ) -> Command {
-        let mut cmd = Command::new("rsync");
-        // Force C locale for consistent output parsing.
-        cmd.env("LC_ALL", "C");
+        let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
@@ -4426,11 +4484,7 @@ fi",
             .arg("-e")
             .arg(ssh_command);
 
-        let compression_level = self.compression_level_for_transfer();
-        if compression_level > 0 {
-            cmd.arg("--compress-choice=zstd");
-            cmd.arg(format!("--compress-level={}", compression_level));
-        }
+        self.append_compression_args(&mut cmd, &capabilities);
         if let Some(bwlimit) = self.transfer_config.bwlimit_kbps
             && bwlimit > 0
         {
@@ -5163,7 +5217,10 @@ where
 {
     let start = TokioInstant::now();
     cmd.kill_on_drop(true);
-    let mut child = cmd.spawn().context("Failed to execute rsync")?;
+    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("Failed to execute rsync ({program})"))?;
 
     let stdout = child.stdout.take().context("Failed to capture stdout")?;
     let stderr = child.stderr.take().context("Failed to capture stderr")?;
@@ -7174,6 +7231,283 @@ Number of files transferred: 42
                 .any(|window| window == ["--include", "/build/**"]),
             "streaming retrieval should include the anchored form of requested artifact patterns (RCH bug d7xc3)"
         );
+    }
+
+    // =========================================================================
+    // rsync flavour argv (issue #66)
+    // =========================================================================
+
+    fn pinned_rsync(flavor: RsyncFlavor) -> ResolvedRsync {
+        ResolvedRsync {
+            path: PathBuf::from("/pinned/rsync"),
+            flavor,
+            version_line: String::new(),
+            source: RsyncSource::Config,
+            shadowed: None,
+        }
+    }
+
+    fn flavour_test_pipeline(flavor: RsyncFlavor, compression_level: u32) -> TransferPipeline {
+        TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "flavour-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig {
+                compression_level,
+                ..TransferConfig::default()
+            },
+        )
+        .with_rsync(pinned_rsync(flavor))
+    }
+
+    fn flavour_test_worker() -> WorkerConfig {
+        WorkerConfig {
+            id: WorkerId::new("flavour-worker"),
+            host: "worker.example".to_string(),
+            user: "ubuntu".to_string(),
+            identity_file: "~/.ssh/id_ed25519".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        }
+    }
+
+    /// Every rsync argv the pipeline builds for a flavour, keyed by builder.
+    fn flavour_argvs(
+        flavor: RsyncFlavor,
+        compression_level: u32,
+    ) -> Vec<(&'static str, Vec<String>)> {
+        let pipeline = flavour_test_pipeline(flavor, compression_level);
+        let worker = flavour_test_worker();
+        let remote = "/data/tmp/rch/flavour-project/abc123";
+        let destination = format!("ubuntu@worker.example:{remote}");
+        let patterns = vec!["target/release/**".to_string()];
+        let sync = pipeline.build_sync_command(&worker, &destination, remote, &[]);
+        let sync_streaming =
+            pipeline.build_sync_streaming_command(&worker, &destination, remote, &[]);
+        let retrieve = pipeline.build_retrieve_command(&worker, remote, &patterns);
+        let retrieve_streaming =
+            pipeline.build_retrieve_streaming_command(&worker, remote, &patterns);
+        let result_dir =
+            pipeline.build_result_dir_retrieve_command(&worker, remote, Path::new("out"));
+        for cmd in [
+            &sync,
+            &sync_streaming,
+            &retrieve,
+            &retrieve_streaming,
+            &result_dir,
+        ] {
+            assert_eq!(
+                cmd.as_std().get_program(),
+                "/pinned/rsync",
+                "builders must exec the resolved binary, not a bare `rsync`"
+            );
+            assert_eq!(
+                cmd.as_std().get_envs().find(|(key, _)| *key == "LC_ALL"),
+                Some((
+                    std::ffi::OsStr::new("LC_ALL"),
+                    Some(std::ffi::OsStr::new("C"))
+                )),
+                "rsync output parsing relies on the C locale"
+            );
+        }
+        vec![
+            ("sync", command_args(&sync)),
+            ("sync_streaming", command_args(&sync_streaming)),
+            ("retrieve", command_args(&retrieve)),
+            ("retrieve_streaming", command_args(&retrieve_streaming)),
+            ("result_dir", command_args(&result_dir)),
+        ]
+    }
+
+    fn assert_has(args: &[String], flag: &str, builder: &str) {
+        assert!(
+            args.iter().any(|arg| arg == flag),
+            "{builder}: expected {flag:?} in {args:?}"
+        );
+    }
+
+    fn assert_lacks(args: &[String], flag: &str, builder: &str) {
+        assert!(
+            !args.iter().any(|arg| arg == flag),
+            "{builder}: {flag:?} must not be passed, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_rsync_argv_modern_flavour_uses_info_flags_and_zstd() {
+        let _guard = test_guard!();
+        let modern = RsyncFlavor::Rsync {
+            major: 3,
+            minor: 4,
+            patch: 1,
+        };
+        for (builder, args) in flavour_argvs(modern, 7) {
+            assert_has(&args, "--compress-choice=zstd", builder);
+            assert_has(&args, "--compress-level=7", builder);
+            assert_lacks(&args, "--progress", builder);
+            assert_lacks(&args, "-vv", builder);
+            match builder {
+                "sync" | "result_dir" => {
+                    assert_has(&args, "--stats", builder);
+                    assert_lacks(&args, "--info=progress2", builder);
+                }
+                "sync_streaming" => {
+                    assert_has(&args, "--info=progress2", builder);
+                    assert_has(&args, "--info=stats2", builder);
+                    assert_lacks(&args, "--stats", builder);
+                }
+                "retrieve" => {
+                    assert_has(&args, "--stats", builder);
+                    assert_has(&args, "--info=name2", builder);
+                    assert_has(&args, "--out-format=%i %n", builder);
+                }
+                "retrieve_streaming" => {
+                    assert_has(&args, "--info=progress2", builder);
+                    assert_has(&args, "--info=stats2", builder);
+                    assert_has(&args, "--info=name2", builder);
+                    assert_has(&args, "--out-format=%i %n", builder);
+                }
+                other => panic!("unexpected builder {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_rsync_argv_openrsync_flavour_uses_compatible_flags() {
+        let _guard = test_guard!();
+        let openrsync = RsyncFlavor::OpenRsync { protocol: Some(29) };
+        for (builder, args) in flavour_argvs(openrsync, 7) {
+            // openrsync rejects every `--info=` value and `--compress-choice`.
+            assert!(
+                !args.iter().any(|arg| arg.starts_with("--info=")),
+                "{builder}: openrsync rejects --info=*, got {args:?}"
+            );
+            assert_lacks(&args, "--compress-choice=zstd", builder);
+            assert_has(&args, "--compress-level=7", builder);
+            // `-z` (inside `-az`) still compresses, with zlib.
+            assert_has(&args, "-az", builder);
+            assert_has(&args, "--stats", builder);
+            match builder {
+                "sync" | "result_dir" => {
+                    assert_lacks(&args, "--progress", builder);
+                    assert_lacks(&args, "-vv", builder);
+                }
+                "sync_streaming" => {
+                    assert_has(&args, "--progress", builder);
+                    assert_lacks(&args, "-vv", builder);
+                }
+                "retrieve" => {
+                    assert_has(&args, "-vv", builder);
+                    assert_has(&args, "--out-format=%i %n", builder);
+                    assert_lacks(&args, "--progress", builder);
+                }
+                "retrieve_streaming" => {
+                    assert_has(&args, "--progress", builder);
+                    assert_has(&args, "-vv", builder);
+                    assert_has(&args, "--out-format=%i %n", builder);
+                }
+                other => panic!("unexpected builder {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_rsync_argv_legacy_flavour_clamps_compression_to_zlib_range() {
+        let _guard = test_guard!();
+        let apple_2_6_9 = RsyncFlavor::Rsync {
+            major: 2,
+            minor: 6,
+            patch: 9,
+        };
+        for (builder, args) in flavour_argvs(apple_2_6_9, 19) {
+            assert_lacks(&args, "--compress-choice=zstd", builder);
+            assert_lacks(&args, "--compress-level=19", builder);
+            assert_has(&args, "--compress-level=9", builder);
+        }
+        // A modern binary keeps the zstd level untouched.
+        let modern = RsyncFlavor::Rsync {
+            major: 3,
+            minor: 2,
+            patch: 7,
+        };
+        for (builder, args) in flavour_argvs(modern, 19) {
+            assert_has(&args, "--compress-level=19", builder);
+        }
+    }
+
+    #[test]
+    fn test_rsync_argv_unknown_flavour_keeps_modern_argv() {
+        let _guard = test_guard!();
+        // Pre-#66 behaviour for a banner rch cannot classify: nothing changes.
+        for (builder, args) in flavour_argvs(RsyncFlavor::Unknown, 3) {
+            assert_has(&args, "--compress-choice=zstd", builder);
+            if builder == "sync_streaming" || builder == "retrieve_streaming" {
+                assert_has(&args, "--info=progress2", builder);
+            }
+        }
+    }
+
+    #[test]
+    fn test_rsync_argv_zero_compression_level_emits_no_compression_flags() {
+        let _guard = test_guard!();
+        for flavor in [
+            RsyncFlavor::Rsync {
+                major: 3,
+                minor: 4,
+                patch: 1,
+            },
+            RsyncFlavor::OpenRsync { protocol: None },
+        ] {
+            for (builder, args) in flavour_argvs(flavor, 0) {
+                assert!(
+                    !args.iter().any(|arg| arg.starts_with("--compress-")),
+                    "{builder}: level 0 must add no compression flags, got {args:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_openrsync_output_feeds_existing_parsers() {
+        // Captured from a real openrsync `--stats -vv --out-format='%i %n'`
+        // retrieval over ssh (issue #66). The up-to-date `.f` line and the
+        // pre-3.1 `Number of files transferred:` spelling must keep the
+        // byte/file parsers and the zero-output manifest working; the
+        // `(reg: N, ...)` breakdown is absent, so the completeness cross-check
+        // yields `None` and the detector fails open.
+        let output = concat!(
+            "opening connection using: ssh worker rsync --server --sender -vv . /r/\n",
+            "Delta transmission enabled for this transfer\n",
+            "[sender] showing directory target because of pattern */\n",
+            "[sender] showing file target/debug/mybin because of pattern /target/debug/**\n",
+            "Transfer starting: 4 files\n",
+            ".d        ./\n",
+            ".d        target/\n",
+            "cd+++++++ target/debug/\n",
+            ">f+++++++ target/debug/mybin\n",
+            ".f        target/debug/other\n",
+            "total: matches=0  hash_hits=0  false_alarms=0 data=0\n",
+            "\n",
+            "sent 77 bytes  received 565 bytes  6420000 bytes/sec\n",
+            "total size is 8  speedup is 0.01\n",
+            "Number of files: 4\n",
+            "Number of files transferred: 1\n",
+            "Total file size: 8 B\n",
+            "Total transferred file size: 8 B\n",
+            "Total sent: 81 B\n",
+            "Total received: 148 B\n",
+        );
+        assert_eq!(parse_rsync_bytes(output), 77);
+        assert_eq!(parse_rsync_files(output), 1);
+        assert_eq!(
+            parse_rsync_itemized_regular_files(output),
+            vec![
+                "target/debug/mybin".to_string(),
+                "target/debug/other".to_string()
+            ]
+        );
+        assert_eq!(parse_rsync_matched_regular_files(output), None);
     }
 
     #[test]
