@@ -7,6 +7,10 @@ Get remote compilation working in 5 minutes.
 - macOS or Linux workstation
 - SSH access to a build server (cloud VM, powerful desktop, etc.)
 - Rust toolchain installed on both machines
+- `rsync` on both machines — rsync 3.2+ recommended. Stock macOS ships
+  *openrsync* (or rsync 2.6.9), which RCH drives in a slower compatibility
+  mode; `brew install rsync` and RCH picks it up automatically (see
+  `rch doctor`).
 - Claude Code or another supported AI coding agent
 
 Need help setting up SSH? See the [SSH setup guide](./guides/ssh-setup.md).

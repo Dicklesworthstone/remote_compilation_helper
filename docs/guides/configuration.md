@@ -78,6 +78,15 @@ Sections and fields:
   counts as forward progress. On a stall, the hook releases the worker's
   reservation and retries the build on another admissible worker. `0` disables
   silence detection.
+- `rsync_bin` (string, optional) — Explicit rsync binary for every local
+  transfer. Unset (the default) lets RCH resolve one: the `PATH` rsync when it
+  is rsync 3.1 or newer, otherwise a modern rsync from
+  `/opt/homebrew/bin`, `/usr/local/bin`, or `/opt/local/bin`, otherwise the
+  `PATH` binary driven with an openrsync/rsync 2.6.9-compatible flag set (no
+  `--info=*`, zlib instead of zstd, no `--append-verify`; the zero-build-output
+  detector fails open). `~` is expanded and a bare name is looked up on `PATH`.
+  The `RCH_RSYNC_BIN` environment variable overrides this setting. `rch doctor`
+  shows the resolved binary and flavour.
 
 ### `[circuit]`
 - `failure_threshold` (u32, default `3`) — Consecutive failures to open.

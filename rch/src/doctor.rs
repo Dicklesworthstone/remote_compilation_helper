@@ -3865,14 +3865,29 @@ fn classify_rsync_check(resolution: Result<ResolvedRsync, RsyncResolveError>) ->
         );
     }
     if capabilities.is_compatibility_mode() {
+        // Name exactly the flags this binary lacks (rsync 3.0.x keeps
+        // `--append-verify`; openrsync and 2.6.9 lose everything).
+        let mut rejected = vec!["`--info=*`"];
+        if !capabilities.compress_choice {
+            rejected.push("`--compress-choice=zstd`");
+        }
+        if !capabilities.append_verify {
+            rejected.push("`--append-verify`");
+        }
+        let compression = if capabilities.compress_choice {
+            "zstd compression"
+        } else {
+            "zlib compression"
+        };
         return result(
             CheckStatus::Pass,
             format!("File synchronization is installed ({flavor}, compatibility mode)"),
             Some(details),
             Some(format!(
-                "{flavor} rejects `--info=*`, `--compress-choice=zstd` and `--append-verify`; rch \
-                 drives it with `--progress --stats -vv` and zlib compression, and the \
-                 zero-build-output detector fails open. For zstd transfers and full diagnostics: {}",
+                "{flavor} rejects {}; rch drives it with `--progress --stats -vv` and {compression}, \
+                 and the zero-build-output detector fails open. For full-speed transfers and \
+                 diagnostics: {}",
+                rejected.join(", "),
                 modern_rsync_install_hint()
             )),
         );

@@ -153,6 +153,28 @@ All dependencies — including the FrankenTUI (`ftui-*`), `rich_rust`, and TOON
 builds on any machine with no special directory layout or pre-cloned
 dependency tree required.
 
+### rsync Requirement (macOS note)
+
+RCH moves source and artifacts with `rsync` over SSH and works best with
+**rsync 3.2 or newer** (`--info=progress2` progress, zstd compression,
+`--append-verify` resumes). On Linux the distro rsync qualifies.
+
+On **macOS**, the stock `/usr/bin/rsync` is *openrsync* (macOS 15+) or Apple's
+rsync 2.6.9 (older releases); neither accepts rsync 3.x flags. RCH handles this
+automatically: it probes `rsync --version`, prefers a Homebrew/MacPorts rsync
+(`/opt/homebrew/bin/rsync`, `/usr/local/bin/rsync`, `/opt/local/bin/rsync`)
+even when it is not first on `PATH`, and otherwise drives the stock binary with
+a compatible flag set (`--progress --stats -vv`, zlib instead of zstd, and the
+zero-build-output detector fails open). For full-speed transfers:
+
+```bash
+brew install rsync
+```
+
+`rch doctor` reports which binary and flavour RCH resolved. To pin one
+explicitly, set `[transfer] rsync_bin = "/path/to/rsync"` or export
+`RCH_RSYNC_BIN`.
+
 ---
 
 ## First-Time Setup
@@ -394,6 +416,9 @@ remote_base = "/data/tmp/rch"
 # Abort a source sync after this many seconds of NO rsync output (dead channel /
 # wedged rsync); a progressing transfer is never affected. 0 disables.
 # source_sync_silence_timeout_secs = 120
+# Explicit rsync binary. Unset lets RCH prefer a modern (3.x) rsync over the
+# stock macOS openrsync automatically; RCH_RSYNC_BIN overrides this.
+# rsync_bin = "/opt/homebrew/bin/rsync"
 adaptive_compression = true
 verify_artifacts = false
 max_transfer_mb = 2048
