@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v1.0.61` (2026-08-29).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v1.0.64` (2026-09-07).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -35,6 +35,7 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v1.0.64`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.64) | Release | 2026-09-07 | rsync flavour probe: stock macOS openrsync no longer breaks every transfer (#66); `[transfer] rsync_bin` / `RCH_RSYNC_BIN`; retrieved artifacts typed against the requesting host (#65, RCH-E327); pooled target `store_base` for external worker volumes (#64) |
 | [`v1.0.63`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.63) | Release | 2026-09-03 | rchd daemon can no longer be wedged by the durable-lease scan: syscall liveness, lease reaping, scan off the runtime threads |
 | [`v1.0.62`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.62) | Release | 2026-08-29 | Convergence over the tailnet API: `GET /repo-convergence/status` token-gated on `:9101`; the dashboard collector folds it in so `worker.convergence_drift` fires on API-collected boxes |
 | [`v1.0.61`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.61) | Release | 2026-08-29 | rchd tailnet status API (`[api]`); dashboard publishes 2-min snapshots to Vercel Blob over that API; problems/diagnose agent views; `web/` retired |
@@ -106,6 +107,90 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 ---
 
 ## [Unreleased]
+
+## [v1.0.64] -- 2026-09-07 (release)
+
+Three fixes for what happens *between* the hook and the worker, all reported from the field.
+The headline is macOS: a stock `/usr/bin/rsync` on macOS 15+ is **openrsync** (protocol 29,
+"rsync 2.6.9 compatible") and rejects every rsync 3.x flag rch used (`--info=progress2`,
+`--compress-choice=zstd`, `--append-verify`) with `unrecognized option`, exit 1, before a
+single byte moved — so on a Mac without Homebrew rsync every offload fell back to a local
+build. rch now probes the flavour and adapts instead of assuming 3.x. The other two close
+gaps found on the same fleet: an unpinned build offloaded to a different-platform worker
+could rsync a foreign ELF straight over the caller's `target/<profile>/` tree undetected,
+and the pooled Cargo target stores could not be moved off the worker's mirror filesystem.
+
+**Delivered capability**
+
+- **rsync flavour probe** (`rch-common/src/rsync_flavor.rs`, #66). `RsyncFlavor` classifies
+  `rsync --version` as upstream rsync (with its version, so 3.1+, 3.0.x and Apple's 2.6.9
+  are told apart), openrsync (with its protocol number), or unknown, and
+  `RsyncCapabilities` maps that to the exact argv fragments each transfer builder needs.
+  `resolve_rsync` picks the binary: an explicit `RCH_RSYNC_BIN`, then `[transfer]
+  rsync_bin`, wins; otherwise a modern rsync in the well-known Homebrew/MacPorts/pkg
+  locations (`/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin`, …) is preferred over
+  a legacy PATH binary; only when nothing modern exists does rch drive the legacy binary with
+  a compatibility argv verified against openrsync (`--progress --stats -vv`, zlib instead of
+  zstd, cumulative progress and the zero-build-output proof degrade gracefully). The
+  `--version` probe is capped at 5 s and memoized per process; `TransferPipeline` pins the
+  resolved flavour for the whole job.
+- **`rch doctor` gates on the probed flavour, not on presence** (#66). Modern rsync: pass.
+  openrsync / 2.6.9: pass in *compatibility mode*, with the hint naming exactly the flags
+  the resolved binary lacks and the platform remedy (`brew install rsync`; rch prefers the
+  Homebrew binary automatically). Unrecognized banner: warning. Older than 2.6.9, missing, or
+  misconfigured: fail.
+- **Docs**: README "rsync Requirement (macOS note)" and the `[transfer] rsync_bin` example;
+  QUICKSTART lists rsync as a prerequisite; the configuration guide documents `rsync_bin`
+  and `RCH_RSYNC_BIN`.
+- **Retrieved artifacts are typed against the requesting host** (`rch/src/hook/
+  artifact_triple.rs`, #65, new `RCH-E327 BuildArtifactForeignTarget`). After retrieval the
+  hook inspects the magic of executables under `target/<profile>/` (unpinned builds, expecting
+  the local host) or `target/<triple>/<profile>/` (pinned `--target`, expecting that triple);
+  Cargo cache trees are skipped and the gate fails open on partial evidence. A conclusive
+  mismatch marks the local tree poisoned and tells the operator to rebuild for this host.
+  Only kinds with an enumerable host output contract are typed (`cargo build`/`doc`/
+  `zigbuild`); test, bench and coverage retrievals are the worker's by design and are not.
+  `RCH_ALLOW_FOREIGN_ARTIFACTS=1` opts out for deliberate cross-build staging. The first cut
+  opened the scope-stripped path instead of the manifest path and so could never fire; the
+  follow-up fixed that and is covered by the module's ELF-on-macOS unit tests.
+- **`[remediation.pooled_target] store_base`** (#64). Workers can place the multi-GB pooled
+  Cargo target stores on an external volume instead of inside the project mirror. The
+  hook's remote build commands, `rchd`'s stale-target sweep, `rch gc` and `rch cache status`
+  all enumerate every scan root (mirror tree plus `store_base`), de-duplicated by path, with
+  the byte cap applied per root. Docs now state the real rule for `[transfer] remote_base`
+  (only consulted for `--clean-overlay` roots, Windows workers and `rch cache warm`; the
+  documented `/tmp/rch` default was wrong). Existing stores are not migrated — setting
+  `store_base` cold-starts the pool and the old directory is reclaimed by the idle sweep.
+- **Toolchain**: `rust-toolchain.toml` pinned to `nightly-2026-08-31` (fleet-wide
+  harmonization so shared hosts can drop extra nightlies).
+
+**Closed workstreams**
+
+- GitHub [#66](https://github.com/Dicklesworthstone/remote_compilation_helper/issues/66)
+  — bare `rsync --info=progress2` rejected by stock macOS openrsync.
+- GitHub [#65](https://github.com/Dicklesworthstone/remote_compilation_helper/issues/65)
+  — foreign-platform artifacts retrieved over the local target tree.
+- GitHub [#64](https://github.com/Dicklesworthstone/remote_compilation_helper/issues/64)
+  — pooled target stores on external worker volumes.
+- [`bd-daspu`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl)
+  closed after the fleet upgrade to v1.0.63 confirmed the lease-scan wedge fixed.
+- [`bd-o7w6x`](https://github.com/Dicklesworthstone/remote_compilation_helper/blob/main/.beads/issues.jsonl)
+  **filed, still open**: hour-long remote builds die exit-137 and are mislabeled "resource
+  exhaustion"; root-caused to the 3600 s external build timeout, not ssh drops or worker OOM.
+
+**Representative commits**
+
+- [`0bf11e4a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0bf11e4a)
+  — rsync flavour detection, binary resolution, compatibility argv, doctor gate (#66).
+- [`e3aea68f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e3aea68f)
+  — rsync requirement docs and the exact-flags doctor hint (#66).
+- [`dcdc01bd`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/dcdc01bd)
+  / [`96cff429`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/96cff429)
+  — artifact typing gate and its manifest-path fix (#65).
+- [`da770b1b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/da770b1b)
+  / [`f4271e09`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f4271e09)
+  / [`357cbe3a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/357cbe3a)
+  — `store_base` config, daemon sweep, gc/cache scan roots and docs (#64).
 
 ## [v1.0.63] -- 2026-09-03 (release)
 
@@ -1999,7 +2084,8 @@ First tagged version. Marks the project's initial functional milestone after 9 d
 - Everything below `v1.0.16` in the reference block uses compare links; newer versions link
   straight to their release or tag page in the timeline.
 
-[Unreleased]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.63...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.64...HEAD
+[v1.0.64]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.63...v1.0.64
 [v1.0.63]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.62...v1.0.63
 [v1.0.62]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.61...v1.0.62
 [v1.0.16]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.15...v1.0.16
