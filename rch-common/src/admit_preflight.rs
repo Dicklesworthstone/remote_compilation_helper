@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::admission_rejection::{AdmissionRejectionSummary, RejectionClass};
 use crate::capability_probe::CapabilityRequirement;
 use crate::patterns::{
-    CompilationKind, classify_command, classify_command_detailed, split_shell_commands,
+    CompilationKind, classify_command, classify_command_detailed, is_cargo_xwin_build,
+    split_shell_commands,
 };
 
 /// The decisive recommendation `rch admit` returns.
@@ -215,8 +216,20 @@ fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> Required
     req.needs_targets.dedup();
     req.needs_toolchains.sort();
     req.needs_toolchains.dedup();
-    req.needs_os = os_from_target_triples(&req.needs_targets);
+    req.needs_os = os_from_target_triples(&host_bound_targets(command, &req.needs_targets));
     req
+}
+
+/// cargo-xwin supplies the MSVC SDK and cross-linker on its build host. Keep
+/// every other target's native-host constraint, and keep requiring Windows
+/// for ordinary Cargo MSVC builds even in a compound command containing xwin.
+fn host_bound_targets(command: &str, targets: &[String]) -> Vec<String> {
+    let cross_msvc = is_cargo_xwin_build(command);
+    targets
+        .iter()
+        .filter(|target| !cross_msvc || !target.to_ascii_lowercase().contains("-windows-msvc"))
+        .cloned()
+        .collect()
 }
 
 /// The host OS a command demands of a worker, if any.
@@ -230,7 +243,8 @@ pub fn required_os_for_command(command: &str) -> Option<String> {
     for part in split_shell_commands(command) {
         let detail = classify_command_detailed(part);
         if detail.classification.is_compilation {
-            triples.extend(derive_capabilities(part, detail.classification.kind).needs_targets);
+            let required = derive_capabilities(part, detail.classification.kind);
+            triples.extend(host_bound_targets(part, &required.needs_targets));
         }
     }
     os_from_target_triples(&triples)
@@ -239,8 +253,9 @@ pub fn required_os_for_command(command: &str) -> Option<String> {
 /// The host OS a set of `--target` triples demands, when they agree on one.
 ///
 /// Only a triple naming an OS the worker must *be* counts. `x86_64-pc-windows-msvc`
-/// links against the MSVC toolchain and needs a real Windows host, so it yields
-/// `windows`; every `*-apple-*` target (darwin, ios, tvos, watchos, visionos)
+/// ordinarily links against the native MSVC toolchain, so it yields `windows`;
+/// explicit cargo-xwin builds remove their MSVC targets before this step.
+/// Every `*-apple-*` target (darwin, ios, tvos, watchos, visionos)
 /// needs the macOS SDK, so it yields `darwin`. `x86_64-pc-windows-gnu` and
 /// `wasm32-unknown-unknown` cross-compile happily from Linux and yield nothing.
 ///
@@ -287,6 +302,7 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
     let mut is_compilation = false;
     let mut family: Option<String> = None;
     let mut required = RequiredCapabilities::default();
+    let mut host_targets = Vec::new();
     for part in &compound {
         let detail = classify_command_detailed(part);
         let c = &detail.classification;
@@ -298,6 +314,7 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
                 family = Some(family_token(kind).to_string());
             }
             let part_req = derive_capabilities(part, c.kind);
+            host_targets.extend(host_bound_targets(part, &part_req.needs_targets));
             required.needs_cargo |= part_req.needs_cargo;
             required.needs_zig |= part_req.needs_zig;
             required.needs_bun |= part_req.needs_bun;
@@ -314,7 +331,7 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
     required.needs_toolchains.dedup();
     // Recomputed over the merged target set: a compound command whose parts
     // disagree on the required OS must not inherit one part's answer.
-    required.needs_os = os_from_target_triples(&required.needs_targets);
+    required.needs_os = os_from_target_triples(&host_targets);
 
     let base_recommendation = if is_compilation {
         AdmitRecommendation::Offload
@@ -392,8 +409,8 @@ mod tests {
 
     #[test]
     fn msvc_target_requires_a_windows_host() {
-        // MSVC links against the Microsoft toolchain: it cannot be produced
-        // anywhere but a real Windows box.
+        // Ordinary Cargo builds use the native Microsoft toolchain. Only an
+        // explicit cross-build entry point can supply that SDK on another OS.
         assert_eq!(
             required_os_for_command("cargo build --target x86_64-pc-windows-msvc"),
             Some("windows".to_string())
@@ -402,6 +419,59 @@ mod tests {
             required_os_for_command("cargo build --target=aarch64-pc-windows-msvc --release"),
             Some("windows".to_string())
         );
+    }
+
+    #[test]
+    fn cargo_xwin_keeps_rust_target_requirements_without_a_native_windows_gate() {
+        for command in [
+            "cargo xwin build --target x86_64-pc-windows-msvc",
+            "cargo +nightly-2026-08-31 xwin build --target=aarch64-pc-windows-msvc",
+            "cargo-xwin xwin build --target x86_64-pc-windows-msvc",
+        ] {
+            let result = preflight(command, true);
+            assert!(result.is_compilation, "{command}");
+            assert!(result.required.needs_cargo, "{command}");
+            assert_eq!(result.family.as_deref(), Some("cargo_build"));
+            assert_eq!(result.required.needs_targets.len(), 1);
+            assert!(result.required.needs_targets[0].contains("-windows-msvc"));
+            assert_eq!(result.required.needs_os, None);
+            assert_eq!(required_os_for_command(command), None);
+        }
+    }
+
+    #[test]
+    fn cargo_xwin_does_not_relax_other_commands_or_apple_targets() {
+        for command in [
+            "cargo xwin build --target x86_64-pc-windows-msvc && cargo build --target x86_64-pc-windows-msvc",
+            "cargo --config xwin build --target x86_64-pc-windows-msvc",
+            "cargo build --manifest-path cargo-xwin --target x86_64-pc-windows-msvc",
+        ] {
+            assert_eq!(
+                required_os_for_command(command).as_deref(),
+                Some("windows"),
+                "{command}"
+            );
+            assert_eq!(
+                preflight(command, true).required.needs_os.as_deref(),
+                Some("windows"),
+                "{command}"
+            );
+        }
+        for command in [
+            "cargo xwin build --target aarch64-apple-darwin",
+            "cargo xwin build --target x86_64-pc-windows-msvc && cargo build --target aarch64-apple-darwin",
+        ] {
+            assert_eq!(
+                required_os_for_command(command).as_deref(),
+                Some("darwin"),
+                "{command}"
+            );
+            assert_eq!(
+                preflight(command, true).required.needs_os.as_deref(),
+                Some("darwin"),
+                "{command}"
+            );
+        }
     }
 
     #[test]
