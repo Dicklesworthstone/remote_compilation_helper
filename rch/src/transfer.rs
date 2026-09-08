@@ -5036,7 +5036,32 @@ fn parse_rsync_itemized_regular_files(output: &str) -> Vec<String> {
 /// when the stats line is missing or malformed.
 fn parse_rsync_matched_regular_files(output: &str) -> Option<u32> {
     output.lines().find_map(|line| {
-        let rest = line.strip_prefix("Number of files:")?;
+        let rest = line.strip_prefix("Number of files:")?.trim();
+        // Rsync omits `reg:` when only directories matched. A complete,
+        // directory-only breakdown proves zero regular files; missing or
+        // inconsistent accounting must remain unknown.
+        if let Some((total, directories)) = rest.split_once(" (dir:") {
+            let parse_count = |value: &str| {
+                let value = value.trim();
+                let grouped = value.contains(',');
+                if !value.split(',').enumerate().all(|(index, group)| {
+                    !group.is_empty()
+                        && group.bytes().all(|byte| byte.is_ascii_digit())
+                        && (!grouped
+                            || if index == 0 {
+                                group.len() <= 3
+                            } else {
+                                group.len() == 3
+                            })
+                }) {
+                    return None;
+                }
+                value.replace(',', "").parse::<u32>().ok()
+            };
+            let total = parse_count(total)?;
+            let directories = parse_count(directories.strip_suffix(')')?)?;
+            return (total == directories).then_some(0);
+        }
         // The first whitespace-delimited token after "(reg:" is the regular-
         // file count; strip thousands commas before parsing.
         let count = rest
@@ -6363,6 +6388,39 @@ Number of files transferred: 42
             None
         );
         assert_eq!(parse_rsync_matched_regular_files(""), None);
+    }
+
+    #[test]
+    fn test_cargo_package_verification_directory_only_rsync_count() {
+        let _guard = test_guard!();
+        // Captured from a real read-only rsync dry-run with the archive glob
+        // that missed Cargo's workspace tmp-registry directory.
+        let output = "Number of files: 2 (dir: 2)\n\
+                      Number of created files: 1 (dir: 1)\n\
+                      Number of regular files transferred: 0\n";
+        assert_eq!(parse_rsync_matched_regular_files(output), Some(0));
+        assert_eq!(
+            parse_rsync_matched_regular_files("Number of files: 1,234 (dir: 1,234)"),
+            Some(0)
+        );
+        for malformed_or_unknown in [
+            "Number of files: 2 (dir: 1)",
+            "Number of files: 2 (dir: 1, link: 1)",
+            "Number of files: unknown (dir: 2)",
+            "Number of files: 2 (dir: unknown)",
+            "Number of files: 2 (dir: 2",
+            "Number of files: 2 (dir: 2) extra",
+            "Number of files: 1,2 (dir: 12)",
+            "Number of files: 2 (dir: 2,)",
+            "Number of files: 2",
+            "Number of regular files transferred: 0",
+        ] {
+            assert_eq!(
+                parse_rsync_matched_regular_files(malformed_or_unknown),
+                None,
+                "unproven regular-file count: {malformed_or_unknown}"
+            );
+        }
     }
 
     #[test]

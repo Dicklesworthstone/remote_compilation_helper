@@ -24,7 +24,7 @@
 use super::artifact_patterns::{
     expected_output_glob_list, get_custom_target_artifact_patterns, get_project_artifact_patterns,
     kind_has_enumerable_output_contract, kind_produces_transferable_artifacts,
-    sync_back_verified_zero_build_outputs,
+    sync_back_verified_zero_build_outputs, sync_back_verified_zero_package_archives,
 };
 use super::artifact_triple::{describe_findings, foreign_target_artifacts};
 use super::cargo_target_dir::{
@@ -1745,16 +1745,17 @@ pub(super) async fn execute_remote_compilation(
         EXIT_ARTIFACT_TRANSFER_FAILED
     } else if result.success()
         && !artifacts_failed
-        && sync_back_verified_zero_build_outputs(
+        && (sync_back_verified_zero_build_outputs(
             &retrieval_manifest,
             retrieval_matched_regular,
             kind,
             retrieval_custom_target_basis,
-        )
+        ) || sync_back_verified_zero_package_archives(retrieval_matched_regular, command))
     {
         // bd-mpbav loud failure, layer B: the sync-back SUCCEEDED (unlike the
         // issue-#19 arm above) yet matched ZERO build outputs — every matched
-        // file was loose target metadata or cache state. The classic cause is
+        // file was loose target metadata or cache state, or package verification
+        // returned no archive files at all. The classic cause is
         // an output directory the include patterns don't cover (a custom
         // cargo profile's `target/<profile>/` before layer A added its globs,
         // or any future pattern gap): the remote binary exists, rsync happily

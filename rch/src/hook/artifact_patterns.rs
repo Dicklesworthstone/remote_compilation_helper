@@ -60,9 +60,13 @@ pub(super) fn get_artifact_patterns(
         && command.is_some_and(rch_common::patterns::is_cargo_package_verification)
     {
         // Cargo's own verifier builds the extracted archive and checks source
-        // mutations. Return that archive, without pulling its temporary registry
-        // or extracted source trees (or unrelated cached binaries) back home.
-        return vec!["target/package/*.crate".to_string()];
+        // mutations. Workspace publication keeps the verified archives in its
+        // temporary registry. Return only archives from those two layouts,
+        // without its index, extracted sources, or duplicate tmp-crate files.
+        return vec![
+            "target/package/*.crate".to_string(),
+            "target/package/tmp-registry/*.crate".to_string(),
+        ];
     }
     let mut patterns = match kind {
         Some(CompilationKind::BunTest) | Some(CompilationKind::BunTypecheck) => {
@@ -467,6 +471,17 @@ pub(super) fn kind_has_enumerable_output_contract(kind: Option<CompilationKind>)
                 | CompilationKind::CargoZigbuild
         )
     )
+}
+
+/// Package verification must return archives even when rsync matched no files.
+/// The package classifier excludes help, listing, and verification-disabled
+/// forms, so the ordinary build guard's no-output exception does not apply.
+/// An unknown file count still cannot establish a verified empty sync.
+pub(super) fn sync_back_verified_zero_package_archives(
+    matched_regular_files: Option<u32>,
+    command: &str,
+) -> bool {
+    matched_regular_files == Some(0) && rch_common::patterns::is_cargo_package_verification(command)
 }
 
 /// The bd-mpbav loud-failure gate: did a sync-back that SUCCEEDED (rsync exit

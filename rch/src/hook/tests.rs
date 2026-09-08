@@ -5,7 +5,7 @@ use super::*;
 use super::artifact_patterns::{
     expected_output_glob_list, get_artifact_patterns, get_custom_target_artifact_patterns,
     get_project_artifact_patterns, kind_produces_transferable_artifacts,
-    sync_back_verified_zero_build_outputs,
+    sync_back_verified_zero_build_outputs, sync_back_verified_zero_package_archives,
 };
 use super::cargo_target_dir::{
     extract_cargo_target_dir_from_command_tokens, feature_set_for_command,
@@ -6908,18 +6908,29 @@ fn test_cargo_package_verification_artifacts_are_exact_archives() {
         assert_eq!(kind, Some(CompilationKind::CargoBuild), "{command}");
         assert_eq!(
             get_artifact_patterns(kind, Some(command)),
-            vec!["target/package/*.crate".to_string()],
-            "return archives without temporary registries or extracted sources"
+            vec![
+                "target/package/*.crate".to_string(),
+                "target/package/tmp-registry/*.crate".to_string(),
+            ],
+            "return archives without registry indexes or extracted sources"
         );
         let custom = get_custom_target_artifact_patterns(kind, Some(command));
-        assert_eq!(expected_output_glob_list(&custom), vec!["package/*.crate"]);
+        assert_eq!(
+            expected_output_glob_list(&custom),
+            vec!["package/*.crate", "package/tmp-registry/*.crate"]
+        );
         assert!(get_project_artifact_patterns(kind, Some(command), true).is_empty());
-        assert!(!sync_back_verified_zero_build_outputs(
-            &["package/asupersync-0.4.11.crate".to_string()],
-            Some(1),
-            kind,
-            true,
-        ));
+        for archive in [
+            "package/asupersync-0.4.11.crate",
+            "package/tmp-registry/asupersync-0.4.11.crate",
+        ] {
+            assert!(!sync_back_verified_zero_build_outputs(
+                &[archive.to_string()],
+                Some(1),
+                kind,
+                true,
+            ));
+        }
     }
     assert!(
         !get_artifact_patterns(Some(CompilationKind::CargoBuild), Some("cargo build"))
@@ -6927,6 +6938,37 @@ fn test_cargo_package_verification_artifacts_are_exact_archives() {
             .any(|pattern| pattern.contains("package/")),
         "ordinary builds must not return stale package archives"
     );
+}
+
+#[test]
+fn test_cargo_package_verification_rejects_known_empty_archive_sync() {
+    let _guard = test_guard!();
+    for command in [
+        "cargo package --workspace --exclude drop_unwrap_finder --locked --allow-dirty",
+        "cargo publish --dry-run --workspace --exclude drop_unwrap_finder --locked --allow-dirty",
+        "env 'CARGO_HOME=/data/tmp/rch-cargo-cache-vmi1293453' 'CARGO_INCREMENTAL=0' 'CARGO_PROFILE_DEV_DEBUG=0' cargo publish --dry-run -j2 --locked --allow-dirty -p franken-kernel -p franken-evidence -p franken-decision -p asupersync-macros",
+    ] {
+        assert!(
+            sync_back_verified_zero_package_archives(Some(0), command),
+            "successful verification with a proven empty sync must fail: {command}"
+        );
+        assert!(!sync_back_verified_zero_package_archives(Some(4), command));
+        assert!(!sync_back_verified_zero_package_archives(None, command));
+    }
+    for command in [
+        "cargo build --help",
+        "cargo package --help",
+        "cargo package --list",
+        "cargo package --no-verify",
+        "cargo publish",
+        "cargo publish --dry-run --no-verify",
+        "cargo publish -- --dry-run",
+    ] {
+        assert!(
+            !sync_back_verified_zero_package_archives(Some(0), command),
+            "the archive guard must remain scoped to verification: {command}"
+        );
+    }
 }
 
 #[test]
