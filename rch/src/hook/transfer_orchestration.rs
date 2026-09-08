@@ -48,7 +48,10 @@ use super::source_fidelity::{
     PreparedSourceContentRoot, finalize_source_content_receipt, prepare_source_content_root,
     verify_source_content_roots,
 };
-use super::ssh::{acquire_remote_source_authority_lock, ensure_worker_projects_topology};
+use super::ssh::{
+    acquire_remote_source_authority_lock, ensure_worker_projects_topology,
+    remote_preflight_topology_policy,
+};
 use super::*;
 
 pub(super) fn source_sync_terminal_summary(
@@ -610,10 +613,16 @@ pub(super) async fn execute_remote_compilation(
         .iter()
         .map(|entry| PathBuf::from(entry.remote_root.as_str()))
         .collect();
+    let remote_topology_policy = remote_preflight_topology_policy(
+        topology_policy,
+        clean_overlay.is_some() && !worker_is_windows,
+        &transfer_config.remote_base,
+        &ownership_scan_roots,
+    )?;
     ensure_worker_projects_topology(
         &worker_config,
         reporter,
-        topology_policy,
+        &remote_topology_policy,
         &ownership_scan_roots,
     )
     .await?;

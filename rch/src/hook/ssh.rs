@@ -421,6 +421,60 @@ fn build_remote_shell_command(remote_cmd: &str) -> String {
     format!("sh -lc {}", shell_escape::escape(remote_cmd.into()))
 }
 
+/// Isolated Git overlays live beneath the configured worker staging base,
+/// not beneath the controller's canonical source root. Keep the controller
+/// policy for ordinary mirrors and validate every isolated destination before
+/// any remote topology command can create or repair a path.
+pub(super) fn remote_preflight_topology_policy(
+    controller_policy: &PathTopologyPolicy,
+    clean_overlay: bool,
+    remote_base: &str,
+    dispatch_closure_roots: &[PathBuf],
+) -> anyhow::Result<PathTopologyPolicy> {
+    if !clean_overlay {
+        return Ok(controller_policy.clone());
+    }
+
+    let remote_base = rch_common::types::validate_remote_base(remote_base)
+        .map_err(|error| anyhow::anyhow!("invalid clean-overlay staging base: {error}"))?;
+    if remote_base.chars().any(char::is_control) || remote_base.contains('\\') {
+        anyhow::bail!("clean-overlay staging base contains an invalid path character");
+    }
+    let staging_root = PathBuf::from(remote_base);
+    if dispatch_closure_roots.is_empty() {
+        anyhow::bail!("clean-overlay staging preflight requires a planned source root");
+    }
+    for root in dispatch_closure_roots {
+        let literal = root.to_str().ok_or_else(|| {
+            anyhow::anyhow!("clean-overlay source destination is not a UTF-8 path")
+        })?;
+        if literal.chars().any(char::is_control)
+            || literal.contains('\\')
+            || literal.split('/').any(|part| part == "." || part == "..")
+        {
+            anyhow::bail!(
+                "invalid clean-overlay source destination: {}",
+                root.display()
+            );
+        }
+        let relative = root.strip_prefix(&staging_root).ok().filter(|relative| {
+            !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+        });
+        if relative.is_none() {
+            anyhow::bail!(
+                "clean-overlay source destination {} is not a strict descendant of staging base {}",
+                root.display(),
+                staging_root.display()
+            );
+        }
+    }
+    // No worker-global alias is required for an invocation-owned archive.
+    Ok(PathTopologyPolicy::new(staging_root.clone(), staging_root))
+}
+
 fn build_worker_projects_topology_cmd(topology_policy: &PathTopologyPolicy) -> String {
     let canonical_display = topology_policy.canonical_root().display().to_string();
     let alias_display = topology_policy.alias_root().display().to_string();
@@ -926,6 +980,137 @@ mod tests {
             },
             policy,
         )
+    }
+
+    #[test]
+    fn clean_overlay_staging_maps_worker_paths_without_changing_controller_policy() {
+        let controller = PathTopologyPolicy::default();
+        let base = "/Users/jemanuel/.cache/rch-release";
+        let roots = vec![PathBuf::from(format!("{base}/asupersync/job-1"))];
+        let staged = remote_preflight_topology_policy(&controller, true, base, &roots)
+            .expect("Mac staging path is independent of Linux controller source path");
+        assert_eq!(staged.canonical_root(), Path::new(base));
+        assert_eq!(staged.alias_root(), staged.canonical_root());
+        assert_eq!(controller.canonical_root(), Path::new("/data/projects"));
+        assert_eq!(controller.alias_root(), Path::new("/dp"));
+
+        let ordinary = remote_preflight_topology_policy(
+            &controller,
+            false,
+            base,
+            &[PathBuf::from("/data/projects/asupersync")],
+        )
+        .expect("ordinary source mirrors retain the controller topology");
+        assert_eq!(ordinary.canonical_root(), controller.canonical_root());
+        assert_eq!(ordinary.alias_root(), controller.alias_root());
+    }
+
+    #[test]
+    fn clean_overlay_staging_refuses_every_destination_outside_the_exact_base() {
+        let controller = PathTopologyPolicy::default();
+        let base = "/Users/jemanuel/.cache/rch-release";
+        let valid = PathBuf::from(format!("{base}/asupersync/job-1"));
+        for invalid in [
+            base.to_string(),
+            format!("{base}-peer/asupersync/job-1"),
+            format!("{base}/../peer/job-1"),
+            format!("{base}/asupersync/../../peer"),
+            format!("{base}/./asupersync/job-1"),
+            format!("{base}/asupersync/evil\npath"),
+            format!("{base}/asupersync\\peer"),
+            "/data/projects/asupersync".to_string(),
+            "asupersync/job-1".to_string(),
+        ] {
+            let roots = vec![valid.clone(), PathBuf::from(&invalid)];
+            assert!(
+                remote_preflight_topology_policy(&controller, true, base, &roots).is_err(),
+                "a valid first root must not hide invalid destination {invalid:?}"
+            );
+        }
+        assert!(remote_preflight_topology_policy(&controller, true, base, &[]).is_err());
+        for invalid_base in [
+            "/",
+            "/tmp",
+            "relative/base",
+            "/tmp/rch/../peer",
+            "/tmp/rch\n",
+        ] {
+            assert!(
+                remote_preflight_topology_policy(
+                    &controller,
+                    true,
+                    invalid_base,
+                    std::slice::from_ref(&valid),
+                )
+                .is_err(),
+                "invalid staging base {invalid_base:?} must refuse before any remote command"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_overlay_staging_preflight_creates_only_its_base_without_an_alias() {
+        let _guard = test_guard!();
+        let raw = tempfile::tempdir().expect("owned topology fixture");
+        let fixture = raw.path().canonicalize().expect("physical fixture path");
+        let controller_root = fixture.join("controller-projects");
+        let controller_alias = fixture.join("controller-alias");
+        // Both controller paths are intentionally unusable as worker topology.
+        // The old preflight would refuse this regular-file canonical root.
+        std::fs::write(&controller_root, b"controller source must stay untouched")
+            .expect("controller sentinel");
+        std::fs::write(&controller_alias, b"peer alias must stay untouched")
+            .expect("peer alias sentinel");
+        let controller = PathTopologyPolicy::new(controller_root.clone(), controller_alias.clone());
+        let staging_base = fixture.join("worker staging");
+        let source_root = staging_base.join("asupersync/job-1");
+        let staged = remote_preflight_topology_policy(
+            &controller,
+            true,
+            staging_base.to_str().expect("UTF-8 fixture path"),
+            std::slice::from_ref(&source_root),
+        )
+        .expect("valid isolated staging topology");
+        let command = build_worker_projects_topology_cmd(&staged);
+        for _ in 0..2 {
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .output()
+                .expect("execute actual topology shell command");
+            assert!(
+                output.status.success(),
+                "staging preflight failed: status={:?}, stdout={}, stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("RCH_TOPOLOGY_OK"));
+            assert!(staging_base.is_dir());
+            assert!(
+                !staging_base.is_symlink(),
+                "alias==canonical stays a directory"
+            );
+            assert!(
+                !source_root.exists(),
+                "preflight only prepares the staging base"
+            );
+            assert_eq!(
+                std::fs::read(&controller_root).expect("controller sentinel survives"),
+                b"controller source must stay untouched"
+            );
+            assert_eq!(
+                std::fs::read(&controller_alias).expect("peer alias sentinel survives"),
+                b"peer alias must stay untouched"
+            );
+            assert_eq!(
+                std::fs::read_dir(&fixture)
+                    .expect("fixture entries")
+                    .count(),
+                3,
+                "preflight must not create another alias or touch a peer tree"
+            );
+        }
     }
 
     #[test]

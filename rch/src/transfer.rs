@@ -2147,7 +2147,13 @@ impl TransferPipeline {
         if self.worker_platform.is_windows() {
             anyhow::bail!("source-content receipts require the rsync transport");
         }
+        self.enumerate_source_upload_files().await
+    }
 
+    // Selection runs entirely locally. Windows include-only tar uploads must
+    // use the same rsync filters as POSIX uploads, without enabling the separate
+    // remote source-content receipt protocol on Windows.
+    async fn enumerate_source_upload_files(&self) -> Result<Vec<PathBuf>> {
         let effective_excludes = self.get_effective_excludes();
         let nonexistent_destination = std::env::temp_dir().join(format!(
             "rch-source-content-enumeration-{}",
@@ -3019,33 +3025,11 @@ fi",
         cmd
     }
 
-    /// Materialize an immutable Git commit directly into this pipeline's fresh
-    /// remote project root without creating a local branch, worktree, clone, or
-    /// staging directory. The archive is streamed from `git archive` to `tar`
-    /// over SSH; the destination must not already exist.
     #[cfg(unix)]
-    pub async fn materialize_git_archive(
-        &self,
-        worker: &WorkerConfig,
+    async fn create_git_archive(
         git_root: &Path,
         base_commit: &str,
-    ) -> Result<CleanOverlayMaterialization> {
-        if use_mock_transport(worker) {
-            return Ok(CleanOverlayMaterialization {
-                sync_result: SyncResult {
-                    bytes_transferred: 0,
-                    files_transferred: 0,
-                    duration_ms: 0,
-                },
-                attempts: vec![TransferAttemptDiagnostic {
-                    attempt: 1,
-                    max_attempts: self.transfer_config.retry.max_attempts.max(1),
-                    outcome: "succeeded",
-                    detail: "mock clean-overlay source transfer completed (unit transport)"
-                        .to_string(),
-                }],
-            });
-        }
+    ) -> Result<tempfile::NamedTempFile> {
         if !matches!(base_commit.len(), 40 | 64)
             || !base_commit.chars().all(|ch| ch.is_ascii_hexdigit())
         {
@@ -3083,7 +3067,37 @@ fi",
                 String::from_utf8_lossy(&archive_output.stderr).trim()
             );
         }
+        Ok(archive_file)
+    }
 
+    /// Materialize an immutable Git commit directly into this pipeline's fresh
+    /// remote project root without creating a local branch, worktree, clone, or
+    /// staging directory. Windows streams the archive to tar over SSH; POSIX
+    /// workers retain the resumable rsync archive transport.
+    #[cfg(unix)]
+    pub async fn materialize_git_archive(
+        &self,
+        worker: &WorkerConfig,
+        git_root: &Path,
+        base_commit: &str,
+    ) -> Result<CleanOverlayMaterialization> {
+        if use_mock_transport(worker) {
+            return Ok(CleanOverlayMaterialization {
+                sync_result: SyncResult {
+                    bytes_transferred: 0,
+                    files_transferred: 0,
+                    duration_ms: 0,
+                },
+                attempts: vec![TransferAttemptDiagnostic {
+                    attempt: 1,
+                    max_attempts: self.transfer_config.retry.max_attempts.max(1),
+                    outcome: "succeeded",
+                    detail: "mock clean-overlay source transfer completed (unit transport)"
+                        .to_string(),
+                }],
+            });
+        }
+        let archive_file = Self::create_git_archive(git_root, base_commit).await?;
         let archive_path = archive_file.path().to_path_buf();
         let payload_bytes = archive_file
             .as_file()
@@ -3092,6 +3106,29 @@ fi",
             .len();
         let attempt_timeout = self.transfer_config.sync_timeout_for_payload(payload_bytes);
         let remote_path = self.remote_path();
+        if self.worker_platform.is_windows() {
+            let start = std::time::Instant::now();
+            let ((), attempts) = run_source_transfer_attempts(
+                &self.transfer_config.retry,
+                attempt_timeout,
+                "clean_overlay_base_sync",
+                |_attempt| async {
+                    self.upload_windows_archive(worker, &archive_path, &remote_path)
+                        .await?;
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(anyhow::Error::new)?;
+            return Ok(CleanOverlayMaterialization {
+                sync_result: SyncResult {
+                    bytes_transferred: payload_bytes,
+                    files_transferred: 0,
+                    duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                },
+                attempts,
+            });
+        }
         let escaped_remote_path = escape(Cow::from(remote_path.as_str()));
         // The remote root includes the clean-overlay job nonce, so it is unique
         // to this execution. Keeping this filename stable across attempts is
@@ -3246,6 +3283,112 @@ fi",
         Ok(())
     }
 
+    /// OpenSSH joins remote argv before cmd.exe parses it. A POSIX single quote
+    /// is literal there, and percent/exclamation expansion also occurs inside
+    /// double quotes. Admit the drive-path alphabet we can pass literally and
+    /// refuse other paths before creating a directory or sending source bytes.
+    fn windows_archive_destination(remote_path: &str) -> Result<String> {
+        let normalized = remote_path.replace('\\', "/");
+        if !is_windows_drive_abs_path(&normalized)
+            || !normalized[2..]
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | ' ' | '-' | '_' | '.'))
+            || normalized[3..].split('/').any(|part| {
+                part == "." || part == ".." || part.ends_with('.') || part.ends_with(' ')
+            })
+        {
+            anyhow::bail!("Windows archive destination is not a safe literal drive path");
+        }
+        Ok(format!("\"{normalized}\""))
+    }
+
+    /// Send an already materialized archive. Both the immutable Git base and
+    /// the selected overlay use this transport; neither sends the working tree
+    /// recursively or invokes rsync on a Windows drive-letter destination.
+    async fn upload_windows_archive(
+        &self,
+        worker: &WorkerConfig,
+        archive_path: &Path,
+        remote_path: &str,
+    ) -> Result<u64> {
+        let destination = Self::windows_archive_destination(remote_path)?;
+        self.run_remote_sh(
+            worker,
+            &format!(
+                "mkdir -p {}",
+                escape(Cow::from(remote_path.replace('\\', "/")))
+            ),
+        )
+        .await?;
+        let mut archive = tokio::fs::File::open(archive_path)
+            .await
+            .context("open Windows source archive")?;
+        let mut ssh = self.worker_ssh_command(worker, &["tar", "xf", "-", "-C", &destination]);
+        ssh.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = ssh.spawn().context("spawn ssh tar for source archive")?;
+        let mut stdin = child.stdin.take().context("source archive ssh stdin")?;
+        // Keep both futures scoped to this transfer: cancellation drops the
+        // SSH child and the pump, and stderr is drained while bytes are sent.
+        let (copied, output) = tokio::join!(
+            async move {
+                let result = tokio::io::copy(&mut archive, &mut stdin).await;
+                drop(stdin);
+                result
+            },
+            child.wait_with_output(),
+        );
+        let output = output.context("wait for Windows source archive extraction")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "remote tar extract failed (exit {:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        copied.context("stream Windows source archive")
+    }
+
+    async fn selected_source_archive(&self) -> Result<(tempfile::NamedTempFile, u32)> {
+        let paths = self.enumerate_source_upload_files().await?;
+        let files_transferred = u32::try_from(paths.len())
+            .context("selected source archive exceeds file-count limit")?;
+        let project_root = self.project_root.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut archive = tempfile::Builder::new()
+                .prefix("rch-selected-overlay-")
+                .suffix(".tar")
+                .tempfile()
+                .context("create selected source archive")?;
+            let mut builder = tar::Builder::new(archive.as_file_mut());
+            for relative in &paths {
+                let path = project_root.join(relative);
+                if !std::fs::symlink_metadata(&path)?.is_file() {
+                    anyhow::bail!(
+                        "selected source is no longer a regular file: {}",
+                        relative.display()
+                    );
+                }
+                let mut file = std::fs::File::open(&path)?;
+                if !file.metadata()?.is_file() {
+                    anyhow::bail!(
+                        "selected source is no longer a regular file: {}",
+                        relative.display()
+                    );
+                }
+                // append_file never recurses and preserves the exact relative
+                // name, including spaces and literal glob characters.
+                builder.append_file(relative, &mut file)?;
+            }
+            builder.finish().context("finish selected source archive")?;
+            drop(builder);
+            Ok((archive, files_transferred))
+        })
+        .await
+        .context("join selected source archive writer")?
+    }
+
     /// Windows source sync: create the remote dir, then `tar czf -` the project
     /// locally (honouring excludes) and pipe it into `tar xzf -` on the worker.
     /// Native `tar` on both ends — no rsync, no `C:`-colon path ambiguity.
@@ -3262,6 +3405,18 @@ fi",
             remote_path,
             worker.id
         );
+
+        if self.sync_include_patterns.is_some() {
+            let (archive, files_transferred) = self.selected_source_archive().await?;
+            let bytes_transferred = self
+                .upload_windows_archive(worker, archive.path(), remote_path)
+                .await?;
+            return Ok(SyncResult {
+                bytes_transferred,
+                files_transferred,
+                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            });
+        }
 
         // 1. Ensure the remote dir exists. `mkdir -p` under Git's sh accepts the
         //    C:/ form. Escape defensively even though our paths have no metachars.
@@ -10509,6 +10664,230 @@ Total file size: 123 bytes";
             ]
         );
         assert!(!patterns.iter().any(|pattern| pattern.contains("peer")));
+    }
+
+    #[test]
+    fn windows_clean_overlay_destination_quotes_spaces_and_refuses_shell_expansion() {
+        for (input, expected) in [
+            ("C:/rch/project/hash", "\"C:/rch/project/hash\""),
+            (r"D:\rch\project name\hash", "\"D:/rch/project name/hash\""),
+        ] {
+            assert_eq!(
+                TransferPipeline::windows_archive_destination(input).expect("literal drive path"),
+                expected
+            );
+        }
+        for input in [
+            "relative/path",
+            "/tmp/rch",
+            "C:/rch/../peer",
+            "C:/rch/./peer",
+            "C:/rch/%TEMP%",
+            "C:/rch/!PATH!",
+            "C:/rch/\" & whoami",
+            "C:/rch/$(whoami)",
+            "C:/rch/a\nb",
+            "C:/rch/a:b",
+            "C:/rch/name.",
+            "C:/rch/name /hash",
+        ] {
+            assert!(
+                TransferPipeline::windows_archive_destination(input).is_err(),
+                "must refuse unsafe remote archive destination {input:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn windows_clean_overlay_archives_preserve_base_and_only_selected_literal_paths() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().expect("source fixture");
+        let destination = tempfile::tempdir().expect("extraction fixture");
+        for dir in ["src", "docs/owned", "target"] {
+            std::fs::create_dir_all(root.path().join(dir)).expect("fixture directory");
+        }
+        for (path, bytes) in [
+            ("src/a[1].rs", "base selected\n"),
+            ("src/a1.rs", "base glob neighbor\n"),
+            ("src/peer.rs", "base peer\n"),
+            ("docs/owned/with space.md", "base document\n"),
+            ("target/selected.rs", "base usually excluded\n"),
+        ] {
+            std::fs::write(root.path().join(path), bytes).expect("base source");
+        }
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "base fixture",
+            ],
+        ] {
+            let mut git = Command::new("git");
+            configure_clean_git_command(&mut git);
+            let output = git
+                .current_dir(root.path())
+                .args(args)
+                .output()
+                .await
+                .expect("fixture git");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let mut git = Command::new("git");
+        configure_clean_git_command(&mut git);
+        let output = git
+            .current_dir(root.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await
+            .expect("base ID");
+        assert!(output.status.success());
+        let base = String::from_utf8(output.stdout).expect("base ID UTF-8");
+
+        for (path, bytes) in [
+            ("src/a[1].rs", "owned selected\n"),
+            ("src/a1.rs", "unselected glob neighbor dirt\n"),
+            ("src/peer.rs", "unselected peer dirt\n"),
+            ("src/untracked.rs", "unselected new peer file\n"),
+            ("docs/owned/with space.md", "owned document\n"),
+            ("docs/owned/new.md", "owned descendant\n"),
+            ("target/selected.rs", "owned usually excluded\n"),
+            ("target/unselected.rs", "unselected target dirt\n"),
+            (".rchignore", "target/\ndocs/\n"),
+        ] {
+            std::fs::write(root.path().join(path), bytes).expect("working-tree dirt");
+        }
+        let immutable = TransferPipeline::create_git_archive(root.path(), base.trim())
+            .await
+            .expect("actual immutable Git archive");
+        tar::Archive::new(std::fs::File::open(immutable.path()).expect("open base archive"))
+            .unpack(destination.path())
+            .expect("extract base archive");
+        assert_eq!(
+            std::fs::read_to_string(destination.path().join("src/a[1].rs")).unwrap(),
+            "base selected\n"
+        );
+        assert!(!destination.path().join("src/untracked.rs").exists());
+
+        let selected = ["src/a[1].rs", "docs/owned", "target/selected.rs"].map(PathBuf::from);
+        let pipeline = TransferPipeline::new(
+            root.path().to_path_buf(),
+            "fixture".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_worker_platform(WorkerPlatform::Windows)
+        .with_sync_include_patterns(clean_overlay_include_patterns(root.path(), &selected).unwrap())
+        .with_sync_delete(false);
+        let (overlay, count) = pipeline
+            .selected_source_archive()
+            .await
+            .expect("selected archive");
+        assert_eq!(count, 4);
+        let mut archive = tar::Archive::new(std::fs::File::open(overlay.path()).unwrap());
+        let names = archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                assert!(entry.header().entry_type().is_file());
+                entry.path().unwrap().into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "docs/owned/new.md",
+                "docs/owned/with space.md",
+                "src/a[1].rs",
+                "target/selected.rs",
+            ]
+            .map(PathBuf::from)
+        );
+        tar::Archive::new(std::fs::File::open(overlay.path()).unwrap())
+            .unpack(destination.path())
+            .expect("extract selected overlay");
+        for (path, expected) in [
+            ("src/a[1].rs", "owned selected\n"),
+            ("src/a1.rs", "base glob neighbor\n"),
+            ("src/peer.rs", "base peer\n"),
+            ("docs/owned/with space.md", "owned document\n"),
+            ("docs/owned/new.md", "owned descendant\n"),
+            ("target/selected.rs", "owned usually excluded\n"),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(destination.path().join(path)).unwrap(),
+                expected,
+                "{path}"
+            );
+        }
+        for absent in [
+            "src/untracked.rs",
+            "target/unselected.rs",
+            ".rchignore",
+            ".git",
+        ] {
+            assert!(
+                !destination.path().join(absent).exists(),
+                "unselected path {absent}"
+            );
+        }
+        assert_eq!(
+            pipeline
+                .enumerate_source_content_files()
+                .await
+                .unwrap_err()
+                .to_string(),
+            "source-content receipts require the rsync transport"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn windows_clean_overlay_empty_selection_does_not_widen_and_symlinks_refuse() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().expect("source fixture");
+        std::fs::write(root.path().join("peer.rs"), "peer dirt").unwrap();
+        let pipeline = TransferPipeline::new(
+            root.path().to_path_buf(),
+            "fixture".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_worker_platform(WorkerPlatform::Windows)
+        .with_sync_include_patterns(Vec::new());
+        let (archive, count) = pipeline
+            .selected_source_archive()
+            .await
+            .expect("empty selection");
+        assert_eq!(count, 0);
+        assert_eq!(
+            tar::Archive::new(std::fs::File::open(archive.path()).unwrap())
+                .entries()
+                .unwrap()
+                .count(),
+            0
+        );
+
+        std::os::unix::fs::symlink("peer.rs", root.path().join("selected.rs")).unwrap();
+        let pipeline = pipeline.with_sync_include_patterns(vec!["/selected.rs".to_string()]);
+        let error = pipeline.selected_source_archive().await.unwrap_err();
+        assert!(
+            error.to_string().contains("refuses non-regular rsync item"),
+            "{error:#}"
+        );
     }
 
     #[test]
