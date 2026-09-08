@@ -133,3 +133,9 @@ docs/evidence/fleet_deploy_audit_*.json
 # I014 policy-overhead probe: machine-local timing, appended per test run
 benchmarks/baselines/i014_scheduler_storm.ndjson
 beads_compliance_audit/
+
+# Next.js / Playwright products under web/ (generated; never source).
+web/.next/
+web/next-env.d.ts
+web/playwright-report/
+web/test-results/
