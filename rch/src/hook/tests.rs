@@ -6896,6 +6896,40 @@ fn test_artifact_patterns_for_test_commands() {
 }
 
 #[test]
+fn test_cargo_package_verification_artifacts_are_exact_archives() {
+    let _guard = test_guard!();
+    for command in [
+        "cargo package --workspace --locked",
+        "cargo package --workspace --target-dir /data/tmp/package-verification",
+        "cargo +nightly publish --dry-run -p asupersync",
+        "env CARGO_INCREMENTAL=0 cargo publish -n --workspace",
+    ] {
+        let kind = classify_command(command).kind;
+        assert_eq!(kind, Some(CompilationKind::CargoBuild), "{command}");
+        assert_eq!(
+            get_artifact_patterns(kind, Some(command)),
+            vec!["target/package/*.crate".to_string()],
+            "return archives without temporary registries or extracted sources"
+        );
+        let custom = get_custom_target_artifact_patterns(kind, Some(command));
+        assert_eq!(expected_output_glob_list(&custom), vec!["package/*.crate"]);
+        assert!(get_project_artifact_patterns(kind, Some(command), true).is_empty());
+        assert!(!sync_back_verified_zero_build_outputs(
+            &["package/asupersync-0.4.11.crate".to_string()],
+            Some(1),
+            kind,
+            true,
+        ));
+    }
+    assert!(
+        !get_artifact_patterns(Some(CompilationKind::CargoBuild), Some("cargo build"))
+            .iter()
+            .any(|pattern| pattern.contains("package/")),
+        "ordinary builds must not return stale package archives"
+    );
+}
+
+#[test]
 fn test_custom_target_artifact_patterns_for_cargo_test_are_skipped() {
     let _guard = test_guard!();
     let patterns = get_custom_target_artifact_patterns(Some(CompilationKind::CargoTest), None);

@@ -51,7 +51,8 @@ pub static COMPILATION_KEYWORDS: &[&str] = &[
 pub static NEVER_INTERCEPT: &[&str] = &[
     // Cargo commands that modify local state or shouldn't be intercepted
     "cargo install",
-    "cargo publish",
+    // `cargo publish` is checked in classify_cargo: only an explicit dry-run
+    // with package verification enabled is a remote compilation command.
     "cargo login",
     "cargo fmt",
     "cargo fix",
@@ -2223,6 +2224,103 @@ fn classify_go(cmd: &str) -> Classification {
     }
 }
 
+/// Whether Cargo will build and verify a package archive without publishing it.
+///
+/// Kept separate from the protocol kind so the client can use the existing
+/// `CargoBuild` worker contract and return the archive that Cargo verified.
+/// Unknown options, shell expansion/quoting, and argument separators are
+/// declined: a token that merely occurs inside an option value must never
+/// authorize offloading a real `cargo publish` invocation.
+pub fn is_cargo_package_verification(command: &str) -> bool {
+    let normalized = normalize_command(command);
+    let cmd = normalized.as_ref();
+    if check_structure(cmd).is_some() || cmd.contains(['\'', '"', '\\', '$', '`']) {
+        return false;
+    }
+
+    let mut tokens = cmd.split_whitespace();
+    if tokens.next() != Some("cargo") {
+        return false;
+    }
+
+    let mut subcommand = None;
+    let mut dry_run = false;
+    const VALUE_FLAGS: &[&str] = &[
+        "--index",
+        "--registry",
+        "--token",
+        "--color",
+        "--config",
+        "-Z",
+        "-C",
+        "-p",
+        "--package",
+        "--exclude",
+        "-F",
+        "--features",
+        "-j",
+        "--jobs",
+        "--target",
+        "--target-dir",
+        "-m",
+        "--manifest-path",
+        "--lockfile-path",
+        "--message-format",
+    ];
+
+    while let Some(token) = tokens.next() {
+        if subcommand.is_none() && token.starts_with('+') {
+            continue;
+        }
+        if matches!(token, "package" | "publish") && subcommand.is_none() {
+            subcommand = Some(token);
+            continue;
+        }
+        if VALUE_FLAGS.contains(&token) {
+            if tokens.next().is_none_or(|value| value.starts_with('-')) {
+                return false;
+            }
+            continue;
+        }
+        if let Some((flag, value)) = token.split_once('=')
+            && VALUE_FLAGS.contains(&flag)
+            && !value.is_empty()
+        {
+            continue;
+        }
+        if ["-j", "-p", "-F", "-m", "-Z"]
+            .iter()
+            .any(|flag| token.starts_with(flag) && token.len() > flag.len())
+        {
+            continue;
+        }
+        match token {
+            "--dry-run" | "-n" => dry_run = true,
+            "--workspace"
+            | "--allow-dirty"
+            | "--no-metadata"
+            | "--exclude-lockfile"
+            | "--all-features"
+            | "--no-default-features"
+            | "--keep-going"
+            | "--locked"
+            | "--offline"
+            | "--frozen"
+            | "--verbose"
+            | "-v"
+            | "-vv"
+            | "-vvv"
+            | "--quiet"
+            | "-q" => {}
+            // Includes --no-verify, --list/-l, --help/-h and --. Reject unknown
+            // value-taking flags rather than mistaking their value for -n.
+            _ => return false,
+        }
+    }
+
+    matches!(subcommand, Some("package")) || (subcommand == Some("publish") && dry_run)
+}
+
 /// Classify cargo subcommands.
 ///
 /// Performance: uses iterator `.nth()` to avoid Vec allocation on the hot path.
@@ -2261,6 +2359,19 @@ fn classify_cargo(cmd: &str) -> Classification {
     match subcommand {
         "build" | "b" => {
             Classification::compilation(CompilationKind::CargoBuild, 0.95, "cargo build")
+        }
+        "package" | "publish" => {
+            if is_cargo_package_verification(cmd) {
+                Classification::compilation(
+                    CompilationKind::CargoBuild,
+                    0.95,
+                    "cargo package verification (includes build)",
+                )
+            } else {
+                Classification::not_compilation(
+                    "cargo package/publish without supported verification (never-intercept)",
+                )
+            }
         }
         "test" | "t" => Classification::compilation(CompilationKind::CargoTest, 0.95, "cargo test"),
         "check" | "c" => {
@@ -5736,6 +5847,81 @@ mod regression_classification {
             },
         ];
         run_cases(&cases);
+    }
+
+    #[test]
+    fn regression_cargo_package_verification_is_compilation() {
+        let _guard = test_guard!();
+        for command in [
+            "cargo package",
+            "cargo package --workspace --locked -j2",
+            "cargo package -p asupersync --features tls --target x86_64-unknown-linux-gnu",
+            "cargo +nightly --offline package --allow-dirty --no-metadata",
+            "cargo --color never package --target-dir=/data/tmp/package-check",
+            "cargo publish --dry-run",
+            "cargo publish -n --workspace --locked --keep-going -j 2",
+            "cargo publish --registry crates-io -p asupersync --dry-run",
+            "cargo +nightly --locked publish --dry-run --features=tls",
+            "env CARGO_INCREMENTAL=0 cargo publish --dry-run --workspace",
+        ] {
+            let classification = classify_command(command);
+            assert!(
+                classification.is_compilation,
+                "{command}: {classification:?}"
+            );
+            assert_eq!(classification.kind, Some(CompilationKind::CargoBuild));
+            assert_eq!(
+                classify_command_detailed(command).classification,
+                classification,
+                "diagnosis must agree with execution for {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn regression_cargo_package_verification_declines_publication_and_metadata() {
+        let _guard = test_guard!();
+        for command in [
+            "cargo publish",
+            "cargo publish --workspace --locked",
+            "cargo +nightly --offline publish",
+            "cargo publish --no-verify",
+            "cargo publish --dry-run --no-verify",
+            "cargo publish --no-verify -n",
+            "cargo publish -qn --no-verify",
+            "cargo package --no-verify",
+            "cargo package --list",
+            "cargo package -l",
+            "cargo package -vl",
+            "cargo package --help",
+            "cargo --help package",
+            "cargo publish --dry-run -h",
+            "cargo publish -- --dry-run",
+            "cargo publish --dry-run -- --no-verify",
+            "cargo publish --dry-run=false",
+            "cargo publish --registry=--dry-run",
+            "cargo publish -p--dry-run",
+            "cargo publish --token=--dry-run",
+            "cargo publish --config --dry-run",
+            "cargo publish --config alias.note=--dry-run",
+            "cargo publish --unknown-option --dry-run",
+            "cargo package --target --no-verify",
+            "cargo package --package --list",
+            "cargo package --config",
+            "cargo publish --config 'alias.note=\"--dry-run\"'",
+            "cargo publish --registry 'example --dry-run registry'",
+            "cargo publish --dry-run --config 'alias.note=\"--no-verify\"'",
+            "cargo publish --dry-run $EXTRA_CARGO_OPTIONS",
+        ] {
+            let classification = classify_command(command);
+            assert!(
+                !classification.is_compilation,
+                "{command}: {classification:?}"
+            );
+            let detailed = classify_command_detailed(command).classification;
+            assert!(!detailed.is_compilation, "{command}: {detailed:?}");
+            assert!(!is_cargo_package_verification(command), "{command}");
+        }
     }
 
     // ------------------------------------------------------------------

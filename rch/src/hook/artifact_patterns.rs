@@ -56,6 +56,14 @@ pub(super) fn get_artifact_patterns(
     kind: Option<CompilationKind>,
     command: Option<&str>,
 ) -> Vec<String> {
+    if kind == Some(CompilationKind::CargoBuild)
+        && command.is_some_and(rch_common::patterns::is_cargo_package_verification)
+    {
+        // Cargo's own verifier builds the extracted archive and checks source
+        // mutations. Return that archive, without pulling its temporary registry
+        // or extracted source trees (or unrelated cached binaries) back home.
+        return vec!["target/package/*.crate".to_string()];
+    }
     let mut patterns = match kind {
         Some(CompilationKind::BunTest) | Some(CompilationKind::BunTypecheck) => {
             default_bun_artifact_patterns()
