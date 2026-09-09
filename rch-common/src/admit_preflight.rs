@@ -220,14 +220,20 @@ fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> Required
     req
 }
 
-/// cargo-xwin supplies the MSVC SDK and cross-linker on its build host. Keep
-/// every other target's native-host constraint, and keep requiring Windows
-/// for ordinary Cargo MSVC builds even in a compound command containing xwin.
+/// Explicit cross-build tools supply their linker on the build host. Darwin
+/// zigbuild still needs the Apple SDK, Zig, and the requested Rust target, but
+/// the SDK can reside on Linux. Keep native constraints for ordinary Cargo and
+/// for targets the selected cross-build tool does not support here.
 fn host_bound_targets(command: &str, targets: &[String]) -> Vec<String> {
     let cross_msvc = is_cargo_xwin_build(command);
+    let cross_darwin = classify_command(command).kind == Some(CompilationKind::CargoZigbuild);
     targets
         .iter()
-        .filter(|target| !cross_msvc || !target.to_ascii_lowercase().contains("-windows-msvc"))
+        .filter(|target| {
+            let target = target.to_ascii_lowercase();
+            !(cross_msvc && target.contains("-windows-msvc")
+                || cross_darwin && target.ends_with("-apple-darwin"))
+        })
         .cloned()
         .collect()
 }
@@ -472,6 +478,54 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn darwin_zigbuild_keeps_linker_and_target_requirements_without_native_host_gate() {
+        for command in [
+            "cargo zigbuild --target aarch64-apple-darwin",
+            "cargo +nightly zigbuild --target=x86_64-apple-darwin",
+            "cargo-zigbuild zigbuild --target aarch64-apple-darwin",
+            "env SDKROOT=/opt/MacOSX.sdk cargo zigbuild --target aarch64-apple-darwin",
+        ] {
+            let result = preflight(command, true);
+            assert!(result.is_compilation, "{command}");
+            assert!(result.required.needs_cargo, "{command}");
+            assert!(result.required.needs_zig, "{command}");
+            assert_eq!(result.family.as_deref(), Some("cargo_zigbuild"));
+            assert_eq!(result.required.needs_targets.len(), 1);
+            assert!(result.required.needs_targets[0].ends_with("-apple-darwin"));
+            assert_eq!(result.required.needs_os, None);
+            assert_eq!(required_os_for_command(command), None);
+        }
+    }
+
+    #[test]
+    fn darwin_zigbuild_does_not_relax_native_commands_or_other_apple_targets() {
+        for command in [
+            "cargo build --target aarch64-apple-darwin",
+            "cargo build --manifest-path cargo-zigbuild --target aarch64-apple-darwin",
+            "cargo --config zigbuild build --target aarch64-apple-darwin",
+            "cargo zigbuild --target aarch64-apple-ios",
+            "cargo zigbuild --target aarch64-apple-darwin && cargo build --target aarch64-apple-darwin",
+        ] {
+            assert_eq!(
+                required_os_for_command(command).as_deref(),
+                Some("darwin"),
+                "{command}"
+            );
+            assert_eq!(
+                preflight(command, true).required.needs_os.as_deref(),
+                Some("darwin"),
+                "{command}"
+            );
+        }
+        let command = "cargo zigbuild --target x86_64-pc-windows-msvc";
+        assert_eq!(required_os_for_command(command).as_deref(), Some("windows"));
+        assert_eq!(
+            preflight(command, true).required.needs_os.as_deref(),
+            Some("windows")
+        );
     }
 
     #[test]
