@@ -1085,6 +1085,28 @@ mod tests {
         std::fs::set_permissions(p, perms).unwrap();
     }
 
+    /// `Command::output()` that retries `ETXTBSY`.
+    ///
+    /// `write_exe` closes its handle before returning, but a sibling test
+    /// thread can fork while that handle is still open; until the child
+    /// execs, the inherited descriptor keeps the file "busy" and executing
+    /// it fails with `ExecutableFileBusy`. The window is microseconds and
+    /// belongs to an unrelated test, so retry briefly instead of failing
+    /// this one (seen as a different shim test each run on rch workers).
+    #[cfg(unix)]
+    fn output_retrying_text_busy(cmd: &mut std::process::Command) -> std::process::Output {
+        let mut attempts = 0;
+        loop {
+            match cmd.output() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => return result.expect("spawn sandboxed shim"),
+            }
+        }
+    }
+
     /// Create a unique sandbox carrying the shim plus the standard stubs
     /// (`rch` announces OFFLOAD, `real-cargo` announces LOCAL and the job cap),
     /// and return its dir. Tests needing more elaborate hosts (fake toolchains,
@@ -1156,7 +1178,7 @@ mod tests {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        cmd.output().unwrap()
+        output_retrying_text_busy(&mut cmd)
     }
 
     /// Execute a rendered shim body under `/bin/sh` in a sandbox with the
@@ -1742,14 +1764,13 @@ esac
             &bin.join(REAL_CARGO_NAME),
             "#!/bin/sh\necho TC-REAL \"$@\" jobs=${CARGO_BUILD_JOBS:-unset} first=${PATH%%:*}\n",
         );
-        let out = std::process::Command::new(bin.join("cargo"))
-            .arg("build")
+        let mut cmd = std::process::Command::new(bin.join("cargo"));
+        cmd.arg("build")
             .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
             .env("RCH_CARGO_WRAPPER_BYPASS", "1")
             .env_remove("CARGO_BUILD_JOBS")
-            .env_remove("RCH_LOCAL_MAX_JOBS")
-            .output()
-            .unwrap();
+            .env_remove("RCH_LOCAL_MAX_JOBS");
+        let out = output_retrying_text_busy(&mut cmd);
         assert!(
             out.status.success(),
             "stderr: {}",
