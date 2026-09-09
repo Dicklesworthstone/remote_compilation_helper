@@ -4,9 +4,12 @@
 
 A worker that fails health/probe is moved by the daemon to a **temporary bypass**
 (quarantine) with **probe backoff**. When probes recover, it enters
-**recovered-pending-canary**, gets one **canary** build, and on success is
+**recovered-pending-canary**, runs the configured **canary** command, and on success is
 **auto-rejoined** to the healthy pool. Circuit breakers follow the same arc
 (open → half-open → closed) automatically.
+
+The default canary is `rustc --version`. Rejoining proves that recovery checks
+and that command passed; validate the project's native build and tests separately.
 
 So the default action for a transiently-sick worker is **nothing** — watch it
 rejoin. Reserve operator action for *genuine, lasting* problems, and always
@@ -182,6 +185,31 @@ manual probe alone does not clear a persisted bypass or prove auto-rejoin.
 rch self-test --worker <worker-id>         # full end-to-end build on that worker
 rch fleet verify --worker <worker-id>      # post-deploy/health verification
 ```
+
+### Native Windows build failures after recovery
+
+Git Bash can put its Unix `link.exe` ahead of Microsoft's linker. If an MSVC
+build invokes the wrong executable, select the installed Microsoft linker in
+the worker's Cargo configuration. `C:/rch/.cargo/config.toml` applies to RCH
+projects beneath `C:/rch`; preserve any existing configuration before editing.
+For example, this toolset was verified on `wsurf` on September 9, 2026:
+
+```toml
+[target.x86_64-pc-windows-msvc]
+linker = 'C:/BuildTools/VC/Tools/MSVC/14.44.35207/bin/HostX64/x64/link.exe'
+```
+
+Verify the installed path on the worker instead of assuming that version exists.
+Then retry the same project command and confirm that its tests actually execute.
+
+An SSH command timeout currently does **not** terminate a Windows build's
+process tree: the transfer code records no Windows process-group identifier and
+reports `remote cleanup not attempted`. Inspect native `cargo`, `rustc`, `cl`,
+and `link` processes, including their parents and creation times, before retrying.
+Wait for an active owned build to finish or use a targeted, reviewed cancellation;
+do not kill unrelated compiler processes. Retain the failed log and target cache.
+A retry can reuse completed dependencies, but the timed-out attempt is not a test
+pass and its absence from the dispatcher queue does not prove remote termination.
 
 ## Recovery procedures by scenario
 
