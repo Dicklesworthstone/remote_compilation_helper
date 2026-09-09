@@ -298,13 +298,17 @@ fn assess_probe_facts(
                 .any(|have| have.starts_with(t.as_str()))
         });
     let min_bytes = (config.min_disk_free_gb * BYTES_PER_GB) as u64;
+    // Git Bash reports `-` for NTFS inode availability; the capability parser
+    // represents that unavailable count as zero. Windows has no fixed Unix
+    // inode pool, so require free bytes there and retain both floors elsewhere.
+    let requires_inodes = facts.os.as_deref() != Some("windows");
     let disk_ok = if facts.disk_roots.is_empty() {
         true
     } else {
-        facts
-            .disk_roots
-            .iter()
-            .all(|r| r.available_bytes >= min_bytes && r.available_inodes >= config.min_disk_inodes)
+        facts.disk_roots.iter().all(|r| {
+            r.available_bytes >= min_bytes
+                && (!requires_inodes || r.available_inodes >= config.min_disk_inodes)
+        })
     };
     let load_ok = load_per_core.is_none_or(|lpc| lpc <= config.max_load_per_core);
 
@@ -1244,6 +1248,47 @@ mod tests {
             assess_probe_facts(&f, Some(0.1), true, &BypassRecoveryConfig::default()).disk_ok,
             "an unmeasurable disk dimension must not trap a reachable worker"
         );
+    }
+
+    #[test]
+    fn assess_windows_disk_without_unix_inode_counts_preserves_byte_floor() {
+        // The real wsurf Git Bash probe reports bytes but `-` for free inodes.
+        // Exercise parsing as well as admission so a healthy native worker can
+        // recover, while missing/low byte capacity still refuses recovery.
+        let config = BypassRecoveryConfig::default();
+        for (available_kb, expected) in [("67108864", true), ("1048576", false), ("-", false)] {
+            let facts = parse_capability_probe(&format!(
+                "RCH_FACT os=mingw64_nt-10.0-26200\n\
+                 RCH_FACT disk=/tmp;498499580;{available_kb};-\n"
+            ));
+            assert_eq!(facts.os.as_deref(), Some("windows"));
+            assert_eq!(facts.disk_roots.len(), 1);
+            assert_eq!(facts.disk_roots[0].available_inodes, 0);
+            assert_eq!(
+                assess_probe_facts(&facts, None, true, &config).disk_ok,
+                expected,
+                "available_kb={available_kb}"
+            );
+        }
+    }
+
+    #[test]
+    fn assess_non_windows_disk_still_requires_free_inodes() {
+        let config = BypassRecoveryConfig::default();
+        for os in ["linux", "darwin", "unknown"] {
+            for (inodes, expected) in [("-", false), ("0", false), ("9999", false), ("10000", true)]
+            {
+                let facts = parse_capability_probe(&format!(
+                    "RCH_FACT os={os}\n\
+                     RCH_FACT disk=/tmp;498499580;67108864;{inodes}\n"
+                ));
+                assert_eq!(
+                    assess_probe_facts(&facts, None, true, &config).disk_ok,
+                    expected,
+                    "os={os}, inodes={inodes}"
+                );
+            }
+        }
     }
 
     #[test]
