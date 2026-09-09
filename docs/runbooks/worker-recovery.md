@@ -155,6 +155,27 @@ rch workers probe <worker-id> -v           # run a probe now
 rch status --fleet                         # confirm it returned to the live pool
 ```
 
+**Native Windows workers:** Git Bash reports `-` for the Unix inode count on
+NTFS. Recovery checks free disk bytes on Windows without imposing the Unix
+inode floor; Unix workers still require both. A `disk` recovery refusal on an
+older daemon despite sufficient free bytes can therefore require a daemon
+upgrade, rather than disk cleanup.
+
+The recovery inventory also queries every installed Rust toolchain. A manual
+worker probe can succeed while the daemon's shorter recovery probe times out.
+If logs show that timeout, measure the complete inventory and give it enough
+time to finish in the local daemon's configuration, for example:
+
+```toml
+[remediation.auto_rejoin]
+probe_timeout_secs = 60
+```
+
+This changes the recovery probe budget; build/test deadlines and worker health
+checks have separate budgets. Apply it with `rch daemon restart --yes --drain`,
+then verify daemon status and the worker's actual recovery state. A successful
+manual probe alone does not clear a persisted bypass or prove auto-rejoin.
+
 ### 6. Verify recovery
 
 ```bash
