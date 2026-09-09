@@ -416,6 +416,29 @@ fn log_reap_audit(worker_id: &WorkerId, stdout: &str) {
 mod tests {
     use super::*;
 
+    /// Run a generated sweep script under `sh` with `TMPDIR` pointed at a
+    /// directory private to this test's fixture.
+    ///
+    /// The sweep also scans the worker's tmp base (`$TMPDIR`, resolved into
+    /// `$__tmpscan`) for reap-class dirs. Every `tempdir()` fixture lives under
+    /// the inherited `TMPDIR`, so with it inherited each test's sweep sees —
+    /// and reaps — the fixtures of every OTHER test running in parallel (on
+    /// rch workers `TMPDIR` is the in-workspace `.rch-tmp`, and the suite
+    /// failed there on exactly that cross-talk). A private base is also what
+    /// a real worker has: one tmp base per daemon, not one shared with
+    /// strangers. It sits beside the fixture's `projects/` so the tmp-base
+    /// pass scans only this test's own tree.
+    fn run_sweep(cmd: &str, fixture_root: &std::path::Path) -> std::process::Output {
+        let private_tmp = fixture_root.join("tmp");
+        std::fs::create_dir_all(&private_tmp).expect("create private TMPDIR");
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .env("TMPDIR", &private_tmp)
+            .output()
+            .expect("run sweep script under sh")
+    }
+
     #[test]
     fn sweep_command_confines_to_base_and_per_job_globs() {
         let cmd = build_sweep_command("/data/projects", 720, None, None);
@@ -452,11 +475,28 @@ mod tests {
         assert!(cmd.contains("mktemp -p \"$__tmpbase\""));
         assert!(!cmd.contains("mktemp -p \"${TMPDIR:-/data/tmp}\""));
         // 6dj11: the legacy /data/tmp/rch_target_* trees (the css
-        // incident class) are swept too — -maxdepth 1, name-anchored,
-        // depth-guarded so a bare /tmp fallback is never scanned.
+        // incident class) are swept too — -maxdepth 1, name-anchored.
+        // a4047390: the tmp base is scanned through `$__tmpscan`, its
+        // `pwd -P` canonicalization (so the dedup against `$__rt` is sound),
+        // depth-guarded BEFORE and AFTER resolution — emptied unless both
+        // spellings are >=2 segments deep — so a bare `/tmp` fallback (or
+        // one resolving to macOS `/private/tmp`) is never scanned, and every
+        // tmp-base find is gated on that resolved root being non-empty.
         assert!(cmd.contains(
-            "case \"$__tmpbase\" in /*/*) find \"$__tmpbase\" -maxdepth 1 -type d -name \"rch_target_*\" -prune"
+            "case \"$__tmpbase\" in /*/*) __tmpscan=$(cd \"$__tmpbase\" 2>/dev/null && pwd -P)"
         ));
+        assert!(cmd.contains("case \"$__tmpscan\" in /*/*) ;; *) __tmpscan=\"\";; esac"));
+        assert!(cmd.contains(
+            "if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune"
+        ));
+        // The staged per-job/per-pid trees below the tmp base are scanned
+        // through the same resolved root (a second, deeper find).
+        assert!(
+            cmd.matches("find \"$__tmpscan\" -maxdepth ").count() >= 2,
+            "legacy and staged tmp-base passes must both use the resolved root: {cmd}"
+        );
+        // Never the unresolved, unguarded spelling.
+        assert!(!cmd.contains("find \"$__tmpbase\""));
         assert!(!cmd.contains("-name \"rch_target_*\" -prune 2>/dev/null | "));
         assert!(cmd.contains("done < \"$__tmpf\""));
         assert!(!cmd.contains("-prune 2>/dev/null | \\\n"));
@@ -527,7 +567,7 @@ mod tests {
         make_idle(&bystander); // even idle, the glob must not match it
 
         let cmd = build_sweep_command(base.to_str().unwrap(), 720, None, None);
-        let out = Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
+        let out = run_sweep(&cmd, tmp.path());
         let stdout = String::from_utf8_lossy(&out.stdout);
 
         // Idle dirs at every depth reaped.
@@ -585,11 +625,7 @@ mod tests {
         fs::write(live_pool.join("artifact.o"), b"x").unwrap();
         // An aged pooled dir with the pooled pass DISABLED must survive.
         let cmd_no_pool = build_sweep_command(base.to_str().unwrap(), 720, None, None);
-        let out = Command::new("sh")
-            .arg("-c")
-            .arg(&cmd_no_pool)
-            .output()
-            .unwrap();
+        let out = run_sweep(&cmd_no_pool, tmp.path());
         assert!(out.status.success());
         assert!(
             dead_pool.exists(),
@@ -598,7 +634,7 @@ mod tests {
 
         // With the pooled pass on, only the long-idle pool is reaped.
         let cmd = build_sweep_command(base.to_str().unwrap(), 720, Some(7 * 24 * 60), None);
-        let out = Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
+        let out = run_sweep(&cmd, tmp.path());
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
@@ -649,7 +685,7 @@ mod tests {
         // oldest aged dirs (~408KB) brings the total to ~612KB ≤ 700 and the
         // loop stops before the newest aged dir.
         let cmd = build_sweep_command(base.to_str().unwrap(), 720, None, Some(700));
-        let out = Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
+        let out = run_sweep(&cmd, tmp.path());
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
 
@@ -700,8 +736,21 @@ mod tests {
 
         // A read-only parent makes the unlink fail (as non-root).
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        // Root (CAP_DAC_OVERRIDE) ignores directory permissions, so the
+        // read-only parent cannot defeat the rm — and some rch workers run
+        // this suite as root. Probe the precondition instead of asserting it:
+        // when a write into the read-only parent succeeds, the failure path
+        // under test is unreachable on this host, so skip rather than fail.
+        if fs::write(parent.join(".rch-perm-probe"), b"").is_ok() {
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "skipping sweep_script_reports_failed_removals_instead_of_silence: \
+                 a read-only parent does not defeat writes here (running as root?)"
+            );
+            return;
+        }
         let cmd = build_sweep_command(base.to_str().unwrap(), 720, None, None);
-        let out = Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
+        let out = run_sweep(&cmd, tmp.path());
         // Restore before asserting so tempdir cleanup works even on failure.
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
 

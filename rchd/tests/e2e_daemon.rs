@@ -425,7 +425,27 @@ fn test_daemon_shutdown() {
         .wait_for_socket(&socket_path, Duration::from_secs(10))
         .unwrap();
 
-    // Send shutdown request
+    // The graceful-shutdown CONTRACT (d3096217): /shutdown is refused while
+    // admission is open — a wrapper could still be handed this daemon
+    // mid-restart — and proceeds only once the restart-admission barrier is
+    // raised and no builds are active or queued. Pin both halves.
+    let premature = send_socket_request(&socket_path, "POST /shutdown").unwrap();
+    let premature_body = extract_json_body(&premature).unwrap();
+    assert!(
+        premature_body.contains("shutdown_blocked"),
+        "Shutdown with open admission must be refused, got: {}",
+        premature_body
+    );
+
+    // Raise the admission barrier (the restart/shutdown precondition).
+    let admission = send_socket_request(&socket_path, "POST /restart-admission").unwrap();
+    assert!(
+        admission.contains("200 OK"),
+        "Expected 200 OK from /restart-admission, got: {}",
+        admission
+    );
+
+    // Send shutdown request (now permitted: admission closed, idle)
     let response = send_socket_request(&socket_path, "POST /shutdown").unwrap();
 
     // Verify response indicates shutdown
