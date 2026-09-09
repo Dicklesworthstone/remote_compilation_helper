@@ -324,7 +324,12 @@ fn rchd_systemd_unit_present() -> bool {
 /// is running and exit. systemd (Restart=always) is then the single source of
 /// truth, eliminating duplicate/orphan rchd regardless of how it was launched.
 /// No-op on macOS and on Linux hosts with no rchd.service (manual management).
-fn defer_to_systemd_if_managed() {
+/// An explicitly separate socket AND worker configuration designate an isolated
+/// pool. Its operator must first drain those workers from any shared daemon.
+fn defer_to_systemd_if_managed(socket: &Path, workers_config: Option<&Path>) {
+    if isolated_worker_pool(socket, workers_config) {
+        return;
+    }
     #[cfg(target_os = "linux")]
     {
         // Only defer when we can CONFIRM we are not the unit's own process.
@@ -344,6 +349,10 @@ fn defer_to_systemd_if_managed() {
             .status();
         std::process::exit(0);
     }
+}
+
+fn isolated_worker_pool(socket: &Path, workers_config: Option<&Path>) -> bool {
+    socket != crate::config::default_socket_path() && workers_config.is_some()
 }
 
 async fn bind_daemon_socket(socket: &Path) -> Result<UnixListener> {
@@ -492,7 +501,7 @@ async fn main() -> Result<()> {
     info!("Starting RCH daemon...");
 
     // Enforce single-instance on systemd hosts before we touch the socket.
-    defer_to_systemd_if_managed();
+    defer_to_systemd_if_managed(&cli.socket, cli.workers_config.as_deref());
     let listener = bind_daemon_socket(&cli.socket).await?;
     info!("Listening on {:?}", cli.socket);
     // Inform systemd we're ready. No-op for Type=simple (the current unit)
@@ -1287,6 +1296,17 @@ fn init_test_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_pool_requires_both_a_separate_socket_and_explicit_workers() {
+        let shared = crate::config::default_socket_path();
+        let isolated = shared.with_extension("isolated-test.sock");
+        let workers = Path::new("/tmp/isolated-workers.toml");
+        assert!(!isolated_worker_pool(&shared, None));
+        assert!(!isolated_worker_pool(&shared, Some(workers)));
+        assert!(!isolated_worker_pool(&isolated, None));
+        assert!(isolated_worker_pool(&isolated, Some(workers)));
+    }
     use rch_common::test_guard;
 
     fn make_test_telemetry() -> Arc<TelemetryStore> {
