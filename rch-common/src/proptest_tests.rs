@@ -1665,6 +1665,7 @@ mod tests {
                 arb_affinity_config(),
                 proptest::option::of(0.1f64..=10.0f64), // max_load_per_core
                 proptest::option::of(1.0f64..=1000.0f64), // min_free_gb
+                0.1f64..=100.0f64,                      // disk_gb_per_slot
             )
                 .prop_map(
                     |(
@@ -1675,6 +1676,7 @@ mod tests {
                         affinity,
                         max_load_per_core,
                         min_free_gb,
+                        disk_gb_per_slot,
                     )| {
                         SelectionConfig {
                             strategy,
@@ -1684,6 +1686,7 @@ mod tests {
                             affinity,
                             max_load_per_core,
                             min_free_gb,
+                            disk_gb_per_slot,
                         }
                     },
                 )

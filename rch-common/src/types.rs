@@ -320,9 +320,16 @@ pub struct SelectionConfig {
     #[serde(default = "default_max_load_per_core")]
     pub max_load_per_core: Option<f64>,
     /// Minimum free disk space in GB. Workers below this are skipped.
-    /// Set to None to disable disk-based filtering.
+    /// Set to None to disable the free-space floor; per-slot disk derating still applies.
     #[serde(default = "default_min_free_gb")]
     pub min_free_gb: Option<f64>,
+    /// Disk budget in GiB per concurrent slot, after reserving `min_free_gb`.
+    /// Must be finite and positive. Unknown disk telemetry preserves configured slots.
+    #[serde(
+        default = "default_disk_gb_per_slot",
+        deserialize_with = "deserialize_disk_gb_per_slot"
+    )]
+    pub disk_gb_per_slot: f64,
 }
 
 impl Default for SelectionConfig {
@@ -335,6 +342,7 @@ impl Default for SelectionConfig {
             affinity: AffinityConfig::default(),
             max_load_per_core: default_max_load_per_core(),
             min_free_gb: default_min_free_gb(),
+            disk_gb_per_slot: default_disk_gb_per_slot(),
         }
     }
 }
@@ -349,6 +357,24 @@ fn default_max_load_per_core() -> Option<f64> {
 
 fn default_min_free_gb() -> Option<f64> {
     Some(10.0) // Skip workers with < 10 GB free
+}
+
+fn default_disk_gb_per_slot() -> f64 {
+    10.0
+}
+
+fn deserialize_disk_gb_per_slot<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let budget = f64::deserialize(deserializer)?;
+    if budget.is_finite() && budget > 0.0 {
+        Ok(budget)
+    } else {
+        Err(serde::de::Error::custom(
+            "disk_gb_per_slot must be finite and greater than zero",
+        ))
+    }
 }
 
 /// Weight configuration for the balanced selection strategy.
@@ -6509,6 +6535,7 @@ retry_max = 2
         // Default thresholds
         assert_eq!(config.max_load_per_core, Some(2.0));
         assert_eq!(config.min_free_gb, Some(10.0));
+        assert_eq!(config.disk_gb_per_slot, 10.0);
     }
 
     #[test]
@@ -6517,12 +6544,25 @@ retry_max = 2
         let config = SelectionConfig {
             max_load_per_core: Some(3.5),
             min_free_gb: Some(25.0),
+            disk_gb_per_slot: 0.83,
             ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: SelectionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.max_load_per_core, Some(3.5));
         assert_eq!(parsed.min_free_gb, Some(25.0));
+        assert_eq!(parsed.disk_gb_per_slot, 0.83);
+    }
+
+    #[test]
+    fn test_selection_disk_slot_budget_validation() {
+        let _guard = test_guard!();
+        for value in ["0.0", "-1.0", "nan", "inf", "-inf"] {
+            let result = toml::from_str::<SelectionConfig>(&format!("disk_gb_per_slot = {value}"));
+            assert!(result.is_err(), "invalid disk slot budget {value}");
+        }
+        let default: SelectionConfig = toml::from_str("").unwrap();
+        assert_eq!(default.disk_gb_per_slot, 10.0);
     }
 
     #[test]

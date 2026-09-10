@@ -1043,10 +1043,9 @@ impl WorkerSelector {
         // still preserving cache affinity once those workers are saturated (the
         // skip condition no longer holds, so the pin is honored).
         for (candidate, _) in eligible {
+            let available_slots = candidate.available_slots().await;
             let config = candidate.config.read().await;
-            if config.priority > pinned_priority
-                && candidate.available_slots().await >= request.estimated_cores
-            {
+            if config.priority > pinned_priority && available_slots >= request.estimated_cores {
                 debug!(
                     "Skipping affinity pin {} for project {}: higher-priority worker {} (priority {}) has capacity",
                     pinned_worker_id, request.project, config.id, config.priority
@@ -1175,13 +1174,13 @@ impl WorkerSelector {
         let mut breakdowns = Vec::with_capacity(workers.len());
 
         for (worker, circuit_state) in workers {
+            let total_slots = worker.effective_total_slots().await;
             let config = worker.config.read().await;
             let worker_id = config.id.as_str().to_string();
             let speed_score = worker.get_speed_score();
-            let total_slots = config.total_slots;
             let used_slots = worker.used_slots();
             let slot_availability = if total_slots > 0 {
-                1.0 - (used_slots as f64 / total_slots as f64)
+                total_slots.saturating_sub(used_slots) as f64 / total_slots as f64
             } else {
                 0.0
             };
@@ -1361,9 +1360,10 @@ impl WorkerSelector {
         for worker in all_workers {
             let config = worker.config.read().await;
             let worker_id = config.id.clone();
-            let total_slots = config.total_slots;
             let declared_os = rch_common::declared_os(&config.tags);
             drop(config);
+
+            let total_slots = worker.effective_total_slots().await;
 
             let status = worker.status().await;
             let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
@@ -1408,6 +1408,23 @@ impl WorkerSelector {
 
             let mut reason_codes = Vec::new();
             let mut soft_reason: Option<String> = None;
+            let hard_admission = if let Some(ref gate) = self.admission_gate {
+                match gate.cached_verdict(worker_id.as_str()).await {
+                    Some(crate::admission::AdmissionVerdict::Reject {
+                        reason_code,
+                        reason,
+                    }) if matches!(
+                        reason_code.as_str(),
+                        "admission_critical_pressure" | "admission_disk_floor"
+                    ) =>
+                    {
+                        Some((reason_code, reason))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
 
             let (final_decision, final_reason) =
                 if !matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded) {
@@ -1480,6 +1497,25 @@ impl WorkerSelector {
                 } else if let Some(reason) = cached_toolchain_failure {
                     push_reason_code(&mut reason_codes, "toolchain.preflight_failed");
                     (WorkerSelectionDiagnosticDecision::Deny, reason)
+                } else if let Some((code, reason)) = hard_admission {
+                    push_reason_code(
+                        &mut reason_codes,
+                        if code == "admission_disk_floor" {
+                            "pressure.disk_floor"
+                        } else {
+                            "pressure.critical"
+                        },
+                    );
+                    (
+                        WorkerSelectionDiagnosticDecision::Deny,
+                        format!("admission rejected: {reason}"),
+                    )
+                } else if pressure.state == PressureState::Critical {
+                    push_reason_code(&mut reason_codes, "pressure.critical");
+                    (
+                        WorkerSelectionDiagnosticDecision::Deny,
+                        format!("critical pressure: {}", pressure.reason_code),
+                    )
                 } else if total_slots < request.estimated_cores {
                     push_reason_code(&mut reason_codes, "slots.request_exceeds_capacity");
                     (
@@ -1901,13 +1937,9 @@ impl WorkerSelector {
 
         for worker in workers {
             let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
-            let (worker_id, total_slots, declared_os) = {
+            let (worker_id, declared_os) = {
                 let config = worker.config.read().await;
-                (
-                    config.id.clone(),
-                    config.total_slots,
-                    rch_common::declared_os(&config.tags),
-                )
+                (config.id.clone(), rch_common::declared_os(&config.tags))
             };
 
             // An explicit worker request is an allow-set, not a scoring hint.
@@ -2012,7 +2044,27 @@ impl WorkerSelector {
             // hard exclusion that must not reach even the fail-open lists. A
             // degraded candidate has to earn its place like any other.
             let mut undersized_but_free = false;
+            let total_slots = worker.effective_total_slots().await;
             let available_slots = worker.available_slots().await;
+            // Preserve the disk-specific gate/audit reason when derating has
+            // already reduced capacity to zero, before the generic slot filter.
+            if total_slots == 0 {
+                let hard_pressure = if let Some(ref gate) = self.admission_gate {
+                    matches!(
+                        gate.evaluate(worker.as_ref(), worker_id.as_str(), &request.project).await,
+                        crate::admission::AdmissionVerdict::Reject { reason_code, .. }
+                            if matches!(reason_code.as_str(), "admission_critical_pressure" | "admission_disk_floor")
+                    )
+                } else {
+                    worker.pressure_assessment().await.state == PressureState::Critical
+                };
+                if hard_pressure {
+                    filtered_by_pressure += 1;
+                    filtered_by_hard_preflight += 1;
+                    metrics::inc_reliability_error("preflight_pressure", "critical_pressure");
+                    continue;
+                }
+            }
             if available_slots < request.estimated_cores {
                 if total_slots < request.estimated_cores {
                     // `estimated_cores` is an ESTIMATE (see
@@ -2810,24 +2862,21 @@ impl WorkerSelector {
         // SpeedScore component (0-1), clamped to valid range
         let speed_score = (worker.get_speed_score() / 100.0).clamp(0.0, 1.0);
 
-        let config = worker.config.read().await;
-        let total_slots = if config.total_slots == 0 {
+        let total_slots = worker.effective_total_slots().await;
+        let total_slots = if total_slots == 0 {
             return 0.0; // Workers with 0 slots should never be selected
         } else {
-            config.total_slots as f64
+            total_slots as f64
         };
 
         // Load factor: penalize heavily loaded workers (0.5-1.0)
-        let load_factor = {
-            let active_slots = config
-                .total_slots
-                .saturating_sub(worker.available_slots().await);
-            let utilization = active_slots as f64 / total_slots;
-            1.0 - (utilization * 0.5)
-        };
+        let utilization = (worker.used_slots() as f64 / total_slots).min(1.0);
+        let load_factor = 1.0 - (utilization * 0.5);
 
         // Slot availability (0-1)
-        let slot_score = worker.available_slots().await as f64 / total_slots;
+        let slot_score = 1.0 - utilization;
+
+        let config = worker.config.read().await;
 
         // Cache affinity (0-1)
         let mut cache_score = cache.estimate_warmth(config.id.as_str(), project, cache_use);
@@ -3210,14 +3259,11 @@ pub async fn select_worker_with_config(
 
     for worker in workers {
         let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
-        let (worker_id, total_slots, declared_os) = {
+        let (worker_id, declared_os) = {
             let config = worker.config.read().await;
-            (
-                config.id.clone(),
-                config.total_slots,
-                rch_common::declared_os(&config.tags),
-            )
+            (config.id.clone(), rch_common::declared_os(&config.tags))
         };
+        let total_slots = worker.effective_total_slots().await;
 
         if has_preferred && !preferred_set.contains(worker_id.as_str()) {
             continue;
@@ -3447,9 +3493,9 @@ async fn compute_score(
     priority_score: f64,
 ) -> f64 {
     // Slot availability score (0.0-1.0)
-    let config = worker.config.read().await;
-    let total_slots = config.total_slots.max(1) as f64;
+    let total_slots = worker.effective_total_slots().await.max(1) as f64;
     let slot_score = (worker.available_slots().await as f64 / total_slots).min(1.0);
+    let config = worker.config.read().await;
 
     // Speed score (already 0-100, normalize to 0-1)
     let speed_score = worker.get_speed_score() / 100.0;

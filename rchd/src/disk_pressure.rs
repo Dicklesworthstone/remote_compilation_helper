@@ -112,6 +112,37 @@ impl Default for PressureAssessment {
     }
 }
 
+/// Convert free disk into a concurrent-slot budget without changing the
+/// operator's configured CPU ceiling. Existing reservations are tracked separately.
+#[derive(Debug, Clone, Copy)]
+pub struct DiskSlotPolicy {
+    floor_gb: f64,
+    gb_per_slot: f64,
+}
+
+impl From<&rch_common::SelectionConfig> for DiskSlotPolicy {
+    fn from(config: &rch_common::SelectionConfig) -> Self {
+        Self {
+            floor_gb: config.min_free_gb.unwrap_or(0.0).max(0.0),
+            gb_per_slot: if config.disk_gb_per_slot.is_finite() && config.disk_gb_per_slot > 0.0 {
+                config.disk_gb_per_slot
+            } else {
+                rch_common::SelectionConfig::default().disk_gb_per_slot
+            },
+        }
+    }
+}
+
+impl DiskSlotPolicy {
+    pub fn effective_slots(&self, configured: u32, pressure: &PressureAssessment) -> u32 {
+        let Some(free_gb) = pressure.disk_free_gb.filter(|free| free.is_finite()) else {
+            return configured;
+        };
+        let disk_slots = ((free_gb - self.floor_gb).max(0.0) / self.gb_per_slot).floor();
+        configured.min(disk_slots as u32)
+    }
+}
+
 /// Policy thresholds for pressure classification.
 #[derive(Debug, Clone)]
 pub struct DiskPressurePolicyConfig {

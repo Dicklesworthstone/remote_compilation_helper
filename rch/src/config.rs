@@ -593,6 +593,8 @@ struct PartialRchConfig {
     #[serde(default)]
     compilation: PartialCompilationConfig,
     #[serde(default)]
+    selection: PartialSelectionConfig,
+    #[serde(default)]
     transfer: PartialTransferConfig,
     #[serde(default)]
     environment: PartialEnvironmentConfig,
@@ -638,6 +640,11 @@ struct PartialGeneralConfig {
     force_remote: Option<bool>,
     log_level: Option<String>,
     socket_path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialSelectionConfig {
+    disk_gb_per_slot: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1280,6 +1287,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "compilation.external_timeout_enabled",
         "compilation.allow_local_fallback",
         "compilation.remote_build_jobs",
+        "selection.disk_gb_per_slot",
         "transfer.compression_level",
         "transfer.exclude_patterns",
         "transfer.sync_timeout_ms",
@@ -1395,6 +1403,11 @@ fn apply_layer(
     if let Some(remote_build_jobs) = layer.compilation.remote_build_jobs {
         config.compilation.remote_build_jobs = remote_build_jobs;
         set_source(sources, "compilation.remote_build_jobs", source.clone());
+    }
+
+    if let Some(disk_gb_per_slot) = layer.selection.disk_gb_per_slot {
+        config.selection.disk_gb_per_slot = disk_gb_per_slot;
+        set_source(sources, "selection.disk_gb_per_slot", source.clone());
     }
 
     if let Some(compression) = layer.transfer.compression_level {
@@ -3606,6 +3619,52 @@ max_concurrent_workers = 3
         assert_eq!(loaded.config.execution.allowlist, vec!["cargo"]);
         assert!(!loaded.config.alerts.enabled);
         assert_eq!(loaded.config.fleet.max_concurrent_workers, 3);
+    }
+
+    #[test]
+    fn test_disk_slot_budget_sources_follow_user_and_project_precedence() {
+        let _guard = test_guard!();
+        let key = "selection.disk_gb_per_slot";
+        let defaults =
+            load_config_with_sources_from_paths(None, None, None).expect("load default sources");
+        assert_eq!(defaults.sources.get(key), Some(&ConfigValueSource::Default));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        let project_path = dir.path().join("project.toml");
+        std::fs::write(&user_path, "[selection]\ndisk_gb_per_slot = 2.5\n")
+            .expect("write user config");
+        let user = load_config_with_sources_from_paths(Some(&user_path), None, None)
+            .expect("load user sources");
+        assert!((user.config.selection.disk_gb_per_slot - 2.5).abs() < f64::EPSILON);
+        assert_eq!(
+            user.sources.get(key),
+            Some(&ConfigValueSource::UserConfig(user_path.clone()))
+        );
+
+        // An explicit project value equal to the default must still override
+        // the user's budget and identify the project as its source.
+        std::fs::write(
+            &project_path,
+            format!(
+                "[selection]\ndisk_gb_per_slot = {}\n",
+                RchConfig::default().selection.disk_gb_per_slot
+            ),
+        )
+        .expect("write project config");
+        let project =
+            load_config_with_sources_from_paths(Some(&user_path), Some(&project_path), None)
+                .expect("load project sources");
+        assert!(
+            (project.config.selection.disk_gb_per_slot
+                - RchConfig::default().selection.disk_gb_per_slot)
+                .abs()
+                < f64::EPSILON
+        );
+        assert_eq!(
+            project.sources.get(key),
+            Some(&ConfigValueSource::ProjectConfig(project_path))
+        );
     }
 
     #[test]

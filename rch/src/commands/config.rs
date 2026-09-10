@@ -18,7 +18,7 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
+const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
 
 fn print_file_validation(
     label: &str,
@@ -815,6 +815,12 @@ pub(super) fn collect_value_sources(
     );
     push_value_source(
         &mut values,
+        "selection.disk_gb_per_slot",
+        config.selection.disk_gb_per_slot.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
         "transfer.compression_level",
         config.transfer.compression_level.to_string(),
         sources,
@@ -1280,6 +1286,19 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
             }
             config.transfer.compression_level = level;
         }
+        "selection.disk_gb_per_slot" => {
+            let budget = parse_f64(value, key)?;
+            if !budget.is_finite() || budget <= 0.0 {
+                return Err(ConfigError::InvalidValue {
+                    field: key.to_string(),
+                    reason: format!("value {budget} is not a positive finite number"),
+                    suggestion: "Use a positive disk budget in GiB per slot, such as 10"
+                        .to_string(),
+                }
+                .into());
+            }
+            config.selection.disk_gb_per_slot = budget;
+        }
         "transfer.exclude_patterns" => {
             config.transfer.exclude_patterns = parse_string_list(value, key)?;
         }
@@ -1464,6 +1483,10 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
         "compilation.remote_build_jobs" => {
             config.compilation.remote_build_jobs = defaults.compilation.remote_build_jobs;
             config.compilation.remote_build_jobs.to_string()
+        }
+        "selection.disk_gb_per_slot" => {
+            config.selection.disk_gb_per_slot = defaults.selection.disk_gb_per_slot;
+            config.selection.disk_gb_per_slot.to_string()
         }
         "transfer.compression_level" => {
             config.transfer.compression_level = defaults.transfer.compression_level;
@@ -2925,5 +2948,48 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_disk_slot_budget_roundtrip_get_and_reset() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let ctx = plain_context();
+        let key = "selection.disk_gb_per_slot";
+
+        config_set_at(&config_path, key, "2.5", &ctx).expect("set disk budget");
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        let values = collect_value_sources(&config, &config::ConfigSourceMap::new());
+        let entry = values
+            .iter()
+            .find(|entry| entry.key == key)
+            .expect("get key");
+        assert_eq!(entry.value, "2.5");
+
+        config_reset_at(&config_path, key, &ctx).expect("reset disk budget");
+        let contents = std::fs::read_to_string(&config_path).expect("read reset config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse reset config");
+        assert!(
+            (config.selection.disk_gb_per_slot - RchConfig::default().selection.disk_gb_per_slot)
+                .abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn config_disk_slot_budget_rejects_invalid_values_without_changing_file() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let ctx = plain_context();
+        let key = "selection.disk_gb_per_slot";
+        config_set_at(&config_path, key, "12", &ctx).expect("set valid budget");
+        let before = std::fs::read(&config_path).expect("read config");
+        for invalid in ["0", "-1", "NaN", "inf", "-inf", "not-a-number"] {
+            assert!(config_set_at(&config_path, key, invalid, &ctx).is_err());
+            assert_eq!(std::fs::read(&config_path).expect("read config"), before);
+        }
     }
 }

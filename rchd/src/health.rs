@@ -459,7 +459,6 @@ impl HealthMonitor {
                 for worker in workers {
                     let worker_config_guard = worker.config.read().await;
                     let worker_id = worker_config_guard.id.as_str().to_string();
-                    let total_slots = worker_config_guard.total_slots;
                     // Drop lock before check_worker_health to avoid holding it during IO
                     drop(worker_config_guard);
 
@@ -589,7 +588,10 @@ impl HealthMonitor {
                     metrics::set_circuit_state(&worker_id, circuit_value);
 
                     // Record slot metrics
-                    metrics::set_worker_slots_total(&worker_id, total_slots);
+                    metrics::set_worker_slots_total(
+                        &worker_id,
+                        worker.effective_total_slots().await,
+                    );
                     metrics::set_worker_slots_available(&worker_id, worker.available_slots().await);
                     if result.healthy {
                         debug!(

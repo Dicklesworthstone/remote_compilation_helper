@@ -624,6 +624,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_disk_slots_report_disk_floor_before_zero_capacity() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(WorkerConfig {
+            id: WorkerId::new("full-worker"),
+            ..Default::default()
+        })
+        .await;
+        let worker = pool.get(&WorkerId::new("full-worker")).await.unwrap();
+        let ctx = crate::test_daemon_context(pool);
+        for free_gb in [9.0, 10.0] {
+            worker
+                .set_pressure_assessment(assessment(PressureState::Healthy, Some(free_gb)))
+                .await;
+            assert_eq!(worker.effective_total_slots().await, 0);
+            let result = ctx
+                .worker_selector
+                .select(&ctx.pool, &select_request("full-disk"))
+                .await;
+            assert!(result.worker.is_none());
+            assert!(matches!(
+                result.reason,
+                rch_common::SelectionReason::NoAdmissibleWorkers(_)
+            ));
+            let audit = ctx.worker_selector.get_last_audit_entry().await.unwrap();
+            assert!(audit.reason.contains("full-worker=admission_disk_floor"));
+        }
+    }
+
+    #[tokio::test]
     async fn selection_with_admission_gate_rejects_critical_worker() {
         let _guard = test_guard!();
         let history = Arc::new(BuildHistory::new(10));

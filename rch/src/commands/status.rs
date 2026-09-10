@@ -2745,6 +2745,14 @@ pub async fn status_overview(
 fn build_fleet_status_report(
     status: &DaemonFullStatusResponse,
 ) -> rch_common::fleet_status::FleetStatusReport {
+    let desired = super::helpers::load_workers_from_config().unwrap_or_default();
+    build_fleet_status_report_with_workers(status, &desired)
+}
+
+fn build_fleet_status_report_with_workers(
+    status: &DaemonFullStatusResponse,
+    desired: &[rch_common::WorkerConfig],
+) -> rch_common::fleet_status::FleetStatusReport {
     use chrono::{DateTime, Utc};
     use rch_common::fleet_diff::WorkerObservation;
     use rch_common::fleet_status::{
@@ -2752,7 +2760,6 @@ fn build_fleet_status_report(
     };
     use std::collections::BTreeSet;
 
-    let desired = super::helpers::load_workers_from_config().unwrap_or_default();
     let desired_ids: BTreeSet<String> = desired.iter().map(|w| w.id.to_string()).collect();
     let live_ids: BTreeSet<String> = status.workers.iter().map(|w| w.id.clone()).collect();
     let now = Utc::now();
@@ -2793,7 +2800,7 @@ fn build_fleet_status_report(
             w.pressure_state.as_deref(),
             Some("critical") | Some("warning")
         );
-        let slots_saturated = w.total_slots > 0 && w.used_slots >= w.total_slots;
+        let slots_saturated = w.used_slots >= w.total_slots;
         signals.push(FleetWorkerSignal {
             observation,
             disk_pressure,
@@ -2803,7 +2810,7 @@ fn build_fleet_status_report(
     }
 
     // Desired workers entirely missing from the live pool.
-    for cfg in &desired {
+    for cfg in desired {
         let id = cfg.id.to_string();
         if live_ids.contains(&id) {
             continue;
@@ -3788,6 +3795,32 @@ mod tests {
         let (ok2, reason2) = smoke_fleet_consistency(&drifted);
         assert!(!ok2);
         assert_eq!(reason2.as_deref(), Some("fleet_workers_absent"));
+    }
+
+    #[test]
+    fn fleet_report_treats_zero_disk_capacity_as_saturated_until_recovery() {
+        use rch_common::fleet_status::FleetProblemClass;
+
+        let desired = vec![rch_common::WorkerConfig {
+            id: rch_common::WorkerId::new("disk-worker"),
+            ..Default::default()
+        }];
+        let mut status = make_daemon_status();
+        let mut worker = mk_worker_status("disk-worker", "healthy", "closed", 0, 90.0);
+        worker.pressure_state = Some("healthy".to_string());
+        status.workers.push(worker);
+
+        // A custom disk floor can leave no usable slots while the broader
+        // pressure assessment is healthy, even before any builds reserve slots.
+        for used in [0, 4] {
+            status.workers[0].used_slots = used;
+            let report = build_fleet_status_report_with_workers(&status, &desired);
+            assert_eq!(report.problem_class, FleetProblemClass::LocalOverload);
+        }
+
+        status.workers[0].total_slots = 5;
+        let report = build_fleet_status_report_with_workers(&status, &desired);
+        assert_eq!(report.problem_class, FleetProblemClass::Healthy);
     }
 
     fn self_test_result(

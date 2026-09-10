@@ -575,16 +575,6 @@ async fn main() -> Result<()> {
     let total_slots: u32 = workers.iter().map(|worker| worker.total_slots).sum();
     info!("Loaded {} workers from configuration", workers.len());
 
-    // Initialize worker pool
-    let worker_pool = workers::WorkerPool::new();
-    for worker_config in workers {
-        info!(
-            "Adding worker: {} ({}@{}, {} slots)",
-            worker_config.id, worker_config.user, worker_config.host, worker_config.total_slots
-        );
-        worker_pool.add_worker(worker_config).await;
-    }
-
     // Load RCH config for selection and circuit breaker settings
     let rch_config = match config::load_rch_config() {
         Ok(mut cfg) => {
@@ -599,6 +589,17 @@ async fn main() -> Result<()> {
             cfg
         }
     };
+
+    // Install the disk-slot policy before adding workers so later config reloads
+    // inherit the same budget as workers present at startup.
+    let worker_pool = workers::WorkerPool::with_selection_config(&rch_config.selection);
+    for worker_config in workers {
+        info!(
+            "Adding worker: {} ({}@{}, {} slots)",
+            worker_config.id, worker_config.user, worker_config.host, worker_config.total_slots
+        );
+        worker_pool.add_worker(worker_config).await;
+    }
 
     // Startup self-consistency check (bd-...-3.2): verify the daemon's bound
     // socket, the hook/CLI's configured socket, and the installed Claude Code

@@ -2306,8 +2306,8 @@ async fn handle_select_worker_with_wrapper(
             // "Failed to reserve 4 slots on hz2" against a 2-slot worker.
             reservation_attempts += 1;
             let reserve_slots = {
-                let total = worker.config.read().await.total_slots;
-                request.estimated_cores.min(total.max(1))
+                let total = worker.effective_total_slots().await;
+                request.estimated_cores.min(total)
             };
             if worker.reserve_slots(reserve_slots).await {
                 let (id, host, user, identity_file, declared_os) = {
@@ -3279,17 +3279,17 @@ pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatu
 
     for worker in &workers {
         let status = worker.status().await;
-        let (worker_id, host, user, total_slots) = {
+        let (worker_id, host, user) = {
             let config = worker.config.read().await;
             (
                 config.id.to_string(),
                 config.host.clone(),
                 config.user.clone(),
-                config.total_slots,
             )
         };
-        let available_slots = worker.available_slots().await;
-        let used_slots = total_slots - available_slots;
+        let total_slots = worker.effective_total_slots().await;
+        let used_slots = worker.used_slots();
+        let available_slots = total_slots.saturating_sub(used_slots);
         let circuit_stats = worker.circuit_stats().await;
         let circuit_state = circuit_stats.state();
         let assignable_slots = if worker_accepts_new_builds(status, circuit_state) {
@@ -6866,6 +6866,87 @@ mod tests {
             status.daemon.slots_available, 9,
             "only healthy/degraded, non-open-circuit capacity should be assignable"
         );
+    }
+
+    #[tokio::test]
+    async fn test_disk_slots_status_preserves_usage_after_derating() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("disk-worker", 8)).await;
+        let worker = pool.get(&WorkerId::new("disk-worker")).await.unwrap();
+        assert!(worker.reserve_slots(4).await);
+        worker
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                disk_free_gb: Some(20.0),
+                ..Default::default()
+            })
+            .await;
+        let ctx = make_test_context(pool);
+        let status = handle_status(&ctx).await.unwrap();
+        assert_eq!(status.workers[0].total_slots, 1);
+        assert_eq!(status.workers[0].used_slots, 4);
+        assert_eq!(status.daemon.slots_total, 1);
+        assert_eq!(status.daemon.slots_available, 0);
+        let snapshots = crate::ui::workers::WorkerStatusPanel::collect_snapshot(&ctx.pool).await;
+        assert_eq!(snapshots[0].total_slots, 1);
+        assert_eq!(snapshots[0].used_slots, 4);
+    }
+
+    #[tokio::test]
+    async fn test_disk_slots_selection_clamps_reservation_to_effective_capacity() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("disk-worker", 8)).await;
+        let worker = pool.get(&WorkerId::new("disk-worker")).await.unwrap();
+        worker
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                disk_free_gb: Some(40.0),
+                ..Default::default()
+            })
+            .await;
+        let ctx = make_test_context(pool);
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "disk-capacity".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 4,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::None,
+            classification_duration_us: None,
+            hook_pid: Some(98765),
+        };
+        let response = handle_select_worker(&ctx, request, false, None)
+            .await
+            .unwrap();
+        assert_eq!(response.worker.unwrap().slots_available, 0);
+        assert_eq!(worker.used_slots(), 3);
+        let build_id = response.build_id.unwrap();
+        assert_eq!(ctx.history.active_build(build_id).unwrap().slots, 3);
+        worker
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                disk_free_gb: Some(70.0),
+                ..Default::default()
+            })
+            .await;
+        assert!(worker.reserve_slots(1).await);
+        handle_release_worker(
+            &ctx,
+            ReleaseRequest {
+                worker_id: WorkerId::new("disk-worker"),
+                slots: 4,
+                build_id: Some(build_id),
+                exit_code: Some(0),
+                duration_ms: None,
+                bytes_transferred: None,
+                timing: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(worker.used_slots(), 1);
+        assert_eq!(worker.available_slots().await, 5);
     }
 
     #[tokio::test]

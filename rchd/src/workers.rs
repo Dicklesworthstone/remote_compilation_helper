@@ -4,7 +4,7 @@
 
 use crate::DaemonContext;
 use crate::disk_pressure::{
-    DiskPressurePolicyConfig, PressureAssessment, evaluate_pressure_policy,
+    DiskPressurePolicyConfig, DiskSlotPolicy, PressureAssessment, evaluate_pressure_policy,
 };
 use crate::health::probe_worker_capabilities;
 use rch_common::{
@@ -448,6 +448,8 @@ pub struct WorkerState {
     toolchain_preflight: RwLock<HashMap<String, ToolchainPreflightStatus>>,
     /// Latest daemon-side pressure policy assessment for this worker.
     pressure_assessment: RwLock<PressureAssessment>,
+    /// Disk budget shared by all workers created by the same daemon pool.
+    disk_slot_policy: DiskSlotPolicy,
     /// Reason for disabling this worker (if disabled).
     disabled_reason: RwLock<Option<String>>,
     /// Administrative intent to apply when a draining worker reaches zero slots.
@@ -469,6 +471,13 @@ pub struct WorkerState {
 impl WorkerState {
     /// Create a new worker state from configuration.
     pub fn new(config: WorkerConfig) -> Self {
+        Self::with_disk_slot_policy(
+            config,
+            DiskSlotPolicy::from(&rch_common::SelectionConfig::default()),
+        )
+    }
+
+    fn with_disk_slot_policy(config: WorkerConfig, disk_slot_policy: DiskSlotPolicy) -> Self {
         Self {
             config: RwLock::new(config),
             lifecycle: RwLock::new(WorkerLifecycle::new()),
@@ -481,6 +490,7 @@ impl WorkerState {
             capabilities: RwLock::new(WorkerCapabilities::new()),
             toolchain_preflight: RwLock::new(HashMap::new()),
             pressure_assessment: RwLock::new(PressureAssessment::default()),
+            disk_slot_policy,
             disabled_reason: RwLock::new(None),
             drain_completion: RwLock::new(DrainCompletionAction::default()),
             disabled_at: AtomicI64::new(0),
@@ -592,17 +602,25 @@ impl WorkerState {
         self.lifecycle.read().await.is_canary_pending()
     }
 
-    /// Get the number of available slots.
+    /// Configured ceiling reduced by current disk headroom.
+    pub async fn effective_total_slots(&self) -> u32 {
+        let config = self.config.read().await;
+        let pressure = self.pressure_assessment.read().await;
+        self.disk_slot_policy
+            .effective_slots(config.total_slots, &pressure)
+    }
+
+    /// Available slots after disk derating and existing reservations.
     pub async fn available_slots(&self) -> u32 {
+        let total = self.effective_total_slots().await;
         let used = self.used_slots.load(Ordering::Relaxed);
-        let total = self.config.read().await.total_slots;
         total.saturating_sub(used)
     }
 
     /// Reserve slots for a job. Returns true if successful.
     ///
-    /// Re-reads total_slots on each CAS iteration to handle concurrent config changes.
-    /// This prevents overallocation if total_slots is reduced while reserving.
+    /// Re-reads disk capacity on each CAS iteration and keeps the config and
+    /// pressure snapshot locked through the reservation to avoid overallocation.
     ///
     /// Also re-checks status on each iteration and refuses reservations on
     /// workers that are `Draining`, `Drained`, or `Disabled`. The selector
@@ -625,24 +643,34 @@ impl WorkerState {
             if !lifecycle_accepts_new_builds(*self.lifecycle.read().await) {
                 return false;
             }
-            // Re-read total_slots on each iteration to handle concurrent config changes.
-            // This is safe because CAS loops typically succeed in 1-2 iterations.
-            let total_slots = self.config.read().await.total_slots;
-            if current.saturating_add(count) > total_slots {
+            let config = self.config.read().await;
+            let pressure = self.pressure_assessment.read().await;
+            let total_slots = self
+                .disk_slot_policy
+                .effective_slots(config.total_slots, &pressure);
+            let Some(next) = current.checked_add(count) else {
+                return false;
+            };
+            if next > total_slots {
                 return false;
             }
-            match self.used_slots.compare_exchange(
+            let reserved = self.used_slots.compare_exchange(
                 current,
-                current + count,
+                next,
                 Ordering::SeqCst,
                 Ordering::Relaxed,
-            ) {
+            );
+            drop(pressure);
+            drop(config);
+            match reserved {
                 Ok(_) => {
                     // TOCTOU defense: re-check the lifecycle after a successful
                     // slot reservation. If a concurrent drain()/disable() or a
                     // bypass quarantine landed between our initial read and the
                     // CAS, roll the reservation back.
-                    if lifecycle_accepts_new_builds(*self.lifecycle.read().await) {
+                    if lifecycle_accepts_new_builds(*self.lifecycle.read().await)
+                        && self.used_slots() <= self.effective_total_slots().await
+                    {
                         return true;
                     }
                     // Roll back the reservation; release_slots also handles
@@ -1105,14 +1133,21 @@ pub struct WorkerPool {
     workers: Arc<RwLock<HashMap<WorkerId, Arc<WorkerState>>>>,
     /// Track worker count atomically for sync access.
     worker_count: Arc<AtomicUsize>,
+    disk_slot_policy: DiskSlotPolicy,
 }
 
 impl WorkerPool {
     /// Create a new empty worker pool.
     pub fn new() -> Self {
+        Self::with_selection_config(&rch_common::SelectionConfig::default())
+    }
+
+    /// Create a pool whose current and subsequently reloaded workers share a disk budget.
+    pub fn with_selection_config(config: &rch_common::SelectionConfig) -> Self {
         Self {
             workers: Arc::new(RwLock::new(HashMap::new())),
             worker_count: Arc::new(AtomicUsize::new(0)),
+            disk_slot_policy: DiskSlotPolicy::from(config),
         }
     }
 
@@ -1129,7 +1164,10 @@ impl WorkerPool {
             }
         }
 
-        let state = Arc::new(WorkerState::new(config));
+        let state = Arc::new(WorkerState::with_disk_slot_policy(
+            config,
+            self.disk_slot_policy,
+        ));
         let mut workers = self.workers.write().await;
         // Check again under write lock
         if let Some(existing) = workers.get(&id) {
@@ -2422,6 +2460,143 @@ mod tests {
 
         state.release_slots(4).await;
         assert_eq!(state.available_slots().await, 4);
+    }
+
+    #[tokio::test]
+    async fn test_disk_slots_derate_at_floor_and_recover() {
+        let state = WorkerState::new(test_config("disk-slots"));
+        assert_eq!(state.effective_total_slots().await, 8);
+        for (free_gb, expected) in [
+            (100.0, 8),
+            (80.0, 7),
+            (40.0, 3),
+            (20.0, 1),
+            (19.9, 0),
+            (10.0, 0),
+            (0.0, 0),
+            (-1.0, 0),
+            (f64::MAX, 8),
+        ] {
+            state
+                .set_pressure_assessment(PressureAssessment {
+                    disk_free_gb: Some(free_gb),
+                    ..Default::default()
+                })
+                .await;
+            assert_eq!(
+                state.effective_total_slots().await,
+                expected,
+                "free GiB={free_gb}"
+            );
+            assert_eq!(state.available_slots().await, expected);
+            assert_eq!(state.config.read().await.total_slots, 8);
+        }
+        for unknown in [None, Some(f64::NAN), Some(f64::INFINITY)] {
+            state
+                .set_pressure_assessment(PressureAssessment {
+                    disk_free_gb: unknown,
+                    ..Default::default()
+                })
+                .await;
+            assert_eq!(state.effective_total_slots().await, 8);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disk_slots_keep_active_reservations_when_capacity_shrinks() {
+        let state = WorkerState::new(test_config("disk-shrink"));
+        assert!(state.reserve_slots(6).await);
+        state
+            .set_pressure_assessment(PressureAssessment {
+                disk_free_gb: Some(20.0),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(state.effective_total_slots().await, 1);
+        assert_eq!(state.used_slots(), 6);
+        assert_eq!(state.available_slots().await, 0);
+        assert!(!state.reserve_slots(1).await);
+        state.release_slots(2).await;
+        assert_eq!(state.used_slots(), 4);
+        assert_eq!(state.available_slots().await, 0);
+        state
+            .set_pressure_assessment(PressureAssessment {
+                disk_free_gb: Some(70.0),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(state.available_slots().await, 2);
+        state.release_slots(4).await;
+        assert_eq!(state.available_slots().await, 6);
+    }
+
+    #[tokio::test]
+    async fn test_disk_slots_budget_survives_worker_reload_and_addition() {
+        let config = rch_common::SelectionConfig {
+            min_free_gb: Some(5.0),
+            disk_gb_per_slot: 2.5,
+            ..Default::default()
+        };
+        let pool = WorkerPool::with_selection_config(&config);
+        pool.add_worker(test_config("first")).await;
+        let first = pool.get(&WorkerId::new("first")).await.unwrap();
+        first
+            .set_pressure_assessment(PressureAssessment {
+                disk_free_gb: Some(12.5),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(first.effective_total_slots().await, 3);
+        let mut reloaded = test_config("first");
+        reloaded.total_slots = 2;
+        pool.add_worker(reloaded).await;
+        assert_eq!(first.effective_total_slots().await, 2);
+        pool.add_worker(test_config("later")).await;
+        let later = pool.get(&WorkerId::new("later")).await.unwrap();
+        later
+            .set_pressure_assessment(first.pressure_assessment().await)
+            .await;
+        assert_eq!(later.effective_total_slots().await, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_disk_slots_concurrent_reservations_respect_capacity() {
+        let state = Arc::new(WorkerState::new(test_config("disk-race")));
+        state
+            .set_pressure_assessment(PressureAssessment {
+                disk_free_gb: Some(40.0),
+                ..Default::default()
+            })
+            .await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let worker = state.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                worker.reserve_slots(1).await
+            }));
+        }
+        let mut reserved = 0;
+        for task in tasks {
+            reserved += u32::from(task.await.unwrap());
+        }
+        assert_eq!(reserved, 3);
+        assert_eq!(state.used_slots(), 3);
+        assert_eq!(state.available_slots().await, 0);
+        state.release_slots(reserved).await;
+        assert_eq!(state.available_slots().await, 3);
+    }
+
+    #[tokio::test]
+    async fn test_slot_reservation_rejects_integer_overflow() {
+        let mut config = test_config("slot-overflow");
+        config.total_slots = u32::MAX;
+        let state = WorkerState::new(config);
+        assert!(state.reserve_slots(u32::MAX).await);
+        assert!(!state.reserve_slots(1).await);
+        assert_eq!(state.used_slots(), u32::MAX);
     }
 
     #[tokio::test]

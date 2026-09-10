@@ -439,6 +439,9 @@ max_transfer_mb = 2048
 
 [selection]
 strategy = "balanced"
+# Reserve this much free disk, then budget space for each concurrent slot (GiB).
+min_free_gb = 10.0
+disk_gb_per_slot = 10.0
 
 [self_healing]
 hook_starts_daemon = true
@@ -452,6 +455,14 @@ suppress_duplicates_secs = 300
 Built-in worker selection defaults to `balanced`, which blends speed, load,
 health, and cache affinity. Use `priority` only when you want explicit
 worker-priority control, and `fair_fastest` when you want extra load spreading.
+
+Worker capacity is capped at the configured `total_slots` and reduced to
+`floor((free_disk_gb - min_free_gb) / disk_gb_per_slot)` as disk fills, with a
+minimum of zero. Unknown disk telemetry keeps the configured ceiling. Existing
+builds retain their reservations when capacity drops; new work waits for space.
+`rch workers list` reports the effective total when the daemon is reachable.
+Change the budget with `rch config set selection.disk_gb_per_slot 10` and restart
+the daemon to apply it.
 
 ### Worker Config Example
 

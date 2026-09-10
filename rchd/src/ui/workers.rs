@@ -139,13 +139,12 @@ impl WorkerStatusPanel {
         for worker in workers {
             let config = worker.config.read().await;
             let id = config.id.as_str().to_string();
-            let total_slots = config.total_slots;
             let tags = config.tags.clone();
             drop(config);
 
             let status = worker.status().await;
-            let available_slots = worker.available_slots().await;
-            let used_slots = total_slots.saturating_sub(available_slots);
+            let total_slots = worker.effective_total_slots().await;
+            let used_slots = worker.used_slots();
             let speed_score = worker.get_speed_score();
 
             snapshots.push(WorkerSnapshot::new(

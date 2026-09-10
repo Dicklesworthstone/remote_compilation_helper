@@ -317,6 +317,26 @@ fn workers_list_verbose_enabled(ctx: &OutputContext) -> bool {
     ctx.is_verbose() && !ctx.is_json()
 }
 
+/// Apply the daemon's current capacity once, before choosing an output format.
+/// Missing daemon data retains the configured ceiling for offline inspection.
+fn apply_live_worker_slots(
+    workers: &mut [WorkerConfig],
+    daemon_status: Option<&DaemonFullStatusResponse>,
+) {
+    let Some(status) = daemon_status else {
+        return;
+    };
+    for worker in workers {
+        if let Some(live) = status
+            .workers
+            .iter()
+            .find(|live| live.id == worker.id.as_str())
+        {
+            worker.total_slots = live.total_slots;
+        }
+    }
+}
+
 fn render_worker_verbose_lines(
     worker: &WorkerConfig,
     daemon_status: Option<&DaemonFullStatusResponse>,
@@ -471,7 +491,7 @@ async fn query_speedscore_list() -> Result<SpeedScoreListResponseFromApi> {
 
 /// List all configured workers.
 pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<()> {
-    let workers = load_workers_from_config()?;
+    let mut workers = load_workers_from_config()?;
     let style = ctx.theme();
 
     // Fetch speedscores if requested
@@ -481,17 +501,23 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
         None
     };
 
-    // In verbose mode, fetch live daemon status for circuit breaker state, slot usage, etc.
-    let daemon_status = if workers_list_verbose_enabled(ctx) {
-        debug!(target: "rch::verbose", "fetching daemon status for verbose workers list");
-        match send_daemon_command("GET /status\n").await {
-            Ok(response) => extract_json_body(&response)
-                .and_then(|json| serde_json::from_str::<DaemonFullStatusResponse>(json).ok()),
-            Err(_) => None,
-        }
-    } else {
+    // Effective disk-limited capacity is live state, including in normal and
+    // JSON output. Bound the query so an unavailable daemon cannot stall a list.
+    let daemon_status = if workers.is_empty() {
         None
+    } else {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            send_daemon_command("GET /status\n"),
+        )
+        .await
+        {
+            Ok(Ok(response)) => extract_json_body(&response)
+                .and_then(|json| serde_json::from_str::<DaemonFullStatusResponse>(json).ok()),
+            Ok(Err(_)) | Err(_) => None,
+        }
     };
+    apply_live_worker_slots(&mut workers, daemon_status.as_ref());
 
     // JSON output mode
     if ctx.is_json() {
@@ -2082,6 +2108,35 @@ mod probe_summary_tests {
         let stdout = SharedOutputBuffer::new().as_writer(true);
         let stderr = SharedOutputBuffer::new().as_writer(true);
         OutputContext::with_writers(config, stdout, stderr)
+    }
+
+    #[test]
+    fn workers_list_uses_live_capacity_including_zero_for_all_formats() {
+        let mut status = make_daemon_status();
+        for effective in [3, 0] {
+            status.workers[0].total_slots = effective;
+            let mut workers = vec![make_worker()];
+            apply_live_worker_slots(&mut workers, Some(&status));
+            // Human rendering consumes this same enriched config as JSON.
+            assert_eq!(workers[0].total_slots, effective);
+            let json = serde_json::to_value(WorkerInfo::from(&workers[0])).unwrap();
+            assert_eq!(json["total_slots"], effective);
+            assert_eq!(workers[0].priority, 100);
+            assert_eq!(workers[0].host, "127.0.0.1");
+        }
+    }
+
+    #[test]
+    fn workers_list_retains_configured_capacity_without_matching_live_status() {
+        let mut workers = vec![make_worker()];
+        apply_live_worker_slots(&mut workers, None);
+        assert_eq!(workers[0].total_slots, 8);
+
+        let mut status = make_daemon_status();
+        status.workers[0].id = "different-worker".to_string();
+        status.workers[0].total_slots = 0;
+        apply_live_worker_slots(&mut workers, Some(&status));
+        assert_eq!(workers[0].total_slots, 8);
     }
 
     #[test]

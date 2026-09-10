@@ -155,23 +155,30 @@ impl<'a> WorkerTable<'a> {
     /// Render summary footer.
     #[cfg(all(feature = "rich-ui", unix))]
     fn render_summary_rich(&self, console: &RchConsole) {
+        console.print_plain(&self.summary());
+    }
+
+    /// Active jobs retain their reservations when disk capacity shrinks. Sum
+    /// each worker's remaining capacity independently so an overcommitted worker
+    /// neither underflows nor consumes another worker's available slots.
+    fn summary(&self) -> String {
         let online = self
             .workers
             .iter()
             .filter(|w| w.status == "healthy" || w.status == "online")
             .count();
         let total = self.workers.len();
-        let total_slots: u32 = self.workers.iter().map(|w| w.total_slots).sum();
-        let used_slots: u32 = self.workers.iter().map(|w| w.used_slots).sum();
+        let total_slots: u64 = self.workers.iter().map(|w| u64::from(w.total_slots)).sum();
+        let available_slots: u64 = self
+            .workers
+            .iter()
+            .map(|w| u64::from(w.total_slots.saturating_sub(w.used_slots)))
+            .sum();
 
-        let summary = format!(
+        format!(
             "Total: {} workers ({} online) | Slots: {}/{} available",
-            total,
-            online,
-            total_slots - used_slots,
-            total_slots
-        );
-        console.print_plain(&summary);
+            total, online, available_slots, total_slots
+        )
     }
 
     /// Render plain text output (no rich formatting).
@@ -224,22 +231,7 @@ impl<'a> WorkerTable<'a> {
 
         // Summary
         console.print_plain("");
-        let online = self
-            .workers
-            .iter()
-            .filter(|w| w.status == "healthy" || w.status == "online")
-            .count();
-        let total = self.workers.len();
-        let total_slots: u32 = self.workers.iter().map(|w| w.total_slots).sum();
-        let used_slots: u32 = self.workers.iter().map(|w| w.used_slots).sum();
-
-        console.print_plain(&format!(
-            "Total: {} workers ({} online) | Slots: {}/{} available",
-            total,
-            online,
-            total_slots - used_slots,
-            total_slots
-        ));
+        console.print_plain(&self.summary());
     }
 
     /// Format status for plain display.
@@ -400,6 +392,31 @@ mod tests {
         let table = WorkerTable::new(&workers, ctx);
         assert_eq!(table.context, OutputContext::Plain);
         assert_eq!(table.workers.len(), 2);
+    }
+
+    #[test]
+    fn summary_preserves_other_workers_capacity_when_disk_limit_shrinks() {
+        let mut workers = sample_workers();
+        workers[0].total_slots = 1;
+        workers[0].used_slots = 4;
+        workers[1].status = "healthy".to_string();
+        workers[1].used_slots = 2;
+        let table = WorkerTable::new(&workers, OutputContext::Plain);
+        assert_eq!(
+            table.summary(),
+            "Total: 2 workers (2 online) | Slots: 6/9 available"
+        );
+        assert_eq!(
+            format_slot_bar(4, 1, OutputContext::Plain),
+            Icons::slot_filled(OutputContext::Plain)
+        );
+        workers[0].total_slots = 0;
+        let table = WorkerTable::new(&workers[..1], OutputContext::Plain);
+        assert_eq!(
+            table.summary(),
+            "Total: 1 workers (1 online) | Slots: 0/0 available"
+        );
+        assert_eq!(format_slot_bar(4, 0, OutputContext::Plain), "-");
     }
 
     #[test]
