@@ -97,13 +97,13 @@ fn scan_local_builds_in(proc_root: &Path) -> Vec<LocalBuild> {
     found
 }
 
-/// Compilers we care about catching. `comm` is truncated to 15 bytes by
-/// the kernel, so prefix matching covers suffixed names (`rustc-lld`,
-/// versioned cargo wrappers).
+/// Compilers we care about catching. Cargo may use the shim's preserved
+/// `cargo-rch-real` executable name. `comm` is truncated to 15 bytes by the
+/// kernel, so prefix matching covers suffixed rustc names (`rustc-lld`).
 #[cfg(any(target_os = "linux", test))]
 #[must_use]
 fn is_compiler_comm(comm: &str) -> bool {
-    comm == "cargo" || comm.starts_with("rustc")
+    comm == "cargo" || comm == "cargo-rch-real" || comm.starts_with("rustc")
 }
 
 #[cfg(target_os = "linux")]
@@ -193,10 +193,13 @@ mod tests {
     #[test]
     fn compiler_comms_match_and_non_compilers_do_not() {
         assert!(is_compiler_comm("cargo"));
+        assert!(is_compiler_comm("cargo-rch-real"));
         assert!(is_compiler_comm("rustc"));
         assert!(is_compiler_comm("rustc-lld"));
         assert!(is_compiler_comm("rustc-1.99"));
         assert!(!is_compiler_comm("rustup"));
+        assert!(!is_compiler_comm("cargo-rch-fake"));
+        assert!(!is_compiler_comm("cargo-rch-realx"));
         assert!(!is_compiler_comm("bash"));
         assert!(!is_compiler_comm("rch"));
         assert!(!is_compiler_comm("rchd"));
