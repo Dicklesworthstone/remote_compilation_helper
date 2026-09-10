@@ -2571,6 +2571,67 @@ fn render_self_test_result_verbose_lines(
 // Status Overview Command
 // =============================================================================
 
+fn local_build_status_hints(
+    observation: Option<&crate::local_builds::LocalBuildObservation>,
+) -> Vec<crate::status_types::RemediationHint> {
+    let Some(observation) = observation else {
+        return Vec::new();
+    };
+    let check = crate::doctor::local_build_check(observation);
+    if check.status != crate::commands::DoctorCheckStatus::Warning {
+        return Vec::new();
+    }
+    let message = match check.details {
+        Some(details) => format!("{}; {details}", check.message),
+        None => check.message,
+    };
+    vec![crate::status_types::RemediationHint {
+        reason_code: "dispatcher_local_builds".to_string(),
+        severity: "warning".to_string(),
+        message,
+        suggested_action: check
+            .suggestion
+            .unwrap_or_else(|| "Check local process and cache access".to_string()),
+        worker_id: None,
+    }]
+}
+
+fn status_error_with_local_builds(
+    error: anyhow::Error,
+    hints: &[crate::status_types::RemediationHint],
+) -> anyhow::Error {
+    if hints.is_empty() {
+        return error;
+    }
+    // The top-level handler emits one machine envelope and preserves typed
+    // ApiError context; do not print a second partial JSON document here.
+    let warning = hints
+        .iter()
+        .map(|hint| hint.message.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let code = if error.downcast_ref::<serde_json::Error>().is_some() {
+        rch_common::ErrorCode::InternalSerdeError
+    } else {
+        rch_common::ErrorCode::InternalDaemonSocket
+    };
+    let api_error = rch_common::ApiError::from_code(code)
+        .with_details(format!("{error:#}"))
+        .with_context("local_build_warning", warning);
+    error.context(api_error)
+}
+
+fn status_view_with_local_builds(
+    report: &impl serde::Serialize,
+    hints: &[crate::status_types::RemediationHint],
+) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(report)?;
+    if !hints.is_empty() {
+        value["local_build_hints"] = serde_json::to_value(hints)?;
+    }
+    Ok(value)
+}
+
 pub async fn status_overview(
     workers: bool,
     jobs: bool,
@@ -2584,12 +2645,24 @@ pub async fn status_overview(
         generate_worker_remediations, remote_admissible_worker_count,
     };
 
-    // Query daemon for full status.
-    let response = send_daemon_command("GET /status\n").await?;
-    let json = extract_json_body(&response)
-        .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
-    let status: DaemonFullStatusResponse =
-        serde_json::from_str(json).context("Failed to parse daemon status response")?;
+    let observation = crate::config::load_config()
+        .ok()
+        .and_then(|config| crate::local_builds::observe(config.general.role));
+    let local_hints = local_build_status_hints(observation.as_ref());
+    for hint in &local_hints {
+        ctx.warning(&hint.message);
+    }
+
+    // Query daemon after surfacing local warnings, including when it is down.
+    let status_result: Result<DaemonFullStatusResponse> = async {
+        let response = send_daemon_command("GET /status\n").await?;
+        let json = extract_json_body(&response)
+            .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
+        serde_json::from_str(json).context("Failed to parse daemon status response")
+    }
+    .await;
+    let status =
+        status_result.map_err(|error| status_error_with_local_builds(error, &local_hints))?;
 
     // `--fleet`: a focused desired/live grouping + dominant-problem summary +
     // absence alerts (bd-session-history-remediation-ocv9i.2.2). Short-circuits
@@ -2597,7 +2670,10 @@ pub async fn status_overview(
     if fleet {
         let report = build_fleet_status_report(&status);
         if ctx.is_json() {
-            let _ = ctx.json(&ApiResponse::ok("status-fleet", &report));
+            let _ = ctx.json(&ApiResponse::ok(
+                "status-fleet",
+                status_view_with_local_builds(&report, &local_hints)?,
+            ));
         } else {
             crate::status_display::render_fleet_status(&report, ctx.style());
         }
@@ -2614,7 +2690,10 @@ pub async fn status_overview(
             .clone()
             .unwrap_or_else(|| build_remediation_view_from_status(&status));
         if ctx.is_json() {
-            let _ = ctx.json(&ApiResponse::ok("status-remediation", &view));
+            let _ = ctx.json(&ApiResponse::ok(
+                "status-remediation",
+                status_view_with_local_builds(&view, &local_hints)?,
+            ));
         } else {
             crate::status_display::render_remediation_view(&view, ctx.style());
         }
@@ -2633,6 +2712,9 @@ pub async fn status_overview(
 
     // Generate remediation hints from all signals.
     let mut remediation_hints: Vec<RemediationHint> = generate_worker_remediations(&status.workers);
+    if ctx.is_json() {
+        remediation_hints.extend(local_hints);
+    }
     if let Some(ref conv) = convergence {
         remediation_hints.extend(generate_convergence_remediations(conv));
     }
@@ -3428,6 +3510,44 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn local_build_status_hints_preserve_pid_and_daemon_failure_context() {
+        let observation = crate::local_builds::LocalBuildObservation {
+            builds: vec![crate::local_builds::LocalBuild {
+                pid: 4242,
+                comm: "cargo-rch-real".to_string(),
+                exe: None,
+            }],
+            scan_error: None,
+            state_error: Some("cache denied".to_string()),
+            transition: None,
+        };
+        let hints = local_build_status_hints(Some(&observation));
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].message.contains("pid=4242"));
+        assert!(hints[0].message.contains("cache denied"));
+        let error = status_error_with_local_builds(anyhow::anyhow!("socket absent"), &hints);
+        let api = error.downcast_ref::<rch_common::ApiError>().unwrap();
+        let json = serde_json::to_value(api).unwrap();
+        assert!(
+            json["context"]["local_build_warning"]
+                .as_str()
+                .unwrap()
+                .contains("pid=4242")
+        );
+        assert_eq!(json["details"], "socket absent");
+        let report =
+            status_view_with_local_builds(&serde_json::json!({"fleet": "down"}), &hints).unwrap();
+        assert_eq!(report["fleet"], "down");
+        assert!(
+            report["local_build_hints"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("pid=4242")
+        );
+        assert!(local_build_status_hints(None).is_empty());
     }
 
     fn check_issue(severity: &str, summary: &str) -> IssueFromApi {

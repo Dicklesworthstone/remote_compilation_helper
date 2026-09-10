@@ -2370,9 +2370,12 @@ fn unknown_worker_filter_error(missing: &[&str], configured: &str) -> anyhow::Er
 }
 
 fn top_level_api_error(error: &anyhow::Error) -> ApiError {
-    // A typed `ApiError` anywhere in the chain already carries the right
-    // code and category; never downgrade it to a string-sniffed guess.
-    if let Some(api_error) = error.chain().find_map(|e| e.downcast_ref::<ApiError>()) {
+    // Preserve typed errors in anyhow context as well as standard sources.
+    // Anyhow context is downcastable through anyhow, but not its source chain.
+    if let Some(api_error) = error
+        .downcast_ref::<ApiError>()
+        .or_else(|| error.chain().find_map(|e| e.downcast_ref::<ApiError>()))
+    {
         return api_error.clone();
     }
     let details = format!("{error:#}");
@@ -9109,6 +9112,22 @@ mod tests {
         let rendered = format!("{api_error}");
         assert!(rendered.contains("nonexistent-worker"), "{rendered}");
         assert!(rendered.contains("alpha, beta"), "{rendered}");
+    }
+
+    #[test]
+    fn top_level_api_error_preserves_typed_context_and_local_build_warning() {
+        let _guard = test_guard!();
+        let expected = ApiError::from_code(ErrorCode::InternalDaemonSocket)
+            .with_details("Failed to connect to daemon: connection refused")
+            .with_context(
+                "local_build_warning",
+                "1 local build on a dispatcher: PID 42",
+            );
+        let error = anyhow::anyhow!("Failed to connect to daemon: connection refused")
+            .context(expected.clone())
+            .context("rch status");
+
+        assert_eq!(top_level_api_error(&error), expected);
     }
 
     #[test]

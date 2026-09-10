@@ -132,6 +132,14 @@ pub enum ReliabilityReasonCode {
     CancellationCleanupDegraded,
     /// Cancellation cleanup is failing.
     CancellationCleanupFailed,
+    /// Unmanaged compiler processes are running on a dispatcher.
+    LocalBuildsDetected,
+    /// Local compiler process observation could not complete.
+    LocalBuildScanUnavailable,
+    /// The shared local-build alarm latch could not be persisted.
+    LocalBuildAlarmStateUnavailable,
+    /// No unmanaged compiler processes were observed on the dispatcher.
+    LocalBuildsAbsent,
 
     // ---- RepoConvergence (R300-R399) ----
     /// Repo-convergence surface is unavailable.
@@ -240,6 +248,10 @@ impl ReliabilityReasonCode {
             Self::CancellationCleanupSkipped => "CancellationCleanupSkipped",
             Self::CancellationCleanupDegraded => "CancellationCleanupDegraded",
             Self::CancellationCleanupFailed => "CancellationCleanupFailed",
+            Self::LocalBuildsDetected => "LocalBuildsDetected",
+            Self::LocalBuildScanUnavailable => "LocalBuildScanUnavailable",
+            Self::LocalBuildAlarmStateUnavailable => "LocalBuildAlarmStateUnavailable",
+            Self::LocalBuildsAbsent => "LocalBuildsAbsent",
             Self::RepoConvergenceUnavailable => "RepoConvergenceUnavailable",
             Self::RepoConvergenceFailed => "RepoConvergenceFailed",
             Self::RepoConvergenceDrift => "RepoConvergenceDrift",
@@ -305,6 +317,10 @@ impl ReliabilityReasonCode {
             Self::CancellationCleanupSkipped => "RCH-R202",
             Self::CancellationCleanupDegraded => "RCH-R203",
             Self::CancellationCleanupFailed => "RCH-R204",
+            Self::LocalBuildsDetected => "RCH-R206",
+            Self::LocalBuildScanUnavailable => "RCH-R207",
+            Self::LocalBuildAlarmStateUnavailable => "RCH-R208",
+            Self::LocalBuildsAbsent => "RCH-R209",
 
             // R300-R399 — RepoConvergence
             Self::RepoConvergenceUnavailable => "RCH-R300",
@@ -377,7 +393,11 @@ impl ReliabilityReasonCode {
             | Self::CancellationCleanupHealthy
             | Self::CancellationCleanupSkipped
             | Self::CancellationCleanupDegraded
-            | Self::CancellationCleanupFailed => C::ProcessTriage,
+            | Self::CancellationCleanupFailed
+            | Self::LocalBuildsDetected
+            | Self::LocalBuildScanUnavailable
+            | Self::LocalBuildAlarmStateUnavailable
+            | Self::LocalBuildsAbsent => C::ProcessTriage,
 
             Self::RepoConvergenceUnavailable
             | Self::RepoConvergenceFailed
@@ -454,7 +474,11 @@ impl ReliabilityReasonCode {
             Self::ProcessDebtUnavailable | Self::CancellationCleanupFailed => true,
             Self::CancellationCleanupHealthy
             | Self::CancellationCleanupSkipped
-            | Self::CancellationCleanupDegraded => false,
+            | Self::CancellationCleanupDegraded
+            | Self::LocalBuildsDetected
+            | Self::LocalBuildScanUnavailable
+            | Self::LocalBuildAlarmStateUnavailable
+            | Self::LocalBuildsAbsent => false,
 
             // Repo-convergence checks are read-only; remediation is git-side.
             Self::RepoConvergenceUnavailable
@@ -554,6 +578,16 @@ impl ReliabilityReasonCode {
             Self::CancellationCleanupFailed => {
                 "Restart the daemon with `rch daemon restart` to reset stale pgid handles."
             }
+            Self::LocalBuildsDetected => {
+                "Run `rch shim status`; check PATH order and absolute-path toolchain Cargo invocations."
+            }
+            Self::LocalBuildScanUnavailable => {
+                "Check access to /proc and retry `rch doctor --reliability --scope=triage`."
+            }
+            Self::LocalBuildAlarmStateUnavailable => {
+                "Check permissions on the rch cache directory; current process warnings remain valid."
+            }
+            Self::LocalBuildsAbsent => "No action needed.",
             Self::RepoConvergenceUnavailable => {
                 "Start the daemon with `rch daemon start` and retry."
             }
@@ -635,6 +669,10 @@ impl ReliabilityReasonCode {
         Self::CancellationCleanupSkipped,
         Self::CancellationCleanupDegraded,
         Self::CancellationCleanupFailed,
+        Self::LocalBuildsDetected,
+        Self::LocalBuildScanUnavailable,
+        Self::LocalBuildAlarmStateUnavailable,
+        Self::LocalBuildsAbsent,
         Self::RepoConvergenceUnavailable,
         Self::RepoConvergenceFailed,
         Self::RepoConvergenceDrift,
@@ -1245,6 +1283,13 @@ mod tests {
         (ReliabilityReasonCode::CancellationCleanupSkipped, false),
         (ReliabilityReasonCode::CancellationCleanupDegraded, false),
         (ReliabilityReasonCode::CancellationCleanupFailed, true),
+        (ReliabilityReasonCode::LocalBuildsDetected, false),
+        (ReliabilityReasonCode::LocalBuildScanUnavailable, false),
+        (
+            ReliabilityReasonCode::LocalBuildAlarmStateUnavailable,
+            false,
+        ),
+        (ReliabilityReasonCode::LocalBuildsAbsent, false),
         // RepoConvergence
         (ReliabilityReasonCode::RepoConvergenceUnavailable, false),
         (ReliabilityReasonCode::RepoConvergenceFailed, false),

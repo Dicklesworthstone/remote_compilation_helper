@@ -2,6 +2,254 @@ use std::process::Command;
 
 use super::common::{assert_contains, init_test_logging};
 
+#[cfg(target_os = "linux")]
+#[test]
+fn dispatcher_local_build_warning_reaches_status_doctor_and_watch_without_daemon() {
+    use std::io::{BufReader, Read, Write};
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct HeldChild(Child);
+    impl Drop for HeldChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("config.toml"),
+        "[general]\nrole = \"dispatcher\"\n[self_healing]\nhook_starts_daemon = false\ndaemon_installs_hooks = false\n").unwrap();
+    std::fs::write(config_dir.join("workers.toml"), "workers = []\n").unwrap();
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let spawn_cargo = |managed: bool| {
+        let cargo_home = temp.path().join(if managed {
+            "cargo-managed"
+        } else {
+            "cargo-unmanaged"
+        });
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        let mut command = Command::new(&cargo);
+        command
+            .arg("login")
+            .env("CARGO_HOME", cargo_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        if managed {
+            command.env("RCH_CARGO_WRAPPER_BYPASS", "1");
+        } else {
+            command.env_remove("RCH_CARGO_WRAPPER_BYPASS");
+        }
+        let mut child = HeldChild(command.spawn().expect("spawn real cargo login"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "cargo login exited before observation"
+            );
+            let comm =
+                std::fs::read_to_string(format!("/proc/{}/comm", child.0.id())).unwrap_or_default();
+            if matches!(comm.trim(), "cargo" | "cargo-rch-real") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cargo never became observable: {comm:?}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        child
+    };
+    let unmanaged = spawn_cargo(false);
+    let managed = spawn_cargo(true);
+    let unmanaged_pid = format!("pid={} ", unmanaged.0.id());
+    let managed_pid = format!("pid={} ", managed.0.id());
+    let cli = |machine: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rch"));
+        command
+            .current_dir(temp.path())
+            .env("HOME", temp.path())
+            .env("XDG_CACHE_HOME", temp.path().join("cache"))
+            .env("XDG_CONFIG_HOME", temp.path().join("xdg-config"))
+            .env("RCH_CONFIG_DIR", &config_dir)
+            .env("RCH_SOCKET_PATH", temp.path().join("absent.sock"))
+            .env("RCH_LOG_LEVEL", "warn")
+            .env_remove("RUST_LOG")
+            .env_remove("RCH_LOG_FILE")
+            .env_remove("RCH_DAEMON_SOCKET")
+            .env_remove("RCH_JSON")
+            .env_remove("RCH_OUTPUT_FORMAT")
+            .env_remove("TOON_DEFAULT_FORMAT")
+            .arg("--no-self-healing");
+        if machine {
+            command.args(["--json", "--format=json"]);
+        }
+        command
+    };
+    let assert_attribution = |detail: &str| {
+        assert!(
+            detail.contains(&unmanaged_pid),
+            "missing unmanaged PID: {detail}"
+        );
+        assert!(
+            !detail.contains(&managed_pid),
+            "managed PID was reported: {detail}"
+        );
+    };
+
+    let human = cli(false).arg("status").output().unwrap();
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    assert_attribution(&stderr);
+    assert_eq!(
+        stderr.matches("RCH LOCAL BUILD ALARM:").count(),
+        1,
+        "{stderr}"
+    );
+    for args in [
+        vec!["status"],
+        vec!["status", "--fleet"],
+        vec!["status", "--remediation"],
+    ] {
+        let output = cli(true).args(&args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("RCH LOCAL BUILD ALARM:"), "{stderr}");
+        assert!(
+            !output.status.success(),
+            "missing daemon must retain failure status"
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let warning = value["error"]["context"]["local_build_warning"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{args:?} omitted local_build_warning: exit={} JSON={value} stderr={stderr}",
+                    output.status
+                )
+            });
+        assert_attribution(warning);
+    }
+    // A reachable service with a malformed response must preserve the same
+    // warning. These sockets test protocol errors, not a healthy real daemon.
+    for (index, body) in ["not-json", "{\"daemon\":"].into_iter().enumerate() {
+        let socket = temp.path().join(format!("invalid-{index}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 12];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"GET /status\n");
+            write!(stream, "HTTP/1.1 200 OK\r\n\r\n{body}").unwrap();
+        });
+        let output = cli(true)
+            .env("RCH_SOCKET_PATH", socket)
+            .arg("status")
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert!(!output.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_attribution(
+            value["error"]["context"]["local_build_warning"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "malformed daemon body {body:?} omitted local_build_warning: JSON={value} stderr={}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                }),
+        );
+    }
+    for args in [
+        vec!["doctor"],
+        vec!["doctor", "--reliability", "--scope=triage"],
+    ] {
+        let output = cli(true).args(&args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("RCH LOCAL BUILD ALARM:"), "{stderr}");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let collection = if args.len() == 1 {
+            "checks"
+        } else {
+            "diagnostics"
+        };
+        let check = value["data"][collection]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| {
+                check["name"] == "dispatcher_local_builds"
+                    || check["check_name"] == "dispatcher_local_builds"
+            })
+            .expect("public doctor path must include local-build diagnostic");
+        assert_attribution(check["details"].as_str().unwrap());
+    }
+
+    let mut watch = HeldChild(
+        cli(true)
+            .args([
+                "doctor",
+                "--reliability",
+                "--scope=triage",
+                "--watch",
+                "--watch-interval=1",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = watch.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for value in serde_json::Deserializer::from_reader(BufReader::new(stdout))
+            .into_iter::<serde_json::Value>()
+        {
+            if sender.send(value).is_err() {
+                break;
+            }
+        }
+    });
+    for expected_sweep in [1, 2] {
+        let value = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("watch sweep")
+            .unwrap();
+        assert_eq!(value["sweep_index"].as_u64(), Some(expected_sweep));
+        let check = value["response"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["check_name"] == "dispatcher_local_builds")
+            .unwrap();
+        assert_attribution(check["details"].as_str().unwrap());
+    }
+    drop(watch);
+    reader.join().unwrap();
+
+    // Worker role must not report this dispatcher-only condition, even while
+    // the very same unmanaged Cargo process remains alive.
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[general]\nrole = \"worker\"\n",
+    )
+    .unwrap();
+    let output = cli(true)
+        .args(["doctor", "--reliability", "--scope=triage"])
+        .output()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        !value["data"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["check_name"] == "dispatcher_local_builds")
+    );
+}
+
 // =============================================================================
 // Help and Version Tests
 // =============================================================================

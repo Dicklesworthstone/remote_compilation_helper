@@ -760,6 +760,76 @@ impl ReliabilityDiagnostic {
 // Main Doctor Function
 // =============================================================================
 
+pub(crate) fn local_build_check(
+    observation: &crate::local_builds::LocalBuildObservation,
+) -> CheckResult {
+    let mut details: Vec<String> = observation
+        .builds
+        .iter()
+        .map(|build| {
+            format!(
+                "pid={} comm={} exe={}",
+                build.pid,
+                build.comm,
+                build
+                    .exe
+                    .as_ref()
+                    .map_or_else(|| "unknown".to_string(), |path| path.display().to_string())
+            )
+        })
+        .collect();
+    if let Some(error) = &observation.scan_error {
+        details.push(format!("Scan: {error}"));
+    }
+    if let Some(error) = &observation.state_error {
+        details.push(format!("Alarm state: {error}"));
+    }
+    let warning = observation.warning();
+    CheckResult {
+        category: "local_builds".to_string(),
+        name: "dispatcher_local_builds".to_string(),
+        status: if warning.is_some() { CheckStatus::Warning } else { CheckStatus::Pass },
+        message: warning.unwrap_or_else(|| "No unmanaged local builds on this dispatcher".to_string()),
+        details: (!details.is_empty()).then(|| details.join("; ")),
+        suggestion: (!observation.builds.is_empty()).then(||
+            "Run rch shim status; check PATH order and absolute-path toolchain Cargo invocations".to_string()),
+        fixable: false,
+        fix_applied: false,
+        fix_message: None,
+    }
+}
+
+fn reliability_local_build_diagnostics(
+    observation: Option<&crate::local_builds::LocalBuildObservation>,
+) -> Vec<ReliabilityDiagnostic> {
+    let Some(observation) = observation else {
+        return Vec::new();
+    };
+    let check = local_build_check(observation);
+    let code = if !observation.builds.is_empty() {
+        ReliabilityReasonCode::LocalBuildsDetected
+    } else if observation.scan_error.is_some() {
+        ReliabilityReasonCode::LocalBuildScanUnavailable
+    } else if observation.state_error.is_some() {
+        ReliabilityReasonCode::LocalBuildAlarmStateUnavailable
+    } else {
+        ReliabilityReasonCode::LocalBuildsAbsent
+    };
+    let mut diagnostic = ReliabilityDiagnostic::new(
+        ReliabilityCategory::ProcessDebt,
+        check.name,
+        if check.status == CheckStatus::Warning {
+            ReliabilitySeverity::Warning
+        } else {
+            ReliabilitySeverity::Pass
+        },
+        check.message,
+        code,
+    );
+    diagnostic.details = check.details;
+    vec![diagnostic]
+}
+
 /// Run all diagnostic checks.
 pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<()> {
     if options.reliability {
@@ -773,6 +843,15 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
     if !ctx.is_json() {
         println!("{}", style.format_header("RCH Diagnostic Report"));
         println!();
+    }
+
+    // Local dispatcher warnings do not depend on daemon or worker availability.
+    if let Ok(config) = crate::config::load_config()
+        && let Some(observation) = crate::local_builds::observe(config.general.role)
+    {
+        let check = local_build_check(&observation);
+        print_check_result(&check, ctx);
+        checks.push(check);
     }
 
     // Run all checks
@@ -1033,18 +1112,29 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
 
     // Phase 2 — sync file I/O. These are microseconds each and can run
     // on the current thread while the spawned probes are in flight.
-    let config_result =
-        if scope.needs_rollout_config() || scope.matches(ReliabilityScope::Ownership) {
-            Some(crate::config::load_config())
-        } else {
-            None
-        };
+    let config_result = if scope.needs_rollout_config()
+        || scope.matches(ReliabilityScope::Ownership)
+        || scope.matches(ReliabilityScope::Triage)
+    {
+        Some(crate::config::load_config())
+    } else {
+        None
+    };
     tracing::debug!(
         target: "rch::doctor::config_loads",
         loaded = matches!(config_result.as_ref(), Some(Ok(_))),
-        skipped = !(scope.needs_rollout_config() || scope.matches(ReliabilityScope::Ownership)),
+        skipped = !(scope.needs_rollout_config() || scope.matches(ReliabilityScope::Ownership)
+            || scope.matches(ReliabilityScope::Triage)),
         "doctor.config.load",
     );
+    let local_observation = if scope.matches(ReliabilityScope::Triage) {
+        config_result
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .and_then(|config| crate::local_builds::observe(config.general.role))
+    } else {
+        None
+    };
 
     // bd-kugfc: resolve the canonical mirror root from config (falling
     // back to the compiled-in default only when config loads cleanly but
@@ -1176,6 +1266,9 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
         ));
     }
     if scope.matches(ReliabilityScope::Triage) {
+        diagnostics.extend(reliability_local_build_diagnostics(
+            local_observation.as_ref(),
+        ));
         diagnostics.extend(reliability_process_debt_diagnostics(daemon_status.as_ref()));
     }
     if scope.matches(ReliabilityScope::Helpers) {
@@ -5840,6 +5933,52 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn local_build_diagnostics_preserve_current_warning_and_failure_details() {
+        let mut observation = crate::local_builds::LocalBuildObservation {
+            builds: vec![crate::local_builds::LocalBuild {
+                pid: 4242,
+                comm: "cargo-rch-real".to_string(),
+                exe: None,
+            }],
+            scan_error: None,
+            state_error: Some("cache denied".to_string()),
+            transition: None,
+        };
+        let check = local_build_check(&observation);
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert!(check.message.contains("1 local builds on a dispatcher"));
+        assert!(check.details.as_ref().unwrap().contains("pid=4242"));
+        assert!(check.details.as_ref().unwrap().contains("cache denied"));
+        assert!(!check.fixable);
+        let diagnostics = reliability_local_build_diagnostics(Some(&observation));
+        assert_eq!(
+            diagnostics[0].code,
+            ReliabilityReasonCode::LocalBuildsDetected
+        );
+        assert_eq!(diagnostics[0].severity, ReliabilitySeverity::Warning);
+
+        observation.builds.clear();
+        observation.scan_error = Some("proc denied".to_string());
+        assert_eq!(
+            reliability_local_build_diagnostics(Some(&observation))[0].code,
+            ReliabilityReasonCode::LocalBuildScanUnavailable
+        );
+        observation.scan_error = None;
+        assert_eq!(
+            reliability_local_build_diagnostics(Some(&observation))[0].code,
+            ReliabilityReasonCode::LocalBuildAlarmStateUnavailable
+        );
+        observation.state_error = None;
+        let diagnostics = reliability_local_build_diagnostics(Some(&observation));
+        assert_eq!(
+            diagnostics[0].code,
+            ReliabilityReasonCode::LocalBuildsAbsent
+        );
+        assert_eq!(diagnostics[0].severity, ReliabilitySeverity::Pass);
+        assert!(reliability_local_build_diagnostics(None).is_empty());
+    }
 
     fn worker_status(
         id: &str,

@@ -583,6 +583,19 @@ rch speedscore --all
 rch doctor --json
 ```
 
+On Linux boxes configured with `[general] role = "dispatcher"`, status and doctor
+also report unmanaged local Cargo/rustc processes. The warning remains visible
+while those processes run, including when the daemon is unavailable. Check
+`rch shim status`, PATH order, and absolute-path toolchain Cargo invocations.
+Processes carrying `RCH_CARGO_WRAPPER_BYPASS=1` or descended from `rch` are excluded.
+
+An alarm event is logged once per observed episode and clears after a successful
+scan finds no unmanaged compiler processes. Status and doctor share a locked
+one-byte latch at `$XDG_CACHE_HOME/rch/local-build-alarm` (normally
+`~/.cache/rch/local-build-alarm`). Scan failures preserve the previous episode;
+latch failures are reported without hiding current builds. Reliability doctor
+includes this check in the `triage` scope and its default `all` scope.
+
 ---
 
 ## Testing and Validation
