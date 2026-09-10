@@ -363,12 +363,9 @@ async fn utilization(pool: &WorkerPool) -> (Option<f64>, u32, u32) {
     let mut total_slots = 0u32;
     let mut used_slots = 0u32;
     for worker in workers {
-        let config = worker.config.read().await;
-        let worker_total = config.total_slots;
-        drop(config);
-        let available = worker.available_slots().await;
+        let worker_total = worker.effective_total_slots().await;
         total_slots = total_slots.saturating_add(worker_total);
-        used_slots = used_slots.saturating_add(worker_total.saturating_sub(available));
+        used_slots = used_slots.saturating_add(worker.used_slots());
     }
 
     if total_slots == 0 {
@@ -1087,5 +1084,50 @@ mod tests {
         // All slots should be available (none used)
         assert_eq!(used, 0);
         assert_eq!(util.unwrap(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_disk_slots_utilization_preserves_actual_usage() {
+        let pool = WorkerPool::new();
+        let id = rch_common::WorkerId::new("disk-metrics");
+        pool.add_worker(rch_common::WorkerConfig {
+            id: id.clone(),
+            host: "localhost".to_string(),
+            user: "test".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        })
+        .await;
+        let worker = pool.get(&id).await.unwrap();
+        assert!(worker.reserve_slots(2).await);
+        for (free_gb, expected) in [
+            (40.0, (Some(200.0 / 3.0), 2, 3)),
+            (20.0, (Some(200.0), 2, 1)),
+            (10.0, (None, 2, 0)),
+            (100.0, (Some(25.0), 2, 8)),
+        ] {
+            worker
+                .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                    disk_free_gb: Some(free_gb),
+                    ..Default::default()
+                })
+                .await;
+            let (util, used, total) = utilization(&pool).await;
+            assert_eq!((used, total), (expected.1, expected.2));
+            match (util, expected.0) {
+                (Some(actual), Some(expected)) => assert!((actual - expected).abs() < 1e-10),
+                _ => assert_eq!(util, expected.0),
+            }
+        }
+        worker.release_slots(2).await;
+        worker
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                disk_free_gb: Some(40.0),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(utilization(&pool).await, (Some(0.0), 0, 3));
     }
 }

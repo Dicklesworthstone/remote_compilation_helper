@@ -328,10 +328,7 @@ impl CacheCleanupScheduler {
 
     /// Check if a worker is eligible for cleanup.
     async fn is_worker_eligible(&self, worker_state: &WorkerState) -> bool {
-        let (worker_id, total_slots) = {
-            let config = worker_state.config.read().await;
-            (config.id.clone(), config.total_slots)
-        };
+        let worker_id = worker_state.config.read().await.id.clone();
 
         // Check worker status
         let status = worker_state.status().await;
@@ -345,11 +342,11 @@ impl CacheCleanupScheduler {
         }
 
         // Check if worker is busy (has active slots)
-        let available = worker_state.available_slots().await;
-        if available < total_slots {
+        let used_slots = worker_state.used_slots();
+        if used_slots != 0 {
             debug!(
-                "Worker {} is busy ({}/{} slots available), skipping cleanup",
-                worker_id, available, total_slots
+                "Worker {} is busy ({} slots reserved), skipping cleanup",
+                worker_id, used_slots
             );
             self.idle_since.write().await.remove(&worker_id);
             return false;
@@ -883,6 +880,42 @@ mod tests {
 
         let eligible_after_threshold = scheduler.is_worker_eligible(&worker_state).await;
         assert!(eligible_after_threshold);
+    }
+
+    #[tokio::test]
+    async fn test_disk_slots_idle_worker_remains_eligible_for_cleanup() {
+        let pool = WorkerPool::new();
+        pool.add_worker(create_test_worker_config("disk-cleanup"))
+            .await;
+        let worker = pool.get(&WorkerId::new("disk-cleanup")).await.unwrap();
+        let scheduler = CacheCleanupScheduler::new(
+            pool,
+            CacheCleanupConfig {
+                idle_threshold_secs: 0,
+                ..Default::default()
+            },
+        );
+        assert!(worker.reserve_slots(2).await);
+        for free_gb in [40.0, 10.0] {
+            worker
+                .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                    disk_free_gb: Some(free_gb),
+                    ..Default::default()
+                })
+                .await;
+            assert!(!scheduler.is_worker_eligible(&worker).await);
+        }
+        worker.release_slots(2).await;
+        assert_eq!(worker.available_slots().await, 0);
+        assert!(scheduler.is_worker_eligible(&worker).await);
+        worker
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                disk_free_gb: Some(40.0),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(worker.available_slots().await, 3);
+        assert!(scheduler.is_worker_eligible(&worker).await);
     }
 
     #[tokio::test]
