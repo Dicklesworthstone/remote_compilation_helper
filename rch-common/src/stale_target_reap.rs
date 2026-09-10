@@ -32,10 +32,14 @@
 //! — never a bare `target`, never a source dir, never `.git`/`.beads`.
 //!
 //! Pooled dirs (`-pool-`) are SHARED by concurrent jobs with identical build
-//! dimensions, but the idle-based predicate still reaps them safely: an actively
-//! building pool dir has a fresh mtime (cargo writes into it continuously), so it
-//! is never evicted while in use, and once every job sharing it has finished it
-//! goes idle like any per-job dir and is reclaimed after `idle_hours`.
+//! dimensions. The idle-based predicate already keeps them safe — an actively
+//! building pool dir has a fresh mtime (cargo writes into it continuously), so
+//! it is never evicted while in use — and on top of that they, and the durable
+//! `rch-cargo-cache-*` caches, must clear two LIVENESS GATES before anything
+//! removes them: no open file descriptor (or cwd) anywhere under the dir, and
+//! no live process whose command line names it. See [`gate_snapshot_fragment`]
+//! and [`evaluate_gc_candidate`]. A gate that cannot be evaluated counts as
+//! "in use": an error must never make a directory eligible for deletion.
 
 /// The glob patterns matched for reaping. Restricted to per-job / per-pid /
 /// pooled dirs so a bare `target` (or any non-rch dir) is never touched.
@@ -44,6 +48,46 @@ pub const REAP_GLOBS: &[&str] = &[
     ".rch-target-*-pid-*",
     ".rch-target-*-pool-*",
 ];
+
+/// Basename glob of the DURABLE per-worker Cargo cache dirs
+/// (`rch-cargo-cache-<worker>`, issue #42) that `rch gc` enumerates and — under
+/// the full gate set — may collect.
+///
+/// Deliberately NOT in [`REAP_GLOBS`]: that list drives the per-job reaper and
+/// the rsync exclude set, where a Cargo cache must never appear. Kept in sync
+/// with [`crate::remote_compilation::RCH_CARGO_CACHE_PREFIX`] by
+/// `cargo_cache_glob_tracks_the_creating_prefix`.
+pub const CARGO_CACHE_GLOB: &str = "rch-cargo-cache-*";
+
+/// Gate prefix spliced in front of a POOLED-dir reap loop body: skip any dir
+/// that fails [`gate_snapshot_fragment`]'s `__gc_gates_ok`. A pooled dir is a
+/// warm cache SHARED by concurrent jobs, so the idle window alone is not
+/// allowed to authorize its removal.
+const POOLED_COLLECT_GATE: &str = "[ -d \"$d\" ] || continue;      if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP pooled-ttl gate %s\\n' \"$d\"; continue; fi; ";
+
+/// Minimum non-zero cargo-cache idle window in minutes (24h), mirroring
+/// [`MIN_POOLED_IDLE_MINUTES`]: a durable Cargo cache is a warm cache too, so a
+/// misconfigured short window is floored rather than honored.
+pub const MIN_CARGO_CACHE_IDLE_MINUTES: u64 = 24 * 60;
+
+/// Convert `[remediation.pooled_target] reaper_pooled_idle_hours` into the
+/// pooled idle window in minutes. `0` means "never collect pooled dirs";
+/// anything else is floored at [`MIN_POOLED_IDLE_MINUTES`].
+///
+/// One helper so `rch gc`, `rch cache status`, the daemon sweep and the
+/// transfer-start janitor cannot each round the same knob differently.
+#[must_use]
+pub fn pooled_idle_minutes_from_hours(idle_hours: u32) -> Option<u64> {
+    (idle_hours != 0).then(|| (u64::from(idle_hours) * 60).max(MIN_POOLED_IDLE_MINUTES))
+}
+
+/// Convert `[remediation.pooled_target] gc_cargo_cache_idle_days` into the
+/// cargo-cache idle window in minutes. `0` means "never collect cache dirs";
+/// anything else is floored at [`MIN_CARGO_CACHE_IDLE_MINUTES`].
+#[must_use]
+pub fn cargo_cache_idle_minutes_from_days(idle_days: u32) -> Option<u64> {
+    (idle_days != 0).then(|| (u64::from(idle_days) * 24 * 60).max(MIN_CARGO_CACHE_IDLE_MINUTES))
+}
 
 /// Whether `s` is safe to use as a `cd` target / `find` root of a reap script:
 /// absolute, at least two path segments deep (never `/` or a bare top-level dir),
@@ -237,25 +281,126 @@ fn dedup_candidate_file(var: &str) -> String {
     )
 }
 
+/// Shell fragment that builds the two GATE SNAPSHOTS every collection of a
+/// pooled/cache dir is required to clear, plus the `__gc_gates_ok` helper that
+/// tests one dir against them.
+///
+/// Two snapshots, taken ONCE per script run (not per candidate — a per-dir
+/// `lsof +D` walks the whole tree, and a warm pool holds millions of inodes):
+///
+/// * `$__held` — every path currently open anywhere on the worker: each
+///   process's cwd plus every open file descriptor. Read straight from
+///   `/proc/<pid>/{cwd,fd}` with one GNU `find -printf '%l'` (no fork per
+///   pid); if `/proc` is unusable it falls back to a single system-wide
+///   `lsof -F n`. `$__held_ok` is 1 only when a snapshot was actually
+///   produced.
+/// * `$__proc` — every process's full command line (`ps -eo args=`), so a
+///   build rooted at a dir is caught even when it holds no descriptor open at
+///   the instant of the sweep (a `rustc` between writes, a `cargo` driver
+///   whose child does the I/O). `$__proc_ok` is 1 only when it is non-empty.
+///
+/// `__gc_gates_ok <dir>` returns 0 (safe to collect) ONLY when BOTH snapshots
+/// exist AND neither matches the dir. Every failure mode — no `/proc`, no
+/// `lsof`, no `ps`, an unwritable temp dir — leaves the corresponding `_ok`
+/// flag at 0 and the helper returns non-zero, i.e. an unavailable gate makes a
+/// dir INELIGIBLE. A false "busy" only wastes disk; a false "free" deletes a
+/// live build.
+///
+/// Matching is exact-prefix via `awk index()`, never a regex: candidate paths
+/// come from `find` output and must never be reinterpreted as a pattern.
+fn gate_snapshot_fragment() -> String {
+    concat!(
+        "__held=\"\"; __held_ok=0; __hsrc=none; __proc=\"\"; __proc_ok=0; ",
+        "if __held=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then ",
+        "  if [ -d /proc/self/fd ]; then ",
+        "    find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 -printf '%l\\n' 2>/dev/null > \"$__held\" || :; ",
+        "  fi; ",
+        "  if [ -s \"$__held\" ]; then __hsrc=proc; ",
+        "  elif command -v lsof >/dev/null 2>&1; then ",
+        "    lsof -w -n -P -F n 2>/dev/null | sed -n 's/^n//p' > \"$__held\" || :; ",
+        "    if [ -s \"$__held\" ]; then __hsrc=lsof; fi; ",
+        "  fi; ",
+        "  if [ -s \"$__held\" ]; then __held_ok=1; fi; ",
+        "fi; ",
+        // The sweep's OWN process chain is excluded from the command-line
+        // snapshot. `collect_paths_command` embeds the paths it is about to
+        // remove into the script, so the shell running it has every one of
+        // them in its argv — without this, the gate matches the sweep itself
+        // and nothing is ever collected (the `pgrep -f` self-match trap, one
+        // level up). Only ancestors are excluded: the snapshot is taken once,
+        // before any candidate is examined, so transient children (`awk`,
+        // `find`, `du`) that carry a candidate path are not in it.
+        "__self_pids=\" $$ \"; __pp=$$; __i=0; ",
+        "while [ \"$__i\" -lt 12 ]; do ",
+        "  __pp=$(ps -o ppid= -p \"$__pp\" 2>/dev/null | tr -d ' '); ",
+        "  case \"$__pp\" in ''|0|1) break;; *[!0-9]*) break;; esac; ",
+        "  __self_pids=\"$__self_pids$__pp \"; __i=$((__i + 1)); ",
+        "done; ",
+        "if __proc=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then ",
+        "  ps -ww -eo pid=,args= > \"$__proc\" 2>/dev/null ",
+        "    || ps -eo pid=,args= > \"$__proc\" 2>/dev/null || :; ",
+        "  if [ -s \"$__proc\" ]; then __proc_ok=1; fi; ",
+        "fi; ",
+        "__gc_handles() { ",
+        "  if [ \"$__held_ok\" -ne 1 ]; then printf unknown; return 0; fi; ",
+        "  if awk -v p=\"$1\" '$0==p || index($0, p \"/\")==1 {f=1; exit} END{exit(f?0:1)}' \"$__held\"; ",
+        "  then printf held; else printf free; fi; ",
+        "}; ",
+        "__gc_procs() { ",
+        "  if [ \"$__proc_ok\" -ne 1 ]; then printf unknown; return 0; fi; ",
+        "  if awk -v p=\"$1\" -v skip=\"$__self_pids\" ",
+        "    '{ if (index(skip, \" \" $1 \" \") > 0) next; if (index($0, p) > 0) { f=1; exit } } ",
+        "     END{exit(f?0:1)}' \"$__proc\"; ",
+        "  then printf held; else printf free; fi; ",
+        "}; ",
+        "__gc_gates_ok() { ",
+        "  [ \"$(__gc_handles \"$1\")\" = free ] || return 1; ",
+        "  [ \"$(__gc_procs \"$1\")\" = free ] || return 1; ",
+        "  return 0; ",
+        "}; ",
+        "printf 'RCH_GC_GATES handles=%s handles_source=%s procs=%s\\n' \"$__held_ok\" \"$__hsrc\" \"$__proc_ok\"; ",
+    )
+    .to_string()
+}
+
+/// Shell fragment removing the gate-snapshot temp files. Safe when a snapshot
+/// was never created (`rm -f ""` is not attempted).
+fn gate_snapshot_cleanup() -> &'static str {
+    "[ -n \"$__held\" ] && rm -f \"$__held\"; [ -n \"$__proc\" ] && rm -f \"$__proc\"; "
+}
+
 fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str) -> String {
+    // The tmp base is resolved by the SAME prelude that creates the durable
+    // per-worker Cargo caches and stages target dirs
+    // (`remote_cargo_home_base_prelude`), so the sweep cannot look somewhere
+    // other than where rch writes. It used to be a hand-copied `$TMPDIR` →
+    // `/data/tmp` → `/tmp` ladder here — the duplication that let ~700 GB of
+    // pooled/cache dirs sit unscanned while `rch gc` reported 0 MB.
+    let tmp_base_prelude = crate::remote_compilation::remote_cargo_home_base_prelude();
+    let tmp_base_var = crate::remote_compilation::RCH_CARGO_HOME_BASE_VAR;
     format!(
         "set -u; \
          base=\"{escaped_base}\"; \
-         if [ ! -d \"$base\" ]; then {on_guard_exit}exit 0; fi; \
-         __rt=$(cd \"$base\" 2>/dev/null && pwd -P) || {{ {on_guard_exit}exit 0; }}; \
-         [ -n \"$__rt\" ] || {{ {on_guard_exit}exit 0; }}; \
-         case \"$__rt\" in */*/*) ;; *) {on_guard_exit}exit 0;; esac; \
-         __tmpbase=\"${{TMPDIR:-}}\"; \
-         [ -n \"$__tmpbase\" ] && [ -d \"$__tmpbase\" ] || __tmpbase=/data/tmp; \
-         [ -d \"$__tmpbase\" ] || __tmpbase=/tmp; \
+         printf 'RCH_GC_ROOT base %s\\n' \"$base\"; \
+         if [ ! -d \"$base\" ]; then printf 'RCH_GC_ROOT_SKIPPED %s missing\\n' \"$base\"; {on_guard_exit}exit 0; fi; \
+         __rt=$(cd \"$base\" 2>/dev/null && pwd -P) || {{ printf 'RCH_GC_ROOT_SKIPPED %s unresolvable\\n' \"$base\"; {on_guard_exit}exit 0; }}; \
+         [ -n \"$__rt\" ] || {{ printf 'RCH_GC_ROOT_SKIPPED %s unresolvable\\n' \"$base\"; {on_guard_exit}exit 0; }}; \
+         case \"$__rt\" in */*/*) ;; *) printf 'RCH_GC_ROOT_SKIPPED %s too-shallow\\n' \"$__rt\"; {on_guard_exit}exit 0;; esac; \
+         printf 'RCH_GC_ROOT resolved %s\\n' \"$__rt\"; \
+         {tmp_base_prelude}; \
+         __tmpbase=\"${{{tmp_base_var}}}\"; \
          __tmpscan=\"\"; \
          case \"$__tmpbase\" in /*/*) __tmpscan=$(cd \"$__tmpbase\" 2>/dev/null && pwd -P) || __tmpscan=\"\";; esac; \
          case \"$__tmpscan\" in /*/*) ;; *) __tmpscan=\"\";; esac; \
-         __tmpf=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) || {{ {on_guard_exit}exit 0; }}; \
+         printf 'RCH_GC_ROOT tmp %s\\n' \"$__tmpscan\"; \
+         {gates}\
+         __tmpf=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) || {{ {cleanup}{on_guard_exit}exit 0; }}; \
          find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null > \"$__tmpf\"; \
          if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf\"; \
            find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null >> \"$__tmpf\"; fi; \
          {dedup}",
+        gates = gate_snapshot_fragment(),
+        cleanup = gate_snapshot_cleanup(),
         dedup = dedup_candidate_file("__tmpf")
     )
 }
@@ -303,9 +448,10 @@ pub fn worker_sweep_command(
                    find \"$__rt\" -maxdepth 8 -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null > \"$__tmpf2\"; \
                    if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf2\"; fi; \
                    {dedup2}\
-                   while IFS= read -r d; do {pooled_body} done < \"$__tmpf2\"; \
+                   while IFS= read -r d; do {pooled_gate}{pooled_body} done < \"$__tmpf2\"; \
                    rm -f \"$__tmpf2\"; \
-                 fi; "
+                 fi; ",
+                pooled_gate = POOLED_COLLECT_GATE,
             )
         }
         None => String::new(),
@@ -371,7 +517,9 @@ pub fn worker_sweep_command(
          rm -f \"$__tmpf\"; \
          {pooled_pass}\
          {cap_pass}\
-         printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\""
+         {gate_cleanup}\
+         printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\"",
+        gate_cleanup = gate_snapshot_cleanup()
     )
 }
 
@@ -470,14 +618,18 @@ pub fn parse_reap_errors(stdout: &str) -> Vec<ReapError> {
 }
 
 /// Build the READ-ONLY enumeration script behind `rch cache status` and
-/// `rch gc --dry-run`: identical candidate discovery to
-/// [`worker_sweep_command`] (so what status shows is exactly what gc would
-/// consider), plus the POOLED `.rch-target-*-pool-*` dirs — deliberately NOT
-/// swept (they are reused across jobs) but usually the largest disk consumers,
-/// so observability must include them. Nothing is removed. One line per
+/// `rch gc`: identical candidate discovery to [`worker_sweep_command`] (so
+/// what status shows is exactly what gc would consider), plus the POOLED
+/// `.rch-target-*-pool-*` stores and the durable `rch-cargo-cache-*` caches —
+/// the two classes that hold most of the bytes on a worker and that gc may
+/// collect under the full gate set. Nothing is removed. One line per
 /// candidate:
 ///
-/// `RCH_TARGET_ENTRY <newest_mtime_unix> <kb> <path>`
+/// `RCH_TARGET_ENTRY <newest_mtime_unix> <kb> <handles> <procs> <path>`
+///
+/// `<handles>` and `<procs>` are the two liveness gates (`free`, `held`, or
+/// `unknown`); see [`gate_snapshot_fragment`]. `unknown` is the fail-closed
+/// answer and makes a warm-cache dir ineligible.
 ///
 /// `newest_mtime_unix` is the newest mtime of the dir or any descendant (the
 /// exact signal the idle predicate tests) and `<kb>` the apparent-size sum,
@@ -498,16 +650,20 @@ pub fn enumerate_targets_command(escaped_base: &str) -> String {
     let dedup = dedup_candidate_file("__tmpf");
     format!(
         "{preamble}\
-         find \"$__rt\" -maxdepth 8 -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf\"; \
-         if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf\"; fi; \
+         find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-pool-*\" -o -name \"{cache_glob}\" \\) -prune 2>/dev/null >> \"$__tmpf\"; \
+         if [ -n \"$__tmpscan\" ]; then \
+           find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-pool-*\" -o -name \"{cache_glob}\" \\) -prune 2>/dev/null >> \"$__tmpf\"; fi; \
          {dedup}\
          while IFS= read -r d; do \
            [ -d \"$d\" ] || continue; \
            set -- $(find \"$d\" -printf '%T@ %s\\n' 2>/dev/null | awk '{{ t=int($1); if (t>n) n=t; s+=$2 }} END {{ printf \"%d %d\", n, int(s/1024) }}'); \
            newest=${{1:-0}}; kb=${{2:-0}}; \
-           printf 'RCH_TARGET_ENTRY %s %s %s\\n' \"$newest\" \"$kb\" \"$d\"; \
+           printf 'RCH_TARGET_ENTRY %s %s %s %s %s\\n' \"$newest\" \"$kb\" \"$(__gc_handles \"$d\")\" \"$(__gc_procs \"$d\")\" \"$d\"; \
          done < \"$__tmpf\"; \
-         rm -f \"$__tmpf\""
+         rm -f \"$__tmpf\"; \
+         {gate_cleanup}",
+        cache_glob = CARGO_CACHE_GLOB,
+        gate_cleanup = gate_snapshot_cleanup()
     )
 }
 
@@ -516,43 +672,660 @@ pub fn enumerate_targets_command(escaped_base: &str) -> String {
 pub struct RemoteTargetEntry {
     /// Newest mtime (Unix seconds) of the dir or any descendant.
     pub newest_mtime_unix: u64,
-    /// Disk usage in KiB (`du -sk`).
+    /// Disk usage in KiB.
     pub kb: u64,
     /// Absolute path on the worker.
     pub path: String,
+    /// Whether any process holds a descriptor open under this dir, or has it
+    /// as its cwd. [`GateEvidence::Unknown`] when the snapshot could not be
+    /// taken — which makes the dir ineligible, never eligible.
+    pub open_handles: GateEvidence,
+    /// Whether a live process's command line names this dir.
+    /// [`GateEvidence::Unknown`] when the snapshot could not be taken.
+    pub live_process: GateEvidence,
 }
 
 impl RemoteTargetEntry {
-    /// Whether this is a pooled (`-pool-`) dir — reused across jobs, shown for
-    /// observability but never swept by gc.
+    /// Whether this is a pooled (`-pool-`) dir — a warm cache reused across
+    /// jobs.
     #[must_use]
     pub fn is_pooled(&self) -> bool {
-        self.path
-            .rsplit('/')
-            .next()
-            .is_some_and(|name| name.starts_with(".rch-target-") && name.contains("-pool-"))
+        self.class() == GcClass::Pooled
     }
+
+    /// What kind of rch runtime dir this is, from its basename alone.
+    #[must_use]
+    pub fn class(&self) -> GcClass {
+        GcClass::from_path(&self.path)
+    }
+
+    /// Idle age in seconds relative to `now_unix`, saturating at 0 for a dir
+    /// whose newest mtime is in the future (clock skew between client and
+    /// worker) — a future mtime reads as "just touched", i.e. too young.
+    #[must_use]
+    pub fn age_secs(&self, now_unix: u64) -> u64 {
+        now_unix.saturating_sub(self.newest_mtime_unix)
+    }
+}
+
+/// What kind of rch runtime directory a path names. Derived in Rust from the
+/// basename (never in the shell) so classification cannot drift between the
+/// enumeration script and the decision that acts on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GcClass {
+    /// `.rch-target-<worker>-job-<id>` / `-pid-<pid>-…`: one build's target dir.
+    PerJob,
+    /// `.rch-target-<worker>-pool-<key>`: a warm target store shared by jobs.
+    Pooled,
+    /// `rch-cargo-cache-<worker>`: the durable per-worker `CARGO_HOME`.
+    CargoCache,
+    /// `rch_target_*`: the pre-`.rch-target-` layout, still found on old hosts.
+    LegacyTarget,
+    /// Anything else. Never collectible — if the enumeration ever hands back a
+    /// path rch does not recognize, gc leaves it alone.
+    Unrecognized,
+}
+
+impl GcClass {
+    /// Classify by basename.
+    #[must_use]
+    pub fn from_path(path: &str) -> Self {
+        let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        if let Some(rest) = name.strip_prefix(".rch-target-") {
+            if rest.contains("-pool-") {
+                return Self::Pooled;
+            }
+            if rest.contains("-job-") || rest.contains("-pid-") {
+                return Self::PerJob;
+            }
+            return Self::Unrecognized;
+        }
+        if name.starts_with(crate::remote_compilation::RCH_CARGO_CACHE_PREFIX) {
+            return Self::CargoCache;
+        }
+        if name.starts_with("rch_target_") {
+            return Self::LegacyTarget;
+        }
+        Self::Unrecognized
+    }
+
+    /// Stable machine-readable tag (JSON output, tests).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PerJob => "per_job",
+            Self::Pooled => "pooled",
+            Self::CargoCache => "cargo_cache",
+            Self::LegacyTarget => "legacy_target",
+            Self::Unrecognized => "unrecognized",
+        }
+    }
+
+    /// The `RCH_REAP_RM` trigger tag recorded for a removal of this class.
+    #[must_use]
+    pub const fn trigger(self) -> &'static str {
+        match self {
+            Self::PerJob | Self::LegacyTarget => "ttl",
+            Self::Pooled => "pooled-ttl",
+            Self::CargoCache => "cache-ttl",
+            Self::Unrecognized => "none",
+        }
+    }
+
+    /// Whether collecting this class demands that BOTH liveness gates be
+    /// *known* and free. True for the two warm-cache classes that this change
+    /// made collectible: they are shared and long-lived, so an unavailable
+    /// gate must block them. Per-job and legacy dirs keep their long-standing
+    /// idle-window authority (an unavailable gate does not newly freeze a
+    /// sweep that has always been safe on the idle window alone), but a gate
+    /// that is available and says "held" still blocks them.
+    #[must_use]
+    pub const fn requires_known_gates(self) -> bool {
+        matches!(self, Self::Pooled | Self::CargoCache)
+    }
+}
+
+impl std::fmt::Display for GcClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The answer one liveness gate gave for one directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum GateEvidence {
+    /// The gate ran and found nothing holding the dir.
+    Free,
+    /// The gate ran and found the dir in use.
+    Held,
+    /// The gate could not run (no `/proc`, no `lsof`, no `ps`, unwritable
+    /// temp, permission denied). The DEFAULT, so any parse gap or missing
+    /// field reads as "unknown" and therefore ineligible.
+    #[default]
+    Unknown,
+}
+
+impl GateEvidence {
+    /// Parse the token the enumeration script prints.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "free" => Some(Self::Free),
+            "held" => Some(Self::Held),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    /// The token form.
+    #[must_use]
+    pub const fn as_token(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Held => "held",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for GateEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_token())
+    }
+}
+
+/// Per-class idle windows, in seconds, that `rch gc` applies. `None` means the
+/// class is never collected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcPolicy {
+    /// Window for [`GcClass::PerJob`] and [`GcClass::LegacyTarget`].
+    pub idle_secs: u64,
+    /// Window for [`GcClass::Pooled`]; `None` disables pooled collection.
+    pub pooled_idle_secs: Option<u64>,
+    /// Window for [`GcClass::CargoCache`]; `None` disables cache collection.
+    pub cache_idle_secs: Option<u64>,
+}
+
+impl GcPolicy {
+    /// The idle window a class must clear, or `None` when the class is not
+    /// collected at all.
+    #[must_use]
+    pub fn window_secs(&self, class: GcClass) -> Option<u64> {
+        match class {
+            GcClass::PerJob | GcClass::LegacyTarget => Some(self.idle_secs),
+            GcClass::Pooled => self.pooled_idle_secs,
+            GcClass::CargoCache => self.cache_idle_secs,
+            GcClass::Unrecognized => None,
+        }
+    }
+}
+
+/// Why a candidate was NOT collected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GcKeepReason {
+    /// The basename is not an rch runtime dir rch is willing to remove.
+    Unrecognized,
+    /// The class is disabled by configuration (a `0` idle window).
+    ClassDisabled,
+    /// Not idle long enough yet.
+    TooYoung {
+        /// Observed idle age.
+        age_secs: u64,
+        /// Window it must clear.
+        required_secs: u64,
+    },
+    /// A process holds a descriptor open under the dir, or is cwd'd into it.
+    OpenHandles,
+    /// A live process's command line names the dir.
+    LiveProcess,
+    /// A gate could not be evaluated. Named so the operator can fix the
+    /// worker rather than wonder why nothing is collected.
+    GateUnavailable(&'static str),
+}
+
+impl std::fmt::Display for GcKeepReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unrecognized => f.write_str("not an rch-managed runtime dir"),
+            Self::ClassDisabled => f.write_str("collection disabled for this class by config"),
+            Self::TooYoung {
+                age_secs,
+                required_secs,
+            } => write!(
+                f,
+                "idle {}h < required {}h",
+                age_secs / 3600,
+                required_secs / 3600
+            ),
+            Self::OpenHandles => f.write_str("open file descriptors under the dir"),
+            Self::LiveProcess => f.write_str("a live process is rooted at the dir"),
+            Self::GateUnavailable(gate) => write!(f, "{gate} gate unavailable (treated as in use)"),
+        }
+    }
+}
+
+impl GcKeepReason {
+    /// Stable machine-readable tag for JSON output.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unrecognized => "unrecognized",
+            Self::ClassDisabled => "class_disabled",
+            Self::TooYoung { .. } => "too_young",
+            Self::OpenHandles => "open_handles",
+            Self::LiveProcess => "live_process",
+            Self::GateUnavailable(_) => "gate_unavailable",
+        }
+    }
+}
+
+/// The decision for one enumerated dir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GcVerdict {
+    /// Every gate passed; gc may remove it (`--apply`).
+    Collect,
+    /// Left in place, with the reason.
+    Keep(GcKeepReason),
+}
+
+impl GcVerdict {
+    /// Whether this dir would be removed.
+    #[must_use]
+    pub fn is_collect(&self) -> bool {
+        matches!(self, Self::Collect)
+    }
+}
+
+/// Decide whether one enumerated dir may be collected.
+///
+/// The gates, ALL of which must hold, in the order they are cheapest to
+/// explain:
+///
+/// 1. the basename is a class rch created and is willing to remove;
+/// 2. the class is enabled (a `0` window disables it);
+/// 3. the dir has been idle at least the class's window — `newest_mtime_unix`
+///    is the newest mtime of the dir *or any descendant*, so an active build
+///    can never clear this;
+/// 4. no open file descriptor and no cwd under the dir;
+/// 5. no live process rooted at the dir.
+///
+/// Any gate that could not be evaluated ([`GateEvidence::Unknown`]) blocks
+/// collection for the classes this change newly made collectible — the whole
+/// point of the conservative rule is that an error must read as "in use", never
+/// as "free".
+#[must_use]
+pub fn evaluate_gc_candidate(
+    entry: &RemoteTargetEntry,
+    now_unix: u64,
+    policy: &GcPolicy,
+) -> GcVerdict {
+    let class = entry.class();
+    if class == GcClass::Unrecognized {
+        return GcVerdict::Keep(GcKeepReason::Unrecognized);
+    }
+    let Some(required_secs) = policy.window_secs(class) else {
+        return GcVerdict::Keep(GcKeepReason::ClassDisabled);
+    };
+    let age_secs = entry.age_secs(now_unix);
+    if age_secs < required_secs {
+        return GcVerdict::Keep(GcKeepReason::TooYoung {
+            age_secs,
+            required_secs,
+        });
+    }
+    let strict = class.requires_known_gates();
+    match entry.open_handles {
+        GateEvidence::Held => return GcVerdict::Keep(GcKeepReason::OpenHandles),
+        GateEvidence::Unknown if strict => {
+            return GcVerdict::Keep(GcKeepReason::GateUnavailable("open-descriptor"));
+        }
+        _ => {}
+    }
+    match entry.live_process {
+        GateEvidence::Held => return GcVerdict::Keep(GcKeepReason::LiveProcess),
+        GateEvidence::Unknown if strict => {
+            return GcVerdict::Keep(GcKeepReason::GateUnavailable("live-process"));
+        }
+        _ => {}
+    }
+    GcVerdict::Collect
+}
+
+/// Second-pass byte-cap eviction, in Rust so every eviction carries the same
+/// per-dir reasoning as a TTL collection.
+///
+/// After the TTL verdicts, when the total size of everything still on disk
+/// exceeds `cap_kb` (`[remediation.pooled_target] reaper_max_cache_gb`; `0`
+/// disables), evict OLDEST-FIRST until back under budget. Returns the indices
+/// of `entries` to additionally collect, in eviction order.
+///
+/// A cap eviction is held to *more* than the TTL pass required of it: the dir
+/// must still clear the SHORT idle window (the active-build safety floor — a
+/// disk budget must never clip a running build) and must still pass the same
+/// liveness gates, including the rule that an unavailable gate blocks a warm
+/// cache. The pre-existing shell cap pass checked only the idle window; this
+/// is strictly the safer of the two.
+#[must_use]
+pub fn select_cap_evictions(
+    entries: &[RemoteTargetEntry],
+    verdicts: &[GcVerdict],
+    now_unix: u64,
+    policy: &GcPolicy,
+    cap_kb: u64,
+) -> Vec<usize> {
+    if cap_kb == 0 || entries.len() != verdicts.len() {
+        return Vec::new();
+    }
+    let mut remaining_kb: u64 = entries
+        .iter()
+        .zip(verdicts)
+        .filter(|(_, v)| !v.is_collect())
+        .map(|(e, _)| e.kb)
+        .sum();
+    if remaining_kb <= cap_kb {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<usize> = entries
+        .iter()
+        .zip(verdicts)
+        .enumerate()
+        .filter(|(_, (entry, verdict))| {
+            if verdict.is_collect() {
+                return false;
+            }
+            let class = entry.class();
+            if class == GcClass::Unrecognized || policy.window_secs(class).is_none() {
+                return false;
+            }
+            if entry.age_secs(now_unix) < policy.idle_secs {
+                return false;
+            }
+            let strict = class.requires_known_gates();
+            let gate_ok = |g: GateEvidence| match g {
+                GateEvidence::Free => true,
+                GateEvidence::Held => false,
+                GateEvidence::Unknown => !strict,
+            };
+            gate_ok(entry.open_handles) && gate_ok(entry.live_process)
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    // Oldest first, so the warm pools that survive are the ones still in use.
+    // Path is the tie-break so the order is deterministic across runs.
+    candidates.sort_by(|a, b| {
+        entries[*a]
+            .newest_mtime_unix
+            .cmp(&entries[*b].newest_mtime_unix)
+            .then_with(|| entries[*a].path.cmp(&entries[*b].path))
+    });
+
+    let mut evict = Vec::new();
+    for idx in candidates {
+        if remaining_kb <= cap_kb {
+            break;
+        }
+        remaining_kb = remaining_kb.saturating_sub(entries[idx].kb);
+        evict.push(idx);
+    }
+    evict
+}
+
+/// One dir `rch gc --apply` intends to remove, with the window and tag the
+/// worker re-checks it against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcCollectTarget {
+    /// Absolute path on the worker.
+    pub path: String,
+    /// Idle window (minutes) the worker re-verifies before removing.
+    pub idle_minutes: u64,
+    /// Trigger tag recorded on the removal.
+    pub trigger: &'static str,
+}
+
+/// Build the removal script for an explicit, already-decided list of dirs.
+///
+/// This is the ONLY code path by which `rch gc --apply` deletes anything, and
+/// it re-runs every gate on the worker immediately before each `rm`:
+/// still-a-directory, still idle past its window, no open descriptors, no live
+/// process. The client's verdict is therefore a *proposal*; the worker's
+/// re-check is the authority, which closes the window between enumeration and
+/// removal (a build can start in between — enumeration of a loaded worker takes
+/// minutes).
+///
+/// Every path is re-validated with [`is_safe_reap_path`] and must carry a
+/// recognized rch basename, so neither a corrupted enumeration nor a hostile
+/// path can widen what gets removed. Returns `Err` naming the offending path
+/// rather than silently dropping it.
+///
+/// Emits the same `RCH_REAP_RM` / `RCH_REAP_ERR` / `RCH_WORKER_REAP_METRICS`
+/// lines as [`worker_sweep_command`], plus `RCH_GC_SKIP <trigger> <reason>
+/// <path>` for a dir the worker's re-check declined.
+pub fn collect_paths_command(targets: &[GcCollectTarget]) -> Result<String, String> {
+    if targets.is_empty() {
+        return Err("no targets to collect".to_string());
+    }
+    let mut list = String::new();
+    for target in targets {
+        if !is_safe_reap_path(&target.path) {
+            return Err(format!(
+                "refusing to collect {:?}: not an absolute, `..`-free, metacharacter-free path at \
+                 least two levels deep",
+                target.path
+            ));
+        }
+        if GcClass::from_path(&target.path) == GcClass::Unrecognized {
+            return Err(format!(
+                "refusing to collect {:?}: basename is not an rch-managed runtime dir",
+                target.path
+            ));
+        }
+        if target.idle_minutes == 0 {
+            return Err(format!(
+                "refusing to collect {:?}: a zero idle window would remove a live dir",
+                target.path
+            ));
+        }
+        if !target
+            .trigger
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err(format!("invalid trigger tag {:?}", target.trigger));
+        }
+        list.push_str(&format!(
+            " \"{}:{}:{}\"",
+            target.idle_minutes, target.trigger, target.path
+        ));
+    }
+    // `$__tmpbase` is the mktemp location for the gate snapshots and is
+    // resolved by the very prelude that creates the dirs being collected.
+    let tmp_base_prelude = crate::remote_compilation::remote_cargo_home_base_prelude();
+    let tmp_base_var = crate::remote_compilation::RCH_CARGO_HOME_BASE_VAR;
+    Ok(format!(
+        "set -u; \
+         {tmp_base_prelude}; \
+         __tmpbase=\"${{{tmp_base_var}}}\"; \
+         {gates}\
+         removed=0; freed_kb=0; \
+         for __e in{list}; do \
+           __mins=${{__e%%:*}}; __r=${{__e#*:}}; __tag=${{__r%%:*}}; d=${{__r#*:}}; \
+           if [ ! -d \"$d\" ]; then printf 'RCH_GC_SKIP %s missing %s\\n' \"$__tag\" \"$d\"; continue; fi; \
+           if find \"$d\" -mmin -\"$__mins\" -print -quit 2>/dev/null | grep -q .; then \
+             printf 'RCH_GC_SKIP %s active %s\\n' \"$__tag\" \"$d\"; continue; fi; \
+           if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP %s gate %s\\n' \"$__tag\" \"$d\"; continue; fi; \
+           sz=$(du -sk \"$d\" 2>/dev/null | awk '{{print $1}}'); [ -z \"$sz\" ] && sz=0; \
+           if __rmerr=$(rm -rf -- \"$d\" 2>&1); then \
+             removed=$((removed + 1)); freed_kb=$((freed_kb + sz)); \
+             printf 'RCH_REAP_RM %s %s %s\\n' \"$sz\" \"$__tag\" \"$d\"; \
+           else \
+             printf 'RCH_REAP_ERR %s %s :: %s\\n' \"$__tag\" \"$d\" \"$(printf '%s' \"$__rmerr\" | head -1)\"; \
+           fi; \
+         done; \
+         {gate_cleanup}\
+         printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\"",
+        gates = gate_snapshot_fragment(),
+        gate_cleanup = gate_snapshot_cleanup(),
+    ))
+}
+
+/// One dir a `--apply` run declined at removal time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcSkip {
+    /// Trigger tag of the pass that declined it.
+    pub trigger: String,
+    /// Why: `missing`, `active`, or `gate`.
+    pub reason: String,
+    /// Absolute path.
+    pub path: String,
+}
+
+/// Parse the `RCH_GC_SKIP <trigger> <reason> <path>` lines.
+#[must_use]
+pub fn parse_gc_skips(stdout: &str) -> Vec<GcSkip> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("RCH_GC_SKIP ")?;
+            let mut parts = rest.splitn(3, ' ');
+            let trigger = parts.next()?.to_string();
+            let reason = parts.next()?.to_string();
+            let path = parts.next()?.trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(GcSkip {
+                trigger,
+                reason,
+                path: path.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The roots one enumeration/sweep run actually looked at, as reported by the
+/// script itself (`RCH_GC_ROOT <kind> <path>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanRootReport {
+    /// The `$base` handed to the script, verbatim.
+    pub requested: Option<String>,
+    /// The canonicalized base actually walked, absent when the guard bailed.
+    pub resolved: Option<String>,
+    /// The canonicalized worker temp base walked, empty/absent when it was
+    /// skipped by the shallow-root guard.
+    pub temp_base: Option<String>,
+    /// `<path> <reason>` for a root the guard refused to walk.
+    pub skipped: Option<String>,
+}
+
+/// Parse the `RCH_GC_ROOT` / `RCH_GC_ROOT_SKIPPED` lines. Lets `rch gc` report
+/// which roots were really scanned instead of the ones it hoped to scan — a
+/// root that silently bails is exactly how this bug hid.
+#[must_use]
+pub fn parse_scan_roots(stdout: &str) -> ScanRootReport {
+    let mut report = ScanRootReport::default();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("RCH_GC_ROOT_SKIPPED ") {
+            if !rest.is_empty() {
+                report.skipped = Some(rest.to_string());
+            }
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("RCH_GC_ROOT ") else {
+            continue;
+        };
+        let Some((kind, value)) = rest.split_once(' ') else {
+            continue;
+        };
+        let value = value.trim();
+        let slot = match kind {
+            "base" => &mut report.requested,
+            "resolved" => &mut report.resolved,
+            "tmp" => &mut report.temp_base,
+            _ => continue,
+        };
+        *slot = (!value.is_empty()).then(|| value.to_string());
+    }
+    report
+}
+
+/// Whether both liveness-gate snapshots were available on this run, from the
+/// `RCH_GC_GATES handles=<0|1> handles_source=<...> procs=<0|1>` line.
+///
+/// A missing line reads as "unavailable" — the fail-closed direction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GateAvailability {
+    /// Whether the open-descriptor snapshot was taken.
+    pub handles: bool,
+    /// Whether the process-command-line snapshot was taken.
+    pub processes: bool,
+}
+
+impl GateAvailability {
+    /// Whether both gates could be evaluated.
+    #[must_use]
+    pub fn both(self) -> bool {
+        self.handles && self.processes
+    }
+}
+
+/// Parse the `RCH_GC_GATES` line.
+#[must_use]
+pub fn parse_gate_availability(stdout: &str) -> GateAvailability {
+    let mut out = GateAvailability::default();
+    let Some(line) = stdout.lines().find(|l| l.contains("RCH_GC_GATES")) else {
+        return out;
+    };
+    for token in line.split_whitespace() {
+        match token.split_once('=') {
+            Some(("handles", v)) => out.handles = v == "1",
+            Some(("procs", v)) => out.processes = v == "1",
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Parse the `RCH_TARGET_ENTRY` lines an [`enumerate_targets_command`] run
 /// prints. Unparseable lines are skipped (fail-open observability).
+///
+/// Two shapes are accepted: the current
+/// `<newest> <kb> <handles> <procs> <path>` and the pre-gate
+/// `<newest> <kb> <path>`, which parses with both gates
+/// [`GateEvidence::Unknown`] — i.e. an old worker script makes every warm-cache
+/// dir ineligible rather than eligible-by-omission.
 #[must_use]
 pub fn parse_target_entries(stdout: &str) -> Vec<RemoteTargetEntry> {
     stdout
         .lines()
         .filter_map(|line| {
             let rest = line.trim().strip_prefix("RCH_TARGET_ENTRY ")?;
-            let mut parts = rest.splitn(3, ' ');
+            let mut parts = rest.splitn(5, ' ');
             let newest_mtime_unix = parts.next()?.parse::<u64>().ok()?;
             let kb = parts.next()?.parse::<u64>().ok()?;
-            let path = parts.next()?.trim();
+            let third = parts.next()?;
+            let (open_handles, live_process, path) = match GateEvidence::from_token(third) {
+                Some(handles) => {
+                    let live = GateEvidence::from_token(parts.next()?)?;
+                    (handles, live, parts.next()?.trim().to_string())
+                }
+                // Legacy 3-field line: everything after `<kb> ` is the path.
+                None => (
+                    GateEvidence::Unknown,
+                    GateEvidence::Unknown,
+                    rest.splitn(3, ' ').nth(2)?.trim().to_string(),
+                ),
+            };
             if path.is_empty() {
                 return None;
             }
             Some(RemoteTargetEntry {
                 newest_mtime_unix,
                 kb,
-                path: path.to_string(),
+                path,
+                open_handles,
+                live_process,
             })
         })
         .collect()
@@ -561,6 +1334,570 @@ pub fn parse_target_entries(stdout: &str) -> Vec<RemoteTargetEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── gc eligibility model (issue: `rch gc` reported 0 MB fleet-wide) ─────
+
+    fn entry(path: &str, age_secs: u64, gates: (GateEvidence, GateEvidence)) -> RemoteTargetEntry {
+        RemoteTargetEntry {
+            newest_mtime_unix: NOW - age_secs,
+            kb: 4_096,
+            path: path.to_string(),
+            open_handles: gates.0,
+            live_process: gates.1,
+        }
+    }
+
+    const NOW: u64 = 1_800_000_000;
+    const FREE: (GateEvidence, GateEvidence) = (GateEvidence::Free, GateEvidence::Free);
+    const DAY: u64 = 24 * 3600;
+
+    fn policy() -> GcPolicy {
+        GcPolicy {
+            idle_secs: 12 * 3600,
+            pooled_idle_secs: Some(7 * DAY),
+            cache_idle_secs: Some(14 * DAY),
+        }
+    }
+
+    const POOL: &str = "/data/projects/repo/.rch-target-hz2-pool-deadbeef";
+    const CACHE: &str = "/data/tmp/rch-cargo-cache-hz2";
+
+    /// The glob gc enumerates with must stay welded to the prefix the creator
+    /// uses; a rename on one side is exactly how these dirs went unscanned.
+    #[test]
+    fn cargo_cache_glob_tracks_the_creating_prefix() {
+        assert_eq!(
+            CARGO_CACHE_GLOB,
+            format!("{}*", crate::remote_compilation::RCH_CARGO_CACHE_PREFIX)
+        );
+        // ...and the durable-cache expression really produces a matching name.
+        let expr = crate::remote_compilation::remote_cargo_cache_expr("hz2");
+        assert!(expr.ends_with("/rch-cargo-cache-hz2"), "{expr}");
+        assert_eq!(
+            GcClass::from_path(&expr.replace("${RCH_CH_BASE}", "/data/tmp")),
+            GcClass::CargoCache
+        );
+    }
+
+    #[test]
+    fn gc_class_is_derived_from_the_basename() {
+        assert_eq!(GcClass::from_path(POOL), GcClass::Pooled);
+        assert_eq!(GcClass::from_path(CACHE), GcClass::CargoCache);
+        assert_eq!(
+            GcClass::from_path("/data/projects/r/.rch-target-hz2-job-1-2-0"),
+            GcClass::PerJob
+        );
+        assert_eq!(
+            GcClass::from_path("/data/projects/r/.rch-target-hz2-pid-42-1-0"),
+            GcClass::PerJob
+        );
+        assert_eq!(
+            GcClass::from_path("/data/tmp/rch_target_old"),
+            GcClass::LegacyTarget
+        );
+        // Never anything else: a bare target dir, a source tree, a git dir.
+        for other in [
+            "/data/projects/repo/target",
+            "/data/projects/repo",
+            "/data/projects/repo/.git",
+            "/data/projects/repo/.rch-target-hz2",
+            "/data/tmp/rch-cargo-home-hz2-run-7",
+        ] {
+            assert_eq!(
+                GcClass::from_path(other),
+                GcClass::Unrecognized,
+                "{other} must never be collectible"
+            );
+        }
+    }
+
+    /// The behaviour the fix exists for: an old, quiet pooled dir IS eligible.
+    #[test]
+    fn pool_and_cache_dirs_are_eligible_when_every_gate_passes() {
+        for (path, age) in [(POOL, 8 * DAY), (CACHE, 15 * DAY)] {
+            assert_eq!(
+                evaluate_gc_candidate(&entry(path, age, FREE), NOW, &policy()),
+                GcVerdict::Collect,
+                "{path} should be collectible"
+            );
+        }
+    }
+
+    /// Each gate ALONE must be able to veto a collection.
+    #[test]
+    fn every_gate_independently_blocks_collection() {
+        let p = policy();
+
+        // 1. age
+        assert_eq!(
+            evaluate_gc_candidate(&entry(POOL, 6 * DAY, FREE), NOW, &p),
+            GcVerdict::Keep(GcKeepReason::TooYoung {
+                age_secs: 6 * DAY,
+                required_secs: 7 * DAY
+            })
+        );
+        assert_eq!(
+            evaluate_gc_candidate(&entry(CACHE, 13 * DAY, FREE), NOW, &p),
+            GcVerdict::Keep(GcKeepReason::TooYoung {
+                age_secs: 13 * DAY,
+                required_secs: 14 * DAY
+            })
+        );
+
+        // 2. open file descriptors
+        assert_eq!(
+            evaluate_gc_candidate(
+                &entry(POOL, 99 * DAY, (GateEvidence::Held, GateEvidence::Free)),
+                NOW,
+                &p
+            ),
+            GcVerdict::Keep(GcKeepReason::OpenHandles)
+        );
+
+        // 3. a live build process rooted at the dir
+        assert_eq!(
+            evaluate_gc_candidate(
+                &entry(POOL, 99 * DAY, (GateEvidence::Free, GateEvidence::Held)),
+                NOW,
+                &p
+            ),
+            GcVerdict::Keep(GcKeepReason::LiveProcess)
+        );
+
+        // 4. class disabled by configuration
+        let disabled = GcPolicy {
+            pooled_idle_secs: None,
+            cache_idle_secs: None,
+            ..p
+        };
+        for path in [POOL, CACHE] {
+            assert_eq!(
+                evaluate_gc_candidate(&entry(path, 99 * DAY, FREE), NOW, &disabled),
+                GcVerdict::Keep(GcKeepReason::ClassDisabled)
+            );
+        }
+
+        // 5. an unrecognized dir is never collected, at any age.
+        assert_eq!(
+            evaluate_gc_candidate(
+                &entry("/data/projects/repo/target", 99 * DAY, FREE),
+                NOW,
+                &p
+            ),
+            GcVerdict::Keep(GcKeepReason::Unrecognized)
+        );
+    }
+
+    /// The conservative rule: a gate that ERRORED reads as "in use". A dir that
+    /// fails to prove itself free is never collected.
+    #[test]
+    fn an_unavailable_gate_makes_a_warm_cache_dir_ineligible() {
+        let p = policy();
+        for gates in [
+            (GateEvidence::Unknown, GateEvidence::Free),
+            (GateEvidence::Free, GateEvidence::Unknown),
+            (GateEvidence::Unknown, GateEvidence::Unknown),
+        ] {
+            for path in [POOL, CACHE] {
+                let verdict = evaluate_gc_candidate(&entry(path, 99 * DAY, gates), NOW, &p);
+                assert!(
+                    matches!(verdict, GcVerdict::Keep(GcKeepReason::GateUnavailable(_))),
+                    "{path} with gates {gates:?} must be ineligible, got {verdict:?}"
+                );
+            }
+        }
+    }
+
+    /// Per-job dirs keep the idle window as their authority (an unavailable
+    /// gate must not newly freeze a sweep that has always been safe on age
+    /// alone) — but a gate that DID run and says "held" still vetoes them.
+    #[test]
+    fn per_job_dirs_keep_idle_window_authority_but_still_honour_a_live_gate() {
+        let p = policy();
+        let job = "/data/projects/repo/.rch-target-hz2-job-1-2-0";
+        assert_eq!(
+            evaluate_gc_candidate(
+                &entry(job, 2 * DAY, (GateEvidence::Unknown, GateEvidence::Unknown)),
+                NOW,
+                &p
+            ),
+            GcVerdict::Collect
+        );
+        assert_eq!(
+            evaluate_gc_candidate(
+                &entry(job, 2 * DAY, (GateEvidence::Held, GateEvidence::Unknown)),
+                NOW,
+                &p
+            ),
+            GcVerdict::Keep(GcKeepReason::OpenHandles)
+        );
+    }
+
+    /// A worker mtime AHEAD of the client's clock must read as "just touched",
+    /// never as a huge age that would collect a live dir.
+    #[test]
+    fn a_future_mtime_reads_as_zero_age() {
+        let mut e = entry(POOL, 0, FREE);
+        e.newest_mtime_unix = NOW + 10_000;
+        assert_eq!(e.age_secs(NOW), 0);
+        assert!(matches!(
+            evaluate_gc_candidate(&e, NOW, &policy()),
+            GcVerdict::Keep(GcKeepReason::TooYoung { .. })
+        ));
+    }
+
+    #[test]
+    fn idle_window_helpers_floor_and_disable() {
+        assert_eq!(pooled_idle_minutes_from_hours(0), None);
+        assert_eq!(
+            pooled_idle_minutes_from_hours(1),
+            Some(MIN_POOLED_IDLE_MINUTES)
+        );
+        assert_eq!(pooled_idle_minutes_from_hours(168), Some(168 * 60));
+        assert_eq!(cargo_cache_idle_minutes_from_days(0), None);
+        assert_eq!(
+            cargo_cache_idle_minutes_from_days(1),
+            Some(MIN_CARGO_CACHE_IDLE_MINUTES)
+        );
+        assert_eq!(cargo_cache_idle_minutes_from_days(14), Some(14 * 24 * 60));
+    }
+
+    /// An old worker script (or a truncated line) yields UNKNOWN gates, which
+    /// is the ineligible direction — never eligible-by-omission.
+    #[test]
+    fn legacy_entry_lines_parse_with_unknown_gates_and_are_ineligible() {
+        let legacy = format!("RCH_TARGET_ENTRY {} 4096 {POOL}\n", NOW - 99 * DAY);
+        let entries = parse_target_entries(&legacy);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, POOL);
+        assert_eq!(entries[0].open_handles, GateEvidence::Unknown);
+        assert_eq!(entries[0].live_process, GateEvidence::Unknown);
+        assert!(matches!(
+            evaluate_gc_candidate(&entries[0], NOW, &policy()),
+            GcVerdict::Keep(GcKeepReason::GateUnavailable(_))
+        ));
+
+        let current = format!(
+            "RCH_TARGET_ENTRY {} 4096 free free {POOL}\n",
+            NOW - 99 * DAY
+        );
+        let entries = parse_target_entries(&current);
+        assert_eq!(entries[0].path, POOL);
+        assert_eq!(entries[0].open_handles, GateEvidence::Free);
+        assert_eq!(
+            evaluate_gc_candidate(&entries[0], NOW, &policy()),
+            GcVerdict::Collect
+        );
+    }
+
+    #[test]
+    fn gate_availability_defaults_to_unavailable() {
+        assert_eq!(
+            parse_gate_availability("nothing here"),
+            GateAvailability::default()
+        );
+        assert!(!parse_gate_availability("").both());
+        let ok = parse_gate_availability("RCH_GC_GATES handles=1 handles_source=proc procs=1\n");
+        assert!(ok.both());
+        let partial =
+            parse_gate_availability("RCH_GC_GATES handles=1 handles_source=proc procs=0\n");
+        assert!(!partial.both());
+        assert!(partial.handles);
+    }
+
+    #[test]
+    fn scan_roots_and_skips_are_reported_back() {
+        let out = "RCH_GC_ROOT base /srv\nRCH_GC_ROOT_SKIPPED /srv too-shallow\n";
+        let roots = parse_scan_roots(out);
+        assert_eq!(roots.requested.as_deref(), Some("/srv"));
+        assert_eq!(roots.resolved, None);
+        assert_eq!(roots.skipped.as_deref(), Some("/srv too-shallow"));
+
+        let out = "RCH_GC_ROOT base /data/projects\nRCH_GC_ROOT resolved /data/projects\nRCH_GC_ROOT tmp \n";
+        let roots = parse_scan_roots(out);
+        assert_eq!(roots.resolved.as_deref(), Some("/data/projects"));
+        assert_eq!(
+            roots.temp_base, None,
+            "an unscanned tmp base is absent, not empty-string"
+        );
+        assert_eq!(roots.skipped, None);
+    }
+
+    #[test]
+    fn collect_paths_command_refuses_anything_it_did_not_recognize() {
+        let good = GcCollectTarget {
+            path: POOL.to_string(),
+            idle_minutes: 10_080,
+            trigger: "pooled-ttl",
+        };
+        assert!(collect_paths_command(std::slice::from_ref(&good)).is_ok());
+        assert!(collect_paths_command(&[]).is_err());
+
+        for bad_path in [
+            "/",
+            "/tmp",
+            "relative/.rch-target-w-pool-a",
+            "/tmp/../etc/.rch-target-w-pool-a",
+            "/tmp/x/.rch-target-w-pool-a; rm -rf /",
+            "/data/projects/repo/target",
+            "/data/projects/repo",
+        ] {
+            let t = GcCollectTarget {
+                path: bad_path.to_string(),
+                ..good.clone()
+            };
+            assert!(
+                collect_paths_command(&[t]).is_err(),
+                "{bad_path} must be refused"
+            );
+        }
+
+        // A zero window would remove a dir that is being written to right now.
+        let zero = GcCollectTarget {
+            idle_minutes: 0,
+            ..good.clone()
+        };
+        assert!(collect_paths_command(&[zero]).is_err());
+    }
+
+    #[test]
+    fn collect_paths_command_rechecks_every_gate_on_the_worker() {
+        let cmd = collect_paths_command(&[GcCollectTarget {
+            path: POOL.to_string(),
+            idle_minutes: 10_080,
+            trigger: "pooled-ttl",
+        }])
+        .expect("valid target");
+
+        // Still a directory, still idle, still unheld — checked in that order,
+        // immediately before the rm, so the enumerate→apply window is closed.
+        assert!(cmd.contains("if [ ! -d \"$d\" ]; then printf 'RCH_GC_SKIP %s missing"));
+        assert!(cmd.contains("find \"$d\" -mmin -\"$__mins\" -print -quit"));
+        assert!(cmd.contains("if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP %s gate"));
+        assert!(cmd.contains("rm -rf -- \"$d\""));
+        assert!(cmd.contains("RCH_WORKER_REAP_METRICS"));
+        // The gate snapshots exist, and an unavailable one fails closed.
+        assert!(cmd.contains("__gc_gates_ok() {"));
+        assert!(cmd.contains("[ \"$(__gc_handles \"$1\")\" = free ] || return 1"));
+        assert!(cmd.contains("[ \"$(__gc_procs \"$1\")\" = free ] || return 1"));
+        assert!(cmd.contains("__held_ok\" -ne 1 ]; then printf unknown"));
+        assert!(cmd.contains("__proc_ok\" -ne 1 ]; then printf unknown"));
+    }
+
+    /// The gates must ride on the SAME temp-base resolution that creates the
+    /// dirs, not a second copy of the ladder.
+    #[test]
+    fn scan_roots_reuse_the_creating_prelude() {
+        let prelude = crate::remote_compilation::remote_cargo_home_base_prelude();
+        for cmd in [
+            enumerate_targets_command("/data/projects"),
+            worker_sweep_command("/data/projects", 720, Some(10_080), None),
+            collect_paths_command(&[GcCollectTarget {
+                path: POOL.to_string(),
+                idle_minutes: 10_080,
+                trigger: "pooled-ttl",
+            }])
+            .unwrap(),
+        ] {
+            assert!(
+                cmd.contains(&prelude),
+                "the temp base must come from remote_cargo_home_base_prelude, not a copy"
+            );
+        }
+        // ...and the old hand-copied ladder is gone for good.
+        let cmd = enumerate_targets_command("/data/projects");
+        assert!(!cmd.contains("__tmpbase=\"${TMPDIR:-}\""));
+    }
+
+    #[test]
+    fn pooled_sweep_pass_is_gated_on_liveness() {
+        let cmd = worker_sweep_command("/data/projects", 720, Some(10_080), None);
+        assert!(
+            cmd.contains("if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP pooled-ttl gate"),
+            "the daemon sweep must apply the same liveness gates to pooled dirs"
+        );
+        // The daemon sweep must NOT delete durable Cargo caches: that class is
+        // collected only by an explicit, dry-run-by-default `rch gc --apply`.
+        assert!(!cmd.contains("rch-cargo-cache-*"));
+    }
+
+    #[test]
+    fn byte_cap_evicts_oldest_first_and_only_past_the_active_floor() {
+        let p = policy();
+        // Three pools, all within their 7-day pooled TTL so none is collected
+        // by the TTL pass; two are past the SHORT (12h) active-build floor.
+        let mut entries = vec![
+            entry(POOL, 5 * DAY, FREE), // oldest
+            entry("/data/projects/r/.rch-target-hz2-pool-b", 2 * DAY, FREE),
+            entry("/data/projects/r/.rch-target-hz2-pool-c", 60, FREE), // fresh
+        ];
+        for e in &mut entries {
+            e.kb = 10_000;
+        }
+        let verdicts: Vec<GcVerdict> = entries
+            .iter()
+            .map(|e| evaluate_gc_candidate(e, NOW, &p))
+            .collect();
+        assert!(verdicts.iter().all(|v| !v.is_collect()));
+
+        // No cap configured: nothing extra.
+        assert!(select_cap_evictions(&entries, &verdicts, NOW, &p, 0).is_empty());
+        // Under budget: nothing extra.
+        assert!(select_cap_evictions(&entries, &verdicts, NOW, &p, 30_000).is_empty());
+        // 30_000 KB on disk, 15_000 budget: evict the oldest until under.
+        let evicted = select_cap_evictions(&entries, &verdicts, NOW, &p, 15_000);
+        assert_eq!(evicted, vec![0, 1]);
+        // The fresh dir is never evicted, however tight the budget.
+        let evicted = select_cap_evictions(&entries, &verdicts, NOW, &p, 1);
+        assert_eq!(
+            evicted,
+            vec![0, 1],
+            "the active-build floor outranks the cap"
+        );
+    }
+
+    #[test]
+    fn byte_cap_still_honours_the_liveness_gates() {
+        let p = policy();
+        let mut held = entry(POOL, 5 * DAY, (GateEvidence::Held, GateEvidence::Free));
+        held.kb = 10_000;
+        let mut unknown = entry(
+            "/data/projects/r/.rch-target-hz2-pool-b",
+            5 * DAY,
+            (GateEvidence::Unknown, GateEvidence::Unknown),
+        );
+        unknown.kb = 10_000;
+        let entries = vec![held, unknown];
+        let verdicts: Vec<GcVerdict> = entries
+            .iter()
+            .map(|e| evaluate_gc_candidate(e, NOW, &p))
+            .collect();
+        assert!(
+            select_cap_evictions(&entries, &verdicts, NOW, &p, 1).is_empty(),
+            "a held dir and an unprovable dir must both survive the cap"
+        );
+    }
+
+    #[test]
+    fn gc_skip_lines_parse_back() {
+        let out = "RCH_GC_SKIP pooled-ttl gate /a/b/.rch-target-w-pool-x\n\
+                   RCH_GC_SKIP cache-ttl active /a/b/rch-cargo-cache-w\n\
+                   RCH_GC_SKIP bogus\n";
+        let skips = parse_gc_skips(out);
+        assert_eq!(skips.len(), 2);
+        assert_eq!(skips[0].trigger, "pooled-ttl");
+        assert_eq!(skips[0].reason, "gate");
+        assert_eq!(skips[1].path, "/a/b/rch-cargo-cache-w");
+    }
+
+    /// End-to-end on a real fixture: an aged pooled dir and an aged Cargo cache
+    /// are BOTH enumerated, both report free gates, and a dir this very test
+    /// process holds a descriptor into reports `held` and survives `--apply`.
+    ///
+    /// Linux-only: the descriptor snapshot reads `/proc/<pid>/fd`, and the
+    /// `lsof` fallback would scan every open file on the host — fine on a
+    /// worker, not something to make a unit test wait for on a dev Mac.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_descriptors_keep_a_stale_pool_alive_end_to_end() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("projects");
+        let tmpbase = tmp.path().join("scratch");
+        let free_pool = base.join("repo").join(".rch-target-w1-pool-free");
+        let held_pool = base.join("repo").join(".rch-target-w1-pool-held");
+        let cache = tmpbase.join("rch-cargo-cache-w1");
+        for d in [&free_pool, &held_pool, &cache] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("artifact.o"), b"xxxx").unwrap();
+        }
+        for d in [&free_pool, &held_pool, &cache] {
+            let ok = Command::new("find")
+                .arg(d)
+                .args(["-exec", "touch", "-t", "202001010000", "{}", "+"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                return; // no usable find/touch here
+            }
+        }
+
+        // Hold a descriptor open under one pool for the rest of the test.
+        let _guard = std::fs::File::open(held_pool.join("artifact.o")).unwrap();
+
+        let enumerate = enumerate_targets_command(base.to_str().unwrap());
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&enumerate)
+            .env("TMPDIR", &tmpbase)
+            .output()
+            .expect("enumerate should execute");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            parse_gate_availability(&stdout).both(),
+            "both gate snapshots must be available on Linux: {stdout}"
+        );
+        let entries = parse_target_entries(&stdout);
+        let find = |needle: &str| {
+            entries
+                .iter()
+                .find(|e| e.path.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not enumerated in {entries:?}"))
+        };
+        assert_eq!(find("rch-cargo-cache-w1").class(), GcClass::CargoCache);
+        assert_eq!(find("pool-held").open_handles, GateEvidence::Held);
+        assert_eq!(find("pool-free").open_handles, GateEvidence::Free);
+
+        // `--apply` must remove the free pool and the cache, and refuse the
+        // held one even though it is just as old.
+        let targets: Vec<GcCollectTarget> = [&free_pool, &held_pool, &cache]
+            .iter()
+            .map(|d| GcCollectTarget {
+                path: std::fs::canonicalize(d)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                idle_minutes: MIN_POOLED_IDLE_MINUTES,
+                trigger: "pooled-ttl",
+            })
+            .collect();
+        let cmd = collect_paths_command(&targets).expect("targets are valid");
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("TMPDIR", &tmpbase)
+            .output()
+            .expect("collect should execute");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "collect must be valid sh: {stderr}");
+        assert!(
+            !stderr.contains("syntax error") && !stderr.contains("unexpected"),
+            "collect emitted shell errors: {stderr}"
+        );
+        assert!(
+            !free_pool.exists(),
+            "an idle, unheld pool must be collected"
+        );
+        assert!(
+            !cache.exists(),
+            "an idle, unheld cargo cache must be collected"
+        );
+        assert!(
+            held_pool.exists(),
+            "a pool with an open descriptor must survive: {stdout}"
+        );
+        let skipped = parse_gc_skips(&stdout);
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.path.contains("pool-held") && s.reason == "gate"),
+            "the held pool must be reported as gate-skipped: {stdout}"
+        );
+        assert_eq!(parse_worker_reap_metrics(&stdout).map(|m| m.0), Some(2));
+    }
 
     #[test]
     fn safe_reap_path_accepts_deep_abs() {
@@ -822,7 +2159,10 @@ mod tests {
     #[test]
     fn enumerate_command_is_read_only_and_includes_pooled_dirs() {
         let cmd = enumerate_targets_command("/data/projects");
-        assert!(cmd.contains("-name \".rch-target-*-pool-*\" -prune"));
+        // Pooled dirs AND the durable per-worker Cargo caches, in one pass.
+        assert!(cmd.contains(
+            "\\( -name \".rch-target-*-pool-*\" -o -name \"rch-cargo-cache-*\" \\) -prune"
+        ));
         assert!(cmd.contains("RCH_TARGET_ENTRY"));
         assert!(cmd.contains("done < \"$__tmpf\""));
         // Read-only: never a recursive removal, and every `rm` targets a shell
@@ -977,11 +2317,8 @@ mod tests {
         );
 
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let listed: Vec<&str> = stdout
-            .lines()
-            .filter_map(|l| l.strip_prefix("RCH_TARGET_ENTRY "))
-            .filter_map(|rest| rest.splitn(3, ' ').nth(2))
-            .collect();
+        let entries = parse_target_entries(&stdout);
+        let listed: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
 
         // Both roots are canonicalized by the script (`pwd -P`), so compare
         // canonical paths — on macOS a tempdir under /var resolves to

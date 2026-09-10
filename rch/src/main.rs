@@ -442,26 +442,48 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
         action: CacheAction,
     },
 
-    /// Reap stale remote target dirs on workers now (bead 6dj11)
+    /// Collect stale rch runtime dirs on workers. PREVIEWS BY DEFAULT.
     ///
-    /// Runs the EXACT sweep the daemon performs periodically — per-job/per-pid
-    /// `.rch-target-*` dirs under the remote sync-root plus the legacy
-    /// `/data/tmp/rch_target_*` trees — on demand. Only dirs with no file
-    /// activity for the configured idle window are removed (a live build
-    /// touches its dir continuously and is never reaped); pooled
-    /// `.rch-target-*-pool-*` dirs are never touched.
+    /// Scans every root rch itself writes to — the pooled `remote_base`, an
+    /// optional pooled `store_base`, any `[remediation.pooled_target]
+    /// gc_extra_roots`, any `--root` flags, and the worker temp base resolved
+    /// exactly as the code that creates the dirs resolves it — and reports
+    /// per-root, per-dir size, idle age and the reason each dir was collected
+    /// or kept.
+    ///
+    /// Four classes are considered: per-job/per-pid `.rch-target-*` dirs,
+    /// legacy `rch_target_*` trees, pooled `.rch-target-*-pool-*` stores and
+    /// the durable per-worker `rch-cargo-cache-*` caches. The two warm-cache
+    /// classes are collected only when ALL of these hold: idle past their
+    /// configured window, no open file descriptor anywhere under the dir, and
+    /// no live process rooted at it. A gate that cannot be evaluated counts as
+    /// "in use" — an error never makes a dir eligible.
+    ///
+    /// Nothing is removed without `--apply`.
     #[command(after_help = r#"EXAMPLES:
-    rch gc --dry-run              # Show what would be reaped, per worker
-    rch gc                        # Reap now on every configured worker
-    rch gc --workers hz2 --json   # Reap on one worker, JSON verdicts"#)]
+    rch gc                                  # Preview on every worker (default)
+    rch gc --workers hz2 --json             # Preview one worker, JSON verdicts
+    rch gc --root /mnt/big/rch              # Also scan an extra root
+    rch gc --apply                          # Actually collect what the preview showed
+    rch gc --apply --workers hz2            # Collect on one worker"#)]
     Gc {
-        /// Show per-dir verdicts without removing anything.
-        #[arg(long, short = 'n')]
+        /// Preview only. This is the DEFAULT; the flag is accepted so existing
+        /// scripts and habits keep working.
+        #[arg(long, short = 'n', conflicts_with = "apply")]
         dry_run: bool,
+
+        /// Actually remove the dirs the preview would collect.
+        #[arg(long)]
+        apply: bool,
 
         /// Worker IDs to sweep (repeatable). Default: every configured worker.
         #[arg(long, value_name = "WORKER_ID")]
         workers: Vec<String>,
+
+        /// Extra root to scan, in addition to the configured ones (repeatable).
+        /// Must be absolute, `..`-free and free of shell metacharacters.
+        #[arg(long = "root", value_name = "PATH")]
+        roots: Vec<String>,
     },
 
     /// Explain why a command would or wouldn't be offloaded
@@ -2145,7 +2167,12 @@ async fn run(args: Vec<OsString>) -> Result<()> {
             } => commands::rabs_gc::run_inventory(cas_root, l2_root, allow_namespace, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
             Commands::Cache { action } => handle_cache(action, &ctx).await,
-            Commands::Gc { dry_run, workers } => handle_gc(dry_run, workers, &ctx).await,
+            Commands::Gc {
+                dry_run,
+                apply,
+                workers,
+                roots,
+            } => handle_gc(dry_run, apply, workers, roots, &ctx).await,
             Commands::Diagnose { command, dry_run } => {
                 handle_diagnose(command, dry_run, &ctx).await
             }
@@ -4067,51 +4094,505 @@ fn selected_reap_workers(worker_filter: &[String]) -> Result<Vec<rch_common::Wor
         .collect())
 }
 
-/// The validated remote sync-root + idle windows the reap surfaces operate on,
-/// sourced from `[remediation.pooled_target]` — the same knobs the daemon's
-/// periodic sweep uses, so status/gc and the sweep can never disagree. The
-/// third element is the LONG pooled-dir window in hours (0 = pooled dirs are
-/// never reaped).
-fn reap_surface_config() -> Result<(Vec<String>, u32, u32, u32)> {
+/// The scan roots + per-class idle policy every reap surface operates on.
+///
+/// One place, sourced from `[remediation.pooled_target]`, so `rch gc`,
+/// `rch cache status` and the daemon sweep can never disagree about where to
+/// look or how long "idle" is. The root set itself comes from
+/// [`rch_common::gc_roots::derive_gc_roots`], which derives it from the values
+/// that CREATE the dirs rather than from a second hand-maintained list.
+struct ReapSurfaceConfig {
+    roots: rch_common::gc_roots::GcRootSet,
+    policy: rch_common::stale_target_reap::GcPolicy,
+    idle_hours: u32,
+    pooled_idle_hours: u32,
+    cache_idle_days: u32,
+    /// Per-scan-root byte budget in KiB; `None` disables cap eviction.
+    max_cache_kb: Option<u64>,
+}
+
+fn reap_surface_config(cli_roots: &[String]) -> Result<ReapSurfaceConfig> {
+    use rch_common::stale_target_reap as reap;
+
     let rch_config = config::load_config().map_err(|e| anyhow::anyhow!("load config: {e}"))?;
-    let base = rch_config.remediation.pooled_target.remote_base.clone();
-    if !rch_common::stale_target_reap::is_safe_reap_base(&base) {
+    let pooled = &rch_config.remediation.pooled_target;
+    let roots = rch_common::gc_roots::derive_gc_roots(pooled, cli_roots);
+    if roots.scan_bases().is_empty() {
+        let detail = roots
+            .rejected
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
         anyhow::bail!(
-            "configured remediation.pooled_target.remote_base {base:?} fails the reap safety \
-             validation; refusing to embed it in a remote shell command"
+            "no usable gc scan root: every candidate failed the reap safety validation, so \
+             nothing may be embedded in a remote shell command ({detail})"
         );
     }
-    // Issue #64: with a pooled `store_base` configured, warm pools live off
-    // the mirror tree, so the reap surfaces must walk that root too or `rch
-    // gc` / `rch cache status` would silently miss the largest stores on the
-    // worker.
-    let mut bases = vec![base.trim_end_matches('/').to_string()];
-    if let Some(store_base) = rch_config
-        .remediation
-        .pooled_target
-        .store_base
-        .as_deref()
-        .map(|base| base.trim_end_matches('/').to_string())
-    {
-        if !rch_common::stale_target_reap::is_safe_reap_base(&store_base) {
-            anyhow::bail!(
-                "configured remediation.pooled_target.store_base {store_base:?} fails the reap \
-                 safety validation; refusing to embed it in a remote shell command"
-            );
+
+    let idle_hours = pooled.reaper_idle_hours;
+    let pooled_idle_hours = pooled.reaper_pooled_idle_hours;
+    let cache_idle_days = pooled.gc_cargo_cache_idle_days;
+    let policy = reap::GcPolicy {
+        idle_secs: reap::idle_minutes_from_hours(idle_hours) * 60,
+        pooled_idle_secs: reap::pooled_idle_minutes_from_hours(pooled_idle_hours).map(|m| m * 60),
+        cache_idle_secs: reap::cargo_cache_idle_minutes_from_days(cache_idle_days).map(|m| m * 60),
+    };
+    Ok(ReapSurfaceConfig {
+        roots,
+        policy,
+        idle_hours,
+        pooled_idle_hours,
+        cache_idle_days,
+        max_cache_kb: (pooled.reaper_max_cache_gb != 0)
+            .then(|| u64::from(pooled.reaper_max_cache_gb) * 1024 * 1024),
+    })
+}
+
+/// Maximum paths per `--apply` removal command. Each path is embedded in the
+/// remote command line, so a worker with thousands of collectible dirs is
+/// swept in batches rather than in one command that could exceed `ARG_MAX`.
+const GC_COLLECT_BATCH: usize = 100;
+
+/// One enumerated dir plus the decision reached about it.
+struct GcDecision {
+    entry: rch_common::stale_target_reap::RemoteTargetEntry,
+    verdict: rch_common::stale_target_reap::GcVerdict,
+    /// Removal tag: the class's own trigger, or `cap` for a budget eviction.
+    trigger: &'static str,
+    /// Idle window (minutes) the worker re-verifies before removing.
+    idle_minutes: u64,
+    /// Which configured root this dir was found under, for reporting.
+    root: String,
+}
+
+/// `rch gc` (bead 6dj11, extended): enumerate every root rch writes to, decide
+/// per dir, and — only with `--apply` — collect what cleared every gate.
+///
+/// PREVIEW IS THE DEFAULT. `--dry-run` is still accepted (and is a no-op)
+/// because the flag lives in scripts and muscle memory; `--apply` is the only
+/// thing that removes anything.
+///
+/// The flow is deliberately enumerate → decide → collect rather than one
+/// fire-and-forget sweep script: the decision is then a pure Rust function
+/// (`evaluate_gc_candidate`) that can be tested and reported per dir, and the
+/// removal command re-checks every gate on the worker immediately before each
+/// `rm`, so the enumerate→apply window cannot delete a build that started in
+/// between.
+async fn handle_gc(
+    dry_run: bool,
+    apply: bool,
+    worker_filter: Vec<String>,
+    cli_roots: Vec<String>,
+    ctx: &OutputContext,
+) -> Result<()> {
+    use rch_common::stale_target_reap as reap;
+
+    // `--dry-run` names the default; clap already refuses it together with
+    // `--apply`, so there is nothing to reconcile.
+    let _ = dry_run;
+    let style = ctx.theme();
+    let surface = reap_surface_config(&cli_roots)?;
+    let workers = selected_reap_workers(&worker_filter)?;
+    let bases = surface.roots.scan_bases();
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut worker_reports = Vec::new();
+    let mut any_ok = false;
+    for worker in &workers {
+        // ── enumerate every root (read-only) ───────────────────────────────
+        let mut stdout = String::new();
+        let mut failure: Option<serde_json::Value> = None;
+        let mut scanned_roots: Vec<serde_json::Value> = Vec::new();
+        let mut gates_available = reap::GateAvailability {
+            handles: true,
+            processes: true,
+        };
+        let mut temp_base: Option<String> = None;
+        for base in &bases {
+            let command = reap::enumerate_targets_command(base);
+            match run_reap_surface_command(worker, &command).await {
+                Ok(result) if result.success() => {
+                    let seen = reap::parse_scan_roots(&result.stdout);
+                    let gates = reap::parse_gate_availability(&result.stdout);
+                    gates_available.handles &= gates.handles;
+                    gates_available.processes &= gates.processes;
+                    if temp_base.is_none() {
+                        temp_base.clone_from(&seen.temp_base);
+                    }
+                    scanned_roots.push(serde_json::json!({
+                        "requested": base,
+                        "resolved": seen.resolved,
+                        "skipped": seen.skipped,
+                    }));
+                    stdout.push_str(&result.stdout);
+                }
+                Ok(result) => {
+                    failure = Some(serde_json::json!({
+                        "id": worker.id.as_str(),
+                        "ok": false,
+                        "error": format!(
+                            "enumeration of {base} exited {}: {}",
+                            result.exit_code,
+                            result.stderr.trim()
+                        ),
+                    }));
+                    break;
+                }
+                Err(e) => {
+                    failure = Some(serde_json::json!({
+                        "id": worker.id.as_str(), "ok": false, "error": format!("ssh: {e}"),
+                    }));
+                    break;
+                }
+            }
         }
-        if !bases.contains(&store_base) {
-            bases.push(store_base);
+        if let Some(error) = failure {
+            worker_reports.push(error);
+            continue;
+        }
+        any_ok = true;
+
+        // ── decide, per dir ────────────────────────────────────────────────
+        let mut seen_paths = std::collections::HashSet::new();
+        let entries: Vec<reap::RemoteTargetEntry> = reap::parse_target_entries(&stdout)
+            .into_iter()
+            .filter(|e| seen_paths.insert(e.path.clone()))
+            .collect();
+        let mut verdicts: Vec<reap::GcVerdict> = entries
+            .iter()
+            .map(|e| reap::evaluate_gc_candidate(e, now_unix, &surface.policy))
+            .collect();
+        let mut triggers: Vec<&'static str> = entries.iter().map(|e| e.class().trigger()).collect();
+        let mut windows: Vec<u64> = entries
+            .iter()
+            .map(|e| {
+                surface
+                    .policy
+                    .window_secs(e.class())
+                    .map_or(0, |secs| (secs / 60).max(1))
+            })
+            .collect();
+        // Byte-cap eviction, held to the SHORT active-build floor and the same
+        // liveness gates as the TTL passes.
+        if let Some(cap_kb) = surface.max_cache_kb {
+            let short_window = reap::idle_minutes_from_hours(surface.idle_hours);
+            for idx in
+                reap::select_cap_evictions(&entries, &verdicts, now_unix, &surface.policy, cap_kb)
+            {
+                verdicts[idx] = reap::GcVerdict::Collect;
+                triggers[idx] = "cap";
+                windows[idx] = short_window;
+            }
+        }
+
+        let temp_base_label = temp_base
+            .clone()
+            .unwrap_or_else(|| rch_common::gc_roots::WORKER_TEMP_BASE_PLACEHOLDER.to_string());
+        let decisions: Vec<GcDecision> = entries
+            .into_iter()
+            .zip(verdicts)
+            .zip(triggers)
+            .zip(windows)
+            .map(|(((entry, verdict), trigger), idle_minutes)| {
+                let root = surface
+                    .roots
+                    .attribute(&entry.path)
+                    .map_or_else(|| temp_base_label.clone(), |r| r.path.clone());
+                GcDecision {
+                    entry,
+                    verdict,
+                    trigger,
+                    idle_minutes,
+                    root,
+                }
+            })
+            .collect();
+
+        // ── collect (only with --apply) ────────────────────────────────────
+        let targets: Vec<reap::GcCollectTarget> = decisions
+            .iter()
+            .filter(|d| d.verdict.is_collect())
+            .map(|d| reap::GcCollectTarget {
+                path: d.entry.path.clone(),
+                idle_minutes: d.idle_minutes,
+                trigger: d.trigger,
+            })
+            .collect();
+        let would_free_kb: u64 = decisions
+            .iter()
+            .filter(|d| d.verdict.is_collect())
+            .map(|d| d.entry.kb)
+            .sum();
+
+        let mut removed_total: u64 = 0;
+        let mut freed_kb_total: u64 = 0;
+        let mut removed_paths: Vec<serde_json::Value> = Vec::new();
+        let mut rm_errors: Vec<serde_json::Value> = Vec::new();
+        let mut skipped: Vec<serde_json::Value> = Vec::new();
+        let mut apply_error: Option<String> = None;
+        if apply && !targets.is_empty() {
+            for batch in targets.chunks(GC_COLLECT_BATCH) {
+                let command = match reap::collect_paths_command(batch) {
+                    Ok(command) => command,
+                    Err(e) => {
+                        apply_error = Some(e);
+                        break;
+                    }
+                };
+                match run_reap_surface_command(worker, &command).await {
+                    Ok(result) if result.success() => {
+                        if let Some((removed, freed_kb)) =
+                            reap::parse_worker_reap_metrics(&result.stdout)
+                        {
+                            removed_total += removed;
+                            freed_kb_total += freed_kb;
+                        } else {
+                            apply_error = Some("collection produced no metrics line".to_string());
+                        }
+                        removed_paths.extend(
+                            reap::parse_reap_events(&result.stdout)
+                                .into_iter()
+                                .map(|e| {
+                                    serde_json::json!({
+                                        "path": e.path, "kb": e.kb, "trigger": e.trigger,
+                                    })
+                                }),
+                        );
+                        rm_errors.extend(reap::parse_reap_errors(&result.stdout).into_iter().map(
+                            |e| {
+                                serde_json::json!({
+                                    "path": e.path, "trigger": e.trigger, "message": e.message,
+                                })
+                            },
+                        ));
+                        skipped.extend(reap::parse_gc_skips(&result.stdout).into_iter().map(|e| {
+                            serde_json::json!({
+                                "path": e.path, "trigger": e.trigger, "reason": e.reason,
+                            })
+                        }));
+                    }
+                    Ok(result) => {
+                        apply_error = Some(format!(
+                            "collection exited {}: {}",
+                            result.exit_code,
+                            result.stderr.trim()
+                        ));
+                        break;
+                    }
+                    Err(e) => {
+                        apply_error = Some(format!("ssh: {e}"));
+                        break;
+                    }
+                }
+            }
+        }
+
+        let dirs: Vec<serde_json::Value> = decisions
+            .iter()
+            .map(|d| {
+                let (verdict, reason) = match &d.verdict {
+                    reap::GcVerdict::Collect => ("collect".to_string(), d.trigger.to_string()),
+                    reap::GcVerdict::Keep(reason) => {
+                        ("keep".to_string(), format!("{}: {reason}", reason.as_str()))
+                    }
+                };
+                serde_json::json!({
+                    "path": d.entry.path,
+                    "root": d.root,
+                    "class": d.entry.class().as_str(),
+                    "kb": d.entry.kb,
+                    "age_secs": d.entry.age_secs(now_unix),
+                    "open_handles": d.entry.open_handles.as_token(),
+                    "live_process": d.entry.live_process.as_token(),
+                    "verdict": verdict,
+                    "reason": reason,
+                })
+            })
+            .collect();
+
+        worker_reports.push(serde_json::json!({
+            "id": worker.id.as_str(),
+            "ok": apply_error.is_none(),
+            "error": apply_error,
+            "gates": {
+                "open_descriptors": gates_available.handles,
+                "processes": gates_available.processes,
+            },
+            "scanned_roots": scanned_roots,
+            "worker_temp_base": temp_base,
+            "dirs": dirs,
+            "would_remove": targets.len(),
+            "would_free_kb": would_free_kb,
+            "removed": removed_total,
+            "freed_kb": freed_kb_total,
+            "entries": removed_paths,
+            "rm_errors": rm_errors,
+            "skipped": skipped,
+        }));
+    }
+
+    let data = serde_json::json!({
+        "dry_run": !apply,
+        "applied": apply,
+        "remote_base": bases.first().cloned().unwrap_or_default(),
+        "scan_bases": bases,
+        "roots": surface
+            .roots
+            .roots
+            .iter()
+            .map(|r| serde_json::json!({ "path": r.path, "source": r.source.as_str() }))
+            .collect::<Vec<_>>(),
+        "rejected_roots": surface
+            .roots
+            .rejected
+            .iter()
+            .map(|r| serde_json::json!({
+                "path": r.path, "source": r.source.as_str(), "reason": r.reason,
+            }))
+            .collect::<Vec<_>>(),
+        "idle_hours": surface.idle_hours,
+        "pooled_idle_hours": surface.pooled_idle_hours,
+        "cargo_cache_idle_days": surface.cache_idle_days,
+        "workers": worker_reports,
+    });
+
+    if ctx.is_json() {
+        ctx.json(&ApiResponse::ok("gc", data))?;
+    } else {
+        let mode = if apply {
+            "collect"
+        } else {
+            "preview — nothing is removed; pass --apply to collect"
+        };
+        println!("rch gc ({mode})");
+        println!(
+            "  windows: per-job {}h · pooled {} · cargo cache {}",
+            surface.idle_hours,
+            if surface.pooled_idle_hours == 0 {
+                "disabled".to_string()
+            } else {
+                format!("{}h", surface.pooled_idle_hours)
+            },
+            if surface.cache_idle_days == 0 {
+                "disabled".to_string()
+            } else {
+                format!("{}d", surface.cache_idle_days)
+            },
+        );
+        println!("  roots:");
+        for root in &surface.roots.roots {
+            println!("    {}  [{}]", root.path, root.source);
+        }
+        for rejection in &surface.roots.rejected {
+            println!("    {} {rejection}", style.muted("✗"));
+        }
+        println!();
+
+        for report in data["workers"].as_array().into_iter().flatten() {
+            let id = report["id"].as_str().unwrap_or("?");
+            if report["ok"].as_bool() != Some(true) {
+                println!(
+                    "  {} {}: {}",
+                    style.muted("✗"),
+                    id,
+                    report["error"].as_str().unwrap_or("unknown error")
+                );
+                continue;
+            }
+            let handles_ok = report["gates"]["open_descriptors"].as_bool() == Some(true);
+            let procs_ok = report["gates"]["processes"].as_bool() == Some(true);
+            println!(
+                "  {id}: gates open-descriptors={} processes={}",
+                if handles_ok { "ok" } else { "UNAVAILABLE" },
+                if procs_ok { "ok" } else { "UNAVAILABLE" },
+            );
+            if !handles_ok || !procs_ok {
+                println!(
+                    "    {} a gate that cannot be evaluated counts as in-use: pooled and \
+                     cargo-cache dirs stay put",
+                    style.muted("!")
+                );
+            }
+            for root in report["scanned_roots"].as_array().into_iter().flatten() {
+                if let Some(skipped) = root["skipped"].as_str() {
+                    println!(
+                        "    {} root {} not scanned: {skipped}",
+                        style.muted("✗"),
+                        root["requested"].as_str().unwrap_or("?"),
+                    );
+                }
+            }
+            let mut by_root: std::collections::BTreeMap<&str, Vec<&serde_json::Value>> =
+                std::collections::BTreeMap::new();
+            for dir in report["dirs"].as_array().into_iter().flatten() {
+                by_root
+                    .entry(dir["root"].as_str().unwrap_or("?"))
+                    .or_default()
+                    .push(dir);
+            }
+            for (root, dirs) in &by_root {
+                println!("    {root}");
+                for dir in dirs {
+                    let collect = dir["verdict"].as_str() == Some("collect");
+                    println!(
+                        "      {:>8} MB  {:<8} {:<13} idle {:>4}h  {}  [{}]",
+                        dir["kb"].as_u64().unwrap_or(0) / 1024,
+                        if collect { "COLLECT" } else { "keep" },
+                        dir["class"].as_str().unwrap_or("?"),
+                        dir["age_secs"].as_u64().unwrap_or(0) / 3600,
+                        dir["path"].as_str().unwrap_or("?"),
+                        dir["reason"].as_str().unwrap_or("?"),
+                    );
+                }
+            }
+            if apply {
+                println!(
+                    "    → removed {} dir(s), freed {} MB",
+                    report["removed"].as_u64().unwrap_or(0),
+                    report["freed_kb"].as_u64().unwrap_or(0) / 1024,
+                );
+                for skip in report["skipped"].as_array().into_iter().flatten() {
+                    println!(
+                        "    {} declined at removal time [{}] {} — {}",
+                        style.muted("!"),
+                        skip["trigger"].as_str().unwrap_or("?"),
+                        skip["path"].as_str().unwrap_or("?"),
+                        skip["reason"].as_str().unwrap_or("?"),
+                    );
+                }
+                for e in report["rm_errors"].as_array().into_iter().flatten() {
+                    println!(
+                        "    {} rm FAILED [{}] {} — {}",
+                        style.muted("✗"),
+                        e["trigger"].as_str().unwrap_or("?"),
+                        e["path"].as_str().unwrap_or("?"),
+                        e["message"].as_str().unwrap_or("?"),
+                    );
+                }
+            } else {
+                println!(
+                    "    → would collect {} dir(s), freeing {} MB (nothing removed)",
+                    report["would_remove"].as_u64().unwrap_or(0),
+                    report["would_free_kb"].as_u64().unwrap_or(0) / 1024,
+                );
+            }
         }
     }
-    Ok((
-        bases,
-        rch_config.remediation.pooled_target.reaper_idle_hours,
-        rch_config
-            .remediation
-            .pooled_target
-            .reaper_pooled_idle_hours,
-        rch_config.remediation.pooled_target.reaper_max_cache_gb,
-    ))
+
+    if !any_ok {
+        anyhow::bail!("gc failed on every selected worker");
+    }
+    if worker_reports
+        .iter()
+        .any(|r| r["ok"].as_bool() != Some(true))
+    {
+        anyhow::bail!("gc failed on at least one selected worker");
+    }
+    Ok(())
 }
 
 /// Run one remote command on a worker over a throwaway SSH session.
@@ -4155,13 +4636,13 @@ async fn handle_cache_status(worker_filter: Vec<String>, ctx: &OutputContext) ->
     use rch_common::stale_target_reap as reap;
 
     let style = ctx.theme();
-    let (bases, idle_hours, pooled_idle_hours, _max_cache_gb) = reap_surface_config()?;
+    // Same roots and same per-class windows `rch gc` uses: status must show the
+    // verdict gc would actually reach, not a second opinion.
+    let surface = reap_surface_config(&[])?;
+    let bases = surface.roots.scan_bases();
+    let idle_hours = surface.idle_hours;
+    let pooled_idle_hours = surface.pooled_idle_hours;
     let workers = selected_reap_workers(&worker_filter)?;
-    let idle_secs = u64::from(idle_hours.max(reap::MIN_IDLE_HOURS)) * 3600;
-    // Pooled dirs reap only under the LONG window; 0 = never (floored at 24h
-    // to match the sweep builder's defense).
-    let pooled_idle_secs = (pooled_idle_hours != 0)
-        .then(|| (u64::from(pooled_idle_hours) * 60).max(reap::MIN_POOLED_IDLE_MINUTES) * 60);
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -4213,21 +4694,23 @@ async fn handle_cache_status(worker_filter: Vec<String>, ctx: &OutputContext) ->
                     .into_iter()
                     .filter(|e| seen.insert(e.path.clone()))
                     .map(|e| {
-                        let age_secs = now_unix.saturating_sub(e.newest_mtime_unix);
-                        let pooled = e.is_pooled();
-                        // Per-job dirs reap at the short window; pooled dirs
-                        // only at the LONG window (never, when disabled).
-                        let reapable = if pooled {
-                            pooled_idle_secs.is_some_and(|w| age_secs >= w)
-                        } else {
-                            age_secs >= idle_secs
+                        // The SHARED verdict function, so `rch cache status`
+                        // and `rch gc` can never disagree about one dir.
+                        let verdict = reap::evaluate_gc_candidate(&e, now_unix, &surface.policy);
+                        let reason = match &verdict {
+                            reap::GcVerdict::Collect => None,
+                            reap::GcVerdict::Keep(r) => Some(r.to_string()),
                         };
                         serde_json::json!({
                             "path": e.path,
                             "kb": e.kb,
-                            "age_secs": age_secs,
-                            "pooled": pooled,
-                            "reapable": reapable,
+                            "age_secs": e.age_secs(now_unix),
+                            "class": e.class().as_str(),
+                            "pooled": e.is_pooled(),
+                            "open_handles": e.open_handles.as_token(),
+                            "live_process": e.live_process.as_token(),
+                            "reapable": verdict.is_collect(),
+                            "kept_because": reason,
                         })
                     })
                     .collect();
@@ -4334,261 +4817,6 @@ async fn handle_cache_status(worker_filter: Vec<String>, ctx: &OutputContext) ->
 
     if !any_ok {
         anyhow::bail!("cache status failed on every selected worker");
-    }
-    Ok(())
-}
-
-/// `rch gc [--dry-run]` (bead 6dj11): run the daemon's exact stale-target
-/// sweep on demand. Dry-run enumerates and reports per-dir verdicts without
-/// removing anything; the real run executes the shared sweep script and
-/// reports removed/freed per worker.
-async fn handle_gc(dry_run: bool, worker_filter: Vec<String>, ctx: &OutputContext) -> Result<()> {
-    use rch_common::stale_target_reap as reap;
-
-    let style = ctx.theme();
-    let (bases, idle_hours, pooled_idle_hours, max_cache_gb) = reap_surface_config()?;
-    let workers = selected_reap_workers(&worker_filter)?;
-    let idle_minutes = reap::idle_minutes_from_hours(idle_hours);
-    let idle_secs = idle_minutes * 60;
-    let pooled_idle_minutes = (pooled_idle_hours != 0)
-        .then(|| (u64::from(pooled_idle_hours) * 60).max(reap::MIN_POOLED_IDLE_MINUTES));
-    let pooled_idle_secs = pooled_idle_minutes.map(|m| m * 60);
-    // Byte-cap eviction runs only in the REAL sweep; the dry-run reports TTL
-    // verdicts and does not simulate cap eviction (it depends on live totals
-    // at sweep time). With a pooled `store_base` configured (issue #64) the
-    // cap applies per scan root, since each root is swept by its own script
-    // run with its own running total.
-    let max_cache_kb = (max_cache_gb != 0).then(|| u64::from(max_cache_gb) * 1024 * 1024);
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let mut worker_reports = Vec::new();
-    let mut any_ok = false;
-    for worker in &workers {
-        let report = if dry_run {
-            // Issue #64: one enumeration per scan root (mirror tree plus a
-            // configured pooled `store_base`), de-duplicated by path.
-            let mut stdout = String::new();
-            let mut failure: Option<serde_json::Value> = None;
-            for base in &bases {
-                let command = reap::enumerate_targets_command(base);
-                match run_reap_surface_command(worker, &command).await {
-                    Ok(result) if result.success() => stdout.push_str(&result.stdout),
-                    Ok(result) => {
-                        failure = Some(serde_json::json!({
-                            "id": worker.id.as_str(),
-                            "ok": false,
-                            "error": format!(
-                                "enumeration of {base} exited {}: {}",
-                                result.exit_code,
-                                result.stderr.trim()
-                            ),
-                        }));
-                        break;
-                    }
-                    Err(e) => {
-                        failure = Some(serde_json::json!({
-                            "id": worker.id.as_str(), "ok": false, "error": format!("ssh: {e}"),
-                        }));
-                        break;
-                    }
-                }
-            }
-            match failure {
-                None => {
-                    any_ok = true;
-                    let mut seen = std::collections::HashSet::new();
-                    let would_reap: Vec<serde_json::Value> = reap::parse_target_entries(&stdout)
-                        .into_iter()
-                        .filter(|e| seen.insert(e.path.clone()))
-                        .filter(|e| {
-                            let age = now_unix.saturating_sub(e.newest_mtime_unix);
-                            if e.is_pooled() {
-                                pooled_idle_secs.is_some_and(|w| age >= w)
-                            } else {
-                                age >= idle_secs
-                            }
-                        })
-                        .map(|e| serde_json::json!({ "path": e.path, "kb": e.kb }))
-                        .collect();
-                    let would_free_kb: u64 =
-                        would_reap.iter().filter_map(|e| e["kb"].as_u64()).sum();
-                    serde_json::json!({
-                        "id": worker.id.as_str(),
-                        "ok": true,
-                        "would_remove": would_reap.len(),
-                        "would_free_kb": would_free_kb,
-                        "entries": would_reap,
-                    })
-                }
-                Some(error) => error,
-            }
-        } else {
-            // Issue #64: sweep every scan root; counters and audit entries
-            // accumulate across them so one worker still reports one result.
-            let mut removed_total: u64 = 0;
-            let mut freed_kb_total: u64 = 0;
-            let mut events: Vec<serde_json::Value> = Vec::new();
-            let mut rm_errors: Vec<serde_json::Value> = Vec::new();
-            let mut failure: Option<serde_json::Value> = None;
-            for base in &bases {
-                let command = reap::worker_sweep_command(
-                    base,
-                    idle_minutes,
-                    pooled_idle_minutes,
-                    max_cache_kb,
-                );
-                match run_reap_surface_command(worker, &command).await {
-                    Ok(result) if result.success() => {
-                        match reap::parse_worker_reap_metrics(&result.stdout) {
-                            Some((removed, freed_kb)) => {
-                                any_ok = true;
-                                removed_total += removed;
-                                freed_kb_total += freed_kb;
-                                // Per-removal audit entries (RCH_REAP_RM
-                                // lines) and failed removals (RCH_REAP_ERR,
-                                // bd-kwvy8).
-                                events.extend(
-                                    reap::parse_reap_events(&result.stdout)
-                                        .into_iter()
-                                        .map(|e| {
-                                            serde_json::json!({
-                                                "path": e.path,
-                                                "kb": e.kb,
-                                                "trigger": e.trigger,
-                                            })
-                                        }),
-                                );
-                                rm_errors.extend(
-                                    reap::parse_reap_errors(&result.stdout)
-                                        .into_iter()
-                                        .map(|e| {
-                                            serde_json::json!({
-                                                "path": e.path,
-                                                "trigger": e.trigger,
-                                                "message": e.message,
-                                            })
-                                        }),
-                                );
-                            }
-                            None => {
-                                failure = Some(serde_json::json!({
-                                    "id": worker.id.as_str(),
-                                    "ok": false,
-                                    "error": format!("sweep of {base} produced no metrics line"),
-                                }));
-                                break;
-                            }
-                        }
-                    }
-                    Ok(result) => {
-                        failure = Some(serde_json::json!({
-                            "id": worker.id.as_str(),
-                            "ok": false,
-                            "error": format!(
-                                "sweep of {base} exited {}: {}",
-                                result.exit_code,
-                                result.stderr.trim()
-                            ),
-                        }));
-                        break;
-                    }
-                    Err(e) => {
-                        failure = Some(serde_json::json!({
-                            "id": worker.id.as_str(), "ok": false, "error": format!("ssh: {e}"),
-                        }));
-                        break;
-                    }
-                }
-            }
-            failure.unwrap_or_else(|| {
-                serde_json::json!({
-                    "id": worker.id.as_str(),
-                    "ok": true,
-                    "removed": removed_total,
-                    "freed_kb": freed_kb_total,
-                    "entries": events,
-                    "rm_errors": rm_errors,
-                })
-            })
-        };
-        worker_reports.push(report);
-    }
-
-    let data = serde_json::json!({
-        "dry_run": dry_run,
-        "remote_base": bases.first().cloned().unwrap_or_default(),
-        "scan_bases": bases,
-        "idle_hours": idle_hours,
-        "pooled_idle_hours": pooled_idle_hours,
-        "workers": worker_reports,
-    });
-
-    if ctx.is_json() {
-        ctx.json(&ApiResponse::ok("gc", data))?;
-    } else {
-        let mode = if dry_run { "dry-run" } else { "reap" };
-        println!(
-            "rch gc ({mode}, idle window: {idle_hours}h, bases: {})\n",
-            bases.join(", ")
-        );
-        for report in data["workers"].as_array().into_iter().flatten() {
-            let id = report["id"].as_str().unwrap_or("?");
-            if report["ok"].as_bool() != Some(true) {
-                println!(
-                    "  {} {}: {}",
-                    style.muted("✗"),
-                    id,
-                    report["error"].as_str().unwrap_or("unknown error")
-                );
-                continue;
-            }
-            if dry_run {
-                println!(
-                    "  {}: would remove {} dir(s), freeing {} MB",
-                    id,
-                    report["would_remove"].as_u64().unwrap_or(0),
-                    report["would_free_kb"].as_u64().unwrap_or(0) / 1024,
-                );
-                for e in report["entries"].as_array().into_iter().flatten() {
-                    println!(
-                        "    {:>8} MB  {}",
-                        e["kb"].as_u64().unwrap_or(0) / 1024,
-                        e["path"].as_str().unwrap_or("?"),
-                    );
-                }
-            } else {
-                println!(
-                    "  {}: removed {} dir(s), freed {} MB",
-                    id,
-                    report["removed"].as_u64().unwrap_or(0),
-                    report["freed_kb"].as_u64().unwrap_or(0) / 1024,
-                );
-                for e in report["entries"].as_array().into_iter().flatten() {
-                    println!(
-                        "    {:>8} MB  [{}]  {}",
-                        e["kb"].as_u64().unwrap_or(0) / 1024,
-                        e["trigger"].as_str().unwrap_or("?"),
-                        e["path"].as_str().unwrap_or("?"),
-                    );
-                }
-                for e in report["rm_errors"].as_array().into_iter().flatten() {
-                    println!(
-                        "    {} rm FAILED [{}] {} — {}",
-                        style.muted("✗"),
-                        e["trigger"].as_str().unwrap_or("?"),
-                        e["path"].as_str().unwrap_or("?"),
-                        e["message"].as_str().unwrap_or("?"),
-                    );
-                }
-            }
-        }
-    }
-
-    if !any_ok {
-        anyhow::bail!("gc failed on every selected worker");
     }
     Ok(())
 }
@@ -5534,6 +5762,100 @@ fn open_browser(url: &str) -> Result<()> {
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    // ── `rch gc` surface (scope-gap fix) ───────────────────────────────────
+
+    fn gc_parts(argv: &[&str]) -> (bool, bool, Vec<String>, Vec<String>) {
+        match Cli::try_parse_from(argv)
+            .expect("gc argv should parse")
+            .command
+        {
+            Some(Commands::Gc {
+                dry_run,
+                apply,
+                workers,
+                roots,
+            }) => (dry_run, apply, workers, roots),
+            _ => panic!("expected Commands::Gc for {argv:?}"),
+        }
+    }
+
+    /// Preview is the default: a bare `rch gc` must NOT remove anything. This
+    /// is the single most load-bearing property of the command — it deletes
+    /// build directories on sixteen machines.
+    #[test]
+    fn gc_defaults_to_a_preview() {
+        let (dry_run, apply, workers, roots) = gc_parts(&["rch", "gc"]);
+        assert!(!apply, "a bare `rch gc` must never apply");
+        assert!(
+            !dry_run,
+            "the flag is off; the DEFAULT is what makes it a preview"
+        );
+        assert!(workers.is_empty());
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn gc_requires_an_explicit_apply_to_remove_anything() {
+        let (_, apply, _, _) = gc_parts(&["rch", "gc", "--apply"]);
+        assert!(apply);
+        // `--dry-run` is still accepted for scripts that pass it...
+        let (dry_run, apply, _, _) = gc_parts(&["rch", "gc", "--dry-run"]);
+        assert!(dry_run && !apply);
+        let (dry_run, apply, _, _) = gc_parts(&["rch", "gc", "-n"]);
+        assert!(dry_run && !apply);
+        // ...but asking for both at once is a mistake, not a silent winner.
+        assert!(
+            Cli::try_parse_from(["rch", "gc", "--dry-run", "--apply"]).is_err(),
+            "--dry-run and --apply must conflict rather than one quietly winning"
+        );
+    }
+
+    /// The scan root set is configurable from the command line, so an operator
+    /// can reach a runtime root rch does not derive on its own.
+    #[test]
+    fn gc_accepts_repeatable_root_flags() {
+        let (_, _, workers, roots) = gc_parts(&[
+            "rch",
+            "gc",
+            "--root",
+            "/mnt/big/rch",
+            "--root",
+            "/srv/rch",
+            "--workers",
+            "hz2",
+        ]);
+        assert_eq!(roots, vec!["/mnt/big/rch", "/srv/rch"]);
+        assert_eq!(workers, vec!["hz2"]);
+    }
+
+    /// The root set gc will scan is derived from the values that CREATE the
+    /// dirs, plus configuration — never from a second hardcoded list.
+    #[test]
+    fn gc_root_set_is_configurable_and_covers_the_worker_temp_base() {
+        use rch_common::gc_roots::{GcRootSource, derive_gc_roots};
+
+        let pooled = rch_common::remediation_config::PooledTargetConfig {
+            gc_extra_roots: vec!["/mnt/big/rch".to_string()],
+            ..Default::default()
+        };
+        let set = derive_gc_roots(&pooled, &["/srv/rch".to_string()]);
+
+        assert_eq!(
+            set.scan_bases(),
+            vec![
+                pooled.remote_base.clone(),
+                "/mnt/big/rch".to_string(),
+                "/srv/rch".to_string()
+            ]
+        );
+        assert!(
+            set.roots
+                .iter()
+                .any(|r| r.source == GcRootSource::WorkerTempBase),
+            "the worker temp base — where rch-cargo-cache-* lives — must always be scanned"
+        );
+    }
 
     #[track_caller]
     fn fail_expected(message: &str) {

@@ -37,6 +37,7 @@ pub mod fleet_provenance;
 pub mod fleet_smoke_profile;
 pub mod fleet_status;
 pub mod force_resync;
+pub mod gc_roots;
 pub mod hooks;
 pub mod incident;
 pub mod incident_ledger;

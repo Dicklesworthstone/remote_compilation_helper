@@ -122,6 +122,17 @@ pub const DEFAULT_POOLED_REAPER_MAX_CACHE_GB: u32 = 0;
 /// Default remote base under which pooled target dirs live.
 pub const DEFAULT_POOLED_REMOTE_BASE: &str = "/data/projects";
 
+/// Default idle window, in DAYS, before `rch gc` will collect a durable
+/// per-worker Cargo cache dir (`rch-cargo-cache-*`, issue #42).
+///
+/// These caches hold the registry and git-dependency state every offloaded
+/// build reuses, and each job refreshes the dir's mtime, so an idle age this
+/// long means no job has touched the worker's cache for two weeks — a cold
+/// corpse, not a warm cache. Collection additionally requires the open-fd and
+/// live-process gates, so this window is a floor, never the sole authority.
+/// `0` disables cache collection entirely.
+pub const DEFAULT_GC_CARGO_CACHE_IDLE_DAYS: u32 = 14;
+
 /// Default maximum telemetry age that still counts as "fresh" (seconds).
 pub const DEFAULT_TELEMETRY_MAX_AGE_SECS: u64 = 120;
 
@@ -401,6 +412,28 @@ pub struct PooledTargetConfig {
     /// build base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_base: Option<String>,
+
+    /// EXTRA roots `rch gc` scans, beyond the ones rch derives itself.
+    ///
+    /// The derived set ([`crate::gc_roots::derive_gc_roots`]) already covers
+    /// [`Self::remote_base`], [`Self::store_base`] and the worker temp base
+    /// resolved by
+    /// [`crate::remote_compilation::remote_cargo_home_base_prelude`]. This
+    /// list exists for runtime roots rch cannot know about — an operator build
+    /// root on a mounted volume, a per-host scratch tree — which is precisely
+    /// how ~700 GB of `.rch-target-*-pool-*` and `rch-cargo-cache-*` went
+    /// uncollected fleet-wide while `rch gc` reported "0 dirs, 0 MB".
+    ///
+    /// Each entry must pass [`crate::stale_target_reap::is_safe_reap_base`]:
+    /// absolute, no `..`, at least one segment, built only from
+    /// `[A-Za-z0-9/._-]` (the value is embedded in a remote shell command).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gc_extra_roots: Vec<String>,
+
+    /// Idle window in DAYS before `rch gc` may collect a durable per-worker
+    /// Cargo cache dir (`rch-cargo-cache-*`); `0` disables cache collection.
+    /// See [`DEFAULT_GC_CARGO_CACHE_IDLE_DAYS`].
+    pub gc_cargo_cache_idle_days: u32,
 }
 
 impl Default for PooledTargetConfig {
@@ -414,6 +447,8 @@ impl Default for PooledTargetConfig {
             reaper_pooled_idle_hours: DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
             reaper_max_cache_gb: DEFAULT_POOLED_REAPER_MAX_CACHE_GB,
             store_base: None,
+            gc_extra_roots: Vec::new(),
+            gc_cargo_cache_idle_days: DEFAULT_GC_CARGO_CACHE_IDLE_DAYS,
         }
     }
 }
@@ -749,6 +784,21 @@ impl RemediationConfig {
                 "reaper_pooled_idle_hours must be 0 (disabled) or >= 24 — pooled dirs are warm caches, not short-TTL targets",
             ));
         }
+        for (idx, root) in self.pooled_target.gc_extra_roots.iter().enumerate() {
+            check_managed_path(
+                "remediation.pooled_target.gc_extra_roots",
+                root,
+                &mut issues,
+            );
+            if !crate::stale_target_reap::is_safe_reap_base(root) {
+                issues.push(RemediationIssue::error(
+                    "remediation.pooled_target.gc_extra_roots",
+                    format!(
+                        "gc_extra_roots[{idx}] {root:?} is not a usable gc scan root (absolute, no `..`, no shell metacharacters)"
+                    ),
+                ));
+            }
+        }
 
         // Telemetry freshness.
         if self.telemetry_freshness.max_age_secs == 0 {
@@ -830,6 +880,12 @@ impl RemediationConfig {
         out.incident_ledger.path = out.incident_ledger.path.as_deref().map(redact_path);
         out.pooled_target.remote_base = redact_path(&out.pooled_target.remote_base);
         out.pooled_target.store_base = out.pooled_target.store_base.as_deref().map(redact_path);
+        out.pooled_target.gc_extra_roots = out
+            .pooled_target
+            .gc_extra_roots
+            .iter()
+            .map(|root| redact_path(root.as_str()))
+            .collect();
         out
     }
 
@@ -1091,6 +1147,83 @@ mod tests {
 
     /// The value is embedded in remote shell commands and in
     /// `CARGO_TARGET_DIR`, so an unsafe base is a hard config error.
+    /// The gc scan roots must be reachable from configuration alone: the whole
+    /// bug was that a runtime root rch writes to could not be added without a
+    /// code change.
+    #[test]
+    fn gc_extra_roots_are_opt_in_and_round_trip() {
+        assert!(
+            RemediationConfig::default()
+                .pooled_target
+                .gc_extra_roots
+                .is_empty()
+        );
+        let parsed: RemediationConfig = toml::from_str(
+            r#"
+            [pooled_target]
+            gc_extra_roots = ["/mnt/big/rch", "/srv/rch"]
+            gc_cargo_cache_idle_days = 21
+            "#,
+        )
+        .expect("parse pooled_target.gc_extra_roots");
+        assert_eq!(
+            parsed.pooled_target.gc_extra_roots,
+            vec!["/mnt/big/rch".to_string(), "/srv/rch".to_string()]
+        );
+        assert_eq!(parsed.pooled_target.gc_cargo_cache_idle_days, 21);
+        let issues = parsed.validate();
+        assert!(
+            issues
+                .iter()
+                .all(|i| i.field != "remediation.pooled_target.gc_extra_roots"
+                    || i.severity != IssueSeverity::Error),
+            "absolute, managed roots must validate cleanly: {issues:?}"
+        );
+
+        let round_trip: RemediationConfig =
+            toml::from_str(&toml::to_string(&parsed).expect("serialize")).expect("round trip");
+        assert_eq!(
+            round_trip.pooled_target.gc_extra_roots,
+            parsed.pooled_target.gc_extra_roots
+        );
+
+        // An unset list is not emitted, so a default config stays tidy.
+        let default_toml =
+            toml::to_string(&RemediationConfig::default()).expect("serialize default");
+        assert!(
+            !default_toml.contains("gc_extra_roots"),
+            "an empty gc_extra_roots must not be emitted: {default_toml}"
+        );
+    }
+
+    /// A gc root is embedded in a remote shell command, so anything that could
+    /// break out of that context is an ERROR, not a sanitized value.
+    #[test]
+    fn unsafe_gc_extra_roots_are_rejected() {
+        for bad in ["/", "relative/x", "/tmp/../etc", "/tmp/$(whoami)", "/a b/c"] {
+            let mut config = RemediationConfig::default();
+            config.pooled_target.gc_extra_roots = vec![bad.to_string()];
+            let issues = config.validate();
+            assert!(
+                issues
+                    .iter()
+                    .any(|i| i.field == "remediation.pooled_target.gc_extra_roots"
+                        && i.severity == IssueSeverity::Error),
+                "{bad:?} must be rejected: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gc_extra_roots_are_redacted_like_every_other_operator_path() {
+        let mut config = RemediationConfig::default();
+        config.pooled_target.gc_extra_roots = vec!["/home/carol/builds".to_string()];
+        assert_eq!(
+            config.redacted().pooled_target.gc_extra_roots,
+            vec!["/home/<redacted>/builds".to_string()]
+        );
+    }
+
     #[test]
     fn unsafe_pooled_store_base_is_rejected() {
         for bad in ["relative/path", "/", "/tmp/../etc", "/toplevel"] {

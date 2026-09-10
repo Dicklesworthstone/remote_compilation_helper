@@ -467,11 +467,13 @@ mod tests {
         assert!(!cmd.contains("/target "));
         // Metrics counters survive the loop: the `while read` is fed from a temp
         // file (redirect-from-file, NOT the right side of a pipe → no subshell).
-        assert!(cmd.contains("__tmpbase=\"${TMPDIR:-}\""));
-        assert!(
-            cmd.contains("[ -n \"$__tmpbase\" ] && [ -d \"$__tmpbase\" ] || __tmpbase=/data/tmp")
-        );
-        assert!(cmd.contains("[ -d \"$__tmpbase\" ] || __tmpbase=/tmp"));
+        // The tmp base comes from the SAME prelude that creates the durable
+        // per-worker Cargo caches and stages target dirs — not a second copy
+        // of the `$TMPDIR` -> /data/tmp -> /tmp ladder. Two copies is exactly
+        // how the sweep came to look somewhere other than where rch writes.
+        assert!(cmd.contains(&rch_common::remote_compilation::remote_cargo_home_base_prelude()));
+        assert!(cmd.contains("__tmpbase=\"${RCH_CH_BASE}\""));
+        assert!(!cmd.contains("__tmpbase=\"${TMPDIR:-}\""));
         assert!(cmd.contains("mktemp -p \"$__tmpbase\""));
         assert!(!cmd.contains("mktemp -p \"${TMPDIR:-/data/tmp}\""));
         // 6dj11: the legacy /data/tmp/rch_target_* trees (the css

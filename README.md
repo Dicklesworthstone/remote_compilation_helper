@@ -252,7 +252,8 @@ rch status [--workers] [--jobs]
 rch check
 rch queue [--watch|--follow]
 rch cancel <id> | --all
-rch gc [--dry-run] [--workers <id>...]          # reap stale remote target dirs
+rch gc [--root DIR]... [--workers <id>...]      # PREVIEW stale rch runtime dirs
+rch gc --apply [--root DIR]...                  # ...and actually collect them
 rch cache warm|clean|status [--workers <id>...] # remote source/target caches
 rch rabs gc plan|run|history [--cas-root DIR] [--mode normal|emergency]
 rch rabs worker|doctor|inventory|reconcile
@@ -436,6 +437,21 @@ max_transfer_mb = 2048
 #
 # Where the reaper SCANS for stale target dirs (not a placement setting).
 # remote_base = "/data/projects"
+#
+# EXTRA roots `rch gc` scans, on top of the ones it derives itself
+# (`remote_base`, `store_base`, and the worker temp base resolved exactly as
+# the code that creates the dirs resolves it: $TMPDIR -> /data/tmp -> /tmp).
+# Use this for a runtime root rch cannot know about, e.g. an operator build
+# root on a mounted volume. Each entry must be absolute, `..`-free and free of
+# shell metacharacters -- it is embedded in a remote command. `rch gc --root`
+# adds one for a single run.
+# gc_extra_roots = ["/mnt/big/rch"]
+#
+# Idle days before `rch gc` may collect a durable per-worker Cargo cache
+# (`rch-cargo-cache-*`). 0 disables. Collection ALSO requires zero open file
+# descriptors under the dir and no live process rooted at it; a gate that
+# cannot be evaluated counts as "in use".
+# gc_cargo_cache_idle_days = 14
 
 [selection]
 strategy = "balanced"

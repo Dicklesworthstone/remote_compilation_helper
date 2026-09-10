@@ -330,10 +330,15 @@ Pooled dirs are *long-lived*, so they need their own bound:
   every `interval_mins` SSHes each worker and applies the **same** idle predicate
   under `remote_base` (default `/data/projects`).
 
-Both match **`REAP_GLOBS = [".rch-target-*-job-*", ".rch-target-*-pid-*"]`**
-([`rch-common/src/stale_target_reap.rs:34`](../../rch-common/src/stale_target_reap.rs)).
-By design these globs match **only the per-job shape** and would **not** match a
-pooled `.rch-target-<toolchain-key>` dir.
+Both match **`REAP_GLOBS`**
+([`rch-common/src/stale_target_reap.rs`](../../rch-common/src/stale_target_reap.rs)).
+As originally designed these globs matched only the per-job shape. They have
+since grown a `".rch-target-*-pool-*"` entry, and pooled stores are now reaped
+on their own much longer window (`reaper_pooled_idle_hours`, default 7 days)
+**and** only after clearing the open-descriptor and live-process gates. The
+durable `rch-cargo-cache-*` caches are deliberately NOT in `REAP_GLOBS` (that
+list also drives rsync excludes); they are enumerated and collected only by an
+explicit `rch gc --apply`.
 
 ### 6.2 How pooling reduces the reaper's job
 

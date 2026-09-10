@@ -86,7 +86,11 @@ fn golden_remediation_config_default_policy() {
                 // (validated >= 24h or 0 = disabled) before the reaper
                 // touches them, and no per-worker byte cap by default.
                 "reaper_pooled_idle_hours": 168,
-                "reaper_max_cache_gb": 0
+                "reaper_max_cache_gb": 0,
+                // `rch gc` may collect a durable per-worker Cargo cache only
+                // after two idle weeks (and only with every liveness gate
+                // clear). `gc_extra_roots` is omitted when empty.
+                "gc_cargo_cache_idle_days": 14
             },
             "telemetry_freshness": {
                 "max_age_secs": 120
