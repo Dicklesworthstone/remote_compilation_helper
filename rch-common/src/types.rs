@@ -398,6 +398,12 @@ pub struct SelectionWeightConfig {
     /// Weight for worker priority (0.0-1.0).
     #[serde(default = "default_weight_priority")]
     pub priority: f64,
+    /// Weight for disk headroom (0.0-1.0); zero disables disk ranking.
+    #[serde(
+        default = "default_weight_disk",
+        deserialize_with = "deserialize_weight_disk"
+    )]
+    pub disk: f64,
     /// Penalty multiplier for half-open circuit workers (0.0-1.0).
     #[serde(default = "default_half_open_penalty")]
     pub half_open_penalty: f64,
@@ -412,6 +418,7 @@ impl Default for SelectionWeightConfig {
             cache: default_weight_cache(),
             network: default_weight_network(),
             priority: default_weight_priority(),
+            disk: default_weight_disk(),
             half_open_penalty: default_half_open_penalty(),
         }
     }
@@ -443,6 +450,24 @@ fn default_weight_priority() -> f64 {
 }
 fn default_half_open_penalty() -> f64 {
     0.5
+}
+
+fn default_weight_disk() -> f64 {
+    0.2
+}
+
+fn deserialize_weight_disk<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let weight = f64::deserialize(deserializer)?;
+    if weight.is_finite() && (0.0..=1.0).contains(&weight) {
+        Ok(weight)
+    } else {
+        Err(serde::de::Error::custom(
+            "disk weight must be finite and between zero and one",
+        ))
+    }
 }
 
 /// Fairness settings for the fair_fastest selection strategy.
@@ -6563,6 +6588,23 @@ retry_max = 2
         }
         let default: SelectionConfig = toml::from_str("").unwrap();
         assert_eq!(default.disk_gb_per_slot, 10.0);
+    }
+
+    #[test]
+    fn test_selection_disk_weight_validation_and_roundtrip() {
+        for value in ["-0.1", "1.1", "nan", "inf", "-inf"] {
+            assert!(toml::from_str::<SelectionWeightConfig>(&format!("disk = {value}")).is_err());
+        }
+        for value in [0.0, 0.2, 1.0] {
+            let weights: SelectionWeightConfig =
+                toml::from_str(&format!("disk = {value}")).unwrap();
+            assert_eq!(weights.disk, value);
+            let roundtrip: SelectionWeightConfig =
+                serde_json::from_str(&serde_json::to_string(&weights).unwrap()).unwrap();
+            assert_eq!(roundtrip.disk, value);
+        }
+        let defaults: SelectionWeightConfig = toml::from_str("").unwrap();
+        assert_eq!(defaults.disk, 0.2);
     }
 
     #[test]

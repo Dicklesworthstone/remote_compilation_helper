@@ -645,6 +645,13 @@ struct PartialGeneralConfig {
 #[derive(Debug, Default, Deserialize)]
 struct PartialSelectionConfig {
     disk_gb_per_slot: Option<f64>,
+    #[serde(default)]
+    weights: PartialSelectionWeights,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialSelectionWeights {
+    disk: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1288,6 +1295,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "compilation.allow_local_fallback",
         "compilation.remote_build_jobs",
         "selection.disk_gb_per_slot",
+        "selection.weights.disk",
         "transfer.compression_level",
         "transfer.exclude_patterns",
         "transfer.sync_timeout_ms",
@@ -1408,6 +1416,10 @@ fn apply_layer(
     if let Some(disk_gb_per_slot) = layer.selection.disk_gb_per_slot {
         config.selection.disk_gb_per_slot = disk_gb_per_slot;
         set_source(sources, "selection.disk_gb_per_slot", source.clone());
+    }
+    if let Some(disk) = layer.selection.weights.disk {
+        config.selection.weights.disk = disk;
+        set_source(sources, "selection.weights.disk", source.clone());
     }
 
     if let Some(compression) = layer.transfer.compression_level {
@@ -3661,6 +3673,33 @@ max_concurrent_workers = 3
                 .abs()
                 < f64::EPSILON
         );
+        assert_eq!(
+            project.sources.get(key),
+            Some(&ConfigValueSource::ProjectConfig(project_path))
+        );
+    }
+
+    #[test]
+    fn test_source_tracking_disk_weight_precedence_and_explicit_default() {
+        let _guard = test_guard!();
+        let key = "selection.weights.disk";
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user.toml");
+        let project_path = dir.path().join("project.toml");
+        let defaults = load_config_with_sources_from_paths(None, None, None).unwrap();
+        assert_eq!(defaults.sources.get(key), Some(&ConfigValueSource::Default));
+        std::fs::write(&user_path, "[selection.weights]\ndisk = 0.7\n").unwrap();
+        let user = load_config_with_sources_from_paths(Some(&user_path), None, None).unwrap();
+        assert_eq!(user.config.selection.weights.disk, 0.7);
+        assert_eq!(
+            user.sources.get(key),
+            Some(&ConfigValueSource::UserConfig(user_path.clone()))
+        );
+        std::fs::write(&project_path, "[selection.weights]\ndisk = 0.2\n").unwrap();
+        let project =
+            load_config_with_sources_from_paths(Some(&user_path), Some(&project_path), None)
+                .unwrap();
+        assert_eq!(project.config.selection.weights.disk, 0.2);
         assert_eq!(
             project.sources.get(key),
             Some(&ConfigValueSource::ProjectConfig(project_path))

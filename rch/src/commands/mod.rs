@@ -521,6 +521,7 @@ mod tests {
                 priority: 100,
                 tags: vec![],
                 speedscore: None,
+                disk: Default::default(),
             },
             WorkerInfo {
                 id: "w2".to_string(),
@@ -530,6 +531,7 @@ mod tests {
                 priority: 50,
                 tags: vec!["fast".to_string()],
                 speedscore: Some(85.5),
+                disk: Default::default(),
             },
         ];
         let response = WorkersListResponse { workers, count: 2 };
@@ -553,6 +555,7 @@ mod tests {
             error_code: None,
             capabilities: None,
             missing_components: Vec::new(),
+            disk: Default::default(),
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["id"], "worker1");
@@ -574,6 +577,7 @@ mod tests {
             error_code: Some("RCH-E108".to_string()),
             capabilities: None,
             missing_components: Vec::new(),
+            disk: Default::default(),
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["status"], "unreachable");

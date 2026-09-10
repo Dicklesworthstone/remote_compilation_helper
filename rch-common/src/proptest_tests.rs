@@ -1600,10 +1600,20 @@ mod tests {
                 0.0f64..=1.0f64, // cache
                 0.0f64..=1.0f64, // network
                 0.0f64..=1.0f64, // priority
+                0.0f64..=1.0f64, // disk
                 0.0f64..=1.0f64, // half_open_penalty
             )
                 .prop_map(
-                    |(speedscore, slots, health, cache, network, priority, half_open_penalty)| {
+                    |(
+                        speedscore,
+                        slots,
+                        health,
+                        cache,
+                        network,
+                        priority,
+                        disk,
+                        half_open_penalty,
+                    )| {
                         SelectionWeightConfig {
                             speedscore,
                             slots,
@@ -1611,6 +1621,7 @@ mod tests {
                             cache,
                             network,
                             priority,
+                            disk,
                             half_open_penalty,
                         }
                     },
@@ -1773,6 +1784,7 @@ mod tests {
                 prop_assert!(config.cache >= 0.0 && config.cache <= 1.0);
                 prop_assert!(config.network >= 0.0 && config.network <= 1.0);
                 prop_assert!(config.priority >= 0.0 && config.priority <= 1.0);
+                prop_assert!(config.disk >= 0.0 && config.disk <= 1.0);
                 prop_assert!(config.half_open_penalty >= 0.0 && config.half_open_penalty <= 1.0);
             }
 
@@ -1787,6 +1799,7 @@ mod tests {
                 prop_assert!(config.cache >= 0.0 && config.cache <= 1.0);
                 prop_assert!(config.network >= 0.0 && config.network <= 1.0);
                 prop_assert!(config.priority >= 0.0 && config.priority <= 1.0);
+                prop_assert!(config.disk >= 0.0 && config.disk <= 1.0);
                 prop_assert!(config.half_open_penalty >= 0.0 && config.half_open_penalty <= 1.0);
             }
         }

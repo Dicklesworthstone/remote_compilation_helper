@@ -17,6 +17,20 @@ use crate::status_types::WorkerCapabilitiesFromApi;
 // Worker Response Types
 // =============================================================================
 
+/// Disk measurements and the daemon's independently cached pressure assessment.
+/// Unknown values remain explicit nulls in both JSON and TOON output.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct WorkerDiskInfo {
+    pub disk_free_gb: Option<f64>,
+    pub disk_free_ratio: Option<f64>,
+    /// `probe` for fresh capability measurements, `daemon` for cached status.
+    pub disk_measurement_source: Option<&'static str>,
+    pub disk_pressure_state: Option<String>,
+    pub disk_pressure_reason: Option<String>,
+    /// Pressure policy is evaluated by the daemon, never reconstructed by the CLI.
+    pub disk_pressure_source: Option<&'static str>,
+}
+
 /// Worker information for JSON output.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct WorkerInfo {
@@ -28,6 +42,8 @@ pub struct WorkerInfo {
     pub tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speedscore: Option<f64>,
+    #[serde(flatten)]
+    pub disk: WorkerDiskInfo,
 }
 
 impl From<&WorkerConfig> for WorkerInfo {
@@ -40,6 +56,7 @@ impl From<&WorkerConfig> for WorkerInfo {
             priority: w.priority,
             tags: w.tags.clone(),
             speedscore: None,
+            disk: WorkerDiskInfo::default(),
         }
     }
 }
@@ -75,6 +92,8 @@ pub struct WorkerProbeResult {
     /// must not report the worker as ready.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_components: Vec<String>,
+    #[serde(flatten)]
+    pub disk: WorkerDiskInfo,
 }
 
 /// Per-error-code tally for a batch probe.

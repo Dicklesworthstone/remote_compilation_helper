@@ -617,6 +617,12 @@ impl WorkerState {
         total.saturating_sub(used)
     }
 
+    /// Continuous disk-headroom credit using the same floor as slot admission.
+    pub async fn disk_headroom(&self) -> f64 {
+        let assessment = self.pressure_assessment.read().await;
+        self.disk_slot_policy.headroom(&assessment)
+    }
+
     /// Reserve slots for a job. Returns true if successful.
     ///
     /// Re-reads disk capacity on each CAS iteration and keeps the config and

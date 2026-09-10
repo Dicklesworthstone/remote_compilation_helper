@@ -480,6 +480,21 @@ builds retain their reservations when capacity drops; new work waits for space.
 Change the budget with `rch config set selection.disk_gb_per_slot 10` and restart
 the daemon to apply it.
 
+Balanced selection also favors free disk before a worker reaches the admission
+floor. `selection.weights.disk` (default `0.2`, range `0` to `1`) adds disk
+headroom credit after the other score adjustments. Equal ample headroom preserves
+the existing worker order. Credit rises from zero at `min_free_gb` to full credit
+at 25% free disk, with at least one slot's disk budget above the floor on small
+disks. Unknown measurements receive full credit; the admission gate still handles
+missing telemetry. Affinity pins and explicit worker requests retain their
+existing behavior. Set the weight to zero to disable disk ranking independently
+of disk admission and slot limits, then restart the daemon to apply the change.
+
+`rch workers list` shows daemon-reported free disk and pressure. `rch workers probe`
+shows fresh disk measurements alongside latency and labels any cached daemon
+pressure separately. JSON and TOON include numeric free GiB and free ratios;
+unavailable measurements remain `null` (displayed as `unknown` in text).
+
 ### Worker Config Example
 
 ```toml

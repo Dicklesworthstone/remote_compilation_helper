@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use crate::status_types::{
     DaemonFullStatusResponse, SpeedScoreListResponseFromApi, SpeedScoreResponseFromApi,
     SpeedScoreViewFromApi, WorkerCapabilitiesFromApi, WorkerCapabilitiesResponseFromApi,
-    extract_json_body,
+    WorkerStatusFromApi, extract_json_body,
 };
 use crate::ui::context::OutputContext;
 use crate::ui::progress::MultiProgressManager;
@@ -31,8 +31,8 @@ use super::helpers::{
 };
 use super::helpers::{config_dir, load_workers_from_config};
 use super::types::{
-    WorkerActionResponse, WorkerBenchmarkResult, WorkerInfo, WorkerProbeResult, WorkerProbeSummary,
-    WorkersCapabilitiesReport, WorkersListResponse, WorkersProbeResponse,
+    WorkerActionResponse, WorkerBenchmarkResult, WorkerDiskInfo, WorkerInfo, WorkerProbeResult,
+    WorkerProbeSummary, WorkersCapabilitiesReport, WorkersListResponse, WorkersProbeResponse,
 };
 
 use crate::hook::required_runtime_for_kind;
@@ -317,6 +317,85 @@ fn workers_list_verbose_enabled(ctx: &OutputContext) -> bool {
     ctx.is_verbose() && !ctx.is_json()
 }
 
+async fn query_worker_disk_status() -> Option<DaemonFullStatusResponse> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        send_daemon_command("GET /status\n"),
+    )
+    .await
+    {
+        Ok(Ok(response)) => {
+            extract_json_body(&response).and_then(|json| serde_json::from_str(json).ok())
+        }
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+fn valid_disk_free(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn disk_info_from_daemon(worker: Option<&WorkerStatusFromApi>) -> WorkerDiskInfo {
+    let Some(worker) = worker else {
+        return WorkerDiskInfo::default();
+    };
+    let disk_free_gb = valid_disk_free(worker.pressure_disk_free_gb);
+    let disk_free_ratio = worker
+        .pressure_disk_free_ratio
+        .filter(|ratio| ratio.is_finite() && (0.0..=1.0).contains(ratio));
+    WorkerDiskInfo {
+        disk_free_gb,
+        disk_free_ratio,
+        disk_measurement_source: (disk_free_gb.is_some() || disk_free_ratio.is_some())
+            .then_some("daemon"),
+        disk_pressure_state: worker.pressure_state.clone(),
+        disk_pressure_reason: worker.pressure_reason_code.clone(),
+        disk_pressure_source: worker.pressure_state.as_ref().map(|_| "daemon"),
+    }
+}
+
+#[cfg(any(unix, test))]
+fn disk_info_from_probe(
+    capabilities: Option<&WorkerCapabilities>,
+    daemon_worker: Option<&WorkerStatusFromApi>,
+) -> WorkerDiskInfo {
+    let mut disk = disk_info_from_daemon(daemon_worker);
+    // Fresh probe failure/missing telemetry stays unknown; cached measurements
+    // must not masquerade as the result of this probe.
+    disk.disk_free_gb = capabilities.and_then(|caps| valid_disk_free(caps.disk_free_gb));
+    disk.disk_free_ratio = capabilities.and_then(|caps| {
+        let free = disk.disk_free_gb?;
+        let total = caps
+            .disk_total_gb
+            .filter(|total| total.is_finite() && *total > 0.0)?;
+        (free <= total).then_some(free / total)
+    });
+    disk.disk_measurement_source = disk.disk_free_gb.map(|_| "probe");
+    disk
+}
+
+fn format_worker_disk(disk: &WorkerDiskInfo) -> String {
+    let free = disk.disk_free_gb.map_or_else(
+        || "unknown".to_string(),
+        |free| format!("{free:.1} GiB free"),
+    );
+    let ratio = disk.disk_free_ratio.map_or_else(
+        || "unknown free %".to_string(),
+        |ratio| format!("{:.1}% free", ratio * 100.0),
+    );
+    let measurement_source = disk.disk_measurement_source.unwrap_or("unknown source");
+    let pressure = match disk.disk_pressure_state.as_deref() {
+        Some("warning") => "WARNING",
+        Some("critical") => "CRITICAL",
+        Some("telemetry_gap") | None => "unknown",
+        Some(state) => state,
+    };
+    let pressure_source = disk
+        .disk_pressure_source
+        .map_or_else(String::new, |source| format!(" (cached {source})"));
+    format!("Disk: {free} ({ratio}, {measurement_source}); pressure: {pressure}{pressure_source}")
+}
+
 /// Apply the daemon's current capacity once, before choosing an output format.
 /// Missing daemon data retains the configured ceiling for offline inspection.
 fn apply_live_worker_slots(
@@ -506,22 +585,19 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
     let daemon_status = if workers.is_empty() {
         None
     } else {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            send_daemon_command("GET /status\n"),
-        )
-        .await
-        {
-            Ok(Ok(response)) => extract_json_body(&response)
-                .and_then(|json| serde_json::from_str::<DaemonFullStatusResponse>(json).ok()),
-            Ok(Err(_)) | Err(_) => None,
-        }
+        query_worker_disk_status().await
     };
     apply_live_worker_slots(&mut workers, daemon_status.as_ref());
+    let mut worker_infos: Vec<WorkerInfo> = workers.iter().map(WorkerInfo::from).collect();
+    for info in &mut worker_infos {
+        let live = daemon_status
+            .as_ref()
+            .and_then(|status| status.workers.iter().find(|worker| worker.id == info.id));
+        info.disk = disk_info_from_daemon(live);
+    }
 
     // JSON output mode
     if ctx.is_json() {
-        let mut worker_infos: Vec<WorkerInfo> = workers.iter().map(WorkerInfo::from).collect();
         // Enrich with speedscore data if available
         if let Some(ref scores) = speedscores {
             for info in &mut worker_infos {
@@ -561,7 +637,7 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
     println!("{}", style.format_header("Configured Workers"));
     println!();
 
-    for worker in &workers {
+    for (worker, info) in workers.iter().zip(&worker_infos) {
         println!(
             "  {} {} {}@{}",
             style.symbols.bullet_filled,
@@ -603,6 +679,7 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
         }
 
         println!("{}", stats_line);
+        println!("    {}", format_worker_disk(&info.disk));
 
         if !worker.tags.is_empty() {
             println!(
@@ -898,6 +975,7 @@ pub async fn workers_probe(
         return Ok(());
     }
 
+    let daemon_status = query_worker_disk_status().await;
     let mut results = Vec::new();
 
     if !ctx.is_json() {
@@ -908,6 +986,12 @@ pub async fn workers_probe(
     }
 
     for worker in targets {
+        let daemon_worker = daemon_status.as_ref().and_then(|status| {
+            status
+                .workers
+                .iter()
+                .find(|live| live.id == worker.id.as_str())
+        });
         if !ctx.is_json() {
             print!(
                 "  {} {}@{}... ",
@@ -930,6 +1014,7 @@ pub async fn workers_probe(
                         let capability_result =
                             probe_connected_worker_capabilities(&mut client).await;
                         let capabilities = capability_result.as_ref().ok().cloned();
+                        let disk = disk_info_from_probe(capabilities.as_ref(), daemon_worker);
                         let missing_components = capabilities.as_ref().map_or_else(
                             || declared_components.clone(),
                             |capabilities| {
@@ -970,21 +1055,24 @@ pub async fn workers_probe(
                             error_code: error_code.clone(),
                             capabilities: capabilities.clone(),
                             missing_components: missing_components.clone(),
+                            disk: disk.clone(),
                         });
                         if !ctx.is_json() {
                             if status == "ok" {
                                 println!(
-                                    "{} ({}ms)",
+                                    "{} ({}ms)  {}",
                                     StatusIndicator::Success.with_label(style, "OK"),
-                                    style.muted(&latency.to_string())
+                                    style.muted(&latency.to_string()),
+                                    format_worker_disk(&disk)
                                 );
                             } else {
                                 println!(
-                                    "{} ({}ms) [{}]",
+                                    "{} ({}ms) [{}]  {}",
                                     StatusIndicator::Warning
                                         .with_label(style, "CAPABILITY_MISSING"),
                                     style.muted(&latency.to_string()),
-                                    style.highlight(error_code.as_deref().unwrap_or("RCH-E205"))
+                                    style.highlight(error_code.as_deref().unwrap_or("RCH-E205")),
+                                    format_worker_disk(&disk)
                                 );
                                 if let Some(error) = error.as_deref() {
                                     println!("    {}", style.warning(error));
@@ -1020,11 +1108,13 @@ pub async fn workers_probe(
                             error_code: Some(code),
                             capabilities: None,
                             missing_components: Vec::new(),
+                            disk: disk_info_from_probe(None, daemon_worker),
                         });
                         if !ctx.is_json() {
                             println!(
-                                "{}",
-                                StatusIndicator::Error.with_label(style, "Health check failed")
+                                "{}  {}",
+                                StatusIndicator::Error.with_label(style, "Health check failed"),
+                                format_worker_disk(&disk_info_from_probe(None, daemon_worker))
                             );
                         }
                     }
@@ -1041,12 +1131,14 @@ pub async fn workers_probe(
                             error_code: Some(code.clone()),
                             capabilities: None,
                             missing_components: Vec::new(),
+                            disk: disk_info_from_probe(None, daemon_worker),
                         });
                         if !ctx.is_json() {
                             println!(
-                                "{} Health check failed [{}]:\n{}",
+                                "{} Health check failed [{}]  {}:\n{}",
                                 StatusIndicator::Error.display(style),
                                 style.highlight(&code),
+                                format_worker_disk(&disk_info_from_probe(None, daemon_worker)),
                                 indent_lines(&report, "    ")
                             );
                         }
@@ -1067,12 +1159,14 @@ pub async fn workers_probe(
                     error_code: Some(code.clone()),
                     capabilities: None,
                     missing_components: Vec::new(),
+                    disk: disk_info_from_probe(None, daemon_worker),
                 });
                 if !ctx.is_json() {
                     println!(
-                        "{} Connection failed [{}]:\n{}",
+                        "{} Connection failed [{}]  {}:\n{}",
                         StatusIndicator::Error.display(style),
                         style.highlight(&code),
+                        format_worker_disk(&disk_info_from_probe(None, daemon_worker)),
                         indent_lines(&report, "    ")
                     );
                 }
@@ -1976,6 +2070,7 @@ mod probe_summary_tests {
             error_code: error_code.map(String::from),
             capabilities: None,
             missing_components: Vec::new(),
+            disk: WorkerDiskInfo::default(),
         }
     }
 
@@ -2108,6 +2203,207 @@ mod probe_summary_tests {
         let stdout = SharedOutputBuffer::new().as_writer(true);
         let stderr = SharedOutputBuffer::new().as_writer(true);
         OutputContext::with_writers(config, stdout, stderr)
+    }
+
+    #[test]
+    fn disk_visibility_preserves_zero_and_marks_daemon_pressure() {
+        let mut status = make_daemon_status();
+        let worker = &mut status.workers[0];
+        worker.pressure_disk_free_gb = Some(0.0);
+        worker.pressure_disk_free_ratio = Some(0.0);
+        worker.pressure_state = Some("critical".to_string());
+        worker.pressure_reason_code = Some("disk_free_critical".to_string());
+        let disk = disk_info_from_daemon(Some(worker));
+        assert_eq!(
+            format_worker_disk(&disk),
+            "Disk: 0.0 GiB free (0.0% free, daemon); pressure: CRITICAL (cached daemon)"
+        );
+        assert_eq!(
+            disk.disk_pressure_reason.as_deref(),
+            Some("disk_free_critical")
+        );
+
+        worker.pressure_disk_free_gb = Some(25.0);
+        worker.pressure_disk_free_ratio = Some(0.125);
+        worker.pressure_state = Some("warning".to_string());
+        let disk = disk_info_from_daemon(Some(worker));
+        assert!(format_worker_disk(&disk).contains("25.0 GiB free (12.5% free"));
+        assert!(format_worker_disk(&disk).contains("pressure: WARNING"));
+
+        worker.pressure_state = Some("telemetry_gap".to_string());
+        worker.pressure_disk_free_gb = None;
+        worker.pressure_disk_free_ratio = None;
+        let disk = disk_info_from_daemon(Some(worker));
+        assert!(format_worker_disk(&disk).starts_with("Disk: unknown"));
+        assert!(format_worker_disk(&disk).contains("pressure: unknown"));
+    }
+
+    #[test]
+    fn disk_visibility_probe_uses_fresh_measurements_and_cached_pressure() {
+        let mut status = make_daemon_status();
+        status.workers[0].pressure_disk_free_gb = Some(5.0);
+        status.workers[0].pressure_disk_free_ratio = Some(0.025);
+        status.workers[0].pressure_state = Some("critical".to_string());
+        let capabilities = WorkerCapabilities {
+            disk_free_gb: Some(25.0),
+            disk_total_gb: Some(200.0),
+            ..Default::default()
+        };
+        let disk = disk_info_from_probe(Some(&capabilities), Some(&status.workers[0]));
+        assert_eq!(
+            format_worker_disk(&disk),
+            "Disk: 25.0 GiB free (12.5% free, probe); pressure: CRITICAL (cached daemon)"
+        );
+
+        // Failure to obtain fresh measurements cannot reuse the cached 5 GiB.
+        let failed = disk_info_from_probe(None, Some(&status.workers[0]));
+        assert!(failed.disk_free_gb.is_none());
+        assert!(failed.disk_free_ratio.is_none());
+        assert!(failed.disk_measurement_source.is_none());
+        assert_eq!(failed.disk_pressure_state.as_deref(), Some("critical"));
+
+        let without_daemon = disk_info_from_probe(Some(&capabilities), None);
+        assert!(format_worker_disk(&without_daemon).contains("25.0 GiB free"));
+        assert!(format_worker_disk(&without_daemon).ends_with("pressure: unknown"));
+        assert!(format_worker_disk(&disk_info_from_daemon(None)).starts_with("Disk: unknown"));
+    }
+
+    #[test]
+    fn disk_visibility_rejects_invalid_measurements_without_inventing_zero() {
+        let mut capabilities = WorkerCapabilities {
+            disk_free_gb: Some(25.0),
+            ..Default::default()
+        };
+        for total in [
+            None,
+            Some(0.0),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(10.0),
+        ] {
+            capabilities.disk_total_gb = total;
+            let disk = disk_info_from_probe(Some(&capabilities), None);
+            assert_eq!(disk.disk_free_gb, Some(25.0));
+            assert!(disk.disk_free_ratio.is_none(), "invalid total {total:?}");
+        }
+        capabilities.disk_total_gb = Some(200.0);
+        for free in [None, Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            capabilities.disk_free_gb = free;
+            let disk = disk_info_from_probe(Some(&capabilities), None);
+            assert!(disk.disk_free_gb.is_none());
+            assert!(disk.disk_free_ratio.is_none());
+        }
+        capabilities.disk_free_gb = Some(0.0);
+        let disk = disk_info_from_probe(Some(&capabilities), None);
+        assert_eq!(disk.disk_free_gb, Some(0.0));
+        assert_eq!(disk.disk_free_ratio, Some(0.0));
+
+        let mut status = make_daemon_status();
+        status.workers[0].pressure_disk_free_gb = Some(f64::NAN);
+        for ratio in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            status.workers[0].pressure_disk_free_ratio = Some(ratio);
+            let disk = disk_info_from_daemon(Some(&status.workers[0]));
+            assert!(disk.disk_free_gb.is_none());
+            assert!(disk.disk_free_ratio.is_none());
+        }
+    }
+
+    #[test]
+    fn disk_visibility_list_and_probe_json_toon_preserve_numbers_and_nulls() {
+        use crate::ui::context::OutputFormat;
+
+        let mut status = make_daemon_status();
+        status.workers[0].pressure_state = Some("warning".to_string());
+        for free in [Some(25.0), Some(0.0), None] {
+            let known = free.is_some();
+            status.workers[0].pressure_disk_free_gb = free;
+            status.workers[0].pressure_disk_free_ratio = free.map(|free| free / 200.0);
+            let disk = disk_info_from_daemon(known.then_some(&status.workers[0]));
+            let mut info = WorkerInfo::from(&make_worker());
+            info.disk = disk;
+            let mut probe = mk("ok", None, None);
+            probe.latency_ms = Some(42);
+            let capabilities = WorkerCapabilities {
+                disk_free_gb: free,
+                disk_total_gb: Some(200.0),
+                ..Default::default()
+            };
+            probe.disk =
+                disk_info_from_probe(Some(&capabilities), known.then_some(&status.workers[0]));
+            let payloads = [
+                serde_json::to_value(WorkersListResponse {
+                    workers: vec![info],
+                    count: 1,
+                })
+                .unwrap(),
+                serde_json::to_value(WorkersProbeResponse {
+                    summary: summarize_probe_results(std::slice::from_ref(&probe)),
+                    results: vec![probe],
+                })
+                .unwrap(),
+            ];
+            for (payload, collection) in payloads.iter().zip(["workers", "results"]) {
+                for format in [OutputFormat::Json, OutputFormat::Toon] {
+                    let stdout = SharedOutputBuffer::new();
+                    let stderr = SharedOutputBuffer::new();
+                    let ctx = OutputContext::with_writers(
+                        OutputConfig {
+                            json: true,
+                            format,
+                            ..Default::default()
+                        },
+                        stdout.as_writer(true),
+                        stderr.as_writer(true),
+                    );
+                    ctx.json(&ApiResponse::ok("workers", payload)).unwrap();
+                    let output = stdout.to_string_lossy();
+                    let json = match format {
+                        OutputFormat::Json => output,
+                        OutputFormat::Toon => toon_rust::toon_to_json(&output).unwrap(),
+                    };
+                    let decoded: serde_json::Value = serde_json::from_str(&json).unwrap();
+                    let worker = &decoded["data"][collection][0];
+                    if known {
+                        assert_eq!(worker["disk_free_gb"].as_f64(), free);
+                        assert_eq!(
+                            worker["disk_free_ratio"].as_f64(),
+                            free.map(|free| free / 200.0)
+                        );
+                        assert_eq!(worker["disk_pressure_state"], "warning");
+                        assert_eq!(worker["disk_pressure_source"], "daemon");
+                        assert_eq!(
+                            worker["disk_measurement_source"],
+                            if collection == "workers" {
+                                "daemon"
+                            } else {
+                                "probe"
+                            }
+                        );
+                    } else {
+                        for key in [
+                            "disk_free_gb",
+                            "disk_free_ratio",
+                            "disk_pressure_state",
+                            "disk_measurement_source",
+                            "disk_pressure_source",
+                            "disk_pressure_reason",
+                        ] {
+                            assert_eq!(worker.get(key), Some(&serde_json::Value::Null));
+                        }
+                    }
+                    if collection == "results" {
+                        // TOON decodes numeric literals through f64, so 42
+                        // returns as JSON 42.0. Require the same numeric value.
+                        assert_eq!(worker["latency_ms"].as_f64(), Some(42.0));
+                        if format == OutputFormat::Json {
+                            assert_eq!(worker["latency_ms"].as_u64(), Some(42));
+                        }
+                    }
+                    assert!(stderr.to_string_lossy().is_empty());
+                }
+            }
+        }
     }
 
     #[test]

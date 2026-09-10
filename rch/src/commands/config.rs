@@ -18,7 +18,7 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
+const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url";
 
 fn print_file_validation(
     label: &str,
@@ -821,6 +821,12 @@ pub(super) fn collect_value_sources(
     );
     push_value_source(
         &mut values,
+        "selection.weights.disk",
+        config.selection.weights.disk.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
         "transfer.compression_level",
         config.transfer.compression_level.to_string(),
         sources,
@@ -1286,6 +1292,19 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
             }
             config.transfer.compression_level = level;
         }
+        "selection.weights.disk" => {
+            let weight = parse_f64(value, key)?;
+            if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
+                return Err(ConfigError::InvalidValue {
+                    field: key.to_string(),
+                    reason: format!("value {weight} is not between zero and one"),
+                    suggestion: "Use a finite weight from 0 to 1; 0 disables disk ranking"
+                        .to_string(),
+                }
+                .into());
+            }
+            config.selection.weights.disk = weight;
+        }
         "selection.disk_gb_per_slot" => {
             let budget = parse_f64(value, key)?;
             if !budget.is_finite() || budget <= 0.0 {
@@ -1487,6 +1506,10 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
         "selection.disk_gb_per_slot" => {
             config.selection.disk_gb_per_slot = defaults.selection.disk_gb_per_slot;
             config.selection.disk_gb_per_slot.to_string()
+        }
+        "selection.weights.disk" => {
+            config.selection.weights.disk = defaults.selection.weights.disk;
+            config.selection.weights.disk.to_string()
         }
         "transfer.compression_level" => {
             config.transfer.compression_level = defaults.transfer.compression_level;
@@ -2991,5 +3014,35 @@ mod tests {
             assert!(config_set_at(&config_path, key, invalid, &ctx).is_err());
             assert_eq!(std::fs::read(&config_path).expect("read config"), before);
         }
+    }
+
+    #[test]
+    fn config_disk_weight_roundtrip_validation_and_reset() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let ctx = plain_context();
+        let key = "selection.weights.disk";
+        for value in ["0", "0.7", "1"] {
+            config_set_at(&path, key, value, &ctx).expect("set disk weight");
+            let config: RchConfig =
+                toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let values = collect_value_sources(&config, &config::ConfigSourceMap::new());
+            assert_eq!(
+                values.iter().find(|entry| entry.key == key).unwrap().value,
+                value
+            );
+        }
+        let before = std::fs::read(&path).unwrap();
+        for invalid in ["-0.1", "1.1", "NaN", "inf", "-inf", "oops"] {
+            assert!(config_set_at(&path, key, invalid, &ctx).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        config_reset_at(&path, key, &ctx).expect("reset disk weight");
+        let config: RchConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            config.selection.weights.disk,
+            RchConfig::default().selection.weights.disk
+        );
     }
 }

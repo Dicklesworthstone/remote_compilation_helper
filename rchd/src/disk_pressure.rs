@@ -134,6 +134,34 @@ impl From<&rch_common::SelectionConfig> for DiskSlotPolicy {
 }
 
 impl DiskSlotPolicy {
+    /// Continuous disk credit, from zero at the reserve floor to full credit
+    /// above 25% free (or one slot's budget above the floor on small disks).
+    /// Missing measurements stay neutral; admission handles telemetry gaps.
+    pub fn headroom(&self, pressure: &PressureAssessment) -> f64 {
+        let ratio = pressure
+            .disk_free_ratio
+            .filter(|ratio| ratio.is_finite() && (0.0..=1.0).contains(ratio));
+        let Some(free_gb) = pressure.disk_free_gb.filter(|free| free.is_finite()) else {
+            return ratio.map_or(1.0, |ratio| (ratio / 0.25).clamp(0.0, 1.0));
+        };
+        if free_gb <= self.floor_gb {
+            return 0.0;
+        }
+        let total_gb = pressure
+            .disk_total_gb
+            .filter(|total| total.is_finite() && *total > 0.0)
+            .or_else(|| {
+                ratio
+                    .filter(|ratio| *ratio > 0.0)
+                    .map(|ratio| free_gb / ratio)
+            })
+            .filter(|total| total.is_finite());
+        let comfort_gb = total_gb
+            .map_or(0.0, |total| total * 0.25)
+            .max(self.floor_gb + self.gb_per_slot);
+        ((free_gb - self.floor_gb) / (comfort_gb - self.floor_gb)).clamp(0.0, 1.0)
+    }
+
     pub fn effective_slots(&self, configured: u32, pressure: &PressureAssessment) -> u32 {
         let Some(free_gb) = pressure.disk_free_gb.filter(|free| free.is_finite()) else {
             return configured;
@@ -539,6 +567,58 @@ mod tests {
     use rch_telemetry::collect::disk::{DiskMetrics, DiskTelemetry};
     use rch_telemetry::collect::memory::MemoryTelemetry;
     use rch_telemetry::protocol::{TelemetrySource, WorkerTelemetry};
+
+    #[test]
+    fn disk_headroom_tracks_floor_comfort_and_recovery() {
+        let policy = DiskSlotPolicy::from(&rch_common::SelectionConfig::default());
+        for (free, expected) in [
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (55.0, 0.5),
+            (100.0, 1.0),
+            (200.0, 1.0),
+        ] {
+            let pressure = PressureAssessment {
+                disk_free_gb: Some(free),
+                disk_total_gb: Some(400.0),
+                ..Default::default()
+            };
+            assert!((policy.headroom(&pressure) - expected).abs() < f64::EPSILON);
+        }
+        let policy = DiskSlotPolicy::from(&rch_common::SelectionConfig {
+            min_free_gb: Some(5.0),
+            disk_gb_per_slot: 2.5,
+            ..Default::default()
+        });
+        let pressure = PressureAssessment {
+            disk_free_gb: Some(6.25),
+            disk_total_gb: Some(20.0),
+            ..Default::default()
+        };
+        assert_eq!(policy.headroom(&pressure), 0.5);
+    }
+
+    #[test]
+    fn disk_headroom_handles_partial_and_invalid_measurements() {
+        let policy = DiskSlotPolicy::from(&rch_common::SelectionConfig::default());
+        assert_eq!(policy.headroom(&PressureAssessment::default()), 1.0);
+        for (free, total, ratio, expected) in [
+            (Some(55.0), None, Some(0.1375), 0.5),
+            (Some(15.0), None, None, 0.5),
+            (None, None, Some(0.125), 0.5),
+            (None, None, Some(0.0), 0.0),
+            (Some(f64::NAN), Some(f64::INFINITY), Some(f64::NAN), 1.0),
+            (None, None, Some(-1.0), 1.0),
+        ] {
+            let pressure = PressureAssessment {
+                disk_free_gb: free,
+                disk_total_gb: total,
+                disk_free_ratio: ratio,
+                ..Default::default()
+            };
+            assert!((policy.headroom(&pressure) - expected).abs() < 1e-12);
+        }
+    }
 
     fn test_capabilities(free_gb: f64, total_gb: f64) -> WorkerCapabilities {
         let mut caps = WorkerCapabilities::new();

@@ -58,6 +58,8 @@ pub struct SelectionWeights {
     pub locality: f64,
     /// Weight for worker priority (0.0-1.0).
     pub priority: f64,
+    /// Weight for disk headroom (0.0-1.0).
+    pub disk: f64,
     /// Penalty for half-open circuit workers (multiplier 0.0-1.0).
     pub half_open_penalty: f64,
 }
@@ -69,6 +71,7 @@ impl Default for SelectionWeights {
             speed: 0.5,
             locality: 0.1,
             priority: 0.1,
+            disk: 0.2,
             half_open_penalty: 0.5, // Half-open workers score at 50% of their normal value
         }
     }
@@ -81,6 +84,7 @@ impl From<&SelectionWeightConfig> for SelectionWeights {
             speed: config.speedscore,
             locality: config.cache,
             priority: config.priority,
+            disk: config.disk,
             half_open_penalty: config.half_open_penalty,
         }
     }
@@ -433,6 +437,8 @@ pub struct WorkerScoreBreakdown {
     pub speed_score: f64,
     /// Slot availability component (0.0-1.0).
     pub slot_availability: f64,
+    /// Disk headroom component (0.0-1.0).
+    pub disk_headroom: f64,
     /// Cache affinity component (0.0-1.0).
     pub cache_affinity: f64,
     /// Priority component (normalized 0.0-1.0).
@@ -1172,6 +1178,7 @@ impl WorkerSelector {
         let cache = self.cache_tracker.read().await;
         let (min_priority, max_priority) = Self::priority_range(workers).await;
         let mut breakdowns = Vec::with_capacity(workers.len());
+        let weights = adjust_weights_for_priority(&self.config.weights, request);
 
         for (worker, circuit_state) in workers {
             let total_slots = worker.effective_total_slots().await;
@@ -1187,6 +1194,25 @@ impl WorkerSelector {
             let cache_affinity = cache.estimate_warmth(&worker_id, &request.project, cache_use);
             let priority_score =
                 Self::normalize_priority(config.priority, min_priority, max_priority);
+            drop(config);
+            let disk_headroom = worker.disk_headroom().await;
+            let total_score = if self.config.strategy == SelectionStrategy::Balanced {
+                self.compute_balanced_score(
+                    worker,
+                    *circuit_state,
+                    &request.project,
+                    &cache,
+                    cache_use,
+                    &weights,
+                    min_priority,
+                    max_priority,
+                )
+                .await
+            } else {
+                // Preserve the existing estimate for strategies that do not
+                // rank by the balanced score.
+                speed_score * slot_availability
+            };
 
             // Check if this worker can actually take the job
             let skip_reason = if *circuit_state == CircuitState::Open {
@@ -1218,9 +1244,10 @@ impl WorkerSelector {
 
             breakdowns.push(WorkerScoreBreakdown {
                 worker_id,
-                total_score: speed_score * slot_availability, // Simplified total
+                total_score,
                 speed_score,
                 slot_availability,
+                disk_headroom,
                 cache_affinity,
                 priority_score,
                 circuit_state: format!("{:?}", circuit_state),
@@ -2876,6 +2903,8 @@ impl WorkerSelector {
         // Slot availability (0-1)
         let slot_score = 1.0 - utilization;
 
+        let disk_headroom = worker.disk_headroom().await;
+
         let config = worker.config.read().await;
 
         // Cache affinity (0-1)
@@ -2952,13 +2981,18 @@ impl WorkerSelector {
             final_score *= 1.0 - PRE_V3_MICROARCH_PENALTY;
         }
 
+        // Add disk credit after the other adjustments: equal ample headroom
+        // must not amplify priority or alter the existing fleet ordering.
+        final_score += weights.disk * disk_headroom;
+
         debug!(
-            "Worker {} balanced score: {:.3} (speed={:.2}, load={:.2}, slots={:.2}, health={:.2}, cache={:.2}, network={:.2}, priority={:.2}, half_open={:?}, admission_penalty={:.2}, reliability_penalty={:.2}, cache_use={:?})",
+            "Worker {} balanced score: {:.3} (speed={:.2}, load={:.2}, slots={:.2}, disk={:.2}, health={:.2}, cache={:.2}, network={:.2}, priority={:.2}, half_open={:?}, admission_penalty={:.2}, reliability_penalty={:.2}, cache_use={:?})",
             config.id,
             final_score,
             speed_score,
             load_factor,
             slot_score,
+            disk_headroom,
             health_score,
             cache_score,
             network_score,
@@ -3433,16 +3467,12 @@ pub async fn select_worker_with_config(
         let id = config.id.clone();
         drop(config); // Release lock before moving worker
 
-        let base_score = compute_score(&worker, request, weights, priority_score).await;
-        let final_score = if circuit_state == CircuitState::HalfOpen {
-            base_score * weights.half_open_penalty
-        } else {
-            base_score
-        };
+        let final_score =
+            compute_score(&worker, request, weights, priority_score, circuit_state).await;
 
         debug!(
-            "Worker {} candidate: circuit={:?}, base_score={:.3}, final_score={:.3}, priority_score={:.2}",
-            id, circuit_state, base_score, final_score, priority_score
+            "Worker {} candidate: circuit={:?}, final_score={:.3}, priority_score={:.2}",
+            id, circuit_state, final_score, priority_score
         );
 
         scored.push((worker, circuit_state, final_score));
@@ -3491,10 +3521,12 @@ async fn compute_score(
     request: &SelectionRequest,
     weights: &SelectionWeights,
     priority_score: f64,
+    circuit_state: CircuitState,
 ) -> f64 {
     // Slot availability score (0.0-1.0)
     let total_slots = worker.effective_total_slots().await.max(1) as f64;
     let slot_score = (worker.available_slots().await as f64 / total_slots).min(1.0);
+    let disk_headroom = worker.disk_headroom().await;
     let config = worker.config.read().await;
 
     // Speed score (already 0-100, normalize to 0-1)
@@ -3514,11 +3546,16 @@ async fn compute_score(
 
     // Priority acts as a mild multiplier on the base score.
     let priority_factor = 1.0 + (weights.priority * priority_score);
-    let score = base_score * priority_factor;
+    let circuit_factor = if circuit_state == CircuitState::HalfOpen {
+        weights.half_open_penalty
+    } else {
+        1.0
+    };
+    let score = base_score * priority_factor * circuit_factor + weights.disk * disk_headroom;
 
     debug!(
-        "Worker {} score: {:.3} (slots: {:.2}, speed: {:.2}, locality: {:.2}, priority: {:.2})",
-        config.id, score, slot_score, speed_score, locality_score, priority_score
+        "Worker {} score: {:.3} (slots: {:.2}, speed: {:.2}, locality: {:.2}, disk: {:.2}, priority: {:.2})",
+        config.id, score, slot_score, speed_score, locality_score, disk_headroom, priority_score
     );
 
     score
@@ -4195,10 +4232,132 @@ mod tests {
             };
             let weights = SelectionWeights::default();
 
-            let score = compute_score(&worker, &request, &weights, 0.5).await;
+            let score = compute_score(&worker, &request, &weights, 0.5, CircuitState::Closed).await;
             assert!(score > 0.0);
             assert!(score <= 1.5);
         });
+    }
+
+    #[tokio::test]
+    async fn test_disk_weight_balanced_prefers_headroom_and_audits_actual_score() {
+        let pool = WorkerPool::new();
+        for (id, free) in [("fuller", 90.0), ("emptier", 200.0)] {
+            let worker = make_worker(id, 8, 80.0);
+            worker
+                .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                    disk_free_gb: Some(free),
+                    disk_total_gb: Some(400.0),
+                    ..Default::default()
+                })
+                .await;
+            assert_eq!(worker.available_slots().await, 8);
+            pool.add_worker_state(worker).await;
+        }
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "disk-ranking".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::None,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+        let mut config = SelectionConfig::default();
+        config.weights.disk = 0.0;
+        let no_disk = WorkerSelector::with_config(config.clone(), CircuitBreakerConfig::default());
+        let candidates: Vec<_> = pool
+            .all_workers()
+            .await
+            .into_iter()
+            .map(|worker| (worker, CircuitState::Closed))
+            .collect();
+        let baseline = no_disk
+            .build_score_breakdowns(&candidates, &request, CacheUse::Build, None)
+            .await;
+        assert!((baseline[0].total_score - baseline[1].total_score).abs() < f64::EPSILON);
+        config.weights.disk = 0.2;
+        let selector = WorkerSelector::with_config(config, CircuitBreakerConfig::default());
+        let selected = selector.select(&pool, &request).await.worker.unwrap();
+        assert_eq!(selected.config.read().await.id.as_str(), "emptier");
+        let audit = selector
+            .build_score_breakdowns(&candidates, &request, CacheUse::Build, Some("emptier"))
+            .await;
+        for entry in &audit {
+            let before = baseline
+                .iter()
+                .find(|value| value.worker_id == entry.worker_id)
+                .unwrap();
+            assert!(
+                (entry.total_score - before.total_score - 0.2 * entry.disk_headroom).abs() < 1e-12
+            );
+        }
+        let winner = audit.iter().find(|entry| entry.selected).unwrap();
+        let loser = audit.iter().find(|entry| !entry.selected).unwrap();
+        assert!(winner.disk_headroom > loser.disk_headroom);
+        assert!(winner.total_score > loser.total_score);
+    }
+
+    #[tokio::test]
+    async fn test_disk_weight_preserves_ample_legacy_priority_order_and_supports_disk_only() {
+        let a = make_worker("fast", 8, 100.0);
+        let b = make_worker("priority", 8, 90.0);
+        for worker in [&a, &b] {
+            worker
+                .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                    disk_free_gb: Some(200.0),
+                    disk_total_gb: Some(400.0),
+                    ..Default::default()
+                })
+                .await;
+        }
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "disk-legacy".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::None,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+        let weights = SelectionWeights {
+            slots: 0.0,
+            speed: 1.0,
+            locality: 0.0,
+            priority: 0.1,
+            disk: 0.2,
+            half_open_penalty: 0.5,
+        };
+        let score_a = compute_score(&a, &request, &weights, 0.0, CircuitState::Closed).await;
+        let score_b = compute_score(&b, &request, &weights, 1.0, CircuitState::Closed).await;
+        assert!((score_a - 1.2).abs() < 1e-12);
+        assert!((score_b - 1.19).abs() < 1e-12);
+        assert!(score_a > score_b);
+        assert!(
+            (compute_score(&a, &request, &weights, 0.0, CircuitState::HalfOpen).await - 0.7).abs()
+                < 1e-12
+        );
+        b.set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+            disk_free_gb: Some(90.0),
+            disk_total_gb: Some(400.0),
+            ..Default::default()
+        })
+        .await;
+        let disk_only = SelectionWeights {
+            speed: 0.0,
+            priority: 0.0,
+            disk: 1.0,
+            ..weights
+        };
+        assert!(
+            compute_score(&a, &request, &disk_only, 0.0, CircuitState::Closed).await
+                > compute_score(&b, &request, &disk_only, 0.0, CircuitState::Closed).await
+        );
     }
 
     #[test]
@@ -4221,7 +4380,7 @@ mod tests {
             };
             let weights = SelectionWeights::default();
 
-            let score = compute_score(&worker, &request, &weights, 0.5).await;
+            let score = compute_score(&worker, &request, &weights, 0.5, CircuitState::Closed).await;
             assert!(score.is_finite());
         });
     }
@@ -4653,6 +4812,7 @@ mod tests {
             speed: 1.0,
             locality: 0.0,
             priority: 0.0,
+            disk: 0.0,
             half_open_penalty: 0.5,
         };
 
@@ -5559,6 +5719,7 @@ mod tests {
                     cache: 0.0,
                     network: 0.0,
                     priority: 0.0,
+                    disk: 0.0,
                     half_open_penalty: 1.0,
                 },
                 ..Default::default()
@@ -6860,6 +7021,7 @@ mod tests {
                     cache: 0.0,
                     network: 1.0,
                     priority: 0.0,
+                    disk: 0.0,
                     half_open_penalty: 1.0,
                 },
                 ..Default::default()
@@ -7528,6 +7690,7 @@ mod tests {
             total_score: 0.85,
             speed_score: 0.9,
             slot_availability: 0.75,
+            disk_headroom: 0.6,
             cache_affinity: 0.5,
             priority_score: 0.8,
             circuit_state: "Closed".to_string(),
@@ -8145,6 +8308,7 @@ mod tests {
                 speedscore in 0.0f64..=1.0f64,
                 cache in 0.0f64..=1.0f64,
                 priority in 0.0f64..=1.0f64,
+                disk in 0.0f64..=1.0f64,
                 half_open_penalty in 0.0f64..=1.0f64,
             ) {
         let _guard = test_guard!();
@@ -8153,6 +8317,7 @@ mod tests {
                     speedscore,
                     cache,
                     priority,
+                    disk,
                     half_open_penalty,
                     health: 0.1,
                     network: 0.1,
@@ -8163,6 +8328,7 @@ mod tests {
                 prop_assert!((weights.speed - speedscore).abs() < f64::EPSILON);
                 prop_assert!((weights.locality - cache).abs() < f64::EPSILON);
                 prop_assert!((weights.priority - priority).abs() < f64::EPSILON);
+                prop_assert!((weights.disk - disk).abs() < f64::EPSILON);
                 prop_assert!((weights.half_open_penalty - half_open_penalty).abs() < f64::EPSILON);
             }
         }
