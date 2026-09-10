@@ -127,6 +127,32 @@ struct Cli {
     api_token_file: Option<String>,
 }
 
+/// Build the selector used by daemon startup with disk admission enabled.
+fn daemon_worker_selector(
+    config: &rch_common::RchConfig,
+    history: Arc<BuildHistory>,
+    ssh_pool: Option<Arc<rch_common::SshPool>>,
+) -> WorkerSelector {
+    let mut selector =
+        WorkerSelector::with_config(config.selection.clone(), config.circuit.clone());
+    let headroom = Arc::new(headroom::HeadroomEstimator::new(
+        history,
+        headroom::HeadroomConfig {
+            floor_free_gb: config.selection.min_free_gb.unwrap_or(0.0),
+            ..Default::default()
+        },
+    ));
+    selector.set_admission_gate(Arc::new(admission::AdmissionGate::new(
+        admission::AdmissionConfig {
+            min_free_gb: config.selection.min_free_gb,
+            ..Default::default()
+        },
+        headroom,
+    )));
+    selector.set_ssh_pool(ssh_pool);
+    selector
+}
+
 /// A minimal `DaemonContext` for unit tests in other modules (the tailnet API
 /// router tests in `http_api`). Mirrors `api::tests::make_test_context`.
 #[cfg(test)]
@@ -152,10 +178,15 @@ pub(crate) fn test_daemon_context(pool: workers::WorkerPool) -> DaemonContext {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn(Arc::new(scheduler).run());
     }
+    let history = Arc::new(BuildHistory::new(100));
     DaemonContext {
         pool,
-        worker_selector: Arc::new(WorkerSelector::new()),
-        history: Arc::new(BuildHistory::new(100)),
+        worker_selector: Arc::new(daemon_worker_selector(
+            &rch_common::RchConfig::default(),
+            history.clone(),
+            None,
+        )),
+        history,
         telemetry,
         benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
         benchmark_trigger,
@@ -581,10 +612,6 @@ async fn main() -> Result<()> {
         let _ = startup_consistency::gather_and_log(cli.socket.clone(), hook_config_socket);
     }
 
-    // Initialize worker selector
-    let mut worker_selector_inner =
-        WorkerSelector::with_config(rch_config.selection.clone(), rch_config.circuit.clone());
-
     // Verify and install Claude Code hook if needed (self-healing)
     if rch_config.self_healing.daemon_installs_hooks {
         match rch_common::verify_and_install_claude_code_hook() {
@@ -643,12 +670,6 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Attach the shared pool to the worker selector's toolchain preflight probe
-    // now that both the selector and the pool exist, then freeze the selector
-    // behind an Arc for the rest of the daemon.
-    worker_selector_inner.set_ssh_pool(ssh_pool.clone());
-    let worker_selector = Arc::new(worker_selector_inner);
-
     // Initialize build history
     let history = if let Some(ref path) = cli.history_file {
         if path.exists() {
@@ -681,6 +702,14 @@ async fn main() -> Result<()> {
                 .with_max_queue_depth(daemon_config.queue.max_depth),
         )
     };
+
+    // Admission uses the same persisted build history as the API. Attach it
+    // before sharing the selector so normal startup cannot omit the gate.
+    let worker_selector = Arc::new(daemon_worker_selector(
+        &rch_config,
+        history.clone(),
+        ssh_pool.clone(),
+    ));
 
     // Initialize self-test config and history
     let self_test_config = match config::load_self_test_config() {

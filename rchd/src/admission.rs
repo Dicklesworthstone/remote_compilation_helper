@@ -32,6 +32,9 @@ use tracing::debug;
 /// Configuration for the admission gate.
 #[derive(Debug, Clone)]
 pub struct AdmissionConfig {
+    /// Hard free-disk floor from the daemon selection configuration (GB).
+    /// Unknown disk capacity remains fail-open.
+    pub min_free_gb: Option<f64>,
     /// Minimum headroom score (0.0-1.0) required for admission.
     /// Workers scoring below this are rejected.
     pub min_headroom_score: f64,
@@ -51,6 +54,7 @@ pub struct AdmissionConfig {
 impl Default for AdmissionConfig {
     fn default() -> Self {
         Self {
+            min_free_gb: None,
             min_headroom_score: 0.2,
             warning_pressure_penalty: 0.4,
             telemetry_gap_penalty: 0.15,
@@ -138,7 +142,7 @@ pub struct AdmissionGate {
     config: AdmissionConfig,
     headroom: Arc<HeadroomEstimator>,
     /// Per-worker hysteresis tracking (across selection rounds).
-    hysteresis: RwLock<HashMap<String, WorkerHysteresis>>,
+    hysteresis: Arc<RwLock<HashMap<String, WorkerHysteresis>>>,
     /// Latest verdicts from the current selection round (cleared per round).
     latest_verdicts: RwLock<HashMap<String, AdmissionVerdict>>,
 }
@@ -149,7 +153,18 @@ impl AdmissionGate {
         Self {
             config,
             headroom,
-            hysteresis: RwLock::new(HashMap::new()),
+            hysteresis: Arc::new(RwLock::new(HashMap::new())),
+            latest_verdicts: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Give a concurrent selection its own verdict cache while preserving
+    /// worker recovery history across requests.
+    pub fn for_selection(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            headroom: self.headroom.clone(),
+            hysteresis: self.hysteresis.clone(),
             latest_verdicts: RwLock::new(HashMap::new()),
         }
     }
@@ -185,13 +200,31 @@ impl AdmissionGate {
             return verdict;
         }
 
-        // Compute headroom score.
-        let disk_free_gb = pressure.disk_free_gb.unwrap_or(0.0);
+        if let (Some(free_gb), Some(floor_gb)) = (pressure.disk_free_gb, self.config.min_free_gb)
+            && free_gb <= floor_gb
+        {
+            let verdict = AdmissionVerdict::Reject {
+                reason_code: "admission_disk_floor".to_string(),
+                reason: format!("free disk {free_gb:.1}GB <= configured floor {floor_gb:.1}GB"),
+            };
+            self.record_rejection(worker_id).await;
+            self.cache_verdict(worker_id, &verdict).await;
+            return verdict;
+        }
+
+        // Missing disk telemetry is unknown, not a full disk. Keep the
+        // fail-open penalty without recording a spurious hysteresis rejection
+        // during startup before the first capability probe arrives.
+        let disk_free_gb = pressure.disk_free_gb;
         let wid = WorkerId::new(worker_id);
-        let h_score = self
-            .headroom
-            .headroom_score(&wid, project_id, disk_free_gb)
-            .await;
+        let h_score = match disk_free_gb {
+            Some(free_gb) => {
+                self.headroom
+                    .headroom_score(&wid, project_id, free_gb)
+                    .await
+            }
+            None => 1.0,
+        };
 
         // Insufficient headroom: reject (immediate, safety first).
         if h_score < self.config.min_headroom_score {
@@ -199,7 +232,9 @@ impl AdmissionGate {
                 reason_code: "admission_insufficient_headroom".to_string(),
                 reason: format!(
                     "headroom score {:.2} < min {:.2} (free={:.1}GB)",
-                    h_score, self.config.min_headroom_score, disk_free_gb
+                    h_score,
+                    self.config.min_headroom_score,
+                    disk_free_gb.unwrap_or(0.0)
                 ),
             };
             self.record_rejection(worker_id).await;
@@ -223,12 +258,15 @@ impl AdmissionGate {
         // Worker admitted — record healthy evaluation and compute penalty.
         self.record_admission(worker_id).await;
 
-        let pressure_penalty = match pressure.state {
+        let mut pressure_penalty = match pressure.state {
             PressureState::Warning => self.config.warning_pressure_penalty,
             PressureState::TelemetryGap => self.config.telemetry_gap_penalty,
             PressureState::Healthy => 0.0,
             PressureState::Critical => unreachable!(),
         };
+        if disk_free_gb.is_none() {
+            pressure_penalty = pressure_penalty.max(self.config.telemetry_gap_penalty);
+        }
 
         let verdict = AdmissionVerdict::Admit {
             pressure_penalty,
@@ -265,6 +303,23 @@ impl AdmissionGate {
     /// Returns `None` if the worker was not evaluated in this round.
     pub async fn cached_verdict(&self, worker_id: &str) -> Option<AdmissionVerdict> {
         self.latest_verdicts.read().await.get(worker_id).cloned()
+    }
+
+    /// Snapshot rejection codes for the selection audit, without advancing
+    /// recovery hysteresis. Sort workers so diagnostics are deterministic.
+    pub async fn rejection_codes(&self) -> Vec<(String, String)> {
+        let verdicts = self.latest_verdicts.read().await;
+        let mut rejections: Vec<_> = verdicts
+            .iter()
+            .filter_map(|(worker, verdict)| match verdict {
+                AdmissionVerdict::Reject { reason_code, .. } => {
+                    Some((worker.clone(), reason_code.clone()))
+                }
+                AdmissionVerdict::Admit { .. } => None,
+            })
+            .collect();
+        rejections.sort();
+        rejections
     }
 
     /// Get the current hysteresis state for a worker (for diagnostics).
@@ -535,6 +590,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_disk_does_not_poison_recovery_hysteresis() {
+        let _guard = test_guard!();
+        let gate = make_gate(Arc::new(BuildHistory::new(10)));
+        let worker = make_worker("w1", make_assessment(PressureState::TelemetryGap, None)).await;
+        let verdict = gate.evaluate(&worker, "w1", "proj-a").await;
+        assert!(verdict.is_admitted());
+        assert!((verdict.pressure_penalty() - 0.15).abs() < f64::EPSILON);
+
+        worker
+            .set_pressure_assessment(make_assessment(PressureState::Healthy, Some(100.0)))
+            .await;
+        assert!(gate.evaluate(&worker, "w1", "proj-a").await.is_admitted());
+
+        worker
+            .set_pressure_assessment(make_assessment(PressureState::Critical, None))
+            .await;
+        assert!(matches!(
+            gate.evaluate(&worker, "w1", "proj-a").await,
+            AdmissionVerdict::Reject { reason_code, .. }
+                if reason_code == "admission_critical_pressure"
+        ));
+    }
+
+    #[tokio::test]
     async fn healthy_pressure_no_penalty() {
         let _guard = test_guard!();
         let history = Arc::new(BuildHistory::new(10));
@@ -595,6 +674,46 @@ mod tests {
     // =================================================================
     // Hysteresis Tests
     // =================================================================
+
+    #[tokio::test]
+    async fn selection_rounds_isolate_verdicts_and_share_recovery() {
+        let _guard = test_guard!();
+        let gate = make_gate(Arc::new(BuildHistory::new(10)));
+        let first = gate.for_selection();
+        let second = gate.for_selection();
+        let warning = make_worker(
+            "warning",
+            make_assessment(PressureState::Warning, Some(50.0)),
+        )
+        .await;
+        let full = make_worker("full", make_assessment(PressureState::Critical, Some(1.0))).await;
+
+        // Deliberately interleave rounds across awaits: starting/evaluating the
+        // second must not erase the first request's scoring or audit evidence.
+        first.evaluate(&warning, "warning", "project-a").await;
+        second.begin_round().await;
+        second.evaluate(&full, "full", "project-b").await;
+        assert!((first.get_pressure_penalty("warning").await - 0.4).abs() < f64::EPSILON);
+        assert!(first.rejection_codes().await.is_empty());
+        assert_eq!(
+            second.rejection_codes().await,
+            vec![(
+                "full".to_string(),
+                "admission_critical_pressure".to_string()
+            )]
+        );
+        first.begin_round().await;
+        assert!(second.cached_verdict("full").await.is_some());
+
+        // Recovery persists across requests even though verdict caches do not.
+        full.set_pressure_assessment(make_assessment(PressureState::Healthy, Some(100.0)))
+            .await;
+        assert!(matches!(
+            first.evaluate(&full, "full", "project-c").await,
+            AdmissionVerdict::Reject { reason_code, .. }
+                if reason_code == "admission_hysteresis_cooldown"
+        ));
+    }
 
     #[tokio::test]
     async fn hysteresis_blocks_immediate_readmission() {

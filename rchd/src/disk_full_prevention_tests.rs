@@ -510,6 +510,120 @@ mod tests {
     // =================================================================
 
     #[tokio::test]
+    async fn daemon_admission_is_present_with_default_context() {
+        let _guard = test_guard!();
+        let context = crate::test_daemon_context(WorkerPool::new());
+        assert!(context.worker_selector.admission_gate.is_some());
+    }
+
+    #[tokio::test]
+    async fn daemon_admission_routes_to_healthy_disk_and_audits_rejection() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        for id in ["full", "healthy"] {
+            pool.add_worker(WorkerConfig {
+                id: WorkerId::new(id),
+                host: "localhost".to_string(),
+                total_slots: 4,
+                ..Default::default()
+            })
+            .await;
+        }
+        let full = pool.get(&WorkerId::new("full")).await.unwrap();
+        full.set_pressure_assessment(assessment(PressureState::Critical, Some(2.0)))
+            .await;
+        let healthy = pool.get(&WorkerId::new("healthy")).await.unwrap();
+        healthy
+            .set_pressure_assessment(assessment(PressureState::Healthy, Some(100.0)))
+            .await;
+        let context = crate::test_daemon_context(pool);
+        let request = select_request("startup-admission");
+        let result = context
+            .worker_selector
+            .select(&context.pool, &request)
+            .await;
+        assert_eq!(
+            result.worker.unwrap().config.read().await.id.as_str(),
+            "healthy"
+        );
+        let audit = context
+            .worker_selector
+            .get_last_audit_entry()
+            .await
+            .unwrap();
+        assert_eq!(audit.selected_worker_id.as_deref(), Some("healthy"));
+        assert!(audit.reason.contains("full=admission_critical_pressure"));
+    }
+
+    #[tokio::test]
+    async fn daemon_admission_enforces_configured_disk_floor() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(WorkerConfig {
+            id: WorkerId::new("floor-worker"),
+            host: "localhost".to_string(),
+            total_slots: 4,
+            ..Default::default()
+        })
+        .await;
+        let worker = pool.get(&WorkerId::new("floor-worker")).await.unwrap();
+        let mut config = rch_common::RchConfig::default();
+        config.selection.min_free_gb = Some(40.0);
+        let selector =
+            crate::daemon_worker_selector(&config, Arc::new(BuildHistory::new(10)), None);
+        for free_gb in [39.0, 40.0] {
+            // A custom floor can reject before the pressure monitor's default
+            // critical band. Neither primary nor fallback may admit this worker.
+            worker
+                .set_pressure_assessment(assessment(PressureState::Healthy, Some(free_gb)))
+                .await;
+            let result = selector.select(&pool, &select_request("floor-test")).await;
+            assert!(
+                result.worker.is_none(),
+                "admitted {free_gb}GB at a 40GB floor"
+            );
+            let audit = selector.get_last_audit_entry().await.unwrap();
+            assert!(audit.reason.contains("floor-worker=admission_disk_floor"));
+            let diagnostics = result.diagnostics.unwrap();
+            assert_eq!(diagnostics.workers.len(), 1);
+            assert!(
+                diagnostics.workers[0]
+                    .reason_codes
+                    .iter()
+                    .any(|code| code == "pressure.disk_floor")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_admission_allows_workers_before_disk_probe() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(WorkerConfig {
+            id: WorkerId::new("unprobed"),
+            host: "localhost".to_string(),
+            total_slots: 4,
+            ..Default::default()
+        })
+        .await;
+        let context = crate::test_daemon_context(pool);
+        let result = context
+            .worker_selector
+            .select(&context.pool, &select_request("unprobed-project"))
+            .await;
+        assert_eq!(
+            result.worker.unwrap().config.read().await.id.as_str(),
+            "unprobed"
+        );
+        let audit = context
+            .worker_selector
+            .get_last_audit_entry()
+            .await
+            .unwrap();
+        assert!(!audit.reason.contains("admission_"));
+    }
+
+    #[tokio::test]
     async fn selection_with_admission_gate_rejects_critical_worker() {
         let _guard = test_guard!();
         let history = Arc::new(BuildHistory::new(10));

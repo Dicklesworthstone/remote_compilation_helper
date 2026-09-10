@@ -559,6 +559,7 @@ impl SelectionAuditLog {
 // ============================================================================
 
 /// Context for strategy-based worker selection.
+#[derive(Clone)]
 pub struct WorkerSelector {
     /// Selection configuration.
     pub config: SelectionConfig,
@@ -686,6 +687,25 @@ impl WorkerSelector {
 
     /// Select a worker while excluding specific worker IDs from consideration.
     pub async fn select_with_exclusions(
+        &self,
+        pool: &WorkerPool,
+        request: &SelectionRequest,
+        excluded_worker_ids: &HashSet<String>,
+    ) -> SelectionResult {
+        // Scoring, diagnostics, and audit must see this request's verdicts.
+        // A shared cache lets concurrent requests erase one another's disk
+        // decisions. Recovery hysteresis stays shared inside the forked gate.
+        let mut round = self.clone();
+        round.admission_gate = self
+            .admission_gate
+            .as_ref()
+            .map(|gate| Arc::new(gate.for_selection()));
+        round
+            .select_in_round(pool, request, excluded_worker_ids)
+            .await
+    }
+
+    async fn select_in_round(
         &self,
         pool: &WorkerPool,
         request: &SelectionRequest,
@@ -1122,6 +1142,23 @@ impl WorkerSelector {
             return None;
         }
 
+        // A busy worker can become available after the primary pass skipped
+        // its admission check. Recheck disk safety before reviving it through
+        // last-success affinity; confirmed pressure cannot fail open remotely.
+        if let Some(gate) = &self.admission_gate {
+            if let crate::admission::AdmissionVerdict::Reject { reason_code, .. } =
+                gate.evaluate(&worker, &fallback_id, &request.project).await
+                && matches!(
+                    reason_code.as_str(),
+                    "admission_critical_pressure" | "admission_disk_floor"
+                )
+            {
+                return None;
+            }
+        } else if worker.pressure_assessment().await.state == PressureState::Critical {
+            return None;
+        }
+
         Some(fallback_id)
     }
 
@@ -1214,6 +1251,13 @@ impl WorkerSelector {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
+        let mut audit_reason = format!("{reason:?}");
+        if let Some(gate) = &self.admission_gate {
+            for (worker_id, reason_code) in gate.rejection_codes().await {
+                audit_reason.push_str(&format!("; {worker_id}={reason_code}"));
+            }
+        }
+
         let entry = SelectionAuditEntry {
             id: 0, // Will be assigned by the log
             timestamp_ms,
@@ -1228,7 +1272,7 @@ impl WorkerSelector {
             eligible_count: workers_evaluated.len(),
             workers_evaluated,
             selected_worker_id,
-            reason: format!("{:?}", reason),
+            reason: audit_reason,
             classification_duration_us: request.classification_duration_us,
             selection_duration_us: duration.as_micros() as u64,
         };
@@ -1539,12 +1583,19 @@ impl WorkerSelector {
                                 reason_code,
                                 reason,
                             }) => {
-                                if reason_code == "admission_critical_pressure" {
+                                if matches!(
+                                    reason_code.as_str(),
+                                    "admission_critical_pressure" | "admission_disk_floor"
+                                ) {
                                     // Hard exclusion (not even fail-open fallback).
                                     Some((
                                         WorkerSelectionDiagnosticDecision::Deny,
-                                        format!("critical pressure: {reason}"),
-                                        "pressure.critical",
+                                        format!("disk admission rejected: {reason}"),
+                                        if reason_code == "admission_disk_floor" {
+                                            "pressure.disk_floor"
+                                        } else {
+                                            "pressure.critical"
+                                        },
                                     ))
                                 } else {
                                     // Non-critical reject: excluded from primary
@@ -2141,8 +2192,11 @@ impl WorkerSelector {
                             "reject",
                             admission_start.elapsed(),
                         );
-                        if reason_code.eq("admission_critical_pressure") {
-                            // Critical pressure: hard exclusion (not even in fallback)
+                        if matches!(
+                            reason_code.as_str(),
+                            "admission_critical_pressure" | "admission_disk_floor"
+                        ) {
+                            // Confirmed disk exhaustion: exclude from fallback too.
                             metrics::inc_reliability_error(
                                 "preflight_pressure",
                                 "critical_pressure",
@@ -7665,6 +7719,47 @@ mod tests {
         let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
         assert_eq!(result.reason, SelectionReason::NoWorkersPassedHealth);
+    }
+
+    #[tokio::test]
+    async fn test_daemon_admission_fallback_rechecks_disk_floor() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker_state(make_worker("worker1", 8, 90.0)).await;
+        let mut config = rch_common::RchConfig::default();
+        config.selection.min_free_gb = Some(40.0);
+        let selector = crate::daemon_worker_selector(
+            &config,
+            Arc::new(crate::history::BuildHistory::new(10)),
+            None,
+        );
+        selector.record_success("worker1", "project-a").await;
+        let request = SelectionRequest {
+            project: "project-a".to_string(),
+            estimated_cores: 1,
+            ..Default::default()
+        };
+        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+        // Unknown telemetry allows a healthy last-success worker.
+        assert_eq!(
+            selector
+                .try_fallback(&pool, &request, &HashSet::new())
+                .await,
+            Some("worker1".to_string())
+        );
+        worker
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                state: PressureState::Healthy,
+                disk_free_gb: Some(39.0),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(
+            selector
+                .try_fallback(&pool, &request, &HashSet::new())
+                .await,
+            None
+        );
     }
 
     #[tokio::test]
