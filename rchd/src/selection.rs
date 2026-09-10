@@ -7737,7 +7737,14 @@ mod tests {
         let request = SelectionRequest {
             project: "project-a".to_string(),
             estimated_cores: 1,
-            ..Default::default()
+            job_mode: false,
+            command: None,
+            command_priority: CommandPriority::Normal,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
         };
         let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
         // Unknown telemetry allows a healthy last-success worker.
