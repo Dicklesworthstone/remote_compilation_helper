@@ -172,6 +172,13 @@ impl GcRootSet {
     /// `/data/projects-old/x` is never attributed to `/data/projects`.
     /// Returns `None` for a path under no configured root — in practice a dir
     /// found under the worker-resolved temp base.
+    ///
+    /// NOTE: this matches the CONFIGURED spelling of each root. The remote
+    /// scripts canonicalize their root with `pwd -P` and report it back
+    /// (`stale_target_reap::parse_scan_roots`), so a caller holding those
+    /// resolved paths — `rch gc` does — must match against them with
+    /// [`path_is_under`] instead; a symlinked `remote_base` matches nothing
+    /// here.
     #[must_use]
     pub fn attribute<'a>(&'a self, path: &str) -> Option<&'a GcRoot> {
         self.roots
