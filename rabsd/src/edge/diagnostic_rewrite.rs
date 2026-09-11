@@ -338,6 +338,23 @@ mod tests {
     }
 
     #[test]
+    fn unused_dependency_notifications_preserve_their_structured_payload() {
+        // Current nightly Cargo requests --json=unused-externs-silent.
+        // This rustc notification has no diagnostic spans or artifact path;
+        // preserve its type, lint level, and dependency names for Cargo.
+        let notification = r#"{"$message_type":"unused_externs","lint_level":"warn","unused_names":["unused_dependency"]}"#;
+        let TranslationOutcome::Translated(translated) =
+            translate_structured_event(&mapping_for("/home/alice/proj"), notification)
+        else {
+            panic!("unused dependency notification must remain structured");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&translated).unwrap(),
+            serde_json::from_str::<serde_json::Value>(notification).unwrap()
+        );
+    }
+
+    #[test]
     fn cargo_compiler_artifact_is_translated_not_confused_with_rustc_notification() {
         // Cargo's outward message has "reason" (and may carry paths);
         // it is a translatable payload, never the verbatim-replay one.
