@@ -3259,6 +3259,114 @@ fn build_remediation_view(
     assemble(&inputs, now_ms)
 }
 
+/// The single most actionable issue for one worker, or `None` when it is fine.
+///
+/// Ordering is by *actionability*, not severity. The administrative axis
+/// (`Disabled` / `Drained`) is checked FIRST and deliberately suppresses every
+/// downstream signal, because on a worker the operator has taken out of service
+/// those signals are both expected and unfixable:
+///
+/// `TelemetryPoller::should_poll_worker` skips `AdminIntent::Drained |
+/// AdminIntent::Disabled` outright, so such a worker's telemetry ALWAYS decays
+/// into `PressureState::TelemetryGap`. Reporting that gap here used to mask the
+/// real reason and, worse, offered "wait for the next poll, or run `rch daemon
+/// restart`" as the fix — two things that provably cannot work: the poller
+/// never polls it, and an admin disable is persisted in `AdminDisableStore` and
+/// re-applied verbatim on daemon startup, so a restart reinstates it. That is
+/// precisely the confident-wrong remediation the TelemetryGap arm warns about
+/// (issue #16), reintroduced one branch further down.
+///
+/// Observed in the field: worker `hz3` was auto-quarantined with reason
+/// `e104-timeout-orphan-unverified` and then sat at `0/10` top-priority slots
+/// for ~18 h while `rch status` reported only "stale/missing pressure
+/// telemetry". The real fix is `rch workers enable <id>`, which also deletes
+/// the durable record.
+fn worker_issue(
+    worker_id: &str,
+    status: WorkerStatus,
+    circuit_state: CircuitState,
+    pressure_state: crate::disk_pressure::PressureState,
+    pressure_reason_code: &str,
+    disabled_reason: Option<&str>,
+) -> Option<Issue> {
+    // --- Administrative axis: deliberate, durable, and it silences the rest. ---
+    if status == WorkerStatus::Disabled {
+        let reason = disabled_reason.unwrap_or("no reason recorded");
+        return Some(Issue {
+            severity: "warning".to_string(),
+            summary: format!(
+                "Worker '{worker_id}' is administratively disabled ({reason}); its slots are withheld, it is not polled for telemetry, and the disable is durable — restarting the daemon re-applies it"
+            ),
+            remediation: Some(format!("rch workers enable {worker_id}")),
+        });
+    }
+    if status == WorkerStatus::Drained {
+        return Some(Issue {
+            severity: "warning".to_string(),
+            summary: format!(
+                "Worker '{worker_id}' is drained; its slots are withheld and it is not polled for telemetry"
+            ),
+            remediation: Some(format!("rch workers enable {worker_id}")),
+        });
+    }
+
+    // --- Eligibility axis. ---
+    if circuit_state == CircuitState::Open {
+        return Some(Issue {
+            severity: "error".to_string(),
+            summary: format!("Circuit open for worker '{worker_id}'"),
+            remediation: Some(format!("rch workers probe {worker_id} --force")),
+        });
+    }
+    if pressure_state == crate::disk_pressure::PressureState::Critical {
+        return Some(Issue {
+            severity: "error".to_string(),
+            summary: format!(
+                "Worker '{worker_id}' in critical pressure state ({pressure_reason_code})"
+            ),
+            remediation: Some(
+                "rch workers capabilities --refresh (inspect pressure metrics and ballast policy)"
+                    .to_string(),
+            ),
+        });
+    }
+    if pressure_state == crate::disk_pressure::PressureState::TelemetryGap {
+        return Some(Issue {
+            severity: "warning".to_string(),
+            summary: format!(
+                "Worker '{worker_id}' has stale/missing pressure telemetry ({pressure_reason_code})"
+            ),
+            // Telemetry ingest is daemon-driven: only the periodic
+            // TelemetryPoller (or worker piggyback) calls
+            // TelemetryStore::ingest(). No client-side `rch workers ...`
+            // subcommand can move an ACTIVE worker out of TelemetryGap; emitting
+            // one as a Fix would train agents to run confident-wrong
+            // commands (issue #16). Workers whose telemetry is stale *because*
+            // they are out of service are handled by the admin arms above.
+            remediation: Some(
+                "telemetry ingest is daemon-driven; wait for next poll (~poll-interval) or run `rch daemon restart` to force a fresh poll cycle"
+                    .to_string(),
+            ),
+        });
+    }
+    if status == WorkerStatus::Unreachable {
+        return Some(Issue {
+            severity: "error".to_string(),
+            summary: format!("Worker '{worker_id}' is unreachable"),
+            remediation: Some(format!("rch workers probe {worker_id}")),
+        });
+    }
+    if status == WorkerStatus::Degraded {
+        return Some(Issue {
+            severity: "warning".to_string(),
+            summary: format!("Worker '{worker_id}' is degraded (slow response)"),
+            remediation: None,
+        });
+    }
+
+    None
+}
+
 /// Full daemon status — the socket `/status` body. Also served over TCP by the
 /// tailnet API (`http_api::create_api_router`), so it is crate-visible.
 pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
@@ -3355,54 +3463,15 @@ pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatu
         });
 
         // Generate issues based on worker state
-        if circuit_state == CircuitState::Open {
-            issues.push(Issue {
-                severity: "error".to_string(),
-                summary: format!("Circuit open for worker '{}'", worker_id),
-                remediation: Some(format!("rch workers probe {} --force", worker_id)),
-            });
-        } else if pressure.state == crate::disk_pressure::PressureState::Critical {
-            issues.push(Issue {
-                severity: "error".to_string(),
-                summary: format!(
-                    "Worker '{}' in critical pressure state ({})",
-                    worker_id, pressure.reason_code
-                ),
-                remediation: Some(
-                    "rch workers capabilities --refresh (inspect pressure metrics and ballast policy)"
-                        .to_string(),
-                ),
-            });
-        } else if pressure.state == crate::disk_pressure::PressureState::TelemetryGap {
-            issues.push(Issue {
-                severity: "warning".to_string(),
-                summary: format!(
-                    "Worker '{}' has stale/missing pressure telemetry ({})",
-                    worker_id, pressure.reason_code
-                ),
-                // Telemetry ingest is daemon-driven: only the periodic
-                // TelemetryPoller (or worker piggyback) calls
-                // TelemetryStore::ingest(). No client-side `rch workers ...`
-                // subcommand can move a worker out of TelemetryGap; emitting
-                // one as a Fix would train agents to run confident-wrong
-                // commands (issue #16).
-                remediation: Some(
-                    "telemetry ingest is daemon-driven; wait for next poll (~poll-interval) or run `rch daemon restart` to force a fresh poll cycle"
-                        .to_string(),
-                ),
-            });
-        } else if status == WorkerStatus::Unreachable {
-            issues.push(Issue {
-                severity: "error".to_string(),
-                summary: format!("Worker '{}' is unreachable", worker_id),
-                remediation: Some(format!("rch workers probe {}", worker_id)),
-            });
-        } else if status == WorkerStatus::Degraded {
-            issues.push(Issue {
-                severity: "warning".to_string(),
-                summary: format!("Worker '{}' is degraded (slow response)", worker_id),
-                remediation: None,
-            });
+        if let Some(issue) = worker_issue(
+            &worker_id,
+            status,
+            circuit_state,
+            pressure.state,
+            &pressure.reason_code,
+            worker.disabled_reason().await.as_deref(),
+        ) {
+            issues.push(issue);
         }
     }
 
@@ -7513,5 +7582,233 @@ mod tests {
         let _guard = test_guard!();
         let result = parse_request("GET /repo-convergence/unknown");
         assert!(result.is_err(), "Unknown subpath should error");
+    }
+
+    // ------------------------------------------------------------------
+    // worker_issue: the admin axis must win over the telemetry gap it causes.
+    //
+    // Regression for the field incident where `hz3` sat at 0/10 top-priority
+    // slots for ~18 h while `rch status` reported only "stale/missing pressure
+    // telemetry" with a remediation ("wait for the next poll, or
+    // `rch daemon restart`") that could never work: the poller skips
+    // Drained/Disabled workers, and an admin disable is persisted and
+    // re-applied on startup.
+    // ------------------------------------------------------------------
+
+    /// A disabled worker whose telemetry has (inevitably) gone stale must
+    /// report the DISABLE, name its reason, and point at `rch workers enable` —
+    /// never the unreachable "wait for the next poll" advice.
+    #[test]
+    fn worker_issue_disabled_beats_the_telemetry_gap_it_causes() {
+        let _guard = test_guard!();
+        let issue = worker_issue(
+            "hz3",
+            WorkerStatus::Disabled,
+            CircuitState::Closed,
+            PressureState::TelemetryGap,
+            "telemetry_unavailable",
+            Some("e104-timeout-orphan-unverified: remote build process group not verified dead"),
+        )
+        .expect("a disabled worker must surface an issue");
+
+        assert_eq!(issue.severity, "warning");
+        assert!(
+            issue.summary.contains("administratively disabled"),
+            "summary must name the real cause, got: {}",
+            issue.summary
+        );
+        assert!(
+            issue.summary.contains("e104-timeout-orphan-unverified"),
+            "summary must carry the recorded disable reason, got: {}",
+            issue.summary
+        );
+        assert!(
+            !issue.summary.contains("stale/missing pressure telemetry"),
+            "the telemetry gap must not mask the disable, got: {}",
+            issue.summary
+        );
+
+        let fix = issue.remediation.expect("a disable is actionable");
+        assert!(
+            fix.contains("rch workers enable hz3"),
+            "must point at the only command that clears it, got: {fix}"
+        );
+        assert!(
+            !fix.contains("daemon restart"),
+            "a restart re-applies the durable disable; never suggest it here, got: {fix}"
+        );
+    }
+
+    /// Same bug class on the sibling admin state: `should_poll_worker` skips
+    /// `Drained` too, so it would have grown the identical phantom gap.
+    #[test]
+    fn worker_issue_drained_beats_the_telemetry_gap_it_causes() {
+        let _guard = test_guard!();
+        let issue = worker_issue(
+            "hz4",
+            WorkerStatus::Drained,
+            CircuitState::Closed,
+            PressureState::TelemetryGap,
+            "telemetry_unavailable",
+            None,
+        )
+        .expect("a drained worker must surface an issue");
+
+        assert_eq!(issue.severity, "warning");
+        assert!(issue.summary.contains("drained"), "got: {}", issue.summary);
+        assert!(
+            !issue.summary.contains("stale/missing pressure telemetry"),
+            "got: {}",
+            issue.summary
+        );
+        assert!(
+            issue
+                .remediation
+                .expect("drain is actionable")
+                .contains("rch workers enable hz4")
+        );
+    }
+
+    /// A disable with no recorded reason must still be reported, and must not
+    /// print an empty parenthetical.
+    #[test]
+    fn worker_issue_disabled_without_a_recorded_reason_is_still_explicit() {
+        let _guard = test_guard!();
+        let issue = worker_issue(
+            "omarchy",
+            WorkerStatus::Disabled,
+            CircuitState::Closed,
+            PressureState::Healthy,
+            "pressure_healthy",
+            None,
+        )
+        .expect("a disabled worker must surface an issue");
+        assert!(
+            issue.summary.contains("no reason recorded"),
+            "got: {}",
+            issue.summary
+        );
+    }
+
+    /// The admin axis also dominates an open circuit: probing a worker the
+    /// operator disabled cannot bring it back, so `--force` would be the same
+    /// confident-wrong advice.
+    #[test]
+    fn worker_issue_disabled_beats_an_open_circuit() {
+        let _guard = test_guard!();
+        let issue = worker_issue(
+            "wsurf",
+            WorkerStatus::Disabled,
+            CircuitState::Open,
+            PressureState::TelemetryGap,
+            "telemetry_unavailable",
+            Some("maintenance"),
+        )
+        .expect("issue expected");
+        assert!(
+            issue.summary.contains("administratively disabled"),
+            "got: {}",
+            issue.summary
+        );
+        assert!(
+            !issue.summary.contains("Circuit open"),
+            "got: {}",
+            issue.summary
+        );
+    }
+
+    /// The fix must NOT silence real telemetry gaps on workers that are still
+    /// in service — those keep the daemon-driven advice, which is correct there.
+    #[test]
+    fn worker_issue_active_worker_keeps_the_telemetry_gap_warning() {
+        let _guard = test_guard!();
+        let issue = worker_issue(
+            "vmi1264463",
+            WorkerStatus::Healthy,
+            CircuitState::Closed,
+            PressureState::TelemetryGap,
+            "disk_metrics_unavailable",
+            None,
+        )
+        .expect("an active worker in a telemetry gap must still warn");
+        assert!(
+            issue.summary.contains("stale/missing pressure telemetry"),
+            "got: {}",
+            issue.summary
+        );
+        assert!(
+            issue
+                .remediation
+                .expect("gap advice retained")
+                .contains("daemon-driven")
+        );
+    }
+
+    /// Untouched arms still behave: an open circuit and a critical-pressure
+    /// worker keep their original error-severity issues, and a healthy worker
+    /// reports nothing at all.
+    #[test]
+    fn worker_issue_preserves_the_pre_existing_arms() {
+        let _guard = test_guard!();
+        let circuit = worker_issue(
+            "w1",
+            WorkerStatus::Healthy,
+            CircuitState::Open,
+            PressureState::Healthy,
+            "pressure_healthy",
+            None,
+        )
+        .expect("issue expected");
+        assert_eq!(circuit.severity, "error");
+        assert!(circuit.summary.contains("Circuit open"));
+
+        let critical = worker_issue(
+            "w2",
+            WorkerStatus::Healthy,
+            CircuitState::Closed,
+            PressureState::Critical,
+            "disk_ratio_below_critical",
+            None,
+        )
+        .expect("issue expected");
+        assert_eq!(critical.severity, "error");
+        assert!(critical.summary.contains("critical pressure state"));
+
+        let unreachable = worker_issue(
+            "w3",
+            WorkerStatus::Unreachable,
+            CircuitState::Closed,
+            PressureState::Healthy,
+            "pressure_healthy",
+            None,
+        )
+        .expect("issue expected");
+        assert_eq!(unreachable.severity, "error");
+        assert!(unreachable.summary.contains("is unreachable"));
+
+        let degraded = worker_issue(
+            "w4",
+            WorkerStatus::Degraded,
+            CircuitState::Closed,
+            PressureState::Healthy,
+            "pressure_healthy",
+            None,
+        )
+        .expect("issue expected");
+        assert_eq!(degraded.severity, "warning");
+        assert!(degraded.remediation.is_none());
+
+        assert!(
+            worker_issue(
+                "w5",
+                WorkerStatus::Healthy,
+                CircuitState::Closed,
+                PressureState::Healthy,
+                "pressure_healthy",
+                None,
+            )
+            .is_none(),
+            "a healthy worker must report no issue"
+        );
     }
 }
