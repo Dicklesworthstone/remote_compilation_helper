@@ -1593,13 +1593,19 @@ preferred_workers = ["hz2", " vmi1264463 ", ""]
 #[test]
 fn test_parse_preferred_workers_from_toml_absent_or_malformed_is_empty() {
     let _guard = test_guard!();
-    assert!(command_parsing::parse_preferred_workers_from_toml("[general]\nenabled = true\n")
-        .is_empty());
-    assert!(command_parsing::parse_preferred_workers_from_toml("[routing]\nother = 1\n").is_empty());
-    assert!(command_parsing::parse_preferred_workers_from_toml(
-        "[routing]\npreferred_workers = \"hz2\"\n"
-    )
-    .is_empty());
+    assert!(
+        command_parsing::parse_preferred_workers_from_toml("[general]\nenabled = true\n")
+            .is_empty()
+    );
+    assert!(
+        command_parsing::parse_preferred_workers_from_toml("[routing]\nother = 1\n").is_empty()
+    );
+    assert!(
+        command_parsing::parse_preferred_workers_from_toml(
+            "[routing]\npreferred_workers = \"hz2\"\n"
+        )
+        .is_empty()
+    );
     assert!(command_parsing::parse_preferred_workers_from_toml("this is not toml {{{").is_empty());
     assert!(command_parsing::parse_preferred_workers_from_toml("").is_empty());
 }
