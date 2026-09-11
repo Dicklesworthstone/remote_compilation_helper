@@ -329,9 +329,10 @@ fn sealed_capture_refuses_special_nodes_lossy_paths_and_escaping_links() {
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::net::UnixListener;
 
-    let dir = tempfile::tempdir().unwrap();
-    let socket_root = dir.path().join("socket");
-    std::fs::create_dir(&socket_root).unwrap();
+    // Unix socket addresses have a small fixed path limit. RCH's isolated
+    // TMPDIR can exceed it before the fixture name is even appended.
+    let socket_dir = tempfile::tempdir_in("/tmp").unwrap();
+    let socket_root = socket_dir.path().to_path_buf();
     let _socket = UnixListener::bind(socket_root.join("node")).unwrap();
     assert!(matches!(
         capture_sealed_source(&[("root".into(), socket_root)], false, 1, 100),
@@ -341,6 +342,7 @@ fn sealed_capture_refuses_special_nodes_lossy_paths_and_escaping_links() {
         })
     ));
 
+    let dir = tempfile::tempdir().unwrap();
     let lossy_root = dir.path().join("lossy");
     std::fs::create_dir(&lossy_root).unwrap();
     std::fs::write(lossy_root.join(OsString::from_vec(vec![0xff])), "bytes").unwrap();
@@ -365,6 +367,30 @@ fn sealed_capture_refuses_special_nodes_lossy_paths_and_escaping_links() {
             ..
         })
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn sealed_capture_special_node_fixture_handles_long_tmpdir() {
+    let dir = tempfile::tempdir().unwrap();
+    let long_tmpdir = dir.path().join("long-tmpdir-".repeat(12));
+    std::fs::create_dir(&long_tmpdir).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "sealed_capture_refuses_special_nodes_lossy_paths_and_escaping_links",
+            "--nocapture",
+        ])
+        .env("TMPDIR", &long_tmpdir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "long-TMPDIR fixture failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
 }
 
 #[cfg(unix)]
