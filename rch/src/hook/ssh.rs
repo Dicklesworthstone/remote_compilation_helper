@@ -16,8 +16,8 @@
 //!   script builder `build_worker_projects_topology_cmd`.
 //! - `should_skip_remote_preflight` — the mock-mode gate that short-circuits all
 //!   remote preflight under test.
-//! - `build_remote_shell_command` — wraps a remote command as a single
-//!   `sh -lc '…'` argument.
+//! - `build_remote_shell_command` — quotes remote scripts for the login shell,
+//!   or directly starts the Windows stdin-script reader.
 //!
 //! Naming note: this is deliberately distinct from
 //! `commands::workers_setup::run_setup_ssh_command`, the simpler setup/probe
@@ -33,6 +33,7 @@
 //! shell-script builders stay private to this module.
 
 use super::*;
+use crate::transfer::WorkerPlatform;
 
 const MAX_OFFLOAD_SSH_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const REMOTE_SOURCE_AUTHORITY_LOCK_DIR: &str = "/tmp/rch-source-authority-locks";
@@ -196,7 +197,10 @@ pub(super) async fn acquire_remote_source_authority_lock(
     cmd.arg("-o").arg("ConnectTimeout=10");
     cmd.arg("-i").arg(identity_file.as_ref());
     cmd.arg(&destination);
-    cmd.arg(build_remote_shell_command(&remote_cmd));
+    cmd.arg(build_remote_shell_command(
+        WorkerPlatform::from_worker(worker),
+        &remote_cmd,
+    ));
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -340,7 +344,10 @@ async fn run_offload_ssh_command_with_optional_stdin(
     ));
     cmd.arg("-i").arg(identity_file.as_ref());
     cmd.arg(&destination);
-    cmd.arg(build_remote_shell_command(remote_cmd));
+    cmd.arg(build_remote_shell_command(
+        WorkerPlatform::from_worker(worker),
+        remote_cmd,
+    ));
     if stdin_payload.is_some() {
         cmd.stdin(Stdio::piped());
     } else {
@@ -417,7 +424,13 @@ async fn run_offload_ssh_command_with_optional_stdin(
     }
 }
 
-fn build_remote_shell_command(remote_cmd: &str) -> String {
+fn build_remote_shell_command(platform: WorkerPlatform, remote_cmd: &str) -> String {
+    // The Windows control-plane script is carried on stdin. Its fixed reader
+    // needs no quoting or login initialization; that extra startup can exhaust
+    // the dependency probe budget before the file checks run.
+    if platform.is_windows() && remote_cmd == "sh -s" {
+        return remote_cmd.to_string();
+    }
     format!("sh -lc {}", shell_escape::escape(remote_cmd.into()))
 }
 
@@ -1118,7 +1131,7 @@ mod tests {
         let _guard = test_guard!();
         let command = "missing=0; if [ \"$missing\" -ne 0 ]; then echo 'bad'; fi";
 
-        let wrapped = build_remote_shell_command(command);
+        let wrapped = build_remote_shell_command(WorkerPlatform::Posix, command);
 
         assert!(wrapped.starts_with("sh -lc "));
         assert!(
@@ -1132,6 +1145,26 @@ mod tests {
         assert!(
             wrapped.contains("if ["),
             "wrapped command should preserve the full script"
+        );
+    }
+
+    #[test]
+    fn test_windows_stdin_reader_avoids_login_but_scripts_remain_quoted() {
+        let _guard = test_guard!();
+        let script = "printf '%s\\n' 'C:/rch/a b/Cargo.toml'; exit 43";
+
+        assert_eq!(
+            build_remote_shell_command(WorkerPlatform::Windows, "sh -s"),
+            "sh -s"
+        );
+        assert_eq!(
+            build_remote_shell_command(WorkerPlatform::Windows, script),
+            format!("sh -lc {}", shell_escape::escape(script.into()))
+        );
+
+        assert_eq!(
+            build_remote_shell_command(WorkerPlatform::Posix, "sh -s"),
+            "sh -lc 'sh -s'"
         );
     }
 
