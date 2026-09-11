@@ -1006,6 +1006,19 @@ async fn execute_benchmark_on_worker(
     worker: &rch_common::WorkerConfig,
     timeout: Duration,
 ) -> anyhow::Result<(SpeedScore, Duration)> {
+    let (command, input) = benchmark_ssh_command(worker, timeout);
+    debug!(
+        worker_id = %worker.id,
+        host = %worker.host,
+        "Executing benchmark via SSH"
+    );
+    execute_benchmark_process(command, input, timeout).await
+}
+
+fn benchmark_ssh_command(
+    worker: &rch_common::WorkerConfig,
+    timeout: Duration,
+) -> (tokio::process::Command, Option<String>) {
     use tokio::process::Command;
 
     // Expand tilde in identity file path
@@ -1019,8 +1032,6 @@ async fn execute_benchmark_on_worker(
         worker.identity_file.clone()
     };
 
-    let start = std::time::Instant::now();
-
     // Build SSH command to run benchmark on worker
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
@@ -1029,7 +1040,23 @@ async fn execute_benchmark_on_worker(
         .arg(format!("ConnectTimeout={}", timeout.as_secs().min(30)));
     cmd.arg("-i").arg(&identity_file);
     cmd.arg(format!("{}@{}", worker.user, worker.host));
-    cmd.arg("~/.local/bin/rch-wkr benchmark --json");
+    let remote =
+        rch_common::ssh::remote_shell_command(worker, "~/.local/bin/rch-wkr benchmark --json");
+    cmd.arg(remote.command);
+    (cmd, remote.stdin_script)
+}
+
+async fn execute_benchmark_process(
+    mut cmd: tokio::process::Command,
+    input: Option<String>,
+    timeout: Duration,
+) -> anyhow::Result<(SpeedScore, Duration)> {
+    let start = std::time::Instant::now();
+    cmd.stdin(if input.is_some() {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    });
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     // Defense in depth: if the surrounding task is dropped mid-flight (e.g.
@@ -1038,12 +1065,6 @@ async fn execute_benchmark_on_worker(
     // `child.kill().await` calls below cover the timeout/IO error paths;
     // `kill_on_drop` covers the panic-unwind/cancellation paths.
     cmd.kill_on_drop(true);
-
-    debug!(
-        worker_id = %worker.id,
-        host = %worker.host,
-        "Executing benchmark via SSH"
-    );
 
     let mut child = cmd
         .spawn()
@@ -1056,6 +1077,7 @@ async fn execute_benchmark_on_worker(
         .stderr
         .take()
         .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr from SSH command"))?;
+    let stdin = child.stdin.take();
 
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
@@ -1069,7 +1091,13 @@ async fn execute_benchmark_on_worker(
         let mut stderr_limited = stderr.take(MAX_BENCHMARK_OUTPUT);
         let t1 = stdout_limited.read_to_end(&mut stdout_buf);
         let t2 = stderr_limited.read_to_end(&mut stderr_buf);
-        tokio::try_join!(t1, t2)
+        let write_input = async {
+            if let (Some(stdin), Some(input)) = (stdin, input) {
+                rch_common::ssh::write_ssh_command_stdin(stdin, &input).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        tokio::try_join!(t1, t2, write_input)
     };
 
     // Wait for output or timeout
@@ -1265,6 +1293,166 @@ mod tests {
             total_slots: 4,
             priority: 100,
             tags: vec![],
+        }
+    }
+
+    #[test]
+    fn test_benchmark_ssh_command_keeps_posix_command_out_of_windows_argv() {
+        for os in ["linux", "Windows"] {
+            let mut worker = make_worker_config("worker-1");
+            worker.tags = vec![rch_common::types::os_tag(os)];
+            worker.identity_file = "/private/key with spaces".into();
+            let (command, input) = benchmark_ssh_command(&worker, Duration::from_secs(300));
+            let argv: Vec<_> = command.as_std().get_args().collect();
+            assert_eq!(command.as_std().get_program(), "ssh");
+            assert!(argv.contains(&std::ffi::OsStr::new("ConnectTimeout=30")));
+            assert!(argv.contains(&std::ffi::OsStr::new("/private/key with spaces")));
+            assert_eq!(argv[argv.len() - 2], "test@localhost");
+            if os == "linux" {
+                assert_eq!(
+                    argv.last().copied(),
+                    Some(std::ffi::OsStr::new(
+                        "~/.local/bin/rch-wkr benchmark --json"
+                    ))
+                );
+                assert!(input.is_none());
+            } else {
+                assert_eq!(argv.last().copied(), Some(std::ffi::OsStr::new("sh -s")));
+                assert!(
+                    input
+                        .as_deref()
+                        .unwrap()
+                        .contains("rch-wkr benchmark --json")
+                );
+                assert!(
+                    argv.iter()
+                        .all(|arg| !arg.to_string_lossy().contains("rch-wkr"))
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_benchmark_process_executes_both_shell_transports_and_parses_components() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // This is a real executable protocol fixture, not a worker performance
+        // measurement. The separate native canary exercises Windows OpenSSH.
+        let home = tempfile::Builder::new()
+            .prefix("rch benchmark & ")
+            .tempdir()
+            .unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let worker_program = bin.join("rch-wkr");
+        std::fs::write(
+            &worker_program,
+            "#!/bin/sh\n[ \"$*\" = 'benchmark --json' ] || exit 23\nif read -r value; then exit 24; fi\nprintf '%s\\n' '{\"score\":72.5,\"components\":{\"cpu\":81,\"memory\":64,\"disk\":57,\"network\":45,\"compilation\":79}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&worker_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for os in ["linux", "windows"] {
+            let mut worker = make_worker_config("worker-1");
+            worker.tags = vec![rch_common::types::os_tag(os)];
+            let (ssh, input) = benchmark_ssh_command(&worker, Duration::from_secs(5));
+            let mut shell = tokio::process::Command::new("sh");
+            shell
+                .arg("-c")
+                .arg(ssh.as_std().get_args().last().unwrap())
+                .env("HOME", home.path());
+            let (score, _) = execute_benchmark_process(shell, input, Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert!((score.total - 72.5).abs() < f64::EPSILON);
+            assert!((score.cpu_score - 81.0).abs() < f64::EPSILON);
+            assert!((score.memory_score - 64.0).abs() < f64::EPSILON);
+            assert!((score.disk_score - 57.0).abs() < f64::EPSILON);
+            assert!((score.network_score - 45.0).abs() < f64::EPSILON);
+            assert!((score.compilation_score - 79.0).abs() < f64::EPSILON);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_benchmark_process_preserves_early_exit_and_rejects_invalid_output() {
+        let mut failure = tokio::process::Command::new("sh");
+        failure.args(["-c", "printf '%s' 'worker diagnostic' >&2; exit 37"]);
+        // More than a pipe buffer forces the writer to encounter a closed
+        // stdin. The remote exit and diagnostic must still be returned.
+        let error = execute_benchmark_process(
+            failure,
+            Some("x".repeat(1024 * 1024)),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("37"), "{error}");
+        assert!(error.contains("worker diagnostic"), "{error}");
+
+        let mut invalid = tokio::process::Command::new("sh");
+        invalid.args(["-c", "printf '%s' 'not a benchmark result'"]);
+        let error = execute_benchmark_process(invalid, None, Duration::from_secs(5))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Failed to parse benchmark score"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_benchmark_process_timeout_and_cancellation_reap_owned_child() {
+        for cancel in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("child.pid");
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    "printf '%s' \"$$\" > \"$1\"; exec sleep 30",
+                    "benchmark-child",
+                ])
+                .arg(&pid_file);
+            let timeout = if cancel {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_secs(1)
+            };
+            // The child never reads stdin: cancel while the new script writer
+            // is blocked, as well as while both output readers are waiting.
+            let task = tokio::spawn(execute_benchmark_process(
+                command,
+                Some("x".repeat(1024 * 1024)),
+                timeout,
+            ));
+            let pid = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                        && let Ok(pid) = contents.parse::<u32>()
+                    {
+                        break pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("owned child must report its PID");
+            if cancel {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                let error = task.await.unwrap().unwrap_err().to_string();
+                assert!(error.contains("Benchmark timed out"), "{error}");
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("owned foreground child must be killed and reaped");
         }
     }
 

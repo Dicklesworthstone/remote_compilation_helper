@@ -717,6 +717,40 @@ pub(crate) fn prefers_system_ssh(config: &WorkerConfig) -> bool {
     declared_os(&config.tags).as_deref() == Some("windows")
 }
 
+/// Remote command and optional stdin payload for a system SSH invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteShellCommand {
+    /// Command argument passed to SSH after the destination.
+    pub command: String,
+    /// Script to write and close concurrently with draining stdout/stderr.
+    /// When absent, the caller should provide null stdin.
+    pub stdin_script: Option<String>,
+}
+
+/// Prepare a POSIX script without exposing its contents to Windows cmd.exe.
+/// Windows uses a fixed `sh -s` reader, which replaces itself with a command
+/// shell whose stdin is empty. An exact `sh -s` keeps its existing EOF behavior.
+/// POSIX workers receive the original command argument and null stdin.
+#[must_use]
+pub fn remote_shell_command(config: &WorkerConfig, command: &str) -> RemoteShellCommand {
+    if prefers_system_ssh(config) {
+        RemoteShellCommand {
+            command: "sh -s".into(),
+            stdin_script: (command != "sh -s").then(|| {
+                format!(
+                    "exec sh -c {} </dev/null\n",
+                    shell_escape::escape(command.into())
+                )
+            }),
+        }
+    } else {
+        RemoteShellCommand {
+            command: command.into(),
+            stdin_script: None,
+        }
+    }
+}
+
 /// Build the argv for the system-ssh fallback, mirroring the proven CLI
 /// system-ssh pattern (see `rch/src/fleet/ssh.rs::SshExecutor::build_ssh_args`
 /// and `rch/src/commands/workers_init.rs`). Pure / testable: no process is
@@ -742,7 +776,7 @@ pub(crate) fn prefers_system_ssh(config: &WorkerConfig) -> bool {
 /// travels through stdin so cmd.exe never interprets its contents.
 pub(crate) fn system_ssh_argv(
     config: &WorkerConfig,
-    command: &str,
+    command: &RemoteShellCommand,
     server_alive_interval: Duration,
 ) -> Vec<OsString> {
     let identity_path = shellexpand::tilde(&config.identity_file);
@@ -767,27 +801,17 @@ pub(crate) fn system_ssh_argv(
         argv.push(OsString::from(format!("ServerAliveInterval={secs}")));
     }
     argv.push(OsString::from(destination));
-    argv.push(OsString::from(if prefers_system_ssh(config) {
-        "sh -s"
-    } else {
-        command
-    }));
+    argv.push(OsString::from(&command.command));
     argv
 }
 
-/// Carry the command through POSIX stdin rather than Windows command-line
-/// quoting. The reader replaces itself with the command shell, whose stdin
-/// remains empty as on the openssh execution path.
-fn system_ssh_stdin(config: &WorkerConfig, command: &str) -> Option<String> {
-    (prefers_system_ssh(config) && command != "sh -s").then(|| {
-        format!(
-            "exec sh -c {} </dev/null\n",
-            shell_escape::escape(command.into())
-        )
-    })
-}
-
-async fn write_system_ssh_stdin(
+/// Write and close an SSH script pipe within the caller's execution deadline.
+/// Run concurrently with output draining. A closed pipe is allowed so the
+/// caller can collect an early SSH failure's actual exit status and stderr.
+///
+/// # Errors
+/// Returns write or shutdown errors other than an expected broken pipe.
+pub async fn write_ssh_command_stdin(
     mut stdin: tokio::process::ChildStdin,
     input: &str,
 ) -> std::io::Result<()> {
@@ -830,8 +854,9 @@ pub(crate) async fn system_ssh_execute(
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
-    let argv = system_ssh_argv(config, command, server_alive_interval);
-    let input = system_ssh_stdin(config, command);
+    let prepared = remote_shell_command(config, command);
+    let argv = system_ssh_argv(config, &prepared, server_alive_interval);
+    let input = prepared.stdin_script;
     // Drop the program name — `Command::new("ssh")` is the standard form.
     let args = argv.into_iter().skip(1);
 
@@ -868,7 +893,7 @@ pub(crate) async fn system_ssh_execute(
 
         let stdin_fut = async {
             if let (Some(stdin), Some(input)) = (stdin, input) {
-                write_system_ssh_stdin(stdin, &input).await?;
+                write_ssh_command_stdin(stdin, &input).await?;
             }
             Ok::<(), anyhow::Error>(())
         };
@@ -1922,7 +1947,8 @@ mod tests {
         // flag, and carries the keepalive when non-zero.
         let _guard = test_guard!();
         let cfg = windows_worker("wsurf");
-        let argv = system_ssh_argv(&cfg, "uname -a", Duration::from_secs(2));
+        let command = remote_shell_command(&cfg, "uname -a");
+        let argv = system_ssh_argv(&cfg, &command, Duration::from_secs(2));
         let s: Vec<String> = argv
             .iter()
             .map(|o| o.to_string_lossy().into_owned())
@@ -1957,16 +1983,15 @@ mod tests {
         let linux = worker_config("linux", "1.2.3.4", "root", "~/.ssh/id_rsa");
         let windows = windows_worker("windows");
         let script = "printf '%s\\n' '%PATH% !VAR! & | < > ^ $()'\nprintf done";
-        let argv = system_ssh_argv(&linux, script, Duration::ZERO);
+        let prepared = remote_shell_command(&linux, script);
+        let argv = system_ssh_argv(&linux, &prepared, Duration::ZERO);
         assert_eq!(argv.last().unwrap(), script);
-        assert!(system_ssh_stdin(&linux, script).is_none());
+        assert!(prepared.stdin_script.is_none());
         for command in [script, "sh -s", "", "sh -s\n"] {
-            let argv = system_ssh_argv(&windows, command, Duration::ZERO);
+            let prepared = remote_shell_command(&windows, command);
+            let argv = system_ssh_argv(&windows, &prepared, Duration::ZERO);
             assert_eq!(argv.last().unwrap(), "sh -s");
-            assert_eq!(
-                system_ssh_stdin(&windows, command).is_none(),
-                command == "sh -s"
-            );
+            assert_eq!(prepared.stdin_script.is_none(), command == "sh -s");
         }
     }
 
@@ -2002,10 +2027,10 @@ mod tests {
                 .spawn()
                 .unwrap();
             let stdin = child.stdin.take().unwrap();
-            let payload = system_ssh_stdin(&config, script).unwrap();
+            let payload = remote_shell_command(&config, script).stdin_script.unwrap();
             let (written, observed) = tokio::time::timeout(Duration::from_secs(5), async {
                 tokio::join!(
-                    write_system_ssh_stdin(stdin, &payload),
+                    write_ssh_command_stdin(stdin, &payload),
                     child.wait_with_output()
                 )
             })
@@ -2026,7 +2051,9 @@ mod tests {
 
         let _guard = test_guard!();
         let script = "cat\nprintf 'AFTER\\n'\nread value || printf 'EMPTY\\n'";
-        let payload = system_ssh_stdin(&windows_worker("windows"), script).unwrap();
+        let payload = remote_shell_command(&windows_worker("windows"), script)
+            .stdin_script
+            .unwrap();
         let split = payload.find("cat\n").unwrap() + "cat\n".len();
         let mut child = tokio::process::Command::new("sh")
             .arg("-s")
@@ -2071,7 +2098,7 @@ mod tests {
         // Force the pipe closed before writing; a tiny concurrent payload
         // could fit in the buffer and accidentally miss BrokenPipe coverage.
         child.wait().await.unwrap();
-        write_system_ssh_stdin(stdin, &"x".repeat(128 * 1024))
+        write_ssh_command_stdin(stdin, &"x".repeat(128 * 1024))
             .await
             .unwrap();
         let output = child.wait_with_output().await.unwrap();
@@ -2087,7 +2114,8 @@ mod tests {
         // calls for omitting the flag entirely at 0).
         let _guard = test_guard!();
         let cfg = windows_worker("wsurf");
-        let argv = system_ssh_argv(&cfg, "echo hi", Duration::from_secs(0));
+        let command = remote_shell_command(&cfg, "echo hi");
+        let argv = system_ssh_argv(&cfg, &command, Duration::from_secs(0));
         let s: Vec<String> = argv
             .iter()
             .map(|o| o.to_string_lossy().into_owned())
@@ -2106,7 +2134,8 @@ mod tests {
         // pool applies for warm masters.
         let _guard = test_guard!();
         let cfg = windows_worker("wsurf");
-        let argv = system_ssh_argv(&cfg, "true", Duration::from_secs(60));
+        let command = remote_shell_command(&cfg, "true");
+        let argv = system_ssh_argv(&cfg, &command, Duration::from_secs(60));
         let s: Vec<String> = argv
             .iter()
             .map(|o| o.to_string_lossy().into_owned())
@@ -2123,7 +2152,8 @@ mod tests {
         let _guard = test_guard!();
         let mut cfg = windows_worker("wsurf");
         cfg.identity_file = "~/.ssh/operator_key".to_string();
-        let argv = system_ssh_argv(&cfg, "true", Duration::from_secs(2));
+        let command = remote_shell_command(&cfg, "true");
+        let argv = system_ssh_argv(&cfg, &command, Duration::from_secs(2));
         let s: Vec<String> = argv
             .iter()
             .map(|o| o.to_string_lossy().into_owned())

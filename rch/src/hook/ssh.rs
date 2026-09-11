@@ -171,6 +171,25 @@ fn build_remote_source_authority_lock_cmd(
     ))
 }
 
+fn source_authority_lock_transport(
+    platform: WorkerPlatform,
+    remote_cmd: &str,
+) -> (String, Option<String>) {
+    if platform.is_windows() {
+        // Unlike one-shot commands, the lock holder MUST retain this input
+        // pipe: its cat waits for EOF before releasing the source locks.
+        (
+            "sh -s".into(),
+            Some(format!(
+                "exec sh -c {}\n",
+                shell_escape::escape(remote_cmd.into())
+            )),
+        )
+    } else {
+        (build_remote_shell_command(platform, remote_cmd), None)
+    }
+}
+
 /// Acquire sorted, worker-side locks for every mutable canonical source root.
 /// One persistent SSH session owns the whole set, so separate coordinator
 /// processes cannot overwrite any member of a Cargo closure while it compiles.
@@ -180,7 +199,6 @@ pub(super) async fn acquire_remote_source_authority_lock(
     wait_timeout: Duration,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
     use anyhow::Context as _;
-    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
 
     let lock_paths = source_authority_lock_paths(authority_roots);
     let ready_marker = format!("RCH_SOURCE_AUTHORITY_READY:{}", uuid::Uuid::new_v4());
@@ -197,19 +215,37 @@ pub(super) async fn acquire_remote_source_authority_lock(
     cmd.arg("-o").arg("ConnectTimeout=10");
     cmd.arg("-i").arg(identity_file.as_ref());
     cmd.arg(&destination);
-    cmd.arg(build_remote_shell_command(
-        WorkerPlatform::from_worker(worker),
-        &remote_cmd,
-    ));
+    let (remote_arg, stdin_bootstrap) =
+        source_authority_lock_transport(WorkerPlatform::from_worker(worker), &remote_cmd);
+    cmd.arg(remote_arg);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .with_context(|| format!("failed to start source-authority lock on {destination}"))?;
-    let stdin = child
+    finish_source_authority_lock_acquisition(
+        child,
+        worker.id.clone(),
+        &ready_marker,
+        stdin_bootstrap.as_deref(),
+        wait_timeout,
+    )
+    .await
+}
+
+async fn finish_source_authority_lock_acquisition(
+    mut child: tokio::process::Child,
+    worker_id: WorkerId,
+    ready_marker: &str,
+    stdin_bootstrap: Option<&str>,
+    wait_timeout: Duration,
+) -> anyhow::Result<RemoteSourceAuthorityLock> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut stdin = child
         .stdin
         .take()
         .ok_or_else(|| anyhow::anyhow!("source-authority lock stdin was not piped"))?;
@@ -229,53 +265,73 @@ pub(super) async fn acquire_remote_source_authority_lock(
             .await?;
         Ok(bytes)
     });
+    // Own cleanup before any fallible write/read: timeout, cancellation and
+    // invalid readiness must not detach the drain or leave a lock holder.
+    let mut guard = RemoteSourceAuthorityLock {
+        worker_id,
+        child: Some(child),
+        stdin: None,
+        stdout_drain: None,
+        stderr_drain: Some(stderr_drain),
+    };
 
     let mut observed = String::new();
-    match timeout(wait_timeout, stdout.read_line(&mut observed)).await {
-        Ok(Ok(0)) => {
+    let acquisition = async {
+        let write_bootstrap = async {
+            if let Some(bootstrap) = stdin_bootstrap {
+                stdin.write_all(bootstrap.as_bytes()).await?;
+                stdin.flush().await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        tokio::try_join!(write_bootstrap, stdout.read_line(&mut observed))
+    };
+    let failure = match timeout(wait_timeout, acquisition).await {
+        Ok(Ok(((), 0))) => Some(format!(
+            "source-authority lock on {} exited before acquisition",
+            guard.worker_id
+        )),
+        Ok(Ok(((), _))) if observed.trim_end() == ready_marker => None,
+        Ok(Ok(((), _))) => Some(format!(
+            "source-authority lock on {} emitted an invalid ready marker: {:?}",
+            guard.worker_id,
+            observed.trim_end()
+        )),
+        Ok(Err(err)) => Some(format!(
+            "failed writing source-authority lock bootstrap or reading readiness on {}: {err}",
+            guard.worker_id
+        )),
+        Err(_) => Some(format!(
+            "timed out waiting {:?} for source-authority locks on {}",
+            wait_timeout, guard.worker_id
+        )),
+    };
+    if let Some(failure) = failure {
+        drop(stdin);
+        if let Some(child) = guard.child.as_mut() {
             let _ = child.start_kill();
-            let stderr = join_lock_drain(Some(stderr_drain)).await?;
-            anyhow::bail!(
-                "source-authority lock on {} exited before acquisition; stderr={}",
-                worker.id,
-                String::from_utf8_lossy(&stderr).trim()
-            );
+            let _ = timeout(Duration::from_secs(1), child.wait()).await;
         }
-        Ok(Ok(_)) if observed.trim_end() == ready_marker => {}
-        Ok(Ok(_)) => {
-            let _ = child.start_kill();
-            anyhow::bail!(
-                "source-authority lock on {} emitted an invalid ready marker: {:?}",
-                worker.id,
-                observed.trim_end()
-            );
-        }
-        Ok(Err(err)) => {
-            let _ = child.start_kill();
-            return Err(err).context("failed reading source-authority lock readiness");
-        }
-        Err(_) => {
-            let _ = child.start_kill();
-            anyhow::bail!(
-                "timed out waiting {:?} for source-authority locks on {}",
-                wait_timeout,
-                worker.id
-            );
-        }
+        let stderr = if let Some(task) = guard.stderr_drain.as_mut() {
+            match timeout(Duration::from_secs(1), task).await {
+                Ok(Ok(Ok(bytes))) => String::from_utf8_lossy(&bytes).trim().to_string(),
+                Ok(Ok(Err(err))) => format!("stderr read failed: {err}"),
+                Ok(Err(err)) => format!("stderr task failed: {err}"),
+                Err(_) => "stderr drain did not finish before cleanup deadline".into(),
+            }
+        } else {
+            String::new()
+        };
+        anyhow::bail!("{failure}; stderr={stderr}");
     }
 
-    let stdout_drain = tokio::spawn(async move {
+    guard.stdin = Some(stdin);
+    guard.stdout_drain = Some(tokio::spawn(async move {
         let mut bytes = Vec::new();
         stdout.read_to_end(&mut bytes).await?;
         Ok(bytes)
-    });
-    Ok(RemoteSourceAuthorityLock {
-        worker_id: worker.id.clone(),
-        child: Some(child),
-        stdin: Some(stdin),
-        stdout_drain: Some(stdout_drain),
-        stderr_drain: Some(stderr_drain),
-    })
+    }));
+    Ok(guard)
 }
 
 pub(super) fn should_skip_remote_preflight(worker: &WorkerConfig) -> bool {
@@ -912,6 +968,231 @@ mod tests {
                 .expect("wait for second lock holder")
                 .success()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn local_source_lock_transport(
+        platform: WorkerPlatform,
+        script: &str,
+    ) -> (tokio::process::Child, Option<String>) {
+        let (remote_arg, bootstrap) = source_authority_lock_transport(platform, script);
+        if platform.is_windows() {
+            assert_eq!(remote_arg, "sh -s");
+            assert!(bootstrap.is_some());
+        } else {
+            assert_eq!(remote_arg, build_remote_shell_command(platform, script));
+            assert!(bootstrap.is_none());
+        }
+        // Actual POSIX reader/flock processes exercise the production stdin
+        // and guard path. This does not emulate or claim native Windows SSH.
+        let child = Command::new("sh")
+            .args(["-c", &format!("exec {remote_arg}")])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn source lock transport");
+        (child, bootstrap)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn windows_source_lock_bootstrap_preserves_exclusion_eof_and_drop_release() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let locks = vec![
+            dir.path()
+                .join("quote' %!& lock")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        let marker = "READY ' \" % ! & $()";
+        let script = build_remote_source_authority_lock_cmd(root, &locks, marker).unwrap();
+        let (child, bootstrap) = local_source_lock_transport(WorkerPlatform::Windows, &script);
+        let mut first = finish_source_authority_lock_acquisition(
+            child,
+            WorkerId::new("windows-reader"),
+            marker,
+            bootstrap.as_deref(),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        first.ensure_held().unwrap();
+
+        let (child, bootstrap) = local_source_lock_transport(WorkerPlatform::Posix, &script);
+        let mut competing = Box::pin(finish_source_authority_lock_acquisition(
+            child,
+            WorkerId::new("posix-reader"),
+            marker,
+            bootstrap.as_deref(),
+            Duration::from_secs(3),
+        ));
+        assert!(
+            timeout(Duration::from_millis(100), &mut competing)
+                .await
+                .is_err()
+        );
+        first.ensure_held().unwrap();
+        first.release().await.unwrap();
+        let mut second = competing.await.unwrap();
+        second.ensure_held().unwrap();
+        drop(second);
+
+        // Guard cancellation must close the inherited pipe as well: a fresh
+        // Windows bootstrap acquires the same lock after the dropped owner.
+        let (child, bootstrap) = local_source_lock_transport(WorkerPlatform::Windows, &script);
+        let mut third = finish_source_authority_lock_acquisition(
+            child,
+            WorkerId::new("windows-after-drop"),
+            marker,
+            bootstrap.as_deref(),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        third.ensure_held().unwrap();
+        third.release().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn windows_source_lock_bootstrap_failures_keep_stderr_and_reap_child() {
+        let _guard = test_guard!();
+        for (script, expected) in [
+            (
+                "printf 'lock refused\\n' >&2; exit 37",
+                "exited before acquisition",
+            ),
+            (
+                "printf 'lock refused\\n' >&2; printf 'WRONG\\n'; exec cat",
+                "invalid ready marker",
+            ),
+        ] {
+            let (child, bootstrap) = local_source_lock_transport(WorkerPlatform::Windows, script);
+            let pid = child.id().unwrap();
+            let result = finish_source_authority_lock_acquisition(
+                child,
+                WorkerId::new("windows-failure"),
+                "READY",
+                bootstrap.as_deref(),
+                Duration::from_secs(3),
+            )
+            .await;
+            let error = match result {
+                Ok(_) => panic!("invalid holder must fail acquisition"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(expected), "{error}");
+            assert!(error.contains("lock refused"), "{error}");
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists(),
+                "owned child must be reaped"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_lock_bootstrap_and_readiness_share_deadline_and_reap_timeout() {
+        let _guard = test_guard!();
+        // A write larger than the pipe cannot finish until the first delay;
+        // readiness follows a second delay. Each is below the one deadline,
+        // but their sum exceeds it, catching a reset between write and read.
+        let script = format!(
+            "{}\nsleep 0.15; printf 'READY\\n'; exec cat",
+            "#pad\n".repeat(18 * 1024)
+        );
+        let (_, bootstrap) = source_authority_lock_transport(WorkerPlatform::Windows, &script);
+        let child = Command::new("sh")
+            .args(["-c", "sleep 0.15; exec sh -s"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let result = finish_source_authority_lock_acquisition(
+            child,
+            WorkerId::new("windows-deadline"),
+            "READY",
+            bootstrap.as_deref(),
+            Duration::from_millis(250),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("combined write/readiness deadline must not reset"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("timed out waiting"), "{error}");
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_lock_bootstrap_write_is_bounded_when_child_never_reads() {
+        let _guard = test_guard!();
+        let child = Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let bootstrap = "x".repeat(1024 * 1024);
+        let result = finish_source_authority_lock_acquisition(
+            child,
+            WorkerId::new("blocked-writer"),
+            "READY",
+            Some(&bootstrap),
+            Duration::from_millis(100),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("blocked bootstrap writer must time out"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("timed out waiting"), "{error}");
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+
+        let child = Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let mut acquisition = Box::pin(finish_source_authority_lock_acquisition(
+            child,
+            WorkerId::new("cancelled-writer"),
+            "READY",
+            Some(&bootstrap),
+            Duration::from_secs(60),
+        ));
+        // Poll the real acquisition while its large write and readiness are
+        // pending. Cancelling an unpolled future would miss the drain/guard
+        // ownership established inside the acquisition function.
+        assert!(
+            timeout(Duration::from_millis(50), &mut acquisition)
+                .await
+                .is_err()
+        );
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        drop(acquisition);
+        timeout(Duration::from_secs(2), async {
+            while Path::new(&format!("/proc/{pid}")).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled acquisition must kill and reap its owned child");
     }
 
     #[cfg(target_os = "linux")]
