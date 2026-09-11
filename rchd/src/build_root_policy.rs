@@ -5,7 +5,7 @@
 //! tiny root filesystem, then exhausting RAM or disk mid-compile. The remote
 //! execution path already keeps caches off tmpfs `/tmp` via a shell prelude
 //! (`$TMPDIR → /data/tmp → /tmp`, see
-//! [`rch_common::gc_roots::remote_cargo_home_base_prelude`]), but
+//! [`rch_common::remote_compilation::remote_cargo_home_base_prelude`]), but
 //! that heuristic is unexplained and does not consider free space or inodes.
 //!
 //! This module adds a structured, **explainable** policy the daemon applies
