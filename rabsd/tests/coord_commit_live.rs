@@ -335,6 +335,44 @@ fn speculative_and_foreground_submissions_share_one_real_process_in_both_orders(
                 .is_empty(),
             "raw process output was never committed as a cache result"
         );
+        assert!(coord.retire_finished_action(&first.action_key).unwrap());
+        assert!(matches!(
+            coord.renew_attempt_lease(
+                &attempt,
+                rabs_protocol::generation::LeaseRenewal {
+                    lease: attempt.execution_lease_id,
+                    seq: rabs_protocol::generation::LeaseRenewalSeq(1),
+                },
+                i64::MAX as u64,
+            ),
+            Err(rabsd::coord::live::AttemptLeaseRefusal::Store(
+                rabs_cas::metadata_store::StoreError::GenerationTombstoned
+            ))
+        ));
+        let resubmitted = coord
+            .submit_action(
+                submission_from_source(Arc::clone(&original)),
+                submission_join(4, SubscriberKind::ForegroundAgent),
+                now_micros(),
+                0,
+            )
+            .unwrap();
+        assert!(resubmitted.actor_created);
+        assert_eq!(resubmitted.action_key, first.action_key);
+        {
+            let mut next = coord.next_action_dispatch().unwrap().unwrap();
+            let admitted = next.begin(&worker, i64::MAX as u64).unwrap();
+            assert!(
+                admitted.action_generation.per_key_ordinal
+                    > attempt.action_generation.per_key_ordinal
+            );
+            assert!(
+                admitted.action_generation.generation_id.0
+                    > attempt.action_generation.generation_id.0
+            );
+            // Admission alone is not another execution. Dropping this unstarted
+            // lease conservatively requires reconciliation before any retry.
+        }
         let changed = coord
             .submit_action(
                 changed_input,

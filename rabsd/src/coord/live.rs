@@ -49,8 +49,8 @@ use rabs_key::typed_digest::{DOMAIN_ACTION_KEY, DOMAIN_DESCRIPTOR};
 use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
 use rabs_protocol::descriptor::{ActionDescriptor, SubscriberKind};
 use rabs_protocol::generation::{
-    ActionGeneration, ActionGenerationId, AttemptAuthority, AttemptId, ExecutionLeaseId,
-    LeaseRenewal, LeaseRenewalSeq, WorkerIncarnationId,
+    AttemptAuthority, AttemptId, ExecutionLeaseId, LeaseRenewal, LeaseRenewalSeq,
+    WorkerIncarnationId,
 };
 use rabs_protocol::input_evidence::{ActionInputManifest, InputFileType};
 use rabs_protocol::result_identity::{
@@ -960,19 +960,25 @@ impl CoordLive {
         if !entry.actor.has_foreground_interest() && !self.optional_admitted()? {
             return Err(SubmissionRefusal::Brownout);
         }
-        // Prepare the fallible pure actor mutation before durable writes. Only a
-        // bound worker lease can supply the opaque registration proof below.
+        // Allocate against durable history rather than the process clock. Only
+        // a bound worker lease supplies the opaque registration proof below.
         let mut actor = entry.actor.clone();
-        let generation_serial = submissions.next_serial()?;
         let attempt_serial = submissions.next_serial()?;
         let lease_serial = submissions.next_serial()?;
         let identity = |counter: u64| (u128::from(self.boot_nonce) << 64) | u128::from(counter);
-        let generation = ActionGeneration {
-            generation_id: ActionGenerationId(identity(generation_serial)),
-            per_key_ordinal: 1,
-            created_under_authority_digest: authority_digest(&held),
-        };
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let generation = store
+            .allocate_bound_generation(&authority_digest(&held), key)
+            .map_err(|error| SubmissionRefusal::Admission(format!("generation: {error:?}")))?;
         if actor.open_generation(generation.clone()) != OpenGenerationReceipt::Opened {
+            store
+                .tombstone_generation(generation.generation_id.0)
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("generation cleanup: {error:?}"))
+                })?;
             return Err(SubmissionRefusal::StaleDispatch);
         }
         let authority = AttemptAuthority {
@@ -986,17 +992,6 @@ impl CoordLive {
             worker_boot_generation: worker.boot_generation,
             worker_incarnation_id: worker.incarnation,
         };
-        let mut store = cas
-            .store()
-            .lock()
-            .map_err(|_| SubmissionRefusal::Unavailable)?;
-        store
-            .create_bound_generation(
-                &authority_digest(&authority.coordinator),
-                &authority.action_generation,
-                key,
-            )
-            .map_err(|error| SubmissionRefusal::Admission(format!("generation: {error:?}")))?;
         if let Err(error) = store.admit_attempt_lease(&authority, self.next_seq(), expires_at_seq) {
             // No executable lease was issued. Burn the failed generation before
             // allowing the still-owned queue claim to return for a fresh attempt.
@@ -1046,8 +1041,9 @@ impl CoordLive {
     }
 
     /// Retire a confirmed finished flight after its consumers have handled the
-    /// outcome. Durable publication/serving records survive in the CAS. Started
-    /// or abandoned executions cannot be forgotten by this cleanup path.
+    /// outcome, durably fencing any late messages from its generation. Published
+    /// serving records survive in the CAS. Started or abandoned executions cannot
+    /// be forgotten by this cleanup path.
     pub fn retire_finished_action(&self, key: &TypedDigest) -> Result<bool, SubmissionRefusal> {
         let mut submissions = self
             .submissions
@@ -1060,6 +1056,21 @@ impl CoordLive {
         {
             return Ok(false);
         }
+        let generation = submissions.entries[key]
+            .actor
+            .active_generation()
+            .ok_or(SubmissionRefusal::StaleDispatch)?
+            .generation_id;
+        self.cas
+            .as_ref()
+            .ok_or(SubmissionRefusal::Unavailable)?
+            .store()
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .tombstone_generation(generation.0)
+            .map_err(|error| {
+                SubmissionRefusal::Admission(format!("generation retirement: {error:?}"))
+            })?;
         submissions.entries.remove(key);
         Ok(true)
     }
@@ -2028,11 +2039,12 @@ mod tests {
             )
             .unwrap();
         let worker = worker_offer(1, 1);
+        let expiry = i64::MAX as u64;
         {
             let mut claim = coord.next_action_dispatch().unwrap().unwrap();
             coord.set_speculation_pressure(PressureBand::Soft).unwrap();
             assert_eq!(
-                claim.begin(&worker, u64::MAX).unwrap_err(),
+                claim.begin(&worker, expiry).unwrap_err(),
                 SubmissionRefusal::Brownout
             );
             assert_eq!(
@@ -2051,19 +2063,17 @@ mod tests {
             .unwrap();
         {
             let mut claim = coord.next_action_dispatch().unwrap().unwrap();
-            assert!(
-                matches!(
-                    claim.begin(&worker, u64::MAX),
-                    Err(SubmissionRefusal::Admission(_))
-                ),
+            assert_eq!(
+                claim.begin(&worker, expiry).unwrap_err(),
+                SubmissionRefusal::Admission("lease: UnknownWorkerFence".into()),
                 "unadmitted worker cannot obtain execution lease"
             );
         }
         coord.admit_worker_session(&worker).unwrap();
         let mut claim = coord.next_action_dispatch().unwrap().unwrap();
-        let authority = claim.begin(&worker, u64::MAX).unwrap().clone();
+        let authority = claim.begin(&worker, expiry).unwrap().clone();
         assert_eq!(
-            claim.begin(&worker, u64::MAX).unwrap_err(),
+            claim.begin(&worker, expiry).unwrap_err(),
             SubmissionRefusal::StaleDispatch
         );
         assert_eq!(
