@@ -471,7 +471,7 @@ mod tests {
         // per-worker Cargo caches and stages target dirs — not a second copy
         // of the `$TMPDIR` -> /data/tmp -> /tmp ladder. Two copies is exactly
         // how the sweep came to look somewhere other than where rch writes.
-        assert!(cmd.contains(&rch_common::remote_compilation::remote_cargo_home_base_prelude()));
+        assert!(cmd.contains(&rch_common::gc_roots::remote_cargo_home_base_prelude()));
         assert!(cmd.contains("__tmpbase=\"${RCH_CH_BASE}\""));
         assert!(!cmd.contains("__tmpbase=\"${TMPDIR:-}\""));
         assert!(cmd.contains("mktemp -p \"$__tmpbase\""));

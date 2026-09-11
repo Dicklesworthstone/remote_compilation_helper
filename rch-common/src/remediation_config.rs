@@ -418,7 +418,7 @@ pub struct PooledTargetConfig {
     /// The derived set ([`crate::gc_roots::derive_gc_roots`]) already covers
     /// [`Self::remote_base`], [`Self::store_base`] and the worker temp base
     /// resolved by
-    /// [`crate::remote_compilation::remote_cargo_home_base_prelude`]. This
+    /// [`crate::gc_roots::remote_cargo_home_base_prelude`]. This
     /// list exists for runtime roots rch cannot know about — an operator build
     /// root on a mounted volume, a per-host scratch tree — which is precisely
     /// how ~700 GB of `.rch-target-*-pool-*` and `rch-cargo-cache-*` went
