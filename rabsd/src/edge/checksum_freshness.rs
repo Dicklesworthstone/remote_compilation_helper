@@ -1,7 +1,7 @@
 //! Checksum-freshness opt-in lane (bead D015; plan §28).
 //!
 //! Nightly Cargo can judge freshness by CONTENT CHECKSUM
-//! (`-Zchecksum-freshness`) instead of mtimes — which dissolves the
+//! (`-Zchecksum-freshness` plus `build.fingerprint="content"`) instead of mtimes — which dissolves the
 //! whole D009/D010 mtime-choreography problem class for toolchains
 //! that support it. But an unvalidated freshness semantic is worse
 //! than the devil we choreograph, so the lane is triple-gated:
@@ -17,8 +17,19 @@
 //!
 //! Materialization absorbs checksum freshness without changing CAS
 //! semantics by construction: CAS objects are already content-addressed
-//! and immutable; the only thing the lane changes is whether Cargo
-//! consults mtimes at all (the D009 floor becomes advisory).
+//! and immutable. The lane changes Cargo's source fingerprint policy;
+//! local build-script freshness still uses mtimes and needs the existing
+//! mtime choreography (Cargo tracking issue rust-lang/cargo#14136).
+
+/// Cargo arguments shared by lane validation and activated production use.
+/// The unstable flag enables the configuration; current Cargo also requires
+/// selecting content fingerprints explicitly. Merely enabling the flag keeps
+/// the default mtime policy (Cargo tracking issue rust-lang/cargo#14136).
+pub const CHECKSUM_CARGO_ARGS: [&str; 3] = [
+    "-Zchecksum-freshness",
+    "--config",
+    "build.fingerprint=\"content\"",
+];
 
 /// The explicit freshness profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -90,7 +101,10 @@ impl ChecksumFreshnessLane {
     #[must_use]
     pub fn cargo_args(&self) -> Vec<String> {
         if self.active() {
-            vec!["-Zchecksum-freshness".to_string()]
+            CHECKSUM_CARGO_ARGS
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect()
         } else {
             Vec::new()
         }
@@ -128,7 +142,14 @@ mod tests {
             Some(&validation()),
         );
         assert!(active.active());
-        assert_eq!(active.cargo_args(), vec!["-Zchecksum-freshness"]);
+        assert_eq!(
+            active.cargo_args(),
+            vec![
+                "-Zchecksum-freshness",
+                "--config",
+                "build.fingerprint=\"content\""
+            ]
+        );
 
         // Stable toolchain: unsupported regardless of the rest.
         let unsupported = ChecksumFreshnessLane::resolve(

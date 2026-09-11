@@ -10,6 +10,7 @@
 use rabs_sandbox::canonical_mounts::{CanonicalMountPlan, UnitMount};
 use rabs_sandbox::canonical_namespace::{HostIsolationSupport, build_canonical_argv, command_for};
 use rabs_sandbox::layout;
+use rabsd::edge::checksum_freshness::CHECKSUM_CARGO_ARGS;
 
 fn supported() -> Option<HostIsolationSupport> {
     let support = HostIsolationSupport::probe();
@@ -58,7 +59,7 @@ fn fixture(root: &std::path::Path) {
     );
 }
 
-/// Build in the namespace; `checksum_lane` adds `-Zchecksum-freshness`.
+/// Build in the namespace with the same checksum selection as production.
 fn build(
     support: &HostIsolationSupport,
     source: &std::path::Path,
@@ -78,7 +79,7 @@ fn build(
     ));
     let mut args = vec!["build".to_string(), "--offline".to_string()];
     if checksum_lane {
-        args.push("-Zchecksum-freshness".to_string());
+        args.extend(CHECKSUM_CARGO_ARGS.iter().map(|arg| (*arg).to_string()));
     }
     let spec = plan.to_spec().unwrap();
     let launch = build_canonical_argv(&spec, support, "cargo", &args).unwrap();
