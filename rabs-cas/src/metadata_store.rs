@@ -35,7 +35,8 @@
 use std::collections::HashMap;
 
 use rabs_protocol::generation::{
-    ActionGeneration, AttemptAuthority, LeaseRenewal, WorkerBootGeneration, WorkerIncarnationId,
+    ActionGeneration, ActionGenerationId, AttemptAuthority, LeaseRenewal, WorkerBootGeneration,
+    WorkerIncarnationId,
 };
 use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use rabs_protocol::serving::ServingValidity;
@@ -500,6 +501,10 @@ pub enum StoreError {
     /// Generation id at or below the high-water mark (ids are NEVER
     /// reused, even after tombstoning).
     GenerationIdNotAboveHighWater,
+    /// The durable global generation identity cannot advance without reuse.
+    GenerationIdentityExhausted,
+    /// The action's durable ordinal cannot advance without wrapping.
+    GenerationOrdinalExhausted,
     /// Attempt id already recorded (attempts are append-only).
     DuplicateAttempt,
     /// Execution lease id already exists.
@@ -1149,6 +1154,15 @@ pub trait RabsMetadataStore {
         generation: &ActionGeneration,
         action_key: &TypedDigest,
     ) -> Result<(), StoreError>;
+
+    /// Allocate and insert a bound generation atomically. The global identity
+    /// and per-key ordinal advance from durable history, including tombstones,
+    /// independently of process clocks and coordinator restarts.
+    fn allocate_bound_generation(
+        &mut self,
+        authority: &TypedDigest,
+        action_key: &TypedDigest,
+    ) -> Result<ActionGeneration, StoreError>;
 
     /// Tombstone a generation (the id stays burned forever).
     fn tombstone_generation(&mut self, id: u128) -> Result<(), StoreError>;
@@ -2969,6 +2983,81 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 &[SqlValue::Blob(u128_blob(id))],
             )?;
             Ok(())
+        })
+    }
+
+    fn allocate_bound_generation(
+        &mut self,
+        authority: &TypedDigest,
+        action_key: &TypedDigest,
+    ) -> Result<ActionGeneration, StoreError> {
+        let authority = authority.clone();
+        let action = digest_key(action_key);
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let id = SqlMetadataStore::<E>::generation_high_water(engine)?
+                .checked_add(1)
+                .ok_or(StoreError::GenerationIdentityExhausted)?;
+            // Fixed-width big-endian blobs have numeric byte ordering. Validate
+            // every non-NULL row's representation before trusting the maximum;
+            // an older corrupt row must not hide behind a valid larger ordinal.
+            // Legacy NULL ordinals have no live lease authority (migration 21).
+            let malformed = engine.query(
+                "SELECT per_key_ordinal FROM action_generations \
+                 WHERE action_key = ?1 AND per_key_ordinal IS NOT NULL \
+                 AND (typeof(per_key_ordinal) != 'blob' OR length(per_key_ordinal) != 8) \
+                 LIMIT 1",
+                &[SqlValue::Text(action.clone())],
+            )?;
+            if !malformed.is_empty() {
+                return Err(StoreError::Corruption(
+                    "generation ordinal representation".into(),
+                ));
+            }
+            let rows = engine.query(
+                "SELECT per_key_ordinal FROM action_generations \
+                 WHERE action_key = ?1 AND per_key_ordinal IS NOT NULL \
+                 ORDER BY per_key_ordinal DESC LIMIT 1",
+                &[SqlValue::Text(action.clone())],
+            )?;
+            let previous = match rows.as_slice() {
+                [] => 0,
+                [row] => match row.as_slice() {
+                    [value] => expect_u64_blob(value, "generation ordinal")?,
+                    _ => return Err(StoreError::Corruption("generation ordinal shape".into())),
+                },
+                _ => {
+                    return Err(StoreError::Corruption(
+                        "generation ordinal row count".into(),
+                    ));
+                }
+            };
+            let ordinal = previous
+                .checked_add(1)
+                .ok_or(StoreError::GenerationOrdinalExhausted)?;
+            let generation = ActionGeneration {
+                generation_id: ActionGenerationId(id),
+                per_key_ordinal: ordinal,
+                created_under_authority_digest: authority.clone(),
+            };
+            engine.execute(
+                "INSERT INTO action_generations \
+                 (id_hex, id, action_key, authority_key, tombstoned, per_key_ordinal) \
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                &[
+                    SqlValue::Text(u128_hex(id)),
+                    SqlValue::Blob(u128_blob(id)),
+                    SqlValue::Text(action),
+                    SqlValue::Text(digest_key(&authority)),
+                    SqlValue::Blob(u64_blob(ordinal)),
+                ],
+            )?;
+            engine.execute(
+                "INSERT OR REPLACE INTO generation_high_water (kind, value) \
+                 VALUES ('action-generation', ?1)",
+                &[SqlValue::Blob(u128_blob(id))],
+            )?;
+            Ok(generation)
         })
     }
 
@@ -7792,6 +7881,152 @@ mod tests {
             ),
             Err(StoreError::GenerationIdNotAboveHighWater)
         );
+    }
+
+    fn allocation_behavior<E: SqlEngine>(store: &mut SqlMetadataStore<E>) {
+        let active = authority(1);
+        let action = digest("rabs.action-key.sha256.v1", 7);
+        let other = digest("rabs.action-key.sha256.v1", 8);
+        store.acquire_authority(&active).unwrap();
+        store
+            .create_generation(&active.digest, 899, &action)
+            .unwrap();
+        let old = ActionGeneration {
+            generation_id: ActionGenerationId(900),
+            per_key_ordinal: 255,
+            created_under_authority_digest: active.digest.clone(),
+        };
+        store
+            .create_bound_generation(&active.digest, &old, &action)
+            .unwrap();
+        store.tombstone_generation(900).unwrap();
+        let next = store
+            .allocate_bound_generation(&active.digest, &action)
+            .unwrap();
+        assert_eq!(next.generation_id, ActionGenerationId(901));
+        assert_eq!(
+            next.per_key_ordinal, 256,
+            "BE blob ordering crosses byte boundary"
+        );
+        assert_eq!(next.created_under_authority_digest, active.digest);
+        let independent = store
+            .allocate_bound_generation(&active.digest, &other)
+            .unwrap();
+        assert_eq!(independent.generation_id, ActionGenerationId(902));
+        assert_eq!(independent.per_key_ordinal, 1);
+        assert_eq!(
+            store.allocate_bound_generation(&authority(2).digest, &action),
+            Err(StoreError::NotActiveAuthority)
+        );
+        assert_eq!(store.generation_count().unwrap(), 4);
+
+        // Bad older ordinals must refuse even with a valid larger row present.
+        for corrupt in [
+            SqlValue::Blob(vec![0; 7]),
+            SqlValue::Text("00000000".into()),
+        ] {
+            store
+                .engine
+                .execute(
+                    "UPDATE action_generations SET per_key_ordinal = ?1 WHERE id_hex = ?2",
+                    &[corrupt, SqlValue::Text(u128_hex(900))],
+                )
+                .unwrap();
+            assert!(matches!(
+                store.allocate_bound_generation(&active.digest, &action),
+                Err(StoreError::Corruption(_))
+            ));
+            assert_eq!(store.generation_count().unwrap(), 4);
+            assert_eq!(
+                SqlMetadataStore::<E>::generation_high_water(&mut store.engine).unwrap(),
+                902
+            );
+        }
+        store
+            .engine
+            .execute(
+                "UPDATE action_generations SET per_key_ordinal = ?1 WHERE id_hex = ?2",
+                &[SqlValue::Blob(u64_blob(255)), SqlValue::Text(u128_hex(900))],
+            )
+            .unwrap();
+        let next = store
+            .allocate_bound_generation(&active.digest, &action)
+            .unwrap();
+        assert_eq!(next.generation_id, ActionGenerationId(903));
+        assert_eq!(next.per_key_ordinal, 257, "256 must sort above 255");
+        let exhausted = ActionGeneration {
+            generation_id: ActionGenerationId(904),
+            per_key_ordinal: u64::MAX,
+            created_under_authority_digest: active.digest.clone(),
+        };
+        store
+            .create_bound_generation(&active.digest, &exhausted, &action)
+            .unwrap();
+        assert_eq!(
+            store.allocate_bound_generation(&active.digest, &action),
+            Err(StoreError::GenerationOrdinalExhausted)
+        );
+        assert_eq!(store.generation_count().unwrap(), 6);
+        assert_eq!(
+            SqlMetadataStore::<E>::generation_high_water(&mut store.engine).unwrap(),
+            904
+        );
+        store
+            .create_generation(&active.digest, u128::MAX, &other)
+            .unwrap();
+        assert_eq!(
+            store.allocate_bound_generation(&active.digest, &other),
+            Err(StoreError::GenerationIdentityExhausted)
+        );
+        assert_eq!(store.generation_count().unwrap(), 7);
+    }
+
+    #[test]
+    fn allocated_generations_enforce_fences_and_bounds_on_both_sql_engines() {
+        let reference = RusqliteEngine::open_in_memory().unwrap();
+        allocation_behavior(&mut SqlMetadataStore::open(reference).unwrap());
+        let candidate = FsqliteEngine::open(&fresh_path("allocation-fsq")).unwrap();
+        allocation_behavior(&mut SqlMetadataStore::open(candidate).unwrap());
+    }
+
+    #[test]
+    fn allocated_generation_identity_and_ordinal_survive_reopen_and_new_authority() {
+        let path = fresh_path("allocation-reopen");
+        let action = digest("rabs.action-key.sha256.v1", 7);
+        let old_id = 1_u128 << 100;
+        {
+            let mut store = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+            let active = authority(1);
+            store.acquire_authority(&active).unwrap();
+            let old = ActionGeneration {
+                generation_id: ActionGenerationId(old_id),
+                per_key_ordinal: 17,
+                created_under_authority_digest: active.digest.clone(),
+            };
+            store
+                .create_bound_generation(&active.digest, &old, &action)
+                .unwrap();
+            let next = store
+                .allocate_bound_generation(&active.digest, &action)
+                .unwrap();
+            assert_eq!(next.generation_id, ActionGenerationId(old_id + 1));
+            assert_eq!(next.per_key_ordinal, 18);
+            store.tombstone_generation(next.generation_id.0).unwrap();
+            store.release_authority(&active.digest).unwrap();
+        }
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+        let active = authority(2);
+        store.acquire_authority(&active).unwrap();
+        store
+            .close_generations_for_other_authorities(&active.digest)
+            .unwrap();
+        let next = store
+            .allocate_bound_generation(&active.digest, &action)
+            .unwrap();
+        assert_eq!(next.generation_id, ActionGenerationId(old_id + 2));
+        assert_eq!(next.per_key_ordinal, 19);
+        assert_eq!(next.created_under_authority_digest, active.digest);
+        assert_eq!(store.generation_count().unwrap(), 3);
     }
 
     #[test]
