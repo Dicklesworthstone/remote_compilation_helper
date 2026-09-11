@@ -2911,7 +2911,10 @@ mod tests {
             );
         }
         // A distinct bundle can complete both the global and individual gates.
-        actor.record_evidence(d(81), true);
+        assert_eq!(
+            actor.record_evidence(d(81), true),
+            EvidenceReceipt::Recorded
+        );
         assert_eq!(actor.evidence().len(), 2);
         assert_eq!(events_of(&actor, EventKind::EvidenceRecorded), 2);
         assert!(actor.serving_eligible(1_200, 0));
@@ -2932,7 +2935,10 @@ mod tests {
         open_with_primary(&mut actor);
         let mut original = join_request(OP_ONE.0, SubscriberKind::Speculative, 3);
         original.deadline_unix_micros = Some(5_000);
-        assert_eq!(actor.join(original.clone(), 1_100, 0), JoinReceipt::JoinedExecution);
+        assert_eq!(
+            actor.join(original.clone(), 1_100, 0),
+            JoinReceipt::JoinedExecution
+        );
         actor
             .advance_delivery(OP_ONE, SubscriberDeliveryState::Waiting)
             .expect("independent delivery state");
