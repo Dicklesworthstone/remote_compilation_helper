@@ -156,31 +156,63 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Collect one run's artifacts from its `deps` directory on disk.
-pub fn collect_run_artifacts(deps_dir: &std::path::Path) -> std::io::Result<RunArtifacts> {
+/// Collect immediate compiler outputs from the recorded output directories.
+/// Cargo's intermediate layout is internal; callers derive these relative
+/// directories from actual rustc invocations instead of assuming `debug/deps`.
+/// Directory-qualified keys preserve distinct outputs with identical basenames.
+pub fn collect_run_artifacts(
+    output_root: &std::path::Path,
+    relative_directories: &[std::path::PathBuf],
+) -> std::io::Result<RunArtifacts> {
+    use std::path::Component;
+    if relative_directories.is_empty()
+        || relative_directories.iter().any(|path| {
+            path.to_str().is_none()
+                || path
+                    .components()
+                    .any(|part| !matches!(part, Component::Normal(_)))
+        })
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "compiler output directories must be nonempty evidence of contained relative paths",
+        ));
+    }
     let mut run = RunArtifacts::default();
-    for entry in std::fs::read_dir(deps_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
+    let directories: std::collections::BTreeSet<_> = relative_directories.iter().collect();
+    for relative in directories {
+        for entry in std::fs::read_dir(output_root.join(relative))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name().into_string().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "non-UTF-8 compiler output name",
+                )
+            })?;
+            let Some(class) = classify_artifact(&name) else {
+                continue;
+            };
+            let raw = std::fs::read(entry.path())?;
+            let content = match class {
+                ArtifactClass::DepInfo => normalize_dep_info(&raw),
+                ArtifactClass::Rlib => normalize_rlib(&raw),
+                ArtifactClass::Rmeta | ArtifactClass::Binary => raw,
+            };
+            let key = relative
+                .join(name)
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            run.artifacts.insert(
+                key,
+                CollectedArtifact {
+                    class,
+                    content_sha256: sha256(&content),
+                },
+            );
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(class) = classify_artifact(&name) else {
-            continue;
-        };
-        let raw = std::fs::read(entry.path())?;
-        let content = match class {
-            ArtifactClass::DepInfo => normalize_dep_info(&raw),
-            ArtifactClass::Rlib => normalize_rlib(&raw),
-            ArtifactClass::Rmeta | ArtifactClass::Binary => raw,
-        };
-        run.artifacts.insert(
-            name,
-            CollectedArtifact {
-                class,
-                content_sha256: sha256(&content),
-            },
-        );
     }
     Ok(run)
 }
@@ -346,12 +378,68 @@ mod tests {
         std::fs::write(dir.path().join("fx-abc.d"), b"z: b\na: c\n").unwrap();
         std::fs::write(dir.path().join("fx-abc"), b"binary").unwrap();
         std::fs::write(dir.path().join(".cargo-lock"), b"").unwrap();
-        let collected = collect_run_artifacts(dir.path()).unwrap();
+        let collected = collect_run_artifacts(dir.path(), &[std::path::PathBuf::new()]).unwrap();
         assert_eq!(collected.artifacts.len(), 3, "the lock dropping is skipped");
         assert_eq!(
             collected.artifacts["fx-abc.d"].content_sha256,
             sha256(b"a: c\nz: b\n"),
             "dep-info hashed post-normalization"
+        );
+    }
+
+    #[test]
+    fn recorded_unit_directories_preserve_same_named_outputs_and_detect_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let a = std::path::PathBuf::from("debug/build/a/unit/out");
+        let b = std::path::PathBuf::from("debug/build/b/unit/out");
+        std::fs::create_dir_all(root.path().join(&a)).unwrap();
+        std::fs::create_dir_all(root.path().join(&b)).unwrap();
+        std::fs::write(root.path().join(&a).join("same.rmeta"), b"unit a").unwrap();
+        std::fs::write(root.path().join(&b).join("same.rmeta"), b"unit b").unwrap();
+        // Unrecorded Cargo metadata is not mistaken for compiler output.
+        std::fs::write(root.path().join("rustc-argv.log"), b"log").unwrap();
+        let before =
+            collect_run_artifacts(root.path(), &[a.clone(), b.clone(), a.clone()]).unwrap();
+        assert_eq!(before.artifacts.len(), 2);
+        assert_eq!(
+            before.artifacts["debug/build/a/unit/out/same.rmeta"].content_sha256,
+            sha256(b"unit a")
+        );
+        assert_eq!(
+            before.artifacts["debug/build/b/unit/out/same.rmeta"].content_sha256,
+            sha256(b"unit b")
+        );
+        std::fs::write(root.path().join(&b).join("same.rmeta"), b"changed").unwrap();
+        let after = collect_run_artifacts(root.path(), &[a, b]).unwrap();
+        let findings = compare_runs(&before, &after);
+        assert_eq!(findings.len(), 1);
+        assert!(matches!(
+            &findings[0],
+            EqualityFinding::ContentMismatch { name, class: ArtifactClass::Rmeta, .. }
+                if name == "debug/build/b/unit/out/same.rmeta"
+        ));
+    }
+
+    #[test]
+    fn missing_or_uncontained_output_directories_refuse_collection() {
+        let root = tempfile::tempdir().unwrap();
+        for invalid in [
+            vec![],
+            vec![std::path::PathBuf::from("../outside")],
+            vec![root.path().to_path_buf()],
+        ] {
+            assert_eq!(
+                collect_run_artifacts(root.path(), &invalid)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(
+            collect_run_artifacts(root.path(), &[std::path::PathBuf::from("missing")])
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
         );
     }
 }

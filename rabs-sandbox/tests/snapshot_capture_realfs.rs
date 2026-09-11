@@ -6,7 +6,8 @@
 //! disk. Runs on any host (no namespace primitives required).
 
 use rabs_sandbox::snapshot_capture::{
-    CaptureConfig, CaptureError, MemberKind, capture_coherent, scan_directory,
+    CaptureConfig, CaptureError, CaptureRejection, MemberKind, capture_coherent,
+    capture_sealed_source, scan_directory,
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -168,6 +169,7 @@ fn sustained_real_mutation_refuses_with_a_typed_refusal() {
     match err {
         CaptureError::Incoherent(refusal) => assert_eq!(refusal.attempts, 3),
         CaptureError::Io(io) => panic!("wrong class: {io}"),
+        CaptureError::Rejected { .. } => panic!("unexpected policy refusal"),
     }
 }
 
@@ -190,5 +192,200 @@ fn declared_git_state_reveals_git_and_changes_the_manifest() {
     assert_ne!(
         hidden.manifest_sha256, declared.manifest_sha256,
         "git visibility is part of the bound identity"
+    );
+}
+
+#[test]
+fn sealed_bytes_and_materialization_survive_live_checkout_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("live");
+    write(&source, "src/main.rs", "fn main() { println!(\"old\"); }\n");
+    write(&source, "run.sh", "#!/bin/sh\nprintf old\n");
+    write(&source, "target/cache", "excluded");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            source.join("run.sh"),
+            std::fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("src/main.rs", source.join("link.rs")).unwrap();
+    }
+    let roots = vec![("workspace".to_string(), source.clone())];
+    let old = capture_sealed_source(&roots, false, 3, 4096).unwrap();
+    let old_bytes = old.file_bytes("workspace", "src/main.rs").unwrap().to_vec();
+    let old_digest = old.closure_digest();
+    assert!(old.file_bytes("workspace", "target/cache").is_none());
+
+    // Replacing the checkout inode cannot change retained bytes. There is no
+    // post-seal source reread when materializing the old image.
+    std::fs::rename(source.join("src/main.rs"), dir.path().join("old-source.rs")).unwrap();
+    write(&source, "src/main.rs", "fn main() { println!(\"new\"); }\n");
+    let new = capture_sealed_source(&roots, false, 3, 4096).unwrap();
+    assert_ne!(old_digest, new.closure_digest());
+    assert_eq!(
+        old.file_bytes("workspace", "src/main.rs").unwrap(),
+        old_bytes
+    );
+    assert_ne!(
+        old.file_bytes("workspace", "src/main.rs"),
+        new.file_bytes("workspace", "src/main.rs")
+    );
+
+    let old_output = dir.path().join("old-image");
+    let old_materialized = old.materialize_into(&old_output).unwrap();
+    let new_materialized = new.materialize_into(&dir.path().join("new-image")).unwrap();
+    let old_root = old_materialized.backing("workspace").unwrap();
+    let new_root = new_materialized.backing("workspace").unwrap();
+    assert_eq!(
+        std::fs::read(old_root.join("src/main.rs")).unwrap(),
+        old_bytes
+    );
+    assert_eq!(
+        std::fs::read(new_root.join("src/main.rs")).unwrap(),
+        new.file_bytes("workspace", "src/main.rs").unwrap()
+    );
+    assert_eq!(
+        old_materialized.provenance("workspace"),
+        old.provenance("workspace")
+    );
+    assert_ne!(old_root, source);
+    assert!(!old_root.join("target").exists());
+    // Existing destinations are never overwritten or accepted as a fresh
+    // materialization, even when they contain an earlier valid image.
+    assert!(old.materialize_into(&old_output).is_err());
+    assert_eq!(
+        std::fs::read(old_root.join("src/main.rs")).unwrap(),
+        old_bytes
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        assert_ne!(
+            std::fs::metadata(old_root.join("run.sh")).unwrap().ino(),
+            std::fs::metadata(source.join("run.sh")).unwrap().ino()
+        );
+        assert_eq!(
+            std::fs::metadata(old_root.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+        assert_eq!(
+            std::fs::read_link(old_root.join("link.rs")).unwrap(),
+            Path::new("src/main.rs")
+        );
+        assert_eq!(std::fs::read(old_root.join("link.rs")).unwrap(), old_bytes);
+    }
+}
+
+#[test]
+fn sealed_closure_byte_limit_is_cumulative_and_root_identity_is_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    write(&a, "file", "aaaa");
+    write(&b, "file", "bbbb");
+    let roots = vec![("a".into(), a.clone()), ("b".into(), b.clone())];
+    assert!(matches!(
+        capture_sealed_source(&roots, false, 3, 7),
+        Err(CaptureError::Rejected {
+            reason: CaptureRejection::ByteLimitExceeded,
+            ..
+        })
+    ));
+    let image = capture_sealed_source(&roots, false, 3, 8).unwrap();
+    assert_eq!(image.file_bytes("a", "file"), Some(b"aaaa".as_slice()));
+    assert_eq!(image.file_bytes("b", "file"), Some(b"bbbb".as_slice()));
+    let reverse = vec![("b".into(), b.clone()), ("a".into(), a.clone())];
+    assert_eq!(
+        image.closure_digest(),
+        capture_sealed_source(&reverse, false, 3, 8)
+            .unwrap()
+            .closure_digest()
+    );
+    for invalid in [
+        vec![],
+        vec![("a".into(), a.clone()), ("a".into(), b)],
+        vec![("../escape".into(), a)],
+    ] {
+        assert!(matches!(
+            capture_sealed_source(&invalid, false, 1, 8),
+            Err(CaptureError::Rejected {
+                reason: CaptureRejection::InvalidRoot,
+                ..
+            })
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sealed_capture_refuses_special_nodes_lossy_paths_and_escaping_links() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::net::UnixListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket_root = dir.path().join("socket");
+    std::fs::create_dir(&socket_root).unwrap();
+    let _socket = UnixListener::bind(socket_root.join("node")).unwrap();
+    assert!(matches!(
+        capture_sealed_source(&[("root".into(), socket_root)], false, 1, 100),
+        Err(CaptureError::Rejected {
+            reason: CaptureRejection::UnsupportedKind,
+            ..
+        })
+    ));
+
+    let lossy_root = dir.path().join("lossy");
+    std::fs::create_dir(&lossy_root).unwrap();
+    std::fs::write(lossy_root.join(OsString::from_vec(vec![0xff])), "bytes").unwrap();
+    assert!(matches!(
+        capture_sealed_source(&[("root".into(), lossy_root)], false, 1, 100),
+        Err(CaptureError::Rejected {
+            reason: CaptureRejection::InvalidPath,
+            ..
+        })
+    ));
+
+    let escape_root = dir.path().join("escape");
+    write(&escape_root, "sub/file", "bytes");
+    std::os::unix::fs::symlink("..", escape_root.join("sub/back")).unwrap();
+    // Lexically sub/back/../outside appears root-contained. Expanding back
+    // first reveals that the second .. escapes the captured root.
+    std::os::unix::fs::symlink("sub/back/../outside", escape_root.join("link")).unwrap();
+    assert!(matches!(
+        capture_sealed_source(&[("root".into(), escape_root)], false, 1, 100),
+        Err(CaptureError::Rejected {
+            reason: CaptureRejection::UnsafeSymlink,
+            ..
+        })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn executable_mode_changes_snapshot_identity_without_changing_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "script", "#!/bin/sh\ntrue\n");
+    let path = dir.path().join("script");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let roots = vec![("workspace".to_string(), dir.path().to_path_buf())];
+    let before = capture_sealed_source(&roots, false, 1, 100).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let after = capture_sealed_source(&roots, false, 1, 100).unwrap();
+    assert_eq!(
+        before.file_bytes("workspace", "script"),
+        after.file_bytes("workspace", "script")
+    );
+    assert_ne!(before.closure_digest(), after.closure_digest());
+    assert_ne!(
+        before.provenance("workspace"),
+        after.provenance("workspace")
     );
 }

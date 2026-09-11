@@ -13,7 +13,9 @@
 use rabs_sandbox::canonical_mounts::{CanonicalMountPlan, UnitMount};
 use rabs_sandbox::canonical_namespace::{HostIsolationSupport, build_canonical_argv, command_for};
 use rabs_sandbox::layout;
-use rabs_sandbox::unit_convergence::{compare, convergence_digest, normalize, parse_wrapper_log};
+use rabs_sandbox::unit_convergence::{
+    compare, convergence_digest, normalize, parse_wrapper_log, recorded_output_directories,
+};
 
 fn supported() -> Option<HostIsolationSupport> {
     let support = HostIsolationSupport::probe();
@@ -73,7 +75,7 @@ fn fixture(root: &std::path::Path) {
     }
 }
 
-/// Build from one worktree; return (wrapper log, produced deps names).
+/// Build from one worktree; return (wrapper log, relative compiler output names).
 fn build_and_log(
     support: &HostIsolationSupport,
     source_backing: &std::path::Path,
@@ -115,12 +117,36 @@ fn build_and_log(
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "fixture build failed:\n{stderr}");
     let log = std::fs::read_to_string(out_backing.path().join("rustc-argv.log")).unwrap();
-    let mut produced: Vec<String> = std::fs::read_dir(out_backing.path().join("debug/deps"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
+    let canonical_output = std::path::PathBuf::from(format!("{}/fixture", layout::OUT));
+    let directories = recorded_output_directories(&parse_wrapper_log(&log), &canonical_output)
+        .expect("every compiler unit must identify its contained output directory");
+    let mut produced = Vec::new();
+    for relative in directories {
+        let mut file_count = 0;
+        for entry in std::fs::read_dir(out_backing.path().join(&relative)).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                produced.push(relative.join(entry.file_name()));
+                file_count += 1;
+            }
+        }
+        assert!(
+            file_count > 0,
+            "compiler output directory {relative:?} is empty"
+        );
+    }
     produced.sort();
-    (log, produced)
+    (
+        log,
+        produced
+            .into_iter()
+            .map(|path| {
+                path.into_os_string()
+                    .into_string()
+                    .expect("UTF-8 fixture outputs")
+            })
+            .collect(),
+    )
 }
 
 /// ACCEPTANCE: -C metadata, unit-hash-bearing extra-filenames, output

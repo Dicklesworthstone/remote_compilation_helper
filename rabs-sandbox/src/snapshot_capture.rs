@@ -30,9 +30,15 @@
 //! locks and mutable build outputs are excluded by class, and the
 //! path-dependency closure is captured all-or-nothing — one root
 //! failing coherence refuses the WHOLE closure.
+//!
+//! The older manifest APIs retain observations, not source bytes. Q003's
+//! [`capture_sealed_source`] retains the accepted descriptor-read bytes across
+//! a paired scan of the complete closure, independent of later checkout edits.
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// How the underlying filesystem lets us establish the boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +70,8 @@ pub enum MemberKind {
         mtime_ns: u128,
         /// SHA-256 of the bytes actually read.
         content_sha256: [u8; 32],
+        /// Permission bits (Unix 0o777; readonly/writable on other platforms).
+        mode: u32,
     },
     /// Symlink — structure preserved byte-for-byte, never followed.
     Symlink {
@@ -196,6 +204,28 @@ pub enum CaptureError {
     Incoherent(CaptureRefusal),
     /// Hard I/O failure.
     Io(CaptureIoError),
+    /// An unsupported or unsafe source cannot become a sealed image.
+    Rejected {
+        /// Logical member/root, without source bytes.
+        path: String,
+        /// The policy or resource boundary that refused capture.
+        reason: CaptureRejection,
+    },
+}
+
+/// Sealed-source refusal reasons, distinct from transient mutations and I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureRejection {
+    /// Empty/duplicate root identity, or an identity unsafe as a path component.
+    InvalidRoot,
+    /// A path cannot be represented losslessly and safely in the manifest.
+    InvalidPath,
+    /// Devices, sockets, FIFOs and unsupported filesystem objects are refused.
+    UnsupportedKind,
+    /// A symlink is absolute or escapes its captured root.
+    UnsafeSymlink,
+    /// The complete closure exceeds the caller's retained-byte limit.
+    ByteLimitExceeded,
 }
 
 /// Capture configuration.
@@ -273,10 +303,12 @@ impl SnapshotManifest {
                     inode: _, // inode is host-physical, not identity
                     mtime_ns: _,
                     content_sha256,
+                    mode,
                 } => {
                     hasher.update(b"f");
                     hasher.update(size.to_le_bytes());
                     hasher.update(content_sha256);
+                    hasher.update(mode.to_le_bytes());
                 }
                 MemberKind::Symlink { target } => {
                     hasher.update(b"l");
@@ -322,12 +354,14 @@ pub fn first_divergence(first: &ScanObservation, second: &ScanObservation) -> Op
                     inode: ia,
                     mtime_ns: ma,
                     content_sha256: ca,
+                    mode: moda,
                 },
                 MemberKind::Regular {
                     size: sb,
                     inode: ib,
                     mtime_ns: mb,
                     content_sha256: cb,
+                    mode: modb,
                 },
             ) => {
                 if ia != ib {
@@ -336,7 +370,7 @@ pub fn first_divergence(first: &ScanObservation, second: &ScanObservation) -> Op
                 if ca != cb {
                     return Some(Divergence::ContentChanged { path: path.clone() });
                 }
-                if sa != sb || ma != mb {
+                if sa != sb || ma != mb || moda != modb {
                     return Some(Divergence::MetadataInconsistent { path: path.clone() });
                 }
             }
@@ -445,6 +479,475 @@ where
         }
     }
     Ok(manifests)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SealedRoot {
+    manifest: SnapshotManifest,
+    files: BTreeMap<String, Arc<[u8]>>,
+}
+
+/// Verified source bytes, owned independently of the mutable checkouts.
+/// No mutable manifest or byte access is exposed. Clones share immutable bytes.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SealedSourceSnapshot {
+    roots: BTreeMap<String, SealedRoot>,
+    digest: [u8; 32],
+}
+
+impl std::fmt::Debug for SealedSourceSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Diagnostics must not dump potentially large/private source bytes.
+        formatter
+            .debug_struct("SealedSourceSnapshot")
+            .field("root_count", &self.roots.len())
+            .field("closure_digest", &self.digest)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A fresh materialization owned by the caller. Execution must mount these
+/// backing directories read-only; the mutable checkout is never a backing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedSource {
+    roots: BTreeMap<String, (PathBuf, SnapshotProvenance)>,
+}
+
+impl MaterializedSource {
+    /// Private physical backing for a captured logical root.
+    #[must_use]
+    pub fn backing(&self, root: &str) -> Option<&Path> {
+        self.roots.get(root).map(|(path, _)| path.as_path())
+    }
+
+    /// Provenance of the bytes written to this root.
+    #[must_use]
+    pub fn provenance(&self, root: &str) -> Option<SnapshotProvenance> {
+        self.roots
+            .get(root)
+            .map(|(_, provenance)| provenance.clone())
+    }
+}
+
+impl SealedSourceSnapshot {
+    /// Manifest of a logical root, with no mutable access.
+    #[must_use]
+    pub fn manifest(&self, root: &str) -> Option<&SnapshotManifest> {
+        self.roots.get(root).map(|root| &root.manifest)
+    }
+
+    /// Provenance for a logical root's execution mount.
+    #[must_use]
+    pub fn provenance(&self, root: &str) -> Option<SnapshotProvenance> {
+        self.manifest(root).map(SnapshotManifest::provenance)
+    }
+
+    /// The descriptor-read bytes accepted at the coherent boundary.
+    #[must_use]
+    pub fn file_bytes(&self, root: &str, path: &str) -> Option<&[u8]> {
+        self.roots.get(root)?.files.get(path).map(AsRef::as_ref)
+    }
+
+    /// Identity of the complete sorted closure, not just its workspace root.
+    #[must_use]
+    pub const fn closure_digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    /// Write retained bytes into a NEW destination, without reading source
+    /// checkouts or making hardlinks. Existing destinations are refused.
+    /// A failure leaves an unpublished partial directory for caller inspection;
+    /// this operation never deletes files or returns a partial handle.
+    pub fn materialize_into(&self, destination: &Path) -> Result<MaterializedSource, CaptureError> {
+        use std::io::Write;
+
+        std::fs::create_dir(destination).map_err(|error| capture_io(destination, error))?;
+        let mut materialized = BTreeMap::new();
+        for (id, root) in &self.roots {
+            let backing = destination.join(id);
+            std::fs::create_dir(&backing).map_err(|error| capture_io(&backing, error))?;
+            // Parents sort before descendants. Symlinks are created only AFTER
+            // all directory/file writes, so they cannot redirect those writes.
+            for (path, kind) in &root.manifest.members {
+                let output = backing.join(path);
+                match kind {
+                    MemberKind::Directory => {
+                        std::fs::create_dir(&output).map_err(|error| capture_io(&output, error))?;
+                    }
+                    MemberKind::Regular { mode, .. } => {
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&output)
+                            .map_err(|error| capture_io(&output, error))?;
+                        file.write_all(&root.files[path])
+                            .map_err(|error| capture_io(&output, error))?;
+                        set_file_mode(&file, *mode).map_err(|error| capture_io(&output, error))?;
+                    }
+                    MemberKind::Symlink { .. } => {}
+                }
+            }
+            for (path, kind) in &root.manifest.members {
+                if let MemberKind::Symlink { target } = kind {
+                    let output = backing.join(path);
+                    materialize_symlink(target, &output, &root.manifest.members, path)?;
+                }
+            }
+            materialized.insert(id.clone(), (backing, root.manifest.provenance()));
+        }
+        Ok(MaterializedSource {
+            roots: materialized,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn set_file_mode(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_file_mode(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
+    let mut permissions = file.metadata()?.permissions();
+    permissions.set_readonly(mode & 0o222 == 0);
+    file.set_permissions(permissions)
+}
+
+fn materialize_symlink(
+    target: &str,
+    output: &Path,
+    members: &BTreeMap<String, MemberKind>,
+    path: &str,
+) -> Result<(), CaptureError> {
+    let resolved = resolve_captured_link(members, path, target)?;
+    #[cfg(unix)]
+    {
+        let _ = resolved;
+        std::os::unix::fs::symlink(target, output).map_err(|error| capture_io(output, error))
+    }
+    #[cfg(windows)]
+    {
+        let directory =
+            resolved.is_empty() || matches!(members.get(&resolved), Some(MemberKind::Directory));
+        if directory {
+            std::os::windows::fs::symlink_dir(target, output)
+        } else {
+            std::os::windows::fs::symlink_file(target, output)
+        }
+        .map_err(|error| capture_io(output, error))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (resolved, output);
+        Err(reject(path, CaptureRejection::UnsupportedKind))
+    }
+}
+
+fn capture_io(path: &Path, error: std::io::Error) -> CaptureError {
+    CaptureError::Io(CaptureIoError {
+        path: path.to_string_lossy().into_owned(),
+        cause: error.to_string(),
+    })
+}
+
+fn reject(path: &str, reason: CaptureRejection) -> CaptureError {
+    CaptureError::Rejected {
+        path: path.to_string(),
+        reason,
+    }
+}
+
+fn safe_component(value: &str) -> bool {
+    !value.is_empty() && !matches!(value, "." | "..") && !value.contains(['/', '\\', ':', '\0'])
+}
+
+#[derive(Debug)]
+struct RetainedScan {
+    observation: ScanObservation,
+    files: BTreeMap<String, Arc<[u8]>>,
+}
+
+/// Seal a complete path-dependency closure with paired generation scans.
+/// `max_bytes` bounds the cumulative regular-file bytes in EACH closure pass;
+/// at most two such passes are retained while validating an attempt. This is
+/// filesystem work, not a wall-time bound on an unresponsive filesystem.
+/// Absolute/escaping symlinks, special nodes and non-lossless paths are refused.
+pub fn capture_sealed_source(
+    roots: &[(String, PathBuf)],
+    declared_git_state: bool,
+    max_attempts: u32,
+    max_bytes: u64,
+) -> Result<SealedSourceSnapshot, CaptureError> {
+    capture_sealed_source_with(
+        roots,
+        declared_git_state,
+        max_attempts,
+        max_bytes,
+        |_, _| {},
+    )
+}
+
+fn capture_sealed_source_with(
+    roots: &[(String, PathBuf)],
+    declared_git_state: bool,
+    max_attempts: u32,
+    max_bytes: u64,
+    mut after_pass: impl FnMut(u32, u32),
+) -> Result<SealedSourceSnapshot, CaptureError> {
+    let mut ordered = BTreeMap::new();
+    for (id, path) in roots {
+        if !safe_component(id) || ordered.insert(id.clone(), path.clone()).is_some() {
+            return Err(reject(id, CaptureRejection::InvalidRoot));
+        }
+    }
+    if ordered.is_empty() {
+        return Err(reject("", CaptureRejection::InvalidRoot));
+    }
+    let attempts = max_attempts.max(1);
+    let mut last = None;
+    for attempt in 0..attempts {
+        let result = (|| {
+            let first = scan_retained_closure(&ordered, declared_git_state, max_bytes)?;
+            after_pass(attempt, 0);
+            let second = scan_retained_closure(&ordered, declared_git_state, max_bytes)?;
+            after_pass(attempt, 1);
+            for (id, first_root) in &first {
+                if let Some(divergence) =
+                    first_divergence(&first_root.observation, &second[id].observation)
+                {
+                    return Err(CaptureError::Incoherent(CaptureRefusal {
+                        attempts: attempt + 1,
+                        last_divergence: divergence,
+                    }));
+                }
+            }
+            let roots: BTreeMap<_, _> = second
+                .into_iter()
+                .map(|(id, scan)| {
+                    let manifest = SnapshotManifest::seal(
+                        &id,
+                        FsSemanticClass::GenerationScan,
+                        scan.observation.members,
+                    );
+                    (
+                        id,
+                        SealedRoot {
+                            manifest,
+                            files: scan.files,
+                        },
+                    )
+                })
+                .collect();
+            let mut digest = Sha256::new();
+            digest.update(b"rabs.sealed-source-closure.v1\0");
+            for (id, root) in &roots {
+                digest.update((id.len() as u64).to_le_bytes());
+                digest.update(id.as_bytes());
+                digest.update(root.manifest.manifest_sha256);
+            }
+            Ok(SealedSourceSnapshot {
+                roots,
+                digest: digest.finalize().into(),
+            })
+        })();
+        match result {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(CaptureError::Incoherent(refusal)) => last = Some(refusal.last_divergence),
+            Err(error) => return Err(error),
+        }
+    }
+    match last {
+        Some(last_divergence) => Err(CaptureError::Incoherent(CaptureRefusal {
+            attempts,
+            last_divergence,
+        })),
+        None => Err(CaptureError::Io(CaptureIoError {
+            path: String::new(),
+            cause: "capture ended without a scan result".to_string(),
+        })),
+    }
+}
+
+fn scan_retained_closure(
+    roots: &BTreeMap<String, PathBuf>,
+    declared_git_state: bool,
+    max_bytes: u64,
+) -> Result<BTreeMap<String, RetainedScan>, CaptureError> {
+    let mut remaining = max_bytes;
+    let mut scans = BTreeMap::new();
+    for (id, root) in roots {
+        let metadata = std::fs::symlink_metadata(root).map_err(|error| capture_io(root, error))?;
+        if !metadata.is_dir() {
+            return Err(reject(id, CaptureRejection::UnsupportedKind));
+        }
+        let mut scan = RetainedScan {
+            observation: ScanObservation::default(),
+            files: BTreeMap::new(),
+        };
+        scan_retained_directory(root, "", declared_git_state, &mut remaining, &mut scan)?;
+        for (path, kind) in &scan.observation.members {
+            if let MemberKind::Symlink { target } = kind {
+                resolve_captured_link(&scan.observation.members, path, target)?;
+            }
+        }
+        scans.insert(id.clone(), scan);
+    }
+    Ok(scans)
+}
+
+fn scan_retained_directory(
+    directory: &Path,
+    relative: &str,
+    declared_git_state: bool,
+    remaining: &mut u64,
+    scan: &mut RetainedScan,
+) -> Result<(), CaptureError> {
+    let entries = std::fs::read_dir(directory).map_err(|error| capture_io(directory, error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| capture_io(directory, error))?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .filter(|name| safe_component(name))
+            .ok_or_else(|| reject(relative, CaptureRejection::InvalidPath))?;
+        let path = entry.path();
+        let rel = if relative.is_empty() {
+            name.to_string()
+        } else {
+            format!("{relative}/{name}")
+        };
+        if member_disposition(&rel, declared_git_state) != MemberDisposition::Include {
+            continue;
+        }
+        let metadata =
+            std::fs::symlink_metadata(&path).map_err(|error| capture_io(&path, error))?;
+        let member = if metadata.file_type().is_symlink() {
+            let target = std::fs::read_link(&path).map_err(|error| capture_io(&path, error))?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| reject(&rel, CaptureRejection::InvalidPath))?;
+            MemberKind::Symlink {
+                target: target.to_string(),
+            }
+        } else if metadata.is_dir() {
+            scan_retained_directory(&path, &rel, declared_git_state, remaining, scan)?;
+            MemberKind::Directory
+        } else if metadata.is_file() {
+            let (member, bytes) = read_retained_file(&path, &rel, &metadata, remaining)?;
+            scan.files.insert(rel.clone(), bytes.into());
+            member
+        } else {
+            return Err(reject(&rel, CaptureRejection::UnsupportedKind));
+        };
+        scan.observation.members.insert(rel, member);
+    }
+    Ok(())
+}
+
+fn read_retained_file(
+    path: &Path,
+    relative: &str,
+    observed: &std::fs::Metadata,
+    remaining: &mut u64,
+) -> Result<(MemberKind, Vec<u8>), CaptureError> {
+    use std::io::Read;
+    let unstable = || {
+        CaptureError::Incoherent(CaptureRefusal {
+            attempts: 0,
+            last_divergence: Divergence::UnstableDuringRead {
+                path: relative.to_string(),
+            },
+        })
+    };
+    if observed.len() > *remaining {
+        return Err(reject(relative, CaptureRejection::ByteLimitExceeded));
+    }
+    let mut file = std::fs::File::open(path).map_err(|error| capture_io(path, error))?;
+    let before = file.metadata().map_err(|error| capture_io(path, error))?;
+    if !before.is_file() || identity_of(observed) != identity_of(&before) {
+        return Err(unstable());
+    }
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| capture_io(path, error))?;
+        if count == 0 {
+            break;
+        }
+        if count as u64 > *remaining {
+            return Err(reject(relative, CaptureRejection::ByteLimitExceeded));
+        }
+        *remaining -= count as u64;
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    let after = file.metadata().map_err(|error| capture_io(path, error))?;
+    if identity_of(&before) != identity_of(&after)
+        || before.len() != after.len()
+        || bytes.len() as u64 != after.len()
+        || mode_of(&before) != mode_of(&after)
+    {
+        return Err(unstable());
+    }
+    let member = MemberKind::Regular {
+        size: after.len(),
+        inode: inode_of(&after),
+        mtime_ns: mtime_ns_of(&after),
+        content_sha256: Sha256::digest(&bytes).into(),
+        mode: mode_of(&after),
+    };
+    Ok((member, bytes))
+}
+
+/// Resolve links against the captured tree, including chained links and `..`
+/// after a link expansion. Lexical normalization alone would permit escapes.
+fn resolve_captured_link(
+    members: &BTreeMap<String, MemberKind>,
+    path: &str,
+    target: &str,
+) -> Result<String, CaptureError> {
+    use std::collections::VecDeque;
+    let invalid = || reject(path, CaptureRejection::UnsafeSymlink);
+    let mut resolved: Vec<String> = path.split('/').map(str::to_string).collect();
+    resolved.pop();
+    let mut pending: VecDeque<String> = target.split('/').map(str::to_string).collect();
+    let mut links = 0;
+    if Path::new(target).is_absolute() || target.contains(['\\', ':']) {
+        return Err(invalid());
+    }
+    while let Some(component) = pending.pop_front() {
+        match component.as_str() {
+            "" | "." => continue,
+            ".." => {
+                resolved.pop().ok_or_else(invalid)?;
+            }
+            _ => {
+                resolved.push(component);
+                let current = resolved.join("/");
+                match members.get(&current) {
+                    Some(MemberKind::Symlink { target }) => {
+                        links += 1;
+                        if links > 40
+                            || Path::new(target).is_absolute()
+                            || target.contains(['\\', ':'])
+                        {
+                            return Err(invalid());
+                        }
+                        resolved.pop();
+                        for component in target.split('/').rev() {
+                            pending.push_front(component.to_string());
+                        }
+                    }
+                    Some(MemberKind::Directory) => {}
+                    Some(MemberKind::Regular { .. }) if pending.is_empty() => {}
+                    _ => return Err(invalid()),
+                }
+            }
+        }
+    }
+    Ok(resolved.join("/"))
 }
 
 /// Membership disposition for one repo-relative path.
@@ -588,7 +1091,11 @@ fn read_regular_via_descriptor(path: &std::path::Path, rel: &str) -> Result<Memb
     }
     let after = file.metadata().map_err(io_err)?;
     let (before_id, after_id) = (identity_of(&before), identity_of(&after));
-    if before_id != after_id || before.len() != after.len() || total != after.len() {
+    if before_id != after_id
+        || before.len() != after.len()
+        || total != after.len()
+        || mode_of(&before) != mode_of(&after)
+    {
         return Err(ScanError::UnstableDuringRead {
             path: rel.to_string(),
         });
@@ -598,7 +1105,23 @@ fn read_regular_via_descriptor(path: &std::path::Path, rel: &str) -> Result<Memb
         inode: inode_of(&after),
         mtime_ns: mtime_ns_of(&after),
         content_sha256: hasher.finalize().into(),
+        mode: mode_of(&after),
     })
+}
+
+#[cfg(unix)]
+fn mode_of(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn mode_of(meta: &std::fs::Metadata) -> u32 {
+    if meta.permissions().readonly() {
+        0o444
+    } else {
+        0o666
+    }
 }
 
 /// (inode, mtime) — the identity/metadata pair verified around a read.
@@ -628,6 +1151,69 @@ fn mtime_ns_of(meta: &std::fs::Metadata) -> u128 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sealed_closure_retries_all_roots_after_between_pass_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(a.join("file"), "a-old").unwrap();
+        std::fs::write(b.join("file"), "b-old").unwrap();
+        let roots = vec![("a".into(), a.clone()), ("b".into(), b.clone())];
+        let mut passes = Vec::new();
+        let image = capture_sealed_source_with(&roots, false, 3, 100, |attempt, pass| {
+            passes.push((attempt, pass));
+            if attempt == 0 && pass == 0 {
+                // Mutation happens after BOTH roots' first scans. A loop
+                // independently sealing each root cannot establish this pair.
+                std::fs::write(a.join("file"), "a-new").unwrap();
+                std::fs::write(b.join("file"), "b-new").unwrap();
+                std::fs::write(b.join("added"), "new member").unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(passes, [(0, 0), (0, 1), (1, 0), (1, 1)]);
+        assert_eq!(image.file_bytes("a", "file"), Some(b"a-new".as_slice()));
+        assert_eq!(image.file_bytes("b", "file"), Some(b"b-new".as_slice()));
+        assert_eq!(
+            image.file_bytes("b", "added"),
+            Some(b"new member".as_slice())
+        );
+        // Retained bytes, not a second filesystem lookup, feed execution.
+        std::fs::write(a.join("file"), "a-later").unwrap();
+        let materialized = image.materialize_into(&dir.path().join("image")).unwrap();
+        assert_eq!(
+            std::fs::read(materialized.backing("a").unwrap().join("file")).unwrap(),
+            b"a-new"
+        );
+    }
+
+    #[test]
+    fn sealed_closure_refuses_sustained_mutation_in_one_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(a.join("file"), "quiet workspace").unwrap();
+        std::fs::write(b.join("file"), "dependency-initial").unwrap();
+        let roots = vec![("a".into(), a), ("b".into(), b.clone())];
+        let mut mutations = 0;
+        let error = capture_sealed_source_with(&roots, false, 3, 100, |attempt, pass| {
+            if pass == 0 {
+                mutations += 1;
+                std::fs::write(b.join("file"), format!("dependency-{attempt}")).unwrap();
+            }
+        })
+        .unwrap_err();
+        assert_eq!(mutations, 3);
+        assert!(matches!(
+            error,
+            CaptureError::Incoherent(CaptureRefusal { attempts: 3, .. })
+        ));
+    }
+
     fn hash_of(gen_marker: u64, path: &str) -> [u8; 32] {
         let mut h = Sha256::new();
         h.update(gen_marker.to_le_bytes());
@@ -648,6 +1234,7 @@ mod tests {
                     inode: *inode,
                     mtime_ns: u128::from(*generation),
                     content_sha256: hash_of(*generation, path),
+                    mode: 0o644,
                 },
             );
         }
@@ -730,6 +1317,7 @@ mod tests {
                 ));
             }
             CaptureError::Io(io) => panic!("wrong error class: {io}"),
+            CaptureError::Rejected { .. } => panic!("unexpected policy refusal"),
         }
     }
 

@@ -16,7 +16,9 @@ use rabs_sandbox::equality_suite::{
     ArtifactClass, classes_covered, collect_run_artifacts, compare_runs,
 };
 use rabs_sandbox::layout;
-use rabs_sandbox::unit_convergence::{compare, normalize, parse_wrapper_log};
+use rabs_sandbox::unit_convergence::{
+    compare, normalize, parse_wrapper_log, recorded_output_directories,
+};
 
 fn supported() -> Option<HostIsolationSupport> {
     let support = HostIsolationSupport::probe();
@@ -122,7 +124,15 @@ fn build_run(
     let out = command_for(&launch).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "fixture build failed:\n{stderr}");
-    let log = std::fs::read_to_string(out_backing.path().join("rustc-argv.log")).unwrap();
+    let log_path = out_backing.path().join("rustc-argv.log");
+    let log = std::fs::read_to_string(&log_path).unwrap_or_else(|error| {
+        panic!(
+            "successful fixture command produced no wrapper log at {}: {error}; toolchain={}\nstdout:\n{}\nstderr:\n{stderr}",
+            log_path.display(),
+            toolchain_dir().display(),
+            String::from_utf8_lossy(&out.stdout),
+        )
+    });
     (out_backing, log)
 }
 
@@ -152,8 +162,11 @@ fn m1_harness_argv_and_artifacts_equal_across_worktrees() {
 
     // Artifact side: rmeta / rlib / dep-info / binary all present and
     // byte-equal, with classified findings on anything else.
-    let run_a = collect_run_artifacts(&out_a.path().join("debug/deps")).unwrap();
-    let run_b = collect_run_artifacts(&out_b.path().join("debug/deps")).unwrap();
+    let canonical_output = std::path::PathBuf::from(format!("{}/fixture", layout::OUT));
+    let directories_a = recorded_output_directories(&argv_a, &canonical_output).unwrap();
+    let directories_b = recorded_output_directories(&argv_b, &canonical_output).unwrap();
+    let run_a = collect_run_artifacts(out_a.path(), &directories_a).unwrap();
+    let run_b = collect_run_artifacts(out_b.path(), &directories_b).unwrap();
     let required = [
         ArtifactClass::Rmeta,
         ArtifactClass::Rlib,
