@@ -4214,17 +4214,36 @@ async fn handle_gc(
             handles: true,
             processes: true,
         };
+        // A root whose guard bailed (missing, unresolvable, too shallow) exits
+        // before the gate snapshots run and so reports none; folding its empty
+        // answer in would mislabel a perfectly healthy worker. Count the runs
+        // that actually reported, and say "unavailable" when none did.
+        let mut gate_runs = 0usize;
         let mut temp_base: Option<String> = None;
+        // (resolved path on the worker, label to report it under). Attribution
+        // MUST use the resolved path: the script canonicalizes each root with
+        // `pwd -P`, so a `remote_base` that is a symlink (or a bind mount)
+        // yields dirs whose paths never start with the configured string, and
+        // every one of them would otherwise be filed under the wrong root.
+        let mut attribution: Vec<(String, String)> = Vec::new();
         for base in &bases {
             let command = reap::enumerate_targets_command(base);
             match run_reap_surface_command(worker, &command).await {
                 Ok(result) if result.success() => {
                     let seen = reap::parse_scan_roots(&result.stdout);
-                    let gates = reap::parse_gate_availability(&result.stdout);
-                    gates_available.handles &= gates.handles;
-                    gates_available.processes &= gates.processes;
+                    if seen.skipped.is_none() {
+                        let gates = reap::parse_gate_availability(&result.stdout);
+                        gates_available.handles &= gates.handles;
+                        gates_available.processes &= gates.processes;
+                        gate_runs += 1;
+                    }
                     if temp_base.is_none() {
                         temp_base.clone_from(&seen.temp_base);
+                    }
+                    if let Some(resolved) = seen.resolved.clone()
+                        && !attribution.iter().any(|(path, _)| *path == resolved)
+                    {
+                        attribution.push((resolved, base.clone()));
                     }
                     scanned_roots.push(serde_json::json!({
                         "requested": base,
@@ -4257,7 +4276,9 @@ async fn handle_gc(
             worker_reports.push(error);
             continue;
         }
-        any_ok = true;
+        if gate_runs == 0 {
+            gates_available = reap::GateAvailability::default();
+        }
 
         // ── decide, per dir ────────────────────────────────────────────────
         let mut seen_paths = std::collections::HashSet::new();
@@ -4292,19 +4313,27 @@ async fn handle_gc(
             }
         }
 
+        // The worker temp base is attributed last and least specifically, so a
+        // configured root NESTED under it still wins.
         let temp_base_label = temp_base
             .clone()
             .unwrap_or_else(|| rch_common::gc_roots::WORKER_TEMP_BASE_PLACEHOLDER.to_string());
+        if let Some(resolved_temp) = temp_base.clone()
+            && !attribution.iter().any(|(path, _)| *path == resolved_temp)
+        {
+            attribution.push((resolved_temp, temp_base_label.clone()));
+        }
         let decisions: Vec<GcDecision> = entries
             .into_iter()
             .zip(verdicts)
             .zip(triggers)
             .zip(windows)
             .map(|(((entry, verdict), trigger), idle_minutes)| {
-                let root = surface
-                    .roots
-                    .attribute(&entry.path)
-                    .map_or_else(|| temp_base_label.clone(), |r| r.path.clone());
+                let root = attribution
+                    .iter()
+                    .filter(|(path, _)| rch_common::gc_roots::path_is_under(&entry.path, path))
+                    .max_by_key(|(path, _)| path.len())
+                    .map_or_else(|| temp_base_label.clone(), |(_, label)| label.clone());
                 GcDecision {
                     entry,
                     verdict,
@@ -4417,6 +4446,7 @@ async fn handle_gc(
             })
             .collect();
 
+        any_ok |= apply_error.is_none();
         worker_reports.push(serde_json::json!({
             "id": worker.id.as_str(),
             "ok": apply_error.is_none(),
@@ -4586,14 +4616,12 @@ async fn handle_gc(
         }
     }
 
+    // Fail-open across the fleet, as every other multi-worker surface does: one
+    // unreachable worker must not throw away the sweep of the other fifteen.
+    // `any_ok` is set only after a worker's COLLECTION also succeeded, so an
+    // `--apply` that failed everywhere still exits non-zero.
     if !any_ok {
         anyhow::bail!("gc failed on every selected worker");
-    }
-    if worker_reports
-        .iter()
-        .any(|r| r["ok"].as_bool() != Some(true))
-    {
-        anyhow::bail!("gc failed on at least one selected worker");
     }
     Ok(())
 }

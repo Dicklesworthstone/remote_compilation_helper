@@ -59,12 +59,6 @@ pub const REAP_GLOBS: &[&str] = &[
 /// `cargo_cache_glob_tracks_the_creating_prefix`.
 pub const CARGO_CACHE_GLOB: &str = "rch-cargo-cache-*";
 
-/// Gate prefix spliced in front of a POOLED-dir reap loop body: skip any dir
-/// that fails [`gate_snapshot_fragment`]'s `__gc_gates_ok`. A pooled dir is a
-/// warm cache SHARED by concurrent jobs, so the idle window alone is not
-/// allowed to authorize its removal.
-const POOLED_COLLECT_GATE: &str = "[ -d \"$d\" ] || continue;      if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP pooled-ttl gate %s\\n' \"$d\"; continue; fi; ";
-
 /// Minimum non-zero cargo-cache idle window in minutes (24h), mirroring
 /// [`MIN_POOLED_IDLE_MINUTES`]: a durable Cargo cache is a warm cache too, so a
 /// misconfigured short window is floored rather than honored.
@@ -365,8 +359,29 @@ fn gate_snapshot_fragment() -> String {
 
 /// Shell fragment removing the gate-snapshot temp files. Safe when a snapshot
 /// was never created (`rm -f ""` is not attempted).
+///
+/// Written as `if`, NOT as `[ -n "$x" ] && rm -f "$x"`: the `&&` form yields
+/// exit status 1 when the variable is empty, and this fragment is the LAST
+/// statement of the enumeration script — a worker whose `mktemp` failed would
+/// have made the whole read-only enumeration look like a failed command.
 fn gate_snapshot_cleanup() -> &'static str {
-    "[ -n \"$__held\" ] && rm -f \"$__held\"; [ -n \"$__proc\" ] && rm -f \"$__proc\"; "
+    "if [ -n \"$__held\" ]; then rm -f \"$__held\"; fi; \
+     if [ -n \"$__proc\" ]; then rm -f \"$__proc\"; fi; "
+}
+
+/// Gate prefix for a POOLED-dir reap loop body, given that pass's idle window.
+///
+/// Order matters: the cheap whole-tree `-mmin` idle test runs FIRST and simply
+/// `continue`s, so a worker mid-build does not pay two `awk` scans per warm
+/// pool, and a worker whose gates are unavailable does not print one skip line
+/// per pool it was never going to touch anyway. Only a dir the TTL pass would
+/// actually remove is gate-checked, and only that dir's refusal is reported.
+fn pooled_collect_gate(idle_minutes: u64) -> String {
+    format!(
+        "[ -d \"$d\" ] || continue; \
+         if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then continue; fi; \
+         if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP pooled-ttl gate %s\\n' \"$d\"; continue; fi; "
+    )
 }
 
 fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str) -> String {
@@ -451,7 +466,7 @@ pub fn worker_sweep_command(
                    while IFS= read -r d; do {pooled_gate}{pooled_body} done < \"$__tmpf2\"; \
                    rm -f \"$__tmpf2\"; \
                  fi; ",
-                pooled_gate = POOLED_COLLECT_GATE,
+                pooled_gate = pooled_collect_gate(window),
             )
         }
         None => String::new(),
@@ -459,8 +474,9 @@ pub fn worker_sweep_command(
     // Byte-cap eviction (bead 6dj11): after the TTL passes, when the TOTAL of
     // every remaining reap-class dir exceeds the budget, evict oldest first —
     // but NEVER a dir with activity within the short idle window (the same
-    // whole-tree `find -mmin` active-build safety floor as the TTL pass) —
-    // until back under. Oldest-first makes this a warm-LRU by construction:
+    // whole-tree `find -mmin` active-build safety floor as the TTL pass), and
+    // never one that fails the liveness gates (a disk budget must not be able
+    // to delete a dir a build is holding open) — until back under. Oldest-first makes this a warm-LRU by construction:
     // the newest warm pools survive, the coldest go first. Ordering uses the
     // dir's own mtime via `date -r` (portable across GNU/BSD, and cargo
     // touches the target root constantly during builds, so it is a good
@@ -494,8 +510,9 @@ pub fn worker_sweep_command(
                    [ \"$total_kb\" -le {cap_kb} ] && break; \
                    [ -d \"$d\" ] || continue; \
                    if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then \
-                     printf 'RCH_REAP_SKIP cap %s active %s\\n' \"$__k\" \"$d\"; continue; \
+                     printf 'RCH_GC_SKIP cap active %s\\n' \"$d\"; continue; \
                    fi; \
+                   if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP cap gate %s\\n' \"$d\"; continue; fi; \
                    if __rmerr=$(rm -rf -- \"$d\" 2>&1); then \
                      removed=$((removed + 1)); freed_kb=$((freed_kb + __k)); total_kb=$((total_kb - __k)); \
                      printf 'RCH_REAP_RM %s cap %s\\n' \"$__k\" \"$d\"; \
@@ -661,7 +678,7 @@ pub fn enumerate_targets_command(escaped_base: &str) -> String {
            printf 'RCH_TARGET_ENTRY %s %s %s %s %s\\n' \"$newest\" \"$kb\" \"$(__gc_handles \"$d\")\" \"$(__gc_procs \"$d\")\" \"$d\"; \
          done < \"$__tmpf\"; \
          rm -f \"$__tmpf\"; \
-         {gate_cleanup}",
+         {gate_cleanup}exit 0",
         cache_glob = CARGO_CACHE_GLOB,
         gate_cleanup = gate_snapshot_cleanup()
     )
@@ -1709,6 +1726,51 @@ mod tests {
         assert!(!cmd.contains("__tmpbase=\"${TMPDIR:-}\""));
     }
 
+    /// The enumeration is read-only and its exit status must mean "the SSH
+    /// command ran", nothing else. A `[ -n "$x" ] && rm -f "$x"` tail would
+    /// exit 1 on a worker whose `mktemp` failed and turn a healthy read-only
+    /// scan into a reported worker failure.
+    #[test]
+    fn enumeration_cannot_exit_nonzero_because_a_temp_file_was_never_made() {
+        let cmd = enumerate_targets_command("/data/projects");
+        assert!(
+            cmd.trim_end().ends_with("exit 0"),
+            "enumerate must end with an explicit status"
+        );
+        for var in ["__held", "__proc"] {
+            assert!(
+                !cmd.contains(&format!("[ -n \"${var}\" ] && rm -f")),
+                "${var} cleanup must be an `if`, not an `&&` whose failure becomes the exit status"
+            );
+            assert!(cmd.contains(&format!("if [ -n \"${var}\" ]; then rm -f \"${var}\"; fi")));
+        }
+    }
+
+    /// The gates are consulted only for a dir the TTL pass would actually
+    /// remove: the cheap idle test runs first, so a busy worker does not pay
+    /// two `awk` scans per warm pool nor emit a skip line for every one.
+    #[test]
+    fn pooled_gate_runs_after_the_cheap_idle_test() {
+        let cmd = worker_sweep_command("/data/projects", 720, Some(10_080), None);
+        let gate = cmd
+            .find("__gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP pooled-ttl")
+            .expect("pooled gate present");
+        let idle = cmd
+            .find("find \"$d\" -mmin -10080 -print -quit")
+            .expect("pooled idle test present");
+        assert!(idle < gate, "the idle test must precede the gate check");
+    }
+
+    #[test]
+    fn byte_cap_eviction_is_gated_on_liveness_too() {
+        let cmd = worker_sweep_command("/data/projects", 720, Some(10_080), Some(1024));
+        assert!(
+            cmd.contains("if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP cap gate"),
+            "a disk budget must not evict a dir a build is holding open"
+        );
+        assert!(cmd.contains("printf 'RCH_GC_SKIP cap active"));
+    }
+
     #[test]
     fn pooled_sweep_pass_is_gated_on_liveness() {
         let cmd = worker_sweep_command("/data/projects", 720, Some(10_080), None);
@@ -2452,7 +2514,10 @@ mod tests {
         assert!(cmd.contains("RCH_REAP_ERR cap"));
         assert!(cmd.contains("RCH_REAP_CAP initial_kb=%s cap_kb=1024"));
         assert!(cmd.contains("RCH_REAP_CAP final_kb=%s"));
-        assert!(cmd.contains("RCH_REAP_SKIP cap %s active %s"));
+        // Cap skips now speak the parseable `RCH_GC_SKIP <trigger> <reason>
+        // <path>` shape the gc surfaces read back, and carry the gate reason.
+        assert!(cmd.contains("RCH_GC_SKIP cap active %s"));
+        assert!(cmd.contains("RCH_GC_SKIP cap gate %s"));
     }
 
     #[test]
