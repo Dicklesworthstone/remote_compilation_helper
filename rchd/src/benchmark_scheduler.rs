@@ -4,7 +4,7 @@
 //! measurement freshness against system load impact.
 //!
 //! ## Scheduling Triggers
-//! - New workers: benchmark immediately on detection
+//! - New workers: queue on detection, run once fresh telemetry permits it
 //! - Stale scores: re-benchmark when score exceeds max age
 //! - Drift detection: re-benchmark if telemetry suggests performance change
 //! - Manual triggers: user-initiated benchmarks via API
@@ -12,7 +12,8 @@
 #![allow(dead_code)] // Scaffold code - will be wired into main.rs in future beads
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use rch_common::WorkerId;
+use rch_common::{WorkerCapabilities, WorkerId};
+use rch_telemetry::protocol::ReceivedTelemetry;
 use rch_telemetry::speedscore::SpeedScore;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::events::EventBus;
+use crate::disk_pressure::{DiskPressurePolicyConfig, PressureState, evaluate_pressure_policy};
 use crate::telemetry::TelemetryStore;
 use crate::workers::{WorkerPool, WorkerState};
 
@@ -160,6 +162,35 @@ impl Default for SchedulerConfig {
             consecutive_failure_alert_threshold: 3,         // Alert after 3 consecutive failures
         }
     }
+}
+
+fn benchmark_telemetry_allows_start(
+    capabilities: &WorkerCapabilities,
+    telemetry: Option<&ReceivedTelemetry>,
+    idle_cpu_threshold: f64,
+) -> bool {
+    let Some(telemetry) = telemetry else {
+        return false;
+    };
+    let cpu = telemetry.telemetry.cpu.overall_percent;
+    let memory = telemetry.telemetry.memory.pressure_score;
+    if !cpu.is_finite()
+        || !(0.0..=idle_cpu_threshold).contains(&cpu)
+        || !memory.is_finite()
+        || !(0.0..=100.0).contains(&memory)
+    {
+        return false;
+    }
+    // Re-evaluate the existing pressure policy against the current receipt:
+    // a cached healthy assessment can outlive its telemetry. Optional
+    // benchmarks must wait when ordinary dispatch would report a telemetry gap.
+    let pressure = evaluate_pressure_policy(
+        capabilities,
+        Some(telemetry),
+        &DiskPressurePolicyConfig::default(),
+    );
+    pressure.telemetry_fresh
+        && matches!(pressure.state, PressureState::Healthy | PressureState::Warning)
 }
 
 fn normalized_event_score(score: f64) -> f64 {
@@ -601,18 +632,18 @@ impl BenchmarkScheduler {
             return false;
         }
 
-        // Check idle state via telemetry
-        if let Some(telemetry) = self.telemetry.latest(worker_id.as_str()) {
-            let cpu_pct = telemetry.telemetry.cpu.overall_percent;
-            if cpu_pct > self.config.idle_cpu_threshold {
-                debug!(
-                    worker_id = %worker_id,
-                    cpu_pct = cpu_pct,
-                    threshold = self.config.idle_cpu_threshold,
-                    "Worker not idle enough for benchmark"
-                );
-                return false;
-            }
+        let capabilities = worker.capabilities().await;
+        let telemetry = self.telemetry.latest(worker_id.as_str());
+        if !benchmark_telemetry_allows_start(
+            &capabilities,
+            telemetry.as_ref(),
+            self.config.idle_cpu_threshold,
+        ) {
+            debug!(
+                worker_id = %worker_id,
+                "Benchmark waiting for fresh, idle telemetry and safe resource pressure"
+            );
+            return false;
         }
 
         true
@@ -707,6 +738,13 @@ impl BenchmarkScheduler {
     async fn start_benchmark(&self, request: ScheduledBenchmarkRequest) {
         let worker_id = request.worker_id.clone();
         let request_id = request.request_id.clone();
+
+        // Queue inspection can yield before dispatch. Keep a request pending
+        // if its worker became busy, unhealthy, or stale in that interval.
+        if !self.is_worker_eligible(&worker_id).await {
+            self.enqueue(request).await;
+            return;
+        }
 
         info!(
             worker_id = %worker_id,
@@ -2818,6 +2856,106 @@ Benchmark complete
             psi: None,
         };
         WorkerTelemetry::new(worker_id.to_string(), cpu, memory, None, None, 1)
+    }
+
+    #[test]
+    fn test_benchmark_admission_requires_fresh_safe_telemetry() {
+        let mut capabilities = WorkerCapabilities {
+            disk_free_gb: Some(50.0),
+            disk_total_gb: Some(100.0),
+            ..WorkerCapabilities::default()
+        };
+        let fresh = ReceivedTelemetry::new(
+            make_telemetry_with_load("admission", 10.0, 30.0, 0.5),
+            TelemetrySource::SshPoll,
+        );
+        let threshold = SchedulerConfig::default().idle_cpu_threshold;
+        assert!(benchmark_telemetry_allows_start(
+            &capabilities, Some(&fresh), threshold
+        ));
+        assert!(!benchmark_telemetry_allows_start(
+            &capabilities, None, threshold
+        ));
+
+        let mut stale = fresh.clone();
+        stale.received_at = Utc::now() - ChronoDuration::seconds(91);
+        assert!(!benchmark_telemetry_allows_start(
+            &capabilities, Some(&stale), threshold
+        ));
+        for cpu in [21.0, f64::NAN, f64::INFINITY, -1.0] {
+            let mut busy = fresh.clone();
+            busy.telemetry.cpu.overall_percent = cpu;
+            assert!(!benchmark_telemetry_allows_start(
+                &capabilities, Some(&busy), threshold
+            ));
+        }
+        for memory in [92.0, 100.0, f64::NAN, f64::INFINITY, -1.0] {
+            let mut pressured = fresh.clone();
+            pressured.telemetry.memory.pressure_score = memory;
+            assert!(!benchmark_telemetry_allows_start(
+                &capabilities, Some(&pressured), threshold
+            ));
+        }
+        capabilities.disk_free_gb = Some(1.0);
+        assert!(!benchmark_telemetry_allows_start(
+            &capabilities, Some(&fresh), threshold
+        ));
+        capabilities.disk_free_gb = None;
+        assert!(!benchmark_telemetry_allows_start(
+            &capabilities, Some(&fresh), threshold
+        ));
+        capabilities.disk_free_gb = Some(20.0);
+        assert!(benchmark_telemetry_allows_start(
+            &capabilities, Some(&fresh), threshold
+        ), "noncritical warning pressure retains the existing admission threshold");
+    }
+
+    #[tokio::test]
+    async fn test_new_worker_benchmark_waits_for_telemetry() {
+        let pool = WorkerPool::new();
+        let worker_id = WorkerId::new("startup-admission");
+        pool.add_worker(make_worker_config(worker_id.as_str())).await;
+        let worker = pool.get(&worker_id).await.unwrap();
+        worker.set_capabilities(WorkerCapabilities {
+            disk_free_gb: Some(50.0),
+            disk_total_gb: Some(100.0),
+            ..WorkerCapabilities::default()
+        }).await;
+        let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let (scheduler, _handle) = BenchmarkScheduler::new(
+            make_test_config(), pool, telemetry.clone(), EventBus::new(16)
+        );
+        let request = ScheduledBenchmarkRequest::new(
+            worker_id.clone(), BenchmarkPriority::High, BenchmarkReason::NewWorker
+        );
+        scheduler.enqueue(request.clone()).await;
+        scheduler.process_pending_queue().await;
+        assert_eq!(scheduler.pending_count().await, 1);
+        assert_eq!(scheduler.running_count().await, 0);
+        assert_eq!(worker.available_slots().await, 4);
+        assert!(!scheduler.is_worker_eligible(&worker_id).await);
+
+        telemetry.ingest(
+            make_telemetry_with_load(worker_id.as_str(), 10.0, 30.0, 0.5),
+            TelemetrySource::SshPoll,
+        );
+        assert!(scheduler.is_worker_eligible(&worker_id).await);
+        assert!(worker.reserve_slots(4).await);
+        assert!(!scheduler.is_worker_eligible(&worker_id).await);
+        worker.release_slots(4).await;
+        assert!(scheduler.is_worker_eligible(&worker_id).await);
+
+        telemetry.ingest(
+            make_telemetry_with_load(worker_id.as_str(), 10.0, 100.0, 0.5),
+            TelemetrySource::SshPoll,
+        );
+        // The request was eligible at selection, then pressure worsened before
+        // dispatch. The start boundary must requeue it without reserving a slot.
+        scheduler.pending_queue.lock().await.clear();
+        scheduler.start_benchmark(request).await;
+        assert_eq!(scheduler.pending_count().await, 1);
+        assert_eq!(scheduler.running_count().await, 0);
+        assert_eq!(worker.available_slots().await, 4);
     }
 
     /// Build a SpeedScore with attached BenchmarkConditions.
