@@ -55,7 +55,7 @@ pub const REAP_GLOBS: &[&str] = &[
 ///
 /// Deliberately NOT in [`REAP_GLOBS`]: that list drives the per-job reaper and
 /// the rsync exclude set, where a Cargo cache must never appear. Kept in sync
-/// with [`crate::gc_roots::RCH_CARGO_CACHE_PREFIX`] by
+/// with [`crate::remote_compilation::RCH_CARGO_CACHE_PREFIX`] by
 /// `cargo_cache_glob_tracks_the_creating_prefix`.
 pub const CARGO_CACHE_GLOB: &str = "rch-cargo-cache-*";
 
@@ -391,8 +391,8 @@ fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str) -> Stri
     // other than where rch writes. It used to be a hand-copied `$TMPDIR` →
     // `/data/tmp` → `/tmp` ladder here — the duplication that let ~700 GB of
     // pooled/cache dirs sit unscanned while `rch gc` reported 0 MB.
-    let tmp_base_prelude = crate::gc_roots::remote_cargo_home_base_prelude();
-    let tmp_base_var = crate::gc_roots::RCH_CARGO_HOME_BASE_VAR;
+    let tmp_base_prelude = crate::remote_compilation::remote_cargo_home_base_prelude();
+    let tmp_base_var = crate::remote_compilation::RCH_CARGO_HOME_BASE_VAR;
     format!(
         "set -u; \
          base=\"{escaped_base}\"; \
@@ -757,7 +757,7 @@ impl GcClass {
             }
             return Self::Unrecognized;
         }
-        if name.starts_with(crate::gc_roots::RCH_CARGO_CACHE_PREFIX) {
+        if name.starts_with(crate::remote_compilation::RCH_CARGO_CACHE_PREFIX) {
             return Self::CargoCache;
         }
         if name.starts_with("rch_target_") {
@@ -1157,8 +1157,8 @@ pub fn collect_paths_command(targets: &[GcCollectTarget]) -> Result<String, Stri
     }
     // `$__tmpbase` is the mktemp location for the gate snapshots and is
     // resolved by the very prelude that creates the dirs being collected.
-    let tmp_base_prelude = crate::gc_roots::remote_cargo_home_base_prelude();
-    let tmp_base_var = crate::gc_roots::RCH_CARGO_HOME_BASE_VAR;
+    let tmp_base_prelude = crate::remote_compilation::remote_cargo_home_base_prelude();
+    let tmp_base_var = crate::remote_compilation::RCH_CARGO_HOME_BASE_VAR;
     Ok(format!(
         "set -u; \
          {tmp_base_prelude}; \
@@ -1385,10 +1385,10 @@ mod tests {
     fn cargo_cache_glob_tracks_the_creating_prefix() {
         assert_eq!(
             CARGO_CACHE_GLOB,
-            format!("{}*", crate::gc_roots::RCH_CARGO_CACHE_PREFIX)
+            format!("{}*", crate::remote_compilation::RCH_CARGO_CACHE_PREFIX)
         );
         // ...and the durable-cache expression really produces a matching name.
-        let expr = crate::gc_roots::remote_cargo_cache_expr("hz2");
+        let expr = crate::remote_compilation::remote_cargo_cache_expr("hz2");
         assert!(expr.ends_with("/rch-cargo-cache-hz2"), "{expr}");
         assert_eq!(
             GcClass::from_path(&expr.replace("${RCH_CH_BASE}", "/data/tmp")),
@@ -1705,7 +1705,7 @@ mod tests {
     /// dirs, not a second copy of the ladder.
     #[test]
     fn scan_roots_reuse_the_creating_prelude() {
-        let prelude = crate::gc_roots::remote_cargo_home_base_prelude();
+        let prelude = crate::remote_compilation::remote_cargo_home_base_prelude();
         for cmd in [
             enumerate_targets_command("/data/projects"),
             worker_sweep_command("/data/projects", 720, Some(10_080), None),

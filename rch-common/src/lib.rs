@@ -185,10 +185,6 @@ pub use force_resync::{
     ForceResyncPlan, ForceResyncReport, InvalidationAction, RefusedInvalidation, ResyncOutcome,
     StaleRoot, apply_force_resync, is_safe_invalidation_target, plan_force_resync,
 };
-pub use gc_roots::{
-    RCH_CARGO_CACHE_PREFIX, RCH_CARGO_HOME_BASE_VAR, RCH_CARGO_HOME_PREFIX,
-    remote_cargo_cache_expr, remote_cargo_home_base_prelude, remote_cargo_home_expr,
-};
 pub use logging::{LogConfig, LogFormat, LoggingGuards, init_logging};
 pub use mock_worker::MockWorkerServer;
 pub use path_topology::{
@@ -205,6 +201,13 @@ pub use protocol::{HookInput, HookOutput, ToolInput};
 pub use queue_contract::{
     AdmissionState, QueueContractOutcome, QueueContractResponse, QueueOptions, StartState,
     WaitResult, resolve_queue_contract,
+};
+// The module is unix-only, so its re-export must be too — otherwise a Windows
+// build (a windows rch-wkr) fails to resolve the import.
+#[cfg(unix)]
+pub use remote_compilation::{
+    RCH_CARGO_CACHE_PREFIX, RCH_CARGO_HOME_BASE_VAR, RCH_CARGO_HOME_PREFIX,
+    remote_cargo_cache_expr, remote_cargo_home_base_prelude, remote_cargo_home_expr,
 };
 pub use repo_updater_contract::{
     MockRepoUpdaterAdapter, REPO_UPDATER_ALIAS_PROJECTS_ROOT, REPO_UPDATER_CANONICAL_PROJECTS_ROOT,
