@@ -13,9 +13,9 @@
 //! 2. **The relocated pooled store** — `[remediation.pooled_target] store_base`
 //!    (issue #64), when an operator moves warm pools onto a bigger volume.
 //! 3. **The worker temp base** — resolved *on the worker* by
-//!    [`crate::remote_compilation::remote_cargo_home_base_prelude`] as
+//!    [`remote_cargo_home_base_prelude`] as
 //!    `$TMPDIR` → `/data/tmp` → `/tmp`. Both the durable per-worker Cargo
-//!    caches ([`crate::remote_compilation::RCH_CARGO_CACHE_PREFIX`], issue #42)
+//!    caches ([`RCH_CARGO_CACHE_PREFIX`], issue #42)
 //!    and staged `.rch-target-*` dirs live under it.
 //!
 //! Before this module the GC scan set was a **second, hardcoded list**: the
@@ -39,6 +39,82 @@
 use crate::remediation_config::PooledTargetConfig;
 use crate::stale_target_reap::is_safe_reap_base;
 
+/// Shell-snippet name of the variable that [`remote_cargo_home_base_prelude`]
+/// assigns the isolated-CARGO_HOME staging base into.
+pub const RCH_CARGO_HOME_BASE_VAR: &str = "RCH_CH_BASE";
+
+/// Basename prefix of every isolated CARGO_HOME staging dir. Cleanup/reaper
+/// passes (in-tree and external, e.g. sbh) match on this exact prefix, so it
+/// must never change.
+pub const RCH_CARGO_HOME_PREFIX: &str = "rch-cargo-home-";
+
+/// A POSIX-`sh` statement that resolves the temp base for isolated CARGO_HOME
+/// staging dirs **on the worker, at job-execution time**, into the shell
+/// variable [`RCH_CARGO_HOME_BASE_VAR`].
+///
+/// Why resolve remotely rather than bake a path in from the client: these dirs
+/// are created and used on the *worker*, and the worker's correct temp location
+/// (`$TMPDIR`, fleet-wide `/data/tmp`) is what matters, not the orchestrating
+/// client's. Critically, rchd runs under systemd and so does **not** inherit
+/// PAM's `/etc/environment` (where `TMPDIR=/data/tmp` lives) — but a build
+/// dispatched over SSH may, and either way the explicit `/data/tmp` fallback
+/// keeps these (potentially large, long-lived) caches off a tmpfs `/tmp` that
+/// would otherwise eat RAM.
+///
+/// Resolution order: `$TMPDIR` (if set and a real directory) → `/data/tmp`
+/// (if it exists) → `/tmp`.
+pub fn remote_cargo_home_base_prelude() -> String {
+    format!(
+        "{var}=\"${{TMPDIR:-}}\"; \
+         [ -n \"${{{var}}}\" ] && [ -d \"${{{var}}}\" ] || {var}=/data/tmp; \
+         [ -d \"${{{var}}}\" ] || {var}=/tmp",
+        var = RCH_CARGO_HOME_BASE_VAR
+    )
+}
+
+/// The shell expression (referencing the variable set by
+/// [`remote_cargo_home_base_prelude`]) for an isolated CARGO_HOME staging dir
+/// whose unique `suffix` is already path-safe. Keeps the
+/// [`RCH_CARGO_HOME_PREFIX`] basename so cleanup matching still works.
+///
+/// Returns an unquoted expression that must be embedded in a context where the
+/// shell expands `$VAR` (i.e. inside double quotes or bare); both call sites
+/// double-quote it.
+pub fn remote_cargo_home_expr(suffix: &str) -> String {
+    format!(
+        "${{{var}}}/{prefix}{suffix}",
+        var = RCH_CARGO_HOME_BASE_VAR,
+        prefix = RCH_CARGO_HOME_PREFIX
+    )
+}
+
+/// Basename prefix of the *durable* per-worker Cargo cache dir used as
+/// `CARGO_HOME` for offloaded builds (issue #42).
+///
+/// Deliberately distinct from [`RCH_CARGO_HOME_PREFIX`]: that prefix names
+/// throwaway per-job staging dirs which orphan-cleanup passes (in-tree and
+/// external, e.g. sbh) are allowed to reap. Dirs with THIS prefix are
+/// long-lived caches — registry downloads and git-dependency db/checkout
+/// state persist here across jobs so an interrupted/timed-out job's
+/// dependency preparation is reusable by the next one. Reapers must not treat
+/// them as orphans (worker disk-pressure reclaim may still clear them; the
+/// only cost is a cold cache).
+pub const RCH_CARGO_CACHE_PREFIX: &str = "rch-cargo-cache-";
+
+/// The shell expression (referencing the variable set by
+/// [`remote_cargo_home_base_prelude`]) for the durable per-worker Cargo cache
+/// dir whose `worker` token is already path-safe.
+///
+/// Returns an unquoted expression that must be embedded in a context where the
+/// shell expands `$VAR` (i.e. inside double quotes or bare).
+pub fn remote_cargo_cache_expr(worker: &str) -> String {
+    format!(
+        "${{{var}}}/{prefix}{worker}",
+        var = RCH_CARGO_HOME_BASE_VAR,
+        prefix = RCH_CARGO_CACHE_PREFIX
+    )
+}
+
 /// Where a scan root came from. Reported per root so an operator reading
 /// `rch gc` output can tell a default from something they configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -52,7 +128,7 @@ pub enum GcRootSource {
     /// A `--root` flag on this invocation.
     CommandLine,
     /// The worker temp base, resolved on the worker at sweep time by
-    /// [`crate::remote_compilation::remote_cargo_home_base_prelude`].
+    /// [`remote_cargo_home_base_prelude`].
     WorkerTempBase,
 }
 
@@ -223,7 +299,7 @@ fn normalize(path: &str) -> String {
 /// but a rejected root is never scanned, and callers surface the rejection.
 ///
 /// The worker temp base is always appended: it is where
-/// [`crate::remote_compilation::remote_cargo_cache_expr`] puts durable Cargo
+/// [`remote_cargo_cache_expr`] puts durable Cargo
 /// caches and where staged `.rch-target-*` dirs live, and it is resolved on the
 /// worker by the very prelude that creates them.
 #[must_use]

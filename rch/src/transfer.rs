@@ -3737,7 +3737,7 @@ fi",
         info!("Sync completed in {}ms", duration.as_millis());
 
         Ok(SyncResult {
-            bytes_transferred: parse_rsync_bytes(&stdout),
+            bytes_transferred: parse_rsync_bytes(&stdout, RsyncTransferDirection::Upload),
             files_transferred: parse_rsync_files(&stdout),
             duration_ms: duration.as_millis() as u64,
         })
@@ -3834,7 +3834,7 @@ fi",
         }
 
         Ok(SyncResult {
-            bytes_transferred: parse_rsync_bytes(&output),
+            bytes_transferred: parse_rsync_bytes(&output, RsyncTransferDirection::Upload),
             files_transferred: parse_rsync_files(&output),
             duration_ms,
         })
@@ -4581,7 +4581,7 @@ fi",
             .into());
         }
 
-        let bytes_transferred = parse_rsync_bytes(&stdout);
+        let bytes_transferred = parse_rsync_bytes(&stdout, RsyncTransferDirection::Download);
         let files_transferred = parse_rsync_files(&stdout);
 
         // Warn if no artifacts were retrieved - this may indicate a build failure
@@ -4806,7 +4806,7 @@ fi",
             .into());
         }
 
-        let bytes_transferred = parse_rsync_bytes(&stdout);
+        let bytes_transferred = parse_rsync_bytes(&stdout, RsyncTransferDirection::Download);
         let files_transferred = parse_rsync_files(&stdout);
         let duration_ms = start.elapsed().as_millis() as u64;
         info!(
@@ -4902,7 +4902,7 @@ fi",
 
         Ok(ArtifactRetrieval::from_rsync_output(
             SyncResult {
-                bytes_transferred: parse_rsync_bytes(&output),
+                bytes_transferred: parse_rsync_bytes(&output, RsyncTransferDirection::Download),
                 files_transferred: parse_rsync_files(&output),
                 duration_ms,
             },
@@ -5243,25 +5243,57 @@ pub struct TransferEstimate {
     pub estimation_ms: u64,
 }
 
-/// Parse bytes transferred from rsync output.
-fn parse_rsync_bytes(output: &str) -> u64 {
-    // rsync output contains "sent X bytes  received Y bytes"
+#[derive(Debug, Clone, Copy)]
+enum RsyncTransferDirection {
+    Upload,
+    Download,
+}
+
+/// Parse rsync protocol bytes in the payload direction for this attempt.
+/// Downloads receive the payload; sent bytes are mostly requests/checksums.
+/// These counters include protocol overhead, not logical file sizes.
+fn parse_rsync_bytes(output: &str, direction: RsyncTransferDirection) -> u64 {
+    let (stats_prefix, summary_key) = match direction {
+        RsyncTransferDirection::Upload => ("Total bytes sent:", "sent"),
+        RsyncTransferDirection::Download => ("Total bytes received:", "received"),
+    };
+    let mut summary_bytes = None;
     for line in output.lines() {
-        if let Some(rest) = line.strip_prefix("Total bytes sent:")
+        let line = line.trim_start();
+        if let Some(rest) = line.strip_prefix(stats_prefix)
             && let Some(bytes_str) = rest.split_whitespace().next()
             && let Ok(bytes) = bytes_str.replace(',', "").parse()
         {
             return bytes;
         }
-        if line.contains("sent")
-            && line.contains("bytes")
-            && let Some(bytes_str) = line.split_whitespace().nth(1)
-            && let Ok(bytes) = bytes_str.replace(',', "").parse()
-        {
-            return bytes;
+
+        // Require the two complete counter fields, so filenames or diagnostics
+        // mentioning "sent" cannot become transfer measurements. Keep this as
+        // a fallback: structured stats take precedence wherever they appear.
+        if summary_bytes.is_none() && (line.starts_with("sent ") || line.starts_with("received ")) {
+            let mut fields = line.split_whitespace();
+            let first_key = fields.next();
+            let first_bytes = fields.next();
+            let first_unit = fields.next();
+            let second_key = fields.next();
+            let second_bytes = fields.next();
+            let second_unit = fields.next();
+            if matches!(
+                (first_key, second_key),
+                (Some("sent"), Some("received")) | (Some("received"), Some("sent"))
+            ) && first_unit == Some("bytes")
+                && second_unit == Some("bytes")
+            {
+                let bytes = if first_key == Some(summary_key) {
+                    first_bytes
+                } else {
+                    second_bytes
+                };
+                summary_bytes = bytes.and_then(|value| value.replace(',', "").parse().ok());
+            }
         }
     }
-    0
+    summary_bytes.unwrap_or(0)
 }
 
 /// Parse files transferred from rsync output.
@@ -5269,7 +5301,10 @@ fn parse_rsync_files(output: &str) -> u32 {
     let mut total_files = None;
 
     for line in output.lines() {
-        if let Some(rest) = line.strip_prefix("Number of files transferred:")
+        let line = line.trim_start();
+        if let Some(rest) = line
+            .strip_prefix("Number of regular files transferred:")
+            .or_else(|| line.strip_prefix("Number of files transferred:"))
             && let Some(count) = rest.split_whitespace().next()
             && let Ok(parsed) = count.replace(',', "").parse::<u32>()
         {
@@ -5283,9 +5318,9 @@ fn parse_rsync_files(output: &str) -> u32 {
         }
     }
 
-    // If we couldn't parse structured stats, return 0 rather than guessing.
-    // The previous heuristic of counting non-empty lines was unreliable as it
-    // would count progress lines, stats, and error messages as files.
+    // Older output with no transferred counter retains the total-tree estimate.
+    // A parsed transferred count of zero already returned above: unchanged
+    // files must not turn a no-op transfer into the total tree count.
     total_files.unwrap_or(0)
 }
 
@@ -6368,10 +6403,21 @@ mod tests {
     fn test_parse_rsync_bytes() {
         let _guard = test_guard!();
         let output = "sent 1,234 bytes  received 567 bytes  1800.50 bytes/sec";
-        assert_eq!(parse_rsync_bytes(output), 1234);
+        assert_eq!(
+            parse_rsync_bytes(output, RsyncTransferDirection::Upload),
+            1234
+        );
+        assert_eq!(
+            parse_rsync_bytes(output, RsyncTransferDirection::Download),
+            567
+        );
 
         let empty = "";
-        assert_eq!(parse_rsync_bytes(empty), 0);
+        assert_eq!(parse_rsync_bytes(empty, RsyncTransferDirection::Upload), 0);
+        assert_eq!(
+            parse_rsync_bytes(empty, RsyncTransferDirection::Download),
+            0
+        );
     }
 
     #[test]
@@ -6379,21 +6425,166 @@ mod tests {
         let _guard = test_guard!();
         // Test "Total bytes sent:" format (newer rsync versions)
         let output = "Total bytes sent: 45,678\nTotal bytes received: 123";
-        assert_eq!(parse_rsync_bytes(output), 45678);
+        assert_eq!(
+            parse_rsync_bytes(output, RsyncTransferDirection::Upload),
+            45678
+        );
+        assert_eq!(
+            parse_rsync_bytes(output, RsyncTransferDirection::Download),
+            123
+        );
     }
 
     #[test]
     fn test_parse_rsync_bytes_no_commas() {
         let _guard = test_guard!();
         let output = "sent 999 bytes  received 100 bytes  1000.00 bytes/sec";
-        assert_eq!(parse_rsync_bytes(output), 999);
+        assert_eq!(
+            parse_rsync_bytes(output, RsyncTransferDirection::Upload),
+            999
+        );
+        assert_eq!(
+            parse_rsync_bytes(output, RsyncTransferDirection::Download),
+            100
+        );
     }
 
     #[test]
     fn test_parse_rsync_bytes_large_number() {
         let _guard = test_guard!();
         let output = "sent 1,234,567,890 bytes  received 100 bytes  total";
-        assert_eq!(parse_rsync_bytes(output), 1234567890);
+        assert_eq!(
+            parse_rsync_bytes(output, RsyncTransferDirection::Upload),
+            1234567890
+        );
+        assert_eq!(
+            parse_rsync_bytes(output, RsyncTransferDirection::Download),
+            100
+        );
+    }
+
+    #[test]
+    fn test_parse_rsync_bytes_structured_stats_override_summary() {
+        let _guard = test_guard!();
+        let summary = "received 12,345 bytes  sent 67 bytes  1000 bytes/sec";
+        assert_eq!(
+            parse_rsync_bytes(summary, RsyncTransferDirection::Upload),
+            67
+        );
+        assert_eq!(
+            parse_rsync_bytes(summary, RsyncTransferDirection::Download),
+            12345
+        );
+        let stats = "  Total bytes received: 98,765\nTotal bytes sent: 43";
+        for output in [format!("{summary}\n{stats}"), format!("{stats}\n{summary}")] {
+            assert_eq!(
+                parse_rsync_bytes(&output, RsyncTransferDirection::Upload),
+                43
+            );
+            assert_eq!(
+                parse_rsync_bytes(&output, RsyncTransferDirection::Download),
+                98765
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_rsync_bytes_rejects_missing_malformed_and_unrelated_counters() {
+        let _guard = test_guard!();
+        for output in [
+            "diagnostic 123 sent bytes",
+            "sent 123 bytes in a filename",
+            "sent 123 items received 456 items",
+            "Total bytes sent: invalid\nTotal bytes received: invalid",
+            "Total bytes sent: 18446744073709551616\nTotal bytes received: 18446744073709551616",
+            "sent invalid bytes received invalid bytes",
+        ] {
+            for direction in [
+                RsyncTransferDirection::Upload,
+                RsyncTransferDirection::Download,
+            ] {
+                assert_eq!(parse_rsync_bytes(output, direction), 0, "{output}");
+            }
+        }
+        // A missing direction cannot borrow the other direction's counter.
+        assert_eq!(
+            parse_rsync_bytes("Total bytes sent: 999", RsyncTransferDirection::Download),
+            0
+        );
+        assert_eq!(
+            parse_rsync_bytes("Total bytes received: 999", RsyncTransferDirection::Upload),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rsync_download_statistics_match_real_payload_noop_and_update() {
+        let _guard = test_guard!();
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let nested = source.path().join("one/two");
+        std::fs::create_dir_all(&nested).unwrap();
+        let payload = vec![0x5a; 1024 * 1024];
+        std::fs::write(nested.join("payload.bin"), &payload).unwrap();
+        std::fs::write(source.path().join("message.txt"), b"first\n").unwrap();
+
+        async fn pull(source: &Path, destination: &Path) -> String {
+            // Both rsync endpoints are real processes. This fixed shell adapter
+            // discards the dummy hostname and starts the actual peer over pipes;
+            // it supplies no simulated protocol, statistics or file contents.
+            let mut command = Command::new("rsync");
+            command
+                .args(["-a", "--checksum", "--stats", "-e"])
+                .arg(r#"sh -c 'shift; exec "$@"' rch-local-peer"#)
+                .arg("--")
+                .arg(format!("local-peer:{}/", source.display()))
+                .arg(format!("{}/", destination.display()))
+                .env("LC_ALL", "C")
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(std::time::Duration::from_secs(15), command.output())
+                .await
+                .expect("real rsync pull must finish within its test deadline")
+                .expect("start real rsync pull");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("real rsync pull: {}\n{stdout}\n{stderr}", output.status);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            stdout
+        }
+
+        let first = pull(source.path(), destination.path()).await;
+        assert_eq!(
+            std::fs::read(destination.path().join("one/two/payload.bin")).unwrap(),
+            payload
+        );
+        assert_eq!(
+            std::fs::read(destination.path().join("message.txt")).unwrap(),
+            b"first\n"
+        );
+        assert_eq!(parse_rsync_files(&first), 2);
+        // Uncompressed first-copy payload dominates the received direction;
+        // request traffic must never masquerade as the downloaded megabyte.
+        let received = parse_rsync_bytes(&first, RsyncTransferDirection::Download);
+        let sent = parse_rsync_bytes(&first, RsyncTransferDirection::Upload);
+        assert!(received >= 1024 * 1024, "{first}");
+        assert!(sent < 8192, "{first}");
+
+        let unchanged = pull(source.path(), destination.path()).await;
+        assert_eq!(parse_rsync_files(&unchanged), 0, "{unchanged}");
+        assert!(parse_rsync_bytes(&unchanged, RsyncTransferDirection::Download) > 0);
+
+        std::fs::write(source.path().join("message.txt"), b"other\n").unwrap();
+        let changed = pull(source.path(), destination.path()).await;
+        assert_eq!(parse_rsync_files(&changed), 1, "{changed}");
+        assert_eq!(
+            std::fs::read(destination.path().join("message.txt")).unwrap(),
+            b"other\n"
+        );
+        assert_eq!(
+            std::fs::read(destination.path().join("one/two/payload.bin")).unwrap(),
+            payload
+        );
     }
 
     #[test]
@@ -6422,8 +6613,17 @@ mod tests {
     #[test]
     fn test_parse_rsync_files_prefers_transferred_count_over_total_tree_count() {
         let _guard = test_guard!();
-        let output = "Number of files: 28,779 (reg: 20,000, dir: 8,779)\nNumber of files transferred: 42\nTotal bytes sent: 1,271,299";
-        assert_eq!(parse_rsync_files(output), 42);
+        for counter in [
+            "Number of files transferred:",
+            "Number of regular files transferred:",
+        ] {
+            for count in [0, 42] {
+                let output = format!(
+                    "Number of files: 28,779 (reg: 20,000, dir: 8,779)\n{counter} {count}\nTotal bytes sent: 1,271,299"
+                );
+                assert_eq!(parse_rsync_files(&output), count);
+            }
+        }
     }
 
     #[test]
@@ -7711,7 +7911,14 @@ Number of files transferred: 42
             "Total sent: 81 B\n",
             "Total received: 148 B\n",
         );
-        assert_eq!(parse_rsync_bytes(output), 77);
+        assert_eq!(
+            parse_rsync_bytes(output, RsyncTransferDirection::Upload),
+            77
+        );
+        assert_eq!(
+            parse_rsync_bytes(output, RsyncTransferDirection::Download),
+            565
+        );
         assert_eq!(parse_rsync_files(output), 1);
         assert_eq!(
             parse_rsync_itemized_regular_files(output),
