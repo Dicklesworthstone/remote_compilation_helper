@@ -1290,7 +1290,10 @@ mod tests {
                     assert_eq!(*content_sha256, hash_of(2, path), "{path} must be gen-2");
                     *content_sha256
                 }
-                other => panic!("unexpected member {other:?}"),
+                other => {
+                    assert!(false, "unexpected member {other:?}");
+                    [0u8; 32]
+                }
             })
             .collect();
         assert_eq!(gens.len(), 2, "both files present, both gen-2");
@@ -1316,8 +1319,12 @@ mod tests {
                     Divergence::ContentChanged { .. } | Divergence::MetadataInconsistent { .. }
                 ));
             }
-            CaptureError::Io(io) => panic!("wrong error class: {io}"),
-            CaptureError::Rejected { .. } => panic!("unexpected policy refusal"),
+            CaptureError::Io(io) => {
+                assert!(false, "wrong error class: {io}");
+            }
+            CaptureError::Rejected { .. } => {
+                assert!(false, "unexpected policy refusal");
+            }
         }
     }
 
