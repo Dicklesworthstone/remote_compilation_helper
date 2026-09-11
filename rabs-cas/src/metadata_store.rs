@@ -2155,8 +2155,8 @@ fn u128_hex(v: u128) -> String {
 }
 
 impl<E: SqlEngine> SqlMetadataStore<E> {
-    /// Open the store over an engine, applying pending migrations
-    /// transactionally.
+    /// Open the store over an engine, applying all pending migrations in one
+    /// transaction. A failed upgrade preserves the previously applied schema.
     pub fn open(engine: E) -> Result<Self, StoreError> {
         let mut store = Self {
             engine,
@@ -2218,12 +2218,18 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
                 0
             }
         };
-        for migration in MIGRATIONS {
-            if migration.version <= applied {
-                continue;
-            }
-            self.engine.execute("BEGIN", &[])?;
-            let mut apply = || -> Result<(), StoreError> {
+        let Some(first_pending) = MIGRATIONS
+            .iter()
+            .position(|migration| migration.version > applied)
+        else {
+            return Ok(());
+        };
+        // No caller can use the store until every pending step has succeeded.
+        // Commit the complete upgrade once, rather than paying a durability
+        // barrier for each historical version on every fresh daemon boot.
+        self.engine.execute("BEGIN", &[])?;
+        let result = (|| -> Result<(), StoreError> {
+            for migration in &MIGRATIONS[first_pending..] {
                 for statement in migration.statements {
                     self.engine.execute(statement, &[])?;
                 }
@@ -2234,19 +2240,16 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
                         SqlValue::Int(0),
                     ],
                 )?;
-                Ok(())
-            };
-            match apply() {
-                Ok(()) => {
-                    self.engine.execute("COMMIT", &[])?;
-                }
-                Err(e) => {
-                    let _ = self.engine.execute("ROLLBACK", &[]);
-                    return Err(e);
-                }
             }
+            self.engine.execute("COMMIT", &[])?;
+            Ok(())
+        })();
+        if result.is_err() {
+            // Include COMMIT failures: a busy/failed commit may leave the
+            // transaction open. Dropping the engine remains the final fallback.
+            let _ = self.engine.execute("ROLLBACK", &[]);
         }
-        Ok(())
+        result
     }
 
     fn intern(&mut self, domain: &'static str) {
@@ -7019,6 +7022,165 @@ mod tests {
     fn fresh_path(tag: &str) -> std::path::PathBuf {
         let n = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("rabs-h009-{}-{}-{}.db", std::process::id(), tag, n))
+    }
+
+    /// Execute real SQL, optionally refusing exactly one mutation before it
+    /// reaches the engine. Rollback remains available after the injected error.
+    struct MigrationProbe<E> {
+        inner: E,
+        executed: Vec<String>,
+        fail_at: Option<usize>,
+    }
+
+    impl<E: SqlEngine> SqlEngine for MigrationProbe<E> {
+        fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<usize, StoreError> {
+            let index = self.executed.len();
+            self.executed.push(sql.to_owned());
+            if self.fail_at == Some(index) {
+                return Err(StoreError::Backend("injected migration failure".into()));
+            }
+            self.inner.execute(sql, params)
+        }
+
+        fn query(
+            &mut self,
+            sql: &str,
+            params: &[SqlValue],
+        ) -> Result<Vec<Vec<SqlValue>>, StoreError> {
+            self.inner.query(sql, params)
+        }
+    }
+
+    fn migration_probe<E>(inner: E, fail_at: Option<usize>) -> MigrationProbe<E> {
+        MigrationProbe {
+            inner,
+            executed: Vec::new(),
+            fail_at,
+        }
+    }
+
+    fn assert_one_migration_commit<E: SqlEngine>(store: &mut SqlMetadataStore<MigrationProbe<E>>) {
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let statements = &store.engine.executed;
+        assert_eq!(statements.iter().filter(|sql| *sql == "BEGIN").count(), 1);
+        assert_eq!(statements.iter().filter(|sql| *sql == "COMMIT").count(), 1);
+        assert!(!statements.iter().any(|sql| sql == "ROLLBACK"));
+        assert_eq!(
+            store
+                .engine
+                .query("SELECT version FROM schema_epochs ORDER BY version", &[])
+                .unwrap(),
+            (1..=SCHEMA_VERSION)
+                .map(|version| vec![SqlValue::Int(i64::from(version))])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn migration_batch_behavior<E: SqlEngine>(open: fn(&std::path::Path) -> Result<E, StoreError>) {
+        let fresh = fresh_path("migration-single-commit");
+        let mut store =
+            SqlMetadataStore::open(migration_probe(open(&fresh).unwrap(), None)).unwrap();
+        assert_one_migration_commit(&mut store);
+        drop(store);
+        let store = SqlMetadataStore::open(migration_probe(open(&fresh).unwrap(), None)).unwrap();
+        assert!(
+            store.engine.executed.is_empty(),
+            "current-schema reopen must not write"
+        );
+        drop(store);
+
+        for version in [0, 19, 20] {
+            let pending_writes: usize = MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version > version)
+                .map(|migration| migration.statements.len() + 1)
+                .sum();
+            // Refuse the final DDL, final epoch insert, or COMMIT itself.
+            for fail_at in [pending_writes - 1, pending_writes, pending_writes + 1] {
+                let path = fresh_path("migration-rollback");
+                let mut engine = open(&path).unwrap();
+                match version {
+                    19 => seed_v19_worker_fence(&mut engine),
+                    20 => seed_v20_attempt_lease(&mut engine),
+                    _ => {}
+                }
+                let queries = [
+                    "SELECT * FROM worker_incarnation_fences ORDER BY worker",
+                    "SELECT * FROM action_generations ORDER BY id_hex",
+                    "SELECT * FROM action_attempts ORDER BY id_hex",
+                ];
+                let prior_rows = if version == 0 {
+                    Vec::new()
+                } else {
+                    queries
+                        .iter()
+                        .map(|sql| engine.query(sql, &[]).unwrap())
+                        .collect::<Vec<_>>()
+                };
+                let mut failed = SqlMetadataStore {
+                    engine: migration_probe(engine, Some(fail_at)),
+                    domains: HashMap::new(),
+                };
+                assert_eq!(
+                    failed.apply_migrations(),
+                    Err(StoreError::Backend("injected migration failure".into()))
+                );
+                assert_eq!(
+                    failed.engine.executed.last().map(String::as_str),
+                    Some("ROLLBACK")
+                );
+                // Verify cleanup before dropping the connection: a still-open
+                // migration transaction would reject this new transaction.
+                failed.engine.execute("BEGIN", &[]).unwrap();
+                failed.engine.execute("ROLLBACK", &[]).unwrap();
+                drop(failed);
+
+                // Reopen the actual file before attempting any new migration.
+                let mut reopened = open(&path).unwrap();
+                if version == 0 {
+                    assert!(
+                        reopened
+                            .query(
+                                "SELECT name FROM sqlite_master WHERE name = 'schema_epochs'",
+                                &[]
+                            )
+                            .unwrap()
+                            .is_empty()
+                    );
+                } else {
+                    assert_eq!(
+                        reopened
+                            .query("SELECT MAX(version) FROM schema_epochs", &[])
+                            .unwrap(),
+                        vec![vec![SqlValue::Int(i64::from(version))]]
+                    );
+                    for (sql, expected) in queries.iter().zip(&prior_rows) {
+                        assert_eq!(
+                            &reopened.query(sql, &[]).unwrap(),
+                            expected,
+                            "version {version}, failure {fail_at}, query {sql}"
+                        );
+                    }
+                }
+                let mut retried = SqlMetadataStore::open(migration_probe(reopened, None)).unwrap();
+                assert_one_migration_commit(&mut retried);
+                if version == 19 {
+                    assert_v19_worker_fence_migrated(&mut retried);
+                } else if version == 20 {
+                    assert_v20_attempt_lease_fails_closed(&mut retried);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_migrations_commit_once_and_rollback_reference() {
+        migration_batch_behavior(RusqliteEngine::open);
+    }
+
+    #[test]
+    fn pending_migrations_commit_once_and_rollback_frankensqlite() {
+        migration_batch_behavior(FsqliteEngine::open);
     }
 
     fn digest(domain: &'static str, tag: u8) -> TypedDigest {
