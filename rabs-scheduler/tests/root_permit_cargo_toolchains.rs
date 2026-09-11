@@ -120,9 +120,10 @@ fn grant_accounts_exactly_around_real_cargo_on_every_installed_channel() {
             .arg("--offline")
             .arg(format!("-j{CAPACITY}"))
             .current_dir(dir.path())
-            // A channel's Cargo otherwise inherits the parent nightly flags,
-            // wrappers, target and nearest toolchain pin from this test run.
-            .env_remove("RUSTFLAGS")
+            // An explicit empty value also overrides ancestor Cargo config:
+            // RCH scratch directories can inherit this repository's nightly
+            // rustflags. Clear parent wrappers/targets and select the compiler.
+            .env("RUSTFLAGS", "")
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
             .env_remove("CARGO_BUILD_RUSTFLAGS")
             .env_remove("RUSTC_WRAPPER")

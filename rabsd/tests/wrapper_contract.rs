@@ -114,9 +114,10 @@ fn capture_contract(channel: &str) -> ContractFingerprint {
     let status = std::process::Command::new("rustup")
         .args(["run", channel, "cargo", "build"])
         .current_dir(source.path())
-        // Capture the selected channel's Cargo contract. Parent nightly flags
-        // and compiler pins belong to the harness, not this scratch build.
-        .env_remove("RUSTFLAGS")
+        // RCH places scratch projects below the repository. An explicit empty
+        // value overrides its ancestor .cargo/config.toml nightly-only flags;
+        // removing the variable would expose those flags again.
+        .env("RUSTFLAGS", "")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("CARGO_BUILD_RUSTFLAGS")
         .env_remove("RUSTC")
