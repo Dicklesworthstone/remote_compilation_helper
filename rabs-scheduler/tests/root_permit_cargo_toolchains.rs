@@ -24,9 +24,11 @@ use rabs_scheduler::acquisition_order::{GrantRefusal, RootGrant};
 const CHANNELS: [&str; 3] = ["stable", "beta", "nightly"];
 const CAPACITY: u32 = 4;
 
-fn cargo_for(channel: &str) -> Option<std::path::PathBuf> {
+fn tool_for(channel: &str, tool: &str) -> Option<std::path::PathBuf> {
     let output = std::process::Command::new("rustup")
-        .args(["which", "--toolchain", channel, "cargo"])
+        .args(["which", "--toolchain", channel, tool])
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .env_remove("RUSTUP_TOOLCHAIN")
         .output()
         .ok()?;
     if !output.status.success() {
@@ -49,16 +51,53 @@ fn scratch_crate(dir: &std::path::Path) {
     )
     .expect("manifest");
     std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").expect("entrypoint");
+    // Observe the compiler chosen by the real Cargo invocation, rather than
+    // assuming that launching a channel's Cargo also selects its rustc.
+    std::fs::write(
+        dir.join("build.rs"),
+        r#"fn main() {
+    let rustc = std::env::var_os("RUSTC").expect("Cargo-selected compiler");
+    let output = std::process::Command::new(&rustc)
+        .arg("-vV")
+        .output()
+        .expect("compiler identity");
+    assert!(output.status.success(), "compiler identity failed");
+    let root = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    std::fs::write(root.join("observed-rustc-path"), rustc.to_str().unwrap()).unwrap();
+    std::fs::write(root.join("observed-rustc-version"), output.stdout).unwrap();
+}
+"#,
+    )
+    .expect("compiler identity build script");
 }
 
 #[test]
 fn grant_accounts_exactly_around_real_cargo_on_every_installed_channel() {
     let mut tested = 0usize;
     for channel in CHANNELS {
-        let Some(cargo) = cargo_for(channel) else {
+        let Some(cargo) = tool_for(channel, "cargo") else {
             eprintln!("channel {channel} not installed — skipped");
             continue;
         };
+        let rustc = tool_for(channel, "rustc")
+            .unwrap_or_else(|| panic!("{channel}: installed Cargo requires its rustc"));
+        let identity = std::process::Command::new(&rustc)
+            .arg("-vV")
+            .env("RUSTUP_TOOLCHAIN", channel)
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .output()
+            .expect("selected compiler identity");
+        assert!(
+            identity.status.success(),
+            "{channel}: rustc -vV failed: {}",
+            String::from_utf8_lossy(&identity.stderr)
+        );
+        eprintln!(
+            "{channel}: cargo={}, rustc={}\n{}",
+            cargo.display(),
+            rustc.display(),
+            String::from_utf8_lossy(&identity.stdout)
+        );
         let dir = tempfile::tempdir().expect("scratch dir");
         scratch_crate(dir.path());
 
@@ -81,12 +120,38 @@ fn grant_accounts_exactly_around_real_cargo_on_every_installed_channel() {
             .arg("--offline")
             .arg(format!("-j{CAPACITY}"))
             .current_dir(dir.path())
+            // A channel's Cargo otherwise inherits the parent nightly flags,
+            // wrappers, target and nearest toolchain pin from this test run.
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("CARGO_BUILD_RUSTFLAGS")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
             .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET")
+            .env("RUSTC", &rustc)
+            .env("RUSTUP_TOOLCHAIN", channel)
+            .env("RUSTUP_AUTO_INSTALL", "0")
             .status()
             .expect("spawn cargo");
         assert!(
             status.success(),
             "{channel}: cargo check -j{CAPACITY} must succeed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("observed-rustc-path"))
+                .expect("Cargo must run the compiler observation build script"),
+            rustc.to_str().expect("rustup compiler path is UTF-8"),
+            "{channel}: Cargo must use the explicitly selected compiler"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("observed-rustc-version"))
+                .expect("build script compiler version"),
+            identity.stdout,
+            "{channel}: Cargo's compiler identity must match the selected channel"
         );
 
         // Children finished: every transferable returns; books balance.
