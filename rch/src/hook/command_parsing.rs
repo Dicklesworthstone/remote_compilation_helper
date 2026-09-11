@@ -11,7 +11,8 @@
 //!
 //! Also hosts two more pure helpers that both the Unix hook and the non-Unix
 //! stub need verbatim: project identity extraction (canonical path + short
-//! blake3 suffix) and preferred-worker env parsing (`RCH_WORKER(S)`).
+//! blake3 suffix) and preferred-worker selection (`RCH_WORKER(S)` merged with
+//! project `.rch/config.toml` `[routing] preferred_workers`).
 //!
 //! NOTHING in this module may depend on daemon/socket/SSH state or on a
 //! specific parent module: it is included verbatim (`#[path]`) by the
@@ -21,6 +22,7 @@ use rch_common::CompilationKind;
 use rch_common::WorkerId;
 use rch_common::normalize_project_path_with_policy;
 use rch_common::path_topology::PathTopologyPolicy;
+use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 fn parse_u32(value: &str) -> Option<u32> {
@@ -395,6 +397,56 @@ pub(crate) fn preferred_workers_from_env() -> Vec<WorkerId> {
         preferred.extend(parse_preferred_workers(&value));
     }
     dedupe_worker_ids(preferred)
+}
+
+/// Env (`RCH_WORKER`/`RCH_WORKERS`) merged with project-local
+/// `.rch/config.toml` `[routing] preferred_workers`, then deduped.
+/// The daemon treats a non-empty list as a hard preference.
+pub(crate) fn preferred_workers() -> Vec<WorkerId> {
+    let mut combined = preferred_workers_from_env();
+    combined.extend(preferred_workers_from_project_config());
+    dedupe_worker_ids(combined)
+}
+
+/// Read `[routing] preferred_workers` from the project-local `.rch/config.toml`
+/// relative to the current dir. Best-effort: missing/malformed/wrong-typed
+/// config yields no pinning, never an error.
+pub(crate) fn preferred_workers_from_project_config() -> Vec<WorkerId> {
+    let path = std::env::current_dir()
+        .map(|dir| dir.join(".rch/config.toml"))
+        .unwrap_or_else(|_| PathBuf::from(".rch/config.toml"));
+    preferred_workers_from_config_path(&path)
+}
+
+pub(super) fn preferred_workers_from_config_path(path: &Path) -> Vec<WorkerId> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_preferred_workers_from_toml(&contents),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Extract `[routing] preferred_workers = ["id", ...]` from project-config TOML.
+/// Unknown sections are ignored; a wrong-typed or malformed value yields empty.
+pub(super) fn parse_preferred_workers_from_toml(contents: &str) -> Vec<WorkerId> {
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        routing: Option<RoutingSection>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RoutingSection {
+        preferred_workers: Option<Vec<String>>,
+    }
+    let Ok(doc) = toml::from_str::<Doc>(contents) else {
+        return Vec::new();
+    };
+    doc.routing
+        .and_then(|routing| routing.preferred_workers)
+        .unwrap_or_default()
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(WorkerId::new)
+        .collect()
 }
 
 pub(super) fn parse_preferred_workers(value: &str) -> Vec<WorkerId> {

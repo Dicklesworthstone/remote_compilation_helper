@@ -2359,7 +2359,7 @@ pub async fn run_exec(
     };
     let command_priority = command_priority_from_env(&reporter);
     let wait_for_worker = queue_when_busy_enabled();
-    let preferred_workers = preferred_workers_from_env();
+    let preferred_workers = command_parsing::preferred_workers();
     let durable_lease = DurableLeaseWriter::create(
         &command,
         require_remote,
@@ -3436,7 +3436,7 @@ pub(crate) use daemon_ipc::{query_daemon, release_worker, restart_admission_is_c
 mod command_parsing;
 pub(crate) use command_parsing::{
     cargo_job_count_for_command, estimate_cores_for_command, extract_project_name_with_policy,
-    preferred_workers_from_env,
+    preferred_workers,
 };
 
 // Human-facing job-output rendering (compile-summary panel, job banner, and the

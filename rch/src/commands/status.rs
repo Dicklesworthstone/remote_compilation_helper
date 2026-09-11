@@ -5,7 +5,7 @@
 
 use crate::hook::{
     cargo_job_count_for_command, estimate_cores_for_command, extract_project_name_with_policy,
-    preferred_workers_from_env, query_daemon, release_worker, required_runtime_for_kind,
+    preferred_workers, query_daemon, release_worker, required_runtime_for_kind,
 };
 use crate::status_types::{
     DaemonFullStatusResponse, IssueFromApi, SelfTestHistoryResponseFromApi,
@@ -471,7 +471,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             .as_ref()
             .or(normalized_project_root.as_ref())
             .and_then(|root| detect_toolchain(root).ok());
-        let preferred_workers = preferred_workers_from_env();
+        let preferred_workers = preferred_workers(); // env + project .rch/config.toml [routing]
 
         match query_daemon(
             &socket_path,

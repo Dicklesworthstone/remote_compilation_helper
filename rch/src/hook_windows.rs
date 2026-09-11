@@ -20,7 +20,7 @@ mod command_parsing;
 
 pub(crate) use command_parsing::{
     cargo_job_count_for_command, estimate_cores_for_command, extract_project_name,
-    extract_project_name_with_policy, preferred_workers_from_env,
+    extract_project_name_with_policy, preferred_workers,
 };
 
 /// Install the fail-open hook-mode panic handler.

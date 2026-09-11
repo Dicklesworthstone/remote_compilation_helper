@@ -1574,6 +1574,44 @@ fn test_parse_preferred_workers_dedupes_ordered_values() {
 }
 
 #[test]
+fn test_parse_preferred_workers_from_toml_routing_section() {
+    let _guard = test_guard!();
+    let toml = r#"
+[general]
+enabled = true
+
+[routing]
+preferred_workers = ["hz2", " vmi1264463 ", ""]
+"#;
+    let ids: Vec<String> = command_parsing::parse_preferred_workers_from_toml(toml)
+        .iter()
+        .map(|w| w.as_str().to_string())
+        .collect();
+    assert_eq!(ids, vec!["hz2".to_string(), "vmi1264463".to_string()]);
+}
+
+#[test]
+fn test_parse_preferred_workers_from_toml_absent_or_malformed_is_empty() {
+    let _guard = test_guard!();
+    assert!(command_parsing::parse_preferred_workers_from_toml("[general]\nenabled = true\n")
+        .is_empty());
+    assert!(command_parsing::parse_preferred_workers_from_toml("[routing]\nother = 1\n").is_empty());
+    assert!(command_parsing::parse_preferred_workers_from_toml(
+        "[routing]\npreferred_workers = \"hz2\"\n"
+    )
+    .is_empty());
+    assert!(command_parsing::parse_preferred_workers_from_toml("this is not toml {{{").is_empty());
+    assert!(command_parsing::parse_preferred_workers_from_toml("").is_empty());
+}
+
+#[test]
+fn test_preferred_workers_from_config_path_missing_file_is_empty() {
+    let _guard = test_guard!();
+    let missing = std::path::Path::new("/tmp/definitely-not-a-real-rch-config-xyz.toml");
+    assert!(command_parsing::preferred_workers_from_config_path(missing).is_empty());
+}
+
+#[test]
 fn test_remote_required_refusal_retryable_classification() {
     let _guard = test_guard!();
     // rch#31: transient capacity/daemon refusals are retryable (distinct exit
