@@ -1285,17 +1285,19 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Graceful shutdown
-    info!("Stopping health monitor...");
-    health_monitor.stop().await;
-    let _ = health_handle.await;
+    // The accept loop has stopped, so clients can no longer refresh heartbeats.
+    // Stop cancellation before awaiting health probes: a slow probe must not
+    // turn a still-running client's quiet build into a false stuck-job signal.
+    cleanup::stop_before_shutdown(&mut cleanup_handle, async {
+        info!("Stopping health monitor...");
+        health_monitor.stop().await;
+        let _ = health_handle.await;
+    })
+    .await;
 
     // Abort background tasks that have no cancellation mechanism
     info!("Stopping background tasks...");
     if let Some(handle) = metrics_handle {
-        handle.abort();
-    }
-    if let Some(handle) = cleanup_handle {
         handle.abort();
     }
 
