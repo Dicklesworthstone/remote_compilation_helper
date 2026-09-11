@@ -171,6 +171,7 @@ impl SshClient {
             && self.config.host == config.host
             && self.config.user == config.user
             && self.config.identity_file == config.identity_file
+            && declared_os(&self.config.tags) == declared_os(&config.tags)
     }
 
     /// Connect to the remote worker.
@@ -737,6 +738,8 @@ pub(crate) fn prefers_system_ssh(config: &WorkerConfig) -> bool {
 /// `server_alive_interval` is rounded up to 1s minimum when non-zero to
 /// avoid `ServerAliveInterval=0` (which OpenSSH treats as "disable
 /// keepalives" — fine — but matches the spec "0 -> omit" intent).
+/// Windows receives only the fixed POSIX reader `sh -s`; the original script
+/// travels through stdin so cmd.exe never interprets its contents.
 pub(crate) fn system_ssh_argv(
     config: &WorkerConfig,
     command: &str,
@@ -764,8 +767,43 @@ pub(crate) fn system_ssh_argv(
         argv.push(OsString::from(format!("ServerAliveInterval={secs}")));
     }
     argv.push(OsString::from(destination));
-    argv.push(OsString::from(command));
+    argv.push(OsString::from(if prefers_system_ssh(config) {
+        "sh -s"
+    } else {
+        command
+    }));
     argv
+}
+
+/// Carry the command through POSIX stdin rather than Windows command-line
+/// quoting. The reader replaces itself with the command shell, whose stdin
+/// remains empty as on the openssh execution path.
+fn system_ssh_stdin(config: &WorkerConfig, command: &str) -> Option<String> {
+    (prefers_system_ssh(config) && command != "sh -s").then(|| {
+        format!(
+            "exec sh -c {} </dev/null\n",
+            shell_escape::escape(command.into())
+        )
+    })
+}
+
+async fn write_system_ssh_stdin(
+    mut stdin: tokio::process::ChildStdin,
+    input: &str,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let result = async {
+        stdin.write_all(input.as_bytes()).await?;
+        stdin.shutdown().await
+    }
+    .await;
+    match result {
+        // An authentication failure or early remote exit can close stdin
+        // before the payload is written. Preserve its actual status/stderr.
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
 }
 
 /// Execute a command on a Windows worker via the system `ssh` binary.
@@ -793,6 +831,7 @@ pub(crate) async fn system_ssh_execute(
     use tokio::process::Command;
 
     let argv = system_ssh_argv(config, command, server_alive_interval);
+    let input = system_ssh_stdin(config, command);
     // Drop the program name — `Command::new("ssh")` is the standard form.
     let args = argv.into_iter().skip(1);
 
@@ -806,7 +845,11 @@ pub(crate) async fn system_ssh_execute(
     let mut child = Command::new("ssh")
         .args(args)
         .env_clear()
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -821,6 +864,14 @@ pub(crate) async fn system_ssh_execute(
     let execution = async {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        let stdin = child.stdin.take();
+
+        let stdin_fut = async {
+            if let (Some(stdin), Some(input)) = (stdin, input) {
+                write_system_ssh_stdin(stdin, &input).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
 
         let stdout_fut = async {
             let mut buf = String::new();
@@ -839,7 +890,7 @@ pub(crate) async fn system_ssh_execute(
             Ok::<String, anyhow::Error>(buf)
         };
 
-        let (stdout, stderr) = tokio::try_join!(stdout_fut, stderr_fut)?;
+        let ((), stdout, stderr) = tokio::try_join!(stdin_fut, stdout_fut, stderr_fut)?;
         let status = child
             .wait()
             .await
@@ -868,8 +919,8 @@ pub(crate) async fn system_ssh_execute(
         Err(_) => {
             // `kill_on_drop(true)` ensures the local ssh process is
             // SIGKILLed when `child` drops here, so no ssh child can leak
-            // even if the remote end is wedged. The remote shell is killed
-            // too because the local ssh process holds the connection.
+            // even if the remote end is wedged. This only owns the local
+            // SSH child; remote process termination is not guaranteed.
             warn!(
                 "system-ssh command timed out on {} after {:?}",
                 config.id, command_timeout
@@ -1420,6 +1471,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ssh_pool_os_transition_replaces_transport_but_case_and_scheduling_reuse() {
+        let _guard = test_guard!();
+        let pool = SshPool::new(SshOptions {
+            control_master: true,
+            ..Default::default()
+        });
+        let mut config = worker_config("worker-a", "1.2.3.4", "root", "~/.ssh/id_rsa");
+        let unlabelled = pool.get_or_create_client_entry(&config).await;
+        config.tags.push(crate::types::os_tag("windows"));
+        let windows = pool.get_or_create_client_entry(&config).await;
+        assert!(!Arc::ptr_eq(&unlabelled, &windows));
+        {
+            let client = windows.read().await;
+            assert!(prefers_system_ssh(&client.config));
+            assert!(!client.options.control_master);
+        }
+
+        config.tags = vec!["gpu".into(), "os: WiNdOwS ".into()];
+        config.total_slots += 1;
+        config.priority += 1;
+        let reused = pool.get_or_create_client_entry(&config).await;
+        assert!(Arc::ptr_eq(&windows, &reused));
+
+        config.tags = vec![crate::types::os_tag("linux")];
+        let linux = pool.get_or_create_client_entry(&config).await;
+        assert!(!Arc::ptr_eq(&windows, &linux));
+        {
+            let client = linux.read().await;
+            assert!(!prefers_system_ssh(&client.config));
+            assert!(client.options.control_master);
+        }
+        // Existing borrowers retain their original transport while the pool
+        // exposes only the replacement to subsequent requests.
+        assert!(prefers_system_ssh(&windows.read().await.config));
+        assert!(unlabelled.read().await.options.control_master);
+        assert_eq!(pool.active_connections().await, 1);
+
+        config.tags.clear();
+        let removed = pool.get_or_create_client_entry(&config).await;
+        assert!(!Arc::ptr_eq(&linux, &removed));
+        assert!(removed.read().await.options.control_master);
+        assert_eq!(pool.active_connections().await, 1);
+    }
+
+    #[tokio::test]
     async fn test_health_check_reports_not_alive_without_session() {
         // get_or_connect's liveness probe relies on health_check() returning a
         // non-true value (without erroring) for a client that has no live
@@ -1822,7 +1918,7 @@ mod tests {
     fn test_system_ssh_argv_basic_windows() {
         // Baseline Windows worker (no port today — WorkerConfig has no
         // `port` field; non-default ports travel as `host:port`). The argv
-        // ends with the destination then the command, never has a `-p`
+        // ends with the destination then a fixed reader, never has a `-p`
         // flag, and carries the keepalive when non-zero.
         let _guard = test_guard!();
         let cfg = windows_worker("wsurf");
@@ -1850,9 +1946,138 @@ mod tests {
         assert!(s.contains(&"ServerAliveInterval=2".to_string()));
         // No -p flag — WorkerConfig has no port.
         assert!(!s.iter().any(|arg| arg == "-p"));
-        // destination is `user@host` then the command.
+        // The script never reaches the account's cmd.exe command line.
         assert!(s.contains(&"jeffr@100.68.2.11".to_string()));
-        assert_eq!(s[s.len() - 1], "uname -a", "command is the last argv");
+        assert_eq!(s[s.len() - 1], "sh -s", "Windows gets only a fixed reader");
+    }
+
+    #[test]
+    fn test_system_ssh_script_transport_keeps_posix_argv_and_exact_stdin_reader() {
+        let _guard = test_guard!();
+        let linux = worker_config("linux", "1.2.3.4", "root", "~/.ssh/id_rsa");
+        let windows = windows_worker("windows");
+        let script = "printf '%s\\n' '%PATH% !VAR! & | < > ^ $()'\nprintf done";
+        let argv = system_ssh_argv(&linux, script, Duration::ZERO);
+        assert_eq!(argv.last().unwrap(), script);
+        assert!(system_ssh_stdin(&linux, script).is_none());
+        for command in [script, "sh -s", "", "sh -s\n"] {
+            let argv = system_ssh_argv(&windows, command, Duration::ZERO);
+            assert_eq!(argv.last().unwrap(), "sh -s");
+            assert_eq!(
+                system_ssh_stdin(&windows, command).is_none(),
+                command == "sh -s"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_system_ssh_stdin_roundtrip_matches_null_stdin_shell() {
+        use std::process::Stdio;
+
+        let _guard = test_guard!();
+        let config = windows_worker("windows");
+        // These are real POSIX shell oracles for the stdin payload; native
+        // Windows SSH dispatch is qualified separately on a Windows worker.
+        for script in [
+            "",
+            "printf '%s\\n' \"apostrophe's\" 'double\"quote' '%PATH% !VAR! ^ & | < >' '$() `x` \\'",
+            "cat\nprintf 'AFTER\\n'\nread value || printf 'EMPTY\\n'",
+            "cat <<'END'\nheredoc ' \" % ! $() \\\nEND\nprintf 'done\\n'",
+            "printf '%s\\n' 'first\nsecond' # trailing comment",
+            "printf 'before\\n'; printf 'diagnostic\\n' >&2; exit 37",
+            "# comment ending with a backslash \\",
+        ] {
+            let expected = tokio::process::Command::new("sh")
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .unwrap();
+            let mut child = tokio::process::Command::new("sh")
+                .arg("-s")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let payload = system_ssh_stdin(&config, script).unwrap();
+            let (written, observed) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(
+                    write_system_ssh_stdin(stdin, &payload),
+                    child.wait_with_output()
+                )
+            })
+            .await
+            .unwrap();
+            written.unwrap();
+            let observed = observed.unwrap();
+            assert_eq!(observed.status.code(), expected.status.code(), "{script:?}");
+            assert_eq!(observed.stdout, expected.stdout, "{script:?}");
+            assert_eq!(observed.stderr, expected.stderr, "{script:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_system_ssh_split_stdin_never_becomes_command_input() {
+        use std::process::Stdio;
+        use tokio::io::AsyncWriteExt;
+
+        let _guard = test_guard!();
+        let script = "cat\nprintf 'AFTER\\n'\nread value || printf 'EMPTY\\n'";
+        let payload = system_ssh_stdin(&windows_worker("windows"), script).unwrap();
+        let split = payload.find("cat\n").unwrap() + "cat\n".len();
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = async {
+            stdin.write_all(&payload.as_bytes()[..split]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stdin.write_all(&payload.as_bytes()[split..]).await.unwrap();
+            stdin.shutdown().await.unwrap();
+        };
+        let ((), output) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(writer, child.wait_with_output())
+        })
+        .await
+        .unwrap();
+        let output = output.unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"AFTER\nEMPTY\n");
+        assert!(output.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_system_ssh_closed_stdin_preserves_early_exit_diagnostic() {
+        use std::process::Stdio;
+
+        let _guard = test_guard!();
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "printf 'remote failure\\n' >&2; exit 37"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        // Force the pipe closed before writing; a tiny concurrent payload
+        // could fit in the buffer and accidentally miss BrokenPipe coverage.
+        child.wait().await.unwrap();
+        write_system_ssh_stdin(stdin, &"x".repeat(128 * 1024))
+            .await
+            .unwrap();
+        let output = child.wait_with_output().await.unwrap();
+        assert_eq!(output.status.code(), Some(37));
+        assert_eq!(output.stderr, b"remote failure\n");
+        assert!(output.stdout.is_empty());
     }
 
     #[test]
