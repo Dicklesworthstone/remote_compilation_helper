@@ -21,8 +21,8 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, info, warn};
 
-use crate::events::EventBus;
 use crate::disk_pressure::{DiskPressurePolicyConfig, PressureState, evaluate_pressure_policy};
+use crate::events::EventBus;
 use crate::telemetry::TelemetryStore;
 use crate::workers::{WorkerPool, WorkerState};
 
@@ -190,7 +190,10 @@ fn benchmark_telemetry_allows_start(
         &DiskPressurePolicyConfig::default(),
     );
     pressure.telemetry_fresh
-        && matches!(pressure.state, PressureState::Healthy | PressureState::Warning)
+        && matches!(
+            pressure.state,
+            PressureState::Healthy | PressureState::Warning
+        )
 }
 
 fn normalized_event_score(score: f64) -> f64 {
@@ -2871,62 +2874,85 @@ Benchmark complete
         );
         let threshold = SchedulerConfig::default().idle_cpu_threshold;
         assert!(benchmark_telemetry_allows_start(
-            &capabilities, Some(&fresh), threshold
+            &capabilities,
+            Some(&fresh),
+            threshold
         ));
         assert!(!benchmark_telemetry_allows_start(
-            &capabilities, None, threshold
+            &capabilities,
+            None,
+            threshold
         ));
 
         let mut stale = fresh.clone();
         stale.received_at = Utc::now() - ChronoDuration::seconds(91);
         assert!(!benchmark_telemetry_allows_start(
-            &capabilities, Some(&stale), threshold
+            &capabilities,
+            Some(&stale),
+            threshold
         ));
         for cpu in [21.0, f64::NAN, f64::INFINITY, -1.0] {
             let mut busy = fresh.clone();
             busy.telemetry.cpu.overall_percent = cpu;
             assert!(!benchmark_telemetry_allows_start(
-                &capabilities, Some(&busy), threshold
+                &capabilities,
+                Some(&busy),
+                threshold
             ));
         }
         for memory in [92.0, 100.0, f64::NAN, f64::INFINITY, -1.0] {
             let mut pressured = fresh.clone();
             pressured.telemetry.memory.pressure_score = memory;
             assert!(!benchmark_telemetry_allows_start(
-                &capabilities, Some(&pressured), threshold
+                &capabilities,
+                Some(&pressured),
+                threshold
             ));
         }
         capabilities.disk_free_gb = Some(1.0);
         assert!(!benchmark_telemetry_allows_start(
-            &capabilities, Some(&fresh), threshold
+            &capabilities,
+            Some(&fresh),
+            threshold
         ));
         capabilities.disk_free_gb = None;
         assert!(!benchmark_telemetry_allows_start(
-            &capabilities, Some(&fresh), threshold
+            &capabilities,
+            Some(&fresh),
+            threshold
         ));
         capabilities.disk_free_gb = Some(20.0);
-        assert!(benchmark_telemetry_allows_start(
-            &capabilities, Some(&fresh), threshold
-        ), "noncritical warning pressure retains the existing admission threshold");
+        assert!(
+            benchmark_telemetry_allows_start(&capabilities, Some(&fresh), threshold),
+            "noncritical warning pressure retains the existing admission threshold"
+        );
     }
 
     #[tokio::test]
     async fn test_new_worker_benchmark_waits_for_telemetry() {
         let pool = WorkerPool::new();
         let worker_id = WorkerId::new("startup-admission");
-        pool.add_worker(make_worker_config(worker_id.as_str())).await;
+        pool.add_worker(make_worker_config(worker_id.as_str()))
+            .await;
         let worker = pool.get(&worker_id).await.unwrap();
-        worker.set_capabilities(WorkerCapabilities {
-            disk_free_gb: Some(50.0),
-            disk_total_gb: Some(100.0),
-            ..WorkerCapabilities::default()
-        }).await;
+        worker
+            .set_capabilities(WorkerCapabilities {
+                disk_free_gb: Some(50.0),
+                disk_total_gb: Some(100.0),
+                ..WorkerCapabilities::default()
+            })
+            .await;
         let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
         let (scheduler, _handle) = BenchmarkScheduler::new(
-            make_test_config(), pool, telemetry.clone(), EventBus::new(16)
+            make_test_config(),
+            pool,
+            telemetry.clone(),
+            EventBus::new(16),
         );
         let request = ScheduledBenchmarkRequest::new(
-            worker_id.clone(), BenchmarkPriority::High, BenchmarkReason::NewWorker
+            worker_id.clone(),
+            BenchmarkPriority::High,
+            BenchmarkReason::NewWorker,
         );
         scheduler.enqueue(request.clone()).await;
         scheduler.process_pending_queue().await;
