@@ -813,7 +813,12 @@ impl ActionActor {
                 // context; per-subscriber fallback/presentation state stays
                 // ITS OWN.
                 existing.interests = existing.interests.saturating_add(1);
-                existing.kind = request.kind;
+                // Interests detach by operation, not by individual kind.
+                // Retain foreground interest until the operation's last
+                // reference leaves; an optional rejoin cannot demote it.
+                if is_background_kind(existing.kind) || !is_background_kind(request.kind) {
+                    existing.kind = request.kind;
+                }
                 existing.queue_priority = existing.queue_priority.max(request.queue_priority);
                 existing.deadline_unix_micros =
                     match (existing.deadline_unix_micros, request.deadline_unix_micros) {
@@ -826,6 +831,7 @@ impl ActionActor {
                 None
             };
         if let Some(interests) = rejoined_interests {
+            self.foreground_interest |= !is_background_kind(request.kind);
             self.push(EventKind::Rejoined);
             return JoinReceipt::Rejoined { interests };
         }
@@ -972,6 +978,10 @@ impl ActionActor {
             return CancelReceipt::InterestDecremented { remaining };
         }
         self.subscribers.remove(&operation.0);
+        self.foreground_interest = self
+            .subscribers
+            .values()
+            .any(|subscriber| !is_background_kind(subscriber.kind));
         self.push(EventKind::Cancelled);
 
         let retained = self.subscribers.len();
@@ -2464,6 +2474,95 @@ mod tests {
     }
 
     // -- G004: reference-counted interests ----------------------------------
+
+    #[test]
+    fn same_operation_rejoins_retain_foreground_in_both_orders() {
+        for background in [SubscriberKind::Speculative, SubscriberKind::GitPrewarm] {
+            for foreground_first in [false, true] {
+                let mut actor = actor();
+                open_with_primary(&mut actor);
+                let mut foreground = join_request(OP_ONE.0, SubscriberKind::ForegroundAgent, 200);
+                foreground.deadline_unix_micros = Some(2_000);
+                let mut optional = join_request(OP_ONE.0, background, 3);
+                optional.deadline_unix_micros = Some(5_000);
+                let (first, second) = if foreground_first {
+                    (foreground, optional)
+                } else {
+                    (optional, foreground)
+                };
+                assert_eq!(actor.join(first, 1_100, 0), JoinReceipt::JoinedExecution);
+                assert_eq!(actor.has_foreground_interest(), foreground_first);
+                assert_eq!(actor.brownout_suspended(), foreground_first);
+                let generation = actor.active_generation().cloned();
+                let key = actor.descriptor_digest().clone();
+                let before = actor.subscriber(&OP_ONE).unwrap().clone();
+                assert_eq!(
+                    actor.join(second, 1_150, 0),
+                    JoinReceipt::Rejoined { interests: 2 }
+                );
+                let subscriber = actor.subscriber(&OP_ONE).unwrap();
+                assert_eq!(subscriber.kind, SubscriberKind::ForegroundAgent);
+                assert_eq!(subscriber.queue_priority, 200);
+                assert_eq!(subscriber.deadline_unix_micros, Some(2_000));
+                assert_eq!(subscriber.delivery, before.delivery);
+                assert_eq!(subscriber.frontiers, before.frontiers);
+                assert_eq!(subscriber.requirements, before.requirements);
+                assert!(actor.has_foreground_interest());
+                assert!(actor.brownout_suspended());
+                assert_eq!(actor.active_generation(), generation.as_ref());
+                assert_eq!(actor.descriptor_digest(), &key);
+                assert_eq!(actor.attempts().count(), 1);
+                assert_eq!(events_of(&actor, EventKind::GenerationOpened), 1);
+                assert_eq!(events_of(&actor, EventKind::Promoted), 0);
+                assert_eq!(
+                    actor.cancel_subscriber(OP_ONE),
+                    CancelReceipt::InterestDecremented { remaining: 1 }
+                );
+                assert!(actor.has_foreground_interest());
+                assert!(actor.brownout_suspended());
+                assert_eq!(actor.attempts().count(), 1);
+                assert_eq!(
+                    actor.cancel_subscriber(OP_ONE),
+                    CancelReceipt::LastInterestCancelledGeneration
+                );
+                assert!(!actor.has_foreground_interest());
+                assert!(!actor.brownout_suspended());
+            }
+        }
+    }
+
+    #[test]
+    fn final_foreground_detach_restores_brownout_for_retained_speculation() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        for (operation, kind, priority) in [
+            (OP_ONE.0, SubscriberKind::ForegroundAgent, 200),
+            (OP_TWO.0, SubscriberKind::CiRequired, 100),
+            (99, SubscriberKind::Speculative, 3),
+        ] {
+            assert_eq!(
+                actor.join(join_request(operation, kind, priority), 1_100, 0),
+                JoinReceipt::JoinedExecution
+            );
+        }
+        let generation = actor.active_generation().cloned();
+        assert_eq!(
+            actor.cancel_subscriber(OP_ONE),
+            CancelReceipt::SharedWorkContinues { retained: 2 }
+        );
+        assert!(actor.brownout_suspended());
+        assert_eq!(
+            actor.cancel_subscriber(OP_TWO),
+            CancelReceipt::SharedWorkContinues { retained: 1 }
+        );
+        assert!(!actor.has_foreground_interest());
+        assert!(!actor.brownout_suspended());
+        assert_eq!(actor.strongest_interest().unwrap().priority, 3);
+        assert_eq!(actor.active_generation(), generation.as_ref());
+        assert_eq!(actor.slot(), PublicationSlotState::Executing);
+        assert_eq!(actor.attempts().count(), 1);
+        assert!(actor.subscriber(&BuildOperationId(99)).is_some());
+    }
 
     #[test]
     fn interest_refcount_survives_partial_cancel() {

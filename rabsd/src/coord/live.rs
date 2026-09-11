@@ -24,11 +24,16 @@
 //! split itself, and the shutdown receipt shows the coord region
 //! abandoned so nothing hides.
 
+use crate::coord::action_actor::{
+    ActionActor, AttemptPurpose, JoinReceipt, JoinRequest, OpenGenerationReceipt, RegisterAttempt,
+    RegisterAttemptReceipt,
+};
 use crate::coord::target_lease::TargetLeaseRegistry;
 use crate::edge::destination_arbiter::{BundleId, DestinationArbiter};
 use crate::janitor::store::LiveCas;
 use rabs_cas::blob_store::RAW_PROFILE_V1;
 use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
+use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::manifest_codec::decode_manifest_v1;
 use rabs_cas::materialization::{decide_materialization, materialize_object};
 use rabs_cas::metadata_store::{AuthorityRow, RabsMetadataStore, StoreError, digest_key};
@@ -38,19 +43,27 @@ use rabs_cas::publication::{
     authority_digest, process_offer,
 };
 use rabs_cas::serving_state::{ServeDecision, serving_gate};
+use rabs_key::action_key::{action_input_manifest_digest, compute_action_key};
 use rabs_key::logical_output_map::DOMAIN_ARTIFACT_BUNDLE_ROOT;
 use rabs_key::typed_digest::{DOMAIN_ACTION_KEY, DOMAIN_DESCRIPTOR};
 use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
-use rabs_protocol::generation::{AttemptAuthority, LeaseRenewal, WorkerIncarnationId};
+use rabs_protocol::descriptor::{ActionDescriptor, SubscriberKind};
+use rabs_protocol::generation::{
+    ActionGeneration, ActionGenerationId, AttemptAuthority, AttemptId, ExecutionLeaseId,
+    LeaseRenewal, LeaseRenewalSeq, WorkerIncarnationId,
+};
+use rabs_protocol::input_evidence::{ActionInputManifest, InputFileType};
 use rabs_protocol::result_identity::{
     CanonicalActionResultManifest, DigestAlgorithm, OutputRole, TypedDigest,
 };
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::{WorkerAdmission, WorkerSessionOffer};
-use std::collections::HashMap;
+use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
+use rabs_scheduler::speculation_brownout::{BrownoutDecision, PressureBand, WorkCategory, decide};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// The role a consult played in its key's flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,6 +337,364 @@ fn install_all(
     Ok(written)
 }
 
+/// Refusal from the shared foreground/speculative submission path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmissionRefusal {
+    /// The coordinator is down, has no authority, or lost a state lock.
+    Unavailable,
+    /// Projection schema, path mapping, object identity or executable bit differs.
+    InvalidSource(String),
+    /// New optional work is stopped at the current pressure band.
+    Brownout,
+    /// A retained operation cannot silently change its serving requirements.
+    ChangedRequirements,
+    /// A dispatch claim is stale or has already started.
+    StaleDispatch,
+    /// A started attempt lost its dispatcher before a confirmed terminal state.
+    /// Reconciliation is required; blindly retrying could execute twice.
+    UnreconciledAttempt,
+    /// The prior execution finished; consult durable serving before a new miss.
+    PriorAttemptFinished,
+    /// Retained actions reached the bounded admission capacity.
+    Capacity,
+    /// A monotonic identifier cannot be allocated without reuse.
+    IdentityExhausted,
+    /// Durable generation or worker-bound lease admission refused.
+    Admission(String),
+}
+
+#[derive(Debug)]
+struct ProjectedFile {
+    root: String,
+    relative: String,
+    executable: bool,
+}
+
+/// A descriptor bound to actual retained source bytes BEFORE submission.
+/// This initial source lane supports projected regular files. Other positive
+/// input kinds need their own verified materializers and are refused explicitly.
+/// Invocation, environment and negative-dependency validation remain the edge's
+/// responsibility; this constructor is not a parser for untrusted wire requests.
+#[derive(Debug)]
+pub struct ActionSubmission {
+    descriptor: ActionDescriptor,
+    source: Arc<SealedSourceSnapshot>,
+    files: Vec<ProjectedFile>,
+}
+
+impl ActionSubmission {
+    /// Validate the positive projection against a coherent image. Mappings are
+    /// `(logical snapshot root, canonical visible root)`, e.g. workspace and
+    /// `/__rabs/workspace`. Neither physical backing paths nor the full snapshot
+    /// digest become action-key inputs.
+    pub fn from_snapshot(
+        descriptor: ActionDescriptor,
+        manifest: &ActionInputManifest,
+        source: Arc<SealedSourceSnapshot>,
+        mappings: &[(String, String)],
+    ) -> Result<Self, SubmissionRefusal> {
+        let invalid = |why: &str| SubmissionRefusal::InvalidSource(why.to_owned());
+        let digest = action_input_manifest_digest(manifest)
+            .map_err(|error| invalid(&format!("invalid input manifest: {error:?}")))?;
+        if digest != descriptor.action_inputs {
+            return Err(invalid("descriptor input digest does not match projection"));
+        }
+        if manifest.inputs.is_empty()
+            || !manifest.directory_enumerations.is_empty()
+            || !manifest.approved_generated_objects.is_empty()
+        {
+            return Err(invalid(
+                "this source lane requires a nonempty regular-file projection",
+            ));
+        }
+        let mut roots = BTreeSet::new();
+        for (root, visible) in mappings {
+            let canonical_root = visible == rabs_sandbox::layout::WORKSPACE
+                || visible
+                    .strip_prefix(&format!("{}/", rabs_sandbox::layout::REPOS))
+                    .is_some_and(source_component);
+            if !canonical_root || !roots.insert(root) || source.manifest(root).is_none() {
+                return Err(invalid("invalid or duplicate snapshot root mapping"));
+            }
+        }
+        for (index, (_, visible)) in mappings.iter().enumerate() {
+            if mappings[..index].iter().any(|(_, prior)| prior == visible) {
+                return Err(invalid("ambiguous canonical root mapping"));
+            }
+        }
+        let mut files = Vec::new();
+        let mut paths = BTreeSet::new();
+        for input in &manifest.inputs {
+            if input.file_type != InputFileType::Regular || !input.symlink_resolution.is_empty() {
+                return Err(invalid("unsupported non-regular source projection"));
+            }
+            let path = std::str::from_utf8(input.virtual_path.as_bytes())
+                .map_err(|_| invalid("source path is not lossless UTF-8"))?;
+            let (root, relative) = mappings
+                .iter()
+                .find_map(|(root, visible)| {
+                    path.strip_prefix(visible.as_str())
+                        .and_then(|suffix| suffix.strip_prefix('/'))
+                        .map(|relative| (root, relative))
+                })
+                .ok_or_else(|| invalid("source path is outside mapped roots"))?;
+            if !relative.split('/').all(source_component) {
+                return Err(invalid("source path contains unsafe components"));
+            }
+            if !paths.insert(path.to_owned()) {
+                return Err(invalid("duplicate source path"));
+            }
+            let member = source
+                .manifest(root)
+                .and_then(|image| image.members.get(relative));
+            let Some(MemberKind::Regular { mode, .. }) = member else {
+                return Err(invalid(
+                    "projected input is absent or not a regular captured file",
+                ));
+            };
+            if (*mode & 0o111 != 0) != input.executable {
+                return Err(invalid(
+                    "projected executable bit differs from captured file",
+                ));
+            }
+            let bytes = source
+                .file_bytes(root, relative)
+                .ok_or_else(|| invalid("projected file has no retained bytes"))?;
+            let object = digest_set(bytes, DigestRequest::default(), None)
+                .map_err(|_| invalid("source object digest failed"))?
+                .atp_content_id;
+            if input.object.0 != object {
+                return Err(invalid("projected object differs from captured bytes"));
+            }
+            files.push(ProjectedFile {
+                root: root.clone(),
+                relative: relative.to_owned(),
+                executable: input.executable,
+            });
+        }
+        Ok(Self {
+            descriptor,
+            source,
+            files,
+        })
+    }
+
+    /// Semantic identity, independent of subscriber kind and full image identity.
+    #[must_use]
+    pub fn key(&self) -> TypedDigest {
+        compute_action_key(&self.descriptor).final_key
+    }
+
+    /// Materialize ONLY projected files into fresh caller-owned backing. Hidden
+    /// parents are created; all file modes are normalized to the keyed executable
+    /// bit (0644/0755 on Unix). Execution must mount this backing read-only.
+    /// Partial failure leaves inspection state and never returns a usable handle.
+    pub fn materialize_into(
+        &self,
+        destination: &Path,
+    ) -> std::io::Result<BTreeMap<String, PathBuf>> {
+        use std::io::Write;
+        std::fs::create_dir(destination)?;
+        let mut backing = BTreeMap::new();
+        for file in &self.files {
+            let root = destination.join(&file.root);
+            let output = root.join(&file.relative);
+            let parent = output
+                .parent()
+                .ok_or_else(|| std::io::Error::other("missing source parent"))?;
+            std::fs::create_dir_all(parent)?;
+            let mut target = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&output)?;
+            let bytes = self
+                .source
+                .file_bytes(&file.root, &file.relative)
+                .ok_or_else(|| std::io::Error::other("validated source bytes disappeared"))?;
+            target.write_all(bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                target.set_permissions(std::fs::Permissions::from_mode(if file.executable {
+                    0o755
+                } else {
+                    0o644
+                }))?;
+            }
+            backing.insert(file.root.clone(), root);
+        }
+        Ok(backing)
+    }
+}
+
+fn source_component(value: &str) -> bool {
+    !value.is_empty() && !matches!(value, "." | "..") && !value.contains(['/', '\\', ':', '\0'])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchState {
+    Queued,
+    Claimed(u64),
+    Started(u64),
+    Finished,
+    Abandoned,
+}
+
+#[derive(Debug)]
+struct SubmittedActor {
+    actor: ActionActor,
+    input: Arc<ActionSubmission>,
+    state: DispatchState,
+    order: u64,
+}
+
+#[derive(Debug, Default)]
+struct ActionSubmissions {
+    entries: HashMap<TypedDigest, SubmittedActor>,
+    serial: u64,
+}
+
+impl ActionSubmissions {
+    fn next_serial(&mut self) -> Result<u64, SubmissionRefusal> {
+        self.serial = self
+            .serial
+            .checked_add(1)
+            .ok_or(SubmissionRefusal::IdentityExhausted)?;
+        Ok(self.serial)
+    }
+}
+
+/// A subscriber joined the coordinator's actual actor, independently of the
+/// connection-scoped shadow-flight counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionReceipt {
+    pub action_key: TypedDigest,
+    pub actor_created: bool,
+    pub join: JoinReceipt,
+}
+
+/// One non-clone dispatch claim. Dropping it BEFORE `begin` restores queue
+/// eligibility. After worker admission, an unconfirmed drop records abandonment
+/// and refuses further dispatch until reconciliation: it cannot silently retry
+/// a process which may still be running.
+#[derive(Debug)]
+pub struct ActionDispatch<'a> {
+    coord: &'a CoordLive,
+    key: TypedDigest,
+    serial: u64,
+    input: Arc<ActionSubmission>,
+    authority: Option<AttemptAuthority>,
+    completed: bool,
+}
+
+impl ActionDispatch<'_> {
+    pub fn input(&self) -> &ActionSubmission {
+        &self.input
+    }
+
+    /// Grant the durable generation/lease and register exactly one primary.
+    /// Call only after fallible source preparation; no process may start before
+    /// this returns an admitted authority tuple.
+    pub fn begin(
+        &mut self,
+        worker: &WorkerSessionOffer,
+        expires_at_seq: u64,
+    ) -> Result<&AttemptAuthority, SubmissionRefusal> {
+        if self.authority.is_some() {
+            return Err(SubmissionRefusal::StaleDispatch);
+        }
+        let authority =
+            self.coord
+                .begin_submitted_dispatch(&self.key, self.serial, worker, expires_at_seq)?;
+        self.authority = Some(authority);
+        self.authority
+            .as_ref()
+            .ok_or(SubmissionRefusal::StaleDispatch)
+    }
+
+    /// Record an observed worker lifecycle transition using the existing actor
+    /// machine. This does not infer that a process ran from a successful lease.
+    pub fn advance(
+        &self,
+        to: rabs_action::state_machines::AttemptState,
+    ) -> Result<(), SubmissionRefusal> {
+        use crate::coord::action_actor::AdvanceAttemptReceipt;
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        let mut submissions = self
+            .coord
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let entry = submissions
+            .entries
+            .get_mut(&self.key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        if entry.state != DispatchState::Started(self.serial) {
+            return Err(SubmissionRefusal::StaleDispatch);
+        }
+        match entry.actor.advance_attempt(authority.attempt_id, to) {
+            AdvanceAttemptReceipt::Advanced => Ok(()),
+            refusal => Err(SubmissionRefusal::Admission(format!(
+                "attempt transition: {refusal:?}"
+            ))),
+        }
+    }
+
+    /// Complete ownership after the worker has confirmed process/stream cleanup
+    /// and the attempt reached Finished. This is NOT a cache publication; offers
+    /// still go through the coordinator's durable publication gate.
+    pub fn complete(mut self) -> Result<(), SubmissionRefusal> {
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        let mut submissions = self
+            .coord
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let entry = submissions
+            .entries
+            .get_mut(&self.key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        if entry.state != DispatchState::Started(self.serial)
+            || !entry.actor.attempts().any(|attempt| {
+                attempt.attempt == authority.attempt_id
+                    && attempt.state == rabs_action::state_machines::AttemptState::Finished
+            })
+        {
+            return Err(SubmissionRefusal::StaleDispatch);
+        }
+        entry.state = DispatchState::Finished;
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for ActionDispatch<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Ok(mut submissions) = self.coord.submissions.lock()
+            && let Some(entry) = submissions.entries.get_mut(&self.key)
+        {
+            match entry.state {
+                DispatchState::Claimed(serial) if serial == self.serial => {
+                    entry.state = DispatchState::Queued
+                }
+                DispatchState::Started(serial) if serial == self.serial => {
+                    entry.state = DispatchState::Abandoned
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// The live coordinator state shared edge↔coord in-process.
 #[derive(Default)]
 pub struct CoordLive {
@@ -331,6 +702,9 @@ pub struct CoordLive {
     leases: Mutex<TargetLeaseRegistry>,
     arbiter: Mutex<DestinationArbiter>,
     flights: Mutex<HashMap<String, u64>>,
+    /// Actual keyed actors and dispatch ownership; shared by all subscriber kinds.
+    submissions: Mutex<ActionSubmissions>,
+    speculation_pressure: Mutex<Option<PressureBand>>,
     /// The durable store, shared with the janitor region that mounted it.
     /// `None` when the mount failed: the daemon runs, but the coordinator
     /// refuses every commit rather than pretending to have one.
@@ -395,6 +769,299 @@ impl CoordLive {
             cas: Some(cas),
             ..Self::new()
         }
+    }
+
+    /// Set optional-work admission pressure. Foreground joins remain eligible.
+    /// Already-started work is not cancelled here (Q006 owns that policy).
+    pub fn set_speculation_pressure(
+        &self,
+        pressure: PressureBand,
+    ) -> Result<(), SubmissionRefusal> {
+        *self
+            .speculation_pressure
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)? = Some(pressure);
+        Ok(())
+    }
+
+    fn optional_admitted(&self) -> Result<bool, SubmissionRefusal> {
+        let pressure = self
+            .speculation_pressure
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        Ok(decide(
+            WorkCategory::NewSpeculation,
+            pressure.unwrap_or(PressureBand::Normal),
+        ) == BrownoutDecision::Admit)
+    }
+
+    /// Submit a cache-miss demand to the ONE coordinator actor registry. Both
+    /// foreground and speculation use this path. Callers attempt durable serving
+    /// separately; no raw execution observation is treated as a cache hit here.
+    /// Source validation has already run in `ActionSubmission::from_snapshot`.
+    pub fn submit_action(
+        &self,
+        input: ActionSubmission,
+        mut request: JoinRequest,
+        now_unix_micros: i64,
+        clock_epoch: u64,
+    ) -> Result<SubmissionReceipt, SubmissionRefusal> {
+        if !self.available() || self.cas.is_none() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let authority = self.authority().ok_or(SubmissionRefusal::Unavailable)?;
+        let optional = matches!(
+            request.kind,
+            SubscriberKind::Speculative | SubscriberKind::GitPrewarm
+        );
+        if optional && !self.optional_admitted()? {
+            return Err(SubmissionRefusal::Brownout);
+        }
+        // Caller-provided numeric priority cannot make optional work compete in
+        // the foreground class; within the class it remains an ordering hint.
+        if optional {
+            request.queue_priority = request.queue_priority.min(199);
+        }
+        let key = input.key();
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        if let Some(entry) = submissions.entries.get_mut(&key) {
+            if entry.state == DispatchState::Abandoned {
+                return Err(SubmissionRefusal::UnreconciledAttempt);
+            }
+            if entry.state == DispatchState::Finished {
+                return Err(SubmissionRefusal::PriorAttemptFinished);
+            }
+            if entry.actor.descriptor() != &input.descriptor {
+                return Err(SubmissionRefusal::InvalidSource(
+                    "same key has a different descriptor".into(),
+                ));
+            }
+            if entry
+                .actor
+                .subscriber(&request.operation)
+                .is_some_and(|existing| existing.requirements != request.requirements)
+            {
+                return Err(SubmissionRefusal::ChangedRequirements);
+            }
+            let join = entry.actor.join(request, now_unix_micros, clock_epoch);
+            return Ok(SubmissionReceipt {
+                action_key: key,
+                actor_created: false,
+                join,
+            });
+        }
+        const MAX_RETAINED_ACTIONS: usize = 1024;
+        if submissions.entries.len() >= MAX_RETAINED_ACTIONS {
+            return Err(SubmissionRefusal::Capacity);
+        }
+        let order = submissions.next_serial()?;
+        let mut actor = ActionActor::new(
+            input.descriptor.clone(),
+            &authority,
+            &authority.cluster_id.0,
+            now_unix_micros,
+        );
+        let join = actor.join(request, now_unix_micros, clock_epoch);
+        submissions.entries.insert(
+            key.clone(),
+            SubmittedActor {
+                actor,
+                input: Arc::new(input),
+                state: DispatchState::Queued,
+                order,
+            },
+        );
+        Ok(SubmissionReceipt {
+            action_key: key,
+            actor_created: true,
+            join,
+        })
+    }
+
+    /// Claim at most one pending execution, atomically with registry mutation.
+    /// Foreground class wins before numeric priority/deadline/FIFO; a join never
+    /// enqueues a second item. Dropped pre-admission claims return to this queue.
+    pub fn next_action_dispatch(&self) -> Result<Option<ActionDispatch<'_>>, SubmissionRefusal> {
+        if !self.available() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let optional_admitted = self.optional_admitted()?;
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let key = submissions
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.state == DispatchState::Queued
+                    && (entry.actor.has_foreground_interest() || optional_admitted)
+            })
+            .filter_map(|(key, entry)| {
+                entry.actor.strongest_interest().map(|interest| {
+                    (
+                        key,
+                        (
+                            !entry.actor.has_foreground_interest(),
+                            std::cmp::Reverse(interest.priority),
+                            interest.earliest_deadline_unix_micros.unwrap_or(i64::MAX),
+                            entry.order,
+                        ),
+                    )
+                })
+            })
+            .min_by_key(|(_, rank)| *rank)
+            .map(|(key, _)| key.clone());
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let serial = submissions.next_serial()?;
+        let entry = submissions
+            .entries
+            .get_mut(&key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        entry.state = DispatchState::Claimed(serial);
+        Ok(Some(ActionDispatch {
+            coord: self,
+            key,
+            serial,
+            input: Arc::clone(&entry.input),
+            authority: None,
+            completed: false,
+        }))
+    }
+
+    fn begin_submitted_dispatch(
+        &self,
+        key: &TypedDigest,
+        serial: u64,
+        worker: &WorkerSessionOffer,
+        expires_at_seq: u64,
+    ) -> Result<AttemptAuthority, SubmissionRefusal> {
+        if !self.available() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let held = self.authority().ok_or(SubmissionRefusal::Unavailable)?;
+        let cas = self.cas.as_ref().ok_or(SubmissionRefusal::Unavailable)?;
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let entry = submissions
+            .entries
+            .get(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        if entry.state != DispatchState::Claimed(serial) {
+            return Err(SubmissionRefusal::StaleDispatch);
+        }
+        if !entry.actor.has_foreground_interest() && !self.optional_admitted()? {
+            return Err(SubmissionRefusal::Brownout);
+        }
+        // Prepare the fallible pure actor mutation before durable writes. Only a
+        // bound worker lease can supply the opaque registration proof below.
+        let mut actor = entry.actor.clone();
+        let generation_serial = submissions.next_serial()?;
+        let attempt_serial = submissions.next_serial()?;
+        let lease_serial = submissions.next_serial()?;
+        let identity = |counter: u64| (u128::from(self.boot_nonce) << 64) | u128::from(counter);
+        let generation = ActionGeneration {
+            generation_id: ActionGenerationId(identity(generation_serial)),
+            per_key_ordinal: 1,
+            created_under_authority_digest: authority_digest(&held),
+        };
+        if actor.open_generation(generation.clone()) != OpenGenerationReceipt::Opened {
+            return Err(SubmissionRefusal::StaleDispatch);
+        }
+        let authority = AttemptAuthority {
+            coordinator: held,
+            action_key: key.clone(),
+            action_generation: generation,
+            attempt_id: AttemptId(identity(attempt_serial)),
+            execution_lease_id: ExecutionLeaseId(identity(lease_serial)),
+            lease_renewal_seq: LeaseRenewalSeq(0),
+            worker_peer_id: worker.worker_peer_id.clone(),
+            worker_boot_generation: worker.boot_generation,
+            worker_incarnation_id: worker.incarnation,
+        };
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        store
+            .create_bound_generation(
+                &authority_digest(&authority.coordinator),
+                &authority.action_generation,
+                key,
+            )
+            .map_err(|error| SubmissionRefusal::Admission(format!("generation: {error:?}")))?;
+        if let Err(error) = store.admit_attempt_lease(&authority, self.next_seq(), expires_at_seq) {
+            // No executable lease was issued. Burn the failed generation before
+            // allowing the still-owned queue claim to return for a fresh attempt.
+            store
+                .tombstone_generation(authority.action_generation.generation_id.0)
+                .map_err(|cleanup| {
+                    SubmissionRefusal::Admission(format!(
+                        "lease: {error:?}; generation cleanup: {cleanup:?}"
+                    ))
+                })?;
+            return Err(SubmissionRefusal::Admission(format!("lease: {error:?}")));
+        }
+        let receipt = actor.register_attempt(RegisterAttempt {
+            validated: ValidatedAttemptLease {
+                authority: authority.clone(),
+            },
+            purpose: AttemptPurpose::Primary,
+        });
+        let entry = submissions
+            .entries
+            .get_mut(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        if receipt != RegisterAttemptReceipt::Registered {
+            entry.state = DispatchState::Abandoned;
+            return Err(SubmissionRefusal::Admission(format!(
+                "actor registration: {receipt:?}"
+            )));
+        }
+        entry.actor = actor;
+        entry.state = DispatchState::Started(serial);
+        Ok(authority)
+    }
+
+    /// Read-only actor observation for subscriber delivery/diagnostics. Mutating
+    /// this copy cannot mutate the coordinator or grant another dispatch.
+    pub fn submitted_actor(
+        &self,
+        key: &TypedDigest,
+    ) -> Result<Option<ActionActor>, SubmissionRefusal> {
+        Ok(self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?
+            .entries
+            .get(key)
+            .map(|entry| entry.actor.clone()))
+    }
+
+    /// Retire a confirmed finished flight after its consumers have handled the
+    /// outcome. Durable publication/serving records survive in the CAS. Started
+    /// or abandoned executions cannot be forgotten by this cleanup path.
+    pub fn retire_finished_action(&self, key: &TypedDigest) -> Result<bool, SubmissionRefusal> {
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        if !submissions
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.state == DispatchState::Finished)
+        {
+            return Ok(false);
+        }
+        submissions.entries.remove(key);
+        Ok(true)
     }
 
     /// Acquire this incarnation's coordinator authority in the durable
@@ -1026,13 +1693,415 @@ pub fn coord_work(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coord::action_actor::SubscriptionRequirements;
     use crate::janitor::store::mount_and_reconcile;
     use rabs_cas::test_support::{attempt_authority_for, offer_under, sample_expected_descriptor};
+    use rabs_protocol::descriptor::ActionClass;
+    use rabs_protocol::durable_ids::BuildOperationId;
     use rabs_protocol::generation::{
         AttemptId, ExecutionLeaseId, LeaseRenewalSeq, WorkerBootGeneration,
     };
+    use rabs_protocol::input_evidence::{INPUT_EVIDENCE_SCHEMA_VERSION, PositiveInput};
+    use rabs_protocol::raw_bytes::RawBytes;
+    use rabs_protocol::result_identity::ObjectId;
     use rabs_protocol::worker_fence::WorkerLeaseBindingRejection;
+    use rabs_sandbox::snapshot_capture::capture_sealed_source;
     use std::sync::Arc;
+
+    fn source_fixture() -> (
+        tempfile::TempDir,
+        Arc<SealedSourceSnapshot>,
+        ActionInputManifest,
+        ActionDescriptor,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("input.txt"), b"projected bytes\n").unwrap();
+        std::fs::write(dir.path().join("unrelated.txt"), b"not an input\n").unwrap();
+        let source = Arc::new(
+            capture_sealed_source(
+                &[("workspace".into(), dir.path().to_path_buf())],
+                false,
+                2,
+                4096,
+            )
+            .unwrap(),
+        );
+        let object = ObjectId(
+            digest_set(b"projected bytes\n", DigestRequest::default(), None)
+                .unwrap()
+                .atp_content_id,
+        );
+        let manifest = ActionInputManifest {
+            schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+            inputs: vec![PositiveInput {
+                virtual_path: RawBytes::from("/__rabs/workspace/input.txt"),
+                object,
+                file_type: InputFileType::Regular,
+                executable: false,
+                symlink_resolution: vec![],
+            }],
+            ..ActionInputManifest::default()
+        };
+        let d = rabs_key::typed_digest::compute("rabs.submission-test.v1", b"fixture");
+        let descriptor = ActionDescriptor {
+            key_epoch: 1,
+            projection_epoch: 1,
+            action_class: ActionClass::CodeGeneratorRun,
+            normalized_invocation: d.clone(),
+            virtual_working_directory: d.clone(),
+            action_inputs: action_input_manifest_digest(&manifest).unwrap(),
+            negative_dependencies: d.clone(),
+            dependency_inputs: d.clone(),
+            toolchain: d.clone(),
+            output_platform: d.clone(),
+            environment: d.clone(),
+            sandbox_semantic_policy: d.clone(),
+            build_path_semantic_policy: d.clone(),
+            execution_semantics: d.clone(),
+            output_declarations: d,
+        };
+        (dir, source, manifest, descriptor)
+    }
+
+    fn submission(
+        source: &Arc<SealedSourceSnapshot>,
+        manifest: &ActionInputManifest,
+        descriptor: &ActionDescriptor,
+    ) -> ActionSubmission {
+        ActionSubmission::from_snapshot(
+            descriptor.clone(),
+            manifest,
+            Arc::clone(source),
+            &[("workspace".into(), rabs_sandbox::layout::WORKSPACE.into())],
+        )
+        .unwrap()
+    }
+
+    fn request(operation: u128, kind: SubscriberKind, priority: u8) -> JoinRequest {
+        JoinRequest {
+            operation: BuildOperationId(operation),
+            kind,
+            queue_priority: priority,
+            deadline_unix_micros: None,
+            presentation: rabs_key::typed_digest::compute("rabs.presentation.v1", b"plain"),
+            requirements: SubscriptionRequirements::unrestricted(),
+        }
+    }
+
+    fn submission_coordinator() -> (tempfile::TempDir, CoordLive) {
+        let state = tempfile::tempdir().unwrap();
+        let coord = CoordLive::with_cas(Arc::new(mount_and_reconcile(state.path()).unwrap()));
+        coord.acquire_boot_authority("submission-tests").unwrap();
+        coord.mark_up();
+        (state, coord)
+    }
+
+    #[test]
+    fn projected_source_binds_bytes_and_materializes_only_keyed_inputs() {
+        let (live, source, manifest, descriptor) = source_fixture();
+        let input = submission(&source, &manifest, &descriptor);
+        std::fs::write(live.path().join("input.txt"), b"edited after capture").unwrap();
+        let fresh = tempfile::tempdir().unwrap();
+        let target = fresh.path().join("projection");
+        let paths = input.materialize_into(&target).unwrap();
+        assert_eq!(
+            std::fs::read(paths["workspace"].join("input.txt")).unwrap(),
+            b"projected bytes\n"
+        );
+        assert!(!paths["workspace"].join("unrelated.txt").exists());
+        assert_eq!(
+            input.materialize_into(&target).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        let edited = Arc::new(
+            capture_sealed_source(
+                &[("workspace".into(), live.path().to_path_buf())],
+                false,
+                2,
+                4096,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            ActionSubmission::from_snapshot(
+                descriptor,
+                &manifest,
+                edited,
+                &[("workspace".into(), rabs_sandbox::layout::WORKSPACE.into())]
+            ),
+            Err(SubmissionRefusal::InvalidSource(_))
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(paths["workspace"].join("input.txt"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+        }
+    }
+
+    #[test]
+    fn projection_refuses_missing_unsafe_and_mismatched_evidence() {
+        let (_live, source, manifest, descriptor) = source_fixture();
+        let mapping = [("workspace".into(), rabs_sandbox::layout::WORKSPACE.into())];
+        for path in [
+            "/__rabs/workspace/../input.txt",
+            "/__rabs/workspace/input.txt/",
+            "/__rabs/workspace/missing",
+            "/__rabs/workspace-else/input.txt",
+            "/__rabs/workspace/input\0.txt",
+            "/__rabs/workspace/./input.txt",
+        ] {
+            let mut changed = manifest.clone();
+            changed.inputs[0].virtual_path = RawBytes::from(path);
+            let mut described = descriptor.clone();
+            described.action_inputs = action_input_manifest_digest(&changed).unwrap();
+            assert!(
+                matches!(
+                    ActionSubmission::from_snapshot(
+                        described,
+                        &changed,
+                        Arc::clone(&source),
+                        &mapping
+                    ),
+                    Err(SubmissionRefusal::InvalidSource(_))
+                ),
+                "{path:?}"
+            );
+        }
+        for case in 0..5 {
+            let mut changed = manifest.clone();
+            match case {
+                0 => changed.inputs[0].object.0.bytes[0] ^= 1,
+                1 => changed.inputs[0].executable = true,
+                2 => changed.inputs[0].file_type = InputFileType::Symlink,
+                3 => changed.inputs[0]
+                    .symlink_resolution
+                    .push(RawBytes::from("input.txt")),
+                _ => changed
+                    .approved_generated_objects
+                    .push(changed.inputs[0].object.clone()),
+            }
+            let mut described = descriptor.clone();
+            described.action_inputs = action_input_manifest_digest(&changed).unwrap();
+            assert!(matches!(
+                ActionSubmission::from_snapshot(described, &changed, Arc::clone(&source), &mapping),
+                Err(SubmissionRefusal::InvalidSource(_))
+            ));
+        }
+        for invalid in [
+            vec![],
+            vec![("workspace".into(), "/tmp/hidden".into())],
+            vec![(
+                "missing-root".into(),
+                rabs_sandbox::layout::WORKSPACE.into(),
+            )],
+            vec![mapping[0].clone(), mapping[0].clone()],
+        ] {
+            assert!(matches!(
+                ActionSubmission::from_snapshot(
+                    descriptor.clone(),
+                    &manifest,
+                    Arc::clone(&source),
+                    &invalid
+                ),
+                Err(SubmissionRefusal::InvalidSource(_))
+            ));
+        }
+        let mut mismatched = descriptor;
+        mismatched.action_inputs.bytes[0] ^= 1;
+        assert!(matches!(
+            ActionSubmission::from_snapshot(mismatched, &manifest, source, &mapping),
+            Err(SubmissionRefusal::InvalidSource(_))
+        ));
+    }
+
+    #[test]
+    fn shared_queue_prioritizes_foreground_and_restores_unstarted_claims() {
+        let (_state, coord) = submission_coordinator();
+        let (_live, source, manifest, descriptor) = source_fixture();
+        let optional = coord
+            .submit_action(
+                submission(&source, &manifest, &descriptor),
+                request(1, SubscriberKind::Speculative, 255),
+                1,
+                0,
+            )
+            .unwrap();
+        let mut foreground_descriptor = descriptor.clone();
+        foreground_descriptor.normalized_invocation.bytes[0] ^= 1;
+        let foreground = coord
+            .submit_action(
+                submission(&source, &manifest, &foreground_descriptor),
+                request(2, SubscriberKind::ForegroundAgent, 0),
+                2,
+                0,
+            )
+            .unwrap();
+        {
+            let first = coord.next_action_dispatch().unwrap().unwrap();
+            assert_eq!(
+                first.input().key(),
+                foreground.action_key,
+                "foreground class beats arbitrary optional priority"
+            );
+            let second = coord.next_action_dispatch().unwrap().unwrap();
+            assert_eq!(second.input().key(), optional.action_key);
+            assert!(coord.next_action_dispatch().unwrap().is_none());
+            // An actual failed preparation does not permanently claim work.
+            let existing = tempfile::tempdir().unwrap();
+            assert!(first.input().materialize_into(existing.path()).is_err());
+        }
+        assert_eq!(
+            coord.next_action_dispatch().unwrap().unwrap().input().key(),
+            foreground.action_key
+        );
+        coord.set_speculation_pressure(PressureBand::Hard).unwrap();
+        assert!(matches!(
+            coord.submit_action(
+                submission(&source, &manifest, &descriptor),
+                request(3, SubscriberKind::Speculative, 1),
+                3,
+                0
+            ),
+            Err(SubmissionRefusal::Brownout)
+        ));
+        let joined = coord
+            .submit_action(
+                submission(&source, &manifest, &descriptor),
+                request(1, SubscriberKind::ForegroundAgent, 1),
+                4,
+                0,
+            )
+            .unwrap();
+        assert!(
+            !joined.actor_created,
+            "foreground rejoins original optional actor under pressure"
+        );
+        assert!(
+            coord
+                .submitted_actor(&optional.action_key)
+                .unwrap()
+                .unwrap()
+                .has_foreground_interest()
+        );
+        let mut conflicting = request(1, SubscriberKind::ForegroundAgent, 2);
+        conflicting.requirements.minimum_evidence_bundles = 1;
+        assert_eq!(
+            coord
+                .submit_action(
+                    submission(&source, &manifest, &descriptor),
+                    conflicting,
+                    5,
+                    0
+                )
+                .unwrap_err(),
+            SubmissionRefusal::ChangedRequirements
+        );
+        assert_eq!(
+            coord
+                .submitted_actor(&optional.action_key)
+                .unwrap()
+                .unwrap()
+                .subscriber(&BuildOperationId(1))
+                .unwrap()
+                .interests,
+            2
+        );
+    }
+
+    #[test]
+    fn pressure_and_worker_fences_are_rechecked_before_start() {
+        let (_state, coord) = submission_coordinator();
+        let (_live, source, manifest, descriptor) = source_fixture();
+        let receipt = coord
+            .submit_action(
+                submission(&source, &manifest, &descriptor),
+                request(1, SubscriberKind::Speculative, 1),
+                1,
+                0,
+            )
+            .unwrap();
+        let worker = worker_offer(1, 1);
+        {
+            let mut claim = coord.next_action_dispatch().unwrap().unwrap();
+            coord.set_speculation_pressure(PressureBand::Soft).unwrap();
+            assert_eq!(
+                claim.begin(&worker, u64::MAX).unwrap_err(),
+                SubmissionRefusal::Brownout
+            );
+            assert_eq!(
+                coord
+                    .submitted_actor(&receipt.action_key)
+                    .unwrap()
+                    .unwrap()
+                    .attempts()
+                    .count(),
+                0
+            );
+        }
+        assert!(coord.next_action_dispatch().unwrap().is_none());
+        coord
+            .set_speculation_pressure(PressureBand::Normal)
+            .unwrap();
+        {
+            let mut claim = coord.next_action_dispatch().unwrap().unwrap();
+            assert!(
+                matches!(
+                    claim.begin(&worker, u64::MAX),
+                    Err(SubmissionRefusal::Admission(_))
+                ),
+                "unadmitted worker cannot obtain execution lease"
+            );
+        }
+        coord.admit_worker_session(&worker).unwrap();
+        let mut claim = coord.next_action_dispatch().unwrap().unwrap();
+        let authority = claim.begin(&worker, u64::MAX).unwrap().clone();
+        assert_eq!(
+            claim.begin(&worker, u64::MAX).unwrap_err(),
+            SubmissionRefusal::StaleDispatch
+        );
+        assert_eq!(
+            coord
+                .submitted_actor(&receipt.action_key)
+                .unwrap()
+                .unwrap()
+                .attempts()
+                .count(),
+            1
+        );
+        assert_eq!(
+            coord
+                .submitted_actor(&receipt.action_key)
+                .unwrap()
+                .unwrap()
+                .attempts()
+                .next()
+                .unwrap()
+                .attempt,
+            authority.attempt_id
+        );
+        assert!(coord.next_action_dispatch().unwrap().is_none());
+        drop(claim); // Started, no terminal process proof: never blindly requeue.
+        assert!(coord.next_action_dispatch().unwrap().is_none());
+        assert!(!coord.retire_finished_action(&receipt.action_key).unwrap());
+        assert_eq!(
+            coord
+                .submit_action(
+                    submission(&source, &manifest, &descriptor),
+                    request(2, SubscriberKind::ForegroundAgent, 200),
+                    2,
+                    0
+                )
+                .unwrap_err(),
+            SubmissionRefusal::UnreconciledAttempt
+        );
+    }
 
     fn worker_offer(generation: u64, incarnation: u128) -> WorkerSessionOffer {
         WorkerSessionOffer {
