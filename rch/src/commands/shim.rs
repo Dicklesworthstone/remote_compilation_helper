@@ -307,10 +307,9 @@ impl Interception {
 
 /// True if `path` is a small text file that hands off to the rch shim.
 ///
-/// Deliberately content-based rather than name-based: the delegating wrapper is
-/// written by installers we do not control, so the only reliable signal is that
-/// it references the shim we own.
-fn delegates_to_shim(path: &Path) -> bool {
+/// Recognize legacy shim references and marked standalone copies. This small
+/// text-file heuristic does not interpret arbitrary shell control flow.
+fn delegates_to_shim(path: &Path, target_executable: bool) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
@@ -322,7 +321,9 @@ fn delegates_to_shim(path: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
         return false;
     };
-    content.contains(".rch/shims/cargo") || content.contains(SHIM_MARKER)
+    // Marked standalone shim copies intercept themselves. Legacy delegators
+    // instead test the canonical target's executable bit before handing off.
+    (target_executable && content.contains(".rch/shims/cargo")) || content.contains(SHIM_MARKER)
 }
 
 /// Resolve the first `cargo` on this process's `PATH` and classify it.
@@ -330,29 +331,38 @@ fn cargo_interception(shim: &Path) -> Interception {
     let Some(path) = std::env::var_os("PATH") else {
         return Interception::None;
     };
-    cargo_interception_in(&path, shim)
+    let Ok(cwd) = std::env::current_dir() else {
+        return Interception::None;
+    };
+    cargo_interception_in(&path, shim, &cwd)
 }
 
-/// Same, over an explicit search path. Split out so the resolution rules are
-/// testable as a pure function instead of by mutating the process environment.
-fn cargo_interception_in(path: &std::ffi::OsStr, shim: &Path) -> Interception {
+/// Resolve external commands with an explicit PATH and absolute working
+/// directory, without changing process-global environment or cwd. Normalize
+/// candidates before using `which` so a literal `~` in PATH stays literal.
+fn cargo_interception_in(path: &std::ffi::OsStr, shim: &Path, cwd: &Path) -> Interception {
+    if !cwd.is_absolute() {
+        return Interception::None;
+    }
+    let Ok(shim) = cwd.join(shim).canonicalize() else {
+        return Interception::None;
+    };
+    // Legacy delegators use `test -x` before handing off. An installed but
+    // non-executable target sends them to real cargo instead.
+    let shim_executable = which::which(&shim).is_ok();
     for entry in std::env::split_paths(path) {
-        // POSIX treats an empty PATH entry as "$PWD". Honoring that here would
-        // make the verdict depend on the directory rch happens to be run from
-        // (a stray ./cargo would be read as the resolved cargo), so skip it —
-        // a cwd-relative hit is never what this check is meant to report on.
-        if entry.as_os_str().is_empty() {
+        // Joining also maps empty entries to cwd, exactly where an external
+        // shell lookup searches. Non-executable files do not shadow later hits.
+        let candidate = cwd.join(entry).join("cargo");
+        let Ok(candidate) = which::which(candidate) else {
             continue;
-        }
-        let candidate = entry.join("cargo");
-        if !candidate.is_file() {
-            continue;
-        }
-        // First cargo on PATH decides — everything after it is shadowed.
-        if candidate == shim {
+        };
+        // Resolve symlink identity before applying the bounded legacy wrapper
+        // heuristic; a symlink to this shim is direct interception.
+        if candidate.canonicalize().ok().as_ref() == Some(&shim) {
             return Interception::Direct;
         }
-        if delegates_to_shim(&candidate) {
+        if delegates_to_shim(&candidate, shim_executable) {
             return Interception::Delegated;
         }
         return Interception::None;
@@ -1808,7 +1818,7 @@ esac
         // Oversized, non-UTF8 payload: stands in for a real multi-MB binary.
         std::fs::write(&p, vec![0u8; 16 * 1024]).unwrap();
         assert!(!is_toolchain_wrapped(&p));
-        assert!(!delegates_to_shim(&p));
+        assert!(!delegates_to_shim(&p, true));
     }
 
     #[cfg(unix)]
@@ -1912,25 +1922,74 @@ esac
         assert!(!bin.join(REAL_CARGO_NAME).exists());
     }
 
+    fn write_path_candidate(path: &Path, contents: &[u8], executable: bool) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if executable { 0o755 } else { 0o644 };
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = executable;
+    }
+
+    #[cfg(unix)]
+    fn shell_cargo_output(path: &std::ffi::OsStr, cwd: &Path) -> String {
+        let output = output_retrying_text_busy(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "cargo"])
+                .env_clear()
+                .env("PATH", path)
+                .env("HOME", cwd)
+                .current_dir(cwd),
+        );
+        assert!(
+            output.status.success(),
+            "shell lookup failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    // Shell-script fixtures model POSIX execution. Windows coverage below uses
+    // real PE images because extensionless shebang files are not executables.
+    #[cfg(unix)]
     #[test]
-    fn empty_path_entries_do_not_resolve_cargo_from_cwd() {
-        // A stray ./cargo must not decide the verdict just because PATH has an
-        // empty component, which POSIX reads as "$PWD".
+    fn empty_path_entries_resolve_cargo_from_cwd_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let shim_dir = dir.path().join("shims");
         std::fs::create_dir_all(&shim_dir).unwrap();
         let shim = shim_dir.join("cargo");
-        std::fs::write(&shim, cargo_shim_body(true)).unwrap();
+        write_path_candidate(&shim, b"#!/bin/sh\nprintf SHIM\n", true);
+        write_path_candidate(
+            &dir.path().join("cargo"),
+            b"#!/bin/sh\nprintf LOCAL\n",
+            true,
+        );
 
-        // Leading empty entry, then the shim dir: the shim must still win.
         let with_empty =
             std::env::join_paths([std::path::PathBuf::new(), shim_dir.clone()]).unwrap();
         assert_eq!(
-            cargo_interception_in(&with_empty, &shim),
+            cargo_interception_in(&with_empty, &shim, dir.path()),
+            Interception::None
+        );
+        let trailing_empty = std::env::join_paths([shim_dir, std::path::PathBuf::new()]).unwrap();
+        assert_eq!(
+            cargo_interception_in(&trailing_empty, &shim, dir.path()),
             Interception::Direct
+        );
+        assert_eq!(shell_cargo_output(&with_empty, dir.path()), "LOCAL");
+        assert_eq!(shell_cargo_output(&trailing_empty, dir.path()), "SHIM");
+        assert_eq!(shell_cargo_output("".as_ref(), dir.path()), "LOCAL");
+        assert_eq!(
+            cargo_interception_in("".as_ref(), &shim, dir.path()),
+            Interception::None
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn first_cargo_on_path_decides_and_a_real_binary_reports_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -1939,25 +1998,26 @@ esac
         std::fs::create_dir_all(&shim_dir).unwrap();
         std::fs::create_dir_all(&real_dir).unwrap();
         let shim = shim_dir.join("cargo");
-        std::fs::write(&shim, cargo_shim_body(true)).unwrap();
+        write_path_candidate(&shim, cargo_shim_body(true).as_bytes(), true);
         // Stand-in for the real multi-MB cargo binary.
-        std::fs::write(real_dir.join("cargo"), vec![0u8; 16 * 1024]).unwrap();
+        write_path_candidate(&real_dir.join("cargo"), &vec![0u8; 16 * 1024], true);
 
         // Real cargo first => shadowed shim, correctly reported as not intercepted.
         let real_first = std::env::join_paths([real_dir.clone(), shim_dir.clone()]).unwrap();
         assert_eq!(
-            cargo_interception_in(&real_first, &shim),
+            cargo_interception_in(&real_first, &shim, dir.path()),
             Interception::None
         );
 
         // Shim first => intercepted.
         let shim_first = std::env::join_paths([shim_dir, real_dir]).unwrap();
         assert_eq!(
-            cargo_interception_in(&shim_first, &shim),
+            cargo_interception_in(&shim_first, &shim, dir.path()),
             Interception::Direct
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn delegating_wrapper_earlier_on_path_is_still_interception() {
         let dir = tempfile::tempdir().unwrap();
@@ -1966,18 +2026,18 @@ esac
         std::fs::create_dir_all(&shim_dir).unwrap();
         std::fs::create_dir_all(&deleg_dir).unwrap();
         let shim = shim_dir.join("cargo");
-        std::fs::write(&shim, cargo_shim_body(true)).unwrap();
+        write_path_candidate(&shim, cargo_shim_body(true).as_bytes(), true);
         // The real-world ~/.local/bin/cargo that execs the shim. This is the
         // case the old PATH-order check reported as "not intercepted".
-        std::fs::write(
-            deleg_dir.join("cargo"),
+        write_path_candidate(
+            &deleg_dir.join("cargo"),
             b"#!/bin/sh\nSHIM=\"$HOME/.rch/shims/cargo\"\nexec \"$SHIM\" \"$@\"\n",
-        )
-        .unwrap();
+            true,
+        );
 
         let deleg_first = std::env::join_paths([deleg_dir, shim_dir]).unwrap();
         assert_eq!(
-            cargo_interception_in(&deleg_first, &shim),
+            cargo_interception_in(&deleg_first, &shim, dir.path()),
             Interception::Delegated
         );
     }
@@ -1991,7 +2051,185 @@ esac
             b"#!/bin/sh\nSHIM=\"$HOME/.rch/shims/cargo\"\nexec \"$SHIM\" \"$@\"\n",
         )
         .unwrap();
-        assert!(delegates_to_shim(&p));
+        assert!(delegates_to_shim(&p, true));
+        assert!(!delegates_to_shim(&p, false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_eligibility_rejects_shebang_files_and_resolves_real_pe_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join("shims");
+        let earlier_dir = dir.path().join("earlier");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&earlier_dir).unwrap();
+        let shim = shim_dir.join("cargo");
+        let earlier = earlier_dir.join("cargo");
+        let executable = std::env::current_exe().unwrap();
+        // Copy an actual native PE image. These files are only inspected;
+        // neither a compiler nor the copied test binary is executed.
+        std::fs::copy(&executable, &shim).unwrap();
+        write_path_candidate(
+            &earlier,
+            b"#!/bin/sh\nexec \"$HOME/.rch/shims/cargo\" \"$@\"\n",
+            true,
+        );
+        let earlier_first = std::env::join_paths([&earlier_dir, &shim_dir]).unwrap();
+        assert!(
+            which::which(&earlier).is_err(),
+            "a shebang is not a native PE image"
+        );
+        assert_eq!(
+            cargo_interception_in(&earlier_first, &shim, dir.path()),
+            Interception::Direct
+        );
+        std::fs::copy(&executable, &earlier).unwrap();
+        assert_eq!(
+            cargo_interception_in(&earlier_first, &shim, dir.path()),
+            Interception::None
+        );
+        let shim_first = std::env::join_paths([&shim_dir, &earlier_dir]).unwrap();
+        assert_eq!(
+            cargo_interception_in(&shim_first, &shim, dir.path()),
+            Interception::Direct
+        );
+        write_path_candidate(&shim, cargo_shim_body(true).as_bytes(), true);
+        assert_eq!(
+            cargo_interception_in(&shim_first, &shim, dir.path()),
+            Interception::None,
+            "an extensionless POSIX shim cannot authorize native interception"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_relative_candidates_use_explicit_cwd_with_real_pe_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let shim = shim_dir.join("cargo");
+        let executable = std::env::current_exe().unwrap();
+        std::fs::copy(&executable, &shim).unwrap();
+        std::fs::copy(executable, dir.path().join("cargo")).unwrap();
+        let cwd_first = std::env::join_paths([Path::new("."), Path::new("shims")]).unwrap();
+        let shim_first = std::env::join_paths([Path::new("shims"), Path::new(".")]).unwrap();
+        assert_eq!(
+            cargo_interception_in(&cwd_first, &shim, dir.path()),
+            Interception::None
+        );
+        assert_eq!(
+            cargo_interception_in(&shim_first, &shim, dir.path()),
+            Interception::Direct
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_lookup_skips_nonexecutables_and_legacy_target_must_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join(".rch/shims");
+        let real_dir = dir.path().join(".cargo/bin");
+        let wrapper_dir = dir.path().join("local-bin");
+        for path in [&shim_dir, &real_dir, &wrapper_dir] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let shim = shim_dir.join("cargo");
+        let real = real_dir.join("cargo");
+        let wrapper = wrapper_dir.join("cargo");
+        write_path_candidate(&shim, b"#!/bin/sh\nprintf SHIM\n", true);
+        write_path_candidate(&real, b"#!/bin/sh\nprintf LOCAL\n", false);
+        let real_first = std::env::join_paths([&real_dir, &shim_dir]).unwrap();
+        assert_eq!(
+            cargo_interception_in(&real_first, &shim, dir.path()),
+            Interception::Direct
+        );
+        assert_eq!(shell_cargo_output(&real_first, dir.path()), "SHIM");
+
+        let legacy = b"#!/bin/sh\nSHIM=\"$HOME/.rch/shims/cargo\"\nif [ -x \"$SHIM\" ]; then exec \"$SHIM\" \"$@\"; fi\nexec \"$HOME/.cargo/bin/cargo\" \"$@\"\n";
+        write_path_candidate(&wrapper, legacy, false);
+        write_path_candidate(&real, b"#!/bin/sh\nprintf LOCAL\n", true);
+        let wrapper_first = std::env::join_paths([&wrapper_dir, &real_dir, &shim_dir]).unwrap();
+        assert_eq!(
+            cargo_interception_in(&wrapper_first, &shim, dir.path()),
+            Interception::None
+        );
+        assert_eq!(shell_cargo_output(&wrapper_first, dir.path()), "LOCAL");
+
+        write_path_candidate(&wrapper, legacy, true);
+        assert_eq!(
+            cargo_interception_in(&wrapper_first, &shim, dir.path()),
+            Interception::Delegated
+        );
+        assert_eq!(shell_cargo_output(&wrapper_first, dir.path()), "SHIM");
+
+        write_path_candidate(&shim, b"#!/bin/sh\nprintf SHIM\n", false);
+        assert_eq!(
+            cargo_interception_in(&wrapper_first, &shim, dir.path()),
+            Interception::None
+        );
+        assert_eq!(shell_cargo_output(&wrapper_first, dir.path()), "LOCAL");
+        let shim_first = std::env::join_paths([&shim_dir, &real_dir]).unwrap();
+        assert_eq!(
+            cargo_interception_in(&shim_first, &shim, dir.path()),
+            Interception::None
+        );
+        assert_eq!(shell_cargo_output(&shim_first, dir.path()), "LOCAL");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_path_and_literal_tilde_follow_cwd_and_symlink_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join("shims");
+        let real_dir = dir.path().join("bin");
+        let literal_tilde = dir.path().join("~/bin");
+        for path in [&shim_dir, &real_dir, &literal_tilde] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let shim = shim_dir.join("cargo");
+        write_path_candidate(&shim, b"#!/bin/sh\nprintf SHIM\n", true);
+        write_path_candidate(&real_dir.join("cargo"), b"#!/bin/sh\nprintf LOCAL\n", true);
+        std::os::unix::fs::symlink(&shim, literal_tilde.join("cargo")).unwrap();
+        for (path, expected, output) in [
+            ("bin:./shims", Interception::None, "LOCAL"),
+            ("./shims:bin", Interception::Direct, "SHIM"),
+            ("~/bin:bin", Interception::Direct, "SHIM"),
+        ] {
+            assert_eq!(
+                cargo_interception_in(path.as_ref(), &shim, dir.path()),
+                expected,
+                "{path}"
+            );
+            assert_eq!(
+                shell_cargo_output(path.as_ref(), dir.path()),
+                output,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            cargo_interception_in("shims".as_ref(), &shim, Path::new("relative-cwd")),
+            Interception::None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_marked_copy_does_not_need_executable_canonical_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join("shims");
+        let copy_dir = dir.path().join("copy");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&copy_dir).unwrap();
+        let shim = shim_dir.join("cargo");
+        write_path_candidate(&shim, cargo_shim_body(true).as_bytes(), false);
+        let marked = format!("#!/bin/sh\n{SHIM_MARKER}{SHIM_VERSION}\nprintf STANDALONE\n");
+        write_path_candidate(&copy_dir.join("cargo"), marked.as_bytes(), true);
+        let path = std::env::join_paths([&copy_dir, &shim_dir]).unwrap();
+        assert_eq!(
+            cargo_interception_in(&path, &shim, dir.path()),
+            Interception::Delegated
+        );
+        assert_eq!(shell_cargo_output(&path, dir.path()), "STANDALONE");
     }
 
     #[test]

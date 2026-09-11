@@ -2,6 +2,146 @@ use std::process::Command;
 
 use super::common::{assert_contains, init_test_logging};
 
+#[cfg(unix)]
+#[test]
+fn shim_status_reports_actual_path_interception_and_absolute_toolchain_gap() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let shim_dir = home.join(".rch/shims");
+    let delegator_dir = home.join(".local/bin");
+    let real_dir = home.join(".cargo/bin");
+    let nonexec_dir = home.join("nonexec");
+    let toolchains = home.join(".rustup/toolchains");
+    let toolchain_bin = toolchains.join("fixture-toolchain/bin");
+    let config_dir = home.join("config");
+    for dir in [
+        &shim_dir,
+        &delegator_dir,
+        &real_dir,
+        &nonexec_dir,
+        &toolchain_bin,
+        &config_dir,
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let executable = |path: &std::path::Path, body: &str| {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    // Harmless executables distinguish which path a real shell takes. They do
+    // not compile or stand in for evidence of actual remote offloading.
+    executable(
+        &shim_dir.join("cargo"),
+        "#!/bin/sh\n# rch-shim-version: 4\nprintf 'intercepted\\n'\n",
+    );
+    executable(
+        &delegator_dir.join("cargo"),
+        "#!/bin/sh\nSHIM=\"$HOME/.rch/shims/cargo\"\nif [ -x \"$SHIM\" ]; then exec \"$SHIM\" \"$@\"; fi\nexec \"$HOME/.cargo/bin/cargo\" \"$@\"\n",
+    );
+    for dir in [real_dir.as_path(), &toolchain_bin, home] {
+        executable(&dir.join("cargo"), "#!/bin/sh\nprintf 'real\\n'\n");
+    }
+    let nonexec = nonexec_dir.join("cargo");
+    std::fs::write(&nonexec, "not an executable cargo").unwrap();
+    std::fs::set_permissions(&nonexec, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[general]\nenabled = true\n",
+    )
+    .unwrap();
+    std::fs::write(config_dir.join("workers.toml"), "workers = []\n").unwrap();
+
+    for (first, expected, shell_output, human_message) in [
+        (
+            shim_dir.as_path(),
+            "direct",
+            "intercepted\n",
+            "PATH resolves the shim ahead",
+        ),
+        (
+            &nonexec_dir,
+            "direct",
+            "intercepted\n",
+            "PATH resolves the shim ahead",
+        ),
+        (
+            &delegator_dir,
+            "delegated",
+            "intercepted\n",
+            "cargo IS intercepted",
+        ),
+        (
+            &real_dir,
+            "none",
+            "real\n",
+            "cargo is not being intercepted",
+        ),
+        (
+            std::path::Path::new(""),
+            "none",
+            "real\n",
+            "cargo is not being intercepted",
+        ),
+    ] {
+        let path = std::env::join_paths([first, &shim_dir, &real_dir]).unwrap();
+        let actual = Command::new("/bin/sh")
+            .args(["-c", "cargo"])
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", &path)
+            .current_dir(home)
+            .output()
+            .unwrap();
+        assert!(actual.status.success(), "{expected}: {actual:?}");
+        assert_eq!(actual.stdout, shell_output.as_bytes(), "{expected}");
+
+        for machine in [true, false] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_rch"));
+            command
+                .env_clear()
+                .env("HOME", home)
+                .env("PATH", &path)
+                .env("RUSTUP_HOME", home.join(".rustup"))
+                .env("RCH_CONFIG_DIR", &config_dir)
+                .env("XDG_CACHE_HOME", home.join("cache"))
+                .env("NO_COLOR", "1")
+                .current_dir(home)
+                .arg("--no-self-healing");
+            if machine {
+                command.args(["--json", "--format=json"]);
+            }
+            let output = command.args(["shim", "status"]).output().unwrap();
+            assert!(output.status.success(), "{expected}: {output:?}");
+            if machine {
+                let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(status["installed"], true, "{status}");
+                assert_eq!(status["interception"], expected, "{status}");
+                assert_eq!(status["on_path_ahead_of_cargo"], expected != "none");
+                assert_eq!(status["toolchains_wrapped"], 0, "{status}");
+                assert_eq!(status["toolchains_total"], 1, "{status}");
+            } else {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(stdout.contains(human_message), "{expected}: {stdout}");
+                assert!(
+                    stdout.contains(
+                        "1 unwrapped toolchain(s) can still build locally via absolute path"
+                    ),
+                    "{expected}: {stdout}"
+                );
+                assert!(stdout.contains("rch shim install"), "{stdout}");
+                if expected != "none" {
+                    assert!(
+                        !stdout.contains("cargo is not being intercepted"),
+                        "{stdout}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn dispatcher_local_build_warning_reaches_status_doctor_and_watch_without_daemon() {
