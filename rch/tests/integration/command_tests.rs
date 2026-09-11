@@ -251,6 +251,237 @@ fn dispatcher_local_build_warning_reaches_status_doctor_and_watch_without_daemon
 }
 
 // =============================================================================
+// Fleet GC Failure-Path Tests
+// =============================================================================
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gc_timeout_streams_progress_reaps_ssh_and_emits_one_machine_response() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct GcChild(Child);
+    impl Drop for GcChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // This executable is an explicit protocol/transport fixture. It does not
+    // contact an SSH server or execute a collection command on any worker.
+    // Apply-mode replies are synthetic metrics, not evidence of real removal.
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    let config = temp.path().join("config");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    let ssh = bin.join("ssh");
+    std::fs::write(
+        &ssh,
+        "#!/bin/sh\n\
+         for arg do\n\
+           case \"$arg\" in\n\
+             *fixture-slow*)\n\
+               if [ \"$RCH_GC_FIXTURE_APPLY\" = 1 ]; then\n\
+                 case \"$*\" in\n\
+                   *RCH_TARGET_ENTRY*)\n\
+                     printf 'RCH_GC_ROOT resolved /tmp\\nRCH_GC_ROOT tmp /tmp\\nRCH_GC_GATES handles=1 handles_source=proc procs=1\\n'\n\
+                     i=0\n\
+                     while [ \"$i\" -le 100 ]; do\n\
+                       printf 'RCH_TARGET_ENTRY 1 10 free free /tmp/rch_target_fixture_%s\\n' \"$i\"\n\
+                       i=$((i + 1))\n\
+                     done\n\
+                     exit 0\n\
+                     ;;\n\
+                 esac\n\
+                 if [ ! -e \"$RCH_GC_FIXTURE_BATCH\" ]; then\n\
+                   printf 'completed\\n' > \"$RCH_GC_FIXTURE_BATCH\"\n\
+                   i=0\n\
+                   while [ \"$i\" -lt 100 ]; do\n\
+                     printf 'RCH_REAP_RM 10 ttl /tmp/rch_target_fixture_%s\\n' \"$i\"\n\
+                     i=$((i + 1))\n\
+                   done\n\
+                   printf 'RCH_WORKER_REAP_METRICS removed=100 freed_kb=1000\\n'\n\
+                   exit 0\n\
+                 fi\n\
+               fi\n\
+               printf '%s\\n' \"$$\" > \"$RCH_GC_FIXTURE_PID_FILE\"\n\
+               exec /bin/sleep 6\n\
+               ;;\n\
+           esac\n\
+         done\n\
+         printf 'controlled SSH connection failure\\n' >&2\n\
+         exit 255\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "[self_healing]\nhook_starts_daemon = false\ndaemon_installs_hooks = false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        config.join("workers.toml"),
+        "[[workers]]\nid = \"slow\"\nhost = \"fixture-slow.invalid\"\nuser = \"fixture\"\nidentity_file = \"missing\"\n\
+         [[workers]]\nid = \"fast\"\nhost = \"fixture-fast.invalid\"\nuser = \"fixture\"\nidentity_file = \"missing\"\n",
+    )
+    .unwrap();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+
+    for (format, apply) in [
+        ("json", false),
+        ("toon", false),
+        ("json", true),
+        ("toon", true),
+    ] {
+        let pid_file = temp.path().join(format!("ssh-{format}-{apply}.pid"));
+        let batch_file = temp.path().join(format!("batch-{format}-{apply}"));
+        let mut child = GcChild(
+            Command::new(env!("CARGO_BIN_EXE_rch"))
+                .current_dir(temp.path())
+                .env("HOME", temp.path())
+                .env("XDG_CACHE_HOME", temp.path().join("cache"))
+                .env("XDG_CONFIG_HOME", temp.path().join("xdg-config"))
+                .env("RCH_CONFIG_DIR", &config)
+                .env("RCH_GC_FIXTURE_PID_FILE", &pid_file)
+                .env("RCH_GC_FIXTURE_APPLY", if apply { "1" } else { "0" })
+                .env("RCH_GC_FIXTURE_BATCH", batch_file)
+                .env("PATH", &path)
+                .env("NO_COLOR", "1")
+                .env("RCH_LOG_LEVEL", "error")
+                .env_remove("RUST_LOG")
+                .env_remove("RCH_LOG_FILE")
+                .env_remove("RCH_JSON")
+                .env_remove("RCH_OUTPUT_FORMAT")
+                .env_remove("TOON_DEFAULT_FORMAT")
+                .args([
+                    "--no-self-healing",
+                    "--json",
+                    &format!("--format={format}"),
+                    "gc",
+                    "--worker-timeout=2",
+                ])
+                .args(apply.then_some("--apply"))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = child.0.stdout.take().unwrap();
+        let stdout_reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            BufReader::new(stdout).read_to_string(&mut text).unwrap();
+            text
+        });
+        let stderr = child.0.stderr.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let stderr_reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            for line in BufReader::new(stderr).lines() {
+                let line = line.unwrap();
+                let _ = sender.send(line.clone());
+                text.push_str(&line);
+                text.push('\n');
+            }
+            text
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut fast_finished_while_running = false;
+        while let Ok(line) = receiver.recv_timeout(Duration::from_secs(10)) {
+            if line.starts_with("[rch gc] fast: failed:") {
+                fast_finished_while_running = child.0.try_wait().unwrap().is_none();
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        drop(child); // Always clean up the CLI before assertions, even on failure.
+        let stdout = stdout_reader.join().unwrap();
+        let stderr = stderr_reader.join().unwrap();
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "slow SSH fixture missing ({format}, apply={apply}): {error}; status={status:?}; stdout={stdout}; stderr={stderr}"
+                )
+            })
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let process_path = std::path::PathBuf::from(format!("/proc/{pid}"));
+        let ssh_was_reaped = !process_path.exists();
+        // A broken runner may leave our six-second fixture alive. Let that
+        // bounded fixture finish before reporting failure; never kill by a
+        // potentially reused PID or leave an indefinite sleeper behind.
+        let cleanup_deadline = Instant::now() + Duration::from_secs(7);
+        while !ssh_was_reaped && process_path.exists() && Instant::now() < cleanup_deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(status.is_some(), "GC exceeded its watchdog: {stderr}");
+        assert_eq!(status.unwrap().code(), Some(1), "{stderr}");
+        assert!(fast_finished_while_running, "buffered progress: {stderr}");
+        let fast = stderr.find("[rch gc] fast: failed:").unwrap();
+        let slow = stderr.find("[rch gc] slow: timed out:").unwrap();
+        assert!(fast < slow, "slow worker blocked fast worker: {stderr}");
+        assert!(ssh_was_reaped, "GC returned with SSH PID {pid} still alive");
+
+        let json = if format == "toon" {
+            toon_rust::toon_to_json(&stdout).unwrap()
+        } else {
+            stdout.clone()
+        };
+        // from_str rejects a second trailing response document.
+        let value: serde_json::Value = serde_json::from_str(&json)
+            .unwrap_or_else(|error| panic!("invalid {format} response: {error}: {stdout}"));
+        assert_eq!(value["success"], false);
+        assert_eq!(value["command"], "gc");
+        assert_eq!(value["error"]["code"], "RCH-E104");
+        assert_eq!(value["data"]["dry_run"], !apply);
+        assert_eq!(value["data"]["applied"], apply);
+        let workers = value["data"]["workers"].as_array().unwrap();
+        assert_eq!(workers.len(), 2);
+        let slow = workers.iter().find(|row| row["id"] == "slow").unwrap();
+        let fast = workers.iter().find(|row| row["id"] == "fast").unwrap();
+        assert_eq!(slow["timed_out"], true);
+        assert_eq!(slow["apply_outcome_unknown"], apply);
+        assert_eq!(slow["phase"], if apply { "collect" } else { "enumerate" });
+        if apply {
+            // These are confirmed replies from batch one. Batch two must not
+            // erase them or claim its own unknown result as zero removals.
+            assert_eq!(slow["removed"].as_f64(), Some(100.0));
+            assert_eq!(slow["freed_kb"].as_f64(), Some(1000.0));
+            assert_eq!(slow["entries"].as_array().unwrap().len(), 100);
+            assert_eq!(
+                slow["unknown_batch_paths"],
+                serde_json::json!(["/tmp/rch_target_fixture_100"])
+            );
+            assert!(stderr.contains("unknown"), "{stderr}");
+            assert!(stderr.contains("100 confirmed"), "{stderr}");
+        }
+        assert_eq!(fast["timed_out"], false);
+        assert_eq!(fast["ok"], false);
+    }
+}
+
+// =============================================================================
 // Help and Version Tests
 // =============================================================================
 

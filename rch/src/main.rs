@@ -484,6 +484,10 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
         /// Must be absolute, `..`-free and free of shell metacharacters.
         #[arg(long = "root", value_name = "PATH")]
         roots: Vec<String>,
+
+        /// Total deadline per worker, across every scan root and collection batch.
+        #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(1..))]
+        worker_timeout: u64,
     },
 
     /// Explain why a command would or wouldn't be offloaded
@@ -1957,7 +1961,20 @@ async fn main() {
     let wants_machine_output = top_level_machine_output_requested(&args);
 
     if let Err(error) = run(args).await {
-        if wants_machine_output {
+        if let Some(failure) = error.downcast_ref::<GcFailure>() {
+            if wants_machine_output {
+                let ctx = OutputContext::new(OutputConfig {
+                    json: true,
+                    format: failure.format,
+                    ..Default::default()
+                });
+                if let Err(render_error) = ctx.json(&failure.response()) {
+                    eprintln!("Failed to serialize GC report: {render_error}");
+                }
+            } else {
+                eprintln!("Error: {failure}");
+            }
+        } else if wants_machine_output {
             let response: ApiResponse<()> =
                 ApiResponse::err(top_level_command_label(), top_level_api_error(&error));
             match serde_json::to_string_pretty(&response) {
@@ -2172,7 +2189,8 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 apply,
                 workers,
                 roots,
-            } => handle_gc(dry_run, apply, workers, roots, &ctx).await,
+                worker_timeout,
+            } => handle_gc(dry_run, apply, workers, roots, worker_timeout, &ctx).await,
             Commands::Diagnose { command, dry_run } => {
                 handle_diagnose(command, dry_run, &ctx).await
             }
@@ -4157,6 +4175,313 @@ fn reap_surface_config(cli_roots: &[String]) -> Result<ReapSurfaceConfig> {
 /// swept in batches rather than in one command that could exceed `ARG_MAX`.
 const GC_COLLECT_BATCH: usize = 100;
 
+const GC_OUTPUT_LIMIT: u64 = 10 * 1024 * 1024;
+#[cfg(unix)]
+const GC_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Carries a complete fleet report to the single top-level output/exit boundary.
+#[derive(Debug, thiserror::Error)]
+#[error("{api_error}")]
+struct GcFailure {
+    data: serde_json::Value,
+    api_error: ApiError,
+    format: OutputFormat,
+}
+
+impl GcFailure {
+    fn response(&self) -> ApiResponse<serde_json::Value> {
+        let mut response = ApiResponse::err("gc", self.api_error.clone());
+        response.data = Some(self.data.clone());
+        response
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct GcCommandError {
+    message: String,
+    timed_out: bool,
+    command_started: bool,
+}
+
+/// Poll all workers independently; a blocked first worker cannot hide a later
+/// completion. The callback runs before polling for the next report.
+async fn collect_gc_reports<F>(
+    tasks: impl IntoIterator<Item = F>,
+    mut completed: impl FnMut(&serde_json::Value),
+) -> Vec<serde_json::Value>
+where
+    F: std::future::Future<Output = serde_json::Value>,
+{
+    use futures::StreamExt;
+    let mut pending: futures::stream::FuturesUnordered<F> = tasks.into_iter().collect();
+    let mut reports = Vec::new();
+    while let Some(report) = pending.next().await {
+        completed(&report);
+        reports.push(report);
+    }
+    reports
+}
+
+fn gc_failed(reports: &[serde_json::Value]) -> bool {
+    reports.iter().any(|r| r["timed_out"] == true) || !reports.iter().any(|r| r["ok"] == true)
+}
+
+fn gc_deadline(seconds: u64) -> Result<tokio::time::Instant> {
+    tokio::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(seconds))
+        .ok_or_else(|| {
+            anyhow::anyhow!("--worker-timeout is too large for this platform's monotonic clock")
+        })
+}
+
+#[cfg(any(unix, test))]
+fn gc_ssh_timed_out(exit_code: Option<i32>, stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    exit_code == Some(255)
+        && (stderr.contains("timed out")
+            || (stderr.contains("timeout, server ") && stderr.contains("not responding")))
+}
+
+fn gc_progress(report: &serde_json::Value) -> String {
+    let id = report["id"].as_str().unwrap_or("?");
+    if report["ok"] == true {
+        format!(
+            "[rch gc] {id}: complete; {} candidate(s), {} confirmed removal(s)",
+            report["would_remove"].as_u64().unwrap_or(0),
+            report["removed"].as_u64().unwrap_or(0),
+        )
+    } else {
+        let outcome = if report["timed_out"] == true {
+            "timed out"
+        } else {
+            "failed"
+        };
+        let uncertain = if report["apply_outcome_unknown"] == true {
+            "; current collection batch outcome unknown"
+        } else {
+            ""
+        };
+        format!(
+            "[rch gc] {id}: {outcome}: {}; {} confirmed removal(s){uncertain}",
+            report["error"].as_str().unwrap_or("unknown error"),
+            report["removed"].as_u64().unwrap_or(0)
+        )
+    }
+}
+
+/// Foreground SSH gives this command ownership of the connecting child too.
+/// SessionBuilder::connect in openssh 0.11.6 launches an unguarded forking
+/// master, so cancelling that future before it returns cannot clean it up.
+#[cfg(unix)]
+fn gc_ssh_command(
+    worker: &rch_common::WorkerConfig,
+    remote_command: &str,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("ssh");
+    command.env("LC_ALL", "C").env("LANG", "C");
+    command.args([
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "ControlPersist=no",
+        "-o",
+        "ForkAfterAuthentication=no",
+        "-o",
+        "ServerAliveInterval=2",
+    ]);
+    let identity = shellexpand::tilde(&worker.identity_file);
+    if std::path::Path::new(identity.as_ref()).exists() {
+        command
+            .arg("-o")
+            .arg("IdentitiesOnly=yes")
+            .arg("-i")
+            .arg(identity.as_ref());
+    }
+    command
+        .arg(format!("{}@{}", worker.user, worker.host))
+        .arg(format!(
+            "sh -c {}",
+            shell_escape::escape(remote_command.into())
+        ));
+    command
+}
+
+#[cfg(unix)]
+async fn gc_read_output(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    limit: u64,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    reader.take(limit + 1).read_to_end(&mut bytes).await?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::other(format!(
+            "SSH output exceeded {limit} bytes; refusing incomplete GC evidence"
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Own and reap the local child even when connecting, reading, or waiting times
+/// out. Output overflow is an error, never a successful truncated inventory.
+#[cfg(unix)]
+async fn run_gc_process(
+    mut command: tokio::process::Command,
+    deadline: tokio::time::Instant,
+    output_budget: u64,
+) -> std::result::Result<rch_common::CommandResult, GcCommandError> {
+    use std::process::Stdio;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(GcCommandError {
+            message: "worker deadline expired before command started".to_string(),
+            timed_out: true,
+            command_started: false,
+        });
+    }
+    if output_budget == 0 {
+        return Err(GcCommandError {
+            message: "worker output budget exhausted before command started".to_string(),
+            timed_out: false,
+            command_started: false,
+        });
+    }
+    let started = std::time::Instant::now();
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| GcCommandError {
+            message: format!("spawn SSH: {error}"),
+            timed_out: false,
+            command_started: false,
+        })?;
+    finish_gc_process(child, deadline, output_budget, started).await
+}
+
+#[cfg(unix)]
+async fn finish_gc_process(
+    mut child: tokio::process::Child,
+    deadline: tokio::time::Instant,
+    output_budget: u64,
+    started: std::time::Instant,
+) -> std::result::Result<rch_common::CommandResult, GcCommandError> {
+    // Both pipes were explicitly requested above.
+    let stdout = child.stdout.take().expect("piped SSH stdout");
+    let stderr = child.stderr.take().expect("piped SSH stderr");
+    let outcome = tokio::time::timeout_at(deadline, async {
+        tokio::try_join!(
+            child.wait(),
+            gc_read_output(stdout, output_budget),
+            gc_read_output(stderr, output_budget)
+        )
+    })
+    .await;
+    let mut error = match outcome {
+        Ok(Ok((status, stdout, stderr))) => {
+            if stdout.len() as u64 + stderr.len() as u64 > output_budget {
+                return Err(GcCommandError {
+                    message: format!(
+                        "combined SSH output exceeded remaining worker budget of {output_budget} bytes"
+                    ),
+                    timed_out: false,
+                    command_started: true,
+                });
+            }
+            let stdout = String::from_utf8(stdout).map_err(|error| GcCommandError {
+                message: format!("invalid UTF-8 in SSH stdout: {error}"),
+                timed_out: false,
+                command_started: true,
+            })?;
+            let stderr = String::from_utf8(stderr).map_err(|error| GcCommandError {
+                message: format!("invalid UTF-8 in SSH stderr: {error}"),
+                timed_out: false,
+                command_started: true,
+            })?;
+            if gc_ssh_timed_out(status.code(), &stderr) {
+                return Err(GcCommandError {
+                    message: stderr.trim().to_string(),
+                    timed_out: true,
+                    command_started: true,
+                });
+            }
+            return Ok(rch_common::CommandResult {
+                exit_code: status.code().unwrap_or(-1),
+                stdout,
+                stderr,
+                duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            });
+        }
+        Ok(Err(error)) => GcCommandError {
+            message: format!("read/wait SSH: {error}"),
+            timed_out: false,
+            command_started: true,
+        },
+        Err(_) => GcCommandError {
+            message: "worker deadline expired while SSH command was in flight".to_string(),
+            timed_out: true,
+            command_started: true,
+        },
+    };
+    if let Err(kill_error) = child.start_kill() {
+        error.message.push_str(&format!("; SSH kill: {kill_error}"));
+    }
+    match tokio::time::timeout(GC_REAP_TIMEOUT, child.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(wait_error)) => error.message.push_str(&format!("; SSH reap: {wait_error}")),
+        Err(_) => error
+            .message
+            .push_str("; local SSH reap exceeded 2s; kill-on-drop remains armed"),
+    }
+    Err(error)
+}
+
+#[cfg(unix)]
+async fn run_gc_surface_command(
+    worker: &rch_common::WorkerConfig,
+    command: &str,
+    deadline: tokio::time::Instant,
+    output_budget: &mut u64,
+) -> std::result::Result<rch_common::CommandResult, GcCommandError> {
+    run_gc_budgeted_process(gc_ssh_command(worker, command), deadline, output_budget).await
+}
+
+#[cfg(unix)]
+async fn run_gc_budgeted_process(
+    command: tokio::process::Command,
+    deadline: tokio::time::Instant,
+    output_budget: &mut u64,
+) -> std::result::Result<rch_common::CommandResult, GcCommandError> {
+    let result = run_gc_process(command, deadline, *output_budget).await?;
+    *output_budget -= result.stdout.len() as u64 + result.stderr.len() as u64;
+    Ok(result)
+}
+
+#[cfg(not(unix))]
+async fn run_gc_surface_command(
+    _worker: &rch_common::WorkerConfig,
+    _command: &str,
+    _deadline: tokio::time::Instant,
+    _output_budget: &mut u64,
+) -> std::result::Result<rch_common::CommandResult, GcCommandError> {
+    Err(GcCommandError {
+        message: "gc requires the Unix SSH transport".to_string(),
+        timed_out: false,
+        command_started: false,
+    })
+}
+
 /// One enumerated dir plus the decision reached about it.
 struct GcDecision {
     entry: rch_common::stale_target_reap::RemoteTargetEntry,
@@ -4187,6 +4512,7 @@ async fn handle_gc(
     apply: bool,
     worker_filter: Vec<String>,
     cli_roots: Vec<String>,
+    worker_timeout: u64,
     ctx: &OutputContext,
 ) -> Result<()> {
     use rch_common::stale_target_reap as reap;
@@ -4203,9 +4529,14 @@ async fn handle_gc(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let mut worker_reports = Vec::new();
-    let mut any_ok = false;
-    for worker in &workers {
+    // Validate before launching any worker; all futures start in this sweep.
+    let deadline = gc_deadline(worker_timeout)?;
+    let bases_ref = &bases;
+    let surface_ref = &surface;
+    let tasks = workers.iter().map(|worker| async move {
+        let bases = bases_ref;
+        let surface = surface_ref;
+        let mut output_budget = GC_OUTPUT_LIMIT;
         // ── enumerate every root (read-only) ───────────────────────────────
         let mut stdout = String::new();
         let mut failure: Option<serde_json::Value> = None;
@@ -4226,9 +4557,9 @@ async fn handle_gc(
         // yields dirs whose paths never start with the configured string, and
         // every one of them would otherwise be filed under the wrong root.
         let mut attribution: Vec<(String, String)> = Vec::new();
-        for base in &bases {
+        for base in bases {
             let command = reap::enumerate_targets_command(base);
-            match run_reap_surface_command(worker, &command).await {
+            match run_gc_surface_command(worker, &command, deadline, &mut output_budget).await {
                 Ok(result) if result.success() => {
                     let seen = reap::parse_scan_roots(&result.stdout);
                     if seen.skipped.is_none() {
@@ -4256,6 +4587,10 @@ async fn handle_gc(
                     failure = Some(serde_json::json!({
                         "id": worker.id.as_str(),
                         "ok": false,
+                        "timed_out": false,
+                        "phase": "enumerate",
+                        "apply_outcome_unknown": false,
+                        "unknown_batch_paths": [],
                         "error": format!(
                             "enumeration of {base} exited {}: {}",
                             result.exit_code,
@@ -4266,15 +4601,17 @@ async fn handle_gc(
                 }
                 Err(e) => {
                     failure = Some(serde_json::json!({
-                        "id": worker.id.as_str(), "ok": false, "error": format!("ssh: {e}"),
+                        "id": worker.id.as_str(), "ok": false,
+                        "error": format!("{} enumeration of {base} (worker deadline {worker_timeout}s): {e}", worker.id),
+                        "timed_out": e.timed_out, "phase": "enumerate",
+                        "apply_outcome_unknown": false, "unknown_batch_paths": [],
                     }));
                     break;
                 }
             }
         }
         if let Some(error) = failure {
-            worker_reports.push(error);
-            continue;
+            return error;
         }
         if gate_runs == 0 {
             gates_available = reap::GateAvailability::default();
@@ -4366,8 +4703,10 @@ async fn handle_gc(
         let mut rm_errors: Vec<serde_json::Value> = Vec::new();
         let mut skipped: Vec<serde_json::Value> = Vec::new();
         let mut apply_error: Option<String> = None;
+        let mut timed_out = false;
+        let mut unknown_batch_paths: Vec<String> = Vec::new();
         if apply && !targets.is_empty() {
-            for batch in targets.chunks(GC_COLLECT_BATCH) {
+            for (batch_index, batch) in targets.chunks(GC_COLLECT_BATCH).enumerate() {
                 let command = match reap::collect_paths_command(batch) {
                     Ok(command) => command,
                     Err(e) => {
@@ -4375,7 +4714,7 @@ async fn handle_gc(
                         break;
                     }
                 };
-                match run_reap_surface_command(worker, &command).await {
+                match run_gc_surface_command(worker, &command, deadline, &mut output_budget).await {
                     Ok(result) if result.success() => {
                         if let Some((removed, freed_kb)) =
                             reap::parse_worker_reap_metrics(&result.stdout)
@@ -4384,6 +4723,7 @@ async fn handle_gc(
                             freed_kb_total += freed_kb;
                         } else {
                             apply_error = Some("collection produced no metrics line".to_string());
+                            unknown_batch_paths = batch.iter().map(|target| target.path.clone()).collect();
                         }
                         removed_paths.extend(
                             reap::parse_reap_events(&result.stdout)
@@ -4406,6 +4746,7 @@ async fn handle_gc(
                                 "path": e.path, "trigger": e.trigger, "reason": e.reason,
                             })
                         }));
+                        if apply_error.is_some() { break; }
                     }
                     Ok(result) => {
                         apply_error = Some(format!(
@@ -4413,10 +4754,15 @@ async fn handle_gc(
                             result.exit_code,
                             result.stderr.trim()
                         ));
+                        unknown_batch_paths = batch.iter().map(|target| target.path.clone()).collect();
                         break;
                     }
                     Err(e) => {
-                        apply_error = Some(format!("ssh: {e}"));
+                        apply_error = Some(format!("{} collection batch {} (worker deadline {worker_timeout}s): {e}", worker.id, batch_index + 1));
+                        timed_out = e.timed_out;
+                        if e.command_started {
+                            unknown_batch_paths = batch.iter().map(|target| target.path.clone()).collect();
+                        }
                         break;
                     }
                 }
@@ -4446,11 +4792,14 @@ async fn handle_gc(
             })
             .collect();
 
-        any_ok |= apply_error.is_none();
-        worker_reports.push(serde_json::json!({
+        serde_json::json!({
             "id": worker.id.as_str(),
             "ok": apply_error.is_none(),
             "error": apply_error,
+            "timed_out": timed_out,
+            "phase": if apply_error.is_some() { "collect" } else { "complete" },
+            "apply_outcome_unknown": !unknown_batch_paths.is_empty(),
+            "unknown_batch_paths": unknown_batch_paths,
             "gates": {
                 "open_descriptors": gates_available.handles,
                 "processes": gates_available.processes,
@@ -4465,8 +4814,25 @@ async fn handle_gc(
             "entries": removed_paths,
             "rm_errors": rm_errors,
             "skipped": skipped,
-        }));
-    }
+        })
+    });
+    let worker_reports =
+        collect_gc_reports(tasks, |report| eprintln!("{}", gc_progress(report))).await;
+    let failed = gc_failed(&worker_reports);
+    let timed_out_workers: Vec<&str> = worker_reports
+        .iter()
+        .filter(|report| report["timed_out"] == true)
+        .filter_map(|report| report["id"].as_str())
+        .collect();
+    let api_error = if timed_out_workers.is_empty() {
+        ApiError::from_code(ErrorCode::SshConnectionFailed)
+            .with_details("gc failed on every selected worker")
+    } else {
+        ApiError::from_code(ErrorCode::SshTimeout).with_details(format!(
+            "gc timed out on worker(s): {}",
+            timed_out_workers.join(", ")
+        ))
+    };
 
     let data = serde_json::json!({
         "dry_run": !apply,
@@ -4490,11 +4856,20 @@ async fn handle_gc(
         "idle_hours": surface.idle_hours,
         "pooled_idle_hours": surface.pooled_idle_hours,
         "cargo_cache_idle_days": surface.cache_idle_days,
+        "worker_timeout_secs": worker_timeout,
         "workers": worker_reports,
     });
 
     if ctx.is_json() {
-        ctx.json(&ApiResponse::ok("gc", data))?;
+        if failed {
+            return Err(GcFailure {
+                data,
+                api_error,
+                format: ctx.format(),
+            }
+            .into());
+        }
+        ctx.json(&ApiResponse::ok("gc", &data))?;
     } else {
         let mode = if apply {
             "collect"
@@ -4534,6 +4909,25 @@ async fn handle_gc(
                     id,
                     report["error"].as_str().unwrap_or("unknown error")
                 );
+                if apply {
+                    println!(
+                        "    confirmed: removed {} dir(s), freed {} MB",
+                        report["removed"].as_u64().unwrap_or(0),
+                        report["freed_kb"].as_u64().unwrap_or(0) / 1024
+                    );
+                    if report["apply_outcome_unknown"] == true {
+                        println!(
+                            "    current batch outcome UNKNOWN; remote collection may have run:"
+                        );
+                        for path in report["unknown_batch_paths"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                        {
+                            println!("      {}", path.as_str().unwrap_or("?"));
+                        }
+                    }
+                }
                 continue;
             }
             let handles_ok = report["gates"]["open_descriptors"].as_bool() == Some(true);
@@ -4616,12 +5010,15 @@ async fn handle_gc(
         }
     }
 
-    // Fail-open across the fleet, as every other multi-worker surface does: one
-    // unreachable worker must not throw away the sweep of the other fifteen.
-    // `any_ok` is set only after a worker's COLLECTION also succeeded, so an
-    // `--apply` that failed everywhere still exits non-zero.
-    if !any_ok {
-        anyhow::bail!("gc failed on every selected worker");
+    // Preserve partial success for ordinary worker failures. A timeout is
+    // always nonzero, and the report retains every completed worker/batch.
+    if failed {
+        return Err(GcFailure {
+            data,
+            api_error,
+            format: ctx.format(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -5796,6 +6193,237 @@ mod tests {
 
     // ── `rch gc` surface (scope-gap fix) ───────────────────────────────────
 
+    #[test]
+    fn gc_worker_deadline_argument_is_positive_and_checked() {
+        let cli = Cli::try_parse_from(["rch", "gc"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gc {
+                worker_timeout: 900,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["rch", "gc", "--worker-timeout", "0"]).is_err());
+        assert!(
+            Cli::try_parse_from(["rch", "gc", "--worker-timeout", "18446744073709551615"]).is_ok()
+        );
+        assert!(gc_deadline(u64::MAX).is_err());
+        assert!(gc_deadline(2).is_ok());
+    }
+
+    #[test]
+    fn gc_partial_failure_policy_and_envelope_keep_worker_evidence() {
+        let good = serde_json::json!({"id":"good", "ok":true, "timed_out":false});
+        let refused = serde_json::json!({"id":"refused", "ok":false, "timed_out":false});
+        let slow = serde_json::json!({"id":"slow", "ok":false, "timed_out":true});
+        assert!(!gc_failed(&[good.clone(), refused.clone()]));
+        assert!(gc_failed(std::slice::from_ref(&refused)));
+        assert!(gc_failed(&[good.clone(), slow.clone()]));
+        let failure = GcFailure {
+            data: serde_json::json!({"workers":[good, slow], "dry_run":true}),
+            api_error: ApiError::from_code(ErrorCode::SshTimeout),
+            format: OutputFormat::Json,
+        };
+        let encoded = serde_json::to_string(&failure.response()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["success"], false);
+        assert_eq!(value["data"]["workers"][0]["id"], "good");
+        assert_eq!(value["data"]["workers"][1]["timed_out"], true);
+        assert_eq!(value["error"]["code"], "RCH-E104");
+    }
+
+    /// Orchestration test: these futures are controlled tasks, not real workers.
+    #[tokio::test]
+    async fn gc_fast_completion_is_reported_before_first_worker_deadline() {
+        let tasks = ["slow", "fast"].into_iter().map(|id| async move {
+            if id == "slow" {
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(20),
+                        std::future::pending::<()>()
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+            serde_json::json!({"id":id, "ok":id == "fast", "timed_out":id == "slow"})
+        });
+        let mut observed = Vec::new();
+        let reports = collect_gc_reports(tasks, |report| {
+            observed.push(report["id"].as_str().unwrap().to_string());
+        })
+        .await;
+        assert_eq!(observed, ["fast", "slow"]);
+        assert_eq!(reports[0]["id"], "fast");
+        assert!(gc_failed(&reports));
+    }
+
+    #[test]
+    fn gc_timeout_classification_covers_connect_and_keepalive() {
+        assert!(gc_ssh_timed_out(
+            Some(255),
+            "ssh: connect to host example port 22: Connection timed out"
+        ));
+        assert!(gc_ssh_timed_out(
+            Some(255),
+            "Timeout, server example not responding."
+        ));
+        assert!(!gc_ssh_timed_out(
+            Some(255),
+            "Permission denied (publickey)."
+        ));
+        assert!(!gc_ssh_timed_out(
+            Some(0),
+            "operation timed out in a log file"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_ssh_is_foreground_and_keeps_remote_script_one_argument() {
+        let worker = rch_common::WorkerConfig {
+            host: "builder.example".to_string(),
+            user: "builder".to_string(),
+            ..Default::default()
+        };
+        let script = "printf '%s\\n' 'a; b'";
+        let command = gc_ssh_command(&worker, script);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        for required in [
+            "ControlMaster=no",
+            "ControlPath=none",
+            "ControlPersist=no",
+            "ForkAfterAuthentication=no",
+            "BatchMode=yes",
+        ] {
+            assert!(
+                args.iter().any(|arg| arg == required),
+                "missing {required}: {args:?}"
+            );
+        }
+        let invocation = shell_words::split(args.last().unwrap()).unwrap();
+        assert_eq!(invocation, ["sh", "-c", script]);
+        assert!(!args.iter().any(|arg| arg == "-f" || arg == "-M"));
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .any(|(key, value)| key == "LC_ALL" && value == Some(std::ffi::OsStr::new("C")))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gc_shared_deadline_is_not_reset_between_commands() {
+        let deadline = gc_deadline(1).unwrap();
+        let mut budget = GC_OUTPUT_LIMIT;
+        let mut first = tokio::process::Command::new("sleep");
+        first.arg("0.6");
+        assert!(
+            run_gc_budgeted_process(first, deadline, &mut budget)
+                .await
+                .unwrap()
+                .success()
+        );
+        let mut second = tokio::process::Command::new("sleep");
+        second.arg("0.6");
+        let error = run_gc_budgeted_process(second, deadline, &mut budget)
+            .await
+            .unwrap_err();
+        assert!(error.timed_out && error.command_started, "{error}");
+        // After expiry even a nonexistent executable must not be spawned.
+        let error = run_gc_budgeted_process(
+            tokio::process::Command::new("rch-gc-nonexistent-command"),
+            deadline,
+            &mut budget,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.timed_out && !error.command_started, "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gc_output_budget_is_shared_and_never_truncated_into_success() {
+        let deadline = gc_deadline(5).unwrap();
+        let mut budget = 7;
+        let mut first = tokio::process::Command::new("printf");
+        first.arg("abcd");
+        assert_eq!(
+            run_gc_budgeted_process(first, deadline, &mut budget)
+                .await
+                .unwrap()
+                .stdout,
+            "abcd"
+        );
+        assert_eq!(budget, 3);
+        let mut second = tokio::process::Command::new("printf");
+        second.arg("efgh");
+        let error = run_gc_budgeted_process(second, deadline, &mut budget)
+            .await
+            .unwrap_err();
+        assert!(!error.timed_out && error.command_started);
+        assert!(error.message.contains("exceeded"), "{error}");
+        let mut combined = tokio::process::Command::new("sh");
+        combined.args(["-c", "printf ab; printf cd >&2"]);
+        let error = run_gc_process(combined, deadline, 3).await.unwrap_err();
+        assert!(error.message.contains("combined SSH output"), "{error}");
+        let error = run_gc_process(
+            tokio::process::Command::new("rch-gc-nonexistent-command"),
+            deadline,
+            0,
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.command_started && !error.timed_out);
+        assert!(error.message.contains("budget exhausted"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn gc_timeout_and_output_overflow_reap_the_owned_child() {
+        for overflow in [false, true] {
+            let mut command = tokio::process::Command::new(if overflow { "yes" } else { "sleep" });
+            if !overflow {
+                command.arg("10");
+            }
+            let child = command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let pid = child.id().unwrap();
+            let result = finish_gc_process(
+                child,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+                32,
+                std::time::Instant::now(),
+            )
+            .await;
+            let error = result.unwrap_err();
+            assert_eq!(error.timed_out, !overflow, "{error}");
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "owned child {pid} was not reaped: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn gc_failed_apply_progress_preserves_confirmed_and_unknown_work() {
+        let report = serde_json::json!({"id":"slow", "ok":false, "timed_out":true, "error":"batch 2 deadline", "removed":100, "apply_outcome_unknown":true});
+        let progress = gc_progress(&report);
+        assert!(progress.contains("slow: timed out"));
+        assert!(progress.contains("100 confirmed removal(s)"));
+        assert!(progress.contains("current collection batch outcome unknown"));
+    }
+
     fn gc_parts(argv: &[&str]) -> (bool, bool, Vec<String>, Vec<String>) {
         match Cli::try_parse_from(argv)
             .expect("gc argv should parse")
@@ -5806,6 +6434,7 @@ mod tests {
                 apply,
                 workers,
                 roots,
+                ..
             }) => (dry_run, apply, workers, roots),
             _ => panic!("expected Commands::Gc for {argv:?}"),
         }

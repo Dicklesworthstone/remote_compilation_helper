@@ -259,6 +259,18 @@ rch rabs gc plan|run|history [--cas-root DIR] [--mode normal|emergency]
 rch rabs worker|doctor|inventory|reconcile
 ```
 
+Fleet GC reports progress on stderr as workers finish. Each worker has a
+15-minute budget shared across connections, scanned roots, and collection
+batches; set `rch gc --worker-timeout=120` for a shorter budget. A timeout makes
+the command exit nonzero while preserving completed workers' results. JSON/TOON
+output contains one final response with those results and the error.
+
+On timeout, GC terminates its foreground SSH process and allows two additional
+seconds to reap it; cleanup failures are reported. This does not confirm whether
+a remote collection batch finished: an interrupted `--apply` batch is reported
+as having an unknown outcome, alongside confirmed earlier batches. The default
+invocation remains a preview.
+
 ### Hook + Agent Integration
 
 ```bash
