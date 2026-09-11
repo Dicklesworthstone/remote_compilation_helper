@@ -35,7 +35,7 @@ const DEFAULT_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for the background capability probe.
 ///
 /// Separate from [`DEFAULT_CHECK_TIMEOUT`] on purpose: liveness detection must
-/// stay tight, but the capability probe is spawned detached and blocks nothing.
+/// stay tight, while capability work runs separately under a per-worker guard.
 /// It runs `rch-wkr capabilities`, which execs rustc/node/npm/go/zig/
 /// cargo-zigbuild and stats the disk behind a fresh SSH handshake — measured at
 /// 6-16s on loaded 10-core build hosts, versus 2.9s idle. Reusing the 10s
@@ -599,13 +599,14 @@ impl HealthMonitor {
                             worker_id, result.response_time_ms
                         );
 
-                        // Probe capabilities after successful health check
-                        // This runs in the background to avoid slowing down health checks
+                        // Capability work runs separately from liveness checks.
+                        // probe_worker_capabilities skips overlapping requests,
+                        // including refreshes from operators or selection.
                         let worker_clone = worker.clone();
                         // Deliberately NOT `config.check_timeout`. That budget governs
                         // liveness detection and must stay tight, but this probe already
-                        // runs detached (see the spawn below), so a slow probe delays
-                        // nothing. `rch-wkr capabilities` shells out to six toolchain
+                        // runs separately (see the spawn below), so a slow probe does
+                        // not delay liveness. `rch-wkr capabilities` shells out to toolchain
                         // binaries behind a fresh SSH handshake; on loaded build hosts it
                         // was measured at 6-16s, so a 10s liveness budget silently dropped
                         // capability data on exactly the busiest workers. Stale
@@ -916,7 +917,8 @@ pub async fn probe_worker(worker: &WorkerState) -> HealthCheckResult {
 /// Probe worker capabilities (Bun, Node, Rust versions).
 ///
 /// Runs `rch-wkr capabilities` on the worker and parses the JSON output.
-/// Returns None if probing fails (worker continues without capability info).
+/// Returns None if probing fails or another caller is already probing this worker.
+/// Callers retain their existing snapshot; overlapping requests do not spawn SSH.
 pub async fn probe_worker_capabilities(
     worker: &Arc<WorkerState>,
     timeout: Duration,
@@ -924,6 +926,10 @@ pub async fn probe_worker_capabilities(
 ) -> Option<rch_common::WorkerCapabilities> {
     use rch_common::{SshClient, SshOptions, WorkerCapabilities};
 
+    let Some(_probe_guard) = worker.try_capability_probe() else {
+        debug!("Skipping capability refresh: another probe is already running for this worker");
+        return None;
+    };
     let worker_config = worker.config.read().await;
 
     // Check if mock mode is enabled
@@ -2213,6 +2219,92 @@ mod tests {
         let caps = capabilities.unwrap();
         // Mock capabilities include Rust
         assert!(caps.rustc_version.is_some());
+    }
+
+    #[tokio::test]
+    async fn capability_refresh_skips_busy_worker_without_blocking_other_workers() {
+        let _lock = test_lock().lock().await;
+        set_mock_enabled_override(Some(true));
+        let worker = Arc::new(WorkerState::new(WorkerConfig {
+            id: WorkerId::new("cap-busy"),
+            ..Default::default()
+        }));
+        let other = Arc::new(WorkerState::new(WorkerConfig {
+            id: WorkerId::new("cap-other"),
+            ..Default::default()
+        }));
+        let mut existing = rch_common::WorkerCapabilities::new();
+        existing.rustc_version = Some("previous observation".to_owned());
+        worker.set_capabilities(existing).await;
+
+        // Represent an in-flight caller using the same guard that the public
+        // probe entry point acquires before looking up any transport.
+        let active = worker.try_capability_probe().unwrap();
+        let skipped = tokio::time::timeout(
+            Duration::from_millis(100),
+            probe_worker_capabilities(&worker, Duration::from_secs(5), None),
+        )
+        .await;
+        let independent = probe_worker_capabilities(&other, Duration::from_secs(5), None).await;
+        let unchanged = worker.capabilities().await;
+        drop(active);
+        let recovered = probe_worker_capabilities(&worker, Duration::from_secs(5), None).await;
+        clear_mock_overrides();
+
+        assert!(
+            skipped.unwrap().is_none(),
+            "busy probe must not reach transport"
+        );
+        assert!(independent.is_some(), "one worker must not block another");
+        assert_eq!(
+            unchanged.rustc_version.as_deref(),
+            Some("previous observation")
+        );
+        assert!(
+            recovered.is_some(),
+            "completion must permit a later refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_refresh_guard_recovers_after_request_cancellation() {
+        let _lock = test_lock().lock().await;
+        set_mock_enabled_override(Some(true));
+        let worker = Arc::new(WorkerState::new(WorkerConfig {
+            id: WorkerId::new("cap-cancelled"),
+            ..Default::default()
+        }));
+        // Stall the real probe after it claims the per-worker guard, before
+        // it can inspect the configuration or reach a transport.
+        let config_guard = worker.config.write().await;
+        let task_worker = Arc::clone(&worker);
+        let task = tokio::spawn(async move {
+            probe_worker_capabilities(&task_worker, Duration::from_secs(5), None).await
+        });
+        let claimed = tokio::time::timeout(Duration::from_secs(1), async {
+            while worker.try_capability_probe().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let skipped = tokio::time::timeout(
+            Duration::from_millis(100),
+            probe_worker_capabilities(&worker, Duration::from_secs(5), None),
+        )
+        .await;
+        task.abort();
+        let cancelled = task.await;
+        drop(config_guard);
+        let recovered = probe_worker_capabilities(&worker, Duration::from_secs(5), None).await;
+        clear_mock_overrides();
+
+        assert!(claimed.is_ok(), "the real probe did not acquire its guard");
+        assert!(skipped.unwrap().is_none());
+        assert!(cancelled.unwrap_err().is_cancelled());
+        assert!(
+            recovered.is_some(),
+            "a cancelled refresh must not wedge the worker"
+        );
     }
 
     // ============================================================================

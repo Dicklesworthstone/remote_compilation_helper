@@ -271,6 +271,13 @@ a remote collection batch finished: an interrupted `--apply` batch is reported
 as having an unknown outcome, alongside confirmed earlier batches. The default
 invocation remains a preview.
 
+Capability refreshes skip duplicate requests for a worker while its probe is
+running. Workers reuse verified Rustup inventory across requests and invalidate
+entries when installed toolchains or component metadata change. Inventory runs
+in bounded batches; unfinished or failed entries appear in `probe_warnings`,
+and their component capabilities remain unavailable until verified. Disk, load,
+and project-topology observations are collected again for each request.
+
 ### Hook + Agent Integration
 
 ```bash

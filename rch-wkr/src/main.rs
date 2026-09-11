@@ -233,7 +233,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Capabilities => {
-            let capabilities = probe_capabilities();
+            let capabilities = probe_capabilities().await;
             // Output as JSON for the daemon to parse
             println!("{}", serde_json::to_string(&capabilities)?);
             Ok(())
@@ -388,7 +388,7 @@ fn print_system_info() {
 ///
 /// This function detects installed runtimes (Rust, Bun, Node.js, npm)
 /// and returns a WorkerCapabilities struct suitable for JSON serialization.
-fn probe_capabilities() -> WorkerCapabilities {
+async fn probe_capabilities() -> WorkerCapabilities {
     use std::process::Command;
 
     let mut capabilities = WorkerCapabilities::new();
@@ -416,7 +416,7 @@ fn probe_capabilities() -> WorkerCapabilities {
         capabilities.rustc_version = parse_rustc_version_stdout(&version_str);
     }
 
-    let (toolchains, components, inventory_warnings) = probe_rustup_inventory();
+    let (toolchains, components, inventory_warnings) = probe_rustup_inventory().await;
     capabilities.rustup_toolchains = toolchains;
     capabilities.rustup_components = components;
     warnings.extend(inventory_warnings);
@@ -529,9 +529,7 @@ fn probe_capabilities() -> WorkerCapabilities {
 /// Probe every installed rustup toolchain and retain toolchain-qualified,
 /// normalized component facts for routing. A failed sub-probe contributes no
 /// facts, which makes component admission fail closed for that toolchain.
-fn probe_rustup_inventory() -> (Vec<String>, Vec<String>, Vec<String>) {
-    use std::process::Command;
-
+async fn probe_rustup_inventory() -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut warnings = Vec::new();
     let Some(rustup) = resolve_tool_binary("rustup") else {
         return (Vec::new(), Vec::new(), Vec::new());
@@ -542,49 +540,996 @@ fn probe_rustup_inventory() -> (Vec<String>, Vec<String>, Vec<String>) {
             rustup.path.display()
         ));
     }
-    let rustup = &rustup.path;
+    let result = async {
+        let home = std::env::var_os("RUSTUP_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".rustup")))
+            .ok_or_else(|| anyhow::anyhow!("cannot determine rustup home"))?;
+        let cache = dirs::cache_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine inventory cache directory"))?
+            .join("rch/rustup-inventory.json");
+        cached_rustup_inventory(
+            &rustup.path,
+            &home,
+            &cache,
+            &inventory_environment(),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(20),
+        )
+        .await
+    }
+    .await;
+    match result {
+        Ok((toolchains, components, inventory_warnings)) => {
+            warnings.extend(inventory_warnings);
+            (toolchains, components, warnings)
+        }
+        Err(error) => {
+            warnings.push(format!("rustup inventory unavailable: {error:#}"));
+            (Vec::new(), Vec::new(), warnings)
+        }
+    }
+}
 
-    let Ok(output) = Command::new(rustup).args(["toolchain", "list"]).output() else {
-        warnings.push("rustup toolchain list failed to spawn".to_owned());
-        return (Vec::new(), Vec::new(), warnings);
+const INVENTORY_CACHE_LIMIT: usize = 2 * 1024 * 1024;
+const INVENTORY_FRESH_MS: i64 = 300_000;
+const INVENTORY_FAILURE_MS: i64 = 5_000;
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct RustupInventoryCache {
+    schema: u32,
+    fingerprint: String,
+    list_generation: String,
+    listed_at: i64,
+    toolchains: Vec<String>,
+    list_error: Option<String>,
+    entries: std::collections::BTreeMap<String, RustupInventoryEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RustupInventoryEntry {
+    fingerprint: String,
+    checked_at: i64,
+    components: Vec<String>,
+    error: Option<String>,
+}
+
+fn inventory_fresh(checked_at: i64, now: i64, failed: bool) -> bool {
+    if checked_at < 0 || now < checked_at {
+        return false;
+    }
+    now.checked_sub(checked_at).is_some_and(|age| {
+        age < if failed {
+            INVENTORY_FAILURE_MS
+        } else {
+            INVENTORY_FRESH_MS
+        }
+    })
+}
+
+fn inventory_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut environment = std::env::vars_os()
+        .filter(|(name, _)| inventory_environment_variable(name))
+        .collect::<Vec<_>>();
+    environment.sort();
+    environment
+}
+
+fn inventory_environment_variable(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy().to_ascii_uppercase();
+    name.starts_with("RUST")
+        || name.starts_with("CARGO")
+        || name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+        || matches!(name.as_str(), "PATH" | "PATHEXT" | "HOME" | "USERPROFILE")
+}
+
+/// Fingerprint rustup's actual install metadata, never infer component facts
+/// from it. Both multirust manifests affect `rustup component list` semantics.
+/// Missing optional metadata is distinct from unreadable metadata. Bounds fail
+/// closed; a partial fingerprint is never eligible for reuse.
+fn inventory_fingerprint(
+    executable: &std::path::Path,
+    home: &std::path::Path,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<String> {
+    use anyhow::Context;
+    let mut digest = blake3::Hasher::new();
+    let mut budget = 32 * 1024 * 1024;
+    digest.update(b"rch-rustup-inventory-v1");
+    digest.update(std::env::current_dir()?.as_os_str().as_encoded_bytes());
+    for (name, value) in environment {
+        digest.update(name.as_encoded_bytes());
+        digest.update(&[0]);
+        digest.update(value.as_encoded_bytes());
+        digest.update(&[0]);
+    }
+    fingerprint_inventory_file(&mut digest, executable, true, &mut budget)?;
+    let home = home.canonicalize().context("resolve rustup home")?;
+    digest.update(home.as_os_str().as_encoded_bytes());
+    fingerprint_inventory_file(&mut digest, &home.join("settings.toml"), true, &mut budget)?;
+    Ok(digest.finalize().to_hex().to_string())
+}
+
+fn inventory_toolchain_fingerprints(
+    home: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut fingerprints = std::collections::BTreeMap::new();
+    for toolchain in inventory_directory(&home.join("toolchains"))? {
+        let name = toolchain
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("invalid rustup toolchain directory name"))?;
+        fingerprints.insert(
+            name.to_owned(),
+            inventory_toolchain_fingerprint(&toolchain)?,
+        );
+    }
+    Ok(fingerprints)
+}
+
+fn inventory_toolchain_fingerprint(toolchain: &std::path::Path) -> Result<String> {
+    let mut digest = blake3::Hasher::new();
+    let mut budget = 32 * 1024 * 1024;
+    fingerprint_inventory_file(&mut digest, toolchain, false, &mut budget)?;
+    fingerprint_inventory_file(
+        &mut digest,
+        &toolchain
+            .join("bin")
+            .join(format!("rustc{}", std::env::consts::EXE_SUFFIX)),
+        false,
+        &mut budget,
+    )?;
+    for metadata in inventory_directory(&toolchain.join("lib/rustlib"))? {
+        let name = metadata.file_name().unwrap_or_default().to_string_lossy();
+        if name.starts_with("manifest-")
+            || matches!(
+                name.as_ref(),
+                "components"
+                    | "multirust-config.toml"
+                    | "multirust-channel-manifest.toml"
+                    | "rust-installer-version"
+            )
+        {
+            fingerprint_inventory_file(&mut digest, &metadata, true, &mut budget)?;
+        }
+    }
+    Ok(digest.finalize().to_hex().to_string())
+}
+
+fn inventory_directory(path: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    let directory = match std::fs::read_dir(path) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
     };
-    if !output.status.success() {
-        warnings.push(format!(
-            "rustup toolchain list exited {:?}",
-            output.status.code()
-        ));
-        return (Vec::new(), Vec::new(), warnings);
+    let mut entries = Vec::new();
+    for entry in directory {
+        anyhow::ensure!(entries.len() < 4096, "rustup metadata directory too large");
+        entries.push(entry?.path());
     }
+    entries.sort();
+    Ok(entries)
+}
 
-    let mut toolchains = parse_rustup_toolchains(&String::from_utf8_lossy(&output.stdout));
-    let mut components = Vec::new();
-    for toolchain in &toolchains {
-        let host = Command::new(rustup)
-            .args(["run", toolchain, "rustc", "-vV"])
-            .output()
-            .ok()
-            .filter(|result| result.status.success())
-            .and_then(|result| parse_rustc_host(&String::from_utf8_lossy(&result.stdout)));
+fn fingerprint_inventory_file(
+    digest: &mut blake3::Hasher,
+    path: &std::path::Path,
+    contents: bool,
+    budget: &mut usize,
+) -> Result<()> {
+    use std::io::Read;
+    digest.update(path.as_os_str().as_encoded_bytes());
+    digest.update(&[0]);
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            digest.update(b"absent");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    digest.update(path.canonicalize()?.as_os_str().as_encoded_bytes());
+    digest.update(
+        format!(
+            "{:?}:{:?}:{}",
+            metadata.modified()?,
+            metadata.created().ok(),
+            metadata.len()
+        )
+        .as_bytes(),
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        digest.update(
+            format!(
+                "{}:{}:{}:{}",
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec()
+            )
+            .as_bytes(),
+        );
+    }
+    if contents {
+        anyhow::ensure!(
+            metadata.is_file(),
+            "rustup metadata is not a regular file: {}",
+            path.display()
+        );
+        let mut file = std::fs::File::open(path)?;
+        let mut buffer = [0; 8192];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            *budget = budget
+                .checked_sub(count)
+                .ok_or_else(|| anyhow::anyhow!("rustup fingerprint exceeds byte limit"))?;
+            digest.update(&buffer[..count]);
+        }
+    }
+    Ok(())
+}
 
-        let Some(output) = Command::new(rustup)
-            .args(["component", "list", "--installed", "--toolchain", toolchain])
-            .output()
-            .ok()
-            .filter(|result| result.status.success())
-        else {
+async fn lock_inventory_cache(
+    path: &std::path::Path,
+    wait: std::time::Duration,
+) -> Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            anyhow::ensure!(metadata.is_file(), "inventory cache is not a regular file")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "inventory cache is not a regular file"
+    );
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(error) => anyhow::bail!("inventory cache lock unavailable: {error}"),
+        }
+    }
+}
+
+fn write_inventory_cache(file: &mut std::fs::File, cache: &RustupInventoryCache) -> Result<()> {
+    use std::io::{Seek, Write};
+    let bytes = serde_json::to_vec(cache)?;
+    anyhow::ensure!(
+        bytes.len() <= INVENTORY_CACHE_LIMIT,
+        "inventory cache exceeds byte limit"
+    );
+    file.rewind()?;
+    file.write_all(&bytes)?;
+    file.set_len(bytes.len() as u64)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+async fn cached_rustup_inventory(
+    executable: &std::path::Path,
+    home: &std::path::Path,
+    path: &std::path::Path,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    wait: std::time::Duration,
+    scan_budget: std::time::Duration,
+) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
+    use std::io::Read;
+    let mut file = lock_inventory_cache(path, wait).await?;
+    let fingerprint = inventory_fingerprint(executable, home, environment)?;
+    let generations = inventory_toolchain_fingerprints(home)?;
+    let list_generation = serde_json::to_string(&generations.keys().collect::<Vec<_>>())?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take((INVENTORY_CACHE_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= INVENTORY_CACHE_LIMIT,
+        "inventory cache exceeds byte limit"
+    );
+    let mut cache = serde_json::from_slice::<RustupInventoryCache>(&bytes)
+        .ok()
+        .filter(|cache| cache.schema == 2 && cache.fingerprint == fingerprint)
+        .unwrap_or_else(|| RustupInventoryCache {
+            schema: 2,
+            fingerprint: fingerprint.clone(),
+            ..Default::default()
+        });
+    cache
+        .entries
+        .retain(|name, entry| generations.get(name) == Some(&entry.fingerprint));
+    let deadline = tokio::time::Instant::now() + scan_budget;
+    let output_budget = std::sync::atomic::AtomicUsize::new(INVENTORY_CACHE_LIMIT);
+    let now = current_unix_ms();
+    if cache.list_generation != list_generation
+        || !inventory_fresh(cache.listed_at, now, cache.list_error.is_some())
+    {
+        cache.toolchains.clear();
+        match inventory_command(executable, &["toolchain", "list"], deadline, &output_budget).await
+        {
+            Ok(output) => {
+                cache.toolchains = parse_rustup_toolchains(&output);
+                cache.list_error = None;
+            }
+            Err(error) => cache.list_error = Some(format!("rustup toolchain list: {error:#}")),
+        }
+        cache.listed_at = current_unix_ms();
+        cache.list_generation = list_generation;
+    }
+    // Missing entries precede refreshes; oldest attempts precede newer ones.
+    // A slow or broken early toolchain cannot monopolize every invocation.
+    let mut pending = cache.toolchains.clone();
+    pending.sort_by_key(|name| cache.entries.get(name).map(|entry| entry.checked_at));
+    for toolchain in &pending {
+        if cache.entries.get(toolchain).is_some_and(|entry| {
+            inventory_fresh(entry.checked_at, current_unix_ms(), entry.error.is_some())
+        }) {
             continue;
+        }
+        if tokio::time::Instant::now() >= deadline
+            || output_budget.load(std::sync::atomic::Ordering::Relaxed) == 0
+        {
+            break;
+        }
+        let generation = generations.get(toolchain).ok_or_else(|| {
+            anyhow::anyhow!("listed toolchain {toolchain} has no installed directory")
+        })?;
+        let result = async {
+            let output = inventory_command(
+                executable,
+                &["run", toolchain, "rustc", "-vV"],
+                deadline,
+                &output_budget,
+            )
+            .await?;
+            let host =
+                parse_rustc_host(&output).ok_or_else(|| anyhow::anyhow!("rustc host missing"))?;
+            let output = inventory_command(
+                executable,
+                &["component", "list", "--installed", "--toolchain", toolchain],
+                deadline,
+                &output_budget,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(parse_rustup_components(toolchain, Some(&host), &output))
+        }
+        .await;
+        let (components, error) = match result {
+            Ok(components) => (components, None),
+            Err(error) => (Vec::new(), Some(format!("{toolchain}: {error:#}"))),
         };
-        components.extend(parse_rustup_components(
-            toolchain,
-            host.as_deref(),
-            &String::from_utf8_lossy(&output.stdout),
-        ));
+        cache.entries.insert(
+            toolchain.clone(),
+            RustupInventoryEntry {
+                fingerprint: generation.clone(),
+                checked_at: current_unix_ms(),
+                components,
+                error,
+            },
+        );
+        anyhow::ensure!(
+            inventory_toolchain_fingerprint(&home.join("toolchains").join(toolchain))?
+                == *generation,
+            "rustup installation changed during inventory scan"
+        );
+        write_inventory_cache(&mut file, &cache)?;
     }
-    toolchains.sort();
-    toolchains.dedup();
+    anyhow::ensure!(
+        inventory_fingerprint(executable, home, environment)? == fingerprint,
+        "rustup installation changed during inventory read/scan"
+    );
+    anyhow::ensure!(
+        inventory_toolchain_fingerprints(home)? == generations,
+        "rustup toolchains changed during inventory read/scan"
+    );
+    write_inventory_cache(&mut file, &cache)?;
+    let mut components = Vec::new();
+    let mut warnings = cache.list_error.into_iter().collect::<Vec<_>>();
+    for toolchain in &cache.toolchains {
+        match cache.entries.get(toolchain) {
+            Some(entry)
+                if inventory_fresh(entry.checked_at, current_unix_ms(), entry.error.is_some()) =>
+            {
+                components.extend(entry.components.clone());
+                warnings.extend(entry.error.clone());
+            }
+            _ => warnings.push(format!(
+                "{toolchain}: inventory pending; shared scan deadline reached"
+            )),
+        }
+    }
     components.sort();
     components.dedup();
-    (toolchains, components, warnings)
+    Ok((cache.toolchains, components, warnings))
+}
+
+/// Retain rustup's environment setup for linked/custom toolchains. Cancellation
+/// kills and reaps the owned foreground rustup process; this does not promise
+/// to terminate descendants created by rustup on every operating system.
+async fn inventory_command(
+    executable: &std::path::Path,
+    args: &[&str],
+    deadline: tokio::time::Instant,
+    output_budget: &std::sync::atomic::AtomicUsize,
+) -> Result<String> {
+    use anyhow::Context;
+    use std::process::Stdio;
+    anyhow::ensure!(
+        tokio::time::Instant::now() < deadline,
+        "inventory deadline reached before spawn"
+    );
+    anyhow::ensure!(
+        output_budget.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "inventory output limit exhausted before spawn"
+    );
+    let mut child = tokio::process::Command::new(executable)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn inventory command")?;
+    let stdout = child.stdout.take().context("missing inventory stdout")?;
+    let stderr = child.stderr.take().context("missing inventory stderr")?;
+    let result = tokio::time::timeout_at(deadline, async {
+        let (stdout, stderr, status) = tokio::try_join!(
+            read_inventory_output(stdout, output_budget),
+            read_inventory_output(stderr, output_budget),
+            async { child.wait().await.map_err(anyhow::Error::from) },
+        )?;
+        anyhow::ensure!(
+            status.success(),
+            "inventory command exited {status}: {}{}",
+            String::from_utf8_lossy(&stderr[..stderr.len().min(2048)]),
+            if stderr.len() > 2048 {
+                " (diagnostic truncated)"
+            } else {
+                ""
+            }
+        );
+        String::from_utf8(stdout).context("inventory output is not UTF-8")
+    })
+    .await;
+    let error = match result {
+        Ok(Ok(stdout)) => return Ok(stdout),
+        Ok(Err(error)) => error,
+        Err(_) => anyhow::anyhow!("inventory command timed out"),
+    };
+    let _ = child.start_kill();
+    let reaped = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
+    if !matches!(reaped, Ok(Ok(_))) {
+        return Err(error.context("owned inventory child reap was not confirmed"));
+    }
+    Err(error)
+}
+
+async fn read_inventory_output(
+    mut pipe: impl tokio::io::AsyncRead + Unpin,
+    budget: &std::sync::atomic::AtomicUsize,
+) -> Result<Vec<u8>> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncReadExt;
+    let mut output = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = pipe.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(output);
+        }
+        budget
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(count)
+            })
+            .map_err(|_| {
+                budget.store(0, Ordering::Relaxed);
+                anyhow::anyhow!("inventory output exceeds shared byte limit")
+            })?;
+        output.extend_from_slice(&buffer[..count]);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod inventory_cache_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    #[test]
+    fn inventory_environment_includes_windows_case_variants_and_hard_expiry() {
+        for name in [
+            "Path",
+            "Rustup_Home",
+            "Cargo_Home",
+            "UserProfile",
+            "DYLD_LIBRARY_PATH",
+        ] {
+            assert!(inventory_environment_variable(name.as_ref()), "{name}");
+        }
+        assert!(!inventory_environment_variable("TERM".as_ref()));
+        assert!(!inventory_fresh(-1, 100, false));
+        assert!(!inventory_fresh(i64::MIN, i64::MAX, false));
+        assert!(!inventory_fresh(0, -1, false));
+        assert!(!inventory_fresh(100, 99, false));
+        assert!(!inventory_fresh(100, 100 + INVENTORY_FRESH_MS, false));
+        assert!(!inventory_fresh(100, 100 + INVENTORY_FAILURE_MS, true));
+    }
+
+    struct Fixture {
+        directory: tempfile::TempDir,
+        executable: PathBuf,
+        home: PathBuf,
+        cache: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let directory = tempfile::tempdir().unwrap();
+            let home = directory.path().join("rustup-home");
+            for name in ["tc-a", "tc-b", "tc-c"] {
+                let root = home.join("toolchains").join(name);
+                std::fs::create_dir_all(root.join("lib/rustlib")).unwrap();
+                std::fs::create_dir_all(root.join("bin")).unwrap();
+                std::fs::write(root.join("bin/rustc"), b"compiler identity").unwrap();
+                std::fs::write(
+                    root.join("lib/rustlib/components"),
+                    b"clippy-test-host\nrustfmt-test-host\n",
+                )
+                .unwrap();
+                std::fs::write(
+                    root.join("lib/rustlib/multirust-config.toml"),
+                    b"version = '1'\n",
+                )
+                .unwrap();
+                std::fs::write(
+                    root.join("lib/rustlib/multirust-channel-manifest.toml"),
+                    b"manifest-version = '2'\n",
+                )
+                .unwrap();
+            }
+            let executable = directory.path().join("rustup-fixture");
+            std::fs::write(
+                &executable,
+                r#"#!/bin/sh
+root=${0%/*}
+printf '%s\n' "$*" >> "$root/commands"
+case "$1" in
+toolchain) printf 'tc-a\ntc-b\ntc-c\n' ;;
+run)
+    if test -f "$root/slow"; then sleep 0.1; fi
+    if test -f "$root/mutate"; then
+        printf changed >> "$root/rustup-home/toolchains/$2/lib/rustlib/multirust-config.toml"
+    fi
+    printf 'rustc 1.99.0\nhost: test-host\n'
+    ;;
+component) cat "$root/rustup-home/toolchains/$5/lib/rustlib/components" ;;
+*) exit 2 ;;
+esac
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let cache = directory.path().join("inventory.json");
+            Self {
+                directory,
+                executable,
+                home,
+                cache,
+            }
+        }
+
+        async fn probe(&self, budget: Duration) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
+            cached_rustup_inventory(
+                &self.executable,
+                &self.home,
+                &self.cache,
+                &[],
+                Duration::from_secs(3),
+                budget,
+            )
+            .await
+        }
+
+        fn command_count(&self) -> usize {
+            std::fs::read_to_string(self.directory.path().join("commands"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        }
+    }
+
+    // Invoked by the test executable itself in separate OS processes. This
+    // test-only environment passes explicit fixture paths; production has no
+    // inventory executable/cache override or synthetic capability mode.
+    #[tokio::test]
+    async fn inventory_process_child() {
+        let fixture = std::env::var_os("RCH_INVENTORY_TEST_ROOT")
+            .is_none()
+            .then(Fixture::new);
+        let root = std::env::var_os("RCH_INVENTORY_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| fixture.as_ref().unwrap().directory.path().to_owned());
+        let result = cached_rustup_inventory(
+            &root.join("rustup-fixture"),
+            &root.join("rustup-home"),
+            &root.join("inventory.json"),
+            &[],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.0.len(), 3);
+        assert_eq!(result.1.len(), 6);
+        assert!(result.2.is_empty(), "{:?}", result.2);
+    }
+
+    #[tokio::test]
+    async fn inventory_concurrent_processes_share_one_scanner() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.directory.path().join("slow"), b"1").unwrap();
+        let mut children = Vec::new();
+        for _ in 0..6 {
+            children.push(
+                tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "inventory_cache_tests::inventory_process_child",
+                        "--nocapture",
+                    ])
+                    .env("RCH_INVENTORY_TEST_ROOT", fixture.directory.path())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        for child in children {
+            let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_eq!(
+            fixture.command_count(),
+            7,
+            "one list plus two commands per toolchain across six processes"
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_reuses_and_invalidates_only_changed_toolchain() {
+        let fixture = Fixture::new();
+        let initial = fixture.probe(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(initial.1.len(), 6);
+        assert_eq!(fixture.command_count(), 7);
+        assert_eq!(
+            fixture.probe(Duration::from_secs(5)).await.unwrap(),
+            initial
+        );
+        assert_eq!(fixture.command_count(), 7);
+        std::fs::write(
+            fixture.home.join("toolchains/tc-b/lib/rustlib/components"),
+            b"clippy-test-host\n",
+        )
+        .unwrap();
+        let changed = fixture.probe(Duration::from_secs(5)).await.unwrap();
+        assert!(!changed.1.contains(&"tc-b:rustfmt".to_owned()));
+        assert!(changed.1.contains(&"tc-a:rustfmt".to_owned()));
+        assert_eq!(
+            fixture.command_count(),
+            9,
+            "component removal only rescans its toolchain"
+        );
+        std::fs::write(
+            fixture
+                .home
+                .join("toolchains/tc-c/lib/rustlib/multirust-channel-manifest.toml"),
+            b"manifest-version = '3'\n",
+        )
+        .unwrap();
+        fixture.probe(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(
+            fixture.command_count(),
+            11,
+            "channel manifest participates in invalidation"
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_incremental_deadline_prioritizes_unvisited_toolchains() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.directory.path().join("slow"), b"1").unwrap();
+        let first = fixture.probe(Duration::from_millis(180)).await.unwrap();
+        assert!(first.1.contains(&"tc-a:clippy".to_owned()));
+        assert!(!first.1.contains(&"tc-c:clippy".to_owned()));
+        assert!(!first.2.is_empty());
+        let mut cache: RustupInventoryCache =
+            serde_json::from_slice(&std::fs::read(&fixture.cache).unwrap()).unwrap();
+        cache.entries.get_mut("tc-a").unwrap().checked_at = 0;
+        std::fs::write(&fixture.cache, serde_json::to_vec(&cache).unwrap()).unwrap();
+        let second = fixture.probe(Duration::from_millis(180)).await.unwrap();
+        assert!(
+            second.1.contains(&"tc-c:clippy".to_owned()),
+            "unvisited last toolchain must precede expired first entry: {second:?}"
+        );
+        assert!(
+            !second.1.contains(&"tc-a:clippy".to_owned()),
+            "expired facts cannot leak when refresh times out"
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_cache_failures_do_not_launch_uncoordinated_scan() {
+        let fixture = Fixture::new();
+        let _held = lock_inventory_cache(&fixture.cache, Duration::ZERO)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let result = cached_rustup_inventory(
+            &fixture.executable,
+            &fixture.home,
+            &fixture.cache,
+            &[],
+            Duration::from_millis(30),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("lock unavailable"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(fixture.command_count(), 0);
+        let result = cached_rustup_inventory(
+            &fixture.executable,
+            &fixture.home,
+            fixture.directory.path(),
+            &[],
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(fixture.command_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn inventory_output_exhaustion_leaves_unvisited_entries_for_next_process() {
+        let fixture = Fixture::new();
+        std::fs::write(
+            fixture.directory.path().join("noise"),
+            vec![b'x'; INVENTORY_CACHE_LIMIT],
+        )
+        .unwrap();
+        std::fs::write(
+            &fixture.executable,
+            r#"#!/bin/sh
+root=${0%/*}
+printf '%s\n' "$*" >> "$root/commands"
+case "$1" in
+toolchain) printf 'tc-a\ntc-b\ntc-c\n' ;;
+run)
+    if test "$2" = tc-a; then cat "$root/noise"; else printf 'host: test-host\n'; fi
+    ;;
+component) printf 'clippy-test-host\n' ;;
+esac
+"#,
+        )
+        .unwrap();
+        let first = fixture.probe(Duration::from_secs(5)).await.unwrap();
+        assert!(first.1.is_empty());
+        let cache: RustupInventoryCache =
+            serde_json::from_slice(&std::fs::read(&fixture.cache).unwrap()).unwrap();
+        assert_eq!(
+            cache.entries.len(),
+            1,
+            "never-started entries must remain missing"
+        );
+        assert_eq!(fixture.command_count(), 2);
+        let next = fixture.probe(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(next.1, ["tc-b:clippy", "tc-c:clippy"]);
+        assert_eq!(
+            fixture.command_count(),
+            6,
+            "failed noisy entry backs off while remaining entries progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_changed_during_scan_and_unreadable_metadata_fail_closed() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.directory.path().join("mutate"), b"1").unwrap();
+        let error = fixture.probe(Duration::from_secs(5)).await.unwrap_err();
+        assert!(error.to_string().contains("changed during inventory scan"));
+        assert!(
+            std::fs::read(&fixture.cache).unwrap().is_empty(),
+            "changed-generation facts cannot be published"
+        );
+        let fixture = Fixture::new();
+        let metadata = fixture.home.join("toolchains/tc-a/lib/rustlib/components");
+        std::fs::rename(&metadata, metadata.with_extension("saved")).unwrap();
+        std::fs::create_dir(&metadata).unwrap();
+        assert!(fixture.probe(Duration::from_secs(5)).await.is_err());
+        assert_eq!(
+            fixture.command_count(),
+            0,
+            "unreadable metadata cannot authorize an untracked scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_linked_toolchain_replacement_invalidates_old_components() {
+        let fixture = Fixture::new();
+        let link = fixture.home.join("toolchains/tc-a");
+        let first = fixture.directory.path().join("linked-first");
+        std::fs::rename(&link, &first).unwrap();
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        fixture.probe(Duration::from_secs(5)).await.unwrap();
+        let second = fixture.directory.path().join("linked-second");
+        std::fs::create_dir_all(second.join("bin")).unwrap();
+        std::fs::create_dir_all(second.join("lib/rustlib")).unwrap();
+        std::fs::write(second.join("bin/rustc"), b"replacement compiler").unwrap();
+        std::fs::write(second.join("lib/rustlib/components"), b"clippy-test-host\n").unwrap();
+        std::fs::rename(&link, fixture.directory.path().join("previous-link")).unwrap();
+        std::os::unix::fs::symlink(second, &link).unwrap();
+        let result = fixture.probe(Duration::from_secs(5)).await.unwrap();
+        assert!(!result.1.contains(&"tc-a:rustfmt".to_owned()));
+        assert_eq!(fixture.command_count(), 9);
+    }
+
+    #[tokio::test]
+    async fn inventory_failed_list_is_bounded_and_negatively_cached() {
+        let fixture = Fixture::new();
+        std::fs::write(&fixture.executable, "#!/bin/sh\nroot=${0%/*}\nprintf command >> \"$root/commands\"\nprintf unavailable >&2\nexit 7\n").unwrap();
+        let first = fixture.probe(Duration::from_secs(5)).await.unwrap();
+        assert!(first.0.is_empty() && first.1.is_empty());
+        assert!(first.2[0].contains("unavailable"));
+        assert_eq!(fixture.probe(Duration::from_secs(5)).await.unwrap(), first);
+        assert_eq!(
+            std::fs::read_to_string(fixture.directory.path().join("commands")).unwrap(),
+            "command"
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_fifo_cache_and_metadata_are_rejected_before_blocking_io() {
+        let fixture = Fixture::new();
+        let metadata = fixture.home.join("toolchains/tc-a/lib/rustlib/components");
+        std::fs::rename(&metadata, metadata.with_extension("saved")).unwrap();
+        for path in [&metadata, &fixture.cache] {
+            inventory_command(
+                std::path::Path::new("mkfifo"),
+                &[path.to_str().unwrap()],
+                tokio::time::Instant::now() + Duration::from_secs(2),
+                &std::sync::atomic::AtomicUsize::new(4096),
+            )
+            .await
+            .unwrap();
+        }
+        let error = inventory_toolchain_fingerprints(&fixture.home).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+        let error = fixture.probe(Duration::from_secs(2)).await.unwrap_err();
+        assert!(error.to_string().contains("cache is not a regular file"));
+        assert_eq!(fixture.command_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn inventory_corruption_and_future_timestamp_cannot_reuse_facts() {
+        let fixture = Fixture::new();
+        std::fs::write(&fixture.cache, b"truncated cache").unwrap();
+        let observed = fixture.probe(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(observed.1.len(), 6);
+        assert_eq!(
+            fixture.command_count(),
+            7,
+            "corruption requires real re-observation"
+        );
+        let mut cache: RustupInventoryCache =
+            serde_json::from_slice(&std::fs::read(&fixture.cache).unwrap()).unwrap();
+        cache.entries.get_mut("tc-a").unwrap().checked_at = i64::MAX;
+        std::fs::write(&fixture.cache, serde_json::to_vec(&cache).unwrap()).unwrap();
+        fixture.probe(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(fixture.command_count(), 9);
+        std::fs::write(&fixture.cache, vec![b'x'; INVENTORY_CACHE_LIMIT + 1]).unwrap();
+        assert!(fixture.probe(Duration::from_secs(5)).await.is_err());
+        assert_eq!(
+            fixture.command_count(),
+            9,
+            "oversize cache must not trigger a scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_timeout_reaps_owned_child_and_output_cap_is_shared() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fixture = Fixture::new();
+        let pid_file = fixture.directory.path().join("pid");
+        std::fs::write(
+            &fixture.executable,
+            "#!/bin/sh\nroot=${0%/*}\nprintf '%s' $$ > \"$root/pid\"\nexec sleep 30\n",
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let error = inventory_command(
+            &fixture.executable,
+            &[],
+            tokio::time::Instant::now() + Duration::from_millis(150),
+            &AtomicUsize::new(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(
+            !std::path::Path::new("/proc").join(pid).exists(),
+            "owned child must be reaped"
+        );
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
+        std::fs::write(
+            &fixture.executable,
+            "#!/bin/sh\nprintf 1234\nprintf 5678 >&2\n",
+        )
+        .unwrap();
+        let budget = AtomicUsize::new(12);
+        inventory_command(
+            &fixture.executable,
+            &[],
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert_eq!(budget.load(Ordering::Relaxed), 4);
+        let error = inventory_command(
+            &fixture.executable,
+            &[],
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &budget,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("shared byte limit"));
+        assert!(
+            inventory_command(
+                &fixture.executable,
+                &[],
+                tokio::time::Instant::now(),
+                &AtomicUsize::new(0)
+            )
+            .await
+            .is_err()
+        );
+    }
 }
 
 /// Build a command for a runtime tool, resolving it through the same

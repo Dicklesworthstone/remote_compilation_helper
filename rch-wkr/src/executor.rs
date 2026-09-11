@@ -610,8 +610,18 @@ mod tests {
     #[tokio::test]
     async fn test_execute_invalid_dir() {
         println!("TEST START: test_execute_invalid_dir");
-        let result = execute("/nonexistent/path", "ls").await;
-        assert!(result.is_err(), "should fail for nonexistent directory");
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-workdir");
+        assert!(!missing.exists(), "fixture directory must not exist");
+        let error = execute(missing.to_str().unwrap(), "ls")
+            .await
+            .expect_err("should fail for nonexistent directory");
+        assert!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "missing working directory must report NotFound: {error:#}"
+        );
         println!("TEST PASS: test_execute_invalid_dir");
     }
 

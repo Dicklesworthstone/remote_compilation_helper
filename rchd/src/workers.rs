@@ -444,6 +444,8 @@ pub struct WorkerState {
     last_error_msg: RwLock<Option<String>>,
     /// Runtime capabilities (Bun, Node, Rust versions).
     capabilities: RwLock<WorkerCapabilities>,
+    /// Serialize daemon-side capability requests from health, operators and selection.
+    capability_probe: tokio::sync::Mutex<()>,
     /// Cached per-toolchain preflight verdicts.
     toolchain_preflight: RwLock<HashMap<String, ToolchainPreflightStatus>>,
     /// Latest daemon-side pressure policy assessment for this worker.
@@ -488,6 +490,7 @@ impl WorkerState {
             circuit: RwLock::new(CircuitStats::new()),
             last_error_msg: RwLock::new(None),
             capabilities: RwLock::new(WorkerCapabilities::new()),
+            capability_probe: tokio::sync::Mutex::new(()),
             toolchain_preflight: RwLock::new(HashMap::new()),
             pressure_assessment: RwLock::new(PressureAssessment::default()),
             disk_slot_policy,
@@ -882,6 +885,12 @@ impl WorkerState {
     /// Set an error message.
     pub async fn set_error(&self, msg: String) {
         *self.last_error_msg.write().await = Some(msg);
+    }
+
+    /// Skip overlapping probes instead of queuing more remote inventory scans.
+    /// The guard releases on normal completion, error, panic or cancellation.
+    pub fn try_capability_probe(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.capability_probe.try_lock().ok()
     }
 
     /// Update worker capabilities.
