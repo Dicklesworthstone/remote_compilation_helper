@@ -53,19 +53,19 @@ tar = { workspace = true }
 zip = { workspace = true }
 
 # Update system dependencies
-reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 sha2 = "0.11.0"
 shell-escape = "0.1.5"
 shell-words = "1.1.0"
 
 # State detection dependencies
-which = "8"
+which = "8.0.6"
 
 # LRU cache for classification decisions
-lru = "0.18"
+lru = "0.18.4"
 
 # Async stream utilities for parallel operations
-futures = "0.3"
+futures = "0.3.34"
 
 # Markdown rendering
 pulldown-cmark = { workspace = true }
@@ -97,7 +97,7 @@ true-e2e = []
 tempfile = "3.25.0"
 proptest = "1.11.0"
 insta = "1.47.2"
-serial_test = "3.2"
+serial_test = "4.0.1"
 
 [[test]]
 name = "true_e2e"

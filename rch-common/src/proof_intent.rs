@@ -19,8 +19,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use schemars::schema::RootSchema;
-use schemars::{JsonSchema, schema_for};
+use schemars::generate::SchemaSettings;
+use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 
 use crate::incident::IncidentReasonCode;
@@ -183,8 +183,10 @@ pub fn proof_intent_schema_version() -> &'static str {
 
 /// Export the JSON Schema for [`ProofIntent`].
 #[must_use]
-pub fn proof_intent_schema() -> RootSchema {
-    schema_for!(ProofIntent)
+pub fn proof_intent_schema() -> Schema {
+    SchemaSettings::draft07()
+        .into_generator()
+        .into_root_schema_for::<ProofIntent>()
 }
 
 /// Current state used to decide whether a stored intent may be replayed.

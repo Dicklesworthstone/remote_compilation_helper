@@ -37,6 +37,13 @@ pub const COORDINATION_ENV_VARS: &[&str] = &["CARGO_MAKEFLAGS", "MAKEFLAGS", "MF
 /// nothing about THIS host's budget.
 pub const CAPACITY_ENV_VARS: &[&str] = &["NUM_JOBS"];
 
+const BRIDGE_DIRECTORY: &str = ".rabs-jobserver";
+
+// The Linux bridge preloads before any client can consume tokens. Keep
+// that write within PIPE_BUF rather than allocating or blocking on an
+// arbitrarily large caller-provided grant.
+const MAX_BRIDGE_TOKENS: u32 = 4096;
+
 /// Whether `name` is a coordination variable (exact, case-sensitive:
 /// canonical env keys are uppercase by construction and I21 forbids
 /// fuzzy matching).
@@ -119,23 +126,32 @@ pub struct JobserverBridge {
 }
 
 impl JobserverBridge {
-    /// Mint a bridge granting `grant_slots` transferable tokens, with
-    /// the fifo created under `host_dir` — the host path of a directory
-    /// visible inside the namespace at `rabs_sandbox::layout::WORKSPACE`.
+    /// Mint a bridge granting `grant_slots` transferable tokens under
+    /// `workspace_backing/.rabs-jobserver`. The workspace backing is
+    /// bound at `rabs_sandbox::layout::WORKSPACE`, so both fifo paths
+    /// are derived from the same relative location.
     ///
     /// # Errors
-    /// Typed [`std::io::Error`] from the mint; callers fail OPEN (plain
-    /// `-jN` env remains authoritative) rather than blocking the action.
-    pub fn mint(grant_slots: u32, host_dir: &std::path::Path) -> std::io::Result<Self> {
+    /// Typed [`std::io::Error`] from directory creation or the mint.
+    /// Callers must refuse execution if the shared budget is unavailable.
+    pub fn mint(grant_slots: u32, workspace_backing: &std::path::Path) -> std::io::Result<Self> {
         let slots = grant_slots.max(1);
+        if slots > MAX_BRIDGE_TOKENS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "jobserver grant exceeds the bounded fifo preload",
+            ));
+        }
+        let host_dir = workspace_backing.join(BRIDGE_DIRECTORY);
+        std::fs::create_dir_all(&host_dir)?;
         let (host_path, writer, _edge_auth_unused) =
-            rabs_asupersync::jobserver::mint_fifo_jobserver(slots as usize, host_dir)?;
+            rabs_asupersync::jobserver::mint_fifo_jobserver(slots as usize, &host_dir)?;
         let name = host_path.file_name().map_or_else(
             || "jobserver.fifo".to_string(),
             |n| n.to_string_lossy().into_owned(),
         );
         let makeflags = format!(
-            "-j{slots} --jobserver-auth=fifo:{}/{}",
+            "-j{slots} --jobserver-auth=fifo:{}/{BRIDGE_DIRECTORY}/{}",
             rabs_sandbox::layout::WORKSPACE,
             name
         );
@@ -214,6 +230,15 @@ mod tests {
         assert_eq!(worker_makeflags(0), "-j1");
         assert_eq!(worker_num_jobs(32), "32");
         assert_eq!(worker_num_jobs(0), "1");
+    }
+
+    #[test]
+    fn bridge_rejects_oversized_grant_before_creating_fifo() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let error = JobserverBridge::mint(u32::MAX, workspace.path())
+            .expect_err("unbounded grant must be refused before allocation");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!workspace.path().join(BRIDGE_DIRECTORY).exists());
     }
 
     #[test]

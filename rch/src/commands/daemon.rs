@@ -262,17 +262,17 @@ pub async fn daemon_status(ctx: &OutputContext) -> Result<()> {
         return Ok(());
     }
 
-    println!("{}", style.format_header("RCH Daemon Status"));
-    println!();
+    eprintln!("{}", style.format_header("RCH Daemon Status"));
+    eprintln!();
 
     if running {
-        println!(
+        eprintln!(
             "  {} {} {}",
             style.key("Status"),
             style.muted(":"),
             StatusIndicator::Success.with_label(style, "Running")
         );
-        println!(
+        eprintln!(
             "  {} {} {}",
             style.key("Socket"),
             style.muted(":"),
@@ -282,7 +282,7 @@ pub async fn daemon_status(ctx: &OutputContext) -> Result<()> {
         if let Some(secs) = uptime_seconds {
             let hours = secs / 3600;
             let mins = (secs % 3600) / 60;
-            println!(
+            eprintln!(
                 "  {} {} ~{}h {}m",
                 style.key("Uptime"),
                 style.muted(":"),
@@ -296,21 +296,21 @@ pub async fn daemon_status(ctx: &OutputContext) -> Result<()> {
         } else {
             "(not found)"
         };
-        println!(
+        eprintln!(
             "  {} {} {}",
             style.key("Status"),
             style.muted(":"),
             StatusIndicator::Error.with_label(style, "Not running")
         );
-        println!(
+        eprintln!(
             "  {} {} {} {}",
             style.key("Socket"),
             style.muted(":"),
             style.muted(&socket_path_str),
             style.muted(socket_note)
         );
-        println!();
-        println!(
+        eprintln!();
+        eprintln!(
             "  {} Start with: {}",
             StatusIndicator::Info.display(style),
             style.highlight("rch daemon start")

@@ -50,14 +50,14 @@ categories = ["development-tools", "command-line-utilities"]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 toon-rust = { package = "tru", version = "0.2.4" }
-schemars = "0.8"
+schemars = "1.2.2"
 
 # Async runtime
 tokio = { version = "1.49.0", features = ["full"] }
 
 # CLI
-clap = { version = "4.5.60", features = ["derive", "env"] }
-clap_complete = { version = "4.5.66", features = ["unstable-dynamic"] }
+clap = { version = "4.6.6", features = ["derive", "env"] }
+clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
 
 # Logging
 tracing = "0.1.44"
@@ -74,23 +74,23 @@ unicode-width = "0.2.2"
 regex = "1.12.3"
 
 # Fast hashing
-blake3 = "1.8.3"
+blake3 = "1.8.7"
 # SHA-256 for RABS typed authoritative digests (bead F034; pure, no-default
 # features; reviewed addition to the rabs-key pure-crate allowlist)
-sha2 = { version = "0.10", default-features = false }
+sha2 = { version = "0.11.0", default-features = false }
 
 # Binary/object file parsing (ELF, Mach-O, etc.)
-object = { version = "0.38.1", default-features = false, features = ["read", "elf", "macho"] }
+object = { version = "0.40.0", default-features = false, features = ["read", "elf", "macho"] }
 
 # UUID generation
-uuid = { version = "1.21.0", features = ["v4", "serde"] }
+uuid = { version = "1.26.1", features = ["v4", "serde"] }
 
 # Random number generation
 rand = "0.10.1"
 
 # Compression
-zstd = "0.13.3"
-flate2 = "1.1.9"
+zstd = "0.14.0"
+flate2 = "1.1.10"
 tar = { version = "0.4.45", default-features = false }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 
@@ -102,15 +102,15 @@ humantime = "2.3.0"
 
 # Cron-style scheduling for daemon tasks
 tokio-cron-scheduler = "0.15.1"
-cron = "0.15"
+cron = "0.17.0"
 
 # SSH
 openssh = "0.11.6"
 
 # Configuration
-toml = "1.0"
+toml = "1.1.6"
 directories = "6.0"
-dirs = "6.0"
+dirs = "7.0.0"
 
 # File watching (for hot-reload)
 notify = "8.2"
@@ -124,44 +124,44 @@ prometheus = "0.14"
 lazy_static = "1.5"
 
 # OpenTelemetry
-opentelemetry = "0.31.0"
-opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31.0", features = ["tonic"] }
-tracing-opentelemetry = "0.32"
+opentelemetry = "0.32.0"
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32.0", features = ["tonic"] }
+tracing-opentelemetry = "0.33.0"
 
 # HTTP server for metrics endpoint
 axum = { version = "0.8.8", features = ["http1"] }
 tower = "0.5"
-hyper = { version = "1.8.1", features = ["full"] }
+hyper = { version = "1.11.1", features = ["full"] }
 
 # HTTP client for webhook dispatch
-ureq = "3.2"
+ureq = "3.4.1"
 
 # Error handling
-thiserror = "2.0.18"
+thiserror = "2.0.20"
 anyhow = "1.0.101"
 miette = { version = "7.6.0", features = ["fancy"] }
 
 # Interactive CLI prompts
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
-console = "0.16.2"
+console = "0.16.6"
 
 # Markdown rendering
 pulldown-cmark = "0.13"
 
 # TUI (Terminal User Interface) — FrankenTUI native stack (published on crates.io)
-ftui = { version = "0.4", default-features = false, features = ["runtime"] }
-ftui-core = { version = "0.4" }
-ftui-render = { version = "0.4" }
-ftui-style = { version = "0.4" }
-ftui-text = { version = "0.4" }
-ftui-layout = { version = "0.4" }
-ftui-widgets = { version = "0.4" }
-ftui-tty = { version = "0.4" }
-ftui-backend = { version = "0.4" }
+ftui = { version = "0.7.0", default-features = false, features = ["runtime"] }
+ftui-core = { version = "0.7.0" }
+ftui-render = { version = "0.7.0" }
+ftui-style = { version = "0.7.0" }
+ftui-text = { version = "0.7.0" }
+ftui-layout = { version = "0.7.0" }
+ftui-widgets = { version = "0.7.0" }
+ftui-tty = { version = "0.7.0" }
+ftui-backend = { version = "0.7.0" }
 
 # Rich terminal output (optional, for enhanced UI; published on crates.io)
-rich_rust = { version = "0.2" }
+rich_rust = { version = "0.2.3" }
 
 # Internal crates
 # Use default-features = false for cross-platform compatibility (rich-ui uses Unix-only rich_rust)

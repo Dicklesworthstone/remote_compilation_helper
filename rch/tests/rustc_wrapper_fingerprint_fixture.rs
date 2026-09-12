@@ -32,7 +32,7 @@ fn write_project(dir: &Path) {
     std::fs::create_dir_all(dir.join("src")).expect("src dir");
     std::fs::write(
         dir.join("Cargo.toml"),
-        format!("[package]\nname = \"{CRATE_NAME}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        format!("[package]\nname = \"{CRATE_NAME}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"),
     )
     .expect("Cargo.toml");
     std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").expect("main.rs");
@@ -46,30 +46,91 @@ fn write_passthrough_wrapper(path: &Path) {
 }
 
 /// One `cargo build` with a single wrapper variable configured (or
-/// removed). Returns whether Cargo reported compiling our crate.
+/// removed). Cargo's artifact `fresh` field records whether rustc actually ran;
+/// human progress text can contain color codes or change independently.
 fn build(dir: &Path, cargo_home: &Path, var: &str, wrapper: Option<&Path>) -> (bool, bool) {
     let mut cmd = Command::new(env!("CARGO"));
     cmd.arg("build")
         .arg("--offline")
+        .arg("--message-format=json")
         .arg("--manifest-path")
         .arg(dir.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(dir.join("target"))
+        .current_dir(dir)
         .env("CARGO_HOME", cargo_home)
+        // Color must not affect the machine-readable rebuild observation.
+        .env("CARGO_TERM_COLOR", "always")
+        .env("CARGO_BUILD_BUILD_DIR", dir.join("target"))
         .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET")
+        .env("RUSTFLAGS", "")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTC")
+        .env("RUSTC", Path::new(env!("CARGO")).with_file_name("rustc"))
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER");
     if let Some(path) = wrapper {
         cmd.env(var, path);
     }
     let output = cmd.output().expect("spawn cargo");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    (
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
         output.status.success(),
-        combined.contains(&format!("Compiling {CRATE_NAME}")),
-    )
+        "Cargo {var}={wrapper:?} failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    let messages: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("Cargo emits valid JSON messages"))
+        .collect();
+    let artifacts: Vec<_> = messages
+        .iter()
+        .filter(|message| {
+            message["reason"] == "compiler-artifact" && message["target"]["name"] == CRATE_NAME
+        })
+        .collect();
+    assert_eq!(
+        artifacts.len(),
+        1,
+        "each build must report exactly our binary artifact:\n{stdout}\n{stderr}"
+    );
+    let artifact = artifacts[0];
+    let manifest = artifact["manifest_path"]
+        .as_str()
+        .expect("artifact manifest");
+    assert_eq!(
+        Path::new(manifest)
+            .canonicalize()
+            .expect("artifact manifest exists"),
+        dir.join("Cargo.toml")
+            .canonicalize()
+            .expect("fixture manifest"),
+        "the artifact must belong to this isolated fixture"
+    );
+    let fresh = artifact["fresh"].as_bool().expect("artifact freshness");
+    let executable = artifact["executable"]
+        .as_str()
+        .expect("binary artifact path");
+    assert!(
+        Path::new(executable).is_file(),
+        "Cargo must produce the binary"
+    );
+    assert!(
+        Command::new(executable)
+            .status()
+            .expect("run fixture binary")
+            .success(),
+        "the real compiled fixture must execute successfully"
+    );
+    (true, !fresh)
 }
 
 #[test]

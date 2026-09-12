@@ -1464,7 +1464,12 @@ mod tests {
         use tokio::net::UnixListener;
 
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        // RCH may provide a long TMPDIR; Unix socket paths have a small fixed
+        // length limit, so keep this fixture under the short system path.
+        let temp_dir = tempfile::Builder::new()
+            .prefix("rch-status-")
+            .tempdir_in("/tmp")
+            .expect("short socket tempdir");
         let socket_path = temp_dir.path().join("custom-rch.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind custom socket");
 

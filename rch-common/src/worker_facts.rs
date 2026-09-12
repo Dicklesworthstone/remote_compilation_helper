@@ -12,8 +12,8 @@
 //! The schema is versioned via [`SchemaComponent::WorkerFacts`] and exports a
 //! JSON Schema through [`worker_facts_schema`].
 
-use schemars::schema::RootSchema;
-use schemars::{JsonSchema, schema_for};
+use schemars::generate::SchemaSettings;
+use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 
 use crate::schema_versions::{SchemaComponent, current_version};
@@ -241,8 +241,10 @@ pub fn worker_facts_schema_version() -> &'static str {
 /// Export the JSON Schema for [`WorkerFacts`] (for `--schema` surfaces and
 /// contract drift tests).
 #[must_use]
-pub fn worker_facts_schema() -> RootSchema {
-    schema_for!(WorkerFacts)
+pub fn worker_facts_schema() -> Schema {
+    SchemaSettings::draft07()
+        .into_generator()
+        .into_root_schema_for::<WorkerFacts>()
 }
 
 /// Derive a Rust target triple from coarse host facts. Helper for facts

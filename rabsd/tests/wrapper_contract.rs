@@ -85,6 +85,37 @@ fn flag_name(argument: &str, next: Option<&str>) -> Option<String> {
 /// this workspace, and does not need to: the contract under test is
 /// the channel's cargo→wrapper interface, not the harness).
 fn capture_contract(channel: &str) -> ContractFingerprint {
+    // Measure the selected channel's Cargo, not an installed RCH shim. The
+    // managed shim adds caller policy (for example CARGO_BUILD_JOBS), which
+    // must not become part of Cargo's recorded wrapper contract.
+    let discovered = std::process::Command::new("rustup")
+        .args(["which", "--toolchain", channel, "cargo"])
+        .output()
+        .expect("locate channel cargo");
+    assert!(discovered.status.success(), "channel cargo must exist");
+    let mut cargo = std::path::PathBuf::from(
+        String::from_utf8(discovered.stdout)
+            .expect("Cargo path is UTF-8")
+            .trim(),
+    );
+    if std::fs::metadata(&cargo).expect("Cargo metadata").len() <= 8 * 1024
+        && std::fs::read_to_string(&cargo)
+            .expect("small Cargo wrapper is text")
+            .lines()
+            .any(|line| line.starts_with("# rch-toolchain-wrap-version:"))
+    {
+        cargo.set_file_name("cargo-rch-real");
+        assert!(cargo.is_file(), "managed shim must retain the real Cargo");
+    }
+    // Match Cargo with its channel's rustc even when RCH prepends a different
+    // pinned compiler to PATH. Do not introduce a RUSTC override into the
+    // environment-name contract captured below.
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let channel_path = std::env::join_paths(
+        std::iter::once(cargo.parent().expect("Cargo bin directory").to_path_buf())
+            .chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("channel executable search path");
     let source = tempfile::tempdir().unwrap();
     write(
         source.path(),
@@ -117,10 +148,9 @@ fn capture_contract(channel: &str) -> ContractFingerprint {
     // This dependency-free probe needs no cache or caller Cargo configuration.
     let cargo_home = tempfile::tempdir().unwrap();
     let status = std::process::Command::new("rustup")
+        .args(["run", channel])
+        .arg(&cargo)
         .args([
-            "run",
-            channel,
-            "cargo",
             "build",
             "--jobs",
             "2",
@@ -132,6 +162,7 @@ fn capture_contract(channel: &str) -> ContractFingerprint {
             "build.sbom=false",
         ])
         .current_dir(source.path())
+        .env("PATH", channel_path)
         // RCH places scratch projects below the repository. An explicit empty
         // value overrides its ancestor .cargo/config.toml nightly-only flags;
         // removing the variable would expose those flags again.
@@ -154,6 +185,8 @@ fn capture_contract(channel: &str) -> ContractFingerprint {
         .env_remove("CARGO_UNSTABLE_SBOM")
         .env_remove("CARGO_SBOM_PATH")
         .env_remove("CARGO_PROFILE_DEV_SPLIT_DEBUGINFO")
+        .env_remove("CARGO_PROFILE_DEV_DEBUG")
+        .env_remove("CARGO_PROFILE_TEST_DEBUG")
         .env_remove("RUSTUP_TOOLCHAIN")
         .env("RUSTUP_AUTO_INSTALL", "0")
         .env("RUSTC_WRAPPER", source.path().join("log-rustc.sh"))

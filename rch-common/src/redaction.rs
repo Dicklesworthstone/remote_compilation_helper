@@ -41,7 +41,8 @@
 use std::sync::LazyLock;
 
 use regex::Regex;
-use schemars::{JsonSchema, schema_for};
+use schemars::JsonSchema;
+use schemars::generate::SchemaSettings;
 use serde::{Deserialize, Serialize};
 
 use crate::schema_versions::{SchemaComponent, current_version};
@@ -230,8 +231,12 @@ impl RedactionPolicy {
     /// The machine-readable JSON Schema for the policy.
     #[must_use]
     pub fn schema_json() -> serde_json::Value {
-        serde_json::to_value(schema_for!(RedactionPolicy))
-            .expect("RedactionPolicy schema serializes")
+        serde_json::to_value(
+            SchemaSettings::draft07()
+                .into_generator()
+                .into_root_schema_for::<RedactionPolicy>(),
+        )
+        .expect("RedactionPolicy schema serializes")
     }
 
     /// Every category the default policy governs (for coverage checks).

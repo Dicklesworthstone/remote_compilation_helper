@@ -80,13 +80,13 @@ pub struct ApiResponse<T: Serialize> {
 pub struct AnyJson(pub serde_json::Value);
 
 impl JsonSchema for AnyJson {
-    fn schema_name() -> String {
-        "AnyJson".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "AnyJson".into()
     }
 
-    fn json_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         // Accept any JSON value.
-        schemars::schema::Schema::Bool(true)
+        true.into()
     }
 }
 

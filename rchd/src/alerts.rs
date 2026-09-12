@@ -666,6 +666,9 @@ fn send_webhook_sync(
     // Build agent with timeout configuration
     let config = ureq::config::Config::builder()
         .timeout_global(Some(std::time::Duration::from_secs(timeout_secs)))
+        // Keep HTTP failures on the status path below so retry classification
+        // does not depend on ureq's error display text.
+        .http_status_as_error(false)
         .build();
     let agent = ureq::Agent::new_with_config(config);
 
@@ -702,6 +705,97 @@ fn send_webhook_sync(
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[test]
+    fn test_webhook_http_payload_signature_and_status() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let _guard = test_guard!();
+        let payload = WebhookPayload {
+            event: "worker_offline".to_string(),
+            timestamp: "2026-09-12T00:00:00Z".to_string(),
+            severity: "error".to_string(),
+            message: "Worker is offline".to_string(),
+            worker_id: Some("test-worker".to_string()),
+            details: WebhookDetails {
+                alert_id: "test-alert".to_string(),
+            },
+        };
+        let expected_body = serde_json::to_string(&payload).unwrap();
+        let expected_signature = compute_hmac_signature(&expected_body, "test-secret");
+
+        for (status, retryable) in [
+            ("204 No Content", false),
+            ("400 Bad Request", false),
+            ("429 Too Many Requests", true),
+            ("503 Service Unavailable", true),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}/webhook", listener.local_addr().unwrap());
+            // ubs:ignore — test deadline below is not security-token generation.
+            let server = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5); // ubs:ignore — monotonic timeout bounds a loopback test.
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        // ubs:ignore — compares an I/O error enum, not secret data.
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "webhook did not connect"); // ubs:ignore — elapsed-time assertion, not token generation.
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("webhook accept failed: {error}"), // ubs:ignore — unexpected socket failure must fail this test.
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                assert_eq!(request_line, "POST /webhook HTTP/1.1\r\n");
+                let mut headers = std::collections::BTreeMap::new();
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (name, value) = line.split_once(':').unwrap();
+                    headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
+                }
+                let length: usize = headers["content-length"].parse().unwrap();
+                assert!(length < 16_384);
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                (headers, body)
+            });
+
+            let result = send_webhook_sync(&url, &payload, 5, Some("test-secret"));
+            let (headers, body) = server.join().unwrap();
+            assert_eq!(body, expected_body.as_bytes());
+            assert_eq!(headers["content-type"], "application/json");
+            assert_eq!(headers["user-agent"], "rchd-alerts/1.0");
+            assert_eq!(headers["x-signature-256"], expected_signature);
+            if status.starts_with("204") {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains(&status[..3]), "{error}");
+                assert_eq!(is_retryable_webhook_error(&error), retryable, "{error}");
+            }
+        }
+    }
 
     // ============== WebhookConfig Tests ==============
 

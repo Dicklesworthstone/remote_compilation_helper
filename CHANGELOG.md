@@ -29,6 +29,37 @@ but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
+## Unreleased — 2.0.0 candidate
+
+- **Rust API break:** public schema helpers now return schemars 1.x `Schema`
+  instead of 0.8 `RootSchema`. Generated contracts and CLI exports continue
+  to use JSON Schema Draft 7.
+- Add disk-aware worker admission, slot limits, scheduling preferences, and
+  disk information in worker listings and probes. Avoid overlapping Rustup
+  inventory scans and require fresh, healthy telemetry for startup benchmarks.
+- Bound fleet GC with worker deadlines, concurrent progress, and explicit
+  partial results. Warn about unmanaged builds on dispatchers and offload
+  `cargo package` and `cargo publish --dry-run`.
+- Fix Windows SSH quoting and source-lock handling, inherited Rust toolchain
+  selection, PATH interception detection, and artifact download statistics.
+- Advance experimental RABS with retained source snapshots, shared action
+  submission, durable generation allocation, subscriber evidence requirements,
+  and atomic metadata migrations.
+- Refresh stable Rust dependencies. Preserve FrankenSQLite rollback and WAL
+  behavior when joining its new connection worker during Drop. Fix webhook
+  retry classification for HTTP 429 and server errors.
+- Share the admitted RABS job budget through the correct namespace FIFO path
+  and refuse execution when its setup fails. Keep human daemon status on stderr
+  while preserving JSON status on stdout.
+
+Known issue (`bd-cfv95`): cached clean-overlay test binaries can retain paths
+to source snapshots that have been removed. For tests that read source fixtures
+at runtime, set `RCH_DISABLE_TARGET_REUSE=1` until source-path validity across
+pooled builds is fixed. The release test gate uses this workaround.
+
+Validation and release artifacts are still pending; this is not a published
+release. See `UPGRADE_LOG.md` for completed dependency gates and limitations.
+
 ## Version Timeline
 
 `Kind` distinguishes a published GitHub Release from a plain git tag. Dates are tag dates.

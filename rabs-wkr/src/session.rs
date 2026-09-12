@@ -67,8 +67,8 @@ pub struct CanonicalExecRequest {
     pub workspace_backing: String,
     /// Execution resource grant for this attempt (bead I004): the
     /// transferable jobserver token budget the coordinator admits.
-    /// `None` falls back to the worker's own slot count (pre-grant
-    /// coordinators).
+    /// It cannot exceed the worker's own slot count; zero floors to
+    /// one. `None` uses the worker's slot count.
     pub jobserver_grant: Option<u32>,
 }
 
@@ -83,9 +83,9 @@ pub struct ExecResult {
     pub stdout_sha256: String,
     /// SHA-256 of stderr bytes (hex).
     pub stderr_sha256: String,
-    /// Whether execution reached the sandbox at all (false = host
-    /// cannot run the canonical namespace; a typed non-result, not a
-    /// fake success).
+    /// Whether execution reached the sandbox at all (false includes
+    /// unavailable isolation or jobserver setup; a typed non-result,
+    /// not a fake success).
     pub executed: bool,
     /// Live process-group members still present after post-exit
     /// cleanup (bead G006). 0 = the managed group resolved fully; any
@@ -294,23 +294,24 @@ pub fn execute_canonical(
     };
     // Worker-local jobserver authority runs on the FINAL env: extra_env
     // may carry smuggled coordination keys, so replacement must see them.
-    replace_with_worker_local(&mut spec.env, slots);
+    let grant = request.jobserver_grant.unwrap_or(slots).min(slots).max(1);
+    replace_with_worker_local(&mut spec.env, grant);
     // Sandbox jobserver bridge (bead I004): one REAL fifo jobserver,
     // sized by the execution grant, carried through the workspace bind
     // by PATH so nested make/cargo/ninja share a single budget instead
-    // of multiplying it per tree depth. Fail-open: on mint failure the
-    // plain `-jN` env above stays authoritative. The bridge binding is
-    // held to function end — its writer keeps the fifo alive for the
-    // whole attempt and Drop unlinks the node after the group resolves.
-    let grant = request.jobserver_grant.unwrap_or(slots);
-    let bridge_host_dir = std::path::Path::new(&request.workspace_backing).join(".rabs-jobserver");
-    let bridge = match crate::jobserver::JobserverBridge::mint(grant, &bridge_host_dir) {
-        Ok(bridge) => {
-            crate::jobserver::JobserverBridge::apply(&mut spec.env, &bridge);
-            Some(bridge)
-        }
-        Err(_) => None,
+    // of multiplying it per tree depth. Refuse execution on mint
+    // failure: independent `-jN` pools cannot enforce the grant. The
+    // bridge binding is held to function end — its writer keeps the
+    // fifo alive for the whole attempt and Drop unlinks the node after
+    // the group resolves.
+    let bridge = match crate::jobserver::JobserverBridge::mint(
+        grant,
+        std::path::Path::new(&request.workspace_backing),
+    ) {
+        Ok(bridge) => bridge,
+        Err(_) => return exec_error(request.request_id),
     };
+    crate::jobserver::JobserverBridge::apply(&mut spec.env, &bridge);
     let Ok(launch) = build_canonical_argv(&spec, &support, &request.program, &request.args) else {
         return exec_error(request.request_id);
     };

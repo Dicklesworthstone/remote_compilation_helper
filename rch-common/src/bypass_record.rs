@@ -43,8 +43,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use schemars::schema::RootSchema;
-use schemars::{JsonSchema, schema_for};
+use schemars::generate::SchemaSettings;
+use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 
 use crate::incident::IncidentReasonCode;
@@ -436,8 +436,10 @@ pub fn bypass_record_schema_version() -> &'static str {
 
 /// Export the JSON Schema for [`BypassRecord`].
 #[must_use]
-pub fn bypass_record_schema() -> RootSchema {
-    schema_for!(BypassRecord)
+pub fn bypass_record_schema() -> Schema {
+    SchemaSettings::draft07()
+        .into_generator()
+        .into_root_schema_for::<BypassRecord>()
 }
 
 // ---------------------------------------------------------------------------

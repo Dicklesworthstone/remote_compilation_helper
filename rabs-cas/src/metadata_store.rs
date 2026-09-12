@@ -6940,15 +6940,27 @@ impl SqlEngine for RusqliteEngine {
 
 /// The FrankenSQLite engine (pure Rust).
 pub struct FsqliteEngine {
-    conn: fsqlite::Connection,
+    conn: fsqlite::AsyncConnection,
 }
 
 impl FsqliteEngine {
     /// Open (or create) a database file.
     pub fn open(path: &std::path::Path) -> Result<Self, StoreError> {
-        fsqlite::Connection::open(path.display().to_string())
+        fsqlite::AsyncConnection::open_sync(path.display().to_string())
             .map(|conn| Self { conn })
             .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+}
+
+impl Drop for FsqliteEngine {
+    fn drop(&mut self) {
+        // Join the engine worker before callers can reopen the database.
+        // Preserve the old Connection Drop behavior: rollback unfinished work
+        // and release resources without checkpointing the committed WAL.
+        if let Err(error) = self.conn.close_without_checkpoint_sync() {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "FrankenSQLite close failed: {error}");
+        }
     }
 }
 
@@ -6976,31 +6988,22 @@ fn from_fsqlite(v: &fsqlite::SqliteValue) -> Result<SqlValue, StoreError> {
 impl SqlEngine for FsqliteEngine {
     fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<usize, StoreError> {
         if params.is_empty() {
-            // fsqlite's prepare() is DML/PRAGMA-only; DDL and transaction
-            // control (all parameterless here) go through Connection::execute.
             return self
                 .conn
-                .execute(sql)
+                .execute_sync(sql)
                 .map_err(|e| StoreError::Backend(e.to_string()));
         }
-        let statement = self
-            .conn
-            .prepare(sql)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
         let bound: Vec<fsqlite::SqliteValue> = params.iter().map(to_fsqlite).collect();
-        statement
-            .execute_with_params(&bound)
+        self.conn
+            .execute_with_params_sync(sql, &bound)
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
     fn query(&mut self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, StoreError> {
-        let statement = self
-            .conn
-            .prepare(sql)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
         let bound: Vec<fsqlite::SqliteValue> = params.iter().map(to_fsqlite).collect();
-        let rows = statement
-            .query_with_params(&bound)
+        let rows = self
+            .conn
+            .query_with_params_sync(sql, &bound)
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         rows.iter()
             .map(|row| row.values().iter().map(from_fsqlite).collect())
@@ -7022,6 +7025,72 @@ mod tests {
     fn fresh_path(tag: &str) -> std::path::PathBuf {
         let n = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("rabs-h009-{}-{}-{}.db", std::process::id(), tag, n))
+    }
+
+    #[test]
+    fn fsqlite_drop_finishes_rollback_before_immediate_reopen() {
+        let path = fresh_path("fsqlite-drop-rollback");
+        assert!(!path.exists());
+        {
+            let mut engine = FsqliteEngine::open(&path).unwrap();
+            engine
+                .execute("CREATE TABLE lifecycle (id INTEGER PRIMARY KEY)", &[])
+                .unwrap();
+            engine
+                .execute("INSERT INTO lifecycle VALUES (?1)", &[SqlValue::Int(1)])
+                .unwrap();
+            engine.execute("BEGIN", &[]).unwrap();
+            engine
+                .execute("INSERT INTO lifecycle VALUES (?1)", &[SqlValue::Int(2)])
+                .unwrap();
+        }
+        let mut reopened = FsqliteEngine::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query("SELECT id FROM lifecycle ORDER BY id", &[])
+                .unwrap(),
+            vec![vec![SqlValue::Int(1)]]
+        );
+        reopened
+            .execute("INSERT INTO lifecycle VALUES (?1)", &[SqlValue::Int(3)])
+            .unwrap();
+        assert_eq!(
+            reopened
+                .query("SELECT id FROM lifecycle ORDER BY id", &[])
+                .unwrap(),
+            vec![vec![SqlValue::Int(1)], vec![SqlValue::Int(3)]]
+        );
+    }
+
+    #[test]
+    fn fsqlite_drop_preserves_committed_wal_before_reopen() {
+        let path = fresh_path("fsqlite-drop-wal");
+        assert!(!path.exists());
+        let mut wal_path = path.as_os_str().to_os_string();
+        wal_path.push("-wal");
+        let wal_path = std::path::PathBuf::from(wal_path);
+        assert!(!wal_path.exists());
+        let wal_before;
+        {
+            let mut engine = FsqliteEngine::open(&path).unwrap();
+            engine.query("PRAGMA journal_mode=WAL", &[]).unwrap();
+            engine.execute("PRAGMA wal_autocheckpoint=0", &[]).unwrap();
+            engine
+                .execute("CREATE TABLE lifecycle (id INTEGER PRIMARY KEY)", &[])
+                .unwrap();
+            engine
+                .execute("INSERT INTO lifecycle VALUES (?1)", &[SqlValue::Int(7)])
+                .unwrap();
+            wal_before = std::fs::read(&wal_path).unwrap();
+            // A WAL header alone is 32 bytes; require committed frame content.
+            assert!(wal_before.len() > 32);
+        }
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
+        let mut reopened = FsqliteEngine::open(&path).unwrap();
+        assert_eq!(
+            reopened.query("SELECT id FROM lifecycle", &[]).unwrap(),
+            vec![vec![SqlValue::Int(7)]]
+        );
     }
 
     /// Execute real SQL, optionally refusing exactly one mutation before it

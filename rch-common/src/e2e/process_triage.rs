@@ -3,7 +3,8 @@
 //! This module defines a shared schema for invoking external process-triage
 //! helpers and safely interpreting their actions/results.
 
-use schemars::{JsonSchema, schema::RootSchema, schema_for};
+use schemars::generate::SchemaSettings;
+use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -650,13 +651,17 @@ fn pattern_matches(command_lower: &str, patterns: &[String]) -> bool {
 }
 
 /// JSON schema for request payload.
-pub fn process_triage_request_schema() -> RootSchema {
-    schema_for!(ProcessTriageRequest)
+pub fn process_triage_request_schema() -> Schema {
+    SchemaSettings::draft07()
+        .into_generator()
+        .into_root_schema_for::<ProcessTriageRequest>()
 }
 
 /// JSON schema for response payload.
-pub fn process_triage_response_schema() -> RootSchema {
-    schema_for!(ProcessTriageResponse)
+pub fn process_triage_response_schema() -> Schema {
+    SchemaSettings::draft07()
+        .into_generator()
+        .into_root_schema_for::<ProcessTriageResponse>()
 }
 
 #[cfg(test)]

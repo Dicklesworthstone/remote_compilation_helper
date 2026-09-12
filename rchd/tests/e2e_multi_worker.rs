@@ -50,6 +50,10 @@ fn create_multi_worker_harness(test_name: &str) -> HarnessResult<TestHarness> {
         .rchd_binary(target_dir.join("rchd"))
         .rch_binary(target_dir.join("rch"))
         .rch_wkr_binary(target_dir.join("rch-wkr"))
+        // CI supplies mock transport. Its default empty stdout is a failed
+        // health probe, so provide the response expected from echo health_check.
+        // This does not enable mock transport for runs against real workers.
+        .env("RCH_MOCK_SSH_STDOUT", "health_check\n")
         .build()
 }
 
@@ -162,6 +166,27 @@ fn parse_selection_response(body: &str) -> Option<serde_json::Value> {
     serde_json::from_str(body).ok()
 }
 
+/// Require a successful selection instead of silently losing failed samples.
+fn selected_worker(response: &str) -> rch_common::SelectedWorker {
+    assert!(
+        response.starts_with("HTTP/1.0 200 OK\r\n"),
+        "Unexpected selection HTTP response: {response}"
+    );
+    let body = extract_json_body(response).expect("selection response has an HTTP body");
+    let parsed = serde_json::from_str::<rch_common::SelectionResponse>(body);
+    assert!(
+        parsed.is_ok(),
+        "Invalid selection response: {body}; error={:?}",
+        parsed.as_ref().err()
+    );
+    let selection = parsed.expect("validated selection response");
+    assert!(
+        selection.worker.is_some(),
+        "Expected an admitted worker for every sample: {body}"
+    );
+    selection.worker.expect("validated worker selection")
+}
+
 // ============================================================================
 // Load Balancing Tests
 // ============================================================================
@@ -210,15 +235,8 @@ fn test_load_balance_distribution() {
         )
         .unwrap();
 
-        if let Some(body) = extract_json_body(&response)
-            && let Some(json) = parse_selection_response(body)
-            && let Some(worker) = json
-                .get("worker")
-                .and_then(|w| w.get("id"))
-                .and_then(|id| id.as_str())
-        {
-            *distribution.entry(worker.to_string()).or_insert(0) += 1;
-        }
+        let worker = selected_worker(&response);
+        *distribution.entry(worker.id.to_string()).or_insert(0) += 1;
     }
 
     harness.logger.info(format!(
@@ -233,6 +251,7 @@ fn test_load_balance_distribution() {
         "[e2e::multi_worker] Total selections: {} (expected: {})",
         total, num_selections
     ));
+    assert_eq!(total, num_selections, "every request must select a worker");
 
     // At minimum, verify multiple workers received selections
     let workers_with_selections = distribution.len();
@@ -302,14 +321,8 @@ fn test_worker_prioritization() {
         )
         .unwrap();
 
-        if let Some(body) = extract_json_body(&response)
-            && let Some(json) = parse_selection_response(body)
-            && let Some(worker_id) = json
-                .get("worker")
-                .and_then(|w| w.get("id"))
-                .and_then(|id| id.as_str())
-            && worker_id == "high-priority"
-        {
+        let worker = selected_worker(&response);
+        if worker.id.as_str() == "high-priority" {
             high_priority_count += 1;
         }
     }

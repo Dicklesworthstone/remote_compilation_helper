@@ -299,7 +299,7 @@ impl SelfTestService {
 
     pub fn status(&self) -> SelfTestStatus {
         let last_run = self.history.latest_run();
-        let next_run = self.compute_next_run(&last_run);
+        let next_run = self.compute_next_run(&last_run, Utc::now());
         SelfTestStatus {
             enabled: self.config.enabled,
             schedule: self.config.schedule.clone(),
@@ -524,10 +524,14 @@ impl SelfTestService {
         }
     }
 
-    fn compute_next_run(&self, last_run: &Option<SelfTestRunRecord>) -> Option<String> {
+    fn compute_next_run(
+        &self,
+        last_run: &Option<SelfTestRunRecord>,
+        now: DateTime<Utc>,
+    ) -> Option<String> {
         if let Some(schedule) = self.config.schedule.as_ref()
             && let Ok(expr) = cron::Schedule::from_str(schedule)
-            && let Some(next) = expr.upcoming(Utc).next()
+            && let Some(next) = expr.after(&now).next()
         {
             return Some(next.to_rfc3339());
         }
@@ -538,7 +542,7 @@ impl SelfTestService {
                 .as_ref()
                 .and_then(|run| DateTime::parse_from_rfc3339(&run.completed_at).ok())
                 .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(Utc::now);
+                .unwrap_or(now);
             let next = base + chrono::Duration::from_std(duration).ok()?;
             return Some(next.to_rfc3339());
         }
@@ -1371,14 +1375,62 @@ mod tests {
         let history = Arc::new(SelfTestHistory::new(5, 5));
         let config = SelfTestConfig {
             enabled: true,
-            schedule: Some("0 0 * * *".to_string()),
+            schedule: Some("0 0 9 * * MON-FRI".to_string()),
             ..Default::default()
         };
 
         let service = SelfTestService::new(pool, config, history);
         let status = service.status();
         assert!(status.enabled);
-        assert_eq!(status.schedule, Some("0 0 * * *".to_string()));
+        assert_eq!(status.schedule, Some("0 0 9 * * MON-FRI".to_string()));
+        assert!(status.next_run.is_some());
+    }
+
+    #[test]
+    fn test_next_run_cron_weekday_rollover() {
+        let _guard = test_guard!();
+        let now = DateTime::parse_from_rfc3339("2026-09-11T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for schedule in ["0 0 9 * * MON-FRI", "0 0 9 * * MON-FRI 2026"] {
+            let service = SelfTestService::new(
+                WorkerPool::new(),
+                SelfTestConfig {
+                    schedule: Some(schedule.to_string()),
+                    ..Default::default()
+                },
+                Arc::new(SelfTestHistory::new(5, 5)),
+            );
+            assert_eq!(
+                service.compute_next_run(&None, now).as_deref(),
+                Some("2026-09-14T09:00:00+00:00"),
+                "schedule {schedule} must advance past Friday's occurrence"
+            );
+        }
+    }
+
+    #[test]
+    fn test_next_run_invalid_cron_falls_back_to_interval() {
+        let _guard = test_guard!();
+        let now = DateTime::parse_from_rfc3339("2026-09-11T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for (interval, expected) in [
+            (Some("1h"), Some("2026-09-11T10:00:00+00:00")),
+            (None, None),
+            (Some("invalid"), None),
+        ] {
+            let service = SelfTestService::new(
+                WorkerPool::new(),
+                SelfTestConfig {
+                    schedule: Some("invalid".to_string()),
+                    interval: interval.map(str::to_string),
+                    ..Default::default()
+                },
+                Arc::new(SelfTestHistory::new(5, 5)),
+            );
+            assert_eq!(service.compute_next_run(&None, now).as_deref(), expected);
+        }
     }
 
     #[test]

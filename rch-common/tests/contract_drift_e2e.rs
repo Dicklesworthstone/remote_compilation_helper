@@ -430,7 +430,7 @@ fn e2e_ru_request_schema_roundtrip() {
     let schema = repo_updater_request_schema();
     let json = serde_json::to_string_pretty(&schema).unwrap();
     assert!(!json.is_empty());
-    let _: schemars::schema::RootSchema = serde_json::from_str(&json).unwrap();
+    let _: schemars::Schema = serde_json::from_str(&json).unwrap();
 }
 
 #[test]
@@ -438,7 +438,7 @@ fn e2e_ru_response_schema_roundtrip() {
     let schema = repo_updater_response_schema();
     let json = serde_json::to_string_pretty(&schema).unwrap();
     assert!(!json.is_empty());
-    let _: schemars::schema::RootSchema = serde_json::from_str(&json).unwrap();
+    let _: schemars::Schema = serde_json::from_str(&json).unwrap();
 }
 
 #[test]
@@ -446,7 +446,7 @@ fn e2e_ru_envelope_schema_roundtrip() {
     let schema = repo_updater_envelope_schema();
     let json = serde_json::to_string_pretty(&schema).unwrap();
     assert!(!json.is_empty());
-    let _: schemars::schema::RootSchema = serde_json::from_str(&json).unwrap();
+    let _: schemars::Schema = serde_json::from_str(&json).unwrap();
 }
 
 #[test]
@@ -617,7 +617,7 @@ fn e2e_pt_request_schema_roundtrip() {
     let schema = process_triage_request_schema();
     let json = serde_json::to_string_pretty(&schema).unwrap();
     assert!(!json.is_empty());
-    let _: schemars::schema::RootSchema = serde_json::from_str(&json).unwrap();
+    let _: schemars::Schema = serde_json::from_str(&json).unwrap();
 }
 
 #[test]
@@ -625,7 +625,7 @@ fn e2e_pt_response_schema_roundtrip() {
     let schema = process_triage_response_schema();
     let json = serde_json::to_string_pretty(&schema).unwrap();
     assert!(!json.is_empty());
-    let _: schemars::schema::RootSchema = serde_json::from_str(&json).unwrap();
+    let _: schemars::Schema = serde_json::from_str(&json).unwrap();
 }
 
 #[test]

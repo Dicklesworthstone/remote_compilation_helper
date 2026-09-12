@@ -2,8 +2,16 @@
   "status": "in_progress",
   "session_date": "2026-09-12",
   "bead": "bd-6q0eo",
-  "current": "tru",
-  "completed": [],
+  "current": "final workspace gates",
+  "candidate_version": "2.0.0",
+  "migration_approval": "User requested continued work after the eleven-file migration approval question on 2026-09-12; completing thirteen CLI exports with explicit Draft 7 generation.",
+  "release_status": "All stable Rust dependency consumer gates passed. Initial full workspace run: 9928 passed, 10 failed, 20 existing ignores; user authorized repairs. Repaired worker tests passed 20 and other repaired fixtures passed 23. Final Linux and native Mac all-target/all-feature compiler checks and strict Clippy passed. Quiet CSS runtime qualification passed all 13 unchanged hook tests, averaging 4ms below 25ms. Private recent stable/beta/nightly toolchains are verified; matrix retest encountered cached test paths pointing at reaped clean-overlay source roots (existing RCH issue bd-cfv95). Complete fresh-target workspace test gate now runs through strict RCH with target reuse disabled, no golden regeneration or channel narrowing. Formatting, refreshed 708-dependency security audit and zero-new-critical UBS comparison passed. Candidate remains unbumped, untagged, unbuilt for release and unpublished. Existing CSS signing identity verified; private key never copied and release archives not yet signed.",
+  "completed": [
+    "tru", "h2", "rich_rust", "lru", "blake3", "chacha20", "clap", "clap_complete",
+    "sha2", "object", "uuid", "zstd (unused declaration)", "flate2", "cron", "toml",
+    "dirs", "opentelemetry family", "hyper", "ureq", "thiserror", "console",
+    "FrankenTUI family", "schemars", "fsqlite", "rusqlite", "serial_test", "reqwest", "futures", "which", "whoami"
+  ],
   "inventory": "/data/tmp/rch-dependency-inventory-20260912.json",
   "previous_completed": [
     "anyhow",
@@ -13,7 +21,6 @@
     "blake3",
     "chrono",
     "tokio",
-    "clap",
     "clap_complete",
     "colored",
     "console",

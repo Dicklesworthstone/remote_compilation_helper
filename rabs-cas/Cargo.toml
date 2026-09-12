@@ -20,8 +20,8 @@ doctest = false
 # a dev-dependency feature only.
 test-support = []
 
-# Core storage semantics stay Tokio-free and Asupersync-free; filesystem
-# effects are permitted here (this crate OWNS durable storage). The metadata
+# Core storage APIs stay synchronous; the FrankenSQLite backend encapsulates
+# its own runtime. Filesystem effects are permitted here (this crate OWNS durable storage). The metadata
 # store abstraction gains a reference-SQLite backend and a gated FrankenSQLite
 # backend in Epic H. Dependency-direction CI (bead A002) forbids Tokio and
 # rabs-asupersync from the core.
@@ -30,8 +30,8 @@ rabs-protocol = { path = "../rabs-protocol" }
 # H009 metadata-store backends: rusqlite (bundled C SQLite) is the
 # reference/differential TRUTH engine; fsqlite (FrankenSQLite, pure Rust)
 # is the dogfood candidate gated by the identical suite (H024).
-rusqlite = { version = "0.39.0", features = ["bundled"] }
-fsqlite = { version = "0.1.19", default-features = false, features = ["native"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+fsqlite = { version = "0.3.18", default-features = false, features = ["async-api"] }
 # Reviewed pure digest crate (F034 pattern): independent recompute of
 # result-projection digests during publication admission (H011).
 sha2 = { workspace = true }
