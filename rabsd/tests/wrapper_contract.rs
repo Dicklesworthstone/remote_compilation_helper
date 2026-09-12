@@ -114,6 +114,8 @@ fn capture_contract(channel: &str) -> ContractFingerprint {
         .unwrap();
     }
     let target = tempfile::tempdir().unwrap();
+    // This dependency-free probe needs no cache or caller Cargo configuration.
+    let cargo_home = tempfile::tempdir().unwrap();
     let status = std::process::Command::new("rustup")
         .args([
             "run",
@@ -158,6 +160,7 @@ fn capture_contract(channel: &str) -> ContractFingerprint {
         .env("RABS_ARGV_LOG", &log_path)
         .env("RABS_ENV_LOG", &env_path)
         .env("CARGO_TARGET_DIR", target.path())
+        .env("CARGO_HOME", cargo_home.path())
         .env("CARGO_INCREMENTAL", "0") // pin: incremental flags vary by default profile
         .status()
         .expect("cargo build");
