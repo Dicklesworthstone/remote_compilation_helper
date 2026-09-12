@@ -1,5 +1,21 @@
 # Dependency Upgrade Log
 
+## 2026-09-12 — dependency refresh and DSR release (bd-6q0eo)
+
+Status: in progress. Registry versions are checked against crates.io; existing
+git, path and prerelease dependencies and the pinned nightly are preserved.
+Each changed dependency receives a separate consumer test before the next
+upgrade. Final workspace tests, compiler checks, Clippy, security audit and
+release artifact verification follow. Historical entries below remain intact.
+
+### tru: 0.2.3 → 0.2.4
+
+- Research: [upstream v0.2.4 release](https://github.com/Dicklesworthstone/toon_rust/releases/tag/v0.2.4), commit d356b8d.
+- Maintenance and dependency changes; upstream reports no encoder/decoder or
+  public API changes. Optional async-stream compiler ICE is outside RCH's
+  enabled feature set.
+- Validation: pending RCH consumer serialization tests.
+
 **Date:** 2026-05-14  |  **Project:** remote_compilation_helper  |  **Language:** Rust + TypeScript
 
 ## Summary
