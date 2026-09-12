@@ -35,7 +35,8 @@
 use std::collections::HashMap;
 
 use rabs_protocol::generation::{
-    ActionGeneration, AttemptAuthority, LeaseRenewal, WorkerBootGeneration, WorkerIncarnationId,
+    ActionGeneration, ActionGenerationId, AttemptAuthority, LeaseRenewal, WorkerBootGeneration,
+    WorkerIncarnationId,
 };
 use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use rabs_protocol::serving::ServingValidity;
@@ -500,6 +501,10 @@ pub enum StoreError {
     /// Generation id at or below the high-water mark (ids are NEVER
     /// reused, even after tombstoning).
     GenerationIdNotAboveHighWater,
+    /// The durable global generation identity cannot advance without reuse.
+    GenerationIdentityExhausted,
+    /// The action's durable ordinal cannot advance without wrapping.
+    GenerationOrdinalExhausted,
     /// Attempt id already recorded (attempts are append-only).
     DuplicateAttempt,
     /// Execution lease id already exists.
@@ -1149,6 +1154,15 @@ pub trait RabsMetadataStore {
         generation: &ActionGeneration,
         action_key: &TypedDigest,
     ) -> Result<(), StoreError>;
+
+    /// Allocate and insert a bound generation atomically. The global identity
+    /// and per-key ordinal advance from durable history, including tombstones,
+    /// independently of process clocks and coordinator restarts.
+    fn allocate_bound_generation(
+        &mut self,
+        authority: &TypedDigest,
+        action_key: &TypedDigest,
+    ) -> Result<ActionGeneration, StoreError>;
 
     /// Tombstone a generation (the id stays burned forever).
     fn tombstone_generation(&mut self, id: u128) -> Result<(), StoreError>;
@@ -2141,8 +2155,8 @@ fn u128_hex(v: u128) -> String {
 }
 
 impl<E: SqlEngine> SqlMetadataStore<E> {
-    /// Open the store over an engine, applying pending migrations
-    /// transactionally.
+    /// Open the store over an engine, applying all pending migrations in one
+    /// transaction. A failed upgrade preserves the previously applied schema.
     pub fn open(engine: E) -> Result<Self, StoreError> {
         let mut store = Self {
             engine,
@@ -2204,12 +2218,18 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
                 0
             }
         };
-        for migration in MIGRATIONS {
-            if migration.version <= applied {
-                continue;
-            }
-            self.engine.execute("BEGIN", &[])?;
-            let mut apply = || -> Result<(), StoreError> {
+        let Some(first_pending) = MIGRATIONS
+            .iter()
+            .position(|migration| migration.version > applied)
+        else {
+            return Ok(());
+        };
+        // No caller can use the store until every pending step has succeeded.
+        // Commit the complete upgrade once, rather than paying a durability
+        // barrier for each historical version on every fresh daemon boot.
+        self.engine.execute("BEGIN", &[])?;
+        let result = (|| -> Result<(), StoreError> {
+            for migration in &MIGRATIONS[first_pending..] {
                 for statement in migration.statements {
                     self.engine.execute(statement, &[])?;
                 }
@@ -2220,19 +2240,16 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
                         SqlValue::Int(0),
                     ],
                 )?;
-                Ok(())
-            };
-            match apply() {
-                Ok(()) => {
-                    self.engine.execute("COMMIT", &[])?;
-                }
-                Err(e) => {
-                    let _ = self.engine.execute("ROLLBACK", &[]);
-                    return Err(e);
-                }
             }
+            self.engine.execute("COMMIT", &[])?;
+            Ok(())
+        })();
+        if result.is_err() {
+            // Include COMMIT failures: a busy/failed commit may leave the
+            // transaction open. Dropping the engine remains the final fallback.
+            let _ = self.engine.execute("ROLLBACK", &[]);
         }
-        Ok(())
+        result
     }
 
     fn intern(&mut self, domain: &'static str) {
@@ -2969,6 +2986,81 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                 &[SqlValue::Blob(u128_blob(id))],
             )?;
             Ok(())
+        })
+    }
+
+    fn allocate_bound_generation(
+        &mut self,
+        authority: &TypedDigest,
+        action_key: &TypedDigest,
+    ) -> Result<ActionGeneration, StoreError> {
+        let authority = authority.clone();
+        let action = digest_key(action_key);
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let id = SqlMetadataStore::<E>::generation_high_water(engine)?
+                .checked_add(1)
+                .ok_or(StoreError::GenerationIdentityExhausted)?;
+            // Fixed-width big-endian blobs have numeric byte ordering. Validate
+            // every non-NULL row's representation before trusting the maximum;
+            // an older corrupt row must not hide behind a valid larger ordinal.
+            // Legacy NULL ordinals have no live lease authority (migration 21).
+            let malformed = engine.query(
+                "SELECT per_key_ordinal FROM action_generations \
+                 WHERE action_key = ?1 AND per_key_ordinal IS NOT NULL \
+                 AND (typeof(per_key_ordinal) != 'blob' OR length(per_key_ordinal) != 8) \
+                 LIMIT 1",
+                &[SqlValue::Text(action.clone())],
+            )?;
+            if !malformed.is_empty() {
+                return Err(StoreError::Corruption(
+                    "generation ordinal representation".into(),
+                ));
+            }
+            let rows = engine.query(
+                "SELECT per_key_ordinal FROM action_generations \
+                 WHERE action_key = ?1 AND per_key_ordinal IS NOT NULL \
+                 ORDER BY per_key_ordinal DESC LIMIT 1",
+                &[SqlValue::Text(action.clone())],
+            )?;
+            let previous = match rows.as_slice() {
+                [] => 0,
+                [row] => match row.as_slice() {
+                    [value] => expect_u64_blob(value, "generation ordinal")?,
+                    _ => return Err(StoreError::Corruption("generation ordinal shape".into())),
+                },
+                _ => {
+                    return Err(StoreError::Corruption(
+                        "generation ordinal row count".into(),
+                    ));
+                }
+            };
+            let ordinal = previous
+                .checked_add(1)
+                .ok_or(StoreError::GenerationOrdinalExhausted)?;
+            let generation = ActionGeneration {
+                generation_id: ActionGenerationId(id),
+                per_key_ordinal: ordinal,
+                created_under_authority_digest: authority.clone(),
+            };
+            engine.execute(
+                "INSERT INTO action_generations \
+                 (id_hex, id, action_key, authority_key, tombstoned, per_key_ordinal) \
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                &[
+                    SqlValue::Text(u128_hex(id)),
+                    SqlValue::Blob(u128_blob(id)),
+                    SqlValue::Text(action),
+                    SqlValue::Text(digest_key(&authority)),
+                    SqlValue::Blob(u64_blob(ordinal)),
+                ],
+            )?;
+            engine.execute(
+                "INSERT OR REPLACE INTO generation_high_water (kind, value) \
+                 VALUES ('action-generation', ?1)",
+                &[SqlValue::Blob(u128_blob(id))],
+            )?;
+            Ok(generation)
         })
     }
 
@@ -6932,6 +7024,165 @@ mod tests {
         std::env::temp_dir().join(format!("rabs-h009-{}-{}-{}.db", std::process::id(), tag, n))
     }
 
+    /// Execute real SQL, optionally refusing exactly one mutation before it
+    /// reaches the engine. Rollback remains available after the injected error.
+    struct MigrationProbe<E> {
+        inner: E,
+        executed: Vec<String>,
+        fail_at: Option<usize>,
+    }
+
+    impl<E: SqlEngine> SqlEngine for MigrationProbe<E> {
+        fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<usize, StoreError> {
+            let index = self.executed.len();
+            self.executed.push(sql.to_owned());
+            if self.fail_at == Some(index) {
+                return Err(StoreError::Backend("injected migration failure".into()));
+            }
+            self.inner.execute(sql, params)
+        }
+
+        fn query(
+            &mut self,
+            sql: &str,
+            params: &[SqlValue],
+        ) -> Result<Vec<Vec<SqlValue>>, StoreError> {
+            self.inner.query(sql, params)
+        }
+    }
+
+    fn migration_probe<E>(inner: E, fail_at: Option<usize>) -> MigrationProbe<E> {
+        MigrationProbe {
+            inner,
+            executed: Vec::new(),
+            fail_at,
+        }
+    }
+
+    fn assert_one_migration_commit<E: SqlEngine>(store: &mut SqlMetadataStore<MigrationProbe<E>>) {
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let statements = &store.engine.executed;
+        assert_eq!(statements.iter().filter(|sql| *sql == "BEGIN").count(), 1);
+        assert_eq!(statements.iter().filter(|sql| *sql == "COMMIT").count(), 1);
+        assert!(!statements.iter().any(|sql| sql == "ROLLBACK"));
+        assert_eq!(
+            store
+                .engine
+                .query("SELECT version FROM schema_epochs ORDER BY version", &[])
+                .unwrap(),
+            (1..=SCHEMA_VERSION)
+                .map(|version| vec![SqlValue::Int(i64::from(version))])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn migration_batch_behavior<E: SqlEngine>(open: fn(&std::path::Path) -> Result<E, StoreError>) {
+        let fresh = fresh_path("migration-single-commit");
+        let mut store =
+            SqlMetadataStore::open(migration_probe(open(&fresh).unwrap(), None)).unwrap();
+        assert_one_migration_commit(&mut store);
+        drop(store);
+        let store = SqlMetadataStore::open(migration_probe(open(&fresh).unwrap(), None)).unwrap();
+        assert!(
+            store.engine.executed.is_empty(),
+            "current-schema reopen must not write"
+        );
+        drop(store);
+
+        for version in [0, 19, 20] {
+            let pending_writes: usize = MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version > version)
+                .map(|migration| migration.statements.len() + 1)
+                .sum();
+            // Refuse the final DDL, final epoch insert, or COMMIT itself.
+            for fail_at in [pending_writes - 1, pending_writes, pending_writes + 1] {
+                let path = fresh_path("migration-rollback");
+                let mut engine = open(&path).unwrap();
+                match version {
+                    19 => seed_v19_worker_fence(&mut engine),
+                    20 => seed_v20_attempt_lease(&mut engine),
+                    _ => {}
+                }
+                let queries = [
+                    "SELECT * FROM worker_incarnation_fences ORDER BY worker",
+                    "SELECT * FROM action_generations ORDER BY id_hex",
+                    "SELECT * FROM action_attempts ORDER BY id_hex",
+                ];
+                let prior_rows = if version == 0 {
+                    Vec::new()
+                } else {
+                    queries
+                        .iter()
+                        .map(|sql| engine.query(sql, &[]).unwrap())
+                        .collect::<Vec<_>>()
+                };
+                let mut failed = SqlMetadataStore {
+                    engine: migration_probe(engine, Some(fail_at)),
+                    domains: HashMap::new(),
+                };
+                assert_eq!(
+                    failed.apply_migrations(),
+                    Err(StoreError::Backend("injected migration failure".into()))
+                );
+                assert_eq!(
+                    failed.engine.executed.last().map(String::as_str),
+                    Some("ROLLBACK")
+                );
+                // Verify cleanup before dropping the connection: a still-open
+                // migration transaction would reject this new transaction.
+                failed.engine.execute("BEGIN", &[]).unwrap();
+                failed.engine.execute("ROLLBACK", &[]).unwrap();
+                drop(failed);
+
+                // Reopen the actual file before attempting any new migration.
+                let mut reopened = open(&path).unwrap();
+                if version == 0 {
+                    assert!(
+                        reopened
+                            .query(
+                                "SELECT name FROM sqlite_master WHERE name = 'schema_epochs'",
+                                &[]
+                            )
+                            .unwrap()
+                            .is_empty()
+                    );
+                } else {
+                    assert_eq!(
+                        reopened
+                            .query("SELECT MAX(version) FROM schema_epochs", &[])
+                            .unwrap(),
+                        vec![vec![SqlValue::Int(i64::from(version))]]
+                    );
+                    for (sql, expected) in queries.iter().zip(&prior_rows) {
+                        assert_eq!(
+                            &reopened.query(sql, &[]).unwrap(),
+                            expected,
+                            "version {version}, failure {fail_at}, query {sql}"
+                        );
+                    }
+                }
+                let mut retried = SqlMetadataStore::open(migration_probe(reopened, None)).unwrap();
+                assert_one_migration_commit(&mut retried);
+                if version == 19 {
+                    assert_v19_worker_fence_migrated(&mut retried);
+                } else if version == 20 {
+                    assert_v20_attempt_lease_fails_closed(&mut retried);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_migrations_commit_once_and_rollback_reference() {
+        migration_batch_behavior(RusqliteEngine::open);
+    }
+
+    #[test]
+    fn pending_migrations_commit_once_and_rollback_frankensqlite() {
+        migration_batch_behavior(FsqliteEngine::open);
+    }
+
     fn digest(domain: &'static str, tag: u8) -> TypedDigest {
         TypedDigest {
             algorithm: DigestAlgorithm::Sha256V1,
@@ -7792,6 +8043,152 @@ mod tests {
             ),
             Err(StoreError::GenerationIdNotAboveHighWater)
         );
+    }
+
+    fn allocation_behavior<E: SqlEngine>(store: &mut SqlMetadataStore<E>) {
+        let active = authority(1);
+        let action = digest("rabs.action-key.sha256.v1", 7);
+        let other = digest("rabs.action-key.sha256.v1", 8);
+        store.acquire_authority(&active).unwrap();
+        store
+            .create_generation(&active.digest, 899, &action)
+            .unwrap();
+        let old = ActionGeneration {
+            generation_id: ActionGenerationId(900),
+            per_key_ordinal: 255,
+            created_under_authority_digest: active.digest.clone(),
+        };
+        store
+            .create_bound_generation(&active.digest, &old, &action)
+            .unwrap();
+        store.tombstone_generation(900).unwrap();
+        let next = store
+            .allocate_bound_generation(&active.digest, &action)
+            .unwrap();
+        assert_eq!(next.generation_id, ActionGenerationId(901));
+        assert_eq!(
+            next.per_key_ordinal, 256,
+            "BE blob ordering crosses byte boundary"
+        );
+        assert_eq!(next.created_under_authority_digest, active.digest);
+        let independent = store
+            .allocate_bound_generation(&active.digest, &other)
+            .unwrap();
+        assert_eq!(independent.generation_id, ActionGenerationId(902));
+        assert_eq!(independent.per_key_ordinal, 1);
+        assert_eq!(
+            store.allocate_bound_generation(&authority(2).digest, &action),
+            Err(StoreError::NotActiveAuthority)
+        );
+        assert_eq!(store.generation_count().unwrap(), 4);
+
+        // Bad older ordinals must refuse even with a valid larger row present.
+        for corrupt in [
+            SqlValue::Blob(vec![0; 7]),
+            SqlValue::Text("00000000".into()),
+        ] {
+            store
+                .engine
+                .execute(
+                    "UPDATE action_generations SET per_key_ordinal = ?1 WHERE id_hex = ?2",
+                    &[corrupt, SqlValue::Text(u128_hex(900))],
+                )
+                .unwrap();
+            assert!(matches!(
+                store.allocate_bound_generation(&active.digest, &action),
+                Err(StoreError::Corruption(_))
+            ));
+            assert_eq!(store.generation_count().unwrap(), 4);
+            assert_eq!(
+                SqlMetadataStore::<E>::generation_high_water(&mut store.engine).unwrap(),
+                902
+            );
+        }
+        store
+            .engine
+            .execute(
+                "UPDATE action_generations SET per_key_ordinal = ?1 WHERE id_hex = ?2",
+                &[SqlValue::Blob(u64_blob(255)), SqlValue::Text(u128_hex(900))],
+            )
+            .unwrap();
+        let next = store
+            .allocate_bound_generation(&active.digest, &action)
+            .unwrap();
+        assert_eq!(next.generation_id, ActionGenerationId(903));
+        assert_eq!(next.per_key_ordinal, 257, "256 must sort above 255");
+        let exhausted = ActionGeneration {
+            generation_id: ActionGenerationId(904),
+            per_key_ordinal: u64::MAX,
+            created_under_authority_digest: active.digest.clone(),
+        };
+        store
+            .create_bound_generation(&active.digest, &exhausted, &action)
+            .unwrap();
+        assert_eq!(
+            store.allocate_bound_generation(&active.digest, &action),
+            Err(StoreError::GenerationOrdinalExhausted)
+        );
+        assert_eq!(store.generation_count().unwrap(), 6);
+        assert_eq!(
+            SqlMetadataStore::<E>::generation_high_water(&mut store.engine).unwrap(),
+            904
+        );
+        store
+            .create_generation(&active.digest, u128::MAX, &other)
+            .unwrap();
+        assert_eq!(
+            store.allocate_bound_generation(&active.digest, &other),
+            Err(StoreError::GenerationIdentityExhausted)
+        );
+        assert_eq!(store.generation_count().unwrap(), 7);
+    }
+
+    #[test]
+    fn allocated_generations_enforce_fences_and_bounds_on_both_sql_engines() {
+        let reference = RusqliteEngine::open_in_memory().unwrap();
+        allocation_behavior(&mut SqlMetadataStore::open(reference).unwrap());
+        let candidate = FsqliteEngine::open(&fresh_path("allocation-fsq")).unwrap();
+        allocation_behavior(&mut SqlMetadataStore::open(candidate).unwrap());
+    }
+
+    #[test]
+    fn allocated_generation_identity_and_ordinal_survive_reopen_and_new_authority() {
+        let path = fresh_path("allocation-reopen");
+        let action = digest("rabs.action-key.sha256.v1", 7);
+        let old_id = 1_u128 << 100;
+        {
+            let mut store = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+            let active = authority(1);
+            store.acquire_authority(&active).unwrap();
+            let old = ActionGeneration {
+                generation_id: ActionGenerationId(old_id),
+                per_key_ordinal: 17,
+                created_under_authority_digest: active.digest.clone(),
+            };
+            store
+                .create_bound_generation(&active.digest, &old, &action)
+                .unwrap();
+            let next = store
+                .allocate_bound_generation(&active.digest, &action)
+                .unwrap();
+            assert_eq!(next.generation_id, ActionGenerationId(old_id + 1));
+            assert_eq!(next.per_key_ordinal, 18);
+            store.tombstone_generation(next.generation_id.0).unwrap();
+            store.release_authority(&active.digest).unwrap();
+        }
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+        let active = authority(2);
+        store.acquire_authority(&active).unwrap();
+        store
+            .close_generations_for_other_authorities(&active.digest)
+            .unwrap();
+        let next = store
+            .allocate_bound_generation(&active.digest, &action)
+            .unwrap();
+        assert_eq!(next.generation_id, ActionGenerationId(old_id + 2));
+        assert_eq!(next.per_key_ordinal, 19);
+        assert_eq!(next.created_under_authority_digest, active.digest);
+        assert_eq!(store.generation_count().unwrap(), 3);
     }
 
     #[test]

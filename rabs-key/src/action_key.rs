@@ -18,10 +18,127 @@
 //! F001 goldens.
 
 use rabs_protocol::descriptor::{ActionClass, ActionDescriptor};
-use rabs_protocol::result_identity::TypedDigest;
+use rabs_protocol::input_evidence::{
+    ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType,
+};
+use rabs_protocol::result_identity::{DigestAlgorithm, ObjectId, TypedDigest};
 
 use crate::canonical::CanonicalEncoder;
 use crate::typed_digest::{DOMAIN_ACTION_KEY, compute};
+
+/// Positive input component domain, shared with descriptor schema vocabulary.
+pub const DOMAIN_ACTION_INPUT_MANIFEST: &str = "rabs.inputs.v1";
+
+/// A manifest cannot be assigned a canonical input-component identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputManifestError {
+    /// The schema has no encoder in this version.
+    UnsupportedSchema {
+        /// The unsupported version supplied by the caller.
+        found: u32,
+    },
+    /// More than one positive input names the same raw virtual path.
+    DuplicatePositivePath,
+    /// More than one enumeration names the same raw virtual directory.
+    DuplicateEnumerationPath,
+}
+
+impl std::fmt::Display for InputManifestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedSchema { found } => {
+                write!(f, "unsupported input manifest schema {found}")
+            }
+            Self::DuplicatePositivePath => f.write_str("duplicate positive input path"),
+            Self::DuplicateEnumerationPath => f.write_str("duplicate directory enumeration path"),
+        }
+    }
+}
+
+impl std::error::Error for InputManifestError {}
+
+fn input_object_encoding(object: &ObjectId) -> Vec<u8> {
+    let mut enc = CanonicalEncoder::new();
+    let algorithm = match object.0.algorithm {
+        DigestAlgorithm::Sha256V1 => 1,
+    };
+    enc.u32(algorithm)
+        .str(object.0.domain)
+        .bytes(&object.0.bytes);
+    enc.finish()
+}
+
+/// Digest the positive manifest as an action-key component, not a CAS object.
+/// Fields follow schema declaration order. Positive paths and enumerations are
+/// unique and sorted by raw path bytes; directory listings are sets. Approved
+/// objects are a membership set sorted by their full canonical identity.
+/// Symlink resolution is an ordered chain and is never sorted. V1 file-type
+/// tags are regular=1, directory=2, symlink=3; SHA-256 V1 has algorithm tag 1.
+pub fn action_input_manifest_digest(
+    manifest: &ActionInputManifest,
+) -> Result<TypedDigest, InputManifestError> {
+    let ActionInputManifest {
+        schema_version,
+        inputs,
+        directory_enumerations,
+        approved_generated_objects,
+    } = manifest;
+    if *schema_version != INPUT_EVIDENCE_SCHEMA_VERSION {
+        return Err(InputManifestError::UnsupportedSchema {
+            found: *schema_version,
+        });
+    }
+    let mut inputs: Vec<_> = inputs.iter().collect();
+    inputs.sort_by(|a, b| a.virtual_path.cmp(&b.virtual_path));
+    if inputs
+        .windows(2)
+        .any(|pair| pair[0].virtual_path == pair[1].virtual_path)
+    {
+        return Err(InputManifestError::DuplicatePositivePath);
+    }
+    let mut enumerations: Vec<_> = directory_enumerations.iter().collect();
+    enumerations.sort_by(|a, b| a.virtual_path.cmp(&b.virtual_path));
+    if enumerations
+        .windows(2)
+        .any(|pair| pair[0].virtual_path == pair[1].virtual_path)
+    {
+        return Err(InputManifestError::DuplicateEnumerationPath);
+    }
+    let mut enc = CanonicalEncoder::new();
+    enc.u32(*schema_version).seq(&inputs, |enc, input| {
+        let file_type = match input.file_type {
+            InputFileType::Regular => 1,
+            InputFileType::Directory => 2,
+            InputFileType::Symlink => 3,
+        };
+        enc.bytes(input.virtual_path.as_bytes())
+            .bytes(&input_object_encoding(&input.object))
+            .u32(file_type)
+            .bool(input.executable)
+            .seq(&input.symlink_resolution, |enc, hop| {
+                enc.bytes(hop.as_bytes());
+            });
+    });
+    enc.seq(&enumerations, |enc, enumeration| {
+        let mut entries: Vec<_> = enumeration.entries.iter().collect();
+        entries.sort_unstable();
+        entries.dedup();
+        enc.bytes(enumeration.virtual_path.as_bytes())
+            .seq(&entries, |enc, entry| {
+                enc.bytes(entry.as_bytes());
+            });
+    });
+    let mut objects: Vec<_> = approved_generated_objects
+        .iter()
+        .map(input_object_encoding)
+        .collect();
+    objects.sort_unstable();
+    objects.dedup();
+    enc.seq(&objects, |enc, object| {
+        enc.bytes(object);
+    });
+    Ok(compute(DOMAIN_ACTION_INPUT_MANIFEST, &enc.finish()))
+}
 
 /// Stable canonical tag for each action class (wire-stable; NOT the Rust
 /// discriminant — enum reordering must not change keys).
@@ -113,7 +230,8 @@ pub fn compute_action_key(descriptor: &ActionDescriptor) -> ActionKeyBreakdown {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rabs_protocol::result_identity::DigestAlgorithm;
+    use rabs_protocol::input_evidence::{DirectoryEnumeration, PositiveInput};
+    use rabs_protocol::raw_bytes::RawBytes;
 
     fn d(domain: &'static str, tag: u8) -> TypedDigest {
         TypedDigest {
@@ -121,6 +239,142 @@ mod tests {
             domain,
             bytes: [tag; 32],
         }
+    }
+
+    fn input_manifest() -> ActionInputManifest {
+        ActionInputManifest {
+            schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+            inputs: vec![
+                PositiveInput {
+                    virtual_path: RawBytes::new(b"/workspace/link".to_vec()),
+                    object: ObjectId(d("rabs.object.v1", 1)),
+                    file_type: InputFileType::Symlink,
+                    executable: false,
+                    symlink_resolution: vec![
+                        RawBytes::new(b"middle".to_vec()),
+                        RawBytes::new(b"actual".to_vec()),
+                    ],
+                },
+                PositiveInput {
+                    virtual_path: RawBytes::new(b"/workspace/\xff".to_vec()),
+                    object: ObjectId(d("rabs.object.v1", 2)),
+                    file_type: InputFileType::Regular,
+                    executable: true,
+                    symlink_resolution: Vec::new(),
+                },
+            ],
+            directory_enumerations: vec![
+                DirectoryEnumeration {
+                    virtual_path: RawBytes::new(b"/workspace".to_vec()),
+                    entries: vec![RawBytes::new(b"link".to_vec()), RawBytes::new(vec![0xff])],
+                },
+                DirectoryEnumeration {
+                    virtual_path: RawBytes::new(b"/empty".to_vec()),
+                    entries: Vec::new(),
+                },
+            ],
+            approved_generated_objects: vec![
+                ObjectId(d("rabs.object.v1", 3)),
+                ObjectId(d("rabs.toolchain-object.v1", 3)),
+            ],
+        }
+    }
+
+    #[test]
+    fn input_manifest_identity_ignores_set_order_and_duplicate_membership() {
+        let original = input_manifest();
+        let mut permuted = original.clone();
+        permuted.inputs.reverse();
+        permuted.directory_enumerations.reverse();
+        for enumeration in &mut permuted.directory_enumerations {
+            enumeration.entries.reverse();
+            if let Some(entry) = enumeration.entries.first().cloned() {
+                enumeration.entries.push(entry);
+            }
+        }
+        permuted.approved_generated_objects.reverse();
+        permuted
+            .approved_generated_objects
+            .push(permuted.approved_generated_objects[0].clone());
+        let digest = action_input_manifest_digest(&original).unwrap();
+        assert_eq!(digest.domain, DOMAIN_ACTION_INPUT_MANIFEST);
+        assert_eq!(digest.algorithm, DigestAlgorithm::Sha256V1);
+        assert_eq!(digest, action_input_manifest_digest(&permuted).unwrap());
+        // Schema-valid empty evidence is distinct from the populated manifest.
+        let empty = ActionInputManifest {
+            schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+            ..ActionInputManifest::default()
+        };
+        assert_ne!(digest, action_input_manifest_digest(&empty).unwrap());
+    }
+
+    #[test]
+    fn input_manifest_identity_binds_all_semantic_fields_and_chain_order() {
+        let original = input_manifest();
+        let digest = action_input_manifest_digest(&original).unwrap();
+        for mutation in 0..14 {
+            let mut changed = original.clone();
+            match mutation {
+                0 => changed.inputs[0].virtual_path = RawBytes::new(b"/other".to_vec()),
+                1 => changed.inputs[0].object.0.bytes[0] ^= 1,
+                2 => changed.inputs[0].object.0.domain = "rabs.other-object.v1",
+                3 => changed.inputs[0].file_type = InputFileType::Regular,
+                4 => changed.inputs[0].file_type = InputFileType::Directory,
+                5 => changed.inputs[0].executable = true,
+                6 => changed.inputs[0].symlink_resolution.reverse(),
+                7 => changed.inputs[0].symlink_resolution[0] = RawBytes::new(b"different".to_vec()),
+                8 => changed.inputs[0]
+                    .symlink_resolution
+                    .push(RawBytes::new(b"extra".to_vec())),
+                9 => {
+                    changed.directory_enumerations[0].virtual_path =
+                        RawBytes::new(b"/elsewhere".to_vec())
+                }
+                10 => changed.directory_enumerations[0]
+                    .entries
+                    .push(RawBytes::new(b"new".to_vec())),
+                11 => changed.approved_generated_objects[0].0.bytes[0] ^= 1,
+                12 => changed.approved_generated_objects[0].0.domain = "rabs.changed-object.v1",
+                13 => changed.inputs[1].virtual_path = RawBytes::new(b"/workspace/\xfe".to_vec()),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                digest,
+                action_input_manifest_digest(&changed).unwrap(),
+                "semantic mutation {mutation} must change identity"
+            );
+        }
+    }
+
+    #[test]
+    fn input_manifest_rejects_unknown_schema_and_duplicate_paths() {
+        for schema in [0, INPUT_EVIDENCE_SCHEMA_VERSION + 1, u32::MAX] {
+            let mut manifest = input_manifest();
+            manifest.schema_version = schema;
+            assert_eq!(
+                action_input_manifest_digest(&manifest),
+                Err(InputManifestError::UnsupportedSchema { found: schema })
+            );
+        }
+        let mut manifest = input_manifest();
+        manifest.inputs.push(manifest.inputs[0].clone());
+        assert_eq!(
+            action_input_manifest_digest(&manifest),
+            Err(InputManifestError::DuplicatePositivePath)
+        );
+        manifest.inputs.last_mut().unwrap().object.0.bytes[0] ^= 1;
+        assert_eq!(
+            action_input_manifest_digest(&manifest),
+            Err(InputManifestError::DuplicatePositivePath)
+        );
+        let mut manifest = input_manifest();
+        manifest
+            .directory_enumerations
+            .push(manifest.directory_enumerations[0].clone());
+        assert_eq!(
+            action_input_manifest_digest(&manifest),
+            Err(InputManifestError::DuplicateEnumerationPath)
+        );
     }
 
     fn descriptor() -> ActionDescriptor {
