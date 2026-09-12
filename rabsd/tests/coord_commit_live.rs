@@ -49,6 +49,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use rabs_action::state_machines::AttemptState;
 use rabs_asupersync::daemon_runtime::{DaemonRunOptions, SubsystemWork, run_daemon};
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, PutOutcome, put_if_absent};
 use rabs_cas::digest_set::{DigestRequest, digest_set};
@@ -64,10 +65,438 @@ use rabs_cas::test_support::{
     offer_serving_object, offer_under, offer_with_manifest_bytes, sample_action_key,
     sample_expected_descriptor,
 };
+use rabs_key::action_key::action_input_manifest_digest;
+use rabs_key::typed_digest::compute;
+use rabs_protocol::descriptor::{ActionClass, ActionDescriptor, SubscriberKind};
+use rabs_protocol::durable_ids::BuildOperationId;
+use rabs_protocol::generation::{WorkerBootGeneration, WorkerIncarnationId};
+use rabs_protocol::input_evidence::{
+    ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+};
+use rabs_protocol::raw_bytes::RawBytes;
 use rabs_protocol::result_identity::DivergenceClass;
 use rabs_protocol::result_identity::ObjectId;
+use rabs_protocol::wire_time::PeerId;
+use rabs_protocol::worker_fence::{WorkerAdmission, WorkerSessionOffer};
+use rabs_sandbox::snapshot_capture::{SealedSourceSnapshot, capture_sealed_source};
+use rabsd::coord::action_actor::{JoinReceipt, JoinRequest, SubscriptionRequirements};
+use rabsd::coord::live::ActionSubmission;
 use rabsd::coord::live::{CoordLive, ExpectedOutputs, ServeOutcome, cluster_id, load_manifest};
 use rabsd::janitor::store::{LiveCas, mount_and_reconcile};
+
+// Q004 exercises the public in-process submission/lease APIs and a real shell
+// process. It does not claim wire delivery, sandbox enforcement or cache serving.
+const SUBMISSION_COMMAND: &str = "IFS= read -r value < input.txt || exit 3; printf '%s\\n' \"$$\" >> \"$1\"; printf '%s\\n' \"$value\"; IFS= read -r release || exit 4; test \"$release\" = release";
+
+fn submission_from_source(source: Arc<SealedSourceSnapshot>) -> ActionSubmission {
+    let bytes = source.file_bytes("workspace", "input.txt").unwrap();
+    let manifest = ActionInputManifest {
+        schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
+        inputs: vec![PositiveInput {
+            virtual_path: RawBytes::new(b"/__rabs/workspace/input.txt".to_vec()),
+            object: ObjectId(
+                digest_set(bytes, DigestRequest::default(), None)
+                    .unwrap()
+                    .atp_content_id,
+            ),
+            file_type: InputFileType::Regular,
+            executable: false,
+            symlink_resolution: Vec::new(),
+        }],
+        ..ActionInputManifest::default()
+    };
+    let descriptor = ActionDescriptor {
+        key_epoch: 1,
+        projection_epoch: 1,
+        action_class: ActionClass::CodeGeneratorRun,
+        normalized_invocation: compute("rabs.invocation.v1", SUBMISSION_COMMAND.as_bytes()),
+        virtual_working_directory: compute("rabs.cwd.v1", b"/__rabs/workspace"),
+        action_inputs: action_input_manifest_digest(&manifest).unwrap(),
+        negative_dependencies: compute("rabs.negdeps.v1", b"none"),
+        dependency_inputs: compute("rabs.deps.v1", b"none"),
+        toolchain: compute("rabs.toolchain.v1", b"fixture-host-sh"),
+        output_platform: compute("rabs.platform.v1", b"fixture-host"),
+        environment: compute("rabs.env.v1", b"fixture"),
+        sandbox_semantic_policy: compute("rabs.sandbox-policy.v1", b"fixture-process-only"),
+        build_path_semantic_policy: compute("rabs.path-policy.v1", b"fixture"),
+        execution_semantics: compute("rabs.exec-semantics.v1", b"shell"),
+        output_declarations: compute("rabs.outputs.v1", b"stdout"),
+    };
+    ActionSubmission::from_snapshot(
+        descriptor,
+        &manifest,
+        source,
+        &[("workspace".into(), "/__rabs/workspace".into())],
+    )
+    .unwrap()
+}
+
+fn capture_submission_source(root: &std::path::Path) -> Arc<SealedSourceSnapshot> {
+    Arc::new(
+        capture_sealed_source(&[("workspace".into(), root.to_path_buf())], false, 2, 1024).unwrap(),
+    )
+}
+
+fn submission_join(operation: u128, kind: SubscriberKind) -> JoinRequest {
+    JoinRequest {
+        operation: BuildOperationId(operation),
+        kind,
+        queue_priority: if kind == SubscriberKind::Speculative {
+            3
+        } else {
+            200
+        },
+        deadline_unix_micros: None,
+        presentation: compute("rabs.presentation.v1", b"plain"),
+        requirements: SubscriptionRequirements::unrestricted(),
+    }
+}
+
+fn submission_coordinator(root: &std::path::Path) -> (Arc<CoordLive>, WorkerSessionOffer) {
+    let cas = Arc::new(mount_and_reconcile(&root.join("cas")).unwrap());
+    let coord = Arc::new(CoordLive::with_cas(cas));
+    coord.acquire_boot_authority("q004-fixture").unwrap();
+    coord.mark_up();
+    let worker = WorkerSessionOffer {
+        worker_peer_id: PeerId("fixture-worker".into()),
+        boot_generation: WorkerBootGeneration(1),
+        incarnation: WorkerIncarnationId(100),
+        reenrollment_proof: None,
+    };
+    let (admission, session) = coord.admit_worker_session(&worker).unwrap();
+    assert_eq!(admission, WorkerAdmission::AdmitNewGeneration);
+    assert!(session.is_some());
+    (coord, worker)
+}
+
+/// Kill/reap the owned process on every assertion failure as well as success.
+struct SubmissionChild(std::process::Child);
+
+impl SubmissionChild {
+    fn wait_until(&mut self, mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                self.0.try_wait().unwrap().is_none(),
+                "submission process exited before readiness"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "submission process readiness deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn release_and_wait(&mut self) {
+        use std::io::Write;
+        self.0
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"release\n")
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                assert!(status.success(), "submission process failed: {status}");
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "submission process exit deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for SubmissionChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn speculative_and_foreground_submissions_share_one_real_process_in_both_orders() {
+    for first_kind in [SubscriberKind::Speculative, SubscriberKind::ForegroundAgent] {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("source");
+        std::fs::create_dir(&live).unwrap();
+        std::fs::write(live.join("input.txt"), b"sealed input\n").unwrap();
+        std::fs::write(live.join("unrelated.txt"), b"first unrelated").unwrap();
+        let original = capture_submission_source(&live);
+        let (coord, worker) = submission_coordinator(dir.path());
+        let first = coord
+            .submit_action(
+                submission_from_source(Arc::clone(&original)),
+                submission_join(1, first_kind),
+                now_micros(),
+                0,
+            )
+            .unwrap();
+        assert!(first.actor_created);
+        let mut dispatch = coord.next_action_dispatch().unwrap().unwrap();
+        let backings = dispatch
+            .input()
+            .materialize_into(&dir.path().join("materialized"))
+            .unwrap();
+        let backing = &backings["workspace"];
+        assert!(!backing.join("unrelated.txt").exists());
+        assert_eq!(
+            std::fs::read(backing.join("input.txt")).unwrap(),
+            b"sealed input\n"
+        );
+        let attempt = dispatch.begin(&worker, i64::MAX as u64).unwrap().clone();
+        for state in [
+            AttemptState::LeaseAccepted,
+            AttemptState::AwaitingInputs,
+            AttemptState::Materializing,
+        ] {
+            dispatch.advance(state).unwrap();
+        }
+        // Change the mutable checkout AFTER capture and materialization. The
+        // process must still observe the sealed image's projected bytes.
+        std::fs::write(live.join("input.txt"), b"changed live input\n").unwrap();
+        let changed_input = submission_from_source(capture_submission_source(&live));
+        assert_ne!(changed_input.key(), first.action_key);
+        std::fs::write(live.join("input.txt"), b"sealed input\n").unwrap();
+        std::fs::write(live.join("unrelated.txt"), b"different unrelated").unwrap();
+        let second_source = capture_submission_source(&live);
+        assert_ne!(original.closure_digest(), second_source.closure_digest());
+        assert_eq!(
+            submission_from_source(Arc::clone(&second_source)).key(),
+            first.action_key
+        );
+        std::fs::write(
+            live.join("input.txt"),
+            b"changed again after both captures\n",
+        )
+        .unwrap();
+        let starts = dir.path().join("process-starts");
+        let stdout = dir.path().join("process-output");
+        let mut child = SubmissionChild(
+            Command::new("/bin/sh")
+                .args(["-c", SUBMISSION_COMMAND, "q004"])
+                .arg(&starts)
+                .current_dir(backing)
+                .stdin(Stdio::piped())
+                .stdout(std::fs::File::create(&stdout).unwrap())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        dispatch.advance(AttemptState::Running).unwrap();
+        let pid = child.0.id().to_string();
+        child
+            .wait_until(|| std::fs::read_to_string(&starts).is_ok_and(|value| value.trim() == pid));
+        let second_kind = if first_kind == SubscriberKind::Speculative {
+            SubscriberKind::ForegroundAgent
+        } else {
+            SubscriberKind::Speculative
+        };
+        let second = coord
+            .submit_action(
+                submission_from_source(second_source),
+                submission_join(2, second_kind),
+                now_micros(),
+                0,
+            )
+            .unwrap();
+        assert!(!second.actor_created);
+        assert_eq!(second.action_key, first.action_key);
+        assert_eq!(second.join, JoinReceipt::JoinedExecution);
+        assert!(coord.next_action_dispatch().unwrap().is_none());
+        let actor = coord.submitted_actor(&first.action_key).unwrap().unwrap();
+        assert!(actor.subscriber(&BuildOperationId(1)).is_some());
+        assert!(actor.subscriber(&BuildOperationId(2)).is_some());
+        assert_eq!(actor.attempts().count(), 1);
+        assert_eq!(actor.attempts().next().unwrap().attempt, attempt.attempt_id);
+        assert!(child.0.try_wait().unwrap().is_none());
+        child.release_and_wait();
+        for state in [
+            AttemptState::ProcessExited,
+            AttemptState::Draining,
+            AttemptState::Finished,
+        ] {
+            dispatch.advance(state).unwrap();
+        }
+        dispatch.complete().unwrap();
+        assert_eq!(std::fs::read(&stdout).unwrap(), b"sealed input\n");
+        assert_eq!(std::fs::read_to_string(&starts).unwrap().lines().count(), 1);
+        assert!(coord.next_action_dispatch().unwrap().is_none());
+        assert!(
+            coord
+                .submitted_actor(&first.action_key)
+                .unwrap()
+                .unwrap()
+                .history()
+                .is_empty(),
+            "raw process output was never committed as a cache result"
+        );
+        assert!(coord.retire_finished_action(&first.action_key).unwrap());
+        assert!(matches!(
+            coord.renew_attempt_lease(
+                &attempt,
+                rabs_protocol::generation::LeaseRenewal {
+                    lease: attempt.execution_lease_id,
+                    seq: rabs_protocol::generation::LeaseRenewalSeq(1),
+                },
+                i64::MAX as u64,
+            ),
+            Err(rabsd::coord::live::AttemptLeaseRefusal::Store(
+                rabs_cas::metadata_store::StoreError::GenerationTombstoned
+            ))
+        ));
+        let resubmitted = coord
+            .submit_action(
+                submission_from_source(Arc::clone(&original)),
+                submission_join(4, SubscriberKind::ForegroundAgent),
+                now_micros(),
+                0,
+            )
+            .unwrap();
+        assert!(resubmitted.actor_created);
+        assert_eq!(resubmitted.action_key, first.action_key);
+        {
+            let mut next = coord.next_action_dispatch().unwrap().unwrap();
+            let admitted = next.begin(&worker, i64::MAX as u64).unwrap();
+            assert!(
+                admitted.action_generation.per_key_ordinal
+                    > attempt.action_generation.per_key_ordinal
+            );
+            assert!(
+                admitted.action_generation.generation_id.0
+                    > attempt.action_generation.generation_id.0
+            );
+            // Admission alone is not another execution. Dropping this unstarted
+            // lease conservatively requires reconciliation before any retry.
+        }
+        let changed = coord
+            .submit_action(
+                changed_input,
+                submission_join(3, SubscriberKind::ForegroundAgent),
+                now_micros(),
+                0,
+            )
+            .unwrap();
+        assert!(changed.actor_created);
+        assert_ne!(changed.action_key, first.action_key);
+        let changed_dispatch = coord.next_action_dispatch().unwrap().unwrap();
+        assert_eq!(changed_dispatch.input().key(), changed.action_key);
+        let changed_backings = changed_dispatch
+            .input()
+            .materialize_into(&dir.path().join("changed-materialized"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(changed_backings["workspace"].join("input.txt")).unwrap(),
+            b"changed live input\n"
+        );
+        assert!(!changed_backings["workspace"].join("unrelated.txt").exists());
+    }
+}
+
+#[test]
+fn concurrent_submission_and_dispatch_claims_collapse_at_public_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let live = dir.path().join("source");
+    std::fs::create_dir(&live).unwrap();
+    std::fs::write(live.join("input.txt"), b"one source\n").unwrap();
+    let source = capture_submission_source(&live);
+    let (coord, _) = submission_coordinator(dir.path());
+    let barrier = std::sync::Barrier::new(8);
+    let receipts = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let coord = &coord;
+                let source = &source;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let input = submission_from_source(Arc::clone(source));
+                    coord
+                        .submit_action(
+                            input,
+                            submission_join(
+                                index,
+                                if index % 2 == 0 {
+                                    SubscriberKind::Speculative
+                                } else {
+                                    SubscriberKind::ForegroundAgent
+                                },
+                            ),
+                            now_micros(),
+                            0,
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        receipts
+            .iter()
+            .filter(|receipt| receipt.actor_created)
+            .count(),
+        1
+    );
+    assert!(
+        receipts
+            .iter()
+            .all(|receipt| receipt.action_key == receipts[0].action_key)
+    );
+    std::thread::scope(|scope| {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let coord = &coord;
+            let ready_tx = ready_tx.clone();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            releases.push(release_tx);
+            handles.push(scope.spawn(move || {
+                let claim = coord.next_action_dispatch().unwrap();
+                ready_tx.send(claim.is_some()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                drop(claim);
+            }));
+        }
+        let winners = (0..8)
+            .filter(|_| ready_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+            .count();
+        assert_eq!(
+            winners, 1,
+            "only one caller owns dispatch while all claims are held"
+        );
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+    // All claims were dropped before begin: exactly one queued action survives.
+    let claim = coord.next_action_dispatch().unwrap().unwrap();
+    assert!(coord.next_action_dispatch().unwrap().is_none());
+    assert_eq!(claim.input().key(), receipts[0].action_key);
+    let actor = coord
+        .submitted_actor(&receipts[0].action_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        actor.attempts().count(),
+        0,
+        "claims alone never imply execution"
+    );
+    for operation in 0..8 {
+        assert!(actor.subscriber(&BuildOperationId(operation)).is_some());
+    }
+}
 
 /// Run the real binary over `state_dir` for a short bounded life.
 fn boot_binary(state_dir: &std::path::Path, ms: &str) -> std::process::Output {
