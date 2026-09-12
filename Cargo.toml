@@ -34,7 +34,7 @@ members = [
 exclude = [".rch-tmp"]
 
 [workspace.package]
-version = "1.0.64"
+version = "2.0.0"
 edition = "2024"
 license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 authors = ["Remote Compilation Helper Contributors"]

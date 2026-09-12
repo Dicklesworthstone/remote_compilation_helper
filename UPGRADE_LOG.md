@@ -10,14 +10,24 @@ release artifact verification follow. Historical entries below remain intact.
 
 The candidate release is 2.0.0: public Rust schema helpers now return schemars
 1.x Schema instead of 0.8 RootSchema. Draft 7 output preserves the dialect,
-but does not preserve that Rust source API. No version bump occurs until the
-required gates pass. The retained staging directory still has 1.1.0 in its name.
+but does not preserve that Rust source API. After the final gate follow-ups,
+the central version and all 16 workspace lockfile entries were bumped to 2.0.0;
+external dependencies did not change. Artifact qualification and publication
+remain pending. The retained staging directory still has 1.1.0 in its name.
 The existing RCH signing identity was found on css; its public key
 1BBD79B28BF718D0 successfully verified the retained v1.0.64 Mac archive.
 No private key was copied or changed.
 
 ### Interim static review
 
+- The final 31-file static comparison after N001/N011 repairs exits 0:
+  zero new criticals, 229 warnings and 35 informational findings. All source
+  hashes match RAM and integration. Receipt:
+  `/run/user/1000/rch-fuchsia-ubs-20260912-2k0kt_kb/extension31final-y6n515rp/final-validation.json`.
+  The explained annotation on the new regression's private shim execution
+  suppresses its untrusted-executable false positive and co-anchored intentional
+  test failure assertion. No production findings were suppressed; the baseline
+  still reports 20 critical findings.
 - The final 29-file scope, including the stock-Cargo probe and macOS cfg fix,
   exits 0 with zero new criticals, 193 warnings and 31 informational findings.
   Every changed Rust file matches its frozen snapshot. Receipt:
@@ -396,6 +406,44 @@ No private key was copied or changed.
   run uses RCH_DISABLE_TARGET_REUSE=1 so all test binaries compile and execute
   in the same fresh source snapshot. No missing fixture is fabricated or golden
   rewritten; all three recent channels remain enabled.
+- In the fresh-target run, the wrapper contract matrix passes all three
+  recent channels without golden changes. N001/N011 instead expose missing
+  channel-specific compiler selection in the isolated Rustup home; their
+  fixture repairs are pending verification.
+- The completed fresh-target workspace run reports 9,935 passed, 5 failed
+  and 20 existing ignores across 167 test binaries, remote/client exit 101
+  in 4,269.7 seconds. Receipt: `workspace-test-fresh-final-1825.log`.
+  The failures are L1 maximum latency, hook classification timing, UI ANSI
+  stripping timing, and the N001/N011 compiler-channel probes. All other
+  groups, including daemon lifecycle, stability and the recorded wrapper
+  matrix, pass. The three timing checks pass unchanged in separate CSS
+  qualifications; the two probe repairs still require targeted verification.
+- Both unchanged L1 latency tests passed on CSS (2 selected, 237 unrelated
+  tests filtered), with binary SHA-256
+  `7df780352c1ac0d9470b611a40d154f8074ac828d0eebfa1b104269374e86062`
+  verified across worker, relay and CSS. The loaded worker exceeded the
+  unchanged 10 ms maximum bound (12.15 ms); its p99 remained below 1 ms.
+  The entire unchanged UI integration harness also passed on CSS (63 tests,
+  zero failed, ignored or filtered), including ANSI-stripping performance.
+  Receipts in the release directory: `css-l1-qualification.nSzAlPvp/l1-latency-tests.log`
+  and `css-ui-qualification.3kYmoX4V/ui-integration-tests.log`. These independent
+  qualifications do not change the full run's original nonzero status.
+- The N001/N011 repairs pass through strict RCH: 3 tests, zero failures,
+  ignores or filters; remote/client exit 0. Receipt:
+  `channel-probe-retests-1939.log`. Both probes pair each channel's actual
+  Cargo with its compiler. N001 now checks the untouched no-op build before
+  replacing executables, preserves hardlinked originals, and excludes
+  non-executable dependency sidecars. Its new hardlink regression executes
+  both shim paths. All three channels report stable no-op fingerprints,
+  successful shim execution, inherited jobserver descriptors and correct
+  output caches, with no timeouts. N011 compares every existing golden and
+  confirms cross-channel equality; no golden was regenerated.
+- After the final probe edits, workspace-wide check and strict Clippy pass
+  again with all targets/features, locked dependencies and the pinned nightly.
+  Remote/client exits are 0. Receipts: `workspace-check-probe-fixes-1941.log`
+  (159.2s) and `workspace-clippy-probe-fixes-1945.log` (349.9s). Formatting
+  also passes. The subsequent version-only lock update is checked against
+  Cargo metadata; release builds will verify the final version and commit.
 
 - All pending stable Rust dependency upgrades have passed their consumer gates.
   Pinned Git/path/prerelease dependencies are preserved. This does not claim

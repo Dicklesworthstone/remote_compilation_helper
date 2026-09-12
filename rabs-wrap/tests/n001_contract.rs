@@ -176,6 +176,21 @@ fn rustup_which(toolchain: &str) -> Option<String> {
     (out.status.success())
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
         .filter(|s| !s.is_empty())
+        .map(stock_cargo_path)
+}
+
+fn stock_cargo_path(path: String) -> String {
+    let mut cargo = PathBuf::from(path);
+    if fs::metadata(&cargo).expect("Cargo metadata").len() <= 8 * 1024
+        && fs::read_to_string(&cargo)
+            .expect("small Cargo wrapper is text")
+            .lines()
+            .any(|line| line.starts_with("# rch-toolchain-wrap-version:"))
+    {
+        cargo.set_file_name("cargo-rch-real");
+        assert!(cargo.is_file(), "managed shim must retain the real Cargo");
+    }
+    cargo.to_str().expect("Cargo path is UTF-8").to_owned()
 }
 
 fn which_plain_cargo() -> Option<String> {
@@ -239,12 +254,18 @@ fn is_build_script_name(name: &str) -> bool {
 /// Every compiled-build-script FILE under a candidate compile dir (flat
 /// vintages keep them at the dir root; nested nightlies under `out/`).
 fn build_script_binaries(compile_dir: &Path) -> Vec<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
     let mut bins = Vec::new();
     for base in [compile_dir.to_path_buf(), compile_dir.join("out")] {
         if let Ok(entries) = fs::read_dir(&base) {
             for entry in entries.flatten() {
                 let p = entry.path();
-                if p.is_file() && is_build_script_name(entry.file_name().to_str().unwrap_or("")) {
+                if is_build_script_name(entry.file_name().to_str().unwrap_or(""))
+                    && p.metadata().is_ok_and(|metadata| {
+                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                    })
+                {
                     bins.push(p);
                 }
             }
@@ -303,8 +324,22 @@ fn probe_channel(channel: &Channel, project: &Path) -> Value {
     // toolchains would relocate/redirect the very artifacts probed here.
     let stock_cargo = || {
         let mut cmd = Command::new(&channel.cargo_path);
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let channel_path = std::env::join_paths(
+            std::iter::once(
+                Path::new(&channel.cargo_path)
+                    .parent()
+                    .expect("Cargo bin directory")
+                    .to_path_buf(),
+            )
+            .chain(std::env::split_paths(&inherited_path)),
+        )
+        .expect("channel executable search path");
         cmd.arg("build")
             .current_dir(project)
+            .env("PATH", channel_path)
+            .env_remove("RUSTC")
+            .env_remove("CARGO_BUILD_RUSTC")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
             .env_remove("RUSTFLAGS")
@@ -334,28 +369,6 @@ fn probe_channel(channel: &Channel, project: &Path) -> Value {
         panic!("[{}] run dir not found after fresh build", channel.name);
     };
 
-    // Every name cargo could exec the build script through (flat vintage
-    // hardlinks two names; nested nightlies keep one under out/). A shim
-    // must cover all of them.
-    let mut script_bins = build_script_binaries(&compile_dir);
-    assert!(
-        !script_bins.is_empty(),
-        "[{}] no build script binary after fresh build",
-        channel.name
-    );
-    let shim_target = script_bins.remove(0);
-    let mut displaced_originals: Vec<(PathBuf, PathBuf)> = std::iter::once(shim_target.clone())
-        .chain(script_bins.iter().cloned())
-        .enumerate()
-        .map(|(i, bin)| {
-            let backup = compile_dir.join(format!("n001_real_{i}.bin"));
-            fs::rename(&bin, &backup).expect("displace real binary");
-            (bin, backup)
-        })
-        .collect();
-    displaced_originals.sort();
-    let original_bytes = fs::read(&displaced_originals[0].1).expect("read real binary");
-
     let probe_after_fresh = read_probe_record_opt(&run_dir).expect("probe.json written by builder");
     let stock_jobserver = probe_after_fresh
         .get("has_cargo_makeflags")
@@ -378,31 +391,33 @@ fn probe_channel(channel: &Channel, project: &Path) -> Value {
         second.stderr_tail
     );
     let reran_on_noop = output_cache_mtime(&run_dir) != output_mtime_before;
+    assert!(
+        output_mtime_before.is_some() && !reran_on_noop,
+        "[{}] untouched no-op build must preserve the output cache timestamp",
+        channel.name
+    );
 
     // Phase 3: launcher-shim experiment. Install a recording shim at the
     // primary expected path (secondaries also shimmed so a hardlink swap
     // cannot dodge us), then trigger a no-op rebuild.
     println!("[n001]   {} phase: shimmed-rebuild", channel.name);
-    let log_path = compile_dir.join("n001_shim.log");
-    let shim = format!(
-        "#!/bin/sh\nprintf '%s\\0' \"$0\" \"$@\" >> \"{log}\"\nprintf '%s\\0' \"$CARGO_MAKEFLAGS\" >> \"{log}\"\nexec \"$N001_REAL_BIN\" \"$@\"\n",
-        log = log_path.display(),
+    let script_bins = build_script_binaries(&compile_dir);
+    assert!(
+        !script_bins.is_empty(),
+        "[{}] no build script binary after stock builds",
+        channel.name
     );
-    fs::write(&shim_target, shim.as_bytes()).expect("install shim");
-    make_executable(&shim_target);
-    for (_, backup) in displaced_originals.iter().skip(1) {
-        fs::write(backup, shim.as_bytes()).ok();
-    }
+    let shim_target = &script_bins[0];
+    let log_path = compile_dir.join("n001_shim.log");
+    let (real_binary, original_bytes) =
+        install_launcher_shims(&compile_dir, &script_bins, &log_path);
 
     let mut shimmed_cmd = stock_cargo();
-    shimmed_cmd.env(
-        "N001_REAL_BIN",
-        displaced_originals[0].1.display().to_string(),
-    );
+    shimmed_cmd.env("N001_REAL_BIN", real_binary);
     let third = run_bounded(shimmed_cmd);
     let shim_build_succeeded = third.success && !third.timed_out;
 
-    let bytes_now = fs::read(&shim_target).unwrap_or_default();
+    let bytes_now = fs::read(shim_target).unwrap_or_default();
     let shim_log = fs::read_to_string(&log_path).unwrap_or_default();
     let shim_executed = !shim_log.is_empty();
     let cargo_proceeded_without_shim = !shim_executed && shim_build_succeeded;
@@ -436,6 +451,76 @@ fn probe_channel(channel: &Channel, project: &Path) -> Value {
 }
 
 // --- Inspection helpers ------------------------------------------------------
+
+fn install_launcher_shims(
+    compile_dir: &Path,
+    script_bins: &[PathBuf],
+    log_path: &Path,
+) -> (PathBuf, Vec<u8>) {
+    let original_bytes = fs::read(&script_bins[0]).expect("read real binary");
+    let mut retained = Vec::new();
+    for (index, binary) in script_bins.iter().enumerate() {
+        let backup = compile_dir.join(format!("n001_real_{index}.bin"));
+        assert!(!backup.exists(), "original backup must be a fresh path");
+        fs::rename(binary, &backup).expect("displace real binary");
+        retained.push(backup);
+    }
+    let shim = format!(
+        "#!/bin/sh\nprintf '%s\\0' \"$0\" \"$@\" >> \"{log}\"\nprintf '%s\\0' \"$CARGO_MAKEFLAGS\" >> \"{log}\"\nexec \"$N001_REAL_BIN\" \"$@\"\n",
+        log = log_path.display(),
+    );
+    // Cargo may hardlink its executable names. Renaming retains those links,
+    // so write only the now-vacant invocation paths, never a retained backup.
+    for binary in script_bins {
+        fs::write(binary, shim.as_bytes()).expect("install shim at invocation path");
+        make_executable(binary);
+    }
+    assert_eq!(
+        fs::read(&retained[0]).expect("read retained original"),
+        original_bytes,
+        "installing shims must preserve the original executable"
+    );
+    (retained.remove(0), original_bytes)
+}
+
+#[test]
+fn launcher_shims_preserve_hardlinked_original_and_cover_each_executable() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let first = dir.path().join("build-script-build");
+    let second = dir.path().join("build_script_build-hash");
+    let depfile = dir.path().join("build_script_build-hash.d");
+    let bytes = b"#!/bin/sh\nprintf 'original executable\\n'\n";
+    fs::write(&first, bytes).expect("write original");
+    make_executable(&first);
+    fs::hard_link(&first, &second).expect("create Cargo-style hardlink");
+    fs::write(&depfile, "dependency metadata").expect("write non-executable sidecar");
+    let binaries = build_script_binaries(dir.path());
+    assert_eq!(binaries, vec![first, second]);
+    let log = dir.path().join("shim.log");
+    let (original, retained_bytes) = install_launcher_shims(dir.path(), &binaries, &log);
+    assert_eq!(retained_bytes, bytes);
+    assert_eq!(fs::read(&original).expect("retained original"), bytes);
+    assert_eq!(
+        fs::read(dir.path().join("n001_real_1.bin")).expect("retained hardlink"),
+        bytes
+    );
+    for binary in &binaries {
+        let output = Command::new(binary) // ubs:ignore -- executable is this test's private shim fixture
+            .env("N001_REAL_BIN", &original)
+            .output()
+            .expect("run installed shim");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"original executable\n");
+    }
+    let log = fs::read_to_string(log).expect("recorded both invocation paths");
+    for binary in &binaries {
+        assert!(log.contains(binary.to_str().expect("test path is UTF-8")));
+    }
+    assert_eq!(
+        fs::read_to_string(depfile).expect("untouched dependency metadata"),
+        "dependency metadata"
+    );
+}
 
 fn read_probe_record_opt(run_dir: &Path) -> Option<Value> {
     let text = fs::read_to_string(run_dir.join("out/probe.json")).ok()?;
