@@ -1,7 +1,11 @@
 {
-  "status": "completed",
-  "current": null,
-  "completed": [
+  "status": "in_progress",
+  "session_date": "2026-09-12",
+  "bead": "bd-6q0eo",
+  "current": "tru",
+  "completed": [],
+  "inventory": "/data/tmp/rch-dependency-inventory-20260912.json",
+  "previous_completed": [
     "anyhow",
     "serde",
     "serde_json",
