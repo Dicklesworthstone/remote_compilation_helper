@@ -49,8 +49,8 @@ use super::source_fidelity::{
     verify_source_content_roots,
 };
 use super::ssh::{
-    acquire_remote_source_authority_lock, ensure_worker_projects_topology,
-    remote_preflight_topology_policy,
+    acquire_clean_overlay_source_pair, acquire_remote_source_authority_lock,
+    ensure_worker_projects_topology, remote_preflight_topology_policy,
 };
 use super::*;
 
@@ -122,9 +122,9 @@ pub(super) fn wrap_command_with_telemetry(command: &str, worker_id: &WorkerId) -
 
 /// Derive the remote-root component for one clean-overlay execution.
 ///
-/// The job nonce deliberately keeps even identical source snapshots in
-/// separate directories: overlapping jobs must never synchronize into the
-/// same remote project root.
+/// Unpooled jobs use a nonce to keep even identical source snapshots in
+/// separate directories. Pooled jobs instead hold an exclusive source-pair
+/// lease throughout materialization, execution, retrieval, and retirement.
 fn clean_overlay_remote_project_hash(
     base_commit: &str,
     overlay_fingerprint: &str,
@@ -140,11 +140,27 @@ fn clean_overlay_remote_project_hash(
     hasher.finalize().to_hex()[..16].to_string()
 }
 
+/// Migrate away from artifacts that embed disposable source paths. Preserve
+/// the pooled basename grammar used by the cache reaper.
+fn clean_overlay_source_pair_pool_name(legacy_name: &str, source_base: &str) -> String {
+    let prefix = legacy_name
+        .rsplit_once('-')
+        .map_or(legacy_name, |(prefix, _)| prefix);
+    let hash = blake3::hash(
+        format!(
+            "rch-clean-overlay-source-pair-v1\0{legacy_name}\0{}",
+            source_base.trim_end_matches('/')
+        )
+        .as_bytes(),
+    );
+    format!("{prefix}-{}", &hash.to_hex()[..32])
+}
+
 /// The STABLE absolute location of a pooled Cargo target store under an
 /// explicit base: `<base>/<project_id>/<pooled dir name>`.
 ///
-/// Used for two things. Issue #60: a clean-overlay run's remote root embeds a
-/// per-command job nonce and is reaped at teardown, so its pooled store must
+/// Used for two things. Issue #60: a clean-overlay run's remote root
+/// is retired at teardown, so its pooled store must
 /// live in a sibling path that survives. Issue #64:
 /// `[remediation.pooled_target] store_base` relocates every build's pooled
 /// store off the filesystem holding the project mirror. Either way the
@@ -416,7 +432,36 @@ pub(super) async fn execute_remote_compilation(
         dependency_plan.sync_roots
     };
     let project_id = project_id_from_path(&normalized_project_root);
-    let project_hash = if let Some(spec) = clean_overlay {
+    if clean_overlay.is_some() && kind.is_some_and(|kind| kind.command_base() == "cargo") {
+        // Reject unsupported command grammar before claiming a persistent
+        // owner or writing source. The real directory is bound once the
+        // primary pipeline has resolved its managed target below.
+        super::cargo_target_dir::managed_clean_overlay_cargo_build_dir(
+            command,
+            "/rch-managed-build-dir-validation",
+        )?;
+    }
+    // Stable compiler-visible paths and their caches form one leased pair.
+    // Windows lacks the POSIX source lease; retain invocation isolation there
+    // with a unique target instead of reusing path-bearing artifacts unsafely.
+    let reuse_disabled = target_reuse_disabled() || (clean_overlay.is_some() && worker_is_windows);
+    let source_pair_pool = (clean_overlay.is_some()
+        && forwarded_cargo_target_dir.is_some()
+        && !reuse_disabled)
+        .then(|| {
+            clean_overlay_source_pair_pool_name(
+                &remote_cargo_pooled_target_dir_name(
+                    &worker_config.id,
+                    &normalized_project_root,
+                    toolchain,
+                    command,
+                ),
+                &transfer_config.remote_base,
+            )
+        });
+    let project_hash = if let Some(pool) = source_pair_pool.as_ref() {
+        format!("paired-{}", &blake3::hash(pool.as_bytes()).to_hex()[..32])
+    } else if let Some(spec) = clean_overlay {
         clean_overlay_remote_project_hash(
             spec.base_commit(),
             spec.overlay_fingerprint(),
@@ -605,6 +650,29 @@ pub(super) async fn execute_remote_compilation(
         project_id, worker_config.id
     ));
 
+    let remote_cap = compilation_config.timeout_for_kind(kind);
+    let command_timeout = if compilation_config.external_timeout_enabled() {
+        remote_cap + std::time::Duration::from_secs(30)
+    } else {
+        remote_cap
+    };
+    // Acquire before topology's ownership repair can inspect/change the pair.
+    let mut source_pair_lock = if source_pair_pool.is_some()
+        && !super::ssh::should_skip_remote_preflight(&worker_config)
+    {
+        reporter.verbose("[RCH] waiting for the clean-overlay source/target pair; same-pool jobs serialize through retrieval");
+        Some(
+            acquire_clean_overlay_source_pair(
+                &worker_config,
+                &sync_plan[0].remote_root,
+                command_timeout,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     // Ensure deterministic remote topology before any repo synchronization.
     // bd-8iwkm/bd-gc0ze: the ownership sweep inside is scoped to this
     // dispatch's closure remote roots so its cost tracks the trees about to
@@ -631,12 +699,6 @@ pub(super) async fn execute_remote_compilation(
     // first rsync until Cargo exits. A sync-only lock is insufficient: another
     // invocation could otherwise replace a manifest or source file after
     // preflight while rustc is still opening the closure.
-    let remote_cap = compilation_config.timeout_for_kind(kind);
-    let command_timeout = if compilation_config.external_timeout_enabled() {
-        remote_cap + std::time::Duration::from_secs(30)
-    } else {
-        remote_cap
-    };
     let mut source_authority_lock = if mutable_source_authority_roots.is_empty()
         || super::ssh::should_skip_remote_preflight(&worker_config)
     {
@@ -659,7 +721,6 @@ pub(super) async fn execute_remote_compilation(
         ));
         Some(guard)
     };
-
     // Best-effort repo convergence for ordinary multi-repo dependency graphs.
     // A clean-overlay run already names an immutable base; mutating repositories
     // behind that receipt would break the source identity guarantee.
@@ -681,18 +742,18 @@ pub(super) async fn execute_remote_compilation(
     // remote incremental cache instead of cold-recompiling into a unique-per-job
     // dir. `RCH_DISABLE_TARGET_REUSE=1` restores the legacy unique-per-job name.
     let remote_cargo_target_dir_name_override = forwarded_cargo_target_dir.as_ref().map(|_| {
-        if target_reuse_disabled() {
+        if reuse_disabled {
             reporter.verbose(
-                "[RCH] remote target-dir reuse disabled (RCH_DISABLE_TARGET_REUSE); using unique-per-job dir",
+                "[RCH] remote target-dir reuse disabled (explicit opt-out or Windows clean-overlay); using unique-per-job dir",
             );
             remote_cargo_target_dir_name(build_id, &worker_config.id)
         } else {
-            let name = remote_cargo_pooled_target_dir_name(
+            let name = source_pair_pool.clone().unwrap_or_else(|| remote_cargo_pooled_target_dir_name(
                 &worker_config.id,
                 &normalized_project_root,
                 toolchain,
                 command,
-            );
+            ));
             reporter.verbose(&format!(
                 "[RCH] remote target-dir reuse active; pooled dir {name}"
             ));
@@ -705,7 +766,7 @@ pub(super) async fn execute_remote_compilation(
         clean_overlay.is_some(),
         &transfer_config.remote_base,
     );
-    let pooled_target_dir_override = if target_reuse_disabled() {
+    let pooled_target_dir_override = if reuse_disabled {
         None
     } else {
         pooled_store_base
@@ -904,6 +965,11 @@ pub(super) async fn execute_remote_compilation(
                 merge_sync_result(&base_result, &overlay_result)
             };
             spec.verify_overlay_unchanged(&entry.local_root)?;
+            if source_pair_pool.is_some() {
+                root_pipeline
+                    .refresh_clean_overlay_source(&worker_config)
+                    .await?;
+            }
             Ok(result)
         } else if sync_streaming {
             root_pipeline
@@ -1020,6 +1086,16 @@ pub(super) async fn execute_remote_compilation(
             normalized_project_root.display()
         )
     })?;
+    let managed_overlay_command = clean_overlay
+        .filter(|_| kind.is_some_and(|kind| kind.command_base() == "cargo"))
+        .map(|_| {
+            super::cargo_target_dir::managed_clean_overlay_cargo_build_dir(
+                command,
+                &pipeline.remote_cargo_target_dir(),
+            )
+        })
+        .transpose()?;
+    let command = managed_overlay_command.as_deref().unwrap_or(command);
     info!(
         "Sync complete: {} files, {} bytes in {}ms",
         sync_result.files_transferred, sync_result.bytes_transferred, sync_result.duration_ms
@@ -1074,6 +1150,9 @@ pub(super) async fn execute_remote_compilation(
         verify_source_content_roots(&worker_config, &prepared_source_roots).await?;
     }
     if let Some(lock) = source_authority_lock.as_mut() {
+        lock.ensure_held()?;
+    }
+    if let Some(lock) = source_pair_lock.as_mut() {
         lock.ensure_held()?;
     }
 
@@ -1201,6 +1280,12 @@ pub(super) async fn execute_remote_compilation(
             },
         )
         .await?;
+
+    if let Some(lock) = source_pair_lock.as_mut() {
+        // The execution SSH session is separate from the holder. A healthy
+        // holder cannot prove Cargo stopped after that transport was lost.
+        lock.ensure_execution_finished(result.exit_code)?;
+    }
 
     if let Some(lock) = source_authority_lock.take() {
         lock.release().await?;
@@ -1842,13 +1927,16 @@ pub(super) async fn execute_remote_compilation(
         result.exit_code
     };
 
-    // bd-p1vlb: a clean-overlay root is invocation-unique (a job nonce is
+    // bd-p1vlb: an unpooled clean-overlay root is invocation-unique (a job nonce is
     // hashed into it) and holds a full materialized snapshot; once artifacts
     // and declared result dirs are retrieved above, the tree is dead weight
     // on the worker's staging base. Best-effort reap: failures only log —
     // residue is caught by periodic `rch cache clean --base` sweeps — and
     // never affect the surfaced exit code.
     if let Some(overlay_remote_root) = overlay_remote_root.as_deref() {
+        if let Some(lock) = source_pair_lock.as_mut() {
+            lock.ensure_held()?;
+        }
         match pipeline
             .reap_remote_tree(&worker_config, overlay_remote_root)
             .await
@@ -1861,6 +1949,12 @@ pub(super) async fn execute_remote_compilation(
                 overlay_remote_root, worker_config.id
             ),
         }
+    }
+    if let Some(lock) = source_pair_lock.take() {
+        // The explicit acknowledgment also verifies that the root is gone.
+        // Never release this lease from an error/Drop path: a remote process
+        // or transfer may still be alive after its client disconnects.
+        lock.release().await?;
     }
 
     Ok(RemoteExecutionResult {
@@ -1875,7 +1969,41 @@ pub(super) async fn execute_remote_compilation(
 #[cfg(test)]
 mod tests {
     use super::clean_overlay_remote_project_hash;
+    use super::clean_overlay_source_pair_pool_name;
     use super::foreign_artifact_gate_disabled_from_value;
+
+    #[test]
+    fn source_pair_pool_migrates_legacy_artifacts_and_keeps_pool_isolation() {
+        let legacy = ".rch-target-worker-pool-0123456789abcdef0123456789abcdef";
+        let paired = clean_overlay_source_pair_pool_name(legacy, "/tmp/rch");
+        assert_ne!(paired, legacy);
+        assert_eq!(
+            paired,
+            clean_overlay_source_pair_pool_name(legacy, "/tmp/rch/")
+        );
+        assert_ne!(
+            paired,
+            clean_overlay_source_pair_pool_name(legacy, "/data/rch")
+        );
+        assert!(paired.starts_with(".rch-target-worker-pool-"));
+        let hash = paired.rsplit_once('-').unwrap().1;
+        assert_eq!(hash.len(), 32);
+        assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(
+            paired,
+            clean_overlay_source_pair_pool_name(
+                ".rch-target-worker-pool-fedcba9876543210fedcba9876543210",
+                "/tmp/rch"
+            )
+        );
+        assert_ne!(
+            paired,
+            clean_overlay_source_pair_pool_name(
+                ".rch-target-other-pool-0123456789abcdef0123456789abcdef",
+                "/tmp/rch"
+            )
+        );
+    }
 
     #[test]
     fn foreign_artifact_gate_is_on_unless_explicitly_disabled() {

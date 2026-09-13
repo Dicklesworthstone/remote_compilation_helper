@@ -49,9 +49,22 @@ pub(super) struct RemoteSourceAuthorityLock {
     stdin: Option<tokio::process::ChildStdin>,
     stdout_drain: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
     stderr_drain: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
+    release_request: Option<String>,
 }
 
 impl RemoteSourceAuthorityLock {
+    /// OpenSSH uses 255 for transport errors; a missing local exit status is
+    /// represented as -1. Neither proves that remote Cargo has stopped.
+    pub(super) fn ensure_execution_finished(&mut self, exit_code: i32) -> anyhow::Result<()> {
+        self.ensure_held()?;
+        if !(0..255).contains(&exit_code) {
+            anyhow::bail!(
+                "source pair remains occupied: SSH execution exit {exit_code} does not prove remote completion"
+            );
+        }
+        Ok(())
+    }
+
     /// Fail closed if the lock-holder SSH process disappeared before Cargo starts.
     pub(super) fn ensure_held(&mut self) -> anyhow::Result<()> {
         let child = self
@@ -70,12 +83,24 @@ impl RemoteSourceAuthorityLock {
 
     /// Release the locks after Cargo exits and prove the holder stayed healthy.
     pub(super) async fn release(mut self) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        if let Some(request) = self.release_request.as_ref() {
+            let stdin = self
+                .stdin
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("source-pair release stdin is missing"))?;
+            tokio::time::timeout_at(deadline, stdin.write_all(format!("{request}\n").as_bytes()))
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out sending source-pair release"))??;
+        }
         drop(self.stdin.take());
         let mut child = self
             .child
             .take()
             .ok_or_else(|| anyhow::anyhow!("remote source-authority lock is not active"))?;
-        let status = match timeout(Duration::from_secs(15), child.wait()).await {
+        let status = match tokio::time::timeout_at(deadline, child.wait()).await {
             Ok(status) => status?,
             Err(_) => {
                 let _ = child.start_kill();
@@ -94,6 +119,14 @@ impl RemoteSourceAuthorityLock {
                 status,
                 String::from_utf8_lossy(&stdout).trim(),
                 String::from_utf8_lossy(&stderr).trim()
+            );
+        }
+        if let Some(request) = self.release_request.as_ref()
+            && stdout != format!("{request}\n").as_bytes()
+        {
+            anyhow::bail!(
+                "source-pair release acknowledgment missing on {}",
+                self.worker_id
             );
         }
         Ok(())
@@ -198,8 +231,6 @@ pub(super) async fn acquire_remote_source_authority_lock(
     authority_roots: &[String],
     wait_timeout: Duration,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
-    use anyhow::Context as _;
-
     let lock_paths = source_authority_lock_paths(authority_roots);
     let ready_marker = format!("RCH_SOURCE_AUTHORITY_READY:{}", uuid::Uuid::new_v4());
     let remote_cmd = build_remote_source_authority_lock_cmd(
@@ -207,6 +238,72 @@ pub(super) async fn acquire_remote_source_authority_lock(
         &lock_paths,
         &ready_marker,
     )?;
+    spawn_source_authority_lock(worker, &remote_cmd, &ready_marker, wait_timeout).await
+}
+
+/// A reusable source path must remain unavailable after holder loss: the old
+/// upload/build can outlive its control SSH connection. Only explicit release
+/// after execution, retrieval and source retirement permits the next owner.
+pub(super) async fn acquire_clean_overlay_source_pair(
+    worker: &WorkerConfig,
+    source_root: &str,
+    wait_timeout: Duration,
+) -> anyhow::Result<RemoteSourceAuthorityLock> {
+    let lock_path = source_authority_lock_paths(&[source_root.to_string()])
+        .into_iter()
+        .next()
+        .expect("one source root produces one lock");
+    let token = uuid::Uuid::new_v4().to_string();
+    let ready = format!("RCH_SOURCE_PAIR_READY:{token}");
+    let release = format!("RCH_SOURCE_PAIR_RELEASE:{token}");
+    let command =
+        clean_overlay_source_pair_lock_command(&lock_path, source_root, &token, &ready, &release);
+    let mut guard = spawn_source_authority_lock(worker, &command, &ready, wait_timeout).await?;
+    guard.release_request = Some(release);
+    Ok(guard)
+}
+
+fn clean_overlay_source_pair_lock_command(
+    lock_path: &str,
+    source_root: &str,
+    token: &str,
+    ready: &str,
+    release: &str,
+) -> String {
+    let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    let owner = format!("{lock_path}.owner");
+    let script = format!(
+        "set -eu; owner={owner}; root={root}; token={token}; \
+         if [ -L \"$owner\" ] || {{ [ -e \"$owner\" ] && [ \"$(cat \"$owner\")\" != released ]; }}; then \
+         echo 'RCH: source pair has an unfinished owner; inspect the prior job or use RCH_DISABLE_TARGET_REUSE=1' >&2; exit 1; fi; \
+         if [ -e \"$root\" ] || [ -L \"$root\" ]; then \
+         echo 'RCH: source pair has unretired source; refusing reuse' >&2; exit 1; fi; \
+         printf '%s\\n' \"$token\" > \"$owner\"; mkdir -p \"$root\"; \
+         printf '%s\\n' {ready}; IFS= read -r request; \
+         [ \"$request\" = {release} ]; [ \"$(cat \"$owner\")\" = \"$token\" ]; \
+         [ ! -e \"$root\" ] && [ ! -L \"$root\" ]; \
+         printf 'released\\n' > \"$owner\"; printf '%s\\n' {release}",
+        owner = quote(&owner),
+        root = quote(source_root),
+        token = quote(token),
+        ready = quote(ready),
+        release = quote(release),
+    );
+    format!(
+        "mkdir -p {} && exec flock -x {} sh -c {}",
+        quote(REMOTE_SOURCE_AUTHORITY_LOCK_DIR),
+        quote(lock_path),
+        quote(&script),
+    )
+}
+
+async fn spawn_source_authority_lock(
+    worker: &WorkerConfig,
+    remote_cmd: &str,
+    ready_marker: &str,
+    wait_timeout: Duration,
+) -> anyhow::Result<RemoteSourceAuthorityLock> {
+    use anyhow::Context as _;
     let identity_file = shellexpand::tilde(&worker.identity_file);
     let destination = format!("{}@{}", worker.user, worker.host);
     let mut cmd = Command::new("ssh");
@@ -216,7 +313,7 @@ pub(super) async fn acquire_remote_source_authority_lock(
     cmd.arg("-i").arg(identity_file.as_ref());
     cmd.arg(&destination);
     let (remote_arg, stdin_bootstrap) =
-        source_authority_lock_transport(WorkerPlatform::from_worker(worker), &remote_cmd);
+        source_authority_lock_transport(WorkerPlatform::from_worker(worker), remote_cmd);
     cmd.arg(remote_arg);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -229,7 +326,7 @@ pub(super) async fn acquire_remote_source_authority_lock(
     finish_source_authority_lock_acquisition(
         child,
         worker.id.clone(),
-        &ready_marker,
+        ready_marker,
         stdin_bootstrap.as_deref(),
         wait_timeout,
     )
@@ -273,6 +370,7 @@ async fn finish_source_authority_lock_acquisition(
         stdin: None,
         stdout_drain: None,
         stderr_drain: Some(stderr_drain),
+        release_request: None,
     };
 
     let mut observed = String::new();
@@ -893,6 +991,167 @@ mod tests {
             source_authority_lock_paths(&["/data/projects/frankensqlite".to_string()]),
             "the same canonical root must serialize source-only revisions even when their project hashes differ"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn claim_test_source_pair(
+        lock: &Path,
+        root: &Path,
+    ) -> anyhow::Result<RemoteSourceAuthorityLock> {
+        let token = uuid::Uuid::new_v4().to_string();
+        let ready = format!("ready:{token}");
+        let release = format!("release:{token}");
+        let script = clean_overlay_source_pair_lock_command(
+            lock.to_str().unwrap(),
+            root.to_str().unwrap(),
+            &token,
+            &ready,
+            &release,
+        );
+        let child = Command::new("sh")
+            .args(["-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut guard = finish_source_authority_lock_acquisition(
+            child,
+            WorkerId::new("local-pair-test"),
+            &ready,
+            None,
+            Duration::from_secs(5),
+        )
+        .await?;
+        guard.release_request = Some(release);
+        Ok(guard)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_pair_serializes_until_retirement_and_explicit_release() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let root = dir.join("source with ' quotes");
+        let lock = dir.join("pair.lock");
+        let first = claim_test_source_pair(&lock, &root).await.unwrap();
+        std::fs::write(root.join("fixture"), "first").unwrap();
+        let second_lock = lock.clone();
+        let second_root = root.clone();
+        let mut second =
+            tokio::spawn(async move { claim_test_source_pair(&second_lock, &second_root).await });
+        assert!(
+            timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("fixture")).unwrap(),
+            "first"
+        );
+        // Retire rather than delete so the test preserves its evidence.
+        std::fs::rename(&root, dir.join("first-retired")).unwrap();
+        first.release().await.unwrap();
+        let second = timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(root.is_dir());
+        assert!(!root.join("fixture").exists());
+        std::fs::write(root.join("fixture"), "second").unwrap();
+        std::fs::rename(&root, dir.join("second-retired")).unwrap();
+        second.release().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("first-retired/fixture")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("second-retired/fixture")).unwrap(),
+            "second"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pair.lock.owner")).unwrap(),
+            "released\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_pair_holder_loss_never_authorizes_another_writer() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let root = dir.join("source");
+        let lock = dir.join("pair.lock");
+        let first = claim_test_source_pair(&lock, &root).await.unwrap();
+        std::fs::write(root.join("fixture"), "owned by interrupted job").unwrap();
+        drop(first);
+        let error = match claim_test_source_pair(&lock, &root).await {
+            Ok(_) => panic!("holder loss must not release a reusable source path"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unfinished owner"), "{error:#}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("fixture")).unwrap(),
+            "owned by interrupted job"
+        );
+        assert_ne!(
+            std::fs::read_to_string(dir.join("pair.lock.owner")).unwrap(),
+            "released\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_pair_execution_transport_loss_preserves_a_running_reader() {
+        use tokio::io::AsyncWriteExt as _;
+
+        for exit_code in [255, -1] {
+            let dir = tempfile::tempdir().unwrap().keep();
+            let root = dir.join("source");
+            let lock = dir.join("pair.lock");
+            let mut owner = claim_test_source_pair(&lock, &root).await.unwrap();
+            std::fs::write(root.join("fixture"), "original source").unwrap();
+            // A separate execution process can survive a transport failure.
+            // Hold it until another claimant has attempted to reuse the pair.
+            let mut reader = Command::new("sh")
+                .current_dir(&root)
+                .args(["-c", "IFS= read -r signal; cat fixture"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            owner.ensure_execution_finished(0).unwrap();
+            owner.ensure_execution_finished(101).unwrap();
+            assert!(owner.ensure_execution_finished(exit_code).is_err());
+            drop(owner);
+            assert!(claim_test_source_pair(&lock, &root).await.is_err());
+            let mut stdin = reader.stdin.take().unwrap();
+            stdin.write_all(b"read\n").await.unwrap();
+            drop(stdin);
+            let output = timeout(Duration::from_secs(5), reader.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"original source");
+            assert!(root.is_dir());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_pair_rejects_empty_or_malformed_ownership_state() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        for (index, contents) in ["", "release", "released\noccupied", "unknown"]
+            .iter()
+            .enumerate()
+        {
+            let lock = dir.join(format!("pair-{index}.lock"));
+            let root = dir.join(format!("source-{index}"));
+            std::fs::write(dir.join(format!("pair-{index}.lock.owner")), contents).unwrap();
+            assert!(claim_test_source_pair(&lock, &root).await.is_err());
+            assert!(!root.exists());
+        }
     }
 
     #[cfg(target_os = "linux")]
