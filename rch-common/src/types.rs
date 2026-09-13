@@ -5970,6 +5970,27 @@ retry_max = 2
     }
 
     #[test]
+    fn test_retry_config_random_jitter_stays_within_bounds() {
+        let _guard = test_guard!();
+        let config = RetryConfig {
+            base_delay_ms: 100,
+            max_delay_ms: 200,
+            jitter_factor: 0.25,
+            ..Default::default()
+        };
+
+        // Jitter applies after the exponential delay is capped. Exercise the
+        // real RNG without requiring any particular random value or sequence.
+        for (attempt, minimum_ms, maximum_ms) in [(1, 75, 125), (3, 150, 250)] {
+            for _ in 0..128 {
+                let delay = config.delay_for_attempt(attempt);
+                assert!(delay >= std::time::Duration::from_millis(minimum_ms));
+                assert!(delay <= std::time::Duration::from_millis(maximum_ms));
+            }
+        }
+    }
+
+    #[test]
     fn test_retry_config_should_retry() {
         let _guard = test_guard!();
         let config = RetryConfig {

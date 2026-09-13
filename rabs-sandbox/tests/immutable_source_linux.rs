@@ -1,4 +1,4 @@
-//! D004 acceptance (Linux): a coherent D018 snapshot materialized as
+//! D004/Q003 acceptance (Linux): a coherent sealed snapshot materialized as
 //! the workspace mounts READ-ONLY in the canonical namespace — a
 //! write-to-source attempt inside the sandbox FAILS as an error, output
 //! roots stay writable, a full cargo build still succeeds from the
@@ -12,7 +12,7 @@
 use rabs_sandbox::canonical_mounts::{CanonicalMountPlan, UnitMount};
 use rabs_sandbox::canonical_namespace::{HostIsolationSupport, build_canonical_argv, command_for};
 use rabs_sandbox::layout;
-use rabs_sandbox::snapshot_capture::{CaptureConfig, capture_coherent, scan_directory};
+use rabs_sandbox::snapshot_capture::capture_sealed_source;
 
 fn supported() -> Option<HostIsolationSupport> {
     let support = HostIsolationSupport::probe();
@@ -51,7 +51,7 @@ fn write(root: &std::path::Path, rel: &str, contents: &str) {
 fn immutable_snapshot_source_refuses_writes_and_still_builds() {
     let Some(support) = supported() else { return };
 
-    // A real fixture crate, captured through the D018 engine.
+    // A real fixture crate, captured as retained immutable bytes.
     let source = tempfile::tempdir().unwrap();
     write(
         source.path(),
@@ -72,11 +72,27 @@ fn immutable_snapshot_source_refuses_writes_and_still_builds() {
          name = \"rabs-d004\"\n\
          version = \"0.1.0\"\n",
     );
-    let manifest = capture_coherent(CaptureConfig::generation_scan(), "workspace", |_a, _p| {
-        scan_directory(source.path(), false)
-    })
+    let image = capture_sealed_source(
+        &[("workspace".to_string(), source.path().to_path_buf())],
+        false,
+        3,
+        64 * 1024,
+    )
     .unwrap();
-    let provenance = manifest.provenance();
+    let provenance = image.provenance("workspace").unwrap();
+    // A read-only bind of the live checkout would still observe this host
+    // edit. The sandbox must instead build from the distinct sealed image.
+    write(
+        source.path(),
+        "src/main.rs",
+        "compile_error!(\"live checkout changed\");\n",
+    );
+    let snapshot_store = tempfile::tempdir().unwrap();
+    let materialized = image
+        .materialize_into(&snapshot_store.path().join("snapshot"))
+        .unwrap();
+    let backing = materialized.backing("workspace").unwrap();
+    assert_ne!(backing, source.path());
 
     let cargo_home = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -87,10 +103,10 @@ fn immutable_snapshot_source_refuses_writes_and_still_builds() {
         cargo_home.path(),
         home.path(),
     )
-    .with_immutable_source(source.path(), provenance.clone());
+    .with_immutable_source(backing, provenance.clone());
     assert_eq!(
         plan.immutable_source.as_ref().unwrap().manifest_sha256,
-        manifest.manifest_sha256,
+        provenance.manifest_sha256,
         "snapshot identity must be bound into the plan's provenance"
     );
     plan.out_units.push(UnitMount {
@@ -128,10 +144,14 @@ fn immutable_snapshot_source_refuses_writes_and_still_builds() {
     // And the backing snapshot on the host is byte-identical to what
     // was captured — nothing leaked through.
     assert_eq!(
-        std::fs::read_to_string(source.path().join("src/main.rs")).unwrap(),
+        std::fs::read_to_string(backing.join("src/main.rs")).unwrap(),
         "fn main() {}\n"
     );
-    assert!(!source.path().join("injected.rs").exists());
+    assert!(!backing.join("injected.rs").exists());
+    assert_eq!(
+        std::fs::read_to_string(source.path().join("src/main.rs")).unwrap(),
+        "compile_error!(\"live checkout changed\");\n"
+    );
 
     // Part 2: a full cargo build still succeeds from the read-only
     // immutable source (outputs land in the out unit, not the source).

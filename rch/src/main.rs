@@ -34,7 +34,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
 use rch_common::{ApiError, ApiResponse, ErrorCode, LogConfig, init_logging};
-use schemars::schema_for;
+use schemars::generate::SchemaSettings;
 use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -2501,6 +2501,11 @@ fn handle_schema_command(action: SchemaAction, ctx: &OutputContext) -> Result<()
 
 /// Handle --schema flag: output JSON Schema for the specified command's JSON output format.
 fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
+    println!("{}", schema_json_for_command(command)?);
+    Ok(())
+}
+
+fn schema_json_for_command(command: &Option<Commands>) -> Result<String> {
     use commands::{
         ConfigDiffResponse, ConfigDoctorResponse, ConfigGetResponse, ConfigLintResponse,
         ConfigResetResponse, ConfigShowResponse, ConfigValidationResponse, DaemonStatusResponse,
@@ -2510,31 +2515,45 @@ fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
     let schema_json = match command {
         Some(Commands::Config { action }) => match action {
             ConfigAction::Lint => {
-                let schema = schema_for!(ConfigLintResponse);
+                let schema = SchemaSettings::draft07()
+                    .into_generator()
+                    .into_root_schema_for::<ConfigLintResponse>();
                 serde_json::to_string_pretty(&schema)?
             }
             ConfigAction::Doctor => {
-                let schema = schema_for!(ConfigDoctorResponse);
+                let schema = SchemaSettings::draft07()
+                    .into_generator()
+                    .into_root_schema_for::<ConfigDoctorResponse>();
                 serde_json::to_string_pretty(&schema)?
             }
             ConfigAction::Diff => {
-                let schema = schema_for!(ConfigDiffResponse);
+                let schema = SchemaSettings::draft07()
+                    .into_generator()
+                    .into_root_schema_for::<ConfigDiffResponse>();
                 serde_json::to_string_pretty(&schema)?
             }
             ConfigAction::Show { .. } => {
-                let schema = schema_for!(ConfigShowResponse);
+                let schema = SchemaSettings::draft07()
+                    .into_generator()
+                    .into_root_schema_for::<ConfigShowResponse>();
                 serde_json::to_string_pretty(&schema)?
             }
             ConfigAction::Get { .. } => {
-                let schema = schema_for!(ConfigGetResponse);
+                let schema = SchemaSettings::draft07()
+                    .into_generator()
+                    .into_root_schema_for::<ConfigGetResponse>();
                 serde_json::to_string_pretty(&schema)?
             }
             ConfigAction::Reset { .. } => {
-                let schema = schema_for!(ConfigResetResponse);
+                let schema = SchemaSettings::draft07()
+                    .into_generator()
+                    .into_root_schema_for::<ConfigResetResponse>();
                 serde_json::to_string_pretty(&schema)?
             }
             ConfigAction::Validate => {
-                let schema = schema_for!(ConfigValidationResponse);
+                let schema = SchemaSettings::draft07()
+                    .into_generator()
+                    .into_root_schema_for::<ConfigValidationResponse>();
                 serde_json::to_string_pretty(&schema)?
             }
             _ => {
@@ -2547,7 +2566,9 @@ fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
         },
         Some(Commands::Workers { action }) => match action {
             WorkersAction::List { .. } => {
-                let schema = schema_for!(WorkersListResponse);
+                let schema = SchemaSettings::draft07()
+                    .into_generator()
+                    .into_root_schema_for::<WorkersListResponse>();
                 serde_json::to_string_pretty(&schema)?
             }
             _ => {
@@ -2560,7 +2581,9 @@ fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
         },
         Some(Commands::Daemon { action }) => match action {
             DaemonAction::Status => {
-                let schema = schema_for!(DaemonStatusResponse);
+                let schema = SchemaSettings::draft07()
+                    .into_generator()
+                    .into_root_schema_for::<DaemonStatusResponse>();
                 serde_json::to_string_pretty(&schema)?
             }
             _ => {
@@ -2572,24 +2595,32 @@ fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
             }
         },
         Some(Commands::Diagnose { .. }) => {
-            let schema = schema_for!(DiagnoseResponse);
+            let schema = SchemaSettings::draft07()
+                .into_generator()
+                .into_root_schema_for::<DiagnoseResponse>();
             serde_json::to_string_pretty(&schema)?
         }
         Some(Commands::Why {
             action: commands::why::WhyAction::Miss { .. },
         }) => {
-            let schema = schema_for!(commands::why::MissExplanation);
+            let schema = SchemaSettings::draft07()
+                .into_generator()
+                .into_root_schema_for::<commands::why::MissExplanation>();
             serde_json::to_string_pretty(&schema)?
         }
         Some(Commands::Why {
             action: commands::why::WhyAction::Refusal { .. },
         }) => {
-            let schema = schema_for!(commands::why::RefusalExplanation);
+            let schema = SchemaSettings::draft07()
+                .into_generator()
+                .into_root_schema_for::<commands::why::RefusalExplanation>();
             serde_json::to_string_pretty(&schema)?
         }
         Some(Commands::Hook { action }) => match action {
             HookAction::Install | HookAction::Uninstall { .. } | HookAction::Status => {
-                let schema = schema_for!(HookActionResponse);
+                let schema = SchemaSettings::draft07()
+                    .into_generator()
+                    .into_root_schema_for::<HookActionResponse>();
                 serde_json::to_string_pretty(&schema)?
             }
             _ => {
@@ -2622,8 +2653,7 @@ fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
         }
     };
 
-    println!("{schema_json}");
-    Ok(())
+    Ok(schema_json)
 }
 
 /// JSON structure for --help-json output.
@@ -6190,6 +6220,44 @@ fn open_browser(url: &str) -> Result<()> {
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[test]
+    fn cli_schema_exports_preserve_draft_7() {
+        let _guard = test_guard!();
+        let commands: &[&[&str]] = &[
+            &["config", "lint"],
+            &["config", "doctor"],
+            &["config", "diff"],
+            &["config", "show"],
+            &["config", "get", "general.enabled"],
+            &["config", "reset", "general.enabled"],
+            &["config", "validate"],
+            &["workers", "list"],
+            &["daemon", "status"],
+            &["diagnose", "cargo", "build"],
+            &["why", "miss", "--prior", "p.json", "--current", "c.json"],
+            &["why", "refusal", "--outcome", "first-seen"],
+            &["hook", "install"],
+            &["hook", "uninstall"],
+            &["hook", "status"],
+        ];
+        for command in commands {
+            let cli = Cli::try_parse_from(
+                ["rch", "--schema"]
+                    .into_iter()
+                    .chain(command.iter().copied()),
+            )
+            .unwrap();
+            let schema: serde_json::Value =
+                serde_json::from_str(&schema_json_for_command(&cli.command).unwrap()).unwrap();
+            assert_eq!(
+                schema["$schema"], "http://json-schema.org/draft-07/schema#",
+                "{command:?}"
+            );
+            assert!(schema.get("$defs").is_none(), "{command:?}");
+            assert_eq!(schema["type"], "object", "{command:?}");
+        }
+    }
 
     // ── `rch gc` surface (scope-gap fix) ───────────────────────────────────
 

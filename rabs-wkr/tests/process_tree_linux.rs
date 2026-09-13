@@ -8,9 +8,11 @@
 //!    installed (pure env surgery).
 //! 2. End-to-end through `execute_canonical`: the action inside the
 //!    canonical namespace records its own coordination env into its
-//!    writable workspace — observing EXACTLY `MAKEFLAGS=-j<slots>`,
-//!    nothing smuggled — while the managed group resolves with zero
-//!    residual members.
+//!    writable workspace — observing the granted budget and a reachable
+//!    worker-owned fifo, nothing smuggled — while the managed group
+//!    resolves with zero residual members.
+//! 3. Failed bridge setup refuses execution instead of silently
+//!    replacing the grant with independent make pools.
 //!
 //! Group-membership/TERM mechanics themselves are covered by the
 //! mechanism module's own tests in rabs-asupersync.
@@ -83,18 +85,93 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
     // The action writes EVERY coordination var it can see into its own
     // writable workspace — the only honest way to assert what the
     // namespace actually presented (the wire carries digests, not bytes).
+    for (requested_grant, expected_grant) in
+        [(Some(2), 2), (Some(u32::MAX), 6), (Some(0), 1), (None, 6)]
+    {
+        let request = CanonicalExecRequest {
+            request_id: 424_242,
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "auth=${MAKEFLAGS##*--jobserver-auth=fifo:}; test -p \"$auth\" || exit 71; \
+             env | grep -E '^(MAKEFLAGS|MFLAGS|CARGO_MAKEFLAGS|NUM_JOBS)=' \
+             > /__rabs/workspace/coord.txt"
+                    .to_string(),
+            ],
+            toolchain_backing: toolchain.path().display().to_string(),
+            workspace_backing: workspace.path().display().to_string(),
+            jobserver_grant: requested_grant,
+        };
+        let result = execute_canonical(
+            &request,
+            cargo_home.path(),
+            home.path(),
+            6,
+            &workspace.path().join("spills"),
+        );
+
+        assert!(result.executed, "namespace host must execute, not refuse");
+        assert_eq!(
+            result.exit_code, 0,
+            "advertised fifo must exist inside the namespace and coordination env must be present"
+        );
+        assert_eq!(
+            result.residual_group_members, 0,
+            "the managed group must resolve with zero surviving members"
+        );
+
+        let observed = std::fs::read_to_string(workspace.path().join("coord.txt"))
+            .expect("action wrote coord.txt");
+        let observed: BTreeMap<_, _> = observed
+            .lines()
+            .map(|line| line.split_once('=').expect("coordination assignment"))
+            .collect();
+        assert_eq!(observed.len(), 2, "no foreign coordination variables");
+        assert_eq!(
+            observed["NUM_JOBS"],
+            expected_grant.to_string(),
+            "effective grant replaces host slots"
+        );
+        let expected_auth =
+            format!("-j{expected_grant} --jobserver-auth=fifo:/__rabs/workspace/.rabs-jobserver/");
+        let fifo_name = observed["MAKEFLAGS"]
+            .strip_prefix(expected_auth.as_str())
+            .expect("worker auth points into the bound bridge directory");
+        assert!(fifo_name.starts_with("rabs-jobserver-"));
+        assert!(fifo_name.ends_with(".fifo"));
+        assert!(!fifo_name.contains('/'));
+        assert!(
+            !workspace
+                .path()
+                .join(".rabs-jobserver")
+                .join(fifo_name)
+                .exists(),
+            "resolved attempt releases its fifo"
+        );
+    }
+}
+
+#[test]
+fn jobserver_setup_failure_refuses_execution() {
+    if !namespace_supported() {
+        return;
+    }
+    let toolchain = tempfile::tempdir().expect("toolchain tempdir");
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let cargo_home = tempfile::tempdir().expect("cargo-home tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let obstruction = workspace.path().join(".rabs-jobserver");
+    std::fs::write(&obstruction, b"keep this input").expect("bridge directory obstruction");
     let request = CanonicalExecRequest {
-        request_id: 424_242,
+        request_id: 424_243,
         program: "sh".to_string(),
         args: vec![
             "-c".to_string(),
-            "env | grep -E '^(MAKEFLAGS|MFLAGS|CARGO_MAKEFLAGS)=' \
-             > /__rabs/workspace/coord.txt"
-                .to_string(),
+            "echo started > /__rabs/workspace/started.txt".to_string(),
         ],
         toolchain_backing: toolchain.path().display().to_string(),
         workspace_backing: workspace.path().display().to_string(),
-        jobserver_grant: None,
+        jobserver_grant: Some(2),
     };
     let result = execute_canonical(
         &request,
@@ -103,18 +180,15 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
         6,
         &workspace.path().join("spills"),
     );
-
-    assert!(result.executed, "namespace host must execute, not refuse");
-    assert_eq!(result.exit_code, 0, "grep must find the coordination var");
-    assert_eq!(
-        result.residual_group_members, 0,
-        "the managed group must resolve with zero surviving members"
+    assert_eq!(result.request_id, request.request_id);
+    assert!(
+        !result.executed,
+        "missing shared jobserver must refuse the action"
     );
-
-    let observed = std::fs::read_to_string(workspace.path().join("coord.txt"))
-        .expect("action wrote coord.txt");
+    assert_eq!(result.exit_code, -1);
+    assert!(!workspace.path().join("started.txt").exists());
     assert_eq!(
-        observed, "MAKEFLAGS=-j6\n",
-        "action observes exactly one worker-authored budget, nothing smuggled"
+        std::fs::read(&obstruction).expect("preserved obstruction"),
+        b"keep this input"
     );
 }

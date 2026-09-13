@@ -123,6 +123,24 @@ pub struct ActiveBuildCleanup {
     context: DaemonContext,
 }
 
+/// Join the cancellation task before any potentially slow shutdown work.
+/// Once socket admission ends, missed heartbeats are no longer evidence that
+/// a client or its worker has stopped making progress.
+pub async fn stop_before_shutdown(
+    cleanup_handle: &mut Option<tokio::task::JoinHandle<()>>,
+    shutdown: impl std::future::Future<Output = ()>,
+) {
+    if let Some(handle) = cleanup_handle.take() {
+        handle.abort();
+        if let Err(error) = handle.await
+            && !error.is_cancelled()
+        {
+            warn!(%error, "Cleanup task failed while stopping daemon");
+        }
+    }
+    shutdown.await;
+}
+
 impl ActiveBuildCleanup {
     pub fn new(context: DaemonContext) -> Self {
         Self { context }
@@ -285,6 +303,65 @@ mod tests {
     use proptest::prelude::*;
     use rch_common::BuildHeartbeatPhase;
     use rch_common::test_guard;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_retains_live_quiet_job_while_normal_stale_cleanup_still_runs() {
+        struct QuietJob(std::process::Child);
+        impl Drop for QuietJob {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut job = QuietJob(
+            std::process::Command::new("sleep")
+                .arg("180")
+                .spawn()
+                .unwrap(),
+        );
+        let context = crate::test_daemon_context(crate::workers::WorkerPool::new());
+        let build = context.history.start_active_build(
+            "shutdown-quiet-job".into(),
+            "shutdown-test-unbound-worker".into(),
+            "sleep 180".into(),
+            job.0.id(),
+            1,
+            rch_common::BuildLocation::Remote,
+        );
+        context
+            .history
+            .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                build_id: build.id,
+                worker_id: rch_common::WorkerId::new("shutdown-test-unbound-worker"),
+                hook_pid: Some(job.0.id()),
+                local_wrapper_id: None,
+                remote_pgid_file: None,
+                phase: BuildHeartbeatPhase::Execute,
+                detail: None,
+                progress_counter: None,
+                progress_percent: None,
+            })
+            .unwrap();
+        let mut cleanup = Some(ActiveBuildCleanup::new(context.clone()).start());
+        // Let the real cleanup loop inspect the fresh live job once.
+        tokio::task::yield_now().await;
+        stop_before_shutdown(&mut cleanup, async {
+            // Real elapsed time matters: history uses std::time::Instant, not
+            // Tokio's virtual clock. This spans both production stale limits.
+            tokio::time::sleep(Duration::from_secs(PROGRESS_STALE_SECS + 6)).await;
+            assert!(job.0.try_wait().unwrap().is_none());
+            assert!(context.history.active_build(build.id).is_some());
+        })
+        .await;
+        assert!(cleanup.is_none());
+        // Negative control: the same now-stale record is still remediated by
+        // normal cleanup. Shutdown must not weaken its evidence thresholds.
+        ActiveBuildCleanup::new(context.clone())
+            .check_active_builds()
+            .await;
+        assert!(context.history.active_build(build.id).is_none());
+    }
 
     #[test]
     fn test_duration_millis_u64_saturates() {

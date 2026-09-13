@@ -277,7 +277,23 @@ fn test_no_color_disables_ansi_in_stderr() {
 fn test_daemon_status_error_to_stderr() {
     require_binary!();
 
-    let (_exit, stdout, _stderr) = run_rch(&["daemon", "status"]);
+    let isolated = tempfile::tempdir().expect("isolated daemon status configuration");
+    let socket = isolated.path().join("absent.sock");
+    let mut command = Command::new(rch_binary()); // ubs:ignore — trusted test binary from Cargo or RCH_BINARY.
+    command
+        .args(["daemon", "status"])
+        .current_dir(isolated.path())
+        .env("RCH_CONFIG_DIR", isolated.path().join("config"))
+        .env("RCH_SOCKET_PATH", &socket)
+        .env("FORCE_COLOR", "1")
+        .env_remove("NO_COLOR")
+        .env_remove("RCH_JSON")
+        .env_remove("RCH_OUTPUT_FORMAT")
+        .env_remove("RCH_HOOK_MODE");
+    let output = command.output().expect("run colored daemon status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "daemon status failed: {stderr}");
 
     // stdout should be minimal for non-JSON commands
     // Errors (like daemon not running) should go to stderr
@@ -285,6 +301,42 @@ fn test_daemon_status_error_to_stderr() {
         !stdout.contains(ANSI_ESC),
         "daemon status stdout contains ANSI codes: {}",
         stdout
+    );
+    assert!(
+        stdout.is_empty(),
+        "human diagnostics belong on stderr: {stdout}"
+    );
+    assert!(
+        stderr.contains(ANSI_ESC),
+        "forced color must remain available on stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Not running"),
+        "missing status diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.contains("rch daemon start"),
+        "missing recovery hint: {stderr}"
+    );
+
+    let json_output = command
+        .arg("--json")
+        .output()
+        .expect("run daemon status JSON");
+    assert!(json_output.status.success());
+    let json_stdout = String::from_utf8_lossy(&json_output.stdout);
+    assert!(
+        !json_stdout.contains(ANSI_ESC),
+        "JSON must not contain ANSI: {json_stdout}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&json_stdout).unwrap_or_else(|error| {
+        panic!("daemon status JSON must stay on stdout: {error}: {json_stdout}") // ubs:ignore — malformed test output must fail the assertion.
+    });
+    assert_eq!(response["success"], true);
+    assert_eq!(response["data"]["running"], false);
+    assert_eq!(
+        response["data"]["socket_path"],
+        socket.to_str().expect("socket path")
     );
 }
 

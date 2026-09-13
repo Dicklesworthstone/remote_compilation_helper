@@ -39,6 +39,10 @@
 use crate::remediation_config::PooledTargetConfig;
 use crate::stale_target_reap::is_safe_reap_base;
 
+// These pure path constants and shell builders must remain platform-neutral:
+// shared GC classification uses them even on a native Windows worker, where
+// the SSH-dependent remote_compilation module is not compiled.
+
 /// Shell-snippet name of the variable that [`remote_cargo_home_base_prelude`]
 /// assigns the isolated-CARGO_HOME staging base into.
 pub const RCH_CARGO_HOME_BASE_VAR: &str = "RCH_CH_BASE";

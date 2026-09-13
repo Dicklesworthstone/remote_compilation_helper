@@ -8,6 +8,7 @@
         "--edition",
         "--emit",
         "--error-format",
+        "--force-warn",
         "--json",
         "--out-dir",
         "-C embed-bitcode",
@@ -17,7 +18,8 @@
       "json": [
         "artifacts",
         "diagnostic-rendered-ansi",
-        "future-incompat"
+        "future-incompat",
+        "unused-externs-silent"
       ]
     },
     "crate": {
@@ -28,6 +30,7 @@
         "--edition",
         "--emit",
         "--error-format",
+        "--force-warn",
         "--json",
         "--out-dir",
         "-C debuginfo",
@@ -39,7 +42,8 @@
       "json": [
         "artifacts",
         "diagnostic-rendered-ansi",
-        "future-incompat"
+        "future-incompat",
+        "unused-externs-silent"
       ]
     }
   },

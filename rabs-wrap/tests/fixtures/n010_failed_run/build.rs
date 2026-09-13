@@ -11,10 +11,13 @@ use std::path::PathBuf;
 
 fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    // Record the real build-script destination independently of its contents.
+    // Use a separate file for each phase so a skipped retry cannot reuse proof.
+    let record = env::var_os("N010_OUT_DIR_RECORD").expect("OUT_DIR record path");
+    fs::write(record, out.to_str().expect("fixture OUT_DIR is UTF-8")).unwrap();
     match env::var("N010_PHASE").as_deref() {
         Ok("fail") => {
-            fs::write(out.join("partial_one.rs"), "pub fn p1() -> u32 { 1 }\n")
-                .unwrap();
+            fs::write(out.join("partial_one.rs"), "pub fn p1() -> u32 { 1 }\n").unwrap();
             fs::write(out.join("partial_two.dat"), b"partial\n").unwrap();
             eprintln!("n010: failing after partial writes");
             std::process::exit(3);

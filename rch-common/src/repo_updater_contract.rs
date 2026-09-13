@@ -9,7 +9,8 @@
 //! - error taxonomy mapped into RCH error codes
 //! - a mockable adapter interface for unit/integration tests
 
-use schemars::{JsonSchema, schema::RootSchema, schema_for};
+use schemars::generate::SchemaSettings;
+use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1337,20 +1338,26 @@ pub fn evaluate_version_compatibility(
 
 /// Build JSON schema for adapter request.
 #[must_use]
-pub fn repo_updater_request_schema() -> RootSchema {
-    schema_for!(RepoUpdaterAdapterRequest)
+pub fn repo_updater_request_schema() -> Schema {
+    SchemaSettings::draft07()
+        .into_generator()
+        .into_root_schema_for::<RepoUpdaterAdapterRequest>()
 }
 
 /// Build JSON schema for normalized adapter response.
 #[must_use]
-pub fn repo_updater_response_schema() -> RootSchema {
-    schema_for!(RepoUpdaterAdapterResponse)
+pub fn repo_updater_response_schema() -> Schema {
+    SchemaSettings::draft07()
+        .into_generator()
+        .into_root_schema_for::<RepoUpdaterAdapterResponse>()
 }
 
 /// Build JSON schema for raw ru envelope.
 #[must_use]
-pub fn repo_updater_envelope_schema() -> RootSchema {
-    schema_for!(RepoUpdaterJsonEnvelope)
+pub fn repo_updater_envelope_schema() -> Schema {
+    SchemaSettings::draft07()
+        .into_generator()
+        .into_root_schema_for::<RepoUpdaterJsonEnvelope>()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

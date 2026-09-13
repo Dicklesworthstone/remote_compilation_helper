@@ -28,7 +28,7 @@ opentelemetry_sdk = { workspace = true }
 # `grpc-tonic` enables the OTLP/gRPC transport (`with_tonic`); the bead targets
 # OTLP gRPC export. Member-level features are additive to the workspace set.
 opentelemetry-otlp = { workspace = true, features = ["grpc-tonic"] }
-rusqlite = { version = "0.39.0", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 
 [features]
 default = ["storage"]

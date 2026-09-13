@@ -229,23 +229,52 @@ fn installed_channels() -> Vec<String> {
 }
 
 fn cargo_bin_for(channel: &str) -> String {
-    let Ok(out) = Command::new("rustup")
+    if channel == "default" {
+        return "cargo".to_owned();
+    }
+    let out = Command::new("rustup")
         .args(["which", "cargo", "--toolchain", channel])
         .output()
-    else {
-        return "cargo".to_owned();
-    };
-    if out.status.success() {
-        String::from_utf8_lossy(&out.stdout).trim().to_owned()
-    } else {
-        "cargo".to_owned()
+        .expect("locate channel cargo");
+    assert!(out.status.success(), "discovered channel Cargo must exist");
+    let mut cargo = PathBuf::from(
+        String::from_utf8(out.stdout)
+            .expect("Cargo path is UTF-8")
+            .trim(),
+    );
+    if fs::metadata(&cargo).expect("Cargo metadata").len() <= 8 * 1024
+        && fs::read_to_string(&cargo)
+            .expect("small Cargo wrapper is text")
+            .lines()
+            .any(|line| line.starts_with("# rch-toolchain-wrap-version:"))
+    {
+        cargo.set_file_name("cargo-rch-real");
+        assert!(cargo.is_file(), "managed shim must retain the real Cargo");
     }
+    cargo.to_str().expect("Cargo path is UTF-8").to_owned()
 }
 
 fn build_consumer(channel: &str, project: &Path) -> RunOutcome {
-    let mut cmd = Command::new(cargo_bin_for(channel));
+    let cargo = cargo_bin_for(channel);
+    let mut cmd = Command::new(&cargo);
+    if channel != "default" {
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let channel_path = std::env::join_paths(
+            std::iter::once(
+                Path::new(&cargo)
+                    .parent()
+                    .expect("Cargo bin directory")
+                    .to_path_buf(),
+            )
+            .chain(std::env::split_paths(&inherited_path)),
+        )
+        .expect("channel executable search path");
+        cmd.env("PATH", channel_path);
+    }
     cmd.arg("build")
         .current_dir(project.join("consumer"))
+        .env_remove("RUSTC")
+        .env_remove("CARGO_BUILD_RUSTC")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("RUSTFLAGS")

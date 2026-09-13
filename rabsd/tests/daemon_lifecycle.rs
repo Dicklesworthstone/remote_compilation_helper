@@ -115,17 +115,32 @@ fn spawn_daemon(marker: &std::path::Path) -> Child {
         .env("RABS_STATE_DIR", marker.with_extension("state"))
         .env("RABS_CONFIG", "/nonexistent-rabs-config")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn daemon")
 }
 
-fn wait_for_marker(marker: &std::path::Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+fn wait_for_marker(child: &mut Child, marker: &std::path::Path) {
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(5);
     while !marker.exists() {
-        assert!(Instant::now() < deadline, "daemon never wrote boot marker");
+        if let Some(status) = child.try_wait().expect("inspect daemon exit") {
+            panic!("daemon exited before writing boot marker: {status}");
+        }
+        if Instant::now() >= deadline {
+            // A failed readiness assertion must not leave our daemon running.
+            // Its inherited stderr remains in the test log for diagnosis.
+            let kill = child.kill();
+            let reaped = child.wait();
+            panic!("daemon never wrote boot marker; kill={kill:?}, wait={reaped:?}");
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
+    eprintln!(
+        "daemon {} boot marker observed after {:?}",
+        child.id(),
+        start.elapsed()
+    );
 }
 
 #[test]
@@ -133,7 +148,7 @@ fn sigterm_exits_clean_within_budget() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("rabsd.boot");
     let mut child = spawn_daemon(&marker);
-    wait_for_marker(&marker);
+    wait_for_marker(&mut child, &marker);
     // Give the signal listener a beat to install, then SIGTERM.
     std::thread::sleep(Duration::from_millis(150));
     let start = Instant::now();
@@ -157,7 +172,7 @@ fn kill_nine_leaves_evidence_and_next_boot_reports_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("rabsd.boot");
     let mut child = spawn_daemon(&marker);
-    wait_for_marker(&marker);
+    wait_for_marker(&mut child, &marker);
     child.kill().expect("SIGKILL"); // kill -9: no cleanup possible
     child.wait().expect("reaped");
     assert!(marker.exists(), "kill -9 must leave the crash evidence");

@@ -26,8 +26,8 @@
 use crate::api::response::AnyJson;
 use crate::api::{ApiError, ApiResponse};
 use crate::errors::catalog::{ErrorCategory, ErrorCode};
-use schemars::schema::RootSchema;
-use schemars::schema_for;
+use schemars::Schema;
+use schemars::generate::SchemaSettings;
 use serde::{Deserialize, Serialize};
 
 /// Generate JSON Schema for the API response envelope.
@@ -35,14 +35,18 @@ use serde::{Deserialize, Serialize};
 /// Returns the schema for `ApiResponse<AnyJson>` which represents
 /// the generic response envelope where `data` can be any JSON value.
 #[must_use]
-pub fn generate_api_response_schema() -> RootSchema {
-    schema_for!(ApiResponse<AnyJson>)
+pub fn generate_api_response_schema() -> Schema {
+    SchemaSettings::draft07()
+        .into_generator()
+        .into_root_schema_for::<ApiResponse<AnyJson>>()
 }
 
 /// Generate JSON Schema for API errors.
 #[must_use]
-pub fn generate_api_error_schema() -> RootSchema {
-    schema_for!(ApiError)
+pub fn generate_api_error_schema() -> Schema {
+    SchemaSettings::draft07()
+        .into_generator()
+        .into_root_schema_for::<ApiError>()
 }
 
 /// Machine-readable error code entry.
@@ -224,6 +228,33 @@ pub fn export_schemas(output_dir: &std::path::Path) -> std::io::Result<SchemaExp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_exported_contract_schemas_use_draft_7() {
+        let schemas = [
+            generate_api_response_schema(),
+            generate_api_error_schema(),
+            crate::proof_intent::proof_intent_schema(),
+            crate::bypass_record::bypass_record_schema(),
+            crate::worker_facts::worker_facts_schema(),
+            crate::repo_updater_contract::repo_updater_request_schema(),
+            crate::repo_updater_contract::repo_updater_response_schema(),
+            crate::repo_updater_contract::repo_updater_envelope_schema(),
+            crate::e2e::process_triage::process_triage_request_schema(),
+            crate::e2e::process_triage::process_triage_response_schema(),
+        ];
+        let values = schemas
+            .into_iter()
+            .map(|schema| serde_json::to_value(schema).unwrap())
+            .chain([
+                crate::redaction::RedactionPolicy::schema_json(),
+                crate::remediation_config::RemediationConfig::schema_json(),
+            ]);
+        for schema in values {
+            assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
+            assert!(schema.get("$defs").is_none());
+        }
+    }
 
     #[test]
     fn test_generate_api_response_schema() {

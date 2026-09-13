@@ -31,7 +31,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use schemars::{JsonSchema, schema_for};
+use schemars::JsonSchema;
+use schemars::generate::SchemaSettings;
 
 use crate::incident_ledger::{IncidentLedgerConfig, default_ledger_path};
 use crate::proof_intent::{ReplayConstraints, StaleSourcePolicy};
@@ -895,8 +896,12 @@ impl RemediationConfig {
     /// acceptance criterion; [`RemediationConfig::human_help`] is the human half.
     #[must_use]
     pub fn schema_json() -> serde_json::Value {
-        serde_json::to_value(schema_for!(RemediationConfig))
-            .expect("RemediationConfig schema serializes")
+        serde_json::to_value(
+            SchemaSettings::draft07()
+                .into_generator()
+                .into_root_schema_for::<RemediationConfig>(),
+        )
+        .expect("RemediationConfig schema serializes")
     }
 
     /// A human-readable summary of every knob and its default value.

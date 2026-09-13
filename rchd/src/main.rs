@@ -358,11 +358,11 @@ fn rchd_systemd_unit_present() -> bool {
 /// An explicitly separate socket AND worker configuration designate an isolated
 /// pool. Its operator must first drain those workers from any shared daemon.
 fn defer_to_systemd_if_managed(socket: &Path, workers_config: Option<&Path>) {
-    if isolated_worker_pool(socket, workers_config) {
-        return;
-    }
     #[cfg(target_os = "linux")]
     {
+        if isolated_worker_pool(socket, workers_config) {
+            return;
+        }
         // Only defer when we can CONFIRM we are not the unit's own process.
         // `Some(true)` (we ARE the unit) or `None` (cgroup unreadable) -> proceed,
         // so we never make the real unit exit-loop under systemd Restart=always.
@@ -380,8 +380,11 @@ fn defer_to_systemd_if_managed(socket: &Path, workers_config: Option<&Path>) {
             .status();
         std::process::exit(0);
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (socket, workers_config);
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn isolated_worker_pool(socket: &Path, workers_config: Option<&Path>) -> bool {
     socket != crate::config::default_socket_path() && workers_config.is_some()
 }
@@ -1285,17 +1288,19 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Graceful shutdown
-    info!("Stopping health monitor...");
-    health_monitor.stop().await;
-    let _ = health_handle.await;
+    // The accept loop has stopped, so clients can no longer refresh heartbeats.
+    // Stop cancellation before awaiting health probes: a slow probe must not
+    // turn a still-running client's quiet build into a false stuck-job signal.
+    cleanup::stop_before_shutdown(&mut cleanup_handle, async {
+        info!("Stopping health monitor...");
+        health_monitor.stop().await;
+        let _ = health_handle.await;
+    })
+    .await;
 
     // Abort background tasks that have no cancellation mechanism
     info!("Stopping background tasks...");
     if let Some(handle) = metrics_handle {
-        handle.abort();
-    }
-    if let Some(handle) = cleanup_handle {
         handle.abort();
     }
 

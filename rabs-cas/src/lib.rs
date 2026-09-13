@@ -32,8 +32,9 @@
 //!
 //! - May depend on `rabs-protocol` (and, as Epic H lands, explicitly
 //!   reviewed pure digest/compression/storage crates).
-//! - **No Tokio, no Asupersync** in the core storage path; async adaptation
-//!   happens in `rabs-asupersync`.
+//! - No direct Tokio or Asupersync dependency. Storage APIs are synchronous;
+//!   caller-side async adaptation happens in `rabs-asupersync`. The reviewed
+//!   FrankenSQLite backend encapsulates its runtime and worker lifecycle.
 //! - Filesystem effects are this crate's business; network effects are not.
 
 pub mod ancestor_selection;

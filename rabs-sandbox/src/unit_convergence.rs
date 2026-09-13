@@ -25,6 +25,9 @@
 //! carry no `--crate-name` and are skipped.
 
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::io;
+use std::path::{Component, Path, PathBuf};
 
 /// One recorded child rustc invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +90,72 @@ fn value_after(argv: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| argv.get(i + 1))
         .cloned()
+}
+
+/// Locate actual compiler output directories without assuming Cargo's internal
+/// artifact layout. Returns sorted, unique paths relative to `canonical_root`.
+/// Every recorded unit must supply a contained, unambiguous `--out-dir`.
+/// This validates lexical paths only; callers own the backing directory mapping.
+pub fn recorded_output_directories(
+    invocations: &[RustcInvocation],
+    canonical_root: &Path,
+) -> io::Result<Vec<PathBuf>> {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+    if !canonical_root.is_absolute()
+        || canonical_root
+            .components()
+            .any(|c| c == Component::ParentDir)
+    {
+        return Err(invalid(
+            "output root must be absolute without parent traversal",
+        ));
+    }
+    if invocations.is_empty() {
+        return Err(invalid("no recorded compiler units"));
+    }
+    let mut directories = BTreeSet::new();
+    for invocation in invocations {
+        let unit_error = |reason| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("compiler unit {}: {reason}", invocation.crate_name),
+            )
+        };
+        let mut output: Option<PathBuf> = None;
+        let mut args = invocation.argv.iter().skip(1);
+        while let Some(arg) = args.next() {
+            let value = if arg == "--out-dir" {
+                Some(
+                    args.next()
+                        .ok_or_else(|| unit_error("missing --out-dir value"))?
+                        .as_str(),
+                )
+            } else {
+                arg.strip_prefix("--out-dir=")
+            };
+            let Some(value) = value else { continue };
+            let path = Path::new(value);
+            if value.is_empty()
+                || value.contains('\0')
+                || !path.is_absolute()
+                || path.components().any(|c| c == Component::ParentDir)
+            {
+                return Err(unit_error("invalid --out-dir path"));
+            }
+            let relative = path
+                .strip_prefix(canonical_root)
+                .map_err(|_| unit_error("--out-dir is outside the canonical output root"))?;
+            if output
+                .as_deref()
+                .is_some_and(|previous| previous != relative)
+            {
+                return Err(unit_error("conflicting --out-dir values"));
+            }
+            output = Some(relative.to_path_buf());
+        }
+        directories.insert(output.ok_or_else(|| unit_error("missing --out-dir"))?);
+    }
+    Ok(directories.into_iter().collect())
 }
 
 /// Sort invocations into normalized order (by crate name, then full
@@ -229,6 +298,97 @@ mod tests {
 
     fn line(args: &[&str]) -> String {
         args.join("\u{1f}")
+    }
+
+    fn output_invocation(args: &[String]) -> RustcInvocation {
+        RustcInvocation {
+            crate_name: "fixture".into(),
+            metadata: Vec::new(),
+            extra_filename: Vec::new(),
+            argv: std::iter::once("rustc".to_string())
+                .chain(args.iter().cloned())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn recorded_outputs_follow_both_cargo_layouts_and_deduplicate_units() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("debug/deps").display().to_string();
+        let current = root
+            .path()
+            .join("debug/build/fixture/hash/out")
+            .display()
+            .to_string();
+        let log = format!(
+            "{}\n{}\n{}\n",
+            line(&["rustc", "--crate-name", "old", "--out-dir", &legacy]),
+            line(&[
+                "rustc",
+                "--crate-name",
+                "new",
+                &format!("--out-dir={current}")
+            ]),
+            line(&["rustc", "--crate-name", "another", "--out-dir", &current]),
+        );
+        assert_eq!(
+            recorded_output_directories(&parse_wrapper_log(&log), root.path()).unwrap(),
+            vec![
+                PathBuf::from("debug/build/fixture/hash/out"),
+                PathBuf::from("debug/deps")
+            ],
+        );
+        let at_root = output_invocation(&[
+            "--out-dir".into(),
+            root.path().display().to_string(),
+            format!("--out-dir={}", root.path().display()),
+        ]);
+        assert_eq!(
+            recorded_output_directories(&[at_root], root.path()).unwrap(),
+            vec![PathBuf::new()],
+        );
+    }
+
+    #[test]
+    fn recorded_outputs_refuse_missing_ambiguous_and_escaping_units() {
+        let root = tempfile::tempdir().unwrap();
+        let good = root.path().join("out").display().to_string();
+        let sibling = format!("{}-other/out", root.path().display());
+        let traversal = root.path().join("inside/../out").display().to_string();
+        let other = root.path().join("other").display().to_string();
+        for bad_args in [
+            vec![],
+            vec!["--out-dir".into()],
+            vec!["--out-dir=".into()],
+            vec!["--out-dir".into(), String::new()],
+            vec!["--out-dir".into(), "relative/out".into()],
+            vec!["--out-dir".into(), sibling],
+            vec!["--out-dir".into(), traversal],
+            vec!["--out-dir".into(), format!("{good}\0")],
+            vec![
+                "--out-dir".into(),
+                good.clone(),
+                format!("--out-dir={other}"),
+            ],
+        ] {
+            let units = [
+                output_invocation(&["--out-dir".into(), good.clone()]),
+                output_invocation(&bad_args),
+            ];
+            let error = recorded_output_directories(&units, root.path()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error.to_string().contains("compiler unit fixture"),
+                "must reject entire record: {bad_args:?}"
+            );
+        }
+        assert!(recorded_output_directories(&[], root.path()).is_err());
+        let unit = output_invocation(&["--out-dir".into(), good]);
+        assert!(
+            recorded_output_directories(std::slice::from_ref(&unit), Path::new("relative"))
+                .is_err()
+        );
+        assert!(recorded_output_directories(&[unit], &root.path().join("inside/..")).is_err());
     }
 
     fn sample_log(metadata: &str, order_swapped: bool) -> String {

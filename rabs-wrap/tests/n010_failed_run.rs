@@ -20,25 +20,34 @@ const CARGO_PHASE_BUDGET_SECS: u64 = 180;
 
 #[test]
 fn n010_failed_run_never_publishes_and_retry_accumulates_ghosts() {
-    let channel = first_available_channel();
+    let cargo = first_available_cargo();
     let dir = tempfile::tempdir().expect("scratch dir");
     let project = copy_fixture(dir.path());
+    // An unrelated compiler-unit directory must never be mistaken for OUT_DIR.
+    fs::create_dir_all(project.join("target/debug/build/000-decoy/000/out"))
+        .expect("plant unrelated compiler output directory");
 
     // PHASE 1: failing run. Stock cargo reports failure; partial OUT_DIR
     // contents survive.
-    let failed = run_bounded(phase_cargo(&channel, &project, "fail"));
+    let failed = run_bounded(phase_cargo(&cargo, &project, "fail"));
     assert!(
         !failed.success && !failed.timed_out,
         "phase-1 run must FAIL (timed_out={}): {}",
         failed.timed_out,
         failed.stderr_tail
     );
-    let Some(run_dir) = find_run_dir(&project) else {
-        panic!("run dir not found after failed build");
-    };
     assert!(
-        run_dir.join("out/partial_one.rs").is_file(),
-        "stock keeps partial files after a failed run"
+        failed
+            .stderr_tail
+            .contains("n010: failing after partial writes"),
+        "the intended build-script failure must occur, not a compiler failure: {}",
+        failed.stderr_tail
+    );
+    let out_dir = recorded_out_dir(&project, "fail");
+    assert!(
+        out_dir.join("partial_one.rs").is_file() && out_dir.join("partial_two.dat").is_file(),
+        "stock keeps both partial files after a failed run in {}",
+        out_dir.display()
     );
 
     // LAW 1 applied to the REAL outcome: exit-3 failure never publishes.
@@ -50,17 +59,22 @@ fn n010_failed_run_never_publishes_and_retry_accumulates_ghosts() {
     );
     // The captured manifest of the failed run exists as EVIDENCE but the
     // decision is structural: no path through this type publishes it.
-    let failure_manifest = capture_manifest(&run_dir);
+    let failure_manifest = capture_manifest(&out_dir);
     assert!(!failure_manifest.out_dir_entries.is_empty());
 
     // PHASE 2: fixed retry in the SAME destination — stock accumulates.
-    let fixed = run_bounded(phase_cargo(&channel, &project, "fix"));
+    let fixed = run_bounded(phase_cargo(&cargo, &project, "fix"));
     assert!(
         fixed.success && !fixed.timed_out,
         "phase-2 retry failed: {}",
         fixed.stderr_tail
     );
-    let retry_manifest = capture_manifest(&run_dir);
+    assert_eq!(
+        recorded_out_dir(&project, "fix"),
+        out_dir,
+        "the retry must actually execute in the same OUT_DIR"
+    );
+    let retry_manifest = capture_manifest(&out_dir);
 
     // Retry-parity arms resolve; unresolved semantics fall back local.
     assert_eq!(
@@ -152,23 +166,41 @@ fn run_bounded(mut cmd: Command) -> RunOutcome {
     }
 }
 
-fn phase_cargo(channel: &str, project: &Path, phase: &str) -> Command {
-    let mut cmd = Command::new(cargo_bin_for(channel));
+fn phase_cargo(cargo: &str, project: &Path, phase: &str) -> Command {
+    // Discovery already returns the executable, not a rustup channel name.
+    // Its sibling compiler belongs to the same installed toolchain.
+    let rustc = Path::new(cargo).with_file_name(if cfg!(windows) { "rustc.exe" } else { "rustc" });
+    let mut cmd = Command::new(cargo);
     cmd.arg("build")
+        .arg("--offline")
+        .arg("--target-dir")
+        .arg(project.join("target"))
         .current_dir(project)
         .env("N010_PHASE", phase)
+        .env("N010_OUT_DIR_RECORD", out_dir_record(project, phase))
+        // Explicit empty flags override ancestor Cargo configuration too.
+        .env("RUSTFLAGS", "")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC")
+        .env("RUSTC", rustc)
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
-        .env_remove("RUSTUP_TOOLCHAIN");
+        .env_remove("CARGO_BUILD_TARGET")
+        .env("CARGO_BUILD_BUILD_DIR", project.join("target"))
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env("RUSTUP_AUTO_INSTALL", "0");
     cmd
 }
 
 fn cargo_bin_for(channel: &str) -> String {
     let Ok(out) = Command::new("rustup")
         .args(["which", "cargo", "--toolchain", channel])
+        .env("RUSTUP_AUTO_INSTALL", "0")
         .output()
     else {
         return "cargo".to_owned();
@@ -180,7 +212,7 @@ fn cargo_bin_for(channel: &str) -> String {
     }
 }
 
-fn first_available_channel() -> String {
+fn first_available_cargo() -> String {
     const PREFERRED: [&str; 3] = ["nightly", "beta", "stable"];
     let rustup_ok = Command::new("rustup")
         .arg("--version")
@@ -190,11 +222,11 @@ fn first_available_channel() -> String {
         for name in PREFERRED {
             let bin = cargo_bin_for(name);
             if bin != "cargo" || Path::new("cargo").exists() {
-                return if bin == "cargo" { name.to_owned() } else { bin };
+                return bin;
             }
         }
     }
-    "stable".to_owned()
+    "cargo".to_owned()
 }
 
 // --- Fixture staging -------------------------------------------------------
@@ -209,35 +241,30 @@ fn copy_fixture(scratch: &Path) -> PathBuf {
     project
 }
 
-// --- Layout discovery + capture ----------------------------------------------
+// --- Recorded run identity + capture -----------------------------------------
 
-fn all_build_dirs(root: &Path) -> Vec<PathBuf> {
-    fn visit(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                out.push(p.clone());
-                if depth < 1 {
-                    visit(&p, depth + 1, out);
-                }
-            }
-        }
-    }
-    let mut out = Vec::new();
-    if root.is_dir() {
-        visit(root, 0, &mut out);
-    }
-    out.sort();
-    out
+fn out_dir_record(project: &Path, phase: &str) -> PathBuf {
+    project.join(format!("n010-{phase}-out-dir"))
 }
 
-fn find_run_dir(project: &Path) -> Option<PathBuf> {
-    all_build_dirs(&project.join("target/debug/build"))
-        .into_iter()
-        .find(|d| d.join("out").is_dir())
+fn recorded_out_dir(project: &Path, phase: &str) -> PathBuf {
+    // Cargo 1.100 also gives compiler units an `out` directory. Read the
+    // build script's actual OUT_DIR instead of guessing from internal layout.
+    let recorded = fs::read_to_string(out_dir_record(project, phase))
+        .expect("the build script must record this phase's OUT_DIR");
+    let out = PathBuf::from(recorded);
+    assert!(out.is_absolute(), "recorded OUT_DIR must be absolute");
+    let out = out.canonicalize().expect("recorded OUT_DIR exists");
+    let target = project
+        .join("target")
+        .canonicalize()
+        .expect("target exists");
+    assert!(
+        out.starts_with(target),
+        "OUT_DIR must stay in the owned target"
+    );
+    assert!(out.is_dir(), "OUT_DIR must be a directory");
+    out
 }
 
 fn visit_files(dir: &Path, rel: &[u8], out: &mut Vec<(Vec<u8>, u64)>) {
@@ -258,9 +285,9 @@ fn visit_files(dir: &Path, rel: &[u8], out: &mut Vec<(Vec<u8>, u64)>) {
     }
 }
 
-fn capture_manifest(run_dir: &Path) -> OutputTreeManifest {
+fn capture_manifest(out_dir: &Path) -> OutputTreeManifest {
     let mut raw = Vec::new();
-    visit_files(&run_dir.join("out"), b"out", &mut raw);
+    visit_files(out_dir, b"out", &mut raw);
     raw.sort();
     OutputTreeManifest::new(
         raw.iter()

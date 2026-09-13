@@ -171,7 +171,8 @@ pub struct ResultAttestation {
 /// Per-subscriber outcome when consulting requirement filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequirementDecision {
-    /// This subscriber may be served from the committed result now.
+    /// This subscriber's requirements are satisfied; global serving validity
+    /// and quarantine must still permit delivery.
     Served,
     /// Identity-compatible but unsatisfied today (e.g. evidence
     /// shortfall): a verification attempt can still satisfy it.
@@ -390,6 +391,10 @@ pub enum JoinReceipt {
     ServedFromCommitted,
     /// Committed but the versioned serving record refuses to serve now.
     CommittedButNotServable(ActionServingDisposition),
+    /// Globally servable, but this subscriber requires more evidence.
+    CommittedNeedsAdditionalVerification,
+    /// Globally servable, but its attestation cannot satisfy this subscriber.
+    CommittedRequirementsRefused(RequirementRefusal),
     /// Joined an in-flight execution generation.
     JoinedExecution,
     /// No result yet and no generation open: awaiting coordinator
@@ -401,6 +406,21 @@ pub enum JoinReceipt {
         /// Live interest count for the operation after the re-join.
         interests: u32,
     },
+    /// The operation already has different immutable serving requirements;
+    /// no subscriber state or retained interest changed.
+    RefusedChangedRequirements,
+}
+
+/// Outcome of admitting evidence for this actor's committed publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceReceipt {
+    /// A new bundle identity was recorded for the committed publication.
+    Recorded,
+    /// This bundle was already recorded; no count, event or validity changed.
+    AlreadyRecorded,
+    /// No publication exists to bind the evidence to. Nothing was retained;
+    /// the sender must submit publication evidence after commit.
+    RefusedNoPublication,
 }
 
 /// Outcome of opening a generation.
@@ -808,12 +828,20 @@ impl ActionActor {
     ) -> JoinReceipt {
         let rejoined_interests =
             if let Some(existing) = self.subscribers.get_mut(&request.operation.0) {
+                if existing.requirements != request.requirements {
+                    return JoinReceipt::RefusedChangedRequirements;
+                }
                 // Reference-counted interest (§21.1): a re-join increments
                 // the operation's live interest count while refreshing
                 // context; per-subscriber fallback/presentation state stays
                 // ITS OWN.
                 existing.interests = existing.interests.saturating_add(1);
-                existing.kind = request.kind;
+                // Interests detach by operation, not by individual kind.
+                // Retain foreground interest until the operation's last
+                // reference leaves; an optional rejoin cannot demote it.
+                if is_background_kind(existing.kind) || !is_background_kind(request.kind) {
+                    existing.kind = request.kind;
+                }
                 existing.queue_priority = existing.queue_priority.max(request.queue_priority);
                 existing.deadline_unix_micros =
                     match (existing.deadline_unix_micros, request.deadline_unix_micros) {
@@ -826,13 +854,22 @@ impl ActionActor {
                 None
             };
         if let Some(interests) = rejoined_interests {
+            self.foreground_interest |= !is_background_kind(request.kind);
             self.push(EventKind::Rejoined);
             return JoinReceipt::Rejoined { interests };
         }
         let receipt = if self.slot == PublicationSlotState::Committed {
             match self.serving.as_ref() {
                 Some(record) if record.may_serve_now(now_unix_micros, clock_epoch) => {
-                    JoinReceipt::ServedFromCommitted
+                    match self.requirement_decision(&request.requirements) {
+                        RequirementDecision::Served => JoinReceipt::ServedFromCommitted,
+                        RequirementDecision::NeedsAdditionalVerification => {
+                            JoinReceipt::CommittedNeedsAdditionalVerification
+                        }
+                        RequirementDecision::Refused(reason) => {
+                            JoinReceipt::CommittedRequirementsRefused(reason)
+                        }
+                    }
                 }
                 Some(record) => JoinReceipt::CommittedButNotServable(record.disposition),
                 None => {
@@ -916,43 +953,42 @@ impl ActionActor {
     /// Requirement filtering for ONE subscriber against the committed
     /// winner's attestation (G004 acceptance): identity mismatches refuse
     /// outright; an evidence shortfall stays satisfiable through
-    /// verification attempts. `None` = unknown operation.
+    /// verification attempts. This is not a global serving authorization:
+    /// callers must also enforce validity and quarantine, as `join` does.
+    /// `None` = unknown operation.
     #[must_use]
     pub fn serving_filter(&self, operation: &BuildOperationId) -> Option<RequirementDecision> {
         let subscriber = self.subscribers.get(&operation.0)?;
-        let requirements = &subscriber.requirements;
+        Some(self.requirement_decision(&subscriber.requirements))
+    }
+
+    fn requirement_decision(&self, requirements: &SubscriptionRequirements) -> RequirementDecision {
         let Some(winner) = self.winner.as_ref() else {
             // Still executing: waiting IS pending verification.
-            return Some(RequirementDecision::NeedsAdditionalVerification);
+            return RequirementDecision::NeedsAdditionalVerification;
         };
         let attested = &winner.attestation;
         if let Some(acceptable) = &requirements.acceptable_isolation
             && !acceptable.contains(&attested.isolation_attained)
         {
-            return Some(RequirementDecision::Refused(
-                RequirementRefusal::IsolationUnacceptable,
-            ));
+            return RequirementDecision::Refused(RequirementRefusal::IsolationUnacceptable);
         }
         if let Some(scope) = &requirements.privacy_scope
             && *scope != attested.privacy_scope
         {
-            return Some(RequirementDecision::Refused(
-                RequirementRefusal::PrivacyScopeMismatch,
-            ));
+            return RequirementDecision::Refused(RequirementRefusal::PrivacyScopeMismatch);
         }
         if let Some(platform) = &requirements.platform
             && *platform != attested.platform
         {
-            return Some(RequirementDecision::Refused(
-                RequirementRefusal::PlatformMismatch,
-            ));
+            return RequirementDecision::Refused(RequirementRefusal::PlatformMismatch);
         }
         if u32::try_from(self.evidence.len()).unwrap_or(u32::MAX)
             < requirements.minimum_evidence_bundles
         {
-            return Some(RequirementDecision::NeedsAdditionalVerification);
+            return RequirementDecision::NeedsAdditionalVerification;
         }
-        Some(RequirementDecision::Served)
+        RequirementDecision::Served
     }
 
     /// Remove ONE subscriber's retained interest (§21.3): closes only that
@@ -972,6 +1008,10 @@ impl ActionActor {
             return CancelReceipt::InterestDecremented { remaining };
         }
         self.subscribers.remove(&operation.0);
+        self.foreground_interest = self
+            .subscribers
+            .values()
+            .any(|subscriber| !is_background_kind(subscriber.kind));
         self.push(EventKind::Cancelled);
 
         let retained = self.subscribers.len();
@@ -1401,24 +1441,39 @@ impl ActionActor {
 
     // -- evidence & serving --------------------------------------------------
 
-    /// Append evidence. When the appended bundle completes the required
+    /// Admit evidence only after publication, once per full typed bundle
+    /// identity. Pre-publication messages are refused without retaining their
+    /// digest, so a later publication-bound submission can still be admitted.
+    /// A replay does not
+    /// add a bundle, record another event, or advance global serving state.
+    /// When a new bundle completes the required
     /// set on an `EvidencePending` publication, the legality table moves
     /// serving to Eligible. Evidence NEVER creates a new key nor rewrites
     /// the publication record (§21.1).
-    pub fn record_evidence(&mut self, digest: TypedDigest, completes_requirements: bool) {
+    pub fn record_evidence(
+        &mut self,
+        digest: TypedDigest,
+        completes_requirements: bool,
+    ) -> EvidenceReceipt {
+        if self.slot != PublicationSlotState::Committed {
+            return EvidenceReceipt::RefusedNoPublication;
+        }
+        if self.evidence.iter().any(|entry| entry.digest == digest) {
+            return EvidenceReceipt::AlreadyRecorded;
+        }
         self.evidence.push(EvidenceEntry {
             digest,
             recorded_at_event: self.next_seq + 1,
         });
         self.push(EventKind::EvidenceRecorded);
         if completes_requirements
-            && self.slot == PublicationSlotState::Committed
             && self.serving.as_ref().is_some_and(|record| {
                 record.disposition == ActionServingDisposition::EvidencePending
             })
         {
             let _ = self.apply_serving_trigger(ServingTransitionTrigger::EvidenceComplete);
         }
+        EvidenceReceipt::Recorded
     }
 
     /// Apply a serving trigger through the A020 legality table; application
@@ -1516,8 +1571,9 @@ impl ActionActor {
 
     // -- message shell --------------------------------------------------------
 
-    /// Dispatch one message, ignoring typed receipts (every outcome lands
-    /// in the event stream; the edge proxy layer adds reply channels).
+    /// Dispatch one fire-and-forget message, ignoring typed receipts. Accepted
+    /// state changes land in the event stream; refusals can leave it unchanged.
+    /// Senders needing an acknowledgment require the edge's reply plumbing.
     pub fn apply(&mut self, msg: ActionActorMsg) {
         match msg {
             ActionActorMsg::Join(request) => {
@@ -1547,7 +1603,9 @@ impl ActionActor {
             ActionActorMsg::RecordEvidence {
                 digest,
                 completes_requirements,
-            } => self.record_evidence(digest, completes_requirements),
+            } => {
+                let _ = self.record_evidence(digest, completes_requirements);
+            }
             ActionActorMsg::ServingTrigger(trigger) => {
                 let _ = self.apply_serving_trigger(trigger);
             }
@@ -2466,6 +2524,95 @@ mod tests {
     // -- G004: reference-counted interests ----------------------------------
 
     #[test]
+    fn same_operation_rejoins_retain_foreground_in_both_orders() {
+        for background in [SubscriberKind::Speculative, SubscriberKind::GitPrewarm] {
+            for foreground_first in [false, true] {
+                let mut actor = actor();
+                open_with_primary(&mut actor);
+                let mut foreground = join_request(OP_ONE.0, SubscriberKind::ForegroundAgent, 200);
+                foreground.deadline_unix_micros = Some(2_000);
+                let mut optional = join_request(OP_ONE.0, background, 3);
+                optional.deadline_unix_micros = Some(5_000);
+                let (first, second) = if foreground_first {
+                    (foreground, optional)
+                } else {
+                    (optional, foreground)
+                };
+                assert_eq!(actor.join(first, 1_100, 0), JoinReceipt::JoinedExecution);
+                assert_eq!(actor.has_foreground_interest(), foreground_first);
+                assert_eq!(actor.brownout_suspended(), foreground_first);
+                let generation = actor.active_generation().cloned();
+                let key = actor.descriptor_digest().clone();
+                let before = actor.subscriber(&OP_ONE).unwrap().clone();
+                assert_eq!(
+                    actor.join(second, 1_150, 0),
+                    JoinReceipt::Rejoined { interests: 2 }
+                );
+                let subscriber = actor.subscriber(&OP_ONE).unwrap();
+                assert_eq!(subscriber.kind, SubscriberKind::ForegroundAgent);
+                assert_eq!(subscriber.queue_priority, 200);
+                assert_eq!(subscriber.deadline_unix_micros, Some(2_000));
+                assert_eq!(subscriber.delivery, before.delivery);
+                assert_eq!(subscriber.frontiers, before.frontiers);
+                assert_eq!(subscriber.requirements, before.requirements);
+                assert!(actor.has_foreground_interest());
+                assert!(actor.brownout_suspended());
+                assert_eq!(actor.active_generation(), generation.as_ref());
+                assert_eq!(actor.descriptor_digest(), &key);
+                assert_eq!(actor.attempts().count(), 1);
+                assert_eq!(events_of(&actor, EventKind::GenerationOpened), 1);
+                assert_eq!(events_of(&actor, EventKind::Promoted), 0);
+                assert_eq!(
+                    actor.cancel_subscriber(OP_ONE),
+                    CancelReceipt::InterestDecremented { remaining: 1 }
+                );
+                assert!(actor.has_foreground_interest());
+                assert!(actor.brownout_suspended());
+                assert_eq!(actor.attempts().count(), 1);
+                assert_eq!(
+                    actor.cancel_subscriber(OP_ONE),
+                    CancelReceipt::LastInterestCancelledGeneration
+                );
+                assert!(!actor.has_foreground_interest());
+                assert!(!actor.brownout_suspended());
+            }
+        }
+    }
+
+    #[test]
+    fn final_foreground_detach_restores_brownout_for_retained_speculation() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        for (operation, kind, priority) in [
+            (OP_ONE.0, SubscriberKind::ForegroundAgent, 200),
+            (OP_TWO.0, SubscriberKind::CiRequired, 100),
+            (99, SubscriberKind::Speculative, 3),
+        ] {
+            assert_eq!(
+                actor.join(join_request(operation, kind, priority), 1_100, 0),
+                JoinReceipt::JoinedExecution
+            );
+        }
+        let generation = actor.active_generation().cloned();
+        assert_eq!(
+            actor.cancel_subscriber(OP_ONE),
+            CancelReceipt::SharedWorkContinues { retained: 2 }
+        );
+        assert!(actor.brownout_suspended());
+        assert_eq!(
+            actor.cancel_subscriber(OP_TWO),
+            CancelReceipt::SharedWorkContinues { retained: 1 }
+        );
+        assert!(!actor.has_foreground_interest());
+        assert!(!actor.brownout_suspended());
+        assert_eq!(actor.strongest_interest().unwrap().priority, 3);
+        assert_eq!(actor.active_generation(), generation.as_ref());
+        assert_eq!(actor.slot(), PublicationSlotState::Executing);
+        assert_eq!(actor.attempts().count(), 1);
+        assert!(actor.subscriber(&BuildOperationId(99)).is_some());
+    }
+
+    #[test]
     fn interest_refcount_survives_partial_cancel() {
         let mut actor = actor();
         open_with_primary(&mut actor);
@@ -2610,5 +2757,279 @@ mod tests {
             actor.serving_filter(&OP_TWO),
             Some(RequirementDecision::Served)
         );
+    }
+
+    #[test]
+    fn late_committed_joins_enforce_each_subscribers_requirements() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        drive_to_offer(&mut actor, 1);
+        assert_eq!(
+            actor.offer_candidate(offer(1, 42, false)),
+            OfferReceipt::AcceptedAsWinner
+        );
+        actor.record_evidence(d(80), true);
+        assert!(actor.serving_eligible(1_200, 0));
+        let winner_before = actor.winner().cloned();
+        let history_before = actor.history().clone();
+
+        let compatible = SubscriptionRequirements {
+            minimum_evidence_bundles: 1,
+            acceptable_isolation: Some(vec![IsolationProfile::StrictHermeticLinux]),
+            privacy_scope: Some("test-scope".into()),
+            platform: Some(d(7)),
+        };
+        let mut cases = vec![(compatible.clone(), JoinReceipt::ServedFromCommitted)];
+        let mut evidence_shortfall = compatible.clone();
+        evidence_shortfall.minimum_evidence_bundles = 2;
+        cases.push((
+            evidence_shortfall,
+            JoinReceipt::CommittedNeedsAdditionalVerification,
+        ));
+        let mut wrong_isolation = compatible.clone();
+        wrong_isolation.acceptable_isolation = Some(vec![IsolationProfile::VolatileLocal]);
+        cases.push((
+            wrong_isolation,
+            JoinReceipt::CommittedRequirementsRefused(RequirementRefusal::IsolationUnacceptable),
+        ));
+        let mut empty_isolation = compatible.clone();
+        empty_isolation.acceptable_isolation = Some(Vec::new());
+        cases.push((
+            empty_isolation,
+            JoinReceipt::CommittedRequirementsRefused(RequirementRefusal::IsolationUnacceptable),
+        ));
+        let mut wrong_privacy = compatible.clone();
+        wrong_privacy.privacy_scope = Some("other-scope".into());
+        cases.push((
+            wrong_privacy,
+            JoinReceipt::CommittedRequirementsRefused(RequirementRefusal::PrivacyScopeMismatch),
+        ));
+        let mut wrong_platform = compatible;
+        wrong_platform.platform = Some(d(99));
+        cases.push((
+            wrong_platform,
+            JoinReceipt::CommittedRequirementsRefused(RequirementRefusal::PlatformMismatch),
+        ));
+
+        for (index, (requirements, expected)) in cases.into_iter().enumerate() {
+            let operation = BuildOperationId(100 + index as u128);
+            let mut request = join_request(operation.0, SubscriberKind::CiRequired, 40);
+            request.requirements = requirements.clone();
+            request.presentation = d(u8::try_from(index).expect("small case matrix"));
+            let presentation = request.presentation.clone();
+            assert_eq!(actor.join(request, 1_200, 0), expected);
+            let subscriber = actor.subscriber(&operation).expect("retained subscription");
+            assert_eq!(subscriber.requirements, requirements);
+            assert_eq!(subscriber.presentation, presentation);
+            assert_eq!(subscriber.interests, 1);
+            assert_eq!(subscriber.delivery, SubscriberDeliveryState::Subscribed);
+            assert_eq!(subscriber.frontiers, ExposureFrontiers::default());
+        }
+        assert_eq!(actor.winner(), winner_before.as_ref());
+        assert_eq!(actor.history(), &history_before);
+        assert!(actor.active_generation().is_none());
+        assert_eq!(actor.attempts().count(), 1);
+        assert_eq!(events_of(&actor, EventKind::GenerationOpened), 1);
+        assert_eq!(events_of(&actor, EventKind::Committed), 1);
+    }
+
+    #[test]
+    fn global_serving_refusal_precedes_subscriber_requirement_success() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        drive_to_offer(&mut actor, 1);
+        assert_eq!(
+            actor.offer_candidate(offer(1, 42, false)),
+            OfferReceipt::AcceptedAsWinner
+        );
+        assert_eq!(
+            actor.join(
+                join_request(100, SubscriberKind::ForegroundAgent, 40),
+                1_200,
+                0
+            ),
+            JoinReceipt::CommittedButNotServable(ActionServingDisposition::EvidencePending)
+        );
+        actor.record_evidence(d(80), true);
+        assert!(actor.serving_eligible(1_200, 0));
+        // A changed clock epoch refuses delivery even when attestation matches.
+        assert_eq!(
+            actor.join(
+                join_request(101, SubscriberKind::ForegroundAgent, 40),
+                1_200,
+                1
+            ),
+            JoinReceipt::CommittedButNotServable(ActionServingDisposition::Eligible)
+        );
+        actor.open_divergence_incident();
+        let quarantined = actor.serving().cloned();
+        actor.record_evidence(d(80), true);
+        actor.record_evidence(d(81), true);
+        assert_eq!(actor.serving(), quarantined.as_ref());
+        for operation in [102, 103] {
+            let mut request = join_request(operation, SubscriberKind::ForegroundAgent, 40);
+            if operation == 103 {
+                request.requirements.platform = Some(d(99));
+            }
+            assert_eq!(
+                actor.join(request, 1_200, 0),
+                JoinReceipt::CommittedButNotServable(ActionServingDisposition::Quarantined)
+            );
+        }
+        assert!(!actor.serving_eligible(1_200, 0));
+        assert_eq!(actor.history().len(), 1);
+    }
+
+    #[test]
+    fn replayed_evidence_neither_satisfies_bundle_minimum_nor_advances_serving() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        drive_to_offer(&mut actor, 1);
+        assert_eq!(
+            actor.offer_candidate(offer(1, 42, false)),
+            OfferReceipt::AcceptedAsWinner
+        );
+        let mut demanding = join_request(OP_ONE.0, SubscriberKind::DeterminismAudit, 40);
+        demanding.requirements.minimum_evidence_bundles = 2;
+        let requirements = demanding.requirements.clone();
+        assert_eq!(
+            actor.join(demanding, 1_200, 0),
+            JoinReceipt::CommittedButNotServable(ActionServingDisposition::EvidencePending)
+        );
+        actor.record_evidence(d(80), false);
+        let first_observation = actor.evidence()[0].clone();
+        let pending = actor.serving().cloned();
+        let event_count = actor.events().len();
+        for completes_requirements in [false, true, true] {
+            actor.record_evidence(d(80), completes_requirements);
+            assert_eq!(actor.evidence(), &vec![first_observation.clone()]);
+            assert_eq!(actor.events().len(), event_count);
+            assert_eq!(actor.serving(), pending.as_ref());
+            assert_eq!(
+                actor.serving_filter(&OP_ONE),
+                Some(RequirementDecision::NeedsAdditionalVerification)
+            );
+        }
+        // A distinct bundle can complete both the global and individual gates.
+        assert_eq!(
+            actor.record_evidence(d(81), true),
+            EvidenceReceipt::Recorded
+        );
+        assert_eq!(actor.evidence().len(), 2);
+        assert_eq!(events_of(&actor, EventKind::EvidenceRecorded), 2);
+        assert!(actor.serving_eligible(1_200, 0));
+        assert_eq!(
+            actor.serving_filter(&OP_ONE),
+            Some(RequirementDecision::Served)
+        );
+        let mut late = join_request(OP_TWO.0, SubscriberKind::CiRequired, 40);
+        late.requirements = requirements;
+        assert_eq!(actor.join(late, 1_200, 0), JoinReceipt::ServedFromCommitted);
+        assert_eq!(actor.history().len(), 1);
+        assert_eq!(events_of(&actor, EventKind::Committed), 1);
+    }
+
+    #[test]
+    fn changed_requirements_refuse_direct_and_mailbox_rejoins_without_mutation() {
+        let mut actor = actor();
+        open_with_primary(&mut actor);
+        let mut original = join_request(OP_ONE.0, SubscriberKind::Speculative, 3);
+        original.deadline_unix_micros = Some(5_000);
+        assert_eq!(
+            actor.join(original.clone(), 1_100, 0),
+            JoinReceipt::JoinedExecution
+        );
+        actor
+            .advance_delivery(OP_ONE, SubscriberDeliveryState::Waiting)
+            .expect("independent delivery state");
+        let subscriber_before = actor.subscriber(&OP_ONE).cloned();
+        let generation_before = actor.active_generation().cloned();
+        let interest_before = actor.strongest_interest();
+        let events_before = actor.events().clone();
+        for dimension in 0..4 {
+            let mut conflicting = original.clone();
+            conflicting.kind = SubscriberKind::ForegroundInteractive;
+            conflicting.queue_priority = 250;
+            conflicting.deadline_unix_micros = Some(2_000);
+            conflicting.presentation = d(99);
+            match dimension {
+                0 => conflicting.requirements.minimum_evidence_bundles = 1,
+                1 => conflicting.requirements.acceptable_isolation = Some(Vec::new()),
+                2 => conflicting.requirements.privacy_scope = Some("other".into()),
+                _ => conflicting.requirements.platform = Some(d(98)),
+            }
+            assert_eq!(
+                actor.join(conflicting.clone(), 1_200, 0),
+                JoinReceipt::RefusedChangedRequirements
+            );
+            actor.apply(ActionActorMsg::Join(conflicting));
+            assert_eq!(actor.subscriber(&OP_ONE), subscriber_before.as_ref());
+            assert_eq!(actor.active_generation(), generation_before.as_ref());
+            assert_eq!(actor.strongest_interest(), interest_before);
+            assert_eq!(actor.events(), &events_before);
+            assert!(!actor.has_foreground_interest());
+            assert_eq!(actor.attempts().count(), 1);
+        }
+        assert_eq!(
+            actor.join(original, 1_200, 0),
+            JoinReceipt::Rejoined { interests: 2 }
+        );
+    }
+
+    #[test]
+    fn evidence_before_publication_refuses_without_poisoning_later_admission() {
+        let mut actor = actor();
+        // Both no-generation and executing states lack a publication binding.
+        for executing in [false, true] {
+            if executing {
+                open_with_primary(&mut actor);
+            }
+            let events_before = actor.events().len();
+            for completes_requirements in [false, true] {
+                assert_eq!(
+                    actor.record_evidence(d(80), completes_requirements),
+                    EvidenceReceipt::RefusedNoPublication
+                );
+                actor.apply(ActionActorMsg::RecordEvidence {
+                    digest: d(80),
+                    completes_requirements,
+                });
+                assert!(actor.evidence().is_empty());
+                assert!(actor.serving().is_none());
+                assert_eq!(actor.events().len(), events_before);
+            }
+        }
+        drive_to_offer(&mut actor, 1);
+        assert_eq!(
+            actor.offer_candidate(offer(1, 42, false)),
+            OfferReceipt::AcceptedAsWinner
+        );
+        assert_eq!(
+            actor.serving().expect("new publication").disposition,
+            ActionServingDisposition::EvidencePending
+        );
+        // The same digest can now be admitted through the message handler;
+        // no unbound pre-commit observation claimed its identity or readiness.
+        actor.apply(ActionActorMsg::RecordEvidence {
+            digest: d(80),
+            completes_requirements: true,
+        });
+        assert!(actor.serving_eligible(1_200, 0));
+        assert_eq!(actor.evidence().len(), 1);
+        assert_eq!(events_of(&actor, EventKind::EvidenceRecorded), 1);
+        let events_after = actor.events().len();
+        let serving_after = actor.serving().cloned();
+        assert_eq!(
+            actor.record_evidence(d(80), true),
+            EvidenceReceipt::AlreadyRecorded
+        );
+        actor.apply(ActionActorMsg::RecordEvidence {
+            digest: d(80),
+            completes_requirements: true,
+        });
+        assert_eq!(actor.events().len(), events_after);
+        assert_eq!(actor.serving(), serving_after.as_ref());
+        assert_eq!(actor.evidence().len(), 1);
+        assert_eq!(actor.history().len(), 1);
     }
 }

@@ -4,7 +4,10 @@
 //! not production breakage. This suite CAPTURES the live contract of
 //! the ambient toolchain (a real `cargo build` of a fixture crate with
 //! a logging RUSTC_WRAPPER) as a host-independent fingerprint, and
-//! compares it against the RECORDED fixture for that channel.
+//! compares it against the RECORDED fixture for that channel. The probe
+//! fixes split-debuginfo to off, disables optional SBOM generation, and
+//! removes known launcher configuration inputs before invoking Cargo.
+//! It tests that normalized profile, not every host/profile combination.
 //!
 //! The fingerprint deliberately contains SHAPES, never host values:
 //! flag NAMES per unit class (plus the full `--error-format` and
@@ -82,6 +85,37 @@ fn flag_name(argument: &str, next: Option<&str>) -> Option<String> {
 /// this workspace, and does not need to: the contract under test is
 /// the channel's cargo→wrapper interface, not the harness).
 fn capture_contract(channel: &str) -> ContractFingerprint {
+    // Measure the selected channel's Cargo, not an installed RCH shim. The
+    // managed shim adds caller policy (for example CARGO_BUILD_JOBS), which
+    // must not become part of Cargo's recorded wrapper contract.
+    let discovered = std::process::Command::new("rustup")
+        .args(["which", "--toolchain", channel, "cargo"])
+        .output()
+        .expect("locate channel cargo");
+    assert!(discovered.status.success(), "channel cargo must exist");
+    let mut cargo = std::path::PathBuf::from(
+        String::from_utf8(discovered.stdout)
+            .expect("Cargo path is UTF-8")
+            .trim(),
+    );
+    if std::fs::metadata(&cargo).expect("Cargo metadata").len() <= 8 * 1024
+        && std::fs::read_to_string(&cargo)
+            .expect("small Cargo wrapper is text")
+            .lines()
+            .any(|line| line.starts_with("# rch-toolchain-wrap-version:"))
+    {
+        cargo.set_file_name("cargo-rch-real");
+        assert!(cargo.is_file(), "managed shim must retain the real Cargo");
+    }
+    // Match Cargo with its channel's rustc even when RCH prepends a different
+    // pinned compiler to PATH. Do not introduce a RUSTC override into the
+    // environment-name contract captured below.
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let channel_path = std::env::join_paths(
+        std::iter::once(cargo.parent().expect("Cargo bin directory").to_path_buf())
+            .chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("channel executable search path");
     let source = tempfile::tempdir().unwrap();
     write(
         source.path(),
@@ -111,20 +145,67 @@ fn capture_contract(channel: &str) -> ContractFingerprint {
         .unwrap();
     }
     let target = tempfile::tempdir().unwrap();
+    // This dependency-free probe needs no cache or caller Cargo configuration.
+    let cargo_home = tempfile::tempdir().unwrap();
     let status = std::process::Command::new("rustup")
-        .args(["run", channel, "cargo", "build"])
+        .args(["run", channel])
+        .arg(&cargo)
+        .args([
+            "build",
+            "--jobs",
+            "2",
+            "--color",
+            "never",
+            "--config",
+            "profile.dev.split-debuginfo=\"off\"",
+            "--config",
+            "build.sbom=false",
+        ])
         .current_dir(source.path())
+        .env("PATH", channel_path)
+        // RCH places scratch projects below the repository. An explicit empty
+        // value overrides its ancestor .cargo/config.toml nightly-only flags;
+        // removing the variable would expose those flags again.
+        .env("RUSTFLAGS", "")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        .env_remove("RUSTC")
+        .env_remove("CARGO_BUILD_RUSTC")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_TARGET")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        // These are caller configuration, not Cargo-generated wrapper outputs.
+        // Keep unknown output keys observable instead of filtering the capture.
+        .env_remove("CARGO_BUILD_JOBS")
+        .env_remove("CARGO_NET_GIT_FETCH_WITH_CLI")
+        .env_remove("CARGO_TERM_COLOR")
+        .env_remove("CARGO_BUILD_SBOM")
+        .env_remove("CARGO_UNSTABLE_SBOM")
+        .env_remove("CARGO_SBOM_PATH")
+        .env_remove("CARGO_PROFILE_DEV_SPLIT_DEBUGINFO")
+        .env_remove("CARGO_PROFILE_DEV_DEBUG")
+        .env_remove("CARGO_PROFILE_TEST_DEBUG")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env("RUSTUP_AUTO_INSTALL", "0")
         .env("RUSTC_WRAPPER", source.path().join("log-rustc.sh"))
         .env("RABS_ARGV_LOG", &log_path)
         .env("RABS_ENV_LOG", &env_path)
         .env("CARGO_TARGET_DIR", target.path())
+        .env("CARGO_HOME", cargo_home.path())
         .env("CARGO_INCREMENTAL", "0") // pin: incremental flags vary by default profile
         .status()
         .expect("cargo build");
     assert!(status.success(), "fixture build failed");
 
-    let mut units = BTreeMap::new();
     let log = std::fs::read_to_string(&log_path).unwrap();
+    let env = std::fs::read_to_string(&env_path).unwrap();
+    parse_contract(&log, &env)
+}
+
+fn parse_contract(log: &str, env: &str) -> ContractFingerprint {
+    let mut units = BTreeMap::new();
     for line in log.lines() {
         let argv: Vec<&str> = line.split('\u{1f}').filter(|s| !s.is_empty()).collect();
         let Some(crate_name_at) = argv.iter().position(|a| *a == "--crate-name") else {
@@ -167,8 +248,7 @@ fn capture_contract(channel: &str) -> ContractFingerprint {
         units.keys().collect::<Vec<_>>()
     );
 
-    let env_keys = std::fs::read_to_string(&env_path)
-        .unwrap()
+    let env_keys = env
         .lines()
         // Keys that embed crate/package specifics or point at OUR
         // logging stay out of the cross-machine contract shape.
@@ -189,6 +269,31 @@ fn capture_contract(channel: &str) -> ContractFingerprint {
     ContractFingerprint { units, env_keys }
 }
 
+#[test]
+fn raw_capture_preserves_contract_drift() {
+    let log = "rustc\u{1f}--crate-name\u{1f}build_script_build\u{1f}--error-format=json\u{1f}--json=artifacts,diagnostic-rendered-ansi\n\
+               rustc\u{1f}--crate-name\u{1f}rabs_c009\u{1f}--error-format=json\u{1f}--json=artifacts,diagnostic-rendered-ansi\n";
+    let env = "CARGO\nCARGO_MAKEFLAGS\nRUSTC_WRAPPER\n";
+    let baseline = parse_contract(log, env);
+    for changed in [
+        log.replace("--error-format=json", "--error-format=human"),
+        log.replace(
+            "artifacts,diagnostic-rendered-ansi",
+            "diagnostic-rendered-ansi",
+        ),
+        log.replace("--json=", "--rabs-contract-probe\u{1f}--json="),
+    ] {
+        assert_ne!(baseline, parse_contract(&changed, env));
+    }
+    for changed in [
+        format!("{env}CARGO_RABS_CONTRACT_PROBE\n"),
+        env.replace("CARGO_MAKEFLAGS\n", ""),
+        format!("{env}CARGO_SBOM_PATH\n"),
+    ] {
+        assert_ne!(baseline, parse_contract(log, &changed));
+    }
+}
+
 /// Channels under test: `RABS_CONTRACT_CHANNELS` (comma-separated) or
 /// the full matrix. A channel whose toolchain is not installed FAILS —
 /// a silently skipped channel would be a hole in the drift net.
@@ -207,6 +312,7 @@ fn channels() -> Vec<String> {
 /// RABS_RECORD_CONTRACT=1).
 #[test]
 fn wrapper_contract_matches_the_recorded_channel_fixtures() {
+    let mut drifted = Vec::new();
     for channel in channels() {
         let probe = std::process::Command::new("rustup")
             .args(["run", &channel, "rustc", "-V"])
@@ -216,6 +322,10 @@ fn wrapper_contract_matches_the_recorded_channel_fixtures() {
             probe.status.success(),
             "channel {channel} not installed — install it or narrow \
              RABS_CONTRACT_CHANNELS explicitly; a silent skip is a drift hole"
+        );
+        eprintln!(
+            "channel {channel}: {}",
+            String::from_utf8_lossy(&probe.stdout).trim()
         );
         let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
@@ -238,10 +348,16 @@ fn wrapper_contract_matches_the_recorded_channel_fixtures() {
             )
         });
         let recorded: ContractFingerprint = serde_json::from_str(&recorded).unwrap();
-        assert_eq!(
-            recorded, live,
-            "wrapper contract DRIFTED on channel {channel} (R29): recorded vs live differ"
-        );
-        eprintln!("channel {channel}: contract matches the recorded fixture");
+        if recorded == live {
+            eprintln!("channel {channel}: contract matches the recorded fixture");
+        } else {
+            // Capture the remaining channels too: one mismatch must not hide
+            // the matrix's other evidence. The test still fails below.
+            eprintln!(
+                "wrapper contract DRIFTED on channel {channel} (R29):\nrecorded: {recorded:#?}\nlive: {live:#?}"
+            );
+            drifted.push(channel);
+        }
     }
+    assert!(drifted.is_empty(), "wrapper contract drift on {drifted:?}");
 }

@@ -156,3 +156,61 @@ fn contract_virtual_time_is_exact_and_reproducible() {
         "virtual time must advance identically across runtimes"
     );
 }
+
+/// CONTRACT (daemon-runtime subsystem admission): an owned root can spawn,
+/// while reinstalling a narrowed task context cannot restore that authority.
+/// Returning from the restricted call must restore the original root context.
+#[test]
+fn contract_native_subsystem_spawn_preserves_context_authority() {
+    use asupersync::cx::Cx;
+    use asupersync::cx::cap;
+    use asupersync::runtime::{RuntimeBuilder, SpawnError};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    let handle = runtime.handle();
+    runtime.block_on(handle.spawn(async {
+        let root = Cx::current().expect("runtime root has a context");
+        let root_depth = Cx::restriction_depth();
+        let invoked = Arc::new(AtomicBool::new(false));
+        let restricted = {
+            let _guard = root.restrict::<cap::None>().set_current_restricted();
+            Cx::current().expect("narrowed context remains present")
+        };
+        {
+            let _guard = Cx::set_current(Some(restricted));
+            let current = Cx::current().unwrap();
+            assert!(!current.capabilities().spawn);
+            assert_eq!(current.task_id(), root.task_id());
+            assert_eq!(current.region_id(), root.region_id());
+            assert_eq!(current.budget(), root.budget());
+            let witness = Arc::clone(&invoked);
+            let refused = current.spawn(move |_| {
+                witness.store(true, Ordering::SeqCst);
+                async { 99_u32 }
+            });
+            assert!(matches!(refused, Err(SpawnError::RuntimeUnavailable)));
+        }
+        assert!(!invoked.load(Ordering::SeqCst));
+        assert_eq!(Cx::restriction_depth(), root_depth);
+        let restored = Cx::current().unwrap();
+        assert_eq!(restored.task_id(), root.task_id());
+        assert_eq!(restored.capabilities(), root.capabilities());
+        let mut child = restored
+            .spawn(|cx| async move {
+                cx.checkpoint().expect("authorized subsystem can run");
+                42_u32
+            })
+            .expect("root authority survives a refused subsystem spawn");
+        let answer = asupersync::time::timeout(
+            restored.now(),
+            std::time::Duration::from_secs(5),
+            child.join(&restored),
+        )
+        .await
+        .expect("subsystem completion is bounded")
+        .expect("subsystem returned successfully");
+        assert_eq!(answer, 42);
+    }));
+}

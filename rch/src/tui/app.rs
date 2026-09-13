@@ -2,28 +2,43 @@
 //!
 //! Main entry point for the interactive dashboard.
 
+#[cfg(unix)]
 use crate::status_display::{
     cancel_build, drain_worker, enable_worker, force_kill_build, query_daemon_full_status,
 };
+#[cfg(any(unix, test))]
 use crate::status_types::DaemonFullStatusResponse;
+#[cfg(unix)]
+use crate::tui::event::{Action, poll_event_with_flags};
+use crate::tui::state::ColorBlindMode;
+#[cfg(unix)]
+use crate::tui::state::{ConfirmAction, ConfirmDialog};
+#[cfg(any(unix, test))]
 use crate::tui::{
-    event::{Action, poll_event_with_flags},
     state::{
-        ActiveBuild, BuildProgress, BuildStatus, CircuitState, ColorBlindMode, ConfirmAction,
-        ConfirmDialog, DaemonState, HistoricalBuild, Panel, Status, TuiState, WorkerState,
-        WorkerStatus,
+        ActiveBuild, BuildProgress, BuildStatus, CircuitState, DaemonState, HistoricalBuild, Panel,
+        Status, TuiState, WorkerState, WorkerStatus,
     },
     widgets,
 };
 use anyhow::Result;
+#[cfg(any(unix, test))]
 use chrono::{DateTime, Utc};
+#[cfg(any(unix, test))]
 use ftui::Frame;
+#[cfg(unix)]
 use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
+#[cfg(any(unix, test))]
 use ftui_render::buffer::Buffer;
+#[cfg(unix)]
 use ftui_render::diff::BufferDiff;
+#[cfg(any(unix, test))]
 use ftui_render::grapheme_pool::GraphemePool;
+#[cfg(unix)]
 use ftui_tty::{TtyBackend, TtySessionOptions};
+#[cfg(any(unix, test))]
 use std::path::PathBuf;
+#[cfg(any(unix, test))]
 use std::time::{Duration, Instant};
 
 /// Configuration for the TUI dashboard.
@@ -118,6 +133,7 @@ pub async fn run_tui(_config: TuiConfig) -> Result<()> {
 }
 
 /// Fetch fresh data from daemon and update TUI state.
+#[cfg(unix)]
 async fn refresh_state(state: &mut TuiState, config: &TuiConfig) {
     if config.mock_data {
         apply_mock_data(state);
@@ -139,6 +155,7 @@ async fn refresh_state(state: &mut TuiState, config: &TuiConfig) {
     state.last_update = Instant::now();
 }
 
+#[cfg(unix)]
 async fn build_initial_state(config: &TuiConfig) -> TuiState {
     let mut state = TuiState::new();
     state.high_contrast = config.high_contrast;
@@ -147,6 +164,7 @@ async fn build_initial_state(config: &TuiConfig) -> TuiState {
     state
 }
 
+#[cfg(unix)]
 fn test_backend_size() -> (u16, u16) {
     let width = std::env::var("COLUMNS")
         .ok()
@@ -159,6 +177,7 @@ fn test_backend_size() -> (u16, u16) {
     (width.max(40), height.max(12))
 }
 
+#[cfg(any(unix, test))]
 fn render_snapshot(state: &TuiState, width: u16, height: u16) -> String {
     let mut pool = GraphemePool::new();
     let mut frame = Frame::new(width, height, &mut pool);
@@ -166,6 +185,7 @@ fn render_snapshot(state: &TuiState, width: u16, height: u16) -> String {
     ftui_buffer_to_string(&frame.buffer, &pool)
 }
 
+#[cfg(any(unix, test))]
 fn ftui_buffer_to_string(buffer: &Buffer, pool: &GraphemePool) -> String {
     let mut out = String::new();
     let width = buffer.width();
@@ -198,6 +218,7 @@ fn ftui_buffer_to_string(buffer: &Buffer, pool: &GraphemePool) -> String {
     out
 }
 
+#[cfg(any(unix, test))]
 fn state_to_json(state: &TuiState) -> serde_json::Value {
     let daemon_status = match state.daemon.status {
         Status::Unknown => "unknown",
@@ -242,6 +263,7 @@ fn state_to_json(state: &TuiState) -> serde_json::Value {
     })
 }
 
+#[cfg(any(unix, test))]
 fn apply_mock_data(state: &mut TuiState) {
     use crate::tui::state::{BuildStatus, CircuitState, WorkerStatus};
     use chrono::Utc;
@@ -327,6 +349,7 @@ fn apply_mock_data(state: &mut TuiState) {
 
 /// Build a deterministic remediation view for the `--mock-data` path, assembled
 /// through the real `rch_common` classifier so the demo matches live behavior.
+#[cfg(any(unix, test))]
 fn build_mock_remediation_view() -> rch_common::remediation_view::RemediationView {
     use rch_common::fleet_diff::WorkerObservation;
     use rch_common::remediation_view::{
@@ -374,6 +397,7 @@ fn build_mock_remediation_view() -> rch_common::remediation_view::RemediationVie
 }
 
 /// Convert daemon API response to TUI state types.
+#[cfg(any(unix, test))]
 fn update_state_from_daemon(state: &mut TuiState, response: DaemonFullStatusResponse) {
     // Operator-facing remediation snapshot (assembled by the daemon). Extract
     // before the rest of `response` is consumed field-by-field below.
@@ -468,6 +492,7 @@ fn update_state_from_daemon(state: &mut TuiState, response: DaemonFullStatusResp
 }
 
 /// Main application loop.
+#[cfg(unix)]
 async fn run_app(backend: &mut TtyBackend, state: &mut TuiState, config: &TuiConfig) -> Result<()> {
     let tick_rate = Duration::from_millis(config.refresh_interval_ms);
     let refresh_interval = Duration::from_millis(config.refresh_interval_ms * 5); // Refresh every 5 ticks
