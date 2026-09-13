@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v1.0.64` (2026-09-07).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.0.0` (2026-09-13).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -29,7 +29,17 @@ but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
-## Unreleased — 2.0.0 candidate
+## Unreleased
+
+The asupersync 0.5.0 and FrankenSQLite 0.4.0 candidate on `main` is separate
+from the qualified 2.0.0 release below. Its independent native Linux
+admission and test follow-ups are recorded in
+`docs/adr/007-asupersync-revision-pin.md` and `UPGRADE_LOG.md`.
+
+## 2.0.0 — 2026-09-13
+
+Published from `3289f5e4e977e001187e48976bcd89e4cca0c752`:
+[GitHub release](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.0.0).
 
 - **Rust API break:** public schema helpers now return schemars 1.x `Schema`
   instead of 0.8 `RootSchema`. Generated contracts and CLI exports continue
@@ -57,8 +67,14 @@ to source snapshots that have been removed. For tests that read source fixtures
 at runtime, set `RCH_DISABLE_TARGET_REUSE=1` until source-path validity across
 pooled builds is fixed. The release test gate uses this workaround.
 
-Validation and release artifacts are still pending; this is not a published
-release. See `UPGRADE_LOG.md` for completed dependency gates and limitations.
+Signed Linux x86-64 GNU and macOS ARM64 archives each contain `rch`, `rchd`,
+and `rch-wkr`. All six binaries report the release version and source commit.
+DSR verified the eight public assets and both archive signatures after publication.
+Linux requires glibc 2.38 by ELF imports and was tested on 2.43; the Mac binaries
+encode macOS 11.0 and were tested on 26.2. Private retention-safe offline installer
+checks passed on both platforms; stock online installs and upgrades were not tested.
+See `UPGRADE_LOG.md` for dependency gates, original test failures and successful
+follow-ups, artifact hashes, and retained limitations.
 
 ## Version Timeline
 
@@ -66,6 +82,7 @@ release. See `UPGRADE_LOG.md` for completed dependency gates and limitations.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v2.0.0`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.0.0) | Release | 2026-09-12 | Stable Rust dependency refresh; schemars 1.x Rust API break with Draft 7 output; worker admission and maintenance fixes; signed Linux x86-64 and macOS ARM64 binaries, published September 13 |
 | [`v1.0.64`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.64) | Release | 2026-09-07 | rsync flavour probe: stock macOS openrsync no longer breaks every transfer (#66); `[transfer] rsync_bin` / `RCH_RSYNC_BIN`; retrieved artifacts typed against the requesting host (#65, RCH-E327); pooled target `store_base` for external worker volumes (#64) |
 | [`v1.0.63`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.63) | Release | 2026-09-03 | rchd daemon can no longer be wedged by the durable-lease scan: syscall liveness, lease reaping, scan off the runtime threads |
 | [`v1.0.62`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.62) | Release | 2026-08-29 | Convergence over the tailnet API: `GET /repo-convergence/status` token-gated on `:9101`; the dashboard collector folds it in so `worker.convergence_drift` fires on API-collected boxes |

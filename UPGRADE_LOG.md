@@ -2,7 +2,7 @@
 
 ## 2026-09-12 — dependency refresh and DSR release (bd-6q0eo)
 
-Status: in progress. Registry versions are checked against crates.io; existing
+Status: released as 2.0.0 on September 13. Registry versions were checked against crates.io; existing
 git, path and prerelease dependencies and the pinned nightly are preserved.
 Each changed dependency receives a separate consumer test before the next
 upgrade. Final workspace tests, compiler checks, Clippy, security audit and
@@ -12,11 +12,125 @@ The candidate release is 2.0.0: public Rust schema helpers now return schemars
 1.x Schema instead of 0.8 RootSchema. Draft 7 output preserves the dialect,
 but does not preserve that Rust source API. After the final gate follow-ups,
 the central version and all 16 workspace lockfile entries were bumped to 2.0.0;
-external dependencies did not change. Artifact qualification and publication
-remain pending. The retained staging directory still has 1.1.0 in its name.
+external dependencies did not change. Both native archives are qualified and
+published from commit `3289f5e4e977e001187e48976bcd89e4cca0c752`.
+The newer asupersync 0.5.0 / FrankenSQLite 0.4.0 candidate on main is not part
+of this release and retains a separate admission process.
+The retained staging directory still has 1.1.0 in its name.
 The existing RCH signing identity was found on css; its public key
 1BBD79B28BF718D0 successfully verified the retained v1.0.64 Mac archive.
 No private key was copied or changed.
+
+### Release artifact qualification — September 12–13
+
+- Release source: `3289f5e4e977e001187e48976bcd89e4cca0c752`, local annotated
+  tag `v2.0.0`. The two native targets use the same sealed source, explicit
+  compiler target and pinned nightly through strict RCH; local fallback is disabled.
+- Linux archive SHA256:
+  `281f5136aae359b2e7a1488c219d52d5c96559990a2b00dc229f0a1f40f11613`
+  (19,494,476 bytes). It contains exactly three regular executable files:
+  `rch`, `rchd`, and `rch-wkr`. All three report version 2.0.0 and commit
+  `3289f5e4e977` when executed on CSS.
+- Required nonweak glibc imports reach 2.38 for the CLI and 2.34 for the daemon
+  and worker. Runtime checks used glibc 2.43; this is not live qualification
+  on older glibc versions. Weak 2.39 imports do not set the minimum requirement.
+- Linux signature SHA256:
+  `db106a0c3d493a3d8b464bc3daf674041e727d1a0cb3ea35e252c9fd08843844`.
+  Signing occurred on CSS with the existing key; CSS, Mac and DSR verification
+  passed against the committed public key. The private key stayed on CSS.
+- A private retention-safe copy of the installer passed in a fresh CSS prefix.
+  Installed binary hashes match the archive; versions, executable modes, bundled
+  skills and default configs passed. Extraction and lock records were retained.
+  This qualifies modified offline installation, not stock online installation,
+  upgrades, services or changes to the running fleet.
+- The original DSR run `fc1d650c-2ea9-4e70-ac56-cf9b247a7eee` retained its Linux
+  success while RCH refused two Mac attempts under critical memory pressure.
+  At 04:20 UTC on September 13, healthy telemetry allowed its Mac build to start.
+  Its CLI finished before another pressure refusal. The next admitted resume
+  reused the CLI in 1.58 seconds and completed the daemon/worker profile.
+  DSR finished with two successful targets, zero failures, and a complete
+  same-source manifest at 04:47:59 UTC on September 13.
+- Detailed Linux receipts are retained under
+  `/private/tmp/rch-release-1.1.0-boldbrook-20260912/` in
+  `css-linux-archive-qualification.8J4L8qjh`,
+  `rch-fuchsia-linux-signature-2.0.0-8dyw1f2l`, and
+  `css-offline-installer-qualification.FBP8MzAt` (Agent Mail 1011–1013).
+- Mac archive SHA256:
+  `076cb10983d47cb016697228ef705efc2d8f0c10eabec74b4e225837f07abbb7`
+  (15,038,888 bytes); signature SHA256:
+  `16b4b1f13df3faed48b41241cfdb4e1489be81b1831031a4e52faafee82859c0`.
+  All three arm64 Mach-O binaries and installed copies report 2.0.0 and
+  `3289f5e4e977`. Encoded minimum macOS is 11.0; runtime checks used 26.2.
+  CSS signing and Mac verification passed against the same pinned release key.
+- Mac modified offline installation passed. An initial receipt-location assertion
+  failed because Darwin's mktemp chose its per-user temporary directory; the
+  installer itself exited 0. The original extraction remains intact, with an
+  additional verified copy under the owned prefix. Follow-up postconditions passed.
+  Receipts: `mac-archive-installer-qualification.9O4mjCP0` and
+  `rch-fuchsia-mac-signature-2.0.0-q0baolct` under the retained Mac root
+  (Agent Mail 1026–1027).
+- Published [v2.0.0](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.0.0)
+  at 04:55:05 UTC on September 13. Strict preflight, draft verification after
+  reviewed notes, and public-release verification all passed. Exactly eight
+  assets are public: two archives with SHA256 and Minisign sidecars, plus the
+  unmodified installer and its SHA256 sidecar. The manifest remains retained
+  evidence rather than an extra upload. The source tag was not rewritten and
+  GitHub Actions remained disabled; no workflow dispatch or fleet rollout ran.
+  Public download/signature evidence is retained under
+  `publication-retained.sYRFq6Uo/dsr-release-bytes.jA1DzL` in the Mac root.
+
+### Follow-on main candidate validation — September 13
+
+The merged main candidate is separate from the published 2.0.0 source. Its
+captured tree is `4b15677fff0c22ce18310b0def31ad20fe374de2`, with lockfile SHA256
+`e4a3ef6d5fc3cc801399046289caa7016115a52f5ac1017bcb77b5e03397a3fd`.
+It combines the release fixes with Asupersync Git revision
+`78b64636e99fea4ea2d868096576021dd3b8e519` and FrankenSQLite 0.4.0,
+retaining the required `async-api` feature and joined-worker Drop behavior.
+
+- Strict RCH Linux workspace check and Clippy passed with all targets, all
+  features, the pinned nightly, `--locked`, and two jobs. Clippy used
+  `-D warnings`. The initial check hit the default 300-second timeout;
+  its explicit 7,200-second retry passed. No local fallback ran.
+- Formatting passed. The candidate's 708-dependency security audit reported
+  zero vulnerabilities and warnings against advisory revision
+  `b50980aad8b8f14f77e25a97b32dd94bf008b0af`.
+- The two changed Rust test files passed static UBS review with zero critical
+  findings, 46 warnings and six informational findings. The baseline had
+  24 warnings and six informational findings; the added warnings concern
+  intentional test assertions and unwraps, with no new suppression.
+- The runtime adapter library and all six integration targets passed: 90 tests,
+  zero failures or ignores, including the new native authority-refusal contract.
+  The fresh test build used target reuse disabled.
+- The database suite's L1 maximum-latency assertion failed on VMI at
+  21,070,173 ns against its unchanged 10 ms limit; its p99 assertion passed.
+  Both unchanged latency tests passed on quiet CSS using the exact retained
+  CAS binary, SHA256
+  `b3ea8dce031b7704db966b9d497536cd0bba9b39b4a830802c8d84df6270cdba`.
+  This was direct harness execution, not a rebuild. The follow-up log SHA256 is
+  `554c5bac5f216a22ae306453500c79154e8406d9ffdaed6f1efb4aa040c9ac22`.
+- The database suite finished with 238 passes and that single timing failure;
+  both crash matrices, H009 differential checks, migration rollback and
+  immediate-reopen/WAL regressions passed. The original Cargo invocation
+  exited 101 after 328 passing adapter/database tests; it is not reported as
+  an all-green run.
+- Cargo stopped before the daemon and worker suites. Their exact retained
+  test binaries subsequently passed all 134 daemon and 10 worker tests on
+  VMI from the matching retained source, without recompilation. Together with
+  the unchanged timing follow-up, all 473 distinct required tests have a
+  passing execution. There were no ignored tests in these selected suites.
+  This admits the candidate on native Linux; it is not Mac test evidence or
+  qualification of new release artifacts.
+
+Receipts are retained under `main-candidate-validation.kGuA9APU` in the Mac
+release root. Check log SHA256:
+`76f34a6a61ef9ae873a35e6da227a1e307ec5b88b8aafeac52cc822d82393695`;
+Clippy log SHA256:
+`03ae635e4eb7c2966c4e4802c330bc8947e97d7d721f572ef4d6d661171abed5`.
+Original required-test log SHA256:
+`0455da8848d4140b2be739839d0612300062cf4ef02a9ec75d2c38d80836d2a8`;
+retained daemon/worker execution log SHA256:
+`397305a872e1e03771f69fe2cdb391e037da1f602c16232ecacd32a83eefcb0b`.
 
 ### Interim static review
 

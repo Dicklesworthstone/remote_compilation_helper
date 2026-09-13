@@ -1,11 +1,12 @@
 {
-  "status": "in_progress",
-  "session_date": "2026-09-12",
+  "status": "complete",
+  "session_date": "2026-09-13",
   "bead": "bd-6q0eo",
-  "current": "final workspace gates",
+  "current": "2.0.0 published and public assets verified",
   "candidate_version": "2.0.0",
   "migration_approval": "User requested continued work after the eleven-file migration approval question on 2026-09-12; completing thirteen CLI exports with explicit Draft 7 generation.",
-  "release_status": "All stable Rust dependency consumer gates passed. Initial full workspace run: 9928 passed, 10 failed, 20 existing ignores; user authorized repairs. Repaired worker tests passed 20 and other repaired fixtures passed 23. Final Linux and native Mac all-target/all-feature compiler checks and strict Clippy passed. Quiet CSS runtime qualification passed all 13 unchanged hook tests, averaging 4ms below 25ms. Private recent stable/beta/nightly toolchains are verified; matrix retest encountered cached test paths pointing at reaped clean-overlay source roots (existing RCH issue bd-cfv95). Complete fresh-target workspace test gate now runs through strict RCH with target reuse disabled, no golden regeneration or channel narrowing. Formatting, refreshed 708-dependency security audit and zero-new-critical UBS comparison passed. Candidate remains unbumped, untagged, unbuilt for release and unpublished. Existing CSS signing identity verified; private key never copied and release archives not yet signed.",
+  "release_status": "Published v2.0.0 at 2026-09-13T04:55:05Z from 3289f5e4e977e001187e48976bcd89e4cca0c752. All stable Rust dependency consumer gates passed. Final fresh-target workspace run: 9935 passed, five failed, 20 existing ignores; unchanged quiet-worker timing follow-ups and repaired stable/beta/nightly channel probes passed. Final compiler/Clippy, formatting, 708-dependency audit and zero-new-critical UBS gates passed with limitations recorded in UPGRADE_LOG.md. DSR completed both native targets in the same run; all six binaries report 2.0.0 and the release commit. Both archive signatures and modified retention-safe fresh offline installers passed. Linux requires glibc 2.38 by ELF imports and was tested on 2.43; Mac minimum metadata is 11.0 and execution used 26.2. Strict draft and public verification passed for exactly eight assets. Private signing key stayed on CSS; no workflow dispatch or fleet rollout. Existing bd-cfv95 remains open; full tests used RCH_DISABLE_TARGET_REUSE=1. The later asupersync 0.5 / FrankenSQLite 0.4 candidate on main is not part of this release and retains separate validation.",
+  "release_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.0.0",
   "completed": [
     "tru", "h2", "rich_rust", "lru", "blake3", "chacha20", "clap", "clap_complete",
     "sha2", "object", "uuid", "zstd (unused declaration)", "flate2", "cron", "toml",
