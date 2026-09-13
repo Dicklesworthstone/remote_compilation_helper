@@ -61,10 +61,34 @@ fn asupersync_uses_the_minimal_profile() {
          is a reviewed rabs-profile change (bead A004); line: {dep_line}"
     );
     assert!(
-        dep_line.contains("rev = \"107adf1df8d274b37c6ed9a12471fe3da44429f2\""),
+        dep_line.contains("rev = \"78b64636e99fea4ea2d868096576021dd3b8e519\""),
         "pin drift: the revision must match ADR 007's current pin; \
          line: {dep_line}"
     );
+}
+
+#[test]
+fn every_runtime_consumer_uses_the_same_release_pin() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut edges = 0;
+    for consumer in ["rabs-asupersync", "rabsd", "rabs-wkr"] {
+        let source = fs::read_to_string(workspace.join(consumer).join("Cargo.toml"))
+            .expect("read runtime consumer manifest");
+        for line in source.lines().map(str::trim) {
+            if !line.starts_with("asupersync =") {
+                continue;
+            }
+            edges += 1;
+            assert!(
+                line.contains("version = \"=0.5.0\"")
+                    && line.contains("rev = \"78b64636e99fea4ea2d868096576021dd3b8e519\"")
+                    && line
+                        .contains("git = \"https://github.com/Dicklesworthstone/asupersync.git\""),
+                "{consumer} runtime pin differs from ADR 007: {line}"
+            );
+        }
+    }
+    assert_eq!(edges, 4, "three production edges and the rabsd dev edge");
 }
 
 #[test]
