@@ -384,40 +384,263 @@ fn defer_to_systemd_if_managed(socket: &Path, workers_config: Option<&Path>) {
     let _ = (socket, workers_config);
 }
 
-#[cfg(any(target_os = "linux", test))]
 fn isolated_worker_pool(socket: &Path, workers_config: Option<&Path>) -> bool {
     socket != crate::config::default_socket_path() && workers_config.is_some()
 }
 
-async fn bind_daemon_socket(socket: &Path) -> Result<UnixListener> {
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod launchd {
+    use super::*;
+    use std::process::{Output, Stdio};
+    use tokio::io::AsyncReadExt;
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum Ownership {
+        Standalone,
+        Managed,
+        Delegated,
+    }
+
+    /// A successful exit alone does not prove enumeration succeeded: launchctl
+    /// can emit an error instead of a table with exit zero.
+    pub(super) fn listed_pid(table: &str, label: &str) -> Result<Option<Option<u32>>> {
+        let mut lines = table.lines().filter(|line| !line.trim().is_empty());
+        if lines
+            .next()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>())
+            != Some(vec!["PID", "Status", "Label"])
+        {
+            bail!("launchctl list did not return its PID/Status/Label table");
+        }
+        let mut found = None;
+        for line in lines {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() != 3 || fields[1].parse::<i32>().is_err() {
+                bail!("malformed launchctl list row");
+            }
+            let pid = if fields[0] == "-" {
+                None
+            } else {
+                Some(positive_pid(fields[0])?)
+            };
+            if fields[2] == label {
+                if found.is_some() {
+                    bail!("ambiguous duplicate launchd label {label}");
+                }
+                found = Some(pid);
+            }
+        }
+        Ok(found)
+    }
+
+    fn positive_pid(value: &str) -> Result<u32> {
+        let pid = value.parse::<u32>().context("invalid launchd PID")?;
+        anyhow::ensure!(pid > 0, "launchd PID must be positive");
+        Ok(pid)
+    }
+
+    pub(super) fn kickstart_pid(output: &str, target: &str) -> Result<u32> {
+        let output = output.trim();
+        let value = output
+            .strip_prefix(target)
+            .and_then(|value| value.strip_prefix(':'))
+            .map_or(output, str::trim);
+        positive_pid(value)
+    }
+
+    pub(super) fn ownership(pid: u32, self_pid: u32) -> Ownership {
+        if pid == self_pid {
+            Ownership::Managed
+        } else {
+            Ownership::Delegated
+        }
+    }
+
+    /// One deadline covers all probes and the start request. Read both pipes
+    /// concurrently with bounded buffers and retain ownership of the child on
+    /// every timeout/error path.
+    pub(super) async fn command(
+        program: &Path,
+        args: &[&str],
+        deadline: tokio::time::Instant,
+    ) -> Result<Output> {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "service-manager startup deadline expired"
+        );
+        let mut child = tokio::process::Command::new(program) // ubs:ignore — fixed /bin/launchctl in production; only tests inject executables.
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawn service-manager command")?;
+        let stdout = child.stdout.take().context("missing manager stdout")?;
+        let stderr = child.stderr.take().context("missing manager stderr")?;
+        let result = tokio::time::timeout_at(deadline, async {
+            let (out, err, status) =
+                tokio::try_join!(read_bounded(stdout), read_bounded(stderr), async {
+                    child
+                        .wait()
+                        .await
+                        .context("wait for service-manager command")
+                })?;
+            Ok::<_, anyhow::Error>(Output {
+                status,
+                stdout: out,
+                stderr: err,
+            })
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("service-manager startup deadline expired"))
+        .and_then(std::convert::identity);
+        if result.is_err() {
+            let _ = child.start_kill();
+            let _ = timeout(Duration::from_secs(1), child.wait()).await;
+        }
+        result
+    }
+
+    async fn read_bounded(reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
+        const LIMIT: u64 = 1024 * 1024;
+        let mut bytes = Vec::new();
+        reader.take(LIMIT + 1).read_to_end(&mut bytes).await?;
+        anyhow::ensure!(
+            bytes.len() <= LIMIT as usize,
+            "service-manager output exceeded limit"
+        );
+        Ok(bytes)
+    }
+
+    async fn list(
+        program: &Path,
+        label: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<Option<u32>>> {
+        let output = command(program, &["list"], deadline).await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "launchctl list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        listed_pid(std::str::from_utf8(&output.stdout)?, label)
+    }
+
+    /// Resolve only the current user's GUI/user domains (plus system for root).
+    /// SSH runs in a different bootstrap context from a GUI LaunchAgent, so a
+    /// valid empty current-context listing alone does not establish absence.
+    pub(super) async fn resolve(
+        program: &Path,
+        label: &str,
+        uid: u32,
+        self_pid: u32,
+        custom_socket: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<Ownership> {
+        let (listed, list_error) = match list(program, label, deadline).await {
+            Ok(listed) => (listed, None),
+            Err(error) => (None, Some(error)),
+        };
+        if listed == Some(Some(self_pid)) {
+            return Ok(Ownership::Managed);
+        }
+        if listed.is_some() && custom_socket {
+            bail!(
+                "cannot delegate a custom socket to launchd without a separate workers configuration"
+            );
+        }
+        if let Some(Some(_)) = listed {
+            // Already running. Never restart or kill it to satisfy an autostart.
+            return Ok(Ownership::Delegated);
+        }
+        if listed == Some(None) {
+            let started = command(program, &["start", label], deadline).await?;
+            anyhow::ensure!(
+                started.status.success(),
+                "launchctl start failed: {}",
+                String::from_utf8_lossy(&started.stderr)
+            );
+            loop {
+                match list(program, label, deadline).await? {
+                    Some(Some(pid)) => return Ok(ownership(pid, self_pid)),
+                    Some(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+                    None => bail!("launchd service disappeared during startup"),
+                }
+            }
+        }
+        let mut targets = vec![format!("gui/{uid}/{label}"), format!("user/{uid}/{label}")];
+        if uid == 0 {
+            targets.push(format!("system/{label}"));
+        }
+        let mut registered = Vec::new();
+        for target in targets {
+            let probe = command(program, &["print", &target], deadline).await?;
+            if probe.status.success() {
+                registered.push(target);
+            } else if probe.status.code() != Some(113) {
+                // launchctl's 113 is the explicit absent service/domain result.
+                // Permission, transport and syntax errors are not absence.
+                bail!(
+                    "cannot establish launchd service presence for {target}: {}",
+                    String::from_utf8_lossy(&probe.stderr)
+                );
+            }
+        }
+        let target = match registered.as_slice() {
+            [] => return list_error.map_or(Ok(Ownership::Standalone), Err),
+            [target] => target,
+            _ => bail!("RCH is registered in multiple launchd domains; refusing ambiguous startup"),
+        };
+        anyhow::ensure!(
+            !custom_socket,
+            "cannot delegate a custom socket to launchd without a separate workers configuration"
+        );
+        // Deliberately no -k: -p returns the existing PID without replacing an
+        // active daemon. Do not parse the undocumented `print` output fields.
+        let started = command(program, &["kickstart", "-p", target], deadline).await?;
+        anyhow::ensure!(
+            started.status.success(),
+            "launchctl kickstart failed: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        Ok(ownership(
+            kickstart_pid(std::str::from_utf8(&started.stdout)?, target)?,
+            self_pid,
+        ))
+    }
+}
+
+async fn bind_daemon_socket(socket: &Path, managed_by_launchd: bool) -> Result<UnixListener> {
     // "Managed by systemd" only if THIS process is the rchd.service unit's own
     // main process (our cgroup is rchd.service) -- NOT merely because
     // INVOCATION_ID was inherited from a parent scope (e.g. an agent's `rch`
     // auto-spawned us). The genuine unit waits out a transiently-held socket
     // (avoids a restart storm); any other rchd bails. A non-unit rchd on a
     // systemd host has already exited via defer_to_systemd_if_managed().
-    let managed_by_systemd = cgroup_says_rchd_unit() == Some(true);
-    bind_daemon_socket_with_mode(socket, managed_by_systemd, Duration::from_secs(5)).await
+    let managed = managed_by_launchd || cgroup_says_rchd_unit() == Some(true);
+    bind_daemon_socket_with_mode(socket, managed, Duration::from_secs(5)).await
 }
 
-/// Inner bind routine taking an explicit `managed_by_systemd` flag and
+/// Inner bind routine taking an explicit `managed` flag and
 /// `wait_backoff` (parameterized for tests).
 ///
 /// If the socket is currently held by another rchd (e.g. an agent's `rch
 /// exec` auto-spawned a detached one during a momentary daemon outage),
-/// exiting with FAILURE causes systemd to restart-storm — which is what
+/// exiting with FAILURE causes the service manager to restart-storm — which is what
 /// happened on css/ts2 (NRestarts in the tens of thousands). When
-/// systemd-managed, wait patiently for the other process to free the
-/// socket instead; this keeps the systemd unit Active and avoids the
+/// managed by systemd or launchd, wait for the other process to free the
+/// socket instead; this keeps the managed process alive and avoids the
 /// storm entirely.
 ///
-/// We also retry on *any* error from the inner attempt when systemd-managed
+/// We also retry on *any* error from the inner attempt when managed
 /// (probe timeouts, races on remove/bind, permission glitches): a one-shot
 /// failure must never crash-loop the unit. Standalone invocations preserve
 /// the original fail-fast behavior.
 async fn bind_daemon_socket_with_mode(
     socket: &Path,
-    managed_by_systemd: bool,
+    managed: bool,
     wait_backoff: Duration,
 ) -> Result<UnixListener> {
     let mut waited_logged = false;
@@ -426,11 +649,11 @@ async fn bind_daemon_socket_with_mode(
         match try_bind_daemon_socket(socket).await {
             Ok(BindAttempt::Bound(listener)) => return Ok(listener),
             Ok(BindAttempt::SocketHeld) => {
-                if managed_by_systemd {
+                if managed {
                     if !waited_logged {
                         warn!(
                             "daemon socket {} already serving; waiting for it to free \
-                             (systemd-managed, will take over when the current owner exits)",
+                             (service-managed, will take over when the current owner exits)",
                             socket.display()
                         );
                         // Visible via `systemctl --user status rchd` so
@@ -446,13 +669,13 @@ async fn bind_daemon_socket_with_mode(
                     socket.display()
                 );
             }
-            Err(e) if managed_by_systemd => {
+            Err(e) if managed => {
                 // Don't restart-storm on transient errors. The most realistic
                 // one is the 300ms connect-probe timeout in
                 // socket_has_live_listener firing under load on the box that
                 // currently holds the socket.
                 warn!(
-                    "daemon socket bind attempt failed (systemd-managed, retrying in {}s): {e:#}",
+                    "daemon socket bind attempt failed (service-managed, retrying in {}s): {e:#}",
                     wait_backoff.as_secs()
                 );
                 tokio::time::sleep(wait_backoff).await;
@@ -536,7 +759,33 @@ async fn main() -> Result<()> {
 
     // Enforce single-instance on systemd hosts before we touch the socket.
     defer_to_systemd_if_managed(&cli.socket, cli.workers_config.as_deref());
-    let listener = bind_daemon_socket(&cli.socket).await?;
+    #[cfg(target_os = "macos")]
+    let managed_by_launchd = if isolated_worker_pool(&cli.socket, cli.workers_config.as_deref()) {
+        false
+    } else {
+        match launchd::resolve(
+            Path::new("/bin/launchctl"),
+            "com.rch.daemon",
+            nix::unistd::Uid::effective().as_raw(),
+            std::process::id(),
+            cli.socket != crate::config::default_socket_path(),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await?
+        {
+            launchd::Ownership::Standalone => false,
+            launchd::Ownership::Managed => true,
+            launchd::Ownership::Delegated => {
+                info!(
+                    "launchd owns rchd; leaving startup and active builds with the registered service"
+                );
+                return Ok(());
+            }
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let managed_by_launchd = false;
+    let listener = bind_daemon_socket(&cli.socket, managed_by_launchd).await?;
     info!("Listening on {:?}", cli.socket);
     // Inform systemd we're ready. No-op for Type=simple (the current unit)
     // and on macOS; essential if anyone ever switches to Type=notify.
@@ -1329,6 +1578,17 @@ fn init_test_logging() {
 }
 
 #[cfg(test)]
+fn socket_test_dir() -> PathBuf {
+    // Remote jobs can set TMPDIR longer than sockaddr_un can represent.
+    // Keep private socket paths short and retain them for failure inspection.
+    tempfile::Builder::new()
+        .prefix("rch-socket-")
+        .tempdir_in("/tmp")
+        .unwrap()
+        .keep()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1450,10 +1710,10 @@ mod tests {
     #[tokio::test]
     async fn test_bind_daemon_socket_creates_listener() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir().unwrap();
-        let socket_path = temp_dir.path().join("rch.sock");
+        let temp_dir = socket_test_dir();
+        let socket_path = temp_dir.join("rch.sock");
 
-        let listener = bind_daemon_socket(&socket_path).await.unwrap();
+        let listener = bind_daemon_socket(&socket_path, false).await.unwrap();
 
         assert!(socket_path.exists());
         drop(listener);
@@ -1462,8 +1722,8 @@ mod tests {
     #[tokio::test]
     async fn test_bind_daemon_socket_refuses_live_listener() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir().unwrap();
-        let socket_path = temp_dir.path().join("rch.sock");
+        let temp_dir = socket_test_dir();
+        let socket_path = temp_dir.join("rch.sock");
         let _existing = UnixListener::bind(&socket_path).unwrap();
 
         // Use the explicit-flag inner function (managed_by_systemd = false)
@@ -1486,12 +1746,12 @@ mod tests {
     #[tokio::test]
     async fn test_bind_daemon_socket_replaces_stale_socket() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir().unwrap();
-        let socket_path = temp_dir.path().join("rch.sock");
+        let temp_dir = socket_test_dir();
+        let socket_path = temp_dir.join("rch.sock");
         let stale_listener = UnixListener::bind(&socket_path).unwrap();
         drop(stale_listener);
 
-        let listener = bind_daemon_socket(&socket_path).await.unwrap();
+        let listener = bind_daemon_socket(&socket_path, false).await.unwrap();
 
         assert!(socket_path.exists());
         drop(listener);
@@ -1505,8 +1765,8 @@ mod tests {
     #[tokio::test]
     async fn test_bind_daemon_socket_waits_when_systemd_managed() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir().unwrap();
-        let socket_path = temp_dir.path().join("rch.sock");
+        let temp_dir = socket_test_dir();
+        let socket_path = temp_dir.join("rch.sock");
         let _holder = UnixListener::bind(&socket_path).unwrap();
 
         // 50 ms backoff (vs the 5 s production value) so the test is quick.
@@ -1533,8 +1793,8 @@ mod tests {
     #[tokio::test]
     async fn test_bind_daemon_socket_takes_over_after_holder_exits() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir().unwrap();
-        let socket_path = temp_dir.path().join("rch.sock");
+        let temp_dir = socket_test_dir();
+        let socket_path = temp_dir.join("rch.sock");
         let holder = UnixListener::bind(&socket_path).unwrap();
 
         let bind_path = socket_path.clone();
@@ -1960,5 +2220,501 @@ mod systemd_singleton_tests {
         assert!(!cgroup_contains_rchd_unit(
             "0::/user.slice/user-1000.slice/user@1000.service/app.slice/some-agent.scope"
         ));
+    }
+}
+
+#[cfg(test)]
+mod launchd_singleton_tests {
+    use super::*;
+
+    // Scripted protocol fixtures exercise error/ordering contracts. These are
+    // not evidence of live launchd integration; native validation is separate.
+    fn manager_fixture(body: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let retained = tempfile::tempdir().unwrap().keep();
+        let program = retained.join("manager");
+        let calls = retained.join("calls");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n{body}\n",
+                shell_escape::escape(calls.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (program, calls)
+    }
+
+    async fn resolve_fixture(program: &Path, custom: bool) -> Result<launchd::Ownership> {
+        launchd::resolve(
+            program,
+            "com.rch.daemon",
+            501,
+            41,
+            custom,
+            tokio::time::Instant::now() + Duration::from_secs(3),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn launchd_unknown_listing_uses_verified_domain_without_forced_restart() {
+        let (program, calls) = manager_fixture(
+            "case \"$*\" in\nlist) echo 'Could not enumerate';;\n'print gui/501/com.rch.daemon') exit 0;;\n'print user/501/com.rch.daemon') exit 113;;\n'kickstart -p gui/501/com.rch.daemon') echo 41;;\n*) exit 99;;\nesac",
+        );
+        assert_eq!(
+            resolve_fixture(&program, false).await.unwrap(),
+            launchd::Ownership::Managed
+        );
+        assert_eq!(
+            std::fs::read_to_string(calls).unwrap(),
+            "list\nprint gui/501/com.rch.daemon\nprint user/501/com.rch.daemon\nkickstart -p gui/501/com.rch.daemon\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn launchd_only_proven_absence_allows_standalone() {
+        for (listing, allowed) in [
+            ("printf 'PID Status Label\\n'", true),
+            ("echo 'enumeration failed'", false),
+        ] {
+            let (program, calls) = manager_fixture(&format!(
+                "case \"$1\" in\nlist) {listing};;\nprint) exit 113;;\n*) exit 99;;\nesac"
+            ));
+            let result = resolve_fixture(&program, false).await;
+            if allowed {
+                assert_eq!(result.unwrap(), launchd::Ownership::Standalone);
+            } else {
+                assert!(result.is_err());
+            }
+            assert!(
+                !std::fs::read_to_string(calls)
+                    .unwrap()
+                    .contains("kickstart")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn launchd_ambiguous_domains_and_custom_socket_never_start_a_service() {
+        for custom in [false, true] {
+            let (program, calls) = manager_fixture(
+                "case \"$1\" in\nlist) printf 'PID Status Label\\n';;\nprint) exit 0;;\n*) exit 99;;\nesac",
+            );
+            assert!(resolve_fixture(&program, custom).await.is_err());
+            assert!(
+                !std::fs::read_to_string(calls)
+                    .unwrap()
+                    .contains("kickstart")
+            );
+        }
+        let (program, calls) =
+            manager_fixture("printf 'PID Status Label\\n42 0 com.rch.daemon\\n'");
+        assert!(resolve_fixture(&program, true).await.is_err());
+        assert_eq!(std::fs::read_to_string(calls).unwrap(), "list\n");
+    }
+
+    #[tokio::test]
+    async fn launchd_live_owner_is_not_restarted_and_stopped_owner_is_started_once() {
+        let (program, calls) =
+            manager_fixture("printf 'PID Status Label\\n42 0 com.rch.daemon\\n'");
+        assert_eq!(
+            resolve_fixture(&program, false).await.unwrap(),
+            launchd::Ownership::Delegated
+        );
+        assert_eq!(std::fs::read_to_string(calls).unwrap(), "list\n");
+        let (program, calls) = manager_fixture(
+            "case \"$1\" in\nlist) if [ -f \"$0.started\" ]; then printf 'PID Status Label\\n42 0 com.rch.daemon\\n'; else printf 'PID Status Label\\n- 0 com.rch.daemon\\n'; fi;;\nstart) printf started > \"$0.started\";;\n*) exit 99;;\nesac",
+        );
+        assert_eq!(
+            resolve_fixture(&program, false).await.unwrap(),
+            launchd::Ownership::Delegated
+        );
+        assert_eq!(
+            std::fs::read_to_string(calls).unwrap(),
+            "list\nstart com.rch.daemon\nlist\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn launchd_failed_start_or_invalid_pid_never_authorizes_binding() {
+        for action in ["exit 7", "echo 0", "echo 'wrong-target: 41'"] {
+            let (program, _) = manager_fixture(&format!(
+                "case \"$*\" in\nlist) printf 'PID Status Label\\n';;\n'print gui/501/com.rch.daemon') exit 0;;\n'print user/501/com.rch.daemon') exit 113;;\n'kickstart -p gui/501/com.rch.daemon') {action};;\n*) exit 99;;\nesac"
+            ));
+            assert!(resolve_fixture(&program, false).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn launchd_expired_budget_cannot_execute_a_manager_action() {
+        let (program, calls) = manager_fixture("exit 0");
+        assert!(
+            launchd::command(
+                &program,
+                &["start", "com.rch.daemon"],
+                tokio::time::Instant::now()
+            )
+            .await
+            .is_err()
+        );
+        assert!(!calls.exists());
+    }
+
+    #[tokio::test]
+    async fn launchd_excess_output_is_refused_before_the_command_deadline() {
+        let result = timeout(
+            Duration::from_secs(3),
+            launchd::command(
+                Path::new("/bin/cat"),
+                &["/dev/zero"],
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            ),
+        )
+        .await
+        .expect("oversized output must not wait for the ten-second deadline");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("output exceeded limit")
+        );
+    }
+
+    #[test]
+    fn launchd_table_distinguishes_absence_stopped_and_live_exact_labels() {
+        let table = "PID\tStatus\tLabel\n-\t0\tcom.rch.daemon.extra\n41\t-15\tother\n";
+        assert_eq!(launchd::listed_pid(table, "com.rch.daemon").unwrap(), None);
+        assert_eq!(launchd::listed_pid(table, "other").unwrap(), Some(Some(41)));
+        assert_eq!(
+            launchd::listed_pid(table, "com.rch.daemon.extra").unwrap(),
+            Some(None)
+        );
+        assert_eq!(
+            launchd::listed_pid("PID Status Label\n", "com.rch.daemon").unwrap(),
+            None
+        );
+        assert_eq!(launchd::ownership(41, 41), launchd::Ownership::Managed);
+        assert_eq!(launchd::ownership(42, 41), launchd::Ownership::Delegated);
+    }
+
+    #[test]
+    fn launchd_table_refuses_failed_or_ambiguous_enumeration() {
+        for table in [
+            "",
+            "Could not connect to launchd",
+            "PID Label Status\n",
+            "PID Status Label\n0 0 com.rch.daemon\n",
+            "PID Status Label\n-1 0 com.rch.daemon\n",
+            "PID Status Label\n1 invalid com.rch.daemon\n",
+            "PID Status Label\n1 0 com.rch.daemon trailing\n",
+            "PID Status Label\n- 0 com.rch.daemon\n1 0 com.rch.daemon\n",
+            "PID Status Label\n1 0 com.rch.daemon\nmalformed unrelated row\n",
+        ] {
+            assert!(
+                launchd::listed_pid(table, "com.rch.daemon").is_err(),
+                "accepted {table:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn launchd_kickstart_accepts_only_a_positive_pid_for_the_requested_target() {
+        let target = "gui/501/com.rch.daemon";
+        assert_eq!(launchd::kickstart_pid("42\n", target).unwrap(), 42);
+        assert_eq!(
+            launchd::kickstart_pid("gui/501/com.rch.daemon: 42\n", target).unwrap(),
+            42
+        );
+        for output in [
+            "",
+            "0",
+            "-42",
+            "42\n43",
+            "other: 42",
+            "failed 42",
+            "4294967296",
+        ] {
+            assert!(launchd::kickstart_pid(output, target).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn launchd_command_deadline_reaps_its_owned_child() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let pid_path = retained.join("manager.pid");
+        let command = format!(
+            "printf '%s' \"$$\" > {}; exec sleep 60",
+            shell_escape::escape(pid_path.to_string_lossy())
+        );
+        let result = launchd::command(
+            Path::new("/bin/sh"),
+            &["-c", &command],
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("deadline expired"));
+        let pid: i32 = std::fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn launchd_command_preserves_failure_output() {
+        let output = launchd::command(
+            Path::new("/bin/sh"),
+            &["-c", "printf stdout; printf stderr >&2; exit 7"],
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"stdout");
+        assert_eq!(output.stderr, b"stderr");
+    }
+
+    #[tokio::test]
+    async fn launchd_managed_owner_waits_without_replacing_a_live_socket() {
+        let retained = socket_test_dir();
+        let socket = retained.join("rch.sock");
+        let holder = UnixListener::bind(&socket).unwrap();
+        let managed = launchd::ownership(std::process::id(), std::process::id())
+            == launchd::Ownership::Managed;
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                bind_daemon_socket(&socket, managed)
+            )
+            .await
+            .is_err()
+        );
+        let connection = UnixStream::connect(&socket).await.unwrap();
+        assert!(
+            timeout(Duration::from_secs(1), holder.accept())
+                .await
+                .is_ok()
+        );
+        drop(connection);
+        assert!(socket.exists());
+    }
+
+    /// A real, uniquely named GUI-domain launchd job executes this same test
+    /// binary. No shared RCH service is changed; all files and sockets remain
+    /// retained, and the parent unloads its job before reporting any failure.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn launchd_native_private_job_preserves_pid_and_waits_for_socket() -> Result<()> {
+        async fn wait_for(path: &Path) -> Result<()> {
+            timeout(Duration::from_secs(15), async {
+                while !path.try_exists()? {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .with_context(|| format!("waiting for {}", path.display()))?
+        }
+
+        async fn manager(retained: &Path, args: &[&str]) -> Result<std::process::Output> {
+            use std::io::Write;
+            let output = launchd::command(
+                Path::new("/bin/launchctl"),
+                args,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await?;
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(retained.join("manager.log"))?;
+            writeln!(log, "launchctl {args:?}: {}", output.status)?;
+            log.write_all(&output.stdout)?;
+            log.write_all(&output.stderr)?;
+            Ok(output)
+        }
+
+        fn xml(value: &str) -> String {
+            value
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        }
+
+        let uid = nix::unistd::Uid::effective().as_raw();
+        if let Ok(label) = std::env::var("RCH_LAUNCHD_NATIVE_LABEL") {
+            anyhow::ensure!(
+                label.starts_with("com.rch.native-test."),
+                "unexpected private label"
+            );
+            let retained = PathBuf::from(std::env::var("RCH_LAUNCHD_NATIVE_DIR")?);
+            let ownership = launchd::resolve(
+                Path::new("/bin/launchctl"),
+                &label,
+                uid,
+                std::process::id(),
+                false,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await?;
+            anyhow::ensure!(
+                ownership == launchd::Ownership::Managed,
+                "job did not recognize its actual managed PID"
+            );
+            std::fs::write(
+                retained.join("managed.pending"),
+                std::process::id().to_string(),
+            )?;
+            std::fs::rename(
+                retained.join("managed.pending"),
+                retained.join("managed.pid"),
+            )?;
+            let listener = timeout(
+                Duration::from_secs(15),
+                bind_daemon_socket(&retained.join("rch.sock"), true),
+            )
+            .await??;
+            std::fs::write(
+                retained.join("bound.pending"),
+                std::process::id().to_string(),
+            )?;
+            std::fs::rename(retained.join("bound.pending"), retained.join("bound.pid"))?;
+            wait_for(&retained.join("parent-finished")).await?;
+            drop(listener);
+            return Ok(());
+        }
+
+        // /tmp keeps Unix socket names below macOS's sockaddr_un length limit.
+        let retained = tempfile::Builder::new()
+            .prefix("rch-launchd-")
+            .tempdir_in("/tmp")?
+            .keep();
+        let label = format!("com.rch.native-test.{}", uuid::Uuid::new_v4());
+        // A readable user domain does not imply bootstrap permission. The
+        // GUI domain is where the installed per-user RCH LaunchAgent runs.
+        let domain = format!("gui/{uid}");
+        let domain_probe = manager(&retained, &["print", &domain]).await?;
+        anyhow::ensure!(
+            domain_probe.status.success(),
+            "native fixture requires the user's GUI domain: {domain_probe:?}"
+        );
+        let target = format!("{domain}/{label}");
+        let absent = manager(&retained, &["print", &target]).await?;
+        anyhow::ensure!(
+            absent.status.code() == Some(113),
+            "private job must not exist before bootstrap: {absent:?}"
+        );
+        let socket = retained.join("rch.sock");
+        let holder = UnixListener::bind(&socket)?;
+        let plist = retained.join("job.plist");
+        let executable = std::env::current_exe()?;
+        std::fs::write(
+            &plist,
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n\
+             <key>Label</key><string>{label}</string>\n\
+             <key>ProgramArguments</key><array><string>{executable}</string>\n\
+             <string>--exact</string><string>launchd_singleton_tests::launchd_native_private_job_preserves_pid_and_waits_for_socket</string>\n\
+             <string>--nocapture</string><string>--test-threads=1</string></array>\n\
+             <key>RunAtLoad</key><true/>\n\
+             <key>EnvironmentVariables</key><dict>\n\
+             <key>RCH_LAUNCHD_NATIVE_LABEL</key><string>{label}</string>\n\
+             <key>RCH_LAUNCHD_NATIVE_DIR</key><string>{directory}</string></dict>\n\
+             <key>StandardOutPath</key><string>{directory}/child.stdout</string>\n\
+             <key>StandardErrorPath</key><string>{directory}/child.stderr</string>\n\
+             </dict></plist>\n",
+                executable = xml(executable
+                    .to_str()
+                    .context("test executable is not UTF-8")?),
+                directory = xml(retained
+                    .to_str()
+                    .context("retained directory is not UTF-8")?),
+            ),
+        )?;
+        eprintln!(
+            "native launchd fixture retained at {} ({target})",
+            retained.display()
+        );
+
+        // Every fallible assertion after bootstrap stays inside this Result so
+        // even partial bootstrap or child failure reaches the owned bootout.
+        let result: Result<()> = async {
+            let started = manager(
+                &retained,
+                &[
+                    "bootstrap",
+                    &domain,
+                    plist.to_str().context("plist path is not UTF-8")?,
+                ],
+            )
+            .await?;
+            anyhow::ensure!(started.status.success(), "bootstrap failed: {started:?}");
+            wait_for(&retained.join("managed.pid")).await?;
+            let pid: u32 = std::fs::read_to_string(retained.join("managed.pid"))?.parse()?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            anyhow::ensure!(
+                !retained.join("bound.pid").exists(),
+                "managed child replaced the held listener"
+            );
+            let connection = UnixStream::connect(&socket).await?;
+            timeout(Duration::from_secs(1), holder.accept()).await??;
+            drop(connection);
+            for _ in 0..2 {
+                let output = manager(&retained, &["kickstart", "-p", &target]).await?;
+                anyhow::ensure!(output.status.success(), "kickstart failed: {output:?}");
+                anyhow::ensure!(
+                    launchd::kickstart_pid(std::str::from_utf8(&output.stdout)?, &target)? == pid,
+                    "non-forced kickstart changed the managed PID"
+                );
+            }
+            anyhow::ensure!(
+                launchd::resolve(
+                    Path::new("/bin/launchctl"),
+                    &label,
+                    uid,
+                    std::process::id(),
+                    false,
+                    tokio::time::Instant::now() + Duration::from_secs(5)
+                )
+                .await?
+                    == launchd::Ownership::Delegated,
+                "parent must delegate to its live private job"
+            );
+            // Preserve the old socket inode instead of deleting it. The child
+            // sees the active pathname become absent and binds on its retry.
+            std::fs::rename(&socket, retained.join("held-socket.retained"))?;
+            drop(holder);
+            wait_for(&retained.join("bound.pid")).await?;
+            anyhow::ensure!(
+                std::fs::read_to_string(retained.join("bound.pid"))?.parse::<u32>()? == pid,
+                "takeover changed PID"
+            );
+            let connection = UnixStream::connect(&socket).await?;
+            drop(connection);
+            std::fs::write(retained.join("parent-finished"), "done")?;
+            Ok(())
+        }
+        .await;
+        let cleanup = manager(&retained, &["bootout", &target]).await;
+        let absent = manager(&retained, &["print", &target]).await;
+        if result.is_err() {
+            eprintln!(
+                "native fixture failure: {result:?}; bootout: {cleanup:?}; absence: {absent:?}"
+            );
+        }
+        result?;
+        let cleanup = cleanup?;
+        anyhow::ensure!(
+            cleanup.status.success(),
+            "private bootout failed: {cleanup:?}"
+        );
+        let absent = absent?;
+        anyhow::ensure!(
+            absent.status.code() == Some(113),
+            "private job still registered: {absent:?}"
+        );
+        Ok(())
     }
 }

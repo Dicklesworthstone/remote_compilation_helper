@@ -259,6 +259,12 @@ rch rabs gc plan|run|history [--cas-root DIR] [--mode normal|emergency]
 rch rabs worker|doctor|inventory|reconcile
 ```
 
+On macOS, daemon autostarts defer to a registered `com.rch.daemon` launchd
+service without restarting its running process. The managed daemon waits if
+another daemon still owns its socket. A private daemon bypasses this service
+discovery when given both a nondefault socket and an explicit workers
+configuration; a custom socket alone cannot be delegated to the shared service.
+
 Fleet GC reports progress on stderr as workers finish. Each worker has a
 15-minute budget shared across connections, scanned roots, and collection
 batches; set `rch gc --worker-timeout=120` for a shorter budget. A timeout makes
