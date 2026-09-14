@@ -414,17 +414,12 @@ pub(super) fn rewrite_cargo_target_dir_command_for_remote(
     command.to_string()
 }
 
-/// Bind Cargo's intermediate cache to the same managed directory as its
-/// artifacts. A final CLI config wins over inherited files, environment and
-/// earlier CLI config without intercepting either compiler wrapper.
-pub(super) fn managed_clean_overlay_cargo_build_dir(
+/// Parse the supported literal command grammar and locate the Cargo executable.
+/// Leading assignments are normalized with an explicit `env` token; the returned
+/// index refers to this normalized argv, after any supported wrapper prefixes.
+pub(super) fn managed_clean_overlay_cargo_tokens(
     command: &str,
-    managed_target: &str,
-) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        !managed_target.is_empty() && !managed_target.chars().any(char::is_control),
-        "managed Cargo build directory must be a nonempty path without control characters"
-    );
+) -> anyhow::Result<(Vec<String>, usize)> {
     // shell_words preserves literal argv, not shell evaluation. Refuse syntax
     // whose expansion or execution would change when those words are re-quoted.
     let mut quote = None;
@@ -552,7 +547,22 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
             _ => anyhow::bail!("unsupported executable prefix in managed Cargo command: {token}"),
         }
     }
-    index += 1;
+    Ok((tokens, index))
+}
+
+/// Bind Cargo's intermediate cache to the same managed directory as its
+/// artifacts. A final CLI config wins over inherited files, environment and
+/// earlier CLI config without intercepting either compiler wrapper.
+pub(super) fn managed_clean_overlay_cargo_build_dir(
+    command: &str,
+    managed_target: &str,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !managed_target.is_empty() && !managed_target.chars().any(char::is_control),
+        "managed Cargo build directory must be a nonempty path without control characters"
+    );
+    let (mut tokens, cargo_index) = managed_clean_overlay_cargo_tokens(command)?;
+    let mut index = cargo_index + 1;
     if tokens
         .get(index)
         .is_some_and(|token| token.starts_with('+'))
@@ -807,7 +817,36 @@ pub(super) fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) ->
 
 #[cfg(test)]
 mod managed_build_dir_tests {
-    use super::managed_clean_overlay_cargo_build_dir;
+    use super::{managed_clean_overlay_cargo_build_dir, managed_clean_overlay_cargo_tokens};
+
+    #[test]
+    fn source_pair_cargo_tokens_distinguishes_prefix_values_from_executable() {
+        for (command, cargo_index) in [
+            ("cargo test", 0),
+            ("/opt/bin/cargo.exe +nightly test", 0),
+            ("/usr/bin/time -f cargo cargo test", 3),
+            ("rustup run cargo /opt/bin/cargo test", 3),
+            (
+                "CARGO_MARK='cargo' /usr/bin/time -f cargo env -u cargo -- X=cargo /opt/bin/cargo test",
+                10,
+            ),
+        ] {
+            let (tokens, actual_index) = managed_clean_overlay_cargo_tokens(command).unwrap();
+            assert_eq!(actual_index, cargo_index, "{command}");
+            let mut expected = shell_words::split(command).unwrap();
+            if command.starts_with("CARGO_MARK=") {
+                expected.insert(0, "env".to_string());
+            }
+            assert_eq!(tokens, expected, "{command}");
+            assert!(matches!(
+                std::path::Path::new(&tokens[actual_index])
+                    .file_name()
+                    .unwrap()
+                    .to_str(),
+                Some("cargo" | "cargo.exe")
+            ));
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
