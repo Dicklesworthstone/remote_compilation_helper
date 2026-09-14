@@ -25,6 +25,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::Instant as TokioInstant;
@@ -4662,41 +4663,77 @@ fi",
         cmd
     }
 
-    /// Best-effort removal of an invocation-unique remote tree (bd-p1vlb).
+    /// Refresh only materialized source timestamps while its source-pair lease
+    /// is held. Git archives and overlays can carry older/equal mtimes even
+    /// when their bytes changed. A timestamp strictly newer than the cached
+    /// artifacts forces normal Cargo freshness to reconsider local units;
+    /// registry/Git dependency files and their compiled cache remain untouched.
+    pub async fn refresh_clean_overlay_source(&self, worker: &WorkerConfig) -> Result<()> {
+        if use_mock_transport(worker) {
+            return Ok(());
+        }
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            self.run_remote_sh(worker, &self.clean_overlay_source_refresh_command()),
+        )
+        .await
+        .context("timed out proving clean-overlay source freshness")?
+    }
+
+    fn clean_overlay_source_refresh_command(&self) -> String {
+        let root = self.remote_path();
+        let pool = self.remote_cargo_target_dir();
+        let quote = |value: &str| escape(Cow::from(value)).into_owned();
+        let anchor = format!("{root}.freshness-anchor");
+        let stamp = format!("{root}.freshness-stamp");
+        format!(
+            "set -eu; root={root}; pool={pool}; anchor={anchor}; stamp={stamp}; \
+             [ ! -L \"$anchor\" ] && [ ! -L \"$stamp\" ] && [ ! -L \"$pool\" ]; touch \"$anchor\"; \
+             if [ -d \"$pool\" ]; then \
+             find \"$pool\" -type f -exec sh -c \
+             'anchor=$1; shift; for file do if [ \"$file\" -nt \"$anchor\" ]; then touch -r \"$file\" \"$anchor\" || exit; fi; done' \
+             sh \"$anchor\" {{}} +; fi; \
+             attempts=0; touch \"$stamp\"; \
+             until [ \"$stamp\" -nt \"$anchor\" ]; do \
+             attempts=$((attempts + 1)); if [ \"$attempts\" -gt 5 ]; then \
+             echo 'RCH: worker clock cannot advance beyond cached artifacts; source freshness unproved' >&2; exit 1; fi; \
+             sleep 1; touch \"$stamp\"; done; \
+             find \"$root\" \\( -type f -o -type d \\) -exec touch -r \"$stamp\" {{}} +",
+            root = quote(&root),
+            pool = quote(&pool),
+            anchor = quote(&anchor),
+            stamp = quote(&stamp),
+        )
+    }
+
+    /// Best-effort removal of an isolated remote tree (bd-p1vlb).
     ///
-    /// Clean-overlay roots are per-run by construction (a job nonce is hashed
-    /// into the remote root), so nothing else ever shares or reuses them —
+    /// Unpooled clean-overlay roots are per-run. A pooled source path may be
+    /// reused only after retirement, under its full-lifecycle source lease —
     /// but each holds a full materialized snapshot. Without explicit reaping,
     /// every overlay run leaks hundreds of MB to GBs on the worker's staging
     /// base (observed: a 37G `/tmp/rch-sync` tmpfs pile within days,
-    /// bd-lvbax). All errors are swallowed by the caller; reaping is
-    /// opportunistic hygiene and must never affect the surfaced job result.
+    /// bd-lvbax). Unpooled retirement is best-effort. Paired source reuse
+    /// requires successful retirement before its owner can release the lease.
     pub async fn reap_remote_tree(&self, worker: &WorkerConfig, root: &str) -> Result<()> {
         if self.worker_platform.is_windows() {
             // Overlay transport is rsync/ssh-only today; nothing to reap.
             return Ok(());
         }
-        let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
-        let target = escape(Cow::from(format!("{}@{}", worker.user, worker.host)));
-        // The root is `[A-Za-z0-9/-]` by construction (hash + project id);
-        // quote it anyway so a future naming scheme cannot turn the removal
-        // into word-splitting.
-        let quoted_root = format!("'{}'", root.replace('\'', "'\\''"));
-        let script = format!("{ssh_command} {target} -- rm -rf -- {quoted_root}");
-        let status = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&script)
-            .status()
-            .await?;
-        if !status.success() {
-            anyhow::bail!(
-                "remote reap of {root} on {} exited with {status}",
-                worker.id
-            );
-        }
-        Ok(())
+        // The source can already have been retired by its owner. Avoid even
+        // invoking removal in that case. A bounded owned SSH child also keeps
+        // cleanup from holding a source-pair lease indefinitely on a lost link.
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            self.run_remote_sh(worker, &Self::remote_tree_retirement_command(root)),
+        )
+        .await
+        .context("timed out retiring clean-overlay source")?
+    }
+
+    fn remote_tree_retirement_command(root: &str) -> String {
+        let root = escape(Cow::from(root));
+        format!("if [ -e {root} ] || [ -L {root} ]; then rm -rf -- {root}; fi")
     }
 
     /// Retrieve one declared job result directory (bd-p0yoo).
@@ -8657,6 +8694,240 @@ Number of files transferred: 42
         assert!(
             command.contains(&managed_assignment("CARGO_TARGET_DIR", stable_pool)),
             "override must drive the injected CARGO_TARGET_DIR: {command}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn source_pair_fixture(root: &Path, dependency: &Path, value: &str, inner: &str) {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("inner/src")).unwrap();
+        let url = toml::Value::String(format!("file://{}", dependency.display()));
+        std::fs::write(root.join("Cargo.toml"), format!(
+            "[package]\nname='pair_fixture'\nversion='0.1.0'\nedition='2024'\n\
+             [workspace]\nexclude=['inner']\n[dependencies]\ninner={{path='inner'}}\nexternal_fixture={{git={url}}}\n"
+        )).unwrap();
+        std::fs::write(
+            root.join("inner/Cargo.toml"),
+            "[package]\nname='inner'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("inner/src/lib.rs"),
+            format!("pub fn value() -> &'static str {{ \"{inner}\" }}\n"),
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), format!(
+            "pub fn value() -> &'static str {{ \"{value}\" }}\n\
+             #[test] fn reads_current_fixture() {{\n\
+             let root = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\"));\n\
+             let expected = std::fs::read_to_string(root.join(\"fixture.txt\")).unwrap();\n\
+             assert_eq!(expected, format!(\"{{}}|{{}}|{{}}\", value(), inner::value(), external_fixture::value()));\n\
+             assert_eq!(std::fs::read_to_string(root.join(\"generation.txt\")).unwrap(), std::env::var(\"RCH_PAIR_GENERATION\").unwrap());\n\
+             assert_eq!(root.canonicalize().unwrap(), std::env::current_dir().unwrap());\n}}\n"
+        )).unwrap();
+        std::fs::write(root.join("fixture.txt"), format!("{value}|{inner}|7")).unwrap();
+        std::fs::write(root.join("generation.txt"), "initial").unwrap();
+        let old = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        for file in [
+            "Cargo.toml",
+            "src/lib.rs",
+            "inner/Cargo.toml",
+            "inner/src/lib.rs",
+            "fixture.txt",
+            "generation.txt",
+        ] {
+            std::fs::File::options()
+                .write(true)
+                .open(root.join(file))
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn source_pair_test_cargo(root: &Path, pool: &Path, checksum: bool) -> std::process::Output {
+        let mut command = std::process::Command::new("cargo");
+        command
+            .current_dir(root)
+            .args(["test", "--offline", "--jobs", "1", "--message-format=json"])
+            .env("CARGO_TARGET_DIR", pool)
+            .env(
+                "RCH_PAIR_GENERATION",
+                std::fs::read_to_string(root.join("generation.txt")).unwrap(),
+            )
+            .env_remove("CARGO_BUILD_BUILD_DIR")
+            // Nested compiles execute on the worker running this RCH-offloaded
+            // test, through its real Cargo rather than recursively offloading.
+            .env("RCH_CARGO_WRAPPER_BYPASS", "1");
+        if checksum {
+            command.arg("-Zchecksum-freshness");
+        }
+        command.output().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn source_pair_external_dependency_fresh(output: &std::process::Output) -> bool {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|message| {
+                message["reason"] == "compiler-artifact"
+                    && message["target"]["name"] == "external_fixture"
+                    && message["fresh"] == true
+            })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_pair_retirement_accepts_an_already_retired_root() {
+        let evidence = tempfile::tempdir().unwrap().keep();
+        let source = evidence.join("source with ' quotes");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("fixture"), "retained source").unwrap();
+        let retained = evidence.join("retired");
+        std::fs::rename(&source, &retained).unwrap();
+        // Only shell builtins are needed when the root is already absent.
+        // An accidental removal invocation must fail instead of passing merely
+        // because `rm -f` tolerates an absent path.
+        let output = std::process::Command::new("/bin/sh")
+            .env("PATH", "")
+            .args([
+                "-c",
+                &TransferPipeline::remote_tree_retirement_command(source.to_str().unwrap()),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read_to_string(retained.join("fixture")).unwrap(),
+            "retained source"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_pair_real_cargo_reuses_dependencies_and_reads_current_source() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let dependency = dir.join("external");
+        std::fs::create_dir_all(dependency.join("src")).unwrap();
+        std::fs::write(
+            dependency.join("Cargo.toml"),
+            "[package]\nname='external_fixture'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("src/lib.rs"),
+            "pub fn value() -> u32 { 7 }\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=RCH Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(&dependency)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        // Negative control: the previous nonce-root policy with unchanged,
+        // old timestamps must reproduce a real runtime fixture-path failure.
+        let legacy_pool = dir.join("legacy-pool");
+        let legacy_a = dir.join("legacy-a");
+        source_pair_fixture(&legacy_a, &dependency, "first", "alpha");
+        // This fixture has only a local file:// Git dependency. Populate its
+        // Cargo cache once before the deliberately offline regression runs.
+        let fetch = std::process::Command::new("cargo")
+            .current_dir(&legacy_a)
+            .args(["fetch"])
+            .output()
+            .unwrap();
+        assert!(
+            fetch.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fetch.stderr)
+        );
+        let first = source_pair_test_cargo(&legacy_a, &legacy_pool, false);
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        std::fs::rename(&legacy_a, dir.join("legacy-a-retired")).unwrap();
+        let legacy_b = dir.join("legacy-b");
+        source_pair_fixture(&legacy_b, &dependency, "first", "alpha");
+        let stale = source_pair_test_cargo(&legacy_b, &legacy_pool, false);
+        assert!(
+            !stale.status.success(),
+            "negative control did not reproduce the stale source path"
+        );
+        assert!(String::from_utf8_lossy(&stale.stdout).contains("reads_current_fixture"));
+
+        for checksum in [false, true] {
+            let root = dir.join(format!("source-{checksum}"));
+            let pool = dir.join(format!("pool-{checksum}"));
+            for (run, (value, inner)) in
+                [("first", "alpha"), ("first", "alpha"), ("later", "omega")]
+                    .into_iter()
+                    .enumerate()
+            {
+                source_pair_fixture(&root, &dependency, value, inner);
+                // Run two changes only a runtime fixture, so a fresh source
+                // namespace must expose new data even when checksum Cargo
+                // reuses the unchanged test executable.
+                std::fs::write(root.join("generation.txt"), format!("generation-{run}")).unwrap();
+                let pipeline = TransferPipeline::new(
+                    root.clone(),
+                    "fixture".into(),
+                    "pair".into(),
+                    TransferConfig::default(),
+                )
+                .with_remote_path_override(root.to_string_lossy().into_owned())
+                .with_remote_cargo_target_dir_override(pool.to_string_lossy().into_owned());
+                assert!(
+                    std::process::Command::new("sh")
+                        .args(["-c", &pipeline.clean_overlay_source_refresh_command()])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                let result = source_pair_test_cargo(&root, &pool, checksum);
+                assert!(
+                    result.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                if run > 0 {
+                    assert!(
+                        source_pair_external_dependency_fresh(&result),
+                        "external dependency was rebuilt"
+                    );
+                }
+                std::fs::rename(&root, dir.join(format!("retired-{checksum}-{run}"))).unwrap();
+                assert!(
+                    !root.exists(),
+                    "source retirement must remove the old runtime path"
+                );
+            }
+        }
+        eprintln!(
+            "source-pair Cargo regression artifacts retained at {}",
+            dir.display()
         );
     }
 

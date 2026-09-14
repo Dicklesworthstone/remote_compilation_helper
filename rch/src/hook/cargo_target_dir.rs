@@ -414,6 +414,221 @@ pub(super) fn rewrite_cargo_target_dir_command_for_remote(
     command.to_string()
 }
 
+/// Bind Cargo's intermediate cache to the same managed directory as its
+/// artifacts. A final CLI config wins over inherited files, environment and
+/// earlier CLI config without intercepting either compiler wrapper.
+pub(super) fn managed_clean_overlay_cargo_build_dir(
+    command: &str,
+    managed_target: &str,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !managed_target.is_empty() && !managed_target.chars().any(char::is_control),
+        "managed Cargo build directory must be a nonempty path without control characters"
+    );
+    // shell_words preserves literal argv, not shell evaluation. Refuse syntax
+    // whose expansion or execution would change when those words are re-quoted.
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if quote == Some(ch) {
+            quote = None;
+        } else if quote.is_none() && matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if quote != Some('\'') && matches!(ch, '$' | '`')
+            || quote.is_none()
+                && matches!(
+                    ch,
+                    ';' | '|' | '&' | '<' | '>' | '\n' | '*' | '?' | '[' | '~' | '(' | ')'
+                )
+        {
+            anyhow::bail!("cannot safely bind Cargo build directory across shell evaluation");
+        }
+    }
+    let mut tokens = shell_words::split(command)?;
+    let assignment = |token: &str| {
+        token.split_once('=').is_some_and(|(key, _)| {
+            !key.is_empty()
+                && key.chars().enumerate().all(|(index, ch)| {
+                    ch == '_' || ch.is_ascii_alphabetic() || index > 0 && ch.is_ascii_digit()
+                })
+        })
+    };
+    // Quoting an assignment as an entire shell word makes it an executable.
+    // An explicit env prefix keeps the same assignment bytes as real argv.
+    if tokens.first().is_some_and(|token| assignment(token)) {
+        tokens.insert(0, "env".to_string());
+    }
+    let mut index = 0;
+    loop {
+        let token = tokens
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("missing Cargo command"))?;
+        let executable = Path::new(token).file_name().and_then(|name| name.to_str());
+        match executable {
+            Some("cargo" | "cargo.exe") => break,
+            Some("env") => {
+                index += 1;
+                while let Some(token) = tokens.get(index) {
+                    match token.as_str() {
+                        "--" => {
+                            index += 1;
+                            break;
+                        }
+                        "-i" | "--ignore-environment" => index += 1,
+                        "-u" | "--unset" | "-C" | "--chdir" => {
+                            anyhow::ensure!(
+                                tokens.get(index + 1).is_some(),
+                                "missing env option value"
+                            );
+                            index += 2;
+                        }
+                        value
+                            if value.starts_with("--unset=")
+                                || value.starts_with("--chdir=")
+                                || assignment(value) =>
+                        {
+                            index += 1
+                        }
+                        value if value.starts_with('-') => anyhow::bail!(
+                            "unsupported env option in managed Cargo command: {value}"
+                        ),
+                        _ => break,
+                    }
+                }
+                while tokens.get(index).is_some_and(|token| assignment(token)) {
+                    index += 1;
+                }
+            }
+            Some("time") => {
+                index += 1;
+                while let Some(token) = tokens.get(index) {
+                    match token.as_str() {
+                        "--" => {
+                            index += 1;
+                            break;
+                        }
+                        "-p" | "--portability" | "-v" | "--verbose" | "-a" | "--append" | "-q"
+                        | "--quiet" => index += 1,
+                        "-f" | "--format" | "-o" | "--output" => {
+                            anyhow::ensure!(
+                                tokens.get(index + 1).is_some(),
+                                "missing time option value"
+                            );
+                            index += 2;
+                        }
+                        value
+                            if value.starts_with("--format=") || value.starts_with("--output=") =>
+                        {
+                            index += 1
+                        }
+                        value if value.starts_with('-') => anyhow::bail!(
+                            "unsupported time option in managed Cargo command: {value}"
+                        ),
+                        _ => break,
+                    }
+                }
+            }
+            Some("rustup") => {
+                anyhow::ensure!(
+                    tokens.get(index + 1).is_some_and(|token| token == "run"),
+                    "expected rustup run before Cargo"
+                );
+                index += 2;
+                if tokens.get(index).is_some_and(|token| token == "--install") {
+                    index += 1;
+                }
+                anyhow::ensure!(
+                    tokens
+                        .get(index)
+                        .is_some_and(|token| !token.is_empty() && !token.starts_with('-')),
+                    "missing rustup toolchain"
+                );
+                index += 1;
+            }
+            _ => anyhow::bail!("unsupported executable prefix in managed Cargo command: {token}"),
+        }
+    }
+    index += 1;
+    if tokens
+        .get(index)
+        .is_some_and(|token| token.starts_with('+'))
+    {
+        index += 1;
+    }
+    // Locate the subcommand without confusing option values for its name.
+    while let Some(token) = tokens.get(index) {
+        match token.as_str() {
+            "--config" | "--color" | "-Z" | "-C" => {
+                anyhow::ensure!(
+                    tokens.get(index + 1).is_some_and(|value| value != "--"),
+                    "missing Cargo global option value"
+                );
+                index += 2;
+            }
+            "-v" | "-vv" | "-q" | "--verbose" | "--quiet" | "--locked" | "--offline"
+            | "--frozen" => index += 1,
+            value
+                if value.starts_with("--config=")
+                    || value.starts_with("--color=")
+                    || value.starts_with("-Z") && value.len() > 2 =>
+            {
+                index += 1
+            }
+            value if value.starts_with('-') => {
+                anyhow::bail!("unsupported Cargo global option: {value}")
+            }
+            _ => break,
+        }
+    }
+    let subcommand = tokens
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("missing Cargo subcommand"))?;
+    if subcommand == "fmt" {
+        return Ok(command.to_string());
+    }
+    anyhow::ensure!(
+        matches!(
+            subcommand.as_str(),
+            "build"
+                | "b"
+                | "check"
+                | "c"
+                | "test"
+                | "t"
+                | "clippy"
+                | "doc"
+                | "d"
+                | "bench"
+                | "run"
+                | "r"
+                | "rustc"
+                | "rustdoc"
+                | "fix"
+        ),
+        "unsupported Cargo subcommand for managed build directory: {subcommand}"
+    );
+    let end = tokens[index + 1..]
+        .iter()
+        .position(|token| token == "--")
+        .map_or(tokens.len(), |offset| index + 1 + offset);
+    anyhow::ensure!(
+        !tokens[index + 1..end]
+            .iter()
+            .any(|token| token == "--build-dir" || token.starts_with("--build-dir=")),
+        "explicit --build-dir is unsupported for clean-overlay execution"
+    );
+    let value = format!(
+        "build.build-dir={}",
+        toml::Value::String(managed_target.to_string())
+    );
+    tokens.splice(end..end, ["--config".to_string(), value]);
+    Ok(join_exec_command(&tokens))
+}
+
 pub(super) fn strip_cargo_target_dir_assignments_from_command_tokens(
     tokens: &[String],
 ) -> Option<Vec<String>> {
@@ -588,4 +803,216 @@ pub(super) fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) ->
     }
 
     scan_target_dir_flag(tokens)
+}
+
+#[cfg(test)]
+mod managed_build_dir_tests {
+    use super::managed_clean_overlay_cargo_build_dir;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_pair_build_dir_real_cargo_overrides_file_env_and_cli() {
+        use std::io::Read as _;
+        use std::path::{Path, PathBuf};
+
+        let root = tempfile::tempdir().unwrap().keep();
+        for directory in ["src", ".cargo", "bin", "cargo-home"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname='managed_build_dir_fixture'\nversion='0.1.0'\nedition='2024'\n[workspace]\n").unwrap();
+        std::fs::write(root.join("fixture.txt"), "sealed fixture").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "#[test] fn reads_fixture() { let root = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\")); assert_eq!(std::fs::read_to_string(root.join(\"fixture.txt\")).unwrap(), \"sealed fixture\"); }\n").unwrap();
+        let outside: Vec<_> = ["outside-A", "outside-B", "outside-C"]
+            .into_iter()
+            .map(|name| root.join(name))
+            .collect();
+        let config_value = |path: &Path| toml::Value::String(path.to_str().unwrap().to_string());
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            format!("[build]\nbuild-dir={}\n", config_value(&outside[0])),
+        )
+        .unwrap();
+        // The harness's Cargo identifies the compiler used to build this test.
+        // A managed toolchain shim retains its real executable beside it.
+        let mut cargo = PathBuf::from(env!("CARGO"));
+        if std::fs::metadata(&cargo).unwrap().len() <= 8 * 1024
+            && std::fs::read_to_string(&cargo)
+                .unwrap()
+                .lines()
+                .any(|line| line.starts_with("# rch-toolchain-wrap-version:"))
+        {
+            cargo.set_file_name("cargo-rch-real");
+        }
+        let mut magic = [0; 4];
+        std::fs::File::open(&cargo)
+            .unwrap()
+            .read_exact(&mut magic)
+            .unwrap();
+        assert_eq!(
+            &magic, b"\x7fELF",
+            "fixture must execute a real Cargo binary"
+        );
+        let cargo_bin = cargo.parent().unwrap();
+        let executable = root.join("bin/cargo");
+        std::os::unix::fs::symlink(&cargo, &executable).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(cargo_bin.to_path_buf())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let pool = root.join("managed pool");
+        for (subcommand, passthrough) in [("test", "--nocapture"), ("clippy", "-D warnings")] {
+            let command = format!(
+                "{} {subcommand} --offline --jobs 1 --message-format=json --config {} -- {passthrough}",
+                shell_words::quote(executable.to_str().unwrap()),
+                shell_words::quote(&format!("build.build-dir={}", config_value(&outside[2])))
+            );
+            let managed =
+                managed_clean_overlay_cargo_build_dir(&command, pool.to_str().unwrap()).unwrap();
+            let output = std::process::Command::new("sh")
+                .args(["-c", &managed])
+                .current_dir(&root)
+                .env("PATH", &path)
+                .env("CARGO_HOME", root.join("cargo-home"))
+                .env("CARGO_TARGET_DIR", &pool)
+                .env("CARGO_BUILD_BUILD_DIR", &outside[1])
+                .env("RUSTC", cargo_bin.join("rustc"))
+                .env("RUSTFLAGS", "")
+                .env("RUSTUP_AUTO_INSTALL", "0")
+                .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env_remove("RUSTUP_TOOLCHAIN")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_BUILD_RUSTC")
+                .env_remove("CARGO_BUILD_TARGET")
+                .env_remove("CARGO_BUILD_TARGET_DIR")
+                .env_remove("CARGO_BUILD_RUSTFLAGS")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                output.status.success(),
+                "{subcommand}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let artifacts: Vec<_> = stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|message| {
+                    message["reason"] == "compiler-artifact"
+                        && message["target"]["name"] == "managed_build_dir_fixture"
+                })
+                .collect();
+            assert!(
+                !artifacts.is_empty(),
+                "real compiler artifact receipt required: {stdout}"
+            );
+            for artifact in artifacts {
+                assert_eq!(
+                    artifact["manifest_path"].as_str(),
+                    root.join("Cargo.toml").to_str()
+                );
+                assert!(!artifact["filenames"].as_array().unwrap().is_empty());
+                for filename in artifact["filenames"].as_array().unwrap() {
+                    let filename = Path::new(filename.as_str().unwrap());
+                    assert!(
+                        filename.starts_with(&pool) && filename.is_file(),
+                        "{}",
+                        filename.display()
+                    );
+                }
+            }
+            if subcommand == "test" {
+                assert!(stdout.contains("test reads_fixture ... ok"), "{stdout}");
+            }
+            assert!(
+                outside.iter().all(|path| !path.exists()),
+                "unmanaged cache directory was created"
+            );
+        }
+        eprintln!(
+            "managed build-dir real Cargo evidence retained at {}",
+            root.display()
+        );
+    }
+
+    #[test]
+    fn source_pair_build_dir_keeps_wrappers_and_literal_arguments() {
+        let command = "env -- CARGO_BUILD_BUILD_DIR='/outside cache' /usr/bin/time -f '%e seconds' rustup run nightly-2026-08-31 /opt/rust/bin/cargo +nightly test --config 'build.build-dir=\"/also outside\"' -p 'space name' -- 'literal $value; with quotes'";
+        let target = "/managed/cache with 'single' and \"double\" quotes";
+        let rewritten = managed_clean_overlay_cargo_build_dir(command, target).unwrap();
+        let original = shell_words::split(command).unwrap();
+        let actual = shell_words::split(&rewritten).unwrap();
+        let separator = original.iter().rposition(|token| token == "--").unwrap();
+        assert_eq!(&actual[..separator], &original[..separator]);
+        assert_eq!(actual[separator], "--config");
+        let config: toml::Value = toml::from_str(&actual[separator + 1]).unwrap();
+        assert_eq!(config["build"]["build-dir"].as_str(), Some(target));
+        assert_eq!(&actual[separator + 2..], &original[separator..]);
+    }
+
+    #[test]
+    fn source_pair_build_dir_final_config_wins_before_clippy_passthrough() {
+        let rewritten = managed_clean_overlay_cargo_build_dir(
+            "RUSTC_WRAPPER='/wrapper with spaces' cargo --config 'build.build-dir=\"/global\"' clippy --all-targets --config=build.build-dir='\"/later\"' -- -D warnings",
+            "/managed",
+        ).unwrap();
+        let tokens = shell_words::split(&rewritten).unwrap();
+        assert_eq!(tokens[0], "env");
+        assert_eq!(tokens[1], "RUSTC_WRAPPER=/wrapper with spaces");
+        let separator = tokens.iter().position(|token| token == "--").unwrap();
+        assert_eq!(&tokens[separator..], ["--", "-D", "warnings"]);
+        assert_eq!(tokens[separator - 2], "--config");
+        let config: toml::Value = toml::from_str(&tokens[separator - 1]).unwrap();
+        assert_eq!(config["build"]["build-dir"].as_str(), Some("/managed"));
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token == "--config=build.build-dir=\"/later\"")
+        );
+    }
+
+    #[test]
+    fn source_pair_build_dir_preserves_format_and_refuses_ambiguous_commands() {
+        let fmt = "env RUSTUP_TOOLCHAIN=nightly cargo fmt --check";
+        assert_eq!(
+            managed_clean_overlay_cargo_build_dir(fmt, "/managed").unwrap(),
+            fmt
+        );
+        for command in [
+            "",
+            "cargo",
+            "cargo --config",
+            "cargo test 'unterminated",
+            "cargo test; echo surprise",
+            "cargo test $(echo filter)",
+            "cargo test $FILTER",
+            "cargo test > output",
+            "sh -c 'cargo test'",
+            "env -S 'cargo test'",
+            "env -u",
+            "rustup run",
+            "cargo custom-build",
+            "cargo test --build-dir /unmanaged",
+            "cargo test --build-dir=/unmanaged",
+        ] {
+            assert!(
+                managed_clean_overlay_cargo_build_dir(command, "/managed").is_err(),
+                "{command}"
+            );
+        }
+        assert!(managed_clean_overlay_cargo_build_dir("cargo test", "").is_err());
+        assert!(managed_clean_overlay_cargo_build_dir("cargo test", "/bad\npath").is_err());
+        // This is a test-binary argument, not an override of Cargo's cache.
+        let passthrough =
+            managed_clean_overlay_cargo_build_dir("cargo test -- --build-dir=/literal", "/managed")
+                .unwrap();
+        assert_eq!(
+            shell_words::split(&passthrough).unwrap().last().unwrap(),
+            "--build-dir=/literal"
+        );
+    }
 }

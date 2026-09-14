@@ -714,6 +714,27 @@ Explicit clean-overlay execution also admits the read-only `cargo fmt --check`
 diagnostic, which the ordinary interception classifier intentionally leaves
 local.
 
+On Unix workers, pooled Cargo builds use a stable source path paired with a
+versioned target cache. Jobs sharing that pair wait until the preceding job
+has finished execution, artifact retrieval, and source retirement. Different
+pairs remain independent. Source timestamps are refreshed beyond cached
+artifacts so changed archive or overlay contents cannot appear older than a
+previous build; registry and Git dependency caches remain reusable.
+Clean-overlay execution also pins Cargo's `build.build-dir` to its assigned
+target directory, overriding ambient and command-line Cargo configuration.
+Explicit `--build-dir` options are refused. This placement applies to isolated
+builds too, so disabling target reuse cannot inherit shared intermediates.
+Managed placement currently supports built-in Cargo build commands and Clippy.
+Other compiling Cargo subcommands, including Nextest and Zigbuild, are refused
+in clean-overlay mode.
+
+An interrupted pair retains its ownership marker and refuses further reuse,
+even if its SSH lock connection disappears. Inspect the prior job before
+recovering that pair, or use `RCH_DISABLE_TARGET_REUSE=1` for a fresh isolated
+build. Windows clean-overlay builds also use isolated targets. The ownership
+marker protects against process interruption; it is not a power-loss durability
+guarantee.
+
 Clean-overlay currently materializes one Git repository. In-repository Cargo
 workspace members are present in the archive. External path dependencies are
 outside the source-identity guarantee: callers must independently ensure they
