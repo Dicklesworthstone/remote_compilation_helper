@@ -301,16 +301,24 @@ pub fn validate_selected_cargo_tree(
         directories: BTreeSet::from([PathBuf::new()]),
         diagnostics: Vec::new(),
     };
+    if !entries.contains_key(Path::new("Cargo.toml")) {
+        tree.diagnostics.push(
+            "selected root Cargo.toml is missing; ambient ancestor discovery is not admitted"
+                .into(),
+        );
+    }
     for path in entries.keys() {
         if path.as_os_str().is_empty()
             || path.to_str().is_none()
-            || path.components().any(|part| {
-                !matches!(part, std::path::Component::Normal(_))
-            })
+            || path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
             || path.to_string_lossy().contains(['\\', ':'])
         {
-            tree.diagnostics
-                .push(format!("invalid selected inventory path: {}", path.display()));
+            tree.diagnostics.push(format!(
+                "invalid selected inventory path: {}",
+                path.display()
+            ));
             continue;
         }
         for parent in path.ancestors().skip(1) {
@@ -331,11 +339,12 @@ pub fn validate_selected_cargo_tree(
             }
         }
         let is_manifest = path.file_name().is_some_and(|name| name == "Cargo.toml");
-        let is_config = path.parent().is_some_and(|parent| {
-            parent.file_name().is_some_and(|name| name == ".cargo")
-        }) && path
-            .file_name()
-            .is_some_and(|name| name == "config" || name == "config.toml");
+        let is_config = path
+            .parent()
+            .is_some_and(|parent| parent.file_name().is_some_and(|name| name == ".cargo"))
+            && path
+                .file_name()
+                .is_some_and(|name| name == "config" || name == "config.toml");
         if !is_manifest && !is_config {
             continue;
         }
@@ -420,7 +429,10 @@ impl SelectedCargoTree<'_> {
                 Some(SelectedCargoEntry::Symlink(target)) => {
                     links += 1;
                     if links > 64 {
-                        return Err(format!("symlink cycle or expansion limit at {}", resolved.display()));
+                        return Err(format!(
+                            "symlink cycle or expansion limit at {}",
+                            resolved.display()
+                        ));
                     }
                     let mut target_components = Self::components(target)?;
                     target_components.append(&mut pending);
@@ -428,7 +440,10 @@ impl SelectedCargoTree<'_> {
                     resolved.pop();
                 }
                 Some(SelectedCargoEntry::File(_)) if !pending.is_empty() => {
-                    return Err(format!("non-directory path component {}", resolved.display()));
+                    return Err(format!(
+                        "non-directory path component {}",
+                        resolved.display()
+                    ));
                 }
                 Some(SelectedCargoEntry::File(_)) => {}
                 None if self.directories.contains(&resolved) => {}
@@ -454,39 +469,65 @@ impl SelectedCargoTree<'_> {
                 match kind {
                     SelectedCargoPathKind::Package => {
                         let manifest = self.resolve(&resolved, "Cargo.toml")?;
-                        if !matches!(self.entries.get(&manifest), Some(SelectedCargoEntry::File(Some(_)))) {
-                            return Err(format!("selected package manifest text missing: {}", manifest.display()));
+                        if !matches!(
+                            self.entries.get(&manifest),
+                            Some(SelectedCargoEntry::File(Some(_)))
+                        ) {
+                            return Err(format!(
+                                "selected package manifest text missing: {}",
+                                manifest.display()
+                            ));
                         }
                     }
                     SelectedCargoPathKind::File => {
-                        if !matches!(self.entries.get(&resolved), Some(SelectedCargoEntry::File(_))) {
-                            return Err(format!("selected regular file missing: {}", resolved.display()));
+                        if !matches!(
+                            self.entries.get(&resolved),
+                            Some(SelectedCargoEntry::File(_))
+                        ) {
+                            return Err(format!(
+                                "selected regular file missing: {}",
+                                resolved.display()
+                            ));
                         }
                     }
                     SelectedCargoPathKind::Directory => {
                         if !self.directories.contains(&resolved) {
-                            return Err(format!("selected directory missing: {}", resolved.display()));
+                            return Err(format!(
+                                "selected directory missing: {}",
+                                resolved.display()
+                            ));
                         }
                     }
                 }
                 Ok(())
             });
         if let Err(error) = result {
-            self.diagnostics.push(format!(
-                "{}: {key}={value}: {error}", declaring.display()
-            ));
+            self.diagnostics
+                .push(format!("{}: {key}={value}: {error}", declaring.display()));
         }
     }
 
     fn dependencies(&mut self, declaring: &Path, base: &Path, key: &str, table: &toml::Table) {
         for (name, dependency) in table {
             if let Some(path) = dependency.as_table().and_then(|value| value.get("path")) {
-                self.reference(declaring, base, &format!("{key}.{name}.path"), path, SelectedCargoPathKind::Package);
+                self.reference(
+                    declaring,
+                    base,
+                    &format!("{key}.{name}.path"),
+                    path,
+                    SelectedCargoPathKind::Package,
+                );
             }
         }
     }
 
-    fn dependency_tables(&mut self, declaring: &Path, base: &Path, prefix: &str, table: &toml::Table) {
+    fn dependency_tables(
+        &mut self,
+        declaring: &Path,
+        base: &Path,
+        prefix: &str,
+        table: &toml::Table,
+    ) {
         for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
             if let Some(dependencies) = table.get(key).and_then(toml::Value::as_table) {
                 self.dependencies(declaring, base, &format!("{prefix}{key}"), dependencies);
@@ -509,12 +550,16 @@ impl SelectedCargoTree<'_> {
 
     fn members(&mut self, declaring: &Path, base: &Path, key: &str, value: &toml::Value) {
         let Some(members) = value.as_array() else {
-            self.diagnostics.push(format!("{}: {key} must be an array", declaring.display()));
+            self.diagnostics
+                .push(format!("{}: {key} must be an array", declaring.display()));
             return;
         };
         for member in members {
             let Some(pattern) = member.as_str() else {
-                self.diagnostics.push(format!("{}: {key} member must be a string", declaring.display()));
+                self.diagnostics.push(format!(
+                    "{}: {key} member must be a string",
+                    declaring.display()
+                ));
                 continue;
             };
             if !contains_glob(pattern) {
@@ -525,10 +570,19 @@ impl SelectedCargoTree<'_> {
             match result {
                 Ok(paths) => {
                     for path in paths {
-                        self.reference(declaring, &path, key, &toml::Value::String(".".into()), SelectedCargoPathKind::Package);
+                        self.reference(
+                            declaring,
+                            &path,
+                            key,
+                            &toml::Value::String(".".into()),
+                            SelectedCargoPathKind::Package,
+                        );
                     }
                 }
-                Err(error) => self.diagnostics.push(format!("{}: {key}={pattern:?}: {error}", declaring.display())),
+                Err(error) => self.diagnostics.push(format!(
+                    "{}: {key}={pattern:?}: {error}",
+                    declaring.display()
+                )),
             }
         }
     }
@@ -567,6 +621,13 @@ impl SelectedCargoTree<'_> {
 
     fn manifest(&mut self, declaring: &Path, table: &toml::Table) {
         let base = declaring.parent().unwrap_or(Path::new(""));
+        if Self::inherits_workspace(&toml::Value::Table(table.clone())) {
+            let workspace = self.selected_workspace(declaring, table);
+            if let Err(error) = workspace {
+                self.diagnostics
+                    .push(format!("{}: workspace inheritance: {error}", declaring.display()));
+            }
+        }
         self.dependency_tables(declaring, base, "", table);
         self.overrides(declaring, base, table);
         if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
@@ -586,50 +647,148 @@ impl SelectedCargoTree<'_> {
         }
         if let Some(package) = table.get("package").and_then(toml::Value::as_table) {
             if let Some(workspace) = package.get("workspace") {
-                self.reference(declaring, base, "package.workspace", workspace, SelectedCargoPathKind::Package);
+                self.reference(
+                    declaring,
+                    base,
+                    "package.workspace",
+                    workspace,
+                    SelectedCargoPathKind::Package,
+                );
             }
             if let Some(build) = package.get("build") {
                 match build {
                     toml::Value::Boolean(false) => {}
-                    toml::Value::Boolean(true) => self.reference(declaring, base, "package.build", &toml::Value::String("build.rs".into()), SelectedCargoPathKind::File),
-                    _ => self.reference(declaring, base, "package.build", build, SelectedCargoPathKind::File),
+                    toml::Value::Boolean(true) => self.reference(
+                        declaring,
+                        base,
+                        "package.build",
+                        &toml::Value::String("build.rs".into()),
+                        SelectedCargoPathKind::File,
+                    ),
+                    _ => self.reference(
+                        declaring,
+                        base,
+                        "package.build",
+                        build,
+                        SelectedCargoPathKind::File,
+                    ),
                 }
             }
         }
-        if let Some(path) = table.get("lib").and_then(toml::Value::as_table).and_then(|lib| lib.get("path")) {
-            self.reference(declaring, base, "lib.path", path, SelectedCargoPathKind::File);
+        if let Some(path) = table
+            .get("lib")
+            .and_then(toml::Value::as_table)
+            .and_then(|lib| lib.get("path"))
+        {
+            self.reference(
+                declaring,
+                base,
+                "lib.path",
+                path,
+                SelectedCargoPathKind::File,
+            );
         }
         for kind in ["bin", "test", "bench", "example"] {
             if let Some(targets) = table.get(kind).and_then(toml::Value::as_array) {
                 for target in targets {
                     if let Some(path) = target.as_table().and_then(|target| target.get("path")) {
-                        self.reference(declaring, base, &format!("{kind}.path"), path, SelectedCargoPathKind::File);
+                        self.reference(
+                            declaring,
+                            base,
+                            &format!("{kind}.path"),
+                            path,
+                            SelectedCargoPathKind::File,
+                        );
                     }
                 }
             }
         }
     }
 
+    fn inherits_workspace(value: &toml::Value) -> bool {
+        match value {
+            toml::Value::Table(table) => {
+                table.get("workspace").and_then(toml::Value::as_bool) == Some(true)
+                    || table.values().any(Self::inherits_workspace)
+            }
+            toml::Value::Array(values) => values.iter().any(Self::inherits_workspace),
+            _ => false,
+        }
+    }
+
+    fn selected_workspace(&self, declaring: &Path, table: &toml::Table) -> Result<(), String> {
+        let base = declaring.parent().unwrap_or(Path::new(""));
+        let explicit = table
+            .get("package")
+            .and_then(toml::Value::as_table)
+            .and_then(|package| package.get("workspace"));
+        let candidates = if let Some(explicit) = explicit {
+            let path = explicit
+                .as_str()
+                .ok_or_else(|| "package.workspace must be a path string".to_string())?;
+            vec![self.resolve(base, path)?]
+        } else {
+            base.ancestors().map(Path::to_path_buf).collect()
+        };
+        for candidate in candidates {
+            let manifest = candidate.join("Cargo.toml");
+            if !self.entries.contains_key(&manifest) {
+                continue;
+            }
+            let resolved = self.resolve(&candidate, "Cargo.toml")?;
+            let Some(SelectedCargoEntry::File(Some(text))) = self.entries.get(&resolved) else {
+                return Err(format!("selected workspace text missing: {}", manifest.display()));
+            };
+            let document = toml::from_str::<toml::Table>(text)
+                .map_err(|error| format!("invalid workspace {}: {error}", manifest.display()))?;
+            if document.get("workspace").is_some_and(toml::Value::is_table) {
+                return Ok(());
+            }
+        }
+        Err("no selected enclosing workspace; ambient ancestor lookup is not admitted".into())
+    }
+
     fn config(&mut self, declaring: &Path, table: &toml::Table) {
-        let base = declaring.parent().and_then(Path::parent).unwrap_or(Path::new(""));
+        let base = declaring
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new(""));
         self.overrides(declaring, base, table);
         if table.contains_key("include") {
-            self.diagnostics.push(format!("{}: config includes are not admitted in a selected tree", declaring.display()));
+            self.diagnostics.push(format!(
+                "{}: config includes are not admitted in a selected tree",
+                declaring.display()
+            ));
         }
         if let Some(paths) = table.get("paths") {
             if let Some(paths) = paths.as_array() {
                 for path in paths {
-                    self.reference(declaring, base, "paths", path, SelectedCargoPathKind::Package);
+                    self.reference(
+                        declaring,
+                        base,
+                        "paths",
+                        path,
+                        SelectedCargoPathKind::Package,
+                    );
                 }
             } else {
-                self.diagnostics.push(format!("{}: config paths must be an array", declaring.display()));
+                self.diagnostics.push(format!(
+                    "{}: config paths must be an array",
+                    declaring.display()
+                ));
             }
         }
         if let Some(sources) = table.get("source").and_then(toml::Value::as_table) {
             for (name, source) in sources {
                 for key in ["directory", "local-registry"] {
                     if let Some(path) = source.as_table().and_then(|source| source.get(key)) {
-                        self.reference(declaring, base, &format!("source.{name}.{key}"), path, SelectedCargoPathKind::Directory);
+                        self.reference(
+                            declaring,
+                            base,
+                            &format!("source.{name}.{key}"),
+                            path,
+                            SelectedCargoPathKind::Directory,
+                        );
                     }
                 }
             }
@@ -2540,6 +2699,255 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn selected_tree(files: &[(&str, &str)]) -> BTreeMap<PathBuf, SelectedCargoEntry> {
+        files
+            .iter()
+            .map(|(path, text)| {
+                (
+                    PathBuf::from(path),
+                    SelectedCargoEntry::File(Some((*text).into())),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn selected_cargo_tree_allows_internal_parent_dependencies_and_workspace_globs() {
+        let entries = selected_tree(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers=['crates/*']\n[workspace.dependencies]\nshared={path='crates/dep'}\n",
+            ),
+            (
+                "crates/app/Cargo.toml",
+                "[package]\nname='app'\nworkspace='../..'\n[dependencies]\nshared={workspace=true}\n[dev-dependencies]\ndep={path='../dep'}\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("crates/app/src/lib.rs", ""),
+            ("crates/dep/Cargo.toml", "[package]\nname='dep'\n"),
+        ]);
+        validate_selected_cargo_tree(&entries).unwrap();
+        assert_eq!(
+            validate_selected_cargo_path(&entries, Path::new("crates/app/../dep/Cargo.toml"))
+                .unwrap(),
+            Path::new("crates/dep/Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn selected_cargo_tree_aggregates_external_roots_and_declaring_manifests() {
+        let entries = selected_tree(&[
+            (
+                "Cargo.toml",
+                "[dependencies]\none={path='../one'}\n[patch.crates-io]\ntwo={path='../two'}\n",
+            ),
+            (
+                "nested/Cargo.toml",
+                "[target.'cfg(windows)'.build-dependencies]\nthree={path='../../three',optional=true}\n",
+            ),
+        ]);
+        let error = validate_selected_cargo_tree(&entries).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &CargoPathDependencyErrorKind::PathPolicyViolation
+        );
+        for expected in [
+            "../one",
+            "../two",
+            "../../three",
+            "nested/Cargo.toml",
+            "target.cfg(windows).build-dependencies.three.path",
+        ] {
+            assert!(error.detail().contains(expected), "{error}");
+        }
+        assert_eq!(error.diagnostics().len(), 3);
+    }
+
+    #[test]
+    fn selected_cargo_tree_checks_replace_workspace_and_compiler_source_paths() {
+        let invalid = [
+            "[replace]\n'old:1.0.0'={path='../external'}\n",
+            "[package]\nworkspace='../external'\n",
+            "[workspace]\nmembers=['../external']\n",
+            "[workspace]\ndefault-members=['../external']\n",
+            "[workspace.dependencies]\nexternal={path='../external'}\n",
+            "[lib]\npath='../external.rs'\n",
+            "[[bin]]\npath='../external.rs'\n",
+            "[[test]]\npath='../external.rs'\n",
+            "[[example]]\npath='../external.rs'\n",
+            "[[bench]]\npath='../external.rs'\n",
+            "[package]\nbuild='../external.rs'\n",
+            "[dependencies]\nexternal={path='/existing/on/worker'}\n",
+            "[dependencies]\nexternal={path='C:\\existing'}\n",
+        ];
+        for manifest in invalid {
+            let error = validate_selected_cargo_tree(&selected_tree(&[("Cargo.toml", manifest)]))
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &CargoPathDependencyErrorKind::PathPolicyViolation,
+                "{manifest}"
+            );
+            assert!(error.detail().contains("Cargo.toml"), "{error}");
+        }
+        validate_selected_cargo_tree(&selected_tree(&[
+            (
+                "Cargo.toml",
+                "[package]\nbuild=true\n[replace]\n'old:1.0.0'={path='dep'}\n",
+            ),
+            ("build.rs", ""),
+            ("dep/Cargo.toml", "[package]\nname='dep'\n"),
+        ]))
+        .unwrap();
+    }
+
+    #[test]
+    fn selected_cargo_tree_resolves_symlinks_before_parent_components() {
+        let mut entries = selected_tree(&[
+            ("Cargo.toml", "[dependencies]\ndep={path='alias/..'}\n"),
+            ("a/Cargo.toml", "[package]\nname='a'\n"),
+            ("a/nested/anchor", ""),
+        ]);
+        entries.insert(
+            PathBuf::from("alias"),
+            SelectedCargoEntry::Symlink("a/nested".into()),
+        );
+        validate_selected_cargo_tree(&entries).unwrap();
+        assert_eq!(
+            validate_selected_cargo_path(&entries, Path::new("alias/../Cargo.toml")).unwrap(),
+            Path::new("a/Cargo.toml")
+        );
+        entries.insert(
+            PathBuf::from("alias"),
+            SelectedCargoEntry::Symlink("../outside".into()),
+        );
+        assert!(
+            validate_selected_cargo_tree(&entries)
+                .unwrap_err()
+                .detail()
+                .contains("escapes")
+        );
+        entries.insert(
+            PathBuf::from("alias"),
+            SelectedCargoEntry::Symlink("other".into()),
+        );
+        entries.insert(
+            PathBuf::from("other"),
+            SelectedCargoEntry::Symlink("alias".into()),
+        );
+        assert!(
+            validate_selected_cargo_tree(&entries)
+                .unwrap_err()
+                .detail()
+                .contains("cycle")
+        );
+    }
+
+    #[test]
+    fn selected_cargo_tree_checks_selected_config_overrides_and_refuses_includes() {
+        let invalid = [
+            "paths=['../external']",
+            "[patch.crates-io]\nexternal={path='../external'}",
+            "[replace]\n'old:1.0.0'={path='../external'}",
+            "[source.local]\ndirectory='../external'",
+            "[source.local]\nlocal-registry='../external'",
+            "include=['extra.toml']",
+        ];
+        for config in invalid {
+            for name in [".cargo/config", ".cargo/config.toml"] {
+                let entries = selected_tree(&[("Cargo.toml", "[workspace]"), (name, config)]);
+                let error = validate_selected_cargo_tree(&entries).unwrap_err();
+                assert!(error.detail().contains(name), "{error}");
+            }
+        }
+        validate_selected_cargo_tree(&selected_tree(&[
+            ("Cargo.toml", "[workspace]"),
+            (".cargo/config.toml", "paths=['dep']\n[source.local]\ndirectory='vendor'\n[build]\nbuild-dir='/managed/cache'"),
+            ("dep/Cargo.toml", "[package]\nname='dep'"),
+            ("vendor/entry", ""),
+        ])).unwrap();
+    }
+
+    #[test]
+    fn selected_cargo_tree_refuses_missing_text_paths_and_invalid_inventory() {
+        assert!(validate_selected_cargo_tree(&BTreeMap::new()).is_err());
+        let mut entries = selected_tree(&[("Cargo.toml", "[dependencies]\ndep={path='dep'}")]);
+        // A real ambient dep directory cannot satisfy a selected inventory.
+        assert!(
+            validate_selected_cargo_tree(&entries)
+                .unwrap_err()
+                .detail()
+                .contains("missing selected path dep")
+        );
+        entries.insert(
+            PathBuf::from("dep/Cargo.toml"),
+            SelectedCargoEntry::File(None),
+        );
+        assert!(
+            validate_selected_cargo_tree(&entries)
+                .unwrap_err()
+                .detail()
+                .contains("text")
+        );
+        let mut entries = selected_tree(&[("Cargo.toml", "[workspace]")]);
+        entries.insert(PathBuf::from("file"), SelectedCargoEntry::File(None));
+        assert!(validate_selected_cargo_path(&entries, Path::new("file/../Cargo.toml")).is_err());
+        assert!(validate_selected_cargo_path(&entries, Path::new("../Cargo.toml")).is_err());
+        entries.insert(PathBuf::from("file/child"), SelectedCargoEntry::File(None));
+        assert!(
+            validate_selected_cargo_tree(&entries)
+                .unwrap_err()
+                .detail()
+                .contains("descendants")
+        );
+        entries.insert(PathBuf::from("../outside"), SelectedCargoEntry::File(None));
+        assert!(
+            validate_selected_cargo_tree(&entries)
+                .unwrap_err()
+                .detail()
+                .contains("invalid selected inventory")
+        );
+    }
+
+    #[test]
+    fn selected_cargo_tree_does_not_skip_nested_inactive_manifests_or_bad_globs() {
+        let entries = selected_tree(&[
+            ("Cargo.toml", "[workspace]\nmembers=['app']"),
+            ("app/Cargo.toml", "[package]\nname='app'"),
+            (
+                "fixtures/unused/Cargo.toml",
+                "[dev-dependencies]\nexternal={path='../../../external'}",
+            ),
+        ]);
+        assert!(
+            validate_selected_cargo_tree(&entries)
+                .unwrap_err()
+                .detail()
+                .contains("fixtures/unused/Cargo.toml")
+        );
+        for pattern in ["crates/**", "crates/[ab]", "missing/*"] {
+            let manifest = format!("[workspace]\nmembers=['{pattern}']");
+            assert!(
+                validate_selected_cargo_tree(&selected_tree(&[("Cargo.toml", &manifest)])).is_err()
+            );
+        }
+        let inherited = selected_tree(&[
+            ("Cargo.toml", "[package]\nname='root'"),
+            ("nested/Cargo.toml", "[package]\nversion.workspace=true\n[dependencies]\nshared.workspace=true"),
+        ]);
+        assert!(
+            validate_selected_cargo_tree(&inherited)
+                .unwrap_err()
+                .detail()
+                .contains("no selected enclosing workspace")
+        );
+        let selected_workspace = selected_tree(&[
+            ("Cargo.toml", "[workspace]\n[workspace.dependencies]\nshared={path='dep'}"),
+            ("dep/Cargo.toml", "[package]\nname='dep'"),
+            ("nested/Cargo.toml", "[package]\nversion.workspace=true\n[dependencies]\nshared.workspace=true"),
+        ]);
+        validate_selected_cargo_tree(&selected_workspace).unwrap();
+    }
 
     #[cfg(unix)]
     struct TopologyFixture {
