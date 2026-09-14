@@ -285,6 +285,53 @@ pub fn validate_selected_cargo_path(
     })
 }
 
+/// Check an inline Cargo configuration override against selected source bytes.
+///
+/// `base` is its repository-relative resolution directory (empty for the root),
+/// not a fabricated configuration filename. Existing selected configs are
+/// validated separately; no synthetic inventory entry can mask a symlink.
+pub fn validate_selected_cargo_config(
+    entries: &BTreeMap<PathBuf, SelectedCargoEntry>,
+    base: &Path,
+    contents: &str,
+) -> Result<(), CargoPathDependencyError> {
+    let resolved_base = validate_selected_cargo_path(
+        entries,
+        if base.as_os_str().is_empty() { Path::new(".") } else { base },
+    )?;
+    let directories = entries
+        .keys()
+        .flat_map(|entry| entry.ancestors().skip(1).map(Path::to_path_buf))
+        .chain(std::iter::once(PathBuf::new()))
+        .collect();
+    let mut tree = SelectedCargoTree {
+        entries,
+        directories,
+        diagnostics: Vec::new(),
+    };
+    if !tree.directories.contains(&resolved_base) {
+        return Err(CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::PathPolicyViolation,
+            "Cargo configuration base is not a selected directory",
+        ).with_dependency_path(base));
+    }
+    let document = toml::from_str::<toml::Table>(contents).map_err(|error| {
+        CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::ManifestParseFailure,
+            format!("invalid inline Cargo configuration: {error}"),
+        )
+    })?;
+    tree.config_at(Path::new("<command-line-config>"), &resolved_base, &document);
+    if tree.diagnostics.is_empty() {
+        Ok(())
+    } else {
+        Err(CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::PathPolicyViolation,
+            format!("inline Cargo configuration is not contained: {}", tree.diagnostics.join("; ")),
+        ).with_diagnostics(tree.diagnostics))
+    }
+}
+
 /// Refuse Cargo source references outside an explicitly selected source tree.
 ///
 /// This is deliberately conservative: every selected manifest/config and every
@@ -753,6 +800,10 @@ impl SelectedCargoTree<'_> {
             .parent()
             .and_then(Path::parent)
             .unwrap_or(Path::new(""));
+        self.config_at(declaring, base, table);
+    }
+
+    fn config_at(&mut self, declaring: &Path, base: &Path, table: &toml::Table) {
         self.overrides(declaring, base, table);
         if table.contains_key("include") {
             self.diagnostics.push(format!(

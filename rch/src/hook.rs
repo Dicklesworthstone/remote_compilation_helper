@@ -2037,6 +2037,67 @@ async fn selected_clean_overlay_cargo_tree(
     Ok(entries)
 }
 
+async fn validate_clean_overlay_cargo_sources(
+    project_root: &Path,
+    spec: &CleanOverlaySpec,
+    command: &str,
+) -> anyhow::Result<()> {
+    use rch_common::cargo_path_deps::{
+        SelectedCargoEntry, validate_selected_cargo_path, validate_selected_cargo_tree,
+    };
+
+    let entries = selected_clean_overlay_cargo_tree(project_root, spec).await?;
+    validate_selected_cargo_tree(&entries)?;
+    let (tokens, cargo_index) = cargo_target_dir::managed_clean_overlay_cargo_tokens(command)?;
+    // Changing cwd also changes Cargo's configuration search. Until that
+    // search is represented in the selected-source plan, do not guess.
+    for token in &tokens[..cargo_index] {
+        if token == "-C" || token == "--chdir" || token.starts_with("--chdir=") {
+            anyhow::bail!("clean-overlay Cargo source validation does not support wrapper chdir");
+        }
+    }
+    let mut index = cargo_index + 1;
+    while let Some(token) = tokens.get(index) {
+        if token == "--" {
+            break;
+        }
+        if token == "-C" || token.starts_with("-C") {
+            anyhow::bail!("clean-overlay Cargo source validation does not support Cargo -C");
+        }
+        let value = if token == "--manifest-path" || token == "--config" {
+            index += 1;
+            Some(tokens.get(index).ok_or_else(|| anyhow::anyhow!("missing {token} value"))?.as_str())
+        } else {
+            token.strip_prefix("--manifest-path=").or_else(|| token.strip_prefix("--config="))
+        };
+        if let Some(value) = value {
+            if token.starts_with("--manifest-path") {
+                let path = validate_selected_cargo_path(&entries, Path::new(value))?;
+                anyhow::ensure!(
+                    matches!(entries.get(&path), Some(SelectedCargoEntry::File(Some(_)))),
+                    "Cargo manifest argument is not selected Cargo metadata: {}", path.display()
+                );
+            } else {
+                // Inline TOML is parsed by the same dependency-path validator.
+                // File-based --config needs an explicit selected-file mapping;
+                // never read it from the ambient controller or worker tree.
+                let _: toml::Value = toml::from_str(value).context(
+                    "clean-overlay supports inline TOML --config only; config files are not admitted",
+                )?;
+                let mut configured = entries.clone();
+                configured.insert(
+                    PathBuf::from(".cargo/config.toml"),
+                    SelectedCargoEntry::File(Some(value.to_owned())),
+                );
+                validate_selected_cargo_tree(&configured)?;
+            }
+        }
+        index += 1;
+    }
+    spec.verify_overlay_unchanged(project_root)?;
+    Ok(())
+}
+
 async fn detect_clean_overlay_toolchain(
     project_root: &Path,
     spec: &CleanOverlaySpec,

@@ -368,14 +368,42 @@ pub(super) async fn execute_remote_compilation(
     // Windows build base and syncs via tar-over-ssh (no rsync/streaming).
     let worker_is_windows = WorkerPlatform::from_worker(&worker_config).is_windows();
 
+    if let Some(spec) = clean_overlay
+        && (kind.is_some_and(|kind| kind.command_base() == "cargo")
+            || classify_command(command).kind.is_some_and(|kind| kind.command_base() == "cargo"))
+        && let Err(error) = super::validate_clean_overlay_cargo_sources(
+            &normalized_project_root, spec, command,
+        ).await
+    {
+        let detail = format!("{error:#}");
+        let report = super::dependency_closure::DependencyPreflightReport {
+            schema_version: DEPENDENCY_PREFLIGHT_SCHEMA_VERSION,
+            worker: worker_config.id.to_string(),
+            verified: false,
+            reason_code: Some(DEPENDENCY_PREFLIGHT_CODE_POLICY),
+            remediation: Some("Clean-overlay requires selected, contained Cargo inputs; external committed-root staging is not implemented yet."),
+            evidence: vec![DependencyPreflightEvidence {
+                root: normalized_project_root.display().to_string(),
+                manifest: "Cargo.toml".to_owned(),
+                required_path: normalized_project_root.display().to_string(),
+                required_kind: "selected_cargo_sources",
+                status: super::dependency_closure::DependencyPreflightStatus::PolicyViolation,
+                reason_code: DEPENDENCY_PREFLIGHT_CODE_POLICY,
+                detail,
+                is_primary: true,
+            }],
+        };
+        return Err(DependencyPreflightFailure::from_report(report).into());
+    }
+
     let exact_dependency_closure_sync =
         clean_overlay.is_none() && command_uses_cargo_dependency_graph(kind);
     let raw_sync_roots = if clean_overlay.is_some() {
         // The immutable Git archive already contains every in-repository
         // workspace member. Syncing ambient sibling roots here could reintroduce
         // the peer dirt this mode exists to exclude, so clean-overlay starts
-        // with one primary root and lets unsupported external path dependencies
-        // fail closed during the remote build.
+        // with one primary root. The selected-source preflight above rejects
+        // escaping dependencies before Cargo can read retained sibling roots.
         vec![normalized_project_root.clone()]
     } else {
         let dependency_plan = build_dependency_runtime_plan(
