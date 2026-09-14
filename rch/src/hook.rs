@@ -1530,6 +1530,7 @@ fn validate_job_result_dirs(dirs: Vec<PathBuf>) -> anyhow::Result<Vec<PathBuf>> 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CleanBaseTreeEntry {
     mode: u32,
+    object_id: String,
     path: PathBuf,
 }
 
@@ -1551,11 +1552,14 @@ fn parse_clean_base_tree(output: &[u8]) -> anyhow::Result<Vec<CleanBaseTreeEntry
         let object_type = fields
             .next()
             .ok_or_else(|| anyhow::anyhow!("clean-overlay base tree record has no object type"))?;
-        let _object_id = fields
+        let object_id = fields
             .next()
             .ok_or_else(|| anyhow::anyhow!("clean-overlay base tree record has no object ID"))?;
         if fields.next().is_some() {
             anyhow::bail!("clean-overlay base tree contains unexpected metadata fields");
+        }
+        if object_id.is_empty() || !object_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("clean-overlay base tree contains an invalid object ID");
         }
         let mode = u32::from_str_radix(mode, 8).context("parse clean-overlay Git tree mode")?;
         if object_type != "blob" && !(mode == 0o160000 && object_type == "commit") {
@@ -1565,6 +1569,7 @@ fn parse_clean_base_tree(output: &[u8]) -> anyhow::Result<Vec<CleanBaseTreeEntry
             .context("clean-overlay base contains a non-UTF-8 Git path")?;
         entries.push(CleanBaseTreeEntry {
             mode,
+            object_id: object_id.to_owned(),
             path: PathBuf::from(path),
         });
     }
@@ -1941,6 +1946,95 @@ async fn git_show_optional(
     Ok(Some(String::from_utf8(output.stdout).with_context(
         || format!("{relative} in clean-overlay base is not UTF-8"),
     )?))
+}
+
+fn is_selected_cargo_metadata(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "Cargo.toml")
+        || (path.parent().and_then(Path::file_name).is_some_and(|name| name == ".cargo")
+            && path.file_name().is_some_and(|name| name == "config" || name == "config.toml"))
+}
+
+/// Inventory only the immutable base and explicitly selected overlays. Never
+/// discover dependency manifests by walking the ambient working tree.
+async fn selected_clean_overlay_cargo_tree(
+    project_root: &Path,
+    spec: &CleanOverlaySpec,
+) -> anyhow::Result<
+    std::collections::BTreeMap<PathBuf, rch_common::cargo_path_deps::SelectedCargoEntry>,
+> {
+    use rch_common::cargo_path_deps::{SelectedCargoEntry, validate_selected_cargo_path};
+    use std::collections::BTreeMap;
+
+    fn add_overlay(
+        root: &Path,
+        relative: &Path,
+        entries: &mut BTreeMap<PathBuf, SelectedCargoEntry>,
+    ) -> anyhow::Result<()> {
+        let metadata = std::fs::symlink_metadata(root.join(relative))?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("clean-overlay selected path became a symlink: {}", relative.display());
+        }
+        if metadata.is_dir() {
+            for child in std::fs::read_dir(root.join(relative))? {
+                add_overlay(root, &relative.join(child?.file_name()), entries)?;
+            }
+        } else if metadata.is_file() {
+            entries.insert(relative.to_path_buf(), SelectedCargoEntry::File(None));
+        } else {
+            anyhow::bail!("unsupported clean-overlay source entry: {}", relative.display());
+        }
+        Ok(())
+    }
+
+    spec.verify_overlay_unchanged(project_root)?;
+    let tree = git_output_bytes(
+        project_root,
+        &["ls-tree", "-rz", "--full-tree", spec.base_commit()],
+    )
+    .await?;
+    let base = parse_clean_base_tree(&tree)?;
+    let mut entries = BTreeMap::new();
+    for entry in &base {
+        let selected = match entry.mode {
+            0o100644 | 0o100755 => SelectedCargoEntry::File(None),
+            0o120000 => SelectedCargoEntry::Symlink(
+                String::from_utf8(
+                    git_output_bytes(project_root, &["cat-file", "blob", &entry.object_id]).await?,
+                )
+                .with_context(|| format!("non-UTF-8 selected symlink {}", entry.path.display()))?,
+            ),
+            _ => anyhow::bail!("unsupported selected Git mode for {}", entry.path.display()),
+        };
+        entries.insert(entry.path.clone(), selected);
+    }
+    for overlay in spec.overlay_paths() {
+        add_overlay(project_root, overlay, &mut entries)?;
+    }
+    let metadata_paths: Vec<_> = entries
+        .keys()
+        .filter(|path| is_selected_cargo_metadata(path))
+        .cloned()
+        .collect();
+    for path in metadata_paths {
+        let target = validate_selected_cargo_path(&entries, &path)?;
+        let bytes = if spec.overlay_paths().iter().any(|overlay| target.starts_with(overlay)) {
+            std::fs::read(project_root.join(&target))
+                .with_context(|| format!("read selected Cargo metadata {}", target.display()))?
+        } else {
+            let entry = base.iter().find(|entry| entry.path == target).ok_or_else(|| {
+                anyhow::anyhow!("selected Cargo metadata has no base object: {}", target.display())
+            })?;
+            git_output_bytes(project_root, &["cat-file", "blob", &entry.object_id]).await?
+        };
+        entries.insert(
+            target.clone(),
+            SelectedCargoEntry::File(Some(String::from_utf8(bytes).with_context(|| {
+                format!("selected Cargo metadata is not UTF-8: {}", target.display())
+            })?)),
+        );
+    }
+    spec.verify_overlay_unchanged(project_root)?;
+    Ok(entries)
 }
 
 async fn detect_clean_overlay_toolchain(
