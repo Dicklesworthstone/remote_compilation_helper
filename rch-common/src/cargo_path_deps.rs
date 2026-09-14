@@ -241,6 +241,402 @@ impl fmt::Display for CargoPathDependencyError {
 
 impl std::error::Error for CargoPathDependencyError {}
 
+/// One entry in a complete, repository-relative selected source inventory.
+///
+/// Retain text for every `Cargo.toml` and `.cargo/config[.toml]`; other regular
+/// files need only their presence. Symlink text is its selected target, never a
+/// target read from the ambient filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectedCargoEntry {
+    File(Option<String>),
+    Symlink(String),
+}
+
+/// Resolve a CLI-selected path without collapsing `..` across symlinks.
+///
+/// The complete selected inventory is validated first. Absolute paths and
+/// references not present in that inventory are refused without filesystem I/O.
+pub fn validate_selected_cargo_path(
+    entries: &BTreeMap<PathBuf, SelectedCargoEntry>,
+    path: &Path,
+) -> Result<PathBuf, CargoPathDependencyError> {
+    validate_selected_cargo_tree(entries)?;
+    let raw = path.to_str().ok_or_else(|| {
+        CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::PathPolicyViolation,
+            "selected Cargo path is not UTF-8",
+        )
+        .with_dependency_path(path)
+    })?;
+    let directories = entries
+        .keys()
+        .flat_map(|entry| entry.ancestors().skip(1).map(Path::to_path_buf))
+        .chain(std::iter::once(PathBuf::new()))
+        .collect();
+    SelectedCargoTree {
+        entries,
+        directories,
+        diagnostics: Vec::new(),
+    }
+    .resolve(Path::new(""), raw)
+    .map_err(|detail| {
+        CargoPathDependencyError::new(CargoPathDependencyErrorKind::PathPolicyViolation, detail)
+            .with_dependency_path(path)
+    })
+}
+
+/// Refuse Cargo source references outside an explicitly selected source tree.
+///
+/// This is deliberately conservative: every selected manifest/config and every
+/// symlink is checked, including inactive dependencies and fixture manifests.
+/// It performs no filesystem reads or Cargo invocations. It does not inspect
+/// command-line overrides, worker/home configuration, or arbitrary file reads
+/// performed by build scripts; callers must admit those separately. External
+/// roots are refused here, not silently substituted with ambient worker copies.
+pub fn validate_selected_cargo_tree(
+    entries: &BTreeMap<PathBuf, SelectedCargoEntry>,
+) -> Result<(), CargoPathDependencyError> {
+    let mut tree = SelectedCargoTree {
+        entries,
+        directories: BTreeSet::from([PathBuf::new()]),
+        diagnostics: Vec::new(),
+    };
+    for path in entries.keys() {
+        if path.as_os_str().is_empty()
+            || path.to_str().is_none()
+            || path.components().any(|part| {
+                !matches!(part, std::path::Component::Normal(_))
+            })
+            || path.to_string_lossy().contains(['\\', ':'])
+        {
+            tree.diagnostics
+                .push(format!("invalid selected inventory path: {}", path.display()));
+            continue;
+        }
+        for parent in path.ancestors().skip(1) {
+            tree.directories.insert(parent.to_path_buf());
+        }
+    }
+    for (path, entry) in entries {
+        if tree.directories.contains(path) {
+            tree.diagnostics.push(format!(
+                "selected file also has descendants: {}",
+                path.display()
+            ));
+        }
+        if matches!(entry, SelectedCargoEntry::Symlink(_)) {
+            if let Err(error) = tree.resolve(Path::new(""), &path.to_string_lossy()) {
+                tree.diagnostics
+                    .push(format!("{}: symlink: {error}", path.display()));
+            }
+        }
+        let is_manifest = path.file_name().is_some_and(|name| name == "Cargo.toml");
+        let is_config = path.parent().is_some_and(|parent| {
+            parent.file_name().is_some_and(|name| name == ".cargo")
+        }) && path
+            .file_name()
+            .is_some_and(|name| name == "config" || name == "config.toml");
+        if !is_manifest && !is_config {
+            continue;
+        }
+        let contents = tree
+            .resolve(Path::new(""), &path.to_string_lossy())
+            .and_then(|resolved| match entries.get(&resolved) {
+                Some(SelectedCargoEntry::File(Some(text))) => Ok(text),
+                _ => Err("selected manifest/config text is unavailable".to_string()),
+            });
+        match contents.and_then(|text| {
+            toml::from_str::<toml::Table>(text)
+                .map_err(|error| format!("invalid selected TOML: {error}"))
+        }) {
+            Ok(document) => {
+                if is_manifest {
+                    tree.manifest(path, &document);
+                } else {
+                    tree.config(path, &document);
+                }
+            }
+            Err(error) => tree
+                .diagnostics
+                .push(format!("{}: {error}", path.display())),
+        }
+    }
+    if tree.diagnostics.is_empty() {
+        Ok(())
+    } else {
+        tree.diagnostics.sort();
+        tree.diagnostics.dedup();
+        Err(CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::PathPolicyViolation,
+            format!(
+                "selected Cargo source tree is not contained: {}",
+                tree.diagnostics.join("; ")
+            ),
+        )
+        .with_diagnostics(tree.diagnostics))
+    }
+}
+
+struct SelectedCargoTree<'a> {
+    entries: &'a BTreeMap<PathBuf, SelectedCargoEntry>,
+    directories: BTreeSet<PathBuf>,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum SelectedCargoPathKind {
+    Package,
+    File,
+    Directory,
+}
+
+impl SelectedCargoTree<'_> {
+    fn components(raw: &str) -> Result<std::collections::VecDeque<String>, String> {
+        if raw.is_empty()
+            || raw.starts_with('/')
+            || raw.contains(['\\', ':'])
+            || raw.chars().any(char::is_control)
+        {
+            return Err(format!("unsupported or absolute path {raw:?}"));
+        }
+        Ok(raw.split('/').map(ToOwned::to_owned).collect())
+    }
+
+    fn resolve(&self, base: &Path, raw: &str) -> Result<PathBuf, String> {
+        let mut pending = Self::components(raw)?;
+        let mut resolved = base.to_path_buf();
+        let mut links = 0;
+        while let Some(component) = pending.pop_front() {
+            match component.as_str() {
+                "" | "." => continue,
+                ".." => {
+                    if !resolved.pop() {
+                        return Err(format!("path {raw:?} escapes the selected root"));
+                    }
+                }
+                _ => resolved.push(&component),
+            }
+            match self.entries.get(&resolved) {
+                Some(SelectedCargoEntry::Symlink(target)) => {
+                    links += 1;
+                    if links > 64 {
+                        return Err(format!("symlink cycle or expansion limit at {}", resolved.display()));
+                    }
+                    let mut target_components = Self::components(target)?;
+                    target_components.append(&mut pending);
+                    pending = target_components;
+                    resolved.pop();
+                }
+                Some(SelectedCargoEntry::File(_)) if !pending.is_empty() => {
+                    return Err(format!("non-directory path component {}", resolved.display()));
+                }
+                Some(SelectedCargoEntry::File(_)) => {}
+                None if self.directories.contains(&resolved) => {}
+                None => return Err(format!("missing selected path {}", resolved.display())),
+            }
+        }
+        Ok(resolved)
+    }
+
+    fn reference(
+        &mut self,
+        declaring: &Path,
+        base: &Path,
+        key: &str,
+        value: &toml::Value,
+        kind: SelectedCargoPathKind,
+    ) {
+        let result = value
+            .as_str()
+            .ok_or_else(|| "path must be a string".to_string())
+            .and_then(|raw| {
+                let resolved = self.resolve(base, raw)?;
+                match kind {
+                    SelectedCargoPathKind::Package => {
+                        let manifest = self.resolve(&resolved, "Cargo.toml")?;
+                        if !matches!(self.entries.get(&manifest), Some(SelectedCargoEntry::File(Some(_)))) {
+                            return Err(format!("selected package manifest text missing: {}", manifest.display()));
+                        }
+                    }
+                    SelectedCargoPathKind::File => {
+                        if !matches!(self.entries.get(&resolved), Some(SelectedCargoEntry::File(_))) {
+                            return Err(format!("selected regular file missing: {}", resolved.display()));
+                        }
+                    }
+                    SelectedCargoPathKind::Directory => {
+                        if !self.directories.contains(&resolved) {
+                            return Err(format!("selected directory missing: {}", resolved.display()));
+                        }
+                    }
+                }
+                Ok(())
+            });
+        if let Err(error) = result {
+            self.diagnostics.push(format!(
+                "{}: {key}={value}: {error}", declaring.display()
+            ));
+        }
+    }
+
+    fn dependencies(&mut self, declaring: &Path, base: &Path, key: &str, table: &toml::Table) {
+        for (name, dependency) in table {
+            if let Some(path) = dependency.as_table().and_then(|value| value.get("path")) {
+                self.reference(declaring, base, &format!("{key}.{name}.path"), path, SelectedCargoPathKind::Package);
+            }
+        }
+    }
+
+    fn dependency_tables(&mut self, declaring: &Path, base: &Path, prefix: &str, table: &toml::Table) {
+        for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            if let Some(dependencies) = table.get(key).and_then(toml::Value::as_table) {
+                self.dependencies(declaring, base, &format!("{prefix}{key}"), dependencies);
+            }
+        }
+    }
+
+    fn overrides(&mut self, declaring: &Path, base: &Path, table: &toml::Table) {
+        if let Some(patches) = table.get("patch").and_then(toml::Value::as_table) {
+            for (registry, patch) in patches {
+                if let Some(patch) = patch.as_table() {
+                    self.dependencies(declaring, base, &format!("patch.{registry}"), patch);
+                }
+            }
+        }
+        if let Some(replacements) = table.get("replace").and_then(toml::Value::as_table) {
+            self.dependencies(declaring, base, "replace", replacements);
+        }
+    }
+
+    fn members(&mut self, declaring: &Path, base: &Path, key: &str, value: &toml::Value) {
+        let Some(members) = value.as_array() else {
+            self.diagnostics.push(format!("{}: {key} must be an array", declaring.display()));
+            return;
+        };
+        for member in members {
+            let Some(pattern) = member.as_str() else {
+                self.diagnostics.push(format!("{}: {key} member must be a string", declaring.display()));
+                continue;
+            };
+            if !contains_glob(pattern) {
+                self.reference(declaring, base, key, member, SelectedCargoPathKind::Package);
+                continue;
+            }
+            let result = self.member_pattern(base, pattern);
+            match result {
+                Ok(paths) => {
+                    for path in paths {
+                        self.reference(declaring, &path, key, &toml::Value::String(".".into()), SelectedCargoPathKind::Package);
+                    }
+                }
+                Err(error) => self.diagnostics.push(format!("{}: {key}={pattern:?}: {error}", declaring.display())),
+            }
+        }
+    }
+
+    fn member_pattern(&self, base: &Path, pattern: &str) -> Result<BTreeSet<PathBuf>, String> {
+        if pattern.contains('[') || pattern.contains("**") {
+            return Err("unsupported workspace glob; explicit selected members required".into());
+        }
+        let components = Self::components(pattern)?;
+        let mut candidates = BTreeSet::from([base.to_path_buf()]);
+        for component in components {
+            let mut next = BTreeSet::new();
+            for candidate in candidates {
+                if contains_wildcard(&component) {
+                    for path in self.directories.iter().chain(self.entries.keys()) {
+                        if path.parent() == Some(candidate.as_path())
+                            && let Some(name) = path.file_name().and_then(|name| name.to_str())
+                            && wildcard_match(&component, name)
+                        {
+                            next.insert(self.resolve(&candidate, name)?);
+                        }
+                    }
+                } else if component.is_empty() {
+                    next.insert(candidate);
+                } else {
+                    next.insert(self.resolve(&candidate, &component)?);
+                }
+            }
+            candidates = next;
+        }
+        if candidates.is_empty() {
+            return Err("workspace glob matches no selected members".into());
+        }
+        Ok(candidates)
+    }
+
+    fn manifest(&mut self, declaring: &Path, table: &toml::Table) {
+        let base = declaring.parent().unwrap_or(Path::new(""));
+        self.dependency_tables(declaring, base, "", table);
+        self.overrides(declaring, base, table);
+        if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
+            for (name, target) in targets {
+                if let Some(target) = target.as_table() {
+                    self.dependency_tables(declaring, base, &format!("target.{name}."), target);
+                }
+            }
+        }
+        if let Some(workspace) = table.get("workspace").and_then(toml::Value::as_table) {
+            self.dependency_tables(declaring, base, "workspace.", workspace);
+            for key in ["members", "default-members"] {
+                if let Some(value) = workspace.get(key) {
+                    self.members(declaring, base, &format!("workspace.{key}"), value);
+                }
+            }
+        }
+        if let Some(package) = table.get("package").and_then(toml::Value::as_table) {
+            if let Some(workspace) = package.get("workspace") {
+                self.reference(declaring, base, "package.workspace", workspace, SelectedCargoPathKind::Package);
+            }
+            if let Some(build) = package.get("build") {
+                match build {
+                    toml::Value::Boolean(false) => {}
+                    toml::Value::Boolean(true) => self.reference(declaring, base, "package.build", &toml::Value::String("build.rs".into()), SelectedCargoPathKind::File),
+                    _ => self.reference(declaring, base, "package.build", build, SelectedCargoPathKind::File),
+                }
+            }
+        }
+        if let Some(path) = table.get("lib").and_then(toml::Value::as_table).and_then(|lib| lib.get("path")) {
+            self.reference(declaring, base, "lib.path", path, SelectedCargoPathKind::File);
+        }
+        for kind in ["bin", "test", "bench", "example"] {
+            if let Some(targets) = table.get(kind).and_then(toml::Value::as_array) {
+                for target in targets {
+                    if let Some(path) = target.as_table().and_then(|target| target.get("path")) {
+                        self.reference(declaring, base, &format!("{kind}.path"), path, SelectedCargoPathKind::File);
+                    }
+                }
+            }
+        }
+    }
+
+    fn config(&mut self, declaring: &Path, table: &toml::Table) {
+        let base = declaring.parent().and_then(Path::parent).unwrap_or(Path::new(""));
+        self.overrides(declaring, base, table);
+        if table.contains_key("include") {
+            self.diagnostics.push(format!("{}: config includes are not admitted in a selected tree", declaring.display()));
+        }
+        if let Some(paths) = table.get("paths") {
+            if let Some(paths) = paths.as_array() {
+                for path in paths {
+                    self.reference(declaring, base, "paths", path, SelectedCargoPathKind::Package);
+                }
+            } else {
+                self.diagnostics.push(format!("{}: config paths must be an array", declaring.display()));
+            }
+        }
+        if let Some(sources) = table.get("source").and_then(toml::Value::as_table) {
+            for (name, source) in sources {
+                for key in ["directory", "local-registry"] {
+                    if let Some(path) = source.as_table().and_then(|source| source.get(key)) {
+                        self.reference(declaring, base, &format!("source.{name}.{key}"), path, SelectedCargoPathKind::Directory);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Resolve local Cargo path dependencies for `entrypoint` using the default topology policy.
 pub fn resolve_cargo_path_dependency_graph(
     entrypoint: &Path,
