@@ -255,7 +255,7 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
             />
           )}
           {d.tests && d.tests.runs > 0 && (
-            <Row k="Test runs (lifetime)" v={`${d.tests.runs} · ${d.tests.passed} passed · ${d.tests.failed} failed · ${d.tests.build_errors} build errors`} />
+            <Row k="Test commands (lifetime)" v={`${d.tests.runs} · ${d.tests.passed} succeeded · ${d.tests.failed} failed`} />
           )}
         </dl>
       </div>

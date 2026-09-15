@@ -374,8 +374,8 @@ export interface Dispatcher {
     claude_code: boolean | null;
     agents: [agent: string | null, installed: boolean][];
   } | null;
-  /** Lifetime test-run counters from the daemon, when reported. */
-  tests?: { runs: number; passed: number; failed: number; build_errors: number } | null;
+  /** Lifetime test-command outcomes: exit zero succeeded; every nonzero exit failed. */
+  tests?: { runs: number; passed: number; failed: number } | null;
   /**
    * This machine's own derated slot reading for every worker in the fleet, as
    * ONE ROW of the (dispatcher x worker) matrix, aligned index-for-index to

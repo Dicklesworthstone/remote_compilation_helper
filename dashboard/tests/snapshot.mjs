@@ -392,7 +392,7 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
       alerts: [{ kind: "worker_offline", severity: "error", worker_id: "hz3", message: "down",
                  first_seen: "t1", last_seen: "t2", state: "active" }],
       issues: [{ severity: "error", summary: "Worker 'hz3' is unreachable", remediation: "rch workers probe hz3" }],
-      test_stats: { total_runs: 10, passed_runs: 7, failed_runs: 2, build_error_runs: 1 },
+      test_stats: { total_runs: 10, passed_runs: 7, failed_runs: 3 },
     },
   } });
   const rich = dispatcherFromProbe("hz3-dev", probe([["s", RICH], ["c", CAPS], ["l", LIST], ["m", MET]]));
@@ -413,7 +413,10 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
     rich.convergence.status === "drifting" && rich.convergence.ready === 1 && rich.convergence.drifting === 1 &&
     JSON.stringify(rich.convergence.workers) === JSON.stringify([["hz4", "drifting", 2]]),
     JSON.stringify(rich.convergence));
-  chk("test counters survive", JSON.stringify(rich.tests) === JSON.stringify({ runs: 10, passed: 7, failed: 2, build_errors: 1 }));
+  chk("test-command counters preserve all outcomes without an inferred build-error category",
+    JSON.stringify(rich.tests) === JSON.stringify({ runs: 10, passed: 7, failed: 3 }));
+  chk("every test command contributes to exactly one terminal outcome",
+    rich.tests.runs === rich.tests.passed + rich.tests.failed);
   chk("per-worker recovery, bypass, pressure confidence and policy rule survive",
     rich.workers[0].recovery_in_secs === 240 && rich.workers[0].bypass === "RCH-I004 10.0.0.1" &&
     rich.workers[0].pressure.confidence === "low" &&
