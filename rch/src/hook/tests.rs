@@ -111,6 +111,119 @@ fn init_clean_overlay_test_repo() -> tempfile::TempDir {
 }
 
 #[tokio::test]
+async fn clean_overlay_cargo_preflight_reads_selected_base_not_ambient_manifest() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    let good = git_output(&root, &["rev-parse", "HEAD"]).await.unwrap();
+    let bad = "[package]\nname='overlay-fixture'\nversion='0.1.0'\n[dependencies]\nstale={path='../stale-sibling'}\n";
+    std::fs::write(root.join("Cargo.toml"), bad).unwrap();
+    git_output(&root, &["add", "Cargo.toml"]).await.unwrap();
+    git_output(
+        &root,
+        &["commit", "-q", "--no-gpg-sign", "-m", "external dependency"],
+    )
+    .await
+    .unwrap();
+    // Ambient bytes disagree in the opposite direction from the selected base.
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='ambient'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    let bad_spec = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    let error = validate_clean_overlay_cargo_sources(&root, &bad_spec, "cargo test")
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("stale-sibling"));
+    let good_spec = prepare_clean_overlay_spec(&root, Some(good), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    validate_clean_overlay_cargo_sources(&root, &good_spec, "cargo test")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn clean_overlay_cargo_preflight_honors_selected_manifest_overlay() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname='overlay-fixture'\nversion='0.1.0'\n[dependencies]\nstale={path='../stale-sibling'}\n").unwrap();
+    let base = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    validate_clean_overlay_cargo_sources(&root, &base, "cargo check")
+        .await
+        .unwrap();
+    let overlay = prepare_clean_overlay_spec(
+        &root,
+        Some("HEAD".into()),
+        true,
+        vec![PathBuf::from("Cargo.toml")],
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let error = validate_clean_overlay_cargo_sources(&root, &overlay, "cargo check")
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("stale-sibling"));
+}
+
+#[tokio::test]
+async fn clean_overlay_cargo_preflight_checks_cli_paths_and_inline_config() {
+    let _guard = test_guard!();
+    let root = init_clean_overlay_test_repo().keep();
+    std::fs::create_dir(root.join(".cargo")).unwrap();
+    // Selected config text must not be admitted as a manifest. Its unknown
+    // package/dependencies keys are not dependency declarations in a config.
+    std::fs::write(
+        root.join(".cargo/config.toml"),
+        "[package]\nname='wrong-kind'\n[dependencies]\nstale={path='../outside'}\n",
+    )
+    .unwrap();
+    let spec = prepare_clean_overlay_spec(
+        &root,
+        Some("HEAD".into()),
+        true,
+        vec![PathBuf::from(".cargo/config.toml")],
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    for command in [
+        "cargo test --manifest-path Cargo.toml",
+        "cargo test --config 'build.build-dir=\"/managed later\"'",
+        "cargo test -- --manifest-path ../ignored-test-argument",
+    ] {
+        validate_clean_overlay_cargo_sources(&root, &spec, command)
+            .await
+            .unwrap();
+    }
+    for command in [
+        "cargo test --manifest-path ../outside/Cargo.toml",
+        "cargo test --manifest-path .cargo/config.toml",
+        "cargo test --config 'paths=[\"../outside\"]'",
+        "cargo test --config ../outside/config.toml",
+        "cargo -C ../outside test",
+        "env --chdir=../outside cargo test",
+    ] {
+        assert!(
+            validate_clean_overlay_cargo_sources(&root, &spec, command)
+                .await
+                .is_err(),
+            "{command}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn clean_overlay_spec_accepts_base_only_and_resolves_commit() {
     let _guard = test_guard!();
     let repo = init_clean_overlay_test_repo();
@@ -3070,10 +3183,11 @@ async fn test_fallback_daemon_malformed_json() {
 #[tokio::test]
 async fn test_fallback_daemon_connection_reset() {
     let _lock = test_lock().lock().await;
+    // ubs:ignore — unique test socket filename, not an authentication token.
     let socket_path = format!(
         "/tmp/rch_test_reset_{}_{}.sock",
-        std::process::id(),
-        std::time::SystemTime::now()
+        std::process::id(), // ubs:ignore — test filename collision avoidance only.
+        std::time::SystemTime::now() // ubs:ignore — test filename collision avoidance only.
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
@@ -3884,7 +3998,7 @@ fn test_add_cargo_isolation_survives_timeout_prefix_and_preserves_status() {
     let _guard = test_guard!();
     let worker_id = rch_common::WorkerId::new("timeout-worker");
     let isolated = add_cargo_isolation("printf cargo >/dev/null; exit 42", &worker_id);
-    let status = std::process::Command::new("sh")
+    let status = std::process::Command::new("sh") // ubs:ignore — executes the fixed isolation-wrapper regression command above.
         .arg("-c")
         .arg(format!(
             "timeout --foreground --preserve-status 5 {}",
@@ -4430,7 +4544,7 @@ fn test_auto_tune_repo_updater_contract_autoseeds_allowlist_and_mode() {
     let repo_specs = vec!["github.com/example/repo".to_string()];
     let auth_context = RepoUpdaterAuthContext {
         source: RepoUpdaterCredentialSource::SshAgent,
-        credential_id: "ssh-agent".to_string(),
+        credential_id: "ssh-agent".to_string(), // ubs:ignore — public credential-source label, not a credential.
         issued_at_unix_ms: 1_700_000_000_000,
         expires_at_unix_ms: 1_700_000_060_000,
         granted_scopes: vec![],
@@ -4498,7 +4612,7 @@ fn test_infer_repo_updater_auth_context_returns_none_without_local_auth() {
 fn test_infer_repo_updater_auth_context_uses_token_env_when_present() {
     let _guard = test_guard!();
     let auth_context =
-        infer_repo_updater_auth_context_with_env_lookup(1_700_000_000_000, |key| key == "GH_TOKEN")
+        infer_repo_updater_auth_context_with_env_lookup(1_700_000_000_000, |key| key == "GH_TOKEN") // ubs:ignore — compares an environment variable name, never its secret value.
             .expect("token env should infer auth context");
     assert_eq!(auth_context.source, RepoUpdaterCredentialSource::TokenEnv);
     assert_eq!(auth_context.credential_id, "env:GH_TOKEN");
