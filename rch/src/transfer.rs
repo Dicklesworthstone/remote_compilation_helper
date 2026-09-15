@@ -1711,7 +1711,7 @@ impl TransferPipeline {
         match estimate {
             Ok(output) if output.status.success() => {
                 if let Some(bytes) =
-                    parse_rsync_total_size(&String::from_utf8_lossy(&output.stdout))
+                    parse_rsync_selected_size(&String::from_utf8_lossy(&output.stdout))
                 {
                     let retry = self.artifact_retry_config_for_size(bytes);
                     info!(
@@ -5474,6 +5474,20 @@ fn parse_rsync_files(output: &str) -> u32 {
 // =============================================================================
 // Transfer Estimation Parsers (bd-3hho)
 // =============================================================================
+
+/// Parse total file size from rsync --dry-run --stats output.
+/// Artifact planning requires the full selected size, even on a no-op copy.
+/// Delta-only statistics cannot establish that bound.
+fn parse_rsync_selected_size(output: &str) -> Option<u64> {
+    output.lines().find_map(|line| {
+        line.strip_prefix("Total file size:")?
+            .split_whitespace()
+            .next()?
+            .replace(',', "")
+            .parse()
+            .ok()
+    })
+}
 
 /// Parse total file size from rsync --dry-run --stats output.
 ///
@@ -10438,6 +10452,25 @@ Total file size: 123 bytes";
         }
     }
 
+    #[test]
+    fn test_artifact_retry_size_requires_full_selected_stat() {
+        assert_eq!(
+            parse_rsync_selected_size(
+                "Total transferred file size: 0 bytes\nTotal file size: 900,000,000 bytes"
+            ),
+            Some(900_000_000)
+        );
+        assert_eq!(
+            parse_rsync_selected_size("Total transferred file size: 900 bytes"),
+            None
+        );
+        assert_eq!(parse_rsync_selected_size("Total file size: invalid"), None);
+        assert_eq!(
+            parse_rsync_selected_size("Total file size: 0 bytes"),
+            Some(0)
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_artifact_retry_real_rsync_selected_payload_exceeds_old_budget() {
@@ -10502,7 +10535,7 @@ Total file size: 123 bytes";
             "{}",
             String::from_utf8_lossy(&planned.stderr)
         );
-        let selected = parse_rsync_total_size(&String::from_utf8_lossy(&planned.stdout))
+        let selected = parse_rsync_selected_size(&String::from_utf8_lossy(&planned.stdout))
             .expect("selected file size");
         assert_eq!(selected, payload.len() as u64);
         assert!(
@@ -10545,7 +10578,7 @@ Total file size: 123 bytes";
             String::from_utf8_lossy(&noop.stderr)
         );
         assert_eq!(
-            parse_rsync_total_size(&String::from_utf8_lossy(&noop.stdout)),
+            parse_rsync_selected_size(&String::from_utf8_lossy(&noop.stdout)),
             Some(selected),
             "planning counts the full selected payload even when already present"
         );
