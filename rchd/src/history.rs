@@ -1544,6 +1544,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_persisted_stats_do_not_invent_compilation_success() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let exits = [0, 1, 101, 130, 137, 143];
+        for (id, exit_code) in exits.into_iter().enumerate() {
+            let mut record = make_build_record(id as u64);
+            record.command = "cargo test".to_string();
+            record.exit_code = exit_code;
+            if let Some(handle) = history.record(record) {
+                handle.await.unwrap();
+            }
+        }
+        let loaded = BuildHistory::load_from_file(&path, 10).unwrap();
+        for stats in [history.stats(), loaded.stats()] {
+            assert_eq!(stats.total_builds, exits.len());
+            assert_eq!(stats.success_count, 1);
+            assert_eq!(stats.failure_count, exits.len() - 1);
+        }
+        let persisted_exits: Vec<_> = loaded
+            .recent(10)
+            .iter()
+            .rev()
+            .map(|record| record.exit_code)
+            .collect();
+        assert_eq!(persisted_exits, exits);
+    }
+
+    #[tokio::test]
     async fn test_persistence_save_load() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("history.jsonl");
