@@ -280,8 +280,8 @@ fn render_full_status_to<W: Write>(
         };
         writeln!(
             out,
-            "  {} {} {} total, {:.0}% pass rate, avg {}",
-            style.key("Tests"),
+            "  {} {} {} total, {:.0}% command success rate, avg {}",
+            style.key("Test commands"),
             style.muted(":"),
             style.highlight(&test_stats.total_runs.to_string()),
             pass_rate,
@@ -1448,7 +1448,6 @@ mod tests {
                 total_runs: 3,
                 passed_runs: 2,
                 failed_runs: 1,
-                build_error_runs: 0,
                 avg_duration_ms: 1200,
                 runs_by_kind: std::collections::HashMap::from([("cargo_test".to_string(), 3)]),
             }),

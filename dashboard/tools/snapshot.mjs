@@ -1114,7 +1114,6 @@ export function dispatcherFromProbe(host, probe) {
           runs: num(ts.total_runs) ?? 0,
           passed: num(ts.passed_runs) ?? 0,
           failed: num(ts.failed_runs) ?? 0,
-          build_errors: num(ts.build_error_runs) ?? 0,
         }
       : null,
     workers,

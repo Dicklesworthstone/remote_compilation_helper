@@ -196,13 +196,15 @@ impl TestRunRecord {
     }
 }
 
-/// Aggregate stats for recent test runs.
+/// Aggregate terminal command outcomes for recent test commands.
+///
+/// Exit codes do not prove which compilation or test phase failed. A successful
+/// command exited zero; every other exit belongs to `failed_runs`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TestRunStats {
     pub total_runs: u64,
     pub passed_runs: u64,
     pub failed_runs: u64,
-    pub build_error_runs: u64,
     pub avg_duration_ms: u64,
     #[serde(default)]
     pub runs_by_kind: HashMap<String, u64>,
@@ -218,8 +220,6 @@ impl TestRunStats {
 
         match record.exit_code {
             0 => self.passed_runs = self.passed_runs.saturating_add(1),
-            101 => self.failed_runs = self.failed_runs.saturating_add(1),
-            1 => self.build_error_runs = self.build_error_runs.saturating_add(1),
             _ => self.failed_runs = self.failed_runs.saturating_add(1),
         }
 
@@ -653,7 +653,6 @@ mod tests {
         assert_eq!(stats.total_runs, 0);
         assert_eq!(stats.passed_runs, 0);
         assert_eq!(stats.failed_runs, 0);
-        assert_eq!(stats.build_error_runs, 0);
         assert_eq!(stats.avg_duration_ms, 0);
         assert!(stats.runs_by_kind.is_empty());
     }
@@ -676,7 +675,6 @@ mod tests {
         assert_eq!(stats.total_runs, 1);
         assert_eq!(stats.passed_runs, 1);
         assert_eq!(stats.failed_runs, 0);
-        assert_eq!(stats.build_error_runs, 0);
         assert_eq!(stats.avg_duration_ms, 1000);
         assert_eq!(stats.runs_by_kind.get("cargo_test"), Some(&1));
     }
@@ -689,7 +687,7 @@ mod tests {
             worker_id: "w".to_string(),
             command: "cargo test".to_string(),
             kind: "cargo_test".to_string(),
-            exit_code: 101, // Rust test failure
+            exit_code: 101, // Cargo command failure; phase unknown
             duration_ms: 500,
             completed_at: Utc::now(),
         };
@@ -699,18 +697,17 @@ mod tests {
         assert_eq!(stats.total_runs, 1);
         assert_eq!(stats.passed_runs, 0);
         assert_eq!(stats.failed_runs, 1);
-        assert_eq!(stats.build_error_runs, 0);
     }
 
     #[test]
-    fn test_run_stats_record_build_error() {
+    fn test_run_stats_record_exit_one() {
         let mut stats = TestRunStats::default();
         let record = TestRunRecord {
             project_id: "p".to_string(),
             worker_id: "w".to_string(),
             command: "cargo test".to_string(),
             kind: "cargo_test".to_string(),
-            exit_code: 1, // Build error
+            exit_code: 1, // Command failure; phase unknown
             duration_ms: 200,
             completed_at: Utc::now(),
         };
@@ -719,8 +716,7 @@ mod tests {
 
         assert_eq!(stats.total_runs, 1);
         assert_eq!(stats.passed_runs, 0);
-        assert_eq!(stats.failed_runs, 0);
-        assert_eq!(stats.build_error_runs, 1);
+        assert_eq!(stats.failed_runs, 1);
     }
 
     #[test]
@@ -794,8 +790,7 @@ mod tests {
         let mut stats = TestRunStats {
             total_runs: 10,
             passed_runs: 7,
-            failed_runs: 2,
-            build_error_runs: 1,
+            failed_runs: 3,
             avg_duration_ms: 1500,
             ..Default::default()
         };
@@ -807,8 +802,7 @@ mod tests {
 
         assert_eq!(parsed.total_runs, 10);
         assert_eq!(parsed.passed_runs, 7);
-        assert_eq!(parsed.failed_runs, 2);
-        assert_eq!(parsed.build_error_runs, 1);
+        assert_eq!(parsed.failed_runs, 3);
         assert_eq!(parsed.avg_duration_ms, 1500);
         assert_eq!(parsed.runs_by_kind.get("cargo_test"), Some(&8));
     }
