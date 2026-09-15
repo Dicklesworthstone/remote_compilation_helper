@@ -207,24 +207,23 @@ impl TelemetryStorage {
     /// Fetch aggregate test run statistics.
     pub fn test_run_stats(&self) -> Result<TestRunStats> {
         let conn = self.conn.lock().expect("telemetry db lock");
-        let (total, passed, failed, avg_duration): (i64, i64, i64, Option<f64>) =
-            conn.query_row(
-                "SELECT
+        let (total, passed, failed, avg_duration): (i64, i64, i64, Option<f64>) = conn.query_row(
+            "SELECT
                     COUNT(*) as total,
                     COUNT(CASE WHEN exit_code = 0 THEN 1 END) as passed,
                     COUNT(CASE WHEN exit_code != 0 THEN 1 END) as failed,
                     AVG(duration_ms) as avg_duration
                  FROM test_runs",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, Option<f64>>(3)?,
-                    ))
-                },
-            )?;
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                ))
+            },
+        )?;
 
         let mut stats = TestRunStats {
             total_runs: total.max(0) as u64,
