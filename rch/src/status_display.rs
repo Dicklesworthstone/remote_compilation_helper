@@ -260,7 +260,7 @@ fn render_full_status_to<W: Write>(
     };
     writeln!(
         out,
-        "  {} {} {} total, {:.0}% success rate",
+        "  {} {} {} total, {:.0}% command success rate",
         style.key("Builds"),
         style.muted(":"),
         style.highlight(&status.stats.total_builds.to_string()),

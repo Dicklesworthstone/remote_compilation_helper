@@ -115,7 +115,7 @@ impl<'a> StatusTable<'a> {
             100.0
         };
         let stats_line = format!(
-            "{} Builds: {} total | {:.0}% success | avg {}",
+            "{} Builds: {} total | {:.0}% command success | avg {}",
             check,
             stats.total_builds,
             success_rate,
@@ -275,7 +275,7 @@ impl<'a> StatusTable<'a> {
             100.0
         };
         console.print_plain(&format!(
-            "  Builds: {} total, {:.0}% success, avg {}",
+            "  Builds: {} total, {:.0}% command success, avg {}",
             stats.total_builds,
             success_rate,
             format_ms_duration(stats.avg_duration_ms)
