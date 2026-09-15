@@ -147,6 +147,193 @@ async fn clean_overlay_cargo_preflight_reads_selected_base_not_ambient_manifest(
         .unwrap();
 }
 
+async fn retained_clean_overlay_sibling_fixture() -> (PathBuf, PathBuf, PathBuf) {
+    let parent = tempfile::tempdir().unwrap().keep();
+    let app = parent.join("app");
+    let dep = parent.join("dep");
+    for (root, manifest) in [
+        (
+            &app,
+            "[package]\nname='app'\nversion='0.1.0'\n[workspace]\n[dependencies]\ndep={path='../dep'}\n",
+        ),
+        (
+            &dep,
+            "[package]\nname='dep'\nversion='0.1.0'\n[workspace]\n",
+        ),
+    ] {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn value() -> u32 { 1 }\n").unwrap();
+        git_output(root, &["init", "-q", "-b", "main"])
+            .await
+            .unwrap();
+        git_output(root, &["config", "user.email", "rch-test@example.invalid"])
+            .await
+            .unwrap();
+        git_output(root, &["config", "user.name", "RCH Test"])
+            .await
+            .unwrap();
+        git_output(root, &["config", "core.hooksPath", "/dev/null"])
+            .await
+            .unwrap();
+        git_output(root, &["add", "Cargo.toml", "src/lib.rs"])
+            .await
+            .unwrap();
+        git_output(
+            root,
+            &[
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "selected sibling fixture",
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    (parent, app, dep)
+}
+
+#[tokio::test]
+async fn clean_overlay_dependency_binding_captures_committed_tree_and_ignores_peer_dirt() {
+    let _guard = test_guard!();
+    let (_retained_parent, app, dep) = retained_clean_overlay_sibling_fixture().await;
+    let commit = git_output(&dep, &["rev-parse", "HEAD"]).await.unwrap();
+    let tree = git_output(&dep, &["rev-parse", "HEAD^{tree}"])
+        .await
+        .unwrap();
+    std::fs::write(
+        dep.join("Cargo.toml"),
+        "[dependencies]\nambient={path='../unselected'}\n",
+    )
+    .unwrap();
+    std::fs::write(dep.join("src/lib.rs"), "pub fn value() -> u32 { 2 }\n").unwrap();
+    let mut spec = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        validate_clean_overlay_cargo_sources(&app, &spec, "cargo test")
+            .await
+            .is_err()
+    );
+    bind_clean_overlay_dependencies(&app, &mut spec, &["../dep=HEAD".into()])
+        .await
+        .unwrap();
+    assert_eq!(spec.primary_directory.as_deref(), Some(Path::new("app")));
+    assert_eq!(spec.dependencies.len(), 1);
+    assert_eq!(spec.dependencies[0].1.base_commit, commit);
+    assert_eq!(spec.dependencies[0].1.tree_object, tree);
+    validate_clean_overlay_cargo_sources(&app, &spec, "cargo test")
+        .await
+        .unwrap();
+    // Moving the symbolic revision after admission cannot change selected bytes.
+    git_output(&dep, &["add", "Cargo.toml", "src/lib.rs"])
+        .await
+        .unwrap();
+    git_output(
+        &dep,
+        &[
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            "different later HEAD",
+        ],
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        git_output(&dep, &["rev-parse", "HEAD"]).await.unwrap(),
+        commit
+    );
+    validate_clean_overlay_cargo_sources(&app, &spec, "cargo test")
+        .await
+        .unwrap();
+    let selected = selected_clean_overlay_cargo_tree(&dep, &spec.dependencies[0].1)
+        .await
+        .unwrap();
+    assert!(
+        matches!(selected.get(Path::new("Cargo.toml")), Some(rch_common::cargo_path_deps::SelectedCargoEntry::File(Some(text))) if !text.contains("unselected"))
+    );
+    let receipt = spec.execution_receipt();
+    assert!(
+        receipt.contains(&format!("commit={commit} tree={tree}")),
+        "{receipt}"
+    );
+    assert!(
+        receipt.contains(&format!(
+            "dependency-root={}",
+            dep.canonicalize().unwrap().display()
+        )),
+        "{receipt}"
+    );
+}
+
+#[tokio::test]
+async fn clean_overlay_dependency_bindings_refuse_duplicate_non_sibling_and_missing_revisions() {
+    let _guard = test_guard!();
+    let (parent, app, _dep) = retained_clean_overlay_sibling_fixture().await;
+    std::fs::create_dir_all(app.join("nested")).unwrap();
+    std::fs::create_dir_all(parent.join("other/deep")).unwrap();
+    for bindings in [
+        vec!["../dep=HEAD", "../dep=HEAD"],
+        vec![".=HEAD"],
+        vec!["nested=HEAD"],
+        vec!["../other/deep=HEAD"],
+        vec!["../dep=missing-ref"],
+        vec!["../dep"],
+        vec!["../dep="],
+    ] {
+        let mut spec = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+            .await
+            .unwrap()
+            .unwrap();
+        let arguments = bindings
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            bind_clean_overlay_dependencies(&app, &mut spec, &arguments)
+                .await
+                .is_err(),
+            "{bindings:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn clean_overlay_dependency_binding_still_rejects_unbound_transitive_root() {
+    let _guard = test_guard!();
+    let (_retained_parent, app, dep) = retained_clean_overlay_sibling_fixture().await;
+    std::fs::write(dep.join("Cargo.toml"), "[package]\nname='dep'\nversion='0.1.0'\n[workspace]\n[dependencies]\nunbound={path='../third'}\n").unwrap();
+    git_output(&dep, &["add", "Cargo.toml"]).await.unwrap();
+    git_output(
+        &dep,
+        &[
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            "unbound transitive sibling",
+        ],
+    )
+    .await
+    .unwrap();
+    let mut spec = prepare_clean_overlay_spec(&app, Some("HEAD".into()), true, vec![], true)
+        .await
+        .unwrap()
+        .unwrap();
+    bind_clean_overlay_dependencies(&app, &mut spec, &["../dep=HEAD".into()])
+        .await
+        .unwrap();
+    let error = validate_clean_overlay_cargo_sources(&app, &spec, "cargo test")
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("third"), "{error:#}");
+}
+
 #[tokio::test]
 async fn clean_overlay_cargo_preflight_honors_selected_manifest_overlay() {
     let _guard = test_guard!();

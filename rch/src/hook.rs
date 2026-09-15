@@ -182,7 +182,10 @@ impl CleanOverlaySpec {
         for (root, spec) in &self.dependencies {
             receipt.push_str(&format!(
                 " dependency-root={} commit={} tree={} overlay-fingerprint={}",
-                root.display(), spec.base_commit, spec.tree_object, spec.overlay_fingerprint
+                root.display(),
+                spec.base_commit,
+                spec.tree_object,
+                spec.overlay_fingerprint
             ));
         }
         receipt
@@ -2097,14 +2100,22 @@ async fn validate_clean_overlay_cargo_sources(
     };
 
     let primary_directory = spec.primary_directory.as_deref().unwrap_or(Path::new(""));
-    let mut entries = selected_clean_overlay_cargo_tree(project_root, spec).await?
-        .into_iter().map(|(path, entry)| (primary_directory.join(path), entry))
+    let mut entries = selected_clean_overlay_cargo_tree(project_root, spec)
+        .await?
+        .into_iter()
+        .map(|(path, entry)| (primary_directory.join(path), entry))
         .collect::<std::collections::BTreeMap<_, _>>();
     for (root, selected) in &spec.dependencies {
-        let directory = root.file_name().ok_or_else(|| anyhow::anyhow!("missing dependency directory"))?;
+        let directory = root
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("missing dependency directory"))?;
         for (path, entry) in selected_clean_overlay_cargo_tree(root, selected).await? {
-            anyhow::ensure!(entries.insert(Path::new(directory).join(path), entry).is_none(),
-                "overlapping selected dependency inventory");
+            anyhow::ensure!(
+                entries
+                    .insert(Path::new(directory).join(path), entry)
+                    .is_none(),
+                "overlapping selected dependency inventory"
+            );
         }
     }
     let primary_manifest = primary_directory.join("Cargo.toml");
@@ -2146,7 +2157,10 @@ async fn validate_clean_overlay_cargo_sources(
                         .is_some_and(|name| name == "Cargo.toml"),
                     "clean-overlay --manifest-path must select a Cargo.toml manifest"
                 );
-                anyhow::ensure!(!Path::new(value).is_absolute(), "absolute manifest path is not selected");
+                anyhow::ensure!(
+                    !Path::new(value).is_absolute(),
+                    "absolute manifest path is not selected"
+                );
                 let path = validate_selected_cargo_path(&entries, &primary_directory.join(value))?;
                 anyhow::ensure!(
                     matches!(entries.get(&path), Some(SelectedCargoEntry::File(Some(_)))),
@@ -2160,7 +2174,12 @@ async fn validate_clean_overlay_cargo_sources(
                 let _: toml::Value = toml::from_str(value).context(
                     "clean-overlay supports inline TOML --config only; config files are not admitted",
                 )?;
-                validate_selected_cargo_config_at(&entries, &primary_manifest, primary_directory, value)?;
+                validate_selected_cargo_config_at(
+                    &entries,
+                    &primary_manifest,
+                    primary_directory,
+                    value,
+                )?;
             }
         }
         index += 1;
@@ -2280,8 +2299,11 @@ async fn prepare_clean_overlay_spec(
         anyhow::bail!("--base did not resolve to a hexadecimal commit object ID");
     }
     validate_clean_overlay_archive_attributes(&canonical_project_root, &base_commit).await?;
-    let tree_object = git_output(&canonical_project_root,
-        &["rev-parse", "--verify", &format!("{base_commit}^{{tree}}")]).await?;
+    let tree_object = git_output(
+        &canonical_project_root,
+        &["rev-parse", "--verify", &format!("{base_commit}^{{tree}}")],
+    )
+    .await?;
     let base_tree = git_output_bytes(
         &canonical_project_root,
         &["ls-tree", "-rz", "--full-tree", &base_commit],
@@ -2339,27 +2361,47 @@ async fn bind_clean_overlay_dependencies(
         return Ok(());
     }
     let primary = std::fs::canonicalize(primary)?;
-    let parent = primary.parent().ok_or_else(|| anyhow::anyhow!("missing primary parent"))?;
+    let parent = primary
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("missing primary parent"))?;
     let primary_name = normalize_clean_overlay_path(Path::new(
-        primary.file_name().ok_or_else(|| anyhow::anyhow!("missing primary directory name"))?,
+        primary
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("missing primary directory name"))?,
     ))?;
     let mut roots = BTreeSet::new();
     let mut names = BTreeSet::from([primary_name.to_string_lossy().to_ascii_lowercase()]);
     for binding in bindings {
-        let (path, revision) = binding.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!("--dependency-base requires PATH=REV")
-        })?;
-        anyhow::ensure!(!path.is_empty() && !revision.is_empty(), "empty dependency path or revision");
+        let (path, revision) = binding
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--dependency-base requires PATH=REV"))?;
+        anyhow::ensure!(
+            !path.is_empty() && !revision.is_empty(),
+            "empty dependency path or revision"
+        );
         let root = std::fs::canonicalize(primary.join(path))
             .with_context(|| format!("resolve selected dependency root {path}"))?;
-        anyhow::ensure!(root != primary && root.parent() == Some(parent),
-            "--dependency-base currently requires sibling Git roots: {}", root.display());
-        let name = normalize_clean_overlay_path(Path::new(root.file_name()
-            .ok_or_else(|| anyhow::anyhow!("missing dependency directory name"))?))?;
-        anyhow::ensure!(names.insert(name.to_string_lossy().to_ascii_lowercase()), "ambiguous dependency directory");
-        anyhow::ensure!(roots.insert(root.clone()), "duplicate dependency binding: {}", root.display());
+        anyhow::ensure!(
+            root != primary && root.parent() == Some(parent),
+            "--dependency-base currently requires sibling Git roots: {}",
+            root.display()
+        );
+        let name = normalize_clean_overlay_path(Path::new(
+            root.file_name()
+                .ok_or_else(|| anyhow::anyhow!("missing dependency directory name"))?,
+        ))?;
+        anyhow::ensure!(
+            names.insert(name.to_string_lossy().to_ascii_lowercase()),
+            "ambiguous dependency directory"
+        );
+        anyhow::ensure!(
+            roots.insert(root.clone()),
+            "duplicate dependency binding: {}",
+            root.display()
+        );
         let selected = prepare_clean_overlay_spec(&root, Some(revision.into()), true, vec![], true)
-            .await?.ok_or_else(|| anyhow::anyhow!("missing dependency selection"))?;
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("missing dependency selection"))?;
         spec.dependencies.push((root, selected));
     }
     spec.dependencies.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2572,12 +2614,22 @@ pub async fn run_exec(
     )
     .await?;
     if !dependency_bases.is_empty() {
-        let spec = clean_overlay_spec.as_mut().ok_or_else(|| anyhow::anyhow!(
-            "--dependency-base requires --clean-overlay"
-        ))?;
+        anyhow::ensure!(
+            clean_overlay_fmt_check
+                || classify_command(&command)
+                    .kind
+                    .is_some_and(|kind| kind.command_base() == "cargo"),
+            "--dependency-base requires a directly classified Cargo command"
+        );
+        let spec = clean_overlay_spec
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("--dependency-base requires --clean-overlay"))?;
         bind_clean_overlay_dependencies(
-            project_root.as_deref().unwrap_or_else(|| Path::new(".")), spec, &dependency_bases,
-        ).await?;
+            project_root.as_deref().unwrap_or_else(|| Path::new(".")),
+            spec,
+            &dependency_bases,
+        )
+        .await?;
     }
     let selection_project = selection_project_for_execution(
         &project,
