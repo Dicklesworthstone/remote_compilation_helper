@@ -254,13 +254,16 @@ pub enum SelectedCargoEntry {
 
 /// Resolve a CLI-selected path without collapsing `..` across symlinks.
 ///
-/// The complete selected inventory is validated first. Absolute paths and
-/// references not present in that inventory are refused without filesystem I/O.
+/// Inventory structure and symlinks are validated, but metadata text is not
+/// required: loaders use this before hydrating selected manifests/configs.
+/// Absolute and missing paths are refused without filesystem I/O. Call
+/// [`validate_selected_cargo_tree`] after hydration to validate Cargo references.
 pub fn validate_selected_cargo_path(
     entries: &BTreeMap<PathBuf, SelectedCargoEntry>,
     path: &Path,
 ) -> Result<PathBuf, CargoPathDependencyError> {
-    validate_selected_cargo_tree(entries)?;
+    let tree = SelectedCargoTree::from_inventory(entries);
+    tree.check_inventory()?;
     let raw = path.to_str().ok_or_else(|| {
         CargoPathDependencyError::new(
             CargoPathDependencyErrorKind::PathPolicyViolation,
@@ -268,18 +271,7 @@ pub fn validate_selected_cargo_path(
         )
         .with_dependency_path(path)
     })?;
-    let directories = entries
-        .keys()
-        .flat_map(|entry| entry.ancestors().skip(1).map(Path::to_path_buf))
-        .chain(std::iter::once(PathBuf::new()))
-        .collect();
-    SelectedCargoTree {
-        entries,
-        directories,
-        diagnostics: Vec::new(),
-    }
-    .resolve(Path::new(""), raw)
-    .map_err(|detail| {
+    tree.resolve(Path::new(""), raw).map_err(|detail| {
         CargoPathDependencyError::new(CargoPathDependencyErrorKind::PathPolicyViolation, detail)
             .with_dependency_path(path)
     })
@@ -295,25 +287,22 @@ pub fn validate_selected_cargo_config(
     base: &Path,
     contents: &str,
 ) -> Result<(), CargoPathDependencyError> {
+    validate_selected_cargo_tree(entries)?;
     let resolved_base = validate_selected_cargo_path(
         entries,
-        if base.as_os_str().is_empty() { Path::new(".") } else { base },
+        if base.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            base
+        },
     )?;
-    let directories = entries
-        .keys()
-        .flat_map(|entry| entry.ancestors().skip(1).map(Path::to_path_buf))
-        .chain(std::iter::once(PathBuf::new()))
-        .collect();
-    let mut tree = SelectedCargoTree {
-        entries,
-        directories,
-        diagnostics: Vec::new(),
-    };
+    let mut tree = SelectedCargoTree::from_inventory(entries);
     if !tree.directories.contains(&resolved_base) {
         return Err(CargoPathDependencyError::new(
             CargoPathDependencyErrorKind::PathPolicyViolation,
             "Cargo configuration base is not a selected directory",
-        ).with_dependency_path(base));
+        )
+        .with_dependency_path(base));
     }
     let document = toml::from_str::<toml::Table>(contents).map_err(|error| {
         CargoPathDependencyError::new(
@@ -321,14 +310,22 @@ pub fn validate_selected_cargo_config(
             format!("invalid inline Cargo configuration: {error}"),
         )
     })?;
-    tree.config_at(Path::new("<command-line-config>"), &resolved_base, &document);
+    tree.config_at(
+        Path::new("<command-line-config>"),
+        &resolved_base,
+        &document,
+    );
     if tree.diagnostics.is_empty() {
         Ok(())
     } else {
         Err(CargoPathDependencyError::new(
             CargoPathDependencyErrorKind::PathPolicyViolation,
-            format!("inline Cargo configuration is not contained: {}", tree.diagnostics.join("; ")),
-        ).with_diagnostics(tree.diagnostics))
+            format!(
+                "inline Cargo configuration is not contained: {}",
+                tree.diagnostics.join("; ")
+            ),
+        )
+        .with_diagnostics(tree.diagnostics))
     }
 }
 
@@ -343,11 +340,7 @@ pub fn validate_selected_cargo_config(
 pub fn validate_selected_cargo_tree(
     entries: &BTreeMap<PathBuf, SelectedCargoEntry>,
 ) -> Result<(), CargoPathDependencyError> {
-    let mut tree = SelectedCargoTree {
-        entries,
-        directories: BTreeSet::from([PathBuf::new()]),
-        diagnostics: Vec::new(),
-    };
+    let mut tree = SelectedCargoTree::from_inventory(entries);
     if !entries.contains_key(Path::new("Cargo.toml")) {
         tree.diagnostics.push(
             "selected root Cargo.toml is missing; ambient ancestor discovery is not admitted"
@@ -355,36 +348,6 @@ pub fn validate_selected_cargo_tree(
         );
     }
     for path in entries.keys() {
-        if path.as_os_str().is_empty()
-            || path.to_str().is_none()
-            || path
-                .components()
-                .any(|part| !matches!(part, std::path::Component::Normal(_)))
-            || path.to_string_lossy().contains(['\\', ':'])
-        {
-            tree.diagnostics.push(format!(
-                "invalid selected inventory path: {}",
-                path.display()
-            ));
-            continue;
-        }
-        for parent in path.ancestors().skip(1) {
-            tree.directories.insert(parent.to_path_buf());
-        }
-    }
-    for (path, entry) in entries {
-        if tree.directories.contains(path) {
-            tree.diagnostics.push(format!(
-                "selected file also has descendants: {}",
-                path.display()
-            ));
-        }
-        if matches!(entry, SelectedCargoEntry::Symlink(_)) {
-            if let Err(error) = tree.resolve(Path::new(""), &path.to_string_lossy()) {
-                tree.diagnostics
-                    .push(format!("{}: symlink: {error}", path.display()));
-            }
-        }
         let is_manifest = path.file_name().is_some_and(|name| name == "Cargo.toml");
         let is_config = path
             .parent()
@@ -417,6 +380,35 @@ pub fn validate_selected_cargo_tree(
                 .push(format!("{}: {error}", path.display())),
         }
     }
+    // A selected `.cargo` directory symlink has no `.cargo/config` inventory
+    // entry of its own. Cargo still reads that alias, relative to this project,
+    // so validate its resolved text without substituting the target's parent.
+    for (path, entry) in entries {
+        if !matches!(entry, SelectedCargoEntry::Symlink(_))
+            || !path.file_name().is_some_and(|name| name == ".cargo")
+        {
+            continue;
+        }
+        for filename in ["config", "config.toml"] {
+            let logical = path.join(filename);
+            let Ok(resolved) = tree.resolve(Path::new(""), &logical.to_string_lossy()) else {
+                // Missing config is allowed; malformed/dangling links themselves
+                // have already been checked across the entire inventory.
+                continue;
+            };
+            let parsed = match entries.get(&resolved) {
+                Some(SelectedCargoEntry::File(Some(text))) => toml::from_str::<toml::Table>(text)
+                    .map_err(|error| format!("invalid selected TOML: {error}")),
+                _ => Err("selected config alias text is unavailable".to_string()),
+            };
+            match parsed {
+                Ok(document) => tree.config(&logical, &document),
+                Err(error) => tree
+                    .diagnostics
+                    .push(format!("{}: {error}", logical.display())),
+            }
+        }
+    }
     if tree.diagnostics.is_empty() {
         Ok(())
     } else {
@@ -446,7 +438,63 @@ enum SelectedCargoPathKind {
     Directory,
 }
 
-impl SelectedCargoTree<'_> {
+impl<'a> SelectedCargoTree<'a> {
+    fn from_inventory(entries: &'a BTreeMap<PathBuf, SelectedCargoEntry>) -> Self {
+        let mut tree = Self {
+            entries,
+            directories: BTreeSet::from([PathBuf::new()]),
+            diagnostics: Vec::new(),
+        };
+        for path in entries.keys() {
+            if path.as_os_str().is_empty()
+                || path.to_str().is_none()
+                || path
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                || path.to_string_lossy().contains(['\\', ':'])
+            {
+                tree.diagnostics.push(format!(
+                    "invalid selected inventory path: {}",
+                    path.display()
+                ));
+                continue;
+            }
+            for parent in path.ancestors().skip(1) {
+                tree.directories.insert(parent.to_path_buf());
+            }
+        }
+        for (path, entry) in entries {
+            if tree.directories.contains(path) {
+                tree.diagnostics.push(format!(
+                    "selected file also has descendants: {}",
+                    path.display()
+                ));
+            }
+            if matches!(entry, SelectedCargoEntry::Symlink(_))
+                && let Err(error) = tree.resolve(Path::new(""), &path.to_string_lossy())
+            {
+                tree.diagnostics
+                    .push(format!("{}: symlink: {error}", path.display()));
+            }
+        }
+        tree
+    }
+
+    fn check_inventory(&self) -> Result<(), CargoPathDependencyError> {
+        if self.diagnostics.is_empty() {
+            Ok(())
+        } else {
+            Err(CargoPathDependencyError::new(
+                CargoPathDependencyErrorKind::PathPolicyViolation,
+                format!(
+                    "invalid selected inventory: {}",
+                    self.diagnostics.join("; ")
+                ),
+            )
+            .with_diagnostics(self.diagnostics.iter().cloned()))
+        }
+    }
+
     fn components(raw: &str) -> Result<std::collections::VecDeque<String>, String> {
         if raw.is_empty()
             || raw.starts_with('/')
@@ -459,6 +507,9 @@ impl SelectedCargoTree<'_> {
     }
 
     fn resolve(&self, base: &Path, raw: &str) -> Result<PathBuf, String> {
+        if !self.directories.contains(base) {
+            return Err(format!("non-directory resolution base {}", base.display()));
+        }
         let mut pending = Self::components(raw)?;
         let mut resolved = base.to_path_buf();
         let mut links = 0;
@@ -671,8 +722,10 @@ impl SelectedCargoTree<'_> {
         if Self::inherits_workspace(&toml::Value::Table(table.clone())) {
             let workspace = self.selected_workspace(declaring, table);
             if let Err(error) = workspace {
-                self.diagnostics
-                    .push(format!("{}: workspace inheritance: {error}", declaring.display()));
+                self.diagnostics.push(format!(
+                    "{}: workspace inheritance: {error}",
+                    declaring.display()
+                ));
             }
         }
         self.dependency_tables(declaring, base, "", table);
@@ -784,7 +837,10 @@ impl SelectedCargoTree<'_> {
             }
             let resolved = self.resolve(&candidate, "Cargo.toml")?;
             let Some(SelectedCargoEntry::File(Some(text))) = self.entries.get(&resolved) else {
-                return Err(format!("selected workspace text missing: {}", manifest.display()));
+                return Err(format!(
+                    "selected workspace text missing: {}",
+                    manifest.display()
+                ));
             };
             let document = toml::from_str::<toml::Table>(text)
                 .map_err(|error| format!("invalid workspace {}: {error}", manifest.display()))?;
@@ -2917,11 +2973,82 @@ mod tests {
             ("dep/Cargo.toml", "[package]\nname='dep'"),
             ("vendor/entry", ""),
         ])).unwrap();
+        let entries = selected_tree(&[
+            ("Cargo.toml", "[workspace]"),
+            ("dep/Cargo.toml", "[package]\nname='dep'"),
+            ("nested/anchor", ""),
+        ]);
+        validate_selected_cargo_config(&entries, Path::new(""), "paths=['dep']").unwrap();
+        validate_selected_cargo_config(&entries, Path::new("nested"), "paths=['../dep']").unwrap();
+        assert!(
+            validate_selected_cargo_config(&entries, Path::new(""), "paths=['../dep']").is_err()
+        );
+        assert!(
+            validate_selected_cargo_config(&entries, Path::new("nested/anchor"), "[build]\njobs=1")
+                .is_err()
+        );
+        let mut alias = selected_tree(&[
+            ("Cargo.toml", "[workspace]"),
+            ("settings/config.toml", "paths=['../external']"),
+        ]);
+        alias.insert(
+            PathBuf::from(".cargo"),
+            SelectedCargoEntry::Symlink("settings".into()),
+        );
+        assert!(
+            validate_selected_cargo_tree(&alias)
+                .unwrap_err()
+                .detail()
+                .contains(".cargo/config.toml")
+        );
+        alias.insert(
+            PathBuf::from("settings/config.toml"),
+            SelectedCargoEntry::File(None),
+        );
+        assert!(
+            validate_selected_cargo_tree(&alias)
+                .unwrap_err()
+                .detail()
+                .contains("alias text")
+        );
     }
 
     #[test]
     fn selected_cargo_tree_refuses_missing_text_paths_and_invalid_inventory() {
         assert!(validate_selected_cargo_tree(&BTreeMap::new()).is_err());
+        let mut unloaded = BTreeMap::from([
+            (PathBuf::from("Cargo.toml"), SelectedCargoEntry::File(None)),
+            (
+                PathBuf::from("settings/config.toml"),
+                SelectedCargoEntry::File(None),
+            ),
+            (
+                PathBuf::from(".cargo"),
+                SelectedCargoEntry::Symlink("settings".into()),
+            ),
+        ]);
+        assert_eq!(
+            validate_selected_cargo_path(&unloaded, Path::new("Cargo.toml")).unwrap(),
+            Path::new("Cargo.toml")
+        );
+        let config_target =
+            validate_selected_cargo_path(&unloaded, Path::new(".cargo/config.toml")).unwrap();
+        assert_eq!(config_target, Path::new("settings/config.toml"));
+        assert!(
+            validate_selected_cargo_tree(&unloaded)
+                .unwrap_err()
+                .detail()
+                .contains("text")
+        );
+        unloaded.insert(
+            PathBuf::from("Cargo.toml"),
+            SelectedCargoEntry::File(Some("[workspace]".into())),
+        );
+        unloaded.insert(
+            config_target,
+            SelectedCargoEntry::File(Some("[build]\njobs=1".into())),
+        );
+        validate_selected_cargo_tree(&unloaded).unwrap();
         let mut entries = selected_tree(&[("Cargo.toml", "[dependencies]\ndep={path='dep'}")]);
         // A real ambient dep directory cannot satisfy a selected inventory.
         assert!(
@@ -2952,6 +3079,7 @@ mod tests {
                 .contains("descendants")
         );
         entries.insert(PathBuf::from("../outside"), SelectedCargoEntry::File(None));
+        assert!(validate_selected_cargo_path(&entries, Path::new("Cargo.toml")).is_err());
         assert!(
             validate_selected_cargo_tree(&entries)
                 .unwrap_err()
@@ -2984,7 +3112,10 @@ mod tests {
         }
         let inherited = selected_tree(&[
             ("Cargo.toml", "[package]\nname='root'"),
-            ("nested/Cargo.toml", "[package]\nversion.workspace=true\n[dependencies]\nshared.workspace=true"),
+            (
+                "nested/Cargo.toml",
+                "[package]\nversion.workspace=true\n[dependencies]\nshared.workspace=true",
+            ),
         ]);
         assert!(
             validate_selected_cargo_tree(&inherited)
@@ -2993,9 +3124,15 @@ mod tests {
                 .contains("no selected enclosing workspace")
         );
         let selected_workspace = selected_tree(&[
-            ("Cargo.toml", "[workspace]\n[workspace.dependencies]\nshared={path='dep'}"),
+            (
+                "Cargo.toml",
+                "[workspace]\n[workspace.dependencies]\nshared={path='dep'}",
+            ),
             ("dep/Cargo.toml", "[package]\nname='dep'"),
-            ("nested/Cargo.toml", "[package]\nversion.workspace=true\n[dependencies]\nshared.workspace=true"),
+            (
+                "nested/Cargo.toml",
+                "[package]\nversion.workspace=true\n[dependencies]\nshared.workspace=true",
+            ),
         ]);
         validate_selected_cargo_tree(&selected_workspace).unwrap();
     }
