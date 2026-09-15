@@ -819,7 +819,6 @@ mod tests {
         assert_eq!(stats.total_runs, 1);
         assert_eq!(stats.passed_runs, 1);
         assert_eq!(stats.failed_runs, 0);
-        assert_eq!(stats.build_error_runs, 0);
         assert!(stats.avg_duration_ms > 0);
         assert_eq!(stats.runs_by_kind.get("cargo_test"), Some(&1));
     }

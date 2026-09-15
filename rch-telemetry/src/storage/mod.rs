@@ -207,13 +207,12 @@ impl TelemetryStorage {
     /// Fetch aggregate test run statistics.
     pub fn test_run_stats(&self) -> Result<TestRunStats> {
         let conn = self.conn.lock().expect("telemetry db lock");
-        let (total, passed, failed, build_error, avg_duration): (i64, i64, i64, i64, Option<f64>) =
+        let (total, passed, failed, avg_duration): (i64, i64, i64, Option<f64>) =
             conn.query_row(
                 "SELECT
                     COUNT(*) as total,
-                    SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) as passed,
-                    SUM(CASE WHEN exit_code = 101 THEN 1 ELSE 0 END) as failed,
-                    SUM(CASE WHEN exit_code = 1 THEN 1 ELSE 0 END) as build_error,
+                    COUNT(CASE WHEN exit_code = 0 THEN 1 END) as passed,
+                    COUNT(CASE WHEN exit_code != 0 THEN 1 END) as failed,
                     AVG(duration_ms) as avg_duration
                  FROM test_runs",
                 [],
@@ -222,8 +221,7 @@ impl TelemetryStorage {
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, Option<f64>>(4)?,
+                        row.get::<_, Option<f64>>(3)?,
                     ))
                 },
             )?;
@@ -232,7 +230,6 @@ impl TelemetryStorage {
             total_runs: total.max(0) as u64,
             passed_runs: passed.max(0) as u64,
             failed_runs: failed.max(0) as u64,
-            build_error_runs: build_error.max(0) as u64,
             avg_duration_ms: avg_duration.unwrap_or(0.0).round() as u64,
             runs_by_kind: HashMap::new(),
         };
@@ -599,7 +596,6 @@ mod tests {
         assert_eq!(stats.total_runs, 1);
         assert_eq!(stats.passed_runs, 1);
         assert_eq!(stats.failed_runs, 0);
-        assert_eq!(stats.build_error_runs, 0);
         assert!(stats.avg_duration_ms > 0);
         assert_eq!(stats.runs_by_kind.get("cargo_test"), Some(&1));
     }
@@ -910,14 +906,14 @@ mod tests {
         };
         storage.insert_test_run(&record_pass).expect("insert");
 
-        // Exit code 101 = test failure
+        // Cargo exit 101 does not distinguish compilation and test failures.
         let record_fail = TestRunRecord {
             exit_code: 101,
             ..record_pass.clone()
         };
         storage.insert_test_run(&record_fail).expect("insert");
 
-        // Exit code 1 = build error
+        // Exit 1 is also a failed command, with no evidence of its phase.
         let record_build_error = TestRunRecord {
             exit_code: 1,
             ..record_pass.clone()
@@ -929,8 +925,7 @@ mod tests {
         let stats = storage.test_run_stats().expect("stats");
         assert_eq!(stats.total_runs, 3);
         assert_eq!(stats.passed_runs, 1);
-        assert_eq!(stats.failed_runs, 1);
-        assert_eq!(stats.build_error_runs, 1);
+        assert_eq!(stats.failed_runs, 2);
     }
 
     // -------------------------------------------------------------------------

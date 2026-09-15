@@ -262,13 +262,12 @@ pub struct BuildStatsFromApi {
     pub avg_duration_ms: u64,
 }
 
-/// Test execution statistics from API.
+/// Terminal test-command outcomes from API; failures carry no phase inference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestRunStatsFromApi {
     pub total_runs: u64,
     pub passed_runs: u64,
     pub failed_runs: u64,
-    pub build_error_runs: u64,
     pub avg_duration_ms: u64,
     #[serde(default)]
     pub runs_by_kind: std::collections::HashMap<String, u64>,
@@ -1408,8 +1407,7 @@ mod tests {
         let json = serde_json::json!({
             "total_runs": 50,
             "passed_runs": 45,
-            "failed_runs": 3,
-            "build_error_runs": 2,
+            "failed_runs": 5,
             "avg_duration_ms": 30000,
             "runs_by_kind": {
                 "unit": 30,
