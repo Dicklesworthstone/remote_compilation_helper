@@ -6509,7 +6509,7 @@ mod tests {
                 roots,
                 ..
             }) => (dry_run, apply, workers, roots),
-            _ => panic!("expected Commands::Gc for {argv:?}"),
+            _ => panic!("expected Commands::Gc for {argv:?}"), // ubs:ignore — test assertion for an unexpected parser result.
         }
     }
 
@@ -6606,7 +6606,7 @@ mod tests {
 
         let actual_json = serde_json::to_string_pretty(&actual).expect("actual JSON renders");
         let expected_json = serde_json::to_string_pretty(expected).expect("expected JSON renders");
-        panic!(
+        panic! { // ubs:ignore — golden-test assertion; never reached by CLI execution.
             "golden mismatch in {fixture_path}\n\
              expected_blake3={}\n\
              actual_blake3={}\n\
@@ -6616,7 +6616,7 @@ mod tests {
              actual:\n{actual_json}",
             blake3::hash(expected_json.as_bytes()),
             blake3::hash(actual_json.as_bytes())
-        );
+        };
     }
 
     // -------------------------------------------------------------------------
@@ -6690,6 +6690,8 @@ mod tests {
             "HEAD",
             "--clean-overlay",
             "--no-overlay",
+            "--dependency-base",
+            "../dep=HEAD",
             "--",
             "cargo",
             "check",
@@ -6698,7 +6700,7 @@ mod tests {
         match cli.command {
             Some(Commands::Exec {
                 base,
-                dependency_base: _,
+                dependency_base,
                 clean_overlay,
                 overlay_path,
                 no_overlay,
@@ -6708,6 +6710,7 @@ mod tests {
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
+                assert_eq!(dependency_base, vec!["../dep=HEAD"]);
                 assert!(clean_overlay);
                 assert!(overlay_path.is_empty());
                 assert!(no_overlay);

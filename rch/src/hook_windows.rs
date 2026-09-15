@@ -84,7 +84,7 @@ pub async fn run_exec(
         anyhow::bail!("No command provided to exec");
     }
 
-    let status = std::process::Command::new("cmd")
+    let status = std::process::Command::new("cmd") // ubs:ignore — explicit user-requested local exec; selected-source modes refuse above.
         .arg("/C")
         .arg(&command)
         .status()?;

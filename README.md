@@ -741,8 +741,9 @@ build. Non-Cargo Windows clean-overlay jobs also use isolated targets. The owner
 marker protects against process interruption; it is not a power-loss durability
 guarantee.
 
-Clean-overlay currently materializes one Git repository. In-repository Cargo
-workspace members are present in the archive. Before Cargo starts, selected
+Clean-overlay materializes the primary Git repository and explicitly bound
+sibling repositories. In-repository Cargo workspace members are present in the
+archive. Before Cargo starts, selected
 manifests, configuration, symlinks, and command-line path overrides are checked
 against the selected Git base and overlays. Escaping paths are refused with
 `RCH-E413`; retained sibling directories on the worker cannot supply those

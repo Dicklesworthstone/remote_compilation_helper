@@ -65,7 +65,7 @@ fn clean_overlay_cargo_policy_failure(
         verified: false,
         reason_code: Some(DEPENDENCY_PREFLIGHT_CODE_POLICY),
         remediation: Some(
-            "Clean-overlay requires selected, contained Cargo inputs; external committed-root staging is not implemented yet.",
+            "Clean-overlay requires selected Cargo inputs. Bind each external sibling Git root with --dependency-base PATH=REV; non-sibling layouts are refused.",
         ),
         evidence: vec![DependencyPreflightEvidence {
             root: root.display().to_string(),
@@ -1118,7 +1118,11 @@ pub(super) async fn execute_remote_compilation(
                 root_outcomes.push((entry.clone(), SyncRootOutcome::Synced));
             }
             Err(e) => {
-                if entry.is_primary || exact_dependency_closure_sync || source_content_receipt {
+                if entry.is_primary
+                    || clean_overlay.is_some()
+                    || exact_dependency_closure_sync
+                    || source_content_receipt
+                {
                     // Cargo dependency-closure builds must not continue against
                     // stale sibling repositories on the worker.
                     if let Some(history) =
