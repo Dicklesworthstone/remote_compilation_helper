@@ -287,7 +287,21 @@ pub fn validate_selected_cargo_config(
     base: &Path,
     contents: &str,
 ) -> Result<(), CargoPathDependencyError> {
-    validate_selected_cargo_tree(entries)?;
+    validate_selected_cargo_config_at(entries, Path::new("Cargo.toml"), base, contents)
+}
+
+/// Validate an inline override within a combined committed-source inventory.
+///
+/// `primary_manifest` identifies the selected Cargo entrypoint, while `base`
+/// identifies the configuration's resolution directory within the container.
+/// Every selected manifest/config is validated before applying the override.
+pub fn validate_selected_cargo_config_at(
+    entries: &BTreeMap<PathBuf, SelectedCargoEntry>,
+    primary_manifest: &Path,
+    base: &Path,
+    contents: &str,
+) -> Result<(), CargoPathDependencyError> {
+    validate_selected_cargo_tree_at(entries, primary_manifest)?;
     let resolved_base = validate_selected_cargo_path(
         entries,
         if base.as_os_str().is_empty() {
@@ -340,12 +354,46 @@ pub fn validate_selected_cargo_config(
 pub fn validate_selected_cargo_tree(
     entries: &BTreeMap<PathBuf, SelectedCargoEntry>,
 ) -> Result<(), CargoPathDependencyError> {
+    validate_selected_cargo_tree_at(entries, Path::new("Cargo.toml"))
+}
+
+/// Validate a selected Cargo entrypoint inside a combined source container.
+///
+/// For example, `app/Cargo.toml` may reference `../dep` when `dep/Cargo.toml`
+/// is also selected. The container boundary, not the primary repository's
+/// boundary, limits resolution. All selected metadata and symlinks retain the
+/// same conservative checks as [`validate_selected_cargo_tree`]. The caller
+/// must bind and materialize the complete inventory; this API reads no ambient
+/// files and does not stage external repositories itself.
+pub fn validate_selected_cargo_tree_at(
+    entries: &BTreeMap<PathBuf, SelectedCargoEntry>,
+    primary_manifest: &Path,
+) -> Result<(), CargoPathDependencyError> {
     let mut tree = SelectedCargoTree::from_inventory(entries);
-    if !entries.contains_key(Path::new("Cargo.toml")) {
-        tree.diagnostics.push(
-            "selected root Cargo.toml is missing; ambient ancestor discovery is not admitted"
-                .into(),
-        );
+    let primary = primary_manifest
+        .to_str()
+        .ok_or_else(|| "primary manifest path is not UTF-8".to_string())
+        .and_then(|raw| {
+            if primary_manifest
+                .file_name()
+                .is_none_or(|name| name != "Cargo.toml")
+            {
+                return Err("primary manifest must be named Cargo.toml".to_string());
+            }
+            let resolved = tree.resolve(Path::new(""), raw)?;
+            if !matches!(
+                entries.get(&resolved),
+                Some(SelectedCargoEntry::File(Some(_)))
+            ) {
+                return Err("selected primary manifest text is unavailable".to_string());
+            }
+            Ok(())
+        });
+    if let Err(error) = primary {
+        tree.diagnostics.push(format!(
+            "selected primary {}: {error}; ambient ancestor discovery is not admitted",
+            primary_manifest.display()
+        ));
     }
     for path in entries.keys() {
         let is_manifest = path.file_name().is_some_and(|name| name == "Cargo.toml");
@@ -2817,6 +2865,107 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn selected_cargo_combined_tree_accepts_only_selected_sibling_roots() {
+        let mut entries = selected_tree(&[
+            (
+                "app/Cargo.toml",
+                "[package]\nname='app'\n[dependencies]\ndep={path='../dep'}",
+            ),
+            ("dep/Cargo.toml", "[package]\nname='dep'"),
+        ]);
+        validate_selected_cargo_tree_at(&entries, Path::new("app/Cargo.toml")).unwrap();
+        // The original API still requires an actual selected root manifest.
+        assert!(validate_selected_cargo_tree(&entries).is_err());
+        entries.insert(
+            PathBuf::from("app/Cargo.toml"),
+            SelectedCargoEntry::File(Some("[dependencies]\ndep={path='../../outside'}".into())),
+        );
+        let error =
+            validate_selected_cargo_tree_at(&entries, Path::new("app/Cargo.toml")).unwrap_err();
+        assert!(error.detail().contains("../../outside"), "{error}");
+        assert!(error.detail().contains("escapes"), "{error}");
+    }
+
+    #[test]
+    fn selected_cargo_combined_tree_requires_entrypoint_and_checks_unrelated_metadata() {
+        let mut entries = selected_tree(&[
+            ("app/Cargo.toml", "[workspace]"),
+            (
+                "other/Cargo.toml",
+                "[dependencies]\nstale={path='../../stale'}",
+            ),
+        ]);
+        let error =
+            validate_selected_cargo_tree_at(&entries, Path::new("app/Cargo.toml")).unwrap_err();
+        assert!(error.detail().contains("other/Cargo.toml"), "{error}");
+        entries.insert(
+            PathBuf::from("other/Cargo.toml"),
+            SelectedCargoEntry::File(Some("[workspace]".into())),
+        );
+        for primary in [
+            "missing/Cargo.toml",
+            "../app/Cargo.toml",
+            "/app/Cargo.toml",
+            "app",
+        ] {
+            assert!(
+                validate_selected_cargo_tree_at(&entries, Path::new(primary)).is_err(),
+                "{primary}"
+            );
+        }
+        entries.insert(
+            PathBuf::from("app/Cargo.toml"),
+            SelectedCargoEntry::File(None),
+        );
+        assert!(
+            validate_selected_cargo_tree_at(&entries, Path::new("app/Cargo.toml"))
+                .unwrap_err()
+                .detail()
+                .contains("primary manifest text")
+        );
+    }
+
+    #[test]
+    fn selected_cargo_combined_config_resolves_from_its_selected_base() {
+        let entries = selected_tree(&[
+            ("app/Cargo.toml", "[workspace]"),
+            ("dep/Cargo.toml", "[package]\nname='dep'"),
+        ]);
+        let primary = Path::new("app/Cargo.toml");
+        validate_selected_cargo_config_at(&entries, primary, Path::new("app"), "paths=['../dep']")
+            .unwrap();
+        validate_selected_cargo_config_at(&entries, primary, Path::new(""), "paths=['dep']")
+            .unwrap();
+        assert!(
+            validate_selected_cargo_config_at(
+                &entries,
+                primary,
+                Path::new("app"),
+                "paths=['../../outside']"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_selected_cargo_config_at(
+                &entries,
+                Path::new("missing/Cargo.toml"),
+                Path::new("app"),
+                "[build]\njobs=1"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_selected_cargo_config_at(
+                &entries,
+                primary,
+                Path::new("app/Cargo.toml"),
+                "[build]\njobs=1"
+            )
+            .is_err()
+        );
     }
 
     #[test]
