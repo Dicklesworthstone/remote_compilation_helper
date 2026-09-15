@@ -639,6 +639,60 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
     Ok(join_exec_command(&tokens))
 }
 
+/// Refuse unselected worker Cargo configuration immediately before Unix Cargo.
+/// The outer command prefixes run first, so the guard sees Cargo's effective
+/// environment. This checks ordinary filesystem state, not atomic protection
+/// against an adversary changing paths between inspection and execution.
+pub(super) fn guard_clean_overlay_cargo_config(command: &str) -> anyhow::Result<String> {
+    let (mut tokens, cargo_index) = managed_clean_overlay_cargo_tokens(command)?;
+    let guard = r#"rch_config_refuse() {
+    printf '%s\n' 'RCH-E413 clean-overlay unselected Cargo configuration' >&2
+    exit 113
+}
+rch_config_directory() {
+    [ -d "$1" ] && [ -r "$1" ] && [ -x "$1" ] || rch_config_refuse
+    /bin/ls -a "$1" >/dev/null 2>&1 || rch_config_refuse
+}
+rch_config_absent() {
+    for rch_config_name in config config.toml; do
+        if [ -e "$1/$rch_config_name" ] || [ -L "$1/$rch_config_name" ]; then
+            rch_config_refuse
+        fi
+    done
+}
+case "${CARGO_HOME-}" in
+    /*) ;;
+    *) rch_config_refuse ;;
+esac
+rch_config_directory "$CARGO_HOME"
+rch_config_absent "$CARGO_HOME"
+rch_config_parent=$(pwd -P) || rch_config_refuse
+case "$rch_config_parent" in
+    /*) ;;
+    *) rch_config_refuse ;;
+esac
+while [ "$rch_config_parent" != / ]; do # ubs:ignore — compares a directory path with filesystem root, not a secret.
+    rch_config_parent=${rch_config_parent%/*}
+    [ -n "$rch_config_parent" ] || rch_config_parent=/
+    rch_config_directory "$rch_config_parent"
+    if [ -e "$rch_config_parent/.cargo" ] || [ -L "$rch_config_parent/.cargo" ]; then
+        rch_config_directory "$rch_config_parent/.cargo"
+        rch_config_absent "$rch_config_parent/.cargo"
+    fi
+done
+exec "$@""#;
+    tokens.splice(
+        cargo_index..cargo_index,
+        [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            guard.to_string(),
+            "rch-clean-overlay-config".to_string(),
+        ],
+    );
+    Ok(join_exec_command(&tokens))
+}
+
 pub(super) fn strip_cargo_target_dir_assignments_from_command_tokens(
     tokens: &[String],
 ) -> Option<Vec<String>> {
@@ -819,6 +873,156 @@ pub(super) fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) ->
 mod managed_build_dir_tests {
     use super::{managed_clean_overlay_cargo_build_dir, managed_clean_overlay_cargo_tokens};
 
+    #[cfg(unix)]
+    struct ConfigGuardFixture {
+        root: std::path::PathBuf,
+        project: std::path::PathBuf,
+        home: std::path::PathBuf,
+        cargo: std::path::PathBuf,
+        sentinel: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl ConfigGuardFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let root = tempfile::Builder::new()
+                .prefix("rch-cfg-")
+                .tempdir_in("/tmp")
+                .unwrap()
+                .keep();
+            let project = root.join("project");
+            let home = root.join("cargo home");
+            let cargo = root.join("cargo");
+            let sentinel = root.join("child-started");
+            std::fs::create_dir(&project).unwrap();
+            std::fs::create_dir(&home).unwrap();
+            std::fs::write(
+                &cargo,
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$RCH_CONFIG_GUARD_SENTINEL\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self {
+                root,
+                project,
+                home,
+                cargo,
+                sentinel,
+            }
+        }
+
+        fn run(&self, prefix: &str) -> std::process::Output {
+            let command = format!(
+                "{prefix} {} test -- 'literal $value; with spaces'",
+                shell_words::quote(self.cargo.to_str().unwrap())
+            );
+            let guarded = super::guard_clean_overlay_cargo_config(&command).unwrap();
+            std::process::Command::new("/bin/sh") // ubs:ignore — executes the quoted guard under test with owned fixture argv.
+                .args(["-c", &guarded])
+                .current_dir(&self.project)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("CARGO_HOME", &self.home)
+                .env("RCH_CONFIG_GUARD_SENTINEL", &self.sentinel)
+                .output()
+                .unwrap()
+        }
+
+        fn assert_refused(&self, output: &std::process::Output) {
+            assert_eq!(output.status.code(), Some(113), "{output:?}");
+            assert_eq!(
+                output.stderr,
+                b"RCH-E413 clean-overlay unselected Cargo configuration\n"
+            );
+            assert!(output.stdout.is_empty());
+            assert!(!self.sentinel.exists(), "Cargo child must not start");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_pair_config_guard_allows_clean_home_and_selected_project_config() {
+        let fixture = ConfigGuardFixture::new();
+        std::fs::create_dir(fixture.project.join(".cargo")).unwrap();
+        std::fs::write(
+            fixture.project.join(".cargo/config.toml"),
+            "[build]\njobs=1\n",
+        )
+        .unwrap();
+        let output = fixture.run("");
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&fixture.sentinel).unwrap(),
+            "test\n--\nliteral $value; with spaces\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_pair_config_guard_refuses_home_config_and_broken_symlink() {
+        for name in ["config", "config.toml"] {
+            for symlink in [false, true] {
+                let fixture = ConfigGuardFixture::new();
+                let path = fixture.home.join(name);
+                if symlink {
+                    std::os::unix::fs::symlink(fixture.root.join("absent"), &path).unwrap();
+                } else {
+                    std::fs::write(&path, "secret-looking-config-value").unwrap();
+                }
+                fixture.assert_refused(&fixture.run(""));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_pair_config_guard_checks_inline_home_after_env_prefix() {
+        let fixture = ConfigGuardFixture::new();
+        let inline_home = fixture.root.join("inline 'cargo' home");
+        std::fs::create_dir(&inline_home).unwrap();
+        std::fs::write(inline_home.join("config.toml"), "must-not-be-printed").unwrap();
+        let prefix = format!(
+            "env -- CARGO_HOME={}",
+            shell_words::quote(inline_home.to_str().unwrap())
+        );
+        fixture.assert_refused(&fixture.run(&prefix));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_pair_config_guard_refuses_ancestor_config() {
+        for name in ["config", "config.toml"] {
+            let fixture = ConfigGuardFixture::new();
+            std::fs::create_dir(fixture.root.join(".cargo")).unwrap();
+            std::fs::write(fixture.root.join(".cargo").join(name), "unselected").unwrap();
+            fixture.assert_refused(&fixture.run(""));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_pair_config_guard_refuses_unknown_home_and_non_directory() {
+        for prefix in ["CARGO_HOME=relative", "CARGO_HOME=", "env -u CARGO_HOME"] {
+            let fixture = ConfigGuardFixture::new();
+            fixture.assert_refused(&fixture.run(prefix));
+        }
+        for exists in [false, true] {
+            let fixture = ConfigGuardFixture::new();
+            let unusable = fixture.root.join("unusable");
+            if exists {
+                std::fs::write(&unusable, "not a directory").unwrap();
+            }
+            let prefix = format!(
+                "CARGO_HOME={}",
+                shell_words::quote(unusable.to_str().unwrap())
+            );
+            fixture.assert_refused(&fixture.run(&prefix));
+        }
+    }
+
     #[test]
     fn source_pair_cargo_tokens_distinguishes_prefix_values_from_executable() {
         for (command, cargo_index) in [
@@ -908,7 +1112,7 @@ mod managed_build_dir_tests {
             );
             let managed =
                 managed_clean_overlay_cargo_build_dir(&command, pool.to_str().unwrap()).unwrap();
-            let output = std::process::Command::new("sh")
+            let output = std::process::Command::new("sh") // ubs:ignore — executes the managed argv rewriter against an owned fixture.
                 .args(["-c", &managed])
                 .current_dir(&root)
                 .env("PATH", &path)
