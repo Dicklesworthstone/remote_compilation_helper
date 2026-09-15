@@ -1290,10 +1290,11 @@ pub(super) async fn execute_remote_compilation(
     // `std::env::set_var` is unsafe in Rust 2024, but reading env is fine. For streaming,
     // we need shared mutable state across stdout/stderr callbacks; use `Rc<RefCell<_>>`
     // to avoid borrow-checker conflicts between the two closures.
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     let stderr_capture_cell = Rc::new(RefCell::new(String::new()));
+    let deadline_triggered = Rc::new(Cell::new(false));
 
     struct CompileUiState {
         progress: Option<CompilationProgress>,
@@ -1343,6 +1344,8 @@ pub(super) async fn execute_remote_compilation(
     let ui_state_stdout = Rc::clone(&ui_state);
     let ui_state_stderr = Rc::clone(&ui_state);
     let stderr_capture_stderr = Rc::clone(&stderr_capture_cell);
+    let deadline_triggered_stderr = Rc::clone(&deadline_triggered);
+    let deadline_pipeline = pipeline.clone();
     let heartbeat_state_stdout = heartbeat_loop
         .as_ref()
         .map(BuildHeartbeatLoop::shared_state);
@@ -1385,6 +1388,10 @@ pub(super) async fn execute_remote_compilation(
                 }
             },
             move |line| {
+                if deadline_pipeline.is_deadline_marker(line) {
+                    deadline_triggered_stderr.set(true);
+                    return;
+                }
                 if let Some(state) = heartbeat_state_stderr.as_ref() {
                     mark_heartbeat_progress(state);
                 }
@@ -2122,6 +2129,7 @@ pub(super) async fn execute_remote_compilation(
     }
 
     Ok(RemoteExecutionResult {
+        deadline_triggered: exit_code == 137 && deadline_triggered.get(),
         exit_code,
         stderr: stderr_capture,
         duration_ms: result.duration_ms,

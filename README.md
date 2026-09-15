@@ -493,6 +493,12 @@ enabled = true
 suppress_duplicates_secs = 300
 ```
 
+When the Unix launcher enforces a compilation deadline, RCH preserves exit 137
+and reports that the configured deadline expired. It does not retry on a larger
+worker or fall back locally. Machine-mode `rch exec` reports
+`outcome: "deadline_exceeded"`. This classification requires evidence from the
+launcher; exit 137 or elapsed time alone does not establish a timeout.
+
 Built-in worker selection defaults to `balanced`, which blends speed, load,
 health, and cache affinity. Use `priority` only when you want explicit
 worker-priority control, and `fair_fastest` when you want extra load spreading.

@@ -30,6 +30,8 @@ use super::*;
 /// Result of remote compilation execution.
 #[derive(Debug)]
 pub(super) struct RemoteExecutionResult {
+    /// This attempt's launcher reported deadline enforcement and exited 137.
+    pub(super) deadline_triggered: bool,
     /// Exit code of the remote command.
     pub(super) exit_code: i32,
     /// Standard error output (used for toolchain detection).
@@ -56,8 +58,9 @@ pub(super) struct ExecResultDirStat {
 /// Machine-readable execution envelope emitted on stdout when the exec
 /// invocation requested machine output (`--json` / `--format`) — bd-uoh4x.
 ///
-/// `outcome` describes DELIVERY, not build success: `completed` means the
+/// `outcome` describes delivery and launcher termination: `completed` means the
 /// remote command ran and its outputs were handled (whatever the exit code),
+/// `deadline_exceeded` means the launcher enforced its deadline (exit 137),
 /// `transport_error` / `collection_error` mean RCH itself failed to deliver.
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct ExecResultEnvelope<'a> {

@@ -1280,6 +1280,8 @@ pub(crate) fn configure_clean_git_command(command: &mut Command) {
 /// Transfer pipeline for remote compilation.
 #[derive(Clone)]
 pub struct TransferPipeline {
+    /// Correlates deadline enforcement with this execution, independently of exit 137.
+    deadline_marker: String,
     /// Local project root.
     project_root: PathBuf,
     /// Project identifier (usually directory name).
@@ -1438,6 +1440,7 @@ impl TransferPipeline {
         };
 
         Self {
+            deadline_marker: format!("RCH_EXTERNAL_DEADLINE:{}", uuid::Uuid::new_v4()),
             project_root,
             project_id: safe_project_id,
             project_hash: safe_project_hash,
@@ -1518,7 +1521,7 @@ impl TransferPipeline {
                 "driving rsync with the openrsync/2.6.9-compatible argv (issue #66)"
             );
         }
-        let mut cmd = Command::new(&resolved.path);
+        let mut cmd = Command::new(&resolved.path); // ubs:ignore — trusted local rsync configuration/PATH selection, not remote input
         // Force C locale for consistent output parsing
         cmd.env("LC_ALL", "C");
         (cmd, capabilities)
@@ -2568,7 +2571,7 @@ impl TransferPipeline {
             // reports 137 (128+SIGKILL) for clean timeout exit semantics.
             let escaped_command = escape(Cow::from(colored_command.as_str()));
             // The watchdog program (single-quoted, no inner single quotes):
-            //   $1 = pgid file, $2 = timeout secs (0 disables), $3.. = command.
+            //   $1 = pgid file, $2 = timeout secs, $3 = deadline marker, $4.. = command.
             // Record $$ (session-leader pgid) so the daemon kill path keeps working.
             // NOTE: group kill is `kill -KILL -PGID` with NO `--`. dash's (/bin/sh)
             // kill builtin mishandles `kill -KILL -- -PGID` (the `--` makes it a
@@ -2581,26 +2584,31 @@ impl TransferPipeline {
             // the orphaned sleep expires, so every successful build held the
             // session for the full timeout and the client misreported it as
             // "SSH command timed out" (#20).
-            let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
-if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) >/dev/null 2>&1 </dev/null & __w=$!; fi; \
+            // Only the timer holds fd 3 (original stderr). Its orphanable sleep
+            // and the workload close it, so a successful build cannot hold SSH
+            // open until the deadline. Emit before killing the timer's group.
+            let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; __m=\"$3\"; shift 3; \"$@\" 3>&- & __c=$!; \
+if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\" 3>&-; printf \"\\n%s\\n\" \"$__m\" >&3; kill -KILL -\"$__p\" 2>/dev/null ) >/dev/null 2>&1 </dev/null & __w=$!; fi; \
 wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
 
             format!(
                 "mkdir -p {} && rm -f {} && \
 if command -v setsid >/dev/null 2>&1; then \
-setsid sh -c '{}' rch-build {} {} sh -lc {}; \
+setsid sh -c '{}' rch-build {} {} {} sh -lc {} 3>&2; \
 else \
-sh -c '{}' rch-build {} {} sh -lc {}; \
+sh -c '{}' rch-build {} {} {} sh -lc {} 3>&2; \
 fi",
                 escaped_run_dir,
                 escaped_pgid_file,
                 watchdog,
                 escaped_pgid_file,
                 external_timeout_secs,
+                self.deadline_marker,
                 escaped_command,
                 watchdog,
                 escaped_pgid_file,
                 external_timeout_secs,
+                self.deadline_marker,
                 escaped_command,
             )
         } else {
@@ -2750,16 +2758,35 @@ fi",
             "Wrapping command with external timeout protection"
         );
 
-        // Use --signal=KILL to ensure the process dies even if stuck in a CPU loop.
-        // The --foreground flag ensures timeout works properly in non-interactive shells.
-        // --preserve-status ensures the exit code reflects whether timeout killed it.
-        // Run through env so leading VAR=value assignments remain environment
-        // assignments after the timeout wrapper is prepended.
-        // Exit code 137 (128 + 9) indicates SIGKILL was sent.
+        // Exit 137 alone is ambiguous. Give the utility a private diagnostic
+        // pipe while forwarding the workload's stdout/stderr through fd 4/3.
+        // Only timeout's own KILL diagnostic can establish deadline enforcement.
+        // The final reader preserves the producer status (POSIX pipelines use
+        // the last command's status), and consumes through EOF before returning.
+        let status_marker = format!("{}_STATUS=", self.deadline_marker);
         format!(
-            "timeout --signal=KILL --foreground --preserve-status {} env {}",
-            timeout_secs, command
+            "{{ {{ LC_ALL=C timeout --verbose --signal=KILL --foreground --preserve-status {timeout_secs} \
+sh -c 'exec \"$@\" 2>&3 3>&- 4>&-' rch-timeout env {command} 2>&1 1>&4; \
+printf '{status_marker}%s\\n' \"$?\"; }} | \
+{{ __s=125; __seen=0; __bad=0; __deadline=0; \
+while IFS= read -r __line || [ -n \"$__line\" ]; do \
+case \"$__line\" in \
+{status_marker}*) __seen=$((__seen + 1)); __value=${{__line#{status_marker}}}; \
+case \"$__value\" in ''|*[!0-9]*) __bad=1;; *) \
+if [ \"${{#__value}}\" -le 3 ] && [ \"$__value\" -le 255 ]; then __s=$__value; else __bad=1; fi;; esac;; \
+\"timeout: sending signal KILL to command 'sh'\") __deadline=1; printf '%s\\n' \"$__line\" >&2;; \
+*) printf '%s\\n' \"$__line\" >&2;; esac; done; \
+if [ \"$__seen\" -ne 1 ] || [ \"$__bad\" -ne 0 ]; then exit 125; fi; \
+if [ \"$__s\" -eq 137 ] && [ \"$__deadline\" -eq 1 ]; then printf '\\n{marker}\\n' >&2; fi; \
+exit \"$__s\"; }}; }} 3>&2 4>&1",
+            marker = self.deadline_marker,
         )
+    }
+
+    /// Match before bounded stderr capture: a noisy workload must not hide a
+    /// deadline receipt at the end of its output. Exit status is checked later.
+    pub(crate) fn is_deadline_marker(&self, line: &str) -> bool {
+        line.trim_end_matches(['\r', '\n']) == self.deadline_marker
     }
 
     // =========================================================================
@@ -3162,7 +3189,7 @@ fi",
                     let escaped_remote_path = escaped_remote_path.clone();
                     let rsync_path = rsync_path.clone();
                     async move {
-                        let mut rsync = Command::new(&rsync_path);
+                        let mut rsync = Command::new(&rsync_path); // ubs:ignore — same trusted rsync resolver as rsync_command; payload remains argv
                         rsync
                             .env("LC_ALL", "C")
                             .arg("-a")
@@ -6344,7 +6371,7 @@ mod tests {
             !script.contains('\''),
             "orchestrator script must contain no single quotes: {script}"
         );
-        let status = Command::new("sh")
+        let status = Command::new("sh") // ubs:ignore — fixed reaper script over this test's generated temporary tree
             .arg("-c")
             .arg(format!("sh -c '{script}'"))
             .status()
@@ -6406,7 +6433,7 @@ mod tests {
             "cd \"{link_str}\" 2>/dev/null || exit 0; \
              for d in {globs}; do {loop_body} done"
         );
-        let status = Command::new("sh")
+        let status = Command::new("sh") // ubs:ignore — fixed reaper script over this test's generated symlink fixture
             .arg("-c")
             .arg(format!("sh -c '{script}'"))
             .status()
@@ -7162,7 +7189,7 @@ Number of files transferred: 42
         .with_compilation_kind(Some(CompilationKind::BunTest));
 
         let wrapped = pipeline.wrap_with_external_timeout("bun test");
-        assert!(wrapped.contains("timeout"));
+        assert!(wrapped.contains("timeout --verbose"));
         assert!(wrapped.contains("--signal=KILL"));
         assert!(wrapped.contains("--foreground"));
         assert!(wrapped.contains("600")); // Default timeout
@@ -7258,6 +7285,7 @@ Number of files transferred: 42
 
         assert!(wrapped.contains("timeout"));
         assert!(wrapped.contains(" env CARGO_TARGET_DIR="));
+        assert!(wrapped.contains("rch-timeout env CARGO_TARGET_DIR="));
         assert!(!wrapped.contains("1800 CARGO_TARGET_DIR="));
         assert!(wrapped.contains("RUSTFLAGS='-C target-cpu=native' cargo test"));
     }
@@ -7313,6 +7341,224 @@ Number of files transferred: 42
         let wrapped = pipeline.wrap_with_external_timeout("bun test");
         assert!(wrapped.contains("180")); // Custom bun_timeout_sec
         assert!(wrapped.contains("bun test"));
+    }
+
+    #[test]
+    fn test_external_timeout_marker_is_exact_and_attempt_specific() {
+        let first = TransferPipeline::new(
+            PathBuf::from("/tmp/test"),
+            "test".into(),
+            "hash".into(),
+            TransferConfig::default(),
+        );
+        let second = TransferPipeline::new(
+            PathBuf::from("/tmp/test"),
+            "test".into(),
+            "hash".into(),
+            TransferConfig::default(),
+        );
+        assert!(first.is_deadline_marker(&first.deadline_marker));
+        assert!(first.is_deadline_marker(&format!("{}\r\n", first.deadline_marker)));
+        for unrelated in [
+            second.deadline_marker,
+            format!("prefix {}", first.deadline_marker),
+            format!("{} suffix", first.deadline_marker),
+            format!("{}_STATUS=137", first.deadline_marker),
+            "timeout: sending signal KILL to command 'sh'".into(),
+        ] {
+            assert!(!first.is_deadline_marker(&unrelated), "{unrelated}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_external_timeout_fixture(directory: &Path, command: &str) -> std::process::Output {
+        // These are actual stock shell/timeout processes, never Cargo/compiler
+        // invocations. Keep fixtures and the exact generated command for review.
+        std::fs::write(directory.join("command.sh"), command).unwrap();
+        let mut child = Command::new("/bin/sh");
+        child
+            .args(["-c", command])
+            .current_dir(directory)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", directory)
+            .env("LC_ALL", "C")
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(6), child.output())
+            .await
+            .expect("finite workload must finish; inherited timer pipes must not hold it open")
+            .expect("run generated production timeout wrapper");
+        std::fs::write(directory.join("stdout"), &output.stdout).unwrap();
+        std::fs::write(directory.join("stderr"), &output.stderr).unwrap();
+        std::fs::write(directory.join("status"), output.status.to_string()).unwrap();
+        output
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_external_timeout_real_fallback_distinguishes_deadline_and_child_137() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let cases = [
+            (
+                "streams",
+                "printf '%s' \"$MESSAGE\"; printf 'stderr-without-newline' >&2",
+                0,
+                false,
+                15,
+            ),
+            (
+                "exit137",
+                "printf 'stdout'; printf 'stderr' >&2; exit 137",
+                137,
+                false,
+                15,
+            ),
+            ("selfkill", "kill -KILL $$", 137, false, 15),
+            (
+                "spoof",
+                "printf \"timeout: sending signal KILL to command 'sh'\\n\" >&2; exit 137",
+                137,
+                false,
+                15,
+            ),
+            ("deadline", "exec sleep 4", 137, true, 1),
+        ];
+        for (name, script, status, deadline, seconds) in cases {
+            let directory = retained.join(name);
+            std::fs::create_dir(&directory).unwrap();
+            let pipeline = TransferPipeline::new(
+                directory.clone(),
+                "test".into(),
+                "hash".into(),
+                TransferConfig::default(),
+            )
+            .with_compilation_config(rch_common::CompilationConfig {
+                build_timeout_sec: seconds,
+                external_timeout_enabled: true,
+                ..Default::default()
+            });
+            let command = format!(
+                "MESSAGE='space $dollar; literal' sh -c {}",
+                escape(Cow::Borrowed(script)),
+            );
+            let output = run_external_timeout_fixture(
+                &directory,
+                &pipeline.wrap_with_external_timeout(&command),
+            )
+            .await;
+            assert_eq!(output.status.code(), Some(status), "{name}: {output:?}");
+            let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+            assert_eq!(
+                stderr.lines().any(|line| pipeline.is_deadline_marker(line)),
+                deadline,
+                "{name}: {stderr}"
+            );
+            match name {
+                "streams" => {
+                    assert_eq!(output.stdout, b"space $dollar; literal");
+                    assert_eq!(output.stderr, b"stderr-without-newline");
+                }
+                "exit137" => {
+                    assert_eq!(output.stdout, b"stdout");
+                    assert_eq!(output.stderr, b"stderr");
+                }
+                "spoof" => assert_eq!(
+                    output.stderr,
+                    b"timeout: sending signal KILL to command 'sh'\n"
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_external_timeout_real_build_id_watchdog_and_pipe_lifetime() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        for (name, script, status, deadline, seconds) in [
+            (
+                "streams",
+                "printf 'stdout'; printf 'stderr-without-newline' >&2",
+                0,
+                false,
+                15,
+            ),
+            ("exit137", "exit 137", 137, false, 15),
+            ("selfkill", "kill -KILL $$", 137, false, 15),
+            (
+                "deadline",
+                "sleep 4 & printf '%s\\n' \"$!\" > descendant.pid; wait",
+                137,
+                true,
+                1,
+            ),
+        ] {
+            let directory = retained.join(name);
+            std::fs::create_dir(&directory).unwrap();
+            let pipeline = TransferPipeline::new(
+                directory.clone(),
+                "test".into(),
+                "hash".into(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(directory.to_str().unwrap())
+            .with_env_allowlist(Vec::new())
+            .with_build_id(Some(1))
+            .with_compilation_config(rch_common::CompilationConfig {
+                build_timeout_sec: seconds,
+                external_timeout_enabled: true,
+                ..Default::default()
+            });
+            // Each case owns a fresh root/run identity: production's initial
+            // stale-PGID unlink encounters no existing file; retain all outputs.
+            let pgid_path = PathBuf::from(pipeline.remote_pgid_file_path().unwrap());
+            assert!(!pgid_path.exists());
+            let command = format!("sh -c {}", escape(Cow::Borrowed(script)));
+            let output = run_external_timeout_fixture(
+                &directory,
+                &pipeline.build_remote_command(&command, None),
+            )
+            .await;
+            assert_eq!(output.status.code(), Some(status), "{name}: {output:?}");
+            let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+            assert_eq!(
+                stderr.lines().any(|line| pipeline.is_deadline_marker(line)),
+                deadline,
+                "{name}: {stderr}"
+            );
+            assert!(
+                std::fs::read_to_string(pgid_path)
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap()
+                    > 1
+            );
+            if name == "streams" {
+                assert_eq!(output.stdout, b"stdout");
+                assert_eq!(output.stderr, b"stderr-without-newline");
+            }
+            if deadline {
+                let descendant = std::fs::read_to_string(directory.join("descendant.pid")).unwrap();
+                let stat_path = PathBuf::from(format!("/proc/{}/stat", descendant.trim()));
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    loop {
+                        match std::fs::read_to_string(&stat_path) {
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                            Ok(stat) if stat.split_whitespace().nth(2) == Some("Z") => break,
+                            Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+                            Err(error) => panic!("read owned descendant state: {error}"), // ubs:ignore — test fails on unexpected fixture I/O
+                        }
+                    }
+                })
+                .await
+                .expect("group deadline must leave no running recorded descendant");
+            }
+        }
     }
 
     #[test]
@@ -7818,7 +8064,7 @@ Number of files transferred: 42
                     assert_has(&args, "--info=name2", builder);
                     assert_has(&args, "--out-format=%i %n", builder);
                 }
-                other => panic!("unexpected builder {other}"),
+                other => panic!("unexpected builder {other}"), // ubs:ignore — exhaustive fixture-builder assertion
             }
         }
     }
@@ -7857,7 +8103,7 @@ Number of files transferred: 42
                     assert_has(&args, "-vv", builder);
                     assert_has(&args, "--out-format=%i %n", builder);
                 }
-                other => panic!("unexpected builder {other}"),
+                other => panic!("unexpected builder {other}"), // ubs:ignore — exhaustive fixture-builder assertion
             }
         }
     }
@@ -9062,7 +9308,7 @@ Number of files transferred: 42
         use std::process::Command;
         use std::time::{Duration, Instant};
 
-        if !Command::new("sh")
+        if !Command::new("sh") // ubs:ignore — fixed test prerequisite probe, no interpolated input
             .arg("-c")
             .arg("command -v setsid")
             .output()
@@ -9109,10 +9355,10 @@ Number of files transferred: 42
         assert!(pgid.parse::<i64>().unwrap() > 1, "recorded a real pgid");
 
         let script = remote_timeout_kill_script(pgf.to_str().unwrap());
-        let output = Command::new("sh").arg("-c").arg(&script).output().unwrap();
+        let output = Command::new("sh").arg("-c").arg(&script).output().unwrap(); // ubs:ignore — production kill script with this test's owned PGID path
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         // Safety net regardless of assertions.
-        let _ = Command::new("sh")
+        let _ = Command::new("sh") // ubs:ignore — test-owned process group; PGID parsed as positive integer above
             .arg("-c")
             .arg(format!("kill -KILL -- -{pgid} 2>/dev/null"))
             .status();
@@ -9124,7 +9370,7 @@ Number of files transferred: 42
             Some(RemoteTimeoutCleanup::Verified),
             "kill script must verify the group dead: {stdout}"
         );
-        let group_alive = Command::new("sh")
+        let group_alive = Command::new("sh") // ubs:ignore — read-only probe of the test's validated numeric PGID
             .arg("-c")
             .arg(format!("kill -0 -- -{pgid} 2>/dev/null"))
             .status()
@@ -9135,7 +9381,7 @@ Number of files transferred: 42
         // Missing pgid file => NothingRecorded verdict.
         let _ = std::fs::remove_file(&pgf);
         let script = remote_timeout_kill_script(pgf.to_str().unwrap());
-        let output = Command::new("sh").arg("-c").arg(&script).output().unwrap();
+        let output = Command::new("sh").arg("-c").arg(&script).output().unwrap(); // ubs:ignore — production missing-PGID script over this test's owned path
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
@@ -9238,7 +9484,7 @@ Number of files transferred: 42
         );
         // The default cargo-test cap (1800s) is passed to the watchdog as an arg.
         assert!(
-            command.contains("1800 sh -lc"),
+            command.contains(&format!("1800 {} sh -lc", pipeline.deadline_marker)),
             "watchdog must receive the test timeout (1800s): {command}"
         );
         assert!(
@@ -9269,7 +9515,7 @@ Number of files transferred: 42
         use std::process::Command;
         use std::time::{Duration, Instant};
 
-        if !Command::new("sh")
+        if !Command::new("sh") // ubs:ignore — fixed test prerequisite probe, no interpolated input
             .arg("-c")
             .arg("command -v setsid")
             .output()
@@ -9337,7 +9583,7 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
             std::thread::sleep(Duration::from_millis(100));
         }
         // Safety net: ensure nothing leaks regardless of assertions.
-        let _ = Command::new("sh")
+        let _ = Command::new("sh") // ubs:ignore — test-owned process group; PGID parsed as positive integer above
             .arg("-c")
             .arg(format!("kill -KILL -- -{pgid} 2>/dev/null"))
             .status();
@@ -9350,7 +9596,7 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
 
         // The whole process group (incl. the TERM-ignoring grandchild) must be gone.
         std::thread::sleep(Duration::from_millis(300));
-        let group_alive = Command::new("sh")
+        let group_alive = Command::new("sh") // ubs:ignore — read-only probe of the test's validated numeric PGID
             .arg("-c")
             .arg(format!("kill -0 -- -{pgid} 2>/dev/null"))
             .status()
@@ -9388,7 +9634,7 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
         // Generous 20s cap; the job itself completes instantly. EOF must NOT
         // wait for the cap.
         let start = Instant::now();
-        let mut child = Command::new("sh")
+        let mut child = Command::new("sh") // ubs:ignore — fixed watchdog pipe-lifetime fixture, no external command input
             .arg("-c")
             .arg(watchdog)
             .arg("rch-build")

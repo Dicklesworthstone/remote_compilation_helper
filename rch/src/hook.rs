@@ -3136,6 +3136,29 @@ pub async fn run_exec(
                 // skipped for jobs and control falls through to the signal /
                 // genuine-failure arms below (which never rerun the command
                 // locally).
+                } else if result.deadline_triggered {
+                    reporter.summary(&format!(
+                        "[RCH] remote {} exceeded its configured deadline (exit {}); not retrying",
+                        worker.id, result.exit_code
+                    ));
+                    emit_exec_envelope(&ExecResultEnvelope {
+                        api_version: "1.0",
+                        command: &remote_command,
+                        outcome: "deadline_exceeded",
+                        location: "remote",
+                        fallback_reason: None,
+                        worker_id: Some(worker.id.as_str()),
+                        remote_exit_code: Some(result.exit_code),
+                        duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                        timing: exec_timing.as_ref(),
+                        result_dirs: exec_dir_stats.as_deref(),
+                        error_code: None,
+                    });
+                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
+                    {
+                        warn!("Failed to persist acknowledged deadline terminal state: {error}");
+                    }
+                    std::process::exit(result.exit_code);
                 } else if !job && is_toolchain_failure(&result.stderr, result.exit_code) {
                     // Worker missing the toolchain — another worker may have it.
                     warn!(
@@ -4180,6 +4203,15 @@ async fn handle_selection_response(
 
                 // Replace original command with a no-op - agent thinks command ran locally
                 HookOutput::allow_with_modified_command("true")
+            } else if result.deadline_triggered {
+                reporter.summary(&format!(
+                    "[RCH] remote {} exceeded its configured deadline (exit {}); not retrying",
+                    worker.id, result.exit_code
+                ));
+                HookOutput::deny(format!(
+                    "Remote compilation exceeded its configured deadline (exit {}). Do not rerun locally; adjust the deadline before retrying.",
+                    result.exit_code
+                ))
             } else if is_toolchain_failure(&result.stderr, result.exit_code) {
                 // Toolchain failure - fall back to local execution
                 warn!(
