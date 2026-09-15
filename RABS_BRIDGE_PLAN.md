@@ -1,5 +1,123 @@
 # RABS Bridge Plan — From Proven Library to Living System
 
+## Reality check and execution order — September 15, 2026
+
+This update is for the operator and implementing agents choosing the next
+delivered capability. It corrects observed library-only closures, missing live
+wiring, and the historical claim below that no RABS process boots. Keep the
+original goals and acceptance below; revise this dated assessment when new
+execution evidence changes it. No product acceptance is waived here.
+
+**Assessment revision:** `32927446` (before these tracking/document edits).
+**Released revision:** `v2.0.0`, `3289f5e4`, September 13. The installed client
+reports that release. Main is 50 commits ahead, including source/overlay,
+deadline, artifact-transfer and dependency changes. A passing main candidate
+is not an installed upgrade. The downloaded Linux release archive contains
+`rch`, `rchd`, and `rch-wkr`; it does not contain the RABS binaries.
+
+**Conclusion:** conventional RCH delivers useful real remote compilation.
+RABS has a running runtime, daemon, coordinator/CAS and shadow path, plus a
+separate operator serve endpoint. It does not yet deliver automatic Cargo
+action-cache hits. Completing only the previously open beads would have left
+several promised capabilities unfinished because their original beads were
+closed at component or prototype fidelity.
+
+### Vision checklist against current evidence
+
+| Goal | Reality | Remaining work / proof |
+|---|---|---|
+| Classify safe commands and preserve hook semantics | Implemented; real Rust CLI offload demonstrated. Five-tier classifier and hook command replacement exist. | Performance proof remains separate; non-Rust recognition is not full ecosystem qualification. `bd-1nhd`. |
+| Execute remotely and return correct output/artifacts | Working for exercised Linux Rust paths. Same binary hash returned over actual SSH. | Exact selected Cargo outputs and true stalled-peer/caller-cancellation tests: `bd-3tkcz`; teardown abort investigation: `bd-dl3qs`. |
+| Protect dispatcher CPU across harnesses | Hook, dispatcher role and Cargo shims exist. | Current shim status reports installed/up-to-date and five wrapped toolchains but no effective PATH interception. This does not prove every toolchain route bypasses. Finish `bd-g2ppt` / `bd-ousos`. |
+| Preserve coherent source/dependency snapshots | Ordinary closure locks, explicit receipts and clean overlays exist; pinned sibling overlay has live evidence. | Finish original closure/materialization and native validation acceptance: `bd-n41ig`, `bd-p2m5h`, `remote_compilation_helper-cargo-materialization-closure-qe8dk`; correct source-version stamping: `bd-xho6o`. |
+| Schedule within real fleet capacity | Live daemon selection, queue, slots and pressure state work. | At the captured observation 7/13 configured workers were critical, 6 warning; zero normal. Availability cannot be inferred from CPU slots alone. Existing pressure/staging/benchmark tasks remain operationally important. |
+| Recover surviving jobs after daemon loss | Planned-restart barrier and durable client identity exist; live recovery is incomplete. | History reload forgets active/queued jobs; unknown heartbeats are ignored. Reopened `bd-session-history-remediation-ocv9i.10.3`. |
+| Report truthful outcome and observability | Status, Prometheus and diagnostics have production consumers. | Test/signal exits are incorrectly inferred to prove successful compilation (`bd-88fpl`). Daemon OTel initializer remains a stub; library exporter/layer not installed (`remote_compilation_helper-62u24.17`). Both reopened. |
+| Meet original hook/selection/pipeline budgets | Classifier microbenchmarks and partial tests exist. | SSH connect timing without assertions is not selection timing; full pipeline budget coverage missing. Reopened `bd-1nhd`; retain full-pipeline child `bd-1t3v` scope. |
+| Support native platform lifecycle | Linux path is strongest; macOS release exists and startup fixes are present on main. | Native launchd and baseline-red tests remain open (`bd-mhv3x`, `remote_compilation_helper-qqa0y`). RABS D013/D021 macOS isolation and Windows transport tasks remain incomplete. |
+| Boot the Asupersync RABS spine | Real runtime and edge/coord/janitor mounting exist. Historical no-process claim is obsolete. | Running processes alone do not prove the entire Phase S contract. |
+| Run authenticated, resumable worker sessions | A canonical-execution TCP prototype works against a test coordinator. | Fixed token and raw newline TCP are not authenticated ATP. Reopened S5 `bd-085cm`; retain J/K transport and execution scope. |
+| Serve automatic Cargo dependency hits | Operator `serve` reaches materialization; wrapper consult remains shadow and then always execs rustc. | `bd-14t4j` then `bd-k52xe`, with real action identity, completion/publication and full output coverage. Shadow keys are intentionally incomplete and must never authorize reuse. |
+| Enforce trust and zero-divergence serving | Serving gates and sampling/quarantine libraries exist. | Sampling/demotion not wired into live serving; unresolved quarantine can be lifted by reevaluation. `bd-okthi`, `bd-rhdef`, H012 and trust/authority tasks. |
+| Deliver multi-agent speedup and advanced cached classes | Scheduler, CAS, materialization and action libraries are substantial. | B009, W2 gates and open K–Q/T milestones cover actual throughput, workspace/build-script/test/link reuse, snapshots and speculation. No supported 3x or >90% served claim yet. |
+| Ship and sustain RABS on the fleet | Service/doctor/source-build/prototype deployment pieces exist. | Reopened S7 `bd-n8qt3` for released install path and S8 `bd-rb754` for actual 24-hour soak/continuous-week exit evidence. Compressed stress is not elapsed production soak. |
+
+### Bridge: close the user-visible paths first
+
+1. **Conventional correctness and capacity.** Finish existing coherent-source,
+   dispatcher interception and artifact tasks; implement daemon crash recovery
+   before trusting restart-resumed admission. Recovery must preserve uncertain
+   ownership and never rerun a possibly completed command. Use durable
+   wrapper/build/worker identities, not PID-only reconstruction. Test overlapping
+   builds, crash during execution and retrieval, duplicate heartbeats/releases,
+   stale identities, exact artifacts and no leaked or double-admitted slots.
+2. **Truthful decisions and measurement.** Fix build outcome classification;
+   keep raw exit, known compile/test phase and unknown state distinct. Complete
+   the original performance suite using actual hook processes, actual selection
+   and paired worker-direct/RCH workloads. Include failures, cold/warm caches,
+   artifact parity, network cost and streaming latency. Do not weaken the 15%
+   requirement to make small-build results green. Wire the existing metrics
+   layer/exporter into the actual daemon and verify a real collector receives
+   the promised metrics/traces/logs with bounded failure and shutdown flush.
+3. **Repair the actual RABS worker/coordinator path.** Complete S5 authenticated
+   ATP control/output transport, real enrollment/incarnation fencing and
+   coordinator-only publication authority, still refusing commits until Phase
+   1 as S5 requires. Run sandbox acceptance through the actual
+   daemon and worker, including reconnect, restart and malformed-peer cases.
+   Finish S7 provisioning and the real S8 shadow/chaos/soak acceptance.
+4. **Deliver one sound automatic served class.** Use immutable registry/git
+   dependency actions first. Connect real input descriptors and completed
+   compiler outputs to coordinator scheduling/publication and the existing
+   materializer. Never promote the shadow upper-bound projection into an
+   authoritative key. Integrate sampling/quarantine and complete output/path/
+   freshness checks before permitting the wrapper to skip rustc. Demonstrate
+   two worktrees: first execution publishes, second hit actually avoids compiler
+   execution, outputs match, and input changes miss. Revoked or partial results
+   cannot be counted as successful hits. Fallback is allowed only before the
+   delivery frontier with remote write rights revoked; partial installation or
+   a lost acknowledgment requires safe recovery or refusal, never a compiler
+   racing late remote writes. `bd-k52xe` now also depends on `bd-okthi` and
+   `bd-rhdef`, retaining its materialization prerequisite.
+5. **Expand only on measured delivery.** Apply the same live integration and
+   differential proof to fleet singleflight/jobserver, workspace actions,
+   build scripts, tests, links and snapshots. Keep original feature scope;
+   defer default-on speculation/frontier work behind demonstrated correctness
+   and positive value. Use the existing B/W2/T corpus and gates, not another
+   reporting framework. Qualify native platforms and publish artifacts from
+   their exact tested revisions before treating main-only fixes as shipped.
+
+### Coverage corrections and verification limits
+
+Initial authoritative tracker count: 2,067 total; 1,860 closed, 185 open,
+20 in progress, two deferred. This is bookkeeping, not percent vision
+delivery. Seven original beads were reopened above; no duplicate gap epics
+were needed. Existing open work covers the other identified gaps, provided
+closure means full original live acceptance rather than another library slice.
+
+The assessment used complete primary README/AGENTS reads, full original and
+RABS plan reads across independent reviewers, production call-site inspection,
+current read-only CLI/status/installation observations, release archive listing,
+Beads history and explicit `bv --db .beads/issues.jsonl` graph validation.
+Do not confuse archived plans, fixtures, component tests or agreement between
+reviewers with independent runtime proof.
+
+Retained same-source verification from the preceding work includes remote
+workspace check/strict Clippy and 14 focused retrieval tests; actual SSH quiet
+and streaming artifact returns took 39.351s and 39.249s where the installed
+baseline failed at 30s. No-op retrieval returned zero files successfully and
+remote/local executable hashes matched. Those are correctness results under
+deliberate throttling, not general speedup benchmarks. This assessment did not
+rerun the entire workspace, crash the shared daemon, complete native macOS
+qualification, or execute a production-duration RABS soak.
+
+The detailed implementation and negative-test TODOs are embedded in each
+reopened original bead. Review passes checked vision coverage, production
+wiring, counterexamples, original acceptance, dependencies and shipped/main
+separation. The historical plan follows as the retained target, not a current
+completion report.
+
+## Historical bridge baseline — August 10, 2026
+
 > Companion to `COMPREHENSIVE_MASTER_PLAN_FOR_RABS_ASUPERSYNC_NATIVE.md`.
 > That document is the vision; THIS one is the gap-closure execution plan
 > from the 2026-08-10 reality check. Finding: 261/513 beads closed, the
