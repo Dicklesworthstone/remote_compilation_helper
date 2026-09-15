@@ -54,6 +54,32 @@ use super::ssh::{
 };
 use super::*;
 
+fn clean_overlay_cargo_policy_failure(
+    root: &Path,
+    worker: &str,
+    detail: String,
+) -> DependencyPreflightFailure {
+    DependencyPreflightFailure::from_report(super::dependency_closure::DependencyPreflightReport {
+        schema_version: DEPENDENCY_PREFLIGHT_SCHEMA_VERSION,
+        worker: worker.to_owned(),
+        verified: false,
+        reason_code: Some(DEPENDENCY_PREFLIGHT_CODE_POLICY),
+        remediation: Some(
+            "Clean-overlay requires selected, contained Cargo inputs; external committed-root staging is not implemented yet.",
+        ),
+        evidence: vec![DependencyPreflightEvidence {
+            root: root.display().to_string(),
+            manifest: "Cargo.toml".to_owned(),
+            required_path: root.display().to_string(),
+            required_kind: "selected_cargo_sources",
+            status: super::dependency_closure::DependencyPreflightStatus::PolicyViolation,
+            reason_code: DEPENDENCY_PREFLIGHT_CODE_POLICY,
+            detail,
+            is_primary: true,
+        }],
+    })
+}
+
 pub(super) fn source_sync_terminal_summary(
     attempts: &[crate::transfer::TransferAttemptDiagnostic],
     clean_overlay: bool,
@@ -368,32 +394,31 @@ pub(super) async fn execute_remote_compilation(
     // Windows build base and syncs via tar-over-ssh (no rsync/streaming).
     let worker_is_windows = WorkerPlatform::from_worker(&worker_config).is_windows();
 
-    if let Some(spec) = clean_overlay
+    let clean_overlay_cargo = clean_overlay.is_some()
         && (kind.is_some_and(|kind| kind.command_base() == "cargo")
-            || classify_command(command).kind.is_some_and(|kind| kind.command_base() == "cargo"))
-        && let Err(error) = super::validate_clean_overlay_cargo_sources(
-            &normalized_project_root, spec, command,
-        ).await
+            || classify_command(command)
+                .kind
+                .is_some_and(|kind| kind.command_base() == "cargo"));
+    if clean_overlay_cargo && worker_is_windows {
+        return Err(clean_overlay_cargo_policy_failure(
+            &normalized_project_root,
+            &worker_config.id.to_string(),
+            "Selected Cargo configuration validation requires a Unix worker".to_owned(),
+        )
+        .into());
+    }
+    if let Some(spec) = clean_overlay
+        && clean_overlay_cargo
+        && let Err(error) =
+            super::validate_clean_overlay_cargo_sources(&normalized_project_root, spec, command)
+                .await
     {
-        let detail = format!("{error:#}");
-        let report = super::dependency_closure::DependencyPreflightReport {
-            schema_version: DEPENDENCY_PREFLIGHT_SCHEMA_VERSION,
-            worker: worker_config.id.to_string(),
-            verified: false,
-            reason_code: Some(DEPENDENCY_PREFLIGHT_CODE_POLICY),
-            remediation: Some("Clean-overlay requires selected, contained Cargo inputs; external committed-root staging is not implemented yet."),
-            evidence: vec![DependencyPreflightEvidence {
-                root: normalized_project_root.display().to_string(),
-                manifest: "Cargo.toml".to_owned(),
-                required_path: normalized_project_root.display().to_string(),
-                required_kind: "selected_cargo_sources",
-                status: super::dependency_closure::DependencyPreflightStatus::PolicyViolation,
-                reason_code: DEPENDENCY_PREFLIGHT_CODE_POLICY,
-                detail,
-                is_primary: true,
-            }],
-        };
-        return Err(DependencyPreflightFailure::from_report(report).into());
+        return Err(clean_overlay_cargo_policy_failure(
+            &normalized_project_root,
+            &worker_config.id.to_string(),
+            format!("{error:#}"),
+        )
+        .into());
     }
 
     let exact_dependency_closure_sync =
@@ -1115,7 +1140,7 @@ pub(super) async fn execute_remote_compilation(
         )
     })?;
     let managed_overlay_command = clean_overlay
-        .filter(|_| kind.is_some_and(|kind| kind.command_base() == "cargo"))
+        .filter(|_| clean_overlay_cargo)
         .map(|_| {
             super::cargo_target_dir::managed_clean_overlay_cargo_build_dir(
                 command,
@@ -1235,7 +1260,13 @@ pub(super) async fn execute_remote_compilation(
     }));
 
     // Add per-worker CARGO_HOME isolation to prevent cache lock contention
-    let isolated_command = add_cargo_isolation(command, &worker_config.id);
+    let guarded_command = clean_overlay_cargo
+        .then(|| super::cargo_target_dir::guard_clean_overlay_cargo_config(command))
+        .transpose()?;
+    let isolated_command = add_cargo_isolation(
+        guarded_command.as_deref().unwrap_or(command),
+        &worker_config.id,
+    );
 
     // Stream stdout/stderr to our stderr so the agent sees the output
     let command_with_telemetry = wrap_command_with_telemetry(&isolated_command, &worker_config.id);
@@ -1983,6 +2014,19 @@ pub(super) async fn execute_remote_compilation(
         // Never release this lease from an error/Drop path: a remote process
         // or transfer may still be alive after its client disconnects.
         lock.release().await?;
+    }
+
+    if clean_overlay_cargo
+        && result.exit_code == 113
+        && stderr_capture.contains("RCH-E413 clean-overlay unselected Cargo configuration")
+    {
+        return Err(clean_overlay_cargo_policy_failure(
+            &normalized_project_root,
+            &worker_config.id.to_string(),
+            "Worker refused unselected Cargo home or ancestor configuration before starting Cargo"
+                .to_owned(),
+        )
+        .into());
     }
 
     Ok(RemoteExecutionResult {
