@@ -1950,8 +1950,13 @@ async fn git_show_optional(
 
 fn is_selected_cargo_metadata(path: &Path) -> bool {
     path.file_name().is_some_and(|name| name == "Cargo.toml")
-        || (path.parent().and_then(Path::file_name).is_some_and(|name| name == ".cargo")
-            && path.file_name().is_some_and(|name| name == "config" || name == "config.toml"))
+        || (path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == ".cargo")
+            && path
+                .file_name()
+                .is_some_and(|name| name == "config" || name == "config.toml"))
 }
 
 /// Inventory only the immutable base and explicitly selected overlays. Never
@@ -1972,7 +1977,10 @@ async fn selected_clean_overlay_cargo_tree(
     ) -> anyhow::Result<()> {
         let metadata = std::fs::symlink_metadata(root.join(relative))?;
         if metadata.file_type().is_symlink() {
-            anyhow::bail!("clean-overlay selected path became a symlink: {}", relative.display());
+            anyhow::bail!(
+                "clean-overlay selected path became a symlink: {}",
+                relative.display()
+            );
         }
         if metadata.is_dir() {
             for child in std::fs::read_dir(root.join(relative))? {
@@ -1981,7 +1989,10 @@ async fn selected_clean_overlay_cargo_tree(
         } else if metadata.is_file() {
             entries.insert(relative.to_path_buf(), SelectedCargoEntry::File(None));
         } else {
-            anyhow::bail!("unsupported clean-overlay source entry: {}", relative.display());
+            anyhow::bail!(
+                "unsupported clean-overlay source entry: {}",
+                relative.display()
+            );
         }
         Ok(())
     }
@@ -2010,20 +2021,42 @@ async fn selected_clean_overlay_cargo_tree(
     for overlay in spec.overlay_paths() {
         add_overlay(project_root, overlay, &mut entries)?;
     }
-    let metadata_paths: Vec<_> = entries
+    let mut metadata_paths: Vec<_> = entries
         .keys()
         .filter(|path| is_selected_cargo_metadata(path))
         .cloned()
         .collect();
+    for (path, entry) in &entries {
+        if path.file_name().is_some_and(|name| name == ".cargo")
+            && matches!(entry, SelectedCargoEntry::Symlink(_))
+        {
+            for name in ["config", "config.toml"] {
+                let candidate = path.join(name);
+                if validate_selected_cargo_path(&entries, &candidate).is_ok() {
+                    metadata_paths.push(candidate);
+                }
+            }
+        }
+    }
     for path in metadata_paths {
         let target = validate_selected_cargo_path(&entries, &path)?;
-        let bytes = if spec.overlay_paths().iter().any(|overlay| target.starts_with(overlay)) {
+        let bytes = if spec
+            .overlay_paths()
+            .iter()
+            .any(|overlay| target.starts_with(overlay))
+        {
             std::fs::read(project_root.join(&target))
                 .with_context(|| format!("read selected Cargo metadata {}", target.display()))?
         } else {
-            let entry = base.iter().find(|entry| entry.path == target).ok_or_else(|| {
-                anyhow::anyhow!("selected Cargo metadata has no base object: {}", target.display())
-            })?;
+            let entry = base
+                .iter()
+                .find(|entry| entry.path == target)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "selected Cargo metadata has no base object: {}",
+                        target.display()
+                    )
+                })?;
             git_output_bytes(project_root, &["cat-file", "blob", &entry.object_id]).await?
         };
         entries.insert(
@@ -2043,7 +2076,8 @@ async fn validate_clean_overlay_cargo_sources(
     command: &str,
 ) -> anyhow::Result<()> {
     use rch_common::cargo_path_deps::{
-        SelectedCargoEntry, validate_selected_cargo_path, validate_selected_cargo_tree,
+        SelectedCargoEntry, validate_selected_cargo_config, validate_selected_cargo_path,
+        validate_selected_cargo_tree,
     };
 
     let entries = selected_clean_overlay_cargo_tree(project_root, spec).await?;
@@ -2061,21 +2095,35 @@ async fn validate_clean_overlay_cargo_sources(
         if token == "--" {
             break;
         }
-        if token == "-C" || token.starts_with("-C") {
+        if token.starts_with("-C") {
             anyhow::bail!("clean-overlay Cargo source validation does not support Cargo -C");
         }
         let value = if token == "--manifest-path" || token == "--config" {
             index += 1;
-            Some(tokens.get(index).ok_or_else(|| anyhow::anyhow!("missing {token} value"))?.as_str())
+            Some(
+                tokens
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("missing {token} value"))?
+                    .as_str(),
+            )
         } else {
-            token.strip_prefix("--manifest-path=").or_else(|| token.strip_prefix("--config="))
+            token
+                .strip_prefix("--manifest-path=")
+                .or_else(|| token.strip_prefix("--config="))
         };
         if let Some(value) = value {
             if token.starts_with("--manifest-path") {
+                anyhow::ensure!(
+                    Path::new(value)
+                        .file_name()
+                        .is_some_and(|name| name == "Cargo.toml"),
+                    "clean-overlay --manifest-path must select a Cargo.toml manifest"
+                );
                 let path = validate_selected_cargo_path(&entries, Path::new(value))?;
                 anyhow::ensure!(
                     matches!(entries.get(&path), Some(SelectedCargoEntry::File(Some(_)))),
-                    "Cargo manifest argument is not selected Cargo metadata: {}", path.display()
+                    "Cargo manifest argument is not selected Cargo metadata: {}",
+                    path.display()
                 );
             } else {
                 // Inline TOML is parsed by the same dependency-path validator.
@@ -2084,12 +2132,7 @@ async fn validate_clean_overlay_cargo_sources(
                 let _: toml::Value = toml::from_str(value).context(
                     "clean-overlay supports inline TOML --config only; config files are not admitted",
                 )?;
-                let mut configured = entries.clone();
-                configured.insert(
-                    PathBuf::from(".cargo/config.toml"),
-                    SelectedCargoEntry::File(Some(value.to_owned())),
-                );
-                validate_selected_cargo_tree(&configured)?;
+                validate_selected_cargo_config(&entries, Path::new(""), value)?;
             }
         }
         index += 1;
