@@ -517,7 +517,11 @@ pub(super) async fn execute_remote_compilation(
                     layout.update(root.file_name().unwrap_or_default().as_encoded_bytes());
                 }
                 debug_assert!(spec.primary_directory.is_some());
-                format!(".rch-target-{}-pool-{}", worker_config.id, &layout.finalize().to_hex()[..32])
+                format!(
+                    ".rch-target-{}-pool-{}",
+                    worker_config.id,
+                    &layout.finalize().to_hex()[..32]
+                )
             } else {
                 legacy
             }
@@ -556,16 +560,24 @@ pub(super) async fn execute_remote_compilation(
     let mut sync_plan = if clean_overlay.is_some() {
         // Explicit committed roots are the whole authority. The ordinary
         // planner reads ambient ancestor manifests and must not widen this set.
-        raw_sync_roots.iter().map(|root| SyncClosurePlanEntry {
-            local_root: root.clone(),
-            project_id: project_id_from_path(root),
-            root_hash: project_hash.clone(),
-            remote_root: String::new(),
-            is_primary: root == &normalized_project_root,
-            mode: SyncClosureMode::Full,
-        }).collect()
+        raw_sync_roots
+            .iter()
+            .map(|root| SyncClosurePlanEntry {
+                local_root: root.clone(),
+                project_id: project_id_from_path(root),
+                root_hash: project_hash.clone(),
+                remote_root: String::new(),
+                is_primary: root == &normalized_project_root,
+                mode: SyncClosureMode::Full,
+            })
+            .collect()
     } else {
-        build_sync_closure_plan(&raw_sync_roots, &normalized_project_root, &project_hash, topology_policy)
+        build_sync_closure_plan(
+            &raw_sync_roots,
+            &normalized_project_root,
+            &project_hash,
+            topology_policy,
+        )
     };
     // Ordinary Cargo invocations target shared canonical worker paths. Capture
     // those logical authorities before any proof/overlay/Windows relocation so
@@ -622,13 +634,17 @@ pub(super) async fn execute_remote_compilation(
     }
     let mut overlay_remote_root: Option<String> = None;
     if let Some(spec) = clean_overlay {
-        anyhow::ensure!(sync_plan.iter().filter(|entry| entry.is_primary).count() == 1,
-            "clean-overlay requires exactly one primary root");
+        anyhow::ensure!(
+            sync_plan.iter().filter(|entry| entry.is_primary).count() == 1,
+            "clean-overlay requires exactly one primary root"
+        );
         let remote_base = transfer_config.remote_base.trim_end_matches('/');
         let container = format!("{remote_base}/{project_id}/{project_hash}");
         for entry in &mut sync_plan {
             entry.remote_root = if spec.primary_directory.is_some() {
-                let directory = entry.local_root.file_name()
+                let directory = entry
+                    .local_root
+                    .file_name()
                     .and_then(|name| name.to_str())
                     .ok_or_else(|| anyhow::anyhow!("invalid selected root directory"))?;
                 format!("{container}/{directory}")
@@ -741,7 +757,9 @@ pub(super) async fn execute_remote_compilation(
         Some(
             acquire_clean_overlay_source_pair(
                 &worker_config,
-                overlay_remote_root.as_deref().ok_or_else(|| anyhow::anyhow!("missing clean-overlay container"))?,
+                overlay_remote_root
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("missing clean-overlay container"))?,
                 command_timeout,
             )
             .await?,
@@ -882,15 +900,24 @@ pub(super) async fn execute_remote_compilation(
         .map(BuildHeartbeatLoop::shared_state);
     let mut root_outcomes: Vec<(SyncClosurePlanEntry, SyncRootOutcome)> = Vec::new();
     for entry in &sync_plan {
-        let root_overlay = clean_overlay.map(|spec| {
-            if entry.is_primary {
-                Ok(spec)
-            } else {
-                spec.dependencies.iter().find(|(root, _)| root == &entry.local_root)
-                    .map(|(_, selected)| selected)
-                    .ok_or_else(|| anyhow::anyhow!("unbound clean-overlay dependency root {}", entry.local_root.display()))
-            }
-        }).transpose()?;
+        let root_overlay = clean_overlay
+            .map(|spec| {
+                if entry.is_primary {
+                    Ok(spec)
+                } else {
+                    spec.dependencies
+                        .iter()
+                        .find(|(root, _)| root == &entry.local_root)
+                        .map(|(_, selected)| selected)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "unbound clean-overlay dependency root {}",
+                                entry.local_root.display()
+                            )
+                        })
+                }
+            })
+            .transpose()?;
         let mut root_pipeline = TransferPipeline::new(
             entry.local_root.clone(),
             entry.project_id.clone(),
@@ -916,7 +943,8 @@ pub(super) async fn execute_remote_compilation(
             if let Some(stable_pool) = pooled_target_dir_override.as_ref() {
                 // Every selected root must become newer than the same cache
                 // whose dep-info may refer to any of its source files.
-                root_pipeline = root_pipeline.with_remote_cargo_target_dir_override(stable_pool.clone());
+                root_pipeline =
+                    root_pipeline.with_remote_cargo_target_dir_override(stable_pool.clone());
             }
         }
         if entry.mode == SyncClosureMode::WorkspaceMetadata {
@@ -1394,11 +1422,19 @@ pub(super) async fn execute_remote_compilation(
 
     let stderr_capture = std::mem::take(&mut *stderr_capture_cell.borrow_mut());
 
-    if result.success() && let Some(spec) = clean_overlay.filter(|spec| !spec.dependencies.is_empty()) {
+    if result.success()
+        && let Some(spec) = clean_overlay.filter(|spec| !spec.dependencies.is_empty())
+    {
         for entry in &sync_plan {
-            let selected = if entry.is_primary { spec } else {
-                &spec.dependencies.iter().find(|(root, _)| root == &entry.local_root)
-                    .ok_or_else(|| anyhow::anyhow!("missing completed dependency binding"))?.1
+            let selected = if entry.is_primary {
+                spec
+            } else {
+                &spec
+                    .dependencies
+                    .iter()
+                    .find(|(root, _)| root == &entry.local_root)
+                    .ok_or_else(|| anyhow::anyhow!("missing completed dependency binding"))?
+                    .1
             };
             reporter.summary_critical(&format!(
                 "[RCH] clean-overlay root receipt: local={} remote={} commit={} tree={} overlay-fingerprint={}",

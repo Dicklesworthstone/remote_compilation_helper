@@ -57,8 +57,14 @@ pub async fn run_exec(
     job: bool,
     result_dirs: Vec<PathBuf>,
     command_parts: Vec<String>,
+    _out_ctx: &crate::ui::context::OutputContext,
 ) -> anyhow::Result<()> {
-    if clean_overlay || base.is_some() || !dependency_bases.is_empty() || !overlay_paths.is_empty() || no_overlay {
+    if clean_overlay
+        || base.is_some()
+        || !dependency_bases.is_empty()
+        || !overlay_paths.is_empty()
+        || no_overlay
+    {
         anyhow::bail!("clean-overlay remote execution is not supported on non-Unix clients");
     }
     if source_content_receipt {
