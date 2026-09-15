@@ -928,6 +928,56 @@ mod tests {
         assert_eq!(stats.failed_runs, 2);
     }
 
+    #[test]
+    fn test_test_run_stats_empty_database() {
+        let storage = TelemetryStorage::new_in_memory().expect("storage");
+        let stats = storage.test_run_stats().expect("empty stats");
+        assert_eq!(stats.total_runs, 0);
+        assert_eq!(stats.passed_runs, 0);
+        assert_eq!(stats.failed_runs, 0);
+        assert_eq!(stats.avg_duration_ms, 0);
+        assert!(stats.runs_by_kind.is_empty());
+    }
+
+    #[test]
+    fn test_test_run_outcomes_match_memory_after_reopen() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let path = directory.path().join("telemetry.db");
+        let storage = TelemetryStorage::new(&path, 30, 24, 365, 0).expect("storage");
+        let mut memory = TestRunStats::default();
+
+        // Exercise every shell exit, including ambiguous Cargo/Bun failures and
+        // signals. No exit code establishes whether compilation completed.
+        for kind in ["cargo_test", "cargo_nextest", "bun_test"] {
+            for exit_code in 0..=255 {
+                let record = TestRunRecord {
+                    project_id: "proj".to_string(),
+                    worker_id: "worker".to_string(),
+                    command: kind.replace('_', " "),
+                    kind: kind.to_string(),
+                    exit_code,
+                    duration_ms: 1000,
+                    completed_at: Utc::now(),
+                };
+                storage.insert_test_run(&record).expect("insert run");
+                memory.record(&record);
+            }
+        }
+        drop(storage);
+
+        let reopened = TelemetryStorage::new(&path, 30, 24, 365, 0).expect("reopen");
+        let persisted = reopened.test_run_stats().expect("persisted stats");
+        for stats in [&memory, &persisted] {
+            assert_eq!(stats.total_runs, 768);
+            assert_eq!(stats.passed_runs, 3);
+            assert_eq!(stats.failed_runs, 765);
+            assert_eq!(stats.total_runs, stats.passed_runs + stats.failed_runs);
+            for kind in ["cargo_test", "cargo_nextest", "bun_test"] {
+                assert_eq!(stats.runs_by_kind.get(kind), Some(&256));
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // latest_speedscore edge cases
     // -------------------------------------------------------------------------
