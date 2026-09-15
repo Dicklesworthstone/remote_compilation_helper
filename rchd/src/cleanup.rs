@@ -3,7 +3,7 @@
 use crate::{DaemonContext, history::StuckDetectorSnapshot};
 use std::path::Path;
 use std::time::{Duration, Instant};
-use tokio::time::interval;
+use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, warn};
 
 const HEARTBEAT_STALE_SECS: u64 = 20;
@@ -12,6 +12,35 @@ const RECENT_PROGRESS_GRACE_SECS: u64 = 15;
 const MIN_BUILD_AGE_SECS: u64 = 30;
 const TRIAGE_BUDGET_MS: u64 = 50;
 const REMEDIATION_CONFIDENCE_THRESHOLD: f64 = 0.85;
+
+/// A delayed observer cannot distinguish a stalled client from a client whose
+/// heartbeat task was paused with it. Allow one normal heartbeat window to
+/// collect new evidence, without changing the recorded heartbeat or progress.
+#[derive(Default)]
+struct ObservationWindow {
+    last_observed: Option<Instant>,
+    recover_until: Option<Instant>,
+}
+
+impl ObservationWindow {
+    fn recovering(&mut self, now: Instant) -> bool {
+        let window = Duration::from_secs(HEARTBEAT_STALE_SECS);
+        let delayed = self.last_observed.is_some_and(|previous| {
+            now.checked_duration_since(previous).unwrap_or_default() >= window
+        });
+        // A second delayed observation must not extend an existing grace.
+        if delayed && self.recover_until.is_none() {
+            self.recover_until = Some(now + window);
+            warn!("Stuck detector observation delayed; awaiting fresh heartbeat evidence");
+        }
+        self.last_observed = Some(now);
+        if self.recover_until.is_some_and(|deadline| now < deadline) {
+            return true;
+        }
+        self.recover_until = None;
+        false
+    }
+}
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -43,6 +72,11 @@ struct StuckEvidence {
 }
 
 impl StuckEvidence {
+    fn should_remediate_after_observation(self, recovering: bool) -> bool {
+        // Observer recovery never extends the absolute lifetime cap.
+        (!recovering || self.build_age_secs > 86400) && self.should_remediate()
+    }
+
     fn should_remediate(self) -> bool {
         let hard_timeout = self.build_age_secs > 86400; // 24 hours
         let dead_hook_evidence = !self.hook_alive && self.heartbeat_stale;
@@ -149,23 +183,38 @@ impl ActiveBuildCleanup {
     pub fn start(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(5));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut observation = ObservationWindow::default();
             loop {
                 ticker.tick().await;
-                self.check_active_builds().await;
+                self.check_active_builds_observed(&mut observation).await;
             }
         })
     }
 
+    #[cfg(test)]
     async fn check_active_builds(&self) {
+        self.check_active_builds_observed(&mut ObservationWindow::default())
+            .await;
+    }
+
+    async fn check_active_builds_observed(&self, observation: &mut ObservationWindow) {
         let triage_started = Instant::now();
+        observation.recovering(triage_started);
         let active_builds = self.context.history.active_builds();
         if active_builds.is_empty() {
             return;
         }
         let active_build_count = active_builds.len();
 
-        let now = Instant::now();
-        for build in active_builds {
+        for candidate in active_builds {
+            // Cancellation of a previous candidate can await remote I/O. Never
+            // reuse the sweep's old heartbeat snapshot after that await.
+            let Some(build) = self.context.history.active_build(candidate.id) else {
+                continue;
+            };
+            let now = Instant::now();
+            let recovering = observation.recovering(now);
             let hook_alive = build.hook_pid == 0 || is_process_alive(build.hook_pid);
             let heartbeat_age_secs = now
                 .checked_duration_since(build.last_heartbeat_mono)
@@ -204,7 +253,8 @@ impl ActiveBuildCleanup {
                 },
             );
 
-            if !evidence.should_remediate() {
+            // Preserve the absolute lifetime cap even during observer recovery.
+            if !evidence.should_remediate_after_observation(recovering) {
                 if !evidence.hook_alive || evidence.heartbeat_stale || evidence.progress_stale {
                     debug!(
                         build_id = build.id,
@@ -303,6 +353,169 @@ mod tests {
     use proptest::prelude::*;
     use rch_common::BuildHeartbeatPhase;
     use rch_common::test_guard;
+
+    #[test]
+    fn observer_normal_cadence_and_cold_start_preserve_stuck_decisions() {
+        let start = Instant::now();
+        let mut observation = ObservationWindow::default();
+        for seconds in [0, 5, 10, 15, 20, 25, 30] {
+            assert!(!observation.recovering(start + Duration::from_secs(seconds)));
+            for hook_alive in [false, true] {
+                assert!(
+                    score_stuck_evidence(StuckEvidenceInput {
+                        hook_alive,
+                        progress_stall_remediable_phase: true,
+                        heartbeat_age_secs: 445,
+                        progress_age_secs: 515,
+                        build_age_secs: 1600,
+                        slots_owned: 1,
+                        has_worker_binding: true,
+                    })
+                    .should_remediate()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn observer_pause_grants_one_bounded_window_without_faking_progress() {
+        let start = Instant::now();
+        let mut observation = ObservationWindow::default();
+        assert!(!observation.recovering(start));
+        let resumed = start + Duration::from_millis(441_361);
+        assert!(observation.recovering(resumed));
+        assert!(observation.recovering(resumed + Duration::from_secs(19)));
+        assert!(!observation.recovering(resumed + Duration::from_secs(20)));
+        // A resumed live hook sends a real heartbeat, even if its compiler is
+        // still quiet. A dead hook and a live-but-stalled hook remain actionable.
+        for (hook_alive, heartbeat_age_secs, expected) in
+            [(true, 0, false), (false, 465, true), (true, 465, true)]
+        {
+            let evidence = score_stuck_evidence(StuckEvidenceInput {
+                hook_alive,
+                progress_stall_remediable_phase: true,
+                heartbeat_age_secs,
+                progress_age_secs: 535,
+                build_age_secs: 1620,
+                slots_owned: 1,
+                has_worker_binding: true,
+            });
+            assert_eq!(evidence.should_remediate(), expected);
+        }
+    }
+
+    #[test]
+    fn observer_gap_during_cancellation_is_detected_and_cannot_extend_grace() {
+        let start = Instant::now();
+        let mut observation = ObservationWindow::default();
+        assert!(!observation.recovering(start));
+        // These observations are candidates in one sweep, not ticker calls.
+        assert!(!observation.recovering(start + Duration::from_millis(1)));
+        let after_cancellation = start + Duration::from_secs(441);
+        assert!(observation.recovering(after_cancellation));
+        // Another delayed cancellation consumes, rather than renews, the grace.
+        assert!(!observation.recovering(after_cancellation + Duration::from_secs(40)));
+        assert!(!observation.recovering(after_cancellation + Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn observer_recovery_preserves_absolute_lifetime_cap() {
+        for (age, expected) in [(86400, false), (86401, true)] {
+            let evidence = score_stuck_evidence(StuckEvidenceInput {
+                hook_alive: true,
+                progress_stall_remediable_phase: true,
+                heartbeat_age_secs: 445,
+                progress_age_secs: 515,
+                build_age_secs: age,
+                slots_owned: 1,
+                has_worker_binding: true,
+            });
+            assert_eq!(evidence.should_remediate_after_observation(true), expected);
+            assert!(evidence.should_remediate_after_observation(false));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn observer_recovery_retains_resuming_job_and_reaps_real_stale_jobs() {
+        struct QuietJob(std::process::Child);
+        impl Drop for QuietJob {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut jobs: Vec<_> = (0..3)
+            .map(|_| {
+                QuietJob(
+                    std::process::Command::new("sleep")
+                        .arg("180")
+                        .spawn()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let context = crate::test_daemon_context(crate::workers::WorkerPool::new());
+        let heartbeat = |id, pid| rch_common::BuildHeartbeatRequest {
+            build_id: id,
+            worker_id: rch_common::WorkerId::new("observer-worker"),
+            hook_pid: Some(pid),
+            local_wrapper_id: None,
+            remote_pgid_file: None,
+            phase: BuildHeartbeatPhase::Execute,
+            detail: None,
+            progress_counter: None,
+            progress_percent: None,
+        };
+        let builds: Vec<_> = jobs
+            .iter()
+            .enumerate()
+            .map(|(index, job)| {
+                let build = context.history.start_active_build(
+                    format!("observer-recovery-{index}"),
+                    "observer-worker".into(),
+                    "sleep 180".into(),
+                    job.0.id(),
+                    1,
+                    rch_common::BuildLocation::Remote,
+                );
+                context
+                    .history
+                    .record_build_heartbeat(heartbeat(build.id, job.0.id()))
+                    .unwrap();
+                context.history.active_build(build.id).unwrap()
+            })
+            .collect();
+        let mut observation = ObservationWindow::default();
+        assert!(!observation.recovering(Instant::now()));
+        // Real history uses std::time::Instant: age actual children and actual
+        // heartbeats past both production stale thresholds without forging them.
+        tokio::time::sleep(Duration::from_secs(PROGRESS_STALE_SECS + 6)).await;
+        jobs[2].0.kill().unwrap();
+        jobs[2].0.wait().unwrap();
+        let cleanup = ActiveBuildCleanup::new(context.clone());
+        cleanup.check_active_builds_observed(&mut observation).await;
+        for build in &builds {
+            let retained = context.history.active_build(build.id).unwrap();
+            assert_eq!(retained.last_heartbeat_mono, build.last_heartbeat_mono);
+            assert_eq!(retained.last_progress_mono, build.last_progress_mono);
+        }
+        assert!(jobs[0].0.try_wait().unwrap().is_none());
+        assert!(jobs[1].0.try_wait().unwrap().is_none());
+        assert!(observation.recover_until.is_some());
+        tokio::time::sleep(Duration::from_secs(HEARTBEAT_STALE_SECS + 1)).await;
+        context
+            .history
+            .record_build_heartbeat(heartbeat(builds[0].id, jobs[0].0.id()))
+            .unwrap();
+        cleanup.check_active_builds_observed(&mut observation).await;
+        assert!(context.history.active_build(builds[0].id).is_some());
+        assert!(jobs[0].0.try_wait().unwrap().is_none());
+        for index in [1, 2] {
+            assert!(context.history.active_build(builds[index].id).is_none());
+            assert!(jobs[index].0.try_wait().unwrap().is_some());
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]
