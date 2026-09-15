@@ -1418,6 +1418,7 @@ mod tests {
         let stats: TestRunStatsFromApi = serde_json::from_value(json).unwrap();
         assert_eq!(stats.total_runs, 50);
         assert_eq!(stats.passed_runs, 45);
+        assert_eq!(stats.failed_runs, 5);
         assert_eq!(stats.runs_by_kind.get("unit"), Some(&30));
     }
 

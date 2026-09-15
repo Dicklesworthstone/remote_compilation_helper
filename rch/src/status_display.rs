@@ -280,8 +280,8 @@ fn render_full_status_to<W: Write>(
         };
         writeln!(
             out,
-            "  {} {} {} total, {:.0}% pass rate, avg {}",
-            style.key("Tests"),
+            "  {} {} {} total, {:.0}% command success rate, avg {}",
+            style.key("Test commands"),
             style.muted(":"),
             style.highlight(&test_stats.total_runs.to_string()),
             pass_rate,
