@@ -1661,17 +1661,26 @@ impl TransferPipeline {
 
     fn artifact_retry_config_for_size(&self, bytes: u64) -> RetryConfig {
         let mut retry = self.effective_rsync_retry_config();
-        if self.transfer_config.max_transfer_time_ms.is_some_and(|ms| ms > 0) {
+        if self
+            .transfer_config
+            .max_transfer_time_ms
+            .is_some_and(|ms| ms > 0)
+        {
             return retry;
         }
         // Budget the uncompressed selected files, not dry-run protocol bytes.
         // A configured bandwidth cap can be slower than the conservative default.
-        let bytes_per_second = self.transfer_config.bwlimit_kbps
+        let bytes_per_second = self
+            .transfer_config
+            .bwlimit_kbps
             .filter(|limit| *limit > 0)
-            .map_or(1024 * 1024, |limit| limit.saturating_mul(1024).min(1024 * 1024));
+            .map_or(1024 * 1024, |limit| {
+                limit.saturating_mul(1024).min(1024 * 1024)
+            });
         let seconds = bytes.div_ceil(bytes_per_second);
         retry.total_timeout_ms = retry.total_timeout_ms.max(
-            30_000_u64.saturating_add(seconds.saturating_mul(1000))
+            30_000_u64
+                .saturating_add(seconds.saturating_mul(1000))
                 .min(TransferConfig::MAX_SYNC_TIMEOUT_MS),
         );
         retry
@@ -1686,26 +1695,41 @@ impl TransferPipeline {
         let fallback = self.effective_rsync_retry_config();
         // An explicit operator ceiling remains the whole retrieval budget:
         // do not spend an additional planning window before starting it.
-        if self.transfer_config.max_transfer_time_ms.is_some_and(|ms| ms > 0) {
+        if self
+            .transfer_config
+            .max_transfer_time_ms
+            .is_some_and(|ms| ms > 0)
+        {
             return fallback;
         }
         let estimate = execute_rsync_with_retry(&fallback, "estimate_artifact_retrieval", || {
             let mut cmd = self.build_retrieve_command(worker, escaped_remote_path, patterns);
             cmd.arg("--dry-run");
             cmd
-        }).await;
+        })
+        .await;
         match estimate {
             Ok(output) if output.status.success() => {
-                if let Some(bytes) = parse_rsync_total_size(&String::from_utf8_lossy(&output.stdout)) {
+                if let Some(bytes) =
+                    parse_rsync_total_size(&String::from_utf8_lossy(&output.stdout))
+                {
                     let retry = self.artifact_retry_config_for_size(bytes);
-                    info!(selected_bytes = bytes, total_timeout_ms = retry.total_timeout_ms,
-                        "Artifact retrieval budget from selected remote files");
+                    info!(
+                        selected_bytes = bytes,
+                        total_timeout_ms = retry.total_timeout_ms,
+                        "Artifact retrieval budget from selected remote files"
+                    );
                     return retry;
                 }
                 warn!("Artifact size estimate missing; retaining configured retrieval budget");
             }
-            Ok(output) => warn!("Artifact size estimate failed: {}", String::from_utf8_lossy(&output.stderr)),
-            Err(error) => warn!("Artifact size estimate failed: {error}; retaining configured retrieval budget"),
+            Ok(output) => warn!(
+                "Artifact size estimate failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => warn!(
+                "Artifact size estimate failed: {error}; retaining configured retrieval budget"
+            ),
         }
         fallback
     }
@@ -4626,7 +4650,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let start = std::time::Instant::now();
 
         // Execute rsync with retry logic for transient errors
-        let retry_config = self.artifact_retry_config(worker, &escaped_remote_path, artifact_patterns).await;
+        let retry_config = self
+            .artifact_retry_config(worker, &escaped_remote_path, artifact_patterns)
+            .await;
         let output = execute_rsync_with_retry(&retry_config, "retrieve_artifacts", || {
             self.build_retrieve_command(worker, &escaped_remote_path, artifact_patterns)
         })
@@ -4990,7 +5016,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         );
 
         let retrieval_start = std::time::Instant::now();
-        let retry_config = self.artifact_retry_config(worker, &escaped_remote_path, artifact_patterns).await;
+        let retry_config = self
+            .artifact_retry_config(worker, &escaped_remote_path, artifact_patterns)
+            .await;
         let (output, _) = run_command_streaming_with_retry(
             &retry_config,
             "retrieve_artifacts_streaming",
@@ -10340,6 +10368,233 @@ Total file size: 123 bytes";
             pipeline.effective_rsync_retry_config().total_timeout_ms,
             5000
         );
+    }
+
+    #[test]
+    fn test_artifact_retry_config_for_size_boundaries() {
+        let _guard = test_guard!();
+        let mut pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/artifact-budget"),
+            "artifact-budget".to_string(),
+            "selected".to_string(),
+            TransferConfig::default(),
+        );
+        pipeline.transfer_config.retry.total_timeout_ms = 30_000;
+        assert_eq!(
+            pipeline.artifact_retry_config_for_size(0).total_timeout_ms,
+            30_000
+        );
+        assert_eq!(
+            pipeline
+                .artifact_retry_config_for_size(31 * 1024 * 1024)
+                .total_timeout_ms,
+            61_000
+        );
+        assert_eq!(
+            pipeline.artifact_retry_config_for_size(1).total_timeout_ms,
+            31_000
+        );
+        pipeline.transfer_config.bwlimit_kbps = Some(64);
+        assert_eq!(
+            pipeline
+                .artifact_retry_config_for_size(1024 * 1024)
+                .total_timeout_ms,
+            46_000
+        );
+        pipeline.transfer_config.bwlimit_kbps = Some(0);
+        assert_eq!(
+            pipeline
+                .artifact_retry_config_for_size(1024 * 1024)
+                .total_timeout_ms,
+            31_000
+        );
+        pipeline.transfer_config.bwlimit_kbps = Some(u64::MAX);
+        assert_eq!(
+            pipeline
+                .artifact_retry_config_for_size(1024 * 1024)
+                .total_timeout_ms,
+            31_000
+        );
+        pipeline.transfer_config.bwlimit_kbps = Some(1);
+        assert_eq!(
+            pipeline
+                .artifact_retry_config_for_size(u64::MAX)
+                .total_timeout_ms,
+            TransferConfig::MAX_SYNC_TIMEOUT_MS
+        );
+        pipeline.transfer_config.retry.total_timeout_ms = 90_000;
+        assert_eq!(
+            pipeline.artifact_retry_config_for_size(0).total_timeout_ms,
+            90_000
+        );
+        pipeline.transfer_config.max_transfer_time_ms = Some(7);
+        for bytes in [0, 31 * 1024 * 1024, u64::MAX] {
+            assert_eq!(
+                pipeline
+                    .artifact_retry_config_for_size(bytes)
+                    .total_timeout_ms,
+                7
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_artifact_retry_real_rsync_selected_payload_exceeds_old_budget() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().expect("artifact fixture").keep();
+        let source = retained.join("source");
+        let destination = retained.join("destination");
+        std::fs::create_dir_all(source.join("wrapper-release/incremental")).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        // Compression is disabled below so the configured bandwidth limit
+        // measures real payload progress, including beyond the former 30s cap.
+        let payload = vec![0x5a; 2 * 1024 * 1024 + 128 * 1024];
+        std::fs::write(source.join("wrapper-release/rch"), &payload).unwrap();
+        std::fs::File::create(source.join("wrapper-release/incremental/cache"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        std::fs::write(source.join("unselected.txt"), b"must not transfer").unwrap();
+        let pipeline = TransferPipeline::new(
+            destination.clone(),
+            "artifact-local-peer".to_string(),
+            "selected".to_string(),
+            TransferConfig {
+                bwlimit_kbps: Some(64),
+                ..TransferConfig::default()
+            },
+        );
+        let worker = worker_with_os(None);
+        let patterns = vec![
+            "- wrapper-release/incremental/***".to_string(),
+            "wrapper-release/**".to_string(),
+        ];
+        let remote = source.to_str().unwrap();
+        let command = || {
+            let mut command = pipeline.build_retrieve_command(&worker, remote, &patterns);
+            // Real rsync endpoints over local pipes; only SSH transport is
+            // replaced. Retain production filter ordering and source selection.
+            command.args([
+                "--no-compress",
+                "-e",
+                r#"sh -c 'if [ "$1" = -l ]; then shift 2; fi; shift; exec "$@"' rch-local-peer"#,
+            ]);
+            command.env("LC_ALL", "C");
+            command
+        };
+        let mut planning = command();
+        planning.arg("--dry-run");
+        let planned = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            execute_rsync_attempt(planning),
+        )
+        .await
+        .expect("bounded real rsync planning")
+        .expect("real rsync planning");
+        eprintln!(
+            "retained fixture: {}\n{}",
+            retained.display(),
+            String::from_utf8_lossy(&planned.stderr)
+        );
+        assert!(
+            planned.status.success(),
+            "{}",
+            String::from_utf8_lossy(&planned.stderr)
+        );
+        let selected = parse_rsync_total_size(&String::from_utf8_lossy(&planned.stdout))
+            .expect("selected file size");
+        assert_eq!(selected, payload.len() as u64);
+        assert!(
+            !destination.join("wrapper-release/rch").exists(),
+            "dry-run must not copy payload"
+        );
+        let retry = pipeline.artifact_retry_config_for_size(selected);
+        let started = std::time::Instant::now();
+        let copied = execute_rsync_with_retry(&retry, "real_artifact_retrieval", command)
+            .await
+            .expect("healthy transfer beyond old cap");
+        eprintln!(
+            "{}\n{}",
+            String::from_utf8_lossy(&copied.stdout),
+            String::from_utf8_lossy(&copied.stderr)
+        );
+        assert!(copied.status.success());
+        assert!(
+            started.elapsed() > std::time::Duration::from_secs(30),
+            "fixture must exercise progress after the old deadline"
+        );
+        assert_eq!(
+            blake3::hash(&std::fs::read(destination.join("wrapper-release/rch")).unwrap()),
+            blake3::hash(&payload)
+        );
+        assert!(!destination.join("wrapper-release/incremental").exists());
+        assert!(!destination.join("unselected.txt").exists());
+        let mut noop = command();
+        noop.arg("--dry-run");
+        let noop = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            execute_rsync_attempt(noop),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            noop.status.success(),
+            "{}",
+            String::from_utf8_lossy(&noop.stderr)
+        );
+        assert_eq!(
+            parse_rsync_total_size(&String::from_utf8_lossy(&noop.stdout)),
+            Some(selected),
+            "planning counts the full selected payload even when already present"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_artifact_retry_explicit_cap_terminates_owned_child() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir()
+            .expect("artifact timeout fixture")
+            .keep();
+        let pid_file = retained.join("owned.pid");
+        let pipeline = TransferPipeline::new(
+            retained.clone(),
+            "artifact-cap".to_string(),
+            "selected".to_string(),
+            TransferConfig {
+                max_transfer_time_ms: Some(500),
+                ..TransferConfig::default()
+            },
+        );
+        let retry = pipeline.artifact_retry_config_for_size(u64::MAX);
+        let result = execute_rsync_with_retry(&retry, "artifact_explicit_cap", || {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "printf '%s' \"$$\" > \"$1\"; exec sleep 10",
+                    "artifact-cap",
+                ])
+                .arg(&pid_file)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "explicit cap cannot be enlarged by payload planning"
+        );
+        let pid = std::fs::read_to_string(&pid_file).expect("owned child actually started");
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while Path::new("/proc").join(pid.trim()).exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deadline must terminate and reap its owned child");
     }
 
     #[tokio::test]
