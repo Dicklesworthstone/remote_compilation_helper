@@ -746,7 +746,21 @@ workspace members are present in the archive. Before Cargo starts, selected
 manifests, configuration, symlinks, and command-line path overrides are checked
 against the selected Git base and overlays. Escaping paths are refused with
 `RCH-E413`; retained sibling directories on the worker cannot supply those
-dependencies. Committed external-root staging is not implemented yet.
+dependencies. To include a sibling Git repository, bind its revision explicitly:
+
+```bash
+rch exec --base HEAD --clean-overlay --no-overlay \
+  --dependency-base ../dep=HEAD -- cargo test
+```
+
+Repeat `--dependency-base PATH=REV` for every external root, including transitive
+dependencies. Each revision resolves to a commit before worker selection; dirty
+files in those repositories are excluded. The selected repositories must be
+siblings of the primary Git root. They are staged under one owned container,
+preserving `../dep` references, and the execution receipt names each commit,
+Git tree hash, and remote path. All roots share the same execution lease and
+are retired together. Cross-repository symlinks and non-sibling layouts are
+currently refused.
 
 This check conservatively covers all selected manifests, including inactive
 fixtures. File-based `--config`, configuration includes, and changes to Cargo's
