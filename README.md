@@ -737,16 +737,25 @@ in clean-overlay mode.
 An interrupted pair retains its ownership marker and refuses further reuse,
 even if its SSH lock connection disappears. Inspect the prior job before
 recovering that pair, or use `RCH_DISABLE_TARGET_REUSE=1` for a fresh isolated
-build. Windows clean-overlay builds also use isolated targets. The ownership
+build. Non-Cargo Windows clean-overlay jobs also use isolated targets. The ownership
 marker protects against process interruption; it is not a power-loss durability
 guarantee.
 
 Clean-overlay currently materializes one Git repository. In-repository Cargo
-workspace members are present in the archive. External path dependencies are
-outside the source-identity guarantee: callers must independently ensure they
-cannot resolve to ambient worker state. The client re-fingerprints overlays
-after upload and refuses execution if their contents changed during admission
-or transfer.
+workspace members are present in the archive. Before Cargo starts, selected
+manifests, configuration, symlinks, and command-line path overrides are checked
+against the selected Git base and overlays. Escaping paths are refused with
+`RCH-E413`; retained sibling directories on the worker cannot supply those
+dependencies. Committed external-root staging is not implemented yet.
+
+This check conservatively covers all selected manifests, including inactive
+fixtures. File-based `--config`, configuration includes, and changes to Cargo's
+working directory are refused. On the worker, any Cargo-home or ancestor
+configuration is refused before Cargo starts, even if that configuration would
+be harmless. Cargo clean-overlay jobs currently require a Unix worker for this
+check. These checks do not sandbox arbitrary file reads by build scripts.
+The client re-fingerprints overlays after upload and refuses execution if their
+contents changed during admission or transfer.
 
 Do not batch several Cargo commands behind a shell wrapper such as
 `rch exec -- bash -lc "cargo test ... && cargo test ..."`. Shell-wrapped
