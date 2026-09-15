@@ -570,6 +570,9 @@ USAGE:
         /// Git commit used as the clean source-tree baseline
         #[arg(long, short = 'b', requires = "clean_overlay")]
         base: Option<String>,
+        /// Bind a sibling Git repository to a commit (repeatable PATH=REV)
+        #[arg(long, requires = "clean_overlay", value_name = "PATH=REV")]
+        dependency_base: Vec<String>,
         /// Transfer a clean Git baseline plus only explicit overlay paths
         #[arg(long, requires = "base")]
         clean_overlay: bool,
@@ -2197,6 +2200,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
             Commands::Admit { command } => handle_admit(command, &ctx).await,
             Commands::Exec {
                 base,
+                dependency_base,
                 clean_overlay,
                 overlay_path,
                 no_overlay,
@@ -2207,6 +2211,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
             } => {
                 hook::run_exec(
                     base,
+                    dependency_base,
                     clean_overlay,
                     overlay_path,
                     no_overlay,
