@@ -423,13 +423,10 @@ pub(super) async fn execute_remote_compilation(
 
     let exact_dependency_closure_sync =
         clean_overlay.is_none() && command_uses_cargo_dependency_graph(kind);
-    let raw_sync_roots = if clean_overlay.is_some() {
-        // The immutable Git archive already contains every in-repository
-        // workspace member. Syncing ambient sibling roots here could reintroduce
-        // the peer dirt this mode exists to exclude, so clean-overlay starts
-        // with one primary root. The selected-source preflight above rejects
-        // escaping dependencies before Cargo can read retained sibling roots.
-        vec![normalized_project_root.clone()]
+    let raw_sync_roots = if let Some(spec) = clean_overlay {
+        let mut roots = vec![normalized_project_root.clone()];
+        roots.extend(spec.dependencies.iter().map(|(root, _)| root.clone()));
+        roots
     } else {
         let dependency_plan = build_dependency_runtime_plan(
             &normalized_project_root,
@@ -543,12 +540,20 @@ pub(super) async fn execute_remote_compilation(
     } else {
         project_hash
     };
-    let mut sync_plan = build_sync_closure_plan(
-        &raw_sync_roots,
-        &normalized_project_root,
-        &project_hash,
-        topology_policy,
-    );
+    let mut sync_plan = if clean_overlay.is_some() {
+        // Explicit committed roots are the whole authority. The ordinary
+        // planner reads ambient ancestor manifests and must not widen this set.
+        raw_sync_roots.iter().map(|root| SyncClosurePlanEntry {
+            local_root: root.clone(),
+            project_id: project_id_from_path(root),
+            root_hash: project_hash.clone(),
+            remote_root: String::new(),
+            is_primary: root == &normalized_project_root,
+            mode: SyncClosureMode::Full,
+        }).collect()
+    } else {
+        build_sync_closure_plan(&raw_sync_roots, &normalized_project_root, &project_hash, topology_policy)
+    };
     // Ordinary Cargo invocations target shared canonical worker paths. Capture
     // those logical authorities before any proof/overlay/Windows relocation so
     // overlapping primary projects that share a path dependency take the same
@@ -603,17 +608,23 @@ pub(super) async fn execute_remote_compilation(
         }
     }
     let mut overlay_remote_root: Option<String> = None;
-    if clean_overlay.is_some() {
-        if sync_plan.len() != 1 || !sync_plan[0].is_primary {
-            anyhow::bail!(
-                "clean-overlay requires a single primary sync root; found {} roots",
-                sync_plan.len()
-            );
-        }
+    if let Some(spec) = clean_overlay {
+        anyhow::ensure!(sync_plan.iter().filter(|entry| entry.is_primary).count() == 1,
+            "clean-overlay requires exactly one primary root");
         let remote_base = transfer_config.remote_base.trim_end_matches('/');
-        sync_plan[0].remote_root = format!("{remote_base}/{project_id}/{project_hash}");
-        overlay_remote_root = Some(sync_plan[0].remote_root.clone());
-        sync_plan[0].root_hash.clone_from(&project_hash);
+        let container = format!("{remote_base}/{project_id}/{project_hash}");
+        for entry in &mut sync_plan {
+            entry.remote_root = if spec.primary_directory.is_some() {
+                let directory = entry.local_root.file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid selected root directory"))?;
+                format!("{container}/{directory}")
+            } else {
+                container.clone()
+            };
+            entry.root_hash.clone_from(&project_hash);
+        }
+        overlay_remote_root = Some(container);
     }
     // Relocate every closure root under the Windows build base so all downstream
     // remote paths (sync target, build cwd, CARGO_TARGET_DIR, manifest
@@ -717,7 +728,7 @@ pub(super) async fn execute_remote_compilation(
         Some(
             acquire_clean_overlay_source_pair(
                 &worker_config,
-                &sync_plan[0].remote_root,
+                overlay_remote_root.as_deref().ok_or_else(|| anyhow::anyhow!("missing clean-overlay container"))?,
                 command_timeout,
             )
             .await?,
@@ -858,6 +869,15 @@ pub(super) async fn execute_remote_compilation(
         .map(BuildHeartbeatLoop::shared_state);
     let mut root_outcomes: Vec<(SyncClosurePlanEntry, SyncRootOutcome)> = Vec::new();
     for entry in &sync_plan {
+        let root_overlay = clean_overlay.map(|spec| {
+            if entry.is_primary {
+                Ok(spec)
+            } else {
+                spec.dependencies.iter().find(|(root, _)| root == &entry.local_root)
+                    .map(|(_, selected)| selected)
+                    .ok_or_else(|| anyhow::anyhow!("unbound clean-overlay dependency root {}", entry.local_root.display()))
+            }
+        }).transpose()?;
         let mut root_pipeline = TransferPipeline::new(
             entry.local_root.clone(),
             entry.project_id.clone(),
@@ -872,7 +892,7 @@ pub(super) async fn execute_remote_compilation(
         .with_worker_platform(WorkerPlatform::from_worker(&worker_config))
         .with_build_id(build_id)
         .with_pooled_target_prune_idle_hours(pooled_target_prune_idle_hours);
-        if let Some(spec) = clean_overlay {
+        if let Some(spec) = root_overlay {
             root_pipeline = root_pipeline
                 .with_sync_include_patterns(clean_overlay_include_patterns(
                     &entry.local_root,
@@ -880,6 +900,11 @@ pub(super) async fn execute_remote_compilation(
                 )?)
                 .with_sync_delete(false)
                 .with_sync_checksum(true);
+            if let Some(stable_pool) = pooled_target_dir_override.as_ref() {
+                // Every selected root must become newer than the same cache
+                // whose dep-info may refer to any of its source files.
+                root_pipeline = root_pipeline.with_remote_cargo_target_dir_override(stable_pool.clone());
+            }
         }
         if entry.mode == SyncClosureMode::WorkspaceMetadata {
             root_pipeline =
@@ -917,7 +942,7 @@ pub(super) async fn execute_remote_compilation(
             None
         };
 
-        if let Some(spec) = clean_overlay {
+        if let Some(spec) = root_overlay {
             reporter.verbose(&format!(
                 "[RCH] clean-overlay transfer estimator bypassed for immutable base {}",
                 spec.base_commit()
@@ -960,7 +985,7 @@ pub(super) async fn execute_remote_compilation(
             entry.local_root.display(),
             entry.remote_root.as_str()
         ));
-        let sync_attempt = if let Some(spec) = clean_overlay {
+        let sync_attempt = if let Some(spec) = root_overlay {
             spec.verify_archive_attributes(&entry.local_root).await?;
             spec.verify_overlay_unchanged(&entry.local_root)?;
             let base_materialization = match root_pipeline

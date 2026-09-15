@@ -148,6 +148,7 @@ const RCH_DISABLE_TARGET_REUSE_ENV: &str = "RCH_DISABLE_TARGET_REUSE";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CleanOverlaySpec {
     base_commit: String,
+    tree_object: String,
     overlay_paths: Vec<PathBuf>,
     overlay_fingerprint: String,
     dependencies: Vec<(PathBuf, CleanOverlaySpec)>,
@@ -175,13 +176,13 @@ impl CleanOverlaySpec {
     /// immutable base plus verified overlay.
     pub(super) fn execution_receipt(&self) -> String {
         let mut receipt = format!(
-            "[RCH] clean-overlay receipt: base={} overlay-fingerprint={}",
-            self.base_commit, self.overlay_fingerprint
+            "[RCH] clean-overlay receipt: base={} overlay-fingerprint={} tree={}",
+            self.base_commit, self.overlay_fingerprint, self.tree_object
         );
         for (root, spec) in &self.dependencies {
             receipt.push_str(&format!(
-                " dependency-root={} commit={} overlay-fingerprint={}",
-                root.display(), spec.base_commit, spec.overlay_fingerprint
+                " dependency-root={} commit={} tree={} overlay-fingerprint={}",
+                root.display(), spec.base_commit, spec.tree_object, spec.overlay_fingerprint
             ));
         }
         receipt
@@ -230,6 +231,12 @@ fn selection_project_for_execution(
     hasher.update(spec.base_commit().as_bytes());
     hasher.update(b"\0");
     hasher.update(spec.overlay_fingerprint().as_bytes());
+    for (root, dependency) in &spec.dependencies {
+        hasher.update(b"\0dependency\0");
+        hasher.update(root.as_os_str().as_encoded_bytes());
+        hasher.update(b"\0");
+        hasher.update(dependency.base_commit.as_bytes());
+    }
     hasher.update(b"\0");
     hasher.update(job_nonce.as_bytes());
     let suffix = hasher.finalize().to_hex();
@@ -2273,6 +2280,8 @@ async fn prepare_clean_overlay_spec(
         anyhow::bail!("--base did not resolve to a hexadecimal commit object ID");
     }
     validate_clean_overlay_archive_attributes(&canonical_project_root, &base_commit).await?;
+    let tree_object = git_output(&canonical_project_root,
+        &["rev-parse", "--verify", &format!("{base_commit}^{{tree}}")]).await?;
     let base_tree = git_output_bytes(
         &canonical_project_root,
         &["ls-tree", "-rz", "--full-tree", &base_commit],
@@ -2310,6 +2319,7 @@ async fn prepare_clean_overlay_spec(
 
     Ok(Some(CleanOverlaySpec {
         base_commit,
+        tree_object,
         overlay_paths,
         overlay_fingerprint,
         dependencies: Vec::new(),

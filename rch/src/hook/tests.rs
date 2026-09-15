@@ -282,8 +282,11 @@ fn clean_overlay_selection_identity_is_source_bound_and_per_job() {
     let _guard = test_guard!();
     let spec = CleanOverlaySpec {
         base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        tree_object: "0123456789abcdef0123456789abcdef01234567".to_string(),
         overlay_paths: vec![PathBuf::from("src/lib.rs")],
         overlay_fingerprint: "first-overlay-fingerprint".to_string(),
+        dependencies: Vec::new(),
+        primary_directory: None,
     };
     let plain = selection_project_for_execution("fixture-project", None, uuid::Uuid::from_u128(1));
     assert_eq!(plain, "fixture-project");
