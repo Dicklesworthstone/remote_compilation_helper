@@ -49,6 +49,7 @@ pub async fn run_hook() -> anyhow::Result<()> {
 /// simply runs the provided command via the local shell.
 pub async fn run_exec(
     base: Option<String>,
+    dependency_bases: Vec<String>,
     clean_overlay: bool,
     overlay_paths: Vec<PathBuf>,
     no_overlay: bool,
@@ -57,7 +58,7 @@ pub async fn run_exec(
     result_dirs: Vec<PathBuf>,
     command_parts: Vec<String>,
 ) -> anyhow::Result<()> {
-    if clean_overlay || base.is_some() || !overlay_paths.is_empty() || no_overlay {
+    if clean_overlay || base.is_some() || !dependency_bases.is_empty() || !overlay_paths.is_empty() || no_overlay {
         anyhow::bail!("clean-overlay remote execution is not supported on non-Unix clients");
     }
     if source_content_receipt {

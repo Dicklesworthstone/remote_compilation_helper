@@ -499,7 +499,7 @@ pub(super) async fn execute_remote_compilation(
         && forwarded_cargo_target_dir.is_some()
         && !reuse_disabled)
         .then(|| {
-            clean_overlay_source_pair_pool_name(
+            let legacy = clean_overlay_source_pair_pool_name(
                 &remote_cargo_pooled_target_dir_name(
                     &worker_config.id,
                     &normalized_project_root,
@@ -507,7 +507,20 @@ pub(super) async fn execute_remote_compilation(
                     command,
                 ),
                 &transfer_config.remote_base,
-            )
+            );
+            if let Some(spec) = clean_overlay.filter(|spec| !spec.dependencies.is_empty()) {
+                let mut layout = blake3::Hasher::new();
+                layout.update(b"rch-selected-sibling-layout-v1\0");
+                layout.update(legacy.as_bytes());
+                for root in &raw_sync_roots {
+                    layout.update(b"\0");
+                    layout.update(root.file_name().unwrap_or_default().as_encoded_bytes());
+                }
+                debug_assert!(spec.primary_directory.is_some());
+                format!(".rch-target-{}-pool-{}", worker_config.id, &layout.finalize().to_hex()[..32])
+            } else {
+                legacy
+            }
         });
     let project_hash = if let Some(pool) = source_pair_pool.as_ref() {
         format!("paired-{}", &blake3::hash(pool.as_bytes()).to_hex()[..32])
@@ -1380,6 +1393,20 @@ pub(super) async fn execute_remote_compilation(
     }
 
     let stderr_capture = std::mem::take(&mut *stderr_capture_cell.borrow_mut());
+
+    if result.success() && let Some(spec) = clean_overlay.filter(|spec| !spec.dependencies.is_empty()) {
+        for entry in &sync_plan {
+            let selected = if entry.is_primary { spec } else {
+                &spec.dependencies.iter().find(|(root, _)| root == &entry.local_root)
+                    .ok_or_else(|| anyhow::anyhow!("missing completed dependency binding"))?.1
+            };
+            reporter.summary_critical(&format!(
+                "[RCH] clean-overlay root receipt: local={} remote={} commit={} tree={} overlay-fingerprint={}",
+                entry.local_root.display(), entry.remote_root, selected.base_commit,
+                selected.tree_object, selected.overlay_fingerprint,
+            ));
+        }
+    }
 
     info!(
         "Remote command finished: exit={} in {}ms",

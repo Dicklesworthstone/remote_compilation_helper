@@ -6655,6 +6655,7 @@ mod tests {
         match cli.command {
             Some(Commands::Exec {
                 base,
+                dependency_base: _,
                 clean_overlay,
                 overlay_path,
                 no_overlay,
@@ -6697,6 +6698,7 @@ mod tests {
         match cli.command {
             Some(Commands::Exec {
                 base,
+                dependency_base: _,
                 clean_overlay,
                 overlay_path,
                 no_overlay,
@@ -6780,6 +6782,7 @@ mod tests {
                 job,
                 result_dir,
                 command,
+                ..
             }) => {
                 assert!(base.is_none());
                 assert!(!clean_overlay);
@@ -6827,6 +6830,7 @@ mod tests {
                 job,
                 result_dir,
                 command,
+                ..
             }) => {
                 assert!(job, "--job must parse as explicit job admission");
                 assert!(base.is_none());
