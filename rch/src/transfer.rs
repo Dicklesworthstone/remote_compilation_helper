@@ -10480,9 +10480,14 @@ Total file size: 123 bytes";
         let destination = retained.join("destination");
         std::fs::create_dir_all(source.join("wrapper-release/incremental")).unwrap();
         std::fs::create_dir_all(&destination).unwrap();
-        // Compression is disabled below so the configured bandwidth limit
-        // measures real payload progress, including beyond the former 30s cap.
-        let payload = vec![0x5a; 2 * 1024 * 1024 + 128 * 1024];
+        // Incompressible bytes keep the actual wire payload large even if the
+        // peer negotiates compression. Repeated bytes did not exercise 30s.
+        let mut payload = vec![0_u8; 2 * 1024 * 1024 + 128 * 1024];
+        std::io::Read::read_exact(
+            &mut std::fs::File::open("/dev/urandom").unwrap(),
+            &mut payload,
+        )
+        .unwrap();
         std::fs::write(source.join("wrapper-release/rch"), &payload).unwrap();
         std::fs::File::create(source.join("wrapper-release/incremental/cache"))
             .unwrap()
