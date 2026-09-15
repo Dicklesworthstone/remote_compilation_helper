@@ -3507,14 +3507,17 @@ impl BuildRecordInput {
     }
 }
 
-/// Aggregate statistics for build history.
+/// Aggregate terminal-command statistics for build history.
+///
+/// These counts do not infer whether compilation completed before a failing
+/// test or interrupted command. The denominator includes every stored record.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BuildStats {
     /// Total number of builds in history.
     pub total_builds: usize,
-    /// Number of successful builds (exit_code == 0).
+    /// Number of successfully completed commands (exit_code == 0).
     pub success_count: usize,
-    /// Number of failed builds (exit_code != 0).
+    /// Number of unsuccessful commands, including interruption (exit_code != 0).
     pub failure_count: usize,
     /// Number of remote builds.
     pub remote_count: usize,
