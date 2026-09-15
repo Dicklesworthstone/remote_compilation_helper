@@ -134,6 +134,16 @@ docs/evidence/fleet_deploy_audit_*.json
 benchmarks/baselines/i014_scheduler_storm.ndjson
 beads_compliance_audit/
 
+# === agent ephemeral residue 2026-09-15 ===
+# Per-host gate wrappers (verify_*.sh is already ignored; these are dotted).
+/.gate_*.sh
+# One-off sample tree and botched copy-paste path names.
+/uoh4x-sample/
+/rabs-key/src;
+/rabs-key/**/*.rs:*
+.rch-tmp/
+.beads-recovery-*/
+
 # Next.js / Playwright products under web/ (generated; never source).
 web/.next/
 web/next-env.d.ts
