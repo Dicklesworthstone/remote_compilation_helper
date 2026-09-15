@@ -499,6 +499,15 @@ worker or fall back locally. Machine-mode `rch exec` reports
 `outcome: "deadline_exceeded"`. This classification requires evidence from the
 launcher; exit 137 or elapsed time alone does not establish a timeout.
 
+Unix artifact downloads estimate the files matched by the retrieval filters
+before transferring them. Their default total retry budget grows with that size
+(30 seconds plus one second per MiB, adjusted for a slower `bwlimit_kbps`, up to
+one hour). An explicit `max_transfer_time_ms` keeps its existing hard ceiling
+and skips estimation. Rsync also stops after 30 seconds without network I/O.
+If estimation fails, RCH logs the failure and retains the configured retry
+budget. These filters can include other cached build outputs in the same profile;
+they do not yet select only the executable named by `cargo build --bin`.
+
 Built-in worker selection defaults to `balanced`, which blends speed, load,
 health, and cache affinity. Use `priority` only when you want explicit
 worker-priority control, and `fair_fastest` when you want extra load spreading.
