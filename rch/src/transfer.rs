@@ -1659,6 +1659,57 @@ impl TransferPipeline {
         retry
     }
 
+    fn artifact_retry_config_for_size(&self, bytes: u64) -> RetryConfig {
+        let mut retry = self.effective_rsync_retry_config();
+        if self.transfer_config.max_transfer_time_ms.is_some_and(|ms| ms > 0) {
+            return retry;
+        }
+        // Budget the uncompressed selected files, not dry-run protocol bytes.
+        // A configured bandwidth cap can be slower than the conservative default.
+        let bytes_per_second = self.transfer_config.bwlimit_kbps
+            .filter(|limit| *limit > 0)
+            .map_or(1024 * 1024, |limit| limit.saturating_mul(1024).min(1024 * 1024));
+        let seconds = bytes.div_ceil(bytes_per_second);
+        retry.total_timeout_ms = retry.total_timeout_ms.max(
+            30_000_u64.saturating_add(seconds.saturating_mul(1000))
+                .min(TransferConfig::MAX_SYNC_TIMEOUT_MS),
+        );
+        retry
+    }
+
+    async fn artifact_retry_config(
+        &self,
+        worker: &WorkerConfig,
+        escaped_remote_path: &str,
+        patterns: &[String],
+    ) -> RetryConfig {
+        let fallback = self.effective_rsync_retry_config();
+        // An explicit operator ceiling remains the whole retrieval budget:
+        // do not spend an additional planning window before starting it.
+        if self.transfer_config.max_transfer_time_ms.is_some_and(|ms| ms > 0) {
+            return fallback;
+        }
+        let estimate = execute_rsync_with_retry(&fallback, "estimate_artifact_retrieval", || {
+            let mut cmd = self.build_retrieve_command(worker, escaped_remote_path, patterns);
+            cmd.arg("--dry-run");
+            cmd
+        }).await;
+        match estimate {
+            Ok(output) if output.status.success() => {
+                if let Some(bytes) = parse_rsync_total_size(&String::from_utf8_lossy(&output.stdout)) {
+                    let retry = self.artifact_retry_config_for_size(bytes);
+                    info!(selected_bytes = bytes, total_timeout_ms = retry.total_timeout_ms,
+                        "Artifact retrieval budget from selected remote files");
+                    return retry;
+                }
+                warn!("Artifact size estimate missing; retaining configured retrieval budget");
+            }
+            Ok(output) => warn!("Artifact size estimate failed: {}", String::from_utf8_lossy(&output.stderr)),
+            Err(error) => warn!("Artifact size estimate failed: {error}; retaining configured retrieval budget"),
+        }
+        fallback
+    }
+
     fn source_sync_attempt_timeout(&self, effective_excludes: &[String]) -> std::time::Duration {
         if self.transfer_config.sync_timeout_ms.is_some() {
             return self.transfer_config.sync_timeout_for_payload(0);
@@ -4286,6 +4337,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd.arg("-az");
         add_portable_rsync_archive_args(&mut cmd);
         cmd.arg("--stats")
+            .arg("--timeout=30")
             .args(capabilities.name_listing_args())
             .arg("--out-format=%i %n")
             .arg("--safe-links")
@@ -4378,6 +4430,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // Flavour-specific spellings of progress / stats / per-file listing
         // (issue #66); see RsyncCapabilities for the mapping.
         cmd.args(capabilities.progress_args())
+            .arg("--timeout=30")
             .args(capabilities.stats_args())
             // name2 + itemized out-format feed the zero-build-output detector
             // (bd-mpbav); see build_retrieve_command for the rationale.
@@ -4573,7 +4626,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let start = std::time::Instant::now();
 
         // Execute rsync with retry logic for transient errors
-        let retry_config = self.effective_rsync_retry_config();
+        let retry_config = self.artifact_retry_config(worker, &escaped_remote_path, artifact_patterns).await;
         let output = execute_rsync_with_retry(&retry_config, "retrieve_artifacts", || {
             self.build_retrieve_command(worker, &escaped_remote_path, artifact_patterns)
         })
@@ -4936,8 +4989,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             build_cmd().as_std().get_args().collect::<Vec<_>>()
         );
 
-        let retry_config = self.effective_rsync_retry_config();
-        let (output, duration_ms) = run_command_streaming_with_retry(
+        let retrieval_start = std::time::Instant::now();
+        let retry_config = self.artifact_retry_config(worker, &escaped_remote_path, artifact_patterns).await;
+        let (output, _) = run_command_streaming_with_retry(
             &retry_config,
             "retrieve_artifacts_streaming",
             None,
@@ -4948,6 +5002,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             },
         )
         .await?;
+        let duration_ms = retrieval_start.elapsed().as_millis() as u64;
 
         // An exit-0 partial download leaves the local artifact tree incomplete;
         // fail rather than report success (see retrieve_artifacts).
