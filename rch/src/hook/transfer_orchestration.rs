@@ -45,7 +45,8 @@ use super::progress_reporting::{
 use super::remote_result::RemoteExecutionResult;
 use super::repo_updater::maybe_sync_repo_set_with_repo_updater;
 use super::source_fidelity::{
-    PreparedSourceContentRoot, finalize_source_content_receipt, prepare_source_content_root,
+    PreparedSourceContentRoot, build_source_commit_env, capture_build_source_stamp,
+    finalize_source_content_receipt, prepare_source_content_root, reconcile_build_source_stamps,
     verify_source_content_roots,
 };
 use super::ssh::{
@@ -437,6 +438,11 @@ pub(super) async fn execute_remote_compilation(
     let dependency_entry_root = explicit_manifest_root
         .as_deref()
         .unwrap_or(&normalized_project_root);
+    let build_source_before = if kind.is_some_and(|kind| kind.command_base() == "cargo") {
+        Some(capture_build_source_stamp(dependency_entry_root, clean_overlay).await)
+    } else {
+        None
+    };
     let raw_sync_roots = if let Some(spec) = clean_overlay {
         let mut roots = vec![normalized_project_root.clone()];
         roots.extend(spec.dependencies.iter().map(|(root, _)| root.clone()));
@@ -838,9 +844,24 @@ pub(super) async fn execute_remote_compilation(
     // remotely (same timeout_for_kind value). Give the local SSH stream a grace
     // margin over that cap so a genuine remote group-kill propagates as exit
     // 137 instead of losing the race to a local "SSH command timed out" (#20).
-    let effective_env_allowlist =
+    let mut effective_env_allowlist =
         cargo_target_env_allowlist(&env_allowlist, forwarded_cargo_target_dir.is_some());
-    let cargo_env_overrides = cargo_target_env_overrides(forwarded_cargo_target_dir.as_deref());
+    let mut cargo_env_overrides_map =
+        cargo_target_env_overrides(forwarded_cargo_target_dir.as_deref()).unwrap_or_default();
+    if build_source_before.is_some() {
+        cargo_env_overrides_map.extend(build_source_commit_env(|key| std::env::var(key).ok()));
+        for key in rch_common::BUILD_COMMIT_ENV_VARS {
+            if !effective_env_allowlist
+                .iter()
+                .map(|item| item.trim())
+                .any(|item| item == *key)
+            {
+                effective_env_allowlist.push((*key).to_owned());
+            }
+        }
+    }
+    let cargo_env_overrides =
+        (!cargo_env_overrides_map.is_empty()).then_some(cargo_env_overrides_map);
     // Remote target-dir name for the forwarded-CARGO_TARGET_DIR sync. By default
     // this is a STABLE pooled name keyed on (project, toolchain, triple, profile,
     // features) so independent jobs with identical dimensions REUSE the same warm
@@ -1302,6 +1323,17 @@ pub(super) async fn execute_remote_compilation(
     if let Some(lock) = source_pair_lock.as_mut() {
         lock.ensure_held()?;
     }
+
+    let stamped_command = if let Some(before) = build_source_before.as_deref() {
+        let after = capture_build_source_stamp(dependency_entry_root, clean_overlay).await;
+        let stamp = reconcile_build_source_stamps(before, &after);
+        Some(super::cargo_target_dir::bind_build_source_stamp(
+            command, &stamp,
+        )?)
+    } else {
+        None
+    };
+    let command = stamped_command.as_deref().unwrap_or(command);
 
     // Step 2: Execute command remotely with streaming output
     // Mask sensitive data (API keys, tokens, passwords) before logging
