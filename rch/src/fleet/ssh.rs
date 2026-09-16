@@ -121,9 +121,24 @@ pub enum FleetSshError {
     /// Host key verification failed.
     #[error("Host key verification failed for {host}")]
     HostKeyVerificationFailed { host: String },
+
+    #[error("SSH timed out on {host}: {reason}")]
+    TransportTimeout { host: String, reason: String },
+
+    #[error("Could not execute SSH for {host}: {reason}")]
+    ExecutionFailed { host: String, reason: String },
 }
 
 impl FleetSshError {
+    pub fn is_timeout(&self) -> bool {
+        matches!(
+            self,
+            Self::ConnectionTimeout { .. }
+                | Self::CommandTimeout { .. }
+                | Self::TransportTimeout { .. }
+        )
+    }
+
     /// Create an error from SSH stderr output.
     pub fn from_ssh_stderr(host: &str, user: &str, stderr: &str, exit_code: i32) -> Self {
         let stderr_lower = stderr.to_lowercase();
@@ -142,7 +157,17 @@ impl FleetSshError {
         }
 
         if stderr_lower.contains("connection timed out")
-            || stderr_lower.contains("connection refused")
+            || stderr_lower.contains("operation timed out")
+            || stderr_lower.contains("connection timeout")
+            || (stderr_lower.contains("timeout, server") && stderr_lower.contains("not responding"))
+        {
+            return FleetSshError::TransportTimeout {
+                host: host.to_owned(),
+                reason: stderr.trim().to_owned(),
+            };
+        }
+
+        if stderr_lower.contains("connection refused")
             || stderr_lower.contains("no route to host")
             || stderr_lower.contains("network is unreachable")
         {
@@ -286,8 +311,8 @@ impl<'a> SshExecutor<'a> {
 
     /// Check SSH connectivity to the worker.
     ///
-    /// Returns `true` if the connection succeeds, `false` otherwise.
-    pub async fn check_connectivity(&self) -> Result<bool> {
+    /// Returns `true` on success and preserves failures as typed errors.
+    pub async fn check_connectivity(&self) -> Result<bool, FleetSshError> {
         // Mock mode: skip actual SSH
         if mock::is_mock_enabled() || mock::is_mock_worker(self.worker) {
             debug!(
@@ -1138,6 +1163,47 @@ mod tests {
             255,
         );
         assert!(matches!(err, FleetSshError::HostUnreachable { .. }));
+    }
+
+    #[test]
+    fn fleet_ssh_timeout_stderr_is_not_confirmed_unreachability() {
+        for stderr in [
+            "ssh: connect to host worker1 port 22: Connection timed out",
+            "kex_exchange_identification: read: Operation timed out",
+            "Timeout, server worker1 not responding.",
+            "Connection timed out during banner exchange\nConnection to 127.0.0.1 port 43817 timed out",
+        ] {
+            let error = FleetSshError::from_ssh_stderr("worker1", "ubuntu", stderr, 255);
+            assert!(
+                matches!(error, FleetSshError::TransportTimeout { .. }),
+                "{stderr}: {error:?}"
+            );
+            assert!(error.is_timeout());
+        }
+    }
+
+    #[test]
+    fn fleet_ssh_timeout_preserves_hard_failure_contrasts() {
+        for stderr in [
+            "ssh: connect to host worker1 port 22: Connection refused",
+            "ssh: connect to host worker1 port 22: No route to host",
+            "ssh: connect to host worker1 port 22: Network is unreachable",
+        ] {
+            let error = FleetSshError::from_ssh_stderr("worker1", "ubuntu", stderr, 255);
+            assert!(matches!(error, FleetSshError::HostUnreachable { .. }));
+            assert!(!error.is_timeout());
+        }
+        let auth = FleetSshError::from_ssh_stderr(
+            "worker1",
+            "ubuntu",
+            "Permission denied (publickey).",
+            255,
+        );
+        assert!(matches!(auth, FleetSshError::AuthenticationFailed { .. }));
+        assert!(!auth.is_timeout());
+        let unknown = FleetSshError::from_ssh_stderr("worker1", "ubuntu", "unknown failure", 255);
+        assert!(matches!(unknown, FleetSshError::CommandFailed { .. }));
+        assert!(!unknown.is_timeout());
     }
 
     #[test]
