@@ -259,7 +259,10 @@ where
             .with_filter(filter)
             .boxed(),
     };
-    tracing_subscriber::registry().with(layer.and_then(formatting))
+    // Keep these as sibling layers. In tracing-subscriber 0.3.23, composing
+    // Layer<Registry> with and_then can use only the outer layer's level hint,
+    // suppressing events that the caller's independently filtered layer needs.
+    tracing_subscriber::registry().with(vec![layer.boxed(), formatting])
 }
 
 fn finish_subscriber<S>(
