@@ -636,6 +636,7 @@ struct PartialLayer0Config {
 #[derive(Debug, Default, Deserialize)]
 struct PartialGeneralConfig {
     enabled: Option<bool>,
+    role: Option<rch_common::BoxRole>,
     force_local: Option<bool>,
     force_remote: Option<bool>,
     log_level: Option<String>,
@@ -1277,6 +1278,7 @@ pub fn validate_workers_config_file(path: &Path) -> FileValidation {
 fn default_sources_map() -> ConfigSourceMap {
     let mut sources = HashMap::new();
     for key in [
+        "general.role",
         "general.enabled",
         "general.force_local",
         "general.force_remote",
@@ -1335,6 +1337,10 @@ fn apply_layer(
     source: &ConfigValueSource,
     _defaults: &RchConfig,
 ) {
+    if let Some(role) = layer.general.role {
+        config.general.role = role;
+        set_source(sources, "general.role", source.clone());
+    }
     if let Some(enabled) = layer.general.enabled {
         config.general.enabled = enabled;
         set_source(sources, "general.enabled", source.clone());
@@ -3604,6 +3610,32 @@ min_local_time_ms = 2000
         assert!(!config.general.force_local);
         assert_eq!(config.general.log_level, "info");
         assert_eq!(config.compilation.min_local_time_ms, 2000);
+    }
+
+    #[test]
+    fn dispatcher_role_source_tracking_preserves_explicit_hybrid_override() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let user = dir.join("user.toml");
+        let project = dir.join("project.toml");
+        std::fs::write(&user, "[general]\nrole = 'dispatcher'\n").unwrap();
+        std::fs::write(&project, "[general]\nrole = 'hybrid'\n").unwrap();
+        let overrides = HashMap::new();
+        let loaded =
+            load_config_with_sources_from_paths(Some(&user), None, Some(&overrides)).unwrap();
+        assert_eq!(loaded.config.general.role, rch_common::BoxRole::Dispatcher);
+        assert_eq!(
+            loaded.sources["general.role"],
+            ConfigValueSource::UserConfig(user.clone())
+        );
+        let loaded =
+            load_config_with_sources_from_paths(Some(&user), Some(&project), Some(&overrides))
+                .unwrap();
+        assert_eq!(loaded.config.general.role, rch_common::BoxRole::Hybrid);
+        assert_eq!(
+            loaded.sources["general.role"],
+            ConfigValueSource::ProjectConfig(project)
+        );
     }
 
     #[test]

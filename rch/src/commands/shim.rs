@@ -828,6 +828,28 @@ pub fn shim_install(
 
 /// `rch shim status` — report install state, version drift, PATH order, and any
 /// local builds currently running.
+pub(crate) fn dispatcher_shim_problems() -> Result<Vec<String>> {
+    let mut problems = Vec::new();
+    let cargo = cargo_shim_path()?;
+    let clippy = cargo_clippy_shim_path()?;
+    for (name, path) in [("cargo", &cargo), ("cargo-clippy", &clippy)] {
+        if which::which(path).is_err() {
+            problems.push(format!("{name} shim is missing or not executable"));
+        } else if installed_shim_version(path).as_deref() != Some(SHIM_VERSION) {
+            problems.push(format!("{name} shim is stale or unmanaged"));
+        }
+    }
+    if !cargo_interception(&cargo).intercepts() {
+        problems.push("PATH does not resolve Cargo through the RCH shim".to_string());
+    }
+    let (wrapped, total) = toolchain_wrap_counts();
+    if wrapped != total {
+        problems.push(format!("only {wrapped}/{total} toolchain Cargo binaries are wrapped"));
+    }
+    Ok(problems)
+}
+
+/// Report shim install state without changing shell or toolchain files.
 pub fn shim_status(ctx: &OutputContext) -> Result<()> {
     let style = ctx.theme();
     let path = cargo_shim_path()?;
