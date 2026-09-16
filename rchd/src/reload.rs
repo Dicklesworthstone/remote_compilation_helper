@@ -1,7 +1,8 @@
-//! Hot-reload support for daemon configuration.
+//! Hot-reload support for the daemon's worker configuration.
 //!
-//! Provides file watching and config reload functionality for workers.toml
-//! and config.toml without requiring a daemon restart.
+//! Watch the selected workers file (including custom filenames) without a
+//! daemon restart. Invalid or unavailable snapshots retain the current fleet;
+//! only an explicit `workers = []` requests an empty fleet.
 
 use crate::config::{self, WorkersConfig};
 use crate::workers::WorkerPool;
@@ -17,7 +18,7 @@ use tracing::{debug, error, info, warn};
 /// Configuration for the hot-reload watcher.
 #[derive(Debug, Clone)]
 pub struct ReloadConfig {
-    /// Path to workers.toml (if provided via CLI).
+    /// Path to the workers configuration (if provided via CLI).
     pub workers_config_path: Option<PathBuf>,
     /// Debounce interval for file changes.
     pub debounce_ms: u64,
@@ -268,6 +269,55 @@ pub async fn apply_worker_diff(pool: &WorkerPool, diff: &ConfigDiff) -> Result<R
     Ok(result)
 }
 
+fn workers_reload_path(config_path: Option<&Path>) -> Result<PathBuf> {
+    let path = match config_path {
+        Some(path) => path.to_path_buf(),
+        None => config::config_dir()
+            .context("Could not determine workers configuration directory")?
+            .join("workers.toml"),
+    };
+    anyhow::ensure!(
+        path.file_name().is_some(),
+        "Workers configuration must name a file: {}",
+        path.display()
+    );
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()
+            .context("Could not resolve relative workers configuration path")?
+            .join(path))
+    }
+}
+
+/// Reload is not first-run startup: absence is not an instruction to remove
+/// the fleet. Read exactly one snapshot, without an exists-then-read race, and
+/// require the workers field so an editor's empty/truncated file cannot pass
+/// serde's startup defaults. Explicit `workers = []` still drains the fleet.
+fn load_workers_reload_snapshot(config_path: Option<&Path>) -> Result<WorkersConfig> {
+    #[derive(serde::Deserialize)]
+    struct Snapshot {
+        workers: Vec<config::WorkerEntry>,
+    }
+
+    let path = workers_reload_path(config_path)?;
+    let contents = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "Failed to read workers reload snapshot {}; retaining current fleet",
+            path.display()
+        )
+    })?;
+    let snapshot: Snapshot = toml::from_str(&contents).with_context(|| {
+        format!(
+            "Invalid workers reload snapshot {}; retaining current fleet (use workers = [] to explicitly empty it)",
+            path.display()
+        )
+    })?;
+    Ok(WorkersConfig {
+        workers: snapshot.workers,
+    })
+}
+
 /// Reload workers configuration from disk and apply changes.
 pub async fn reload_workers(
     pool: &WorkerPool,
@@ -276,9 +326,8 @@ pub async fn reload_workers(
 ) -> Result<ReloadResult> {
     info!("Reloading workers configuration...");
 
-    // Load new configuration
-    let new_config =
-        config::load_workers_config(config_path).context("Failed to load workers configuration")?;
+    // Never turn a missing or incomplete snapshot into an empty desired fleet.
+    let new_config = load_workers_reload_snapshot(config_path)?;
 
     // Validate if requested
     let mut warnings = Vec::new();
@@ -333,6 +382,26 @@ pub enum ReloadMessage {
     Shutdown,
 }
 
+/// A rename can carry both the old and new path. Remove events trigger a
+/// read-only reconciliation too; the strict loader retains the previous fleet.
+/// Rescan notifications may have no paths, and must not be silently discarded.
+fn event_requires_workers_reload(event: &Event, workers_path: &Path) -> bool {
+    event.need_rescan()
+        || (!event.kind.is_access() && event.paths.iter().any(|path| path == workers_path))
+}
+
+fn queue_workers_reload(tx: &mpsc::Sender<ReloadMessage>, workers_path: &Path) {
+    match tx.try_send(ReloadMessage::ConfigChanged(workers_path.to_path_buf())) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {
+            // A queued notification already requests a fresh snapshot. Coalesce
+            // bursts instead of blocking notify's thread (including on drop).
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            debug!("Config watcher receiver has shut down");
+        }
+    }
+}
+
 /// File watcher for configuration hot-reload.
 pub struct ConfigWatcher {
     config: ReloadConfig,
@@ -365,59 +434,47 @@ impl ConfigWatcher {
         mut self,
         tx: mpsc::Sender<ReloadMessage>,
     ) -> Result<tokio::task::JoinHandle<()>> {
-        // Determine paths to watch
-        let workers_path = self.config.workers_config_path.clone();
-        let config_dir = config::config_dir();
+        let selected = workers_reload_path(self.config.workers_config_path.as_deref())?;
+        // Watch the parent, not the file inode, so atomic replacements keep
+        // working. Resolve only the directory: the file need not exist yet and
+        // its leaf may itself be an operator-managed symlink.
+        let parent = selected
+            .parent()
+            .context("Workers configuration has no parent directory")?
+            .canonicalize()
+            .with_context(|| format!("Failed to resolve workers config parent for {selected:?}"))?;
+        let workers_path = parent.join(
+            selected
+                .file_name()
+                .context("Workers configuration must name a file")?,
+        );
+        // Freeze the same path for automatic and manual reloads. Do not watch
+        // a custom basename but then reread the default workers.toml instead.
+        self.config.workers_config_path = Some(workers_path.clone());
 
-        // Set up file watcher
         let watcher_tx = tx.clone();
+        let watched_path = workers_path.clone();
         let debounce = Duration::from_millis(self.config.debounce_ms);
-
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             match res {
-                Ok(event) => {
-                    // Only handle modify/create events
-                    if event.kind.is_modify() || event.kind.is_create() {
-                        for path in event.paths {
-                            if let Some(filename) = path.file_name() {
-                                let name = filename.to_string_lossy();
-                                if name == "workers.toml" || name == "config.toml" {
-                                    debug!("Config file changed: {:?}", path);
-                                    if let Err(e) = watcher_tx
-                                        .blocking_send(ReloadMessage::ConfigChanged(path.clone()))
-                                    {
-                                        error!("Failed to send reload message: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                Ok(event) if event_requires_workers_reload(&event, &watched_path) => {
+                    debug!("Workers config changed: {:?}", watched_path);
+                    queue_workers_reload(&watcher_tx, &watched_path);
                 }
+                Ok(_) => {}
                 Err(e) => {
-                    error!("File watcher error: {}", e);
+                    error!("File watcher error: {}; reconciling workers snapshot", e);
+                    queue_workers_reload(&watcher_tx, &watched_path);
                 }
             }
         })?;
-
-        // Watch the workers config path if provided
-        if let Some(ref path) = workers_path
-            && let Some(parent) = path.parent()
-        {
-            watcher.watch(parent, RecursiveMode::NonRecursive)?;
-            info!("Watching for config changes in {:?}", parent);
-        }
-
-        // Watch the default config directory
-        if let Some(dir) = config_dir
-            && dir.exists()
-        {
-            watcher.watch(&dir, RecursiveMode::NonRecursive)?;
-            info!("Watching for config changes in {:?}", dir);
-        }
-
+        watcher.watch(&parent, RecursiveMode::NonRecursive)?;
+        info!("Watching workers configuration {:?}", workers_path);
         self._watcher = Some(watcher);
 
-        // Start the reload loop
+        // Close the gap between the daemon's initial read and watch registration.
+        // The callback and this reconciliation use the same bounded queue.
+        queue_workers_reload(&tx, &workers_path);
         let handle = tokio::spawn(async move {
             self.run_reload_loop().await;
         });
@@ -487,7 +544,7 @@ impl ConfigWatcher {
             }
             Err(e) => {
                 error!("Configuration reload failed: {}", e);
-                // Fail-open: keep running with existing config
+                // Keep serving the last successfully loaded worker configuration.
             }
         }
     }
@@ -1459,5 +1516,208 @@ enabled = true
 
         let result = reload_workers(&pool, Some(&workers_path), true).await;
         assert!(result.is_err());
+    }
+
+    async fn reload_safety_pool() -> WorkerPool {
+        let pool = WorkerPool::new();
+        for id in ["busy", "idle"] {
+            pool.add_worker(WorkerConfig {
+                id: WorkerId::new(id),
+                total_slots: 8,
+                ..WorkerConfig::default()
+            })
+            .await;
+        }
+        let busy = pool.get(&WorkerId::new("busy")).await.unwrap();
+        assert!(busy.reserve_slots(1).await);
+        busy.add_cached_project("retained-project".to_owned()).await;
+        pool
+    }
+
+    #[tokio::test]
+    async fn reload_safety_missing_and_incomplete_snapshots_preserve_the_fleet() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let pool = reload_safety_pool().await;
+        let cases = [
+            ("missing", None),
+            ("empty", Some("")),
+            ("comments", Some("# editor has not written the workers yet\n")),
+            ("wrong-table", Some("[general]\nenabled = true\n")),
+            ("malformed", Some("[[workers]\n")),
+            ("incomplete-entry", Some("[[workers]]\nid = 'busy'\n")),
+        ];
+        for (name, contents) in cases {
+            let path = root.join(name);
+            if let Some(contents) = contents {
+                std::fs::write(&path, contents).unwrap();
+            }
+            for validate in [false, true] {
+                assert!(
+                    reload_workers(&pool, Some(&path), validate).await.is_err(),
+                    "accepted {name} with validation={validate}"
+                );
+                assert_eq!(pool.len(), 2);
+                let busy = pool.get(&WorkerId::new("busy")).await.unwrap();
+                let idle = pool.get(&WorkerId::new("idle")).await.unwrap();
+                assert_eq!(busy.used_slots(), 1);
+                assert!(busy.has_cached_project("retained-project").await);
+                assert!(!busy.is_draining().await);
+                assert!(!idle.is_draining().await);
+            }
+        }
+        assert!(reload_workers(&pool, Some(&root), true).await.is_err());
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reload_safety_explicit_empty_snapshot_still_drains_without_losing_reservations() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("workers.toml");
+        std::fs::write(&path, "workers = []\n").unwrap();
+        for validate in [false, true] {
+            let pool = reload_safety_pool().await;
+            let result = reload_workers(&pool, Some(&path), validate).await.unwrap();
+            assert_eq!(result.removed, 1);
+            assert_eq!(result.warnings.len(), 1);
+            assert!(pool.get(&WorkerId::new("idle")).await.is_none());
+            let busy = pool.get(&WorkerId::new("busy")).await.unwrap();
+            assert!(busy.is_draining().await);
+            assert_eq!(busy.used_slots(), 1);
+        }
+    }
+
+    #[test]
+    fn reload_safety_event_filter_uses_the_selected_path_and_rescan_flag() {
+        use notify::event::{AccessKind, CreateKind, Flag, ModifyKind, RemoveKind, RenameMode};
+        use notify::EventKind;
+
+        let selected = PathBuf::from("/config/fleet-primary.toml");
+        let sibling = PathBuf::from("/config/workers.toml");
+        for kind in [
+            EventKind::Any,
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Remove(RemoveKind::File),
+        ] {
+            assert!(event_requires_workers_reload(
+                &Event::new(kind).add_path(selected.clone()),
+                &selected
+            ));
+            assert!(!event_requires_workers_reload(
+                &Event::new(kind).add_path(sibling.clone()),
+                &selected
+            ));
+        }
+        let rename = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(sibling)
+            .add_path(selected.clone());
+        assert!(event_requires_workers_reload(&rename, &selected));
+        let read = Event::new(EventKind::Access(AccessKind::Any)).add_path(selected.clone());
+        assert!(!event_requires_workers_reload(&read, &selected));
+        let rescan = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        assert!(event_requires_workers_reload(&rescan, &selected));
+    }
+
+    #[tokio::test]
+    async fn reload_safety_notification_bursts_coalesce_without_blocking() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let path = Path::new("/config/fleet-primary.toml");
+        for _ in 0..10_000 {
+            queue_workers_reload(&tx, path);
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ReloadMessage::ConfigChanged(received)) if received == path
+        ));
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        queue_workers_reload(&tx, path);
+        assert!(rx.try_recv().is_ok(), "later changes must still be delivered");
+        drop(rx);
+        queue_workers_reload(&tx, path);
+    }
+
+    #[tokio::test]
+    async fn reload_safety_native_watcher_tracks_custom_file_replacements_and_recovers() {
+        struct WatcherTask(tokio::task::JoinHandle<()>);
+        impl Drop for WatcherTask {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
+        fn write_snapshot(path: &Path, slots: u32) {
+            std::fs::write(
+                path,
+                format!("[[workers]]\nid = 'watched'\nhost = 'localhost'\ntotal_slots = {slots}\n"),
+            )
+            .unwrap();
+        }
+
+        async fn wait_for_slots(pool: &WorkerPool, slots: u32) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(worker) = pool.get(&WorkerId::new("watched")).await
+                        && worker.config.read().await.total_slots == slots
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("native watcher did not apply the selected snapshot");
+        }
+
+        let root = tempfile::tempdir().unwrap().keep();
+        let selected = root.join("fleet-primary.toml");
+        write_snapshot(&selected, 8);
+        // No initial pool load: registration must reconcile an edit that could
+        // have happened between daemon startup's read and installing the watch.
+        let pool = WorkerPool::new();
+        let (watcher, tx) = ConfigWatcher::new(
+            ReloadConfig {
+                workers_config_path: Some(selected.clone()),
+                debounce_ms: 20,
+                validate_before_apply: true,
+            },
+            pool.clone(),
+        )
+        .unwrap();
+        let mut task = WatcherTask(watcher.start(tx.clone()).await.unwrap());
+        wait_for_slots(&pool, 8).await;
+        let busy = pool.get(&WorkerId::new("watched")).await.unwrap();
+        assert!(busy.reserve_slots(1).await);
+
+        // Watch the directory so replacing the inode does not lose the watch.
+        let replacement = root.join("replacement.toml");
+        write_snapshot(&replacement, 16);
+        std::fs::rename(&replacement, &selected).unwrap();
+        wait_for_slots(&pool, 16).await;
+        assert_eq!(busy.used_slots(), 1);
+
+        let retained = root.join("previous-snapshot.retained");
+        std::fs::rename(&selected, &retained).unwrap();
+        assert!(reload_workers(&pool, Some(&selected), true).await.is_err());
+        assert!(!busy.is_draining().await);
+        assert_eq!(busy.used_slots(), 1);
+        write_snapshot(&selected, 32);
+        wait_for_slots(&pool, 32).await;
+
+        // This is an intentional empty snapshot, not a failed read.
+        std::fs::write(&replacement, "workers = []\n").unwrap();
+        std::fs::rename(&replacement, &selected).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !busy.is_draining().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("explicit empty snapshot must drain the busy worker");
+        assert_eq!(busy.used_slots(), 1);
+        tx.send(ReloadMessage::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), &mut task.0)
+            .await
+            .expect("watcher shutdown blocked")
+            .unwrap();
     }
 }

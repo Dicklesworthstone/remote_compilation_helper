@@ -40,7 +40,7 @@ mod workers;
 
 use anyhow::{Context, Result, bail};
 use chrono::{Duration as ChronoDuration, Local};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use rch_common::{LogConfig, SelfTestConfig, init_logging};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -76,7 +76,7 @@ use ui::{DaemonBanner, MetricsDashboard, WorkerStatusPanel};
     about = "RCH daemon - worker fleet orchestration"
 )]
 struct Cli {
-    /// Path to Unix socket
+    /// Socket pin; otherwise use socket environment overrides and config.toml [general].socket_path
     #[arg(short, long, default_value_os_t = crate::config::default_socket_path())]
     socket: PathBuf,
 
@@ -125,6 +125,38 @@ struct Cli {
     /// `[api] token_file` in config.toml.
     #[arg(long)]
     api_token_file: Option<String>,
+}
+
+/// Resolve the listener and the client's effective shared endpoint before
+/// service-manager delegation or binding (#69). Keep an explicit CLI pin
+/// distinct from clap's default, even when their path strings are equal.
+fn daemon_socket_for_startup(
+    matches: &clap::ArgMatches,
+    configured: &str,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<(PathBuf, String)> {
+    // Match rch::config's canonical-over-alias precedence. An explicitly empty
+    // value wins too: it must fail validation, not select another daemon.
+    let client_socket = ["RCH_SOCKET_PATH", "RCH_DAEMON_SOCKET"]
+        .into_iter()
+        .find_map(&mut lookup)
+        .unwrap_or_else(|| configured.to_owned());
+    let socket = if matches.value_source("socket") == Some(clap::parser::ValueSource::CommandLine) {
+        matches
+            .get_one::<PathBuf>("socket")
+            .cloned()
+            .context("missing --socket value")?
+    } else {
+        PathBuf::from(&client_socket)
+    };
+    anyhow::ensure!(
+        socket.is_absolute()
+            && socket.file_name().is_some()
+            && !socket.to_string_lossy().chars().any(char::is_control),
+        "daemon socket must be an absolute file path without control characters: {}; set --socket, RCH_SOCKET_PATH, or config.toml [general].socket_path",
+        socket.display()
+    );
+    Ok((socket, client_socket))
 }
 
 /// Build the selector used by daemon startup with disk admission enabled.
@@ -357,10 +389,14 @@ fn rchd_systemd_unit_present() -> bool {
 /// No-op on macOS and on Linux hosts with no rchd.service (manual management).
 /// An explicitly separate socket AND worker configuration designate an isolated
 /// pool. Its operator must first drain those workers from any shared daemon.
-fn defer_to_systemd_if_managed(socket: &Path, workers_config: Option<&Path>) {
+fn defer_to_systemd_if_managed(
+    socket: &Path,
+    workers_config: Option<&Path>,
+    shared_socket: &Path,
+) {
     #[cfg(target_os = "linux")]
     {
-        if isolated_worker_pool(socket, workers_config) {
+        if isolated_worker_pool(socket, workers_config, shared_socket) {
             return;
         }
         // Only defer when we can CONFIRM we are not the unit's own process.
@@ -381,11 +417,17 @@ fn defer_to_systemd_if_managed(socket: &Path, workers_config: Option<&Path>) {
         std::process::exit(0);
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = (socket, workers_config);
+    let _ = (socket, workers_config, shared_socket);
 }
 
-fn isolated_worker_pool(socket: &Path, workers_config: Option<&Path>) -> bool {
-    socket != crate::config::default_socket_path() && workers_config.is_some()
+fn isolated_worker_pool(
+    socket: &Path,
+    workers_config: Option<&Path>,
+    shared_socket: &Path,
+) -> bool {
+    // A configured shared endpoint is not an isolated pool merely because it
+    // differs from the compiled default (#69).
+    socket != shared_socket && workers_config.is_some()
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -686,13 +728,29 @@ async fn bind_daemon_socket_with_mode(
 }
 
 async fn try_bind_daemon_socket(socket: &Path) -> Result<BindAttempt> {
-    if socket.exists() {
-        if socket_has_live_listener(socket).await? {
-            return Ok(BindAttempt::SocketHeld);
+    use std::os::unix::fs::FileTypeExt;
+
+    match std::fs::symlink_metadata(socket) {
+        Ok(metadata) => {
+            // A typo in a socket pin must never turn stale-socket cleanup into
+            // deletion of an operator's regular file, directory, or symlink.
+            anyhow::ensure!(
+                metadata.file_type().is_socket(),
+                "refusing to replace non-socket path {}",
+                socket.display()
+            );
+            if socket_has_live_listener(socket).await? {
+                return Ok(BindAttempt::SocketHeld);
+            }
+            std::fs::remove_file(socket).with_context(|| {
+                format!("failed to remove stale daemon socket {}", socket.display())
+            })?;
         }
-        std::fs::remove_file(socket).with_context(|| {
-            format!("failed to remove stale daemon socket {}", socket.display())
-        })?;
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect daemon socket {}", socket.display()));
+        }
     }
 
     let listener = UnixListener::bind(socket)
@@ -753,7 +811,8 @@ async fn drain_connections(connections: &mut tokio::task::JoinSet<()>, grace: Du
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches)?;
     let startup_started = Instant::now();
 
     if cli.debug_routing {
@@ -770,10 +829,29 @@ async fn main() -> Result<()> {
 
     info!("Starting RCH daemon...");
 
+    // #69: resolve the endpoint before delegation or binding, not after the
+    // listener is already live. Invalid configuration must not silently launch
+    // a daemon on a different endpoint. Operator-owned files are not rewritten.
+    let mut rch_config = config::load_rch_config()
+        .context("could not resolve RCH configuration before binding the daemon socket")?;
+    rch_config.self_healing = rch_config.self_healing.with_env_overrides();
+    let (socket, client_socket) = daemon_socket_for_startup(
+        &matches,
+        &rch_config.general.socket_path,
+        |name| std::env::var(name).ok(),
+    )?;
+    cli.socket = socket;
+    rch_config.general.socket_path = client_socket;
+    let shared_socket = PathBuf::from(&rch_config.general.socket_path);
+
     // Enforce single-instance on systemd hosts before we touch the socket.
-    defer_to_systemd_if_managed(&cli.socket, cli.workers_config.as_deref());
+    defer_to_systemd_if_managed(&cli.socket, cli.workers_config.as_deref(), &shared_socket);
     #[cfg(target_os = "macos")]
-    let managed_by_launchd = if isolated_worker_pool(&cli.socket, cli.workers_config.as_deref()) {
+    let managed_by_launchd = if isolated_worker_pool(
+        &cli.socket,
+        cli.workers_config.as_deref(),
+        &shared_socket,
+    ) {
         false
     } else {
         match launchd::resolve(
@@ -781,7 +859,7 @@ async fn main() -> Result<()> {
             "com.rch.daemon",
             nix::unistd::Uid::effective().as_raw(),
             std::process::id(),
-            cli.socket != crate::config::default_socket_path(),
+            cli.socket != shared_socket,
             tokio::time::Instant::now() + Duration::from_secs(5),
         )
         .await?
@@ -829,21 +907,6 @@ async fn main() -> Result<()> {
     let worker_count = workers.len();
     let total_slots: u32 = workers.iter().map(|worker| worker.total_slots).sum();
     info!("Loaded {} workers from configuration", workers.len());
-
-    // Load RCH config for selection and circuit breaker settings
-    let rch_config = match config::load_rch_config() {
-        Ok(mut cfg) => {
-            // Apply environment variable overrides to self-healing config
-            cfg.self_healing = cfg.self_healing.with_env_overrides();
-            cfg
-        }
-        Err(e) => {
-            warn!("Failed to load RCH config: {}, using defaults", e);
-            let mut cfg = rch_common::RchConfig::default();
-            cfg.self_healing = cfg.self_healing.with_env_overrides();
-            cfg
-        }
-    };
 
     // Install the disk-slot policy before adding workers so later config reloads
     // inherit the same budget as workers present at startup.
@@ -1618,6 +1681,76 @@ fn socket_test_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn socket_startup_honors_config_and_client_environment_precedence() {
+        let matches = Cli::command().try_get_matches_from(["rchd"]).unwrap();
+        let (socket, client) =
+            daemon_socket_for_startup(&matches, "/configured.sock", |_| None).unwrap();
+        assert_eq!(socket, PathBuf::from("/configured.sock"));
+        assert_eq!(client, "/configured.sock");
+        let (socket, client) = daemon_socket_for_startup(&matches, "/configured.sock", |name| {
+            (name == "RCH_DAEMON_SOCKET").then(|| "/alias.sock".to_owned())
+        })
+        .unwrap();
+        assert_eq!(socket, PathBuf::from("/alias.sock"));
+        assert_eq!(client, "/alias.sock");
+        let (socket, client) = daemon_socket_for_startup(&matches, "/configured.sock", |name| {
+            Some(if name == "RCH_SOCKET_PATH" { "/canonical.sock" } else { "/alias.sock" }.to_owned())
+        })
+        .unwrap();
+        assert_eq!(socket, PathBuf::from("/canonical.sock"));
+        assert_eq!(client, "/canonical.sock");
+    }
+
+    #[test]
+    fn socket_startup_cli_pin_wins_even_when_equal_to_parser_default() {
+        let default = crate::config::default_socket_path();
+        for flag in ["--socket", "-s"] {
+            let matches = Cli::command()
+                .try_get_matches_from([
+                    std::ffi::OsStr::new("rchd"),
+                    std::ffi::OsStr::new(flag),
+                    default.as_os_str(),
+                ])
+                .unwrap();
+            let (socket, client) = daemon_socket_for_startup(&matches, "/configured.sock", |_| {
+                Some("/environment.sock".to_owned())
+            })
+            .unwrap();
+            assert_eq!(socket, default);
+            assert_eq!(client, "/environment.sock");
+        }
+    }
+
+    #[test]
+    fn socket_startup_invalid_pin_does_not_fall_back_to_another_endpoint() {
+        let matches = Cli::command().try_get_matches_from(["rchd"]).unwrap();
+        for invalid in ["", "relative.sock", "~/rch.sock", "/", "/tmp/rch\n.sock"] {
+            assert!(daemon_socket_for_startup(&matches, invalid, |_| None).is_err());
+            assert!(daemon_socket_for_startup(&matches, "/configured.sock", |name| {
+                Some(if name == "RCH_SOCKET_PATH" { invalid } else { "/alias.sock" }.to_owned())
+            })
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_binding_preserves_non_socket_entries() {
+        let root = socket_test_dir();
+        let file = root.join("operator-file");
+        std::fs::write(&file, "must survive socket misconfiguration").unwrap();
+        let link = root.join("socket-link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let dangling = root.join("dangling-link");
+        std::os::unix::fs::symlink(root.join("absent"), &dangling).unwrap();
+        for path in [&file, &link, &dangling, &root] {
+            assert!(try_bind_daemon_socket(path).await.is_err());
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "must survive socket misconfiguration");
+        assert_eq!(std::fs::read_link(&link).unwrap(), file);
+        assert_eq!(std::fs::read_link(&dangling).unwrap(), root.join("absent"));
+    }
+
     #[tokio::test]
     async fn connection_drain_waits_for_completed_request() {
         let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
@@ -1659,13 +1792,14 @@ mod tests {
 
     #[test]
     fn isolated_pool_requires_both_a_separate_socket_and_explicit_workers() {
-        let shared = crate::config::default_socket_path();
-        let isolated = shared.with_extension("isolated-test.sock");
-        let workers = Path::new("/tmp/isolated-workers.toml");
-        assert!(!isolated_worker_pool(&shared, None));
-        assert!(!isolated_worker_pool(&shared, Some(workers)));
-        assert!(!isolated_worker_pool(&isolated, None));
-        assert!(isolated_worker_pool(&isolated, Some(workers)));
+        for shared in [crate::config::default_socket_path(), PathBuf::from("/configured.sock")] {
+            let isolated = shared.with_extension("isolated-test.sock");
+            let workers = Path::new("/tmp/isolated-workers.toml");
+            assert!(!isolated_worker_pool(&shared, None, &shared));
+            assert!(!isolated_worker_pool(&shared, Some(workers), &shared));
+            assert!(!isolated_worker_pool(&isolated, None, &shared));
+            assert!(isolated_worker_pool(&isolated, Some(workers), &shared));
+        }
     }
     use rch_common::test_guard;
 
