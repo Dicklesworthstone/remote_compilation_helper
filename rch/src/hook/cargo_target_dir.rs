@@ -971,25 +971,14 @@ mod managed_build_dir_tests {
             std::fs::write(dir.path().join(&target), b"\xcf\xfa\xed\xfe\0\0\0\0").unwrap();
             let manifest = vec![host.clone(), target.clone()];
             assert!(
-                foreign_target_artifacts(
-                    dir.path(),
-                    &manifest,
-                    custom,
-                    &pinned,
-                    Some(&pinned)
-                )
-                .is_empty()
+                foreign_target_artifacts(dir.path(), &manifest, custom, &pinned, Some(&pinned))
+                    .is_empty()
             );
             // The exclusion is only for host tools. A foreign binary under the
             // requested triple still fails, and native builds keep their guard.
             std::fs::write(dir.path().join(&target), b"\x7fELF\0\0\0\0").unwrap();
-            let foreign = foreign_target_artifacts(
-                dir.path(),
-                &manifest,
-                custom,
-                &pinned,
-                Some(&pinned),
-            );
+            let foreign =
+                foreign_target_artifacts(dir.path(), &manifest, custom, &pinned, Some(&pinned));
             assert_eq!(foreign.len(), 1);
             assert_eq!(foreign[0].path, target);
             let native = foreign_target_artifacts(dir.path(), &manifest, custom, &pinned, None);

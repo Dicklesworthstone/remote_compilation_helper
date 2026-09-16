@@ -1484,7 +1484,10 @@ fn project_toolchain_for_root(root: &Path) -> Result<ProjectToolchain> {
             .all(|component| !component.chars().any(char::is_control)),
         "Rust toolchain component contains control characters"
     );
-    Ok(ProjectToolchain { channel, components })
+    Ok(ProjectToolchain {
+        channel,
+        components,
+    })
 }
 
 fn detect_project_toolchain() -> Result<ProjectToolchain> {
@@ -1586,7 +1589,10 @@ async fn sync_toolchain_to_worker(
         Ok(false) => {
             // Need to install - update spinner message
             if let Some(ref s) = spinner {
-                s.set_message(&format!("{}: Installing {}...", worker_id, toolchain.channel));
+                s.set_message(&format!(
+                    "{}: Installing {}...",
+                    worker_id, toolchain.channel
+                ));
             }
         }
         Err(e) => {
@@ -1605,7 +1611,10 @@ async fn sync_toolchain_to_worker(
 
     if dry_run {
         if let Some(s) = spinner {
-            s.finish_warning(&format!("{}: Would install {}", worker_id, toolchain.channel));
+            s.finish_warning(&format!(
+                "{}: Would install {}",
+                worker_id, toolchain.channel
+            ));
         }
         return ToolchainSyncResult {
             worker_id: worker_id.clone(),
@@ -1646,7 +1655,10 @@ async fn sync_toolchain_to_worker(
 }
 
 /// Check the toolchain and every required component on a remote worker.
-async fn check_remote_toolchain(worker: &WorkerConfig, toolchain: &ProjectToolchain) -> Result<bool> {
+async fn check_remote_toolchain(
+    worker: &WorkerConfig,
+    toolchain: &ProjectToolchain,
+) -> Result<bool> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("ConnectTimeout=10");
@@ -1670,7 +1682,10 @@ async fn check_remote_toolchain(worker: &WorkerConfig, toolchain: &ProjectToolch
 }
 
 /// Install a toolchain and its components, then verify the resulting state.
-async fn install_remote_toolchain(worker: &WorkerConfig, toolchain: &ProjectToolchain) -> Result<()> {
+async fn install_remote_toolchain(
+    worker: &WorkerConfig,
+    toolchain: &ProjectToolchain,
+) -> Result<()> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("ConnectTimeout=60"); // Toolchain install can take a while
@@ -2261,7 +2276,8 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                remote_toolchain_has_components(&format!("{header}{inventory}"), &required).unwrap(),
+                remote_toolchain_has_components(&format!("{header}{inventory}"), &required)
+                    .unwrap(),
                 expected,
                 "{inventory}"
             );
@@ -2306,9 +2322,7 @@ mod tests {
         let channel = "nightly'; $cash `echo literal`";
         let script = format!("{fake}{}", check_toolchain_command(channel));
         let required = vec!["clippy".into(), "rust-src".into(), "rustfmt".into()];
-        for (present, list_exit, expected_exit) in
-            [("1", "0", 0), ("1", "23", 23), ("0", "0", 0)]
-        {
+        for (present, list_exit, expected_exit) in [("1", "0", 0), ("1", "23", 23), ("0", "0", 0)] {
             let output = std::process::Command::new("sh")
                 .args(["-c", &script])
                 .env("RCH_TEST_CHANNEL", channel)
