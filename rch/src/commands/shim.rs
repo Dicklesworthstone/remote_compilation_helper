@@ -860,7 +860,12 @@ pub fn shim_status(ctx: &OutputContext) -> Result<()> {
     } else {
         None
     };
-    let up_to_date = version.as_deref() == Some(SHIM_VERSION);
+    let up_to_date = version.as_deref() == Some(SHIM_VERSION)
+        && which::which(&path).is_ok()
+        && cargo_clippy_shim_path().is_ok_and(|clippy| {
+            installed_shim_version(&clippy).as_deref() == Some(SHIM_VERSION)
+                && which::which(clippy).is_ok()
+        });
     let interception = if installed {
         cargo_interception(&path)
     } else {
