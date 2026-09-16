@@ -35,7 +35,7 @@ use rabs_cas::blob_store::RAW_PROFILE_V1;
 use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
 use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::manifest_codec::decode_manifest_v1;
-use rabs_cas::materialization::{decide_materialization, materialize_object};
+use rabs_cas::materialization::{MaterializationMode, materialize_object};
 use rabs_cas::metadata_store::{AuthorityRow, RabsMetadataStore, StoreError, digest_key};
 use rabs_cas::publication::{
     AUTHORITY_DIGEST_DOMAIN, CommitDurabilityProfile, OBSERVABLE_PROJECTION_DOMAIN,
@@ -324,10 +324,10 @@ fn install_all(
 ) -> Result<Vec<PathBuf>, ServeError> {
     let mut written = Vec::with_capacity(plan.len());
     for (object, path, text) in plan {
-        // The destination is a subscriber's mutable target tree, and no
-        // reflink isolation has been verified here (nothing computes
-        // that yet), so the policy resolves to a private copy.
-        let mode = decide_materialization(true, false, false);
+        // The backend verifies filesystem CoW isolation before cloning. An
+        // unsupported filesystem or cross-device copy retains the verified
+        // private-copy path; mutable subscribers never alias a CAS inode.
+        let mode = MaterializationMode::VerifiedCowReflink;
         materialize_object(store, object, path, mode).map_err(|e| ServeError::Materialize {
             path: text.clone(),
             reason: e.to_string(),
