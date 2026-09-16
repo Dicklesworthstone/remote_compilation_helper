@@ -1034,6 +1034,7 @@ async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) ->
         target: "rch::doctor::verdict",
         verdict = response.summary.overall.label(),
         scope = metric_scope,
+        daemon_unreachable = response.daemon_unreachable,
         exit_code,
         strict = options.strict,
         lenient = options.lenient,
