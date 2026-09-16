@@ -8,7 +8,7 @@
 //! same evidence emit byte-identical config:
 //!
 //! - **Capability detection is exact.** `-Zthreads` turns on only
-//!   when the rustc version string proves a supported nightly —
+//!   when an explicitly requested nightly reports the actual option —
 //!   never an unconditional unstable flag; a stable or unknown
 //!   toolchain yields a typed "not supported" with the evidence
 //!   echoed. Linker selection reuses the F-series
@@ -32,9 +32,10 @@
 //!   anything beyond the safe core.
 
 use crate::linker_profiles::{LinkerFamily, detect_family};
+use std::num::NonZeroU32;
 
 /// Pack schema version (bump on any semantic change to a knob).
-pub const LAYER0_PACK_VERSION: u32 = 1;
+pub const LAYER0_PACK_VERSION: u32 = 2;
 
 /// The benchmark verdict a knob carries (B014's KILL rule made data).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,13 +67,12 @@ pub struct Knob {
     pub fragment: String,
 }
 
-/// Evidence for `-Zthreads` support: the rustc version line.
-/// Supported = a nightly at or past 1.98 (parallel frontend soak
-/// window per the plan); anything else — stable, beta, older nightly,
-/// unparseable — is typed unsupported with the line echoed.
+/// Evidence for `-Zthreads` support: a nightly version line AND successful
+/// `rustc -Z help` output from the same compiler. A version alone cannot prove
+/// that a custom compiler contains an unstable option.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZThreadsSupport {
-    /// Proven supported by the version evidence.
+    /// Nightly identity and successful option evidence agree.
     Supported {
         /// The nightly version that proved it.
         version: String,
@@ -84,9 +84,11 @@ pub enum ZThreadsSupport {
     },
 }
 
-/// Detect `-Zthreads` support from `rustc --version` output.
+/// Detect support from the same compiler's version and successful `-Z help`.
+/// `None` means the option probe failed or was not performed. Stable and beta
+/// remain unsupported even when a caller uses `RUSTC_BOOTSTRAP`.
 #[must_use]
-pub fn detect_zthreads(rustc_version_line: &str) -> ZThreadsSupport {
+pub fn detect_zthreads(rustc_version_line: &str, z_help: Option<&str>) -> ZThreadsSupport {
     let line = rustc_version_line.trim();
     // Shape: "rustc 1.99.0-nightly (abcdef 2026-07-01)".
     let unsupported = || ZThreadsSupport::Unsupported {
@@ -98,18 +100,24 @@ pub fn detect_zthreads(rustc_version_line: &str) -> ZThreadsSupport {
     let Some((semver, _)) = rest.split_once(' ') else {
         return unsupported();
     };
-    if !semver.ends_with("-nightly") {
-        return unsupported();
-    }
-    let core = semver.trim_end_matches("-nightly");
-    let mut parts = core.split('.');
-    let (Some(major), Some(minor)) = (
-        parts.next().and_then(|p| p.parse::<u32>().ok()),
-        parts.next().and_then(|p| p.parse::<u32>().ok()),
-    ) else {
+    let Some(core) = semver.strip_suffix("-nightly") else {
         return unsupported();
     };
-    if major > 1 || (major == 1 && minor >= 98) {
+    let parts: Vec<_> = core.split('.').collect();
+    if parts.len() != 3
+        || parts.iter().any(|p| {
+            p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) || p.parse::<u32>().is_err()
+        })
+    {
+        return unsupported();
+    }
+    let has_threads = z_help.is_some_and(|help| {
+        help.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next() == Some("-Z") && fields.next() == Some("threads=val")
+        })
+    });
+    if has_threads {
         ZThreadsSupport::Supported {
             version: semver.to_owned(),
         }
@@ -146,6 +154,10 @@ pub const PALETTE_V1: CommandPalette = CommandPalette {
 pub struct PackEvidence {
     /// `rustc --version` line.
     pub rustc_version_line: String,
+    /// Successful `-Z help` stdout from that same compiler; failed probes are None.
+    pub rustc_z_help: Option<String>,
+    /// Explicit operator opt-in. None leaves the unstable flag absent.
+    pub zthreads: Option<NonZeroU32>,
     /// Linker `--version` first lines, in discovery order.
     pub linker_version_lines: Vec<String>,
     /// Whether `sccache` is on PATH (the caller probed).
@@ -188,18 +200,26 @@ pub fn assemble(evidence: &PackEvidence) -> Layer0Pack {
     });
 
     // -Zthreads: exact capability detection, never unconditional.
-    match detect_zthreads(&evidence.rustc_version_line) {
-        ZThreadsSupport::Supported { version } => knobs.push(Knob {
+    match (
+        evidence.zthreads,
+        detect_zthreads(
+            &evidence.rustc_version_line,
+            evidence.rustc_z_help.as_deref(),
+        ),
+    ) {
+        (Some(threads), ZThreadsSupport::Supported { version }) => knobs.push(Knob {
             id: "zthreads-parallel-frontend",
             enabled: true,
             benchmark_verdict: BenchmarkVerdict::Ungated,
-            fragment: format!("# proven by {version}\n[build]\nrustflags = [\"-Zthreads=8\"]\n"),
+            fragment: format!(
+                "# option reported by {version}\n[build]\nrustflags = [\"-Zthreads={threads}\"]\n"
+            ),
         }),
-        ZThreadsSupport::Unsupported { evidence } => knobs.push(Knob {
+        _ => knobs.push(Knob {
             id: "zthreads-parallel-frontend",
             enabled: false,
             benchmark_verdict: BenchmarkVerdict::Ungated,
-            fragment: format!("# disabled: not proven by \"{evidence}\"\n"),
+            fragment: "# disabled: explicit opt-in and compiler capability required\n".to_owned(),
         }),
     }
 
@@ -237,6 +257,20 @@ pub fn assemble(evidence: &PackEvidence) -> Layer0Pack {
             benchmark_verdict: BenchmarkVerdict::Ungated,
             fragment: "# no faster linker detected; system default stays\n".to_owned(),
         }),
+    }
+
+    // A target-specific rustflags array takes precedence over build.rustflags
+    // in Cargo. Keep the independently toggleable threads knob in that section
+    // too when this pack selects a target-specific linker.
+    if matches!(best, Some((LinkerFamily::Wild | LinkerFamily::Lld, _)))
+        && let Some(knob) = knobs
+            .iter_mut()
+            .find(|k| k.id == "zthreads-parallel-frontend" && k.enabled)
+        && let Some(threads) = evidence.zthreads
+    {
+        knob.fragment.push_str(&format!(
+            "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-Zthreads={threads}\"]\n"
+        ));
     }
 
     // cargo-hakari workspace-hack: only when the tool is present.
@@ -283,6 +317,8 @@ impl Layer0Pack {
         let mut section_order: Vec<String> = Vec::new();
         let mut sections: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
+        let mut rustflags: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
         for knob in self.knobs.iter().filter(|k| k.enabled) {
             let mut current = String::new(); // "" = preamble (comments)
             for line in knob.fragment.lines() {
@@ -294,6 +330,14 @@ impl Layer0Pack {
                     }
                     let body = sections.get_mut(&current).expect("just inserted");
                     body.push_str(&format!("# knob: {}\n", knob.id));
+                } else if let Some(flags) = line
+                    .strip_prefix("rustflags = [")
+                    .and_then(|s| s.strip_suffix(']'))
+                {
+                    rustflags
+                        .entry(current.clone())
+                        .or_default()
+                        .push(flags.to_owned());
                 } else {
                     let body = sections.entry(current.clone()).or_insert_with(|| {
                         section_order.push(current.clone());
@@ -312,6 +356,9 @@ impl Layer0Pack {
                 out.push('\n');
             }
             out.push_str(&sections[section]);
+            if let Some(flags) = rustflags.get(section) {
+                out.push_str(&format!("rustflags = [{}]\n", flags.join(", ")));
+            }
         }
         out
     }
@@ -358,6 +405,8 @@ mod tests {
     fn evidence(rustc: &str, linkers: &[&str]) -> PackEvidence {
         PackEvidence {
             rustc_version_line: rustc.to_owned(),
+            rustc_z_help: Some("    -Z threads=val -- number of compiler threads".to_owned()),
+            zthreads: NonZeroU32::new(8),
             linker_version_lines: linkers.iter().map(|s| (*s).to_owned()).collect(),
             sccache_available: true,
             hakari_available: false,
@@ -368,19 +417,26 @@ mod tests {
     fn b014_zthreads_is_exact_capability_detection_never_unconditional() {
         // Supported nightly: on.
         assert!(matches!(
-            detect_zthreads("rustc 1.99.0-nightly (abc 2026-07-01)"),
+            detect_zthreads(
+                "rustc 1.99.0-nightly (abc 2026-07-01)",
+                Some("-Z threads=val -- threads")
+            ),
             ZThreadsSupport::Supported { .. }
         ));
-        // Stable, beta, old nightly, garbage: all typed-unsupported
+        // Stable, beta, malformed nightly, garbage: all typed-unsupported
         // with the evidence echoed.
         for line in [
             "rustc 1.99.0 (abc 2026-07-01)",
             "rustc 1.99.0-beta.2 (abc 2026-07-01)",
-            "rustc 1.97.0-nightly (abc 2026-05-01)",
+            "rustc 1.97.garbage-nightly (abc 2026-05-01)",
+            "rustc 1.99.0-nightly-nightly (abc 2026-07-01)",
+            "rustc +1.99.0-nightly (abc 2026-07-01)",
             "not rustc at all",
             "",
         ] {
-            let ZThreadsSupport::Unsupported { evidence } = detect_zthreads(line) else {
+            let ZThreadsSupport::Unsupported { evidence } =
+                detect_zthreads(line, Some("-Z threads=val -- threads"))
+            else {
                 panic!("{line:?} must not enable an unstable flag");
             };
             assert_eq!(evidence, line.trim());
@@ -391,6 +447,44 @@ mod tests {
         assert!(!pack.render_config().contains("-Zthreads"));
         let pack = assemble(&evidence("rustc 1.99.0-nightly (abc 2026-07-01)", &[]));
         assert!(pack.render_config().contains("-Zthreads=8"));
+    }
+
+    #[test]
+    fn zthreads_requires_opt_in_and_exact_successful_option_evidence() {
+        let mut e = evidence("rustc 1.97.0-nightly (abc 2026-05-01)", &[]);
+        // Support is measured, not guessed from a future version cutoff.
+        assert!(assemble(&e).render_config().contains("-Zthreads=8"));
+        e.zthreads = None;
+        assert!(!assemble(&e).render_config().contains("-Zthreads"));
+        e.zthreads = NonZeroU32::new(2);
+        for help in [
+            None,
+            Some(""),
+            Some("-Z llvm-threads=val"),
+            Some("description mentions -Z threads=val"),
+            Some("-Z threads-extra=val"),
+        ] {
+            e.rustc_z_help = help.map(str::to_owned);
+            assert!(!assemble(&e).render_config().contains("-Zthreads"));
+        }
+        e.rustc_z_help = Some("    -Z threads=val -- compiler threads\n".to_owned());
+        assert!(assemble(&e).render_config().contains("-Zthreads=2"));
+    }
+
+    #[test]
+    fn threads_and_linker_flags_share_target_array_without_losing_independent_toggle() {
+        let mut pack = assemble(&evidence(
+            "rustc 1.100.0-nightly (abc 2026-08-31)",
+            &["LLD 18.1.0"],
+        ));
+        let rendered = pack.render_config();
+        assert!(
+            rendered.contains("rustflags = [\"-Zthreads=8\", \"-C\", \"link-arg=-fuse-ld=lld\"]")
+        );
+        pack.disable("zthreads-parallel-frontend").unwrap();
+        let disabled = pack.render_config();
+        assert!(!disabled.contains("-Zthreads"));
+        assert!(disabled.contains("rustflags = [\"-C\", \"link-arg=-fuse-ld=lld\"]"));
     }
 
     #[test]
