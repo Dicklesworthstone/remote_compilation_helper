@@ -504,6 +504,7 @@ fn cargo_command_tokens_with_wrappers(
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("missing Cargo command"))?;
         let executable = Path::new(token).file_name().and_then(|name| name.to_str());
+        let wrapper_start = index;
         match executable {
             Some(
                 "cargo" | "cargo.exe" | "cargo-zigbuild" | "cargo-zigbuild.exe" | "cargo-xwin"
@@ -532,6 +533,10 @@ fn cargo_command_tokens_with_wrappers(
                                 || assignment(value) =>
                         {
                             index += 1
+                        }
+                        value if value.starts_with('-') && allow_classified_wrappers => {
+                            let cargo_index = classified_cargo_suffix(&tokens, wrapper_start)?;
+                            return Ok((tokens, cargo_index));
                         }
                         value if value.starts_with('-') => anyhow::bail!(
                             "unsupported env option in managed Cargo command: {value}"
@@ -565,6 +570,10 @@ fn cargo_command_tokens_with_wrappers(
                         {
                             index += 1
                         }
+                        value if value.starts_with('-') && allow_classified_wrappers => {
+                            let cargo_index = classified_cargo_suffix(&tokens, wrapper_start)?;
+                            return Ok((tokens, cargo_index));
+                        }
                         value if value.starts_with('-') => anyhow::bail!(
                             "unsupported time option in managed Cargo command: {value}"
                         ),
@@ -590,38 +599,42 @@ fn cargo_command_tokens_with_wrappers(
                 index += 1;
             }
             _ if allow_classified_wrappers => {
-                // Reuse the classifier's wrapper vocabulary, but bind only
-                // when its normalized command is an unchanged argv suffix.
-                // Preserve wrapper arguments and the actual executable path.
-                let remaining = join_exec_command(&tokens[index..]);
-                let normalized = rch_common::patterns::normalize_command(&remaining);
-                let suffix = shell_words::split(&normalized)?;
-                let start = tokens.len().checked_sub(suffix.len());
-                if let Some(start) = start.filter(|&start| start >= index)
-                    && !suffix.is_empty()
-                    && matches!(
-                        Path::new(&tokens[start])
-                            .file_name()
-                            .and_then(|name| name.to_str()),
-                        Some(
-                            "cargo"
-                                | "cargo.exe"
-                                | "cargo-zigbuild"
-                                | "cargo-zigbuild.exe"
-                                | "cargo-xwin"
-                                | "cargo-xwin.exe"
-                        )
-                    )
-                    && tokens[start + 1..] == suffix[1..]
-                {
-                    return Ok((tokens, start));
-                }
-                anyhow::bail!("cannot locate an unchanged Cargo argv suffix: {command}");
+                let cargo_index = classified_cargo_suffix(&tokens, wrapper_start)?;
+                return Ok((tokens, cargo_index));
             }
             _ => anyhow::bail!("unsupported executable prefix in managed Cargo command: {token}"),
         }
     }
     Ok((tokens, index))
+}
+
+/// Reuse the classifier's wrapper vocabulary only for an unchanged argv
+/// suffix. Execution retains wrapper arguments and the actual executable path.
+fn classified_cargo_suffix(tokens: &[String], wrapper_start: usize) -> anyhow::Result<usize> {
+    let remaining = join_exec_command(&tokens[wrapper_start..]);
+    let normalized = rch_common::patterns::normalize_command(&remaining);
+    let suffix = shell_words::split(&normalized)?;
+    let start = tokens.len().checked_sub(suffix.len());
+    if let Some(start) = start.filter(|&start| start >= wrapper_start)
+        && !suffix.is_empty()
+        && matches!(
+            Path::new(&tokens[start])
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(
+                "cargo"
+                    | "cargo.exe"
+                    | "cargo-zigbuild"
+                    | "cargo-zigbuild.exe"
+                    | "cargo-xwin"
+                    | "cargo-xwin.exe"
+            )
+        )
+        && tokens[start + 1..] == suffix[1..]
+    {
+        return Ok(start);
+    }
+    anyhow::bail!("cannot locate an unchanged Cargo argv suffix: {remaining}");
 }
 
 /// Bind Cargo's intermediate cache to the same managed directory as its
@@ -1429,11 +1442,15 @@ mod managed_build_dir_tests {
             "cargo +nightly test -- --nocapture",
             "env -i cargo check",
             "env --debug cargo build",
+            "env -uCARGO_HOME cargo build",
+            "time -f%U cargo build",
+            "time -l cargo build",
             "cargo-zigbuild zigbuild --target x86_64-unknown-linux-gnu",
             "env -i /opt/bin/cargo-zigbuild build --release",
             "rustup run nightly cargo-zigbuild zigbuild --locked",
             "cargo-xwin xwin build --release",
             "nice -n 10 cargo build",
+            "nice --adjustment=+5 cargo build",
             "timeout -s KILL 90 cargo test -- --nocapture",
             "ionice -c 2 -n 4 cargo build",
             "sudo nice -n 5 cargo build",
@@ -1623,6 +1640,18 @@ mod managed_build_dir_tests {
                 &source_a,
                 alias("VERGEN_GIT_SHA", &alias_c),
                 &alias_c,
+            ),
+            (
+                "cargo-cli-config-empty-caller",
+                &source_a,
+                alias("VERGEN_GIT_SHA", ""),
+                &source_a,
+            ),
+            (
+                "cargo-cli-config-invalid-caller",
+                &source_a,
+                alias("VERGEN_GIT_SHA", "not-a-revision"),
+                &source_a,
             ),
             (
                 "explicit-rch-git-commit",

@@ -1473,6 +1473,35 @@ fn looks_like_duration_or_priority(token: &str) -> bool {
     token.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
+/// Read a wrapper argument without splitting a fully quoted token. `rch exec`
+/// quotes literal flags such as `-f%U` when rebuilding its shell command.
+/// Mixed/unterminated quoting is left unrecognized rather than guessing where
+/// the wrapped command starts.
+fn split_wrapper_word(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    let first = input.chars().next()?;
+    if matches!(first, '\'' | '"') {
+        let end = input[1..].find(first)? + 1;
+        let word = &input[1..end];
+        let rest = &input[end + 1..];
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        // Escaped quotes and expansions need shell parsing; do not interpret
+        // them as literal flag names here.
+        if first == '"' && word.contains(['\\', '$', '`']) {
+            return None;
+        }
+        Some((word, rest.trim_start()))
+    } else {
+        let (word, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+        if word.contains(['\'', '"', '\\']) {
+            return None;
+        }
+        Some((word, rest.trim_start()))
+    }
+}
+
 /// Normalize a command by stripping common wrappers (sudo, time, env, etc.)
 pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
     let mut result = cmd.trim();
@@ -1502,20 +1531,18 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
                     // command word and a real `cargo build` is misclassified as non-compilation
                     // (silent local fallback). Space-attached forms (`-n10`, `--adjustment=10`)
                     // carry their value in the same token and need no extra consume.
-                    while result.starts_with('-') {
-                        // Find the end of this token
-                        let (flag, rest_after_flag) = result
-                            .split_once(char::is_whitespace)
-                            .unwrap_or((result, ""));
-
-                        // Safety: we checked starts_with('-'), so token is not empty
-                        result = rest_after_flag.trim_start();
+                    while let Some((flag, rest_after_flag)) = split_wrapper_word(result) {
+                        if !flag.starts_with('-') {
+                            break;
+                        }
+                        result = rest_after_flag;
 
                         if wrapper_flag_takes_value(wrapper, flag) {
-                            let (_value, rest_after_value) = result
-                                .split_once(char::is_whitespace)
-                                .unwrap_or((result, ""));
-                            result = rest_after_value.trim_start();
+                            let Some((_value, rest_after_value)) = split_wrapper_word(result)
+                            else {
+                                break;
+                            };
+                            result = rest_after_value;
                         }
                     }
 
@@ -5565,6 +5592,11 @@ mod tests_normalize_whitespace {
             "chrt -r 10 cargo build",
             "timeout 60 cargo build",
             "timeout -s KILL 90 cargo test",
+            "time '-f%U' cargo build",
+            "time \"-f%U\" cargo build",
+            "nice '--adjustment=+5' cargo build",
+            "nice '-n' '5' cargo build",
+            "env '--unset' 'RUSTFLAGS' cargo build",
         ] {
             assert!(
                 classify_command(cmd).is_compilation,
@@ -5574,6 +5606,9 @@ mod tests_normalize_whitespace {
         // A wrapper around a non-build must still pass through (not offloaded).
         assert!(!classify_command("nice -n 10 ls -la").is_compilation);
         assert!(!classify_command("timeout 60 echo hi").is_compilation);
+        assert!(!classify_command("time '-f%U' echo cargo build").is_compilation);
+        assert!(!classify_command("time '-f%U cargo build").is_compilation);
+        assert!(!classify_command("time '-f%U'echo cargo build").is_compilation);
     }
 
     #[test]

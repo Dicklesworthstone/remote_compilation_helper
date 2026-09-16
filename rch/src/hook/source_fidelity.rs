@@ -475,18 +475,16 @@ where
 {
     rch_common::BUILD_COMMIT_ENV_VARS
         .iter()
-        .filter_map(|&key| {
-            let value = lookup(key)
-                .map(|value| value.trim().to_owned())
-                .filter(|value| stamp_commit_hash(value))?;
-            Some((key.to_owned(), value))
-        })
+        .filter_map(|&key| lookup(key).map(|value| (key.to_owned(), value)))
         .collect()
 }
 
 /// Remove inherited worker aliases before restoring the caller's environment.
 /// Unset and empty are different to Cargo's `[env]` defaults: absent aliases
 /// must stay unset so selected configuration can supply an explicit revision.
+/// Present values are preserved exactly, even if empty or invalid as a commit;
+/// their presence suppresses Cargo defaults just as it does locally. The build
+/// script owns revision validation after Cargo resolves its environment.
 /// Caller command prefixes run inside this boundary, preserving `env -i` and
 /// `env -u` as well as inline assignments without changing shell evaluation.
 pub(super) fn bind_build_source_aliases(
@@ -499,7 +497,7 @@ pub(super) fn bind_build_source_aliases(
         prefix.push_str(key);
     }
     for key in rch_common::BUILD_COMMIT_ENV_VARS {
-        if let Some(value) = aliases.get(*key).filter(|value| stamp_commit_hash(value)) {
+        if let Some(value) = aliases.get(*key) {
             prefix.push(' ');
             prefix.push_str(key);
             prefix.push('=');
@@ -1002,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn build_source_stamp_commit_env_filters_and_preserves_aliases() {
+    fn build_source_stamp_commit_env_preserves_exact_present_aliases() {
         let valid_a = "a".repeat(40);
         let valid_b = "b".repeat(7);
         let values: std::collections::HashMap<String, String> = [
@@ -1014,12 +1012,15 @@ mod tests {
         .map(|(key, value)| (key.to_owned(), value))
         .collect();
         let env = build_source_commit_env(|key| values.get(key).cloned());
-        assert_eq!(env.len(), 2);
-        assert_eq!(env["RCH_GIT_COMMIT"], valid_a);
+        assert_eq!(env.len(), 3);
+        assert_eq!(env["RCH_GIT_COMMIT"], format!("  {valid_a}  "));
         assert_eq!(env["VERGEN_GIT_SHA"], valid_b);
-        assert!(!env.contains_key("GIT_COMMIT"));
+        assert_eq!(env["GIT_COMMIT"], "not-a-hash\n");
         assert!(!env.contains_key("GITHUB_SHA"));
         assert_ne!(env["RCH_GIT_COMMIT"], env["VERGEN_GIT_SHA"]);
+        let empty = build_source_commit_env(|key| (key == "GITHUB_SHA").then(String::new));
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty["GITHUB_SHA"], "");
     }
 
     #[cfg(unix)]
@@ -1035,6 +1036,13 @@ mod tests {
             _ => None,
         });
         let empty = std::collections::HashMap::new();
+        let literal = "  'quoted' \"double\" $HOME $(printf EVALUATED >&2) `printf EVALUATED >&2`;\ntrailing  ";
+        let raw_aliases = build_source_commit_env(|key| match key {
+            "RCH_GIT_COMMIT" => Some(String::new()),
+            "VERGEN_GIT_SHA" => Some("not-a-hash".to_owned()),
+            "GIT_COMMIT" => Some(literal.to_owned()),
+            _ => None,
+        });
         let inline = format!(
             "RCH_GIT_COMMIT={inline_commit} sh -c {}",
             shell_words::quote(report)
@@ -1046,6 +1054,11 @@ mod tests {
         );
         for (command, caller, expected) in [
             (report, &empty, "unset\nunset\nunset\nunset\n".to_owned()),
+            (
+                report,
+                &raw_aliases,
+                format!("\nnot-a-hash\n{literal}\nunset\n"),
+            ),
             (
                 report,
                 &aliases,
@@ -1085,6 +1098,10 @@ mod tests {
                 String::from_utf8(output.stdout).unwrap(),
                 expected,
                 "{command}"
+            );
+            assert!(
+                output.stderr.is_empty(),
+                "alias bytes must not be evaluated"
             );
         }
     }
