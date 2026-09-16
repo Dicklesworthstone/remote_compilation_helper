@@ -14,12 +14,39 @@ fn main() {
     for key in BUILD_COMMIT_ENV_VARS {
         println!("cargo:rerun-if-env-changed={key}");
     }
+    println!("cargo:rerun-if-env-changed=RCH_BUILD_SOURCE");
 
     register_git_rerun_paths();
 
-    if let Some(commit) = env_commit().or_else(git_head_commit) {
+    let source = env::var_os("RCH_BUILD_SOURCE");
+    let commit = env_commit().or_else(|| match source.as_ref() {
+        Some(source) => source
+            .to_str()
+            .map(str::trim)
+            .filter(|source| is_build_source_stamp(source))
+            .map(str::to_owned),
+        None => git_head_commit(),
+    });
+    if source.is_some() {
+        for key in BUILD_COMMIT_ENV_VARS {
+            println!("cargo:rustc-env={key}=");
+        }
+    }
+    if let Some(commit) = commit {
         println!("cargo:rustc-env=RCH_GIT_COMMIT={commit}");
     }
+}
+
+fn is_build_source_stamp(value: &str) -> bool {
+    is_commit_hash(value)
+        || value.strip_suffix("-dirty").is_some_and(is_commit_hash)
+        || value
+            .split_once("-overlay-")
+            .is_some_and(|(commit, fingerprint)| {
+                is_commit_hash(commit)
+                    && fingerprint.len() == 64
+                    && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
 }
 
 fn env_commit() -> Option<String> {

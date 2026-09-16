@@ -126,7 +126,16 @@ pub fn build_version_value_with_commit(package_version: &str, commit: Option<&st
 
     if let Some(commit) = commit.map(str::trim).filter(|value| !value.is_empty()) {
         value.push_str(" (commit ");
-        value.push_str(short_commit(commit));
+        let (revision, suffix) = commit
+            .split_once('-')
+            .map_or((commit, None), |(revision, suffix)| {
+                (revision, Some(suffix))
+            });
+        value.push_str(short_commit(revision));
+        if let Some(suffix) = suffix {
+            value.push('-');
+            value.push_str(suffix);
+        }
         value.push(')');
     }
 
@@ -352,6 +361,17 @@ mod build_version_tests {
             build_version_value_with_commit("1.0.24", Some("  ")),
             "1.0.24"
         );
+    }
+
+    #[test]
+    fn build_source_stamp_version_preserves_nonclean_suffixes() {
+        let hash = "a".repeat(40);
+        for suffix in ["dirty".to_string(), format!("overlay-{}", "b".repeat(64))] {
+            assert_eq!(
+                build_version_value_with_commit("2.0.0", Some(&format!("{hash}-{suffix}"))),
+                format!("2.0.0 (commit {}-{suffix})", "a".repeat(12))
+            );
+        }
     }
 
     #[test]
