@@ -2087,8 +2087,9 @@ configure_dispatcher_shim() {
     DISPATCHER_SHIM_CONFIGURED=false
     [[ "$MODE" == "local" ]] || return 0
     local rch_bin config_dir role
-    rch_bin="$(cd "$INSTALL_DIR" && pwd)/$HOOK_BIN"
-    config_dir="$(cd "$CONFIG_DIR" && pwd)"
+    rch_bin=$(cd "$INSTALL_DIR" && pwd) || return 1
+    rch_bin="$rch_bin/$HOOK_BIN"
+    config_dir=$(cd "$CONFIG_DIR" && pwd) || return 1
     # Resolve the machine configuration with RCH's TOML parser, outside the
     # checkout that happened to invoke this installer. Never infer a role from
     # grep matches in comments or a project's override.
@@ -2096,6 +2097,7 @@ configure_dispatcher_shim() {
         RCH_CONFIG_DIR="$config_dir" RCH_JSON=0 \
         "$rch_bin" --color never config get general.role); then
         warn "Cannot determine machine role; dispatcher shim setup was not completed"
+        warn "This installer requires a CLI with 'config get general.role' (the initial v2.0.0 release lacks it). Upgrade installer and binaries together, or fix the configuration error above."
         return 1
     fi
     [[ "$role" == "dispatcher" ]] || return 0
@@ -2135,7 +2137,7 @@ configure_dispatcher_shim() {
         */zsh)
             shell_files=("${ZDOTDIR:-$HOME}/.zshenv" "${ZDOTDIR:-$HOME}/.zprofile" "${ZDOTDIR:-$HOME}/.zshrc")
             ;;
-        */fish) shell_files=("$HOME/.config/fish/config.fish") ;;
+        */fish) shell_files=("${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish") ;;
         */bash)
             shell_files=("$HOME/.bashrc")
             # Bash reads only the first existing login file in this order.
@@ -2171,8 +2173,9 @@ configure_dispatcher_shim() {
 
 install_dispatcher_shim_watchdog() {
     [[ "${DISPATCHER_SHIM_CONFIGURED:-false}" == "true" ]] || return 0
-    local watchdog="$HOME/.rch/shim-watchdog"
+    local watchdog="$HOME/.rch/shim-watchdog" watchdog_tmp
     mkdir -p "$HOME/.rch"
+    watchdog_tmp=$(mktemp "$HOME/.rch/shim-watchdog.XXXXXXXX") || return 1
     # Persist only this self-contained repair function, not the downloader or
     # installer entry point. %q preserves spaces and shell metacharacters.
     {
@@ -2182,13 +2185,20 @@ install_dispatcher_shim_watchdog() {
         printf 'SHELL=%q\n' "${SHELL:-/bin/bash}"
         printf 'ZDOTDIR=%q\n' "${ZDOTDIR:-$HOME}"
         printf 'RCH_NO_RC=%q\n' "${RCH_NO_RC:-0}"
+        if [[ -n "${RUSTUP_HOME:-}" ]]; then
+            printf 'export RUSTUP_HOME=%q\n' "$RUSTUP_HOME"
+        fi
+        if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+            printf 'export XDG_CONFIG_HOME=%q\n' "$XDG_CONFIG_HOME"
+        fi
         printf 'info() { printf "%%s\\n" "$*"; }\n'
         printf 'warn() { printf "%%s\\n" "$*" >&2; }\n'
         printf 'success() { printf "%%s\\n" "$*"; }\n'
         declare -f configure_dispatcher_shim
         printf '\nconfigure_dispatcher_shim\n'
-    } > "$watchdog"
-    chmod 755 "$watchdog"
+    } > "$watchdog_tmp"
+    chmod 755 "$watchdog_tmp"
+    mv -f "$watchdog_tmp" "$watchdog"
     if [[ "${NO_SERVICE:-false}" == "true" || "${ENABLE_SERVICE:-true}" != "true" ]]; then
         info "Dispatcher repair installed at $watchdog; timer disabled by service preference"
         return 0
@@ -2197,7 +2207,7 @@ install_dispatcher_shim_watchdog() {
         warn "No user systemd; schedule $watchdog to repair dispatcher drift periodically"
         return 0
     fi
-    local unit_dir="$HOME/.config/systemd/user"
+    local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     mkdir -p "$unit_dir"
     if systemctl --user cat rch-fleet-watchdog.service >/dev/null 2>&1; then
         mkdir -p "$unit_dir/rch-fleet-watchdog.service.d"
