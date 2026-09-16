@@ -12,6 +12,7 @@ use crate::error::PlatformError;
 use crate::status_types::{DaemonFullStatusResponse, extract_json_body, format_duration};
 use crate::ui::theme::Theme;
 use anyhow::{Context, Result};
+use rch_telemetry::TestRunStatsScope;
 use std::io::Write;
 
 /// Format milliseconds as human-readable duration.
@@ -268,6 +269,13 @@ fn render_full_status_to<W: Write>(
     )?;
 
     if let Some(test_stats) = &status.test_stats {
+        let scope = match &test_stats.scope {
+            TestRunStatsScope::Unknown => "scope unknown".to_string(),
+            TestRunStatsScope::StoredHistory => "all stored records".to_string(),
+            TestRunStatsScope::RecentMemory { max_records } => {
+                format!("recent memory, up to {max_records}")
+            }
+        };
         let pass_rate = if test_stats.total_runs > 0 {
             (test_stats.passed_runs as f64 / test_stats.total_runs as f64) * 100.0
         } else {
@@ -280,8 +288,9 @@ fn render_full_status_to<W: Write>(
         };
         writeln!(
             out,
-            "  {} {} {} total, {:.0}% command success rate, avg {}",
+            "  {} ({}) {} {} total, {:.0}% command success rate, avg {}",
             style.key("Test commands"),
+            scope,
             style.muted(":"),
             style.highlight(&test_stats.total_runs.to_string()),
             pass_rate,
@@ -1445,6 +1454,7 @@ mod tests {
                 avg_duration_ms: 895,
             },
             test_stats: Some(TestRunStatsFromApi {
+                scope: TestRunStatsScope::Unknown,
                 total_runs: 3,
                 passed_runs: 2,
                 failed_runs: 1,
@@ -1578,6 +1588,39 @@ mod tests {
         let (state, explanation, _help) = circuit_state_explanation("weird_state", 0, None, None);
         assert_eq!(state, "UNKNOWN");
         assert!(explanation.contains("Unknown"));
+    }
+
+    #[test]
+    fn test_render_test_command_statistics_scope() {
+        let _guard = test_guard!();
+        for (scope, expected) in [
+            (TestRunStatsScope::Unknown, "scope unknown"),
+            (TestRunStatsScope::StoredHistory, "all stored records"),
+            (
+                TestRunStatsScope::RecentMemory { max_records: 200 },
+                "recent memory, up to 200",
+            ),
+        ] {
+            let mut status = sample_status();
+            status.test_stats.as_mut().expect("test stats").scope = scope;
+            let style = Theme::new(false, true, false);
+            let mut buf = Vec::new();
+            render_full_status_to(
+                &mut buf,
+                &status,
+                false,
+                false,
+                None,
+                &[],
+                &crate::status_types::SystemPosture::RemoteReady,
+                &style,
+            )
+            .expect("render");
+            let output = String::from_utf8(buf).expect("utf8 output");
+            assert!(output.contains(&format!("Test commands ({expected})")));
+            assert!(output.contains("3 total, 67% command success rate"));
+            assert!(!output.contains("lifetime"));
+        }
     }
 
     #[test]

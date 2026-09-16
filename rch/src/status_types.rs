@@ -7,6 +7,7 @@ use rch_common::{
     BuildCancellationMetadata, BypassRecord, CommandTimingBreakdown, SavedTimeStats,
     WorkerCapabilities,
 };
+use rch_telemetry::TestRunStatsScope;
 use serde::{Deserialize, Serialize};
 
 /// Full status response from daemon's GET /status.
@@ -265,6 +266,8 @@ pub struct BuildStatsFromApi {
 /// Terminal test-command outcomes from API; failures carry no phase inference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestRunStatsFromApi {
+    #[serde(default)]
+    pub scope: TestRunStatsScope,
     pub total_runs: u64,
     pub passed_runs: u64,
     pub failed_runs: u64,
@@ -1420,6 +1423,31 @@ mod tests {
         assert_eq!(stats.passed_runs, 45);
         assert_eq!(stats.failed_runs, 5);
         assert_eq!(stats.runs_by_kind.get("unit"), Some(&30));
+        assert_eq!(stats.scope, TestRunStatsScope::Unknown);
+    }
+
+    #[test]
+    fn test_deserialize_test_run_stats_known_scope() {
+        for (scope_json, expected) in [
+            (
+                serde_json::json!({"source": "stored_history"}),
+                TestRunStatsScope::StoredHistory,
+            ),
+            (
+                serde_json::json!({"source": "recent_memory", "max_records": 200}),
+                TestRunStatsScope::RecentMemory { max_records: 200 },
+            ),
+        ] {
+            let stats: TestRunStatsFromApi = serde_json::from_value(serde_json::json!({
+                "scope": scope_json,
+                "total_runs": 0,
+                "passed_runs": 0,
+                "failed_runs": 0,
+                "avg_duration_ms": 0
+            }))
+            .expect("deserialize known statistics scope");
+            assert_eq!(stats.scope, expected);
+        }
     }
 
     #[test]
