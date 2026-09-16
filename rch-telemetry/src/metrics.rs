@@ -24,6 +24,7 @@ const VERDICT_LABELS: &[&str] = &["healthy", "degraded", "failing", "unknown"];
 const SCOPE_LABELS: &[&str] = &[
     "all",
     "topology",
+    "ownership",
     "convergence",
     "pressure",
     "triage",
@@ -1152,6 +1153,40 @@ mod tests {
                 .with_label_values(&["degraded", "all"])
                 .get(),
             1.0
+        );
+    }
+
+    #[test]
+    fn doctor_verdict_preserves_ownership_scope_in_registered_metrics() {
+        let (metrics, layer) = metrics_with_layer();
+        let registry = Registry::new();
+        metrics.register(&registry).unwrap();
+        run_with_layer(layer, || {
+            tracing::info!(
+                target: "rch::doctor::verdict",
+                verdict = "Healthy",
+                scope = "ownership",
+                "doctor.verdict",
+            );
+        });
+        let families = registry.gather();
+        let verdicts = families
+            .iter()
+            .find(|family| family.name() == "rch_doctor_verdict_total")
+            .unwrap();
+        assert_eq!(verdicts.get_metric().len(), 1);
+        let sample = &verdicts.get_metric()[0];
+        assert_eq!(sample.get_counter().value(), 1.0);
+        let labels = sample.get_label();
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.name() == "scope" && label.value() == "ownership")
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.name() == "verdict" && label.value() == "healthy")
         );
     }
 
