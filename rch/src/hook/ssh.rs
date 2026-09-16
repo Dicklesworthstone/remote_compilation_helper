@@ -939,7 +939,15 @@ async fn repair_worker_mirror_ownership(
     // bd-gc0ze: closure-scoped sweeps normally finish in seconds; 600s bounds
     // pathological trees without failing every dispatch the way the old fixed
     // 60s budget did once mirrors grew past multi-GB.
-    let output = run_offload_ssh_command(worker, &cmd, Duration::from_secs(600)).await?;
+    // rch#71: keep the closure-sized script off argv. The existing stdin
+    // executor retains the timeout, concurrent output drains and kill-on-drop.
+    let output = run_offload_ssh_command_with_stdin(
+        worker,
+        "sh -s",
+        cmd.as_bytes(),
+        Duration::from_secs(600),
+    )
+    .await?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -970,6 +978,170 @@ async fn repair_worker_mirror_ownership(
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_worker_ownership_repair_streams_large_closure() {
+        let _guard = test_guard!();
+        const DIR_ENV: &str = "RCH_OWNERSHIP_TEST_DIR";
+        const ROOT_ENV: &str = "RCH_OWNERSHIP_TEST_ROOT";
+
+        // Re-enter this test in a child with its own PATH. Do not mutate the
+        // process-wide environment while the rest of the test suite runs.
+        if let Some(dir) = std::env::var_os(DIR_ENV) {
+            let dir = PathBuf::from(dir);
+            let worker = WorkerConfig {
+                id: WorkerId::new("ownership-stdin-test"),
+                host: "ownership-test.invalid".into(),
+                user: "ubuntu".into(),
+                ..WorkerConfig::default()
+            };
+            assert!(!should_skip_remote_preflight(&worker));
+            let reporter = HookReporter::new(OutputVisibility::Summary);
+            let mut roots: Vec<PathBuf> = (0..4096)
+                .map(|i| {
+                    dir.join("missing")
+                        .join(format!("dep-{i:04}-{}", "x".repeat(160)))
+                })
+                .collect();
+            // An existing, shell-sensitive root at the end also proves that
+            // the large payload was not truncated or its roots reinterpreted.
+            roots.push(PathBuf::from(std::env::var_os(ROOT_ENV).unwrap()));
+            let script = build_worker_ownership_repair_cmd(&roots, &worker.user);
+            assert!(script.len() > 128 * 1024);
+
+            for (mode, count, error, calls) in [
+                ("healthy", 0, None, "detect\n"),
+                ("repair", 1, None, "detect\nrepair\ndetect\n"),
+                ("check-unavailable", 0, None, "detect\n"),
+                (
+                    "unavailable",
+                    0,
+                    Some((46, "RCH_OWNERSHIP_REPAIR_UNAVAILABLE:detected=1")),
+                    "detect\nrepair\n",
+                ),
+                (
+                    "partial",
+                    0,
+                    Some((47, "RCH_OWNERSHIP_PARTIAL:remaining=1")),
+                    "detect\nrepair\ndetect\n",
+                ),
+            ] {
+                std::fs::write(dir.join("mode"), mode).unwrap();
+                std::fs::write(dir.join("state"), "pending").unwrap();
+                std::fs::write(dir.join("calls"), "").unwrap();
+                let result = timeout(
+                    Duration::from_secs(20),
+                    repair_worker_mirror_ownership(&worker, &reporter, &roots),
+                )
+                .await
+                .expect("ownership repair must not hang on stdin/EOF");
+                if let Some((code, marker)) = error {
+                    let error = result.expect_err(mode).to_string();
+                    assert!(error.contains(&format!("status Some({code})")), "{error}");
+                    assert!(error.contains(marker), "{error}");
+                } else {
+                    assert_eq!(result.expect(mode), count, "{mode}");
+                }
+                assert_eq!(std::fs::read(dir.join("payload")).unwrap(), script.as_bytes());
+                assert_eq!(std::fs::read_to_string(dir.join("calls")).unwrap(), calls);
+            }
+            std::fs::write(dir.join("finished"), "ok").unwrap();
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let root = dir.path().join("root with ' quotes; $cash `echo nope`");
+        std::fs::create_dir(&root).unwrap();
+        let ssh = bin.join("ssh");
+        std::fs::write(
+            &ssh,
+            r#"#!/bin/sh
+set -eu
+LC_ALL=C
+export LC_ALL
+remote=''
+for arg; do
+    [ "${#arg}" -lt 131072 ] || exit 90
+    remote=$arg
+done
+[ "$remote" = "sh -lc 'sh -s'" ] || exit 91
+cat > "$RCH_OWNERSHIP_TEST_DIR/payload"
+# Execute the real remote wrapper and script, replacing only privileged work.
+{
+cat <<'RCH_TEST_SUDO'
+sudo() {
+    [ "$1" = -n ] && [ "$2" = find ] || return 92
+    shift 2
+    [ "$1" = "$RCH_OWNERSHIP_TEST_ROOT" ] || return 93
+    shift
+    [ "$1" = -xdev ] && [ "$2" = -user ] && [ "$3" = root ] || return 94
+    shift 3
+    mode=$(cat "$RCH_OWNERSHIP_TEST_DIR/mode")
+    case "$1" in
+        -print)
+            [ "$#" -eq 1 ] || return 95
+            echo detect >> "$RCH_OWNERSHIP_TEST_DIR/calls"
+            [ "$mode" != check-unavailable ] || return 1
+            if [ "$mode" != healthy ] && [ "$(cat "$RCH_OWNERSHIP_TEST_DIR/state")" != repaired ]; then
+                printf 'root-owned-entry\n'
+            fi
+            ;;
+        -exec)
+            [ "$#" -eq 6 ] && [ "$2" = chown ] && [ "$3" = -h ] &&
+                [ "$4" = ubuntu ] && [ "$5" = '{}' ] && [ "$6" = + ] || return 96
+            echo repair >> "$RCH_OWNERSHIP_TEST_DIR/calls"
+            [ "$mode" != unavailable ] || return 1
+            if [ "$mode" = repair ]; then
+                echo repaired > "$RCH_OWNERSHIP_TEST_DIR/state"
+            fi
+            ;;
+        *) return 97 ;;
+    esac
+}
+RCH_TEST_SUDO
+cat "$RCH_OWNERSHIP_TEST_DIR/payload"
+} | /bin/sh -c "$remote"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let paths = std::iter::once(bin).chain(std::env::split_paths(&old_path));
+        let path = std::env::join_paths(paths).unwrap();
+        let test_name = concat!(
+            module_path!(),
+            "::test_worker_ownership_repair_streams_large_closure"
+        );
+        let test_name = test_name.split_once("::").unwrap().1;
+        let output = timeout(
+            Duration::from_secs(60),
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(DIR_ENV, dir.path())
+                .env(ROOT_ENV, &root)
+                .env("PATH", path)
+                .env("RCH_MOCK_SSH", "0")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("isolated ownership regression timed out")
+        .expect("start isolated ownership regression");
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            dir.path().join("finished").is_file(),
+            "child test did not run"
+        );
+    }
 
     #[test]
     fn source_authority_lock_keys_are_sorted_deduplicated_and_root_stable() {
