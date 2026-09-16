@@ -75,7 +75,7 @@ impl Default for ReloadResult {
 pub struct ConfigDiff {
     /// Workers to add (new in config).
     pub to_add: Vec<WorkerConfig>,
-    /// Workers to update (exist but changed).
+    /// Workers to update or reconcile after a drain.
     pub to_update: Vec<WorkerConfig>,
     /// Worker IDs to remove (no longer in config).
     pub to_remove: Vec<WorkerId>,
@@ -94,6 +94,7 @@ pub async fn compute_worker_diff(
 ) -> Result<ConfigDiff> {
     let current_workers = pool.all_workers().await;
     let mut current_ids: HashSet<WorkerId> = HashSet::new();
+    let mut draining_ids: HashSet<WorkerId> = HashSet::new();
 
     // Build map of current workers
     let mut current_configs: std::collections::HashMap<WorkerId, WorkerConfig> =
@@ -101,6 +102,9 @@ pub async fn compute_worker_diff(
     for worker in &current_workers {
         let config = worker.config.read().await.clone();
         current_ids.insert(config.id.clone());
+        if worker.is_draining().await || worker.is_drained().await {
+            draining_ids.insert(config.id.clone());
+        }
         current_configs.insert(config.id.clone(), config);
     }
 
@@ -114,8 +118,12 @@ pub async fn compute_worker_diff(
     // Find workers to add or update
     for new_config in new_workers {
         if let Some(current_config) = current_configs.get(&new_config.id) {
-            // Worker exists - check if it changed
-            if worker_config_changed(current_config, new_config) {
+            // Reintroduced inventory can be byte-identical while the old state
+            // is still draining for removal. update_config cancels only that
+            // removal intent; manual drains/disables and health remain intact.
+            if worker_config_changed(current_config, new_config)
+                || draining_ids.contains(&new_config.id)
+            {
                 to_update.push(new_config.clone());
             }
         } else {
@@ -237,33 +245,31 @@ pub async fn apply_worker_diff(pool: &WorkerPool, diff: &ConfigDiff) -> Result<R
         result.updated += 1;
     }
 
-    // Note: We don't remove workers immediately to avoid disrupting active jobs.
-    // Instead, we mark them for draining. A separate process should handle removal
-    // once jobs complete.
-    //
-    // `result.removed` counts workers that were *actually removed* from the pool.
-    // Drained workers stay in the pool until their jobs finish, so they belong in
-    // the warnings list, not the removed count — otherwise the reload summary
-    // claims workers were removed when they're still scheduling builds.
+    // Close admission even for an apparently idle worker before removing it.
+    // Selectors retain Arc<WorkerState> snapshots: removing only the map entry
+    // leaves those handles able to reserve slots outside the authoritative pool.
+    // A reservation admitted before the drain must remain tracked until release.
     for id in &diff.to_remove {
         if let Some(worker) = pool.get(id).await {
+            worker.drain_for_removal().await;
             let used_slots = worker.used_slots();
             if used_slots > 0 {
                 info!(
                     "Worker {} has {} active slots, marking for drain instead of removal",
                     id, used_slots
                 );
-                worker.drain_for_removal().await;
                 result.warnings.push(format!(
                     "Worker {} has active jobs, draining instead of removing",
                     id
                 ));
-            } else {
-                info!("Worker {} removed (no active jobs)", id);
-                pool.remove_worker(id).await;
-                result.removed += 1;
             }
         }
+    }
+    if !diff.to_remove.is_empty() {
+        // This rechecks identity, lifecycle, removal intent and reservations
+        // under the pool lock. Count only entries actually removed, including
+        // earlier config-removal drains that completed during this reload.
+        result.removed = pool.prune_drained().await;
     }
 
     Ok(result)
@@ -1727,5 +1733,129 @@ enabled = true
             .await
             .expect("watcher shutdown blocked")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_retirement_invalidates_idle_selector_handles() {
+        let pool = WorkerPool::new();
+        let config = WorkerConfig::default();
+        let id = config.id.clone();
+        pool.add_worker(config.clone()).await;
+        // A selector can keep this Arc after its pool snapshot has gone stale.
+        let selected = pool.get(&id).await.unwrap();
+        let diff = compute_worker_diff(&pool, &[]).await.unwrap();
+        let result = apply_worker_diff(&pool, &diff).await.unwrap();
+        assert_eq!(result.removed, 1);
+        assert!(pool.get(&id).await.is_none());
+        assert!(!selected.reserve_slots(1).await);
+        assert_eq!(selected.used_slots(), 0);
+
+        pool.add_worker(config).await;
+        let replacement = pool.get(&id).await.unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&selected, &replacement));
+        assert!(!selected.reserve_slots(1).await);
+        assert!(replacement.reserve_slots(1).await);
+        assert_eq!(replacement.used_slots(), 1);
+        replacement.release_slots(1).await;
+    }
+
+    #[tokio::test]
+    async fn reload_retirement_identical_reintroduction_cancels_pending_removal() {
+        use rch_common::{CircuitState, WorkerStatus};
+
+        for complete_before_restore in [false, true] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let path = root.join("workers.toml");
+            let snapshot = "[[workers]]\nid = 'restored'\nhost = 'localhost'\ntotal_slots = 8\n";
+            std::fs::write(&path, snapshot).unwrap();
+            let pool = WorkerPool::new();
+            reload_workers(&pool, Some(&path), true).await.unwrap();
+            let id = WorkerId::new("restored");
+            let original = pool.get(&id).await.unwrap();
+            assert!(original.reserve_slots(1).await);
+            original.add_cached_project("retained-project".to_owned()).await;
+            original.set_speed_score(73.0);
+            original.apply_health_status(WorkerStatus::Degraded).await;
+            original.open_circuit().await;
+
+            std::fs::write(&path, "workers = []\n").unwrap();
+            let removed = reload_workers(&pool, Some(&path), true).await.unwrap();
+            assert_eq!(removed.removed, 0);
+            assert!(original.is_draining().await);
+            if complete_before_restore {
+                original.release_slots(1).await;
+                assert!(original.is_drained().await);
+            }
+
+            // Restore exactly the original bytes, not a changed slot count.
+            std::fs::write(&path, snapshot).unwrap();
+            let result = reload_workers(&pool, Some(&path), true).await.unwrap();
+            assert_eq!(result.updated, 1);
+            assert_eq!(result.added, 0);
+            let restored = pool.get(&id).await.unwrap();
+            assert!(std::sync::Arc::ptr_eq(&original, &restored));
+            assert!(!restored.is_draining().await);
+            assert!(!restored.is_drained().await);
+            assert_eq!(restored.status().await, WorkerStatus::Degraded);
+            assert_eq!(restored.circuit_state().await, Some(CircuitState::Open));
+            assert_eq!(restored.get_speed_score(), 73.0);
+            assert!(restored.has_cached_project("retained-project").await);
+            assert_eq!(restored.used_slots(), if complete_before_restore { 0 } else { 1 });
+            if !complete_before_restore {
+                restored.release_slots(1).await;
+            }
+            assert_eq!(pool.prune_drained().await, 0);
+            assert!(pool.get(&id).await.is_some());
+            let desired = restored.config.read().await.clone();
+            assert!(compute_worker_diff(&pool, &[desired]).await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_retirement_reconciliation_preserves_operator_drains_and_disables() {
+        use rch_common::{CircuitState, WorkerStatus};
+
+        for intent in ["draining", "drained", "disabled", "disable-after-drain"] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let path = root.join("workers.toml");
+            let snapshot = "[[workers]]\nid = 'operator'\nhost = 'localhost'\ntotal_slots = 8\n";
+            std::fs::write(&path, snapshot).unwrap();
+            let pool = WorkerPool::new();
+            reload_workers(&pool, Some(&path), true).await.unwrap();
+            let id = WorkerId::new("operator");
+            let worker = pool.get(&id).await.unwrap();
+            assert!(worker.reserve_slots(1).await);
+            worker.apply_health_status(WorkerStatus::Unreachable).await;
+            worker.open_circuit().await;
+            match intent {
+                "disabled" => worker.disable(Some("maintenance".to_owned())).await,
+                "disable-after-drain" => {
+                    worker.drain_then_disable(Some("maintenance".to_owned())).await;
+                }
+                _ => worker.drain().await,
+            }
+            if intent == "drained" {
+                worker.release_slots(1).await;
+            }
+            let status = worker.status().await;
+            let slots = worker.used_slots();
+            reload_workers(&pool, Some(&path), true).await.unwrap();
+            assert_eq!(worker.status().await, status, "{intent}");
+            assert_eq!(worker.used_slots(), slots, "{intent}");
+            assert_eq!(worker.circuit_state().await, Some(CircuitState::Open));
+            assert!(!worker.reserve_slots(1).await, "{intent}");
+            if slots != 0 {
+                worker.release_slots(slots).await;
+            }
+            if matches!(intent, "disabled" | "disable-after-drain") {
+                assert!(worker.is_disabled().await);
+                assert_eq!(worker.disabled_reason().await.as_deref(), Some("maintenance"));
+            } else {
+                assert!(worker.is_drained().await);
+            }
+            assert_eq!(pool.prune_drained().await, 0);
+            let retained = pool.get(&id).await.unwrap();
+            assert!(std::sync::Arc::ptr_eq(&worker, &retained));
+        }
     }
 }
