@@ -624,8 +624,15 @@ request handling after parsing, including errors and cancellation. Event streams
 and the separate HTTP API are excluded. The same observations reach Prometheus,
 including when OTLP is disabled. Shutdown drains request tasks before a
 best-effort final export. The banner reports exporter configuration, not collector
-connectivity. Trace/log export and forwarding CLI doctor/hook events remain
-unfinished.
+connectivity.
+
+The same opt-in settings enable direct OTLP verdict export for single-shot
+`rch doctor --reliability`, including under `--quiet`. Its service name defaults
+to `rch`. Each report emits one `rch_doctor_verdict_total` observation, labeled
+with the actual verdict and scope (combined scopes use `other`), and flushes
+before returning its original exit code. These CLI metrics are not forwarded to
+the daemon's Prometheus endpoint. Hook/watch telemetry, remaining doctor event
+metrics, and trace/log export remain unfinished.
 
 Quick checks:
 
