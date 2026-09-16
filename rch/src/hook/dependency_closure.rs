@@ -15,7 +15,7 @@
 //!   `/data/projects` + `/dp` canonical-root conventions.
 //! - **Dependency preflight** — once the closure is synced,
 //!   [`verify_remote_dependency_manifests`] probes each remote root over SSH (via
-//!   the sibling `ssh` submodule's `run_offload_ssh_command`) to confirm every
+//!   the sibling `ssh` submodule's stdin-capable executor) to confirm every
 //!   required `Cargo.toml` plus source entrypoint exists remotely, producing a
 //!   [`DependencyPreflightReport`]; a failed verification surfaces as a
 //!   [`DependencyPreflightFailure`] that forces a local fallback. The cargo
@@ -35,7 +35,7 @@
 //! while the preflight types/consts that `hook` itself re-exports arrive via the
 //! test module's `use super::*`.
 
-use super::ssh::{run_offload_ssh_command, should_skip_remote_preflight};
+use super::ssh::{run_offload_ssh_command_with_stdin, should_skip_remote_preflight};
 use super::*;
 
 pub(super) fn merge_sync_result(base: &SyncResult, extra: &SyncResult) -> SyncResult {
@@ -987,7 +987,16 @@ pub(super) async fn verify_remote_dependency_manifests(
     let mut probe_failure: Option<String> = None;
 
     for verify_cmd in build_remote_dependency_preflight_commands(&synced_checks) {
-        match run_offload_ssh_command(worker, &verify_cmd, Duration::from_secs(20)).await {
+        // A 128-path batch can still exceed argv limits when paths are long.
+        // Keep scripts on stdin, including after the ownership preflight (#71).
+        match run_offload_ssh_command_with_stdin(
+            worker,
+            "sh -s",
+            verify_cmd.as_bytes(),
+            Duration::from_secs(20),
+        )
+        .await
+        {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1080,4 +1089,156 @@ pub(super) fn build_remote_dependency_preflight_commands(
         .chunks(DEPENDENCY_PREFLIGHT_PROBE_BATCH_SIZE)
         .filter_map(build_remote_dependency_preflight_command)
         .collect()
+}
+
+#[cfg(all(test, unix))]
+mod stdin_tests {
+    use super::*;
+    use rch_common::test_guard;
+
+    #[tokio::test]
+    async fn dependency_preflight_streams_large_batches() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const DIR_ENV: &str = "RCH_DEPENDENCY_STDIN_TEST_DIR";
+        const ROOT_COUNT: usize = 128;
+        let _guard = test_guard!();
+        if let Some(dir) = std::env::var_os(DIR_ENV) {
+            let dir = PathBuf::from(dir);
+            let project = dir.join("project with ' quote");
+            let worker = WorkerConfig {
+                id: WorkerId::new("dependency-stdin-test"),
+                host: "dependency-stdin.invalid".into(),
+                user: "ubuntu".into(),
+                ..WorkerConfig::default()
+            };
+            assert!(!should_skip_remote_preflight(&worker));
+            let outcomes: Vec<_> = (0..ROOT_COUNT)
+                .map(|index| {
+                    let remote_root = if index == ROOT_COUNT - 1 {
+                        project.clone()
+                    } else {
+                        let mut root = dir.join(format!("absent-{index}"));
+                        for _ in 0..20 {
+                            root.push("r".repeat(96));
+                        }
+                        root
+                    };
+                    (
+                        SyncClosurePlanEntry {
+                            local_root: project.clone(),
+                            remote_root: remote_root.to_string_lossy().into_owned(),
+                            project_id: format!("fixture-{index}"),
+                            root_hash: "fixture".into(),
+                            is_primary: index == ROOT_COUNT - 1,
+                            mode: SyncClosureMode::Full,
+                        },
+                        SyncRootOutcome::Synced,
+                    )
+                })
+                .collect();
+            let checks = synced_dependency_preflight_checks(&outcomes);
+            assert_eq!(checks.len(), ROOT_COUNT * 2);
+            let commands = build_remote_dependency_preflight_commands(&checks);
+            assert!(commands.iter().all(|command| command.len() > 128 * 1024));
+
+            let reporter = HookReporter::new(OutputVisibility::Summary);
+            let error = verify_remote_dependency_manifests(&worker, &outcomes, &reporter)
+                .await
+                .expect_err("absent fixture paths must remain missing, not pass preflight");
+            let report = error
+                .downcast::<DependencyPreflightFailure>()
+                .expect("typed dependency failure")
+                .report;
+            assert!(!report.verified);
+            assert_eq!(report.evidence.len(), ROOT_COUNT * 2);
+            assert_eq!(
+                report
+                    .evidence
+                    .iter()
+                    .filter(|item| item.status == DependencyPreflightStatus::Missing)
+                    .count(),
+                (ROOT_COUNT - 1) * 2,
+                "E2BIG must not turn missing files into unknown transport failures"
+            );
+            assert_eq!(
+                report
+                    .evidence
+                    .iter()
+                    .filter(|item| item.status == DependencyPreflightStatus::Present)
+                    .count(),
+                2,
+                "the final root proves every stdin batch was fully processed"
+            );
+            verify_remote_dependency_manifests(
+                &worker,
+                &outcomes[ROOT_COUNT - 1..],
+                &reporter,
+            )
+            .await
+            .expect("healthy paths must still pass preflight");
+            std::fs::write(dir.join("finished"), "ok").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project with ' quote");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"preflight-fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let ssh = bin.join("ssh");
+        std::fs::write(
+            &ssh,
+            r#"#!/bin/sh
+set -eu
+LC_ALL=C
+export LC_ALL
+remote=''
+for arg; do
+    [ "${#arg}" -lt 131072 ] || exit 90
+    remote=$arg
+done
+[ "$remote" = "sh -lc 'sh -s'" ] || exit 91
+exec /bin/sh -c "$remote"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&old_path)),
+        )
+        .unwrap();
+        let name = concat!(module_path!(), "::dependency_preflight_streams_large_batches");
+        let name = name.split_once("::").unwrap().1;
+        let output = timeout(
+            Duration::from_secs(60),
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(DIR_ENV, dir.path())
+                .env("PATH", path)
+                .env("RCH_MOCK_SSH", "0")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("dependency stdin regression timed out")
+        .expect("start isolated dependency stdin regression");
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            dir.path().join("finished").is_file(),
+            "child test did not run"
+        );
+    }
 }
