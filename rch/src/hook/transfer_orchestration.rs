@@ -186,6 +186,32 @@ fn clean_overlay_source_pair_pool_name(legacy_name: &str, source_base: &str) -> 
     format!("{prefix}-{}", &hash.to_hex()[..32])
 }
 
+/// Bind freshness to the entire selected closure, including explicit overlays.
+/// The source-pair lease and fresh-root materialization remain prerequisites;
+/// this identity only permits reusing the prior source timestamp, not bytes.
+fn clean_overlay_freshness_identity(spec: &CleanOverlaySpec) -> String {
+    fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
+        hash.update(&(bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    fn selected(hash: &mut blake3::Hasher, spec: &CleanOverlaySpec) {
+        field(hash, spec.base_commit().as_bytes());
+        field(hash, spec.tree_object.as_bytes());
+        field(hash, spec.overlay_fingerprint().as_bytes());
+        hash.update(&(spec.dependencies.len() as u64).to_le_bytes());
+        let mut dependencies = spec.dependencies.iter().collect::<Vec<_>>();
+        dependencies.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (root, dependency) in dependencies {
+            field(hash, root.as_os_str().as_encoded_bytes());
+            selected(hash, dependency);
+        }
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"rch-clean-overlay-freshness-v1\0");
+    selected(&mut hash, spec);
+    hash.finalize().to_hex().to_string()
+}
+
 /// The STABLE absolute location of a pooled Cargo target store under an
 /// explicit base: `<base>/<project_id>/<pooled dir name>`.
 ///
@@ -1123,7 +1149,12 @@ pub(super) async fn execute_remote_compilation(
             spec.verify_overlay_unchanged(&entry.local_root)?;
             if source_pair_pool.is_some() {
                 root_pipeline
-                    .refresh_clean_overlay_source(&worker_config)
+                    .refresh_clean_overlay_source(
+                        &worker_config,
+                        &clean_overlay_freshness_identity(
+                            clean_overlay.expect("root overlay has a selected closure"),
+                        ),
+                    )
                     .await?;
             }
             Ok(result)
@@ -2209,6 +2240,36 @@ mod tests {
     use super::clean_overlay_remote_project_hash;
     use super::clean_overlay_source_pair_pool_name;
     use super::foreign_artifact_gate_disabled_from_value;
+    use super::{CleanOverlaySpec, clean_overlay_freshness_identity};
+
+    #[test]
+    fn source_pair_freshness_identity_binds_overlays_and_canonical_dependency_closure() {
+        let leaf = CleanOverlaySpec {
+            base_commit: "a".repeat(40),
+            tree_object: "b".repeat(40),
+            overlay_paths: Vec::new(),
+            overlay_fingerprint: "c".repeat(64),
+            dependencies: Vec::new(),
+            primary_directory: None,
+        };
+        let mut source = leaf.clone();
+        source.dependencies = vec![("/a".into(), leaf.clone()), ("/b".into(), leaf)];
+        let expected = clean_overlay_freshness_identity(&source);
+        source.dependencies.reverse();
+        assert_eq!(clean_overlay_freshness_identity(&source), expected);
+        let mut changed = source.clone();
+        changed.dependencies[0].1.overlay_fingerprint = "d".repeat(64);
+        assert_ne!(clean_overlay_freshness_identity(&changed), expected);
+        changed = source.clone();
+        changed.dependencies[0].1.base_commit = "e".repeat(40);
+        assert_ne!(clean_overlay_freshness_identity(&changed), expected);
+        changed = source.clone();
+        changed.overlay_fingerprint = "f".repeat(64);
+        assert_ne!(clean_overlay_freshness_identity(&changed), expected);
+        changed = source;
+        changed.dependencies[0].0 = "/different".into();
+        assert_ne!(clean_overlay_freshness_identity(&changed), expected);
+    }
 
     #[test]
     fn source_pair_pool_migrates_legacy_artifacts_and_keeps_pool_isolation() {
