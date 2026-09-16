@@ -465,6 +465,124 @@ pub(super) async fn finalize_source_content_receipt(
     })
 }
 
+fn stamp_commit_hash(value: &str) -> bool {
+    (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(super) fn build_source_commit_env<F>(mut lookup: F) -> std::collections::HashMap<String, String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    rch_common::BUILD_COMMIT_ENV_VARS
+        .iter()
+        .map(|&key| {
+            let value = lookup(key)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| stamp_commit_hash(value))
+                .unwrap_or_default();
+            (key.to_owned(), value)
+        })
+        .collect()
+}
+
+async fn build_source_git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let mut command = Command::new("git");
+    configure_clean_git_command(&mut command);
+    command
+        .arg("--no-optional-locks")
+        .args(["-c", "core.fsmonitor=false"])
+        .current_dir(root)
+        .args(args)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let output = timeout(Duration::from_secs(5), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+fn clean_overlay_build_source_stamp(spec: &CleanOverlaySpec) -> String {
+    if spec.is_base_only() && spec.dependencies.is_empty() {
+        return spec.base_commit().to_owned();
+    }
+    if spec.dependencies.is_empty() {
+        return format!(
+            "{}-overlay-{}",
+            spec.base_commit(),
+            spec.overlay_fingerprint()
+        );
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rch-build-source-selection-v1\0");
+    hasher.update(spec.base_commit().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(spec.tree_object.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(spec.overlay_fingerprint().as_bytes());
+    let mut dependencies = spec.dependencies.iter().collect::<Vec<_>>();
+    dependencies.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (root, dependency) in dependencies {
+        hasher.update(b"\0dependency\0");
+        hasher.update(root.file_name().unwrap_or_default().as_encoded_bytes());
+        hasher.update(b"\0");
+        hasher.update(clean_overlay_build_source_stamp(dependency).as_bytes());
+        hasher.update(b"\0");
+        hasher.update(dependency.tree_object.as_bytes());
+    }
+    format!(
+        "{}-overlay-{}",
+        spec.base_commit(),
+        hasher.finalize().to_hex()
+    )
+}
+
+pub(super) async fn capture_build_source_stamp(
+    root: &Path,
+    overlay: Option<&CleanOverlaySpec>,
+) -> String {
+    if let Some(spec) = overlay {
+        return clean_overlay_build_source_stamp(spec);
+    }
+    let Some(head) = build_source_git_output(root, &["rev-parse", "--verify", "HEAD"])
+        .await
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| stamp_commit_hash(value))
+    else {
+        return "unknown".to_owned();
+    };
+    if build_source_git_output(root, &["ls-files", "--error-unmatch", "--", "Cargo.toml"])
+        .await
+        .is_none()
+    {
+        return "unknown".to_owned();
+    }
+    match build_source_git_output(
+        root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ],
+    )
+    .await
+    {
+        Some(status) if status.is_empty() => head,
+        Some(_) => format!("{head}-dirty"),
+        None => "unknown".to_owned(),
+    }
+}
+
+pub(super) fn reconcile_build_source_stamps(before: &str, after: &str) -> String {
+    if before == after {
+        before.to_owned()
+    } else {
+        "unknown".to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,5 +692,309 @@ mod tests {
         let mut invalid = manifest;
         invalid.files[0].path = "src\tlib.rs".to_string();
         assert!(remote_manifest_payload(&invalid).is_err());
+    }
+
+    fn build_source_stamp_git(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .expect("git fixture command runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn build_source_stamp_git_commit(root: &Path, message: &str) {
+        build_source_stamp_git(
+            root,
+            &[
+                "-c",
+                "user.name=RCH-Test",
+                "-c",
+                "user.email=rch-test@example.invalid",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                message,
+            ],
+        );
+    }
+
+    fn build_source_stamp_fixture_repo() -> (PathBuf, String) {
+        let root = tempfile::tempdir().unwrap().keep();
+        build_source_stamp_git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='stamp-fixture'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn baseline() {}\n").unwrap();
+        build_source_stamp_git(&root, &["add", "Cargo.toml", "src/lib.rs"]);
+        build_source_stamp_git_commit(&root, "initial");
+        let head = build_source_stamp_git(&root, &["rev-parse", "HEAD"]);
+        assert!(stamp_commit_hash(&head));
+        (root, head)
+    }
+
+    fn build_source_stamp_overlay_spec(
+        base_commit: &str,
+        tree_object: &str,
+        overlay_fingerprint: &str,
+        overlay_paths: Vec<PathBuf>,
+        dependencies: Vec<(PathBuf, CleanOverlaySpec)>,
+    ) -> CleanOverlaySpec {
+        CleanOverlaySpec {
+            base_commit: base_commit.to_owned(),
+            tree_object: tree_object.to_owned(),
+            overlay_paths,
+            overlay_fingerprint: overlay_fingerprint.to_owned(),
+            dependencies,
+            primary_directory: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn build_source_stamp_clean_repo_is_head() {
+        let (root, head) = build_source_stamp_fixture_repo();
+        assert_eq!(capture_build_source_stamp(&root, None).await, head);
+        eprintln!(
+            "build-source clean-repo fixture retained at {}",
+            root.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn build_source_stamp_tracked_edit_is_dirty() {
+        let (root, head) = build_source_stamp_fixture_repo();
+        std::fs::write(root.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+        assert_eq!(
+            capture_build_source_stamp(&root, None).await,
+            format!("{head}-dirty")
+        );
+        eprintln!("build-source dirty fixture retained at {}", root.display());
+    }
+
+    #[tokio::test]
+    async fn build_source_stamp_untracked_source_is_dirty() {
+        let (root, first) = build_source_stamp_fixture_repo();
+        std::fs::write(root.join("src/lib.rs"), "pub fn second() {}\n").unwrap();
+        build_source_stamp_git(&root, &["add", "src/lib.rs"]);
+        build_source_stamp_git_commit(&root, "second");
+        let second = build_source_stamp_git(&root, &["rev-parse", "HEAD"]);
+        assert_ne!(first, second);
+        assert_eq!(capture_build_source_stamp(&root, None).await, second);
+        std::fs::write(root.join("src/extra.rs"), "pub fn extra() {}\n").unwrap();
+        assert_eq!(
+            capture_build_source_stamp(&root, None).await,
+            format!("{second}-dirty")
+        );
+        eprintln!(
+            "build-source untracked fixture retained at {}",
+            root.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn build_source_stamp_non_git_root_is_unknown() {
+        let root = tempfile::tempdir().unwrap().keep();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='not-git'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        assert_eq!(capture_build_source_stamp(&root, None).await, "unknown");
+        eprintln!(
+            "build-source non-git fixture retained at {}",
+            root.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn build_source_stamp_ignored_nested_package_is_unknown() {
+        let (root, _head) = build_source_stamp_fixture_repo();
+        std::fs::write(root.join(".gitignore"), "generated/\n").unwrap();
+        build_source_stamp_git(&root, &["add", ".gitignore"]);
+        build_source_stamp_git_commit(&root, "ignore generated");
+        let nested = root.join("generated");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("Cargo.toml"),
+            "[package]\nname='generated'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        assert_eq!(capture_build_source_stamp(&nested, None).await, "unknown");
+        eprintln!(
+            "build-source ignored-package fixture retained at {}",
+            root.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn build_source_stamp_missing_root_is_unknown() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let missing = root.join("absent");
+        assert_eq!(capture_build_source_stamp(&missing, None).await, "unknown");
+        eprintln!(
+            "build-source missing-root fixture retained at {}",
+            root.display()
+        );
+    }
+
+    #[test]
+    fn build_source_stamp_reconcile_downgrades_on_mutation() {
+        let head = "a".repeat(40);
+        let other = "b".repeat(40);
+        assert_eq!(reconcile_build_source_stamps(&head, &head), head);
+        assert_eq!(
+            reconcile_build_source_stamps(&head, &format!("{head}-dirty")),
+            "unknown"
+        );
+        assert_eq!(reconcile_build_source_stamps(&head, &other), "unknown");
+        let dirty = format!("{head}-dirty");
+        assert_eq!(reconcile_build_source_stamps(&dirty, &dirty), dirty);
+        assert_eq!(
+            reconcile_build_source_stamps("unknown", "unknown"),
+            "unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_source_stamp_overlay_base_only_ignores_ambient_worktree() {
+        let (root, _head) = build_source_stamp_fixture_repo();
+        std::fs::write(root.join("src/lib.rs"), "pub fn ambient_dirt() {}\n").unwrap();
+        let spec = build_source_stamp_overlay_spec(
+            &"a".repeat(40),
+            &"c".repeat(40),
+            &"d".repeat(64),
+            vec![],
+            vec![],
+        );
+        assert_eq!(
+            capture_build_source_stamp(&root, Some(&spec)).await,
+            "a".repeat(40)
+        );
+        eprintln!(
+            "build-source base-only fixture retained at {}",
+            root.display()
+        );
+    }
+
+    #[test]
+    fn build_source_stamp_overlay_stamp_tracks_selection() {
+        let base = "a".repeat(40);
+        let tree = "c".repeat(40);
+        let fingerprint = "d".repeat(64);
+        let selected = build_source_stamp_overlay_spec(
+            &base,
+            &tree,
+            &fingerprint,
+            vec![PathBuf::from("src/lib.rs")],
+            vec![],
+        );
+        let stamp = clean_overlay_build_source_stamp(&selected);
+        assert_eq!(stamp, format!("{base}-overlay-{fingerprint}"));
+
+        let changed_fingerprint = build_source_stamp_overlay_spec(
+            &base,
+            &tree,
+            &"e".repeat(64),
+            vec![PathBuf::from("src/lib.rs")],
+            vec![],
+        );
+        assert_ne!(
+            stamp,
+            clean_overlay_build_source_stamp(&changed_fingerprint)
+        );
+
+        let dep_root_a = PathBuf::from("/data/projects/dep-a");
+        let dep_root_b = PathBuf::from("/data/projects/dep-b");
+        let dep_a = build_source_stamp_overlay_spec(
+            &"1".repeat(40),
+            &"2".repeat(40),
+            &"3".repeat(64),
+            vec![],
+            vec![],
+        );
+        let dep_b = build_source_stamp_overlay_spec(
+            &"4".repeat(40),
+            &"5".repeat(40),
+            &"6".repeat(64),
+            vec![],
+            vec![],
+        );
+        let with_deps = build_source_stamp_overlay_spec(
+            &base,
+            &tree,
+            &fingerprint,
+            vec![PathBuf::from("src/lib.rs")],
+            vec![
+                (dep_root_a.clone(), dep_a.clone()),
+                (dep_root_b.clone(), dep_b.clone()),
+            ],
+        );
+        let stamp_with_deps = clean_overlay_build_source_stamp(&with_deps);
+        assert!(stamp_with_deps.starts_with(&format!("{base}-overlay-")));
+        assert_ne!(stamp_with_deps, stamp);
+
+        let reordered = build_source_stamp_overlay_spec(
+            &base,
+            &tree,
+            &fingerprint,
+            vec![PathBuf::from("src/lib.rs")],
+            vec![
+                (dep_root_b.clone(), dep_b.clone()),
+                (dep_root_a.clone(), dep_a.clone()),
+            ],
+        );
+        assert_eq!(
+            stamp_with_deps,
+            clean_overlay_build_source_stamp(&reordered)
+        );
+
+        let dep_a_changed = build_source_stamp_overlay_spec(
+            &"7".repeat(40),
+            &dep_a.tree_object,
+            &dep_a.overlay_fingerprint,
+            vec![],
+            vec![],
+        );
+        let changed_dep = build_source_stamp_overlay_spec(
+            &base,
+            &tree,
+            &fingerprint,
+            vec![PathBuf::from("src/lib.rs")],
+            vec![(dep_root_a, dep_a_changed), (dep_root_b, dep_b)],
+        );
+        assert_ne!(
+            stamp_with_deps,
+            clean_overlay_build_source_stamp(&changed_dep)
+        );
+    }
+
+    #[test]
+    fn build_source_stamp_commit_env_filters_and_preserves_aliases() {
+        let valid_a = "a".repeat(40);
+        let valid_b = "b".repeat(7);
+        let values: std::collections::HashMap<String, String> = [
+            ("RCH_GIT_COMMIT", format!("  {valid_a}  ")),
+            ("VERGEN_GIT_SHA", valid_b.clone()),
+            ("GIT_COMMIT", "not-a-hash\n".to_owned()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect();
+        let env = build_source_commit_env(|key| values.get(key).cloned());
+        assert_eq!(env.len(), rch_common::BUILD_COMMIT_ENV_VARS.len());
+        assert_eq!(env["RCH_GIT_COMMIT"], valid_a);
+        assert_eq!(env["VERGEN_GIT_SHA"], valid_b);
+        assert_eq!(env["GIT_COMMIT"], "");
+        assert_eq!(env["GITHUB_SHA"], "");
+        assert_ne!(env["RCH_GIT_COMMIT"], env["VERGEN_GIT_SHA"]);
     }
 }
