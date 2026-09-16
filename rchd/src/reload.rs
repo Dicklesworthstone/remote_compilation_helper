@@ -1773,7 +1773,9 @@ enabled = true
             let id = WorkerId::new("restored");
             let original = pool.get(&id).await.unwrap();
             assert!(original.reserve_slots(1).await);
-            original.add_cached_project("retained-project".to_owned()).await;
+            original
+                .add_cached_project("retained-project".to_owned())
+                .await;
             original.set_speed_score(73.0);
             original.apply_health_status(WorkerStatus::Degraded).await;
             original.open_circuit().await;
@@ -1800,14 +1802,22 @@ enabled = true
             assert_eq!(restored.circuit_state().await, Some(CircuitState::Open));
             assert_eq!(restored.get_speed_score(), 73.0);
             assert!(restored.has_cached_project("retained-project").await);
-            assert_eq!(restored.used_slots(), if complete_before_restore { 0 } else { 1 });
+            assert_eq!(
+                restored.used_slots(),
+                if complete_before_restore { 0 } else { 1 }
+            );
             if !complete_before_restore {
                 restored.release_slots(1).await;
             }
             assert_eq!(pool.prune_drained().await, 0);
             assert!(pool.get(&id).await.is_some());
             let desired = restored.config.read().await.clone();
-            assert!(compute_worker_diff(&pool, &[desired]).await.unwrap().is_empty());
+            assert!(
+                compute_worker_diff(&pool, &[desired])
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 
@@ -1830,7 +1840,9 @@ enabled = true
             match intent {
                 "disabled" => worker.disable(Some("maintenance".to_owned())).await,
                 "disable-after-drain" => {
-                    worker.drain_then_disable(Some("maintenance".to_owned())).await;
+                    worker
+                        .drain_then_disable(Some("maintenance".to_owned()))
+                        .await;
                 }
                 _ => worker.drain().await,
             }
@@ -1849,7 +1861,10 @@ enabled = true
             }
             if matches!(intent, "disabled" | "disable-after-drain") {
                 assert!(worker.is_disabled().await);
-                assert_eq!(worker.disabled_reason().await.as_deref(), Some("maintenance"));
+                assert_eq!(
+                    worker.disabled_reason().await.as_deref(),
+                    Some("maintenance")
+                );
             } else {
                 assert!(worker.is_drained().await);
             }
