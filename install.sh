@@ -2100,6 +2100,9 @@ configure_dispatcher_shim() {
     fi
     [[ "$role" == "dispatcher" ]] || return 0
     info "Restoring dispatcher Cargo interception..."
+    # A service manager does not inherit shell rc PATH. Establish the repair
+    # process's own lookup before status; repair future shells separately below.
+    export PATH="$HOME/.rch/shims:${rch_bin%/*}:$PATH"
     local shim_current=false
     if [[ "${RCH_SHIM_WATCHDOG:-}" == "1" ]]; then
         # Status is retained in the journal. Without jq we conservatively
@@ -2121,31 +2124,48 @@ configure_dispatcher_shim() {
     DISPATCHER_SHIM_CONFIGURED=true
 
     # The installer's environment cannot repair its parent's PATH. Persist the
-    # prepend for new shells and make it effective for remaining install steps.
-    export PATH="$HOME/.rch/shims:$PATH"
+    # prepend for new shells.
     if [[ "${RCH_NO_RC:-}" == "1" ]]; then
         info "RCH_NO_RC=1 set; skipping dispatcher shell rc modification"
         return 0
     fi
-    local shell_rc path_line
+    local shell_rc path_line quoted_install
+    local shell_files=()
     case "${SHELL:-/bin/bash}" in
-        */zsh) shell_rc="$HOME/.zshrc" ;;
-        */fish) shell_rc="$HOME/.config/fish/config.fish" ;;
-        */bash) shell_rc="$HOME/.bashrc" ;;
-        *) shell_rc="$HOME/.profile" ;;
+        */zsh)
+            shell_files=("${ZDOTDIR:-$HOME}/.zshenv" "${ZDOTDIR:-$HOME}/.zprofile" "${ZDOTDIR:-$HOME}/.zshrc")
+            ;;
+        */fish) shell_files=("$HOME/.config/fish/config.fish") ;;
+        */bash)
+            shell_files=("$HOME/.bashrc")
+            # Bash reads only the first existing login file in this order.
+            # Do not create .bash_profile and thereby shadow an existing .profile.
+            if [[ -f "$HOME/.bash_profile" ]]; then
+                shell_files+=("$HOME/.bash_profile")
+            elif [[ -f "$HOME/.bash_login" ]]; then
+                shell_files+=("$HOME/.bash_login")
+            else
+                shell_files+=("$HOME/.profile")
+            fi
+            ;;
+        *) shell_files=("$HOME/.profile") ;;
     esac
+    quoted_install="${rch_bin%/*}"
+    quoted_install="${quoted_install//\'/\'\\\'\'}"
     if [[ "${SHELL:-/bin/bash}" == */fish ]]; then
-        path_line='set -gx PATH "$HOME/.rch/shims" $PATH'
+        path_line="set -gx PATH \"\$HOME/.rch/shims\" '$quoted_install' \$PATH"
     else
-        path_line='export PATH="$HOME/.rch/shims:$PATH"'
+        path_line="export PATH=\"\$HOME/.rch/shims\":'$quoted_install':\"\$PATH\""
     fi
-    mkdir -p "$(dirname "$shell_rc")"
     # Reassert at the end: an updater may have appended its own PATH prepend
     # after an older RCH line. Consecutive installs remain idempotent.
-    if [[ ! -f "$shell_rc" ]] || [[ "$(tail -n 1 "$shell_rc")" != "$path_line" ]]; then
-        printf '\n# RCH dispatcher: keep Cargo offload ahead of toolchain binaries\n%s\n' "$path_line" >> "$shell_rc"
-    fi
-    success "Dispatcher shim restored; new shells load $shell_rc"
+    for shell_rc in "${shell_files[@]}"; do
+        mkdir -p "$(dirname "$shell_rc")"
+        if [[ ! -f "$shell_rc" ]] || [[ "$(tail -n 1 "$shell_rc")" != "$path_line" ]]; then
+            printf '\n# RCH dispatcher: keep Cargo offload ahead of toolchain binaries\n%s\n' "$path_line" >> "$shell_rc"
+        fi
+    done
+    success "Dispatcher shim restored; shell startup files: ${shell_files[*]}"
     warn "Existing shells must refresh PATH or restart; this installer cannot change their environment"
 }
 
@@ -2160,6 +2180,7 @@ install_dispatcher_shim_watchdog() {
         printf 'MODE=local\nHOOK_BIN=rch\nRCH_SHIM_WATCHDOG=1\n'
         printf 'INSTALL_DIR=%q\nCONFIG_DIR=%q\n' "$(cd "$INSTALL_DIR" && pwd)" "$(cd "$CONFIG_DIR" && pwd)"
         printf 'SHELL=%q\n' "${SHELL:-/bin/bash}"
+        printf 'ZDOTDIR=%q\n' "${ZDOTDIR:-$HOME}"
         printf 'RCH_NO_RC=%q\n' "${RCH_NO_RC:-0}"
         printf 'info() { printf "%%s\\n" "$*"; }\n'
         printf 'warn() { printf "%%s\\n" "$*" >&2; }\n'
