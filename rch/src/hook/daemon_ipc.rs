@@ -10,6 +10,114 @@
 use super::*;
 use serde::Deserialize;
 
+const MAX_DAEMON_HEADER_BYTES: usize = 16 * 1024;
+const MAX_DAEMON_BODY_BYTES: usize = 64 * 1024;
+const MAX_DAEMON_STATUS_BYTES: usize = 1024;
+
+/// Bound the entire write, not each partial write. A listening daemon can
+/// accept a connection and then stop reading; the response deadline has not
+/// started yet, so an unbounded write would strand the dispatch indefinitely.
+async fn write_daemon_request<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    request: &[u8],
+    budget: Duration,
+) -> anyhow::Result<()> {
+    timeout(budget, async {
+        writer.write_all(request).await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "Daemon request write timed out after {}ms",
+            budget.as_millis()
+        )
+    })??;
+    Ok(())
+}
+
+/// This is the daemon's one-response-per-connection protocol, not a general
+/// HTTP client. Limit bytes *before* reading them: read_line followed by a
+/// length check cannot bound a peer that never sends a newline.
+async fn read_daemon_body<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    budget: Duration,
+    allow_bare_json: bool,
+) -> anyhow::Result<String> {
+    const MAX_RESPONSE_BYTES: usize = MAX_DAEMON_HEADER_BYTES + MAX_DAEMON_BODY_BYTES + 4;
+    let mut reader = reader.take((MAX_RESPONSE_BYTES + 1) as u64);
+    let mut response = String::new();
+    timeout(budget, reader.read_to_string(&mut response))
+        .await
+        .map_err(|_| anyhow::anyhow!("Daemon response timed out after {}ms", budget.as_millis()))??;
+    anyhow::ensure!(
+        response.len() <= MAX_RESPONSE_BYTES,
+        "Daemon response exceeded {} byte limit",
+        MAX_RESPONSE_BYTES
+    );
+    let body = if let Some((headers, body)) = response
+        .split_once("\r\n\r\n")
+        .or_else(|| response.split_once("\n\n"))
+    {
+        anyhow::ensure!(
+            headers.len() <= MAX_DAEMON_HEADER_BYTES,
+            "Daemon response headers exceeded {} byte limit",
+            MAX_DAEMON_HEADER_BYTES
+        );
+        validate_daemon_status(headers.lines().next().unwrap_or_default())?;
+        body
+    } else {
+        anyhow::ensure!(
+            allow_bare_json && !response.starts_with("HTTP/"),
+            "Daemon response is missing complete HTTP headers"
+        );
+        response.as_str()
+    };
+    anyhow::ensure!(
+        body.len() <= MAX_DAEMON_BODY_BYTES,
+        "Daemon response body exceeded {}KB limit",
+        MAX_DAEMON_BODY_BYTES / 1024
+    );
+    Ok(body.trim().to_string())
+}
+
+fn validate_daemon_status(line: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        line.len() <= MAX_DAEMON_STATUS_BYTES,
+        "Daemon response status exceeded {} byte limit",
+        MAX_DAEMON_STATUS_BYTES
+    );
+    let mut status = line.split_whitespace();
+    anyhow::ensure!(
+        matches!(status.next(), Some("HTTP/1.0" | "HTTP/1.1"))
+            && status.next() == Some("200"),
+        "Daemon returned non-success HTTP status: {}",
+        line.trim()
+    );
+    Ok(())
+}
+
+async fn read_daemon_ack<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    budget: Duration,
+) -> anyhow::Result<()> {
+    let mut reader = BufReader::new(reader).take((MAX_DAEMON_STATUS_BYTES + 1) as u64);
+    let mut line = String::new();
+    timeout(budget, reader.read_line(&mut line))
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon response timed out; release was not acknowledged"))??;
+    anyhow::ensure!(
+        line.len() <= MAX_DAEMON_STATUS_BYTES,
+        "Daemon response status exceeded {} byte limit",
+        MAX_DAEMON_STATUS_BYTES
+    );
+    anyhow::ensure!(
+        line.ends_with('\n'),
+        "daemon closed the connection without a complete acknowledgement"
+    );
+    validate_daemon_status(&line)
+}
+
 #[derive(Deserialize)]
 struct RestartAdmissionStatus {
     admission_closed: bool,
@@ -33,25 +141,11 @@ pub(crate) async fn restart_admission_is_closed(socket_path: &str) -> anyhow::Re
                 daemon_io_timeout().as_millis()
             )
         })??;
-    let (mut reader, mut writer) = stream.into_split();
-    writer.write_all(b"GET /restart-admission\n").await?;
-    writer.flush().await?;
+    let (reader, mut writer) = stream.into_split();
+    write_daemon_request(&mut writer, b"GET /restart-admission\n", daemon_io_timeout()).await?;
 
-    let mut response = String::new();
-    timeout(daemon_io_timeout(), reader.read_to_string(&mut response))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Restart-admission response timed out after {}ms",
-                daemon_io_timeout().as_millis()
-            )
-        })??;
-    let body = response
-        .split_once("\r\n\r\n")
-        .or_else(|| response.split_once("\n\n"))
-        .map_or(response.as_str(), |(_, body)| body)
-        .trim();
-    let status: RestartAdmissionStatus = serde_json::from_str(body)
+    let body = read_daemon_body(reader, daemon_io_timeout(), true).await?;
+    let status: RestartAdmissionStatus = serde_json::from_str(&body)
         .map_err(|error| anyhow::anyhow!("Malformed restart-admission response: {error}"))?;
     Ok(status.admission_closed)
 }
@@ -179,53 +273,12 @@ pub(crate) async fn query_daemon(
         query.push_str(&format!("&wait_timeout_secs={}", wait_timeout_secs));
     }
 
-    // Send request
+    // Bound writes independently from the longer, queue-aware response wait.
     let request = format!("GET /select-worker?{}\n", query);
-    writer.write_all(request.as_bytes()).await?;
-    writer.flush().await?;
-
-    // Read response (skip HTTP headers) with timeout and body size limit.
-    // Body is capped at 64KB to prevent unbounded memory growth.
-    const MAX_RESPONSE_BODY: usize = 64 * 1024;
-    let response_timeout = daemon_response_timeout(wait_for_worker);
-
-    let read_response = async {
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
-        let mut body = String::new();
-        let mut in_body = false;
-
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).await?;
-            if n == 0 {
-                break;
-            }
-            if in_body {
-                if body.len() + line.len() > MAX_RESPONSE_BODY {
-                    return Err(anyhow::anyhow!(
-                        "Daemon response body exceeded {}KB limit",
-                        MAX_RESPONSE_BODY / 1024
-                    ));
-                }
-                body.push_str(&line);
-            } else if line.trim().is_empty() {
-                in_body = true;
-            }
-        }
-
-        parse_selection_response(body.trim())
-            .map_err(|e| anyhow::anyhow!("Failed to parse daemon response: {}", e))
-    };
-
-    let response = timeout(response_timeout, read_response)
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Daemon response timed out after {}s",
-                response_timeout.as_secs()
-            )
-        })??;
+    write_daemon_request(&mut writer, request.as_bytes(), daemon_io_timeout()).await?;
+    let body = read_daemon_body(reader, daemon_response_timeout(wait_for_worker), false).await?;
+    let response = parse_selection_response(&body)
+        .map_err(|e| anyhow::anyhow!("Failed to parse daemon response: {}", e))?;
 
     if let Some(worker) = response.worker.as_ref()
         && !selected_worker_is_requested(&worker.id, preferred_workers)
@@ -318,33 +371,15 @@ pub(crate) async fn release_worker(
         request.push('\n');
     }
 
-    writer.write_all(request.as_bytes()).await?;
-    writer.flush().await?;
+    write_daemon_request(&mut writer, request.as_bytes(), daemon_io_timeout())
+        .await
+        .context("release was not acknowledged")?;
 
     // The daemon writes its HTTP status only after processing the release.
-    // Require that acknowledgement so callers never report a reservation as
-    // released when the socket disappeared, timed out, or returned an error.
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let bytes_read = timeout(daemon_io_timeout(), reader.read_line(&mut line))
+    // A complete, bounded acknowledgement is required before publishing success.
+    read_daemon_ack(reader, daemon_io_timeout())
         .await
-        .map_err(|_| {
-            anyhow::anyhow!("daemon response timed out; release was not acknowledged")
-        })??;
-    if bytes_read == 0 {
-        anyhow::bail!("daemon closed the connection; release was not acknowledged");
-    }
-    let mut status = line.split_whitespace();
-    let protocol = status.next().unwrap_or_default();
-    let code = status.next().unwrap_or_default();
-    if !protocol.starts_with("HTTP/") || code != "200" {
-        anyhow::bail!(
-            "daemon returned non-success release acknowledgement: {}",
-            line.trim()
-        );
-    }
-
-    Ok(())
+        .context("release was not acknowledged")
 }
 
 /// Record a successful build on a worker (for cache affinity).
@@ -375,14 +410,10 @@ pub(crate) async fn record_build(
         request.push_str("&is_test=1");
     }
     request.push('\n');
-    writer.write_all(request.as_bytes()).await?;
-    writer.flush().await?;
+    write_daemon_request(&mut writer, request.as_bytes(), daemon_io_timeout()).await?;
 
-    // Read response line with timeout
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let _ = timeout(daemon_io_timeout(), reader.read_line(&mut line)).await;
-
+    // Best-effort reporting still must not allocate or wait without bounds.
+    let _ = read_daemon_ack(reader, daemon_io_timeout()).await;
     Ok(())
 }
 
@@ -411,13 +442,8 @@ pub(crate) async fn disable_worker_for_fault(
         urlencoding_encode(worker_id.as_str()),
         urlencoding_encode(reason)
     );
-    writer.write_all(request.as_bytes()).await?;
-    writer.flush().await?;
-
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let _ = timeout(daemon_io_timeout(), reader.read_line(&mut line)).await;
-
+    write_daemon_request(&mut writer, request.as_bytes(), daemon_io_timeout()).await?;
+    let _ = read_daemon_ack(reader, daemon_io_timeout()).await;
     Ok(())
 }
 
@@ -465,18 +491,16 @@ pub(super) fn queue_when_busy_enabled() -> bool {
     queue_when_busy_enabled_from(value.as_deref())
 }
 
-/// Default connect/read timeout for one daemon IPC exchange, in milliseconds.
+/// Default connect/write/read timeout for one daemon IPC exchange, in milliseconds.
 const DEFAULT_DAEMON_IO_TIMEOUT_MS: u64 = 5_000;
 /// Bounds accepted for `RCH_DAEMON_TIMEOUT_MS`; anything outside is ignored
 /// so a typo can neither make every hook call fail instantly nor hang it.
 const DAEMON_IO_TIMEOUT_MS_RANGE: std::ops::RangeInclusive<u64> = 100..=600_000;
 
-/// Resolve the daemon socket connect/read timeout from an
-/// `RCH_DAEMON_TIMEOUT_MS` value (issue #57). This is the knob `rch --help`
-/// and `rch capabilities` advertise; it bounds each socket connect and each
-/// response read, while the select-worker *response* wait keeps its own
-/// `RCH_DAEMON_RESPONSE_TIMEOUT_SECS` / `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS`
-/// policy (queued builds legitimately wait far longer than an IPC round trip).
+/// Resolve the daemon socket I/O timeout from an `RCH_DAEMON_TIMEOUT_MS`
+/// value (issue #57). It bounds each connect, the entire request write, and
+/// each response read. The select-worker response wait retains its separate
+/// queue-aware policy because queued builds legitimately wait much longer.
 pub(super) fn daemon_io_timeout_from(raw: Option<&str>) -> Duration {
     raw.and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|ms| DAEMON_IO_TIMEOUT_MS_RANGE.contains(ms))
@@ -575,5 +599,184 @@ mod daemon_io_timeout_tests {
             daemon_io_timeout_from(Some("600000")),
             Duration::from_millis(600_000)
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_ipc_tests {
+    use super::*;
+
+    async fn caller_fixture(
+        response: Vec<u8>,
+        expected_request: &'static str,
+        admission: bool,
+    ) -> anyhow::Result<bool> {
+        // Keep the fixture for diagnosis; do not mutate the test runner's env.
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("ipc.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            assert!(request.starts_with(expected_request), "{request}");
+            // Oversized responses may be rejected before every byte is sent.
+            let _ = writer.write_all(&response).await;
+        };
+        let client = async {
+            if admission {
+                restart_admission_is_closed(path.to_str().unwrap()).await
+            } else {
+                release_worker(
+                    path.to_str().unwrap(),
+                    &WorkerId::new("ipc-test"),
+                    1,
+                    Some(42),
+                    Some(0),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map(|()| true)
+            }
+        };
+        let (result, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(client, server)
+        })
+        .await
+        .expect("real daemon IPC fixture must terminate");
+        result
+    }
+
+    #[tokio::test]
+    async fn restart_admission_rejects_http_errors_through_the_real_socket_caller() {
+        for (status, success) in [("200 OK", true), ("500 Error", false), ("503 Busy", false)] {
+            let response = format!("HTTP/1.1 {status}\r\n\r\n{{\"admission_closed\":false}}");
+            let result = caller_fixture(response.into_bytes(), "GET /restart-admission", true).await;
+            assert_eq!(result.is_ok(), success, "{status}: {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn release_requires_complete_bounded_success_acknowledgement() {
+        for (response, success) in [("HTTP/1.1 200 OK\r\n".to_string(), true), ("HTTP/1.1 200 OK".to_string(), false), ("HTTP/1.1 500 Error\r\n".to_string(), false), ("H".repeat(MAX_DAEMON_STATUS_BYTES + 1), false)] {
+            let result = caller_fixture(response.into_bytes(), "POST /release-worker?", false).await;
+            assert_eq!(result.is_ok(), success, "{result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_request_write_is_bounded_and_cancellation_stops_writing() {
+        let (mut writer, mut peer) = tokio::io::duplex(16);
+        let error = timeout(
+            Duration::from_secs(1),
+            write_daemon_request(&mut writer, &[b'x'; 4096], Duration::from_millis(20)),
+        )
+        .await
+        .expect("write deadline must fire")
+        .expect_err("an unread full pipe cannot finish the request");
+        assert!(error.to_string().contains("request write timed out"));
+        drop(writer);
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, vec![b'x'; 16], "no detached writer may continue");
+    }
+
+    #[tokio::test]
+    async fn partial_write_progress_does_not_reset_the_deadline() {
+        let (mut writer, mut peer) = tokio::io::duplex(1);
+        let write = async {
+            let result = write_daemon_request(
+                &mut writer,
+                &[b'x'; 4096],
+                Duration::from_millis(30),
+            )
+            .await;
+            drop(writer);
+            result
+        };
+        let drain = async {
+            let mut count = 0;
+            let mut byte = [0];
+            while peer.read(&mut byte).await.unwrap() != 0 {
+                count += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            count
+        };
+        let (result, received) = timeout(Duration::from_secs(2), async {
+            tokio::join!(write, drain)
+        })
+        .await
+        .expect("partial progress must not prolong a stalled dispatch");
+        assert!(result.unwrap_err().to_string().contains("request write timed out"));
+        assert!(received < 4096);
+    }
+
+    #[tokio::test]
+    async fn response_limits_apply_without_newlines_or_eof() {
+        let error = read_daemon_body(
+            tokio::io::repeat(b'x'),
+            Duration::from_secs(1),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeded"), "{error}");
+        let error = read_daemon_ack(tokio::io::repeat(b'H'), Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeded"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn body_and_header_limits_are_independent_and_checked_before_trimming() {
+        let prefix = "HTTP/1.1 200 OK\r\n\r\n";
+        let exact = format!("{prefix}{}", " ".repeat(MAX_DAEMON_BODY_BYTES));
+        assert!(read_daemon_body(exact.as_bytes(), Duration::from_secs(1), false).await.is_ok());
+        let oversized = format!("{exact} ");
+        assert!(read_daemon_body(oversized.as_bytes(), Duration::from_secs(1), false).await.is_err());
+        let headers = format!("HTTP/1.1 200 OK\r\nX: {}\r\n\r\n{{}}", "x".repeat(MAX_DAEMON_HEADER_BYTES));
+        assert!(read_daemon_body(headers.as_bytes(), Duration::from_secs(1), false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn status_failures_cannot_authorize_admission_or_acknowledge_release() {
+        for status in ["HTTP/1.1 500 Error", "HTTP/1.1 503 Busy", "garbage 200 OK"] {
+            let reply = format!("{status}\r\n\r\n{{\"admission_closed\":false}}");
+            assert!(read_daemon_body(reply.as_bytes(), Duration::from_secs(1), true).await.is_err());
+            assert!(read_daemon_ack(reply.as_bytes(), Duration::from_secs(1)).await.is_err());
+        }
+        assert!(read_daemon_ack(b"HTTP/1.1 200 OK".as_slice(), Duration::from_secs(1)).await.is_err());
+        for reply in [
+            "HTTP/1.1 200 OK\r\n\r\n{\"admission_closed\":false}",
+            "HTTP/1.0 200 OK\n\n{\"admission_closed\":false}",
+            "{\"admission_closed\":false}",
+        ] {
+            assert_eq!(
+                read_daemon_body(reply.as_bytes(), Duration::from_secs(1), true).await.unwrap(),
+                "{\"admission_closed\":false}"
+            );
+        }
+        let (reader, mut peer) = tokio::io::duplex(64);
+        peer.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
+        read_daemon_ack(reader, Duration::from_secs(1))
+            .await
+            .expect("a complete acknowledgement must not wait for peer EOF");
+    }
+
+    #[tokio::test]
+    async fn silent_response_is_bounded_without_shortening_the_queue_policy() {
+        let (reader, _peer) = tokio::io::duplex(16);
+        let error = read_daemon_body(reader, Duration::from_millis(20), false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("response timed out"));
+        assert_eq!(daemon_response_timeout_for(false, None, None), Duration::from_secs(30));
+        assert_eq!(daemon_response_timeout_for(true, None, None), Duration::from_secs(330));
+        assert_eq!(daemon_response_timeout_for(true, Some("90"), Some("450")), Duration::from_secs(90));
     }
 }
