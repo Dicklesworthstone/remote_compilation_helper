@@ -31,9 +31,9 @@ pub(super) fn selected_manifest_root(
     }
     let (words, cargo_index) = managed_clean_overlay_cargo_tokens(command)?;
     let mut selected = None;
-    let mut changes_directory = words[..cargo_index].iter().any(|word| {
-        matches!(word.as_str(), "-C" | "--chdir") || word.starts_with("--chdir=")
-    });
+    let mut changes_directory = words[..cargo_index]
+        .iter()
+        .any(|word| matches!(word.as_str(), "-C" | "--chdir") || word.starts_with("--chdir="));
     let mut args = words[cargo_index + 1..].iter();
     while let Some(arg) = args.next() {
         if arg == "--" {
@@ -79,7 +79,10 @@ pub(super) fn selected_manifest_root(
                     | "--artifact-dir"
                     | "--out-dir"
             ) {
-                anyhow::ensure!(args.next().is_some(), "missing value for Cargo option {arg}");
+                anyhow::ensure!(
+                    args.next().is_some(),
+                    "missing value for Cargo option {arg}"
+                );
             }
             None
         };
@@ -104,7 +107,10 @@ pub(super) fn selected_manifest_root(
     );
     let manifest = invocation_root.join(selected);
     anyhow::ensure!(
-        manifest.file_name().is_some_and(|name| name == "Cargo.toml") && manifest.is_file(),
+        manifest
+            .file_name()
+            .is_some_and(|name| name == "Cargo.toml")
+            && manifest.is_file(),
         "selected Cargo manifest is not a file: {}",
         manifest.display()
     );
@@ -186,7 +192,8 @@ mod tests {
         synced_dependency_preflight_checks,
     };
     use super::super::super::{
-        CompilationKind, HookReporter, OutputVisibility, WorkerConfig, build_dependency_runtime_plan,
+        CompilationKind, HookReporter, OutputVisibility, WorkerConfig,
+        build_dependency_runtime_plan,
     };
     use super::*;
 
@@ -213,10 +220,26 @@ mod tests {
             vec!["cargo", "test", "--manifest-path", value],
             vec!["cargo", "+nightly", "test", "--manifest-path", value],
             vec![
-                "env", "--", "KEY=value", "rustup", "run", "nightly", "cargo", "test",
-                "--manifest-path", value,
+                "env",
+                "--",
+                "KEY=value",
+                "rustup",
+                "run",
+                "nightly",
+                "cargo",
+                "test",
+                "--manifest-path",
+                value,
             ],
-            vec!["/usr/bin/time", "-f", "cargo", "cargo", "test", "--manifest-path", value],
+            vec![
+                "/usr/bin/time",
+                "-f",
+                "cargo",
+                "cargo",
+                "test",
+                "--manifest-path",
+                value,
+            ],
         ] {
             assert_eq!(
                 selected_manifest_root(&shell_words::join(args), &base, &policy).unwrap(),
@@ -267,7 +290,10 @@ mod tests {
             "env -C ignored cargo build --manifest-path Cargo.toml",
             "cargo -C ignored build --manifest-path Cargo.toml",
         ] {
-            assert!(selected_manifest_root(command, &root, &policy).is_err(), "{command}");
+            assert!(
+                selected_manifest_root(command, &root, &policy).is_err(),
+                "{command}"
+            );
         }
     }
 
@@ -289,8 +315,11 @@ mod tests {
         package(&dep, "external_dep", "");
         let reporter = HookReporter::new(OutputVisibility::None);
         for (name, selected, external) in [("a", &a, true), ("b", &b, false)] {
-            let command = format!("cargo test --manifest-path crates/{name}/Cargo.toml --all-targets");
-            let entry = selected_manifest_root(&command, &repo, &policy).unwrap().unwrap();
+            let command =
+                format!("cargo test --manifest-path crates/{name}/Cargo.toml --all-targets");
+            let entry = selected_manifest_root(&command, &repo, &policy)
+                .unwrap()
+                .unwrap();
             assert_eq!(&entry, selected);
             let graph = build_dependency_runtime_plan(
                 &entry,
@@ -302,7 +331,10 @@ mod tests {
             assert_eq!(graph.sync_roots.contains(&dep), external);
             let plan = build_sync_closure_plan(&graph.sync_roots, &repo, "fixture", &policy);
             assert_eq!(plan.iter().filter(|entry| entry.is_primary).count(), 1);
-            assert!(plan.iter().any(|entry| entry.is_primary && entry.local_root == repo));
+            assert!(
+                plan.iter()
+                    .any(|entry| entry.is_primary && entry.local_root == repo)
+            );
             assert!(
                 !plan.iter().any(|entry| &entry.local_root == selected),
                 "nested package must stay collapsed into repository sync"
@@ -336,7 +368,10 @@ mod tests {
                 Path::new(&check.required_path)
                     .starts_with(base.join("remote/repo/crates").join(other))
             }));
-            let present = checks.iter().map(|check| check.required_path.clone()).collect();
+            let present = checks
+                .iter()
+                .map(|check| check.required_path.clone())
+                .collect();
             let worker = WorkerConfig::default();
             let healthy = build_dependency_preflight_report(
                 &worker,
@@ -350,7 +385,11 @@ mod tests {
                 let missing = std::collections::BTreeSet::from([check.required_path.clone()]);
                 let report =
                     build_dependency_preflight_report(&worker, &outcomes, &present, &missing, None);
-                assert!(!report.verified, "missing {} must refuse", check.required_path);
+                assert!(
+                    !report.verified,
+                    "missing {} must refuse",
+                    check.required_path
+                );
                 assert!(report.evidence.iter().any(|item| {
                     item.required_path == check.required_path
                         && item.status == DependencyPreflightStatus::Missing
@@ -377,11 +416,15 @@ mod tests {
         };
         for (outcome, status) in [
             (
-                SyncRootOutcome::Skipped { reason: "not uploaded".into() },
+                SyncRootOutcome::Skipped {
+                    reason: "not uploaded".into(),
+                },
                 DependencyPreflightStatus::Stale,
             ),
             (
-                SyncRootOutcome::Failed { error: "upload failed".into() },
+                SyncRootOutcome::Failed {
+                    error: "upload failed".into(),
+                },
                 DependencyPreflightStatus::Unknown,
             ),
         ] {

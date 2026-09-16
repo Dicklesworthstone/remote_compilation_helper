@@ -442,12 +442,8 @@ pub(super) async fn execute_remote_compilation(
         roots.extend(spec.dependencies.iter().map(|(root, _)| root.clone()));
         roots
     } else {
-        let dependency_plan = build_dependency_runtime_plan(
-            dependency_entry_root,
-            kind,
-            reporter,
-            topology_policy,
-        );
+        let dependency_plan =
+            build_dependency_runtime_plan(dependency_entry_root, kind, reporter, topology_policy);
         if let Some(decision) = dependency_plan.fail_open_decision.as_ref() {
             let report = build_dependency_runtime_fail_open_report(
                 &worker_config,
