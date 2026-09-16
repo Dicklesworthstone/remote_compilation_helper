@@ -2695,9 +2695,26 @@ fi",
         // `remote_build_jobs_fragment`. Windows workers run Git's sh without
         // nproc/meminfo/sysctl and are skipped.
         let build_jobs_fragment = self.remote_build_jobs_fragment();
+        let cargo_home_base = if command.contains("cargo") {
+            let base_var = rch_common::RCH_CARGO_HOME_BASE_VAR;
+            let physical_base = if self.worker_platform.is_windows() {
+                String::new()
+            } else {
+                format!(
+                    "case \"${{{base_var}}}\" in /*) ;; *) {base_var}=\"./${{{base_var}}}\" ;; esac; {base_var}=\"$(CDPATH= cd \"${{{base_var}}}\" && pwd -P)\" || exit $?; "
+                )
+            };
+            format!(
+                "{}; {physical_base}export {base_var}; ",
+                rch_common::remote_cargo_home_base_prelude()
+            )
+        } else {
+            String::new()
+        };
 
         format!(
-            "export LC_ALL=C; {}touch {} && cd {} && {}{}{}",
+            "export LC_ALL=C; {}{}touch {} && cd {} && {}{}{}",
+            cargo_home_base,
             build_jobs_fragment,
             escaped_remote_path,
             escaped_remote_path,
@@ -8682,6 +8699,215 @@ Number of files transferred: 42
             !command.contains("/root/cass-ft-target"),
             "host-absolute target-dir must NOT be forwarded: {command}"
         );
+    }
+
+    #[cfg(unix)]
+    fn cargo_home_boundary_pipeline(root: &Path) -> TransferPipeline {
+        TransferPipeline::new(
+            root.to_path_buf(),
+            "cache-boundary".to_owned(),
+            "abcd1234".to_owned(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(root.to_str().unwrap())
+        .with_compilation_config(rch_common::CompilationConfig {
+            external_timeout_enabled: false,
+            remote_build_jobs: RemoteBuildJobs::Off,
+            ..Default::default()
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_home_boundary_worker_base_survives_managed_env_and_cd() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let worker_base = retained.join("worker volume");
+        std::fs::create_dir(&worker_base).unwrap();
+        let alias = retained.join("worker alias");
+        std::os::unix::fs::symlink(&worker_base, &alias).unwrap();
+        let physical_base = worker_base.canonicalize().unwrap();
+        let cdpath = retained.join("cdpath search");
+        std::fs::create_dir_all(cdpath.join("worker volume")).unwrap();
+        let dash_base = retained.join("-");
+        std::fs::create_dir(&dash_base).unwrap();
+        let temp_values = [
+            (
+                worker_base.as_os_str().to_os_string(),
+                physical_base.clone(),
+            ),
+            (
+                std::ffi::OsString::from("worker volume"),
+                physical_base.clone(),
+            ),
+            (alias.as_os_str().to_os_string(), physical_base),
+            (
+                std::ffi::OsString::from("-"),
+                dash_base.canonicalize().unwrap(),
+            ),
+        ];
+        for (case, (temp_value, physical_base)) in temp_values.into_iter().enumerate() {
+            let worker = WorkerId::new(format!("cache-worker-{case}"));
+            let cache = physical_base.join(format!("rch-cargo-cache-{}", worker.as_str()));
+            for round in 0..2 {
+                let source = retained.join(format!("source-{case}-{round}"));
+                std::fs::create_dir(&source).unwrap();
+                let pipeline = cargo_home_boundary_pipeline(&source)
+                    .with_env_allowlist(vec!["TMPDIR".to_owned(), "RCH_CH_BASE".to_owned()])
+                    .with_env_overrides(HashMap::from([
+                        (
+                            "TMPDIR".to_owned(),
+                            "/nonexistent/client-only-temp".to_owned(),
+                        ),
+                        (
+                            "RCH_CH_BASE".to_owned(),
+                            source.join("forwarded-poison").to_str().unwrap().to_owned(),
+                        ),
+                    ]));
+                let workload = crate::hook::add_cargo_isolation(
+                    "printf 'cargo-home=%s\\ntmpdir=%s\\n' \"$CARGO_HOME\" \"$TMPDIR\"; printf 'cache-probe-stderr' >&2",
+                    &worker,
+                );
+                let command = pipeline.build_remote_command(&workload, None);
+                let output = std::process::Command::new("sh")
+                    .args(["-c", &command])
+                    .current_dir(&retained)
+                    .env("TMPDIR", &temp_value)
+                    .env("CDPATH", &cdpath)
+                    .env("OLDPWD", &cdpath)
+                    .env("RCH_CH_BASE", retained.join("stale-inherited-base"))
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{case}/{round}: {output:?}");
+                assert_eq!(output.stderr, b"cache-probe-stderr");
+                let physical_source = source.canonicalize().unwrap();
+                assert_eq!(
+                    output.stdout,
+                    format!(
+                        "cargo-home={}\ntmpdir={}\n",
+                        cache.display(),
+                        physical_source.join(".rch-tmp").display()
+                    )
+                    .into_bytes(),
+                    "{case}/{round}"
+                );
+                assert!(!cache.starts_with(&physical_source));
+                let marker = cache.join("cache-marker");
+                if round == 0 {
+                    std::fs::write(&marker, b"cache survives distinct source roots").unwrap();
+                } else {
+                    assert_eq!(
+                        std::fs::read(&marker).unwrap(),
+                        b"cache survives distinct source roots"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_home_boundary_preserves_explicit_home_streams_and_exit() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let worker_base = retained.join("worker volume");
+        let source = retained.join("source");
+        let explicit_home = retained.join("explicit home");
+        for directory in [&worker_base, &source, &explicit_home] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let inner = "printf '%s\\ncargo-out' \"$CARGO_HOME\"; printf 'cargo-err' >&2; exit 42";
+        let requested = format!(
+            "CARGO_HOME={} sh -c {}",
+            shell_words::quote(explicit_home.to_str().unwrap()),
+            shell_words::quote(inner)
+        );
+        let workload = crate::hook::add_cargo_isolation(&requested, &WorkerId::new("cache-worker"));
+        let command = cargo_home_boundary_pipeline(&source).build_remote_command(&workload, None);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .current_dir(&retained)
+            .env("TMPDIR", &worker_base)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(42), "{output:?}");
+        assert_eq!(
+            output.stdout,
+            format!("{}\ncargo-out", explicit_home.display()).into_bytes()
+        );
+        assert_eq!(output.stderr, b"cargo-err");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_home_boundary_worker_temp_fallbacks() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let source = retained.join("source");
+        std::fs::create_dir(&source).unwrap();
+        let fallback = if Path::new("/data/tmp").is_dir() {
+            Path::new("/data/tmp")
+        } else {
+            Path::new("/tmp")
+        }
+        .canonicalize()
+        .unwrap();
+        let missing = retained.join("missing");
+        for value in [
+            None,
+            Some(std::ffi::OsStr::new("")),
+            Some(missing.as_os_str()),
+        ] {
+            let command = cargo_home_boundary_pipeline(&source)
+                .build_remote_command("printf 'cargo-base=%s' \"$RCH_CH_BASE\"", None);
+            let mut process = std::process::Command::new("sh");
+            process
+                .args(["-c", &command])
+                .current_dir(&retained)
+                .env("RCH_CH_BASE", retained.join("stale-inherited-base"));
+            if let Some(value) = value {
+                process.env("TMPDIR", value);
+            } else {
+                process.env_remove("TMPDIR");
+            }
+            let output = process.output().unwrap();
+            assert!(output.status.success(), "{value:?}: {output:?}");
+            assert_eq!(
+                output.stdout,
+                format!("cargo-base={}", fallback.display()).into_bytes()
+            );
+            assert!(output.stderr.is_empty(), "{output:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_home_boundary_precedes_pgid_launch_and_skips_non_cargo() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let pipeline = cargo_home_boundary_pipeline(&retained).with_build_id(Some(1));
+        let workload =
+            crate::hook::add_cargo_isolation("cargo build", &WorkerId::new("cache-worker"));
+        let command = pipeline.build_remote_command(&workload, None);
+        let capture = command.find("export RCH_CH_BASE").unwrap();
+        assert!(capture < command.find("touch ").unwrap());
+        assert!(capture < command.find("&& cd ").unwrap());
+        assert!(capture < command.find("setsid sh -c").unwrap());
+        let plain = "printf plain";
+        assert_eq!(
+            crate::hook::add_cargo_isolation(plain, &WorkerId::new("cache-worker")),
+            plain
+        );
+        assert!(
+            !pipeline
+                .build_remote_command(plain, None)
+                .contains("RCH_CH_BASE")
+        );
+        let windows = cargo_home_boundary_pipeline(&retained)
+            .with_worker_platform(WorkerPlatform::Windows)
+            .build_remote_command(&workload, None);
+        assert!(windows.contains("export RCH_CH_BASE"));
+        assert!(!windows.contains("RCH_CH_BASE=\"$("));
     }
 
     // ---- issue #49: per-job CARGO_BUILD_JOBS cap on the worker ----

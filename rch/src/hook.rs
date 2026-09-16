@@ -4756,7 +4756,7 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
 }
 
 /// Add per-worker CARGO_HOME isolation to prevent cache lock contention.
-fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
+pub(crate) fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
     // Check if this is a cargo command that could benefit from isolation
     if !command.contains("cargo") {
         return command.to_string();
@@ -4798,10 +4798,11 @@ fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
     let cargo_home = rch_common::remote_cargo_cache_expr(&safe_worker_id);
     let quoted_cargo_home = format!("\"{cargo_home}\"");
     let base_prelude = rch_common::remote_cargo_home_base_prelude();
+    let base_var = rch_common::RCH_CARGO_HOME_BASE_VAR;
 
     let escaped_command = shell_escape::escape(command.into());
     let script = format!(
-        "{base_prelude}; mkdir -p {cargo_home} || exit $?; touch {cargo_home} 2>/dev/null || true; export CARGO_HOME={cargo_home}; if command -v git >/dev/null 2>&1; then export CARGO_NET_GIT_FETCH_WITH_CLI=true; fi; sh -c {command}",
+        "{base_var}=\"${{1:-}}\"; if [ -z \"${{{base_var}}}\" ]; then {base_prelude}; fi; mkdir -p {cargo_home} || exit $?; touch {cargo_home} 2>/dev/null || true; export CARGO_HOME={cargo_home}; if command -v git >/dev/null 2>&1; then export CARGO_NET_GIT_FETCH_WITH_CLI=true; fi; sh -c {command}",
         base_prelude = base_prelude,
         cargo_home = quoted_cargo_home,
         command = escaped_command
@@ -4811,7 +4812,10 @@ fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
     // Running the env assignment inside an explicit shell prevents `timeout`
     // from trying to exec `CARGO_HOME=...` as argv[0]. The wrapped command is
     // the script's final statement, so its exit status propagates unchanged.
-    format!("sh -c {}", shell_escape::escape(script.into()))
+    format!(
+        "sh -c {} rch-cargo-cache \"${{{base_var}:-}}\"",
+        shell_escape::escape(script.into())
+    )
 }
 
 #[cfg(test)]
