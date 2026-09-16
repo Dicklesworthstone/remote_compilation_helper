@@ -1001,10 +1001,14 @@ pub(super) async fn verify_remote_dependency_manifests(
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 let (present, missing) = parse_dependency_preflight_probe_output(&stdout);
-                let batch_had_missing = !missing.is_empty();
-                present_paths.extend(present);
-                missing_paths.extend(missing);
-                if !output.status.success() && !batch_had_missing {
+                // Do not publish positive evidence from a failed SSH session.
+                // Even complete stdout can arrive before a transport failure;
+                // otherwise the report can say verified despite probe_failure.
+                let expected_missing_exit = output.status.code() == Some(43) && !missing.is_empty();
+                if output.status.success() || expected_missing_exit {
+                    present_paths.extend(present);
+                    missing_paths.extend(missing);
+                } else {
                     probe_failure = Some(format!(
                         "probe exited with status {:?}; stdout='{}'; stderr='{}'",
                         output.status.code(),
@@ -1170,13 +1174,30 @@ mod stdin_tests {
                 2,
                 "the final root proves every stdin batch was fully processed"
             );
-            verify_remote_dependency_manifests(
-                &worker,
-                &outcomes[ROOT_COUNT - 1..],
-                &reporter,
-            )
-            .await
-            .expect("healthy paths must still pass preflight");
+            verify_remote_dependency_manifests(&worker, &outcomes[ROOT_COUNT - 1..], &reporter)
+                .await
+                .expect("healthy paths must still pass preflight");
+            // SSH can forward every present line and still exit unsuccessfully.
+            // None of those lines may certify a failed batch as verified.
+            for code in [1, 42, 43, 255] {
+                std::fs::write(dir.join("exit-after-output"), code.to_string()).unwrap();
+                let failure = verify_remote_dependency_manifests(
+                    &worker,
+                    &outcomes[ROOT_COUNT - 1..],
+                    &reporter,
+                )
+                .await
+                .expect_err("failed transport must not verify complete positive output")
+                .downcast::<DependencyPreflightFailure>()
+                .expect("typed transport verification failure");
+                assert_eq!(failure.reason_code, DEPENDENCY_PREFLIGHT_CODE_UNKNOWN);
+                assert!(!failure.report.verified);
+                assert_eq!(failure.report.evidence.len(), 2);
+                assert!(failure.report.evidence.iter().all(|item| {
+                    item.status == DependencyPreflightStatus::Unknown
+                        && item.detail.contains(&format!("status Some({code})"))
+                }));
+            }
             std::fs::write(dir.join("finished"), "ok").unwrap();
             return;
         }
@@ -1205,16 +1226,19 @@ for arg; do
     remote=$arg
 done
 [ "$remote" = "sh -lc 'sh -s'" ] || exit 91
+if [ -f "$RCH_DEPENDENCY_STDIN_TEST_DIR/exit-after-output" ]; then
+    /bin/sh -c "$remote"
+    exit "$(cat "$RCH_DEPENDENCY_STDIN_TEST_DIR/exit-after-output")"
+fi
 exec /bin/sh -c "$remote"
 "#,
         )
         .unwrap();
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
         let old_path = std::env::var_os("PATH").unwrap_or_default();
-        let path = std::env::join_paths(
-            std::iter::once(bin).chain(std::env::split_paths(&old_path)),
-        )
-        .unwrap();
+        let path =
+            std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&old_path)))
+                .unwrap();
         let name = concat!(module_path!(), "::dependency_preflight_streams_large_batches");
         let name = name.split_once("::").unwrap().1;
         let output = timeout(
