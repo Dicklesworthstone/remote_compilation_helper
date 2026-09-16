@@ -363,6 +363,26 @@ pub(super) async fn execute_remote_compilation(
     pooled_target_store_base: Option<&str>,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
+    // The build is already registered. Source validation and fingerprinting can
+    // outlast the stuck detector's deadline before any remote transfer begins.
+    // Keep this RAII guard alive across preflight, including every early error;
+    // the remote process-group path is attached only once planning establishes it.
+    let mut heartbeat_loop = build_id.map(|id| {
+        BuildHeartbeatLoop::start(
+            socket_path,
+            id,
+            &worker_config.id,
+            local_wrapper_id,
+            durable_lease,
+        )
+    });
+    if let Some(loop_ref) = heartbeat_loop.as_ref() {
+        loop_ref.update_phase(
+            BuildHeartbeatPhase::SyncUp,
+            Some("source_validation".to_string()),
+        );
+        loop_ref.flush().await;
+    }
     if source_content_receipt && WorkerPlatform::from_worker(&worker_config).is_windows() {
         anyhow::bail!("source-content receipts require the Unix rsync transport");
     }
@@ -705,15 +725,6 @@ pub(super) async fn execute_remote_compilation(
             .iter()
             .find(|entry| entry.is_primary)
             .map(|entry| TransferPipeline::remote_pgid_file_path_for_root(&entry.remote_root, id))
-    });
-    let mut heartbeat_loop = build_id.map(|id| {
-        BuildHeartbeatLoop::start(
-            socket_path,
-            id,
-            &worker_config.id,
-            local_wrapper_id,
-            durable_lease,
-        )
     });
     if let Some(loop_ref) = heartbeat_loop.as_ref() {
         loop_ref.set_remote_pgid_file(remote_pgid_file);
