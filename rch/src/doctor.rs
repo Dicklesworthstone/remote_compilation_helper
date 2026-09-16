@@ -799,6 +799,29 @@ pub(crate) fn local_build_check(
     }
 }
 
+fn dispatcher_shim_check(role: rch_common::BoxRole, problems: Vec<String>) -> CheckResult {
+    let required = role == rch_common::BoxRole::Dispatcher;
+    let unhealthy = required && !problems.is_empty();
+    CheckResult {
+        category: "configuration".to_string(),
+        name: "dispatcher_shim".to_string(),
+        status: if unhealthy { CheckStatus::Warning } else { CheckStatus::Pass },
+        message: if unhealthy {
+            "role=dispatcher: Cargo interception needs repair".to_string()
+        } else if required {
+            "role=dispatcher: Cargo shims are current and effective on PATH".to_string()
+        } else {
+            format!("role={}: dispatcher shims are not required", role.as_str())
+        },
+        details: unhealthy.then(|| problems.join("; ")),
+        suggestion: unhealthy.then(||
+            "Run rch shim install and put ~/.rch/shims first on PATH; restart existing agent shells".to_string()),
+        fixable: false,
+        fix_applied: false,
+        fix_message: None,
+    }
+}
+
 fn reliability_local_build_diagnostics(
     observation: Option<&crate::local_builds::LocalBuildObservation>,
 ) -> Vec<ReliabilityDiagnostic> {
@@ -846,12 +869,21 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
     }
 
     // Local dispatcher warnings do not depend on daemon or worker availability.
-    if let Ok(config) = crate::config::load_config()
-        && let Some(observation) = crate::local_builds::observe(config.general.role)
-    {
-        let check = local_build_check(&observation);
+    if let Ok(config) = crate::config::load_config() {
+        let problems = if config.general.role == rch_common::BoxRole::Dispatcher {
+            crate::commands::shim::dispatcher_shim_problems()
+                .unwrap_or_else(|error| vec![format!("Cannot inspect shims: {error:#}")])
+        } else {
+            Vec::new()
+        };
+        let check = dispatcher_shim_check(config.general.role, problems);
         print_check_result(&check, ctx);
         checks.push(check);
+        if let Some(observation) = crate::local_builds::observe(config.general.role) {
+            let check = local_build_check(&observation);
+            print_check_result(&check, ctx);
+            checks.push(check);
+        }
     }
 
     // Run all checks
@@ -5970,6 +6002,39 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn dispatcher_role_shim_check_is_read_only_and_preserves_findings() {
+        use rch_common::BoxRole;
+        let problems = vec![
+            "missing cargo".to_string(),
+            "PATH bypasses shim".to_string(),
+        ];
+        let check = dispatcher_shim_check(BoxRole::Dispatcher, problems.clone());
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert_eq!(
+            check.details.as_deref(),
+            Some("missing cargo; PATH bypasses shim")
+        );
+        assert!(
+            check
+                .suggestion
+                .as_deref()
+                .unwrap()
+                .contains("rch shim install")
+        );
+        assert!(!check.fixable && !check.fix_applied);
+        assert_eq!(
+            dispatcher_shim_check(BoxRole::Dispatcher, vec![]).status,
+            CheckStatus::Pass
+        );
+        for role in [BoxRole::Worker, BoxRole::Hybrid] {
+            let check = dispatcher_shim_check(role, problems.clone());
+            assert_eq!(check.status, CheckStatus::Pass);
+            assert!(check.message.contains(role.as_str()));
+            assert!(check.details.is_none() && check.suggestion.is_none());
+        }
+    }
 
     #[test]
     fn local_build_diagnostics_preserve_current_warning_and_failure_details() {
