@@ -46,9 +46,8 @@ use super::remote_result::RemoteExecutionResult;
 use super::repo_updater::maybe_sync_repo_set_with_repo_updater;
 use super::source_fidelity::{
     PreparedSourceContentRoot, bind_build_source_aliases, build_source_commit_env,
-    capture_build_source_stamp,
-    finalize_source_content_receipt, prepare_source_content_root, reconcile_build_source_stamps,
-    verify_source_content_roots,
+    capture_build_source_stamp, finalize_source_content_receipt, prepare_source_content_root,
+    reconcile_build_source_stamps, verify_source_content_roots,
 };
 use super::ssh::{
     acquire_clean_overlay_source_pair, acquire_remote_source_authority_lock,
@@ -854,9 +853,8 @@ pub(super) async fn execute_remote_compilation(
         // Alias cleanup/restoration belongs immediately around the caller's
         // command, after worker environment assembly. Empty forwarded values
         // would suppress valid Cargo `[env]` defaults from selected config.
-        effective_env_allowlist.retain(|key| {
-            !rch_common::BUILD_COMMIT_ENV_VARS.contains(&key.trim())
-        });
+        effective_env_allowlist
+            .retain(|key| !rch_common::BUILD_COMMIT_ENV_VARS.contains(&key.trim()));
     }
     let cargo_env_overrides = cargo_target_env_overrides(forwarded_cargo_target_dir.as_deref());
     // Remote target-dir name for the forwarded-CARGO_TARGET_DIR sync. By default
