@@ -87,6 +87,10 @@ pub enum MemberKind {
 pub struct ScanObservation {
     /// Sorted member map (BTreeMap keeps digest input deterministic).
     pub members: BTreeMap<String, MemberKind>,
+    // Local mutation evidence only, never part of the portable manifest hash.
+    // Keeping this across passes catches write/restore cycles whose bytes and
+    // mtime match again. Synthetic scanners can populate members via Default.
+    identities: BTreeMap<String, FileIdentity>,
 }
 
 /// The first divergence between two scans of one attempt.
@@ -381,6 +385,11 @@ pub fn first_divergence(first: &ScanObservation, second: &ScanObservation) -> Op
             }
             (MemberKind::Directory, MemberKind::Directory) => {}
             _ => return Some(Divergence::KindChanged { path: path.clone() }),
+        }
+    }
+    for path in first.identities.keys().chain(second.identities.keys()) {
+        if first.identities.get(path) != second.identities.get(path) {
+            return Some(Divergence::MetadataInconsistent { path: path.clone() });
         }
     }
     None
@@ -840,6 +849,16 @@ fn scan_retained_directory(
         } else {
             return Err(reject(&rel, CaptureRejection::UnsupportedKind));
         };
+        let after = std::fs::symlink_metadata(&path).map_err(|error| capture_io(&path, error))?;
+        if identity_of(&metadata) != identity_of(&after) {
+            return Err(CaptureError::Incoherent(CaptureRefusal {
+                attempts: 0,
+                last_divergence: Divergence::UnstableDuringRead { path: rel },
+            }));
+        }
+        scan.observation
+            .identities
+            .insert(rel.clone(), identity_of(&after));
         scan.observation.members.insert(rel, member);
     }
     Ok(())
@@ -850,6 +869,16 @@ fn read_retained_file(
     relative: &str,
     observed: &std::fs::Metadata,
     remaining: &mut u64,
+) -> Result<(MemberKind, Vec<u8>), CaptureError> {
+    read_retained_file_with(path, relative, observed, remaining, |_| {})
+}
+
+fn read_retained_file_with(
+    path: &Path,
+    relative: &str,
+    observed: &std::fs::Metadata,
+    remaining: &mut u64,
+    mut after_chunk: impl FnMut(usize),
 ) -> Result<(MemberKind, Vec<u8>), CaptureError> {
     use std::io::Read;
     let unstable = || {
@@ -882,6 +911,7 @@ fn read_retained_file(
         }
         *remaining -= count as u64;
         bytes.extend_from_slice(&buffer[..count]);
+        after_chunk(count);
     }
     let after = file.metadata().map_err(|error| capture_io(path, error))?;
     if identity_of(&before) != identity_of(&after)
@@ -1043,6 +1073,9 @@ pub fn scan_directory(
                 path: rel.clone(),
                 cause: e.to_string(),
             })?;
+            observation
+                .identities
+                .insert(rel.clone(), identity_of(&meta));
             if meta.file_type().is_symlink() {
                 let target = std::fs::read_link(&path).map_err(|e| ScanError::Io {
                     path: rel.clone(),
@@ -1124,9 +1157,33 @@ fn mode_of(meta: &std::fs::Metadata) -> u32 {
     }
 }
 
-/// (inode, mtime) — the identity/metadata pair verified around a read.
-fn identity_of(meta: &std::fs::Metadata) -> (u64, u128) {
-    (inode_of(meta), mtime_ns_of(meta))
+/// Descriptor identity and mutation metadata verified around a read.
+/// Unix change time detects writes whose original mtime was restored; device
+/// identity prevents an equal inode number on another filesystem from matching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    inode: u64,
+    device: u64,
+    mtime_ns: u128,
+    ctime_secs: i64,
+    ctime_ns: i64,
+}
+
+fn identity_of(meta: &std::fs::Metadata) -> FileIdentity {
+    #[cfg(unix)]
+    let (device, ctime_secs, ctime_ns) = {
+        use std::os::unix::fs::MetadataExt;
+        (meta.dev(), meta.ctime(), meta.ctime_nsec())
+    };
+    #[cfg(not(unix))]
+    let (device, ctime_secs, ctime_ns) = (0, 0, 0);
+    FileIdentity {
+        inode: inode_of(meta),
+        device,
+        mtime_ns: mtime_ns_of(meta),
+        ctime_secs,
+        ctime_ns,
+    }
 }
 
 #[cfg(unix)]
@@ -1150,6 +1207,246 @@ fn mtime_ns_of(meta: &std::fs::Metadata) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_mtime_write_between_observation_and_open_is_refused() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("input.rs");
+        std::fs::write(&path, b"original source").unwrap();
+        let observed = std::fs::metadata(&path).unwrap();
+        // Same inode, size and mtime: only change time exposes this real write.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(&path, b"modified source").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(observed.modified().unwrap())
+            .unwrap();
+        let mut budget = 1024;
+        let result = read_retained_file(&path, "input.rs", &observed, &mut budget);
+        assert!(
+            matches!(result, Err(CaptureError::Incoherent(_))),
+            "a real intervening write must be refused even when mtime is restored: {result:?}"
+        );
+        eprintln!(
+            "retained restored-mtime mutation fixture: {}",
+            dir.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_mid_read_write_with_restored_mtime_refuses_hybrid_bytes() {
+        use std::io::{Seek, Write};
+        let retained = tempfile::tempdir().unwrap().keep();
+        let path = retained.join("input");
+        let original = vec![b'A'; 192 * 1024];
+        std::fs::write(&path, &original).unwrap();
+        let observed = std::fs::metadata(&path).unwrap();
+        let mut budget = original.len() as u64;
+        let mut chunks = 0;
+        let mut first_chunk = 0;
+        // Schedule a real write after the first descriptor read. This controls
+        // interleaving only: the scanner still reads and stats the actual file.
+        // Writer changes prefix first, then suffix. A-prefix/B-suffix NEVER
+        // exists on disk, but a reader missing the mutation would return it.
+        let result = read_retained_file_with(&path, "input", &observed, &mut budget, |count| {
+            chunks += 1;
+            if chunks == 1 {
+                first_chunk = count;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                let mut writer = std::fs::File::options().write(true).open(&path).unwrap();
+                writer.rewind().unwrap();
+                writer.write_all(&vec![b'B'; first_chunk]).unwrap();
+                writer
+                    .write_all(&vec![b'B'; original.len() - first_chunk])
+                    .unwrap();
+                writer.set_modified(observed.modified().unwrap()).unwrap();
+            }
+        });
+        assert!(chunks >= 3, "mutation must occur during a multi-chunk read");
+        assert!(first_chunk > 0 && first_chunk <= 64 * 1024);
+        if let Ok((_, bytes)) = &result {
+            assert!(bytes[..first_chunk].iter().all(|byte| *byte == b'A'));
+            assert!(bytes[first_chunk..].iter().all(|byte| *byte == b'B'));
+            panic!(
+                "accepted hybrid that never existed: first_chunk={first_chunk}, total={}",
+                bytes.len()
+            );
+        }
+        assert!(
+            matches!(result, Err(CaptureError::Incoherent(_))),
+            "must refuse a hybrid image that never existed: {result:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), vec![b'B'; original.len()]);
+        eprintln!(
+            "retained real mid-read mutation fixture: {}, first_chunk={first_chunk}",
+            retained.display()
+        );
+    }
+
+    #[test]
+    fn generated_real_tree_mutations_retry_the_entire_closure() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        // Deterministic generated orders exercise both in-place writes with
+        // restored mtimes and rename-based inode replacement, on real files.
+        for seed in 0..32_usize {
+            let root = retained.join(format!("case-{seed}"));
+            std::fs::create_dir(&root).unwrap();
+            let mut files = Vec::new();
+            for index in 0..4 {
+                let path = root.join(format!("file-{index}"));
+                std::fs::write(&path, b"generation-A").unwrap();
+                files.push(path);
+            }
+            let roots = vec![("workspace".to_string(), root.clone())];
+            let mut passes = Vec::new();
+            let image = capture_sealed_source_with(&roots, false, 2, 1024, |attempt, pass| {
+                passes.push((attempt, pass));
+                if attempt == 0 && pass == 0 {
+                    for offset in 0..4 {
+                        let index = (offset + seed) % 4;
+                        let path = &files[index];
+                        if (seed >> index) & 1 == 0 {
+                            let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+                            std::fs::write(path, b"generation-B").unwrap();
+                            std::fs::File::options()
+                                .write(true)
+                                .open(path)
+                                .unwrap()
+                                .set_modified(modified)
+                                .unwrap();
+                        } else {
+                            // Keep the replaced file outside the captured root;
+                            // no fixture cleanup can mask a missing member.
+                            let old = retained.join(format!("old-{seed}-{index}"));
+                            std::fs::rename(path, old).unwrap();
+                            std::fs::write(path, b"generation-B").unwrap();
+                        }
+                    }
+                }
+            })
+            .unwrap();
+            assert_eq!(passes, [(0, 0), (0, 1), (1, 0), (1, 1)], "seed={seed}");
+            for index in 0..4 {
+                assert_eq!(
+                    image.file_bytes("workspace", &format!("file-{index}")),
+                    Some(b"generation-B".as_slice()),
+                    "seed={seed} member={index} must come from the accepted pass"
+                );
+            }
+        }
+        eprintln!(
+            "retained generated mutation fixtures: {}",
+            retained.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_write_restore_between_passes_invalidates_the_observation() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let root = retained.join("source");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("input");
+        std::fs::write(&path, b"generation-A").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let initial = scan_directory(&root, false).unwrap();
+        let mut passes = Vec::new();
+        let image = capture_sealed_source_with(
+            &[("workspace".to_string(), root.clone())],
+            false,
+            2,
+            1024,
+            |attempt, pass| {
+                passes.push((attempt, pass));
+                if attempt == 0 && pass == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    std::fs::write(&path, b"generation-B").unwrap();
+                    std::fs::write(&path, b"generation-A").unwrap();
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_modified(modified)
+                        .unwrap();
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(passes, [(0, 0), (0, 1), (1, 0), (1, 1)]);
+        let final_scan = scan_directory(&root, false).unwrap();
+        assert!(matches!(
+            first_divergence(&initial, &final_scan),
+            Some(Divergence::MetadataInconsistent { .. })
+        ));
+        // Local change-time evidence must not perturb portable source identity
+        // when the accepted bytes and semantic metadata are unchanged.
+        assert_eq!(
+            SnapshotManifest::seal(
+                "workspace",
+                FsSemanticClass::GenerationScan,
+                initial.members
+            )
+            .manifest_sha256,
+            SnapshotManifest::seal(
+                "workspace",
+                FsSemanticClass::GenerationScan,
+                final_scan.members
+            )
+            .manifest_sha256
+        );
+        assert_eq!(
+            image.file_bytes("workspace", "input"),
+            Some(b"generation-A".as_slice())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_directory_swap_to_escaping_symlink_never_seals_external_bytes() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let outside = retained.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"must not enter snapshot").unwrap();
+        for index in 0..2 {
+            let root = retained.join(format!("root-{index}"));
+            let child = root.join("src");
+            std::fs::create_dir_all(&child).unwrap();
+            std::fs::write(child.join("safe"), b"workspace source").unwrap();
+            let target = if index % 2 == 0 {
+                outside.clone()
+            } else {
+                PathBuf::from("../outside")
+            };
+            let error = capture_sealed_source_with(
+                &[("workspace".to_string(), root.clone())],
+                false,
+                2,
+                1024,
+                |attempt, pass| {
+                    if attempt == 0 && pass == 0 {
+                        std::fs::rename(&child, retained.join(format!("old-src-{index}"))).unwrap();
+                        std::os::unix::fs::symlink(&target, &child).unwrap();
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    CaptureError::Rejected {
+                        reason: CaptureRejection::UnsafeSymlink,
+                        ..
+                    }
+                ),
+                "case={index} must refuse path escape: {error:?}"
+            );
+        }
+        eprintln!("retained path-escape fixtures: {}", retained.display());
+    }
 
     #[test]
     fn sealed_closure_retries_all_roots_after_between_pass_mutation() {
@@ -1238,7 +1535,10 @@ mod tests {
                 },
             );
         }
-        ScanObservation { members }
+        ScanObservation {
+            members,
+            ..ScanObservation::default()
+        }
     }
 
     #[test]
