@@ -1239,7 +1239,10 @@ exec /bin/sh -c "$remote"
         let path =
             std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&old_path)))
                 .unwrap();
-        let name = concat!(module_path!(), "::dependency_preflight_streams_large_batches");
+        let name = concat!(
+            module_path!(),
+            "::dependency_preflight_streams_large_batches"
+        );
         let name = name.split_once("::").unwrap().1;
         let output = timeout(
             Duration::from_secs(60),
