@@ -826,8 +826,7 @@ pub fn shim_install(
     Ok(())
 }
 
-/// `rch shim status` — report install state, version drift, PATH order, and any
-/// local builds currently running.
+/// Read-only checks shared with the dispatcher's doctor report.
 pub(crate) fn dispatcher_shim_problems() -> Result<Vec<String>> {
     let mut problems = Vec::new();
     let cargo = cargo_shim_path()?;
@@ -844,7 +843,9 @@ pub(crate) fn dispatcher_shim_problems() -> Result<Vec<String>> {
     }
     let (wrapped, total) = toolchain_wrap_counts();
     if wrapped != total {
-        problems.push(format!("only {wrapped}/{total} toolchain Cargo binaries are wrapped"));
+        problems.push(format!(
+            "only {wrapped}/{total} toolchain Cargo binaries are wrapped"
+        ));
     }
     Ok(problems)
 }

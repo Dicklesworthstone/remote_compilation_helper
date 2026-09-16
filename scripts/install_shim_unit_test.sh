@@ -9,6 +9,8 @@ rch_test_binary=${1:?pass an already-built RCH binary}
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/rch-install-shim.XXXXXXXX")
 printf 'Retained installer fixture: %s\n' "$fixture"
 export HOME="$fixture/home" RUSTUP_HOME="$fixture/rustup"
+export XDG_CONFIG_HOME="$fixture/xdg-config" XDG_CACHE_HOME="$fixture/xdg-cache"
+export XDG_DATA_HOME="$fixture/xdg-data" ZDOTDIR="$HOME"
 export RCH_CONFIG_DIR="$fixture/config" RCH_INSTALL_DIR="$fixture/bin"
 export RCH_INSTALLER_LIB=1 RCH_NO_UPDATE_CHECK=1
 mkdir -p "$HOME" "$RUSTUP_HOME" "$RCH_CONFIG_DIR" "$RCH_INSTALL_DIR"
@@ -58,6 +60,14 @@ PATH="$original_path" "$HOME/.rch/shim-watchdog"
 [[ "$(PATH="$original_path" bash --noprofile --norc -c '. "$HOME/.bashrc"; command -v cargo')" == "$HOME/.rch/shims/cargo" ]]
 before_rc=$(cat "$HOME/.bashrc")
 printf 'PASS: a watchdog cycle repairs nonexecutable shim and updater PATH drift\n'
+
+if command -v zsh >/dev/null 2>&1; then
+    export SHELL=/bin/zsh
+    configure_dispatcher_shim
+    [[ "$(PATH="$original_path" zsh -f -c '. "$HOME/.zshrc"; command -v cargo')" == "$HOME/.rch/shims/cargo" ]]
+    export SHELL=/bin/bash
+    printf 'PASS: fresh Zsh resolves the installed shim first\n'
+fi
 
 for role in worker hybrid; do
     printf '[general]\nrole = "%s"\n' "$role" > "$CONFIG_DIR/config.toml"
