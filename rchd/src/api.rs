@@ -682,6 +682,21 @@ pub async fn handle_connection(
     ctx: DaemonContext,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
 ) -> Result<()> {
+    handle_connection_with_metrics(
+        stream,
+        ctx,
+        shutdown_tx,
+        metrics::tracing::request_metrics(),
+    )
+    .await
+}
+
+async fn handle_connection_with_metrics(
+    stream: UnixStream,
+    ctx: DaemonContext,
+    shutdown_tx: tokio::sync::mpsc::Sender<()>,
+    request_metrics: Option<rch_telemetry::metrics::Metrics>,
+) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -695,8 +710,15 @@ pub async fn handle_connection(
     let line = line.trim();
     debug!("Received request: {}", line);
 
+    // Observe finite request handling, including error returns and cancellation.
+    // Event subscriptions live until disconnect, so their lifetime is not a
+    // request latency sample. Reading the initial request line is excluded.
+    let request = parse_request(line);
+    let _request_duration = (!matches!(&request, Ok(ApiRequest::Events)))
+        .then(|| metrics::tracing::RequestDuration::start(request_metrics));
+
     // Parse and handle the request
-    let (response_json, content_type) = match parse_request(line) {
+    let (response_json, content_type) = match request {
         Ok(ApiRequest::SelectWorker {
             request,
             local_wrapper_id,
@@ -4124,6 +4146,106 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("GET /events").unwrap();
         assert!(matches!(req, ApiRequest::Events), "expected events request");
+    }
+
+    #[tokio::test]
+    async fn socket_request_duration_records_real_responses_and_errors() {
+        use prometheus::Encoder;
+
+        let _guard = test_guard!();
+        let registry = prometheus::Registry::new();
+        let observations = rch_telemetry::metrics::Metrics::new().expect("metrics");
+        observations.register(&registry).expect("register metrics");
+        let histogram = observations
+            .request_duration_seconds
+            .with_label_values(&["rchd_api"]);
+
+        for request in ["GET /health\n", "GET /unknown-endpoint\n"] {
+            let (mut client, server) = UnixStream::pair().expect("socket pair");
+            let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::channel(1);
+            let task = tokio::spawn(handle_connection_with_metrics(
+                server,
+                make_test_context(WorkerPool::new()),
+                shutdown_tx,
+                Some(observations.clone()),
+            ));
+            client.write_all(request.as_bytes()).await.expect("request");
+            let mut response = String::new();
+            tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut response))
+                .await
+                .expect("response deadline")
+                .expect("response bytes");
+            let result = task.await.expect("join handler");
+            if request.contains("/health") {
+                result.expect("write health response");
+                assert!(response.starts_with("HTTP/1.0"), "{response}");
+                let body = response.split_once("\r\n\r\n").expect("HTTP body").1;
+                let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
+                assert!(body.get("status").is_some(), "{body}");
+            } else {
+                let error = result.expect_err("unknown route returns early");
+                assert!(error.to_string().contains("Unknown endpoint"), "{error}");
+                assert!(response.is_empty(), "no response was written: {response}");
+            }
+        }
+        assert_eq!(histogram.get_sample_count(), 2);
+        let mut text = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&registry.gather(), &mut text)
+            .expect("encode registered collector");
+        assert!(
+            String::from_utf8(text)
+                .unwrap()
+                .contains("rch_request_duration_seconds_count{entrypoint=\"rchd_api\"} 2\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn socket_request_duration_observes_cancellation_but_excludes_event_streams() {
+        let _guard = test_guard!();
+        let observations = rch_telemetry::metrics::Metrics::new().expect("metrics");
+        let histogram = observations
+            .request_duration_seconds
+            .with_label_values(&["rchd_api"]);
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::channel(1);
+        client
+            .write_all(b"POST /build-heartbeat\n")
+            .await
+            .expect("request without body");
+        let request = handle_connection_with_metrics(
+            server,
+            make_test_context(WorkerPool::new()),
+            shutdown_tx,
+            Some(observations.clone()),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), request)
+                .await
+                .is_err(),
+            "cancel the handler while it waits for the heartbeat body"
+        );
+        assert_eq!(histogram.get_sample_count(), 1, "cancelled finite request");
+
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(handle_connection_with_metrics(
+            server,
+            make_test_context(WorkerPool::new()),
+            shutdown_tx,
+            Some(observations),
+        ));
+        client.write_all(b"GET /events\n").await.expect("subscribe");
+        let mut reader = BufReader::new(client);
+        let mut header = String::new();
+        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut header))
+            .await
+            .expect("stream header deadline")
+            .expect("stream header");
+        assert_eq!(header, "HTTP/1.0 200 OK\r\n");
+        task.abort();
+        assert!(task.await.expect_err("stream cancelled").is_cancelled());
+        assert_eq!(histogram.get_sample_count(), 1, "stream lifetime excluded");
     }
 
     /// Regression for bd-xqg58: the socket `reload` must read the file the

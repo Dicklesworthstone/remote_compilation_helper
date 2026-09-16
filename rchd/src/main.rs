@@ -738,6 +738,19 @@ fn is_stale_socket_connect_error(error: &std::io::Error) -> bool {
     )
 }
 
+/// Finish request observations before shutting down their metric provider.
+async fn drain_connections(connections: &mut tokio::task::JoinSet<()>, grace: Duration) {
+    let drained = tokio::time::timeout(grace, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        connections.abort_all();
+        // Await cancellation so request guards have run before the final export.
+        while connections.join_next().await.is_some() {}
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -810,16 +823,6 @@ async fn main() -> Result<()> {
         }
         Err(e) => warn!("Failed to construct remediation metrics: {}", e),
     }
-
-    // Initialize OpenTelemetry tracing (optional, configured via env vars)
-    let _otel_guard = match metrics::tracing::init_otel() {
-        Ok(guard) => guard,
-        Err(e) => {
-            warn!("Failed to initialize OpenTelemetry: {}", e);
-            None
-        }
-    };
-    let otel_enabled = _otel_guard.is_some();
 
     // Load worker configuration
     let workers = config::load_workers(cli.workers_config.as_deref())?;
@@ -1347,6 +1350,19 @@ async fn main() -> Result<()> {
 
     let commit_hash = rch_common::build_commit().map(|value| value.to_string());
 
+    // Register request metrics after fallible startup, before accepting clients.
+    // Exporter construction configures OTLP; it does not verify connectivity.
+    let otel_guard = match metrics::tracing::init_otel() {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            warn!("Failed to initialize OpenTelemetry: {}", e);
+            None
+        }
+    };
+    let otel_enabled = otel_guard
+        .as_ref()
+        .is_some_and(metrics::tracing::OtelGuard::otel_enabled);
+
     let banner = DaemonBanner::new(
         env!("CARGO_PKG_VERSION"),
         option_env!("PROFILE").map(|value| value.to_string()),
@@ -1393,6 +1409,7 @@ async fn main() -> Result<()> {
 
     // Shutdown channel
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+    let mut connections = tokio::task::JoinSet::new();
 
     // Main accept loop - platform-specific due to SIGHUP handling
     #[cfg(unix)]
@@ -1404,7 +1421,7 @@ async fn main() -> Result<()> {
                         Ok((stream, _addr)) => {
                             let ctx = context.clone();
                             let tx = shutdown_tx.clone();
-                            tokio::spawn(async move {
+                            connections.spawn(async move {
                                 if let Err(e) = api::handle_connection(stream, ctx, tx).await {
                                     if e.downcast_ref::<std::io::Error>()
                                         .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::BrokenPipe)
@@ -1425,6 +1442,7 @@ async fn main() -> Result<()> {
                     info!("Shutdown signal received");
                     break;
                 }
+                _ = connections.join_next(), if !connections.is_empty() => {}
                 _ = sigint.recv() => {
                     info!("SIGINT received, shutting down");
                     break;
@@ -1491,7 +1509,7 @@ async fn main() -> Result<()> {
                         Ok((stream, _addr)) => {
                             let ctx = context.clone();
                             let tx = shutdown_tx.clone();
-                            tokio::spawn(async move {
+                            connections.spawn(async move {
                                 if let Err(e) = api::handle_connection(stream, ctx, tx).await {
                                     if e.downcast_ref::<std::io::Error>()
                                         .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::BrokenPipe)
@@ -1512,6 +1530,7 @@ async fn main() -> Result<()> {
                     info!("Shutdown signal received");
                     break;
                 }
+                _ = connections.join_next(), if !connections.is_empty() => {}
                 _ = tokio::signal::ctrl_c() => {
                     info!("Ctrl-C received, shutting down");
                     break;
@@ -1547,6 +1566,8 @@ async fn main() -> Result<()> {
     })
     .await;
 
+    drain_connections(&mut connections, Duration::from_secs(1)).await;
+
     // Abort background tasks that have no cancellation mechanism
     info!("Stopping background tasks...");
     if let Some(handle) = metrics_handle {
@@ -1565,6 +1586,11 @@ async fn main() -> Result<()> {
     // Clean up socket
     if std::path::Path::new(&context.socket_path).exists() {
         let _ = std::fs::remove_file(&context.socket_path);
+    }
+
+    // Flush the metric provider while its Tokio transport runtime is alive.
+    if let Some(guard) = otel_guard {
+        guard.shutdown().await;
     }
 
     info!("Daemon stopped");
@@ -1591,6 +1617,45 @@ fn socket_test_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connection_drain_waits_for_completed_request() {
+        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+        let mut connections = tokio::task::JoinSet::new();
+        connections.spawn(async move {
+            tokio::task::yield_now().await;
+            finished_tx.send(()).unwrap();
+        });
+        drain_connections(&mut connections, Duration::from_secs(1)).await;
+        assert!(connections.is_empty());
+        assert_eq!(finished_rx.try_recv(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn connection_drain_runs_pending_request_guards_before_returning() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ObservationOnDrop(Arc<AtomicBool>);
+        impl Drop for ObservationOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let observed = Arc::new(AtomicBool::new(false));
+        let observation = observed.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut connections = tokio::task::JoinSet::new();
+        connections.spawn(async move {
+            let _observation = ObservationOnDrop(observation);
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        drain_connections(&mut connections, Duration::from_millis(5)).await;
+        assert!(connections.is_empty());
+        assert!(observed.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn isolated_pool_requires_both_a_separate_socket_and_explicit_workers() {

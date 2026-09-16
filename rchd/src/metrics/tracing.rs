@@ -1,146 +1,155 @@
-//! OpenTelemetry tracing initialization for distributed tracing.
+//! Daemon request metrics with an optional OTLP metrics mirror.
 //!
-//! This module provides optional OpenTelemetry integration for the RCH daemon.
-//! When enabled via environment variables, traces can be exported to an OTLP
-//! collector for distributed tracing across the RCH pipeline.
+//! This does not export tracing spans or logs. Request observations always reach
+//! the daemon's Prometheus registry; OTLP export is explicitly opt-in.
 //!
 //! # Environment Variables
 //!
 //! - `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP endpoint URL (e.g., "http://localhost:4317")
+//! - `RCH_OTEL_EXPORTER_OTLP_ENDPOINT`: Preferred endpoint override
 //! - `OTEL_SERVICE_NAME`: Service name (defaults to "rchd")
 //! - `RCH_OTEL_ENABLED`: Set to "1" or "true" to enable OpenTelemetry
+//! - `RCH_OTEL_EXPORT_INTERVAL_SECS`: Positive export interval (default 30)
 
-use anyhow::Result;
-use std::env;
+use anyhow::{Result, anyhow};
+use rch_telemetry::metrics::Metrics;
+use rch_telemetry::otlp::{OtelMetrics, OtlpConfig};
+use std::sync::{LazyLock, RwLock};
+use std::time::Instant;
 
-/// OpenTelemetry configuration.
-#[derive(Debug, Clone)]
-pub struct OtelConfig {
-    /// Whether OpenTelemetry is enabled.
-    pub enabled: bool,
-    /// OTLP endpoint URL.
-    pub endpoint: Option<String>,
-    /// Service name.
-    pub service_name: String,
-}
+// Reuse registered collectors across initialization cycles. Only the active
+// mirror is replaceable; disabled initialization cannot pin an exporter forever.
+static PROMETHEUS_METRICS: LazyLock<Result<Metrics>> = LazyLock::new(|| {
+    let metrics = Metrics::new()?;
+    metrics.register(&super::REGISTRY)?;
+    Ok(metrics)
+});
+static REQUEST_METRICS: RwLock<Option<Metrics>> = RwLock::new(None);
 
-impl Default for OtelConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            endpoint: None,
-            service_name: "rchd".to_string(),
-        }
+/// Initialize metrics inside the Tokio runtime, before accepting requests.
+pub fn init_otel() -> Result<OtelGuard> {
+    let mut config = OtlpConfig::from_env();
+    if std::env::var("OTEL_SERVICE_NAME")
+        .ok()
+        .is_none_or(|name| name.trim().is_empty())
+    {
+        config.service_name = "rchd".to_string();
     }
+    init_with_config(&config)
 }
 
-impl OtelConfig {
-    /// Load configuration from environment variables.
-    pub fn from_env() -> Self {
-        let enabled = env::var("RCH_OTEL_ENABLED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-
-        let endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
-
-        let service_name = env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "rchd".to_string());
-
-        Self {
-            enabled,
-            endpoint,
-            service_name,
-        }
+pub(crate) fn init_with_config(config: &OtlpConfig) -> Result<OtelGuard> {
+    let mut current = REQUEST_METRICS
+        .write()
+        .map_err(|_| anyhow!("daemon request metrics lock poisoned"))?;
+    if current.is_some() {
+        return Err(anyhow!("daemon request metrics already initialized"));
     }
+    let metrics = PROMETHEUS_METRICS
+        .as_ref()
+        .map_err(|error| anyhow!("registering daemon request metrics: {error}"))?;
+    let (metrics, exporter) = configured_metrics(config, metrics.clone())?;
+    *current = Some(metrics);
+    Ok(OtelGuard { exporter })
 }
 
-/// Initialize OpenTelemetry tracing layer.
-///
-/// This function sets up OpenTelemetry tracing if enabled via environment
-/// variables. Returns `Ok(None)` if OpenTelemetry is not enabled.
-///
-/// # Returns
-///
-/// - `Ok(Some(guard))` if OpenTelemetry was initialized
-/// - `Ok(None)` if OpenTelemetry is disabled
-/// - `Err(_)` if initialization failed
-pub fn init_otel() -> Result<Option<OtelGuard>> {
-    let config = OtelConfig::from_env();
-
-    if !config.enabled {
-        tracing::debug!("OpenTelemetry disabled (set RCH_OTEL_ENABLED=1 to enable)");
-        return Ok(None);
-    }
-
-    // Require an endpoint when enabled
-    let Some(endpoint) = config.endpoint else {
-        tracing::warn!("OpenTelemetry enabled but OTEL_EXPORTER_OTLP_ENDPOINT not set, disabling");
-        return Ok(None);
-    };
-
-    tracing::info!(
-        "Initializing OpenTelemetry tracing: endpoint={}, service={}",
-        endpoint,
-        config.service_name
-    );
-
-    // Note: Full OpenTelemetry initialization would require:
-    // 1. opentelemetry_otlp::new_pipeline().tracing()
-    // 2. Setting up the OTLP exporter with the endpoint
-    // 3. Creating a tracing-opentelemetry layer
-    // 4. Registering it with tracing_subscriber
-    //
-    // For now, we provide a stub that can be expanded when distributed
-    // tracing is needed. The Prometheus metrics provide sufficient
-    // observability for single-daemon operation.
-
-    Ok(Some(OtelGuard {
-        _service_name: config.service_name,
-    }))
+fn configured_metrics(
+    config: &OtlpConfig,
+    metrics: Metrics,
+) -> Result<(Metrics, Option<OtelMetrics>)> {
+    let exporter = OtelMetrics::from_config(config)?;
+    Ok((metrics.with_otel(exporter.clone()), exporter))
 }
 
-/// Guard that shuts down OpenTelemetry on drop.
+pub fn request_metrics() -> Option<Metrics> {
+    REQUEST_METRICS
+        .read()
+        .ok()
+        .and_then(|current| current.clone())
+}
+
+/// Owns the active metrics mirror. Call `shutdown` before stopping the runtime.
 pub struct OtelGuard {
-    _service_name: String,
+    exporter: Option<OtelMetrics>,
 }
 
-impl Drop for OtelGuard {
+impl OtelGuard {
+    /// Whether an exporter was configured, not proof of collector receipt.
+    pub fn otel_enabled(&self) -> bool {
+        self.exporter.is_some()
+    }
+
+    /// Detach the mirror and flush its provider without blocking a runtime thread.
+    /// The caller must first finish or cancel and join request tasks.
+    pub async fn shutdown(self) {
+        if let Ok(mut current) = REQUEST_METRICS.write() {
+            *current = None;
+        }
+        if let Some(exporter) = self.exporter
+            && let Err(error) = tokio::task::spawn_blocking(move || exporter.shutdown()).await
+        {
+            tracing::warn!(%error, "OTLP metrics shutdown task failed");
+        }
+    }
+}
+
+/// Measures a finite request through normal return, error, or cancellation.
+/// No completion outcome is inferred from dropping the timer.
+pub struct RequestDuration {
+    metrics: Option<Metrics>,
+    started: Instant,
+}
+
+impl RequestDuration {
+    pub fn start(metrics: Option<Metrics>) -> Self {
+        Self {
+            metrics,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for RequestDuration {
     fn drop(&mut self) {
-        tracing::debug!("Shutting down OpenTelemetry tracing");
-        // In full implementation: opentelemetry::global::shutdown_tracer_provider();
+        if let Some(metrics) = &self.metrics {
+            metrics.observe_request_duration("rchd_api", self.started.elapsed().as_secs_f64());
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prometheus::Encoder;
     use rch_common::test_guard;
 
     #[test]
-    fn test_otel_config_default() {
+    fn explicitly_disabled_exporter_preserves_prometheus_recording() {
         let _guard = test_guard!();
-        let config = OtelConfig::default();
-        assert!(!config.enabled);
-        assert!(config.endpoint.is_none());
-        assert_eq!(config.service_name, "rchd");
-    }
-
-    #[test]
-    fn test_otel_config_from_env() {
-        let _guard = test_guard!();
-        // Test reads current env state without modifying it
-        // (env::remove_var is unsafe in Rust 2024 edition)
-        let config = OtelConfig::from_env();
-        // Config should have a valid service name
-        assert!(!config.service_name.is_empty());
-    }
-
-    #[test]
-    fn test_init_otel_returns_result() {
-        let _guard = test_guard!();
-        // Test that init_otel returns a valid result without modifying env
-        // (env::remove_var is unsafe in Rust 2024 edition)
-        let result = init_otel();
-        // Should not panic and should return Ok
-        assert!(result.is_ok());
+        let config = OtlpConfig {
+            enabled: false,
+            endpoint: Some("http://127.0.0.1:4317".to_string()),
+            service_name: "rchd".to_string(),
+            ..OtlpConfig::default()
+        };
+        let registry = prometheus::Registry::new();
+        let metrics = Metrics::new().expect("metrics");
+        metrics.register(&registry).expect("register metrics");
+        let (metrics, exporter) = configured_metrics(&config, metrics).expect("disabled config");
+        assert!(
+            exporter.is_none(),
+            "disabled even with a configured endpoint"
+        );
+        assert!(!metrics.otel_enabled());
+        drop(RequestDuration::start(Some(metrics)));
+        let mut text = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&registry.gather(), &mut text)
+            .expect("encode registered metrics");
+        assert!(
+            String::from_utf8(text)
+                .unwrap()
+                .contains("rch_request_duration_seconds_count{entrypoint=\"rchd_api\"} 1\n")
+        );
     }
 }

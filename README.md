@@ -605,7 +605,7 @@ RCH exposes observability through daemon APIs and metrics:
 
 - daemon health/readiness endpoints
 - Prometheus metrics collection
-- OpenTelemetry tracing integration
+- opt-in OTLP export of daemon request-duration metrics
 - telemetry-backed worker SpeedScore history
 - queue/build history, active alerts, cancellation metadata in status APIs
 - an opt-in **tailnet status API** (`[api] bind = "tailscale"`): the daemon's
@@ -614,6 +614,18 @@ RCH exposes observability through daemon APIs and metrics:
   are you local-only right now?" without ssh
 - the **fleet dashboard** under `dashboard/` (encrypted static console + an
   agent endpoint `GET /api/fleet?view=problems|diagnose|help`); `rch web` opens it
+
+Enable OTLP metrics in the daemon's environment with `RCH_OTEL_ENABLED=1`
+and `RCH_OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317` (OTLP/gRPC).
+The endpoint falls back to `OTEL_EXPORTER_OTLP_ENDPOINT`. `OTEL_SERVICE_NAME`
+defaults to `rchd`; `RCH_OTEL_EXPORT_INTERVAL_SECS` defaults to 30.
+`rch_request_duration_seconds{entrypoint="rchd_api"}` records finite Unix-socket
+request handling after parsing, including errors and cancellation. Event streams
+and the separate HTTP API are excluded. The same observations reach Prometheus,
+including when OTLP is disabled. Shutdown drains request tasks before a
+best-effort final export. The banner reports exporter configuration, not collector
+connectivity. Trace/log export and forwarding CLI doctor/hook events remain
+unfinished.
 
 Quick checks:
 

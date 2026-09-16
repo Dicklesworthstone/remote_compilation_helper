@@ -137,9 +137,9 @@ impl DaemonBanner {
             "metrics off"
         };
         let otel = if self.otel_enabled {
-            "otel"
+            "OTLP metrics configured"
         } else {
-            "otel off"
+            "OTLP metrics off"
         };
         format!("{telemetry} | {metrics} | {otel}")
     }
@@ -340,7 +340,7 @@ mod tests {
         let summary = banner.features_summary();
         assert!(summary.contains("telemetry"));
         assert!(summary.contains("metrics"));
-        assert!(summary.contains("otel"));
+        assert!(summary.contains("OTLP metrics configured"));
         assert!(!summary.contains("off"));
     }
 
@@ -351,7 +351,7 @@ mod tests {
         let summary = banner.features_summary();
         assert!(summary.contains("telemetry off"));
         assert!(summary.contains("metrics off"));
-        assert!(summary.contains("otel off"));
+        assert!(summary.contains("OTLP metrics off"));
     }
 
     #[test]
@@ -361,7 +361,7 @@ mod tests {
         let summary = banner.features_summary();
         assert!(!summary.contains("telemetry off"));
         assert!(summary.contains("metrics off"));
-        assert!(summary.contains("otel off"));
+        assert!(summary.contains("OTLP metrics off"));
     }
 
     // ==================== startup_ms tests ====================
