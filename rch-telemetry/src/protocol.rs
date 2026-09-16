@@ -877,12 +877,24 @@ mod tests {
     #[test]
     fn test_run_stats_scope_wire_format() {
         for (scope, wire) in [
-            (TestRunStatsScope::Unknown, serde_json::json!({"source": "unknown"})),
-            (TestRunStatsScope::StoredHistory, serde_json::json!({"source": "stored_history"})),
-            (TestRunStatsScope::RecentMemory { max_records: 200 }, serde_json::json!({"source": "recent_memory", "max_records": 200})),
+            (
+                TestRunStatsScope::Unknown,
+                serde_json::json!({"source": "unknown"}),
+            ),
+            (
+                TestRunStatsScope::StoredHistory,
+                serde_json::json!({"source": "stored_history"}),
+            ),
+            (
+                TestRunStatsScope::RecentMemory { max_records: 200 },
+                serde_json::json!({"source": "recent_memory", "max_records": 200}),
+            ),
         ] {
             assert_eq!(serde_json::to_value(&scope).unwrap(), wire);
-            assert_eq!(serde_json::from_value::<TestRunStatsScope>(wire).unwrap(), scope);
+            assert_eq!(
+                serde_json::from_value::<TestRunStatsScope>(wire).unwrap(),
+                scope
+            );
         }
         let missing = serde_json::json!({"total_runs": 10, "passed_runs": 7, "failed_runs": 3, "avg_duration_ms": 4});
         let stats: TestRunStats = serde_json::from_value(missing).unwrap();

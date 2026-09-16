@@ -958,7 +958,10 @@ mod tests {
         assert_eq!(stats.total_runs, 0);
         assert_eq!(stats.passed_runs, 0);
         assert_eq!(stats.failed_runs, 0);
-        assert_eq!(stats.scope, TestRunStatsScope::RecentMemory { max_records: 200 });
+        assert_eq!(
+            stats.scope,
+            TestRunStatsScope::RecentMemory { max_records: 200 }
+        );
     }
 
     #[tokio::test]
@@ -992,13 +995,18 @@ mod tests {
         // Corrupt an actual row through a separate SQLite connection. The
         // production storage reader rejects its negative duration.
         let connection = rusqlite::Connection::open(&path).unwrap();
-        connection.execute("UPDATE test_runs SET duration_ms = -1", []).unwrap();
+        connection
+            .execute("UPDATE test_runs SET duration_ms = -1", [])
+            .unwrap();
         assert!(storage.test_run_stats().is_err());
         let fallback = store.test_run_stats().await;
         assert_eq!(fallback.total_runs, 1);
         assert_eq!(fallback.failed_runs, 1);
         assert_eq!(fallback.avg_duration_ms, 5);
-        assert_eq!(fallback.scope, TestRunStatsScope::RecentMemory { max_records: 200 });
+        assert_eq!(
+            fallback.scope,
+            TestRunStatsScope::RecentMemory { max_records: 200 }
+        );
     }
 
     #[tokio::test]
@@ -1059,7 +1067,10 @@ mod tests {
         assert_eq!(stats.total_runs, 200);
         assert_eq!(stats.passed_runs, 200);
         assert_eq!(stats.failed_runs, 0);
-        assert_eq!(stats.scope, TestRunStatsScope::RecentMemory { max_records: 200 });
+        assert_eq!(
+            stats.scope,
+            TestRunStatsScope::RecentMemory { max_records: 200 }
+        );
     }
 
     #[test]

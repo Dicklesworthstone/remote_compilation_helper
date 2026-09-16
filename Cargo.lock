@@ -5324,6 +5324,7 @@ dependencies = [
  "rch-common",
  "rch-telemetry",
  "rich_rust",
+ "rusqlite",
  "serde",
  "serde_json",
  "serial_test",
