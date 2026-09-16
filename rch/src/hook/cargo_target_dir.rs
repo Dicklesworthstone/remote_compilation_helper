@@ -221,35 +221,55 @@ pub(super) fn target_reuse_disabled_from_value(value: Option<String>) -> bool {
         .unwrap_or(false)
 }
 
-/// The Rust target triple this build will compile for: an explicit `--target
-/// <triple>` / `--target=<triple>` from the command wins, otherwise the host
-/// default the binary was built for (`std::env::consts`-derived). This is a
-/// pooled-dir cache DIMENSION — a cross-compile must not share a host build's
-/// pool — so a stable, host-correct fallback matters.
+/// The Rust target triple this build will compile for: an explicit `--target`
+/// or inline `--config build.target=...` wins, otherwise the host default the
+/// binary was built for (`std::env::consts`-derived). This is a pooled-dir cache
+/// DIMENSION — a cross-compile must not share a host build's pool.
 pub(super) fn target_triple_for_command(command: &str) -> String {
     explicit_target_triple_for_command(command).unwrap_or_else(default_host_target_triple)
 }
 
-/// The explicit `--target <triple>` / `--target=<triple>` this command pins, if
-/// any. `None` means the build is UNPINNED and therefore targets the host that
-/// runs it — which, on an offloaded build, is the worker rather than the caller
-/// (GitHub #65).
+/// The target pinned by Cargo's own arguments, not arguments after `--`.
+/// An explicit `--target` outranks inline `--config build.target=...`; repeated
+/// string config overrides are applied left-to-right, as in Cargo. This does
+/// not resolve config files, environment defaults, or multi-target arrays.
+///
+/// GitHub #68: ignoring inline build.target misclassified worker-host proc
+/// macros as foreign target output, and also selected the wrong pooled cache.
 pub(super) fn explicit_target_triple_for_command(command: &str) -> Option<String> {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    let mut iter = tokens.iter();
+    let (tokens, cargo_index) = cargo_command_tokens(command).ok()?;
+    let mut iter = tokens[cargo_index + 1..].iter();
+    let mut configured_target = None;
     while let Some(token) = iter.next() {
+        if token == "--" {
+            break;
+        }
         if let Some(value) = token.strip_prefix("--target=") {
             if !value.is_empty() {
                 return Some(value.to_string());
             }
-        } else if *token == "--target"
-            && let Some(value) = iter.next()
-            && !value.is_empty()
-        {
-            return Some((*value).to_string());
+        } else if token == "--target" {
+            if let Some(value) = iter.next().filter(|value| !value.is_empty()) {
+                return Some(value.to_string());
+            }
+        } else {
+            let config = if token == "--config" {
+                iter.next().map(String::as_str)
+            } else {
+                token.strip_prefix("--config=")
+            };
+            if let Some(config) = config
+                && let Ok(config) = toml::from_str::<toml::Value>(config)
+                && let Some(target) = config.get("build").and_then(|build| build.get("target"))
+            {
+                configured_target = target
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+            }
         }
     }
-    None
+    configured_target
 }
 
 /// Best-effort host target triple, assembled from compile-time `std::env::consts`.
@@ -443,6 +463,13 @@ pub(super) fn managed_clean_overlay_cargo_tokens(
             anyhow::bail!("cannot safely bind Cargo build directory across shell evaluation");
         }
     }
+    cargo_command_tokens(command)
+}
+
+/// Tokenize without evaluating shell syntax and skip supported executable
+/// prefixes. Shared with target detection so `env --` and wrapper option values
+/// are not mistaken for Cargo's argument separator or executable.
+fn cargo_command_tokens(command: &str) -> anyhow::Result<(Vec<String>, usize)> {
     let mut tokens = shell_words::split(command)?;
     let assignment = |token: &str| {
         token.split_once('=').is_some_and(|(key, _)| {
@@ -873,6 +900,104 @@ pub(super) fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) ->
 mod managed_build_dir_tests {
     use super::{managed_clean_overlay_cargo_build_dir, managed_clean_overlay_cargo_tokens};
 
+    #[test]
+    fn explicit_target_honors_inline_config_and_shell_quoting() {
+        let target = "aarch64-apple-darwin";
+        for command in [
+            r#"cargo build --config 'build.target="aarch64-apple-darwin"'"#,
+            r#"cargo build --config='build.target="aarch64-apple-darwin"'"#,
+            r#"cargo --config "build.target = 'aarch64-apple-darwin'" build"#,
+            r#"cargo build --target 'aarch64-apple-darwin'"#,
+            r#"cargo build '--target=aarch64-apple-darwin'"#,
+            r#"env -- CARGO_TARGET_DIR='/custom target' /opt/bin/cargo +nightly build --config 'build.target="aarch64-apple-darwin"'"#,
+            r#"/usr/bin/time -f cargo env -u cargo -- rustup run nightly cargo build --config 'build.target="aarch64-apple-darwin"'"#,
+        ] {
+            assert_eq!(
+                super::explicit_target_triple_for_command(command).as_deref(),
+                Some(target),
+                "{command}"
+            );
+            assert_eq!(super::target_triple_for_command(command), target);
+        }
+    }
+
+    #[test]
+    fn explicit_target_obeys_precedence_and_ignores_passthrough() {
+        for command in [
+            r#"cargo build --config 'build.target="x86_64-unknown-linux-gnu"' --target aarch64-apple-darwin"#,
+            r#"cargo build --target=aarch64-apple-darwin --config 'build.target="x86_64-unknown-linux-gnu"'"#,
+            r#"cargo build --config 'build.target="x86_64-unknown-linux-gnu"' --config 'build.target="aarch64-apple-darwin"' --config 'build.jobs=2'"#,
+            r#"cargo rustc --config 'build.target="aarch64-apple-darwin"' -- --target x86_64-unknown-linux-gnu"#,
+        ] {
+            assert_eq!(
+                super::explicit_target_triple_for_command(command).as_deref(),
+                Some("aarch64-apple-darwin"),
+                "{command}"
+            );
+        }
+        for command in [
+            "cargo build --release",
+            "cargo build --target-dir /tmp/target",
+            "cargo test -- --target aarch64-apple-darwin",
+            r#"cargo test -- --config 'build.target="aarch64-apple-darwin"'"#,
+            "cargo build --config .cargo/extra.toml",
+            r#"cargo build --config 'build.target-dir="aarch64-apple-darwin"'"#,
+            r#"cargo build --config 'build.target=["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]'"#,
+            "cargo build --config 'unterminated",
+        ] {
+            assert_eq!(
+                super::explicit_target_triple_for_command(command),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_cross_target_artifacts_exclude_host_tools_but_keep_target_guard() {
+        use super::super::artifact_triple::foreign_target_artifacts;
+
+        let command = r#"cargo build --release --config 'build.target="aarch64-apple-darwin"' --config 'target.aarch64-apple-darwin.linker="/usr/local/bin/zigcc-aarch64-darwin"'"#;
+        let pinned = super::explicit_target_triple_for_command(command).unwrap();
+        for custom in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let prefix = if custom { "" } else { "target/" };
+            let host = format!("{prefix}release/deps/libclap_derive-fixture.so");
+            let target = format!("{prefix}{pinned}/release/app");
+            for path in [&host, &target] {
+                std::fs::create_dir_all(dir.path().join(path).parent().unwrap()).unwrap();
+            }
+            std::fs::write(dir.path().join(&host), b"\x7fELF\0\0\0\0").unwrap();
+            std::fs::write(dir.path().join(&target), b"\xcf\xfa\xed\xfe\0\0\0\0").unwrap();
+            let manifest = vec![host.clone(), target.clone()];
+            assert!(
+                foreign_target_artifacts(
+                    dir.path(),
+                    &manifest,
+                    custom,
+                    &pinned,
+                    Some(&pinned)
+                )
+                .is_empty()
+            );
+            // The exclusion is only for host tools. A foreign binary under the
+            // requested triple still fails, and native builds keep their guard.
+            std::fs::write(dir.path().join(&target), b"\x7fELF\0\0\0\0").unwrap();
+            let foreign = foreign_target_artifacts(
+                dir.path(),
+                &manifest,
+                custom,
+                &pinned,
+                Some(&pinned),
+            );
+            assert_eq!(foreign.len(), 1);
+            assert_eq!(foreign[0].path, target);
+            let native = foreign_target_artifacts(dir.path(), &manifest, custom, &pinned, None);
+            assert_eq!(native.len(), 1);
+            assert_eq!(native[0].path, host);
+        }
+    }
+
     #[cfg(unix)]
     struct ConfigGuardFixture {
         root: std::path::PathBuf,
@@ -1117,8 +1242,8 @@ mod managed_build_dir_tests {
                 .current_dir(&root)
                 .env("PATH", &path)
                 .env("CARGO_HOME", root.join("cargo-home"))
-                .env("CARGO_TARGET_DIR", &pool)
                 .env("CARGO_BUILD_BUILD_DIR", &outside[1])
+                .env("CARGO_TARGET_DIR", &pool)
                 .env("RUSTC", cargo_bin.join("rustc"))
                 .env("RUSTFLAGS", "")
                 .env("RUSTUP_AUTO_INSTALL", "0")
