@@ -1043,7 +1043,10 @@ mod tests {
                 } else {
                     assert_eq!(result.expect(mode), count, "{mode}");
                 }
-                assert_eq!(std::fs::read(dir.join("payload")).unwrap(), script.as_bytes());
+                assert_eq!(
+                    std::fs::read(dir.join("payload")).unwrap(),
+                    script.as_bytes()
+                );
                 assert_eq!(std::fs::read_to_string(dir.join("calls")).unwrap(), calls);
             }
             std::fs::write(dir.join("finished"), "ok").unwrap();
