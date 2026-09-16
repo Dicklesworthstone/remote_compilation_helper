@@ -216,12 +216,14 @@ impl TelemetryStorage {
         let rows = stmt.query_map([], |row| {
             let kind: String = row.get(0)?;
             let exit_code: i32 = row.get(1)?;
-            let duration_ms: u64 = row.get(2)?;
+            let duration_ms: i64 = row.get(2)?;
             Ok((kind, exit_code, duration_ms))
         })?;
 
         for row in rows {
             let (kind, exit_code, duration_ms) = row?;
+            let duration_ms = u64::try_from(duration_ms)
+                .context("Stored test run duration must not be negative")?;
             stats.record_outcome(&kind, exit_code, duration_ms);
         }
 
