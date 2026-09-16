@@ -59,6 +59,9 @@ const PROBE_RESULT_LABELS: &[&str] = &[
 const SEVERITY_LABELS: &[&str] = &["info", "warning", "critical", "error", "other"];
 const FIX_OUTCOME_LABELS: &[&str] = &[
     "applied",
+    "already_satisfied",
+    "would_apply",
+    "manual",
     "failed",
     "skipped",
     "dry_run",
@@ -597,9 +600,10 @@ impl MetricsLayer {
                 self.metrics.record_doctor_diagnostic(code, severity);
                 true
             }
-            "doctor.fix.step.applied" | "doctor.fix.step.failed" => {
+            "doctor.remediation.step" | "doctor.fix.step.applied" | "doctor.fix.step.failed" => {
                 let outcome = fields
                     .string("outcome")
+                    .or_else(|| fields.string("status"))
                     .unwrap_or_else(|| fix_outcome_from_event(event_name));
                 self.metrics.record_doctor_fix_step(outcome);
                 if let Some(seconds) = fields.duration_seconds() {
@@ -1187,6 +1191,55 @@ mod tests {
             labels
                 .iter()
                 .any(|label| label.name() == "verdict" && label.value() == "healthy")
+        );
+    }
+
+    #[test]
+    fn remediation_event_preserves_each_outcome_and_measured_duration() {
+        let (metrics, layer) = metrics_with_layer();
+        run_with_layer(layer, || {
+            for status in [
+                "applied",
+                "already-satisfied",
+                "would-apply",
+                "manual",
+                "failed",
+            ] {
+                tracing::info!(
+                    target: "rch::doctor::remediation",
+                    status,
+                    duration_seconds = 0.125_f64,
+                    command = "private command text",
+                    "doctor.remediation.step",
+                );
+            }
+        });
+        for outcome in [
+            "applied",
+            "already_satisfied",
+            "would_apply",
+            "manual",
+            "failed",
+        ] {
+            assert_eq!(
+                metrics
+                    .doctor_fix_steps_total
+                    .with_label_values(&[outcome])
+                    .get(),
+                1.0
+            );
+            let histogram = metrics
+                .doctor_fix_duration_seconds
+                .with_label_values(&[outcome]);
+            assert_eq!(histogram.get_sample_count(), 1);
+            assert_eq!(histogram.get_sample_sum(), 0.125);
+        }
+        assert_eq!(
+            metrics
+                .doctor_fix_steps_total
+                .with_label_values(&["other"])
+                .get(),
+            0.0
         );
     }
 

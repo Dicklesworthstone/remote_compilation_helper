@@ -637,9 +637,15 @@ when several diagnostics report the missing daemon. The asynchronous
 `rch_doctor_probe_duration_seconds{probe,result}` once on completion, RPC error,
 or timeout. Durations measure each probe's execution, not time spent waiting
 to join other probes. Skipped probes emit nothing; panic/cancellation and
-helper/ownership probe durations are not yet exported. These CLI metrics are
-not forwarded to the daemon's Prometheus endpoint. Hook/watch telemetry, remaining doctor event
-metrics, and trace/log export remain unfinished.
+helper/ownership probe durations are not yet exported. With `--fix`, each
+remediation step also emits `rch_doctor_fix_steps_total` and
+`rch_doctor_fix_duration_seconds`, labeled by its actual outcome: `applied`,
+`already_satisfied`, `would_apply`, `manual`, or `failed`. Dry-run previews
+remain `would_apply`; they are never counted as applied changes. Durations
+measure step execution, excluding the initial shared configuration load.
+These CLI metrics are not forwarded to the daemon's Prometheus endpoint.
+Hook/watch telemetry, remaining doctor event metrics, and trace/log export
+remain unfinished.
 
 Quick checks:
 

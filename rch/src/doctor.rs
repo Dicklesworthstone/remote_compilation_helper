@@ -3467,6 +3467,7 @@ fn apply_reliability_remediations(response: &mut ReliabilityDoctorResponse) {
 
     let mut outcomes = Vec::with_capacity(response.remediation_plan.len());
     for step in &response.remediation_plan {
+        let started = Instant::now();
         let outcome = match auto_config_flip(step.code) {
             Some(flip) => {
                 let already = current
@@ -3517,6 +3518,7 @@ fn apply_reliability_remediations(response: &mut ReliabilityDoctorResponse) {
             order = outcome.order,
             code = outcome.code.code(),
             status = outcome.status.label(),
+            duration_seconds = started.elapsed().as_secs_f64(),
             preview,
             command = %outcome.command,
             detail = outcome.detail.as_deref().unwrap_or(""),
