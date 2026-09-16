@@ -9606,10 +9606,9 @@ exit 0\n"
     async fn timed_async_probe_exports_measured_outcomes_once() {
         use tracing_subscriber::prelude::*;
 
-        let metrics = std::sync::Arc::new(rch_telemetry::metrics::Metrics::new().unwrap());
-        let subscriber = tracing_subscriber::registry().with(
-            rch_telemetry::metrics::MetricsLayer::new(std::sync::Arc::clone(&metrics)),
-        );
+        let metrics = rch_telemetry::metrics::Metrics::new().unwrap();
+        let subscriber = tracing_subscriber::registry()
+            .with(rch_telemetry::metrics::MetricsLayer::new(metrics.clone()));
         let _subscriber = tracing::subscriber::set_default(subscriber);
 
         let success = timed_async_probe("daemon_status", async {
