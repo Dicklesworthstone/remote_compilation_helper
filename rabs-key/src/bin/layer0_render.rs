@@ -119,6 +119,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires explicit RCH_L0_STABLE_TOOLCHAIN and RCH_L0_NIGHTLY_TOOLCHAIN; run with --ignored on the remote validation worker"]
     fn layer0_real_compilers_render_and_compile_supported_and_unsupported() {
         let retained = tempfile::Builder::new()
             .prefix("rch-layer0-threads-")
@@ -126,7 +127,12 @@ mod tests {
             .unwrap()
             .keep();
         eprintln!("retained Layer 0 compiler fixture: {}", retained.display());
-        for (channel, supported) in [("stable", false), ("nightly-2026-08-31", true)] {
+        for (label, variable, supported) in [
+            ("stable", "RCH_L0_STABLE_TOOLCHAIN", false),
+            ("nightly", "RCH_L0_NIGHTLY_TOOLCHAIN", true),
+        ] {
+            let selected = std::env::var(variable).expect("explicit toolchain input is required");
+            let channel = selected.as_str();
             let which = |program| {
                 let output = Command::new("rustup")
                     .env("RUSTUP_AUTO_INSTALL", "0")
@@ -156,7 +162,7 @@ mod tests {
             assert_eq!(config.contains("-Zthreads=2"), supported);
             evidence.zthreads = None;
             assert!(!assemble(&evidence).render_config().contains("-Zthreads"));
-            let project = retained.join(channel);
+            let project = retained.join(label);
             std::fs::create_dir_all(project.join("src")).unwrap();
             std::fs::write(project.join("Cargo.toml"), "[package]\nname='layer0_threads_real'\nversion='0.0.0'\nedition='2021'\n[workspace]\n").unwrap();
             std::fs::write(project.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n#[test] fn real_execution() { assert_eq!(answer(), 42); }\n").unwrap();
