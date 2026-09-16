@@ -3,12 +3,11 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::protocol::{TestRunRecord, TestRunStats, WorkerTelemetry};
+use crate::protocol::{TestRunRecord, TestRunStats, TestRunStatsAccumulator, WorkerTelemetry};
 use crate::speedscore::SpeedScore;
 
 mod schema;
@@ -186,6 +185,8 @@ impl TelemetryStorage {
 
     /// Insert a test run record.
     pub fn insert_test_run(&self, record: &TestRunRecord) -> Result<()> {
+        let duration_ms = i64::try_from(record.duration_ms)
+            .context("Test run duration exceeds SQLite INTEGER range")?;
         let conn = self.conn.lock().expect("telemetry db lock");
         conn.execute(
             "INSERT INTO test_runs (
@@ -197,7 +198,7 @@ impl TelemetryStorage {
                 record.command,
                 record.kind,
                 record.exit_code,
-                record.duration_ms as i64,
+                duration_ms,
                 record.completed_at.timestamp(),
             ],
         )?;
@@ -207,45 +208,24 @@ impl TelemetryStorage {
     /// Fetch aggregate test run statistics.
     pub fn test_run_stats(&self) -> Result<TestRunStats> {
         let conn = self.conn.lock().expect("telemetry db lock");
-        let (total, passed, failed, avg_duration): (i64, i64, i64, Option<f64>) = conn.query_row(
-            "SELECT
-                    COUNT(*) as total,
-                    COUNT(CASE WHEN exit_code = 0 THEN 1 END) as passed,
-                    COUNT(CASE WHEN exit_code != 0 THEN 1 END) as failed,
-                    AVG(duration_ms) as avg_duration
-                 FROM test_runs",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<f64>>(3)?,
-                ))
-            },
-        )?;
-
-        let mut stats = TestRunStats {
-            total_runs: total.max(0) as u64,
-            passed_runs: passed.max(0) as u64,
-            failed_runs: failed.max(0) as u64,
-            avg_duration_ms: avg_duration.unwrap_or(0.0).round() as u64,
-            runs_by_kind: HashMap::new(),
-        };
-
-        let mut stmt = conn.prepare_cached("SELECT kind, COUNT(*) FROM test_runs GROUP BY kind")?;
+        // Stream one scan into the same exact accumulator used by the daemon.
+        // SQLite AVG uses floating point and SUM can overflow an INTEGER even
+        // when every individual duration and the final mean fit that type.
+        let mut stats = TestRunStatsAccumulator::default();
+        let mut stmt = conn.prepare_cached("SELECT kind, exit_code, duration_ms FROM test_runs")?;
         let rows = stmt.query_map([], |row| {
             let kind: String = row.get(0)?;
-            let count: i64 = row.get(1)?;
-            Ok((kind, count))
+            let exit_code: i32 = row.get(1)?;
+            let duration_ms: u64 = row.get(2)?;
+            Ok((kind, exit_code, duration_ms))
         })?;
 
         for row in rows {
-            let (kind, count) = row?;
-            stats.runs_by_kind.insert(kind, count.max(0) as u64);
+            let (kind, exit_code, duration_ms) = row?;
+            stats.record_outcome(&kind, exit_code, duration_ms);
         }
 
-        Ok(stats)
+        Ok(stats.finish())
     }
 
     /// Fetch the latest SpeedScore for a worker.
@@ -943,7 +923,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary database directory");
         let path = directory.path().join("telemetry.db");
         let storage = TelemetryStorage::new(&path, 30, 24, 365, 0).expect("storage");
-        let mut memory = TestRunStats::default();
+        let mut memory = TestRunStatsAccumulator::default();
 
         // Exercise every shell exit, including ambiguous Cargo/Bun failures and
         // signals. No exit code establishes whether compilation completed.
@@ -963,6 +943,7 @@ mod tests {
             }
         }
         drop(storage);
+        let memory = memory.finish();
 
         let reopened = TelemetryStorage::new(&path, 30, 24, 365, 0).expect("reopen");
         let persisted = reopened.test_run_stats().expect("persisted stats");
@@ -975,6 +956,71 @@ mod tests {
                 assert_eq!(stats.runs_by_kind.get(kind), Some(&256));
             }
         }
+    }
+
+    #[test]
+    fn test_test_run_duration_mean_matches_memory_after_reopen() {
+        let directory = tempfile::tempdir().expect("database directory");
+        for (index, (durations, expected)) in [
+            (vec![0, 1], 1),
+            (vec![0, 0, 1], 0),
+            (vec![1, 2, 2], 2),
+            (vec![2, 2, 1], 2),
+            (vec![i64::MAX as u64, i64::MAX as u64 - 1], i64::MAX as u64),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = directory.path().join(format!("duration-{index}.db"));
+            let storage = TelemetryStorage::new(&path, 30, 24, 365, 0).expect("storage");
+            let mut memory = TestRunStatsAccumulator::default();
+            for duration_ms in durations {
+                let record = TestRunRecord {
+                    project_id: "proj".to_string(),
+                    worker_id: "worker".to_string(),
+                    command: "cargo test".to_string(),
+                    kind: "cargo_test".to_string(),
+                    exit_code: 0,
+                    duration_ms,
+                    completed_at: Utc::now(),
+                };
+                storage.insert_test_run(&record).expect("persist duration");
+                memory.record(&record);
+            }
+            drop(storage);
+            let storage = TelemetryStorage::new(&path, 30, 24, 365, 0).expect("reopen");
+            assert_eq!(storage.test_run_stats().unwrap().avg_duration_ms, expected);
+            assert_eq!(memory.finish().avg_duration_ms, expected);
+        }
+    }
+
+    #[test]
+    fn test_test_run_invalid_durations_are_rejected() {
+        let storage = TelemetryStorage::new_in_memory().expect("storage");
+        let record = TestRunRecord {
+            project_id: "proj".to_string(),
+            worker_id: "worker".to_string(),
+            command: "cargo test".to_string(),
+            kind: "cargo_test".to_string(),
+            exit_code: 0,
+            duration_ms: u64::MAX,
+            completed_at: Utc::now(),
+        };
+        assert!(storage.insert_test_run(&record).is_err());
+        assert_eq!(storage.test_run_stats().unwrap().total_runs, 0);
+
+        let record = TestRunRecord {
+            duration_ms: 0,
+            ..record
+        };
+        storage.insert_test_run(&record).unwrap();
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE test_runs SET duration_ms = -1", [])
+            .unwrap();
+        assert!(storage.test_run_stats().is_err());
     }
 
     // -------------------------------------------------------------------------

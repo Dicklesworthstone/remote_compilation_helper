@@ -7,7 +7,8 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use directories::ProjectDirs;
 use rch_common::{SshClient, SshOptions};
 use rch_telemetry::protocol::{
-    ReceivedTelemetry, TelemetrySource, TestRunRecord, TestRunStats, WorkerTelemetry,
+    ReceivedTelemetry, TelemetrySource, TestRunRecord, TestRunStats, TestRunStatsAccumulator,
+    WorkerTelemetry,
 };
 use rch_telemetry::speedscore::SpeedScore;
 use rch_telemetry::storage::{SpeedScoreHistoryPage, TelemetryStorage};
@@ -151,11 +152,11 @@ impl TelemetryStore {
         }
 
         let test_runs = self.test_runs.read().unwrap_or_else(|e| e.into_inner());
-        let mut stats = TestRunStats::default();
+        let mut stats = TestRunStatsAccumulator::default();
         for record in test_runs.iter() {
             stats.record(record);
         }
-        stats
+        stats.finish()
     }
 
     /// Persist a completed benchmark's SpeedScore.
@@ -969,14 +970,14 @@ mod tests {
         );
         store.record_test_run(success_run);
 
-        // Failed run (exit code 101 is Rust's test failure exit code)
+        // Failed command; exit 101 alone does not identify its failed phase.
         let failed_run = TestRunRecord::new(
             "proj".to_string(),
             "worker-2".to_string(),
             "cargo test".to_string(),
             CompilationKind::CargoTest,
-            101, // Rust test failure exit code
-            500,
+            101,
+            1001,
         );
         store.record_test_run(failed_run);
 
@@ -984,6 +985,7 @@ mod tests {
         assert_eq!(stats.total_runs, 2);
         assert_eq!(stats.passed_runs, 1);
         assert_eq!(stats.failed_runs, 1);
+        assert_eq!(stats.avg_duration_ms, 1001);
     }
 
     #[test]

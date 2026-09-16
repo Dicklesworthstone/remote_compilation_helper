@@ -210,20 +210,40 @@ pub struct TestRunStats {
     pub runs_by_kind: HashMap<String, u64>,
 }
 
-impl TestRunStats {
-    /// Add a test run record into the aggregate stats.
+/// Exact working state kept separately from the serialized statistics snapshot.
+#[derive(Debug, Default)]
+pub struct TestRunStatsAccumulator {
+    stats: TestRunStats,
+    total_duration_ms: u128,
+}
+
+impl TestRunStatsAccumulator {
+    /// Add a completed command without rounding its contribution.
     pub fn record(&mut self, record: &TestRunRecord) {
-        let total_duration =
-            self.avg_duration_ms.saturating_mul(self.total_runs) + record.duration_ms;
-        self.total_runs = self.total_runs.saturating_add(1);
-        self.avg_duration_ms = total_duration / self.total_runs;
+        self.record_outcome(&record.kind, record.exit_code, record.duration_ms);
+    }
 
-        match record.exit_code {
-            0 => self.passed_runs = self.passed_runs.saturating_add(1),
-            _ => self.failed_runs = self.failed_runs.saturating_add(1),
+    pub(crate) fn record_outcome(&mut self, kind: &str, exit_code: i32, duration_ms: u64) {
+        self.stats.total_runs += 1;
+        self.total_duration_ms += u128::from(duration_ms);
+        match exit_code {
+            0 => self.stats.passed_runs += 1,
+            _ => self.stats.failed_runs += 1,
         }
+        *self.stats.runs_by_kind.entry(kind.to_string()).or_insert(0) += 1;
+    }
 
-        *self.runs_by_kind.entry(record.kind.clone()).or_insert(0) += 1;
+    /// Produce a snapshot, rounding the exact mean to the nearest millisecond.
+    /// Half-millisecond ties round upward. Empty collections have mean zero.
+    pub fn finish(mut self) -> TestRunStats {
+        if self.stats.total_runs > 0 {
+            let count = u128::from(self.stats.total_runs);
+            let quotient = self.total_duration_ms / count;
+            let remainder = self.total_duration_ms % count;
+            self.stats.avg_duration_ms =
+                (quotient + u128::from(remainder >= count - remainder)) as u64;
+        }
+        self.stats
     }
 }
 
@@ -659,7 +679,7 @@ mod tests {
 
     #[test]
     fn test_run_stats_record_passed() {
-        let mut stats = TestRunStats::default();
+        let mut stats = TestRunStatsAccumulator::default();
         let record = TestRunRecord {
             project_id: "p".to_string(),
             worker_id: "w".to_string(),
@@ -671,6 +691,7 @@ mod tests {
         };
 
         stats.record(&record);
+        let stats = stats.finish();
 
         assert_eq!(stats.total_runs, 1);
         assert_eq!(stats.passed_runs, 1);
@@ -681,7 +702,7 @@ mod tests {
 
     #[test]
     fn test_run_stats_record_failed() {
-        let mut stats = TestRunStats::default();
+        let mut stats = TestRunStatsAccumulator::default();
         let record = TestRunRecord {
             project_id: "p".to_string(),
             worker_id: "w".to_string(),
@@ -693,6 +714,7 @@ mod tests {
         };
 
         stats.record(&record);
+        let stats = stats.finish();
 
         assert_eq!(stats.total_runs, 1);
         assert_eq!(stats.passed_runs, 0);
@@ -701,7 +723,7 @@ mod tests {
 
     #[test]
     fn test_run_stats_record_exit_one() {
-        let mut stats = TestRunStats::default();
+        let mut stats = TestRunStatsAccumulator::default();
         let record = TestRunRecord {
             project_id: "p".to_string(),
             worker_id: "w".to_string(),
@@ -713,6 +735,7 @@ mod tests {
         };
 
         stats.record(&record);
+        let stats = stats.finish();
 
         assert_eq!(stats.total_runs, 1);
         assert_eq!(stats.passed_runs, 0);
@@ -721,7 +744,7 @@ mod tests {
 
     #[test]
     fn test_run_stats_record_other_exit_code() {
-        let mut stats = TestRunStats::default();
+        let mut stats = TestRunStatsAccumulator::default();
         let record = TestRunRecord {
             project_id: "p".to_string(),
             worker_id: "w".to_string(),
@@ -733,6 +756,7 @@ mod tests {
         };
 
         stats.record(&record);
+        let stats = stats.finish();
 
         // Other exit codes count as failed
         assert_eq!(stats.total_runs, 1);
@@ -741,7 +765,7 @@ mod tests {
 
     #[test]
     fn test_run_stats_multiple_records_avg_duration() {
-        let mut stats = TestRunStats::default();
+        let mut stats = TestRunStatsAccumulator::default();
 
         for duration in [1000, 2000, 3000] {
             let record = TestRunRecord {
@@ -756,6 +780,7 @@ mod tests {
             stats.record(&record);
         }
 
+        let stats = stats.finish();
         assert_eq!(stats.total_runs, 3);
         assert_eq!(stats.passed_runs, 3);
         assert_eq!(stats.avg_duration_ms, 2000); // (1000+2000+3000)/3
@@ -763,7 +788,7 @@ mod tests {
 
     #[test]
     fn test_run_stats_multiple_kinds() {
-        let mut stats = TestRunStats::default();
+        let mut stats = TestRunStatsAccumulator::default();
 
         let kinds = ["cargo_test", "cargo_test", "cargo_nextest", "cargo_build"];
         for kind in kinds {
@@ -779,10 +804,35 @@ mod tests {
             stats.record(&record);
         }
 
+        let stats = stats.finish();
         assert_eq!(stats.total_runs, 4);
         assert_eq!(stats.runs_by_kind.get("cargo_test"), Some(&2));
         assert_eq!(stats.runs_by_kind.get("cargo_nextest"), Some(&1));
         assert_eq!(stats.runs_by_kind.get("cargo_build"), Some(&1));
+    }
+
+    #[test]
+    fn test_run_stats_duration_rounding_is_exact_and_order_independent() {
+        for (durations, expected) in [
+            (vec![], 0),
+            (vec![0, 1], 1),
+            (vec![0, 0, 1], 0),
+            (vec![1, 2, 2], 2),
+            (vec![2, 1, 2], 2),
+            (vec![2, 2, 1], 2),
+            (vec![u64::MAX, u64::MAX], u64::MAX),
+            (vec![u64::MAX - 1, u64::MAX], u64::MAX),
+        ] {
+            let mut accumulator = TestRunStatsAccumulator::default();
+            for duration in &durations {
+                accumulator.record_outcome("cargo_test", 0, *duration);
+            }
+            assert_eq!(
+                accumulator.finish().avg_duration_ms,
+                expected,
+                "{durations:?}"
+            );
+        }
     }
 
     #[test]
