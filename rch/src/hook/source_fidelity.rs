@@ -475,14 +475,38 @@ where
 {
     rch_common::BUILD_COMMIT_ENV_VARS
         .iter()
-        .map(|&key| {
+        .filter_map(|&key| {
             let value = lookup(key)
                 .map(|value| value.trim().to_owned())
-                .filter(|value| stamp_commit_hash(value))
-                .unwrap_or_default();
-            (key.to_owned(), value)
+                .filter(|value| stamp_commit_hash(value))?;
+            Some((key.to_owned(), value))
         })
         .collect()
+}
+
+/// Remove inherited worker aliases before restoring the caller's environment.
+/// Unset and empty are different to Cargo's `[env]` defaults: absent aliases
+/// must stay unset so selected configuration can supply an explicit revision.
+/// Caller command prefixes run inside this boundary, preserving `env -i` and
+/// `env -u` as well as inline assignments without changing shell evaluation.
+pub(super) fn bind_build_source_aliases(
+    command: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut prefix = String::from("env");
+    for key in rch_common::BUILD_COMMIT_ENV_VARS {
+        prefix.push_str(" -u ");
+        prefix.push_str(key);
+    }
+    for key in rch_common::BUILD_COMMIT_ENV_VARS {
+        if let Some(value) = aliases.get(*key).filter(|value| stamp_commit_hash(value)) {
+            prefix.push(' ');
+            prefix.push_str(key);
+            prefix.push('=');
+            prefix.push_str(&shell_words::quote(value));
+        }
+    }
+    format!("{prefix} sh -c {}", shell_words::quote(command))
 }
 
 async fn build_source_git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {

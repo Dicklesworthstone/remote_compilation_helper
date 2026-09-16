@@ -45,7 +45,8 @@ use super::progress_reporting::{
 use super::remote_result::RemoteExecutionResult;
 use super::repo_updater::maybe_sync_repo_set_with_repo_updater;
 use super::source_fidelity::{
-    PreparedSourceContentRoot, build_source_commit_env, capture_build_source_stamp,
+    PreparedSourceContentRoot, bind_build_source_aliases, build_source_commit_env,
+    capture_build_source_stamp,
     finalize_source_content_receipt, prepare_source_content_root, reconcile_build_source_stamps,
     verify_source_content_roots,
 };
@@ -846,22 +847,18 @@ pub(super) async fn execute_remote_compilation(
     // 137 instead of losing the race to a local "SSH command timed out" (#20).
     let mut effective_env_allowlist =
         cargo_target_env_allowlist(&env_allowlist, forwarded_cargo_target_dir.is_some());
-    let mut cargo_env_overrides_map =
-        cargo_target_env_overrides(forwarded_cargo_target_dir.as_deref()).unwrap_or_default();
-    if build_source_before.is_some() {
-        cargo_env_overrides_map.extend(build_source_commit_env(|key| std::env::var(key).ok()));
-        for key in rch_common::BUILD_COMMIT_ENV_VARS {
-            if !effective_env_allowlist
-                .iter()
-                .map(|item| item.trim())
-                .any(|item| item == *key)
-            {
-                effective_env_allowlist.push((*key).to_owned());
-            }
-        }
+    let build_source_aliases = build_source_before
+        .as_ref()
+        .map(|_| build_source_commit_env(|key| std::env::var(key).ok()));
+    if build_source_aliases.is_some() {
+        // Alias cleanup/restoration belongs immediately around the caller's
+        // command, after worker environment assembly. Empty forwarded values
+        // would suppress valid Cargo `[env]` defaults from selected config.
+        effective_env_allowlist.retain(|key| {
+            !rch_common::BUILD_COMMIT_ENV_VARS.contains(&key.trim())
+        });
     }
-    let cargo_env_overrides =
-        (!cargo_env_overrides_map.is_empty()).then_some(cargo_env_overrides_map);
+    let cargo_env_overrides = cargo_target_env_overrides(forwarded_cargo_target_dir.as_deref());
     // Remote target-dir name for the forwarded-CARGO_TARGET_DIR sync. By default
     // this is a STABLE pooled name keyed on (project, toolchain, triple, profile,
     // features) so independent jobs with identical dimensions REUSE the same warm
@@ -1390,8 +1387,12 @@ pub(super) async fn execute_remote_compilation(
     let guarded_command = clean_overlay_cargo
         .then(|| super::cargo_target_dir::guard_clean_overlay_cargo_config(command))
         .transpose()?;
+    let guarded_command = guarded_command.as_deref().unwrap_or(command);
+    let alias_bound_command = build_source_aliases
+        .as_ref()
+        .map(|aliases| bind_build_source_aliases(guarded_command, aliases));
     let isolated_command = add_cargo_isolation(
-        guarded_command.as_deref().unwrap_or(command),
+        alias_bound_command.as_deref().unwrap_or(guarded_command),
         &worker_config.id,
     );
 
