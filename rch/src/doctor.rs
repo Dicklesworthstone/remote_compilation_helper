@@ -1062,6 +1062,30 @@ async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) ->
 /// "unavailable" (Warning verdict).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Measure each async probe in its own task, before results are joined.
+/// Only completed observations are exported here; panic/cancellation remain
+/// forensic events without fabricated zero-duration histogram samples.
+async fn timed_async_probe<T, E>(
+    probe: &'static str,
+    future: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<Result<T, E>, tokio::time::error::Elapsed> {
+    let started = Instant::now();
+    let result = tokio::time::timeout(PROBE_TIMEOUT, future).await;
+    let outcome = match &result {
+        Ok(Ok(_)) => "completed",
+        Ok(Err(_)) => "inner_error",
+        Err(_) => "timeout",
+    };
+    tracing::info!(
+        target: "rch::doctor::probe_duration",
+        probe,
+        result = outcome,
+        duration_seconds = started.elapsed().as_secs_f64(),
+        "doctor.probe.end",
+    );
+    result
+}
+
 /// Single-shot collection of a reliability doctor response. Extracted
 /// from `run_reliability_doctor` so both the single-shot path and the
 /// `--watch` loop (t25) can re-use the exact same probe gating, scope
@@ -1107,13 +1131,13 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
     // run doesn't pay the I/O cost it can't consume).
     let join_start = Instant::now();
     let daemon_handle = scope.needs_daemon_status().then(|| {
-        tokio::spawn(async move {
-            tokio::time::timeout(PROBE_TIMEOUT, query_daemon_full_status()).await
-        })
+        tokio::spawn(
+            async move { timed_async_probe("daemon_status", query_daemon_full_status()).await },
+        )
     });
     let convergence_handle = scope.needs_repo_convergence_status().then(|| {
         tokio::spawn(async move {
-            tokio::time::timeout(PROBE_TIMEOUT, query_repo_convergence_status()).await
+            timed_async_probe("repo_convergence", query_repo_convergence_status()).await
         })
     });
     // Helper-compat probe is sync subprocess work. `spawn_blocking` puts
@@ -9576,6 +9600,43 @@ exit 0\n"
             "details should retain the probe outcome"
         );
         // TEST PASS: failed helper probe stays bounded and visible
+    }
+
+    #[tokio::test]
+    async fn timed_async_probe_exports_measured_outcomes_once() {
+        use tracing_subscriber::prelude::*;
+
+        let metrics = std::sync::Arc::new(rch_telemetry::metrics::Metrics::new().unwrap());
+        let subscriber = tracing_subscriber::registry().with(
+            rch_telemetry::metrics::MetricsLayer::new(std::sync::Arc::clone(&metrics)),
+        );
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        let success = timed_async_probe("daemon_status", async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok::<_, &str>(42)
+        })
+        .await;
+        assert_eq!(success.unwrap().unwrap(), 42);
+        let error =
+            timed_async_probe("repo_convergence", async { Err::<(), _>("rpc failed") }).await;
+        assert_eq!(error.unwrap().unwrap_err(), "rpc failed");
+        let timeout =
+            timed_async_probe("daemon_status", std::future::pending::<Result<(), &str>>()).await;
+        assert!(timeout.is_err());
+
+        for (probe, outcome, minimum) in [
+            ("daemon_status", "completed", 0.005),
+            ("repo_convergence", "inner_error", 0.0),
+            ("daemon_status", "timeout", PROBE_TIMEOUT.as_secs_f64()),
+        ] {
+            let histogram = metrics
+                .doctor_probe_duration_seconds
+                .with_label_values(&[probe, outcome]);
+            assert_eq!(histogram.get_sample_count(), 1, "{probe}/{outcome}");
+            assert!(histogram.get_sample_sum() >= minimum, "{probe}/{outcome}");
+            assert!(histogram.get_sample_sum() > 0.0, "{probe}/{outcome}");
+        }
     }
 
     #[tokio::test]
