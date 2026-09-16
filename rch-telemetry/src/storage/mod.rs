@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::protocol::{TestRunRecord, TestRunStats, TestRunStatsAccumulator, WorkerTelemetry};
+use crate::protocol::{
+    TestRunRecord, TestRunStats, TestRunStatsAccumulator, TestRunStatsScope, WorkerTelemetry,
+};
 use crate::speedscore::SpeedScore;
 
 mod schema;
@@ -227,7 +229,9 @@ impl TelemetryStorage {
             stats.record_outcome(&kind, exit_code, duration_ms);
         }
 
-        Ok(stats.finish())
+        let mut stats = stats.finish();
+        stats.scope = TestRunStatsScope::StoredHistory;
+        Ok(stats)
     }
 
     /// Fetch the latest SpeedScore for a worker.
@@ -913,6 +917,7 @@ mod tests {
     fn test_test_run_stats_empty_database() {
         let storage = TelemetryStorage::new_in_memory().expect("storage");
         let stats = storage.test_run_stats().expect("empty stats");
+        assert_eq!(stats.scope, TestRunStatsScope::StoredHistory);
         assert_eq!(stats.total_runs, 0);
         assert_eq!(stats.passed_runs, 0);
         assert_eq!(stats.failed_runs, 0);
@@ -949,6 +954,8 @@ mod tests {
 
         let reopened = TelemetryStorage::new(&path, 30, 24, 365, 0).expect("reopen");
         let persisted = reopened.test_run_stats().expect("persisted stats");
+        assert_eq!(persisted.scope, TestRunStatsScope::StoredHistory);
+        assert_eq!(memory.scope, TestRunStatsScope::Unknown);
         for stats in [&memory, &persisted] {
             assert_eq!(stats.total_runs, 768);
             assert_eq!(stats.passed_runs, 3);

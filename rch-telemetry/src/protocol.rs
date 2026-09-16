@@ -196,12 +196,28 @@ impl TestRunRecord {
     }
 }
 
-/// Aggregate terminal command outcomes for recent test commands.
+/// Which records contributed to a test-command statistics snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum TestRunStatsScope {
+    /// The producer did not identify its reporting window.
+    #[default]
+    Unknown,
+    /// All currently stored records, which may omit failed/pending writes.
+    StoredHistory,
+    /// The most recent records received by this daemon process.
+    RecentMemory { max_records: usize },
+}
+
+/// Aggregate terminal command outcomes for test commands.
 ///
 /// Exit codes do not prove which compilation or test phase failed. A successful
 /// command exited zero; every other exit belongs to `failed_runs`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TestRunStats {
+    /// Set by the data owner; arithmetic alone cannot establish a window.
+    #[serde(default)]
+    pub scope: TestRunStatsScope,
     pub total_runs: u64,
     pub passed_runs: u64,
     pub failed_runs: u64,
@@ -670,6 +686,7 @@ mod tests {
     #[test]
     fn test_run_stats_default_is_empty() {
         let stats = TestRunStats::default();
+        assert_eq!(stats.scope, TestRunStatsScope::Unknown);
         assert_eq!(stats.total_runs, 0);
         assert_eq!(stats.passed_runs, 0);
         assert_eq!(stats.failed_runs, 0);
@@ -855,6 +872,21 @@ mod tests {
         assert_eq!(parsed.failed_runs, 3);
         assert_eq!(parsed.avg_duration_ms, 1500);
         assert_eq!(parsed.runs_by_kind.get("cargo_test"), Some(&8));
+    }
+
+    #[test]
+    fn test_run_stats_scope_wire_format() {
+        for (scope, wire) in [
+            (TestRunStatsScope::Unknown, serde_json::json!({"source": "unknown"})),
+            (TestRunStatsScope::StoredHistory, serde_json::json!({"source": "stored_history"})),
+            (TestRunStatsScope::RecentMemory { max_records: 200 }, serde_json::json!({"source": "recent_memory", "max_records": 200})),
+        ] {
+            assert_eq!(serde_json::to_value(&scope).unwrap(), wire);
+            assert_eq!(serde_json::from_value::<TestRunStatsScope>(wire).unwrap(), scope);
+        }
+        let missing = serde_json::json!({"total_runs": 10, "passed_runs": 7, "failed_runs": 3, "avg_duration_ms": 4});
+        let stats: TestRunStats = serde_json::from_value(missing).unwrap();
+        assert_eq!(stats.scope, TestRunStatsScope::Unknown);
     }
 
     // ========================

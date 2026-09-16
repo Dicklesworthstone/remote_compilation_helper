@@ -40,7 +40,7 @@ pub use collect::memory::{MemoryInfo, MemoryPressureStall, MemoryTelemetry};
 pub use collect::network::{
     NetDevStats, NetworkCollector, NetworkError, NetworkMetrics, NetworkTelemetry,
 };
-pub use protocol::{TestRunRecord, TestRunStats, TestRunStatsAccumulator};
+pub use protocol::{TestRunRecord, TestRunStats, TestRunStatsAccumulator, TestRunStatsScope};
 pub use remediation::{
     AdmissionDecision, BypassTransition, RemediationAttributes, RemediationMetrics,
     SelfHealingAction, SelfHealingOutcome,

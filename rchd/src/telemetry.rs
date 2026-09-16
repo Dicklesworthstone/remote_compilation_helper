@@ -8,7 +8,7 @@ use directories::ProjectDirs;
 use rch_common::{SshClient, SshOptions};
 use rch_telemetry::protocol::{
     ReceivedTelemetry, TelemetrySource, TestRunRecord, TestRunStats, TestRunStatsAccumulator,
-    WorkerTelemetry,
+    TestRunStatsScope, WorkerTelemetry,
 };
 use rch_telemetry::speedscore::SpeedScore;
 use rch_telemetry::storage::{SpeedScoreHistoryPage, TelemetryStorage};
@@ -19,6 +19,8 @@ use std::time::Duration;
 use tokio::task;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
+
+const TEST_RUN_MEMORY_CAPACITY: usize = 200;
 
 /// In-memory telemetry store with time-based eviction.
 pub struct TelemetryStore {
@@ -124,7 +126,7 @@ impl TelemetryStore {
     /// Record a test run for telemetry and optional persistence.
     pub fn record_test_run(&self, record: TestRunRecord) {
         let mut test_runs = self.test_runs.write().unwrap_or_else(|e| e.into_inner());
-        if test_runs.len() >= 200 {
+        if test_runs.len() >= TEST_RUN_MEMORY_CAPACITY {
             test_runs.pop_front();
         }
         test_runs.push_back(record.clone());
@@ -156,7 +158,11 @@ impl TelemetryStore {
         for record in test_runs.iter() {
             stats.record(record);
         }
-        stats.finish()
+        let mut stats = stats.finish();
+        stats.scope = TestRunStatsScope::RecentMemory {
+            max_records: TEST_RUN_MEMORY_CAPACITY,
+        };
+        stats
     }
 
     /// Persist a completed benchmark's SpeedScore.
@@ -952,6 +958,47 @@ mod tests {
         assert_eq!(stats.total_runs, 0);
         assert_eq!(stats.passed_runs, 0);
         assert_eq!(stats.failed_runs, 0);
+        assert_eq!(stats.scope, TestRunStatsScope::RecentMemory { max_records: 200 });
+    }
+
+    #[tokio::test]
+    async fn test_test_run_scope_tracks_storage_read_failure() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.db");
+        let storage = Arc::new(TelemetryStorage::new(&path, 30, 24, 365, 0).unwrap());
+        let mut store = TelemetryStore::new(Duration::from_secs(300), None);
+        let record = TestRunRecord::new(
+            "proj".to_string(),
+            "worker".to_string(),
+            "cargo test".to_string(),
+            CompilationKind::CargoTest,
+            101,
+            5,
+        );
+        // Populate memory before attaching storage to avoid an asynchronous
+        // persistence race. An empty database still has a known stored scope.
+        store.record_test_run(record.clone());
+        store.storage = Some(Arc::clone(&storage));
+        let empty = store.test_run_stats().await;
+        assert_eq!(empty.total_runs, 0);
+        assert_eq!(empty.scope, TestRunStatsScope::StoredHistory);
+
+        storage.insert_test_run(&record).unwrap();
+        let stored = store.test_run_stats().await;
+        assert_eq!(stored.total_runs, 1);
+        assert_eq!(stored.scope, TestRunStatsScope::StoredHistory);
+
+        // Corrupt an actual row through a separate SQLite connection. The
+        // production storage reader rejects its negative duration.
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute("UPDATE test_runs SET duration_ms = -1", []).unwrap();
+        assert!(storage.test_run_stats().is_err());
+        let fallback = store.test_run_stats().await;
+        assert_eq!(fallback.total_runs, 1);
+        assert_eq!(fallback.failed_runs, 1);
+        assert_eq!(fallback.avg_duration_ms, 5);
+        assert_eq!(fallback.scope, TestRunStatsScope::RecentMemory { max_records: 200 });
     }
 
     #[tokio::test]
@@ -988,8 +1035,8 @@ mod tests {
         assert_eq!(stats.avg_duration_ms, 1001);
     }
 
-    #[test]
-    fn test_test_run_stats_max_capacity() {
+    #[tokio::test]
+    async fn test_test_run_stats_max_capacity() {
         let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(300), None);
 
@@ -1000,15 +1047,19 @@ mod tests {
                 "worker-1".to_string(),
                 "cargo test".to_string(),
                 CompilationKind::CargoTest,
-                0,
+                if i < 5 { 101 } else { 0 },
                 100,
             );
             store.record_test_run(record);
         }
 
         // Should only retain the latest 200
-        let test_runs = store.test_runs.read().unwrap();
-        assert_eq!(test_runs.len(), 200);
+        assert_eq!(store.test_runs.read().unwrap().len(), 200);
+        let stats = store.test_run_stats().await;
+        assert_eq!(stats.total_runs, 200);
+        assert_eq!(stats.passed_runs, 200);
+        assert_eq!(stats.failed_runs, 0);
+        assert_eq!(stats.scope, TestRunStatsScope::RecentMemory { max_records: 200 });
     }
 
     #[test]
