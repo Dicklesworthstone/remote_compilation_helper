@@ -9,7 +9,7 @@ use crate::ui::progress::Spinner;
 use crate::ui::theme::StatusIndicator;
 use anyhow::{Context, Result};
 use rch_common::{ApiError, ApiResponse, ErrorCode, WorkerConfig};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::path::Path;
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -23,10 +23,10 @@ use super::workers_deploy::{
 // Workers Sync Toolchain Command
 // =============================================================================
 
-/// Synchronize Rust toolchain to workers.
+/// Synchronize the project's Rust toolchain and declared components to workers.
 ///
-/// Detects the project's required toolchain from rust-toolchain.toml,
-/// checks each worker's installed toolchains, and installs if missing.
+/// Uses the same channel resolution as the build path. A runnable compiler
+/// alone is not sufficient: every required component must also be installed.
 pub async fn workers_sync_toolchain(
     worker_id: Option<String>,
     all: bool,
@@ -55,7 +55,7 @@ pub async fn workers_sync_toolchain(
         return Ok(());
     }
 
-    // Detect project toolchain
+    // Resolve one plan for the whole fleet, including component requirements.
     let toolchain = detect_project_toolchain()?;
 
     // Load workers configuration
@@ -109,7 +109,12 @@ pub async fn workers_sync_toolchain(
         println!(
             "  {} Required toolchain: {}",
             style.muted("→"),
-            style.highlight(&toolchain)
+            style.highlight(&toolchain.channel)
+        );
+        println!(
+            "  {} Required components: {}",
+            style.muted("→"),
+            toolchain.components.join(", ")
         );
         if dry_run {
             println!(
@@ -134,7 +139,9 @@ pub async fn workers_sync_toolchain(
         let _ = ctx.json(&ApiResponse::ok(
             "workers sync-toolchain",
             serde_json::json!({
-                "toolchain": toolchain,
+                "toolchain": toolchain.channel,
+                "components": toolchain.components,
+                "dry_run": dry_run,
                 "results": results,
             }),
         ));
@@ -146,8 +153,13 @@ pub async fn workers_sync_toolchain(
 
         println!();
         println!(
-            "  {} Installed: {}, Already present: {}, Failed: {}",
+            "  {} {}: {}, Already present: {}, Failed: {}",
             style.muted("Summary:"),
+            if dry_run {
+                "Would install"
+            } else {
+                "Installed"
+            },
             style.success(&(success_count - already_count).to_string()),
             style.muted(&already_count.to_string()),
             if fail_count > 0 {
@@ -266,7 +278,12 @@ pub async fn workers_setup(
             }
         );
         if let Some(ref tc) = toolchain {
-            println!("  {} Toolchain: {}", style.muted("→"), style.highlight(tc));
+            println!(
+                "  {} Toolchain: {} (components: {})",
+                style.muted("→"),
+                style.highlight(&tc.channel),
+                tc.components.join(", ")
+            );
         }
         if dry_run {
             println!(
@@ -302,7 +319,7 @@ pub async fn workers_setup(
     for worker in &target_workers {
         let result = setup_single_worker(
             worker,
-            toolchain.as_deref(),
+            toolchain.as_ref(),
             dry_run,
             skip_binary,
             skip_toolchain,
@@ -318,7 +335,9 @@ pub async fn workers_setup(
         let _ = ctx.json(&ApiResponse::ok(
             "workers setup",
             serde_json::json!({
-                "toolchain": toolchain,
+                "toolchain": toolchain.as_ref().map(|tc| tc.channel.as_str()),
+                "components": toolchain.as_ref().map(|tc| tc.components.as_slice()).unwrap_or(&[]),
+                "dry_run": dry_run,
                 "results": all_results,
             }),
         ));
@@ -365,7 +384,7 @@ struct SetupResult {
 /// Setup a single worker: deploy binary and sync toolchain.
 async fn setup_single_worker(
     worker: &WorkerConfig,
-    toolchain: Option<&str>,
+    toolchain: Option<&ProjectToolchain>,
     dry_run: bool,
     skip_binary: bool,
     skip_toolchain: bool,
@@ -490,7 +509,7 @@ async fn setup_single_worker(
         }
 
         if dry_run {
-            // Check if already installed for dry-run reporting
+            // Check the compiler AND all required components without installing.
             match check_remote_toolchain(worker, tc).await {
                 Ok(true) => {
                     if !ctx.is_json() {
@@ -504,6 +523,8 @@ async fn setup_single_worker(
                     }
                 }
                 Err(e) => {
+                    result.success = false;
+                    result.errors.push(format!("Toolchain check: {}", e));
                     if !ctx.is_json() {
                         println!("{} ({})", style.warning("check failed"), e);
                     }
@@ -1428,14 +1449,10 @@ async fn verify_worker_health(worker: &WorkerConfig) -> Result<bool> {
     Ok(stdout == "OK")
 }
 
-#[derive(Debug, Deserialize)]
-struct RustToolchainToml {
-    toolchain: Option<RustToolchainSection>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RustToolchainSection {
-    channel: Option<String>,
+#[derive(Debug, Clone)]
+struct ProjectToolchain {
+    channel: String,
+    components: Vec<String>,
 }
 
 fn normalize_toolchain_channel(channel: &str) -> Result<String> {
@@ -1449,60 +1466,96 @@ fn normalize_toolchain_channel(channel: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-fn parse_rust_toolchain_toml_channel(content: &str, path: &Path) -> Result<Option<String>> {
-    let parsed: RustToolchainToml =
-        toml::from_str(content).with_context(|| format!("Failed to parse {}", path.display()))?;
-    parsed
-        .toolchain
-        .and_then(|toolchain| toolchain.channel)
-        .map(|channel| normalize_toolchain_channel(&channel))
-        .transpose()
+fn project_toolchain_for_root(root: &Path) -> Result<ProjectToolchain> {
+    // Share build-time resolution: ambient overrides, nearest ancestor file,
+    // then rustup's active toolchain. Do not guess stable in an unrelated cwd.
+    let info = crate::toolchain::detect_toolchain(root)
+        .with_context(|| format!("Failed to resolve Rust toolchain in {}", root.display()))?;
+    let channel = normalize_toolchain_channel(&info.rustup_toolchain())?;
+    let mut components = crate::toolchain::detect_declared_components(root);
+    // Preserve RCH's existing rust-src requirement, including on workers whose
+    // compiler was already installed before setup (GitHub #67).
+    components.push("rust-src".to_string());
+    components.sort();
+    components.dedup();
+    anyhow::ensure!(
+        components
+            .iter()
+            .all(|component| !component.chars().any(char::is_control)),
+        "Rust toolchain component contains control characters"
+    );
+    Ok(ProjectToolchain { channel, components })
 }
 
+fn detect_project_toolchain() -> Result<ProjectToolchain> {
+    project_toolchain_for_root(&std::env::current_dir()?)
+}
+
+/// Read-only probe. Capture the worker's actual host triple so a component
+/// installed for a different target cannot satisfy a host component request.
 fn check_toolchain_command(toolchain: &str) -> String {
     let toolchain = shell_escape_str(toolchain);
     format!(
-        "rustup run -- {toolchain} rustc --version >/dev/null 2>&1 && echo FOUND || echo NOTFOUND"
+        "if v=$(RUSTUP_AUTO_INSTALL=0 rustup run -- {toolchain} rustc -vV 2>/dev/null); then \
+         printf 'RCH_TOOLCHAIN_FOUND\\n%s\\nRCH_TOOLCHAIN_COMPONENTS\\n' \"$v\"; \
+         RUSTUP_AUTO_INSTALL=0 rustup component list --installed --toolchain={toolchain}; \
+         else printf 'RCH_TOOLCHAIN_MISSING\\n'; fi"
     )
 }
 
-fn install_toolchain_command(toolchain: &str) -> String {
-    let toolchain = shell_escape_str(toolchain);
-    format!(
-        "rustup install -- {toolchain} && rustup component add rust-src --toolchain={toolchain}"
-    )
+fn component_key<'a>(component: &'a str, host_suffix: &str) -> &'a str {
+    let component = component.strip_suffix(host_suffix).unwrap_or(component);
+    // rustup accepts historical aliases such as clippy-preview and llvm-tools-preview.
+    component.strip_suffix("-preview").unwrap_or(component)
 }
 
-/// Detect the project's required toolchain from rust-toolchain.toml or rust-toolchain.
-pub(super) fn detect_project_toolchain() -> Result<String> {
-    use std::fs;
-
-    // Check for rust-toolchain.toml first
-    let toml_path = std::env::current_dir()?.join("rust-toolchain.toml");
-    if toml_path.exists() {
-        let content = fs::read_to_string(&toml_path)
-            .with_context(|| format!("Failed to read {}", toml_path.display()))?;
-        if let Some(channel) = parse_rust_toolchain_toml_channel(&content, &toml_path)? {
-            return Ok(channel);
-        }
+fn remote_toolchain_has_components(stdout: &str, required: &[String]) -> Result<bool> {
+    if stdout.trim() == "RCH_TOOLCHAIN_MISSING" {
+        return Ok(false);
     }
+    let lines: Vec<_> = stdout.lines().map(str::trim).collect();
+    anyhow::ensure!(
+        lines.first() == Some(&"RCH_TOOLCHAIN_FOUND"),
+        "Toolchain probe did not report a recognized state"
+    );
+    let separator = lines
+        .iter()
+        .position(|line| *line == "RCH_TOOLCHAIN_COMPONENTS")
+        .context("Toolchain probe omitted component inventory")?;
+    let host = lines[1..separator]
+        .iter()
+        .find_map(|line| line.strip_prefix("host:").map(str::trim))
+        .filter(|host| !host.is_empty() && !host.chars().any(char::is_whitespace))
+        .context("Toolchain probe omitted compiler host triple")?;
+    let host_suffix = format!("-{host}");
+    let installed: Vec<_> = lines[separator + 1..]
+        .iter()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    Ok(required.iter().all(|component| {
+        installed.iter().any(|installed| {
+            component_key(installed, &host_suffix) == component_key(component, &host_suffix)
+        })
+    }))
+}
 
-    // Check for rust-toolchain (plain text)
-    let plain_path = std::env::current_dir()?.join("rust-toolchain");
-    if plain_path.exists() {
-        let content = fs::read_to_string(&plain_path)
-            .with_context(|| format!("Failed to read {}", plain_path.display()))?;
-        return normalize_toolchain_channel(&content);
-    }
-
-    // Default to stable if no toolchain file
-    Ok("stable".to_string())
+fn install_toolchain_command(toolchain: &ProjectToolchain) -> String {
+    let channel = shell_escape_str(&toolchain.channel);
+    let components = toolchain
+        .components
+        .iter()
+        .map(|component| format!("--component={}", shell_escape_str(component)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Supplying components to install also repairs an existing toolchain and
+    // lets rustup select an available nightly with the complete requested set.
+    format!("rustup toolchain install {components} -- {channel}")
 }
 
 /// Sync toolchain to a single worker.
 async fn sync_toolchain_to_worker(
     worker: &WorkerConfig,
-    toolchain: &str,
+    toolchain: &ProjectToolchain,
     dry_run: bool,
     ctx: &OutputContext,
 ) -> ToolchainSyncResult {
@@ -1516,7 +1569,7 @@ async fn sync_toolchain_to_worker(
         None
     };
 
-    // Check if toolchain is already installed
+    // A runnable compiler without its required components is not ready.
     match check_remote_toolchain(worker, toolchain).await {
         Ok(true) => {
             if let Some(s) = spinner {
@@ -1526,14 +1579,14 @@ async fn sync_toolchain_to_worker(
                 worker_id: worker_id.clone(),
                 success: true,
                 already_installed: true,
-                installed_toolchain: Some(toolchain.to_string()),
+                installed_toolchain: Some(toolchain.channel.clone()),
                 error: None,
             };
         }
         Ok(false) => {
             // Need to install - update spinner message
             if let Some(ref s) = spinner {
-                s.set_message(&format!("{}: Installing {}...", worker_id, toolchain));
+                s.set_message(&format!("{}: Installing {}...", worker_id, toolchain.channel));
             }
         }
         Err(e) => {
@@ -1552,7 +1605,7 @@ async fn sync_toolchain_to_worker(
 
     if dry_run {
         if let Some(s) = spinner {
-            s.finish_warning(&format!("{}: Would install {}", worker_id, toolchain));
+            s.finish_warning(&format!("{}: Would install {}", worker_id, toolchain.channel));
         }
         return ToolchainSyncResult {
             worker_id: worker_id.clone(),
@@ -1567,13 +1620,13 @@ async fn sync_toolchain_to_worker(
     match install_remote_toolchain(worker, toolchain).await {
         Ok(()) => {
             if let Some(s) = spinner {
-                s.finish_success(&format!("{}: Installed {}", worker_id, toolchain));
+                s.finish_success(&format!("{}: Installed {}", worker_id, toolchain.channel));
             }
             ToolchainSyncResult {
                 worker_id: worker_id.clone(),
                 success: true,
                 already_installed: false,
-                installed_toolchain: Some(toolchain.to_string()),
+                installed_toolchain: Some(toolchain.channel.clone()),
                 error: None,
             }
         }
@@ -1592,24 +1645,32 @@ async fn sync_toolchain_to_worker(
     }
 }
 
-/// Check if a toolchain is installed on a remote worker.
-async fn check_remote_toolchain(worker: &WorkerConfig, toolchain: &str) -> Result<bool> {
+/// Check the toolchain and every required component on a remote worker.
+async fn check_remote_toolchain(worker: &WorkerConfig, toolchain: &ProjectToolchain) -> Result<bool> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("ConnectTimeout=10");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-i").arg(&worker.identity_file);
     cmd.arg(format!("{}@{}", worker.user, worker.host));
-    cmd.arg(check_toolchain_command(toolchain));
+    cmd.arg(check_toolchain_command(&toolchain.channel));
 
     let output = cmd.output().await.context("Failed to SSH to worker")?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    Ok(stdout.trim() == "FOUND")
+    anyhow::ensure!(
+        output.status.success(),
+        "Toolchain probe failed on {} (exit {:?}): {}",
+        worker.id,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    remote_toolchain_has_components(
+        &String::from_utf8_lossy(&output.stdout),
+        &toolchain.components,
+    )
 }
 
-/// Install a toolchain on a remote worker.
-async fn install_remote_toolchain(worker: &WorkerConfig, toolchain: &str) -> Result<()> {
+/// Install a toolchain and its components, then verify the resulting state.
+async fn install_remote_toolchain(worker: &WorkerConfig, toolchain: &ProjectToolchain) -> Result<()> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("ConnectTimeout=60"); // Toolchain install can take a while
@@ -1623,8 +1684,19 @@ async fn install_remote_toolchain(worker: &WorkerConfig, toolchain: &str) -> Res
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(SshError::ToolchainInstallFailed {
             host: worker.host.clone(),
-            toolchain: toolchain.to_string(),
+            toolchain: toolchain.channel.clone(),
             message: stderr.trim().to_string(),
+        }
+        .into());
+    }
+    if !check_remote_toolchain(worker, toolchain).await? {
+        return Err(SshError::ToolchainInstallFailed {
+            host: worker.host.clone(),
+            toolchain: toolchain.channel.clone(),
+            message: format!(
+                "Post-install verification did not find the compiler and required components: {}",
+                toolchain.components.join(", ")
+            ),
         }
         .into());
     }
@@ -2115,43 +2187,184 @@ mod tests {
     }
 
     #[test]
-    fn rust_toolchain_toml_parsing_handles_comments_and_rejects_controls() {
-        let parsed = parse_rust_toolchain_toml_channel(
-            "[toolchain]\nchannel = \"nightly-2026-04-22\" # pinned\n",
-            Path::new("rust-toolchain.toml"),
+    fn project_toolchain_plan_includes_nearest_declared_components() {
+        let root = TempDir::new().unwrap();
+        fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = 'beta' # pinned\ncomponents = ['rustfmt', 'clippy', 'rust-src', 'clippy']\n",
+        )
+        .unwrap();
+        let child = root.path().join("member");
+        fs::create_dir(&child).unwrap();
+        let plan = project_toolchain_for_root(&child).unwrap();
+        assert_eq!(plan.components, ["clippy", "rust-src", "rustfmt"]);
+        assert_eq!(
+            plan.channel,
+            crate::toolchain::detect_toolchain(&child)
+                .unwrap()
+                .rustup_toolchain(),
+            "setup must use the same channel resolution as builds, including ambient overrides"
         );
-
-        assert!(
-            matches!(&parsed, Ok(Some(channel)) if channel == "nightly-2026-04-22"),
-            "TOML parser should extract channel with comments, got {parsed:?}"
+        fs::write(child.join("rust-toolchain"), "stable\n").unwrap();
+        let nearer = project_toolchain_for_root(&child).unwrap();
+        assert_eq!(
+            nearer.components,
+            ["rust-src"],
+            "nearer declaration shadows ancestor components"
         );
-
-        let err = normalize_toolchain_channel("stable\nwhoops")
-            .err()
-            .map(|err| err.to_string());
-        assert!(
-            err.as_deref()
-                .is_some_and(|message| message.contains("control characters")),
-            "unexpected error for invalid toolchain channel: {err:?}"
-        );
+        assert!(normalize_toolchain_channel("stable\nwhoops").is_err());
+        assert!(normalize_toolchain_channel("").is_err());
     }
 
     #[test]
     fn remote_toolchain_commands_escape_channel_values() {
+        let plan = ProjectToolchain {
+            channel: "-nightly".to_string(),
+            components: vec!["clippy".into(), "rust-src".into(), "rustfmt".into()],
+        };
+        let check = check_toolchain_command(&plan.channel);
+        assert!(check.contains("rustup run -- '-nightly' rustc -vV"));
+        assert!(check.contains("--toolchain='-nightly'"));
+        assert_eq!(check.matches("RUSTUP_AUTO_INSTALL=0").count(), 2);
         assert_eq!(
-            check_toolchain_command("-nightly"),
-            "rustup run -- '-nightly' rustc --version >/dev/null 2>&1 && echo FOUND || echo NOTFOUND"
+            install_toolchain_command(&plan),
+            "rustup toolchain install --component=clippy --component=rust-src --component=rustfmt -- '-nightly'"
         );
-        assert_eq!(
-            install_toolchain_command("-nightly"),
-            "rustup install -- '-nightly' && rustup component add rust-src --toolchain='-nightly'"
-        );
+        let single_quote = install_toolchain_command(&ProjectToolchain {
+            channel: "nightly'bad".into(),
+            ..plan
+        });
+        assert!(single_quote.contains("'nightly'\\''bad'"), "{single_quote}");
+    }
 
-        let single_quote = install_toolchain_command("nightly'bad");
-        assert!(
-            single_quote.contains("'nightly'\\''bad'"),
-            "single quotes in toolchain values must be shell escaped: {single_quote}"
+    #[test]
+    fn remote_toolchain_probe_requires_every_component_for_the_worker_host() {
+        let required = vec!["clippy".into(), "rust-src".into(), "rustfmt".into()];
+        let header = "RCH_TOOLCHAIN_FOUND\nrustc 1.99.0\nhost: x86_64-unknown-linux-gnu\nRCH_TOOLCHAIN_COMPONENTS\n";
+        for (inventory, expected) in [
+            ("rustc-x86_64-unknown-linux-gnu\n", false),
+            (
+                "clippy-x86_64-unknown-linux-gnu\nrust-src\nrustfmt-x86_64-unknown-linux-gnu\n",
+                true,
+            ),
+            (
+                "clippy-aarch64-apple-darwin\nrust-src\nrustfmt-x86_64-unknown-linux-gnu\n",
+                false,
+            ),
+            (
+                "clippy-preview-x86_64-unknown-linux-gnu\nrust-src\nrustfmt-preview-x86_64-unknown-linux-gnu\n",
+                true,
+            ),
+            (
+                "clippy-extra-x86_64-unknown-linux-gnu\nrust-src\nrustfmt-x86_64-unknown-linux-gnu\n",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                remote_toolchain_has_components(&format!("{header}{inventory}"), &required).unwrap(),
+                expected,
+                "{inventory}"
+            );
+        }
+        assert!(!remote_toolchain_has_components("RCH_TOOLCHAIN_MISSING\n", &required).unwrap());
+        for malformed in [
+            "",
+            "FOUND\n",
+            "RCH_TOOLCHAIN_FOUND\nhost: x86_64-unknown-linux-gnu\n",
+            "RCH_TOOLCHAIN_FOUND\nRCH_TOOLCHAIN_COMPONENTS\n",
+            "RCH_TOOLCHAIN_FOUND\nhost: bad host\nRCH_TOOLCHAIN_COMPONENTS\n",
+        ] {
+            assert!(
+                remote_toolchain_has_components(malformed, &required).is_err(),
+                "{malformed:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_toolchain_shell_probe_keeps_inventory_failures_nonzero() {
+        let fake = r#"rustup() {
+    [ "${RUSTUP_AUTO_INSTALL-}" = 0 ] || return 88
+    case "$1" in
+        run)
+            [ "$#" -eq 5 ] && [ "$2" = -- ] && [ "$3" = "$RCH_TEST_CHANNEL" ] &&
+                [ "$4" = rustc ] && [ "$5" = -vV ] || return 89
+            [ "$RCH_TEST_PRESENT" = 1 ] || return 1
+            printf 'rustc 1.99.0\nhost: x86_64-unknown-linux-gnu\n'
+            ;;
+        component)
+            [ "$#" -eq 4 ] && [ "$2" = list ] && [ "$3" = --installed ] &&
+                [ "$4" = "--toolchain=$RCH_TEST_CHANNEL" ] || return 90
+            printf 'clippy-x86_64-unknown-linux-gnu\nrust-src\nrustfmt-x86_64-unknown-linux-gnu\n'
+            return "$RCH_TEST_LIST_EXIT"
+            ;;
+        *) return 91 ;;
+    esac
+}
+"#;
+        let channel = "nightly'; $cash `echo literal`";
+        let script = format!("{fake}{}", check_toolchain_command(channel));
+        let required = vec!["clippy".into(), "rust-src".into(), "rustfmt".into()];
+        for (present, list_exit, expected_exit) in
+            [("1", "0", 0), ("1", "23", 23), ("0", "0", 0)]
+        {
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .env("RCH_TEST_CHANNEL", channel)
+                .env("RCH_TEST_PRESENT", present)
+                .env("RCH_TEST_LIST_EXIT", list_exit)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(expected_exit), "{output:?}");
+            if output.status.success() {
+                assert_eq!(
+                    remote_toolchain_has_components(
+                        &String::from_utf8_lossy(&output.stdout),
+                        &required,
+                    )
+                    .unwrap(),
+                    present == "1"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_toolchain_install_passes_all_components_as_literal_arguments() {
+        let plan = ProjectToolchain {
+            channel: "nightly'bad; echo wrong".into(),
+            components: vec![
+                "clippy".into(),
+                "rust-src".into(),
+                "rustfmt".into(),
+                "literal' $name; `echo no`".into(),
+            ],
+        };
+        let fake = r#"rustup() { printf '%s\0' "$@"; return "$RCH_TEST_EXIT"; }; "#;
+        let script = format!("{fake}{}", install_toolchain_command(&plan));
+        let mut expected = vec!["toolchain".to_string(), "install".to_string()];
+        expected.extend(
+            plan.components
+                .iter()
+                .map(|component| format!("--component={component}")),
         );
+        expected.extend(["--".to_string(), plan.channel.clone()]);
+        for status in [0, 19] {
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .env("RCH_TEST_EXIT", status.to_string())
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(status));
+            let actual: Vec<_> = std::str::from_utf8(&output.stdout)
+                .unwrap()
+                .split_terminator('\0')
+                .map(str::to_string)
+                .collect();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[cfg(unix)]
