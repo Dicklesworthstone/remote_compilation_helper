@@ -1028,6 +1028,16 @@ export function dispatcherFromProbe(host, probe) {
     : null;
 
   const ts = status?.daemon?.test_stats ?? null;
+  const reportedTestScope = ts?.scope;
+  let testScope = { source: "unknown" };
+  if (reportedTestScope && typeof reportedTestScope === "object" && !Array.isArray(reportedTestScope)) {
+    if (reportedTestScope.source === "stored_history") {
+      testScope = { source: "stored_history" };
+    } else if (reportedTestScope.source === "recent_memory" &&
+               Number.isSafeInteger(reportedTestScope.max_records) && reportedTestScope.max_records >= 0) {
+      testScope = { source: "recent_memory", max_records: reportedTestScope.max_records };
+    }
+  }
 
   return {
     id: dispatcherId(host),
@@ -1114,6 +1124,7 @@ export function dispatcherFromProbe(host, probe) {
           runs: num(ts.total_runs) ?? 0,
           passed: num(ts.passed_runs) ?? 0,
           failed: num(ts.failed_runs) ?? 0,
+          scope: testScope,
         }
       : null,
     workers,

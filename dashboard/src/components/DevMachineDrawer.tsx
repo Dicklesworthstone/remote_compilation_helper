@@ -255,7 +255,15 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
             />
           )}
           {d.tests && d.tests.runs > 0 && (
-            <Row k="Test commands (lifetime)" v={`${d.tests.runs} · ${d.tests.passed} succeeded · ${d.tests.failed} failed`} />
+            <Row
+              k={`Test commands (${d.tests.scope?.source === "stored_history"
+                ? "all stored records"
+                : d.tests.scope?.source === "recent_memory" &&
+                  Number.isSafeInteger(d.tests.scope.max_records) && d.tests.scope.max_records >= 0
+                  ? `recent memory up to ${d.tests.scope.max_records}`
+                  : "scope unknown"})`}
+              v={`${d.tests.runs} · ${d.tests.passed} succeeded · ${d.tests.failed} failed`}
+            />
           )}
         </dl>
       </div>

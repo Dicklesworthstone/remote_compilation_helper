@@ -414,9 +414,31 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
     JSON.stringify(rich.convergence.workers) === JSON.stringify([["hz4", "drifting", 2]]),
     JSON.stringify(rich.convergence));
   chk("test-command counters preserve all outcomes without an inferred build-error category",
-    JSON.stringify(rich.tests) === JSON.stringify({ runs: 10, passed: 7, failed: 3 }));
+    JSON.stringify(rich.tests) === JSON.stringify({ runs: 10, passed: 7, failed: 3, scope: { source: "unknown" } }));
   chk("every test command contributes to exactly one terminal outcome",
     rich.tests.runs === rich.tests.passed + rich.tests.failed);
+  for (const [label, scope, expected] of [
+    ["stored history", { source: "stored_history" }, { source: "stored_history" }],
+    ["recent memory", { source: "recent_memory", max_records: 200 }, { source: "recent_memory", max_records: 200 }],
+    ["reported capacity, not an assumed default", { source: "recent_memory", max_records: 37 }, { source: "recent_memory", max_records: 37 }],
+    ["missing", undefined, { source: "unknown" }],
+    ["explicit unknown", { source: "unknown" }, { source: "unknown" }],
+    ["unrecognized", { source: "future_source", max_records: 200 }, { source: "unknown" }],
+    ["null", null, { source: "unknown" }],
+    ["string", "stored_history", { source: "unknown" }],
+    ["missing capacity", { source: "recent_memory" }, { source: "unknown" }],
+    ["string capacity", { source: "recent_memory", max_records: "200" }, { source: "unknown" }],
+    ["negative capacity", { source: "recent_memory", max_records: -1 }, { source: "unknown" }],
+    ["fractional capacity", { source: "recent_memory", max_records: 1.5 }, { source: "unknown" }],
+    ["unsafe capacity", { source: "recent_memory", max_records: Number.MAX_SAFE_INTEGER + 1 }, { source: "unknown" }],
+  ]) {
+    const status = JSON.parse(RICH);
+    status.data.daemon.test_stats.scope = scope;
+    const scoped = dispatcherFromProbe("hz3-dev", probe([["s", JSON.stringify(status)], ["c", CAPS], ["l", LIST], ["m", MET]]));
+    chk(`test-command scope: ${label}`,
+      JSON.stringify(scoped.tests) === JSON.stringify({ runs: 10, passed: 7, failed: 3, scope: expected }),
+      JSON.stringify(scoped.tests));
+  }
   chk("per-worker recovery, bypass, pressure confidence and policy rule survive",
     rich.workers[0].recovery_in_secs === 240 && rich.workers[0].bypass === "RCH-I004 10.0.0.1" &&
     rich.workers[0].pressure.confidence === "low" &&

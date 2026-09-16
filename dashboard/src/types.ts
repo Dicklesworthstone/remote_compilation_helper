@@ -374,8 +374,13 @@ export interface Dispatcher {
     claude_code: boolean | null;
     agents: [agent: string | null, installed: boolean][];
   } | null;
-  /** Lifetime test-command outcomes: exit zero succeeded; every nonzero exit failed. */
-  tests?: { runs: number; passed: number; failed: number } | null;
+  /** Test-command outcomes within the reported scope; missing scope is unknown. */
+  tests?: {
+    runs: number;
+    passed: number;
+    failed: number;
+    scope?: { source: "stored_history" } | { source: "recent_memory"; max_records: number } | { source: "unknown" };
+  } | null;
   /**
    * This machine's own derated slot reading for every worker in the fleet, as
    * ONE ROW of the (dispatcher x worker) matrix, aligned index-for-index to
