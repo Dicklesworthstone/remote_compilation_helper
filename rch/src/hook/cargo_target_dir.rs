@@ -440,6 +440,13 @@ pub(super) fn rewrite_cargo_target_dir_command_for_remote(
 pub(super) fn managed_clean_overlay_cargo_tokens(
     command: &str,
 ) -> anyhow::Result<(Vec<String>, usize)> {
+    literal_cargo_tokens(command, false)
+}
+
+fn literal_cargo_tokens(
+    command: &str,
+    allow_classified_wrappers: bool,
+) -> anyhow::Result<(Vec<String>, usize)> {
     // shell_words preserves literal argv, not shell evaluation. Refuse syntax
     // whose expansion or execution would change when those words are re-quoted.
     let mut quote = None;
@@ -463,13 +470,20 @@ pub(super) fn managed_clean_overlay_cargo_tokens(
             anyhow::bail!("cannot safely bind Cargo build directory across shell evaluation");
         }
     }
-    cargo_command_tokens(command)
+    cargo_command_tokens_with_wrappers(command, allow_classified_wrappers)
 }
 
 /// Tokenize without evaluating shell syntax and skip supported executable
 /// prefixes. Shared with target detection so `env --` and wrapper option values
 /// are not mistaken for Cargo's argument separator or executable.
 fn cargo_command_tokens(command: &str) -> anyhow::Result<(Vec<String>, usize)> {
+    cargo_command_tokens_with_wrappers(command, false)
+}
+
+fn cargo_command_tokens_with_wrappers(
+    command: &str,
+    allow_classified_wrappers: bool,
+) -> anyhow::Result<(Vec<String>, usize)> {
     let mut tokens = shell_words::split(command)?;
     let assignment = |token: &str| {
         token.split_once('=').is_some_and(|(key, _)| {
@@ -491,7 +505,10 @@ fn cargo_command_tokens(command: &str) -> anyhow::Result<(Vec<String>, usize)> {
             .ok_or_else(|| anyhow::anyhow!("missing Cargo command"))?;
         let executable = Path::new(token).file_name().and_then(|name| name.to_str());
         match executable {
-            Some("cargo" | "cargo.exe" | "cargo-zigbuild" | "cargo-zigbuild.exe") => break,
+            Some(
+                "cargo" | "cargo.exe" | "cargo-zigbuild" | "cargo-zigbuild.exe" | "cargo-xwin"
+                | "cargo-xwin.exe",
+            ) => break,
             Some("env") => {
                 index += 1;
                 while let Some(token) = tokens.get(index) {
@@ -501,6 +518,7 @@ fn cargo_command_tokens(command: &str) -> anyhow::Result<(Vec<String>, usize)> {
                             break;
                         }
                         "-i" | "--ignore-environment" => index += 1,
+                        "--debug" if allow_classified_wrappers => index += 1,
                         "-u" | "--unset" | "-C" | "--chdir" => {
                             anyhow::ensure!(
                                 tokens.get(index + 1).is_some(),
@@ -570,6 +588,35 @@ fn cargo_command_tokens(command: &str) -> anyhow::Result<(Vec<String>, usize)> {
                     "missing rustup toolchain"
                 );
                 index += 1;
+            }
+            _ if allow_classified_wrappers => {
+                // Reuse the classifier's wrapper vocabulary, but bind only
+                // when its normalized command is an unchanged argv suffix.
+                // Preserve wrapper arguments and the actual executable path.
+                let remaining = join_exec_command(&tokens[index..]);
+                let normalized = rch_common::patterns::normalize_command(&remaining);
+                let suffix = shell_words::split(&normalized)?;
+                let start = tokens.len().checked_sub(suffix.len());
+                if let Some(start) = start.filter(|&start| start >= index)
+                    && !suffix.is_empty()
+                    && matches!(
+                        Path::new(&tokens[start])
+                            .file_name()
+                            .and_then(|name| name.to_str()),
+                        Some(
+                            "cargo"
+                                | "cargo.exe"
+                                | "cargo-zigbuild"
+                                | "cargo-zigbuild.exe"
+                                | "cargo-xwin"
+                                | "cargo-xwin.exe"
+                        )
+                    )
+                    && tokens[start + 1..] == suffix[1..]
+                {
+                    return Ok((tokens, start));
+                }
+                anyhow::bail!("cannot locate an unchanged Cargo argv suffix: {command}");
             }
             _ => anyhow::bail!("unsupported executable prefix in managed Cargo command: {token}"),
         }
@@ -680,7 +727,7 @@ pub(super) fn bind_build_source_stamp(command: &str, stamp: &str) -> anyhow::Res
         !stamp.is_empty() && !stamp.chars().any(char::is_control),
         "invalid build-source stamp"
     );
-    let (mut tokens, cargo_index) = managed_clean_overlay_cargo_tokens(command)?;
+    let (mut tokens, cargo_index) = literal_cargo_tokens(command, true)?;
     let end = tokens
         .iter()
         .enumerate()
@@ -1381,9 +1428,16 @@ mod managed_build_dir_tests {
             "cargo build",
             "cargo +nightly test -- --nocapture",
             "env -i cargo check",
+            "env --debug cargo build",
             "cargo-zigbuild zigbuild --target x86_64-unknown-linux-gnu",
             "env -i /opt/bin/cargo-zigbuild build --release",
             "rustup run nightly cargo-zigbuild zigbuild --locked",
+            "cargo-xwin xwin build --release",
+            "nice -n 10 cargo build",
+            "timeout -s KILL 90 cargo test -- --nocapture",
+            "ionice -c 2 -n 4 cargo build",
+            "sudo nice -n 5 cargo build",
+            "/usr/bin/time -f cargo nice -n 5 cargo build",
             vergen_command.as_str(),
             alias_command.as_str(),
             "/usr/bin/time -f cargo rustup run nightly cargo build",
@@ -1448,6 +1502,8 @@ mod managed_build_dir_tests {
         let stamp = "a".repeat(40);
         assert!(super::bind_build_source_stamp("cargo build $FLAGS", &stamp).is_err());
         assert!(super::bind_build_source_stamp("cargo build; echo x", &stamp).is_err());
+        assert!(super::bind_build_source_stamp("env --debug cargo build; echo x", &stamp).is_err());
+        assert!(super::bind_build_source_stamp("env -u cargo build", &stamp).is_err());
         assert!(super::bind_build_source_stamp("cargo test `id`", &stamp).is_err());
         assert!(super::bind_build_source_stamp("sh -c 'cargo test'", &stamp).is_err());
         assert!(super::bind_build_source_stamp("cargo build", "").is_err());
@@ -1728,6 +1784,8 @@ mod managed_build_dir_tests {
             "",
             "cargo",
             "cargo-zigbuild build --release",
+            "nice -n 5 cargo build",
+            "env --debug cargo build",
             "cargo --config",
             "cargo test 'unterminated",
             "cargo test; echo surprise",
