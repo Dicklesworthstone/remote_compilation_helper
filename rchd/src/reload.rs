@@ -455,8 +455,8 @@ impl ConfigWatcher {
         let watcher_tx = tx.clone();
         let watched_path = workers_path.clone();
         let debounce = Duration::from_millis(self.config.debounce_ms);
-        let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            match res {
+        let mut watcher =
+            notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
                 Ok(event) if event_requires_workers_reload(&event, &watched_path) => {
                     debug!("Workers config changed: {:?}", watched_path);
                     queue_workers_reload(&watcher_tx, &watched_path);
@@ -466,8 +466,7 @@ impl ConfigWatcher {
                     error!("File watcher error: {}; reconciling workers snapshot", e);
                     queue_workers_reload(&watcher_tx, &watched_path);
                 }
-            }
-        })?;
+            })?;
         watcher.watch(&parent, RecursiveMode::NonRecursive)?;
         info!("Watching workers configuration {:?}", workers_path);
         self._watcher = Some(watcher);
@@ -1541,7 +1540,10 @@ enabled = true
         let cases = [
             ("missing", None),
             ("empty", Some("")),
-            ("comments", Some("# editor has not written the workers yet\n")),
+            (
+                "comments",
+                Some("# editor has not written the workers yet\n"),
+            ),
             ("wrong-table", Some("[general]\nenabled = true\n")),
             ("malformed", Some("[[workers]\n")),
             ("incomplete-entry", Some("[[workers]]\nid = 'busy'\n")),
@@ -1588,8 +1590,8 @@ enabled = true
 
     #[test]
     fn reload_safety_event_filter_uses_the_selected_path_and_rescan_flag() {
-        use notify::event::{AccessKind, CreateKind, Flag, ModifyKind, RemoveKind, RenameMode};
         use notify::EventKind;
+        use notify::event::{AccessKind, CreateKind, Flag, ModifyKind, RemoveKind, RenameMode};
 
         let selected = PathBuf::from("/config/fleet-primary.toml");
         let sibling = PathBuf::from("/config/workers.toml");
@@ -1629,9 +1631,15 @@ enabled = true
             rx.try_recv(),
             Ok(ReloadMessage::ConfigChanged(received)) if received == path
         ));
-        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         queue_workers_reload(&tx, path);
-        assert!(rx.try_recv().is_ok(), "later changes must still be delivered");
+        assert!(
+            rx.try_recv().is_ok(),
+            "later changes must still be delivered"
+        );
         drop(rx);
         queue_workers_reload(&tx, path);
     }

@@ -389,11 +389,7 @@ fn rchd_systemd_unit_present() -> bool {
 /// No-op on macOS and on Linux hosts with no rchd.service (manual management).
 /// An explicitly separate socket AND worker configuration designate an isolated
 /// pool. Its operator must first drain those workers from any shared daemon.
-fn defer_to_systemd_if_managed(
-    socket: &Path,
-    workers_config: Option<&Path>,
-    shared_socket: &Path,
-) {
+fn defer_to_systemd_if_managed(socket: &Path, workers_config: Option<&Path>, shared_socket: &Path) {
     #[cfg(target_os = "linux")]
     {
         if isolated_worker_pool(socket, workers_config, shared_socket) {
@@ -835,11 +831,10 @@ async fn main() -> Result<()> {
     let mut rch_config = config::load_rch_config()
         .context("could not resolve RCH configuration before binding the daemon socket")?;
     rch_config.self_healing = rch_config.self_healing.with_env_overrides();
-    let (socket, client_socket) = daemon_socket_for_startup(
-        &matches,
-        &rch_config.general.socket_path,
-        |name| std::env::var(name).ok(),
-    )?;
+    let (socket, client_socket) =
+        daemon_socket_for_startup(&matches, &rch_config.general.socket_path, |name| {
+            std::env::var(name).ok()
+        })?;
     cli.socket = socket;
     rch_config.general.socket_path = client_socket;
     let shared_socket = PathBuf::from(&rch_config.general.socket_path);
@@ -1695,7 +1690,14 @@ mod tests {
         assert_eq!(socket, PathBuf::from("/alias.sock"));
         assert_eq!(client, "/alias.sock");
         let (socket, client) = daemon_socket_for_startup(&matches, "/configured.sock", |name| {
-            Some(if name == "RCH_SOCKET_PATH" { "/canonical.sock" } else { "/alias.sock" }.to_owned())
+            Some(
+                if name == "RCH_SOCKET_PATH" {
+                    "/canonical.sock"
+                } else {
+                    "/alias.sock"
+                }
+                .to_owned(),
+            )
         })
         .unwrap();
         assert_eq!(socket, PathBuf::from("/canonical.sock"));
@@ -1727,10 +1729,19 @@ mod tests {
         let matches = Cli::command().try_get_matches_from(["rchd"]).unwrap();
         for invalid in ["", "relative.sock", "~/rch.sock", "/", "/tmp/rch\n.sock"] {
             assert!(daemon_socket_for_startup(&matches, invalid, |_| None).is_err());
-            assert!(daemon_socket_for_startup(&matches, "/configured.sock", |name| {
-                Some(if name == "RCH_SOCKET_PATH" { invalid } else { "/alias.sock" }.to_owned())
-            })
-            .is_err());
+            assert!(
+                daemon_socket_for_startup(&matches, "/configured.sock", |name| {
+                    Some(
+                        if name == "RCH_SOCKET_PATH" {
+                            invalid
+                        } else {
+                            "/alias.sock"
+                        }
+                        .to_owned(),
+                    )
+                })
+                .is_err()
+            );
         }
     }
 
@@ -1746,7 +1757,10 @@ mod tests {
         for path in [&file, &link, &dangling, &root] {
             assert!(try_bind_daemon_socket(path).await.is_err());
         }
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "must survive socket misconfiguration");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "must survive socket misconfiguration"
+        );
         assert_eq!(std::fs::read_link(&link).unwrap(), file);
         assert_eq!(std::fs::read_link(&dangling).unwrap(), root.join("absent"));
     }
@@ -1792,7 +1806,10 @@ mod tests {
 
     #[test]
     fn isolated_pool_requires_both_a_separate_socket_and_explicit_workers() {
-        for shared in [crate::config::default_socket_path(), PathBuf::from("/configured.sock")] {
+        for shared in [
+            crate::config::default_socket_path(),
+            PathBuf::from("/configured.sock"),
+        ] {
             let isolated = shared.with_extension("isolated-test.sock");
             let workers = Path::new("/tmp/isolated-workers.toml");
             assert!(!isolated_worker_pool(&shared, None, &shared));

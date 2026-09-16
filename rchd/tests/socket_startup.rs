@@ -56,8 +56,12 @@ fn daemon_command(root: &Path) -> Command {
         ])
         .arg(root.join("config/workers.toml"))
         .stdin(Stdio::null())
-        .stdout(Stdio::from(fs::File::create(root.join("daemon.stdout")).unwrap()))
-        .stderr(Stdio::from(fs::File::create(root.join("daemon.stderr")).unwrap()));
+        .stdout(Stdio::from(
+            fs::File::create(root.join("daemon.stdout")).unwrap(),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(root.join("daemon.stderr")).unwrap(),
+        ));
     command
 }
 
@@ -67,7 +71,10 @@ fn wait_for_exit(child: &mut OwnedDaemon, root: &Path) -> ExitStatus {
         if let Some(status) = child.0.try_wait().unwrap() {
             return status;
         }
-        assert!(Instant::now() < deadline, "daemon did not exit; fixture={root:?}");
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not exit; fixture={root:?}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -79,7 +86,10 @@ fn assert_serving(child: &mut OwnedDaemon, expected: &Path, root: &Path) {
             child.0.try_wait().unwrap().is_none(),
             "daemon exited before binding {expected:?}; fixture={root:?}"
         );
-        assert!(Instant::now() < deadline, "wrong daemon endpoint; fixture={root:?}");
+        assert!(
+            Instant::now() < deadline,
+            "wrong daemon endpoint; fixture={root:?}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     let mut stream = UnixStream::connect(expected).unwrap();
@@ -87,7 +97,10 @@ fn assert_serving(child: &mut OwnedDaemon, expected: &Path, root: &Path) {
     stream.set_write_timeout(Some(LIMIT)).unwrap();
     stream.write_all(b"GET /status\n").unwrap();
     let mut response = String::new();
-    stream.take(256 * 1024).read_to_string(&mut response).unwrap();
+    stream
+        .take(256 * 1024)
+        .read_to_string(&mut response)
+        .unwrap();
     let (headers, body) = response
         .split_once("\r\n\r\n")
         .or_else(|| response.split_once("\n\n"))
@@ -102,7 +115,14 @@ fn assert_serving(child: &mut OwnedDaemon, expected: &Path, root: &Path) {
 
 #[test]
 fn socket_startup_real_daemon_honors_config_environment_and_cli() {
-    for case in ["config", "alias-no-config", "alias", "canonical", "cli", "cli-default"] {
+    for case in [
+        "config",
+        "alias-no-config",
+        "alias",
+        "canonical",
+        "cli",
+        "cli-default",
+    ] {
         let root = fixture();
         let configured = root.join("configured.sock");
         let alias = root.join("alias.sock");
@@ -112,7 +132,10 @@ fn socket_startup_real_daemon_honors_config_environment_and_cli() {
         if case != "alias-no-config" {
             fs::write(
                 root.join("config/config.toml"),
-                format!("[general]\nsocket_path = {:?}\n", configured.to_str().unwrap()),
+                format!(
+                    "[general]\nsocket_path = {:?}\n",
+                    configured.to_str().unwrap()
+                ),
             )
             .unwrap();
         }
@@ -142,7 +165,10 @@ fn socket_startup_real_daemon_honors_config_environment_and_cli() {
         assert_serving(&mut child, expected, &root);
         for other in [&configured, &alias, &canonical, &explicit, &default] {
             if other != expected {
-                assert!(!other.exists(), "unexpected listener {other:?}; fixture={root:?}");
+                assert!(
+                    !other.exists(),
+                    "unexpected listener {other:?}; fixture={root:?}"
+                );
             }
         }
     }
@@ -157,7 +183,10 @@ fn socket_startup_invalid_config_or_empty_canonical_refuses_before_binding() {
         let text = if malformed {
             "[general\n".to_owned()
         } else {
-            format!("[general]\nsocket_path = {:?}\n", configured.to_str().unwrap())
+            format!(
+                "[general]\nsocket_path = {:?}\n",
+                configured.to_str().unwrap()
+            )
         };
         let path = root.join("config/config.toml");
         fs::write(&path, &text).unwrap();
@@ -168,9 +197,15 @@ fn socket_startup_invalid_config_or_empty_canonical_refuses_before_binding() {
         }
         let mut child = OwnedDaemon(command.spawn().unwrap());
         let status = wait_for_exit(&mut child, &root);
-        assert!(!status.success(), "invalid configuration was accepted; fixture={root:?}");
+        assert!(
+            !status.success(),
+            "invalid configuration was accepted; fixture={root:?}"
+        );
         for socket in [configured, alias, root.join("runtime/rch.sock")] {
-            assert!(!socket.exists(), "bound {socket:?} before refusing invalid config");
+            assert!(
+                !socket.exists(),
+                "bound {socket:?} before refusing invalid config"
+            );
         }
         assert_eq!(fs::read_to_string(path).unwrap(), text);
     }
