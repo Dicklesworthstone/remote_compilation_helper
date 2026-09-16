@@ -632,8 +632,13 @@ to `rch`. Each report emits one `rch_doctor_verdict_total` observation, labeled
 with the actual verdict and scope (combined scopes use `other`), and flushes
 before returning its original exit code. Reports whose `daemon_unreachable`
 flag is true also increment `rch_doctor_daemon_unreachable_total` once, even
-when several diagnostics report the missing daemon. These CLI metrics are not forwarded to
-the daemon's Prometheus endpoint. Hook/watch telemetry, remaining doctor event
+when several diagnostics report the missing daemon. The asynchronous
+`daemon_status` and `repo_convergence` probes also emit
+`rch_doctor_probe_duration_seconds{probe,result}` once on completion, RPC error,
+or timeout. Durations measure each probe's execution, not time spent waiting
+to join other probes. Skipped probes emit nothing; panic/cancellation and
+helper/ownership probe durations are not yet exported. These CLI metrics are
+not forwarded to the daemon's Prometheus endpoint. Hook/watch telemetry, remaining doctor event
 metrics, and trace/log export remain unfinished.
 
 Quick checks:

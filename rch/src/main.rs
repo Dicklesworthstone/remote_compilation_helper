@@ -2091,9 +2091,12 @@ async fn run(args: Vec<OsString>) -> Result<()> {
         rch_common::init_logging_with_layer(
             &log_config,
             layer.with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
-                // Other doctor events do not yet all carry the metric layer's
-                // required duration fields. Export only the complete verdict.
-                metadata.target() == "rch::doctor::verdict"
+                // Export measured probe completions, not the older forensic
+                // failure events that lack durations and would double count.
+                matches!(
+                    metadata.target(),
+                    "rch::doctor::verdict" | "rch::doctor::probe_duration"
+                )
             })),
         )
     } else {
