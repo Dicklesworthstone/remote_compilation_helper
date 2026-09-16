@@ -17,7 +17,7 @@
 //! typed refusal, not a silent ignore (config drift must be loud).
 
 use rabs_asupersync::daemon_runtime::{DaemonRunOptions, run_daemon};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -184,6 +184,7 @@ fn probe_daemon(socket_path: &str) -> bool {
 }
 
 fn main() {
+    let boot_started_at = Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--version") => {
@@ -319,6 +320,7 @@ fn main() {
     });
     let coord_work = rabsd::coord::live::coord_work(std::sync::Arc::clone(&coord));
     let options = DaemonRunOptions {
+        boot_started_at,
         run_for,
         boot_marker: Some(std::path::PathBuf::from(marker)),
         edge_work: Some(rabsd::edge::server::edge_work(

@@ -68,7 +68,8 @@ pub struct SubsystemOutcome {
 pub struct ShutdownReceipt {
     /// Per-subsystem outcomes in spawn order.
     pub subsystems: Vec<SubsystemOutcome>,
-    /// Boot-to-ready duration.
+    /// Startup-origin-to-subsystem-spawn duration, including caller setup.
+    /// This does not establish that an edge socket has started accepting.
     pub boot_ms: u128,
     /// Shutdown-initiated-to-exit duration.
     pub shutdown_ms: u128,
@@ -177,6 +178,10 @@ pub type SubsystemWork = Box<
 
 /// Options for one daemon run.
 pub struct DaemonRunOptions {
+    /// Startup origin captured before configuration and persistent-store setup.
+    /// Defaults to option construction for embedded callers; the binary passes
+    /// its main-entry timestamp so CAS reconciliation is included.
+    pub boot_started_at: Instant,
     /// Auto-trigger shutdown after this duration (None = wait for
     /// SIGTERM/SIGINT via the asupersync signal listener).
     pub run_for: Option<Duration>,
@@ -198,6 +203,7 @@ pub struct DaemonRunOptions {
 impl std::fmt::Debug for DaemonRunOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DaemonRunOptions")
+            .field("boot_started_at", &self.boot_started_at)
             .field("run_for", &self.run_for)
             .field("boot_marker", &self.boot_marker)
             .field("behavior", &self.behavior)
@@ -211,6 +217,7 @@ impl std::fmt::Debug for DaemonRunOptions {
 impl Default for DaemonRunOptions {
     fn default() -> Self {
         Self {
+            boot_started_at: Instant::now(),
             run_for: None,
             boot_marker: None,
             behavior: [SubsystemBehavior::Clean; 4],
@@ -276,7 +283,7 @@ async fn subsystem_body(
 /// Boot the runtime island, run the subsystem regions, shut down
 /// cleanly, and return the receipt generated from the accounting.
 pub fn run_daemon(options: DaemonRunOptions) -> Result<ShutdownReceipt, DaemonError> {
-    let boot_start = Instant::now();
+    let boot_start = options.boot_started_at;
 
     // Crash-evidence marker: found-at-boot means the prior incarnation
     // died unclean (kill -9 / panic-abort).
@@ -408,6 +415,7 @@ mod tests {
 
     fn options(run_for_ms: u64) -> DaemonRunOptions {
         DaemonRunOptions {
+            boot_started_at: Instant::now(),
             run_for: Some(Duration::from_millis(run_for_ms)),
             boot_marker: None,
             behavior: [SubsystemBehavior::Clean; 4],
@@ -415,6 +423,21 @@ mod tests {
             coord_work: None,
             janitor_work: None,
         }
+    }
+
+    #[test]
+    fn boot_timing_includes_pre_runtime_setup() {
+        let opts = options(30);
+        // Real pre-runtime work must not disappear when run_daemon starts.
+        std::thread::sleep(Duration::from_millis(40));
+        let setup_ms = opts.boot_started_at.elapsed().as_millis();
+        let receipt = run_daemon(opts).expect("daemon runs after setup");
+        assert!(receipt.clean(), "{receipt:?}");
+        assert!(
+            receipt.boot_ms >= setup_ms,
+            "boot {}ms omitted setup {setup_ms}ms",
+            receipt.boot_ms
+        );
     }
 
     #[test]
