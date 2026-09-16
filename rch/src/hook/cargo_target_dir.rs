@@ -491,7 +491,7 @@ fn cargo_command_tokens(command: &str) -> anyhow::Result<(Vec<String>, usize)> {
             .ok_or_else(|| anyhow::anyhow!("missing Cargo command"))?;
         let executable = Path::new(token).file_name().and_then(|name| name.to_str());
         match executable {
-            Some("cargo" | "cargo.exe") => break,
+            Some("cargo" | "cargo.exe" | "cargo-zigbuild" | "cargo-zigbuild.exe") => break,
             Some("env") => {
                 index += 1;
                 while let Some(token) = tokens.get(index) {
@@ -589,6 +589,15 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
         "managed Cargo build directory must be a nonempty path without control characters"
     );
     let (mut tokens, cargo_index) = managed_clean_overlay_cargo_tokens(command)?;
+    anyhow::ensure!(
+        matches!(
+            Path::new(&tokens[cargo_index])
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("cargo" | "cargo.exe")
+        ),
+        "managed clean-overlay build directory requires the Cargo executable"
+    );
     let mut index = cargo_index + 1;
     if tokens
         .get(index)
@@ -1452,7 +1461,7 @@ mod managed_build_dir_tests {
         use std::path::PathBuf;
 
         let root = tempfile::tempdir().unwrap().keep();
-        for directory in ["src", "bin", "cargo-home", "target"] {
+        for directory in ["src", "bin", "cargo-home", "target", ".cargo"] {
             std::fs::create_dir(root.join(directory)).unwrap();
         }
         std::fs::write(
@@ -1546,6 +1555,19 @@ mod managed_build_dir_tests {
             ("overlay", &overlay, Default::default(), &overlay),
             ("unknown-stamp", "unknown", Default::default(), ""),
             ("malformed-stamp", "not a stamp!", Default::default(), ""),
+            ("cargo-cli-config", &source_a, Default::default(), &alias_d),
+            (
+                "cargo-project-config",
+                &source_a,
+                Default::default(),
+                &alias_d,
+            ),
+            (
+                "cargo-cli-config-caller-wins",
+                &source_a,
+                alias("VERGEN_GIT_SHA", &alias_c),
+                &alias_c,
+            ),
             (
                 "explicit-rch-git-commit",
                 &source_a,
@@ -1571,14 +1593,32 @@ mod managed_build_dir_tests {
             ),
         ];
         for (name, stamp, aliases, expected_stdout) in &cases {
+            std::fs::write(
+                root.join(".cargo/config.toml"),
+                if *name == "cargo-project-config" {
+                    format!("[env]\nVERGEN_GIT_SHA = '{alias_d}'\n")
+                } else {
+                    String::new()
+                },
+            )
+            .unwrap();
+            let extra_config = if name.starts_with("cargo-cli-config") {
+                format!(
+                    " --config {}",
+                    shell_words::quote(&format!("env.VERGEN_GIT_SHA='{alias_d}'"))
+                )
+            } else {
+                String::new()
+            };
             let command = format!(
-                "{} run --quiet --offline --jobs 1",
+                "{} run --quiet --offline --jobs 1{extra_config}",
                 shell_words::quote(executable.to_str().unwrap())
             );
             let bound = super::bind_build_source_stamp(&command, stamp).unwrap();
             let env = super::super::source_fidelity::build_source_commit_env(|key| {
                 aliases.get(key).cloned()
             });
+            let bound = super::super::source_fidelity::bind_build_source_aliases(&bound, &env);
             let mut process = std::process::Command::new("sh");
             process
                 .args(["-c", &bound])
@@ -1602,8 +1642,8 @@ mod managed_build_dir_tests {
                 .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
                 .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
                 .env_remove("RCH_BUILD_SOURCE");
-            for (key, value) in &env {
-                process.env(key, value);
+            for key in rch_common::BUILD_COMMIT_ENV_VARS {
+                process.env(key, "e".repeat(40));
             }
             let output = process.output().unwrap();
             let stdout = String::from_utf8(output.stdout).unwrap();
@@ -1630,6 +1670,10 @@ mod managed_build_dir_tests {
             shell_words::quote(executable.to_str().unwrap()),
         );
         let bound = super::bind_build_source_stamp(&env_i_command, &source_a).unwrap();
+        let bound = super::super::source_fidelity::bind_build_source_aliases(
+            &bound,
+            &alias("RCH_GIT_COMMIT", &alias_c),
+        );
         let output = std::process::Command::new("sh")
             .args(["-c", &bound])
             .current_dir(&root)
@@ -1647,6 +1691,26 @@ mod managed_build_dir_tests {
             "env -i: stderr={}",
             String::from_utf8_lossy(&output.stderr)
         );
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            format!("[env]\nVERGEN_GIT_SHA = '{alias_d}'\n"),
+        )
+        .unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", &bound])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "env -i with config: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim_end(),
+            alias_d,
+            "Cargo config must apply after caller env -i clears restored aliases"
+        );
         eprintln!(
             "build-source real Cargo evidence retained at {}",
             root.display()
@@ -1663,6 +1727,7 @@ mod managed_build_dir_tests {
         for command in [
             "",
             "cargo",
+            "cargo-zigbuild build --release",
             "cargo --config",
             "cargo test 'unterminated",
             "cargo test; echo surprise",

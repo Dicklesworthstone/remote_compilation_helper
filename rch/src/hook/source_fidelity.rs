@@ -1014,11 +1014,96 @@ mod tests {
         .map(|(key, value)| (key.to_owned(), value))
         .collect();
         let env = build_source_commit_env(|key| values.get(key).cloned());
-        assert_eq!(env.len(), rch_common::BUILD_COMMIT_ENV_VARS.len());
+        assert_eq!(env.len(), 2);
         assert_eq!(env["RCH_GIT_COMMIT"], valid_a);
         assert_eq!(env["VERGEN_GIT_SHA"], valid_b);
-        assert_eq!(env["GIT_COMMIT"], "");
-        assert_eq!(env["GITHUB_SHA"], "");
+        assert!(!env.contains_key("GIT_COMMIT"));
+        assert!(!env.contains_key("GITHUB_SHA"));
         assert_ne!(env["RCH_GIT_COMMIT"], env["VERGEN_GIT_SHA"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_source_stamp_alias_boundary_preserves_unset_and_caller_wrappers() {
+        let report = r#"printf '%s\n' "${RCH_GIT_COMMIT-unset}" "${VERGEN_GIT_SHA-unset}" "${GIT_COMMIT-unset}" "${GITHUB_SHA-unset}""#;
+        let caller_commit = "a".repeat(40);
+        let caller_vergen = "b".repeat(40);
+        let inline_commit = "c".repeat(40);
+        let aliases = build_source_commit_env(|key| match key {
+            "RCH_GIT_COMMIT" => Some(caller_commit.clone()),
+            "VERGEN_GIT_SHA" => Some(caller_vergen.clone()),
+            _ => None,
+        });
+        let empty = std::collections::HashMap::new();
+        let inline = format!(
+            "RCH_GIT_COMMIT={inline_commit} sh -c {}",
+            shell_words::quote(report)
+        );
+        let unset = format!("env -u RCH_GIT_COMMIT sh -c {}", shell_words::quote(report));
+        let cleared = format!(
+            "env -i PATH=/usr/bin:/bin sh -c {}",
+            shell_words::quote(report)
+        );
+        for (command, caller, expected) in [
+            (report, &empty, "unset\nunset\nunset\nunset\n".to_owned()),
+            (
+                report,
+                &aliases,
+                format!("{caller_commit}\n{caller_vergen}\nunset\nunset\n"),
+            ),
+            (
+                inline.as_str(),
+                &aliases,
+                format!("{inline_commit}\n{caller_vergen}\nunset\nunset\n"),
+            ),
+            (
+                unset.as_str(),
+                &aliases,
+                format!("unset\n{caller_vergen}\nunset\nunset\n"),
+            ),
+            (
+                cleared.as_str(),
+                &aliases,
+                "unset\nunset\nunset\nunset\n".to_owned(),
+            ),
+        ] {
+            let mut process = std::process::Command::new("sh");
+            process.env_clear().env("PATH", "/usr/bin:/bin");
+            for key in rch_common::BUILD_COMMIT_ENV_VARS {
+                process.env(key, "d".repeat(40));
+            }
+            let output = process
+                .args(["-c", &bind_build_source_aliases(command, caller)])
+                .output()
+                .expect("run real shell alias boundary");
+            assert!(
+                output.status.success(),
+                "{command}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                expected,
+                "{command}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_source_stamp_alias_boundary_preserves_output_and_remote_exit() {
+        let command = "printf '%s\\n' 'literal $HOME `id` \"quoted\"'; printf '%s\\n' 'diagnostic' >&2; exit 7";
+        let output = std::process::Command::new("sh")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .args([
+                "-c",
+                &bind_build_source_aliases(command, &Default::default()),
+            ])
+            .output()
+            .expect("run real shell preserving command bytes");
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"literal $HOME `id` \"quoted\"\n");
+        assert_eq!(output.stderr, b"diagnostic\n");
     }
 }
