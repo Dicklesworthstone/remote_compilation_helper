@@ -1955,6 +1955,20 @@ fn base_log_level_for_cli(cli: &Cli) -> String {
     }
 }
 
+/// Keep collector setup off the hook path and non-reporting doctor modes.
+fn reliability_metrics_requested(cli: &Cli) -> bool {
+    !cli.schema
+        && !cli.robot_triage
+        && matches!(
+            cli.command,
+            Some(Commands::Doctor {
+                reliability: true,
+                watch: false,
+                ..
+            })
+        )
+}
+
 /// Use current-thread runtime for CLI commands to minimize startup overhead.
 /// Multi-threaded runtime spawns one thread per CPU core (64 cores = 128MB stack allocations).
 /// Current-thread runtime uses a single thread, drastically reducing startup time.
@@ -1964,6 +1978,9 @@ async fn main() {
     let wants_machine_output = top_level_machine_output_requested(&args);
 
     if let Err(error) = run(args).await {
+        if let Some(exit) = error.downcast_ref::<doctor::DoctorExit>() {
+            std::process::exit(exit.0);
+        }
         if let Some(failure) = error.downcast_ref::<GcFailure>() {
             if wants_machine_output {
                 let ctx = OutputContext::new(OutputConfig {
@@ -2045,7 +2062,42 @@ async fn run(args: Vec<OsString>) -> Result<()> {
     // path below) is interpreted by Claude Code as "deny" and BLOCKS the user's
     // command — so an init failure (e.g. an unwritable RCH_LOG_FILE directory)
     // must degrade to no-logging and continue, not propagate and exit non-zero.
-    let _logging_guards = match init_logging(&log_config) {
+    let otel = if reliability_metrics_requested(&cli) {
+        match rch_telemetry::otlp::OtelMetrics::from_env() {
+            Ok(exporter) => exporter,
+            Err(error) => {
+                eprintln!("rch: OTLP metrics initialization failed ({error:#}); continuing");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let metrics_layer = otel.as_ref().and_then(|exporter| {
+        match rch_telemetry::metrics::Metrics::new() {
+            Ok(metrics) => Some(rch_telemetry::metrics::MetricsLayer::new(
+                metrics.with_otel(Some(exporter.clone())),
+            )),
+            Err(error) => {
+                eprintln!("rch: metrics initialization failed ({error}); continuing");
+                None
+            }
+        }
+    });
+    let logging = if let Some(layer) = metrics_layer {
+        use tracing_subscriber::Layer;
+        rch_common::init_logging_with_layer(
+            &log_config,
+            layer.with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                // Other doctor events do not yet all carry the metric layer's
+                // required duration fields. Export only the complete verdict.
+                metadata.target() == "rch::doctor::verdict"
+            })),
+        )
+    } else {
+        init_logging(&log_config)
+    };
+    let _logging_guards = match logging {
         Ok(guards) => Some(guards),
         Err(error) => {
             eprintln!("rch: logging initialization failed ({error:#}); continuing without logging");
@@ -2089,6 +2141,16 @@ async fn run(args: Vec<OsString>) -> Result<()> {
         tracing::debug!(target: "rch::verbose", mode = ?ctx.mode(), format = %ctx.format(), "verbose output enabled");
     }
 
+    let result = dispatch_command(cli, ctx).await;
+    if let Some(exporter) = otel
+        && let Err(error) = tokio::task::spawn_blocking(move || exporter.shutdown()).await
+    {
+        eprintln!("rch: OTLP metrics shutdown task failed ({error})");
+    }
+    result
+}
+
+async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
     // Agent-oriented mega-command. Handle before hook mode so `rch --robot-triage`
     // never waits for stdin when an agent is asking what to do next.
     if cli.robot_triage {
@@ -6225,6 +6287,29 @@ fn open_browser(url: &str) -> Result<()> {
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[test]
+    fn reliability_metrics_leave_hook_and_nonreporting_modes_uninstrumented() {
+        for args in [
+            vec!["rch"],
+            vec!["rch", "status"],
+            vec!["rch", "doctor"],
+            vec!["rch", "doctor", "--reliability", "--watch"],
+            vec!["rch", "--schema", "doctor", "--reliability"],
+            vec!["rch", "--robot-triage", "doctor", "--reliability"],
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("valid CLI");
+            assert!(!reliability_metrics_requested(&cli), "{args:?}");
+        }
+        for args in [
+            vec!["rch", "doctor", "--reliability"],
+            vec!["rch", "--quiet", "doctor", "--reliability", "--strict"],
+            vec!["rch", "doctor", "--reliability", "--scope", "schema"],
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("valid CLI");
+            assert!(reliability_metrics_requested(&cli), "{args:?}");
+        }
+    }
 
     #[test]
     fn cli_schema_exports_preserve_draft_7() {

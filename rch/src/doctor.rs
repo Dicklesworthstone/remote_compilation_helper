@@ -992,6 +992,12 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
     Ok(())
 }
 
+/// The report has already been rendered; the CLI must preserve this status
+/// without printing a second error response, after flushing telemetry.
+#[derive(Debug, thiserror::Error)]
+#[error("reliability doctor finished with exit code {0}")]
+pub(crate) struct DoctorExit(pub i32);
+
 async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) -> Result<()> {
     // Watch mode short-circuits the single-shot path: it loops, diffs,
     // and returns only after SIGINT or a signal-handler error.
@@ -1018,9 +1024,16 @@ async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) ->
         .summary
         .overall
         .exit_code(options.strict, options.lenient);
+    let metric_scope = match options.scope.0.as_slice() {
+        [scope] => scope.as_str(),
+        // Count one verdict for a multi-scope report without pretending that
+        // its aggregate verdict belongs to each individual scope.
+        _ => "other",
+    };
     tracing::info!(
         target: "rch::doctor::verdict",
         verdict = response.summary.overall.label(),
+        scope = metric_scope,
         exit_code,
         strict = options.strict,
         lenient = options.lenient,
@@ -1033,12 +1046,11 @@ async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) ->
     if exit_code == 0 {
         Ok(())
     } else {
-        // Non-zero exit must reach the caller. Use process::exit AFTER all
-        // output has been flushed (println! above is line-buffered to stdout
-        // which auto-flushes on newline).
+        // Return the already-rendered status so the CLI can flush its exporter
+        // before exiting, without replacing this report with an error envelope.
         let _ = std::io::Write::flush(&mut std::io::stdout());
         let _ = std::io::Write::flush(&mut std::io::stderr());
-        std::process::exit(exit_code);
+        Err(DoctorExit(exit_code).into())
     }
 }
 
