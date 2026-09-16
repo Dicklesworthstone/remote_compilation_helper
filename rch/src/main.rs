@@ -1964,6 +1964,8 @@ fn reliability_metrics_requested(cli: &Cli) -> bool {
             Some(Commands::Doctor {
                 reliability: true,
                 watch: false,
+                runbook: None,
+                runbook_list: false,
                 ..
             })
         )
@@ -2073,17 +2075,17 @@ async fn run(args: Vec<OsString>) -> Result<()> {
     } else {
         None
     };
-    let metrics_layer = otel.as_ref().and_then(|exporter| {
-        match rch_telemetry::metrics::Metrics::new() {
-            Ok(metrics) => Some(rch_telemetry::metrics::MetricsLayer::new(
-                metrics.with_otel(Some(exporter.clone())),
-            )),
-            Err(error) => {
-                eprintln!("rch: metrics initialization failed ({error}); continuing");
-                None
-            }
-        }
-    });
+    let metrics_layer =
+        otel.as_ref()
+            .and_then(|exporter| match rch_telemetry::metrics::Metrics::new() {
+                Ok(metrics) => Some(rch_telemetry::metrics::MetricsLayer::new(
+                    metrics.with_otel(Some(exporter.clone())),
+                )),
+                Err(error) => {
+                    eprintln!("rch: metrics initialization failed ({error}); continuing");
+                    None
+                }
+            });
     let logging = if let Some(layer) = metrics_layer {
         use tracing_subscriber::Layer;
         rch_common::init_logging_with_layer(
@@ -6295,6 +6297,8 @@ mod tests {
             vec!["rch", "status"],
             vec!["rch", "doctor"],
             vec!["rch", "doctor", "--reliability", "--watch"],
+            vec!["rch", "doctor", "--reliability", "--runbook-list"],
+            vec!["rch", "doctor", "--reliability", "--runbook", "RCH-R001"],
             vec!["rch", "--schema", "doctor", "--reliability"],
             vec!["rch", "--robot-triage", "doctor", "--reliability"],
         ] {
