@@ -203,12 +203,13 @@ mod tests {
             eprintln!("{channel} Cargo stdout:\n{stdout}\nCargo stderr:\n{stderr}");
             assert!(output.status.success(), "{channel} Cargo failed");
             assert!(stdout.contains("1 passed; 0 failed"));
-            assert_eq!(
-                stderr
-                    .lines()
-                    .any(|line| line.contains("Running `") && line.contains("-Zthreads=2")),
-                supported
-            );
+            let invocation = stderr
+                .lines()
+                .find(|line| {
+                    line.contains(&compiler) && line.contains("--crate-name layer0_threads_real")
+                })
+                .expect("verbose Cargo must show the selected compiler invocation");
+            assert_eq!(invocation.contains("-Zthreads=2"), supported);
         }
     }
 }
