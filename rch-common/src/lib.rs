@@ -189,7 +189,7 @@ pub use gc_roots::{
     RCH_CARGO_CACHE_PREFIX, RCH_CARGO_HOME_BASE_VAR, RCH_CARGO_HOME_PREFIX,
     remote_cargo_cache_expr, remote_cargo_home_base_prelude, remote_cargo_home_expr,
 };
-pub use logging::{LogConfig, LogFormat, LoggingGuards, init_logging};
+pub use logging::{LogConfig, LogFormat, LoggingGuards, init_logging, init_logging_with_layer};
 pub use mock_worker::MockWorkerServer;
 pub use path_topology::{
     DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT, NormalizationDecision,

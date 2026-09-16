@@ -9,8 +9,9 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use tracing::Subscriber;
 use tracing_subscriber::{
-    EnvFilter, fmt,
+    EnvFilter, Layer, Registry, fmt,
     fmt::writer::{BoxMakeWriter, MakeWriterExt},
+    layer::{Identity, SubscriberExt},
     util::SubscriberInitExt,
 };
 
@@ -143,11 +144,19 @@ pub struct LoggingGuards {
 /// Returns guards that must be kept alive for the duration of the program
 /// (particularly when file logging is enabled).
 pub fn init_logging(config: &LogConfig) -> Result<LoggingGuards> {
-    match config.format {
-        LogFormat::Pretty => init_with_format(config, LogFormat::Pretty),
-        LogFormat::Json => init_with_format(config, LogFormat::Json),
-        LogFormat::Compact => init_with_format(config, LogFormat::Compact),
-    }
+    init_with_layer(config, None::<Identity>, true)
+}
+
+/// Initialize logging with an independently filtered event or span layer.
+///
+/// The diagnostic `EnvFilter` applies only to formatted logs. The caller must
+/// apply any desired filtering to `layer` itself. Returns an error if another
+/// global subscriber is already installed: success means this layer was attached.
+pub fn init_logging_with_layer<L>(config: &LogConfig, layer: L) -> Result<LoggingGuards>
+where
+    L: Layer<Registry> + Send + Sync + 'static,
+{
+    init_with_layer(config, layer, false)
 }
 
 fn build_writer(
@@ -193,63 +202,76 @@ fn build_writer(
     }
 }
 
-fn init_with_format(config: &LogConfig, format: LogFormat) -> Result<LoggingGuards> {
+fn init_with_layer<L>(
+    config: &LogConfig,
+    layer: L,
+    allow_already_initialized: bool,
+) -> Result<LoggingGuards>
+where
+    L: Layer<Registry> + Send + Sync + 'static,
+{
     let filter = config.env_filter();
     let (writer, file_guard) = build_writer(config)?;
     let ansi = file_guard.is_none();
+    let subscriber = build_subscriber(config, writer, ansi, filter, layer);
+    finish_subscriber(subscriber, file_guard, allow_already_initialized)
+}
 
-    match format {
-        LogFormat::Pretty => {
-            let subscriber = fmt::Subscriber::builder()
-                .with_writer(writer)
-                .with_target(config.with_target)
-                .with_thread_ids(config.with_thread_ids)
-                .with_file(config.with_file_line)
-                .with_line_number(config.with_file_line)
-                .with_env_filter(filter)
-                .with_ansi(ansi)
-                .pretty()
-                .finish();
-            finish_subscriber(subscriber, file_guard)
-        }
-        LogFormat::Json => {
-            let subscriber = fmt::Subscriber::builder()
-                .with_writer(writer)
-                .with_target(config.with_target)
-                .with_thread_ids(config.with_thread_ids)
-                .with_file(config.with_file_line)
-                .with_line_number(config.with_file_line)
-                .with_env_filter(filter)
-                .with_ansi(false)
-                .json()
-                .finish();
-            finish_subscriber(subscriber, file_guard)
-        }
-        LogFormat::Compact => {
-            let subscriber = fmt::Subscriber::builder()
-                .with_writer(writer)
-                .with_target(config.with_target)
-                .with_thread_ids(config.with_thread_ids)
-                .with_file(config.with_file_line)
-                .with_line_number(config.with_file_line)
-                .with_env_filter(filter)
-                .with_ansi(ansi)
-                .compact()
-                .finish();
-            finish_subscriber(subscriber, file_guard)
-        }
-    }
+fn build_subscriber<L>(
+    config: &LogConfig,
+    writer: BoxMakeWriter,
+    ansi: bool,
+    filter: EnvFilter,
+    layer: L,
+) -> impl Subscriber + Send + Sync + 'static
+where
+    L: Layer<Registry> + Send + Sync + 'static,
+{
+    let formatting: Box<dyn Layer<Registry> + Send + Sync> = match config.format {
+        LogFormat::Pretty => fmt::layer()
+            .with_writer(writer)
+            .with_target(config.with_target)
+            .with_thread_ids(config.with_thread_ids)
+            .with_file(config.with_file_line)
+            .with_line_number(config.with_file_line)
+            .with_ansi(ansi)
+            .pretty()
+            .with_filter(filter)
+            .boxed(),
+        LogFormat::Json => fmt::layer()
+            .with_writer(writer)
+            .with_target(config.with_target)
+            .with_thread_ids(config.with_thread_ids)
+            .with_file(config.with_file_line)
+            .with_line_number(config.with_file_line)
+            .with_ansi(false)
+            .json()
+            .with_filter(filter)
+            .boxed(),
+        LogFormat::Compact => fmt::layer()
+            .with_writer(writer)
+            .with_target(config.with_target)
+            .with_thread_ids(config.with_thread_ids)
+            .with_file(config.with_file_line)
+            .with_line_number(config.with_file_line)
+            .with_ansi(ansi)
+            .compact()
+            .with_filter(filter)
+            .boxed(),
+    };
+    tracing_subscriber::registry().with(layer.and_then(formatting))
 }
 
 fn finish_subscriber<S>(
     subscriber: S,
     file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    allow_already_initialized: bool,
 ) -> Result<LoggingGuards>
 where
     S: Subscriber + Send + Sync + 'static,
 {
     if let Err(err) = subscriber.try_init() {
-        if err.to_string().contains("already initialized") {
+        if allow_already_initialized && err.to_string().contains("already initialized") {
             return Ok(LoggingGuards {
                 _file_guard: file_guard,
             });
@@ -289,6 +311,106 @@ fn is_valid_level(level: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct EventTargets(Arc<Mutex<Vec<&'static str>>>);
+
+    impl Layer<Registry> for EventTargets {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, Registry>,
+        ) {
+            self.0.lock().unwrap().push(event.metadata().target());
+        }
+    }
+
+    #[test]
+    fn attached_layer_receives_info_despite_error_only_diagnostics_in_all_formats() {
+        for format in [LogFormat::Pretty, LogFormat::Json, LogFormat::Compact] {
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let writer = CapturedWriter(output.clone());
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let collector =
+                EventTargets(observed.clone()).with_filter(tracing_subscriber::filter::filter_fn(
+                    |metadata| metadata.target().starts_with("rch::doctor::"),
+                ));
+            let config = LogConfig {
+                format,
+                with_target: false,
+                with_thread_ids: false,
+                with_file_line: false,
+                ..LogConfig::default()
+            };
+            let subscriber = build_subscriber(
+                &config,
+                BoxMakeWriter::new(move || writer.clone()),
+                false,
+                EnvFilter::new("error"),
+                collector,
+            );
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "rch::doctor::verdict", "quiet doctor verdict");
+                tracing::info!(target: "rch::unrelated", "irrelevant info");
+                tracing::error!(target: "rch::unrelated", "visible diagnostic");
+            });
+            assert_eq!(
+                *observed.lock().unwrap(),
+                ["rch::doctor::verdict"],
+                "caller filtering must remain independent of diagnostic filtering: {format:?}"
+            );
+            let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            assert!(text.contains("visible diagnostic"), "{format:?}: {text}");
+            assert!(!text.contains("quiet doctor verdict"), "{format:?}: {text}");
+            assert!(!text.contains("irrelevant info"), "{format:?}: {text}");
+            if format == LogFormat::Json {
+                let event: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+                assert_eq!(event["level"], "ERROR");
+                assert_eq!(event["fields"]["message"], "visible diagnostic");
+            }
+        }
+    }
+
+    #[test]
+    fn absent_extra_layer_preserves_diagnostic_filtering_in_all_formats() {
+        for format in [LogFormat::Pretty, LogFormat::Json, LogFormat::Compact] {
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let writer = CapturedWriter(output.clone());
+            let config = LogConfig {
+                format,
+                ..LogConfig::default()
+            };
+            let subscriber = build_subscriber(
+                &config,
+                BoxMakeWriter::new(move || writer.clone()),
+                false,
+                EnvFilter::new("warn"),
+                None::<Identity>,
+            );
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!("filtered info");
+                tracing::warn!("visible warning");
+            });
+            let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            assert!(text.contains("visible warning"), "{format:?}: {text}");
+            assert!(!text.contains("filtered info"), "{format:?}: {text}");
+        }
+    }
 
     #[test]
     fn test_parse_targets() {
