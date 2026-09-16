@@ -666,6 +666,34 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
     Ok(join_exec_command(&tokens))
 }
 
+pub(super) fn bind_build_source_stamp(command: &str, stamp: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !stamp.is_empty() && !stamp.chars().any(char::is_control),
+        "invalid build-source stamp"
+    );
+    let (mut tokens, cargo_index) = managed_clean_overlay_cargo_tokens(command)?;
+    let end = tokens
+        .iter()
+        .enumerate()
+        .skip(cargo_index + 1)
+        .find_map(|(index, token)| (token == "--").then_some(index))
+        .unwrap_or(tokens.len());
+    let value = format!(
+        "env.RCH_BUILD_SOURCE.value={}",
+        toml::Value::String(stamp.to_owned())
+    );
+    tokens.splice(
+        end..end,
+        [
+            "--config".to_owned(),
+            value,
+            "--config".to_owned(),
+            "env.RCH_BUILD_SOURCE.force=true".to_owned(),
+        ],
+    );
+    Ok(join_exec_command(&tokens))
+}
+
 /// Refuse unselected worker Cargo configuration immediately before Unix Cargo.
 /// The outer command prefixes run first, so the guard sees Cargo's effective
 /// environment. This checks ordinary filesystem state, not atomic protection
@@ -1329,6 +1357,296 @@ mod managed_build_dir_tests {
             tokens
                 .iter()
                 .any(|token| token == "--config=build.build-dir=\"/later\"")
+        );
+    }
+
+    #[test]
+    fn build_source_stamp_bind_places_config_before_cargo_separator() {
+        let stamp = "a".repeat(40);
+        let vergen_command = format!("env -- VERGEN_GIT_SHA={} cargo build", "b".repeat(40));
+        let alias_command = format!(
+            "RCH_GIT_COMMIT={} cargo test -- --config fixture",
+            "c".repeat(40)
+        );
+        for command in [
+            "cargo build",
+            "cargo +nightly test -- --nocapture",
+            "env -i cargo check",
+            vergen_command.as_str(),
+            alias_command.as_str(),
+            "/usr/bin/time -f cargo rustup run nightly cargo build",
+        ] {
+            let bound = super::bind_build_source_stamp(command, &stamp)
+                .unwrap_or_else(|error| panic!("{command}: {error}"));
+            let original = shell_words::split(command).unwrap();
+            let mut expected = original.clone();
+            if original.first().is_some_and(|token| {
+                token.split_once('=').is_some_and(|(key, _)| {
+                    !key.is_empty()
+                        && key
+                            .chars()
+                            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+                })
+            }) {
+                expected.insert(0, "env".to_string());
+            }
+            let actual = shell_words::split(&bound).unwrap();
+            let configs: Vec<_> = actual
+                .iter()
+                .enumerate()
+                .filter(|(index, token)| {
+                    *token == "--config" && actual[index + 1].starts_with("env.RCH_BUILD_SOURCE.")
+                })
+                .collect();
+            assert_eq!(configs.len(), 2, "{command}: {bound}");
+            let (config_index, _) = configs[0];
+            let value_config: toml::Value = toml::from_str(&actual[config_index + 1]).unwrap();
+            assert_eq!(
+                value_config["env"]["RCH_BUILD_SOURCE"]["value"].as_str(),
+                Some(stamp.as_str()),
+                "{command}"
+            );
+            assert_eq!(actual[config_index + 2], "--config", "{command}: {bound}");
+            let force_config: toml::Value = toml::from_str(&actual[config_index + 3]).unwrap();
+            assert_eq!(
+                force_config["env"]["RCH_BUILD_SOURCE"]["force"].as_bool(),
+                Some(true),
+                "{command}"
+            );
+            assert_eq!(
+                &actual[..config_index],
+                &expected[..config_index],
+                "{command}"
+            );
+            assert_eq!(
+                &actual[config_index + 4..],
+                &expected[config_index..],
+                "{command}"
+            );
+            if let Some(token) = expected.get(config_index) {
+                assert_eq!(token, "--", "{command}: {bound}");
+            } else {
+                assert_eq!(config_index, expected.len(), "{command}: {bound}");
+            }
+        }
+    }
+
+    #[test]
+    fn build_source_stamp_bind_rejects_shell_evaluation_and_bad_stamps() {
+        let stamp = "a".repeat(40);
+        assert!(super::bind_build_source_stamp("cargo build $FLAGS", &stamp).is_err());
+        assert!(super::bind_build_source_stamp("cargo build; echo x", &stamp).is_err());
+        assert!(super::bind_build_source_stamp("cargo test `id`", &stamp).is_err());
+        assert!(super::bind_build_source_stamp("sh -c 'cargo test'", &stamp).is_err());
+        assert!(super::bind_build_source_stamp("cargo build", "").is_err());
+        assert!(super::bind_build_source_stamp("cargo build", "bad\nstamp").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_source_stamp_real_cargo_binds_stamp_through_build_script() {
+        use std::io::Read as _;
+        use std::path::PathBuf;
+
+        let root = tempfile::tempdir().unwrap().keep();
+        for directory in ["src", "bin", "cargo-home", "target"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='build_source_stamp_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("build.rs"),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../rch-common/build.rs"
+            )),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/main.rs"),
+            "fn main() { println!(\"{}\", option_env!(\"RCH_GIT_COMMIT\").unwrap_or(\"\")); }\n",
+        )
+        .unwrap();
+        let fixture_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .expect("git fixture command runs");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        fixture_git(&["init", "-q", "-b", "main"]);
+        fixture_git(&["add", "Cargo.toml", "build.rs", "src/main.rs"]);
+        fixture_git(&[
+            "-c",
+            "user.name=RCH-Test",
+            "-c",
+            "user.email=rch-test@example.invalid",
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            "fixture",
+        ]);
+        let fixture_head = fixture_git(&["rev-parse", "HEAD"]);
+        assert_ne!(fixture_head, "a".repeat(40));
+
+        let mut cargo = PathBuf::from(env!("CARGO"));
+        if std::fs::metadata(&cargo).unwrap().len() <= 8 * 1024
+            && std::fs::read_to_string(&cargo)
+                .unwrap()
+                .lines()
+                .any(|line| line.starts_with("# rch-toolchain-wrap-version:"))
+        {
+            cargo.set_file_name("cargo-rch-real");
+        }
+        let mut magic = [0; 4];
+        std::fs::File::open(&cargo)
+            .unwrap()
+            .read_exact(&mut magic)
+            .unwrap();
+        assert_eq!(
+            &magic, b"\x7fELF",
+            "fixture must execute a real Cargo binary"
+        );
+        let cargo_bin = cargo.parent().unwrap();
+        let executable = root.join("bin/cargo");
+        std::os::unix::fs::symlink(&cargo, &executable).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(cargo_bin.to_path_buf())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let rustc = cargo_bin.join("rustc");
+
+        let source_a = "a".repeat(40);
+        let dirty_a = format!("{source_a}-dirty");
+        let overlay = format!("{source_a}-overlay-{}", "b".repeat(64));
+        let alias_c = "c".repeat(40);
+        let alias_d = "d".repeat(40);
+        let alias = |key: &str, value: &str| {
+            [(key.to_owned(), value.to_owned())]
+                .into_iter()
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let cases: Vec<(&str, &str, std::collections::HashMap<String, String>, &str)> = vec![
+            ("plain", &source_a, Default::default(), &source_a),
+            ("dirty", &dirty_a, Default::default(), &dirty_a),
+            ("overlay", &overlay, Default::default(), &overlay),
+            ("unknown-stamp", "unknown", Default::default(), ""),
+            ("malformed-stamp", "not a stamp!", Default::default(), ""),
+            (
+                "explicit-rch-git-commit",
+                &source_a,
+                alias("RCH_GIT_COMMIT", &alias_c),
+                &alias_c,
+            ),
+            (
+                "explicit-vergen",
+                &source_a,
+                alias("VERGEN_GIT_SHA", &alias_d),
+                &alias_d,
+            ),
+            (
+                "caller-alias-precedence",
+                &source_a,
+                [
+                    ("RCH_GIT_COMMIT".to_owned(), alias_c.clone()),
+                    ("VERGEN_GIT_SHA".to_owned(), alias_d.clone()),
+                ]
+                .into_iter()
+                .collect(),
+                &alias_c,
+            ),
+        ];
+        for (name, stamp, aliases, expected_stdout) in &cases {
+            let command = format!(
+                "{} run --quiet --offline --jobs 1",
+                shell_words::quote(executable.to_str().unwrap())
+            );
+            let bound = super::bind_build_source_stamp(&command, stamp).unwrap();
+            let env = super::super::source_fidelity::build_source_commit_env(|key| {
+                aliases.get(key).cloned()
+            });
+            let mut process = std::process::Command::new("sh");
+            process
+                .args(["-c", &bound])
+                .current_dir(&root)
+                .env("PATH", &path)
+                .env("HOME", &root)
+                .env("CARGO_HOME", root.join("cargo-home"))
+                .env("CARGO_TARGET_DIR", root.join("target"))
+                .env("RUSTC", &rustc)
+                .env("RUSTFLAGS", "")
+                .env("RUSTUP_AUTO_INSTALL", "0")
+                .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env_remove("RUSTUP_TOOLCHAIN")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_BUILD_RUSTC")
+                .env_remove("CARGO_BUILD_TARGET")
+                .env_remove("CARGO_BUILD_TARGET_DIR")
+                .env_remove("CARGO_BUILD_RUSTFLAGS")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RCH_BUILD_SOURCE");
+            for (key, value) in &env {
+                process.env(key, value);
+            }
+            let output = process.output().unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                output.status.success(),
+                "{name}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                stdout.trim_end(),
+                *expected_stdout,
+                "{name}: stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let env_i_command = format!(
+            "env -i PATH={} HOME={} RUSTC={} CARGO_HOME={} CARGO_TARGET_DIR={} RUSTUP_AUTO_INSTALL=0 RCH_CARGO_WRAPPER_BYPASS=1 {} run --quiet --offline --jobs 1",
+            shell_words::quote(path.to_str().unwrap()),
+            shell_words::quote(root.to_str().unwrap()),
+            shell_words::quote(rustc.to_str().unwrap()),
+            shell_words::quote(root.join("cargo-home").to_str().unwrap()),
+            shell_words::quote(root.join("target").to_str().unwrap()),
+            shell_words::quote(executable.to_str().unwrap()),
+        );
+        let bound = super::bind_build_source_stamp(&env_i_command, &source_a).unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", &bound])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "env -i: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            stdout.trim_end(),
+            source_a,
+            "env -i: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        eprintln!(
+            "build-source real Cargo evidence retained at {}",
+            root.display()
         );
     }
 
