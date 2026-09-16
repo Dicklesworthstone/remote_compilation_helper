@@ -54,6 +54,9 @@ use super::ssh::{
 };
 use super::*;
 
+#[path = "cargo_manifest.rs"]
+mod cargo_manifest;
+
 fn clean_overlay_cargo_policy_failure(
     root: &Path,
     worker: &str,
@@ -423,13 +426,24 @@ pub(super) async fn execute_remote_compilation(
 
     let exact_dependency_closure_sync =
         clean_overlay.is_none() && command_uses_cargo_dependency_graph(kind);
+    // #70: the invocation/transfer basis need not be a Cargo package. Select
+    // the graph entrypoint without changing the build cwd or artifact basis.
+    let explicit_manifest_root = if exact_dependency_closure_sync {
+        cargo_manifest::selected_manifest_root(command, &normalized_project_root, topology_policy)
+            .context("cannot plan the selected Cargo manifest")?
+    } else {
+        None
+    };
+    let dependency_entry_root = explicit_manifest_root
+        .as_deref()
+        .unwrap_or(&normalized_project_root);
     let raw_sync_roots = if let Some(spec) = clean_overlay {
         let mut roots = vec![normalized_project_root.clone()];
         roots.extend(spec.dependencies.iter().map(|(root, _)| root.clone()));
         roots
     } else {
         let dependency_plan = build_dependency_runtime_plan(
-            &normalized_project_root,
+            dependency_entry_root,
             kind,
             reporter,
             topology_policy,
@@ -437,7 +451,7 @@ pub(super) async fn execute_remote_compilation(
         if let Some(decision) = dependency_plan.fail_open_decision.as_ref() {
             let report = build_dependency_runtime_fail_open_report(
                 &worker_config,
-                &normalized_project_root,
+                dependency_entry_root,
                 decision,
             );
             if let Ok(report_json) = serde_json::to_string(&report) {
@@ -446,13 +460,13 @@ pub(super) async fn execute_remote_compilation(
                     report_json
                 ));
             }
-            if source_content_receipt {
+            if source_content_receipt || explicit_manifest_root.is_some() {
                 warn!(
-                    "Dependency planner could not prove the exact source closure on {} [{}]: refusing source-content receipt mode ({})",
+                    "Dependency planner could not prove the exact source closure on {} [{}]: refusing selected-manifest/receipt execution ({})",
                     worker_config.id, decision.reason_code, decision.remediation
                 );
                 reporter.verbose(&format!(
-                    "[RCH] dependency planner refusal [{}]: source-content receipt requires an exact closure — {}",
+                    "[RCH] dependency planner refusal [{}]: selected-manifest and receipt modes require an exact closure — {}",
                     decision.reason_code, decision.remediation
                 ));
                 return Err(DependencyPreflightFailure::from_report(report).into());
@@ -1256,7 +1270,21 @@ pub(super) async fn execute_remote_compilation(
     }
 
     if exact_dependency_closure_sync {
-        verify_remote_dependency_manifests(&worker_config, &root_outcomes, reporter).await?;
+        // Verify package authorities even when their transfers were collapsed
+        // into a manifest-less repository basis. Use the actual remote mapping
+        // and sync outcomes rather than inventing a root Cargo.toml (#70).
+        let manifest_outcomes;
+        let preflight_outcomes = if explicit_manifest_root.is_some() {
+            manifest_outcomes = cargo_manifest::manifest_preflight_outcomes(
+                &root_outcomes,
+                &raw_sync_roots,
+                topology_policy,
+            )?;
+            &manifest_outcomes
+        } else {
+            &root_outcomes
+        };
+        verify_remote_dependency_manifests(&worker_config, preflight_outcomes, reporter).await?;
     }
 
     if source_content_build_id.is_some() {
