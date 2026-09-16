@@ -644,7 +644,7 @@ impl CancellationOrchestrator {
 
         match ssh_result {
             Ok(Ok(output)) => {
-                let success = output.status.success();
+                let success = remote_kill_confirmed(&output, record.build_id);
                 debug!(
                     "Remote kill for build {} on {}: success={}",
                     record.build_id, record.worker_id, success
@@ -872,23 +872,27 @@ impl CancellationOrchestrator {
 
 // ── Process signal helpers ───────────────────────────────────────────────
 
-fn build_remote_kill_script(remote_pgid_file: Option<&str>, build_id: u64) -> String {
-    if let Some(remote_pgid_file) = remote_pgid_file {
-        let escaped_file = shell_escape::escape(std::borrow::Cow::from(remote_pgid_file));
-        return format!(
-            "sh -lc 'pgid_file=$1; \
-if [ ! -r \"$pgid_file\" ]; then exit 1; fi; \
-pgid=$(cat \"$pgid_file\" 2>/dev/null); \
-if [ -z \"$pgid\" ]; then exit 1; fi; \
-kill -TERM -\"$pgid\" 2>/dev/null || kill -TERM \"$pgid\" 2>/dev/null || exit 1; \
-sleep 1; \
-kill -KILL -\"$pgid\" 2>/dev/null || kill -KILL \"$pgid\" 2>/dev/null || true; \
-exit 0' sh {file}",
-            file = escaped_file,
-        );
-    }
+// Keep the executable protocol as a shell source so tests run the exact bytes
+// sent to workers, including the process-table verification after signalling.
+const REMOTE_CANCELLATION_SCRIPT: &str = include_str!("cancellation_remote.sh");
 
-    format!("pkill -9 -f 'RCH_BUILD_ID={build_id};'")
+fn build_remote_kill_script(remote_pgid_file: Option<&str>, build_id: u64) -> String {
+    let Some(remote_pgid_file) = remote_pgid_file else {
+        // Matching command text cannot prove that a build's descendants exited.
+        // Retain the reservation when no process-group identity was recorded.
+        return "exit 42".to_owned();
+    };
+    format!(
+        "sh -c {} sh {} {build_id}",
+        shell_escape::escape(std::borrow::Cow::Borrowed(REMOTE_CANCELLATION_SCRIPT)),
+        shell_escape::escape(std::borrow::Cow::Borrowed(remote_pgid_file)),
+    )
+}
+
+fn remote_kill_confirmed(output: &std::process::Output, build_id: u64) -> bool {
+    // Neither SSH exit zero nor partial/stale output is a termination receipt.
+    output.status.success()
+        && output.stdout.as_slice() == format!("RCH_REMOTE_CANCELLED_V1:{build_id}\n").as_bytes()
 }
 
 /// Use the existing safe syscall wrapper: spawning /bin/kill can block the
@@ -1697,5 +1701,250 @@ mod tests {
         assert!(send_signal_to_process(pid, false));
         child.0.wait().unwrap();
         assert!(wait_for_process_exit(pid, Duration::from_secs(1)).await);
+    }
+
+    #[test]
+    fn remote_cancel_receipt_requires_success_and_one_complete_matching_record() {
+        use std::os::unix::process::ExitStatusExt;
+
+        for (code, stdout, expected) in [
+            (0, "RCH_REMOTE_CANCELLED_V1:42\n", true),
+            (0, "", false),
+            (0, "RCH_REMOTE_CANCELLED_V1:42", false),
+            (0, "RCH_REMOTE_CANCELLED_V1:41\n", false),
+            (0, "RCH_REMOTE_CANCELLED_V1:42\nRCH_REMOTE_CANCELLED_V1:42\n", false),
+            (255, "RCH_REMOTE_CANCELLED_V1:42\n", false),
+        ] {
+            let output = std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            };
+            assert_eq!(remote_kill_confirmed(&output, 42), expected, "{code}: {stdout:?}");
+        }
+    }
+
+    async fn remote_cancel_probe_fixture(path: &std::path::Path, prefix: &str) -> std::process::Output {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("{prefix}\n{REMOTE_CANCELLATION_SCRIPT}"))
+                .arg("rch-cancel-fixture")
+                .arg(path)
+                .arg("42")
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("remote cancellation probe exceeded its test deadline")
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn remote_cancel_rejects_unsafe_and_missing_identity_without_signalling() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("group with 'quote $dollar;`backtick`.pgid");
+        // The spy cannot send a real signal even if validation regresses.
+        let spy = "kill() { printf SIGNALLED; return 0; }; sleep() { :; };";
+        for value in ["", "0", "1", "-1", "-42", "00", "012", "2 3", "2\n3", "2147483648", "999999999999999999999", "$(false)"] {
+            std::fs::write(&path, value).unwrap();
+            let output = remote_cancel_probe_fixture(&path, spy).await;
+            assert_eq!(output.status.code(), Some(42), "{value:?}");
+            assert!(output.stdout.is_empty(), "invalid ID reached a signal: {value:?}");
+        }
+        let link = root.join("link.pgid");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        for invalid in [root.join("missing.pgid"), root.clone(), link] {
+            let output = remote_cancel_probe_fixture(&invalid, spy).await;
+            assert_eq!(output.status.code(), Some(42));
+            assert!(output.stdout.is_empty());
+        }
+        let script = build_remote_kill_script(None, 42);
+        assert!(!script.contains("pkill"), "missing identity must not select processes by text");
+        let output = tokio::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        assert!(!remote_kill_confirmed(&output, 42));
+    }
+
+    #[tokio::test]
+    async fn remote_cancel_observation_errors_and_survivors_never_confirm_success() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("group.pgid");
+        std::fs::write(&path, "123\n").unwrap();
+        // Execute the production shell source with only OS failures injected.
+        // All kill calls are inert; sleep is shortened for deterministic faults.
+        for (probe, expected) in [
+            ("ps() { return 1; };", 44),
+            ("ps() { :; };", 44),
+            ("ps() { printf 'not a process table\\n'; };", 44),
+            ("ps() { printf '10 10 S\\n'; };", 44),
+            ("ps() { printf '%s 123 S\\n' \"$$\"; };", 44),
+            ("ps() { printf '%s 99 S\\n100 123 R\\n' \"$$\"; };", 45),
+            ("ps() { printf '%s 99 S\\n100 123 Z\\n101 123 S\\n' \"$$\"; };", 45),
+            ("ps() { printf '%s 99 S\\n100 123 Z\\n' \"$$\"; };", 0),
+            ("ps() { printf '%s 99 S\\n' \"$$\"; };", 0),
+        ] {
+            let prefix = format!("kill() {{ return 0; }}; sleep() {{ :; }}; {probe}");
+            let output = remote_cancel_probe_fixture(&path, &prefix).await;
+            assert_eq!(output.status.code(), Some(expected), "{probe}: {output:?}");
+            assert_eq!(remote_kill_confirmed(&output, 42), expected == 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn remote_cancel_real_process_group_is_verified_and_retryable() {
+        use std::os::unix::process::CommandExt;
+
+        struct OwnedGroup(std::process::Child);
+        impl Drop for OwnedGroup {
+            fn drop(&mut self) {
+                // Keep the leader unreaped until here, so its PID cannot be
+                // reused by another group before this owned cleanup.
+                let pid = i32::try_from(self.0.id()).unwrap();
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = self.0.wait();
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap().keep();
+        let child_pid_path = root.join("child.pid");
+        let group = OwnedGroup(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "trap '' TERM; sleep 60 & printf '%s\\n' \"$!\" > \"$1\"; wait", "rch-group"])
+                .arg(&child_pid_path)
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let unrelated = OwnedGroup(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let child_pid: u32 = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&child_pid_path)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let path = root.join("group with 'quote $dollar;`backtick`.pgid");
+        std::fs::write(&path, format!("{}\n", group.0.id())).unwrap();
+        let script = build_remote_kill_script(Some(path.to_str().unwrap()), 42);
+        for _ in 0..2 {
+            let output = tokio::time::timeout(
+                Duration::from_secs(8),
+                tokio::process::Command::new("/bin/sh")
+                    .args(["-c", &script])
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(remote_kill_confirmed(&output, 42), "{output:?}");
+            assert!(!is_process_alive(group.0.id()));
+            assert!(!is_process_alive(child_pid));
+            assert!(is_process_alive(unrelated.0.id()));
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_cancel_transport_requires_receipt_before_releasing_reservations() {
+        const CHILD_ROOT: &str = "RCH_REMOTE_CANCEL_TEST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT).map(std::path::PathBuf::from) {
+            let pool = WorkerPool::new();
+            let config = rch_common::WorkerConfig::default();
+            let id = config.id.clone();
+            pool.add_worker(config).await;
+            let worker = pool.get(&id).await.unwrap();
+            assert!(worker.reserve_slots(3).await);
+            let history = Arc::new(BuildHistory::new(100));
+            let active = history.start_active_build(
+                "receipt".to_owned(), id.to_string(), "cargo test".to_owned(),
+                0, 1, rch_common::BuildLocation::Remote,
+            );
+            std::fs::write(root.join("build-id"), active.id.to_string()).unwrap();
+            let ctx = make_test_context(pool, history.clone());
+            let orch = CancellationOrchestrator::new(test_config(), test_events());
+            for mode in ["empty", "truncated", "wrong-id", "duplicate", "failed", "confirmed"] {
+                std::fs::write(root.join("mode"), mode).unwrap();
+                let mut record = test_record(CancellationState::Requested, 0, false);
+                record.build_id = active.id;
+                record.worker_id = id.to_string();
+                record.hook_pid = 0;
+                record.slots_released = 0;
+                record.remote_pgid_file = Some("/test/owned-group.pgid".to_owned());
+                orch.execute_cancellation(&ctx, &mut record, true).await;
+                orch.run_cleanup(&ctx, &mut record).await;
+                if mode == "confirmed" {
+                    assert_eq!(record.state, CancellationState::Completed);
+                    assert_eq!(record.slots_released, 1);
+                    assert_eq!(worker.used_slots(), 2);
+                    assert!(history.active_build(active.id).is_none());
+                    orch.run_cleanup(&ctx, &mut record).await;
+                    assert_eq!(worker.used_slots(), 2);
+                } else {
+                    assert_eq!(record.state, CancellationState::Failed, "{mode}");
+                    assert_eq!(record.slots_released, 0);
+                    assert_eq!(worker.used_slots(), 3);
+                    assert!(history.active_build(active.id).is_some());
+                    assert!(history.recent(10).is_empty());
+                }
+            }
+            std::fs::write(root.join("child-completed"), "ok").unwrap();
+            return;
+        }
+
+        // Isolate PATH in a child test process; never change global test env or
+        // contact a worker. The fake SSH controls only exit/status receipts.
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap().keep();
+        let ssh = root.join("ssh");
+        std::fs::write(&ssh, r#"#!/bin/sh
+id=$(/bin/cat "$RCH_REMOTE_CANCEL_TEST_ROOT/build-id") || exit 99
+mode=$(/bin/cat "$RCH_REMOTE_CANCEL_TEST_ROOT/mode") || exit 99
+case "$mode" in
+  empty) exit 0;;
+  truncated) printf 'RCH_REMOTE_CANCELLED_V1:%s' "$id";;
+  wrong-id) printf 'RCH_REMOTE_CANCELLED_V1:0\n';;
+  duplicate) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id" "$id";;
+  failed) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id"; exit 255;;
+  confirmed) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id";;
+  *) exit 99;;
+esac
+"#).unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cancellation::tests::remote_cancel_transport_requires_receipt_before_releasing_reservations", "--nocapture"])
+                .env(CHILD_ROOT, &root)
+                .env("PATH", format!("{}:/usr/bin:/bin", root.display()))
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(output.status.success(), "isolated SSH fixture failed: {output:?}");
+        assert!(root.join("child-completed").is_file(), "child regression did not execute");
     }
 }
