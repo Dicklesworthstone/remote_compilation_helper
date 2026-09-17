@@ -566,12 +566,12 @@ fn operation_script(
     outcome(
         &mut t,
         "peer-high-water",
-        &store.record_peer_authority_high_water(&active, "peer-1", 5, 100),
+        &store.record_peer_authority_high_water(&active, "peer-1", 5, 11, 100),
     );
     outcome(
         &mut t,
         "peer-high-water-stale",
-        &store.record_peer_authority_high_water(&active, "peer-1", 4, 101),
+        &store.record_peer_authority_high_water(&active, "peer-1", 4, 11, 101),
     );
     outcome(
         &mut t,

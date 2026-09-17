@@ -616,6 +616,14 @@ fn toolchain_wrap_counts() -> (usize, usize) {
     (wrapped, cargos.len())
 }
 
+fn toolchain_wrappers_current() -> bool {
+    toolchain_cargos().iter().all(|cargo| {
+        toolchain_wrap_version(cargo).as_deref() == Some(TOOLCHAIN_WRAP_VERSION)
+            && which::which(cargo).is_ok()
+            && which::which(cargo.with_file_name(REAL_CARGO_NAME)).is_ok()
+    })
+}
+
 /// Count `rustc`/`cargo` processes running on this box right now (best-effort,
 /// Unix only). A dispatcher with the shim working should see ~0 (aside from
 /// rust-analyzer's short-lived probes).
@@ -826,8 +834,7 @@ pub fn shim_install(
     Ok(())
 }
 
-/// `rch shim status` — report install state, version drift, PATH order, and any
-/// local builds currently running.
+/// Read-only checks shared with the dispatcher's doctor report.
 pub(crate) fn dispatcher_shim_problems() -> Result<Vec<String>> {
     let mut problems = Vec::new();
     let cargo = cargo_shim_path()?;
@@ -844,7 +851,11 @@ pub(crate) fn dispatcher_shim_problems() -> Result<Vec<String>> {
     }
     let (wrapped, total) = toolchain_wrap_counts();
     if wrapped != total {
-        problems.push(format!("only {wrapped}/{total} toolchain Cargo binaries are wrapped"));
+        problems.push(format!(
+            "only {wrapped}/{total} toolchain Cargo binaries are wrapped"
+        ));
+    } else if !toolchain_wrappers_current() {
+        problems.push("toolchain Cargo wrappers are stale or not executable".to_string());
     }
     Ok(problems)
 }
@@ -859,7 +870,13 @@ pub fn shim_status(ctx: &OutputContext) -> Result<()> {
     } else {
         None
     };
-    let up_to_date = version.as_deref() == Some(SHIM_VERSION);
+    let up_to_date = version.as_deref() == Some(SHIM_VERSION)
+        && which::which(&path).is_ok()
+        && cargo_clippy_shim_path().is_ok_and(|clippy| {
+            installed_shim_version(&clippy).as_deref() == Some(SHIM_VERSION)
+                && which::which(clippy).is_ok()
+        })
+        && toolchain_wrappers_current();
     let interception = if installed {
         cargo_interception(&path)
     } else {

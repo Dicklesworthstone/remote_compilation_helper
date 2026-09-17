@@ -2095,7 +2095,9 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 // failure events that lack durations and would double count.
                 matches!(
                     metadata.target(),
-                    "rch::doctor::verdict" | "rch::doctor::probe_duration"
+                    "rch::doctor::verdict"
+                        | "rch::doctor::probe_duration"
+                        | "rch::doctor::remediation"
                 )
             })),
         )

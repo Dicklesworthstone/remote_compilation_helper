@@ -1429,9 +1429,9 @@ impl TransferPipeline {
 
         #[cfg(unix)]
         let ssh_options = SshOptions {
-            server_alive_interval: transfer_config
-                .ssh_server_alive_interval_secs
-                .map(std::time::Duration::from_secs),
+            server_alive_interval: Some(std::time::Duration::from_secs(
+                transfer_config.ssh_server_alive_interval_secs.unwrap_or(15),
+            )),
             control_persist_idle: transfer_config
                 .ssh_control_persist_secs
                 .map(std::time::Duration::from_secs),
@@ -4786,32 +4786,47 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd
     }
 
-    /// Refresh only materialized source timestamps while its source-pair lease
-    /// is held. Git archives and overlays can carry older/equal mtimes even
-    /// when their bytes changed. A timestamp strictly newer than the cached
-    /// artifacts forces normal Cargo freshness to reconsider local units;
-    /// registry/Git dependency files and their compiled cache remain untouched.
-    pub async fn refresh_clean_overlay_source(&self, worker: &WorkerConfig) -> Result<()> {
+    /// Apply a content epoch while the source-pair lease is held, after complete
+    /// fresh-root materialization and overlay verification. Identical selected
+    /// bytes reuse their timestamp; changed bytes must be newer than artifacts
+    /// even when their archived mtimes are old. This never reuses source files.
+    pub async fn refresh_clean_overlay_source(
+        &self,
+        worker: &WorkerConfig,
+        identity: &str,
+    ) -> Result<()> {
         if use_mock_transport(worker) {
             return Ok(());
         }
         tokio::time::timeout(
             Duration::from_secs(120),
-            self.run_remote_sh(worker, &self.clean_overlay_source_refresh_command()),
+            self.run_remote_sh(
+                worker,
+                &self.clean_overlay_source_refresh_command(identity)?,
+            ),
         )
         .await
         .context("timed out proving clean-overlay source freshness")?
     }
 
-    fn clean_overlay_source_refresh_command(&self) -> String {
+    fn clean_overlay_source_refresh_command(&self, identity: &str) -> Result<String> {
+        if identity.len() != 64 || !identity.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("invalid clean-overlay freshness identity");
+        }
         let root = self.remote_path();
         let pool = self.remote_cargo_target_dir();
         let quote = |value: &str| escape(Cow::from(value)).into_owned();
         let anchor = format!("{root}.freshness-anchor");
-        let stamp = format!("{root}.freshness-stamp");
-        format!(
-            "set -eu; root={root}; pool={pool}; anchor={anchor}; stamp={stamp}; \
-             [ ! -L \"$anchor\" ] && [ ! -L \"$stamp\" ] && [ ! -L \"$pool\" ]; touch \"$anchor\"; \
+        let epoch = format!("{root}.freshness-epoch-v1");
+        Ok(format!(
+            "set -eu; root={root}; pool={pool}; anchor={anchor}; epoch={epoch}; identity={identity}; \
+             [ ! -L \"$anchor\" ] && [ ! -L \"$epoch\" ] && [ ! -L \"$pool\" ]; \
+             [ ! -e \"$epoch\" ] || [ -f \"$epoch\" ]; \
+             if [ -f \"$epoch\" ] && [ \"$(wc -c < \"$epoch\" | tr -d ' ')\" = 65 ] && \
+             [ \"$(cat \"$epoch\")\" = \"$identity\" ]; then \
+             find \"$root\" \\( -type f -o -type d \\) -exec touch -r \"$epoch\" {{}} +; exit 0; fi; \
+             stamp=$(mktemp \"$epoch.pending.XXXXXX\"); \
+             printf '%s\\n' \"$identity\" > \"$stamp\"; touch \"$anchor\"; \
              if [ -d \"$pool\" ]; then \
              find \"$pool\" -type f -exec sh -c \
              'anchor=$1; shift; for file do if [ \"$file\" -nt \"$anchor\" ]; then touch -r \"$file\" \"$anchor\" || exit; fi; done' \
@@ -4821,12 +4836,14 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
              attempts=$((attempts + 1)); if [ \"$attempts\" -gt 5 ]; then \
              echo 'RCH: worker clock cannot advance beyond cached artifacts; source freshness unproved' >&2; exit 1; fi; \
              sleep 1; touch \"$stamp\"; done; \
-             find \"$root\" \\( -type f -o -type d \\) -exec touch -r \"$stamp\" {{}} +",
+             find \"$root\" \\( -type f -o -type d \\) -exec touch -r \"$stamp\" {{}} +; \
+             mv -f \"$stamp\" \"$epoch\"",
             root = quote(&root),
             pool = quote(&pool),
             anchor = quote(&anchor),
-            stamp = quote(&stamp),
-        )
+            epoch = quote(&epoch),
+            identity = quote(identity),
+        ))
     }
 
     /// Best-effort removal of an isolated remote tree (bd-p1vlb).
@@ -9377,6 +9394,79 @@ Number of files transferred: 42
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn source_pair_epoch_publication_requires_complete_refresh_and_valid_identity() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let root = retained.join("source");
+        let pool = retained.join("pool");
+        let epoch = retained.join("source.freshness-epoch-v1");
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "fixture".into(),
+            "pair".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(root.to_string_lossy().into_owned())
+        .with_remote_cargo_target_dir_override(pool.to_string_lossy().into_owned());
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        let run = |identity: &str| {
+            std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &pipeline
+                        .clean_overlay_source_refresh_command(identity)
+                        .unwrap(),
+                ])
+                .output()
+                .unwrap()
+        };
+        assert!(
+            pipeline
+                .clean_overlay_source_refresh_command("not-an-identity")
+                .is_err()
+        );
+        // Refresh fails before publication when the complete root is absent.
+        assert!(!run(&first).status.success());
+        assert!(!epoch.exists());
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("input"), "first").unwrap();
+        assert!(run(&first).status.success());
+        let first_time = std::fs::metadata(&epoch).unwrap().modified().unwrap();
+        let published = std::fs::read(&epoch).unwrap();
+        std::fs::rename(&root, retained.join("retired")).unwrap();
+        // A failed next epoch cannot replace the prior committed marker.
+        assert!(!run(&second).status.success());
+        assert_eq!(std::fs::read(&epoch).unwrap(), published);
+        assert_eq!(
+            std::fs::metadata(&epoch).unwrap().modified().unwrap(),
+            first_time
+        );
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("input"), "first").unwrap();
+        assert!(run(&first).status.success());
+        assert_eq!(
+            std::fs::metadata(root.join("input"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            first_time
+        );
+        std::fs::write(&epoch, "malformed retained marker").unwrap();
+        assert!(run(&first).status.success());
+        assert_eq!(
+            std::fs::read_to_string(&epoch).unwrap(),
+            format!("{first}\n")
+        );
+        assert!(std::fs::metadata(&epoch).unwrap().modified().unwrap() > first_time);
+        assert!(run(&second).status.success());
+        assert_eq!(
+            std::fs::read_to_string(&epoch).unwrap(),
+            format!("{second}\n")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn source_pair_real_cargo_reuses_dependencies_and_reads_current_source() {
         let dir = tempfile::tempdir().unwrap().keep();
         let dependency = dir.join("external");
@@ -9449,16 +9539,27 @@ Number of files transferred: 42
         for checksum in [false, true] {
             let root = dir.join(format!("source-{checksum}"));
             let pool = dir.join(format!("pool-{checksum}"));
-            for (run, (value, inner)) in
-                [("first", "alpha"), ("first", "alpha"), ("later", "omega")]
-                    .into_iter()
-                    .enumerate()
+            for (run, (value, inner, generation)) in [
+                ("first", "alpha", 0),
+                ("first", "alpha", 0),
+                ("first", "alpha", 1),
+                ("later", "omega", 2),
+            ]
+            .into_iter()
+            .enumerate()
             {
                 source_pair_fixture(&root, &dependency, value, inner);
-                // Run two changes only a runtime fixture, so a fresh source
+                // Run three changes only a runtime fixture, so a fresh source
                 // namespace must expose new data even when checksum Cargo
                 // reuses the unchanged test executable.
-                std::fs::write(root.join("generation.txt"), format!("generation-{run}")).unwrap();
+                std::fs::write(
+                    root.join("generation.txt"),
+                    format!("generation-{generation}"),
+                )
+                .unwrap();
+                let identity = blake3::hash(format!("{value}\0{inner}\0{generation}").as_bytes())
+                    .to_hex()
+                    .to_string();
                 let pipeline = TransferPipeline::new(
                     root.clone(),
                     "fixture".into(),
@@ -9469,7 +9570,12 @@ Number of files transferred: 42
                 .with_remote_cargo_target_dir_override(pool.to_string_lossy().into_owned());
                 assert!(
                     std::process::Command::new("sh")
-                        .args(["-c", &pipeline.clean_overlay_source_refresh_command()])
+                        .args([
+                            "-c",
+                            &pipeline
+                                .clean_overlay_source_refresh_command(&identity)
+                                .unwrap()
+                        ])
                         .status()
                         .unwrap()
                         .success()
@@ -9486,6 +9592,25 @@ Number of files transferred: 42
                         source_pair_external_dependency_fresh(&result),
                         "external dependency was rebuilt"
                     );
+                }
+                if run == 1 || run == 3 {
+                    for name in ["inner", "pair_fixture"] {
+                        let artifacts = String::from_utf8_lossy(&result.stdout)
+                            .lines()
+                            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                            .filter(|message| {
+                                message["reason"] == "compiler-artifact"
+                                    && message["target"]["name"] == name
+                            })
+                            .collect::<Vec<_>>();
+                        assert!(!artifacts.is_empty(), "missing actual artifact for {name}");
+                        assert!(
+                            artifacts
+                                .iter()
+                                .all(|artifact| artifact["fresh"] == (run == 1)),
+                            "identical bytes must be Fresh; changed old-mtime bytes must rebuild: run={run} {name}: {artifacts:?}"
+                        );
+                    }
                 }
                 std::fs::rename(&root, dir.join(format!("retired-{checksum}-{run}"))).unwrap();
                 assert!(

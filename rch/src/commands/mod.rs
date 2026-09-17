@@ -18,7 +18,7 @@ mod hook;
 mod init;
 mod queue;
 pub mod rabs_gc;
-mod shim;
+pub(crate) mod shim;
 mod speedscore;
 mod status;
 mod sync;
