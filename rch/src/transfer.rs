@@ -1360,7 +1360,16 @@ pub struct TransferPipeline {
     /// [`rch_common::rsync_flavor::resolve_rsync_cached`] using
     /// `transfer_config.rsync_bin`; tests pin a flavour to assert argv.
     rsync_override: Option<ResolvedRsync>,
+    /// Non-replayable, identity-bound remote completion evidence.
+    recovery_completion: Option<(String, String)>,
+    /// Cooperative collection-only cancellation; the sender never drops a live child future.
+    retrieval_control: Option<(tokio::sync::watch::Receiver<bool>, TokioInstant)>,
 }
+
+/// Only emitted after the interrupted local receiver has been killed and reaped.
+#[derive(Debug, thiserror::Error)]
+#[error("artifact collection interrupted for same-job recovery")]
+pub(crate) struct RetrievalCancelled;
 
 /// Validate a project hash for safe use in file paths.
 ///
@@ -1465,7 +1474,196 @@ impl TransferPipeline {
             pooled_target_prune_idle_hours:
                 rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
             rsync_override: None,
+            recovery_completion: None,
+            retrieval_control: None,
         }
+    }
+
+    pub(crate) fn with_retrieval_control(
+        mut self,
+        cancel: tokio::sync::watch::Receiver<bool>,
+        started: TokioInstant,
+    ) -> Self {
+        self.retrieval_control = Some((cancel, started));
+        self
+    }
+
+    async fn execute_retrieval_rsync(
+        &self,
+        config: &RetryConfig,
+        operation: &str,
+        build: impl Fn() -> Command,
+        mut on_line: impl FnMut(&str),
+    ) -> Result<std::process::Output> {
+        let Some((cancel, started)) = self.retrieval_control.as_ref() else {
+            return execute_rsync_with_retry(config, operation, build).await;
+        };
+        let deadline = *started + Duration::from_millis(config.total_timeout_ms);
+        let mut cancel = cancel.clone();
+        for attempt in 0..config.max_attempts.max(1) {
+            if *cancel.borrow() {
+                return Err(RetrievalCancelled.into());
+            }
+            anyhow::ensure!(
+                TokioInstant::now() < deadline,
+                "{operation}: retrieval deadline exceeded"
+            );
+            if attempt > 0 {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => anyhow::bail!("{operation}: retrieval deadline exceeded"),
+                    _ = cancel.wait_for(|requested| *requested) => return Err(RetrievalCancelled.into()),
+                    _ = sleep(config.delay_for_attempt(attempt)) => {},
+                }
+            }
+            if *cancel.borrow() {
+                return Err(RetrievalCancelled.into());
+            }
+            anyhow::ensure!(
+                TokioInstant::now() < deadline,
+                "{operation}: retrieval deadline exceeded"
+            );
+            let mut cmd = build();
+            cmd.kill_on_drop(true);
+            let mut child = cmd.spawn().with_context(|| format!("spawn {operation}"))?;
+            let mut stdout = child.stdout.take().context("retrieval stdout missing")?;
+            let mut stderr = child.stderr.take().context("retrieval stderr missing")?;
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let mut out_buffer = [0_u8; 8192];
+            let mut err_buffer = [0_u8; 8192];
+            let mut out_open = true;
+            let mut err_open = true;
+            let collected = async {
+                while out_open || err_open {
+                    tokio::select! {
+                        read = stdout.read(&mut out_buffer), if out_open => {
+                            let n = read?;
+                            out_open = n != 0;
+                            on_line(&String::from_utf8_lossy(&out_buffer[..n]));
+                            if out.len() < 10 * 1024 * 1024 { out.extend_from_slice(&out_buffer[..n]); }
+                        },
+                        read = stderr.read(&mut err_buffer), if err_open => {
+                            let n = read?;
+                            err_open = n != 0;
+                            on_line(&String::from_utf8_lossy(&err_buffer[..n]));
+                            if err.len() < 10 * 1024 * 1024 { err.extend_from_slice(&err_buffer[..n]); }
+                        },
+                    }
+                }
+                child.wait().await
+            };
+            let status = tokio::select! {
+                biased;
+                result = collected => Some(result),
+                _ = cancel.wait_for(|requested| *requested) => None,
+                _ = tokio::time::sleep_until(deadline) => None,
+            };
+            let status = match status {
+                Some(Ok(status)) => status,
+                other => {
+                    // kill() awaits wait(); a retry must never overlap a receiver.
+                    child
+                        .kill()
+                        .await
+                        .context("stop and reap interrupted retrieval")?;
+                    if let Some(Err(error)) = other {
+                        return Err(error.into());
+                    }
+                    if *cancel.borrow() {
+                        return Err(RetrievalCancelled.into());
+                    }
+                    anyhow::bail!("{operation}: retrieval deadline exceeded");
+                }
+            };
+            if !status.success()
+                && is_retryable_transport_error_text(&String::from_utf8_lossy(&err))
+                && attempt + 1 < config.max_attempts.max(1)
+            {
+                continue;
+            }
+            return Ok(std::process::Output {
+                status,
+                stdout: out,
+                stderr: err,
+            });
+        }
+        unreachable!("at least one retrieval attempt is required")
+    }
+
+    pub(crate) fn with_recovery_completion(mut self, path: String, identity: String) -> Self {
+        self.recovery_completion = Some((path, identity));
+        self
+    }
+
+    pub(crate) fn with_local_root(mut self, root: PathBuf) -> Self {
+        self.project_root = root;
+        self
+    }
+
+    /// The supervisor owns all output descriptors, so loss of the streaming
+    /// channel cannot suppress its terminal record or execute the command twice.
+    fn durable_execution_command(&self, command: String) -> String {
+        let Some((path, identity)) = &self.recovery_completion else {
+            return command;
+        };
+        let quote = |value: &str| escape(Cow::from(value)).into_owned();
+        let supervisor = format!(
+            "trap '' HUP; ( {command}\n); s=$?; printf '%s %s\\n' {identity} \"$s\" > {pending} && sync -f {pending} && mv -f -- {pending} {done} && sync -f {directory}; exit \"$s\"",
+            identity = quote(identity),
+            pending = quote(&format!("{path}.pending")),
+            done = quote(path),
+            directory = quote(Path::new(path).parent().unwrap().to_str().unwrap()),
+        );
+        format!(
+            "set -e; umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; \
+             nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
+             p=$!; tail -c +1 -f {out} & a=$!; tail -c +1 -f {err} >&2 & b=$!; \
+             trap 'kill \"$a\" \"$b\" 2>/dev/null || :' EXIT; \
+             while [ ! -f {done} ]; do sleep 1; done; \
+             sleep 1; kill \"$a\" \"$b\" 2>/dev/null || :; \
+             read -r identity status < {done}; [ \"$identity\" = {identity} ]; exit \"$status\"",
+            claim = quote(&format!("{path}.started")),
+            out = quote(&format!("{path}.stdout")),
+            err = quote(&format!("{path}.stderr")),
+            supervisor = quote(&supervisor),
+            done = quote(path),
+            identity = quote(identity),
+            directory = quote(Path::new(path).parent().unwrap().to_str().unwrap()),
+        )
+    }
+
+    pub(crate) async fn read_recovery_completion(
+        &self,
+        worker: &WorkerConfig,
+    ) -> Result<Option<i32>> {
+        let Some((path, identity)) = &self.recovery_completion else {
+            return Ok(None);
+        };
+        let script = format!(
+            "if [ -f {p} ] && [ ! -L {p} ]; then cat -- {p}; fi",
+            p = escape(Cow::from(path.as_str()))
+        );
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.worker_ssh_command(worker, &["sh", "-c", &escape(Cow::from(script.as_str()))])
+                .output(),
+        )
+        .await??;
+        anyhow::ensure!(output.status.success(), "completion probe SSH failed");
+        let text = std::str::from_utf8(&output.stdout)?.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let (observed, status) = text
+            .split_once(' ')
+            .context("malformed remote completion")?;
+        anyhow::ensure!(observed == identity, "remote completion identity mismatch");
+        let status: i32 = status.parse()?;
+        anyhow::ensure!(
+            (0..=255).contains(&status),
+            "invalid remote completion status"
+        );
+        Ok(Some(status))
     }
 
     /// Pin the rsync binary and flavour instead of probing (issue #66).
@@ -1702,12 +1900,19 @@ impl TransferPipeline {
         {
             return fallback;
         }
-        let estimate = execute_rsync_with_retry(&fallback, "estimate_artifact_retrieval", || {
-            let mut cmd = self.build_retrieve_command(worker, escaped_remote_path, patterns);
-            cmd.arg("--dry-run");
-            cmd
-        })
-        .await;
+        let estimate = self
+            .execute_retrieval_rsync(
+                &fallback,
+                "estimate_artifact_retrieval",
+                || {
+                    let mut cmd =
+                        self.build_retrieve_command(worker, escaped_remote_path, patterns);
+                    cmd.arg("--dry-run");
+                    cmd
+                },
+                |_| {},
+            )
+            .await;
         match estimate {
             Ok(output) if output.status.success() => {
                 if let Some(bytes) =
@@ -4241,9 +4446,23 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         let command_timeout = self.ssh_options.command_timeout;
         const MAX_OUTPUT_SIZE: usize = 10 * 1024 * 1024;
+        let mut completion_tick = tokio::time::interval(Duration::from_secs(3));
+        completion_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut durable_status = None;
 
         let status = match tokio::time::timeout(command_timeout, async {
-            while let Some(event) = rx.recv().await {
+            loop {
+                let event = tokio::select! {
+                    event = rx.recv() => match event { Some(event) => event, None => break },
+                    _ = completion_tick.tick(), if self.recovery_completion.is_some() => {
+                        if let Ok(Some(status)) = self.read_recovery_completion(worker).await {
+                            durable_status = Some(status);
+                            let _ = child.kill().await;
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 match event {
                     StreamEvent::Stdout(line) => {
                         on_stdout(&line);
@@ -4297,7 +4516,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         let duration = start.elapsed();
         Ok(CommandResult {
-            exit_code: status.code().unwrap_or(-1),
+            exit_code: durable_status.unwrap_or_else(|| status.code().unwrap_or(-1)),
             stdout: stdout_acc,
             stderr: stderr_acc,
             duration_ms: duration.as_millis() as u64,
@@ -4321,7 +4540,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         F: FnMut(&str),
         G: FnMut(&str),
     {
-        let wrapped_command = self.build_remote_command(command, toolchain);
+        let wrapped_command =
+            self.durable_execution_command(self.build_remote_command(command, toolchain));
 
         if use_mock_transport(worker) {
             let mut client = MockSshClient::new(worker.clone(), MockConfig::from_env());
@@ -4670,10 +4890,14 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let retry_config = self
             .artifact_retry_config(worker, &escaped_remote_path, artifact_patterns)
             .await;
-        let output = execute_rsync_with_retry(&retry_config, "retrieve_artifacts", || {
-            self.build_retrieve_command(worker, &escaped_remote_path, artifact_patterns)
-        })
-        .await?;
+        let output = self
+            .execute_retrieval_rsync(
+                &retry_config,
+                "retrieve_artifacts",
+                || self.build_retrieve_command(worker, &escaped_remote_path, artifact_patterns),
+                |_| {},
+            )
+            .await?;
 
         let duration = start.elapsed();
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -4939,10 +5163,14 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let start = std::time::Instant::now();
         let retry_config = self.effective_rsync_retry_config();
-        let output = execute_rsync_with_retry(&retry_config, "retrieve_result_dir", || {
-            self.build_result_dir_retrieve_command(worker, &escaped_remote_path, rel)
-        })
-        .await?;
+        let output = self
+            .execute_retrieval_rsync(
+                &retry_config,
+                "retrieve_result_dir",
+                || self.build_result_dir_retrieve_command(worker, &escaped_remote_path, rel),
+                |_| {},
+            )
+            .await?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -5053,17 +5281,41 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let retry_config = self
             .artifact_retry_config(worker, &escaped_remote_path, artifact_patterns)
             .await;
-        let (output, _) = run_command_streaming_with_retry(
-            &retry_config,
-            "retrieve_artifacts_streaming",
-            None,
-            None,
-            build_cmd,
-            |line| {
-                on_line(line);
-            },
-        )
-        .await?;
+        let output = if self.retrieval_control.is_some() {
+            let output = self
+                .execute_retrieval_rsync(
+                    &retry_config,
+                    "retrieve_artifacts_streaming",
+                    build_cmd,
+                    &mut on_line,
+                )
+                .await?;
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if !output.status.success() {
+                return Err(TransferError::SyncFailed {
+                    reason: "rsync artifact retrieval failed".to_owned(),
+                    exit_code: output.status.code(),
+                    stderr: combined,
+                }
+                .into());
+            }
+            combined
+        } else {
+            run_command_streaming_with_retry(
+                &retry_config,
+                "retrieve_artifacts_streaming",
+                None,
+                None,
+                build_cmd,
+                &mut on_line,
+            )
+            .await?
+            .0
+        };
         let duration_ms = retrieval_start.elapsed().as_millis() as u64;
 
         // An exit-0 partial download leaves the local artifact tree incomplete;

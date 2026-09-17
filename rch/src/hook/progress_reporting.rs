@@ -96,6 +96,7 @@ impl BuildHeartbeatLoop {
 
         let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(BUILD_HEARTBEAT_INTERVAL);
+            let mut last_warning = None;
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
@@ -119,6 +120,35 @@ impl BuildHeartbeatLoop {
                         };
                         if let Err(e) = send_build_heartbeat(&socket_path_owned, &heartbeat).await {
                             debug!("build heartbeat send failed for build {}: {}", build_id, e);
+                        }
+                        if let Some(lease) = durable_lease_for_task.as_ref()
+                        {
+                            let evidence = lease.snapshot();
+                            let cancellation = default_job_lease_directory().join(format!("{}.cancel", evidence.identity.local_wrapper_id));
+                            if let Ok(bytes) = std::fs::read(cancellation)
+                                && serde_json::from_slice::<JobIdentity>(&bytes).ok().as_ref() == Some(&evidence.identity)
+                                && let Ok(status) = crate::commands::jobs::query(&evidence).await
+                                && status["status"] == "completed"
+                            {
+                                let code = status["record"]["exit_code"].as_i64().and_then(|n| i32::try_from(n).ok()).unwrap_or(130);
+                                if lease.record_exit(code).and_then(|()| lease.acknowledge_terminal()).is_ok() {
+                                    std::process::exit(code);
+                                }
+                            }
+                            let observed = crate::commands::jobs::query(&evidence).await;
+                            let mut state = rch_common::job_recovery::WrapperState::waiting(evidence.state);
+                            if let Ok(status) = observed {
+                                if status["status"] == "not_found" { state.remote_absent = true; }
+                                if status["status"] == "completed" {
+                                    state.job_state = rch_common::job_identity::JobLifecycleState::Finished;
+                                    state.artifacts_pending = evidence.recovery.is_some();
+                                }
+                            }
+                            let warning = rch_common::job_recovery::diagnose_stuck_wrapper(&evidence.identity, &state);
+                            if warning.stuck && last_warning != Some(warning.class) {
+                                if let Ok(json) = serde_json::to_string(&warning) { eprintln!("{json}"); }
+                                last_warning = Some(warning.class);
+                            }
                         }
                         if let Some(lease) = durable_lease_for_task.as_ref()
                             && let Err(error) = lease.heartbeat(phase_token)
@@ -235,26 +265,26 @@ async fn send_build_heartbeat(
     socket_path: &str,
     heartbeat: &BuildHeartbeatRequest,
 ) -> anyhow::Result<()> {
-    if !Path::new(socket_path).exists() {
-        return Ok(());
-    }
+    anyhow::ensure!(
+        Path::new(socket_path).exists(),
+        "daemon socket disappeared during heartbeat"
+    );
 
     let stream = match timeout(Duration::from_secs(2), UnixStream::connect(socket_path)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(e.into()),
-        Err(_) => return Ok(()), // Timeout connecting — don't block hook
+        Err(_) => anyhow::bail!("daemon heartbeat connection timed out"),
     };
     let (reader, mut writer) = stream.into_split();
 
     let body = serde_json::to_string(heartbeat)?;
     let request = format!("POST /build-heartbeat\n{}\n", body);
-    writer.write_all(request.as_bytes()).await?;
-    writer.flush().await?;
-    writer.shutdown().await?;
-
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let _ = timeout(Duration::from_secs(5), reader.read_line(&mut line)).await;
-
-    Ok(())
+    timeout(Duration::from_secs(5), async {
+        writer.write_all(request.as_bytes()).await?;
+        writer.flush().await?;
+        writer.shutdown().await
+    })
+    .await
+    .context("heartbeat write timed out")??;
+    super::daemon_ipc::read_daemon_ack(reader, Duration::from_secs(5)).await
 }

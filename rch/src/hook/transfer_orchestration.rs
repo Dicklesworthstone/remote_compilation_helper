@@ -58,6 +58,82 @@ use super::*;
 #[path = "cargo_manifest.rs"]
 mod cargo_manifest;
 
+#[path = "retrieval_recovery.rs"]
+pub(crate) mod recovery;
+
+/// A recovery request can interrupt collection, never execution. Keep the same
+/// session and authority guards outside this boundary across the one explicit
+/// retry, and wait for transport cancellation to reap its receiver first.
+async fn retrieve_with_live_recovery<T>(
+    pipeline: &TransferPipeline,
+    lease: Option<&DurableLeaseWriter>,
+    mut retrieve: impl AsyncFnMut(&TransferPipeline) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let Some(lease) = lease else {
+        return retrieve(pipeline).await;
+    };
+    let evidence = lease.snapshot();
+    if evidence.recovery.is_none() || evidence.identity.remote_build_id.is_none() {
+        return retrieve(pipeline).await;
+    }
+    let receipt = default_job_lease_directory()
+        .join(format!("{}.recover", evidence.identity.local_wrapper_id));
+    let started = tokio::time::Instant::now();
+    for attempt in 0..2 {
+        let (cancel, requested) = tokio::sync::watch::channel(false);
+        let controlled = pipeline.clone().with_retrieval_control(requested, started);
+        let result = {
+            let retrieval = retrieve(&controlled);
+            tokio::pin!(retrieval);
+            let mut poll = tokio::time::interval(Duration::from_millis(250));
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut retrieval => break Some(result),
+                    _ = poll.tick(), if attempt == 0 => {
+                        if consume_recovery_request(&receipt, &evidence.identity) {
+                            info!(wrapper_id = %evidence.identity.local_wrapper_id, "Interrupting artifact collection for same-job recovery");
+                            let _ = cancel.send(true);
+                            let result = retrieval.await;
+                            if result.as_ref().is_err_and(|error| error.is::<crate::transfer::RetrievalCancelled>()) {
+                                break None;
+                            }
+                            // A raced completion (or failure) is authoritative;
+                            // only acknowledged cancellation authorizes retry.
+                            break Some(result);
+                        }
+                    }
+                }
+            }
+        };
+        if let Some(result) = result {
+            return result;
+        }
+        info!(wrapper_id = %evidence.identity.local_wrapper_id, "Retrying artifact collection after receiver reaped; command not replayed");
+    }
+    unreachable!("second collection attempt cannot consume another request")
+}
+
+fn consume_recovery_request(path: &Path, identity: &JobIdentity) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    if serde_json::from_slice::<JobIdentity>(&bytes).ok().as_ref() != Some(identity) {
+        return false;
+    }
+    // Retain evidence and avoid overwriting any previous acknowledgment. The
+    // wrapper is the sole consumer; producers atomically write the same identity.
+    let consumed = path.with_extension(format!("recover-consumed-{}", uuid::Uuid::new_v4()));
+    match std::fs::rename(path, consumed) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(%error, "Could not consume same-job recovery request");
+            false
+        }
+    }
+}
+
 fn clean_overlay_cargo_policy_failure(
     root: &Path,
     worker: &str,
@@ -646,15 +722,7 @@ pub(super) async fn execute_remote_compilation(
     // overlapping primary projects that share a path dependency take the same
     // remote lock. Source-content and clean-overlay runs already own isolated
     // source roots and do not need this mutable-authority guard.
-    let mutable_source_authority_roots =
-        if exact_dependency_closure_sync && source_content_build_id.is_none() {
-            sync_plan
-                .iter()
-                .map(|entry| entry.remote_root.clone())
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+    let recovery_identity = uuid::Uuid::new_v4().simple().to_string();
     if let Some(proof_build_id) = source_content_build_id {
         let proof_base = format!(
             "{}/source-content-{}-{}",
@@ -843,39 +911,6 @@ pub(super) async fn execute_remote_compilation(
     )
     .await?;
 
-    // Hold every mutable source authority from before repo convergence and the
-    // first rsync until Cargo exits. A sync-only lock is insufficient: another
-    // invocation could otherwise replace a manifest or source file after
-    // preflight while rustc is still opening the closure.
-    let mut source_authority_lock = if mutable_source_authority_roots.is_empty()
-        || super::ssh::should_skip_remote_preflight(&worker_config)
-    {
-        None
-    } else {
-        reporter.verbose(&format!(
-            "[RCH] waiting for {} remote source-authority lock(s) on {}",
-            mutable_source_authority_roots.len(),
-            worker_config.id
-        ));
-        let guard = acquire_remote_source_authority_lock(
-            &worker_config,
-            &mutable_source_authority_roots,
-            command_timeout,
-        )
-        .await?;
-        reporter.verbose(&format!(
-            "[RCH] acquired remote source-authority locks on {}",
-            worker_config.id
-        ));
-        Some(guard)
-    };
-    // Best-effort repo convergence for ordinary multi-repo dependency graphs.
-    // A clean-overlay run already names an immutable base; mutating repositories
-    // behind that receipt would break the source identity guarantee.
-    if clean_overlay.is_none() {
-        maybe_sync_repo_set_with_repo_updater(&worker_config, &sync_roots, reporter).await;
-    }
-
     // Build transfer pipelines with color mode, command timeout, and compilation kind.
     // When the in-session watchdog is active it enforces the real build cap
     // remotely (same timeout_for_kind value). Give the local SSH stream a grace
@@ -937,6 +972,69 @@ pub(super) async fn execute_remote_compilation(
                 stable
             })
     };
+    let mut mutable_source_authority_roots: Vec<String> = sync_plan
+        .iter()
+        .map(|entry| entry.remote_root.clone())
+        .filter(|root| source_pair_pool.is_none() || Some(root) != overlay_remote_root.as_ref())
+        .collect();
+    if let Some(primary) = sync_plan.iter().find(|entry| entry.is_primary) {
+        mutable_source_authority_roots.push(pooled_target_dir_override.clone().unwrap_or_else(
+            || {
+                format!(
+                    "{}/{}",
+                    primary.remote_root,
+                    remote_cargo_target_dir_name_override
+                        .as_deref()
+                        .unwrap_or(".rch-target")
+                )
+            },
+        ));
+    }
+    mutable_source_authority_roots.sort();
+    mutable_source_authority_roots.dedup();
+    if worker_is_windows {
+        mutable_source_authority_roots.clear();
+    }
+    let mut source_authority_lock = if mutable_source_authority_roots.is_empty()
+        || super::ssh::should_skip_remote_preflight(&worker_config)
+    {
+        None
+    } else {
+        reporter.verbose(&format!(
+            "[RCH] waiting for {} remote source-authority lock(s) on {}",
+            mutable_source_authority_roots.len(),
+            worker_config.id
+        ));
+        let guard = acquire_remote_source_authority_lock(
+            &worker_config,
+            &mutable_source_authority_roots,
+            command_timeout,
+        )
+        .await?;
+        reporter.verbose(&format!(
+            "[RCH] acquired remote source-authority locks on {}",
+            worker_config.id
+        ));
+        Some(guard)
+    };
+    if !mutable_source_authority_roots.is_empty()
+        && !super::ssh::should_skip_remote_preflight(&worker_config)
+    {
+        recovery::claim_sources(
+            &worker_config,
+            &mutable_source_authority_roots,
+            &recovery_identity,
+        )
+        .await?;
+    }
+    // Hold source and output authorities through retrieval, not only execution.
+    // Best-effort repo convergence for ordinary multi-repo dependency graphs.
+    // A clean-overlay run already names an immutable base; mutating repositories
+    // behind that receipt would break the source identity guarantee.
+    if clean_overlay.is_none() {
+        maybe_sync_repo_set_with_repo_updater(&worker_config, &sync_roots, reporter).await;
+    }
+
     let mut primary_pipeline: Option<TransferPipeline> = None;
     let mut aggregate_sync_result: Option<SyncResult> = None;
     let mut prepared_source_roots: Vec<PreparedSourceContentRoot> = Vec::new();
@@ -1287,6 +1385,42 @@ pub(super) async fn execute_remote_compilation(
         })
         .transpose()?;
     let command = managed_overlay_command.as_deref().unwrap_or(command);
+    let mut recovery_session =
+        if !worker_is_windows && !super::ssh::should_skip_remote_preflight(&worker_config) {
+            durable_lease
+                .map(|writer| {
+                    recovery::RecoverySession::prepare(
+                        writer,
+                        &worker_config,
+                        &pipeline,
+                        mutable_source_authority_roots.clone(),
+                        source_pair_lock
+                            .as_ref()
+                            .and_then(|lock| lock.pair_token())
+                            .map(|token| {
+                                (
+                                    overlay_remote_root.clone().expect("paired root"),
+                                    token.to_owned(),
+                                )
+                            }),
+                        overlay_remote_root.clone(),
+                        transfer_config.clone(),
+                        normalized_project_root.clone(),
+                        forwarded_cargo_target_dir.as_deref(),
+                        kind,
+                        command,
+                        result_dirs,
+                        recovery_identity.clone(),
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+    let pipeline = match recovery_session.as_ref() {
+        Some(session) => session.completion_pipeline(pipeline),
+        None => pipeline,
+    };
     info!(
         "Sync complete: {} files, {} bytes in {}ms",
         sync_result.files_transferred, sync_result.bytes_transferred, sync_result.duration_ms
@@ -1520,12 +1654,18 @@ pub(super) async fn execute_remote_compilation(
         lock.ensure_execution_finished(result.exit_code)?;
     }
 
-    if let Some(lock) = source_authority_lock.take() {
-        lock.release().await?;
-        reporter.verbose(&format!(
-            "[RCH] released remote source-authority locks on {} after Cargo exit",
-            worker_config.id
-        ));
+    if let Some(session) = recovery_session.as_mut() {
+        let completed = pipeline
+            .read_recovery_completion(&worker_config)
+            .await?
+            .context(
+                "SSH exit has no exact durable completion evidence; use jobs recover, never replay",
+            )?;
+        anyhow::ensure!(
+            completed == result.exit_code,
+            "SSH status disagrees with durable completion"
+        );
+        session.completed(completed)?;
     }
 
     let stderr_capture = std::mem::take(&mut *stderr_capture_cell.borrow_mut());
@@ -1643,6 +1783,10 @@ pub(super) async fn execute_remote_compilation(
             forwarded_cargo_target_dir.is_some(),
         );
         if !artifact_patterns.is_empty() {
+            let retrieval_pipeline = match recovery_session.as_ref() {
+                Some(session) => session.staging_pipeline("project", &pipeline)?,
+                None => pipeline.clone(),
+            };
             info!("Retrieving build artifacts...");
             reporter.verbose("[RCH] artifacts: retrieving...");
             let heartbeat_state_download = heartbeat_loop
@@ -1658,23 +1802,37 @@ pub(super) async fn execute_remote_compilation(
                 None
             };
 
-            let retrieval = if let Some(progress) = &mut download_progress {
-                pipeline
-                    .retrieve_artifacts_streaming(&worker_config, &artifact_patterns, |line| {
-                        progress.update_from_line(line);
-                        if let Some(state) = heartbeat_state_download.as_ref() {
-                            mark_heartbeat_progress(state);
-                        }
-                    })
-                    .await
-            } else {
-                pipeline
-                    .retrieve_artifacts(&worker_config, &artifact_patterns)
-                    .await
-            };
+            let retrieval = retrieve_with_live_recovery(
+                &retrieval_pipeline,
+                durable_lease,
+                async |retrieval_pipeline| {
+                    if let Some(progress) = &mut download_progress {
+                        retrieval_pipeline
+                            .retrieve_artifacts_streaming(
+                                &worker_config,
+                                &artifact_patterns,
+                                |line| {
+                                    progress.update_from_line(line);
+                                    if let Some(state) = heartbeat_state_download.as_ref() {
+                                        mark_heartbeat_progress(state);
+                                    }
+                                },
+                            )
+                            .await
+                    } else {
+                        retrieval_pipeline
+                            .retrieve_artifacts(&worker_config, &artifact_patterns)
+                            .await
+                    }
+                },
+            )
+            .await;
 
             match retrieval {
                 Ok(artifact_result) => {
+                    if let Some(session) = recovery_session.as_mut() {
+                        session.publish("project")?;
+                    }
                     info!(
                         "Artifacts retrieved: {} files, {} bytes in {}ms",
                         artifact_result.stats.files_transferred,
@@ -1780,6 +1938,10 @@ pub(super) async fn execute_remote_compilation(
                 .with_compilation_kind(kind)
                 .with_remote_path_override(remote_target_path.clone())
                 .with_worker_platform(WorkerPlatform::from_worker(&worker_config));
+                let target_pipeline = match recovery_session.as_ref() {
+                    Some(session) => session.staging_pipeline("target", &target_pipeline)?,
+                    None => target_pipeline,
+                };
 
                 let mut target_progress = if progress_enabled {
                     Some(TransferProgress::download(
@@ -1791,26 +1953,40 @@ pub(super) async fn execute_remote_compilation(
                     None
                 };
 
-                let target_retrieval = if let Some(progress) = &mut target_progress {
-                    let heartbeat_state_target = heartbeat_loop
-                        .as_ref()
-                        .map(BuildHeartbeatLoop::shared_state);
-                    target_pipeline
-                        .retrieve_artifacts_streaming(&worker_config, &custom_patterns, |line| {
-                            progress.update_from_line(line);
-                            if let Some(state) = heartbeat_state_target.as_ref() {
-                                mark_heartbeat_progress(state);
-                            }
-                        })
-                        .await
-                } else {
-                    target_pipeline
-                        .retrieve_artifacts(&worker_config, &custom_patterns)
-                        .await
-                };
+                let target_retrieval = retrieve_with_live_recovery(
+                    &target_pipeline,
+                    durable_lease,
+                    async |target_pipeline| {
+                        if let Some(progress) = &mut target_progress {
+                            let heartbeat_state_target = heartbeat_loop
+                                .as_ref()
+                                .map(BuildHeartbeatLoop::shared_state);
+                            target_pipeline
+                                .retrieve_artifacts_streaming(
+                                    &worker_config,
+                                    &custom_patterns,
+                                    |line| {
+                                        progress.update_from_line(line);
+                                        if let Some(state) = heartbeat_state_target.as_ref() {
+                                            mark_heartbeat_progress(state);
+                                        }
+                                    },
+                                )
+                                .await
+                        } else {
+                            target_pipeline
+                                .retrieve_artifacts(&worker_config, &custom_patterns)
+                                .await
+                        }
+                    },
+                )
+                .await;
 
                 match target_retrieval {
                     Ok(target_result) => {
+                        if let Some(session) = recovery_session.as_mut() {
+                            session.publish("target")?;
+                        }
                         info!(
                             "Custom CARGO_TARGET_DIR artifacts retrieved: {} files, {} bytes in {}ms",
                             target_result.stats.files_transferred,
@@ -1883,8 +2059,26 @@ pub(super) async fn execute_remote_compilation(
             loop_ref.flush().await;
         }
         for dir in result_dirs {
-            match pipeline.retrieve_result_dir(&worker_config, dir).await {
+            let phase_name = format!("result:{}", dir.display());
+            let result_pipeline = match recovery_session.as_ref() {
+                Some(session) => session.staging_pipeline(&phase_name, &pipeline)?,
+                None => pipeline.clone(),
+            };
+            match retrieve_with_live_recovery(
+                &result_pipeline,
+                durable_lease,
+                async |result_pipeline| {
+                    result_pipeline
+                        .retrieve_result_dir(&worker_config, dir)
+                        .await
+                },
+            )
+            .await
+            {
                 Ok(retrieved) => {
+                    if let Some(session) = recovery_session.as_mut() {
+                        session.publish(&phase_name)?;
+                    }
                     reporter.verbose(&format!(
                         "[RCH] result dir '{}': {} files, {} bytes",
                         dir.display(),
@@ -2181,6 +2375,10 @@ pub(super) async fn execute_remote_compilation(
     } else {
         result.exit_code
     };
+    let retrieval_complete = !artifacts_failed && result_dir_failures.is_empty();
+    if retrieval_complete && let Some(session) = recovery_session.as_mut() {
+        session.returned(exit_code)?;
+    }
 
     // bd-p1vlb: an unpooled clean-overlay root is invocation-unique (a job nonce is
     // hashed into it) and holds a full materialized snapshot; once artifacts
@@ -2188,7 +2386,7 @@ pub(super) async fn execute_remote_compilation(
     // on the worker's staging base. Best-effort reap: failures only log —
     // residue is caught by periodic `rch cache clean --base` sweeps — and
     // never affect the surfaced exit code.
-    if let Some(overlay_remote_root) = overlay_remote_root.as_deref() {
+    if retrieval_complete && let Some(overlay_remote_root) = overlay_remote_root.as_deref() {
         if let Some(lock) = source_pair_lock.as_mut() {
             lock.ensure_held()?;
         }
@@ -2205,10 +2403,13 @@ pub(super) async fn execute_remote_compilation(
             ),
         }
     }
-    if let Some(lock) = source_pair_lock.take() {
+    if retrieval_complete && let Some(lock) = source_pair_lock.take() {
         // The explicit acknowledgment also verifies that the root is gone.
         // Never release this lease from an error/Drop path: a remote process
         // or transfer may still be alive after its client disconnects.
+        lock.release().await?;
+    }
+    if let Some(lock) = source_authority_lock.take() {
         lock.release().await?;
     }
 

@@ -462,10 +462,12 @@ fn read_binary_identity(path: &Path) -> Option<BinaryIdentity> {
     }
     let header = &header[..filled];
     let format = classify_binary_format(header)?;
-    let architectures = elf_cpu_architecture(header).map(|cpu| vec![cpu]).or_else(|| {
-        let len = file.metadata().ok()?.len();
-        artifact_identity::architectures(&mut file, format, header, len)
-    });
+    let architectures = elf_cpu_architecture(header)
+        .map(|cpu| vec![cpu])
+        .or_else(|| {
+            let len = file.metadata().ok()?.len();
+            artifact_identity::architectures(&mut file, format, header, len)
+        });
     Some(BinaryIdentity {
         format,
         architectures,
@@ -783,11 +785,7 @@ mod tests {
     }
 
     fn elf_header(machine: u16, class: u8, little_endian: bool) -> Vec<u8> {
-        let (size, size_offset) = if class == 1 {
-            (52, 40)
-        } else {
-            (64, 52)
-        };
+        let (size, size_offset) = if class == 1 { (52, 40) } else { (64, 52) };
         let mut header = vec![0; size];
         header[..4].copy_from_slice(b"\x7fELF");
         header[4] = class;
@@ -826,12 +824,9 @@ mod tests {
                 );
             }
         }
-        for (machine, class, little_endian) in [
-            (0, 2, true),
-            (65535, 2, true),
-            (3, 2, true),
-            (62, 2, false),
-        ] {
+        for (machine, class, little_endian) in
+            [(0, 2, true), (65535, 2, true), (3, 2, true), (62, 2, false)]
+        {
             assert_eq!(
                 elf_cpu_architecture(&elf_header(machine, class, little_endian)),
                 None

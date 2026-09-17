@@ -1282,12 +1282,48 @@ fn now_unix_ms() -> u64 {
 /// scan can distinguish an acknowledged terminal command from an uncertain
 /// dead wrapper.
 #[derive(Clone)]
-struct DurableLeaseWriter {
+pub(crate) struct DurableLeaseWriter {
     path: PathBuf,
     lease: Arc<Mutex<DurableJobLease>>,
 }
 
 impl DurableLeaseWriter {
+    pub(crate) fn load(wrapper_id: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            wrapper_id.starts_with("rchw-") && uuid::Uuid::parse_str(&wrapper_id[5..]).is_ok(),
+            "invalid wrapper identity"
+        );
+        let path = durable_lease_path(wrapper_id);
+        let lease: DurableJobLease = serde_json::from_slice(&std::fs::read(&path)?)?;
+        anyhow::ensure!(
+            lease.schema_version == 1 && lease.identity.local_wrapper_id == wrapper_id,
+            "durable lease identity or schema mismatch"
+        );
+        Ok(Self {
+            path,
+            lease: Arc::new(Mutex::new(lease)),
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> DurableJobLease {
+        self.lease.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub(crate) fn set_recovery(&self, recovery: serde_json::Value) -> anyhow::Result<()> {
+        self.lease
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .recovery = Some(recovery);
+        self.persist()
+    }
+
+    pub(crate) fn record_exit(&self, exit_code: i32) -> anyhow::Result<()> {
+        self.lease
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .exit_code = Some(exit_code);
+        self.persist()
+    }
     fn create(
         command: &str,
         strict_remote: bool,
@@ -1338,7 +1374,7 @@ impl DurableLeaseWriter {
         self.persist()
     }
 
-    fn heartbeat(&self, phase: &str) -> anyhow::Result<()> {
+    pub(crate) fn heartbeat(&self, phase: &str) -> anyhow::Result<()> {
         {
             let mut lease = self
                 .lease
@@ -1349,12 +1385,26 @@ impl DurableLeaseWriter {
         self.persist()
     }
 
-    fn acknowledge_terminal(&self) -> anyhow::Result<()> {
+    /// A terminal acknowledgement requires observed delivery completion: the
+    /// exact command result is recorded, no validated retrieval recipe is
+    /// outstanding (or it reports fully-returned outputs), and no later
+    /// heartbeats are expected. Refuses to fake completion otherwise.
+    pub(crate) fn acknowledge_terminal(&self) -> anyhow::Result<()> {
         {
             let mut lease = self
                 .lease
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(recovery) = lease.recovery.as_ref()
+                && recovery
+                    .get("returned")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_none()
+            {
+                anyhow::bail!(
+                    "durable retrieval evidence is incomplete; terminal acknowledgement refused (state stays recoverable)"
+                );
+            }
             lease.acknowledge_terminal(now_unix_ms());
         }
         self.persist()
@@ -2909,6 +2959,7 @@ pub async fn run_exec(
                 None,
                 None,
                 None,
+                Some(&wrapper_id),
             )
             .await;
             if let Err(error) = release {
@@ -2922,10 +2973,26 @@ pub async fn run_exec(
                 worker.id
             );
         };
-        durable_lease
-            .admit(remote_build_id, &worker.id)
-            .context("persist admitted durable job lease")?;
-
+        if let Err(error) = durable_lease.admit(remote_build_id, &worker.id) {
+            let warning = rch_common::job_recovery::diagnose_stuck_wrapper(
+                &durable_lease.snapshot().identity,
+                &rch_common::job_recovery::WrapperState::waiting(
+                    rch_common::job_identity::JobLifecycleState::Queued,
+                )
+                .reservation_failed(),
+            );
+            eprintln!("{}", serde_json::to_string(&warning)?);
+            release_worker(&config.general.socket_path, &worker.id, estimated_cores,
+                Some(remote_build_id), Some(EXIT_BUILD_ERROR), None, None, None, Some(&wrapper_id)).await
+                .context("reservation release failed after durable admission failure; command was not executed")?;
+            exit_with_gated_local_fallback(
+                &command,
+                &reporter,
+                &format!("durable reservation persistence failed: {error}"),
+                require_remote || job,
+                allow_local_fallback,
+            );
+        }
         if !selected_worker_is_requested(&worker.id, &current_query_preferred) {
             let requested = current_query_preferred
                 .iter()
@@ -2949,6 +3016,7 @@ pub async fn run_exec(
                 None,
                 None,
                 None,
+                Some(&wrapper_id),
             )
             .await
             .err();
@@ -3048,6 +3116,7 @@ pub async fn run_exec(
             None,
             None,
             release_timing.as_ref(),
+            Some(&wrapper_id),
         )
         .await
         {
@@ -3057,6 +3126,9 @@ pub async fn run_exec(
                 false
             }
         };
+        if let Ok(result) = result.as_ref() {
+            durable_lease.record_exit(result.exit_code)?;
+        }
 
         // Classify the outcome. Terminal cases (success, real build/test failure,
         // preflight/transfer-skip decisions, SSH-timeout fail-closed) exit here;
@@ -3667,6 +3739,7 @@ mod progress_reporting;
 // unqualified.
 mod transfer_orchestration;
 use transfer_orchestration::execute_remote_compilation;
+pub(crate) use transfer_orchestration::recovery::recover_job;
 
 // Exact source-byte manifest construction and worker-side re-verification for
 // `rch exec --source-content-receipt` proof runs.
@@ -4136,6 +4209,7 @@ async fn handle_selection_response(
         None,
         None,
         release_timing.as_ref(),
+        None,
     )
     .await
     {

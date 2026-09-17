@@ -313,6 +313,7 @@ mod tests {
         );
         package(&b, "selected_b", "");
         package(&dep, "external_dep", "");
+        assert_eq!(a.join("../../../dep").canonicalize().unwrap(), dep);
         let reporter = HookReporter::new(OutputVisibility::None);
         for (name, selected, external) in [("a", &a, true), ("b", &b, false)] {
             let command =

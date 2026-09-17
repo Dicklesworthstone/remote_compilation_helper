@@ -143,7 +143,9 @@ fn fat_macho_cpus<R: Read + Seek>(
             || end > file_len
             || size < 28
             || offset % alignment_bytes != 0
-            || ranges.iter().any(|&(start, stop)| offset < stop && start < end)
+            || ranges
+                .iter()
+                .any(|&(start, stop)| offset < stop && start < end)
         {
             return None;
         }
@@ -170,11 +172,7 @@ fn fat_macho_cpus<R: Read + Seek>(
 /// Native PE images only: the DOS magic alone says nothing about CPU or even
 /// whether a COFF image header is present. Check the PE signature, machine,
 /// optional-header class and declared header spans before accepting evidence.
-fn pe_cpu<R: Read + Seek>(
-    reader: &mut R,
-    prefix: &[u8],
-    file_len: u64,
-) -> Option<CpuArchitecture> {
+fn pe_cpu<R: Read + Seek>(reader: &mut R, prefix: &[u8], file_len: u64) -> Option<CpuArchitecture> {
     let dos = prefix.get(..64)?;
     if dos.get(..2)? != b"MZ" {
         return None;
@@ -200,7 +198,10 @@ fn pe_cpu<R: Read + Seek>(
     if section_end > file_len {
         return None;
     }
-    let magic = header_u16(&read_at::<2, _>(reader, optional_offset, optional_end)?, true)?;
+    let magic = header_u16(
+        &read_at::<2, _>(reader, optional_offset, optional_end)?,
+        true,
+    )?;
     let (cpu, fixed_len) = match (header_u16(&coff[4..], true)?, magic) {
         (0x014c, 0x010b) => (CpuArchitecture::X86, 96),
         (0x8664, 0x020b) => (CpuArchitecture::X86_64, 112),
@@ -212,11 +213,7 @@ fn pe_cpu<R: Read + Seek>(
     };
     let mut optional = [0; 112];
     if fixed_len == 96 {
-        optional[..96].copy_from_slice(&read_at::<96, _>(
-            reader,
-            optional_offset,
-            optional_end,
-        )?);
+        optional[..96].copy_from_slice(&read_at::<96, _>(reader, optional_offset, optional_end)?);
     } else {
         optional = read_at::<112, _>(reader, optional_offset, optional_end)?;
     }
@@ -364,8 +361,8 @@ mod tests {
         for (offset, value) in [
             (4, u32::MAX),    // count cannot drive an allocation
             (8, 0x0100_000c), // table CPU disagrees with its actual slice
-            (32, 64),        // invalid alignment exponent
-            (36, 1),         // reserved fat_arch_64 field
+            (32, 64),         // invalid alignment exponent
+            (36, 1),          // reserved fat_arch_64 field
         ] {
             let mut image = original.clone();
             image[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
@@ -453,15 +450,26 @@ mod tests {
             for image in [thin(0x0100_0007), fat(&[0x0100_0007], false, false)] {
                 std::fs::write(&path, image).unwrap();
                 let findings = foreign_target_artifacts(
-                    &root, &[relative.into()], custom, "aarch64-apple-darwin", None,
+                    &root,
+                    &[relative.into()],
+                    custom,
+                    "aarch64-apple-darwin",
+                    None,
                 );
                 assert_eq!(findings.len(), 1);
                 assert!(describe_findings(&findings).contains("Mach-O; CPU x86_64"));
             }
             std::fs::write(&path, fat(&[0x0100_0007, 0x0100_000c], true, false)).unwrap();
-            assert!(foreign_target_artifacts(
-                &root, &[relative.into()], custom, "aarch64-apple-darwin", None,
-            ).is_empty());
+            assert!(
+                foreign_target_artifacts(
+                    &root,
+                    &[relative.into()],
+                    custom,
+                    "aarch64-apple-darwin",
+                    None,
+                )
+                .is_empty()
+            );
         }
         let triple = "aarch64-apple-darwin";
         let requested = format!("target/{triple}/release/app");

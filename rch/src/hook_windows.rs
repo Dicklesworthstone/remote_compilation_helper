@@ -126,6 +126,7 @@ pub(crate) async fn release_worker(
     _duration_ms: Option<u64>,
     _bytes_transferred: Option<u64>,
     _timing: Option<&CommandTimingBreakdown>,
+    _local_wrapper_id: Option<&str>,
 ) -> anyhow::Result<()> {
     Ok(())
 }
