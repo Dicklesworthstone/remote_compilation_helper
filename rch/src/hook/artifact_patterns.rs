@@ -542,3 +542,191 @@ pub(super) fn sync_back_verified_zero_build_outputs(
         .iter()
         .any(|path| retrieved_path_is_build_output(path, custom_target_sync))
 }
+
+#[cfg(test)]
+mod profile_artifact_tests {
+    use super::*;
+
+    #[test]
+    fn cargo_profile_artifacts_use_wrapped_profile_for_includes_and_cache_excludes() {
+        for kind in [
+            CompilationKind::CargoBuild,
+            CompilationKind::CargoDoc,
+            CompilationKind::CargoZigbuild,
+        ] {
+            for command in [
+                "env -- cargo build --profile release-perf",
+                "/usr/bin/time -f cargo -- cargo build --profile release-perf",
+                "rustup run nightly cargo build --config --profile=decoy --profile release-perf",
+            ] {
+                let project = get_artifact_patterns(Some(kind), Some(command));
+                for include in ["target/release-perf/**", "target/*/release-perf/**"] {
+                    assert!(
+                        project.iter().any(|pattern| pattern == include),
+                        "{command}: {project:?}"
+                    );
+                }
+                let custom = get_custom_target_artifact_patterns(Some(kind), Some(command));
+                for include in ["release-perf/**", "*/release-perf/**"] {
+                    assert!(
+                        custom.iter().any(|pattern| pattern == include),
+                        "{command}: {custom:?}"
+                    );
+                }
+                let first_include = custom
+                    .iter()
+                    .position(|pattern| !pattern.starts_with("- "))
+                    .unwrap();
+                for exclude in custom_profile_cache_excludes("release-perf") {
+                    assert!(
+                        custom.iter().position(|pattern| pattern == &exclude).unwrap() < first_include,
+                        "profile cache exclusion must precede every output include"
+                    );
+                }
+                assert!(custom.iter().all(|pattern| !pattern.contains("decoy")));
+                assert!(
+                    get_project_artifact_patterns(Some(kind), Some(command), true)
+                        .iter()
+                        .all(|pattern| !pattern.starts_with("target/")),
+                    "custom-target forwarding must not re-enable stale project-root retrieval"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_profile_artifacts_keep_passthrough_and_stream_only_policies_unchanged() {
+        let build = Some(CompilationKind::CargoBuild);
+        for command in [
+            "env -- cargo run -- --profile release-perf",
+            "cargo build --config --profile=decoy",
+            "env -- cargo build --profile=release",
+        ] {
+            assert_eq!(
+                get_artifact_patterns(build, Some(command)),
+                get_artifact_patterns(build, None)
+            );
+            assert_eq!(
+                get_custom_target_artifact_patterns(build, Some(command)),
+                get_custom_target_artifact_patterns(build, None)
+            );
+        }
+        for kind in [
+            CompilationKind::CargoTest,
+            CompilationKind::CargoCheck,
+            CompilationKind::CargoClippy,
+            CompilationKind::CargoNextest,
+            CompilationKind::CargoBench,
+        ] {
+            let command = Some("env -- cargo test --profile release-perf");
+            assert_eq!(
+                get_artifact_patterns(Some(kind), command),
+                get_artifact_patterns(Some(kind), None)
+            );
+            assert_eq!(
+                get_custom_target_artifact_patterns(Some(kind), command),
+                get_custom_target_artifact_patterns(Some(kind), None)
+            );
+        }
+        // A stale DEFAULT-profile output is still an output. The zero-output
+        // guard cannot rescue a missing custom-profile include on a warm tree.
+        assert!(!sync_back_verified_zero_build_outputs(
+            &["debug/application".to_owned()],
+            Some(1),
+            build,
+            true,
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cargo_profile_artifacts_real_rsync_refreshes_custom_outputs_without_cache_or_source_overwrite() {
+        use std::path::Path;
+        use std::process::Stdio;
+        use std::time::Duration;
+        use tokio::process::Command;
+
+        let root = tempfile::tempdir().unwrap().keep();
+        for (index, prefix) in ["release-perf", "aarch64-unknown-linux-gnu/release-perf"]
+            .iter()
+            .enumerate()
+        {
+            let source = root.join(format!("source-{index}"));
+            let destination = root.join(format!("destination-{index}"));
+            let relative = Path::new(prefix).join("application");
+            for base in [&source, &destination] {
+                std::fs::create_dir_all(base.join(prefix)).unwrap();
+            }
+            std::fs::create_dir_all(source.join("debug")).unwrap();
+            std::fs::write(source.join("debug/application"), b"older default-profile output\n")
+                .unwrap();
+            std::fs::write(source.join(&relative), b"fresh requested custom-profile output\n")
+                .unwrap();
+            std::fs::write(destination.join(&relative), b"stale local custom-profile output\n")
+                .unwrap();
+            std::fs::write(source.join("source.rs"), b"foreign source\n").unwrap();
+            std::fs::write(destination.join("source.rs"), b"local source sentinel\n").unwrap();
+            for cache in ["incremental", ".fingerprint", "build"] {
+                std::fs::create_dir_all(source.join(prefix).join(cache)).unwrap();
+                std::fs::write(source.join(prefix).join(cache).join("cache"), b"must stay remote\n")
+                    .unwrap();
+            }
+            std::fs::write(source.join(prefix).join("application.d"), b"must stay remote\n")
+                .unwrap();
+
+            // Drive real rsync from the PRODUCTION profile-aware pattern list,
+            // not a replacement parser or hand-authored profile include.
+            let patterns = get_custom_target_artifact_patterns(
+                Some(CompilationKind::CargoBuild),
+                Some("env -- /usr/bin/time -f cargo -- cargo build --profile release-perf"),
+            );
+            let mut command = Command::new("rsync");
+            command.args([
+                "-a",
+                "--checksum",
+                "--no-owner",
+                "--no-group",
+                "--safe-links",
+                "--prune-empty-dirs",
+            ]);
+            for pattern in &patterns {
+                if let Some(exclude) = pattern.strip_prefix("- ") {
+                    command.arg(format!("--exclude={exclude}"));
+                }
+            }
+            command.arg("--include=*/");
+            for pattern in &patterns {
+                if !pattern.starts_with("- ") {
+                    command.arg(format!("--include=/{pattern}"));
+                }
+            }
+            command
+                .arg("--exclude=*")
+                .arg(format!("{}/", source.display()))
+                .arg(format!("{}/", destination.display()))
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+                .await
+                .expect("owned local rsync fixture exceeded its deadline")
+                .expect("rsync must be installed to run the artifact-transfer regression");
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                std::fs::read(destination.join(&relative)).unwrap(),
+                b"fresh requested custom-profile output\n",
+                "successful sync left the requested artifact stale for {prefix}"
+            );
+            assert_eq!(
+                std::fs::read(destination.join("source.rs")).unwrap(),
+                b"local source sentinel\n"
+            );
+            for cache in ["incremental", ".fingerprint", "build"] {
+                assert!(
+                    !destination.join(prefix).join(cache).exists(),
+                    "copied {prefix}/{cache}"
+                );
+            }
+            assert!(!destination.join(prefix).join("application.d").exists());
+        }
+    }
+}

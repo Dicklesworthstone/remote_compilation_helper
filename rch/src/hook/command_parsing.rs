@@ -227,10 +227,107 @@ pub(super) fn has_ignored_only_flag(command: &str) -> bool {
 }
 
 /// Check if the command has the --exact flag for exact test name matching.
-///
-/// Exact matching typically results in running a single test.
 pub(super) fn has_exact_flag(command: &str) -> bool {
     tokenize_command(command).iter().any(|t| t == "--exact")
+}
+
+/// Locate Cargo without treating a wrapper's option value as the executable.
+/// Wrapper `--` belongs to that wrapper, not to Cargo's argument passthrough.
+/// Keep this platform-neutral: both hook backends use the profile analyzer.
+fn cargo_profile_tokens(command: &str) -> Option<(Vec<String>, usize)> {
+    let tokens = shell_words::split(command).ok()?;
+    let assignment = |word: &str| {
+        word.split_once('=')
+            .is_some_and(|(key, _)| rch_common::ssh_utils::is_valid_env_key(key))
+    };
+    let mut index = 0;
+    loop {
+        while tokens.get(index).is_some_and(|word| assignment(word)) {
+            index += 1;
+        }
+        let executable = Path::new(tokens.get(index)?)
+            .file_name()?
+            .to_str()?;
+        match executable {
+            "cargo" | "cargo.exe" | "cargo-zigbuild" | "cargo-zigbuild.exe"
+            | "cargo-xwin" | "cargo-xwin.exe" => return Some((tokens, index)),
+            "env" | "time" => {
+                let is_env = executable == "env";
+                index += 1;
+                while let Some(word) = tokens.get(index) {
+                    if word == "--" {
+                        index += 1;
+                        break;
+                    }
+                    let takes_value = if is_env {
+                        matches!(word.as_str(), "-u" | "--unset" | "-C" | "--chdir")
+                    } else {
+                        matches!(word.as_str(), "-f" | "--format" | "-o" | "--output")
+                    };
+                    if takes_value {
+                        tokens.get(index + 1)?;
+                        index += 2;
+                        continue;
+                    }
+                    let flag = if is_env {
+                        matches!(word.as_str(), "-i" | "--ignore-environment" | "--debug")
+                            || word.starts_with("--unset=")
+                            || word.starts_with("--chdir=")
+                            || word.starts_with("-u") && word.len() > 2
+                            || word.starts_with("-C") && word.len() > 2
+                    } else {
+                        matches!(
+                            word.as_str(),
+                            "-p" | "--portability" | "-v" | "--verbose" | "-a"
+                                | "--append" | "-q" | "--quiet"
+                        ) || word.starts_with("--format=")
+                            || word.starts_with("--output=")
+                            || word.starts_with("-f") && word.len() > 2
+                            || word.starts_with("-o") && word.len() > 2
+                    };
+                    if flag {
+                        index += 1;
+                    } else if word.starts_with('-') {
+                        // In particular env -S reparses its payload; it is not
+                        // an unchanged Cargo argv suffix we can inspect here.
+                        return None;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "rustup" => {
+                if tokens.get(index + 1)?.as_str() != "run" {
+                    return None;
+                }
+                index += 2;
+                if tokens.get(index).is_some_and(|word| word == "--install") {
+                    index += 1;
+                }
+                if tokens.get(index).is_some_and(|word| word == "--") {
+                    index += 1;
+                }
+                let channel = tokens.get(index)?;
+                if channel.is_empty() || channel.starts_with('-') {
+                    return None;
+                }
+                index += 1;
+            }
+            _ => {
+                // Reuse the classifier for its other wrappers (nice, timeout,
+                // taskset, ...), but only when it identifies an unchanged argv
+                // suffix. Never search arbitrary argument values for "cargo".
+                let remaining = shell_words::join(&tokens[index..]);
+                let normalized = rch_common::patterns::normalize_command(&remaining);
+                let suffix = shell_words::split(&normalized).ok()?;
+                let start = tokens.len().checked_sub(suffix.len())?;
+                if suffix.is_empty() || start <= index || tokens[start + 1..] != suffix[1..] {
+                    return None;
+                }
+                index = start;
+            }
+        }
+    }
 }
 
 /// Resolve the output-directory name cargo will use for the `--profile <name>`
@@ -246,55 +343,49 @@ pub(super) fn has_exact_flag(command: &str) -> bool {
 /// no `bench/` directory — both reuse the covered dirs.) So:
 ///
 /// - `cargo build`, `--release`, `-r`, `--profile dev|test|release|bench`
-///   → `None` (output dir already covered by `target/{debug,release}/**`).
-/// - `--profile release-perf` (any custom name) → `Some("release-perf")`.
+///   → `None` (output dir already covered by default patterns).
+/// - `cargo build --profile release-perf` → `Some("release-perf")`.
 ///
-/// Without this, a custom-profile remote build syncs back only the loose
-/// target-root metadata files (`.rustc_info.json`, `CACHEDIR.TAG`) while the
-/// real binary stays on the worker — the local binary silently goes STALE
-/// even though the build "succeeded" (bd-mpbav).
-///
-/// Only tokens BEFORE a bare `--` are considered: after `--`, arguments go to
-/// the test/bench binary, not cargo (e.g. `cargo test -- --profile x` must
-/// not be misread as a cargo profile). The value is validated as a plain
-/// profile name (`[A-Za-z0-9._-]+`) because it is interpolated into rsync
-/// include/exclude patterns — anything path-like or glob-like is rejected
-/// (cargo itself would reject it too).
+/// Wrappers and their option values are skipped before inspecting Cargo's
+/// arguments. Only Cargo's own `--` ends the scan. Values of other Cargo
+/// options cannot masquerade as a profile selector. Profile names are plain
+/// path components, never rsync patterns or traversal components.
 pub(super) fn cargo_custom_profile_output_dir(command: &str) -> Option<String> {
-    let tokens = tokenize_command(command);
-    let mut iter = tokens.iter().peekable();
+    let (tokens, cargo_index) = cargo_profile_tokens(command)?;
+    let mut iter = tokens[cargo_index + 1..].iter();
     while let Some(token) = iter.next() {
-        // End of cargo's own arguments: everything past `--` belongs to the
-        // executed test/bench binary, never to cargo.
         if token == "--" {
             break;
         }
         let value = if token == "--profile" {
-            // `--profile <name>`: the profile name is the next token.
-            iter.next().cloned()?
+            iter.next()?.as_str()
         } else if let Some(name) = token.strip_prefix("--profile=") {
-            // `--profile=<name>` single-token form.
-            name.to_string()
+            name
         } else {
+            // These values are opaque even if they look like --profile=P or
+            // --. Joined options already keep their value in the same token.
+            if matches!(
+                token.as_str(),
+                "--config" | "--target" | "--target-dir" | "--manifest-path"
+                    | "--lockfile-path" | "--package" | "-p" | "--exclude"
+                    | "--features" | "-F" | "--bin" | "--example" | "--test"
+                    | "--bench" | "--color" | "--message-format" | "--jobs"
+                    | "-j" | "-Z" | "-C" | "--artifact-dir" | "--out-dir"
+            ) {
+                iter.next()?;
+            }
             continue;
         };
-        // Built-in profiles reuse the already-covered dirs (see doc comment):
-        // dev/test → debug, release/bench → release.
-        if matches!(value.as_str(), "dev" | "test" | "release" | "bench") {
+        if matches!(value, "dev" | "test" | "release" | "bench") {
             return None;
         }
-        // A custom profile name doubles as the output directory name. Restrict
-        // to cargo's profile-name charset so the value can never smuggle a
-        // path traversal or rsync wildcard into the artifact patterns.
         let is_plain_profile_name = !value.is_empty()
+            && !matches!(value, "." | "..")
+            && !value.starts_with('-')
             && value
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
-        return if is_plain_profile_name {
-            Some(value)
-        } else {
-            None
-        };
+        return is_plain_profile_name.then(|| value.to_string());
     }
     None
 }
@@ -513,4 +604,89 @@ pub(crate) fn extract_project_name_with_policy(policy: &PathTopologyPolicy) -> S
     let short_hash = &hash[..8];
 
     format!("{}-{}", name, short_hash)
+}
+
+#[cfg(test)]
+mod cargo_profile_tests {
+    use super::cargo_custom_profile_output_dir;
+
+    #[test]
+    fn cargo_profile_boundaries_skip_wrappers_without_losing_the_selected_output_tree() {
+        for command in [
+            "env -- cargo build --profile release-perf",
+            "env -- KEY=value /usr/bin/cargo +nightly build --profile=release-perf",
+            "env -u --profile=wrong -- cargo build --profile release-perf",
+            "env -C 'directory with spaces' -- cargo build --profile release-perf",
+            "/usr/bin/time -f cargo -- cargo build --profile release-perf",
+            "/usr/bin/time --format=--profile=wrong -- cargo build --profile release-perf",
+            "env -- /usr/bin/time -f '--profile=wrong' -- rustup run nightly cargo build --profile release-perf",
+            "rustup run --install nightly cargo build --profile release-perf",
+            "nice -n 10 env -- cargo build --profile release-perf",
+            "timeout 60 env -- cargo build --profile release-perf",
+            "env -- cargo-zigbuild zigbuild --profile release-perf --target aarch64-unknown-linux-gnu",
+            "env -- cargo-xwin build --profile release-perf",
+        ] {
+            assert_eq!(
+                cargo_custom_profile_output_dir(command).as_deref(),
+                Some("release-perf"),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_profile_boundaries_ignore_other_option_values_and_program_arguments() {
+        for option in [
+            "--config", "--target", "--target-dir", "--manifest-path",
+            "--package", "-p", "--exclude", "--features", "-F", "--bin",
+            "--example", "--test", "--bench", "--color", "--message-format",
+            "--jobs", "-j", "-Z", "-C", "--lockfile-path", "--artifact-dir",
+            "--out-dir",
+        ] {
+            let command = format!(
+                "env -- cargo build {option} --profile=decoy --profile release-perf"
+            );
+            assert_eq!(
+                cargo_custom_profile_output_dir(&command).as_deref(),
+                Some("release-perf"),
+                "{command}"
+            );
+            assert_eq!(
+                cargo_custom_profile_output_dir(&format!(
+                    "cargo build {option} --profile=decoy"
+                )),
+                None,
+                "{option} value is not a profile selector"
+            );
+        }
+        for command in [
+            "env -- cargo run -- --profile release-perf",
+            "rustup run nightly cargo test -- --profile=release-perf",
+            "cargo build --config=--profile=decoy",
+            "env -- print-args cargo build --profile release-perf",
+            "printf '%s' 'cargo build --profile release-perf'",
+        ] {
+            assert_eq!(cargo_custom_profile_output_dir(command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn cargo_profile_boundaries_preserve_literals_and_refuse_pattern_or_path_components() {
+        for profile in ["dev", "test", "release", "bench", "", ".", "..", "../peer", "a/b", "a*b", "a?b", "[ab]", "--", "-bad", "a\\b"] {
+            let command = shell_words::join(["cargo", "build", "--profile", profile]);
+            assert_eq!(cargo_custom_profile_output_dir(&command), None, "{profile:?}");
+        }
+        for command in [
+            "cargo build --profile",
+            "cargo build --profile=",
+            "cargo build --profile 'unterminated",
+            "cargo build --profile 'release\\-perf'",
+        ] {
+            assert_eq!(cargo_custom_profile_output_dir(command), None, "{command}");
+        }
+        assert_eq!(
+            cargo_custom_profile_output_dir("cargo build --profile 'release-perf.v2'").as_deref(),
+            Some("release-perf.v2")
+        );
+    }
 }
