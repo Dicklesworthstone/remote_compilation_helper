@@ -4,6 +4,8 @@
 //! deterministic cleanup (slots, history, events), and per-worker
 //! cancellation debt for reliability integration.
 
+mod batch;
+
 use crate::DaemonContext;
 use crate::api::{CancelAllBuildsResponse, CancelBuildResponse, CancelledBuildInfo};
 use crate::events::EventBus;
@@ -264,6 +266,8 @@ pub struct CancellationOrchestrator {
     active: Arc<Mutex<HashMap<u64, CancellationRecord>>>,
     /// Per-worker cancellation debt tracking.
     worker_stats: Arc<RwLock<HashMap<String, WorkerCancelStats>>>,
+    /// Bound bulk work across concurrent requests and orchestrator clones.
+    bulk_permits: Arc<tokio::sync::Semaphore>,
     /// Event bus for structured event emission.
     events: EventBus,
 }
@@ -291,6 +295,7 @@ impl CancellationOrchestrator {
             config,
             active: Arc::new(Mutex::new(HashMap::new())),
             worker_stats: Arc::new(RwLock::new(HashMap::new())),
+            bulk_permits: Arc::new(tokio::sync::Semaphore::new(batch::MAX_BULK_CANCELLATIONS)),
             events,
         }
     }
@@ -452,67 +457,14 @@ impl CancellationOrchestrator {
         }
     }
 
-    /// Cancel all active builds, counting only confirmed cancellations.
+    /// Cancel the current snapshot with bounded, daemon-owned concurrency.
+    /// Caller interruption does not abandon later builds in the snapshot.
     pub async fn cancel_all_builds(
         &self,
         ctx: &DaemonContext,
         force: bool,
     ) -> CancelAllBuildsResponse {
-        let active_builds = ctx.history.active_builds();
-
-        if active_builds.is_empty() {
-            return CancelAllBuildsResponse {
-                status: "ok".to_string(),
-                cancelled_count: 0,
-                cancelled: vec![],
-                message: Some("No active builds to cancel".to_string()),
-            };
-        }
-
-        let mut cancelled = Vec::with_capacity(active_builds.len());
-        let mut unconfirmed = Vec::new();
-
-        for build in active_builds {
-            let resp = self
-                .cancel_build(ctx, build.id, CancelReason::User, force)
-                .await;
-            if resp.status == "cancelled" {
-                cancelled.push(CancelledBuildInfo {
-                    build_id: resp.build_id,
-                    worker_id: resp.worker_id.clone().unwrap_or_default(),
-                    project_id: resp.project_id.clone().unwrap_or_default(),
-                    slots_released: resp.slots_released,
-                });
-            } else {
-                unconfirmed.push(resp.build_id);
-            }
-        }
-
-        let cancelled_count = cancelled.len();
-        let status = if unconfirmed.is_empty() {
-            "ok"
-        } else if cancelled.is_empty() {
-            "failed"
-        } else {
-            "partial"
-        };
-
-        CancelAllBuildsResponse {
-            status: status.to_string(),
-            cancelled_count,
-            cancelled,
-            message: Some(format!(
-                "{} build(s) {}; {} cancellation(s) unconfirmed: {:?}",
-                cancelled_count,
-                if force {
-                    "forcefully terminated"
-                } else {
-                    "cancelled"
-                },
-                unconfirmed.len(),
-                unconfirmed,
-            )),
-        }
+        batch::cancel_all_builds(self, ctx, force).await
     }
 
     /// One budget bounds all termination stages, including lock waits and force.
@@ -1042,11 +994,11 @@ mod tests {
         assert_eq!(duration_millis_u64(Duration::from_secs(u64::MAX)), u64::MAX);
     }
 
-    fn test_events() -> EventBus {
+    pub(super) fn test_events() -> EventBus {
         EventBus::new(64)
     }
 
-    fn test_config() -> CancellationConfig {
+    pub(super) fn test_config() -> CancellationConfig {
         CancellationConfig {
             grace_period: Duration::from_millis(100),
             kill_timeout: Duration::from_millis(50),
@@ -1088,7 +1040,7 @@ mod tests {
         trigger
     }
 
-    fn make_test_context(pool: WorkerPool, history: Arc<BuildHistory>) -> DaemonContext {
+    pub(super) fn make_test_context(pool: WorkerPool, history: Arc<BuildHistory>) -> DaemonContext {
         let events = test_events();
         DaemonContext {
             pool: pool.clone(),
