@@ -12,7 +12,7 @@ description = "RABS edge + coordinator daemon (combined deployment; roles, autho
 publish = false
 
 [lib]
-doctest = false
+doctest = true
 
 # Daemon crate: composes the domain crates and (via rabs-asupersync) the
 # runtime. The edge/coord role split is structural (src/edge.rs, src/coord.rs)

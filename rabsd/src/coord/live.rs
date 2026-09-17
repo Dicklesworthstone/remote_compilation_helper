@@ -695,6 +695,79 @@ impl Drop for ActionDispatch<'_> {
     }
 }
 
+/// Subscriber capability for an edge attached to this coordinator.
+///
+/// Clones share the authoritative registry; they cannot claim execution or
+/// publish results. This is an in-process capability boundary, not a remote
+/// authentication protocol. Materialization still uses coordinator-owned state.
+///
+/// ```compile_fail,E0599
+/// use rabsd::coord::live::EdgeSubscriber;
+/// fn dispatch(edge: EdgeSubscriber) {
+///     edge.next_action_dispatch();
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use rabsd::coord::live::EdgeSubscriber;
+/// fn publish(edge: EdgeSubscriber) {
+///     let _publish = EdgeSubscriber::commit_offer;
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct EdgeSubscriber {
+    coord: Arc<CoordLive>,
+}
+
+impl EdgeSubscriber {
+    pub fn submit_action(
+        &self,
+        input: ActionSubmission,
+        request: JoinRequest,
+        now_unix_micros: i64,
+        clock_epoch: u64,
+    ) -> Result<SubmissionReceipt, SubmissionRefusal> {
+        self.coord
+            .submit_action(input, request, now_unix_micros, clock_epoch)
+    }
+
+    pub fn serve_action(
+        &self,
+        action_key: &TypedDigest,
+        destination_root: &Path,
+        expected: &ExpectedOutputs,
+        now_unix_micros: i64,
+        now_epoch: u64,
+    ) -> Result<ServeOutcome, ServeError> {
+        self.coord.serve_action(
+            action_key,
+            destination_root,
+            expected,
+            now_unix_micros,
+            now_epoch,
+        )
+    }
+
+    #[must_use]
+    pub fn available(&self) -> bool {
+        self.coord.available()
+    }
+
+    #[must_use]
+    pub fn status_json(&self) -> String {
+        self.coord.status_json()
+    }
+
+    #[must_use]
+    pub fn begin_flight(&self, key: &str) -> FlightRole {
+        self.coord.begin_flight(key)
+    }
+
+    pub fn end_flight(&self, key: &str) {
+        self.coord.end_flight(key);
+    }
+}
+
 /// The live coordinator state shared edge↔coord in-process.
 #[derive(Default)]
 pub struct CoordLive {
@@ -751,6 +824,14 @@ fn boot_micros() -> u64 {
 }
 
 impl CoordLive {
+    /// Mint an edge capability without transferring coordinator ownership.
+    #[must_use]
+    pub fn edge_subscriber(self: &Arc<Self>) -> EdgeSubscriber {
+        EdgeSubscriber {
+            coord: Arc::clone(self),
+        }
+    }
+
     /// New, with no store (unavailable until the coord region marks
     /// itself up). Commits refuse with [`CommitRefusal::NoStore`].
     #[must_use]

@@ -1,0 +1,289 @@
+{
+  "schema_version": "br.doctor.schema_migration.applied.v1",
+  "run_id": "20260917T051954.222850Z-360604-0",
+  "database_path": "/data/projects/remote_compilation_helper/.beads/beads.db",
+  "plan_token": "d619b13a1f21ffd66d403ea2310a3d2c60076efeb6787a76fd1e27425cc82da5",
+  "prepared_receipt_sha256": "52442e172ca7f336de38ed198f297364274a07bc76854e6fc4ec68abcc96aeaa",
+  "marked_at": "2026-09-17T05:19:54.254217110+00:00",
+  "forecast": {
+    "from_version": 17,
+    "to_version": 19,
+    "content_hash_rows_rebuilt": 0,
+    "gate_result_history_created": false,
+    "prerequisites_column_added": true,
+    "dependency_type_key_added": true,
+    "post_migration_maintenance": true
+  },
+  "effects": {
+    "from_version": 17,
+    "to_version": 19,
+    "content_hash_rows_rebuilt": 0,
+    "gate_result_history_created": false,
+    "prerequisites_column_added": true,
+    "dependency_type_key_added": true,
+    "post_migration_maintenance_completed": true
+  },
+  "raw_before": {
+    "components": [
+      {
+        "suffix": "",
+        "present": true,
+        "length": 15220736,
+        "sha256": "87587237a48cb42d21e2d047ef5d73be2bb80a2d7ef06b7d29a6c81269fcd386",
+        "unix_mode": 33152
+      },
+      {
+        "suffix": "-wal",
+        "present": true,
+        "length": 32,
+        "sha256": "fa4a8d7b64d77ec92993fcd1db643359297837ea79e33a371ee1eda000f88b3c",
+        "unix_mode": 33204
+      },
+      {
+        "suffix": "-shm",
+        "present": true,
+        "length": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+        "unix_mode": 33204
+      },
+      {
+        "suffix": "-journal",
+        "present": false,
+        "length": null,
+        "sha256": null,
+        "unix_mode": null
+      }
+    ]
+  },
+  "logical_before": {
+    "user_version": 17,
+    "integrity_check": "ok",
+    "schema_sha256": "e339d05116c473695936cdb829fe368eeb71bc89cb94c7d2a9470f6f64fa3102",
+    "contents_sha256": "75a435aba123b19954d43e789bcc3db7b803a53a9e00f61ef951770dec41e9fe",
+    "tables": [
+      {
+        "name": "blocked_issues_cache",
+        "row_count": 120,
+        "rows_sha256": "e1b41de4ffa1cbc1afbc608f161076502db85e49ad2950faf61a1151a88e53ec"
+      },
+      {
+        "name": "capacity_exemption_history",
+        "row_count": 0,
+        "rows_sha256": "093b079b9c2a552c936ecb3e31471049f83bf52d3bd9fd2a3c21733d9cd125c1"
+      },
+      {
+        "name": "capacity_exemptions",
+        "row_count": 0,
+        "rows_sha256": "fbda7353fb3baafd599889c90557842a503be99c1dcb186eca832ad2794cb7b4"
+      },
+      {
+        "name": "capacity_occupancy",
+        "row_count": 46,
+        "rows_sha256": "237d8a8b5579c86e8a902032b806879f945a1a8420e4d3ce1ec1941c2d83caad"
+      },
+      {
+        "name": "child_counters",
+        "row_count": 72,
+        "rows_sha256": "49ffd860272f94d80aa4da9d9b591b5579c02b7cc10b521d2875144d5b65acfb"
+      },
+      {
+        "name": "close_metadata",
+        "row_count": 0,
+        "rows_sha256": "fd96e66f70122d836c45823be36b8d96be0a7423a9149ec2dd05f16c4263d31f"
+      },
+      {
+        "name": "comments",
+        "row_count": 897,
+        "rows_sha256": "89f224f8839cee5c5d469733a8595a3379b5e914a28600fc0b3742cf2f2346e9"
+      },
+      {
+        "name": "config",
+        "row_count": 1,
+        "rows_sha256": "7d7d586788e2aa3c9bad2d421571a4cb9834d6a6996437259b506731702ae1fc"
+      },
+      {
+        "name": "dependencies",
+        "row_count": 3598,
+        "rows_sha256": "f5d0c20453d01b0877288e81bff6b8a83d89ec1f6fd06f93cd3554ea3e010170"
+      },
+      {
+        "name": "dirty_issues",
+        "row_count": 0,
+        "rows_sha256": "cc278c69726f5a1f8dcdb479e985171f764ae8c4d8d41b8280826baf1b1be1ba"
+      },
+      {
+        "name": "events",
+        "row_count": 1093,
+        "rows_sha256": "f7137bce58eab0f71e8f656fd8ee5d2a2bead32292072eebe0a2abc81bf2d7dd"
+      },
+      {
+        "name": "export_hashes",
+        "row_count": 2068,
+        "rows_sha256": "e6767340a6a2846f0f8d78be792f886978902973ef21bcc0d9bda1d252c03c6f"
+      },
+      {
+        "name": "gate_result_history",
+        "row_count": 0,
+        "rows_sha256": "ade6edf42bcd9c1b088917fba2152530722844ee57e6447eafe84fd20f177162"
+      },
+      {
+        "name": "gate_results",
+        "row_count": 0,
+        "rows_sha256": "a360c72db907c2936d5c05af4e653445922cc0355d2a23543f62c22716ab7f3a"
+      },
+      {
+        "name": "issues",
+        "row_count": 2068,
+        "rows_sha256": "13c5e8dae731fcd99038ef38e70a92401679d0d4d61750d37bd2497eaa4fc18a"
+      },
+      {
+        "name": "labels",
+        "row_count": 3632,
+        "rows_sha256": "0d001ab25264b2209e33b26b418e05f13c59dc0cdc4b9929b5e63a229a5c0d4b"
+      },
+      {
+        "name": "metadata",
+        "row_count": 10,
+        "rows_sha256": "79b3d897d07fd2e7a56c3b0f4778f9e709e14795eb3797b84f9df50c8f2675f8"
+      },
+      {
+        "name": "sqlite_sequence",
+        "row_count": 2,
+        "rows_sha256": "4f4c3fca2a8474d63bb9fdd8b96ddd835930f7364c648b65a71fd6836f88e1a0"
+      }
+    ]
+  },
+  "raw_after": {
+    "components": [
+      {
+        "suffix": "",
+        "present": true,
+        "length": 37220352,
+        "sha256": "9d5581a71dfa9682d7ac77497d6575bc86e318abbc04ebbd8f5497a666b70e7e",
+        "unix_mode": 33152
+      },
+      {
+        "suffix": "-wal",
+        "present": false,
+        "length": null,
+        "sha256": null,
+        "unix_mode": null
+      },
+      {
+        "suffix": "-shm",
+        "present": false,
+        "length": null,
+        "sha256": null,
+        "unix_mode": null
+      },
+      {
+        "suffix": "-journal",
+        "present": false,
+        "length": null,
+        "sha256": null,
+        "unix_mode": null
+      }
+    ]
+  },
+  "logical_after": {
+    "user_version": 19,
+    "integrity_check": "ok",
+    "schema_sha256": "ebe4bda57cbb0ad571a9c3af51a1a13b7d3a7c8f73de00af5aff844c2999f227",
+    "contents_sha256": "f66939784591d9ec66783de4e292fdf8299ee479294dbacb20bc214edbee74fa",
+    "tables": [
+      {
+        "name": "blocked_issues_cache",
+        "row_count": 120,
+        "rows_sha256": "e1b41de4ffa1cbc1afbc608f161076502db85e49ad2950faf61a1151a88e53ec"
+      },
+      {
+        "name": "capacity_exemption_history",
+        "row_count": 0,
+        "rows_sha256": "093b079b9c2a552c936ecb3e31471049f83bf52d3bd9fd2a3c21733d9cd125c1"
+      },
+      {
+        "name": "capacity_exemptions",
+        "row_count": 0,
+        "rows_sha256": "fbda7353fb3baafd599889c90557842a503be99c1dcb186eca832ad2794cb7b4"
+      },
+      {
+        "name": "capacity_occupancy",
+        "row_count": 46,
+        "rows_sha256": "237d8a8b5579c86e8a902032b806879f945a1a8420e4d3ce1ec1941c2d83caad"
+      },
+      {
+        "name": "child_counters",
+        "row_count": 72,
+        "rows_sha256": "49ffd860272f94d80aa4da9d9b591b5579c02b7cc10b521d2875144d5b65acfb"
+      },
+      {
+        "name": "close_metadata",
+        "row_count": 0,
+        "rows_sha256": "fd96e66f70122d836c45823be36b8d96be0a7423a9149ec2dd05f16c4263d31f"
+      },
+      {
+        "name": "comments",
+        "row_count": 897,
+        "rows_sha256": "89f224f8839cee5c5d469733a8595a3379b5e914a28600fc0b3742cf2f2346e9"
+      },
+      {
+        "name": "config",
+        "row_count": 1,
+        "rows_sha256": "7d7d586788e2aa3c9bad2d421571a4cb9834d6a6996437259b506731702ae1fc"
+      },
+      {
+        "name": "dependencies",
+        "row_count": 3598,
+        "rows_sha256": "f5d0c20453d01b0877288e81bff6b8a83d89ec1f6fd06f93cd3554ea3e010170"
+      },
+      {
+        "name": "dirty_issues",
+        "row_count": 0,
+        "rows_sha256": "cc278c69726f5a1f8dcdb479e985171f764ae8c4d8d41b8280826baf1b1be1ba"
+      },
+      {
+        "name": "events",
+        "row_count": 1093,
+        "rows_sha256": "f7137bce58eab0f71e8f656fd8ee5d2a2bead32292072eebe0a2abc81bf2d7dd"
+      },
+      {
+        "name": "export_hashes",
+        "row_count": 2068,
+        "rows_sha256": "e6767340a6a2846f0f8d78be792f886978902973ef21bcc0d9bda1d252c03c6f"
+      },
+      {
+        "name": "gate_result_history",
+        "row_count": 0,
+        "rows_sha256": "ade6edf42bcd9c1b088917fba2152530722844ee57e6447eafe84fd20f177162"
+      },
+      {
+        "name": "gate_results",
+        "row_count": 0,
+        "rows_sha256": "a360c72db907c2936d5c05af4e653445922cc0355d2a23543f62c22716ab7f3a"
+      },
+      {
+        "name": "issues",
+        "row_count": 2068,
+        "rows_sha256": "64f672a11d71e1183863eb97fcc7a1d57ef0448294b9e3e963cf77e92e63d0b5"
+      },
+      {
+        "name": "labels",
+        "row_count": 3632,
+        "rows_sha256": "0d001ab25264b2209e33b26b418e05f13c59dc0cdc4b9929b5e63a229a5c0d4b"
+      },
+      {
+        "name": "metadata",
+        "row_count": 10,
+        "rows_sha256": "79b3d897d07fd2e7a56c3b0f4778f9e709e14795eb3797b84f9df50c8f2675f8"
+      },
+      {
+        "name": "sqlite_sequence",
+        "row_count": 2,
+        "rows_sha256": "4f4c3fca2a8474d63bb9fdd8b96ddd835930f7364c648b65a71fd6836f88e1a0"
+      }
+    ]
+  },
+  "attested": true,
+  "attestation_errors": [],
+  "undo_command": "br doctor migrate-schema undo 20260917T051954.222850Z-360604-0"
+}

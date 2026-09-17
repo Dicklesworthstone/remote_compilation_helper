@@ -11,11 +11,11 @@
 //! **evidence-only**, mirroring the fail-open philosophy of the sibling
 //! zero-output gate (`artifact_patterns::sync_back_verified_zero_build_outputs`):
 //! it fires solely when a retrieved file's own leading bytes prove it is an
-//! executable container that cannot run on the requesting host, and declines
-//! whenever the evidence is partial (unrecognized triple, unreadable file,
+//! executable container or CPU architecture different from the requested target,
+//! and declines whenever the evidence is partial (unrecognized triple, unreadable file,
 //! unknown magic).
 //!
-//! # Scope: unpinned builds only
+//! # Scope: requested target outputs only
 //!
 //! When the command carries an explicit `--target <triple>`, cargo writes the
 //! cross output under `target/<triple>/<profile>/` while *host* tooling —
@@ -35,6 +35,10 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+
+// File-format decoding stays separate from retrieval scope and failure policy.
+#[path = "artifact_identity.rs"]
+mod artifact_identity;
 
 /// How many retrieved files the gate is willing to open. A `target/debug/deps`
 /// tree can hold thousands of files; the mismatch this gate exists to catch is
@@ -73,6 +77,114 @@ impl BinaryFormat {
 
 /// Bytes of leading header the classifier needs.
 const MAGIC_LEN: usize = 4;
+
+/// Enough for an ELF64 header. Never read a whole executable into memory.
+const HEADER_LEN: usize = 64;
+
+/// CPU families for which the target and header encodings are unambiguous.
+/// This is not an ISA-extension, OS ABI, or dynamic-loader compatibility check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpuArchitecture {
+    X86,
+    X86_64,
+    X86_64X32,
+    Arm,
+    ArmBe,
+    Aarch64,
+    Aarch64Be,
+}
+
+impl CpuArchitecture {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::X86 => "x86",
+            Self::X86_64 => "x86_64",
+            Self::X86_64X32 => "x86_64 (x32 ABI)",
+            Self::Arm => "arm",
+            Self::ArmBe => "arm (big-endian)",
+            Self::Aarch64 => "aarch64",
+            Self::Aarch64Be => "aarch64 (big-endian)",
+        }
+    }
+}
+
+fn expected_cpu_architecture(triple: &str) -> Option<CpuArchitecture> {
+    let triple = triple.to_ascii_lowercase();
+    match triple.split('-').next()? {
+        "x86_64" if triple.ends_with("-gnux32") => Some(CpuArchitecture::X86_64X32),
+        "x86_64" | "x86_64h" => Some(CpuArchitecture::X86_64),
+        "i386" | "i486" | "i586" | "i686" => Some(CpuArchitecture::X86),
+        "aarch64" | "arm64e" => Some(CpuArchitecture::Aarch64),
+        "aarch64_be" => Some(CpuArchitecture::Aarch64Be),
+        "arm" | "armv4t" | "armv5te" | "armv6" | "armv7" | "armv7a" | "thumbv7neon" => {
+            Some(CpuArchitecture::Arm)
+        }
+        "armeb" | "armebv7r" => Some(CpuArchitecture::ArmBe),
+        _ => None,
+    }
+}
+
+fn header_u16(bytes: &[u8], little_endian: bool) -> Option<u16> {
+    let bytes = bytes.get(..2)?.try_into().ok()?;
+    Some(if little_endian {
+        u16::from_le_bytes(bytes)
+    } else {
+        u16::from_be_bytes(bytes)
+    })
+}
+
+fn header_u32(bytes: &[u8], little_endian: bool) -> Option<u32> {
+    let bytes = bytes.get(..4)?.try_into().ok()?;
+    Some(if little_endian {
+        u32::from_le_bytes(bytes)
+    } else {
+        u32::from_be_bytes(bytes)
+    })
+}
+
+/// Decode only complete executable/shared-object ELF headers with known CPU,
+/// class, and byte order. A truncated or inconsistent header is not positive
+/// evidence of an architecture mismatch. ELF magic alone still proves format.
+fn elf_cpu_architecture(header: &[u8]) -> Option<CpuArchitecture> {
+    if classify_binary_format(header)? != BinaryFormat::Elf {
+        return None;
+    }
+    let (size, size_offset) = match header.get(4)? {
+        1 => (52, 40),
+        2 => (64, 52),
+        _ => return None,
+    };
+    let header = header.get(..size)?;
+    let little_endian = match header[5] {
+        1 => true,
+        2 => false,
+        _ => return None,
+    };
+    if header[6] != 1
+        || header_u32(&header[20..], little_endian)? != 1
+        || usize::from(header_u16(&header[size_offset..], little_endian)?) != size
+        || !matches!(header_u16(&header[16..], little_endian)?, 2 | 3)
+    {
+        return None;
+    }
+    let machine = header_u16(&header[18..], little_endian)?;
+    match (machine, header[4], little_endian) {
+        (3, 1, true) => Some(CpuArchitecture::X86),
+        (62, 2, true) => Some(CpuArchitecture::X86_64),
+        (62, 1, true) => Some(CpuArchitecture::X86_64X32),
+        (40, 1, true) => Some(CpuArchitecture::Arm),
+        (40, 1, false) => Some(CpuArchitecture::ArmBe),
+        (183, 2, true) => Some(CpuArchitecture::Aarch64),
+        (183, 2, false) => Some(CpuArchitecture::Aarch64Be),
+        _ => None,
+    }
+}
+
+struct BinaryIdentity {
+    format: BinaryFormat,
+    /// None means architecture evidence is unavailable, not an empty CPU set.
+    architectures: Option<Vec<CpuArchitecture>>,
+}
 
 /// Identify an executable container from its leading bytes.
 ///
@@ -259,13 +371,15 @@ fn in_scope_output_path<'a>(
     Some(rel)
 }
 
-/// One retrieved file whose container format cannot run on the requesting host.
+/// One retrieved file whose format or CPU differs from the requested target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ForeignArtifact {
     /// Path as it appeared in the retrieval manifest (relative to the sync root).
     pub(super) path: String,
     /// The container format actually found in the file.
     pub(super) found: BinaryFormat,
+    /// Present only for a proven same-format CPU mismatch.
+    architecture: Option<String>,
 }
 
 /// Inspect a successful retrieval's manifest and report every file that is
@@ -288,6 +402,7 @@ pub(super) fn foreign_target_artifacts(
     let Some(expected) = expected_binary_format(expected_triple) else {
         return Vec::new();
     };
+    let expected_cpu = expected_cpu_architecture(expected_triple);
     let mut findings = Vec::new();
     let mut inspected = 0usize;
     for path in manifest {
@@ -303,13 +418,29 @@ pub(super) fn foreign_target_artifacts(
         // default-root phase (so the path keeps its `target/` prefix) or the
         // local target dir for a forwarded `CARGO_TARGET_DIR`.
         let full = local_base.join(path);
-        let Some(found) = read_binary_format(&full) else {
+        let Some(identity) = read_binary_identity(&full) else {
             continue;
         };
+        let found = identity.format;
         if found != expected {
             findings.push(ForeignArtifact {
                 path: path.clone(),
                 found,
+                architecture: None,
+            });
+        } else if let (Some(expected_cpu), Some(cpus)) = (expected_cpu, identity.architectures)
+            && !cpus.is_empty()
+            && !cpus.contains(&expected_cpu)
+        {
+            findings.push(ForeignArtifact {
+                path: path.clone(),
+                found,
+                architecture: Some(
+                    cpus.iter()
+                        .map(|cpu| cpu.label())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
             });
         }
     }
@@ -317,11 +448,11 @@ pub(super) fn foreign_target_artifacts(
 }
 
 /// Read just enough of a file to classify it. Any I/O error is "no evidence".
-fn read_binary_format(path: &Path) -> Option<BinaryFormat> {
+fn read_binary_identity(path: &Path) -> Option<BinaryIdentity> {
     let mut file = File::open(path).ok()?;
-    let mut header = [0u8; MAGIC_LEN];
+    let mut header = [0u8; HEADER_LEN];
     let mut filled = 0usize;
-    while filled < MAGIC_LEN {
+    while filled < header.len() {
         match file.read(&mut header[filled..]) {
             Ok(0) => break,
             Ok(n) => filled += n,
@@ -329,14 +460,26 @@ fn read_binary_format(path: &Path) -> Option<BinaryFormat> {
             Err(_) => return None,
         }
     }
-    classify_binary_format(&header[..filled])
+    let header = &header[..filled];
+    let format = classify_binary_format(header)?;
+    let architectures = elf_cpu_architecture(header).map(|cpu| vec![cpu]).or_else(|| {
+        let len = file.metadata().ok()?.len();
+        artifact_identity::architectures(&mut file, format, header, len)
+    });
+    Some(BinaryIdentity {
+        format,
+        architectures,
+    })
 }
 
 /// Render the operator-facing detail for a set of findings.
 pub(super) fn describe_findings(findings: &[ForeignArtifact]) -> String {
     findings
         .iter()
-        .map(|f| format!("{} ({})", f.path, f.found.label()))
+        .map(|f| match &f.architecture {
+            Some(cpu) => format!("{} ({}; CPU {cpu})", f.path, f.found.label()),
+            None => format!("{} ({})", f.path, f.found.label()),
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -518,6 +661,7 @@ mod tests {
             vec![ForeignArtifact {
                 path: "target/release/arch-repro".to_string(),
                 found: BinaryFormat::Elf,
+                architecture: None,
             }]
         );
         assert_eq!(
@@ -636,5 +780,169 @@ mod tests {
         let findings =
             foreign_target_artifacts(dir.path(), &manifest, false, "aarch64-apple-darwin", None);
         assert_eq!(findings.len(), MAX_FINDINGS_REPORTED);
+    }
+
+    fn elf_header(machine: u16, class: u8, little_endian: bool) -> Vec<u8> {
+        let (size, size_offset) = if class == 1 {
+            (52, 40)
+        } else {
+            (64, 52)
+        };
+        let mut header = vec![0; size];
+        header[..4].copy_from_slice(b"\x7fELF");
+        header[4] = class;
+        header[5] = if little_endian { 1 } else { 2 };
+        header[6] = 1;
+        for (offset, value) in [(16, 2_u16), (18, machine), (size_offset, size as u16)] {
+            let bytes = if little_endian {
+                value.to_le_bytes()
+            } else {
+                value.to_be_bytes()
+            };
+            header[offset..offset + 2].copy_from_slice(&bytes);
+        }
+        header[if little_endian { 20 } else { 23 }] = 1;
+        header
+    }
+
+    #[test]
+    fn elf_cpu_decodes_complete_headers_and_refuses_inconclusive_evidence() {
+        for (machine, class, little_endian, expected) in [
+            (3, 1, true, CpuArchitecture::X86),
+            (62, 2, true, CpuArchitecture::X86_64),
+            (62, 1, true, CpuArchitecture::X86_64X32),
+            (40, 1, true, CpuArchitecture::Arm),
+            (40, 1, false, CpuArchitecture::ArmBe),
+            (183, 2, true, CpuArchitecture::Aarch64),
+            (183, 2, false, CpuArchitecture::Aarch64Be),
+        ] {
+            let header = elf_header(machine, class, little_endian);
+            assert_eq!(elf_cpu_architecture(&header), Some(expected));
+            for length in 0..header.len() {
+                assert_eq!(
+                    elf_cpu_architecture(&header[..length]),
+                    None,
+                    "length {length}"
+                );
+            }
+        }
+        for (machine, class, little_endian) in [
+            (0, 2, true),
+            (65535, 2, true),
+            (3, 2, true),
+            (62, 2, false),
+        ] {
+            assert_eq!(
+                elf_cpu_architecture(&elf_header(machine, class, little_endian)),
+                None
+            );
+        }
+        for (offset, value) in [(4, 0), (5, 0), (6, 0), (16, 1), (20, 0), (52, 0)] {
+            let mut header = elf_header(62, 2, true);
+            header[offset] = value;
+            assert_eq!(
+                elf_cpu_architecture(&header),
+                None,
+                "invalid field at {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_format_cpu_mismatch_is_reported_in_both_retrieval_bases() {
+        let dir = TempDir::new().unwrap();
+        for (custom, path) in [(false, "target/release/app"), (true, "release/app")] {
+            for (machine, expected, found) in [
+                (62, "aarch64-unknown-linux-gnu", "x86_64"),
+                (183, "x86_64-unknown-linux-gnu", "aarch64"),
+            ] {
+                let header = elf_header(machine, 2, true);
+                // Negative control: the previous four-byte-only gate accepts
+                // this incompatible executable because both sides are ELF.
+                assert_eq!(
+                    classify_binary_format(&header),
+                    expected_binary_format(expected)
+                );
+                write_file(dir.path(), path, &header);
+                let findings =
+                    foreign_target_artifacts(dir.path(), &[path.into()], custom, expected, None);
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].architecture.as_deref(), Some(found));
+                assert_eq!(
+                    describe_findings(&findings),
+                    format!("{path} (ELF; CPU {found})")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_gate_preserves_pinned_cross_build_scope_and_native_outputs() {
+        let dir = TempDir::new().unwrap();
+        let triple = "aarch64-unknown-linux-gnu";
+        let requested = format!("target/{triple}/release/app");
+        let host_macro = "target/release/deps/libmacro.so";
+        let cache = format!("target/{triple}/release/build/worker-helper");
+        write_file(dir.path(), &requested, &elf_header(183, 2, true));
+        write_file(dir.path(), host_macro, &elf_header(62, 2, true));
+        write_file(dir.path(), &cache, &elf_header(62, 2, true));
+        let manifest = vec![requested.clone(), host_macro.into(), cache];
+        assert!(
+            foreign_target_artifacts(dir.path(), &manifest, false, triple, Some(triple)).is_empty()
+        );
+        write_file(dir.path(), &requested, &elf_header(62, 2, true));
+        let findings = foreign_target_artifacts(dir.path(), &manifest, false, triple, Some(triple));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].path, requested);
+        // An unpinned host build must not inspect residue from a cross build.
+        assert!(
+            foreign_target_artifacts(
+                dir.path(),
+                &manifest,
+                false,
+                "x86_64-unknown-linux-gnu",
+                None,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn cpu_gate_keeps_unknown_architectures_and_short_headers_fail_open() {
+        let dir = TempDir::new().unwrap();
+        let path = "release/app";
+        for bytes in [ELF.to_vec(), elf_header(0, 2, true)] {
+            write_file(dir.path(), path, &bytes);
+            assert!(
+                foreign_target_artifacts(
+                    dir.path(),
+                    &[path.into()],
+                    true,
+                    "aarch64-unknown-linux-gnu",
+                    None,
+                )
+                .is_empty()
+            );
+        }
+        write_file(dir.path(), path, &elf_header(62, 2, true));
+        assert!(
+            foreign_target_artifacts(
+                dir.path(),
+                &[path.into()],
+                true,
+                "unknown-unknown-linux-gnu",
+                None,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            expected_cpu_architecture("x86_64-unknown-linux-gnux32"),
+            Some(CpuArchitecture::X86_64X32)
+        );
+        assert_eq!(
+            expected_cpu_architecture("aarch64_be-unknown-linux-gnu"),
+            Some(CpuArchitecture::Aarch64Be)
+        );
+        assert_eq!(expected_cpu_architecture("aarch64_32-apple-watchos"), None);
     }
 }

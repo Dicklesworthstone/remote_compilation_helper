@@ -1,0 +1,139 @@
+{
+  "schema_version": "br.doctor.schema_migration.prepared.v1",
+  "run_id": "20260910T190811.394034Z-2121324-0",
+  "database_path": "/data/projects/remote_compilation_helper/.beads/beads.db",
+  "plan_token": "a43c22de37abee4bfe21584cd14639fd1177dd86ed9965825bc8ee61e9290395",
+  "marked_at": "2026-09-10T19:08:11.441503546+00:00",
+  "forecast": {
+    "from_version": 16,
+    "to_version": 17,
+    "content_hash_rows_rebuilt": 0,
+    "gate_result_history_created": false,
+    "post_migration_maintenance": true
+  },
+  "raw_before": {
+    "components": [
+      {
+        "suffix": "",
+        "present": true,
+        "length": 22958080,
+        "sha256": "904e570c6455eec5aa2dbe8bc928dc34a6efec77b9dd687383ae9b19f38b77de",
+        "unix_mode": 33152
+      },
+      {
+        "suffix": "-wal",
+        "present": true,
+        "length": 32,
+        "sha256": "f08d4fd673a4eabe21015bd40d71fe662c2bc93e4d31645fc5c9a7d0f9b321f4",
+        "unix_mode": 33152
+      },
+      {
+        "suffix": "-shm",
+        "present": true,
+        "length": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+        "unix_mode": 33152
+      },
+      {
+        "suffix": "-journal",
+        "present": false,
+        "length": null,
+        "sha256": null,
+        "unix_mode": null
+      }
+    ]
+  },
+  "logical_before": {
+    "user_version": 16,
+    "integrity_check": "ok",
+    "schema_sha256": "d030d7d749a786cc72df856bc2393e85f81f1a099ecbb51aa5ae58c3a5d80d76",
+    "contents_sha256": "06d40f67aa0de1cddf559a0c8c71e39cc91bf980fc96e92ca37b4e1f938530ce",
+    "tables": [
+      {
+        "name": "blocked_issues_cache",
+        "row_count": 245,
+        "rows_sha256": "a86b68ef7a93fb328935ae3c7fed2eaf967cf20983fc95f766c811b838da8db0"
+      },
+      {
+        "name": "capacity_exemption_history",
+        "row_count": 0,
+        "rows_sha256": "093b079b9c2a552c936ecb3e31471049f83bf52d3bd9fd2a3c21733d9cd125c1"
+      },
+      {
+        "name": "capacity_exemptions",
+        "row_count": 0,
+        "rows_sha256": "fbda7353fb3baafd599889c90557842a503be99c1dcb186eca832ad2794cb7b4"
+      },
+      {
+        "name": "child_counters",
+        "row_count": 71,
+        "rows_sha256": "6eb39f5cfb4bfb0c2d1eb672c74d03e818cfdf2903754a8915b364d570612a77"
+      },
+      {
+        "name": "close_metadata",
+        "row_count": 0,
+        "rows_sha256": "fd96e66f70122d836c45823be36b8d96be0a7423a9149ec2dd05f16c4263d31f"
+      },
+      {
+        "name": "comments",
+        "row_count": 602,
+        "rows_sha256": "75dcb7da62db664097c1136089ce2492f43799f7b10fd44e7d162412539b507e"
+      },
+      {
+        "name": "config",
+        "row_count": 1,
+        "rows_sha256": "7d7d586788e2aa3c9bad2d421571a4cb9834d6a6996437259b506731702ae1fc"
+      },
+      {
+        "name": "dependencies",
+        "row_count": 3541,
+        "rows_sha256": "e30b901d41f1347d8c6578feaaf97b17cebdd697d3882a5e02d8c247168d6ce3"
+      },
+      {
+        "name": "dirty_issues",
+        "row_count": 0,
+        "rows_sha256": "cc278c69726f5a1f8dcdb479e985171f764ae8c4d8d41b8280826baf1b1be1ba"
+      },
+      {
+        "name": "events",
+        "row_count": 693,
+        "rows_sha256": "05792426224500f893c868020d730241c9b316c02f6e979956bc44ae81fdaf3c"
+      },
+      {
+        "name": "export_hashes",
+        "row_count": 1967,
+        "rows_sha256": "741fc9b6a30d4a27a14ddd7aa19c48de1a3e5aa7829c446e57e7aa8639f22b4f"
+      },
+      {
+        "name": "gate_result_history",
+        "row_count": 0,
+        "rows_sha256": "ade6edf42bcd9c1b088917fba2152530722844ee57e6447eafe84fd20f177162"
+      },
+      {
+        "name": "gate_results",
+        "row_count": 0,
+        "rows_sha256": "a360c72db907c2936d5c05af4e653445922cc0355d2a23543f62c22716ab7f3a"
+      },
+      {
+        "name": "issues",
+        "row_count": 1967,
+        "rows_sha256": "261eea148bf1b14515032d249d915f155a2b191f3a8258037f7124731bbd6684"
+      },
+      {
+        "name": "labels",
+        "row_count": 3587,
+        "rows_sha256": "3d966d43799c0f337216ebcdd94f8cd6ecabe3c76bd87e24f84b7ad7a575d96d"
+      },
+      {
+        "name": "metadata",
+        "row_count": 7,
+        "rows_sha256": "444a0c3d65f8a8137b01d974336362bd93aa6ffb8aff0a06fdbe19f96d0922da"
+      },
+      {
+        "name": "sqlite_sequence",
+        "row_count": 2,
+        "rows_sha256": "983f8295d8b8a699cc23d15acd098285992368f277924ae925c806d27d823cf6"
+      }
+    ]
+  }
+}

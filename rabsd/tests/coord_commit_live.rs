@@ -406,30 +406,30 @@ fn concurrent_submission_and_dispatch_claims_collapse_at_public_api() {
     let source = capture_submission_source(&live);
     let (coord, _) = submission_coordinator(dir.path());
     let barrier = std::sync::Barrier::new(8);
+    let edges = [coord.edge_subscriber(), coord.edge_subscriber()];
     let receipts = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..8)
             .map(|index| {
-                let coord = &coord;
+                let edge = &edges[index as usize % edges.len()];
                 let source = &source;
                 let barrier = &barrier;
                 scope.spawn(move || {
                     barrier.wait();
                     let input = submission_from_source(Arc::clone(source));
-                    coord
-                        .submit_action(
-                            input,
-                            submission_join(
-                                index,
-                                if index % 2 == 0 {
-                                    SubscriberKind::Speculative
-                                } else {
-                                    SubscriberKind::ForegroundAgent
-                                },
-                            ),
-                            now_micros(),
-                            0,
-                        )
-                        .unwrap()
+                    edge.submit_action(
+                        input,
+                        submission_join(
+                            index,
+                            if index % 2 == 0 {
+                                SubscriberKind::Speculative
+                            } else {
+                                SubscriberKind::ForegroundAgent
+                            },
+                        ),
+                        now_micros(),
+                        0,
+                    )
+                    .unwrap()
                 })
             })
             .collect();
@@ -669,7 +669,7 @@ fn coordinator_commits_then_quarantines_divergence_under_running_daemon() {
             rabsd::edge::server::EdgeServerConfig {
                 socket_path: state_dir.join("rabsd.sock"),
                 state_dir: state_dir.clone(),
-                coord: Arc::clone(&coord),
+                coord: coord.edge_subscriber(),
             },
         )),
         coord_work: Some(coord_work),

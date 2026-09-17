@@ -53,8 +53,8 @@ pub struct EdgeServerConfig {
     pub socket_path: PathBuf,
     /// Shadow-plane state directory (index + receipts).
     pub state_dir: PathBuf,
-    /// The live coordinator (S6: consults route through it in-process).
-    pub coord: std::sync::Arc<crate::coord::live::CoordLive>,
+    /// Restricted subscriber capability; never a lease/publication owner.
+    pub coord: crate::coord::live::EdgeSubscriber,
 }
 
 fn log_line(kind: &str, fields: &[(&str, &str)]) {
@@ -133,7 +133,7 @@ async fn serve(
     // Acceptor as a region-owned child task; aborted at shutdown so a
     // blocked accept (or a hung connection it spawned) cannot wedge us.
     let acceptor_cx = cx.clone();
-    let coord = std::sync::Arc::clone(&config.coord);
+    let coord = config.coord.clone();
     let acceptor = cx
         .spawn(move |cx| accept_loop(cx, listener, policy, socket_evidence, shadow, coord))
         .map_err(|e| format!("acceptor spawn: {e:?}"))?;
@@ -153,7 +153,7 @@ async fn accept_loop(
     policy: AdmissionPolicy,
     socket_evidence: SocketMetadata,
     shadow: std::sync::Arc<std::sync::Mutex<crate::edge::shadow::ShadowPlane>>,
-    coord: std::sync::Arc<crate::coord::live::CoordLive>,
+    coord: crate::coord::live::EdgeSubscriber,
 ) {
     let mut connection_id: u64 = 0;
     loop {
@@ -162,7 +162,7 @@ async fn accept_loop(
                 connection_id += 1;
                 let id = connection_id;
                 let shadow = std::sync::Arc::clone(&shadow);
-                let coord = std::sync::Arc::clone(&coord);
+                let coord = coord.clone();
                 let spawned = cx.spawn(move |cx| async move {
                     let _ = cx.checkpoint();
                     handle_connection(id, stream, policy, socket_evidence, shadow, coord).await;
@@ -227,7 +227,7 @@ async fn handle_connection(
     policy: AdmissionPolicy,
     socket_evidence: SocketMetadata,
     shadow: std::sync::Arc<std::sync::Mutex<crate::edge::shadow::ShadowPlane>>,
-    coord: std::sync::Arc<crate::coord::live::CoordLive>,
+    coord: crate::coord::live::EdgeSubscriber,
 ) {
     let trace = format!("edge-conn-{id}");
     // Admission: kernel peer credentials against the policy.
@@ -310,7 +310,7 @@ async fn handle_connection(
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("consult") => {
                 match parse_observation(&value) {
                     Some(observation) => {
-                        let coord_for_flight = std::sync::Arc::clone(&coord);
+                        let coord_for_flight = coord.clone();
                         let mut joined: Option<(String, &'static str)> = None;
                         let decision = shadow.lock().map_err(|_| ()).and_then(|mut plane| {
                             plane
@@ -402,10 +402,7 @@ async fn handle_connection(
 /// working directory, which is not the caller's.
 ///
 /// [`CoordLive::serve_action`]: crate::coord::live::CoordLive::serve_action
-fn serve_reply(
-    coord: &std::sync::Arc<crate::coord::live::CoordLive>,
-    value: &serde_json::Value,
-) -> String {
+fn serve_reply(coord: &crate::coord::live::EdgeSubscriber, value: &serde_json::Value) -> String {
     use crate::coord::live::{ExpectedOutputs, ServeOutcome};
 
     let Some(action_key) = value
