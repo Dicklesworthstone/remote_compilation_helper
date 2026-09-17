@@ -1516,6 +1516,23 @@ pub trait RabsMetadataStore {
     /// replayed or stale proofs are refused.
     fn record_operator_reset(&mut self, generation: u64, seq: u64) -> Result<(), StoreError>;
 
+    /// Apply a signature-verified operator reset (H037/S020): atomically
+    /// consume `generation` into the reset ledger and rewrite `peer_id`'s
+    /// high-water to the offered (credential_generation, term, incarnation).
+    /// The CALLER must have verified the cluster-root reset signature;
+    /// this API only enforces ledger monotonicity and atomicity. A
+    /// generation not strictly above the ledger refuses (replayed proof),
+    /// and a non-strictly-increasing pair is rejected outright.
+    fn apply_operator_reset_to_peer(
+        &mut self,
+        authority: &TypedDigest,
+        peer_id: &str,
+        reset_generation: u64,
+        credential_generation: u64,
+        term: u64,
+        incarnation: u128,
+    ) -> Result<(), StoreError>;
+
     /// Highest consumed operator-reset generation, if any.
     fn highest_operator_reset(&mut self) -> Result<Option<u64>, StoreError>;
 
@@ -4430,6 +4447,48 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     &[SqlValue::Text(action_key), SqlValue::Text(disposition)],
                 )?;
             }
+            Ok(())
+        })
+    }
+    fn apply_operator_reset_to_peer(
+        &mut self,
+        authority: &TypedDigest,
+        peer_id: &str,
+        reset_generation: u64,
+        credential_generation: u64,
+        term: u64,
+        incarnation: u128,
+    ) -> Result<(), StoreError> {
+        let authority = authority.clone();
+        let peer = peer_id.to_owned();
+        let reset_int = i64::try_from(reset_generation)
+            .map_err(|_| StoreError::Corruption("reset generation out of range".into()))?;
+        let term_int = to_seq(term, "term")?;
+        let generation_int = to_seq(credential_generation, "credential_generation")?;
+        self.in_txn(move |engine| {
+            SqlMetadataStore::<E>::require_active(engine, &authority)?;
+            let ledger = engine.query("SELECT MAX(generation) FROM operator_resets", &[])?;
+            if let Some(SqlValue::Int(highest)) = ledger.first().and_then(|r| r.first())
+                && reset_int <= *highest
+            {
+                return Err(StoreError::StaleOperatorReset);
+            }
+            engine.execute(
+                "INSERT INTO operator_resets (generation, applied_seq) VALUES (?1, ?2)",
+                &[SqlValue::Int(reset_int), SqlValue::Int(reset_int)],
+            )?;
+            engine.execute(
+                "INSERT OR REPLACE INTO peer_authority_high_water \
+                 (peer_id, term, observed_seq, incarnation, credential_generation) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    SqlValue::Text(peer),
+                    SqlValue::Int(term_int),
+                    SqlValue::Int(reset_int),
+                    SqlValue::Blob(incarnation.to_be_bytes().to_vec()),
+                    SqlValue::Int(generation_int),
+                ],
+            )?;
             Ok(())
         })
     }
@@ -8685,6 +8744,59 @@ mod tests {
         let engine = FsqliteEngine::open(&path).unwrap();
         let mut store = SqlMetadataStore::open(engine).unwrap();
         h038_fence_check_after_reopen(&mut store);
+    }
+
+    fn s020_operator_reset_consumption<E: SqlEngine>(
+        open: fn(&std::path::Path) -> Result<E, StoreError>,
+        tag: &str,
+    ) {
+        let path = fresh_path(tag);
+        let mut store = SqlMetadataStore::open(open(&path).unwrap()).unwrap();
+        store.acquire_authority(&authority(1)).unwrap();
+        let active = digest("rabs.authority.sha256.v1", 1);
+        store
+            .record_peer_authority_high_water(&active, "peer-1", 2, 5, 11, 100)
+            .unwrap();
+        // A signature-verified reset (caller-verified; this API consumes
+        // it) fencing the old authority must lift the incarnation and
+        // generation fences in one atomic step.
+        store
+            .apply_operator_reset_to_peer(&active, "peer-1", 1, 2, 5, 99)
+            .unwrap();
+        assert_eq!(
+            store.peer_authority_high_water("peer-1").unwrap(),
+            Some((2, 5, 1))
+        );
+        store
+            .record_peer_authority_high_water(&active, "peer-1", 2, 5, 99, 201)
+            .unwrap();
+        assert_eq!(
+            store.record_peer_authority_high_water(&active, "peer-1", 2, 5, 11, 202),
+            Err(StoreError::StalePeerAuthority),
+            "the fenced pre-reset incarnation must stay refused"
+        );
+        // Replayed reset generations are refused by ledger monotonicity.
+        assert_eq!(
+            store.apply_operator_reset_to_peer(&active, "peer-1", 1, 2, 6, 99),
+            Err(StoreError::StaleOperatorReset)
+        );
+        store
+            .apply_operator_reset_to_peer(&active, "peer-1", 2, 3, 7, 100)
+            .unwrap();
+        assert_eq!(store.highest_operator_reset().unwrap(), Some(2));
+        assert_eq!(
+            store.peer_authority_high_water("peer-1").unwrap(),
+            Some((3, 7, 2))
+        );
+    }
+    #[test]
+    fn s020_operator_reset_reopens_fenced_peer_reference() {
+        s020_operator_reset_consumption(RusqliteEngine::open, "s020-reset-ref");
+    }
+
+    #[test]
+    fn s020_operator_reset_reopens_fenced_peer_frankensqlite() {
+        s020_operator_reset_consumption(FsqliteEngine::open, "s020-reset-fsq");
     }
 
     fn table_names<E: SqlEngine>(store: &mut SqlMetadataStore<E>) -> Vec<String> {
