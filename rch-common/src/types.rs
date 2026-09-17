@@ -3530,25 +3530,36 @@ pub struct BuildStats {
 /// Saved time statistics from remote builds.
 ///
 /// Tracks estimated time savings from offloading builds to remote workers.
-/// Uses local build history to estimate what remote builds would have taken locally.
+/// Estimates are only produced from an observed local baseline; without one the
+/// stats carry measured remote durations with `estimate_basis = "none"` and
+/// zero estimated savings rather than a fabricated speedup factor.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SavedTimeStats {
     /// Total time spent on remote builds (milliseconds).
     pub total_remote_duration_ms: u64,
     /// Estimated total time if those builds ran locally (milliseconds).
+    /// Zero when no local baseline exists.
     pub estimated_local_duration_ms: u64,
     /// Time saved by offloading (milliseconds).
-    /// Computed as max(0, estimated_local - remote).
+    /// Computed as max(0, estimated_local - remote); zero without a baseline.
     pub time_saved_ms: u64,
     /// Number of remote builds included in calculation.
     pub builds_counted: usize,
     /// Average speedup factor (local_estimate / remote_duration).
     /// A value of 2.0 means remote builds are ~2x faster than local.
+    /// Zero when the estimate basis is "none".
     pub avg_speedup: f64,
     /// Total time saved today (milliseconds).
     pub today_saved_ms: u64,
     /// Total time saved this week (milliseconds).
     pub week_saved_ms: u64,
+    /// How the local-time estimate was derived: "observed_local_mean" when
+    /// successful local builds back the baseline, "none" otherwise.
+    #[serde(default)]
+    pub estimate_basis: String,
+    /// Number of successful local builds backing the baseline (0 for "none").
+    #[serde(default)]
+    pub local_baseline_builds: usize,
 }
 
 // ============================================================================

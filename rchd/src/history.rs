@@ -804,12 +804,12 @@ impl BuildHistory {
 
     /// Calculate saved time statistics from remote builds.
     ///
-    /// Uses local build history to estimate what remote builds would have taken
-    /// locally, then computes time saved. If no local builds exist, uses a
-    /// default speedup factor (2.0x) based on typical remote worker performance.
+    /// Estimates what remote builds would have taken locally ONLY from an
+    /// observed baseline of successful local builds (`estimate_basis` =
+    /// "observed_local_mean"). Without such a baseline no savings are claimed:
+    /// the stats report measured remote durations with `estimate_basis` =
+    /// "none" and zero estimated savings.
     pub fn saved_time_stats(&self) -> SavedTimeStats {
-        const DEFAULT_SPEEDUP: f64 = 2.0;
-
         let records = self.records.read().unwrap_or_else(|e| e.into_inner());
         let now = Utc::now();
         let today_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
@@ -849,13 +849,13 @@ impl BuildHistory {
             let remote_ms = build.duration_ms;
             total_remote_duration_ms += remote_ms;
 
-            // Estimate local duration: use exec time * speedup or avg_local
+            // Estimate local duration only from the observed local mean. No
+            // invented per-build scaling: without a baseline the estimate is
+            // zero and the stats say so via estimate_basis = "none".
             let estimated_local_ms = if avg_local_duration_ms > 0 {
-                // Use the ratio of this build's exec time to average, then scale
                 avg_local_duration_ms
             } else {
-                // No local builds: use remote exec time * default speedup
-                (remote_ms as f64 * DEFAULT_SPEEDUP) as u64
+                0
             };
             estimated_local_duration_ms += estimated_local_ms;
 
@@ -883,6 +883,12 @@ impl BuildHistory {
             0.0
         };
 
+        let (estimate_basis, local_baseline_builds) = if avg_local_duration_ms > 0 {
+            ("observed_local_mean", local_builds.len())
+        } else {
+            ("none", 0)
+        };
+
         SavedTimeStats {
             total_remote_duration_ms,
             estimated_local_duration_ms,
@@ -891,6 +897,8 @@ impl BuildHistory {
             avg_speedup,
             today_saved_ms,
             week_saved_ms,
+            estimate_basis: estimate_basis.to_string(),
+            local_baseline_builds,
         }
     }
 
@@ -1866,11 +1874,12 @@ mod tests {
     }
 
     #[test]
-    fn test_saved_time_stats_only_remote_builds_default_speedup() {
+    fn test_saved_time_stats_without_local_baseline_makes_no_up_estimate() {
         let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
-        // Add remote builds only (no local for comparison, uses default 2x speedup)
+        // Remote builds only: there is no observed local baseline, so no local
+        // estimate may be invented (the old code fabricated a 2.0x factor).
         for i in 1..=3 {
             let mut record = make_build_record(i);
             record.location = BuildLocation::Remote;
@@ -1882,9 +1891,38 @@ mod tests {
         let stats = history.saved_time_stats();
         assert_eq!(stats.builds_counted, 3);
         assert_eq!(stats.total_remote_duration_ms, 3000);
-        // With default 2x speedup: estimated local = 3 * 1000 * 2 = 6000
-        assert_eq!(stats.estimated_local_duration_ms, 6000);
-        assert_eq!(stats.time_saved_ms, 3000);
+        assert_eq!(stats.estimate_basis, "none");
+        assert_eq!(stats.local_baseline_builds, 0);
+        assert_eq!(stats.estimated_local_duration_ms, 0);
+        assert_eq!(stats.time_saved_ms, 0);
+        assert_eq!(stats.today_saved_ms, 0);
+        assert_eq!(stats.week_saved_ms, 0);
+        assert_eq!(stats.avg_speedup, 0.0);
+    }
+
+    #[test]
+    fn test_saved_time_stats_observed_local_mean_backs_estimate() {
+        let _guard = test_guard!();
+        let history = BuildHistory::new(10);
+
+        for i in 1..=2 {
+            let mut record = make_build_record(i);
+            record.location = BuildLocation::Local;
+            record.duration_ms = 2000;
+            history.record(record);
+        }
+        let mut remote = make_build_record(3);
+        remote.location = BuildLocation::Remote;
+        remote.worker_id = Some("worker-1".to_string());
+        remote.duration_ms = 1000;
+        history.record(remote);
+
+        let stats = history.saved_time_stats();
+        assert_eq!(stats.builds_counted, 1);
+        assert_eq!(stats.estimate_basis, "observed_local_mean");
+        assert_eq!(stats.local_baseline_builds, 2);
+        assert_eq!(stats.estimated_local_duration_ms, 2000);
+        assert_eq!(stats.time_saved_ms, 1000);
         assert!((stats.avg_speedup - 2.0).abs() < 0.01);
     }
 

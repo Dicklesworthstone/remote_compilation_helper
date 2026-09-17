@@ -316,8 +316,16 @@ fn render_full_status_to<W: Write>(
     if let Some(saved_time) = &status.saved_time
         && saved_time.builds_counted > 0
     {
-        let time_saved_str = format_duration_ms(saved_time.time_saved_ms);
-        let speedup_str = if saved_time.avg_speedup > 0.0 {
+        // Old daemons (pre estimate_basis) report savings with an unknown
+        // basis; new daemons label fabricated-2x-free stats "none". Never show
+        // a bare speedup number without an observed basis.
+        let basis_known = saved_time.estimate_basis == "observed_local_mean";
+        let time_saved_str = if basis_known {
+            format_duration_ms(saved_time.time_saved_ms)
+        } else {
+            "n/a (no local baseline)".to_string()
+        };
+        let speedup_str = if basis_known && saved_time.avg_speedup > 0.0 {
             format!("{:.1}x", saved_time.avg_speedup)
         } else {
             "-".to_string()
