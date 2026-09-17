@@ -16,6 +16,7 @@ mod daemon;
 mod helpers;
 mod hook;
 mod init;
+pub mod jobs;
 mod queue;
 pub mod rabs_gc;
 pub(crate) mod shim;

@@ -328,6 +328,12 @@ USAGE:
     rch check --verbose"#)]
     Check,
 
+    /// Inspect, follow, cancel or retrieve an existing durable job (never replay it)
+    Jobs {
+        #[command(subcommand)]
+        action: Option<commands::jobs::JobsAction>,
+    },
+
     /// Show build queue - active and waiting compilations
     #[command(after_help = r#"EXAMPLES:
     rch queue                 # Show active builds and queue
@@ -2215,6 +2221,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
             } => handle_status(workers, jobs, fleet, remediation, &ctx).await,
             Commands::Check => commands::check(&ctx).await,
             Commands::Queue { watch, follow } => commands::queue_status(watch, follow, &ctx).await,
+            Commands::Jobs { action } => commands::jobs::run(action, &ctx).await,
             Commands::Cancel {
                 build_id,
                 all,

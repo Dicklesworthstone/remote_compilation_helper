@@ -501,6 +501,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                         None,
                         None,
                         None, // timing
+                        None, // local_wrapper_id
                     )
                     .await
                 {

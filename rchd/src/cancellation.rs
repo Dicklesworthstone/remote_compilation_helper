@@ -103,6 +103,9 @@ pub struct CancellationRecord {
     pub slots: u32,
     pub slots_released: u32,
     pub hook_pid: u32,
+    /// Boot+start evidence binding the recorded PID to its owning wrapper.
+    #[serde(skip)]
+    pub hook_process_identity: Option<String>,
     pub remote_pgid_file: Option<String>,
 }
 
@@ -357,6 +360,7 @@ impl CancellationOrchestrator {
                 slots: build.slots,
                 slots_released: 0,
                 hook_pid: build.hook_pid,
+                hook_process_identity: build.hook_process_identity.clone(),
                 remote_pgid_file: build.remote_pgid_file,
             };
             active.insert(build_id, record.clone());
@@ -391,8 +395,27 @@ impl CancellationOrchestrator {
                     slots_released: 0,
                 };
             };
+            // A persisted PID alone cannot identify its owner after restart.
+            // Do not signal it until exact process identity is available.
+            if current.hook_pid != 0
+                && (current.hook_process_identity.is_none()
+                    || crate::history::process_identity(current.hook_pid)
+                        != current.hook_process_identity)
+            {
+                return CancelBuildResponse {
+                    status: "failed".into(),
+                    build_id,
+                    worker_id: Some(record.worker_id),
+                    project_id: Some(project_id),
+                    message: Some(
+                        "Wrapper process identity unverified; reservation retained".into(),
+                    ),
+                    slots_released: 0,
+                };
+            }
             record.hook_pid = current.hook_pid;
             record.remote_pgid_file = current.remote_pgid_file;
+            record.hook_process_identity = current.hook_process_identity.clone();
             record.slots = current.slots;
 
             owner.events.emit(
@@ -409,7 +432,7 @@ impl CancellationOrchestrator {
                 .execute_cancellation(&context, &mut record, force)
                 .await;
             // Keep finalization in this same task. Caller cancellation after
-            // take_active_build must not lose its slot-release/history owner.
+            // confirmation must not lose its slot-release/history owner.
             owner.run_cleanup(&context, &mut record).await;
             owner.record_cancellation_stats(&record).await;
 
@@ -497,6 +520,37 @@ impl CancellationOrchestrator {
         }
     }
 
+    /// Only exact boot+start evidence may authorize a local signal; PID reuse
+    /// or an uncertain identity fails closed rather than risking a victim.
+    fn verified_hook_identity(record: &CancellationRecord) -> Option<u32> {
+        if record.hook_pid == 0 {
+            return None;
+        }
+        if crate::history::process_identity(record.hook_pid).as_deref()
+            == record
+                .hook_process_identity
+                .as_deref()
+                .filter(|identity| !identity.is_empty())
+        {
+            Some(record.hook_pid)
+        } else {
+            None
+        }
+    }
+
+    async fn send_verified_signal(&self, record: &CancellationRecord, force: bool) -> bool {
+        match Self::verified_hook_identity(record) {
+            Some(pid) => send_signal_to_process(pid, force),
+            None => {
+                warn!(
+                    "Skipping unverified local signal for build {}",
+                    record.build_id
+                );
+                false
+            }
+        }
+    }
+
     async fn execute_cancellation_stages(
         &self,
         ctx: &DaemonContext,
@@ -512,7 +566,7 @@ impl CancellationOrchestrator {
         if force {
             record.state = CancellationState::Escalated;
             if record.hook_pid > 0 {
-                send_signal_to_process(record.hook_pid, true);
+                self.send_verified_signal(record, true).await;
             }
             let remote_stopped = !remote_required || self.try_remote_kill(ctx, record).await;
             let local_stopped =
@@ -524,7 +578,7 @@ impl CancellationOrchestrator {
         // Step 1: Send SIGTERM.
         record.state = CancellationState::TermSent;
         if record.hook_pid > 0 {
-            send_signal_to_process(record.hook_pid, false);
+            self.send_verified_signal(record, false).await;
         }
 
         let local_stopped = wait_for_process_exit(record.hook_pid, self.config.grace_period).await;
@@ -568,7 +622,7 @@ impl CancellationOrchestrator {
 
         record.state = CancellationState::Escalated;
         if record.hook_pid > 0 {
-            send_signal_to_process(record.hook_pid, true);
+            self.send_verified_signal(record, true).await;
         }
         let local_stopped = wait_for_process_exit(record.hook_pid, self.config.kill_timeout).await;
         record.state = cancellation_terminal_state(local_stopped, remote_stopped);
@@ -699,29 +753,14 @@ impl CancellationOrchestrator {
         // A failed attempt is not a terminal build. Taking it out of history
         // would both release unconfirmed capacity and prevent a later retry.
         let claimed_active = if record.state == CancellationState::Completed {
-            ctx.history.take_active_build(record.build_id)
+            ctx.history.active_build(record.build_id)
         } else {
             record.state = CancellationState::Failed;
             record.cleanup_ok = false;
             record.slots_released = 0;
             None
         };
-        let history_ok = claimed_active.is_some();
-
-        // Release only after claiming a confirmed cancellation. A racing normal
-        // completion or another cleanup owner must never cause a second release.
-        if history_ok && record.slots > 0 {
-            if let Some(worker) = ctx.pool.get(&WorkerId::new(worker_id)).await {
-                worker.release_slots(record.slots).await;
-                record.slots_released = record.slots;
-            } else {
-                warn!(
-                    "Worker {} not found during slot release for build {}",
-                    worker_id, record.build_id
-                );
-                record.cleanup_ok = false;
-            }
-        }
+        let mut history_ok = false;
 
         // 3. Build cancellation metadata and write finalized cancelled record.
         let elapsed = record.requested_at.elapsed();
@@ -750,8 +789,33 @@ impl CancellationOrchestrator {
                 final_state: record.state.to_string(),
                 worker_health: worker_health.as_ref().map(worker_health_for_history),
             };
-            ctx.history
-                .record_cancelled_build(state, None, Some(cancellation));
+            match ctx.history.complete_durable(
+                state.id,
+                &state.worker_id,
+                state.local_wrapper_id.as_deref(),
+                130,
+                None,
+                None,
+                None,
+                Some(cancellation),
+            ) {
+                Ok(Some((state, _))) => {
+                    history_ok = true;
+                    if let Some(worker) = ctx.pool.get(&WorkerId::new(&state.worker_id)).await {
+                        worker.release_slots(state.slots).await;
+                        record.slots_released = state.slots;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        "Unable to persist cancellation for {}: {error}",
+                        record.build_id
+                    );
+                    record.state = CancellationState::Failed;
+                    record.cleanup_ok = false;
+                }
+            }
             if matches!(
                 record.reason,
                 CancelReason::Timeout | CancelReason::StuckDetector
@@ -1092,6 +1156,7 @@ mod tests {
             slots: 1,
             slots_released: 1,
             hook_pid: 12345,
+            hook_process_identity: None,
             remote_pgid_file: None,
         }
     }
@@ -1467,7 +1532,8 @@ mod tests {
             slots: 1,
             slots_released: 0,
             hook_pid: 0,
-            remote_pgid_file: Some("/tmp/rch/project/.rch-run/42.pgid".to_string()),
+            hook_process_identity: None,
+            remote_pgid_file: None,
         };
 
         orch.execute_cancellation(&ctx, &mut record, false).await;
@@ -1502,6 +1568,7 @@ mod tests {
             slots: 0,
             slots_released: 0,
             hook_pid: 0,
+            hook_process_identity: None,
             remote_pgid_file: None,
         };
 

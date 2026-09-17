@@ -56,6 +56,12 @@ pub(super) struct RemoteSourceAuthorityLock {
 }
 
 impl RemoteSourceAuthorityLock {
+    pub(super) fn pair_token(&self) -> Option<&str> {
+        self.release_request
+            .as_deref()?
+            .strip_prefix("RCH_SOURCE_PAIR_RELEASE:")
+    }
+
     /// OpenSSH uses 255 for transport errors; a missing local exit status is
     /// represented as -1. Neither proves that remote Cargo has stopped.
     pub(super) fn ensure_execution_finished(&mut self, exit_code: i32) -> anyhow::Result<()> {
@@ -288,6 +294,95 @@ pub(super) async fn acquire_clean_overlay_source_pair(
     guard.release_request = Some(release);
     Ok(guard)
 }
+/// Reattach only the recorded owner; never create or steal a source pair.
+pub(super) async fn recover_clean_overlay_source_pair(
+    worker: &WorkerConfig,
+    source_root: &str,
+    token: &str,
+    wait_timeout: Duration,
+) -> anyhow::Result<RemoteSourceAuthorityLock> {
+    let lock_path = source_authority_lock_paths(&[source_root.to_owned()])
+        .pop()
+        .expect("one source root");
+    let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    let ready = format!("RCH_SOURCE_PAIR_READY:{token}");
+    let release = format!("RCH_SOURCE_PAIR_RELEASE:{token}");
+    let owner = format!("{lock_path}.owner");
+    let receipt = format!(
+        "{lock_path}.released-{}",
+        blake3::hash(token.as_bytes()).to_hex()
+    );
+    let script = format!(
+        "set -eu; owner={owner}; root={root}; token={token}; \
+         [ ! -L \"$owner\" ] && [ \"$(cat \"$owner\")\" = \"$token\" ]; \
+         printf '%s\\n' {ready}; IFS= read -r request; \
+         [ \"$request\" = {release} ]; [ \"$(cat \"$owner\")\" = \"$token\" ]; \
+         [ ! -e \"$root\" ] && [ ! -L \"$root\" ]; \
+         printf '%s\\n' {token} > {receipt}; sync -f {receipt}; \
+         printf 'released\\n' > \"$owner\"; sync -f \"$owner\"; printf '%s\\n' {release}",
+        owner = quote(&owner),
+        root = quote(source_root),
+        token = quote(token),
+        ready = quote(&ready),
+        release = quote(&release),
+        receipt = quote(&receipt),
+    );
+    let command = format!(
+        "exec flock -x {} sh -c {}",
+        quote(&lock_path),
+        quote(&script)
+    );
+    let mut guard = spawn_source_authority_lock(worker, &command, &ready, wait_timeout).await?;
+    guard.release_request = Some(release);
+    Ok(guard)
+}
+
+/// Reconcile only an exact-token release receipt while holding the pair lock.
+/// Consumed by retirement retry after a lost release acknowledgement.
+pub(super) async fn clean_overlay_source_pair_was_released(
+    worker: &WorkerConfig,
+    source_root: &str,
+    token: &str,
+) -> anyhow::Result<bool> {
+    let lock_path = source_authority_lock_paths(&[source_root.to_owned()])
+        .pop()
+        .expect("one source root");
+    let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    let owner = format!("{lock_path}.owner");
+    let receipt = format!(
+        "{lock_path}.released-{}",
+        blake3::hash(token.as_bytes()).to_hex()
+    );
+    let script = format!(
+        "set -eu; [ ! -L {receipt} ]; \
+         if [ ! -f {receipt} ]; then printf pending; exit 0; fi; \
+         [ \"$(cat {receipt})\" = {token} ]; [ ! -L {owner} ]; \
+         if [ \"$(cat {owner})\" = {token} ]; then \
+         [ ! -e {root} ] && [ ! -L {root} ]; \
+         printf 'released\\n' > {owner}; sync -f {owner}; fi; printf released",
+        receipt = quote(&receipt),
+        token = quote(token),
+        owner = quote(&owner),
+        root = quote(source_root),
+    );
+    let command = format!("flock -x {} sh -c {}", quote(&lock_path), quote(&script));
+    let output = run_offload_ssh_command_with_stdin(
+        worker,
+        "sh -s",
+        command.as_bytes(),
+        Duration::from_secs(15),
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot verify source-pair release receipt"
+    );
+    match output.stdout.as_slice() {
+        b"released" => Ok(true),
+        b"pending" => Ok(false),
+        _ => anyhow::bail!("invalid source-pair release response"),
+    }
+}
 
 fn clean_overlay_source_pair_lock_command(
     lock_path: &str,
@@ -298,6 +393,10 @@ fn clean_overlay_source_pair_lock_command(
 ) -> String {
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
     let owner = format!("{lock_path}.owner");
+    let receipt = format!(
+        "{lock_path}.released-{}",
+        blake3::hash(token.as_bytes()).to_hex()
+    );
     let script = format!(
         "set -eu; owner={owner}; root={root}; token={token}; \
          if [ -L \"$owner\" ] || {{ [ -e \"$owner\" ] && [ \"$(cat \"$owner\")\" != released ]; }}; then \
@@ -308,12 +407,14 @@ fn clean_overlay_source_pair_lock_command(
          printf '%s\\n' {ready}; IFS= read -r request; \
          [ \"$request\" = {release} ]; [ \"$(cat \"$owner\")\" = \"$token\" ]; \
          [ ! -e \"$root\" ] && [ ! -L \"$root\" ]; \
-         printf 'released\\n' > \"$owner\"; printf '%s\\n' {release}",
+         printf '%s\\n' {token} > {receipt}; sync -f {receipt}; \
+         printf 'released\\n' > \"$owner\"; sync -f \"$owner\"; printf '%s\\n' {release}",
         owner = quote(&owner),
         root = quote(source_root),
         token = quote(token),
         ready = quote(ready),
         release = quote(release),
+        receipt = quote(&receipt),
     );
     format!(
         "mkdir -p {} && exec flock -x {} sh -c {}",

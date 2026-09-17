@@ -163,9 +163,14 @@ enum ApiRequest {
     CancelBuild {
         build_id: u64,
         force: bool,
+        local_wrapper_id: Option<String>,
     },
     CancelAllBuilds {
         force: bool,
+    },
+    BuildRecovery {
+        build_id: u64,
+        local_wrapper_id: String,
     },
     /// Drain a worker (stop sending new jobs, let existing jobs complete).
     WorkerDrain {
@@ -1086,10 +1091,56 @@ async fn handle_connection_with_metrics(
                 }
             }
         }
-        Ok(ApiRequest::CancelBuild { build_id, force }) => {
+        Ok(ApiRequest::BuildRecovery {
+            build_id,
+            local_wrapper_id,
+        }) => {
+            let response = if let Some(active) = ctx.history.active_build(build_id) {
+                if active.local_wrapper_id.as_deref() == Some(local_wrapper_id.as_str()) {
+                    serde_json::json!({"status":"active","active":active})
+                } else {
+                    serde_json::json!({"status":"identity_mismatch"})
+                }
+            } else if let Some(record) = ctx.history.terminal_build(build_id, &local_wrapper_id) {
+                serde_json::json!({"status":"completed","record":record,"local_wrapper_id":local_wrapper_id})
+            } else if ctx.history.has_terminal_build(build_id) {
+                serde_json::json!({"status":"identity_mismatch"})
+            } else {
+                serde_json::json!({"status":"not_found"})
+            };
+            (response.to_string(), "application/json")
+        }
+        Ok(ApiRequest::CancelBuild {
+            build_id,
+            force,
+            local_wrapper_id,
+        }) => {
             metrics::inc_requests("cancel-build");
-            let response = handle_cancel_build(&ctx, build_id, force).await;
-            (serde_json::to_string(&response)?, "application/json")
+            if let Some(record) = local_wrapper_id
+                .as_deref()
+                .and_then(|wrapper| ctx.history.terminal_build(build_id, wrapper))
+            {
+                (serde_json::json!({"status":"completed","record":record,"local_wrapper_id":local_wrapper_id}).to_string(), "application/json")
+            } else {
+                let response = if ctx
+                    .history
+                    .active_build(build_id)
+                    .is_some_and(|state| state.local_wrapper_id != local_wrapper_id)
+                    || ctx.history.has_terminal_build(build_id)
+                {
+                    CancelBuildResponse {
+                        status: "error".to_string(),
+                        build_id,
+                        worker_id: None,
+                        project_id: None,
+                        message: Some("build ownership mismatch".to_string()),
+                        slots_released: 0,
+                    }
+                } else {
+                    handle_cancel_build(&ctx, build_id, force).await
+                };
+                (serde_json::to_string(&response)?, "application/json")
+            }
         }
         Ok(ApiRequest::CancelAllBuilds { force }) => {
             metrics::inc_requests("cancel-all-builds");
@@ -1314,6 +1365,24 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     }
 
     // Build cancellation endpoints
+    if method == "GET" && path.starts_with("/builds/") {
+        let (route, query) = path.split_once('?').unwrap_or((path, ""));
+        let build_id = route
+            .trim_start_matches("/builds/")
+            .trim_end_matches('/')
+            .parse::<u64>()
+            .map_err(|_| anyhow!("Invalid build id"))?;
+        let local_wrapper_id = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("local_wrapper_id="))
+            .map(percent_unescape_query_value)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| anyhow!("Missing local_wrapper_id"))?;
+        return Ok(ApiRequest::BuildRecovery {
+            build_id,
+            local_wrapper_id,
+        });
+    }
     if method == "POST" && path.starts_with("/builds") {
         let (path_only, query) = split_path_query(path);
 
@@ -1342,6 +1411,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     .map_err(|_| anyhow!("Invalid build id: {}", parts[0]))?;
 
                 let mut force = false;
+                let mut local_wrapper_id = None;
                 for param in query.split('&') {
                     if param.is_empty() {
                         continue;
@@ -1351,10 +1421,16 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     let value = kv.next().unwrap_or("");
                     if key == "force" {
                         force = value == "1" || value.eq_ignore_ascii_case("true");
+                    } else if key == "local_wrapper_id" {
+                        local_wrapper_id = Some(percent_unescape_query_value(value));
                     }
                 }
 
-                return Ok(ApiRequest::CancelBuild { build_id, force });
+                return Ok(ApiRequest::CancelBuild {
+                    build_id,
+                    force,
+                    local_wrapper_id,
+                });
             }
         }
     }
@@ -1457,6 +1533,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let mut exit_code = None;
         let mut duration_ms = None;
         let mut bytes_transferred = None;
+        let mut local_wrapper_id = None;
 
         for param in query.split('&') {
             if param.is_empty() {
@@ -1473,6 +1550,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 "exit_code" => exit_code = value.parse().ok(),
                 "duration_ms" => duration_ms = value.parse().ok(),
                 "bytes_transferred" => bytes_transferred = value.parse().ok(),
+                "local_wrapper_id" => local_wrapper_id = Some(percent_unescape_query_value(value)),
                 _ => {} // Ignore unknown parameters
             }
         }
@@ -1487,7 +1565,8 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             exit_code,
             duration_ms,
             bytes_transferred,
-            timing: None, // Parsed from body in handle_connection
+            local_wrapper_id,
+            timing: None,
         }));
     }
 
@@ -2215,7 +2294,7 @@ async fn handle_select_worker_with_wrapper(
     wait_timeout_secs: Option<u64>,
     local_wrapper_id: Option<String>,
 ) -> Result<SelectionResponse> {
-    if *ctx.admission_barrier.read().await {
+    if *ctx.admission_barrier.read().await || ctx.history.ownership_failed() {
         return Ok(SelectionResponse {
             worker: None,
             reason: SelectionReason::SelectionError("restart_admission_barrier_active".to_string()),
@@ -2276,7 +2355,7 @@ async fn handle_select_worker_with_wrapper(
         local_wrapper_id: Option<String>,
     ) -> Result<SelectionResponse> {
         let admission = ctx.admission_barrier.read().await;
-        if *admission {
+        if *admission || ctx.history.ownership_failed() {
             return Ok(SelectionResponse {
                 worker: None,
                 reason: SelectionReason::SelectionError(
@@ -2287,160 +2366,153 @@ async fn handle_select_worker_with_wrapper(
             });
         }
         let response = async {
-        // Retry loop to handle race conditions where slots are taken between selection and reservation.
-        let mut reservation_attempts = 0;
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut excluded_worker_ids = ctx.history.active_workers_for_project(&request.project);
+            // Retry loop to handle race conditions where slots are taken between selection and reservation.
+            let mut reservation_attempts = 0;
+            const MAX_ATTEMPTS: u32 = 3;
+            let mut excluded_worker_ids = ctx.history.active_workers_for_project(&request.project);
 
-        loop {
-            // Use the configured worker selector.
-            let result = ctx
-                .worker_selector
-                .select_with_exclusions(&ctx.pool, request, &excluded_worker_ids)
-                .await;
-            let selection_reason = result.reason;
-            let selection_diagnostics = result.diagnostics;
+            loop {
+                // Use the configured worker selector.
+                let result = ctx
+                    .worker_selector
+                    .select_with_exclusions(&ctx.pool, request, &excluded_worker_ids)
+                    .await;
+                let selection_reason = result.reason;
+                let selection_diagnostics = result.diagnostics;
 
-            let Some(worker) = result.worker else {
-                debug!("No worker selected: {}", selection_reason);
-                return Ok(SelectionResponse {
-                    worker: None,
-                    reason: selection_reason,
-                    build_id: None,
-                    diagnostics: selection_diagnostics,
-                });
-            };
-
-            let selected_worker_id = worker.config.read().await.id.clone();
-
-            // Reserve the slots.
-            //
-            // Clamp to what this worker can physically hold. `estimated_cores`
-            // is an estimate derived from `compilation.build_slots`, and
-            // admission may deliberately hand back a worker whose TOTAL slots
-            // are below it (see the `capacity_degraded` path in
-            // `selection.rs`) rather than let the build fall back to local.
-            // Reserving the unclamped estimate on such a worker can never
-            // succeed, so without this clamp the selection loop burns all three
-            // attempts on "race condition" retries and then reports
-            // AllWorkersBusy — a phantom race against a worker that was simply
-            // too small. Observed live on ts1 2026-08-26: repeated
-            // "Failed to reserve 4 slots on hz2" against a 2-slot worker.
-            reservation_attempts += 1;
-            let reserve_slots = {
-                let total = worker.effective_total_slots().await;
-                request.estimated_cores.min(total)
-            };
-            if worker.reserve_slots(reserve_slots).await {
-                let (id, host, user, identity_file, declared_os) = {
-                    let config = worker.config.read().await;
-                    (
-                        config.id.clone(),
-                        config.host.clone(),
-                        config.user.clone(),
-                        config.identity_file.clone(),
-                        rch_common::declared_os(&config.tags),
-                    )
+                let Some(worker) = result.worker else {
+                    debug!("No worker selected: {}", selection_reason);
+                    return Ok(SelectionResponse {
+                        worker: None,
+                        reason: selection_reason,
+                        build_id: None,
+                        diagnostics: selection_diagnostics,
+                    });
                 };
 
-                let command = request
-                    .command
-                    .clone()
-                    .unwrap_or_else(|| "<unknown>".to_string());
+                let selected_worker_id = worker.config.read().await.id.clone();
 
-                let build_id = if let Some(hook_pid) = request.hook_pid.filter(|pid| *pid > 0) {
-                    let Some(state) = ctx.history.try_start_active_build_with_wrapper(
+                // Reserve the slots.
+                //
+                // Clamp to what this worker can physically hold. `estimated_cores`
+                // is an estimate derived from `compilation.build_slots`, and
+                // admission may deliberately hand back a worker whose TOTAL slots
+                // are below it (see the `capacity_degraded` path in
+                // `selection.rs`) rather than let the build fall back to local.
+                // Reserving the unclamped estimate on such a worker can never
+                // succeed, so without this clamp the selection loop burns all three
+                // attempts on "race condition" retries and then reports
+                // AllWorkersBusy — a phantom race against a worker that was simply
+                // too small. Observed live on ts1 2026-08-26: repeated
+                // "Failed to reserve 4 slots on hz2" against a 2-slot worker.
+                reservation_attempts += 1;
+                let reserve_slots = {
+                    let total = worker.effective_total_slots().await;
+                    request.estimated_cores.min(total)
+                };
+                if worker.reserve_slots(reserve_slots).await {
+                    let (id, host, user, identity_file, declared_os) = {
+                        let config = worker.config.read().await;
+                        (
+                            config.id.clone(),
+                            config.host.clone(),
+                            config.user.clone(),
+                            config.identity_file.clone(),
+                            rch_common::declared_os(&config.tags),
+                        )
+                    };
+
+                    let command = request
+                        .command
+                        .clone()
+                        .unwrap_or_else(|| "<unknown>".to_string());
+
+                    let admission = ctx.history.try_start_active_build_with_wrapper(
                         request.project.clone(),
                         id.as_str().to_string(),
                         command.clone(),
-                        hook_pid,
+                        request.hook_pid.unwrap_or(0),
                         local_wrapper_id.clone(),
-                        // MUST be the clamped count we actually reserved:
-                        // `handle_release_worker` releases `state.slots`, so
-                        // recording the raw estimate would over-release on any
-                        // undersized worker and free capacity held by something
-                        // else on that box.
                         reserve_slots,
                         rch_common::BuildLocation::Remote,
-                    ) else {
-                        debug!(
-                            "Worker {} lost same-project active-build race for {} after slot reservation",
-                            id, request.project
-                        );
-                        // Must mirror the clamped reservation above, or a
-                        // degraded (too-small) worker leaks slots on every
-                        // lost active-build race until it looks permanently full.
-                        worker.release_slots(reserve_slots).await;
-                        excluded_worker_ids.insert(id.as_str().to_string());
-                        continue;
+                    );
+                    let state = match admission {
+                        Ok(Some(state)) => state,
+                        Ok(None) => {
+                            worker.release_slots(reserve_slots).await;
+                            if ctx.history.ownership_failed() {
+                                anyhow::bail!(
+                                    "durable ownership uncertain; admission closed until restart"
+                                );
+                            }
+                            excluded_worker_ids.insert(id.as_str().to_string());
+                            continue;
+                        }
+                        Err(error) => {
+                            return Err(error.into());
+                        }
                     };
+                    let build_id = Some(state.id);
                     if !cfg!(test) {
                         metrics::inc_active_builds("remote");
                     }
                     ctx.events.emit(
                         "build_started",
                         &serde_json::json!({
-                            "build_id": state.id,
-                            "project_id": request.project.clone(),
-                            "worker_id": id.as_str(),
-                            "command": command,
-                            "local_wrapper_id": local_wrapper_id.clone(),
-                            "slots": reserve_slots,
+                            "build_id": state.id, "project_id": request.project.clone(),
+                            "worker_id": id.as_str(), "command": command,
+                            "local_wrapper_id": local_wrapper_id.clone(), "slots": reserve_slots,
                         }),
                     );
-                    Some(state.id)
-                } else {
-                    None
-                };
 
-                let slots_available = worker.available_slots().await;
-                let speed_score = worker.get_speed_score();
+                    let slots_available = worker.available_slots().await;
+                    let speed_score = worker.get_speed_score();
 
-                if request.command_priority != CommandPriority::Normal {
-                    ctx.events.emit(
-                        "priority_hint",
-                        &serde_json::json!({
-                            "project": request.project.clone(),
-                            "worker_id": id.as_str(),
-                            "priority": request.command_priority.to_string(),
-                            "estimated_cores": request.estimated_cores,
-                            "command": request.command.clone(),
+                    if request.command_priority != CommandPriority::Normal {
+                        ctx.events.emit(
+                            "priority_hint",
+                            &serde_json::json!({
+                                "project": request.project.clone(),
+                                "worker_id": id.as_str(),
+                                "priority": request.command_priority.to_string(),
+                                "estimated_cores": request.estimated_cores,
+                                "command": request.command.clone(),
+                            }),
+                        );
+                    }
+
+                    return Ok(SelectionResponse {
+                        worker: Some(SelectedWorker {
+                            id,
+                            host,
+                            user,
+                            identity_file,
+                            slots_available,
+                            speed_score,
+                            declared_os,
                         }),
-                    );
+                        reason: selection_reason,
+                        build_id,
+                        diagnostics: selection_diagnostics,
+                    });
                 }
 
-                return Ok(SelectionResponse {
-                    worker: Some(SelectedWorker {
-                        id,
-                        host,
-                        user,
-                        identity_file,
-                        slots_available,
-                        speed_score,
-                        declared_os,
-                    }),
-                    reason: selection_reason,
-                    build_id,
-                    diagnostics: selection_diagnostics,
-                });
-            }
+                warn!(
+                    "Failed to reserve {} slots on {} (race condition), attempt {}/{}",
+                    reserve_slots, selected_worker_id, reservation_attempts, MAX_ATTEMPTS
+                );
 
-            warn!(
-                "Failed to reserve {} slots on {} (race condition), attempt {}/{}",
-                reserve_slots, selected_worker_id, reservation_attempts, MAX_ATTEMPTS
-            );
-
-            if reservation_attempts >= MAX_ATTEMPTS {
-                // Give up after max attempts.
-                return Ok(SelectionResponse {
-                    worker: None,
-                    reason: SelectionReason::AllWorkersBusy,
-                    build_id: None,
-                    diagnostics: None,
-                });
+                if reservation_attempts >= MAX_ATTEMPTS {
+                    // Give up after max attempts.
+                    return Ok(SelectionResponse {
+                        worker: None,
+                        reason: SelectionReason::AllWorkersBusy,
+                        build_id: None,
+                        diagnostics: None,
+                    });
+                }
+                // Loop again - next selection will see reduced slot count.
             }
-            // Loop again - next selection will see reduced slot count.
-        }
         }
         .await;
         drop(admission);
@@ -2463,7 +2535,7 @@ async fn handle_select_worker_with_wrapper(
         .unwrap_or_else(|| "<unknown>".to_string());
 
     let admission = ctx.admission_barrier.read().await;
-    if *admission {
+    if *admission || ctx.history.ownership_failed() {
         return Ok(SelectionResponse {
             worker: None,
             reason: SelectionReason::SelectionError("restart_admission_barrier_active".to_string()),
@@ -2600,6 +2672,7 @@ async fn handle_select_worker_with_wrapper(
 async fn handle_restart_admission(ctx: &DaemonContext, close: bool) -> RestartAdmissionResponse {
     let mut admission = ctx.admission_barrier.write().await;
     let was_closed = *admission;
+    let close = close || ctx.history.ownership_failed();
     *admission = close;
     let active_build_ids: Vec<u64> = ctx
         .history
@@ -2667,7 +2740,7 @@ async fn restart_admission_status(ctx: &DaemonContext) -> RestartAdmissionRespon
         Err(error) => (Vec::new(), Some(error.to_string())),
     };
     RestartAdmissionResponse {
-        admission_closed: *admission,
+        admission_closed: *admission || ctx.history.ownership_failed(),
         restart_permitted: false,
         active_build_ids,
         queued_build_ids,
@@ -2774,29 +2847,22 @@ fn lease_blocks_restart(
 async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> Result<()> {
     let exit_code = request.exit_code.unwrap_or(0);
     let (release_worker_id, release_slots, record) = if let Some(build_id) = request.build_id {
-        let Some(state) = ctx.history.take_active_build(build_id) else {
-            // A build-id release is canonical and idempotent. If the active
-            // record is already gone, the original release was processed; do
-            // not fall back to caller-provided slots and accidentally release
-            // capacity reserved by a later build.
-            debug!(
-                "Ignoring duplicate release for completed build {}",
-                build_id
-            );
-            return Ok(());
-        };
-        let release_worker_id = WorkerId::new(state.worker_id.clone());
-        let release_slots = state.slots;
-        let record = ctx.history.record_completed_build(
-            state,
+        let Some((state, record)) = ctx.history.complete_durable(
+            build_id,
+            request.worker_id.as_str(),
+            request.local_wrapper_id.as_deref(),
             exit_code,
             request.duration_ms,
             request.bytes_transferred,
             request.timing,
-        );
-        (release_worker_id, release_slots, Some(record))
+            None,
+        )?
+        else {
+            return Ok(());
+        };
+        (WorkerId::new(state.worker_id), state.slots, Some(record))
     } else {
-        (request.worker_id.clone(), request.slots, None)
+        anyhow::bail!("release requires durable build_id; unowned slot release refused")
     };
 
     debug!(
@@ -2884,6 +2950,14 @@ async fn handle_build_heartbeat(
     let progress_counter = request.progress_counter;
     let progress_percent = request.progress_percent;
 
+    if ctx.history.ownership_failed() {
+        return BuildHeartbeatResponse {
+            status: "error: durable ownership uncertain; restart required".to_string(),
+            build_id,
+            worker_id,
+            phase,
+        };
+    }
     if let Some(state) = ctx.history.record_build_heartbeat(request) {
         let event_phase = heartbeat_phase_to_str(&state.heartbeat_phase).to_string();
         let event_detail = state.heartbeat_detail.clone();
@@ -2908,6 +2982,15 @@ async fn handle_build_heartbeat(
             phase,
         }
     } else {
+        if ctx.history.ownership_failed() {
+            return BuildHeartbeatResponse {
+                status: "error: failed to persist heartbeat ownership; restart required"
+                    .to_string(),
+                build_id,
+                worker_id,
+                phase,
+            };
+        }
         warn!(
             "Ignoring heartbeat for unknown build {} on worker {}",
             build_id, worker_id
@@ -5036,6 +5119,7 @@ mod tests {
         handle_release_worker(
             &ctx,
             ReleaseRequest {
+                local_wrapper_id: Some("rchw-daemon-correlation".to_string()),
                 worker_id: WorkerId::new("worker1"),
                 slots: 2,
                 build_id: Some(build_id),
@@ -5713,7 +5797,9 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("POST /builds/123/cancel").unwrap();
         match req {
-            ApiRequest::CancelBuild { build_id, force } => {
+            ApiRequest::CancelBuild {
+                build_id, force, ..
+            } => {
                 assert_eq!(build_id, 123);
                 assert!(!force);
             }
@@ -5722,7 +5808,9 @@ mod tests {
 
         let req = parse_request("POST /builds/456/cancel?force=true").unwrap();
         match req {
-            ApiRequest::CancelBuild { build_id, force } => {
+            ApiRequest::CancelBuild {
+                build_id, force, ..
+            } => {
                 assert_eq!(build_id, 456);
                 assert!(force);
             }
@@ -6598,6 +6686,7 @@ mod tests {
         let ctx = make_test_context(pool.clone());
 
         let request = ReleaseRequest {
+            local_wrapper_id: None,
             worker_id: WorkerId::new("worker1"),
             slots: 4,
             build_id: None,
@@ -6608,11 +6697,9 @@ mod tests {
         };
 
         let result = handle_release_worker(&ctx, request).await;
-        assert!(result.is_ok());
-
-        // Verify slots were released
-        let available = worker.available_slots().await;
-        assert_eq!(available, 8);
+        assert!(result.is_err());
+        // An unowned legacy request cannot free another build's reservation.
+        assert_eq!(worker.available_slots().await, 4);
     }
 
     #[tokio::test]
@@ -6639,6 +6726,7 @@ mod tests {
         worker.reserve_slots(4).await;
 
         let request = ReleaseRequest {
+            local_wrapper_id: None,
             worker_id: WorkerId::new("worker1"),
             slots: 4,
             build_id: Some(build_id),
@@ -6689,6 +6777,7 @@ mod tests {
         assert!(worker.reserve_slots(4).await);
 
         let request = ReleaseRequest {
+            local_wrapper_id: None,
             worker_id: WorkerId::new("worker1"),
             slots: 0,
             build_id: Some(build_id),
@@ -6724,6 +6813,7 @@ mod tests {
         assert!(worker.reserve_slots(4).await);
 
         let release = || ReleaseRequest {
+            local_wrapper_id: None,
             worker_id: WorkerId::new("worker1"),
             slots: 4,
             build_id: Some(build_id),
@@ -6767,6 +6857,7 @@ mod tests {
                 handle_release_worker(
                     &ctx,
                     ReleaseRequest {
+                        local_wrapper_id: None,
                         worker_id: WorkerId::new("worker1"),
                         slots: 4,
                         build_id: Some(build_id),
@@ -6801,6 +6892,7 @@ mod tests {
         handle_release_worker(
             &ctx,
             ReleaseRequest {
+                local_wrapper_id: None,
                 worker_id: WorkerId::new("worker1"),
                 slots: 4,
                 build_id: Some(build_id),
@@ -6836,6 +6928,7 @@ mod tests {
         worker.reserve_slots(4).await;
 
         let request = ReleaseRequest {
+            local_wrapper_id: None,
             worker_id: WorkerId::new("worker1"),
             slots: 4,
             build_id: Some(build_id),
@@ -7125,6 +7218,7 @@ mod tests {
         handle_release_worker(
             &ctx,
             ReleaseRequest {
+                local_wrapper_id: None,
                 worker_id: WorkerId::new("disk-worker"),
                 slots: 4,
                 build_id: Some(build_id),
