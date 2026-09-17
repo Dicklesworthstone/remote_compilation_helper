@@ -36,6 +36,10 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+// File-format decoding stays separate from retrieval scope and failure policy.
+#[path = "artifact_identity.rs"]
+mod artifact_identity;
+
 /// How many retrieved files the gate is willing to open. A `target/debug/deps`
 /// tree can hold thousands of files; the mismatch this gate exists to catch is
 /// a whole-directory property, so a bounded sample is sufficient evidence and
@@ -458,7 +462,10 @@ fn read_binary_identity(path: &Path) -> Option<BinaryIdentity> {
     }
     let header = &header[..filled];
     let format = classify_binary_format(header)?;
-    let architectures = elf_cpu_architecture(header).map(|cpu| vec![cpu]);
+    let architectures = elf_cpu_architecture(header).map(|cpu| vec![cpu]).or_else(|| {
+        let len = file.metadata().ok()?.len();
+        artifact_identity::architectures(&mut file, format, header, len)
+    });
     Some(BinaryIdentity {
         format,
         architectures,
