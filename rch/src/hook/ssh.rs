@@ -417,7 +417,10 @@ async fn finish_source_authority_lock_acquisition(
             if observed
                 .strip_suffix('\n')
                 .map(|line| line.strip_suffix('\r').unwrap_or(line))
-                == Some(ready_marker) => None,
+                == Some(ready_marker) =>
+        {
+            None
+        }
         Ok(Ok(((), _))) => Some(format!(
             "source-authority lock on {} emitted an invalid ready marker: {:?}",
             guard.worker_id,
@@ -2477,7 +2480,10 @@ exec /bin/ln \"$@\"\n",
         .await
         .expect("release ignored its deadline after child exit")
         .unwrap_err();
-        assert!(error.to_string().contains("timed out releasing"), "{error:#}");
+        assert!(
+            error.to_string().contains("timed out releasing"),
+            "{error:#}"
+        );
         source_lock_assert_readers_dropped(notices).await;
     }
 
@@ -2505,7 +2511,11 @@ exec /bin/ln \"$@\"\n",
     async fn source_lock_lifecycle_caller_cancellation_aborts_both_release_readers() {
         let (guard, _writers, notices) = source_lock_pending_release_fixture().await;
         let mut release = Box::pin(guard.release_with_timeout(Duration::from_secs(60)));
-        assert!(timeout(Duration::from_millis(40), &mut release).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(40), &mut release)
+                .await
+                .is_err()
+        );
         drop(release);
         source_lock_assert_readers_dropped(notices).await;
     }
@@ -2550,7 +2560,10 @@ exec /bin/ln \"$@\"\n",
         for script in [
             "printf READY".to_owned(),
             "printf 'READY \\n'; exec cat".to_owned(),
-            format!("printf %s {}; exec cat", "x".repeat(MAX_SOURCE_LOCK_READY_BYTES + 1)),
+            format!(
+                "printf %s {}; exec cat",
+                "x".repeat(MAX_SOURCE_LOCK_READY_BYTES + 1)
+            ),
         ] {
             let child = Command::new("/bin/sh")
                 .args(["-c", &script])
@@ -2572,7 +2585,10 @@ exec /bin/ln \"$@\"\n",
             )
             .await
             .expect("invalid readiness waited for EOF or the acquisition timeout");
-            assert!(result.is_err(), "invalid readiness authorized a source writer");
+            assert!(
+                result.is_err(),
+                "invalid readiness authorized a source writer"
+            );
         }
     }
 
@@ -2601,7 +2617,10 @@ exec /bin/ln \"$@\"\n",
         .await
         .unwrap();
         guard.release_request = Some("RELEASE".to_owned());
-        let error = guard.release_with_timeout(Duration::from_secs(2)).await.unwrap_err();
+        let error = guard
+            .release_with_timeout(Duration::from_secs(2))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("exceeded"), "{error:#}");
     }
 }

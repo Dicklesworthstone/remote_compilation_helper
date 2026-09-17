@@ -3090,6 +3090,8 @@ fn derive_check_outcome(
     daemon_issues: &[IssueFromApi],
     hook_installed: bool,
 ) -> (String, i32, Vec<String>) {
+    // Daemon issues carry the actual state and cause (including administrative
+    // disables). Rank them with worker states so the most severe cause is first.
     let mut ranked_issues: Vec<(CheckIssueSeverity, String)> = workers
         .iter()
         .filter(|worker| worker.status != "healthy")
@@ -3701,11 +3703,6 @@ mod tests {
             issues.first().map(String::as_str),
             Some(CHECK_HOOK_NOT_INSTALLED_ISSUE)
         );
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue == "Worker builder-2 is unreachable")
-        );
         assert!(issues.iter().any(|issue| issue == "worker pressure"));
     }
 
@@ -3731,6 +3728,34 @@ mod tests {
         assert_eq!(status, "not_ready");
         assert_eq!(exit_code, 2);
         assert_eq!(issues, vec!["daemon failed to clean up a build"]);
+    }
+
+    #[test]
+    fn check_critical_cause_precedes_disabled_worker_warning() {
+        let daemon_issues = vec![
+            check_issue("warning", "builder-2 administratively disabled"),
+            check_issue("critical", "builder-1 disk pressure"),
+        ];
+        let (status, exit_code, issues) =
+            derive_check_outcome(2, 1, &["builder-2".to_string()], &daemon_issues, true);
+        assert_eq!(status, "not_ready");
+        assert_eq!(exit_code, 2);
+        assert_eq!(issues.first(), Some(&daemon_issues[1].summary));
+        assert!(!issues.iter().any(|issue| issue.contains("unreachable")));
+    }
+
+    #[test]
+    fn check_disabled_fleet_does_not_claim_connectivity_failure() {
+        let daemon_issues = vec![check_issue(
+            "warning",
+            "builder-1 administratively disabled",
+        )];
+        let (status, exit_code, issues) =
+            derive_check_outcome(1, 0, &["builder-1".to_string()], &daemon_issues, true);
+        assert_eq!(status, "not_ready");
+        assert_eq!(exit_code, 2);
+        assert!(issues.contains(&daemon_issues[0].summary));
+        assert!(!issues.iter().any(|issue| issue.contains("unreachable")));
     }
 
     #[test]
