@@ -3086,36 +3086,41 @@ fn check_issue_severity(severity: &str) -> CheckIssueSeverity {
 fn derive_check_outcome(
     total_count: usize,
     healthy_count: usize,
-    unhealthy: &[String],
+    workers: &[WorkerStatusFromApi],
     daemon_issues: &[IssueFromApi],
     hook_installed: bool,
 ) -> (String, i32, Vec<String>) {
     // Daemon issues carry the actual state and cause (including administrative
-    // disables). Present the most severe cause before generic worker health.
-    let mut ordered_issues: Vec<_> = daemon_issues.iter().collect();
-    ordered_issues.sort_by_key(|issue| std::cmp::Reverse(check_issue_severity(&issue.severity)));
-    let mut issues_list: Vec<String> = ordered_issues
-        .into_iter()
-        .map(|issue| issue.summary.clone())
+    // disables). Rank them with worker states so the most severe cause is first.
+    let mut ranked_issues: Vec<(CheckIssueSeverity, String)> = workers
+        .iter()
+        .filter(|worker| worker.status != "healthy")
+        .map(|worker| {
+            (
+                CheckIssueSeverity::Warning,
+                format!("Worker {} is {}", worker.id, worker.status),
+            )
+        })
         .collect();
-    issues_list.extend(
-        unhealthy
+    ranked_issues.extend(
+        daemon_issues
             .iter()
-            .map(|w| format!("Worker {w} is not healthy")),
+            .map(|issue| (check_issue_severity(&issue.severity), issue.summary.clone())),
     );
 
-    let daemon_issue_severity = daemon_issues
-        .iter()
-        .map(|issue| check_issue_severity(&issue.severity))
-        .max();
-
-    let (mut status, mut exit_code, mut issues) = if total_count == 0 {
-        issues_list.insert(0, "No workers configured".to_string());
-        ("not_ready".to_string(), 2, issues_list)
+    let (mut status, mut exit_code) = if total_count == 0 {
+        ranked_issues.insert(
+            0,
+            (
+                CheckIssueSeverity::Error,
+                "No workers configured".to_string(),
+            ),
+        );
+        ("not_ready".to_string(), 2)
     } else if healthy_count == total_count {
-        ("ready".to_string(), 0, issues_list)
+        ("ready".to_string(), 0)
     } else if healthy_count > 0 {
-        if issues_list.is_empty() {
+        if !workers.iter().any(|worker| worker.status != "healthy") {
             let not_healthy = total_count.saturating_sub(healthy_count);
             let worker_word = if not_healthy == 1 {
                 "worker"
@@ -3123,17 +3128,28 @@ fn derive_check_outcome(
                 "workers"
             };
             let verb = if not_healthy == 1 { "is" } else { "are" };
-            issues_list.push(format!(
+            ranked_issues.push((CheckIssueSeverity::Warning, format!(
                 "{not_healthy} configured {worker_word} {verb} not healthy ({healthy_count}/{total_count} healthy)"
-            ));
+            )));
         }
-        ("degraded".to_string(), 1, issues_list)
+        ("degraded".to_string(), 1)
     } else {
-        issues_list.insert(0, "No healthy workers available".to_string());
-        ("not_ready".to_string(), 2, issues_list)
+        let cause = if workers.len() == total_count
+            && workers.iter().all(|worker| worker.status == "unreachable")
+        {
+            "All workers are unreachable"
+        } else {
+            "No healthy workers available"
+        };
+        ranked_issues.insert(0, (CheckIssueSeverity::Error, cause.to_string()));
+        ("not_ready".to_string(), 2)
     };
 
-    match daemon_issue_severity {
+    match daemon_issues
+        .iter()
+        .map(|issue| check_issue_severity(&issue.severity))
+        .max()
+    {
         Some(CheckIssueSeverity::Error) => {
             status = "not_ready".to_string();
             exit_code = 2;
@@ -3146,15 +3162,20 @@ fn derive_check_outcome(
     }
 
     if !hook_installed {
-        if status == "ready" || status == "degraded" {
-            issues.insert(0, CHECK_HOOK_NOT_INSTALLED_ISSUE.to_string());
-        } else {
-            issues.push(CHECK_HOOK_NOT_INSTALLED_ISSUE.to_string());
-        }
+        ranked_issues.push((
+            CheckIssueSeverity::Error,
+            CHECK_HOOK_NOT_INSTALLED_ISSUE.to_string(),
+        ));
         status = "not_ready".to_string();
         exit_code = 2;
     }
 
+    // Stable ordering retains every diagnostic and puts the cause of the exit first.
+    ranked_issues.sort_by(|a, b| b.0.cmp(&a.0));
+    let issues = ranked_issues
+        .into_iter()
+        .map(|(_, summary)| summary)
+        .collect();
     (status, exit_code, issues)
 }
 
@@ -3162,7 +3183,7 @@ fn derive_check_outcome(
 ///
 /// Returns exit codes:
 /// - 0: Ready (daemon running, hook installed, all workers healthy)
-/// - 1: Degraded (daemon running, some workers unreachable)
+/// - 1: Degraded (daemon running, some workers not healthy or warning issues)
 /// - 2: Not ready (daemon/hook missing or fatal issues)
 pub async fn check(ctx: &OutputContext) -> Result<()> {
     #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -3219,11 +3240,7 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                             let unhealthy: Vec<String> = daemon_status
                                 .workers
                                 .iter()
-                                .filter(|w| {
-                                    w.status != "healthy"
-                                        && w.status != "draining"
-                                        && w.status != "drained"
-                                })
+                                .filter(|w| w.status != "healthy")
                                 .map(|w| w.id.clone())
                                 .collect();
 
@@ -3242,7 +3259,7 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                             let (status, exit_code, issues) = derive_check_outcome(
                                 total_count,
                                 healthy_count,
-                                &unhealthy,
+                                &daemon_status.workers,
                                 &daemon_status.issues,
                                 hook_installed,
                             );
@@ -3669,7 +3686,13 @@ mod tests {
 
     #[test]
     fn test_check_outcome_degraded_missing_hook_promotes_not_ready() {
-        let unhealthy = vec!["builder-2".to_string()];
+        let unhealthy = vec![mk_worker_status(
+            "builder-2",
+            "unreachable",
+            "closed",
+            4,
+            1.0,
+        )];
         let daemon_issues = vec![check_issue("warning", "worker pressure")];
         let (status, exit_code, issues) =
             derive_check_outcome(2, 1, &unhealthy, &daemon_issues, false);
@@ -3767,6 +3790,89 @@ mod tests {
         assert_eq!(
             issues,
             vec!["1 configured worker is not healthy (2/3 healthy)".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_check_disabled_worker_preserves_state_without_claiming_unreachable() {
+        let workers = vec![
+            mk_worker_status("builder-1", "healthy", "closed", 4, 1.0),
+            mk_worker_status("builder-2", "disabled", "closed", 4, 1.0),
+        ];
+        let (status, exit_code, issues) = derive_check_outcome(2, 1, &workers, &[], true);
+        assert_eq!((status.as_str(), exit_code), ("degraded", 1));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("builder-2") && issue.contains("disabled"))
+        );
+        assert!(!issues.iter().any(|issue| issue.contains("unreachable")));
+
+        let (status, exit_code, issues) = derive_check_outcome(1, 0, &workers[1..], &[], true);
+        assert_eq!((status.as_str(), exit_code), ("not_ready", 2));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("builder-2") && issue.contains("disabled"))
+        );
+        assert!(!issues.iter().any(|issue| issue.contains("unreachable")));
+    }
+
+    #[test]
+    fn test_check_highest_severity_cause_precedes_worker_and_daemon_warnings() {
+        let workers = vec![mk_worker_status("builder-2", "disabled", "closed", 4, 1.0)];
+        let daemon_issues = vec![
+            check_issue("info", "maintenance scheduled"),
+            check_issue("warning", "stale telemetry"),
+            check_issue("CRITICAL", "disk capacity exhausted"),
+        ];
+        let (status, exit_code, issues) =
+            derive_check_outcome(2, 1, &workers, &daemon_issues, true);
+        assert_eq!((status.as_str(), exit_code), ("not_ready", 2));
+        // Both JSON and the CLI headline consume this severity-ordered issue list.
+        assert_eq!(
+            issues.first().map(String::as_str),
+            Some("disk capacity exhausted")
+        );
+        assert!(issues.iter().any(|issue| issue.contains("disabled")));
+        assert!(issues.iter().any(|issue| issue == "stale telemetry"));
+        assert!(issues.iter().any(|issue| issue == "maintenance scheduled"));
+    }
+
+    #[test]
+    fn test_check_warning_precedes_info_and_missing_hook_precedes_warnings() {
+        let daemon_issues = vec![
+            check_issue("info", "maintenance scheduled"),
+            check_issue("warning", "worker pressure"),
+        ];
+        let (status, exit_code, issues) = derive_check_outcome(1, 1, &[], &daemon_issues, true);
+        assert_eq!((status.as_str(), exit_code), ("degraded", 1));
+        assert_eq!(issues.first().map(String::as_str), Some("worker pressure"));
+
+        let (status, exit_code, issues) = derive_check_outcome(1, 1, &[], &daemon_issues, false);
+        assert_eq!((status.as_str(), exit_code), ("not_ready", 2));
+        assert_eq!(
+            issues.first().map(String::as_str),
+            Some(CHECK_HOOK_NOT_INSTALLED_ISSUE)
+        );
+        assert!(issues.iter().any(|issue| issue == "worker pressure"));
+    }
+
+    #[test]
+    fn test_check_unreachable_summary_requires_all_worker_states_to_be_unreachable() {
+        let workers = vec![mk_worker_status("builder-1", "unreachable", "open", 4, 1.0)];
+        let (status, exit_code, issues) = derive_check_outcome(1, 0, &workers, &[], true);
+        assert_eq!((status.as_str(), exit_code), ("not_ready", 2));
+        assert_eq!(
+            issues.first().map(String::as_str),
+            Some("All workers are unreachable")
+        );
+
+        let (_, _, issues) = derive_check_outcome(2, 0, &workers, &[], true);
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue == "All workers are unreachable")
         );
     }
 
