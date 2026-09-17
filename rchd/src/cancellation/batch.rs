@@ -302,4 +302,187 @@ mod tests {
             assert_eq!(history.recent(100).len(), confirmed.len());
         }
     }
+
+    #[tokio::test]
+    async fn cancellation_batch_concurrent_snapshots_share_limit_and_retain_real_reservations() {
+        let pool = WorkerPool::new();
+        let history = Arc::new(BuildHistory::new(100));
+        let per_batch = MAX_BULK_CANCELLATIONS + 3;
+        let reserved = u32::try_from(per_batch).unwrap() + 2;
+        let mut workers = Vec::new();
+        let mut snapshots = [BTreeSet::new(), BTreeSet::new()];
+        for (index, snapshot) in snapshots.iter_mut().enumerate() {
+            let id = rch_common::WorkerId::new(format!("bulk-worker-{index}"));
+            pool.add_worker(rch_common::WorkerConfig {
+                id: id.clone(),
+                host: "bulk-cancellation.invalid".to_owned(),
+                total_slots: reserved + 2,
+                ..rch_common::WorkerConfig::default()
+            })
+            .await;
+            let worker = pool.get(&id).await.unwrap();
+            assert!(worker.reserve_slots(reserved).await);
+            workers.push(worker);
+            for build in 0..per_batch {
+                let active = history.start_active_build(
+                    format!("batch-{index}-build-{build}"),
+                    id.to_string(),
+                    "cargo test".to_owned(),
+                    0,
+                    1,
+                    BuildLocation::Remote,
+                );
+                snapshot.insert(active.id);
+            }
+        }
+        let context = make_test_context(pool, history.clone());
+        let owner = CancellationOrchestrator::new(
+            CancellationConfig {
+                cleanup_timeout: Duration::ZERO,
+                ..test_config()
+            },
+            test_events(),
+        );
+        let stats = owner.worker_stats.write().await;
+        let [first_ids, second_ids] = snapshots;
+        let first = tokio::spawn(cancel_batch(
+            owner.clone(),
+            context.clone(),
+            first_ids,
+            false,
+        ));
+        wait_for_attempt_count(&owner, MAX_BULK_CANCELLATIONS).await;
+        let second = tokio::spawn(cancel_batch(owner.clone(), context, second_ids, true));
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            assert_eq!(
+                owner.active_cancellations().await.len(),
+                MAX_BULK_CANCELLATIONS,
+                "a second batch multiplied the shared operation budget"
+            );
+        }
+        drop(stats);
+        let (first, second) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("both bounded snapshots must make progress");
+        for result in [first.unwrap(), second.unwrap()] {
+            assert_eq!(result.status, "failed");
+            assert_eq!(result.cancelled_count, 0);
+            assert!(result.cancelled.is_empty());
+        }
+        assert_eq!(history.active_builds().len(), per_batch * 2);
+        assert!(history.recent(100).is_empty());
+        for worker in workers {
+            assert_eq!(
+                worker.used_slots(),
+                reserved,
+                "failed bulk cancellation released live or unrelated reservations"
+            );
+        }
+        assert_eq!(owner.bulk_permits.available_permits(), MAX_BULK_CANCELLATIONS);
+        assert!(owner.active_cancellations().await.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancellation_batch_aborted_caller_still_terminates_all_owned_hooks() {
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap().keep();
+        let history = Arc::new(BuildHistory::new(100));
+        let mut children = Vec::new();
+        let mut expected = BTreeSet::new();
+        for index in 0..2 {
+            let ready = root.join(format!("hook-{index}-ready"));
+            let child = OwnedChild(
+                std::process::Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "trap '' TERM; printf ready > \"$1\"; exec /bin/sleep 60",
+                        "bulk-owned-hook",
+                    ])
+                    .arg(&ready)
+                    .spawn()
+                    .unwrap(),
+            );
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while std::fs::read(&ready).ok().as_deref() != Some(b"ready") {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let build = history.start_active_build(
+                format!("owned-bulk-hook-{index}"),
+                "no-remote-work".to_owned(),
+                "fixture".to_owned(),
+                child.0.id(),
+                0,
+                BuildLocation::Remote,
+            );
+            expected.insert(build.id);
+            children.push(child);
+        }
+        let sentinel = OwnedChild(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        );
+        let context = make_test_context(WorkerPool::new(), history.clone());
+        let owner = CancellationOrchestrator::new(
+            CancellationConfig {
+                grace_period: Duration::from_secs(1),
+                kill_timeout: Duration::from_secs(1),
+                ..test_config()
+            },
+            test_events(),
+        );
+        let caller_owner = owner.clone();
+        let caller = tokio::spawn(async move {
+            caller_owner.cancel_all_builds(&context, false).await
+        });
+        wait_for_attempt_count(&owner, 2).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let late = history.start_active_build(
+            "late-live-sentinel".to_owned(),
+            "no-remote-work".to_owned(),
+            "fixture".to_owned(),
+            sentinel.0.id(),
+            0,
+            BuildLocation::Remote,
+        );
+        wait_for_attempt_count(&owner, 0).await;
+        for child in &children {
+            assert!(
+                !crate::cancellation::is_process_alive(child.0.id()),
+                "aborting a bulk caller abandoned one of its requested hooks"
+            );
+        }
+        assert!(crate::cancellation::is_process_alive(sentinel.0.id()));
+        assert!(history.active_build(late.id).is_some());
+        assert_eq!(history.active_builds().len(), 1);
+        let completed = history.recent(100);
+        assert_eq!(completed.len(), 2);
+        assert_eq!(
+            completed.iter().map(|build| build.id).collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert!(completed.iter().all(|build| {
+            build.exit_code == 130
+                && build
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.final_state == "completed")
+        }));
+    }
 }
