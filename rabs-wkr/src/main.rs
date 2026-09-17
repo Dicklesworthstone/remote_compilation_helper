@@ -174,7 +174,7 @@ async fn session_loop(
     let ack = read_frame(&mut stream)
         .await
         .ok_or_else(|| "no session-ok".to_string())?;
-    if !ack.contains("session-ok") {
+    if !session_ack_accepted(&ack) {
         return Err(format!("handshake refused: {ack}"));
     }
 
@@ -266,6 +266,18 @@ async fn session_loop(
     }
 }
 
+fn session_ack_accepted(frame: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(frame)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("kind")
+                .and_then(|kind| kind.as_str())
+                .map(|kind| kind == "session-ok")
+        })
+        .unwrap_or(false)
+}
+
 fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest, String> {
     Ok(CanonicalExecRequest {
         request_id: value
@@ -309,6 +321,24 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_ack_requires_success_message_kind() {
+        assert!(session_ack_accepted(
+            r#"{"kind":"session-ok","session_id":7}"#
+        ));
+        for frame in [
+            r#"{"kind":"error","reason":"session-ok denied"}"#,
+            r#"{"reason":"session-ok"}"#,
+            r#""session-ok""#,
+            r#"{"kind":"session-ok"} trailing"#,
+        ] {
+            assert!(
+                !session_ack_accepted(frame),
+                "accepted invalid acknowledgment: {frame}"
+            );
+        }
+    }
 
     #[test]
     fn i003_remote_request_carries_no_local_descriptors() {

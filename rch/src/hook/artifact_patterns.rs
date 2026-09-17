@@ -579,7 +579,11 @@ mod profile_artifact_tests {
                     .unwrap();
                 for exclude in custom_profile_cache_excludes("release-perf") {
                     assert!(
-                        custom.iter().position(|pattern| pattern == &exclude).unwrap() < first_include,
+                        custom
+                            .iter()
+                            .position(|pattern| pattern == &exclude)
+                            .unwrap()
+                            < first_include,
                         "profile cache exclusion must precede every output include"
                     );
                 }
@@ -640,7 +644,8 @@ mod profile_artifact_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn cargo_profile_artifacts_real_rsync_refreshes_custom_outputs_without_cache_or_source_overwrite() {
+    async fn cargo_profile_artifacts_real_rsync_refreshes_custom_outputs_without_cache_or_source_overwrite()
+     {
         use std::path::Path;
         use std::process::Stdio;
         use std::time::Duration;
@@ -658,21 +663,36 @@ mod profile_artifact_tests {
                 std::fs::create_dir_all(base.join(prefix)).unwrap();
             }
             std::fs::create_dir_all(source.join("debug")).unwrap();
-            std::fs::write(source.join("debug/application"), b"older default-profile output\n")
-                .unwrap();
-            std::fs::write(source.join(&relative), b"fresh requested custom-profile output\n")
-                .unwrap();
-            std::fs::write(destination.join(&relative), b"stale local custom-profile output\n")
-                .unwrap();
+            std::fs::write(
+                source.join("debug/application"),
+                b"older default-profile output\n",
+            )
+            .unwrap();
+            std::fs::write(
+                source.join(&relative),
+                b"fresh requested custom-profile output\n",
+            )
+            .unwrap();
+            std::fs::write(
+                destination.join(&relative),
+                b"stale local custom-profile output\n",
+            )
+            .unwrap();
             std::fs::write(source.join("source.rs"), b"foreign source\n").unwrap();
             std::fs::write(destination.join("source.rs"), b"local source sentinel\n").unwrap();
             for cache in ["incremental", ".fingerprint", "build"] {
                 std::fs::create_dir_all(source.join(prefix).join(cache)).unwrap();
-                std::fs::write(source.join(prefix).join(cache).join("cache"), b"must stay remote\n")
-                    .unwrap();
-            }
-            std::fs::write(source.join(prefix).join("application.d"), b"must stay remote\n")
+                std::fs::write(
+                    source.join(prefix).join(cache).join("cache"),
+                    b"must stay remote\n",
+                )
                 .unwrap();
+            }
+            std::fs::write(
+                source.join(prefix).join("application.d"),
+                b"must stay remote\n",
+            )
+            .unwrap();
 
             // Drive real rsync from the PRODUCTION profile-aware pattern list,
             // not a replacement parser or hand-authored profile include.

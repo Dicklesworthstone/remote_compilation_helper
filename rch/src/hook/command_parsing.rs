@@ -245,12 +245,10 @@ fn cargo_profile_tokens(command: &str) -> Option<(Vec<String>, usize)> {
         while tokens.get(index).is_some_and(|word| assignment(word)) {
             index += 1;
         }
-        let executable = Path::new(tokens.get(index)?)
-            .file_name()?
-            .to_str()?;
+        let executable = Path::new(tokens.get(index)?).file_name()?.to_str()?;
         match executable {
-            "cargo" | "cargo.exe" | "cargo-zigbuild" | "cargo-zigbuild.exe"
-            | "cargo-xwin" | "cargo-xwin.exe" => return Some((tokens, index)),
+            "cargo" | "cargo.exe" | "cargo-zigbuild" | "cargo-zigbuild.exe" | "cargo-xwin"
+            | "cargo-xwin.exe" => return Some((tokens, index)),
             "env" | "time" => {
                 let is_env = executable == "env";
                 index += 1;
@@ -278,8 +276,13 @@ fn cargo_profile_tokens(command: &str) -> Option<(Vec<String>, usize)> {
                     } else {
                         matches!(
                             word.as_str(),
-                            "-p" | "--portability" | "-v" | "--verbose" | "-a"
-                                | "--append" | "-q" | "--quiet"
+                            "-p" | "--portability"
+                                | "-v"
+                                | "--verbose"
+                                | "-a"
+                                | "--append"
+                                | "-q"
+                                | "--quiet"
                         ) || word.starts_with("--format=")
                             || word.starts_with("--output=")
                             || word.starts_with("-f") && word.len() > 2
@@ -366,11 +369,28 @@ pub(super) fn cargo_custom_profile_output_dir(command: &str) -> Option<String> {
             // --. Joined options already keep their value in the same token.
             if matches!(
                 token.as_str(),
-                "--config" | "--target" | "--target-dir" | "--manifest-path"
-                    | "--lockfile-path" | "--package" | "-p" | "--exclude"
-                    | "--features" | "-F" | "--bin" | "--example" | "--test"
-                    | "--bench" | "--color" | "--message-format" | "--jobs"
-                    | "-j" | "-Z" | "-C" | "--artifact-dir" | "--out-dir"
+                "--config"
+                    | "--target"
+                    | "--target-dir"
+                    | "--manifest-path"
+                    | "--lockfile-path"
+                    | "--package"
+                    | "-p"
+                    | "--exclude"
+                    | "--features"
+                    | "-F"
+                    | "--bin"
+                    | "--example"
+                    | "--test"
+                    | "--bench"
+                    | "--color"
+                    | "--message-format"
+                    | "--jobs"
+                    | "-j"
+                    | "-Z"
+                    | "-C"
+                    | "--artifact-dir"
+                    | "--out-dir"
             ) {
                 iter.next()?;
             }
@@ -637,24 +657,38 @@ mod cargo_profile_tests {
     #[test]
     fn cargo_profile_boundaries_ignore_other_option_values_and_program_arguments() {
         for option in [
-            "--config", "--target", "--target-dir", "--manifest-path",
-            "--package", "-p", "--exclude", "--features", "-F", "--bin",
-            "--example", "--test", "--bench", "--color", "--message-format",
-            "--jobs", "-j", "-Z", "-C", "--lockfile-path", "--artifact-dir",
+            "--config",
+            "--target",
+            "--target-dir",
+            "--manifest-path",
+            "--package",
+            "-p",
+            "--exclude",
+            "--features",
+            "-F",
+            "--bin",
+            "--example",
+            "--test",
+            "--bench",
+            "--color",
+            "--message-format",
+            "--jobs",
+            "-j",
+            "-Z",
+            "-C",
+            "--lockfile-path",
+            "--artifact-dir",
             "--out-dir",
         ] {
-            let command = format!(
-                "env -- cargo build {option} --profile=decoy --profile release-perf"
-            );
+            let command =
+                format!("env -- cargo build {option} --profile=decoy --profile release-perf");
             assert_eq!(
                 cargo_custom_profile_output_dir(&command).as_deref(),
                 Some("release-perf"),
                 "{command}"
             );
             assert_eq!(
-                cargo_custom_profile_output_dir(&format!(
-                    "cargo build {option} --profile=decoy"
-                )),
+                cargo_custom_profile_output_dir(&format!("cargo build {option} --profile=decoy")),
                 None,
                 "{option} value is not a profile selector"
             );
@@ -672,9 +706,16 @@ mod cargo_profile_tests {
 
     #[test]
     fn cargo_profile_boundaries_preserve_literals_and_refuse_pattern_or_path_components() {
-        for profile in ["dev", "test", "release", "bench", "", ".", "..", "../peer", "a/b", "a*b", "a?b", "[ab]", "--", "-bad", "a\\b"] {
+        for profile in [
+            "dev", "test", "release", "bench", "", ".", "..", "../peer", "a/b", "a*b", "a?b",
+            "[ab]", "--", "-bad", "a\\b",
+        ] {
             let command = shell_words::join(["cargo", "build", "--profile", profile]);
-            assert_eq!(cargo_custom_profile_output_dir(&command), None, "{profile:?}");
+            assert_eq!(
+                cargo_custom_profile_output_dir(&command),
+                None,
+                "{profile:?}"
+            );
         }
         for command in [
             "cargo build --profile",
