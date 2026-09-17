@@ -39,12 +39,13 @@ const MAX_OFFLOAD_SSH_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SOURCE_LOCK_READY_BYTES: usize = 4096;
 const MAX_SOURCE_LOCK_OUTPUT_BYTES: usize = 64 * 1024;
 const REMOTE_SOURCE_AUTHORITY_LOCK_DIR: &str = "/tmp/rch-source-authority-locks";
+const SOURCE_AUTHORITY_LOCK_HOLDER: &str = include_str!("source_lock_holder.sh");
 
 /// Keeps the worker-side advisory locks for a mutable Cargo source closure alive.
 ///
-/// The remote shell blocks on this SSH session's stdin after acquiring every
+/// The remote holder blocks on this SSH session's stdin after acquiring every
 /// lock. Dropping the guard kills the local SSH child; the resulting EOF/HUP
-/// tears down the nested `flock` processes and releases their kernel locks.
+/// ends the holder and releases its inherited kernel locks.
 pub(super) struct RemoteSourceAuthorityLock {
     worker_id: WorkerId,
     child: Option<tokio::process::Child>,
@@ -194,25 +195,37 @@ fn build_remote_source_authority_lock_cmd(
     if lock_paths.is_empty() {
         anyhow::bail!("remote source-authority lock set must not be empty");
     }
-    let mut nested = format!(
-        "sh -c {}",
-        shell_escape::escape(
-            format!(
-                "printf '%s\\n' {} && cat >/dev/null",
-                shell_escape::escape(ready_marker.into())
-            )
-            .into()
-        )
-    );
-    for path in lock_paths.iter().rev() {
-        nested = format!(
-            "flock -x {} {nested}",
-            shell_escape::escape(path.as_str().into())
-        );
+    let mut seen = std::collections::HashSet::new();
+    for path in lock_paths {
+        // The quoted here-document carries literal, one-path-per-line data.
+        // Absolute paths cannot equal its non-path delimiter. Keep the caller's
+        // established canonical-root order; re-sorting hashes could deadlock
+        // against older holders that acquire the same roots in that order.
+        if !path.starts_with('/')
+            || path.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0))
+            || !seen.insert(path)
+        {
+            anyhow::bail!("invalid or duplicate source-authority lock path: {path:?}");
+        }
     }
+    if ready_marker.is_empty()
+        || ready_marker.len() >= MAX_SOURCE_LOCK_READY_BYTES
+        || ready_marker.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0))
+    {
+        anyhow::bail!("invalid source-authority ready marker");
+    }
+    // The closure is data on fd 3, not an argument to SSH, sh, or flock.
+    // The fixed holder re-execs with --no-fork and inherits each acquired
+    // descriptor, avoiding both E2BIG and one live flock process per root.
+    // One descriptor per root is still necessary; exhaustion fails before
+    // readiness and process exit releases every partially acquired lock.
+    let holder = shell_escape::escape(SOURCE_AUTHORITY_LOCK_HOLDER.into());
     Ok(format!(
-        "set -e; mkdir -p -- {}; exec {nested}",
-        shell_escape::escape(lock_dir.into())
+        "set -e\nmkdir -p -- {directory}\nexec 3<<'RCH_SOURCE_LOCK_PATHS'\n{paths}\nRCH_SOURCE_LOCK_PATHS\nexec sh -c {holder} {holder} {count} {ready}",
+        directory = shell_escape::escape(lock_dir.into()),
+        paths = lock_paths.join("\n"),
+        count = lock_paths.len(),
+        ready = shell_escape::escape(ready_marker.into()),
     ))
 }
 
@@ -220,19 +233,18 @@ fn source_authority_lock_transport(
     platform: WorkerPlatform,
     remote_cmd: &str,
 ) -> (String, Option<String>) {
-    if platform.is_windows() {
-        // Unlike one-shot commands, the lock holder MUST retain this input
-        // pipe: its cat waits for EOF before releasing the source locks.
-        (
-            "sh -s".into(),
-            Some(format!(
-                "exec sh -c {}\n",
-                shell_escape::escape(remote_cmd.into())
-            )),
-        )
+    let reader = if platform.is_windows() {
+        "sh -s".to_owned()
     } else {
-        (build_remote_shell_command(platform, remote_cmd), None)
-    }
+        // Preserve POSIX login initialization without putting the closure in
+        // its -c argument, and replace the login shell rather than retaining it.
+        build_remote_shell_command(platform, "exec sh -s")
+    };
+    // Parse the entire compound command before executing any stdin consumer.
+    // The pipe must remain OPEN afterward: EOF releases ordinary source locks,
+    // while source pairs read their explicit release request from the same pipe.
+    // An exec sh -c '<large script>' bootstrap would merely move E2BIG remotely.
+    (reader, Some(format!("{{\n{remote_cmd}\n}}\n")))
 }
 
 /// Acquire sorted, worker-side locks for every mutable canonical source root.
@@ -1213,18 +1225,12 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             &ready,
             &release,
         );
-        let child = Command::new("sh")
-            .args(["-c", &script])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+        let (child, bootstrap) = local_source_lock_transport(WorkerPlatform::Posix, &script);
         let mut guard = finish_source_authority_lock_acquisition(
             child,
             WorkerId::new("local-pair-test"),
             &ready,
-            None,
+            bootstrap.as_deref(),
             Duration::from_secs(5),
         )
         .await?;
@@ -1440,13 +1446,16 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
         script: &str,
     ) -> (tokio::process::Child, Option<String>) {
         let (remote_arg, bootstrap) = source_authority_lock_transport(platform, script);
-        if platform.is_windows() {
-            assert_eq!(remote_arg, "sh -s");
-            assert!(bootstrap.is_some());
+        let expected = if platform.is_windows() {
+            "sh -s".to_owned()
         } else {
-            assert_eq!(remote_arg, build_remote_shell_command(platform, script));
-            assert!(bootstrap.is_none());
-        }
+            build_remote_shell_command(platform, "exec sh -s")
+        };
+        assert_eq!(remote_arg, expected);
+        assert_eq!(
+            bootstrap.as_deref(),
+            Some(format!("{{\n{script}\n}}\n").as_str())
+        );
         // Actual POSIX reader/flock processes exercise the production stdin
         // and guard path. This does not emulate or claim native Windows SSH.
         let child = Command::new("sh")
@@ -2622,5 +2631,217 @@ exec /bin/ln \"$@\"\n",
             .await
             .unwrap_err();
         assert!(error.to_string().contains("exceeded"), "{error:#}");
+    }
+
+    #[test]
+    fn source_lock_scaling_rejects_ambiguous_path_records() {
+        assert!(build_remote_source_authority_lock_cmd("/tmp", &[], "READY").is_err());
+        for path in ["relative", "/tmp/a\n/tmp/b", "/tmp/a\r", "/tmp/a\0b"] {
+            let paths = vec!["/tmp/valid".to_owned(), path.to_owned()];
+            assert!(build_remote_source_authority_lock_cmd("/tmp", &paths, "READY").is_err());
+        }
+        let duplicate = vec!["/tmp/same".to_owned(); 2];
+        assert!(build_remote_source_authority_lock_cmd("/tmp", &duplicate, "READY").is_err());
+        for marker in ["", "READY\nFORGED", "READY\r", "READY\0"] {
+            assert!(
+                build_remote_source_authority_lock_cmd("/tmp", &["/tmp/one".into()], marker)
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn source_lock_scaling_is_held(path: &str) -> bool {
+        let output = timeout(
+            Duration::from_secs(5),
+            Command::new("flock")
+                .args(["-n", "-x", "--", path, "sh", "-c", "exit 0"])
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("independent nonblocking lock probe hung")
+        .unwrap();
+        assert!(matches!(output.status.code(), Some(0 | 1)), "{output:?}");
+        output.status.code() == Some(1)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_lock_scaling_streams_548_roots_and_preserves_exclusion() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let lock_dir = dir.join("d".repeat(100));
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let mut locks = (0..548)
+            .map(|index| {
+                lock_dir
+                    .join(format!("{index:04}-{}.lock", "k".repeat(180)))
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        locks[547] = lock_dir
+            .join(format!("quote' $cash `literal`; {}", "z".repeat(170)))
+            .display()
+            .to_string();
+        let marker = "READY ' \" $() ; `literal`";
+        let script =
+            build_remote_source_authority_lock_cmd(lock_dir.to_str().unwrap(), &locks, marker)
+                .unwrap();
+        assert!(script.len() > 128 * 1024);
+        for platform in [WorkerPlatform::Posix, WorkerPlatform::Windows] {
+            let (child, bootstrap) = local_source_lock_transport(platform, &script);
+            let pid = child.id().unwrap();
+            let mut first = finish_source_authority_lock_acquisition(
+                child,
+                WorkerId::new("large-closure"),
+                marker,
+                bootstrap.as_deref(),
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+            first.ensure_held().unwrap();
+            // No nesting of live flock parents: the original process becomes
+            // the final stdin holder. A shell may retain one heredoc helper.
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    if std::fs::read_link(format!("/proc/{pid}/exe"))
+                        .ok()
+                        .and_then(|path| path.file_name().map(|name| name == "cat"))
+                        == Some(true)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("lock acquisition retained a flock process chain");
+            for index in [0, 274, 547] {
+                assert!(source_lock_scaling_is_held(&locks[index]).await);
+            }
+            assert!(
+                !source_lock_scaling_is_held(dir.join("disjoint.lock").to_str().unwrap()).await
+            );
+            let overlap = build_remote_source_authority_lock_cmd(
+                lock_dir.to_str().unwrap(),
+                std::slice::from_ref(&locks[547]),
+                "SECOND",
+            )
+            .unwrap();
+            let (child, bootstrap) = local_source_lock_transport(platform, &overlap);
+            let mut second = Box::pin(finish_source_authority_lock_acquisition(
+                child,
+                WorkerId::new("overlapping-closure"),
+                "SECOND",
+                bootstrap.as_deref(),
+                Duration::from_secs(20),
+            ));
+            assert!(
+                timeout(Duration::from_millis(100), &mut second)
+                    .await
+                    .is_err()
+            );
+            first.release().await.unwrap();
+            let second = second.await.unwrap();
+            second.release().await.unwrap();
+            for index in [0, 274, 547] {
+                assert!(!source_lock_scaling_is_held(&locks[index]).await);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_lock_scaling_descriptor_exhaustion_never_publishes_readiness() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let locks = (0..32)
+            .map(|index| dir.join(format!("{index}.lock")).display().to_string())
+            .collect::<Vec<_>>();
+        let script = format!(
+            "ulimit -n 16\n{}",
+            build_remote_source_authority_lock_cmd(dir.to_str().unwrap(), &locks, "READY").unwrap()
+        );
+        let (child, bootstrap) = local_source_lock_transport(WorkerPlatform::Posix, &script);
+        let result = finish_source_authority_lock_acquisition(
+            child,
+            WorkerId::new("limited-descriptors"),
+            "READY",
+            bootstrap.as_deref(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "partial lock set must never authorize a source writer"
+        );
+        for path in &locks {
+            assert!(!source_lock_scaling_is_held(path).await);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_lock_scaling_cancelled_acquisition_releases_its_prefix() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let a = dir.join("a.lock").display().to_string();
+        let b = dir.join("b.lock").display().to_string();
+        let first_script = build_remote_source_authority_lock_cmd(
+            dir.to_str().unwrap(),
+            std::slice::from_ref(&b),
+            "FIRST",
+        )
+        .unwrap();
+        let (child, bootstrap) = local_source_lock_transport(WorkerPlatform::Posix, &first_script);
+        let first = finish_source_authority_lock_acquisition(
+            child,
+            WorkerId::new("blocking-owner"),
+            "FIRST",
+            bootstrap.as_deref(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let script = build_remote_source_authority_lock_cmd(
+            dir.to_str().unwrap(),
+            &[a.clone(), b.clone()],
+            "SECOND",
+        )
+        .unwrap();
+        let (child, bootstrap) = local_source_lock_transport(WorkerPlatform::Posix, &script);
+        let mut second = Box::pin(finish_source_authority_lock_acquisition(
+            child,
+            WorkerId::new("partial-owner"),
+            "SECOND",
+            bootstrap.as_deref(),
+            Duration::from_secs(20),
+        ));
+        timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(
+                    timeout(Duration::from_millis(50), &mut second)
+                        .await
+                        .is_err()
+                );
+                if source_lock_scaling_is_held(&a).await {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(second);
+        timeout(Duration::from_secs(5), async {
+            while source_lock_scaling_is_held(&a).await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("aborted acquisition leaked its partial lock set");
+        assert!(source_lock_scaling_is_held(&b).await);
+        first.release().await.unwrap();
+        assert!(!source_lock_scaling_is_held(&b).await);
     }
 }
