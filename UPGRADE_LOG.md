@@ -1,5 +1,41 @@
 # Dependency Upgrade Log
 
+## 2026-09-17 — FrankenSQLite 0.4.4 and compatible Cargo refresh (bd-p6i41)
+
+User-directed update: FrankenSQLite v0.4.4 (tagged; all 15 `fsqlite*` crates
+published to crates.io 2026-09-17T13:33Z). `rabs-cas/Cargo.toml` pin advanced
+`fsqlite = "=0.4.0"` → `"=0.4.4"` (feature set unchanged: `default-features =
+false, features = ["async-api"]`); `cargo update -p fsqlite --precise 0.4.4`
+then a general `cargo update` refreshed 154 lockfile packages within their
+compatibility ranges. Deliberate pins preserved: asupersync Git revision
+`78b64636e99fea4ea2d868096576021dd3b8e519` (0.5.0, ADR 007), rusqlite 0.40.2,
+all path deps, and the pinned nightly. Asupersync advance requires its own
+ADR-007 admission; unchanged here.
+
+Verification evidence:
+- `cargo test --locked -p rabs-cas --lib` on hz4 via RCH: 243 of 245 tests
+  `ok` (all H009 differential, migration/reopen, S020 reset, H024 admission)
+  before the 1800s SSH command budget terminated the session (compilation
+  had finished; only the two `h015` crash-matrix tests were still running;
+  no orphaned rabs process remained on hz4 — checked via its identity key).
+- The two `h015` crash-matrix tests were rerun locally
+  (`RCH_CARGO_WRAPPER_BYPASS=1`, permitted when rch cannot admit work):
+  3 passed / 0 failed in 566s, including
+  `h015_frankensqlite_matrix_matches_reference_at_every_kill_point`
+  (byte-identical crash states at every kill boundary) on 0.4.4.
+- Workspace `cargo check --locked --all-targets` exit 0 (9m28s, ovh-a) and
+  `cargo clippy --locked --all-targets -D warnings` exit 0 (2m25s, ovh-a),
+  both through RCH under the refreshed lockfile.
+- `cargo audit`: 715 crates scanned, zero vulnerabilities.
+- Not run: full workspace test suite (rabsd/rabs-wkr/runtime suites),
+  Mac targets, release qualification. The 2026-09-12 admission scope
+  (ADR 007) for the runtime-coupled integration targets was not re-run;
+  the H009/H015/H024 storage gates cover the 0.4.4 storage upgrade itself.
+
+Two transient RCH-E104/E205 events on hz4 (20s/1800s SSH timeouts) were
+worker-side, not build failures; hz4 was later re-probed healthy by the
+daemon and other agents' builds ran there concurrently. No fleet changes.
+
 ## 2026-09-12 — dependency refresh and DSR release (bd-6q0eo)
 
 Status: released as 2.0.0 on September 13. Registry versions were checked against crates.io; existing
