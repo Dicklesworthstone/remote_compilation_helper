@@ -713,6 +713,12 @@ pub(super) fn collect_value_sources(
 
     push_value_source(
         &mut values,
+        "general.role",
+        config.general.role.as_str().to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
         "general.enabled",
         config.general.enabled.to_string(),
         sources,
@@ -1204,6 +1210,21 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
     };
 
     match key {
+        "general.role" => {
+            config.general.role = match value.trim().trim_matches('"') {
+                "dispatcher" => rch_common::BoxRole::Dispatcher,
+                "worker" => rch_common::BoxRole::Worker,
+                "hybrid" => rch_common::BoxRole::Hybrid,
+                _ => {
+                    return Err(ConfigError::InvalidValue {
+                        field: key.to_string(),
+                        reason: "unknown machine role".to_string(),
+                        suggestion: "Use dispatcher, worker, or hybrid".to_string(),
+                    }
+                    .into());
+                }
+            };
+        }
         "general.enabled" => {
             config.general.enabled = parse_bool(value, key)?;
         }
@@ -1433,6 +1454,10 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
 
     let defaults = RchConfig::default();
     let value = match key {
+        "general.role" => {
+            config.general.role = defaults.general.role;
+            config.general.role.as_str().to_string()
+        }
         "general.enabled" => {
             config.general.enabled = defaults.general.enabled;
             config.general.enabled.to_string()
@@ -2841,6 +2866,33 @@ mod tests {
         let contents = std::fs::read_to_string(&config_path).expect("read config");
         let config: RchConfig = toml::from_str(&contents).expect("parse config");
         assert!(config.self_healing.hook_starts_daemon);
+    }
+
+    #[test]
+    fn dispatcher_role_config_round_trip_and_invalid_value_preserves_file() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let path = dir.join("config.toml");
+        for role in ["dispatcher", "worker", "hybrid"] {
+            apply_config_set(&path, "general.role", role).unwrap();
+            let bytes = std::fs::read_to_string(&path).unwrap();
+            let config: RchConfig = toml::from_str(&bytes).unwrap();
+            let values = collect_value_sources(&config, &Default::default());
+            assert_eq!(
+                values
+                    .iter()
+                    .find(|v| v.key == "general.role")
+                    .unwrap()
+                    .value,
+                role
+            );
+            assert!(apply_config_set(&path, "general.role", "dispatcherr").is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        }
+        apply_config_set(&path, "general.role", "dispatcher").unwrap();
+        config_reset_at(&path, "general.role", &plain_context()).unwrap();
+        let config: RchConfig = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(config.general.role, rch_common::BoxRole::Hybrid);
     }
 
     /// GH #38 regression: `rch config set path_topology.canonical_root <path>`
