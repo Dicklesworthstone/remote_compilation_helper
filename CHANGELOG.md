@@ -36,6 +36,12 @@ from the qualified 2.0.0 release below. Its independent native Linux
 admission and test follow-ups are recorded in
 `docs/adr/007-asupersync-revision-pin.md` and `UPGRADE_LOG.md`.
 
+- Add durable job ownership and same-identity `jobs attach`, `jobs cancel`, and
+  `jobs recover` commands. Recover stalled artifact retrieval without replaying
+  compilation; retain publication and retirement evidence for recovery retries.
+- Fix path normalization when canonical and alias roots are identical: resolve
+  parent components while retaining the final canonical-root containment check.
+
 ## 2.0.0 — 2026-09-13
 
 Published from `3289f5e4e977e001187e48976bcd89e4cca0c752`:
