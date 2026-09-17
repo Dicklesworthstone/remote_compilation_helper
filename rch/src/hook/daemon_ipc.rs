@@ -39,7 +39,7 @@ async fn write_daemon_request<W: tokio::io::AsyncWrite + Unpin>(
 /// This is the daemon's one-response-per-connection protocol, not a general
 /// HTTP client. Limit bytes *before* reading them: read_line followed by a
 /// length check cannot bound a peer that never sends a newline.
-async fn read_daemon_body<R: tokio::io::AsyncRead + Unpin>(
+pub(super) async fn read_daemon_body<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     budget: Duration,
     allow_bare_json: bool,

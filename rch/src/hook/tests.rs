@@ -25,13 +25,12 @@ use super::daemon_ipc::{
 };
 use super::dependency_closure::{
     DEPENDENCY_PREFLIGHT_CODE_MISSING, DEPENDENCY_PREFLIGHT_CODE_STALE,
-    DEPENDENCY_PREFLIGHT_PROBE_BATCH_SIZE, DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING,
-    DEPENDENCY_PREFLIGHT_REMEDIATION_STALE, DependencyPreflightCheck, SyncClosureMode,
-    SyncClosurePlanEntry, SyncRootOutcome, build_dependency_preflight_report,
-    build_remote_dependency_preflight_command, build_remote_dependency_preflight_commands,
+    DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING, DEPENDENCY_PREFLIGHT_REMEDIATION_STALE,
+    DependencyPreflightCheck, SyncClosureMode, SyncClosurePlanEntry, SyncRootOutcome,
+    build_dependency_preflight_report, build_remote_dependency_preflight_command,
     build_sync_closure_manifest, build_sync_closure_plan, canonicalize_sync_root_for_plan,
     cargo_package_source_entrypoints, cargo_workspace_member_source_entrypoints,
-    dependency_preflight_checks_for_entry, is_within_sync_topology,
+    dependency_preflight_checks_for_entry, dependency_preflight_timeout, is_within_sync_topology,
     parse_dependency_preflight_probe_output, synced_dependency_preflight_checks,
     verify_remote_dependency_manifests,
 };
@@ -4900,9 +4899,9 @@ fn test_windows_offload_control_commands_use_stdin_script_transport() {
 }
 
 #[test]
-fn test_build_remote_dependency_preflight_commands_batches_large_workspaces() {
+fn test_build_remote_dependency_preflight_command_covers_large_workspaces() {
     let _guard = test_guard!();
-    let checks = (0..=DEPENDENCY_PREFLIGHT_PROBE_BATCH_SIZE)
+    let checks = (0..2119)
         .map(|idx| DependencyPreflightCheck {
             root: "/data/projects/big".to_string(),
             manifest: "/data/projects/big/Cargo.toml".to_string(),
@@ -4912,16 +4911,21 @@ fn test_build_remote_dependency_preflight_commands_batches_large_workspaces() {
         })
         .collect::<Vec<_>>();
 
-    let commands = build_remote_dependency_preflight_commands(&checks);
+    let command = build_remote_dependency_preflight_command(&checks).unwrap();
+    for check in &checks {
+        assert!(command.contains(&check.required_path));
+    }
+}
 
-    assert_eq!(
-        commands.len(),
-        2,
-        "one more than the batch size must be split into two SSH commands"
-    );
-    assert!(commands[0].contains("/data/projects/big/tests/case_127.rs"));
-    assert!(!commands[0].contains("/data/projects/big/tests/case_128.rs"));
-    assert!(commands[1].contains("/data/projects/big/tests/case_128.rs"));
+#[test]
+fn test_dependency_preflight_timeout_retains_total_probe_budget() {
+    for (paths, seconds) in [(0, 20), (1, 20), (128, 20), (129, 40), (2119, 340)] {
+        assert_eq!(
+            dependency_preflight_timeout(paths),
+            Duration::from_secs(seconds)
+        );
+    }
+    assert!(dependency_preflight_timeout(usize::MAX) >= Duration::from_secs(340));
 }
 
 #[test]
@@ -6222,8 +6226,21 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
                 continue;
             }
             let heartbeat: BuildHeartbeatRequest = serde_json::from_str(&body).unwrap();
+            let response = serde_json::json!({
+                "status": "ok",
+                "build_id": heartbeat.build_id,
+                "worker_id": heartbeat.worker_id,
+                "phase": match heartbeat.phase {
+                    BuildHeartbeatPhase::SyncUp => "sync_up",
+                    BuildHeartbeatPhase::Execute => "execute",
+                    BuildHeartbeatPhase::SyncDown => "sync_down",
+                    BuildHeartbeatPhase::Finalize => "finalize",
+                },
+            });
+            let response =
+                format!("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{response}\n");
             received_tx.send(heartbeat).expect("retain heartbeat");
-            if let Err(error) = writer.write_all(b"{}\n").await {
+            if let Err(error) = writer.write_all(response.as_bytes()).await {
                 // Guard drop may close the peer after its complete request.
                 assert!(
                     matches!(

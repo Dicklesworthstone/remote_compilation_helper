@@ -1,0 +1,284 @@
+{
+  "schema_version": "br.doctor.schema_migration.applied.v1",
+  "run_id": "20260917T050133.566349Z-891740-0",
+  "database_path": "/data/projects/remote_compilation_helper/.beads/beads.db",
+  "plan_token": "edbc9a8e39ec0392149e466bb3389c259e973360447fc1bf637100a735e25387",
+  "prepared_receipt_sha256": "1a8634591eefcefeec7c4693b0638ee797810eadbd0bc7d244a7df8f047365c7",
+  "marked_at": "2026-09-17T05:01:33.695001773+00:00",
+  "forecast": {
+    "from_version": 16,
+    "to_version": 19,
+    "content_hash_rows_rebuilt": 0,
+    "gate_result_history_created": false,
+    "prerequisites_column_added": true,
+    "dependency_type_key_added": true,
+    "post_migration_maintenance": true
+  },
+  "effects": {
+    "from_version": 16,
+    "to_version": 19,
+    "content_hash_rows_rebuilt": 0,
+    "gate_result_history_created": false,
+    "prerequisites_column_added": true,
+    "dependency_type_key_added": true,
+    "post_migration_maintenance_completed": true
+  },
+  "raw_before": {
+    "components": [
+      {
+        "suffix": "",
+        "present": true,
+        "length": 17362944,
+        "sha256": "c7ae9201c53eb4cfa1af3fecdd23b489838a899a8610c5b2f19c833d307c957b",
+        "unix_mode": 33152
+      },
+      {
+        "suffix": "-wal",
+        "present": true,
+        "length": 32,
+        "sha256": "81462c0ba8d0a08c38cce25853c465a6cc39c04f7040591e400bc7e05366bc34",
+        "unix_mode": 33204
+      },
+      {
+        "suffix": "-shm",
+        "present": true,
+        "length": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+        "unix_mode": 33152
+      },
+      {
+        "suffix": "-journal",
+        "present": false,
+        "length": null,
+        "sha256": null,
+        "unix_mode": null
+      }
+    ]
+  },
+  "logical_before": {
+    "user_version": 16,
+    "integrity_check": "ok",
+    "schema_sha256": "d030d7d749a786cc72df856bc2393e85f81f1a099ecbb51aa5ae58c3a5d80d76",
+    "contents_sha256": "2d338b0a7b97624343a80cca48f299c0a8e8865aa373a71105de7f078e891351",
+    "tables": [
+      {
+        "name": "blocked_issues_cache",
+        "row_count": 8,
+        "rows_sha256": "740128e255acd2d8ac6c6e4cdd3d8a0798c1775009ce30f6435509c692504f5f"
+      },
+      {
+        "name": "capacity_exemption_history",
+        "row_count": 0,
+        "rows_sha256": "093b079b9c2a552c936ecb3e31471049f83bf52d3bd9fd2a3c21733d9cd125c1"
+      },
+      {
+        "name": "capacity_exemptions",
+        "row_count": 0,
+        "rows_sha256": "fbda7353fb3baafd599889c90557842a503be99c1dcb186eca832ad2794cb7b4"
+      },
+      {
+        "name": "child_counters",
+        "row_count": 50,
+        "rows_sha256": "33bab6139691b77d8cf8daafec210c6d96cc0d66840dfc0c2a476cd1d515fdcd"
+      },
+      {
+        "name": "close_metadata",
+        "row_count": 0,
+        "rows_sha256": "fd96e66f70122d836c45823be36b8d96be0a7423a9149ec2dd05f16c4263d31f"
+      },
+      {
+        "name": "comments",
+        "row_count": 600,
+        "rows_sha256": "e2de168242f31f607843749ce5b9d4df9b0a08f1ec6273bfeadcb7425835d079"
+      },
+      {
+        "name": "config",
+        "row_count": 1,
+        "rows_sha256": "7d7d586788e2aa3c9bad2d421571a4cb9834d6a6996437259b506731702ae1fc"
+      },
+      {
+        "name": "dependencies",
+        "row_count": 2375,
+        "rows_sha256": "a87b0e79dc1f631d874370d8a005219ea06abef94042fde4cbc431645c00206b"
+      },
+      {
+        "name": "dirty_issues",
+        "row_count": 0,
+        "rows_sha256": "cc278c69726f5a1f8dcdb479e985171f764ae8c4d8d41b8280826baf1b1be1ba"
+      },
+      {
+        "name": "events",
+        "row_count": 0,
+        "rows_sha256": "9f8bd34621fc7b3456e02ae96f2c0b56ba83a3d15e1466634c980ae5a0b1e5d4"
+      },
+      {
+        "name": "export_hashes",
+        "row_count": 1452,
+        "rows_sha256": "dce28cbc7ea1c781e25b5f62d988775e779ad833d90190942981c8c052ce97be"
+      },
+      {
+        "name": "gate_result_history",
+        "row_count": 0,
+        "rows_sha256": "ade6edf42bcd9c1b088917fba2152530722844ee57e6447eafe84fd20f177162"
+      },
+      {
+        "name": "gate_results",
+        "row_count": 0,
+        "rows_sha256": "a360c72db907c2936d5c05af4e653445922cc0355d2a23543f62c22716ab7f3a"
+      },
+      {
+        "name": "issues",
+        "row_count": 1452,
+        "rows_sha256": "18fb18ff15183920afb31aa3f69992dd6643fe3db11d6951297372c446132067"
+      },
+      {
+        "name": "labels",
+        "row_count": 1613,
+        "rows_sha256": "d8c9d879433745c9e7d255d7f522866f28e696f4b97f70f410fad1421798269d"
+      },
+      {
+        "name": "metadata",
+        "row_count": 7,
+        "rows_sha256": "c0cfca0c75257cba684ea6fea85f47ea935901197df62914a972dc5f91bcdbb1"
+      },
+      {
+        "name": "sqlite_sequence",
+        "row_count": 1,
+        "rows_sha256": "246c87a0c6931f8b1d71781f762a370c6eced30e5b20e220cfee5a295a45a40b"
+      }
+    ]
+  },
+  "raw_after": {
+    "components": [
+      {
+        "suffix": "",
+        "present": true,
+        "length": 21340160,
+        "sha256": "fc799993b314860234ba87ee54e4efd3bff7f2d037c540f0f61e96579669d2bf",
+        "unix_mode": 33152
+      },
+      {
+        "suffix": "-wal",
+        "present": false,
+        "length": null,
+        "sha256": null,
+        "unix_mode": null
+      },
+      {
+        "suffix": "-shm",
+        "present": false,
+        "length": null,
+        "sha256": null,
+        "unix_mode": null
+      },
+      {
+        "suffix": "-journal",
+        "present": false,
+        "length": null,
+        "sha256": null,
+        "unix_mode": null
+      }
+    ]
+  },
+  "logical_after": {
+    "user_version": 19,
+    "integrity_check": "ok",
+    "schema_sha256": "ebe4bda57cbb0ad571a9c3af51a1a13b7d3a7c8f73de00af5aff844c2999f227",
+    "contents_sha256": "ae9920b269814e03af7749a8f98a24d48694b270f7501af86c5fc6f39d87780f",
+    "tables": [
+      {
+        "name": "blocked_issues_cache",
+        "row_count": 8,
+        "rows_sha256": "740128e255acd2d8ac6c6e4cdd3d8a0798c1775009ce30f6435509c692504f5f"
+      },
+      {
+        "name": "capacity_exemption_history",
+        "row_count": 0,
+        "rows_sha256": "093b079b9c2a552c936ecb3e31471049f83bf52d3bd9fd2a3c21733d9cd125c1"
+      },
+      {
+        "name": "capacity_exemptions",
+        "row_count": 0,
+        "rows_sha256": "fbda7353fb3baafd599889c90557842a503be99c1dcb186eca832ad2794cb7b4"
+      },
+      {
+        "name": "capacity_occupancy",
+        "row_count": 0,
+        "rows_sha256": "dabbdb58ea49d71bca1d7009676e4635877eaf260f4c892b2c665ab88ebde075"
+      },
+      {
+        "name": "child_counters",
+        "row_count": 50,
+        "rows_sha256": "33bab6139691b77d8cf8daafec210c6d96cc0d66840dfc0c2a476cd1d515fdcd"
+      },
+      {
+        "name": "close_metadata",
+        "row_count": 0,
+        "rows_sha256": "fd96e66f70122d836c45823be36b8d96be0a7423a9149ec2dd05f16c4263d31f"
+      },
+      {
+        "name": "comments",
+        "row_count": 600,
+        "rows_sha256": "e2de168242f31f607843749ce5b9d4df9b0a08f1ec6273bfeadcb7425835d079"
+      },
+      {
+        "name": "config",
+        "row_count": 1,
+        "rows_sha256": "7d7d586788e2aa3c9bad2d421571a4cb9834d6a6996437259b506731702ae1fc"
+      },
+      {
+        "name": "dependencies",
+        "row_count": 2375,
+        "rows_sha256": "a87b0e79dc1f631d874370d8a005219ea06abef94042fde4cbc431645c00206b"
+      },
+      {
+        "name": "dirty_issues",
+        "row_count": 0,
+        "rows_sha256": "cc278c69726f5a1f8dcdb479e985171f764ae8c4d8d41b8280826baf1b1be1ba"
+      },
+      {
+        "name": "events",
+        "row_count": 0,
+        "rows_sha256": "9f8bd34621fc7b3456e02ae96f2c0b56ba83a3d15e1466634c980ae5a0b1e5d4"
+      },
+      {
+        "name": "export_hashes",
+        "row_count": 1452,
+        "rows_sha256": "dce28cbc7ea1c781e25b5f62d988775e779ad833d90190942981c8c052ce97be"
+      },
+      {
+        "name": "gate_result_history",
+        "row_count": 0,
+        "rows_sha256": "ade6edf42bcd9c1b088917fba2152530722844ee57e6447eafe84fd20f177162"
+      },
+      {
+        "name": "gate_results",
+        "row_count": 0,
+        "rows_sha256": "a360c72db907c2936d5c05af4e653445922cc0355d2a23543f62c22716ab7f3a"
+      },
+      {
+        "name": "issues",
+        "row_count": 1452,
+        "rows_sha256": "c83b79809217b62a5ec248f519227c5cccaecf7732f85667cb31c4caca3a9490"
+      },
+      {
+        "name": "labels",
+        "row_count": 1613,
+        "rows_sha256": "d8c9d879433745c9e7d255d7f522866f28e696f4b97f70f410fad1421798269d"
+      },
+      {
+        "name": "metadata",
+        "row_count": 7,
+        "rows_sha256": "c0cfca0c75257cba684ea6fea85f47ea935901197df62914a972dc5f91bcdbb1"
+      },
+      {
+        "name": "sqlite_sequence",
+        "row_count": 1,
+        "rows_sha256": "246c87a0c6931f8b1d71781f762a370c6eced30e5b20e220cfee5a295a45a40b"
+      }
+    ]
+  },
+  "attested": true,
+  "attestation_errors": [],
+  "undo_command": "br doctor migrate-schema undo 20260917T050133.566349Z-891740-0"
+}

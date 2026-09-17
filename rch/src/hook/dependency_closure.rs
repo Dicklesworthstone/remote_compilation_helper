@@ -115,7 +115,7 @@ pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN: &str =
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY: &str = "Path dependency topology policy failed; move dependencies under the canonical project root (path_topology.canonical_root, default /data/projects, alias /dp) and retry.";
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_TIMEOUT: &str = "Dependency planner timed out; rerun after system load decreases or investigate cargo metadata latency.";
 pub(super) const DEPENDENCY_PREFLIGHT_REMEDIATION_MATERIALIZATION: &str = "Cargo path materialization is incomplete; repair the reported repository manifest/path dependency before retrying remote Cargo execution.";
-pub(super) const DEPENDENCY_PREFLIGHT_PROBE_BATCH_SIZE: usize = 128;
+const DEPENDENCY_PREFLIGHT_PATHS_PER_TIMEOUT_WINDOW: usize = 128;
 const WORKSPACE_METADATA_SYNC_PATTERNS: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
@@ -986,14 +986,15 @@ pub(super) async fn verify_remote_dependency_manifests(
     let mut missing_paths = std::collections::BTreeSet::new();
     let mut probe_failure: Option<String> = None;
 
-    for verify_cmd in build_remote_dependency_preflight_commands(&synced_checks) {
-        // A 128-path batch can still exceed argv limits when paths are long.
-        // Keep scripts on stdin, including after the ownership preflight (#71).
+    if let Some(verify_cmd) = build_remote_dependency_preflight_command(&synced_checks) {
+        // Stdin transport has no argv-size limit. Probe the entire closure in
+        // one SSH session instead of paying a handshake and login-shell startup
+        // for every 128 paths. Retain the former batches' total timeout budget.
         match run_offload_ssh_command_with_stdin(
             worker,
             "sh -s",
             verify_cmd.as_bytes(),
-            Duration::from_secs(20),
+            dependency_preflight_timeout(synced_checks.len()),
         )
         .await
         {
@@ -1020,9 +1021,6 @@ pub(super) async fn verify_remote_dependency_manifests(
             Err(err) => {
                 probe_failure = Some(err.to_string());
             }
-        }
-        if probe_failure.is_some() {
-            break;
         }
     }
 
@@ -1086,13 +1084,11 @@ pub(super) fn build_remote_dependency_preflight_command(
     ))
 }
 
-pub(super) fn build_remote_dependency_preflight_commands(
-    checks: &[DependencyPreflightCheck],
-) -> Vec<String> {
-    checks
-        .chunks(DEPENDENCY_PREFLIGHT_PROBE_BATCH_SIZE)
-        .filter_map(build_remote_dependency_preflight_command)
-        .collect()
+pub(super) fn dependency_preflight_timeout(check_count: usize) -> Duration {
+    let windows = check_count
+        .div_ceil(DEPENDENCY_PREFLIGHT_PATHS_PER_TIMEOUT_WINDOW)
+        .max(1);
+    Duration::from_secs(20).saturating_mul(u32::try_from(windows).unwrap_or(u32::MAX))
 }
 
 #[cfg(all(test, unix))]
@@ -1143,8 +1139,8 @@ mod stdin_tests {
                 .collect();
             let checks = synced_dependency_preflight_checks(&outcomes);
             assert_eq!(checks.len(), ROOT_COUNT * 2);
-            let commands = build_remote_dependency_preflight_commands(&checks);
-            assert!(commands.iter().all(|command| command.len() > 128 * 1024));
+            let command = build_remote_dependency_preflight_command(&checks).unwrap();
+            assert!(command.len() > 256 * 1024);
 
             let reporter = HookReporter::new(OutputVisibility::Summary);
             let error = verify_remote_dependency_manifests(&worker, &outcomes, &reporter)
@@ -1172,7 +1168,12 @@ mod stdin_tests {
                     .filter(|item| item.status == DependencyPreflightStatus::Present)
                     .count(),
                 2,
-                "the final root proves every stdin batch was fully processed"
+                "the final root proves the entire stdin script was processed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join("ssh-calls")).unwrap(),
+                "probe\n",
+                "oversized multi-root checks must use exactly one SSH connection"
             );
             verify_remote_dependency_manifests(&worker, &outcomes[ROOT_COUNT - 1..], &reporter)
                 .await
@@ -1220,6 +1221,7 @@ mod stdin_tests {
 set -eu
 LC_ALL=C
 export LC_ALL
+printf 'probe\n' >> "$RCH_DEPENDENCY_STDIN_TEST_DIR/ssh-calls"
 remote=''
 for arg; do
     [ "${#arg}" -lt 131072 ] || exit 90
