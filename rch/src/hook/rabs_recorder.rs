@@ -159,6 +159,15 @@ pub(super) fn append_line(path: &Path, line: &str, max_bytes: u64) -> std::io::R
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Lock a stable sidecar: locking the spool itself would leave writers
+    // holding different inodes after rotation. Dropping the handle unlocks it.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("ndjsonl.lock"))?;
+    lock.lock()?;
     if let Ok(meta) = std::fs::metadata(path)
         && meta.len() >= max_bytes
     {
@@ -171,8 +180,10 @@ pub(super) fn append_line(path: &Path, line: &str, max_bytes: u64) -> std::io::R
         .create(true)
         .append(true)
         .open(path)?;
-    file.write_all(line.as_bytes())?;
-    file.write_all(b"\n")
+    let mut record = Vec::with_capacity(line.len() + 1);
+    record.extend_from_slice(line.as_bytes());
+    record.push(b'\n');
+    file.write_all(&record)
 }
 
 /// Record one completed offloaded invocation. Called from
@@ -340,5 +351,35 @@ mod tests {
         append_line(&path, "{\"d\":4}", 1).unwrap();
         assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "{\"c\":3}\n");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"d\":4}\n");
+    }
+
+    #[test]
+    fn concurrent_spool_writers_preserve_every_record() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("invocations.ndjsonl");
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let path = &path;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for sequence in 0..200 {
+                        let line = serde_json::json!([worker, sequence]).to_string();
+                        append_line(path, &line, u64::MAX).unwrap();
+                    }
+                });
+            }
+        });
+        let content = std::fs::read_to_string(path).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for line in content.lines() {
+            let record: [usize; 2] = serde_json::from_str(line).unwrap();
+            assert!(seen.insert(record), "duplicate record: {record:?}");
+        }
+        let expected: std::collections::HashSet<_> = (0..8)
+            .flat_map(|worker| (0..200).map(move |sequence| [worker, sequence]))
+            .collect();
+        assert_eq!(seen, expected);
     }
 }
