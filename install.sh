@@ -2083,6 +2083,132 @@ EOF
 # PATH Setup
 # ============================================================================
 
+configure_dispatcher_shim() {
+    DISPATCHER_SHIM_CONFIGURED=false
+    [[ "$MODE" == "local" ]] || return 0
+    local rch_bin config_dir role
+    rch_bin="$(cd "$INSTALL_DIR" && pwd)/$HOOK_BIN"
+    config_dir="$(cd "$CONFIG_DIR" && pwd)"
+    # Resolve the machine configuration with RCH's TOML parser, outside the
+    # checkout that happened to invoke this installer. Never infer a role from
+    # grep matches in comments or a project's override.
+    if ! role=$(cd "$HOME" && env -u RCH_OUTPUT_FORMAT -u TOON_DEFAULT_FORMAT \
+        RCH_CONFIG_DIR="$config_dir" RCH_JSON=0 \
+        "$rch_bin" --color never config get general.role); then
+        warn "Cannot determine machine role; dispatcher shim setup was not completed"
+        return 1
+    fi
+    [[ "$role" == "dispatcher" ]] || return 0
+    info "Restoring dispatcher Cargo interception..."
+    local shim_current=false
+    if [[ "${RCH_SHIM_WATCHDOG:-}" == "1" ]]; then
+        # Status is retained in the journal. Without jq we conservatively
+        # reassert, rather than treating an unparsed response as healthy.
+        local shim_status
+        shim_status=$(cd "$HOME" && RCH_CONFIG_DIR="$config_dir" \
+            "$rch_bin" --json shim status) || return 1
+        printf '%s\n' "$shim_status"
+        if command -v jq >/dev/null 2>&1 &&
+            jq -e '(.data // .) | .installed and .up_to_date and
+                .clippy_shim_installed and .on_path_ahead_of_cargo and
+                (.toolchains_wrapped == .toolchains_total)' <<< "$shim_status" >/dev/null; then
+            shim_current=true
+        fi
+    fi
+    if [[ "$shim_current" != "true" ]]; then
+        (cd "$HOME" && RCH_CONFIG_DIR="$config_dir" "$rch_bin" shim install) || return 1
+    fi
+    DISPATCHER_SHIM_CONFIGURED=true
+
+    # The installer's environment cannot repair its parent's PATH. Persist the
+    # prepend for new shells and make it effective for remaining install steps.
+    export PATH="$HOME/.rch/shims:$PATH"
+    if [[ "${RCH_NO_RC:-}" == "1" ]]; then
+        info "RCH_NO_RC=1 set; skipping dispatcher shell rc modification"
+        return 0
+    fi
+    local shell_rc path_line
+    case "${SHELL:-/bin/bash}" in
+        */zsh) shell_rc="$HOME/.zshrc" ;;
+        */fish) shell_rc="$HOME/.config/fish/config.fish" ;;
+        */bash) shell_rc="$HOME/.bashrc" ;;
+        *) shell_rc="$HOME/.profile" ;;
+    esac
+    if [[ "${SHELL:-/bin/bash}" == */fish ]]; then
+        path_line='set -gx PATH "$HOME/.rch/shims" $PATH'
+    else
+        path_line='export PATH="$HOME/.rch/shims:$PATH"'
+    fi
+    mkdir -p "$(dirname "$shell_rc")"
+    # Reassert at the end: an updater may have appended its own PATH prepend
+    # after an older RCH line. Consecutive installs remain idempotent.
+    if [[ ! -f "$shell_rc" ]] || [[ "$(tail -n 1 "$shell_rc")" != "$path_line" ]]; then
+        printf '\n# RCH dispatcher: keep Cargo offload ahead of toolchain binaries\n%s\n' "$path_line" >> "$shell_rc"
+    fi
+    success "Dispatcher shim restored; new shells load $shell_rc"
+    warn "Existing shells must refresh PATH or restart; this installer cannot change their environment"
+}
+
+install_dispatcher_shim_watchdog() {
+    [[ "${DISPATCHER_SHIM_CONFIGURED:-false}" == "true" ]] || return 0
+    local watchdog="$HOME/.rch/shim-watchdog"
+    mkdir -p "$HOME/.rch"
+    # Persist only this self-contained repair function, not the downloader or
+    # installer entry point. %q preserves spaces and shell metacharacters.
+    {
+        printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+        printf 'MODE=local\nHOOK_BIN=rch\nRCH_SHIM_WATCHDOG=1\n'
+        printf 'INSTALL_DIR=%q\nCONFIG_DIR=%q\n' "$(cd "$INSTALL_DIR" && pwd)" "$(cd "$CONFIG_DIR" && pwd)"
+        printf 'SHELL=%q\n' "${SHELL:-/bin/bash}"
+        printf 'RCH_NO_RC=%q\n' "${RCH_NO_RC:-0}"
+        printf 'info() { printf "%%s\\n" "$*"; }\n'
+        printf 'warn() { printf "%%s\\n" "$*" >&2; }\n'
+        printf 'success() { printf "%%s\\n" "$*"; }\n'
+        declare -f configure_dispatcher_shim
+        printf '\nconfigure_dispatcher_shim\n'
+    } > "$watchdog"
+    chmod 755 "$watchdog"
+    if [[ "${NO_SERVICE:-false}" == "true" || "${ENABLE_SERVICE:-true}" != "true" ]]; then
+        info "Dispatcher repair installed at $watchdog; timer disabled by service preference"
+        return 0
+    fi
+    if ! systemd_user_available; then
+        warn "No user systemd; schedule $watchdog to repair dispatcher drift periodically"
+        return 0
+    fi
+    local unit_dir="$HOME/.config/systemd/user"
+    mkdir -p "$unit_dir"
+    if systemctl --user cat rch-fleet-watchdog.service >/dev/null 2>&1; then
+        mkdir -p "$unit_dir/rch-fleet-watchdog.service.d"
+        cat > "$unit_dir/rch-fleet-watchdog.service.d/50-rch-shim.conf" << 'EOF'
+[Service]
+ExecStartPost="%h/.rch/shim-watchdog"
+EOF
+        systemctl --user daemon-reload
+        success "Dispatcher repair attached to each fleet-watchdog cycle"
+        return 0
+    fi
+    cat > "$unit_dir/rch-shim-watchdog.service" << 'EOF'
+[Unit]
+Description=Restore dispatcher Cargo interception
+[Service]
+Type=oneshot
+ExecStart="%h/.rch/shim-watchdog"
+EOF
+    cat > "$unit_dir/rch-shim-watchdog.timer" << 'EOF'
+[Unit]
+Description=Periodically restore dispatcher Cargo interception
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable --now rch-shim-watchdog.timer
+    success "Dispatcher repair timer enabled (two-minute interval)"
+}
+
 setup_path() {
     # Test harnesses and automation MUST set RCH_NO_RC=1: modifying the
     # user's real shell rc from a non-interactive/CI context is how a test
@@ -2879,6 +3005,8 @@ main() {
     fi
 
     setup_path
+    configure_dispatcher_shim
+    install_dispatcher_shim_watchdog
     setup_shell_completions
     verify_installation
 
