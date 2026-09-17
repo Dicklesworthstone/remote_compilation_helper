@@ -35,7 +35,7 @@ use crate::linker_profiles::{LinkerFamily, detect_family};
 use std::num::NonZeroU32;
 
 /// Pack schema version (bump on any semantic change to a knob).
-pub const LAYER0_PACK_VERSION: u32 = 2;
+pub const LAYER0_PACK_VERSION: u32 = 3;
 
 /// The benchmark verdict a knob carries (B014's KILL rule made data).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +158,10 @@ pub struct PackEvidence {
     pub rustc_z_help: Option<String>,
     /// Explicit operator opt-in. None leaves the unstable flag absent.
     pub zthreads: Option<NonZeroU32>,
+    /// Explicit opt-in to source lines without variable/type debug information.
+    pub line_tables_only: bool,
+    /// Explicit opt-in to separate debug files, which must accompany the binary.
+    pub split_debuginfo_unpacked: bool,
     /// Linker `--version` first lines, in discovery order.
     pub linker_version_lines: Vec<String>,
     /// Whether `sccache` is on PATH (the caller probed).
@@ -183,18 +187,18 @@ pub struct Layer0Pack {
 pub fn assemble(evidence: &PackEvidence) -> Layer0Pack {
     let mut knobs = Vec::new();
 
-    // Debuginfo reduction: safe-core default-on (line-tables-only for
-    // dev; full debuginfo stays available via the debug profile lane).
+    // Debugging tradeoffs require explicit opt-in. An unconfigured pack leaves
+    // Cargo's debug profile and target-specific split defaults untouched.
     knobs.push(Knob {
         id: "debuginfo-line-tables-only",
-        enabled: true,
+        enabled: evidence.line_tables_only,
         benchmark_verdict: BenchmarkVerdict::Ungated,
         fragment: "[profile.dev]\ndebug = \"line-tables-only\"\n".to_owned(),
     });
-    // Unpacked split debuginfo (macOS/Linux dev-lane).
+    // Retain the separate files when debugging an unpacked artifact.
     knobs.push(Knob {
         id: "split-debuginfo-unpacked",
-        enabled: true,
+        enabled: evidence.split_debuginfo_unpacked,
         benchmark_verdict: BenchmarkVerdict::Ungated,
         fragment: "[profile.dev]\nsplit-debuginfo = \"unpacked\"\n".to_owned(),
     });
@@ -407,9 +411,31 @@ mod tests {
             rustc_version_line: rustc.to_owned(),
             rustc_z_help: Some("    -Z threads=val -- number of compiler threads".to_owned()),
             zthreads: NonZeroU32::new(8),
+            line_tables_only: true,
+            split_debuginfo_unpacked: true,
             linker_version_lines: linkers.iter().map(|s| (*s).to_owned()).collect(),
             sccache_available: true,
             hakari_available: false,
+        }
+    }
+
+    #[test]
+    fn debug_knobs_require_opt_in_and_toggle_independently() {
+        let mut e = evidence("rustc 1.100.0 (abc)", &[]);
+        for (lines, split) in [(false, false), (true, false), (false, true), (true, true)] {
+            e.line_tables_only = lines;
+            e.split_debuginfo_unpacked = split;
+            let mut pack = assemble(&e);
+            let rendered = pack.render_config();
+            assert_eq!(rendered.contains("debug = \"line-tables-only\""), lines);
+            assert_eq!(rendered.contains("split-debuginfo = \"unpacked\""), split);
+            pack.disable("debuginfo-line-tables-only").unwrap();
+            assert!(
+                !pack
+                    .render_config()
+                    .contains("debug = \"line-tables-only\"")
+            );
+            assert_eq!(pack.render_config().contains("split-debuginfo"), split);
         }
     }
 

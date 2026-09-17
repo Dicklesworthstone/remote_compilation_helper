@@ -59,6 +59,13 @@ configure_dispatcher_shim
 grep -F "$fixture/local-tools" "$HOME/.bashrc"
 printf 'PASS: repeated install repairs updater PATH drift without discarding rc text\n'
 
+before_profile=$(cat "$HOME/.profile")
+printf '# Existing login profile owned by the user\n' > "$HOME/.bash_profile"
+configure_dispatcher_shim
+[[ "$(cat "$HOME/.profile")" == "$before_profile" ]]
+[[ "$(PATH="$original_path" bash --noprofile --norc -c '. "$HOME/.bash_profile"; command -v cargo')" == "$HOME/.rch/shims/cargo" ]]
+printf 'PASS: Bash uses an existing login profile without shadowing or rewriting .profile\n'
+
 before_rc=$(cat "$HOME/.bashrc")
 export RCH_NO_RC=1
 configure_dispatcher_shim
@@ -69,7 +76,7 @@ printf 'PASS: RCH_NO_RC preserves shell configuration\n'
 export NO_SERVICE=true
 install_dispatcher_shim_watchdog
 [[ -x "$HOME/.rch/shim-watchdog" ]]
-[[ ! -e "$HOME/.config/systemd/user/rch-shim-watchdog.timer" ]]
+[[ ! -e "$XDG_CONFIG_HOME/systemd/user/rch-shim-watchdog.timer" ]]
 before_inode=$(stat -c '%i' "$HOME/.rch/shims/cargo")
 PATH="$original_path" "$HOME/.rch/shim-watchdog"
 PATH="$original_path" "$HOME/.rch/shim-watchdog"
@@ -91,7 +98,7 @@ chmod 644 "$HOME/.rch/shims/cargo-clippy"
 printf 'PASS: watchdog repairs a nonexecutable companion Clippy shim\n'
 printf '#!/bin/sh\n# rch-toolchain-wrap-version: 1\nprintf STALE\\n\n' > "$RUSTUP_HOME/toolchains/fixture/bin/cargo"
 "$rch_test_binary" --json shim status | jq -e '.up_to_date == false'
-"$HOME/.rch/shim-watchdog"
+env -u RUSTUP_HOME "$HOME/.rch/shim-watchdog"
 "$rch_test_binary" --json shim status | jq -e '.up_to_date == true and .toolchains_wrapped == 1'
 printf 'PASS: watchdog refreshes a stale absolute-path toolchain wrapper\n'
 
@@ -121,3 +128,26 @@ if configure_dispatcher_shim; then
 fi
 [[ "$(cat "$HOME/.bashrc")" == "$before_rc" ]]
 printf 'PASS: invalid config refuses without touching shell configuration\n'
+
+# Unit-test service routing without invoking the real user manager. This is
+# deliberately not evidence of a live systemd timer or fleet deployment.
+printf '[general]\nrole = "dispatcher"\n' > "$CONFIG_DIR/config.toml"
+configure_dispatcher_shim
+export NO_SERVICE=false ENABLE_SERVICE=true
+systemd_user_available() { return 0; }
+systemctl() {
+    printf '%s\n' "$*" >> "$fixture/systemctl-calls"
+    if [[ "$*" == '--user cat rch-fleet-watchdog.service' ]]; then
+        [[ "${fixture_existing_fleet:-false}" == true ]]
+    fi
+}
+install_dispatcher_shim_watchdog
+grep -Fx 'ExecStart="%h/.rch/shim-watchdog"' "$XDG_CONFIG_HOME/systemd/user/rch-shim-watchdog.service"
+grep -Fx 'OnUnitActiveSec=2min' "$XDG_CONFIG_HOME/systemd/user/rch-shim-watchdog.timer"
+grep -Fx -- '--user enable --now rch-shim-watchdog.timer' "$fixture/systemctl-calls"
+fixture_existing_fleet=true
+before_timer=$(cat "$XDG_CONFIG_HOME/systemd/user/rch-shim-watchdog.timer")
+install_dispatcher_shim_watchdog
+grep -Fx 'ExecStartPost="%h/.rch/shim-watchdog"' "$XDG_CONFIG_HOME/systemd/user/rch-fleet-watchdog.service.d/50-rch-shim.conf"
+[[ "$(cat "$XDG_CONFIG_HOME/systemd/user/rch-shim-watchdog.timer")" == "$before_timer" ]]
+printf 'PASS: unit fixture routes repair into existing fleet service or creates fallback timer\n'

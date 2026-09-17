@@ -15,9 +15,13 @@ fn main() {
 fn run() -> Result<(), String> {
     let mut compiler = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
     let mut threads = None;
+    let mut line_tables_only = false;
+    let mut split_debuginfo_unpacked = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
+            Some("--line-tables-only") => line_tables_only = true,
+            Some("--split-debuginfo-unpacked") => split_debuginfo_unpacked = true,
             Some("--rustc") => compiler = args.next().ok_or("--rustc needs an executable path")?,
             Some("--zthreads") => {
                 threads = Some(
@@ -28,7 +32,7 @@ fn run() -> Result<(), String> {
             }
             Some("--help" | "-h") => {
                 println!(
-                    "Usage: layer0_render [--rustc PATH] [--zthreads COUNT]\n\nUnstable threads are OFF unless explicitly requested and the selected nightly\nreports support. --rustc defaults to RUSTC, then rustc on PATH. Apply the rendered\nCargo config only with that same compiler/toolchain. Existing Cargo env/target\nrustflags take Cargo's normal precedence; no wrappers or user files are changed."
+                    "Usage: layer0_render [--rustc PATH] [--zthreads COUNT] [--line-tables-only] [--split-debuginfo-unpacked]\n\nDebug settings are preserved unless explicitly requested. --line-tables-only\nkeeps source breakpoints/backtraces but removes variable/type information.\n--split-debuginfo-unpacked requires retaining separate debug files with the binary;\ncheck support on the selected target. Both affect the dev profile.\nUnstable threads are OFF unless explicitly requested and the selected nightly\nreports support. --rustc defaults to RUSTC, then rustc on PATH. Apply the rendered\nCargo config only with that same compiler/toolchain. Existing Cargo env/target\nrustflags take Cargo's normal precedence; no wrappers or user files are changed."
                 );
                 return Ok(());
             }
@@ -49,6 +53,8 @@ fn run() -> Result<(), String> {
         rustc_version_line: version_line,
         rustc_z_help,
         zthreads: threads,
+        line_tables_only,
+        split_debuginfo_unpacked,
         linker_version_lines,
         sccache_available: probe("sccache", "--version"),
         hakari_available: probe("cargo", "hakari"),
@@ -119,6 +125,175 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires GDB and explicit RCH_L0_DEBUG_TOOLCHAIN; run with --ignored on the remote validation worker"]
+    fn layer0_real_debug_breakpoints_and_size_time() {
+        let channel = std::env::var("RCH_L0_DEBUG_TOOLCHAIN").expect("explicit toolchain required");
+        let retained = tempfile::Builder::new()
+            .prefix("rch-layer0-debug-")
+            .tempdir_in("/tmp")
+            .unwrap()
+            .keep();
+        eprintln!("retained debug benchmark: {}", retained.display());
+        let which = |program| {
+            let output = Command::new("rustup")
+                .env("RUSTUP_AUTO_INSTALL", "0")
+                .args(["which", "--toolchain", &channel, program])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let compiler = which("rustc");
+        let cargo = which("cargo");
+        let (version, _) = compiler_evidence(compiler.as_ref(), false).unwrap();
+        eprintln!("compiler={compiler} version={version}");
+        let mut measurements = Vec::new();
+        // Three fresh-target samples per combination. Rotate ordering to avoid
+        // attributing the first Cargo/filesystem warmup to a particular knob.
+        let variants = [
+            ("full", false, false),
+            ("lines", true, false),
+            ("split", false, true),
+            ("lines-split", true, true),
+        ];
+        for sample in 0..3 {
+            for offset in 0..variants.len() {
+                let (label, lines, split) = variants[(offset + sample) % variants.len()];
+                let project = retained.join(format!("{label}-{sample}"));
+                std::fs::create_dir_all(project.join("src")).unwrap();
+                std::fs::write(project.join("Cargo.toml"), "[package]\nname='layer0_debug_real'\nversion='0.0.0'\nedition='2021'\n[workspace]\n[profile.dev]\ndebug='full'\nsplit-debuginfo='off'\n").unwrap();
+                std::fs::write(project.join("src/main.rs"), "#[inline(never)]\nfn calculate(values: &[u64]) -> u64 {\n    let doubled: Vec<u64> = values.iter().map(|v| v * 2).collect();\n    let answer: u64 = doubled.iter().sum();\n    std::hint::black_box(answer)\n}\nfn main() { println!(\"{}\", calculate(&[3, 7, 11])); }\n").unwrap();
+                let evidence = PackEvidence {
+                    rustc_version_line: version.clone(),
+                    rustc_z_help: None,
+                    zthreads: None,
+                    line_tables_only: lines,
+                    split_debuginfo_unpacked: split,
+                    linker_version_lines: Vec::new(),
+                    sccache_available: false,
+                    hakari_available: false,
+                };
+                let config = project.join("layer0.toml");
+                std::fs::write(&config, assemble(&evidence).render_config()).unwrap();
+                let target = project.join("target");
+                let started = std::time::Instant::now();
+                let output = Command::new(&cargo)
+                    .current_dir(&project)
+                    .env("RUSTC", &compiler)
+                    .env("RUSTUP_TOOLCHAIN", &channel)
+                    .env("RUSTUP_AUTO_INSTALL", "0")
+                    .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                    .env("CARGO_HOME", retained.join("cargo-home"))
+                    .env("CARGO_TARGET_DIR", &target)
+                    .env("CARGO_INCREMENTAL", "0")
+                    .env_remove("RUSTFLAGS")
+                    .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                    .env_remove("CARGO_BUILD_RUSTFLAGS")
+                    .env_remove("RUSTC_WRAPPER")
+                    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                    .env_remove("CARGO_PROFILE_DEV_DEBUG")
+                    .env_remove("CARGO_PROFILE_DEV_SPLIT_DEBUGINFO")
+                    .env_remove("CARGO_BUILD_TARGET")
+                    .env_remove("CARGO_BUILD_BUILD_DIR")
+                    .args(["build", "--offline", "--verbose", "--jobs", "1", "--config"])
+                    .arg(&config)
+                    .output()
+                    .unwrap();
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                std::fs::write(project.join("cargo.stdout"), &output.stdout).unwrap();
+                std::fs::write(project.join("cargo.stderr"), &output.stderr).unwrap();
+                assert!(
+                    output.status.success(),
+                    "{label}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let executable = target.join("debug/layer0_debug_real");
+                let run = Command::new(&executable).output().unwrap();
+                assert!(run.status.success());
+                assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
+                // GDB launches only this owned inferior; no system ptrace policy
+                // change or attachment to another process is necessary.
+                let mut debugger = Command::new("timeout");
+                debugger.args(["30s", "gdb", "--batch", "-nx", "-ex", "set debuginfod enabled off", "-ex", "set pagination off", "-ex", "break src/main.rs:5", "-ex", "run", "-ex", "python assert gdb.selected_frame().find_sal().line == 5", "-ex", "python assert gdb.selected_frame().find_sal().symtab.fullname().endswith('/src/main.rs')"]);
+                if !lines {
+                    debugger.args([
+                        "-ex",
+                        "python assert int(gdb.parse_and_eval('answer')) == 42; print('GDB_VARIABLE_VERIFIED')",
+                    ]);
+                }
+                let debug = debugger
+                    .args([
+                        "-ex",
+                        "python print('GDB_PYTHON_AVAILABLE')",
+                        "-ex",
+                        "continue",
+                        "--args",
+                    ])
+                    .arg(&executable)
+                    .current_dir(&project)
+                    .output()
+                    .unwrap();
+                std::fs::write(project.join("gdb.stdout"), &debug.stdout).unwrap();
+                std::fs::write(project.join("gdb.stderr"), &debug.stderr).unwrap();
+                let stdout = String::from_utf8_lossy(&debug.stdout);
+                let stderr = String::from_utf8_lossy(&debug.stderr);
+                assert!(
+                    debug.status.success()
+                        && !stderr.contains("Traceback")
+                        && !stderr.contains("Error while executing Python"),
+                    "{label}: {stdout}\n{stderr}"
+                );
+                assert!(
+                    stdout.contains("Breakpoint 1,")
+                        && stdout.contains("exited normally")
+                        && stdout.contains("GDB_PYTHON_AVAILABLE"),
+                    "{label}: {stdout}\n{stderr}"
+                );
+                if !lines {
+                    assert!(
+                        stdout.contains("GDB_VARIABLE_VERIFIED"),
+                        "{label}: {stdout}\n{stderr}"
+                    );
+                }
+                let binary_bytes = std::fs::metadata(&executable).unwrap().len();
+                let mut split_bytes = 0;
+                // Cargo's build-dir layout differs across toolchains. Count
+                // retained DWARF files throughout this owned target, not just
+                // the legacy debug/deps directory.
+                let mut directories = vec![target.clone()];
+                while let Some(directory) = directories.pop() {
+                    for entry in std::fs::read_dir(directory).unwrap() {
+                        let entry = entry.unwrap();
+                        if entry.file_type().unwrap().is_dir() {
+                            directories.push(entry.path());
+                        } else if entry.path().extension().is_some_and(|ext| ext == "dwo") {
+                            split_bytes += entry.metadata().unwrap().len();
+                        }
+                    }
+                }
+                if split && !lines {
+                    assert!(
+                        split_bytes > 0,
+                        "full unpacked mode must retain separate debug data"
+                    );
+                }
+                let row = serde_json::json!({"variant": label, "sample": sample, "elapsed_ms": elapsed_ms, "binary_bytes": binary_bytes, "split_bytes": split_bytes, "debug_bundle_bytes": binary_bytes + split_bytes});
+                eprintln!("debug measurement {row}");
+                measurements.push(row);
+            }
+        }
+        std::fs::write(
+            retained.join("measurements.json"),
+            serde_json::to_vec_pretty(&measurements).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
     #[ignore = "requires explicit RCH_L0_STABLE_TOOLCHAIN and RCH_L0_NIGHTLY_TOOLCHAIN; run with --ignored on the remote validation worker"]
     fn layer0_real_compilers_render_and_compile_supported_and_unsupported() {
         let retained = tempfile::Builder::new()
@@ -154,6 +329,8 @@ mod tests {
                 rustc_version_line: version,
                 rustc_z_help: help,
                 zthreads: NonZeroU32::new(2),
+                line_tables_only: false,
+                split_debuginfo_unpacked: false,
                 linker_version_lines: Vec::new(),
                 sccache_available: false,
                 hakari_available: false,

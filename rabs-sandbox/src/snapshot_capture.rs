@@ -228,6 +228,8 @@ pub enum CaptureRejection {
     UnsupportedKind,
     /// A symlink is absolute or escapes its captured root.
     UnsafeSymlink,
+    /// A descendant crosses a mount boundary, including a bind mount.
+    CrossMount,
     /// The complete closure exceeds the caller's retained-byte limit.
     ByteLimitExceeded,
 }
@@ -794,6 +796,15 @@ fn scan_retained_closure(
             observation: ScanObservation::default(),
             files: BTreeMap::new(),
         };
+        #[cfg(target_os = "linux")]
+        scan_retained_root(
+            root,
+            &metadata,
+            declared_git_state,
+            &mut remaining,
+            &mut scan,
+        )?;
+        #[cfg(not(target_os = "linux"))]
         scan_retained_directory(root, "", declared_git_state, &mut remaining, &mut scan)?;
         for (path, kind) in &scan.observation.members {
             if let MemberKind::Symlink { target } = kind {
@@ -805,6 +816,199 @@ fn scan_retained_closure(
     Ok(scans)
 }
 
+#[cfg(target_os = "linux")]
+fn sealed_open_error(path: &str, error: rustix::io::Errno) -> CaptureError {
+    match error {
+        rustix::io::Errno::XDEV => reject(path, CaptureRejection::CrossMount),
+        rustix::io::Errno::LOOP => reject(path, CaptureRejection::UnsafeSymlink),
+        rustix::io::Errno::AGAIN | rustix::io::Errno::NOENT => sealed_unstable(path),
+        // ENOSYS / EINVAL / permission failures are refusals, not permission
+        // to fall back to an unconfined pathname traversal.
+        error => capture_io(Path::new(path), std::io::Error::from(error)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_unstable(path: &str) -> CaptureError {
+    CaptureError::Incoherent(CaptureRefusal {
+        attempts: 0,
+        last_divergence: Divergence::UnstableDuringRead {
+            path: path.to_string(),
+        },
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn open_sealed_entry(
+    root: &std::fs::File,
+    relative: &str,
+    flags: rustix::fs::OFlags,
+) -> Result<std::fs::File, CaptureError> {
+    use rustix::fs::{Mode, ResolveFlags, openat2};
+    openat2(
+        root,
+        relative,
+        flags,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+    )
+    .map(std::fs::File::from)
+    .map_err(|error| sealed_open_error(relative, error))
+}
+
+#[cfg(target_os = "linux")]
+fn scan_retained_root(
+    path: &Path,
+    observed: &std::fs::Metadata,
+    declared_git_state: bool,
+    remaining: &mut u64,
+    scan: &mut RetainedScan,
+) -> Result<(), CaptureError> {
+    use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
+
+    // The explicit root is the trust boundary. Ordinary ancestor aliases (e.g.
+    // /dp -> /data/projects) remain valid; a leaf symlink and proc magic links
+    // do not. Descendants use stricter resolution from this anchored descriptor.
+    let root = openat2(
+        CWD,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_MAGICLINKS,
+    )
+    .map(std::fs::File::from)
+    .map_err(|error| sealed_open_error(&path.to_string_lossy(), error))?;
+    let before = root.metadata().map_err(|error| capture_io(path, error))?;
+    if identity_of(observed) != identity_of(&before) {
+        return Err(sealed_unstable(""));
+    }
+    scan_retained_directory_fd(&root, &root, "", declared_git_state, remaining, scan)?;
+    let after = root.metadata().map_err(|error| capture_io(path, error))?;
+    if identity_of(&before) != identity_of(&after) {
+        return Err(sealed_unstable(""));
+    }
+    // Empty relative name is reserved for the root's local mutation evidence;
+    // it is never a manifest member or a portable identity input.
+    scan.observation
+        .identities
+        .insert(String::new(), identity_of(&after));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn scan_retained_directory_fd(
+    root: &std::fs::File,
+    directory: &std::fs::File,
+    relative: &str,
+    declared_git_state: bool,
+    remaining: &mut u64,
+    scan: &mut RetainedScan,
+) -> Result<(), CaptureError> {
+    use rustix::fs::{Dir, OFlags, readlinkat};
+
+    let before = directory
+        .metadata()
+        .map_err(|error| capture_io(Path::new(relative), error))?;
+    let mut entries =
+        Dir::read_from(directory).map_err(|error| sealed_open_error(relative, error))?;
+    while let Some(entry) = entries.read() {
+        let entry = entry.map_err(|error| sealed_open_error(relative, error))?;
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let name = name
+            .to_str()
+            .ok()
+            .filter(|name| safe_component(name))
+            .ok_or_else(|| reject(relative, CaptureRejection::InvalidPath))?;
+        let rel = if relative.is_empty() {
+            name.to_string()
+        } else {
+            format!("{relative}/{name}")
+        };
+        if member_disposition(&rel, declared_git_state) != MemberDisposition::Include {
+            continue;
+        }
+        // O_PATH inspects special files without opening them for I/O. With
+        // NOFOLLOW, openat2 permits the terminal symlink itself as a descriptor.
+        let entry_flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let observed = open_sealed_entry(root, &rel, entry_flags)?;
+        let metadata = observed
+            .metadata()
+            .map_err(|error| capture_io(Path::new(&rel), error))?;
+        let member = if metadata.file_type().is_symlink() {
+            let target = readlinkat(&observed, "", Vec::new())
+                .map_err(|error| sealed_open_error(&rel, error))?;
+            let target = target
+                .to_str()
+                .map_err(|_| reject(&rel, CaptureRejection::InvalidPath))?;
+            MemberKind::Symlink {
+                target: target.to_string(),
+            }
+        } else if metadata.is_dir() {
+            let child = open_sealed_entry(
+                root,
+                &rel,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            )?;
+            let child_metadata = child
+                .metadata()
+                .map_err(|error| capture_io(Path::new(&rel), error))?;
+            if identity_of(&metadata) != identity_of(&child_metadata) {
+                return Err(sealed_unstable(&rel));
+            }
+            scan_retained_directory_fd(root, &child, &rel, declared_git_state, remaining, scan)?;
+            MemberKind::Directory
+        } else if metadata.is_file() {
+            let file = open_sealed_entry(
+                root,
+                &rel,
+                OFlags::RDONLY
+                    | OFlags::NONBLOCK
+                    | OFlags::NOCTTY
+                    | OFlags::NOFOLLOW
+                    | OFlags::CLOEXEC,
+            )?;
+            let (member, bytes) = read_retained_descriptor(
+                file,
+                Path::new(&rel),
+                &rel,
+                &metadata,
+                remaining,
+                |_| {},
+            )?;
+            scan.files.insert(rel.clone(), bytes.into());
+            member
+        } else {
+            return Err(reject(&rel, CaptureRejection::UnsupportedKind));
+        };
+        // Re-resolve through the root even after descriptor reads: a rename or
+        // mount substitution must not leave a retired inode in the sealed tree.
+        let current = open_sealed_entry(root, &rel, entry_flags)?;
+        let after = current
+            .metadata()
+            .map_err(|error| capture_io(Path::new(&rel), error))?;
+        if identity_of(&metadata) != identity_of(&after) {
+            return Err(sealed_unstable(&rel));
+        }
+        scan.observation
+            .identities
+            .insert(rel.clone(), identity_of(&after));
+        scan.observation.members.insert(rel, member);
+    }
+    let after = directory
+        .metadata()
+        .map_err(|error| capture_io(Path::new(relative), error))?;
+    if identity_of(&before) != identity_of(&after) {
+        return Err(sealed_unstable(relative));
+    }
+    Ok(())
+}
+
+// Other platforms retain the path-based scanner. They do not claim Linux's
+// descriptor-relative symlink and mount-boundary guarantees.
+#[cfg(not(target_os = "linux"))]
 fn scan_retained_directory(
     directory: &Path,
     relative: &str,
@@ -864,6 +1068,7 @@ fn scan_retained_directory(
     Ok(())
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn read_retained_file(
     path: &Path,
     relative: &str,
@@ -873,7 +1078,20 @@ fn read_retained_file(
     read_retained_file_with(path, relative, observed, remaining, |_| {})
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn read_retained_file_with(
+    path: &Path,
+    relative: &str,
+    observed: &std::fs::Metadata,
+    remaining: &mut u64,
+    after_chunk: impl FnMut(usize),
+) -> Result<(MemberKind, Vec<u8>), CaptureError> {
+    let file = std::fs::File::open(path).map_err(|error| capture_io(path, error))?;
+    read_retained_descriptor(file, path, relative, observed, remaining, after_chunk)
+}
+
+fn read_retained_descriptor(
+    mut file: std::fs::File,
     path: &Path,
     relative: &str,
     observed: &std::fs::Metadata,
@@ -892,7 +1110,6 @@ fn read_retained_file_with(
     if observed.len() > *remaining {
         return Err(reject(relative, CaptureRejection::ByteLimitExceeded));
     }
-    let mut file = std::fs::File::open(path).map_err(|error| capture_io(path, error))?;
     let before = file.metadata().map_err(|error| capture_io(path, error))?;
     if !before.is_file() || identity_of(observed) != identity_of(&before) {
         return Err(unstable());
@@ -1207,6 +1424,102 @@ fn mtime_ns_of(meta: &std::fs::Metadata) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn real_ancestor_alias_and_internal_relative_link_remain_supported() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let actual = retained.join("actual");
+        let root = actual.join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/input"), b"source via alias").unwrap();
+        std::os::unix::fs::symlink("src/input", root.join("link")).unwrap();
+        let alias = retained.join("alias");
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        let image = capture_sealed_source(
+            &[("workspace".to_string(), alias.join("project"))],
+            false,
+            2,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(
+            image.file_bytes("workspace", "src/input"),
+            Some(b"source via alias".as_slice())
+        );
+        let output = image
+            .materialize_into(&retained.join("materialized"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(output.backing("workspace").unwrap().join("link")).unwrap(),
+            b"source via alias"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires privilege to create a private mount namespace; run explicitly on an authorized worker"]
+    fn private_mount_namespace_refuses_bind_mounted_members() {
+        const CHILD_ROOT: &str = "RABS_BIND_TEST_CHILD_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            // Prove the real bind mount succeeded before exercising capture.
+            assert_eq!(
+                std::fs::read(root.join("mounted/secret")).unwrap(),
+                b"external bytes"
+            );
+            let result = capture_sealed_source(&[("workspace".to_string(), root)], false, 2, 1024);
+            assert!(
+                matches!(result, Err(CaptureError::Rejected { .. })),
+                "bind mount must be refused, got {result:?}"
+            );
+            assert!(matches!(
+                result,
+                Err(CaptureError::Rejected {
+                    reason: CaptureRejection::CrossMount,
+                    ..
+                })
+            ));
+            return;
+        }
+        let retained = tempfile::tempdir().unwrap().keep();
+        let root = retained.join("source");
+        let outside = retained.join("outside");
+        std::fs::create_dir_all(root.join("mounted")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"external bytes").unwrap();
+        std::fs::write(root.join("local"), b"safe source").unwrap();
+        let normal =
+            capture_sealed_source(&[("workspace".to_string(), root.clone())], false, 2, 1024)
+                .unwrap();
+        assert_eq!(
+            normal.file_bytes("workspace", "local"),
+            Some(b"safe source".as_slice())
+        );
+        let output = std::process::Command::new("unshare")
+            .args(["--mount", "--propagation", "private", "sh", "-c"])
+            .arg("set -eu; mount --bind \"$1\" \"$2\"; exec \"$3\" --exact snapshot_capture::tests::private_mount_namespace_refuses_bind_mounted_members --ignored --nocapture")
+            .arg("rch-private-bind-test")
+            .arg(&outside)
+            .arg(root.join("mounted"))
+            .arg(std::env::current_exe().unwrap())
+            .env(CHILD_ROOT, &root)
+            .output()
+            .unwrap();
+        std::fs::write(retained.join("child.stdout"), &output.stdout).unwrap();
+        std::fs::write(retained.join("child.stderr"), &output.stderr).unwrap();
+        assert!(
+            output.status.success(),
+            "private mount child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Namespace teardown leaves the parent's source tree unchanged.
+        assert!(!root.join("mounted/secret").exists());
+        eprintln!(
+            "retained private bind-mount fixture: {}",
+            retained.display()
+        );
+    }
 
     #[cfg(unix)]
     #[test]
