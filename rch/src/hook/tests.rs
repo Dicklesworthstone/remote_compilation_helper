@@ -6222,8 +6222,21 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
                 continue;
             }
             let heartbeat: BuildHeartbeatRequest = serde_json::from_str(&body).unwrap();
+            let response = serde_json::json!({
+                "status": "ok",
+                "build_id": heartbeat.build_id,
+                "worker_id": heartbeat.worker_id,
+                "phase": match heartbeat.phase {
+                    BuildHeartbeatPhase::SyncUp => "sync_up",
+                    BuildHeartbeatPhase::Execute => "execute",
+                    BuildHeartbeatPhase::SyncDown => "sync_down",
+                    BuildHeartbeatPhase::Finalize => "finalize",
+                },
+            });
+            let response =
+                format!("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{response}\n");
             received_tx.send(heartbeat).expect("retain heartbeat");
-            if let Err(error) = writer.write_all(b"{}\n").await {
+            if let Err(error) = writer.write_all(response.as_bytes()).await {
                 // Guard drop may close the peer after its complete request.
                 assert!(
                     matches!(
