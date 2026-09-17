@@ -1429,9 +1429,9 @@ impl TransferPipeline {
 
         #[cfg(unix)]
         let ssh_options = SshOptions {
-            server_alive_interval: transfer_config
-                .ssh_server_alive_interval_secs
-                .map(std::time::Duration::from_secs),
+            server_alive_interval: Some(std::time::Duration::from_secs(
+                transfer_config.ssh_server_alive_interval_secs.unwrap_or(15),
+            )),
             control_persist_idle: transfer_config
                 .ssh_control_persist_secs
                 .map(std::time::Duration::from_secs),

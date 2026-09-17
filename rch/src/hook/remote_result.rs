@@ -255,7 +255,7 @@ fn extract_tick_quoted_value(line: &str, prefix: &str) -> Option<String> {
 /// The signal number is exit_code - 128.
 ///
 /// Common signals:
-/// - 137 (SIGKILL = 9): Typically OOM killer
+/// - 137 (SIGKILL = 9): Cause unknown without independent worker evidence
 /// - 143 (SIGTERM = 15): Graceful termination request
 /// - 139 (SIGSEGV = 11): Segmentation fault
 #[allow(dead_code)]

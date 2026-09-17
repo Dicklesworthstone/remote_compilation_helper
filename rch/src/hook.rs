@@ -92,7 +92,7 @@ use rich_rust::renderables::Panel;
 // For RCH, ALL non-zero exits should deny local re-execution because:
 // 1. Exit 101: Tests failed remotely, re-running locally won't help
 // 2. Exit 1: Build error would occur locally too
-// 3. Exit 128+N: Likely resource exhaustion (OOM), local might also fail
+// 3. Exit 128+N: The termination cause is unknown; local reruns may also fail
 //
 // The only exception is toolchain failures (missing rust version), which
 // should fall back to local in case the local machine has the toolchain.
@@ -3282,12 +3282,10 @@ pub async fn run_exec(
                         },
                     }
                 } else if let Some(signal) = is_signal_killed(result.exit_code) {
-                    // Signal kill (137/SIGKILL == OOM, etc.): the small worker
-                    // could not hold the build. Retry on a BIGGER worker; if all
-                    // are exhausted surface the failure rather than OOM the
-                    // orchestrator by falling back to local.
+                    // The exit code cannot distinguish OOM from an external
+                    // kill or SSH/session cleanup. Preserve the retry policy.
                     warn!(
-                        "Remote build killed by {} (exit {}) on {} — likely resource exhaustion; will retry on a bigger worker if available",
+                        "Remote build killed by {} (exit {}) on {} — cause unconfirmed; inspect worker OOM and SSH/session logs; will retry on another worker if available",
                         signal_name(signal),
                         result.exit_code,
                         worker.id
@@ -3302,7 +3300,7 @@ pub async fn run_exec(
                         on_exhaust: RemoteFaultExhaustAction::ExitWithCode {
                             code: result.exit_code,
                             summary: format!(
-                                "[RCH] remote {} killed ({})",
+                                "[RCH] remote {} killed ({}) — cause unconfirmed; inspect worker OOM and SSH/session logs",
                                 worker.id,
                                 signal_name(signal)
                             ),

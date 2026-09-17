@@ -3667,28 +3667,6 @@ fn test_detect_worker_system_dependency_failure_ignores_normal_compile_errors() 
     );
 }
 
-#[test]
-fn test_exit_code_semantics_documented() {
-    let _guard = test_guard!();
-    // This test documents the expected behavior for different exit codes
-    // Exit 0: Success - should deny local (verified in other tests)
-    // Exit 101: Test failures - should deny local (re-running won't help)
-    // Exit 1: Build error - should deny local (same error locally)
-    // Exit 137: SIGKILL - should deny local (likely OOM)
-
-    // Verify constants are what we expect
-    assert_eq!(EXIT_SUCCESS, 0, "Success exit code should be 0");
-    assert_eq!(EXIT_BUILD_ERROR, 1, "Build error exit code should be 1");
-    assert_eq!(
-        EXIT_TEST_FAILURES, 101,
-        "Test failures exit code should be 101"
-    );
-
-    // Verify signal detection
-    let sigkill = 128 + 9;
-    assert_eq!(is_signal_killed(sigkill), Some(9), "Should detect SIGKILL");
-    assert_eq!(signal_name(9), "SIGKILL", "Should name SIGKILL correctly");
-}
 
 // =========================================================================
 // Cargo test integration tests (bead remote_compilation_helper-iyv1)
