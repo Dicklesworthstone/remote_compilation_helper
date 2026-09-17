@@ -889,44 +889,77 @@ fn skip_env_option_prefix(tokens: &[String], mut index: usize) -> usize {
     index
 }
 
+/// Find the single literal --target-dir option belonging to Cargo. Both
+/// extraction and removal use this span, so a wrapper separator or opaque
+/// option value cannot make those two operations disagree about the target.
+fn cargo_target_dir_flag_span(tokens: &[String]) -> Option<(std::ops::Range<usize>, String)> {
+    let command = shell_words::join(tokens);
+    let (normalized, cargo_index) = cargo_command_tokens_with_wrappers(&command, true).ok()?;
+    // The shared parser may add `env` for leading assignments. Map its index
+    // back to the original argv; never reconstruct or change wrapper arguments.
+    let added = normalized.len().checked_sub(tokens.len())?;
+    if added > 1 || normalized.get(added..)? != tokens {
+        return None;
+    }
+    let mut index = cargo_index.checked_sub(added)? + 1;
+    let mut selected = None;
+    while let Some(token) = tokens.get(index) {
+        if token == "--" {
+            break;
+        }
+        let (end, value) = if token == "--target-dir" {
+            let value = tokens.get(index + 1)?;
+            if value.starts_with('-') {
+                return None;
+            }
+            (index + 2, Some(value.as_str()))
+        } else if let Some(value) = token.strip_prefix("--target-dir=") {
+            (index + 1, Some(value))
+        } else {
+            // A value can itself spell --target-dir or --. It remains an
+            // opaque value, not an option to extract/remove or a separator.
+            let takes_value = matches!(
+                token.as_str(),
+                "--config" | "--target" | "--manifest-path" | "--lockfile-path"
+                    | "--profile" | "--package" | "-p" | "--exclude" | "--features"
+                    | "-F" | "--bin" | "--example" | "--test" | "--bench" | "--color"
+                    | "--message-format" | "--jobs" | "-j" | "-Z" | "-C"
+                    | "--artifact-dir" | "--out-dir" | "--build-dir"
+            );
+            if takes_value {
+                tokens.get(index + 1)?;
+            }
+            (index + if takes_value { 2 } else { 1 }, None)
+        };
+        if let Some(value) = value {
+            if selected.is_some() || value.is_empty() || value.chars().any(char::is_control) {
+                // Do not turn an invalid or ambiguous invocation into a valid
+                // build by deleting its diagnostics-producing arguments.
+                return None;
+            }
+            selected = Some((index..end, value.to_string()));
+        }
+        index = end;
+    }
+    selected
+}
+
 pub(super) fn strip_cargo_target_dir_flags_from_command_tokens(
     tokens: &[String],
 ) -> Option<Vec<String>> {
-    let mut stripped = Vec::with_capacity(tokens.len());
-    let mut changed = false;
-    let mut index = 0usize;
-
-    while let Some(token) = tokens.get(index) {
-        if token == "--" {
-            stripped.extend_from_slice(&tokens[index..]);
-            break;
-        }
-        if token == "--target-dir" {
-            changed = true;
-            index += 1;
-            if tokens.get(index).is_some() {
-                index += 1;
-            }
-            continue;
-        }
-
-        if token
-            .strip_prefix("--target-dir=")
-            .is_some_and(|value| !value.is_empty())
-        {
-            changed = true;
-            index += 1;
-            continue;
-        }
-
-        stripped.push(token.clone());
-        index += 1;
-    }
-
-    changed.then_some(stripped)
+    let (span, _) = cargo_target_dir_flag_span(tokens)?;
+    let mut stripped = tokens.to_vec();
+    stripped.drain(span);
+    Some(stripped)
 }
 
 pub(super) fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) -> Option<String> {
+    // Cargo's explicit option wins over inline and inherited environment.
+    // Resolve it before scanning assignment prefixes, not afterward.
+    if let Some((_, value)) = cargo_target_dir_flag_span(tokens) {
+        return Some(value);
+    }
+
     fn scan_assignment_prefix(tokens: &[String], start: usize) -> Option<String> {
         let mut index = start;
         while let Some(token) = tokens.get(index) {
@@ -938,25 +971,6 @@ pub(super) fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) ->
                 continue;
             }
             break;
-        }
-        None
-    }
-
-    fn scan_target_dir_flag(tokens: &[String]) -> Option<String> {
-        let mut index = 0usize;
-        while let Some(token) = tokens.get(index) {
-            if token == "--" {
-                break;
-            }
-            if token == "--target-dir" {
-                return tokens.get(index + 1).cloned();
-            }
-            if let Some(value) = token.strip_prefix("--target-dir=")
-                && !value.is_empty()
-            {
-                return Some(value.to_string());
-            }
-            index += 1;
         }
         None
     }
@@ -976,21 +990,12 @@ pub(super) fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) ->
             }
             "env" => {
                 index = skip_env_option_prefix(tokens, index + 1);
-                if let Some(value) = scan_assignment_prefix(tokens, index) {
-                    return Some(value);
-                }
-                return scan_target_dir_flag(tokens);
+                return scan_assignment_prefix(tokens, index);
             }
-            _ => {
-                if let Some(value) = scan_assignment_prefix(tokens, index) {
-                    return Some(value);
-                }
-                return scan_target_dir_flag(tokens);
-            }
+            _ => return scan_assignment_prefix(tokens, index),
         }
     }
-
-    scan_target_dir_flag(tokens)
+    None
 }
 
 #[cfg(test)]
@@ -1844,5 +1849,94 @@ mod managed_build_dir_tests {
             shell_words::split(&passthrough).unwrap().last().unwrap(),
             "--build-dir=/literal"
         );
+    }
+
+    #[test]
+    fn target_dir_scope_wrappers_and_cli_precedence_agree_with_removal() {
+        for command in [
+            "env -- cargo build --target-dir 'caller target'",
+            "/usr/bin/time -f cargo -- cargo build --target-dir='caller target'",
+            "env -- rustup run nightly cargo +nightly test --target-dir 'caller target' -- --target-dir=program-value",
+            "nice -n 10 cargo build --target-dir 'caller target'",
+            "CARGO_TARGET_DIR=env-target cargo build --target-dir 'caller target'",
+            "env -- CARGO_TARGET_DIR=env-target cargo build --target-dir 'caller target'",
+        ] {
+            let tokens = shell_words::split(command).unwrap();
+            assert_eq!(
+                super::extract_cargo_target_dir_from_command_tokens(&tokens).as_deref(),
+                Some("caller target"),
+                "{command}"
+            );
+            let (span, _) = super::cargo_target_dir_flag_span(&tokens).unwrap();
+            let mut expected = tokens.clone();
+            expected.drain(span);
+            assert_eq!(
+                super::strip_cargo_target_dir_flags_from_command_tokens(&tokens),
+                Some(expected),
+                "{command}"
+            );
+            let reporter = super::HookReporter::new(super::OutputVisibility::None);
+            let local = super::resolve_forwarded_cargo_target_dir_with_lookup(
+                Some(super::CompilationKind::CargoBuild),
+                std::path::Path::new("/project"),
+                &reporter,
+                |_| Some("ambient-target".to_string()),
+                Some(&tokens),
+            )
+            .unwrap();
+            assert_eq!(local, std::path::Path::new("/project/caller target"));
+            let rewritten = super::rewrite_cargo_target_dir_command_for_remote(
+                command,
+                Some(&tokens),
+                Some(&local),
+                &reporter,
+            );
+            assert!(
+                super::cargo_target_dir_flag_span(&shell_words::split(&rewritten).unwrap()).is_none(),
+                "caller target-dir survived in remote Cargo argv: {rewritten}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_dir_scope_keeps_opaque_values_passthrough_and_invalid_options() {
+        for option in [
+            "--config", "--target", "--manifest-path", "--lockfile-path", "--profile",
+            "--package", "-p", "--exclude", "--features", "-F", "--bin", "--example",
+            "--test", "--bench", "--color", "--message-format", "--jobs", "-j", "-Z",
+            "-C", "--artifact-dir", "--out-dir", "--build-dir",
+        ] {
+            let tokens = shell_words::split(&format!(
+                "env -- cargo build {option} --target-dir=decoy --target-dir actual -- --target-dir=program"
+            ))
+            .unwrap();
+            assert_eq!(
+                super::extract_cargo_target_dir_from_command_tokens(&tokens).as_deref(),
+                Some("actual"),
+                "{option}"
+            );
+            let stripped = super::strip_cargo_target_dir_flags_from_command_tokens(&tokens).unwrap();
+            assert!(stripped.iter().any(|word| word == "--target-dir=decoy"));
+            assert_eq!(stripped.last().unwrap(), "--target-dir=program");
+        }
+        for command in [
+            "env -- cargo test -- --target-dir=program",
+            "cargo build --config --target-dir=decoy",
+            "/usr/bin/time -f --target-dir=decoy cargo build",
+            "env -u --target-dir=decoy cargo build",
+            "printf cargo --target-dir decoy",
+            "cargo build --target-dir",
+            "cargo build --target-dir=",
+            "cargo build --target-dir --release",
+            "cargo build --target-dir one --target-dir two",
+        ] {
+            let tokens = shell_words::split(command).unwrap();
+            assert_eq!(super::cargo_target_dir_flag_span(&tokens), None, "{command}");
+            assert_eq!(
+                super::strip_cargo_target_dir_flags_from_command_tokens(&tokens),
+                None,
+                "{command}"
+            );
+        }
     }
 }
