@@ -1121,6 +1121,21 @@ impl WorkerState {
     pub fn used_slots(&self) -> u32 {
         self.used_slots.load(Ordering::Relaxed)
     }
+
+    /// Startup-only reconstruction, independent of present admission limits.
+    pub fn restore_slots(&self, count: u32) -> std::io::Result<()> {
+        self.used_slots
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                used.checked_add(count)
+            })
+            .map(|_| ())
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "durable reservation overflow",
+                )
+            })
+    }
 }
 
 /// Cached result of checking a concrete Rust toolchain on a worker.

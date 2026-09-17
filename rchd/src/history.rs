@@ -7,6 +7,7 @@ use rch_common::{
     BuildCancellationMetadata, BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation,
     BuildRecord, BuildStats, CommandTimingBreakdown, SavedTimeStats,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -18,6 +19,31 @@ use tokio::fs::OpenOptions as AsyncOpenOptions;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableOwnership {
+    version: u32,
+    active: Vec<ActiveBuildState>,
+    completed: Vec<TerminalOwnership>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TerminalOwnership {
+    record: BuildRecord,
+    local_wrapper_id: Option<String>,
+}
+
+/// Linux boot identity plus process start ticks distinguish PID reuse and reboot.
+pub fn process_identity(pid: u32) -> Option<String> {
+    if pid <= 1 {
+        return None;
+    }
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let start_ticks = fields.split_whitespace().nth(19)?;
+    Some(format!("{}:{start_ticks}", boot.trim()))
+}
 /// Default maximum number of builds to retain.
 const DEFAULT_CAPACITY: usize = 100;
 
@@ -33,15 +59,18 @@ fn build_record_succeeded(record: &BuildRecord) -> bool {
 }
 
 /// In-flight build state tracked for active build visibility.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveBuildState {
     pub id: u64,
     pub project_id: String,
     pub worker_id: String,
     pub command: String,
     pub started_at: String,
+    #[serde(skip, default = "Instant::now")]
     pub started_at_mono: Instant,
     pub hook_pid: u32,
+    #[serde(default)]
+    pub hook_process_identity: Option<String>,
     /// Client wrapper identity, allowing the daemon's active build to be
     /// joined with the client-side durable lease without relying on a reusable PID.
     pub local_wrapper_id: Option<String>,
@@ -54,8 +83,10 @@ pub struct ActiveBuildState {
     pub heartbeat_percent: Option<f64>,
     pub heartbeat_count: u64,
     pub last_heartbeat_at: String,
+    #[serde(skip, default = "Instant::now")]
     pub last_heartbeat_mono: Instant,
     pub last_progress_at: String,
+    #[serde(skip, default = "Instant::now")]
     pub last_progress_mono: Instant,
     pub detector_hook_alive: bool,
     pub detector_heartbeat_stale: bool,
@@ -64,6 +95,9 @@ pub struct ActiveBuildState {
     pub detector_build_age_secs: u64,
     pub detector_slots_owned: u32,
     pub detector_last_evaluated_at: Option<String>,
+    /// Restarted ownership must not authorize signalling a reused local PID.
+    #[serde(skip)]
+    pub recovered: bool,
 }
 
 /// Snapshot of stuck-detector evidence for an active build.
@@ -121,6 +155,11 @@ pub struct BuildHistory {
     next_queue_id: AtomicU64,
     /// Persistence path (optional).
     persistence_path: Option<PathBuf>,
+    /// Terminal receipts share the atomic ownership commit, not the JSONL log.
+    terminal: RwLock<HashMap<u64, TerminalOwnership>>,
+    ownership_failed: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_after_ownership_rename: std::sync::atomic::AtomicBool,
 }
 
 /// Default maximum queue depth.
@@ -146,6 +185,10 @@ impl BuildHistory {
             next_id: AtomicU64::new(initial_id),
             next_queue_id: AtomicU64::new(1),
             persistence_path: None,
+            terminal: RwLock::new(HashMap::new()),
+            ownership_failed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_after_ownership_rename: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -164,6 +207,9 @@ impl BuildHistory {
     pub fn with_persistence(mut self, path: PathBuf) -> Self {
         self.persistence_path = Some(path);
         self
+    }
+    pub fn ownership_failed(&self) -> bool {
+        self.ownership_failed.load(Ordering::SeqCst)
     }
 
     /// Get the next build ID.
@@ -246,6 +292,7 @@ impl BuildHistory {
             worker_id,
             command,
             started_at: started_at.clone(),
+            hook_process_identity: process_identity(hook_pid),
             started_at_mono,
             hook_pid,
             local_wrapper_id,
@@ -268,10 +315,13 @@ impl BuildHistory {
             detector_build_age_secs: 0,
             detector_slots_owned: slots,
             detector_last_evaluated_at: None,
+            recovered: false,
         };
 
         let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
         active.insert(id, state.clone());
+        self.persist_ownership(&active, None)
+            .expect("persist active build before exposing ownership");
         state
     }
 
@@ -289,6 +339,7 @@ impl BuildHistory {
         self.try_start_active_build_with_wrapper(
             project_id, worker_id, command, hook_pid, None, slots, location,
         )
+        .expect("persist active build before exposing ownership")
     }
 
     /// Try to register an active build with a client durable-lease id.
@@ -302,7 +353,7 @@ impl BuildHistory {
         local_wrapper_id: Option<String>,
         slots: u32,
         location: BuildLocation,
-    ) -> Option<ActiveBuildState> {
+    ) -> std::io::Result<Option<ActiveBuildState>> {
         let id = self.next_id();
         let started_at = Utc::now().to_rfc3339();
         let started_at_mono = Instant::now();
@@ -312,6 +363,7 @@ impl BuildHistory {
             worker_id,
             command,
             started_at: started_at.clone(),
+            hook_process_identity: process_identity(hook_pid),
             started_at_mono,
             hook_pid,
             local_wrapper_id,
@@ -334,16 +386,23 @@ impl BuildHistory {
             detector_build_age_secs: 0,
             detector_slots_owned: slots,
             detector_last_evaluated_at: None,
+            recovered: false,
         };
 
         let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        if self.ownership_failed() {
+            return Ok(None);
+        }
         if active.values().any(|existing| {
             existing.project_id == state.project_id && existing.worker_id == state.worker_id
         }) {
-            return None;
+            return Ok(None);
         }
         active.insert(id, state.clone());
-        Some(state)
+        if let Err(error) = self.persist_ownership(&active, None) {
+            return Err(error);
+        }
+        Ok(Some(state))
     }
 
     /// Record a heartbeat/progress update for an active build.
@@ -364,18 +423,27 @@ impl BuildHistory {
             return None;
         }
 
-        // Keep hook PID in sync if the heartbeat carries it.
+        // A durable identity can never be replaced or omitted when reattaching.
+        if state.local_wrapper_id.is_some() && state.local_wrapper_id != heartbeat.local_wrapper_id
+        {
+            return None;
+        }
+        if state.recovered && state.local_wrapper_id.is_none() {
+            return None;
+        }
+        if heartbeat.remote_pgid_file.as_ref().is_some_and(|path| {
+            state
+                .remote_pgid_file
+                .as_ref()
+                .is_some_and(|recorded| recorded != path)
+        }) {
+            return None;
+        }
         if let Some(pid) = heartbeat.hook_pid.filter(|pid| *pid > 0) {
             state.hook_pid = pid;
+            state.hook_process_identity = process_identity(pid);
         }
         if let Some(local_wrapper_id) = heartbeat.local_wrapper_id {
-            if state
-                .local_wrapper_id
-                .as_ref()
-                .is_some_and(|recorded| recorded != &local_wrapper_id)
-            {
-                return None;
-            }
             state.local_wrapper_id = Some(local_wrapper_id);
         }
         if let Some(remote_pgid_file) = heartbeat
@@ -426,7 +494,12 @@ impl BuildHistory {
             state.last_progress_mono = now;
         }
 
-        Some(state.clone())
+        let updated = state.clone();
+        if let Err(error) = self.persist_ownership(&active, None) {
+            warn!("Unable to persist build heartbeat: {error}");
+            return None;
+        }
+        Some(updated)
     }
 
     /// Record the latest stuck-detector evidence snapshot for an active build.
@@ -459,71 +532,19 @@ impl BuildHistory {
         bytes_transferred: Option<u64>,
         timing: Option<CommandTimingBreakdown>,
     ) -> Option<BuildRecord> {
-        let state = self.take_active_build(build_id)?;
-        Some(self.record_completed_build(state, exit_code, duration_ms, bytes_transferred, timing))
-    }
-
-    /// Record a completed build from an active state already claimed by the caller.
-    pub fn record_completed_build(
-        &self,
-        state: ActiveBuildState,
-        exit_code: i32,
-        duration_ms: Option<u64>,
-        bytes_transferred: Option<u64>,
-        timing: Option<CommandTimingBreakdown>,
-    ) -> BuildRecord {
-        let duration_ms =
-            duration_ms.unwrap_or_else(|| state.started_at_mono.elapsed().as_millis() as u64);
-        let record = BuildRecord {
-            id: state.id,
-            started_at: state.started_at,
-            completed_at: Utc::now().to_rfc3339(),
-            project_id: state.project_id,
-            worker_id: Some(state.worker_id),
-            command: state.command,
+        let state = self.active_build(build_id)?;
+        self.complete_durable(
+            build_id,
+            &state.worker_id,
+            state.local_wrapper_id.as_deref(),
             exit_code,
             duration_ms,
-            location: state.location,
             bytes_transferred,
             timing,
-            cancellation: None,
-        };
-
-        self.record(record.clone());
-        record
-    }
-
-    /// Claim an active build for deterministic finalization.
-    pub fn take_active_build(&self, build_id: u64) -> Option<ActiveBuildState> {
-        let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
-        active.remove(&build_id)
-    }
-
-    /// Record a cancelled build from a claimed active state.
-    pub fn record_cancelled_build(
-        &self,
-        state: ActiveBuildState,
-        bytes_transferred: Option<u64>,
-        cancellation: Option<BuildCancellationMetadata>,
-    ) -> BuildRecord {
-        let duration_ms = state.started_at_mono.elapsed().as_millis() as u64;
-        let record = BuildRecord {
-            id: state.id,
-            started_at: state.started_at,
-            completed_at: Utc::now().to_rfc3339(),
-            project_id: state.project_id,
-            worker_id: Some(state.worker_id),
-            command: state.command,
-            exit_code: 130,
-            duration_ms,
-            location: state.location,
-            bytes_transferred,
-            timing: None,
-            cancellation,
-        };
-
-        self.record(record.clone());
-        record
+            None,
+        )
+        .expect("persist terminal ownership before release")
+        .map(|(_, record)| record)
     }
 
     /// Cancel an active build, moving it into history with a cancel exit code.
@@ -533,8 +554,19 @@ impl BuildHistory {
         bytes_transferred: Option<u64>,
         cancellation: Option<BuildCancellationMetadata>,
     ) -> Option<BuildRecord> {
-        let state = self.take_active_build(build_id)?;
-        Some(self.record_cancelled_build(state, bytes_transferred, cancellation))
+        let state = self.active_build(build_id)?;
+        self.complete_durable(
+            build_id,
+            &state.worker_id,
+            state.local_wrapper_id.as_deref(),
+            130,
+            None,
+            bytes_transferred,
+            None,
+            cancellation,
+        )
+        .expect("persist terminal ownership before release")
+        .map(|(_, record)| record)
     }
 
     /// Get a specific active build by ID.
@@ -924,13 +956,19 @@ impl BuildHistory {
 
     /// Load history from a JSONL file.
     pub fn load_from_file(path: &Path, capacity: usize) -> std::io::Result<Self> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
+        let file = match File::open(path) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
 
         let mut records = VecDeque::with_capacity(capacity);
         let mut max_id = 0u64;
 
-        for line in reader.lines() {
+        for line in file
+            .into_iter()
+            .flat_map(|file| BufReader::new(file).lines())
+        {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
@@ -950,6 +988,65 @@ impl BuildHistory {
             }
         }
 
+        let ownership_path = path.with_extension("ownership.json");
+        let mut active = HashMap::new();
+        let mut terminal = HashMap::new();
+        match File::open(&ownership_path) {
+            Ok(file) => {
+                let snapshot: DurableOwnership = serde_json::from_reader(file)?;
+                if snapshot.version != 1 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unsupported ownership version",
+                    ));
+                }
+                for mut state in snapshot.active {
+                    if state.id == 0 || state.worker_id.is_empty() || active.contains_key(&state.id)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid or duplicate active ownership",
+                        ));
+                    }
+                    for (wall, mono) in [
+                        (&state.started_at, &mut state.started_at_mono),
+                        (&state.last_heartbeat_at, &mut state.last_heartbeat_mono),
+                        (&state.last_progress_at, &mut state.last_progress_mono),
+                    ] {
+                        let timestamp = DateTime::parse_from_rfc3339(wall).map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?;
+                        let age = Utc::now()
+                            .signed_duration_since(timestamp)
+                            .to_std()
+                            .unwrap_or_default();
+                        *mono = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+                    }
+                    state.recovered = true;
+                    max_id = max_id.max(state.id);
+                    active.insert(state.id, state);
+                }
+                for receipt in snapshot.completed {
+                    let id = receipt.record.id;
+                    if active.contains_key(&id) || terminal.contains_key(&id) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "conflicting terminal ownership",
+                        ));
+                    }
+                    max_id = max_id.max(id);
+                    if !records.iter().any(|record| record.id == id) {
+                        records.push_back(receipt.record.clone());
+                    }
+                    terminal.insert(id, receipt);
+                }
+                while records.len() > capacity {
+                    records.pop_front();
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         debug!("Loaded {} build records from {:?}", records.len(), path);
 
         let epoch_secs = std::time::SystemTime::now()
@@ -959,16 +1056,25 @@ impl BuildHistory {
         let epoch_id = (epoch_secs << 24) | 1;
         let initial_id = std::cmp::max(max_id + 1, epoch_id);
 
-        Ok(Self {
+        let history = Self {
             records: RwLock::new(records),
-            active: RwLock::new(HashMap::new()),
+            active: RwLock::new(active),
             queued: RwLock::new(VecDeque::new()),
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             next_id: AtomicU64::new(initial_id),
             next_queue_id: AtomicU64::new(1),
             persistence_path: Some(path.to_path_buf()),
-        })
+            terminal: RwLock::new(terminal),
+            ownership_failed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_after_ownership_rename: std::sync::atomic::AtomicBool::new(false),
+        };
+        history.persist_ownership(
+            &history.active.read().unwrap_or_else(|e| e.into_inner()),
+            None,
+        )?;
+        Ok(history)
     }
 
     /// Persist a single record to the JSONL file (append mode).
@@ -1020,6 +1126,143 @@ impl BuildHistory {
 
         Ok(())
     }
+
+    pub fn terminal_build(&self, build_id: u64, wrapper: &str) -> Option<BuildRecord> {
+        self.terminal
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&build_id)
+            .filter(|receipt| receipt.local_wrapper_id.as_deref() == Some(wrapper))
+            .map(|receipt| receipt.record.clone())
+    }
+    pub fn has_terminal_build(&self, build_id: u64) -> bool {
+        self.terminal
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&build_id)
+    }
+
+    /// One locked transition owns both the durable terminal receipt and release.
+    pub fn complete_durable(
+        &self,
+        build_id: u64,
+        worker_id: &str,
+        wrapper: Option<&str>,
+        exit_code: i32,
+        duration_ms: Option<u64>,
+        bytes_transferred: Option<u64>,
+        timing: Option<CommandTimingBreakdown>,
+        cancellation: Option<BuildCancellationMetadata>,
+    ) -> std::io::Result<Option<(ActiveBuildState, BuildRecord)>> {
+        let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        let Some(state) = active.get(&build_id) else {
+            let terminal = self.terminal.read().unwrap_or_else(|e| e.into_inner());
+            if terminal.get(&build_id).is_some_and(|receipt| {
+                receipt.record.worker_id.as_deref() == Some(worker_id)
+                    && receipt.local_wrapper_id.as_deref() == wrapper
+            }) {
+                return Ok(None);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "unknown build or ownership mismatch",
+            ));
+        };
+        if state.worker_id != worker_id || state.local_wrapper_id.as_deref() != wrapper {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "build ownership mismatch",
+            ));
+        }
+        let record = BuildRecord {
+            id: state.id,
+            started_at: state.started_at.clone(),
+            completed_at: Utc::now().to_rfc3339(),
+            project_id: state.project_id.clone(),
+            worker_id: Some(state.worker_id.clone()),
+            command: state.command.clone(),
+            exit_code,
+            duration_ms: duration_ms
+                .unwrap_or_else(|| state.started_at_mono.elapsed().as_millis() as u64),
+            location: state.location.clone(),
+            bytes_transferred,
+            timing,
+            cancellation,
+        };
+        let receipt = TerminalOwnership {
+            record: record.clone(),
+            local_wrapper_id: state.local_wrapper_id.clone(),
+        };
+        self.persist_ownership(&active, Some(&receipt))?;
+        self.terminal
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(build_id, receipt);
+        let state = active.remove(&build_id).expect("locked ownership exists");
+        self.record(record.clone());
+        Ok(Some((state, record)))
+    }
+
+    /// Atomically commit ownership before admitting or acknowledging a job.
+    fn persist_ownership(
+        &self,
+        active: &HashMap<u64, ActiveBuildState>,
+        completed: Option<&TerminalOwnership>,
+    ) -> std::io::Result<()> {
+        if self.ownership_failed() {
+            return Err(std::io::Error::other(
+                "durable ownership uncertain; restart required",
+            ));
+        }
+        let result = self.write_ownership(active, completed);
+        if result.is_err() {
+            self.ownership_failed.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn write_ownership(
+        &self,
+        active: &HashMap<u64, ActiveBuildState>,
+        completed: Option<&TerminalOwnership>,
+    ) -> std::io::Result<()> {
+        let Some(path) = &self.persistence_path else {
+            return Ok(());
+        };
+        let path = path.with_extension("ownership.json");
+        let terminal = self.terminal.read().unwrap_or_else(|e| e.into_inner());
+        let snapshot = DurableOwnership {
+            version: 1,
+            active: active
+                .values()
+                .filter(|state| completed.is_none_or(|receipt| receipt.record.id != state.id))
+                .cloned()
+                .collect(),
+            completed: terminal.values().chain(completed).cloned().collect(),
+        };
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let temporary = path.with_extension("tmp");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)?;
+        serde_json::to_writer(&mut file, &snapshot)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        #[cfg(test)]
+        if self.fail_after_ownership_rename.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other(
+                "injected post-rename ownership failure",
+            ));
+        }
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
 }
 
 impl Default for BuildHistory {
@@ -1058,6 +1301,37 @@ mod tests {
             timing: None,
             cancellation: None,
         }
+    }
+
+    #[tokio::test]
+    async fn active_build_survives_history_restart() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        // Ensure the persistence file exists through the normal completed
+        // history path, so a missing file cannot mask loss of the active job.
+        history
+            .record(make_build_record(1))
+            .expect("persistence task")
+            .await
+            .unwrap();
+        let running = history.start_active_build_with_wrapper(
+            "restart-project".to_string(),
+            "worker-1".to_string(),
+            "cargo check".to_string(),
+            std::process::id(),
+            Some("restart-wrapper".to_string()),
+            2,
+            BuildLocation::Remote,
+        );
+        drop(history);
+
+        let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(
+            recovered.active_build(running.id).is_some(),
+            "restart lost active build {}; surviving work must remain tracked",
+            running.id
+        );
     }
 
     #[test]

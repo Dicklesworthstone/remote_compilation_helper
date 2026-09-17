@@ -1,8 +1,6 @@
 //! Daemon-owned, bounded fan-out for fleet-wide cancellation.
 
-use super::{
-    CancelAllBuildsResponse, CancelReason, CancellationOrchestrator, CancelledBuildInfo,
-};
+use super::{CancelAllBuildsResponse, CancelReason, CancellationOrchestrator, CancelledBuildInfo};
 use crate::DaemonContext;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -178,7 +176,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_batch_finishes_snapshot_after_caller_abort_without_admitting_later_jobs() {
+    async fn cancellation_batch_finishes_snapshot_after_caller_abort_without_admitting_later_jobs()
+    {
         for force in [false, true] {
             let history = Arc::new(BuildHistory::new(100));
             let requested = MAX_BULK_CANCELLATIONS + 3;
@@ -289,7 +288,12 @@ mod tests {
                     .collect::<Vec<_>>(),
                 confirmed
             );
-            assert!(result.cancelled.iter().all(|build| build.slots_released == 0));
+            assert!(
+                result
+                    .cancelled
+                    .iter()
+                    .all(|build| build.slots_released == 0)
+            );
             assert_eq!(history.recent(100).len(), confirmed.len());
             assert_eq!(history.active_builds().len(), retained.len());
             for id in retained {
@@ -381,7 +385,10 @@ mod tests {
                 "failed bulk cancellation released live or unrelated reservations"
             );
         }
-        assert_eq!(owner.bulk_permits.available_permits(), MAX_BULK_CANCELLATIONS);
+        assert_eq!(
+            owner.bulk_permits.available_permits(),
+            MAX_BULK_CANCELLATIONS
+        );
         assert!(owner.active_cancellations().await.is_empty());
     }
 
@@ -447,9 +454,8 @@ mod tests {
             test_events(),
         );
         let caller_owner = owner.clone();
-        let caller = tokio::spawn(async move {
-            caller_owner.cancel_all_builds(&context, false).await
-        });
+        let caller =
+            tokio::spawn(async move { caller_owner.cancel_all_builds(&context, false).await });
         wait_for_attempt_count(&owner, 2).await;
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
@@ -474,7 +480,10 @@ mod tests {
         let completed = history.recent(100);
         assert_eq!(completed.len(), 2);
         assert_eq!(
-            completed.iter().map(|build| build.id).collect::<BTreeSet<_>>(),
+            completed
+                .iter()
+                .map(|build| build.id)
+                .collect::<BTreeSet<_>>(),
             expected
         );
         assert!(completed.iter().all(|build| {
