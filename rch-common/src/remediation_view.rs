@@ -485,13 +485,23 @@ pub fn build_inputs(
         }
         total_live += 1;
         let state = derive_worker_diff(&r.observation);
-        if state == WorkerDiffState::Ready {
+        // Capacity-aware: a worker with no free slot, or at critical disk
+        // pressure, cannot take a command now even when its diff state is
+        // Ready. Zero-slot workers (disk-locked capacity) and saturated workers
+        // are therefore counted in total_live but not admissible.
+        let no_free_slot = r.slots_total == 0 || r.slots_used >= r.slots_total;
+        let at_critical_pressure = r.disk_level == DiskLevel::Critical;
+        if state == WorkerDiffState::Ready && !no_free_slot && !at_critical_pressure {
             admissible += 1;
         } else {
-            let reason = match state {
-                WorkerDiffState::FactsUnknown => "missing capability facts",
-                WorkerDiffState::CommandIneligible => "not admissible for command",
-                WorkerDiffState::TemporarilyBypassed => "temporarily bypassed",
+            let reason = match (state, no_free_slot, at_critical_pressure) {
+                (WorkerDiffState::AdminDisabled, _, _) => "administratively disabled",
+                (WorkerDiffState::TemporarilyBypassed, _, _) => "temporarily bypassed",
+                (WorkerDiffState::FactsUnknown, _, _) => "missing capability facts",
+                (WorkerDiffState::Unreachable, _, _) => "unreachable",
+                (_, _, true) => "critical disk pressure",
+                (_, true, _) => "no free slot",
+                (WorkerDiffState::CommandIneligible, _, _) => "not admissible for command",
                 _ => "ineligible",
             };
             *blocker_counts.entry(reason).or_default() += 1;
@@ -1574,6 +1584,47 @@ mod tests {
         // The no-facts worker is live but not admissible.
         assert_eq!(inputs.telemetry.unknown, 1);
         assert!(inputs.admissible.top_blocker_reason.is_some() || inputs.admissible.admissible > 0);
+    }
+
+    #[test]
+    fn zero_slot_or_critical_pressure_workers_are_not_command_admissible() {
+        // Live-fleet shape seen 2026-09-17: workers reported healthy with
+        // total_slots == 0, or critical disk pressure, yet the admissible band
+        // claimed every live worker "can run a command now".
+        let mut zero_slot = ready_row("hz1");
+        zero_slot.slots_total = 0;
+        let mut critical = ready_row("hz2");
+        critical.disk_level = DiskLevel::Critical;
+        let mut saturated = ready_row("css");
+        saturated.slots_used = saturated.slots_total; // 8/8 busy, no free slot
+
+        let rows = vec![zero_slot.clone(), critical.clone(), saturated.clone()];
+        let inputs = build_inputs(
+            &rows,
+            JobsInput::default(),
+            ProofQueueInput::default(),
+            Vec::new(),
+            300,
+        );
+        assert_eq!(inputs.admissible.total_live, 3);
+        assert_eq!(
+            inputs.admissible.admissible, 0,
+            "no free slot or critical pressure must not read as admissible"
+        );
+        assert!(inputs.admissible.top_blocker_reason.is_some());
+
+        // One genuinely free, healthy worker remains admissible.
+        let mut free = ready_row("ovh-a");
+        free.slots_used = 2;
+        let rows = vec![zero_slot, critical, saturated, free];
+        let inputs = build_inputs(
+            &rows,
+            JobsInput::default(),
+            ProofQueueInput::default(),
+            Vec::new(),
+            300,
+        );
+        assert_eq!(inputs.admissible.admissible, 1);
     }
 
     #[test]

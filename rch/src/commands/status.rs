@@ -3090,11 +3090,19 @@ fn derive_check_outcome(
     daemon_issues: &[IssueFromApi],
     hook_installed: bool,
 ) -> (String, i32, Vec<String>) {
-    let mut issues_list: Vec<String> = unhealthy
-        .iter()
-        .map(|w| format!("Worker {} is unreachable", w))
+    // Daemon issues carry the actual state and cause (including administrative
+    // disables). Present the most severe cause before generic worker health.
+    let mut ordered_issues: Vec<_> = daemon_issues.iter().collect();
+    ordered_issues.sort_by_key(|issue| std::cmp::Reverse(check_issue_severity(&issue.severity)));
+    let mut issues_list: Vec<String> = ordered_issues
+        .into_iter()
+        .map(|issue| issue.summary.clone())
         .collect();
-    issues_list.extend(daemon_issues.iter().map(|issue| issue.summary.clone()));
+    issues_list.extend(
+        unhealthy
+            .iter()
+            .map(|w| format!("Worker {w} is not healthy")),
+    );
 
     let daemon_issue_severity = daemon_issues
         .iter()
@@ -3121,7 +3129,7 @@ fn derive_check_outcome(
         }
         ("degraded".to_string(), 1, issues_list)
     } else {
-        issues_list.insert(0, "All workers are unreachable".to_string());
+        issues_list.insert(0, "No healthy workers available".to_string());
         ("not_ready".to_string(), 2, issues_list)
     };
 
@@ -3339,21 +3347,11 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
             );
         }
         "degraded" => {
-            if workers_info.unhealthy.is_empty() {
-                let issue = issues
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or("some workers are not fully healthy");
-                println!("{} RCH degraded: {}", style.warning("\u{26A0}"), issue);
-            } else {
-                println!(
-                    "{} RCH degraded: {}/{} workers unreachable ({})",
-                    style.warning("\u{26A0}"),
-                    workers_info.unhealthy.len(),
-                    workers_info.total,
-                    workers_info.unhealthy.join(", ")
-                );
-            }
+            let issue = issues
+                .first()
+                .map(String::as_str)
+                .unwrap_or("some workers are not fully healthy");
+            println!("{} RCH degraded: {}", style.warning("\u{26A0}"), issue);
         }
         "not_ready" => {
             let issue = issues
@@ -3682,11 +3680,6 @@ mod tests {
             issues.first().map(String::as_str),
             Some(CHECK_HOOK_NOT_INSTALLED_ISSUE)
         );
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue == "Worker builder-2 is unreachable")
-        );
         assert!(issues.iter().any(|issue| issue == "worker pressure"));
     }
 
@@ -3712,6 +3705,34 @@ mod tests {
         assert_eq!(status, "not_ready");
         assert_eq!(exit_code, 2);
         assert_eq!(issues, vec!["daemon failed to clean up a build"]);
+    }
+
+    #[test]
+    fn check_critical_cause_precedes_disabled_worker_warning() {
+        let daemon_issues = vec![
+            check_issue("warning", "builder-2 administratively disabled"),
+            check_issue("critical", "builder-1 disk pressure"),
+        ];
+        let (status, exit_code, issues) =
+            derive_check_outcome(2, 1, &["builder-2".to_string()], &daemon_issues, true);
+        assert_eq!(status, "not_ready");
+        assert_eq!(exit_code, 2);
+        assert_eq!(issues.first(), Some(&daemon_issues[1].summary));
+        assert!(!issues.iter().any(|issue| issue.contains("unreachable")));
+    }
+
+    #[test]
+    fn check_disabled_fleet_does_not_claim_connectivity_failure() {
+        let daemon_issues = vec![check_issue(
+            "warning",
+            "builder-1 administratively disabled",
+        )];
+        let (status, exit_code, issues) =
+            derive_check_outcome(1, 0, &["builder-1".to_string()], &daemon_issues, true);
+        assert_eq!(status, "not_ready");
+        assert_eq!(exit_code, 2);
+        assert!(issues.contains(&daemon_issues[0].summary));
+        assert!(!issues.iter().any(|issue| issue.contains("unreachable")));
     }
 
     #[test]

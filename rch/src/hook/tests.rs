@@ -3667,7 +3667,6 @@ fn test_detect_worker_system_dependency_failure_ignores_normal_compile_errors() 
     );
 }
 
-
 // =========================================================================
 // Cargo test integration tests (bead remote_compilation_helper-iyv1)
 // =========================================================================
