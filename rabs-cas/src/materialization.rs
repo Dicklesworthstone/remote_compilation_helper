@@ -14,13 +14,12 @@
 //!   into place. Unverified bytes are never installed, and a partially
 //!   written file is never visible at the destination path.
 //!
-//! Only [`MaterializationMode::PrivateCopy`] is implemented here.
-//! `VerifiedCowReflink` needs the H017 reflink backend AND something
-//! that actually verifies reflink isolation on the filesystem in hand
-//! (nothing computes that today); `ReadOnlyBind` needs mount
-//! privileges. Both are typed refusals rather than a silent downgrade —
-//! a caller that asked for CoW isolation and got a copy would be
-//! reasoning about the wrong isolation properties.
+//! [`MaterializationMode::VerifiedCowReflink`] attempts Linux FICLONE
+//! only after a private filesystem probe verifies content and metadata
+//! isolation. Unsupported or failed clones fall back to a verified private
+//! copy (I33). Both paths verify the object identity before publication;
+//! the reflink path hashes the actual staged clone.
+//! `ReadOnlyBind` still needs mount privileges and is a typed refusal.
 //!
 //! ## Why the mode policy looks like this
 //!
@@ -39,7 +38,7 @@
 //! - mtime adjustments apply only to private materializations (the
 //!   mode carries the permission).
 
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
@@ -151,7 +150,7 @@ pub fn materialize_object(
     destination: &Path,
     mode: MaterializationMode,
 ) -> Result<u64, MaterializeError> {
-    if mode != MaterializationMode::PrivateCopy {
+    if mode == MaterializationMode::ReadOnlyBind {
         return Err(MaterializeError::ModeUnsupported(mode));
     }
     let key = digest_key(object);
@@ -178,8 +177,8 @@ pub fn materialize_object(
 
     let mut last: Option<MaterializeError> = None;
     for source in raw {
-        match copy_verified(&source, object, &key, &parent, destination) {
-            Ok(bytes) => return Ok(bytes),
+        match copy_verified(&source, object, &key, &parent, destination, mode) {
+            Ok((bytes, _reflinked)) => return Ok(bytes),
             // A corrupt copy is reported as such immediately: silently
             // trying the next one would hide store corruption that the
             // GC/quarantine flow needs to hear about.
@@ -198,13 +197,39 @@ fn copy_verified(
     key: &str,
     parent: &Path,
     destination: &Path,
-) -> Result<u64, MaterializeError> {
+    mode: MaterializationMode,
+) -> Result<(u64, bool), MaterializeError> {
     let mut input = std::fs::File::open(source).map_err(|e| MaterializeError::Unreadable {
         path: source.to_owned(),
         error: e.to_string(),
     })?;
     let staging = staging_path(parent, destination);
-    let mut output = std::fs::File::create(&staging).map_err(io_err("create-staging"))?;
+    let mut output = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .map_err(io_err("create-staging"))?;
+    let reflinked = mode == MaterializationMode::VerifiedCowReflink
+        && try_verified_reflink(&input, &output, parent);
+    let prepare = if reflinked {
+        // Hash the actual private clone, not a potentially changing source.
+        output
+            .try_clone()
+            .map(|clone| input = clone)
+            .map_err(io_err("read-cloned-staging"))
+    } else {
+        // A failed ioctl may have touched the staging file. The fallback must
+        // not retain a suffix from that attempt, even for an empty CAS object.
+        output
+            .set_len(0)
+            .map_err(io_err("reset-staging"))
+            .and_then(|()| output.rewind().map_err(io_err("rewind-staging")))
+    };
+    if let Err(error) = prepare {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error);
+    }
     let mut writer = StreamingObjectWriter::new(DigestRequest::default(), None);
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut written = 0_u64;
@@ -225,7 +250,7 @@ fn copy_verified(
                 error: format!("{e:?}"),
             });
         }
-        if let Err(e) = std::io::Write::write_all(&mut output, &buffer[..read]) {
+        if !reflinked && let Err(e) = std::io::Write::write_all(&mut output, &buffer[..read]) {
             break Err(MaterializeError::Io {
                 step: "write-staging",
                 error: e.to_string(),
@@ -264,7 +289,84 @@ fn copy_verified(
             error: error.to_string(),
         });
     }
-    Ok(written)
+    Ok((written, reflinked))
+}
+
+/// Only Linux's safe FICLONE binding is enabled. Other platforms retain the
+/// verified-copy backend until their clone API has equivalent isolation tests.
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "sparc", target_arch = "sparc64"))
+))]
+fn try_verified_reflink(input: &std::fs::File, output: &std::fs::File, parent: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let (Ok(source), Ok(target)) = (input.metadata(), output.metadata()) else {
+        return false;
+    };
+    if !source.is_file()
+        || !target.is_file()
+        || source.dev() != target.dev()
+        || source.ino() == target.ino()
+    {
+        return false;
+    }
+    // Do not cache a probe by st_dev alone: remounts/device reuse and differing
+    // filesystem policies can invalidate it. Anonymous probes are bounded (4KiB)
+    // and leave no named files behind.
+    verify_reflink_isolation(parent).unwrap_or(false)
+        && rustix::fs::ioctl_ficlone(output, input).is_ok()
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    not(any(target_arch = "sparc", target_arch = "sparc64"))
+)))]
+fn try_verified_reflink(_input: &std::fs::File, _output: &std::fs::File, _parent: &Path) -> bool {
+    false
+}
+
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "sparc", target_arch = "sparc64"))
+))]
+fn verify_reflink_isolation(parent: &Path) -> std::io::Result<bool> {
+    use rustix::fs::{Mode, OFlags, open};
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let anonymous = || {
+        open(
+            parent,
+            OFlags::TMPFILE | OFlags::RDWR | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map(std::fs::File::from)
+        .map_err(std::io::Error::from)
+    };
+    let mut source = anonymous()?;
+    let mut clone = anonymous()?;
+    let bytes = [0x5a; 4096];
+    source.write_all(&bytes)?;
+    source.set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100))?;
+    let before = source.metadata()?;
+    if rustix::fs::ioctl_ficlone(&clone, &source).is_err()
+        || clone.metadata()?.ino() == before.ino()
+    {
+        return Ok(false);
+    }
+    clone.write_all(b"changed private content")?;
+    clone.set_len(23)?;
+    clone.set_permissions(std::fs::Permissions::from_mode(0o640))?;
+    clone.set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(200))?;
+    let after = source.metadata()?;
+    source.rewind()?;
+    let mut original = Vec::new();
+    source.read_to_end(&mut original)?;
+    Ok(original == bytes
+        && before.len() == after.len()
+        && before.mode() == after.mode()
+        && before.modified()? == after.modified()?)
 }
 
 fn staging_path(parent: &Path, destination: &Path) -> PathBuf {
@@ -281,8 +383,9 @@ fn staging_path(parent: &Path, destination: &Path) -> PathBuf {
 pub enum MaterializationMode {
     /// Full private copy: mutation and mtime changes permitted.
     PrivateCopy,
-    /// Copy-on-write reflink VERIFIED isolated on this filesystem:
-    /// mutation permitted (the write is redirected), mtime permitted.
+    /// Prefer a copy-on-write reflink after verifying isolation on this
+    /// filesystem; fall back to a private copy if unsupported or unverified.
+    /// Both outcomes permit mutation and mtime changes (I33).
     VerifiedCowReflink,
     /// Read-only bind of the CAS bytes: no mutation, no mtime change.
     ReadOnlyBind,
@@ -778,6 +881,175 @@ mod tests {
     }
 
     #[test]
+    fn h017_production_materialization_preserves_cas_content_and_metadata() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let bytes = b"shared immutable artifact".repeat(4096);
+        let (mut store, _layout, object) = store_with_object(&dir, &bytes);
+        let source = PathBuf::from(&store.object_locations(&object).unwrap()[0].0);
+        let before = fs::metadata(&source).unwrap();
+        let target = dir.join("target.rlib");
+        assert_eq!(
+            materialize_object(
+                &mut store,
+                &object,
+                &target,
+                MaterializationMode::VerifiedCowReflink
+            )
+            .unwrap(),
+            bytes.len() as u64
+        );
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            assert_ne!(before.ino(), fs::metadata(&target).unwrap().ino());
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(fs::metadata(&source).unwrap().mode(), before.mode());
+        }
+        filetime::set_file_mtime(&target, FileTime::from_unix_time(123, 0)).unwrap();
+        fs::write(&target, b"mutated subscriber output").unwrap();
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(&source).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        eprintln!(
+            "H017 production content/metadata isolation evidence: {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn h017_reflink_request_still_refuses_corrupt_bytes_before_publication() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let (mut store, _layout, object) = store_with_object(&dir, b"original object");
+        let source = &store.object_locations(&object).unwrap()[0].0;
+        fs::write(source, b"corrupt object").unwrap();
+        let target = dir.join("existing.rlib");
+        fs::write(&target, b"previous artifact").unwrap();
+        assert!(matches!(
+            materialize_object(
+                &mut store,
+                &object,
+                &target,
+                MaterializationMode::VerifiedCowReflink
+            ),
+            Err(MaterializeError::ContentMismatch { .. })
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"previous artifact");
+    }
+
+    #[test]
+    fn h017_empty_object_replaces_existing_output_without_stale_suffix() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let (mut store, _layout, object) = store_with_object(&dir, b"");
+        let target = dir.join("empty.rlib");
+        fs::write(&target, b"previous nonempty output").unwrap();
+        assert_eq!(
+            materialize_object(
+                &mut store,
+                &object,
+                &target,
+                MaterializationMode::VerifiedCowReflink
+            )
+            .unwrap(),
+            0
+        );
+        assert!(fs::read(&target).unwrap().is_empty());
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "sparc", target_arch = "sparc64"))
+    ))]
+    #[test]
+    fn h017_tmpfs_unsupported_reflink_falls_back_to_verified_copy() {
+        let dir = tempfile::tempdir_in("/dev/shm").unwrap().keep();
+        let source = dir.join("source");
+        let target = dir.join("target");
+        let bytes = b"tmpfs fallback artifact";
+        fs::write(&source, bytes).unwrap();
+        // This case requires a genuinely unsupported filesystem, not an injected
+        // ioctl failure. The separate opt-in test requires real reflink success.
+        assert!(!verify_reflink_isolation(&dir).unwrap());
+        let object = crate::digest_set::digest_set(bytes, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+        let (count, reflinked) = copy_verified(
+            source.to_str().unwrap(),
+            &object,
+            &digest_key(&object),
+            &dir,
+            &target,
+            MaterializationMode::VerifiedCowReflink,
+        )
+        .unwrap();
+        assert!(!reflinked);
+        assert_eq!(count, bytes.len() as u64);
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+        fs::write(&target, b"independent").unwrap();
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        eprintln!(
+            "H017 tmpfs verified-copy fallback evidence: {}",
+            dir.display()
+        );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "sparc", target_arch = "sparc64"))
+    ))]
+    #[test]
+    #[ignore = "requires RABS_REFLINK_TEST_ROOT on a real reflink-capable filesystem"]
+    fn h017_real_reflink_backend_is_required_and_mutation_independent() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = std::env::var_os("RABS_REFLINK_TEST_ROOT").expect("explicit capable filesystem");
+        let dir = tempfile::tempdir_in(root).unwrap().keep();
+        assert!(
+            verify_reflink_isolation(&dir).unwrap(),
+            "filesystem must support real reflinks"
+        );
+        let source = dir.join("source");
+        let target = dir.join("target");
+        let bytes = b"reflink immutable artifact".repeat(4096);
+        fs::write(&source, &bytes).unwrap();
+        let before = fs::metadata(&source).unwrap();
+        let object = crate::digest_set::digest_set(&bytes, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+        let (count, reflinked) = copy_verified(
+            source.to_str().unwrap(),
+            &object,
+            &digest_key(&object),
+            &dir,
+            &target,
+            MaterializationMode::VerifiedCowReflink,
+        )
+        .unwrap();
+        assert!(
+            reflinked,
+            "copy fallback must not satisfy the positive reflink gate"
+        );
+        assert_eq!(count, bytes.len() as u64);
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+        assert_ne!(before.ino(), fs::metadata(&target).unwrap().ino());
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        filetime::set_file_mtime(&target, FileTime::from_unix_time(123, 0)).unwrap();
+        fs::write(&target, b"target changed").unwrap();
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        let after = fs::metadata(&source).unwrap();
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+        fs::write(&source, b"source changed later").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"target changed");
+        eprintln!(
+            "H017 real reflink content+metadata evidence: {}",
+            dir.display()
+        );
+    }
+
+    #[test]
     fn materializes_real_bytes_and_the_copy_is_private() {
         let dir = scratch_dir("materialize");
         let bytes = b"the committed artifact bytes".repeat(1000);
@@ -866,16 +1138,18 @@ mod tests {
             ),
             Err(MaterializeError::NoUsableCopy { .. })
         ));
-        // A mode we cannot honor is refused, never downgraded to a copy.
-        for mode in [
-            MaterializationMode::VerifiedCowReflink,
-            MaterializationMode::ReadOnlyBind,
-        ] {
-            assert_eq!(
-                materialize_object(&mut store, &object, &dir.join("b.rlib"), mode),
-                Err(MaterializeError::ModeUnsupported(mode))
-            );
-        }
+        // Copy is not a substitute for a requested read-only bind.
+        assert_eq!(
+            materialize_object(
+                &mut store,
+                &object,
+                &dir.join("b.rlib"),
+                MaterializationMode::ReadOnlyBind,
+            ),
+            Err(MaterializeError::ModeUnsupported(
+                MaterializationMode::ReadOnlyBind
+            ))
+        );
         assert!(!dir.join("b.rlib").exists());
         let _ = fs::remove_dir_all(&dir);
     }
