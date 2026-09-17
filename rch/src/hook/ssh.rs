@@ -36,6 +36,8 @@ use super::*;
 use crate::transfer::WorkerPlatform;
 
 const MAX_OFFLOAD_SSH_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SOURCE_LOCK_READY_BYTES: usize = 4096;
+const MAX_SOURCE_LOCK_OUTPUT_BYTES: usize = 64 * 1024;
 const REMOTE_SOURCE_AUTHORITY_LOCK_DIR: &str = "/tmp/rch-source-authority-locks";
 
 /// Keeps the worker-side advisory locks for a mutable Cargo source closure alive.
@@ -82,54 +84,64 @@ impl RemoteSourceAuthorityLock {
     }
 
     /// Release the locks after Cargo exits and prove the holder stayed healthy.
-    pub(super) async fn release(mut self) -> anyhow::Result<()> {
+    pub(super) async fn release(self) -> anyhow::Result<()> {
+        self.release_with_timeout(Duration::from_secs(15)).await
+    }
+
+    async fn release_with_timeout(mut self, budget: Duration) -> anyhow::Result<()> {
         use tokio::io::AsyncWriteExt as _;
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        if let Some(request) = self.release_request.as_ref() {
-            let stdin = self
-                .stdin
+        let deadline = tokio::time::Instant::now() + budget;
+        let collect = async {
+            if let Some(request) = self.release_request.as_ref() {
+                let stdin = self
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("source-pair release stdin is missing"))?;
+                stdin.write_all(format!("{request}\n").as_bytes()).await?;
+            }
+            drop(self.stdin.take());
+            // Keep the child AND both handles in the guard until the whole
+            // protocol finishes. Taking a JoinHandle would detach its reader
+            // when this future times out or its caller stops waiting.
+            let child = self
+                .child
                 .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("source-pair release stdin is missing"))?;
-            tokio::time::timeout_at(deadline, stdin.write_all(format!("{request}\n").as_bytes()))
-                .await
-                .map_err(|_| anyhow::anyhow!("timed out sending source-pair release"))??;
-        }
-        drop(self.stdin.take());
-        let mut child = self
-            .child
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("remote source-authority lock is not active"))?;
-        let status = match tokio::time::timeout_at(deadline, child.wait()).await {
-            Ok(status) => status?,
-            Err(_) => {
-                let _ = child.start_kill();
+                .ok_or_else(|| anyhow::anyhow!("remote source-authority lock is not active"))?;
+            let wait = async { Ok::<_, anyhow::Error>(child.wait().await?) };
+            let (status, stdout, stderr) = tokio::try_join!(
+                wait,
+                join_lock_drain(self.stdout_drain.as_mut()),
+                join_lock_drain(self.stderr_drain.as_mut()),
+            )?;
+            if !status.success() {
                 anyhow::bail!(
-                    "timed out releasing remote source-authority lock on {}",
+                    "remote source-authority lock on {} exited unexpectedly: {}; stdout={}; stderr={}",
+                    self.worker_id,
+                    status,
+                    String::from_utf8_lossy(&stdout).trim(),
+                    String::from_utf8_lossy(&stderr).trim()
+                );
+            }
+            if let Some(request) = self.release_request.as_ref()
+                && stdout != format!("{request}\n").as_bytes()
+            {
+                anyhow::bail!(
+                    "source-pair release acknowledgment missing on {}",
                     self.worker_id
                 );
             }
+            Ok(())
         };
-        let stdout = join_lock_drain(self.stdout_drain.take()).await?;
-        let stderr = join_lock_drain(self.stderr_drain.take()).await?;
-        if !status.success() {
-            anyhow::bail!(
-                "remote source-authority lock on {} exited unexpectedly: {}; stdout={}; stderr={}",
-                self.worker_id,
-                status,
-                String::from_utf8_lossy(&stdout).trim(),
-                String::from_utf8_lossy(&stderr).trim()
-            );
-        }
-        if let Some(request) = self.release_request.as_ref()
-            && stdout != format!("{request}\n").as_bytes()
-        {
-            anyhow::bail!(
-                "source-pair release acknowledgment missing on {}",
+        // A successful wait() does not imply EOF: descendants can retain the
+        // pipes. The same deadline must cover the write, wait and BOTH drains.
+        match tokio::time::timeout_at(deadline, collect).await {
+            Ok(result) => result,
+            Err(_) => anyhow::bail!(
+                "timed out releasing remote source-authority lock on {}",
                 self.worker_id
-            );
+            ),
         }
-        Ok(())
     }
 }
 
@@ -148,7 +160,7 @@ impl Drop for RemoteSourceAuthorityLock {
 }
 
 async fn join_lock_drain(
-    task: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
+    task: Option<&mut tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
 ) -> anyhow::Result<Vec<u8>> {
     match task {
         Some(task) => Ok(task.await??),
@@ -355,13 +367,10 @@ async fn finish_source_authority_lock_acquisition(
         .stderr
         .take()
         .ok_or_else(|| anyhow::anyhow!("source-authority lock stderr was not piped"))?;
-    let stderr_drain = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        tokio::io::BufReader::new(stderr)
-            .read_to_end(&mut bytes)
-            .await?;
-        Ok(bytes)
-    });
+    let stderr_drain = tokio::spawn(crate::transfer::read_bounded_output_stream(
+        stderr,
+        MAX_SOURCE_LOCK_OUTPUT_BYTES,
+    ));
     // Own cleanup before any fallible write/read: timeout, cancellation and
     // invalid readiness must not detach the drain or leave a lock holder.
     let mut guard = RemoteSourceAuthorityLock {
@@ -382,14 +391,33 @@ async fn finish_source_authority_lock_acquisition(
             }
             Ok::<(), std::io::Error>(())
         };
-        tokio::try_join!(write_bootstrap, stdout.read_line(&mut observed))
+        let read_ready = async {
+            // Bound the read itself, not just the buffer after read_line has
+            // waited for an arbitrarily large or never-terminated frame.
+            let read = (&mut stdout)
+                .take((MAX_SOURCE_LOCK_READY_BYTES + 1) as u64)
+                .read_line(&mut observed)
+                .await?;
+            if read > MAX_SOURCE_LOCK_READY_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "source-authority ready frame exceeded its byte limit",
+                ));
+            }
+            Ok(read)
+        };
+        tokio::try_join!(write_bootstrap, read_ready)
     };
     let failure = match timeout(wait_timeout, acquisition).await {
         Ok(Ok(((), 0))) => Some(format!(
             "source-authority lock on {} exited before acquisition",
             guard.worker_id
         )),
-        Ok(Ok(((), _))) if observed.trim_end() == ready_marker => None,
+        Ok(Ok(((), _)))
+            if observed
+                .strip_suffix('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                == Some(ready_marker) => None,
         Ok(Ok(((), _))) => Some(format!(
             "source-authority lock on {} emitted an invalid ready marker: {:?}",
             guard.worker_id,
@@ -424,11 +452,10 @@ async fn finish_source_authority_lock_acquisition(
     }
 
     guard.stdin = Some(stdin);
-    guard.stdout_drain = Some(tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).await?;
-        Ok(bytes)
-    }));
+    guard.stdout_drain = Some(tokio::spawn(crate::transfer::read_bounded_output_stream(
+        stdout,
+        MAX_SOURCE_LOCK_OUTPUT_BYTES,
+    )));
     Ok(guard)
 }
 
@@ -2370,5 +2397,211 @@ exec /bin/ln \"$@\"\n",
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(unix)]
+    async fn source_lock_pending_release_fixture() -> (
+        RemoteSourceAuthorityLock,
+        Vec<tokio::io::DuplexStream>,
+        Vec<tokio::sync::oneshot::Receiver<()>>,
+    ) {
+        struct ReaderDropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for ReaderDropped {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        // Establish the exact regression boundary: SSH already exited, but
+        // both reader pipes remain open as if inherited by descendants.
+        assert!(child.wait().await.unwrap().success());
+        let mut writers = Vec::new();
+        let mut notices = Vec::new();
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let (reader, writer) = tokio::io::duplex(16);
+            let (sender, notice) = tokio::sync::oneshot::channel();
+            let dropped = ReaderDropped(Some(sender));
+            tasks.push(tokio::spawn(async move {
+                let _dropped = dropped;
+                crate::transfer::read_bounded_output_stream(reader, MAX_SOURCE_LOCK_OUTPUT_BYTES)
+                    .await
+            }));
+            writers.push(writer);
+            notices.push(notice);
+        }
+        let stderr_drain = tasks.pop();
+        let stdout_drain = tasks.pop();
+        (
+            RemoteSourceAuthorityLock {
+                worker_id: WorkerId::new("pending-lock-release"),
+                child: Some(child),
+                stdin: None,
+                stdout_drain,
+                stderr_drain,
+                release_request: None,
+            },
+            writers,
+            notices,
+        )
+    }
+
+    #[cfg(unix)]
+    async fn source_lock_assert_readers_dropped(notices: Vec<tokio::sync::oneshot::Receiver<()>>) {
+        for notice in notices {
+            timeout(Duration::from_secs(1), notice)
+                .await
+                .expect("release detached an output reader")
+                .expect("reader drop notification lost");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_lock_lifecycle_release_deadline_includes_eof_after_child_exit() {
+        let (guard, _writers, notices) = source_lock_pending_release_fixture().await;
+        let error = timeout(
+            Duration::from_secs(1),
+            guard.release_with_timeout(Duration::from_millis(40)),
+        )
+        .await
+        .expect("release ignored its deadline after child exit")
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out releasing"), "{error:#}");
+        source_lock_assert_readers_dropped(notices).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_lock_lifecycle_release_surfaces_stderr_error_without_waiting_for_stdout() {
+        let (mut guard, _writers, notices) = source_lock_pending_release_fixture().await;
+        guard.stderr_drain.take().unwrap().abort();
+        guard.stderr_drain = Some(tokio::spawn(async {
+            Err(std::io::Error::other("injected lock stderr failure"))
+        }));
+        let error = timeout(
+            Duration::from_secs(1),
+            guard.release_with_timeout(Duration::from_secs(60)),
+        )
+        .await
+        .expect("stderr failure was hidden behind a pending stdout reader")
+        .unwrap_err();
+        assert!(error.to_string().contains("injected lock stderr failure"));
+        source_lock_assert_readers_dropped(notices).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_lock_lifecycle_caller_cancellation_aborts_both_release_readers() {
+        let (guard, _writers, notices) = source_lock_pending_release_fixture().await;
+        let mut release = Box::pin(guard.release_with_timeout(Duration::from_secs(60)));
+        assert!(timeout(Duration::from_millis(40), &mut release).await.is_err());
+        drop(release);
+        source_lock_assert_readers_dropped(notices).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_lock_lifecycle_release_requires_complete_ack_and_successful_exit() {
+        for (reply, expected) in [
+            ("printf '%s\\n' \"$request\"", true),
+            ("printf '%s' \"$request\"", false),
+            ("printf 'WRONG\\n'", false),
+            ("printf '%s\\n' \"$request\" \"$request\"", false),
+            ("printf '%s\\n' \"$request\"; exit 37", false),
+        ] {
+            let script = format!("printf 'READY\\n'; IFS= read -r request; {reply}");
+            let child = Command::new("/bin/sh")
+                .args(["-c", &script])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut guard = finish_source_authority_lock_acquisition(
+                child,
+                WorkerId::new("lock-ack-fixture"),
+                "READY",
+                None,
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+            guard.release_request = Some("RELEASE".to_owned());
+            let result = guard.release_with_timeout(Duration::from_secs(2)).await;
+            assert_eq!(result.is_ok(), expected, "{reply}: {result:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_lock_lifecycle_readiness_refuses_truncated_padded_and_oversized_frames() {
+        for script in [
+            "printf READY".to_owned(),
+            "printf 'READY \\n'; exec cat".to_owned(),
+            format!("printf %s {}; exec cat", "x".repeat(MAX_SOURCE_LOCK_READY_BYTES + 1)),
+        ] {
+            let child = Command::new("/bin/sh")
+                .args(["-c", &script])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let result = timeout(
+                Duration::from_secs(2),
+                finish_source_authority_lock_acquisition(
+                    child,
+                    WorkerId::new("invalid-lock-ready"),
+                    "READY",
+                    None,
+                    Duration::from_secs(60),
+                ),
+            )
+            .await
+            .expect("invalid readiness waited for EOF or the acquisition timeout");
+            assert!(result.is_err(), "invalid readiness authorized a source writer");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_lock_lifecycle_stdout_overflow_cannot_certify_release() {
+        let script = format!(
+            "printf 'READY\\n'; IFS= read -r request; head -c {} /dev/zero; exit 0",
+            MAX_SOURCE_LOCK_OUTPUT_BYTES + 1
+        );
+        let child = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut guard = finish_source_authority_lock_acquisition(
+            child,
+            WorkerId::new("oversized-lock-output"),
+            "READY",
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        guard.release_request = Some("RELEASE".to_owned());
+        let error = guard.release_with_timeout(Duration::from_secs(2)).await.unwrap_err();
+        assert!(error.to_string().contains("exceeded"), "{error:#}");
     }
 }

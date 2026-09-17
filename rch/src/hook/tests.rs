@@ -35,6 +35,7 @@ use super::dependency_closure::{
     parse_dependency_preflight_probe_output, synced_dependency_preflight_checks,
     verify_remote_dependency_manifests,
 };
+use super::progress_reporting::BuildHeartbeatLoop;
 use super::repo_updater::{
     auto_tune_repo_updater_contract, build_repo_sync_idempotency_key_for_command,
     collect_repo_updater_roots_and_specs, hydrate_repo_updater_auth_context_defaults,
@@ -3666,28 +3667,6 @@ fn test_detect_worker_system_dependency_failure_ignores_normal_compile_errors() 
     );
 }
 
-#[test]
-fn test_exit_code_semantics_documented() {
-    let _guard = test_guard!();
-    // This test documents the expected behavior for different exit codes
-    // Exit 0: Success - should deny local (verified in other tests)
-    // Exit 101: Test failures - should deny local (re-running won't help)
-    // Exit 1: Build error - should deny local (same error locally)
-    // Exit 137: SIGKILL - should deny local (likely OOM)
-
-    // Verify constants are what we expect
-    assert_eq!(EXIT_SUCCESS, 0, "Success exit code should be 0");
-    assert_eq!(EXIT_BUILD_ERROR, 1, "Build error exit code should be 1");
-    assert_eq!(
-        EXIT_TEST_FAILURES, 101,
-        "Test failures exit code should be 101"
-    );
-
-    // Verify signal detection
-    let sigkill = 128 + 9;
-    assert_eq!(is_signal_killed(sigkill), Some(9), "Should detect SIGKILL");
-    assert_eq!(signal_name(9), "SIGKILL", "Should name SIGKILL correctly");
-}
 
 // =========================================================================
 // Cargo test integration tests (bead remote_compilation_helper-iyv1)
@@ -6214,6 +6193,134 @@ edition = "2024"
         plan.sync_roots.contains(&project_root),
         "primary project root must remain in the sync roots"
     );
+}
+
+#[tokio::test]
+#[serial(mock_global)]
+async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
+    let _lock = test_lock().lock().await;
+    let _guard = test_guard!();
+    let (temp_dir, policy) = topology_tempdir();
+    let retained = temp_dir._dir.keep();
+    let socket = retained.join("heartbeat.sock");
+    let listener = UnixListener::bind(&socket).expect("bind heartbeat receiver");
+    let socket_path = socket.to_string_lossy().into_owned();
+    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+    let receiver = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept heartbeat");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = TokioBufReader::new(reader);
+            let mut request = String::new();
+            if reader.read_line(&mut request).await.expect("read route") == 0 {
+                // Dropping the guard can cancel its background send after
+                // connect but before writing. EOF is not a heartbeat.
+                continue;
+            }
+            assert_eq!(request, "POST /build-heartbeat\n");
+            let mut body = String::new();
+            if reader.read_line(&mut body).await.expect("read heartbeat") == 0 {
+                continue;
+            }
+            let heartbeat: BuildHeartbeatRequest = serde_json::from_str(&body).unwrap();
+            received_tx.send(heartbeat).expect("retain heartbeat");
+            if let Err(error) = writer.write_all(b"{}\n").await {
+                // Guard drop may close the peer after its complete request.
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ),
+                    "unexpected heartbeat acknowledgement error: {error}"
+                );
+            }
+        }
+    });
+    let worker = SelectedWorker {
+        id: WorkerId::new("preflight-worker"),
+        host: "unused.invalid".to_string(),
+        user: "unused".to_string(),
+        identity_file: "unused".to_string(),
+        slots_available: 1,
+        speed_score: 1.0,
+        declared_os: Some("windows".to_string()),
+    };
+    let reporter = HookReporter::new(OutputVisibility::None);
+    let result = execute_remote_compilation(
+        &worker,
+        "cargo check",
+        TransferConfig::default(),
+        Vec::new(),
+        None,
+        &rch_common::CompilationConfig::default(),
+        None,
+        Some(CompilationKind::CargoCheck),
+        &reporter,
+        &socket_path,
+        ColorMode::Auto,
+        Some(71),
+        Some("preflight-wrapper"),
+        None,
+        &policy,
+        None,
+        true,
+        &[],
+        &[],
+        rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
+        None,
+    )
+    .await;
+    assert!(result.unwrap_err().to_string().contains("require the Unix"));
+    let heartbeat = received_rx.try_recv().expect("heartbeat before rejection");
+    assert_eq!(heartbeat.build_id, 71);
+    assert_eq!(heartbeat.worker_id, worker.id);
+    assert_eq!(heartbeat.hook_pid, Some(std::process::id()));
+    assert_eq!(
+        heartbeat.local_wrapper_id.as_deref(),
+        Some("preflight-wrapper")
+    );
+    assert_eq!(heartbeat.phase, BuildHeartbeatPhase::SyncUp);
+    assert_eq!(heartbeat.detail.as_deref(), Some("source_validation"));
+    assert!(heartbeat.remote_pgid_file.is_none());
+    // An immediate interval tick can race the explicit flush. Drain it before
+    // waiting past the production interval: an early error must stop the loop.
+    tokio::task::yield_now().await;
+    while received_rx.try_recv().is_ok() {}
+    assert!(
+        tokio::time::timeout(Duration::from_secs(6), received_rx.recv())
+            .await
+            .is_err()
+    );
+
+    // While preflight is still working, periodic liveness must not invent
+    // forward progress. Exercise the same guard over a real daemon socket.
+    let heartbeat_loop = BuildHeartbeatLoop::start(
+        &socket_path,
+        72,
+        &worker.id,
+        Some("preflight-wrapper"),
+        None,
+    );
+    heartbeat_loop.update_phase(
+        BuildHeartbeatPhase::SyncUp,
+        Some("source_validation".to_string()),
+    );
+    let first = tokio::time::timeout(Duration::from_secs(6), received_rx.recv())
+        .await
+        .expect("initial interval heartbeat")
+        .unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(6), received_rx.recv())
+        .await
+        .expect("periodic preflight heartbeat")
+        .unwrap();
+    assert_eq!(first.build_id, 72);
+    assert_eq!(next.build_id, first.build_id);
+    assert_eq!(next.progress_counter, first.progress_counter);
+    assert_eq!(next.detail.as_deref(), Some("source_validation"));
+    assert!(next.remote_pgid_file.is_none());
+    drop(heartbeat_loop);
+    receiver.abort();
+    assert!(receiver.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]

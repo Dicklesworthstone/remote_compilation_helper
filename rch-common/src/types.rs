@@ -2711,7 +2711,7 @@ pub struct TransferConfig {
     pub exclude_patterns: Vec<String>,
     /// SSH keepalive interval in seconds (`ssh -o ServerAliveInterval=<N>`).
     ///
-    /// When unset, OpenSSH defaults apply (keepalive disabled).
+    /// When unset, build transfers use 15 seconds. Zero disables keepalives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_server_alive_interval_secs: Option<u64>,
     /// SSH ControlPersist idle timeout in seconds (`ssh -o ControlPersist=<N>s`).
