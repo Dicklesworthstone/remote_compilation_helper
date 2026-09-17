@@ -204,3 +204,74 @@ fn malformed_exec_request_does_not_tear_down_the_session() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn session_acknowledgement_requires_exact_json_kind() {
+    // No sandbox capability required: this checks admission before execution.
+    for (ack, admitted) in [
+        (r#"{"kind":"refusal","reason":"session-ok denied"}"#, false),
+        ("not-json session-ok", false),
+        (r#""session-ok""#, false),
+        (r#"{"kind":"not-session-ok"}"#, false),
+        (r#"{"kind":"session-ok"} trailing"#, false),
+        (r#"{"kind":"session-ok","extension":true}"#, true),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut worker = spawn_worker(&addr);
+        // Always kill/reap, including on assertion failure or I/O timeout.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "worker did not connect");
+                        assert!(worker.try_wait().unwrap().is_none(), "worker exited early");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept worker: {error}"),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let hello: serde_json::Value = serde_json::from_str(&read_line(&mut reader)).unwrap();
+            assert_eq!(hello["kind"], "worker-hello");
+            // Write both frames together so even a fast refusal cannot race a
+            // second write. A rejected acknowledgement must never produce a heartbeat.
+            writeln!(writer, "{ack}\n{{\"kind\":\"ping\"}}").unwrap();
+            let mut response = String::new();
+            let received = reader.read_line(&mut response);
+            if admitted {
+                received.unwrap();
+                let heartbeat: serde_json::Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(heartbeat["kind"], "heartbeat");
+            } else {
+                assert!(
+                    matches!(received, Ok(0))
+                        || received.is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset),
+                    "rejected acknowledgement advanced session: {ack}; response={response:?}"
+                );
+            }
+            drop(writer);
+            drop(reader);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = worker.try_wait().unwrap() {
+                    assert_eq!(status.code(), Some(if admitted { 0 } else { 1 }), "{ack}");
+                    break;
+                }
+                assert!(Instant::now() < deadline, "worker did not exit: {ack}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }));
+        let _ = worker.kill();
+        let _ = worker.wait();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
