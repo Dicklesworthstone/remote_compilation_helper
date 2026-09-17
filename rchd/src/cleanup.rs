@@ -435,9 +435,76 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    // Isolate the transport override from other tests. The substitute SSH runs
+    // the actual cancellation command locally; it never invents a receipt.
+    #[cfg(target_os = "linux")]
+    async fn isolated_cleanup_transport(test: &str) -> Option<std::path::PathBuf> {
+        const ROOT: &str = "RCH_CLEANUP_TEST_ROOT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            return Some(root.into());
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap().keep();
+        let ssh = root.join("ssh");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\nfor arg do command=$arg; done\nexec /bin/sh -c \"$command\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(240),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env(ROOT, &root)
+                .env("PATH", format!("{}:/usr/bin:/bin", root.display()))
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("isolated cleanup test timed out")
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated cleanup failed: {output:?}"
+        );
+        assert!(
+            root.join("completed").is_file(),
+            "child test did not finish"
+        );
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn cleanup_worker_context(id: &str, slots: u32) -> DaemonContext {
+        let pool = crate::workers::WorkerPool::new();
+        let config = rch_common::WorkerConfig {
+            id: rch_common::WorkerId::new(id),
+            total_slots: slots,
+            ..Default::default()
+        };
+        pool.add_worker(config).await;
+        assert!(
+            pool.get(&rch_common::WorkerId::new(id))
+                .await
+                .unwrap()
+                .reserve_slots(slots)
+                .await
+        );
+        crate::test_daemon_context(pool)
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn observer_recovery_retains_resuming_job_and_reaps_real_stale_jobs() {
+        use std::os::unix::process::CommandExt;
+        let Some(root) = isolated_cleanup_transport(
+            "cleanup::tests::observer_recovery_retains_resuming_job_and_reaps_real_stale_jobs",
+        )
+        .await
+        else {
+            return;
+        };
         struct QuietJob(std::process::Child);
         impl Drop for QuietJob {
             fn drop(&mut self) {
@@ -450,18 +517,30 @@ mod tests {
                 QuietJob(
                     std::process::Command::new("sleep")
                         .arg("180")
+                        .process_group(0)
                         .spawn()
                         .unwrap(),
                 )
             })
             .collect();
-        let context = crate::test_daemon_context(crate::workers::WorkerPool::new());
+        let context = cleanup_worker_context("observer-worker", 3).await;
+        for job in &jobs {
+            std::fs::write(
+                root.join(format!("{}.pgid", job.0.id())),
+                job.0.id().to_string(),
+            )
+            .unwrap();
+        }
         let heartbeat = |id, pid| rch_common::BuildHeartbeatRequest {
             build_id: id,
             worker_id: rch_common::WorkerId::new("observer-worker"),
             hook_pid: Some(pid),
             local_wrapper_id: None,
-            remote_pgid_file: None,
+            remote_pgid_file: Some(
+                root.join(format!("{pid}.pgid"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             phase: BuildHeartbeatPhase::Execute,
             detail: None,
             progress_counter: None,
@@ -492,7 +571,8 @@ mod tests {
         // heartbeats past both production stale thresholds without forging them.
         tokio::time::sleep(Duration::from_secs(PROGRESS_STALE_SECS + 6)).await;
         jobs[2].0.kill().unwrap();
-        jobs[2].0.wait().unwrap();
+        // Keep the exited leader unreaped until confirmation so its PID/PGID
+        // cannot be reused for an unrelated process while cancellation runs.
         let cleanup = ActiveBuildCleanup::new(context.clone());
         cleanup.check_active_builds_observed(&mut observation).await;
         for build in &builds {
@@ -503,6 +583,15 @@ mod tests {
         assert!(jobs[0].0.try_wait().unwrap().is_none());
         assert!(jobs[1].0.try_wait().unwrap().is_none());
         assert!(observation.recover_until.is_some());
+        assert_eq!(
+            context
+                .pool
+                .get(&rch_common::WorkerId::new("observer-worker"))
+                .await
+                .unwrap()
+                .used_slots(),
+            3
+        );
         tokio::time::sleep(Duration::from_secs(HEARTBEAT_STALE_SECS + 1)).await;
         context
             .history
@@ -515,11 +604,29 @@ mod tests {
             assert!(context.history.active_build(builds[index].id).is_none());
             assert!(jobs[index].0.try_wait().unwrap().is_some());
         }
+        assert_eq!(
+            context
+                .pool
+                .get(&rch_common::WorkerId::new("observer-worker"))
+                .await
+                .unwrap()
+                .used_slots(),
+            1
+        );
+        std::fs::write(root.join("completed"), "ok").unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn shutdown_retains_live_quiet_job_while_normal_stale_cleanup_still_runs() {
+        use std::os::unix::process::CommandExt;
+        let Some(root) = isolated_cleanup_transport(
+            "cleanup::tests::shutdown_retains_live_quiet_job_while_normal_stale_cleanup_still_runs",
+        )
+        .await
+        else {
+            return;
+        };
         struct QuietJob(std::process::Child);
         impl Drop for QuietJob {
             fn drop(&mut self) {
@@ -530,10 +637,13 @@ mod tests {
         let mut job = QuietJob(
             std::process::Command::new("sleep")
                 .arg("180")
+                .process_group(0)
                 .spawn()
                 .unwrap(),
         );
-        let context = crate::test_daemon_context(crate::workers::WorkerPool::new());
+        let context = cleanup_worker_context("shutdown-test-unbound-worker", 1).await;
+        let pgid_file = root.join("shutdown.pgid");
+        std::fs::write(&pgid_file, job.0.id().to_string()).unwrap();
         let build = context.history.start_active_build(
             "shutdown-quiet-job".into(),
             "shutdown-test-unbound-worker".into(),
@@ -549,7 +659,7 @@ mod tests {
                 worker_id: rch_common::WorkerId::new("shutdown-test-unbound-worker"),
                 hook_pid: Some(job.0.id()),
                 local_wrapper_id: None,
-                remote_pgid_file: None,
+                remote_pgid_file: Some(pgid_file.to_string_lossy().into_owned()),
                 phase: BuildHeartbeatPhase::Execute,
                 detail: None,
                 progress_counter: None,
@@ -565,6 +675,15 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(PROGRESS_STALE_SECS + 6)).await;
             assert!(job.0.try_wait().unwrap().is_none());
             assert!(context.history.active_build(build.id).is_some());
+            assert_eq!(
+                context
+                    .pool
+                    .get(&rch_common::WorkerId::new("shutdown-test-unbound-worker"))
+                    .await
+                    .unwrap()
+                    .used_slots(),
+                1
+            );
         })
         .await;
         assert!(cleanup.is_none());
@@ -574,6 +693,17 @@ mod tests {
             .check_active_builds()
             .await;
         assert!(context.history.active_build(build.id).is_none());
+        assert!(job.0.try_wait().unwrap().is_some());
+        assert_eq!(
+            context
+                .pool
+                .get(&rch_common::WorkerId::new("shutdown-test-unbound-worker"))
+                .await
+                .unwrap()
+                .used_slots(),
+            0
+        );
+        std::fs::write(root.join("completed"), "ok").unwrap();
     }
 
     #[test]
