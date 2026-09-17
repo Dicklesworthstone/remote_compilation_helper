@@ -174,7 +174,10 @@ async fn session_loop(
     let ack = read_frame(&mut stream)
         .await
         .ok_or_else(|| "no session-ok".to_string())?;
-    if !ack.contains("session-ok") {
+    let acknowledged = serde_json::from_str::<serde_json::Value>(&ack).is_ok_and(|value| {
+        value.get("kind").and_then(serde_json::Value::as_str) == Some("session-ok")
+    });
+    if !acknowledged {
         return Err(format!("handshake refused: {ack}"));
     }
 

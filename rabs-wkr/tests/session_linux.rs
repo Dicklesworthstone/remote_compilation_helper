@@ -234,8 +234,12 @@ fn session_acknowledgement_requires_exact_json_kind() {
                     Err(error) => panic!("accept worker: {error}"),
                 }
             };
-            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            stream.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let mut writer = stream.try_clone().unwrap();
             let mut reader = BufReader::new(stream);
             let hello: serde_json::Value = serde_json::from_str(&read_line(&mut reader)).unwrap();
