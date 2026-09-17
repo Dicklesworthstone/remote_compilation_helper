@@ -920,11 +920,29 @@ fn cargo_target_dir_flag_span(tokens: &[String]) -> Option<(std::ops::Range<usiz
             // opaque value, not an option to extract/remove or a separator.
             let takes_value = matches!(
                 token.as_str(),
-                "--config" | "--target" | "--manifest-path" | "--lockfile-path"
-                    | "--profile" | "--package" | "-p" | "--exclude" | "--features"
-                    | "-F" | "--bin" | "--example" | "--test" | "--bench" | "--color"
-                    | "--message-format" | "--jobs" | "-j" | "-Z" | "-C"
-                    | "--artifact-dir" | "--out-dir" | "--build-dir"
+                "--config"
+                    | "--target"
+                    | "--manifest-path"
+                    | "--lockfile-path"
+                    | "--profile"
+                    | "--package"
+                    | "-p"
+                    | "--exclude"
+                    | "--features"
+                    | "-F"
+                    | "--bin"
+                    | "--example"
+                    | "--test"
+                    | "--bench"
+                    | "--color"
+                    | "--message-format"
+                    | "--jobs"
+                    | "-j"
+                    | "-Z"
+                    | "-C"
+                    | "--artifact-dir"
+                    | "--out-dir"
+                    | "--build-dir"
             );
             if takes_value {
                 tokens.get(index + 1)?;
@@ -1892,7 +1910,8 @@ mod managed_build_dir_tests {
                 &reporter,
             );
             assert!(
-                super::cargo_target_dir_flag_span(&shell_words::split(&rewritten).unwrap()).is_none(),
+                super::cargo_target_dir_flag_span(&shell_words::split(&rewritten).unwrap())
+                    .is_none(),
                 "caller target-dir survived in remote Cargo argv: {rewritten}"
             );
         }
@@ -1901,10 +1920,29 @@ mod managed_build_dir_tests {
     #[test]
     fn target_dir_scope_keeps_opaque_values_passthrough_and_invalid_options() {
         for option in [
-            "--config", "--target", "--manifest-path", "--lockfile-path", "--profile",
-            "--package", "-p", "--exclude", "--features", "-F", "--bin", "--example",
-            "--test", "--bench", "--color", "--message-format", "--jobs", "-j", "-Z",
-            "-C", "--artifact-dir", "--out-dir", "--build-dir",
+            "--config",
+            "--target",
+            "--manifest-path",
+            "--lockfile-path",
+            "--profile",
+            "--package",
+            "-p",
+            "--exclude",
+            "--features",
+            "-F",
+            "--bin",
+            "--example",
+            "--test",
+            "--bench",
+            "--color",
+            "--message-format",
+            "--jobs",
+            "-j",
+            "-Z",
+            "-C",
+            "--artifact-dir",
+            "--out-dir",
+            "--build-dir",
         ] {
             let tokens = shell_words::split(&format!(
                 "env -- cargo build {option} --target-dir=decoy --target-dir actual -- --target-dir=program"
@@ -1915,7 +1953,8 @@ mod managed_build_dir_tests {
                 Some("actual"),
                 "{option}"
             );
-            let stripped = super::strip_cargo_target_dir_flags_from_command_tokens(&tokens).unwrap();
+            let stripped =
+                super::strip_cargo_target_dir_flags_from_command_tokens(&tokens).unwrap();
             assert!(stripped.iter().any(|word| word == "--target-dir=decoy"));
             assert_eq!(stripped.last().unwrap(), "--target-dir=program");
         }
@@ -1931,7 +1970,11 @@ mod managed_build_dir_tests {
             "cargo build --target-dir one --target-dir two",
         ] {
             let tokens = shell_words::split(command).unwrap();
-            assert_eq!(super::cargo_target_dir_flag_span(&tokens), None, "{command}");
+            assert_eq!(
+                super::cargo_target_dir_flag_span(&tokens),
+                None,
+                "{command}"
+            );
             assert_eq!(
                 super::strip_cargo_target_dir_flags_from_command_tokens(&tokens),
                 None,
