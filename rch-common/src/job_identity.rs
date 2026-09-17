@@ -16,11 +16,8 @@
 //!   [`derive_job_lifecycle_state`] correlation over observable [`JobSignals`],
 //!   and [`JobRecord`] for `rch jobs --json`.
 //!
-//! The correlation is a pure function so the state machine is unit-tested
-//! without a live daemon. Wiring the wrapper id through `rch exec`, queue
-//! admission, heartbeat, and the `rch jobs` command are follow-on integration
-//! beads (10.2 / 10.3); this bead establishes the shared identity contract both
-//! the client and daemon correlate against.
+//! The wrapper persists this identity through admission, heartbeat and retrieval;
+//! recovery commands reconcile the same identity without replaying a command.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -231,6 +228,12 @@ pub struct DurableJobLease {
     /// A terminal state is valid only after the daemon acknowledges release or
     /// completion.  A dead wrapper with this false must remain uncertain.
     pub terminal_acknowledged: bool,
+    /// Validated retrieval-only recipe. Never contains command argv or environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<serde_json::Value>,
+    /// Observed command result, independent of artifact delivery and release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
 }
 
 impl DurableJobLease {
@@ -262,6 +265,8 @@ impl DurableJobLease {
             self_healing_enabled,
             command_fingerprint,
             terminal_acknowledged: false,
+            recovery: None,
+            exit_code: None,
         }
     }
 

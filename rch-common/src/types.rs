@@ -664,6 +664,9 @@ pub struct ReleaseRequest {
     /// Optional build ID to mark complete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_id: Option<u64>,
+    /// Exact client wrapper identity associated with the admitted build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_wrapper_id: Option<String>,
     /// Optional exit code for the build (used to finalize active build tracking).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,

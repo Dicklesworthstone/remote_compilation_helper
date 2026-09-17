@@ -391,6 +391,13 @@ fn verify_alias(
     canonical_root: &Path,
     decisions: &mut Vec<NormalizationDecision>,
 ) -> Result<Option<PathBuf>, PathNormalizationError> {
+    // With one namespace there is no alias mapping to validate. Resolve the
+    // actual path (including parent components and symlinks), then let the
+    // caller enforce containment against the canonical root.
+    if alias_root == canonical_root {
+        return Ok(None);
+    }
+
     let metadata = std::fs::symlink_metadata(alias_root).map_err(|e| {
         let kind = if e.kind() == std::io::ErrorKind::NotFound {
             PathNormalizationErrorKind::AliasMissing
@@ -611,6 +618,30 @@ mod tests {
         );
         assert!(!normalized.used_alias_prefix());
         assert!(normalized.decision_trace().len() >= 4);
+    }
+    #[test]
+    fn identical_roots_resolve_contained_parents_and_reject_escape() {
+        let fixture = TestFixture::new("identical-roots", false, None);
+        let nested = fixture.canonical_root.join("repo/crates/a");
+        let dependency = fixture.canonical_root.join("dep");
+        let outside = fixture.root.join("data/outside");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let policy = PathTopologyPolicy::new(
+            fixture.canonical_root.clone(),
+            fixture.canonical_root.clone(),
+        );
+        let normalized =
+            normalize_project_path_with_policy(&nested.join("../../../dep"), &policy).unwrap();
+        assert_eq!(normalized.canonical_path(), dependency);
+        let error =
+            normalize_project_path_with_policy(&nested.join("../../../../outside"), &policy)
+                .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &PathNormalizationErrorKind::OutsideCanonicalRoot
+        );
     }
 
     #[cfg(unix)]
