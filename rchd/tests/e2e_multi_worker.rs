@@ -50,9 +50,14 @@ fn create_multi_worker_harness(test_name: &str) -> HarnessResult<TestHarness> {
         .rchd_binary(target_dir.join("rchd"))
         .rch_binary(target_dir.join("rch"))
         .rch_wkr_binary(target_dir.join("rch-wkr"))
-        // CI supplies mock transport. Its default empty stdout is a failed
-        // health probe, so provide the response expected from echo health_check.
-        // This does not enable mock transport for runs against real workers.
+        // These scenarios spawn synthetic `localhost` workers; without mock
+        // transport the daemon health loop dials real SSH, and on hosts where
+        // that fails the fleet degrades below the distribution's admissible
+        // capacity (observed on macOS: worker-2 health probe failed, success
+        // rate 0.0 refused admission, test failed after prior passes).
+        // Always enable mock transport for this suite; `RCH_MOCK_SSH_STDOUT`
+        // supplies the health-check response the probes expect.
+        .env("RCH_MOCK_SSH", "1")
         .env("RCH_MOCK_SSH_STDOUT", "health_check\n")
         .build()
 }

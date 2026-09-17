@@ -62,8 +62,9 @@ use rabs_protocol::worker_fence::{
 /// worker boot-generation and active-incarnation fencing; v21 = T038
 /// durable clone ambiguity plus normalized worker bindings on attempts
 /// (every execution lease links through its attempt); v22 = peer
-/// authority incarnation fencing (legacy rows require a newer term).
-pub const SCHEMA_VERSION: u32 = 22;
+/// authority incarnation fencing (legacy rows require a newer term);
+/// v23 = credential-generation fencing (legacy unknown generations fail closed).
+pub const SCHEMA_VERSION: u32 = 23;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -476,6 +477,12 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 22,
         statements: &["ALTER TABLE peer_authority_high_water ADD COLUMN incarnation BLOB"],
+    },
+    Migration {
+        version: 23,
+        statements: &[
+            "ALTER TABLE peer_authority_high_water ADD COLUMN credential_generation INTEGER",
+        ],
     },
 ];
 
@@ -1526,23 +1533,25 @@ pub trait RabsMetadataStore {
     // --- H038: fences, peer high-water, handoffs (authoritative
     // coordination state; writes require the ACTIVE authority) ---
 
-    /// Record a peer authority term and incarnation. Lower terms are stale;
-    /// equal terms require the exact previously recorded incarnation.
-    /// Legacy rows without incarnation evidence require a newer term.
+    /// Record an authenticated peer's credential generation, term and incarnation.
+    /// Compare generation first, then term; equal pairs require the same incarnation.
+    /// The caller must verify the credential chain before recording a new generation.
+    /// Legacy rows with unknown generations fail closed; no reset bypass is implied.
     fn record_peer_authority_high_water(
         &mut self,
         authority: &TypedDigest,
         peer_id: &str,
+        credential_generation: u64,
         term: u64,
         incarnation: u128,
         observed_seq: u64,
     ) -> Result<(), StoreError>;
 
-    /// The recorded (term, `observed_seq`) high-water for a peer, if any.
+    /// The recorded (credential generation, term, `observed_seq`) for a peer.
     fn peer_authority_high_water(
         &mut self,
         peer_id: &str,
-    ) -> Result<Option<(u64, u64)>, StoreError>;
+    ) -> Result<Option<(u64, u64, u64)>, StoreError>;
 
     /// Atomically admit a worker session under the active coordinator:
     /// evaluate the durable boot-generation/incarnation fence, advance
@@ -4429,6 +4438,7 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         &mut self,
         authority: &TypedDigest,
         peer_id: &str,
+        credential_generation: u64,
         term: u64,
         incarnation: u128,
         observed_seq: u64,
@@ -4436,11 +4446,12 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         let authority = authority.clone();
         let peer = peer_id.to_owned();
         let term_int = to_seq(term, "term")?;
+        let generation_int = to_seq(credential_generation, "credential_generation")?;
         let observed = to_seq(observed_seq, "observed_seq")?;
         self.in_txn(move |engine| {
             SqlMetadataStore::<E>::require_active(engine, &authority)?;
             let rows = engine.query(
-                "SELECT term, incarnation FROM peer_authority_high_water WHERE peer_id = ?1",
+                "SELECT term, incarnation, credential_generation FROM peer_authority_high_water WHERE peer_id = ?1",
                 &[SqlValue::Text(peer.clone())],
             )?;
             if let Some(row) = rows.first() {
@@ -4449,10 +4460,15 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                         .ok_or_else(|| StoreError::Corruption("peer high-water shape".into()))?,
                     "peer term",
                 )?;
-                if term < stored {
+                let stored_generation = match row.get(2) {
+                    Some(SqlValue::Null) => return Err(StoreError::StalePeerAuthority),
+                    Some(value) => expect_u64(value, "peer credential generation")?,
+                    None => return Err(StoreError::Corruption("peer high-water shape".into())),
+                };
+                if (credential_generation, term) < (stored_generation, stored) {
                     return Err(StoreError::StalePeerAuthority);
                 }
-                if term == stored {
+                if (credential_generation, term) == (stored_generation, stored) {
                     if !matches!(row.get(1), Some(SqlValue::Blob(bytes)) if bytes.as_slice() == incarnation.to_be_bytes()) {
                         return Err(StoreError::StalePeerAuthority);
                     }
@@ -4461,12 +4477,13 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             }
             engine.execute(
                 "INSERT OR REPLACE INTO peer_authority_high_water \
-                 (peer_id, term, observed_seq, incarnation) VALUES (?1, ?2, ?3, ?4)",
+                 (peer_id, term, observed_seq, incarnation, credential_generation) VALUES (?1, ?2, ?3, ?4, ?5)",
                 &[
                     SqlValue::Text(peer),
                     SqlValue::Int(term_int),
                     SqlValue::Int(observed),
                     SqlValue::Blob(incarnation.to_be_bytes().to_vec()),
+                    SqlValue::Int(generation_int),
                 ],
             )?;
             Ok(())
@@ -4476,18 +4493,22 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
     fn peer_authority_high_water(
         &mut self,
         peer_id: &str,
-    ) -> Result<Option<(u64, u64)>, StoreError> {
+    ) -> Result<Option<(u64, u64, u64)>, StoreError> {
         let rows = self.engine.query(
-            "SELECT term, observed_seq FROM peer_authority_high_water WHERE peer_id = ?1",
+            "SELECT credential_generation, term, observed_seq FROM peer_authority_high_water WHERE peer_id = ?1",
             &[SqlValue::Text(peer_id.to_owned())],
         )?;
         let Some(row) = rows.first() else {
             return Ok(None);
         };
-        let [term, observed] = row.as_slice() else {
+        let [generation, term, observed] = row.as_slice() else {
             return Err(StoreError::Corruption("peer high-water shape".into()));
         };
+        if matches!(generation, SqlValue::Null) {
+            return Err(StoreError::StalePeerAuthority);
+        }
         Ok(Some((
+            expect_u64(generation, "peer credential generation")?,
             expect_u64(term, "peer term")?,
             expect_u64(observed, "observed_seq")?,
         )))
@@ -6408,7 +6429,7 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             ),
             (
                 "peer_authority_high_water",
-                "SELECT peer_id, term, observed_seq, incarnation FROM peer_authority_high_water \
+                "SELECT peer_id, term, observed_seq, incarnation, credential_generation FROM peer_authority_high_water \
                  ORDER BY peer_id",
             ),
             (
@@ -7690,40 +7711,53 @@ mod tests {
 
         // Peer authority terms fence rollback; equal terms also fence clones.
         assert_eq!(
-            store.record_peer_authority_high_water(&wrong, "peer-1", 5, 11, 100),
+            store.record_peer_authority_high_water(&wrong, "peer-1", 2, 5, 11, 100),
             Err(StoreError::NotActiveAuthority)
         );
         store
-            .record_peer_authority_high_water(&active, "peer-1", 5, 11, 100)
+            .record_peer_authority_high_water(&active, "peer-1", 2, 5, 11, 100)
             .unwrap();
         store
-            .record_peer_authority_high_water(&active, "peer-1", 5, 11, 101)
+            .record_peer_authority_high_water(&active, "peer-1", 2, 5, 11, 101)
             .unwrap();
         assert_eq!(
-            store.record_peer_authority_high_water(&active, "peer-1", 5, 12, 102),
+            store.record_peer_authority_high_water(&active, "peer-1", 2, 5, 12, 102),
             Err(StoreError::StalePeerAuthority)
         );
         assert_eq!(
             store.peer_authority_high_water("peer-1").unwrap(),
-            Some((5, 100)),
+            Some((2, 5, 100)),
             "a conflicting incarnation must not change the durable mark"
         );
         assert_eq!(
-            store.record_peer_authority_high_water(&active, "peer-1", 4, 11, 102),
+            store.record_peer_authority_high_water(&active, "peer-1", 2, 4, 11, 102),
             Err(StoreError::StalePeerAuthority)
         );
         store
-            .record_peer_authority_high_water(&active, "peer-1", 6, 12, 103)
+            .record_peer_authority_high_water(&active, "peer-1", 2, 6, 12, 103)
             .unwrap();
         assert_eq!(
-            store.record_peer_authority_high_water(&active, "peer-1", 6, 11, 104),
+            store.record_peer_authority_high_water(&active, "peer-1", 2, 6, 11, 104),
             Err(StoreError::StalePeerAuthority)
         );
         assert_eq!(
             store.peer_authority_high_water("peer-1").unwrap(),
-            Some((6, 103))
+            Some((2, 6, 103))
         );
         assert_eq!(store.peer_authority_high_water("peer-2").unwrap(), None);
+        assert_eq!(
+            store.record_peer_authority_high_water(&active, "peer-1", 1, 999, 12, 105),
+            Err(StoreError::StalePeerAuthority),
+            "a larger term cannot revive an older credential generation"
+        );
+        store
+            .record_peer_authority_high_water(&active, "peer-1", 3, 1, 13, 106)
+            .unwrap();
+        assert_eq!(
+            store.peer_authority_high_water("peer-1").unwrap(),
+            Some((3, 1, 106)),
+            "a new credential generation opens a new term namespace"
+        );
 
         // S022/I47: BOOT generations are monotone; random incarnation
         // IDs are equality fences, never ordered counters. Admission and
@@ -8314,7 +8348,7 @@ mod tests {
         );
         store.advance_edge_fence(&active, "edge-1", 9).unwrap();
         store
-            .record_peer_authority_high_water(&active, "peer-1", 5, 11, 100)
+            .record_peer_authority_high_water(&active, "peer-1", 2, 5, 11, 100)
             .unwrap();
     }
     fn h038_fence_check_after_reopen(store: &mut dyn RabsMetadataStore) {
@@ -8323,16 +8357,32 @@ mod tests {
         store.acquire_authority(&authority(1)).unwrap();
         let active = digest("rabs.authority.sha256.v1", 1);
         assert_eq!(
-            store.record_peer_authority_high_water(&active, "peer-1", 5, 12, 101),
+            store.record_peer_authority_high_water(&active, "peer-1", 2, 5, 12, 101),
             Err(StoreError::StalePeerAuthority),
             "reopening must not let a clone reuse an accepted term"
         );
         store
-            .record_peer_authority_high_water(&active, "peer-1", 5, 11, 102)
+            .record_peer_authority_high_water(&active, "peer-1", 2, 5, 11, 102)
             .unwrap();
         assert_eq!(
             store.peer_authority_high_water("peer-1").unwrap(),
-            Some((5, 100))
+            Some((2, 5, 100))
+        );
+        assert_eq!(
+            store.record_peer_authority_high_water(&active, "peer-1", 1, 999, 11, 103),
+            Err(StoreError::StalePeerAuthority),
+            "credential rollback remains fenced after reopening"
+        );
+        store
+            .record_peer_authority_high_water(&active, "peer-1", 3, 1, 12, 104)
+            .unwrap();
+        assert_eq!(
+            store.record_peer_authority_high_water(&active, "peer-1", 2, 999, 11, 105),
+            Err(StoreError::StalePeerAuthority)
+        );
+        assert_eq!(
+            store.peer_authority_high_water("peer-1").unwrap(),
+            Some((3, 1, 104))
         );
         assert_eq!(
             store
