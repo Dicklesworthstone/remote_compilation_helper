@@ -5,7 +5,7 @@
 //! Universal images require checking the actual slices, not just trusting
 //! their directory's CPU claims. No executable code is loaded or run.
 
-use super::{BinaryFormat, CpuArchitecture, header_u32};
+use super::{BinaryFormat, CpuArchitecture, header_u16, header_u32};
 use std::io::{Read, Seek, SeekFrom};
 
 const MAX_FAT_SLICES: usize = 64;
@@ -17,6 +17,9 @@ pub(super) fn architectures<R: Read + Seek>(
     prefix: &[u8],
     file_len: u64,
 ) -> Option<Vec<CpuArchitecture>> {
+    if format == BinaryFormat::Pe {
+        return pe_cpu(reader, prefix, file_len).map(|cpu| vec![cpu]);
+    }
     if format != BinaryFormat::MachO {
         return None;
     }
@@ -162,6 +165,82 @@ fn fat_macho_cpus<R: Read + Seek>(
         }
     }
     Some(cpus)
+}
+
+/// Native PE images only: the DOS magic alone says nothing about CPU or even
+/// whether a COFF image header is present. Check the PE signature, machine,
+/// optional-header class and declared header spans before accepting evidence.
+fn pe_cpu<R: Read + Seek>(
+    reader: &mut R,
+    prefix: &[u8],
+    file_len: u64,
+) -> Option<CpuArchitecture> {
+    let dos = prefix.get(..64)?;
+    if dos.get(..2)? != b"MZ" {
+        return None;
+    }
+    let offset = u64::from(header_u32(&dos[60..], true)?);
+    if offset < 64 {
+        return None;
+    }
+    let coff = read_at::<24, _>(reader, offset, file_len)?;
+    if &coff[..4] != b"PE\0\0" || header_u16(&coff[22..], true)? & 0x0002 == 0 {
+        return None;
+    }
+    let sections = u64::from(header_u16(&coff[6..], true)?);
+    // Windows limits image section counts to 96. Counts and offsets never
+    // become allocation sizes, and an incomplete section table is inconclusive.
+    if !(1..=96).contains(&sections) {
+        return None;
+    }
+    let optional_len = u64::from(header_u16(&coff[20..], true)?);
+    let optional_offset = offset.checked_add(24)?;
+    let optional_end = optional_offset.checked_add(optional_len)?;
+    let section_end = optional_end.checked_add(sections.checked_mul(40)?)?;
+    if section_end > file_len {
+        return None;
+    }
+    let magic = header_u16(&read_at::<2, _>(reader, optional_offset, optional_end)?, true)?;
+    let (cpu, fixed_len) = match (header_u16(&coff[4..], true)?, magic) {
+        (0x014c, 0x010b) => (CpuArchitecture::X86, 96),
+        (0x8664, 0x020b) => (CpuArchitecture::X86_64, 112),
+        (0x01c4, 0x010b) => (CpuArchitecture::Arm, 96),
+        (0xaa64, 0x020b) => (CpuArchitecture::Aarch64, 112),
+        // In particular, ARM64EC/ARM64X machine IDs describe hybrid ABIs;
+        // do not reinterpret them as ordinary ARM64 or x64 native evidence.
+        _ => return None,
+    };
+    let mut optional = [0; 112];
+    if fixed_len == 96 {
+        optional[..96].copy_from_slice(&read_at::<96, _>(
+            reader,
+            optional_offset,
+            optional_end,
+        )?);
+    } else {
+        optional = read_at::<112, _>(reader, optional_offset, optional_end)?;
+    }
+    let headers_size = u64::from(header_u32(&optional[60..], true)?);
+    if headers_size < section_end || headers_size > file_len {
+        return None;
+    }
+    let directories = u64::from(header_u32(&optional[fixed_len - 4..], true)?);
+    let directory_offset = optional_offset.checked_add(u64::try_from(fixed_len).ok()?)?;
+    if directory_offset.checked_add(directories.checked_mul(8)?)? > optional_end {
+        return None;
+    }
+    // .NET platform-neutral assemblies also use IMAGE_FILE_MACHINE_I386.
+    // Without interpreting their CLR flags and managed/native payload, that
+    // machine field cannot prove an x86 mismatch. Decline all managed images.
+    if directories > 14 {
+        let clr = read_at::<8, _>(reader, directory_offset.checked_add(14 * 8)?, optional_end)?;
+        if clr != [0; 8] {
+            return None;
+        }
+    }
+    // At most 146 indirect bytes (signature/COFF + magic + fixed header + CLR)
+    // in addition to the caller's 64-byte prefix; never load an entire image.
+    Some(cpu)
 }
 
 #[cfg(test)]
@@ -395,6 +474,236 @@ mod tests {
         let manifest = vec![requested.clone(), host_macro.into()];
         assert!(foreign_target_artifacts(&root, &manifest, false, triple, Some(triple)).is_empty());
         std::fs::write(root.join(&requested), thin(0x0100_0007)).unwrap();
+        let findings = foreign_target_artifacts(&root, &manifest, false, triple, Some(triple));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].path, requested);
+    }
+
+    fn pe_image(machine: u16, wide: bool, managed: bool) -> Vec<u8> {
+        let fixed_len = if wide { 112 } else { 96 };
+        let optional_len = fixed_len + 16 * 8;
+        let optional_offset = 128 + 24;
+        let mut image = vec![0; optional_offset + optional_len + 40];
+        image[..2].copy_from_slice(b"MZ");
+        image[60..64].copy_from_slice(&128_u32.to_le_bytes());
+        image[128..132].copy_from_slice(b"PE\0\0");
+        image[132..134].copy_from_slice(&machine.to_le_bytes());
+        image[134..136].copy_from_slice(&1_u16.to_le_bytes());
+        image[148..150].copy_from_slice(&u16::try_from(optional_len).unwrap().to_le_bytes());
+        image[150..152].copy_from_slice(&2_u16.to_le_bytes());
+        let magic: u16 = if wide { 0x020b } else { 0x010b };
+        image[152..154].copy_from_slice(&magic.to_le_bytes());
+        let size = u32::try_from(image.len()).unwrap();
+        image[212..216].copy_from_slice(&size.to_le_bytes());
+        let count_offset = optional_offset + fixed_len - 4;
+        image[count_offset..count_offset + 4].copy_from_slice(&16_u32.to_le_bytes());
+        if managed {
+            let clr = optional_offset + fixed_len + 14 * 8;
+            image[clr..clr + 4].copy_from_slice(&0x1000_u32.to_le_bytes());
+            image[clr + 4..clr + 8].copy_from_slice(&72_u32.to_le_bytes());
+        }
+        image
+    }
+
+    fn decode_pe(image: &[u8]) -> Option<Vec<CpuArchitecture>> {
+        architectures(
+            &mut Cursor::new(image),
+            BinaryFormat::Pe,
+            &image[..image.len().min(64)],
+            u64::try_from(image.len()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn pe_cpu_complete_native_images_and_truncated_header_spans() {
+        for (machine, wide, cpu) in [
+            (0x014c, false, CpuArchitecture::X86),
+            (0x8664, true, CpuArchitecture::X86_64),
+            (0x01c4, false, CpuArchitecture::Arm),
+            (0xaa64, true, CpuArchitecture::Aarch64),
+        ] {
+            let mut image = pe_image(machine, wide, false);
+            assert_eq!(decode_pe(&image), Some(vec![cpu]));
+            for length in 0..image.len() {
+                assert_eq!(decode_pe(&image[..length]), None, "{machine:x}, {length}");
+            }
+            // DLLs share the same CPU evidence; no entry point is required.
+            image[150..152].copy_from_slice(&0x2002_u16.to_le_bytes());
+            assert_eq!(decode_pe(&image), Some(vec![cpu]));
+        }
+    }
+
+    #[test]
+    fn pe_cpu_rejects_invalid_offsets_signatures_classes_and_directory_counts() {
+        for (machine, wide) in [(0x014c, true), (0x8664, false), (0xaa64, false)] {
+            assert_eq!(decode_pe(&pe_image(machine, wide, false)), None);
+        }
+        let original = pe_image(0x8664, true, false);
+        for (offset, value) in [
+            (60, 0_u32),
+            (60, 63),
+            (60, u32::MAX),
+            (128, 0),
+            (212, 0),
+            (212, u32::MAX),
+            (260, 17),
+            (260, u32::MAX),
+        ] {
+            let mut image = original.clone();
+            image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert_eq!(decode_pe(&image), None, "invalid field at {offset}");
+        }
+        for (offset, value) in [
+            (0, 0_u16),
+            (132, 0),
+            (134, 0),
+            (134, 97),
+            (148, 0),
+            (148, 111),
+            (148, u16::MAX),
+            (150, 0),
+            (152, 0x0107),
+        ] {
+            let mut image = original.clone();
+            image[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+            assert_eq!(decode_pe(&image), None, "invalid field at {offset}");
+        }
+        // No data directories is valid. Never read a nonexistent CLR entry.
+        let mut image = original;
+        image[260..264].copy_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(decode_pe(&image), Some(vec![CpuArchitecture::X86_64]));
+    }
+
+    #[test]
+    fn pe_cpu_managed_and_hybrid_machine_ids_remain_inconclusive() {
+        for (machine, wide) in [(0x014c, false), (0x8664, true), (0xaa64, true)] {
+            assert_eq!(decode_pe(&pe_image(machine, wide, true)), None);
+        }
+        // Even a malformed half-present CLR directory is not native evidence.
+        for (rva, size) in [(0, 72_u32), (0x1000_u32, 0)] {
+            let mut image = pe_image(0x014c, false, true);
+            image[360..364].copy_from_slice(&rva.to_le_bytes());
+            image[364..368].copy_from_slice(&size.to_le_bytes());
+            assert_eq!(decode_pe(&image), None);
+        }
+        for machine in [0xa641, 0xa64e, 0, 0xffff] {
+            assert_eq!(decode_pe(&pe_image(machine, true, false)), None);
+        }
+    }
+
+    #[test]
+    fn pe_cpu_indirect_reads_are_bounded_and_io_errors_are_inconclusive() {
+        struct Meter {
+            input: Cursor<Vec<u8>>,
+            bytes_read: usize,
+            fail_read: bool,
+            fail_seek: bool,
+        }
+        impl Read for Meter {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.fail_read {
+                    return Err(std::io::Error::other("injected read failure"));
+                }
+                let count = self.input.read(buffer)?;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+        impl Seek for Meter {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                if self.fail_seek {
+                    return Err(std::io::Error::other("injected seek failure"));
+                }
+                self.input.seek(position)
+            }
+        }
+        let image = pe_image(0xaa64, true, false);
+        for (fail_read, fail_seek) in [(false, false), (true, false), (false, true)] {
+            let mut reader = Meter {
+                input: Cursor::new(image.clone()),
+                bytes_read: 0,
+                fail_read,
+                fail_seek,
+            };
+            let result = architectures(
+                &mut reader,
+                BinaryFormat::Pe,
+                &image[..64],
+                u64::try_from(image.len()).unwrap(),
+            );
+            if fail_read || fail_seek {
+                assert_eq!(result, None);
+            } else {
+                assert_eq!(result, Some(vec![CpuArchitecture::Aarch64]));
+                assert_eq!(reader.bytes_read, 146);
+            }
+            assert!(reader.bytes_read <= 146);
+        }
+        // A maximal indirect offset may seek, but cannot cause a large read.
+        let mut prefix = image[..64].to_vec();
+        prefix[60..64].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut reader = Cursor::new(image);
+        assert_eq!(
+            architectures(&mut reader, BinaryFormat::Pe, &prefix, u64::MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn pe_cpu_production_guard_checks_both_bases_dlls_and_pinned_scope() {
+        use super::super::{describe_findings, foreign_target_artifacts};
+
+        let root = tempfile::tempdir().unwrap().keep();
+        for (custom, relative) in [(false, "target/release/app.exe"), (true, "release/app.exe")] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, pe_image(0x8664, true, false)).unwrap();
+            let findings = foreign_target_artifacts(
+                &root,
+                &[relative.into()],
+                custom,
+                "aarch64-pc-windows-msvc",
+                None,
+            );
+            assert_eq!(findings.len(), 1);
+            assert!(describe_findings(&findings).contains("PE; CPU x86_64"));
+            std::fs::write(&path, pe_image(0xaa64, true, false)).unwrap();
+            assert!(
+                foreign_target_artifacts(
+                    &root,
+                    &[relative.into()],
+                    custom,
+                    "aarch64-pc-windows-msvc",
+                    None,
+                )
+                .is_empty()
+            );
+            std::fs::write(&path, pe_image(0x014c, false, true)).unwrap();
+            assert!(
+                foreign_target_artifacts(
+                    &root,
+                    &[relative.into()],
+                    custom,
+                    "x86_64-pc-windows-msvc",
+                    None,
+                )
+                .is_empty(),
+                "managed I386 headers are not proof of a wrong-CPU native image"
+            );
+        }
+        let triple = "aarch64-pc-windows-msvc";
+        let requested = format!("target/{triple}/release/library.dll");
+        let host_macro = "target/release/deps/macro.dll";
+        for (relative, machine) in [(&requested[..], 0xaa64), (host_macro, 0x8664)] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut image = pe_image(machine, true, false);
+            image[150..152].copy_from_slice(&0x2002_u16.to_le_bytes());
+            std::fs::write(path, image).unwrap();
+        }
+        let manifest = vec![requested.clone(), host_macro.into()];
+        assert!(foreign_target_artifacts(&root, &manifest, false, triple, Some(triple)).is_empty());
+        std::fs::write(root.join(&requested), pe_image(0x8664, true, false)).unwrap();
         let findings = foreign_target_artifacts(&root, &manifest, false, triple, Some(triple));
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].path, requested);
