@@ -210,7 +210,9 @@ fn build_remote_source_authority_lock_cmd(
     }
     if ready_marker.is_empty()
         || ready_marker.len() >= MAX_SOURCE_LOCK_READY_BYTES
-        || ready_marker.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0))
+        || ready_marker
+            .bytes()
+            .any(|byte| matches!(byte, b'\n' | b'\r' | 0))
     {
         anyhow::bail!("invalid source-authority ready marker");
     }

@@ -3171,7 +3171,7 @@ fn derive_check_outcome(
     }
 
     // Stable ordering retains every diagnostic and puts the cause of the exit first.
-    ranked_issues.sort_by(|a, b| b.0.cmp(&a.0));
+    ranked_issues.sort_by_key(|(severity, _)| std::cmp::Reverse(*severity));
     let issues = ranked_issues
         .into_iter()
         .map(|(_, summary)| summary)
@@ -3736,8 +3736,13 @@ mod tests {
             check_issue("warning", "builder-2 administratively disabled"),
             check_issue("critical", "builder-1 disk pressure"),
         ];
-        let (status, exit_code, issues) =
-            derive_check_outcome(2, 1, &["builder-2".to_string()], &daemon_issues, true);
+        let (status, exit_code, issues) = derive_check_outcome(
+            2,
+            1,
+            &[mk_worker_status("builder-2", "disabled", "closed", 0, 1.0)],
+            &daemon_issues,
+            true,
+        );
         assert_eq!(status, "not_ready");
         assert_eq!(exit_code, 2);
         assert_eq!(issues.first(), Some(&daemon_issues[1].summary));
@@ -3750,8 +3755,13 @@ mod tests {
             "warning",
             "builder-1 administratively disabled",
         )];
-        let (status, exit_code, issues) =
-            derive_check_outcome(1, 0, &["builder-1".to_string()], &daemon_issues, true);
+        let (status, exit_code, issues) = derive_check_outcome(
+            1,
+            0,
+            &[mk_worker_status("builder-1", "disabled", "closed", 0, 1.0)],
+            &daemon_issues,
+            true,
+        );
         assert_eq!(status, "not_ready");
         assert_eq!(exit_code, 2);
         assert!(issues.contains(&daemon_issues[0].summary));
