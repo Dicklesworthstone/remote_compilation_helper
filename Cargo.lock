@@ -4944,6 +4944,7 @@ dependencies = [
  "rabs-protocol",
  "rabs-replay",
  "rusqlite",
+ "rustix",
  "sha2 0.11.0",
  "tempfile",
 ]
