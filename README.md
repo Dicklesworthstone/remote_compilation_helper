@@ -318,6 +318,24 @@ partially transferable fails loudly (`RCH-E309`, exit 102) regardless of the
 job's own exit status. Paths must be repository-relative; conflicts with
 `--clean-overlay` / `--source-content-receipt` are refused.
 
+### Same-identity job recovery
+
+```bash
+rch jobs                                      # list durable local job leases
+rch jobs attach <wrapper-id> --timeout-secs 300 # observe the original job
+rch jobs cancel <wrapper-id>                   # cancel the identity-matched job
+rch jobs recover <wrapper-id> --timeout-secs 300
+```
+
+These commands never replay the original command. Recovery requires retained
+identity and completion/retrieval evidence; ambiguous or missing evidence is
+reported as an error. For a live wrapper stalled during artifact retrieval,
+`recover_requested` means the request was recorded, not that outputs have arrived:
+use `jobs attach` to observe completion. The wrapper cancels and reaps the old
+transfer before retrying that retrieval phase. An absent wrapper can recover
+outstanding outputs from its retained journal without starting another build.
+Use a rebuilt daemon with the identity-aware job routes; older daemons are refused.
+
 ### Config + Diagnostics
 
 ```bash

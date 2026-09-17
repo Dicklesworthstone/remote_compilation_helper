@@ -558,6 +558,14 @@ mod launchd {
         deadline: tokio::time::Instant,
     ) -> Result<Option<Option<u32>>> {
         let output = command(program, &["list"], deadline).await?;
+        #[cfg(test)]
+        eprintln!(
+            "launchd list {}: status={} stdout={:?} stderr={:?}",
+            program.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         anyhow::ensure!(
             output.status.success(),
             "launchctl list failed: {}",
@@ -581,6 +589,11 @@ mod launchd {
             Ok(listed) => (listed, None),
             Err(error) => (None, Some(error)),
         };
+        #[cfg(test)]
+        eprintln!(
+            "launchd resolve {}: uid={uid} self_pid={self_pid} custom_socket={custom_socket} listed={listed:?} list_error={list_error:?}",
+            program.display()
+        );
         if listed == Some(Some(self_pid)) {
             return Ok(Ownership::Managed);
         }
@@ -629,7 +642,13 @@ mod launchd {
         let target = match registered.as_slice() {
             [] => return list_error.map_or(Ok(Ownership::Standalone), Err),
             [target] => target,
-            _ => bail!("RCH is registered in multiple launchd domains; refusing ambiguous startup"),
+            _ => {
+                let initial = list_error.as_ref().map(ToString::to_string).unwrap_or_default();
+                anyhow::bail!(
+                    "RCH is registered in multiple launchd domains; refusing ambiguous startup (initial listing: {initial_listing})",
+                    initial_listing = if initial.is_empty() { "succeeded".to_string() } else { initial }
+                )
+            }
         };
         anyhow::ensure!(
             !custom_socket,
@@ -984,38 +1003,34 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Initialize build history
-    let history = if let Some(ref path) = cli.history_file {
-        if path.exists() {
-            match BuildHistory::load_from_file(path, cli.history_capacity) {
-                Ok(h) => {
-                    info!("Loaded build history from {:?} ({} entries)", path, h.len());
-                    Arc::new(h.with_max_queue_depth(daemon_config.queue.max_depth))
-                }
-                Err(e) => {
-                    warn!("Failed to load history from {:?}: {}", path, e);
-                    Arc::new(
-                        BuildHistory::new(cli.history_capacity)
-                            .with_persistence(path.clone())
-                            .with_max_queue_depth(daemon_config.queue.max_depth),
-                    )
-                }
-            }
-        } else {
-            info!("Creating new build history at {:?}", path);
-            Arc::new(
-                BuildHistory::new(cli.history_capacity)
-                    .with_persistence(path.clone())
-                    .with_max_queue_depth(daemon_config.queue.max_depth),
-            )
-        }
-    } else {
-        info!("Build history in-memory only (no persistence)");
-        Arc::new(
-            BuildHistory::new(cli.history_capacity)
-                .with_max_queue_depth(daemon_config.queue.max_depth),
-        )
-    };
+    // Ownership is mandatory. An isolated socket gets isolated default storage.
+    let history_path = cli
+        .history_file
+        .clone()
+        .unwrap_or_else(|| cli.socket.with_extension("history.jsonl"));
+    let history = Arc::new(
+        BuildHistory::load_from_file(&history_path, cli.history_capacity)
+            .with_context(|| {
+                format!(
+                    "Cannot recover durable ownership from {}",
+                    history_path.display()
+                )
+            })?
+            .with_max_queue_depth(daemon_config.queue.max_depth),
+    );
+    for build in history.active_builds() {
+        let worker = worker_pool
+            .get(&rch_common::WorkerId::new(&build.worker_id))
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Durable build {} owns missing worker {}; refusing admission",
+                    build.id,
+                    build.worker_id
+                )
+            })?;
+        worker.restore_slots(build.slots)?;
+    }
 
     // Admission uses the same persisted build history as the API. Attach it
     // before sharing the selector so normal startup cannot omit the gate.
@@ -2536,7 +2551,15 @@ mod launchd_singleton_tests {
         let (program, calls) =
             manager_fixture("printf 'PID Status Label\\n42 0 com.rch.daemon\\n'");
         assert_eq!(
-            resolve_fixture(&program, false).await.unwrap(),
+            resolve_fixture(&program, false)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "launchd fixture {} failed: {error:#}; manager calls: {:?}",
+                        program.display(),
+                        std::fs::read_to_string(&calls)
+                    )
+                }),
             launchd::Ownership::Delegated
         );
         assert_eq!(std::fs::read_to_string(calls).unwrap(), "list\n");
@@ -2544,7 +2567,15 @@ mod launchd_singleton_tests {
             "case \"$1\" in\nlist) if [ -f \"$0.started\" ]; then printf 'PID Status Label\\n42 0 com.rch.daemon\\n'; else printf 'PID Status Label\\n- 0 com.rch.daemon\\n'; fi;;\nstart) printf started > \"$0.started\";;\n*) exit 99;;\nesac",
         );
         assert_eq!(
-            resolve_fixture(&program, false).await.unwrap(),
+            resolve_fixture(&program, false)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "launchd fixture {} failed: {error:#}; manager calls: {:?}",
+                        program.display(),
+                        std::fs::read_to_string(&calls)
+                    )
+                }),
             launchd::Ownership::Delegated
         );
         assert_eq!(

@@ -18,10 +18,8 @@
 //! stuck class, the recommended [`RecoveryAction`], the ledger-mappable
 //! [`IncidentReasonCode`], and the exact safe commands offered to the agent.
 //!
-//! Wiring the `rch jobs attach|cancel|recover` CLI verbs and the daemon-side
-//! cancel/reattach RPCs onto this contract is the follow-on integration layer;
-//! this module establishes the decision contract both the client surface and the
-//! incident ledger correlate against.
+//! The client `rch jobs attach|cancel|recover` verbs and waiting-wrapper
+//! heartbeat use this contract; recovery never re-executes the command.
 
 use serde::{Deserialize, Serialize};
 

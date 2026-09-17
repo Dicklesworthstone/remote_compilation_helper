@@ -98,7 +98,7 @@ fn validate_daemon_status(line: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn read_daemon_ack<R: tokio::io::AsyncRead + Unpin>(
+pub(super) async fn read_daemon_ack<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     budget: Duration,
 ) -> anyhow::Result<()> {
@@ -304,6 +304,7 @@ pub(crate) async fn query_daemon(
             None,
             None,
             None,
+            local_wrapper_id,
         )
         .await
         .err();
@@ -339,6 +340,7 @@ pub(crate) async fn release_worker(
     duration_ms: Option<u64>,
     bytes_transferred: Option<u64>,
     timing: Option<&CommandTimingBreakdown>,
+    local_wrapper_id: Option<&str>,
 ) -> anyhow::Result<()> {
     if !Path::new(socket_path).exists() {
         anyhow::bail!("daemon socket is missing; release was not acknowledged");
@@ -359,6 +361,12 @@ pub(crate) async fn release_worker(
     );
     if let Some(build_id) = build_id {
         request.push_str(&format!("&build_id={}", build_id));
+    }
+    if let Some(wrapper_id) = local_wrapper_id {
+        request.push_str(&format!(
+            "&local_wrapper_id={}",
+            urlencoding_encode(wrapper_id)
+        ));
     }
     if let Some(exit_code) = exit_code {
         request.push_str(&format!("&exit_code={}", exit_code));
@@ -643,6 +651,7 @@ mod bounded_ipc_tests {
                     1,
                     Some(42),
                     Some(0),
+                    None,
                     None,
                     None,
                     None,
