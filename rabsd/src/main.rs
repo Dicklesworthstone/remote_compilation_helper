@@ -327,7 +327,7 @@ fn main() {
             rabsd::edge::server::EdgeServerConfig {
                 socket_path: std::path::PathBuf::from(&config.socket_path),
                 state_dir: state_dir.clone(),
-                coord,
+                coord: coord.edge_subscriber(),
             },
         )),
         coord_work: Some(coord_work),
