@@ -4976,6 +4976,7 @@ name = "rabs-sandbox"
 version = "2.0.0"
 dependencies = [
  "rabs-protocol",
+ "rustix",
  "sha2 0.11.0",
  "tempfile",
 ]
