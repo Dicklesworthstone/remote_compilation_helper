@@ -6,7 +6,7 @@
 //! mutable snapshot of build phase/progress ([`BuildHeartbeatSnapshot`]), the
 //! background loop that ticks every [`BUILD_HEARTBEAT_INTERVAL`] and on demand
 //! ([`BuildHeartbeatLoop`]), the progress-counter bump used by output-streaming
-//! callbacks ([`mark_heartbeat_progress`]), and the single fire-and-forget
+//! callbacks ([`mark_heartbeat_progress`]), and the acknowledged
 //! socket send ([`send_build_heartbeat`]).
 //!
 //! The loop is driven from the hook's `execute_remote_compilation` path; the
@@ -252,9 +252,177 @@ async fn send_build_heartbeat(
     writer.flush().await?;
     writer.shutdown().await?;
 
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let _ = timeout(Duration::from_secs(5), reader.read_line(&mut line)).await;
+    let body = super::daemon_ipc::read_daemon_body(reader, Duration::from_secs(5), false).await?;
+    #[derive(serde::Deserialize)]
+    struct Acknowledgement {
+        status: String,
+        build_id: u64,
+        worker_id: String,
+        phase: String,
+    }
+    let acknowledgement: Acknowledgement = serde_json::from_str(&body)?;
+    anyhow::ensure!(
+        acknowledgement.build_id == heartbeat.build_id
+            && acknowledgement.worker_id == heartbeat.worker_id.as_str()
+            && acknowledgement.phase == heartbeat_phase_token(&heartbeat.phase),
+        "Daemon heartbeat acknowledgement does not match the submitted build, worker and phase"
+    );
+    if acknowledgement.status == "ignored" {
+        warn!(
+            build_id = heartbeat.build_id,
+            worker_id = %heartbeat.worker_id,
+            local_wrapper_id = ?heartbeat.local_wrapper_id,
+            phase = heartbeat_phase_token(&heartbeat.phase),
+            reason = "heartbeat_unknown_build",
+            "Daemon no longer tracks this build; remote execution may still be active. Inspect rch status --jobs and rch queue before intervening; do not rerun the command"
+        );
+    }
+    anyhow::ensure!(
+        acknowledgement.status == "ok",
+        "Daemon did not acknowledge heartbeat: {}",
+        acknowledgement.status
+    );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unknown_build_heartbeat_is_not_acknowledged() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let socket = root.join("heartbeat.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).await.unwrap();
+            let (route, body) = request.split_once('\n').unwrap();
+            assert_eq!(route, "POST /build-heartbeat");
+            let heartbeat: BuildHeartbeatRequest = serde_json::from_str(body).unwrap();
+            let response = serde_json::json!({
+                "status": "ignored",
+                "build_id": heartbeat.build_id,
+                "worker_id": heartbeat.worker_id,
+                "phase": "execute"
+            });
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{response}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let heartbeat = BuildHeartbeatRequest {
+            build_id: 71,
+            worker_id: WorkerId::new("lost-worker"),
+            hook_pid: Some(std::process::id()),
+            local_wrapper_id: Some("lost-wrapper".to_string()),
+            remote_pgid_file: None,
+            phase: BuildHeartbeatPhase::Execute,
+            detail: None,
+            progress_counter: Some(1),
+            progress_percent: None,
+        };
+        let result = send_build_heartbeat(socket.to_str().unwrap(), &heartbeat).await;
+        server.await.unwrap();
+        assert!(
+            result.is_err(),
+            "an ignored heartbeat is not an acknowledgement"
+        );
+    }
+
+    #[tokio::test]
+    async fn known_build_heartbeat_is_acknowledged() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let socket = root.join("heartbeat.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).await.unwrap();
+            let (_, body) = request.split_once('\n').unwrap();
+            let heartbeat: BuildHeartbeatRequest = serde_json::from_str(body).unwrap();
+            let response = serde_json::json!({
+                "status": "ok",
+                "build_id": heartbeat.build_id,
+                "worker_id": heartbeat.worker_id,
+                "phase": "execute"
+            });
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{response}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let heartbeat = BuildHeartbeatRequest {
+            build_id: 72,
+            worker_id: WorkerId::new("tracked-worker"),
+            hook_pid: Some(std::process::id()),
+            local_wrapper_id: Some("tracked-wrapper".to_string()),
+            remote_pgid_file: None,
+            phase: BuildHeartbeatPhase::Execute,
+            detail: None,
+            progress_counter: Some(2),
+            progress_percent: None,
+        };
+        let result = send_build_heartbeat(socket.to_str().unwrap(), &heartbeat).await;
+        server.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "a matching ok acknowledgement must succeed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_acknowledgement_is_rejected() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let socket = root.join("heartbeat.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).await.unwrap();
+            // Acknowledge a different build: correlation must fail closed.
+            let response = serde_json::json!({
+                "status": "ok",
+                "build_id": 999,
+                "worker_id": "tracked-worker",
+                "phase": "execute"
+            });
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{response}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let heartbeat = BuildHeartbeatRequest {
+            build_id: 72,
+            worker_id: WorkerId::new("tracked-worker"),
+            hook_pid: Some(std::process::id()),
+            local_wrapper_id: Some("tracked-wrapper".to_string()),
+            remote_pgid_file: None,
+            phase: BuildHeartbeatPhase::Execute,
+            detail: None,
+            progress_counter: Some(3),
+            progress_percent: None,
+        };
+        let result = send_build_heartbeat(socket.to_str().unwrap(), &heartbeat).await;
+        server.await.unwrap();
+        let error = result.expect_err("mismatched acknowledgement must not pass");
+        assert!(error.to_string().contains("does not match"), "{error}");
+    }
 }
