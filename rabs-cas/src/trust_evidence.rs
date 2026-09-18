@@ -34,7 +34,7 @@
 //! a more permissive one. The serving gate independently checks durable
 //! quarantine, including when the disposition update has not landed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use rabs_protocol::serving::TrustEvidenceTier;
@@ -110,7 +110,7 @@ impl From<StoreError> for TrustEvidenceError {
 /// Reject an already-stale caller before the non-authority-gated
 /// evidence/quarantine writes. The ledger write still performs its own
 /// transactional authority check; this is not a replacement for it.
-fn require_active_authority(
+pub(crate) fn require_active_authority(
     store: &mut dyn RabsMetadataStore,
     authority: &TypedDigest,
 ) -> Result<(), StoreError> {
@@ -198,33 +198,43 @@ pub struct TrustReevaluation {
     pub ledger_version: u32,
 }
 
-/// Derive the observed tier from distinct successful attempts bound to
-/// THIS action and a known worker. Repeated sample rows for one attempt
-/// are not independent executions; missing attribution is not a new
-/// worker identity. Labels observed evidence only — never semantic
-/// correctness (plan §113).
-fn observed_tier(
+/// Evidence counts shared by tier evaluation and sampled-serving policy.
+/// Each known same-action attempt counts once; a failed observation
+/// dominates any passed observations of that SAME attempt.
+pub(crate) struct VerificationEvidence {
+    /// Distinct, attributable attempts with at least one observation.
+    pub(crate) attempts: u64,
+    /// Attributable attempts with no failed observation.
+    pub(crate) passed_attempts: u64,
+    /// Distinct worker identities among passing attempts.
+    pub(crate) passed_workers: usize,
+    /// All failed samples, including unattributed ones, remain adverse.
+    pub(crate) adverse_samples: u64,
+}
+
+/// Aggregate verification evidence without inventing executions or
+/// worker identities. Unknown and foreign-action attempts never count
+/// as positive evidence; their negative observations are still retained.
+pub(crate) fn verification_evidence(
     store: &mut dyn RabsMetadataStore,
     action: &TypedDigest,
-) -> Result<(TrustEvidenceTier, u64), StoreError> {
+) -> Result<VerificationEvidence, StoreError> {
     let samples = store.list_verification_samples(action)?;
-    let adverse = samples.iter().filter(|sample| !sample.passed).count() as u64;
+    let adverse_samples = samples.iter().filter(|sample| !sample.passed).count() as u64;
     let rows = store.query(
         "SELECT DISTINCT a.id_hex, a.worker FROM verification_samples s \
          JOIN action_attempts a ON a.id_hex = s.attempt_hex \
          JOIN action_generations g ON g.id_hex = a.generation_hex \
-         WHERE s.action_key = ?1 AND g.action_key = ?1 AND s.passed = 1 \
+         WHERE s.action_key = ?1 AND g.action_key = ?1 \
          ORDER BY a.id_hex",
         &[SqlValue::Text(digest_key(action))],
     )?;
-    let mut passed_workers = BTreeSet::new();
-    let mut passed_attempts = 0_u64;
+    let mut attempts = BTreeMap::new();
     for row in rows {
         match row.as_slice() {
-            [SqlValue::Text(_), SqlValue::Text(worker)] => {
+            [SqlValue::Text(attempt), SqlValue::Text(worker)] => {
                 if !worker.is_empty() {
-                    passed_attempts += 1;
-                    passed_workers.insert(worker.clone());
+                    attempts.insert(attempt.clone(), (worker.clone(), true));
                 }
             }
             _ => {
@@ -234,13 +244,41 @@ fn observed_tier(
             }
         }
     }
-    let tier = match (passed_attempts, passed_workers.len()) {
+    for sample in &samples {
+        if let Some((_, passed)) = attempts.get_mut(&sample.attempt_hex) {
+            *passed &= sample.passed;
+        }
+    }
+    let mut passed_workers = BTreeSet::new();
+    let mut passed_attempts = 0_u64;
+    for (worker, passed) in attempts.values() {
+        if *passed {
+            passed_attempts += 1;
+            passed_workers.insert(worker.as_str());
+        }
+    }
+    Ok(VerificationEvidence {
+        attempts: attempts.len() as u64,
+        passed_attempts,
+        passed_workers: passed_workers.len(),
+        adverse_samples,
+    })
+}
+
+/// Derive an observed evidence tier, never a semantic-correctness claim
+/// (plan §113), from independent attributable verification attempts.
+fn observed_tier(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+) -> Result<(TrustEvidenceTier, u64), StoreError> {
+    let evidence = verification_evidence(store, action)?;
+    let tier = match (evidence.passed_attempts, evidence.passed_workers) {
         (0, _) => TrustEvidenceTier::UnverifiedCandidate,
         (1, _) => TrustEvidenceTier::ShadowMatched,
         (_, 0 | 1) => TrustEvidenceTier::ReproducibleSameWorker,
         (_, _) => TrustEvidenceTier::ReproducibleCrossWorker,
     };
-    Ok((tier, adverse))
+    Ok((tier, evidence.adverse_samples))
 }
 
 /// Re-evaluate one action's serving from its CURRENT evidence under the
@@ -712,18 +750,16 @@ mod tests {
     /// Unattributed, foreign-action and repeated samples never invent
     /// independent executions. Real independent attempts still promote.
     /// Once quarantined, even a weaker policy cannot restore serving.
-    fn independent_evidence_and_sticky_quarantine(
-        store: &mut dyn RabsMetadataStore,
-    ) -> Vec<String> {
+    fn independent_evidence_and_sticky_quarantine(store: &mut dyn RabsMetadataStore) -> Vec<String> {
         let (active, action) = published_fixture(store);
         let action_key = digest_key(&action);
         let frozen = publication_lines(store);
         let policies = vec![policy(1, false, TrustEvidenceTier::ReproducibleCrossWorker)];
 
         // Unknown attempts used to fabricate distinct worker identities.
-        for attempt in [90, 91] {
+        for (attempt, seq) in [(90_u128, 90_u64), (91, 91)] {
             store
-                .record_verification_sample(&action, attempt, true, attempt)
+                .record_verification_sample(&action, attempt, true, seq)
                 .unwrap();
         }
         // A real worker on another action is not evidence for this one.
@@ -798,6 +834,15 @@ mod tests {
             serving_gate(store, &action_key, 200, 0).unwrap(),
             ServeDecision::NotServable { .. }
         ));
+
+        // A later passing observation cannot erase an attempt's failed
+        // observation or count it as an additional successful execution.
+        store.record_verification_sample(&action, 20, false, 111).unwrap();
+        store.record_verification_sample(&action, 20, true, 112).unwrap();
+        let evidence = verification_evidence(store, &action).unwrap();
+        assert_eq!(evidence.attempts, 3);
+        assert_eq!(evidence.passed_attempts, 2);
+        assert_eq!(evidence.adverse_samples, 1);
         assert_eq!(publication_lines(store), frozen);
         store.differential_snapshot().unwrap()
     }
@@ -811,10 +856,10 @@ mod tests {
 
     #[test]
     fn independent_evidence_and_quarantine_differential() {
-        let mut reference =
-            SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("evidence-ref")).unwrap()).unwrap();
-        let mut candidate =
-            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("evidence-fsq")).unwrap()).unwrap();
+        let reference_engine = RusqliteEngine::open(&fresh_path("evidence-ref")).unwrap();
+        let candidate_engine = FsqliteEngine::open(&fresh_path("evidence-fsq")).unwrap();
+        let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+        let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
         assert_eq!(
             independent_evidence_and_sticky_quarantine(&mut reference),
             independent_evidence_and_sticky_quarantine(&mut candidate)
@@ -829,7 +874,9 @@ mod tests {
             let (active, action) = published_fixture(&mut store);
             let action_key = digest_key(&action);
             let policies = vec![policy(1, false, TrustEvidenceTier::ShadowMatched)];
-            store.record_verification_sample(&action, 20, true, 100).unwrap();
+            store
+                .record_verification_sample(&action, 20, true, 100)
+                .unwrap();
             let blocking = if named_blocker {
                 store
                     .add_quarantine(QuarantineScope::LogicalObject, "object:damaged", "bad bytes")
@@ -842,7 +889,11 @@ mod tests {
                 .put_serving_record(
                     &active,
                     &action_key,
-                    if named_blocker { DISPOSITION_SERVABLE } else { DISPOSITION_QUARANTINED },
+                    if named_blocker {
+                        DISPOSITION_SERVABLE
+                    } else {
+                        DISPOSITION_QUARANTINED
+                    },
                     1,
                     &ServingValidity {
                         evaluated_at_unix_micros: 0,
@@ -866,9 +917,7 @@ mod tests {
         }
     }
 
-    fn compromise_without_policy_is_still_blocked(
-        store: &mut dyn RabsMetadataStore,
-    ) -> Vec<String> {
+    fn compromise_without_policy_is_still_blocked(store: &mut dyn RabsMetadataStore) -> Vec<String> {
         let (active, action) = published_fixture(store);
         let action_key = digest_key(&action);
         let frozen = publication_lines(store);
@@ -885,13 +934,21 @@ mod tests {
             Err(TrustEvidenceError::Store(StoreError::NotActiveAuthority))
         );
         assert_eq!(store.differential_snapshot().unwrap(), before);
-        assert_eq!(serving_gate(store, &action_key, 200, 0).unwrap(), ServeDecision::Servable);
+        assert_eq!(
+            serving_gate(store, &action_key, 200, 0).unwrap(),
+            ServeDecision::Servable
+        );
 
         assert_eq!(
             report_compromise(store, &active, &action, &report, 10, 20, &[], 101),
             Err(TrustEvidenceError::NoActivePolicy)
         );
-        assert!(store.list_evidence_keys(&action).unwrap().contains(&digest_key(&report)));
+        assert!(
+            store
+                .list_evidence_keys(&action)
+                .unwrap()
+                .contains(&digest_key(&report))
+        );
         assert_eq!(
             serving_gate(store, &action_key, 200, 0).unwrap(),
             ServeDecision::Blocked {
@@ -920,10 +977,10 @@ mod tests {
 
     #[test]
     fn compromise_without_policy_differential() {
-        let mut reference =
-            SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("compromise-ref")).unwrap()).unwrap();
-        let mut candidate =
-            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("compromise-fsq")).unwrap()).unwrap();
+        let reference_engine = RusqliteEngine::open(&fresh_path("compromise-ref")).unwrap();
+        let candidate_engine = FsqliteEngine::open(&fresh_path("compromise-fsq")).unwrap();
+        let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+        let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
         assert_eq!(
             compromise_without_policy_is_still_blocked(&mut reference),
             compromise_without_policy_is_still_blocked(&mut candidate)
