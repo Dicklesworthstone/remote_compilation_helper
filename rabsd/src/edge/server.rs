@@ -449,6 +449,12 @@ fn serve_reply(coord: &crate::coord::live::EdgeSubscriber, value: &serde_json::V
     )
     .unwrap_or(i64::MAX);
     match coord.serve_action(&action_key, destination, &expected, now, 0) {
+        Ok(ServeOutcome::ExecutePrivately(reason)) => serde_json::json!({
+            "kind": "serve-result",
+            "outcome": "execute-privately",
+            "reason": format!("{reason:?}"),
+        })
+        .to_string(),
         Ok(ServeOutcome::Served { files }) => {
             let list: Vec<String> = files
                 .iter()
@@ -544,6 +550,67 @@ fn parse_observation(value: &serde_json::Value) -> Option<crate::edge::shadow::C
             })
             .unwrap_or_default(),
     })
+}
+
+#[cfg(test)]
+mod live_serve_tests {
+    use super::*;
+    use rabs_cas::test_support::{
+        install_admission_world, install_offer_closure, offer_under,
+        sample_action_key, sample_expected_descriptor,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn serve_frame_cannot_choose_its_own_risk_or_evidence_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Arc::new(
+            crate::janitor::store::mount_and_reconcile(&dir.path().join("cas")).unwrap(),
+        );
+        let coord = Arc::new(crate::coord::live::CoordLive::with_cas(Arc::clone(&cas)));
+        let authority = coord.acquire_boot_authority("serve-frame-fixture").unwrap();
+        coord.mark_up();
+        let offer = offer_under(&authority);
+        {
+            let mut store = cas.store().lock().unwrap();
+            install_admission_world(&mut *store, &authority);
+            install_offer_closure(&mut *store, &offer);
+        }
+        coord.commit_offer(&offer, &sample_expected_descriptor()).unwrap();
+        let destination = dir.path().join("not-written");
+        let key = sample_action_key()
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let frame = serde_json::json!({
+            "kind": "serve",
+            "action_key": key,
+            "destination_root": destination.to_str().unwrap(),
+            "expected_outputs": ["out/lib.rlib"],
+            "risk": "low-risk-registry",
+            "min_samples": 0,
+            "sample_rate_basis_points": 10_000,
+            "verified": true,
+        });
+        let reply: serde_json::Value =
+            serde_json::from_str(&serve_reply(&coord.edge_subscriber(), &frame)).unwrap();
+        assert_eq!(reply["kind"], "serve-result");
+        assert_eq!(reply["outcome"], "execute-privately");
+        assert!(reply["reason"].as_str().unwrap().contains("ElevatedClassRisk"));
+        assert!(!destination.exists());
+
+        // The absence of an output expectation is not an authorization bypass.
+        let mut inspection_claim = frame;
+        inspection_claim.as_object_mut().unwrap().remove("expected_outputs");
+        let reply: serde_json::Value = serde_json::from_str(&serve_reply(
+            &coord.edge_subscriber(),
+            &inspection_claim,
+        ))
+        .unwrap();
+        assert_eq!(reply["outcome"], "execute-privately");
+        assert!(!destination.exists());
+    }
 }
 
 fn parse_hello(frame: &[u8]) -> Result<VersionHello, String> {

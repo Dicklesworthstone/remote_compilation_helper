@@ -34,13 +34,19 @@ use crate::janitor::store::LiveCas;
 use rabs_cas::blob_store::RAW_PROFILE_V1;
 use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
 use rabs_cas::digest_set::{DigestRequest, digest_set};
-use rabs_cas::manifest_codec::decode_manifest_v1;
+use rabs_cas::manifest_codec::{decode_manifest_v1, encode_manifest_v1};
 use rabs_cas::materialization::{MaterializationMode, materialize_object};
-use rabs_cas::metadata_store::{AuthorityRow, RabsMetadataStore, StoreError, digest_key};
+use rabs_cas::metadata_store::{
+    AuthorityRow, RabsMetadataStore, SqlValue, StoreError, digest_key,
+};
 use rabs_cas::publication::{
     AUTHORITY_DIGEST_DOMAIN, CommitDurabilityProfile, OBSERVABLE_PROJECTION_DOMAIN,
     OfferPreparedActionResult, OfferRefusal, PublicationOutcome, SEMANTIC_PROJECTION_DOMAIN,
     authority_digest, process_offer,
+};
+use rabs_cas::serving_sample_gate::{
+    ActionClassRisk, PrivateExecutionReason, SampleGateDecision, SamplingPolicy,
+    serving_sample_decision,
 };
 use rabs_cas::serving_state::{ServeDecision, serving_gate};
 use rabs_key::action_key::{action_input_manifest_digest, compute_action_key};
@@ -194,9 +200,26 @@ impl std::fmt::Display for CommitRefusal {
     }
 }
 
+/// Why a work-skipping edge request must execute privately instead.
+/// These decisions precede destination reservation and all artifact writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayRefusal {
+    /// A completed comparison failed. Negative evidence, including an
+    /// unattributed failure, must never be averaged away by later passes.
+    FailedVerification {
+        /// Number of adverse observations retained for this action.
+        observations: u64,
+    },
+    /// The existing class/evidence/sampling policy requires private execution.
+    Sampling(PrivateExecutionReason),
+}
+
 /// The answer to a serve request that is not a fault.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeOutcome {
+    /// The result may be retained, but this request is not authorized to
+    /// skip execution. Nothing has been reserved or installed.
+    ExecutePrivately(ReplayRefusal),
     /// Materialized; these files now exist (empty when the committed
     /// manifest declares no materializable output).
     Served {
@@ -250,6 +273,8 @@ pub enum ExpectedOutputs {
 /// Why a serve could not even be attempted. Nothing is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeError {
+    /// Work-skipping replay requires this process's live, active coordinator.
+    CoordinatorUnavailable,
     /// No store is mounted.
     NoStore,
     /// A lock was poisoned by a panic elsewhere.
@@ -282,6 +307,7 @@ pub enum ServeError {
 impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::CoordinatorUnavailable => write!(f, "no live coordinator authority for replay"),
             Self::NoStore => write!(f, "no rabs-cas store mounted"),
             Self::StoreUnavailable => write!(f, "store lock poisoned"),
             Self::Store(error) => write!(f, "store error: {error}"),
@@ -335,6 +361,161 @@ fn install_all(
         written.push(path.clone());
     }
     Ok(written)
+}
+
+// The class receipt is derived from the actual keyed descriptor at submission,
+// never from a class/risk flag supplied in a socket frame. Its sequence is fixed:
+// an action key has one semantic class, independent of attempts and restarts.
+const LIVE_CLASS_RECEIPT: &str = "rabs-live-action-class-v1";
+const LIVE_DEPENDENCY_CLASS: &str = "rustc-dependency-compile";
+const LIVE_PRIVATE_CLASS: &str = "private-only";
+
+// This is an additional floor, not a replacement for the stored serving policy.
+// In particular it never promotes a quarantined/evidence-pending record, renews
+// its TTL, or changes a trust-policy version. Every edge-delivered artifact
+// passes this floor; the Cargo wrapper itself remains in shadow mode.
+const LIVE_SAMPLING_POLICY: SamplingPolicy = SamplingPolicy::sample_all(2, 10_000);
+
+fn record_descriptor_class(
+    store: &mut dyn RabsMetadataStore,
+    descriptor: &ActionDescriptor,
+) -> Result<(), StoreError> {
+    let class = if descriptor.action_class
+        == rabs_protocol::descriptor::ActionClass::RustcDependencyCompile
+    {
+        LIVE_DEPENDENCY_CLASS
+    } else {
+        LIVE_PRIVATE_CLASS
+    };
+    store.record_decision_receipt(
+        LIVE_CLASS_RECEIPT,
+        &digest_key(&compute_action_key(descriptor).final_key),
+        0,
+        class,
+        "semantic class bound to the submitted action descriptor",
+    )
+}
+
+fn recorded_action_risk(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+) -> Result<ActionClassRisk, StoreError> {
+    let rows = store.query(
+        "SELECT decision FROM decision_receipts \
+         WHERE kind = ?1 AND subject = ?2 AND seq = 0",
+        &[
+            SqlValue::Text(LIVE_CLASS_RECEIPT.to_owned()),
+            SqlValue::Text(digest_key(action)),
+        ],
+    )?;
+    match rows.as_slice() {
+        // Legacy publications and unknown classes do not silently become
+        // dependency actions, including after a coordinator restart.
+        [] => Ok(ActionClassRisk::Elevated),
+        [row] => match row.as_slice() {
+            [SqlValue::Text(class)] if class == LIVE_DEPENDENCY_CLASS => {
+                Ok(ActionClassRisk::LowRiskRegistry)
+            }
+            [SqlValue::Text(_)] => Ok(ActionClassRisk::Elevated),
+            _ => Err(StoreError::Backend("invalid live action-class receipt".to_owned())),
+        },
+        _ => Err(StoreError::Backend("ambiguous live action-class receipt".to_owned())),
+    }
+}
+
+/// Record ONLY a comparison admitted by the real publication engine. A first
+/// publication is not a comparison, and retransmitting the winning attempt is
+/// not a second execution. Invalid/stale offers never reach this function.
+fn record_live_verification(
+    store: &mut dyn RabsMetadataStore,
+    offer: &OfferPreparedActionResult,
+    outcome: &PublicationOutcome,
+    committed: Option<&CanonicalActionResultManifest>,
+) -> Result<(), StoreError> {
+    let passed = match outcome {
+        PublicationOutcome::Committed(_) => return Ok(()),
+        PublicationOutcome::IdempotentEvidenceAppended => true,
+        PublicationOutcome::Quarantined(_) => false,
+    };
+    let action = &offer.manifest.action_key;
+    let attempt = offer.authority.attempt_id.0;
+    if passed {
+        // A repeated pointer is not itself a verified comparison. Bind the
+        // offered value to its content id AND the independently loaded baseline.
+        // Missing/corrupt baseline bytes must never manufacture passing evidence.
+        let baseline = committed.ok_or_else(|| {
+            StoreError::Backend("verification baseline unavailable".to_owned())
+        })?;
+        let bytes = encode_manifest_v1(&offer.manifest);
+        let offered_id = digest_set(&bytes, DigestRequest::default(), None)
+            .map_err(|_| StoreError::Backend("verification manifest digest failed".to_owned()))?
+            .atp_content_id;
+        if offered_id != offer.manifest_id.0
+            || encode_manifest_v1(baseline) != bytes
+        {
+            return Err(StoreError::Backend(
+                "verification manifest does not match its committed bytes".to_owned(),
+            ));
+        }
+        let rows = store.query(
+            "SELECT winner_attempt_hex FROM action_publications WHERE action_key = ?1",
+            &[SqlValue::Text(digest_key(action))],
+        )?;
+        let [row] = rows.as_slice() else {
+            return Err(StoreError::Backend("missing verification baseline".to_owned()));
+        };
+        let [SqlValue::Text(winner)] = row.as_slice() else {
+            return Err(StoreError::Backend("invalid verification baseline".to_owned()));
+        };
+        let winner = u128::from_str_radix(winner, 16)
+            .map_err(|_| StoreError::Backend("invalid winner attempt identity".to_owned()))?;
+        if winner == attempt {
+            return Ok(());
+        }
+    }
+
+    let samples = store.list_verification_samples(action)?;
+    // Never overwrite a failure with a pass, or count a replay twice. Some
+    // store backends implement record_verification_sample as an upsert, so
+    // allocate a fresh sequence instead of assuming a reserved sequence is free.
+    if samples.iter().any(|sample| {
+        u128::from_str_radix(&sample.attempt_hex, 16).ok() == Some(attempt)
+            && (passed || !sample.passed)
+    }) {
+        return Ok(());
+    }
+    let seq = samples
+        .iter()
+        .map(|sample| sample.seq)
+        .max()
+        .map_or(Some(0), |seq| seq.checked_add(1))
+        .ok_or_else(|| StoreError::Backend("verification sequence exhausted".to_owned()))?;
+    store.record_verification_sample(action, attempt, passed, seq)
+}
+
+/// Final live replay admission, called with the SAME store lock subsequently
+/// held through manifest reload and installation. No result from this function
+/// is a reusable authorization token: every request is evaluated afresh.
+fn live_replay_gate(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+    policy: &SamplingPolicy,
+) -> Result<Option<ReplayRefusal>, StoreError> {
+    let risk = recorded_action_risk(store, action)?;
+    let adverse = store
+        .list_verification_samples(action)?
+        .iter()
+        .filter(|sample| !sample.passed)
+        .count();
+    if adverse != 0 {
+        return Ok(Some(ReplayRefusal::FailedVerification {
+            observations: u64::try_from(adverse).unwrap_or(u64::MAX),
+        }));
+    }
+    match serving_sample_decision(store, action, risk, policy)? {
+        SampleGateDecision::ServeFromCache => Ok(None),
+        SampleGateDecision::ExecutePrivately(reason) => Ok(Some(ReplayRefusal::Sampling(reason))),
+    }
 }
 
 /// Refusal from the shared foreground/speculative submission path.
@@ -739,12 +920,16 @@ impl EdgeSubscriber {
         now_unix_micros: i64,
         now_epoch: u64,
     ) -> Result<ServeOutcome, ServeError> {
-        self.coord.serve_action(
+        // Every edge request must pass the live evidence/class gate. Omitting
+        // expected outputs changes only output-set matching; it is not an
+        // inspection capability and cannot waive trust or sampling policy.
+        self.coord.serve_action_inner(
             action_key,
             destination_root,
             expected,
             now_unix_micros,
             now_epoch,
+            Some(LIVE_SAMPLING_POLICY),
         )
     }
 
@@ -939,6 +1124,26 @@ impl CoordLive {
             return Err(SubmissionRefusal::Capacity);
         }
         let order = submissions.next_serial()?;
+        {
+            let cas = self.cas.as_ref().ok_or(SubmissionRefusal::Unavailable)?;
+            let mut store = cas
+                .store()
+                .lock()
+                .map_err(|_| SubmissionRefusal::Unavailable)?;
+            match store.active_authority().map_err(|error| {
+                SubmissionRefusal::Admission(format!("class authority: {error:?}"))
+            })? {
+                Some(active) if active.digest == authority_digest(&authority) => {}
+                _ => return Err(SubmissionRefusal::Unavailable),
+            }
+            // Projection and bounded admission checks have succeeded. A
+            // rejected queue flood must not grow the durable class ledger.
+            // This follows the submissions -> store order used by dispatch.
+            // The socket caller never supplies this keyed risk classification.
+            record_descriptor_class(&mut *store, &input.descriptor).map_err(|error| {
+                SubmissionRefusal::Admission(format!("action class: {error:?}"))
+            })?;
+        }
         let mut actor = ActionActor::new(
             input.descriptor.clone(),
             &authority,
@@ -1418,7 +1623,7 @@ impl CoordLive {
             _ => None,
         };
 
-        process_offer(
+        let outcome = process_offer(
             &mut *store,
             offer,
             expected_descriptor,
@@ -1427,7 +1632,26 @@ impl CoordLive {
             seq,
             CommitDurabilityProfile::RequireDurableClosure,
         )
-        .map_err(CommitRefusal::Offer)
+        .map_err(CommitRefusal::Offer)?;
+        if let Err(error) =
+            record_live_verification(&mut *store, offer, &outcome, committed.as_ref())
+        {
+            // The canonical publication/quarantine ALREADY succeeded. Never
+            // turn missing feedback into a false "nothing committed" refusal
+            // that could cause a caller to rerun completed work. Missing
+            // positive evidence cannot pass the live sampling floor; a
+            // divergence was already durably blocked by process_offer.
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "v": 1,
+                    "kind": "rabsd-verification-feedback-error",
+                    "action_key": digest_key(&offer.manifest.action_key),
+                    "error": format!("{error:?}"),
+                })
+            );
+        }
+        Ok(outcome)
     }
 
     /// Serve a committed action into a live worktree: the first path in
@@ -1467,6 +1691,37 @@ impl CoordLive {
         now_unix_micros: i64,
         now_epoch: u64,
     ) -> Result<ServeOutcome, ServeError> {
+        // Coordinator-owned inspection/materialization. Restricted edge
+        // callers route through serve_action_inner with the sampling floor.
+        self.serve_action_inner(
+            action_key,
+            destination_root,
+            expected,
+            now_unix_micros,
+            now_epoch,
+            None,
+        )
+    }
+
+    fn serve_action_inner(
+        &self,
+        action_key: &TypedDigest,
+        destination_root: &Path,
+        expected: &ExpectedOutputs,
+        now_unix_micros: i64,
+        now_epoch: u64,
+        sampling: Option<SamplingPolicy>,
+    ) -> Result<ServeOutcome, ServeError> {
+        // Take the authority snapshot BEFORE the store lock, preserving the
+        // existing authority -> store lock order during coordinator startup.
+        let replay_authority = if sampling.is_some() {
+            if !self.available() {
+                return Err(ServeError::CoordinatorUnavailable);
+            }
+            Some(self.authority().ok_or(ServeError::CoordinatorUnavailable)?)
+        } else {
+            None
+        };
         let cas = self.cas.as_ref().ok_or(ServeError::NoStore)?;
         let key = digest_key(action_key);
         let mut store = cas
@@ -1474,12 +1729,27 @@ impl CoordLive {
             .lock()
             .map_err(|_| ServeError::StoreUnavailable)?;
         declare_coordinator_domains(&mut *store);
+        if let Some(held) = replay_authority {
+            match store
+                .active_authority()
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+            {
+                Some(active) if active.digest == authority_digest(&held) => {}
+                _ => return Err(ServeError::CoordinatorUnavailable),
+            }
+        }
 
         match serving_gate(&mut *store, &key, now_unix_micros, now_epoch)
             .map_err(|e| ServeError::Store(format!("{e:?}")))?
         {
             ServeDecision::Servable => {}
             decision => return Ok(ServeOutcome::NotServable(decision)),
+        }
+        if let Some(policy) = sampling
+            && let Some(refusal) = live_replay_gate(&mut *store, action_key, &policy)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+        {
+            return Ok(ServeOutcome::ExecutePrivately(refusal));
         }
         let Some(manifest_key) = store
             .published_manifest_key(action_key)
@@ -1492,6 +1762,11 @@ impl CoordLive {
         let Some(manifest) = load_manifest(&mut *store, &manifest_key) else {
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
         };
+        if manifest.action_key != *action_key {
+            // A corrupt publication pointer must not substitute another
+            // action's otherwise valid, content-addressed output manifest.
+            return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
+        }
 
         // The interlock: does this commit produce what the caller's own
         // work would have produced? Checked BEFORE any path resolution,
@@ -1678,6 +1953,10 @@ pub fn declare_coordinator_domains(store: &mut dyn RabsMetadataStore) {
     }
 }
 
+/// Maximum canonical manifest bytes accepted by live replay. Oversized
+/// manifests produce a conservative miss, not an unbounded daemon allocation.
+const MAX_LIVE_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Load a canonical result manifest out of its CAS bytes, by object
 /// digest key (`domain:hex`, as stored on the publication row).
 ///
@@ -1691,18 +1970,66 @@ pub fn load_manifest(
     store: &mut dyn RabsMetadataStore,
     manifest_key: &str,
 ) -> Option<CanonicalActionResultManifest> {
+    use std::io::Read;
+
     let object = object_id_from_key(manifest_key)?;
+    // A quarantine of the logical object is stronger than selecting another
+    // physical copy. Do not infer release from an omitted serving reference.
+    if !store
+        .query(
+            "SELECT 1 FROM quarantines WHERE scope = 'logical-object' AND subject = ?1 LIMIT 1",
+            &[SqlValue::Text(manifest_key.to_owned())],
+        )
+        .ok()?
+        .is_empty()
+    {
+        return None;
+    }
     let locations = store.object_locations(&object).ok()?;
-    locations
-        .into_iter()
-        // Only the raw representation is bytes-as-stored; compressed and
-        // packed copies need their own decoders (H030) and are skipped
-        // rather than mis-read.
-        .filter(|(_, encoding, _)| encoding == RAW_PROFILE_V1)
-        .find_map(|(path, _, _)| {
-            let bytes = std::fs::read(&path).ok()?;
-            decode_manifest_v1(&bytes).ok()
-        })
+    for (path, encoding, _) in locations {
+        // Preserve the existing representation boundary: compressed/packed
+        // copies require their own decoders and are not raw manifests.
+        if encoding != RAW_PROFILE_V1 {
+            continue;
+        }
+        // Stored manifests are regular CAS files. In particular, do not open
+        // a recorded FIFO/device or follow a symlink before applying the byte
+        // bound. The content digest remains authoritative after opening.
+        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_LIVE_MANIFEST_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || u64::try_from(bytes.len()).ok()? > MAX_LIVE_MANIFEST_BYTES
+        {
+            continue;
+        }
+        let digests = digest_set(&bytes, DigestRequest::default(), None).ok()?;
+        if digests.atp_content_id != object {
+            // Decodable bytes are not necessarily the committed bytes. A bad
+            // location must never drive divergence comparison or installation.
+            // Quarantine just THIS copy, then try another verified replica.
+            store.set_location_quarantined(&object, &path, true).ok()?;
+            continue;
+        }
+        let Ok(manifest) = decode_manifest_v1(&bytes) else {
+            continue;
+        };
+        if rabs_key::logical_output_map::verify_manifest_bundle_root(&manifest).is_ok()
+            && rabs_cas::publication::semantic_result_digest_v1(&manifest)
+                == manifest.semantic_result_digest
+            && encode_manifest_v1(&manifest) == bytes
+        {
+            return Some(manifest);
+        }
+    }
+    None
 }
 
 /// Parse a `rabs.object.sha256.v1:<64 hex>` digest key back into a typed
@@ -1886,6 +2213,47 @@ mod tests {
         coord.acquire_boot_authority("submission-tests").unwrap();
         coord.mark_up();
         (state, coord)
+    }
+
+    #[test]
+    fn live_serving_class_is_key_bound_and_survives_reopen() {
+        let (state, coord) = submission_coordinator();
+        let (_source_dir, source, manifest, mut descriptor) = source_fixture();
+        descriptor.action_class = ActionClass::RustcDependencyCompile;
+        let dependency = coord
+            .submit_action(
+                submission(&source, &manifest, &descriptor),
+                request(1, SubscriberKind::ForegroundAgent, 1),
+                1,
+                0,
+            )
+            .unwrap();
+        descriptor.action_class = ActionClass::RustcWorkspaceCompile;
+        let workspace = coord
+            .submit_action(
+                submission(&source, &manifest, &descriptor),
+                request(2, SubscriberKind::ForegroundAgent, 1),
+                2,
+                0,
+            )
+            .unwrap();
+        assert_ne!(dependency.action_key, workspace.action_key);
+        drop(coord);
+        let reopened = mount_and_reconcile(state.path()).unwrap();
+        let mut store = reopened.store().lock().unwrap();
+        assert_eq!(
+            recorded_action_risk(&mut *store, &dependency.action_key).unwrap(),
+            ActionClassRisk::LowRiskRegistry
+        );
+        assert_eq!(
+            recorded_action_risk(&mut *store, &workspace.action_key).unwrap(),
+            ActionClassRisk::Elevated
+        );
+        let unknown = rabs_key::typed_digest::compute(DOMAIN_ACTION_KEY, b"not submitted");
+        assert_eq!(
+            recorded_action_risk(&mut *store, &unknown).unwrap(),
+            ActionClassRisk::Elevated
+        );
     }
 
     #[test]
