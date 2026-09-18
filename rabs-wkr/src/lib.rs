@@ -20,4 +20,5 @@ pub mod artifacts;
 pub mod execution;
 pub mod jobserver;
 pub mod output;
+pub mod request_journal;
 pub mod session;
