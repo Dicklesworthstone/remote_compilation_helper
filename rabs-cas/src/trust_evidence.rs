@@ -17,26 +17,33 @@
 //! - the **mutable serving disposition** (`action_serving_states`).
 //!
 //! [`reevaluate_action`] recomputes serving from the CURRENT evidence
-//! under the LATEST NON-REVOKED policy: verification samples (joined to
-//! their attempts' workers) derive the observed tier; a failed sample is
-//! adverse evidence; a compromise report — recognizable by its digest
-//! DOMAIN, never by parsing reason strings — forces quarantine. With no
-//! active policy the evaluation is a typed refusal and existing state is
-//! left untouched (fail toward the last evaluated state, mirroring
-//! R127's fail-toward-retention).
+//! under the LATEST NON-REVOKED policy. Only distinct, attributable
+//! attempts belonging to this action derive a positive observed tier.
+//! Failed samples remain adverse evidence. Neither positive evidence nor
+//! a weaker policy releases existing quarantine or named blockers: that
+//! requires the explicit repair flow, not ordinary reevaluation.
+//!
+//! With no active policy an ordinary evaluation leaves state untouched.
+//! A compromise report is different: durable quarantine is written
+//! BEFORE appending the report or evaluating policy, so a missing policy
+//! or interrupted evaluation cannot leave the compromised result usable.
 //!
 //! Write ordering inside one evaluation (each store call is its own
 //! transaction): quarantine first, ledger second, disposition LAST — a
 //! crash between steps can leave a stricter-than-necessary state, never
-//! a more permissive one.
+//! a more permissive one. The serving gate independently checks durable
+//! quarantine, including when the disposition update has not landed.
+
+use std::collections::BTreeSet;
 
 use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use rabs_protocol::serving::TrustEvidenceTier;
 use sha2::{Digest, Sha256};
 
 use crate::metadata_store::{
-    QuarantineScope, RabsMetadataStore, StoreError, TrustEvaluationRow, digest_key,
+    QuarantineScope, RabsMetadataStore, SqlValue, StoreError, TrustEvaluationRow, digest_key,
 };
+use crate::serving_state::action_quarantine_present;
 
 /// Domain separator for the canonical evidence-set digest.
 pub const EVIDENCE_SET_DOMAIN: &str = "rabs.evidence-set.sha256.v1";
@@ -78,9 +85,12 @@ pub fn latest_nonrevoked_policy(policies: &[TrustPolicy]) -> Option<&TrustPolicy
 pub enum TrustEvidenceError {
     /// Underlying store error.
     Store(StoreError),
-    /// Every supplied policy is revoked (or none were supplied): the
-    /// evaluation is refused and serving state is left untouched.
+    /// Every supplied policy is revoked (or none were supplied).
+    /// Ordinary reevaluation leaves state untouched; a compromise
+    /// report remains durably quarantined even when evaluation fails.
     NoActivePolicy,
+    /// The append-only ledger cannot advance without overflowing.
+    LedgerVersionExhausted,
     /// The action has no committed publication to evaluate.
     NotPublished,
     /// A compromise report must carry [`COMPROMISE_REPORT_DOMAIN`]; any
@@ -94,6 +104,19 @@ pub enum TrustEvidenceError {
 impl From<StoreError> for TrustEvidenceError {
     fn from(error: StoreError) -> Self {
         Self::Store(error)
+    }
+}
+
+/// Reject an already-stale caller before the non-authority-gated
+/// evidence/quarantine writes. The ledger write still performs its own
+/// transactional authority check; this is not a replacement for it.
+fn require_active_authority(
+    store: &mut dyn RabsMetadataStore,
+    authority: &TypedDigest,
+) -> Result<(), StoreError> {
+    match store.read_authority()? {
+        Some(current) if &current.digest == authority => Ok(()),
+        _ => Err(StoreError::NotActiveAuthority),
     }
 }
 
@@ -175,32 +198,43 @@ pub struct TrustReevaluation {
     pub ledger_version: u32,
 }
 
-/// Derive the observed tier from verification samples joined to their
-/// attempts' workers. Labels observed evidence only — never semantic
-/// correctness (plan §113): one passed verification is a shadow match,
-/// repeats on one worker are same-worker reproduction, passes on two or
-/// more workers are cross-worker reproduction.
+/// Derive the observed tier from distinct successful attempts bound to
+/// THIS action and a known worker. Repeated sample rows for one attempt
+/// are not independent executions; missing attribution is not a new
+/// worker identity. Labels observed evidence only — never semantic
+/// correctness (plan §113).
 fn observed_tier(
     store: &mut dyn RabsMetadataStore,
     action: &TypedDigest,
 ) -> Result<(TrustEvidenceTier, u64), StoreError> {
     let samples = store.list_verification_samples(action)?;
     let adverse = samples.iter().filter(|sample| !sample.passed).count() as u64;
-    let mut passed_workers = Vec::new();
-    let mut passed_samples = 0_u64;
-    for sample in &samples {
-        if !sample.passed {
-            continue;
-        }
-        passed_samples += 1;
-        let worker = store
-            .attempt_worker_by_hex(&sample.attempt_hex)?
-            .unwrap_or_else(|| format!("unattributed:{}", sample.attempt_hex));
-        if !passed_workers.contains(&worker) {
-            passed_workers.push(worker);
+    let rows = store.query(
+        "SELECT DISTINCT a.id_hex, a.worker FROM verification_samples s \
+         JOIN action_attempts a ON a.id_hex = s.attempt_hex \
+         JOIN action_generations g ON g.id_hex = a.generation_hex \
+         WHERE s.action_key = ?1 AND g.action_key = ?1 AND s.passed = 1 \
+         ORDER BY a.id_hex",
+        &[SqlValue::Text(digest_key(action))],
+    )?;
+    let mut passed_workers = BTreeSet::new();
+    let mut passed_attempts = 0_u64;
+    for row in rows {
+        match row.as_slice() {
+            [SqlValue::Text(_), SqlValue::Text(worker)] => {
+                if !worker.is_empty() {
+                    passed_attempts += 1;
+                    passed_workers.insert(worker.clone());
+                }
+            }
+            _ => {
+                return Err(StoreError::Backend(
+                    "invalid verification attempt attribution row".to_owned(),
+                ));
+            }
         }
     }
-    let tier = match (passed_samples, passed_workers.len()) {
+    let tier = match (passed_attempts, passed_workers.len()) {
         (0, _) => TrustEvidenceTier::UnverifiedCandidate,
         (1, _) => TrustEvidenceTier::ShadowMatched,
         (_, 0 | 1) => TrustEvidenceTier::ReproducibleSameWorker,
@@ -212,7 +246,8 @@ fn observed_tier(
 /// Re-evaluate one action's serving from its CURRENT evidence under the
 /// latest non-revoked policy. Appends a ledger row and rewrites the
 /// serving disposition; the publication row is never touched (I42 — the
-/// tests pin this byte-for-byte).
+/// tests pin this byte-for-byte). Existing quarantine and named blocking
+/// references remain authoritative, even when all new evidence passes.
 pub fn reevaluate_action(
     store: &mut dyn RabsMetadataStore,
     authority: &TypedDigest,
@@ -224,6 +259,13 @@ pub fn reevaluate_action(
         return Err(TrustEvidenceError::NotPublished);
     }
     let policy = latest_nonrevoked_policy(policies).ok_or(TrustEvidenceError::NoActivePolicy)?;
+    require_active_authority(store, authority)?;
+    let action_key = digest_key(action);
+    let action_quarantined = action_quarantine_present(store, &action_key)?;
+    let serving = store.serving_record(&action_key)?;
+    let serving_blocked = serving.as_ref().is_some_and(|record| {
+        record.disposition == DISPOSITION_QUARANTINED || !record.blocking.is_empty()
+    });
     let keys = store.list_evidence_keys(action)?;
     let compromised = keys
         .iter()
@@ -235,18 +277,21 @@ pub fn reevaluate_action(
         (DISPOSITION_QUARANTINED, "compromised")
     } else if adverse_samples > 0 {
         (DISPOSITION_QUARANTINED, "adverse-evidence")
+    } else if action_quarantined || serving_blocked {
+        (DISPOSITION_QUARANTINED, "unresolved-quarantine")
     } else if tier >= policy.required_tier {
         (DISPOSITION_SERVABLE, tier_tag(tier))
     } else {
         (DISPOSITION_EVIDENCE_PENDING, tier_tag(tier))
     };
 
-    // Quarantine FIRST (stricter state can only be added early, never
-    // skipped by a crash after the disposition write).
-    if disposition == DISPOSITION_QUARANTINED {
+    // Quarantine FIRST, but do not overwrite an unresolved incident's
+    // original reason. Named object/location blockers remain in the
+    // serving record; reevaluation neither drops nor repairs them.
+    if !action_quarantined && (compromised || adverse_samples > 0) {
         store.add_quarantine(
             QuarantineScope::ActionEntry,
-            &digest_key(action),
+            &action_key,
             if compromised {
                 "post-publication compromise report in evidence set"
             } else {
@@ -256,7 +301,8 @@ pub fn reevaluate_action(
     }
     let ledger_version = store
         .latest_trust_evaluation(action)?
-        .map_or(1, |latest| latest.version + 1);
+        .map_or(Some(1), |latest| latest.version.checked_add(1))
+        .ok_or(TrustEvidenceError::LedgerVersionExhausted)?;
     store.append_trust_evaluation(
         authority,
         action,
@@ -264,16 +310,17 @@ pub fn reevaluate_action(
             version: ledger_version,
             state: state_tag.to_owned(),
             reason: format!(
-                "policy v{}; evidence-set {}; adverse {}; compromised {}",
+                "policy v{}; evidence-set {}; adverse {}; compromised {}; prior-blocker {}",
                 policy.version,
                 digest_key(&evidence_set),
                 adverse_samples,
-                compromised
+                compromised,
+                action_quarantined || serving_blocked
             ),
             evaluated_seq: seq,
         },
     )?;
-    store.set_serving_disposition_key(&digest_key(action), disposition)?;
+    store.set_serving_disposition_key(&action_key, disposition)?;
     Ok(TrustReevaluation {
         policy_version: policy.version,
         observed_tier: tier,
@@ -287,8 +334,13 @@ pub fn reevaluate_action(
 
 /// Attach a post-publication compromise report to an action's evidence
 /// set (append-only) and immediately re-evaluate. The report digest MUST
-/// carry [`COMPROMISE_REPORT_DOMAIN`]; anything else is refused before
-/// any store write.
+/// carry [`COMPROMISE_REPORT_DOMAIN`]; wrong domains, unpublished actions,
+/// and already-stale authorities are refused before any store write.
+///
+/// Once admitted, quarantine lands FIRST. A later error, including
+/// [`TrustEvidenceError::NoActivePolicy`], does not undo that protection.
+/// Recovery must use the explicit repair flow rather than retrying with
+/// a more permissive policy.
 #[allow(clippy::too_many_arguments)]
 pub fn report_compromise(
     store: &mut dyn RabsMetadataStore,
@@ -310,6 +362,15 @@ pub fn report_compromise(
     let manifest_key = store
         .published_manifest_key(action)?
         .ok_or(TrustEvidenceError::NotPublished)?;
+    require_active_authority(store, authority)?;
+    let action_key = digest_key(action);
+    if !action_quarantine_present(store, &action_key)? {
+        store.add_quarantine(
+            QuarantineScope::ActionEntry,
+            &action_key,
+            "post-publication compromise report admitted",
+        )?;
+    }
     store.append_evidence(action, &manifest_key, report, generation, attempt)?;
     reevaluate_action(store, authority, action, policies, seq)
 }
@@ -321,6 +382,8 @@ mod tests {
         ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationRow, ResultKindTag,
         RusqliteEngine, SqlMetadataStore,
     };
+    use crate::serving_state::{ServeDecision, serving_gate};
+    use rabs_protocol::serving::ServingValidity;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -643,6 +706,227 @@ mod tests {
         assert_eq!(
             reevaluate_action(&mut store, &active, &unpublished, &policies, 100),
             Err(TrustEvidenceError::NotPublished)
+        );
+    }
+
+    /// Unattributed, foreign-action and repeated samples never invent
+    /// independent executions. Real independent attempts still promote.
+    /// Once quarantined, even a weaker policy cannot restore serving.
+    fn independent_evidence_and_sticky_quarantine(
+        store: &mut dyn RabsMetadataStore,
+    ) -> Vec<String> {
+        let (active, action) = published_fixture(store);
+        let action_key = digest_key(&action);
+        let frozen = publication_lines(store);
+        let policies = vec![policy(1, false, TrustEvidenceTier::ReproducibleCrossWorker)];
+
+        // Unknown attempts used to fabricate distinct worker identities.
+        for attempt in [90, 91] {
+            store
+                .record_verification_sample(&action, attempt, true, attempt)
+                .unwrap();
+        }
+        // A real worker on another action is not evidence for this one.
+        let foreign = digest("rabs.action-key.sha256.v1", 8);
+        store
+            .upsert_action_entry(&ActionEntryRow {
+                action_key: foreign.clone(),
+                key_epoch: 0,
+                projection_epoch: 0,
+            })
+            .unwrap();
+        store.create_generation(&active, 11, &foreign).unwrap();
+        store.record_attempt(30, 11, "worker-c", 92).unwrap();
+        store
+            .record_verification_sample(&action, 30, true, 93)
+            .unwrap();
+        // Empty attribution is not a worker identity either.
+        store.record_attempt(31, 10, "", 94).unwrap();
+        store
+            .record_verification_sample(&action, 31, true, 95)
+            .unwrap();
+        let eval = reevaluate_action(store, &active, &action, &policies, 100).unwrap();
+        assert_eq!(eval.observed_tier, TrustEvidenceTier::UnverifiedCandidate);
+        assert_eq!(eval.disposition, DISPOSITION_EVIDENCE_PENDING);
+
+        for seq in [101, 102, 103] {
+            store
+                .record_verification_sample(&action, 20, true, seq)
+                .unwrap();
+        }
+        let eval = reevaluate_action(store, &active, &action, &policies, 104).unwrap();
+        assert_eq!(eval.observed_tier, TrustEvidenceTier::ShadowMatched);
+        assert_eq!(eval.disposition, DISPOSITION_EVIDENCE_PENDING);
+
+        store.record_attempt(22, 10, "worker-a", 105).unwrap();
+        store
+            .record_verification_sample(&action, 22, true, 106)
+            .unwrap();
+        let eval = reevaluate_action(store, &active, &action, &policies, 107).unwrap();
+        assert_eq!(eval.observed_tier, TrustEvidenceTier::ReproducibleSameWorker);
+        assert_eq!(eval.disposition, DISPOSITION_EVIDENCE_PENDING);
+        store
+            .record_verification_sample(&action, 21, true, 108)
+            .unwrap();
+        let eval = reevaluate_action(store, &active, &action, &policies, 109).unwrap();
+        assert_eq!(eval.observed_tier, TrustEvidenceTier::ReproducibleCrossWorker);
+        assert_eq!(eval.disposition, DISPOSITION_SERVABLE);
+
+        store
+            .add_quarantine(QuarantineScope::ActionEntry, &action_key, "closure corruption")
+            .unwrap();
+        let record = store.serving_record(&action_key).unwrap().unwrap();
+        assert_eq!(record.disposition, DISPOSITION_SERVABLE);
+        assert!(record.blocking.is_empty());
+        let weaker = vec![policy(2, false, TrustEvidenceTier::UnverifiedCandidate)];
+        let eval = reevaluate_action(store, &active, &action, &weaker, 110).unwrap();
+        assert_eq!(eval.disposition, DISPOSITION_QUARANTINED);
+        assert_eq!(
+            store.latest_trust_evaluation(&action).unwrap().unwrap().state,
+            "unresolved-quarantine"
+        );
+        assert_eq!(
+            store
+                .query(
+                    "SELECT reason FROM quarantines WHERE scope = 'action-entry' AND subject = ?1",
+                    &[SqlValue::Text(action_key.clone())],
+                )
+                .unwrap(),
+            vec![vec![SqlValue::Text("closure corruption".to_owned())]]
+        );
+        assert!(matches!(
+            serving_gate(store, &action_key, 200, 0).unwrap(),
+            ServeDecision::NotServable { .. }
+        ));
+        assert_eq!(publication_lines(store), frozen);
+        store.differential_snapshot().unwrap()
+    }
+
+    #[test]
+    fn independent_evidence_and_quarantine_reference() {
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        independent_evidence_and_sticky_quarantine(&mut store);
+    }
+
+    #[test]
+    fn independent_evidence_and_quarantine_differential() {
+        let mut reference =
+            SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("evidence-ref")).unwrap()).unwrap();
+        let mut candidate =
+            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("evidence-fsq")).unwrap()).unwrap();
+        assert_eq!(
+            independent_evidence_and_sticky_quarantine(&mut reference),
+            independent_evidence_and_sticky_quarantine(&mut candidate)
+        );
+    }
+
+    #[test]
+    fn positive_evidence_preserves_named_blockers_and_quarantined_disposition() {
+        for named_blocker in [false, true] {
+            let engine = RusqliteEngine::open_in_memory().unwrap();
+            let mut store = SqlMetadataStore::open(engine).unwrap();
+            let (active, action) = published_fixture(&mut store);
+            let action_key = digest_key(&action);
+            let policies = vec![policy(1, false, TrustEvidenceTier::ShadowMatched)];
+            store.record_verification_sample(&action, 20, true, 100).unwrap();
+            let blocking = if named_blocker {
+                store
+                    .add_quarantine(QuarantineScope::LogicalObject, "object:damaged", "bad bytes")
+                    .unwrap();
+                vec![(QuarantineScope::LogicalObject, "object:damaged".to_owned())]
+            } else {
+                Vec::new()
+            };
+            store
+                .put_serving_record(
+                    &active,
+                    &action_key,
+                    if named_blocker { DISPOSITION_SERVABLE } else { DISPOSITION_QUARANTINED },
+                    1,
+                    &ServingValidity {
+                        evaluated_at_unix_micros: 0,
+                        maximum_age_micros: None,
+                        clock_uncertainty_micros: 0,
+                        coordinator_clock_epoch: 0,
+                    },
+                    &blocking,
+                )
+                .unwrap();
+            let before = store.serving_record(&action_key).unwrap().unwrap();
+            let eval = reevaluate_action(&mut store, &active, &action, &policies, 101).unwrap();
+            assert_eq!(eval.disposition, DISPOSITION_QUARANTINED);
+            let after = store.serving_record(&action_key).unwrap().unwrap();
+            assert_eq!(after.blocking, before.blocking);
+            assert_eq!(after.state_revision, before.state_revision);
+            assert!(matches!(
+                serving_gate(&mut store, &action_key, 200, 0).unwrap(),
+                ServeDecision::NotServable { .. }
+            ));
+        }
+    }
+
+    fn compromise_without_policy_is_still_blocked(
+        store: &mut dyn RabsMetadataStore,
+    ) -> Vec<String> {
+        let (active, action) = published_fixture(store);
+        let action_key = digest_key(&action);
+        let frozen = publication_lines(store);
+        let report = digest(COMPROMISE_REPORT_DOMAIN, 66);
+        let policies = vec![policy(1, false, TrustEvidenceTier::ShadowMatched)];
+        let wrong = digest("rabs.authority.sha256.v1", 2);
+        let before = store.differential_snapshot().unwrap();
+        assert_eq!(
+            report_compromise(store, &wrong, &action, &report, 10, 20, &policies, 100),
+            Err(TrustEvidenceError::Store(StoreError::NotActiveAuthority))
+        );
+        assert_eq!(
+            reevaluate_action(store, &wrong, &action, &policies, 100),
+            Err(TrustEvidenceError::Store(StoreError::NotActiveAuthority))
+        );
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+        assert_eq!(serving_gate(store, &action_key, 200, 0).unwrap(), ServeDecision::Servable);
+
+        assert_eq!(
+            report_compromise(store, &active, &action, &report, 10, 20, &[], 101),
+            Err(TrustEvidenceError::NoActivePolicy)
+        );
+        assert!(store.list_evidence_keys(&action).unwrap().contains(&digest_key(&report)));
+        assert_eq!(
+            serving_gate(store, &action_key, 200, 0).unwrap(),
+            ServeDecision::Blocked {
+                references: vec![("action-entry".to_owned(), action_key.clone())],
+            }
+        );
+        let revoked = vec![policy(1, true, TrustEvidenceTier::ShadowMatched)];
+        assert_eq!(
+            report_compromise(store, &active, &action, &report, 10, 20, &revoked, 102),
+            Err(TrustEvidenceError::NoActivePolicy)
+        );
+        assert!(matches!(
+            serving_gate(store, &action_key, 200, 0).unwrap(),
+            ServeDecision::Blocked { .. }
+        ));
+        assert_eq!(publication_lines(store), frozen);
+        store.differential_snapshot().unwrap()
+    }
+
+    #[test]
+    fn compromise_without_policy_reference() {
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        compromise_without_policy_is_still_blocked(&mut store);
+    }
+
+    #[test]
+    fn compromise_without_policy_differential() {
+        let mut reference =
+            SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("compromise-ref")).unwrap()).unwrap();
+        let mut candidate =
+            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("compromise-fsq")).unwrap()).unwrap();
+        assert_eq!(
+            compromise_without_policy_is_still_blocked(&mut reference),
+            compromise_without_policy_is_still_blocked(&mut candidate)
         );
     }
 }
