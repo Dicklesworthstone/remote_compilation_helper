@@ -14,11 +14,10 @@
 //! operation → generation → action → attempt exactly like every other
 //! runtime resource in this crate.
 //!
-//! Deliberately OUT of scope here (neighboring beads):
-//! - graceful TERM → drain → escalate → reap policy (G008) — this module
-//!   provides only the primitive `ManagedProcessGroup::signal_group`;
-//! - termination classification for publication eligibility (G009);
-//! - supervision/restart budgets (G010, `supervision.rs`).
+//! The controlled bounded wait mounts G008's TERM → drain → KILL → reap
+//! ordering. The caller owns cancellation/deadline classification; this
+//! module returns the real process status and never publishes a result.
+//! Supervision/restart budgets remain in G010 (`supervision.rs`).
 //!
 //! Safety posture: the workspace forbids `unsafe`. Group formation uses
 //! the stable `std::os::unix::process::CommandExt::process_group` (no
@@ -35,8 +34,7 @@ use crate::region_tree::Attribution;
 /// Signal delivered to a whole process group via `kill(1)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupSignal {
-    /// Graceful request (`TERM`) — escalation to [`GroupSignal::Kill`] is
-    /// G008 policy, not this primitive.
+    /// Graceful request (`TERM`).
     Term,
     /// Unconditional (`KILL`).
     Kill,
@@ -280,45 +278,79 @@ impl ManagedProcessGroup {
         self.leader.wait_with_output()
     }
 
-    /// Bounded-drain successor to [`Self::wait_with_output`] (bead G007;
-    /// risk R36). Both pipes drain concurrently into STRICT per-stream
-    /// bounds: heads stay resident (diagnostics live there), overflow
-    /// streams incrementally to spill files (`stdout.spill` /
-    /// `stderr.spill` under `limits.spill_dir`) instead of growing
-    /// memory.
-    ///
-    /// Ordering encodes the cancellation contract: lanes start first,
-    /// leader exit is observed, [`reap_residuals`] forces EOF for any
-    /// orphaned descendant still holding a pipe write end (so a cancelled
-    /// action completes deterministically instead of hanging), lanes are
-    /// joined with everything written up to the kill captured — THEN the
-    /// exit status is returned. A plain `read-to-end + wait` cannot give
-    /// that guarantee: an orphan-held pipe blocks EOF indefinitely.
-    ///
-    /// # Errors
-    /// Typed [`io::Error`] from lane drains, spill writes, or the wait.
+    /// Drain both streams with G007 resident bounds and reap the group.
+    /// Callers without cancellation retain the same output/cleanup contract.
     pub fn wait_with_bounded_drain(
         self,
         limits: &crate::stream_drain::DrainLimits,
     ) -> io::Result<crate::stream_drain::DrainedOutput> {
-        use crate::stream_drain::{join_lane, spawn_lanes};
-        let pgid = self.pgid;
-        let mut leader = self.leader;
-        let (out_lane, err_lane) = spawn_lanes(&mut leader, limits);
-        let status = leader.wait()?;
-        // Post-leader closer BEFORE joining lanes: orphaned descendants
-        // can hold pipe write ends indefinitely; killing the group forces
-        // EOF so the joins below always terminate. In the natural-exit
-        // happy path this is a single /proc probe returning 0.
-        let residual_group_members = reap_residuals(pgid);
-        let stdout =
-            out_lane.map_or_else(|| Ok(crate::stream_drain::LaneDrain::empty()), join_lane)?;
-        let stderr =
-            err_lane.map_or_else(|| Ok(crate::stream_drain::LaneDrain::empty()), join_lane)?;
+        self.wait_with_bounded_drain_controlled(limits, || false)
+    }
+
+    /// Drain stdout/stderr while observing a caller-owned stop condition.
+    ///
+    /// This is blocking process supervision and MUST run off an async reactor.
+    /// `stop_requested` is polled while the leader is alive. The first stop
+    /// sends TERM to the owned group; after 250 ms, KILL is sent regardless of
+    /// whether TERM succeeded. No timer thread keeps a raw PID after this
+    /// ownership ends. The returned status is the REAL leader status: callers
+    /// must retain their stop reason even when a TERM handler exits with zero.
+    ///
+    /// Group cleanup precedes BOTH lane joins, including wait errors. A failed
+    /// stdout archive must not cause the stderr thread to be silently detached.
+    /// The containment limit remains POSIX process-group membership; descendants
+    /// that deliberately escape require the sandbox's namespace/cgroup fence.
+    ///
+    /// # Errors
+    /// Wait, pipe-drain, or spill errors, after attempting group cleanup and
+    /// joining both output lanes. The stop predicate must not panic.
+    pub fn wait_with_bounded_drain_controlled(
+        mut self,
+        limits: &crate::stream_drain::DrainLimits,
+        mut stop_requested: impl FnMut() -> bool,
+    ) -> io::Result<crate::stream_drain::DrainedOutput> {
+        use crate::stream_drain::{LaneDrain, join_lane, spawn_lanes};
+        use std::time::{Duration, Instant};
+
+        let (out_lane, err_lane) = spawn_lanes(&mut self.leader, limits);
+        let mut stopping_at = None;
+        let mut killed = false;
+        let status = loop {
+            match self.leader.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(error) => {
+                    // Never return while the failed wait still owns live work.
+                    let _ = self.signal_group(GroupSignal::Kill);
+                    let _ = self.leader.kill();
+                    let _ = self.leader.wait();
+                    break Err(error);
+                }
+            }
+            if stopping_at.is_none() && stop_requested() {
+                stopping_at = Some(Instant::now());
+                let _ = self.signal_group(GroupSignal::Term);
+            }
+            if !killed
+                && stopping_at.is_some_and(|at: Instant| at.elapsed() >= Duration::from_millis(250))
+            {
+                if self.signal_group(GroupSignal::Kill).is_err() {
+                    // A missing/failing kill utility must not leave the leader
+                    // running. Residual cleanup below still reports descendants.
+                    let _ = self.leader.kill();
+                }
+                killed = true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let residual_group_members = reap_residuals(self.pgid);
+        // Evaluate both joins before propagating either error.
+        let stdout = out_lane.map_or_else(|| Ok(LaneDrain::empty()), join_lane);
+        let stderr = err_lane.map_or_else(|| Ok(LaneDrain::empty()), join_lane);
         Ok(crate::stream_drain::DrainedOutput {
-            status,
-            stdout,
-            stderr,
+            status: status?,
+            stdout: stdout?,
+            stderr: stderr?,
             residual_group_members,
         })
     }
@@ -533,5 +565,59 @@ mod tests {
             group.signal_group(GroupSignal::Term).is_err(),
             "signaling a dead group unexpectedly succeeded"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn controlled_wait_escalates_and_drains_both_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = ManagedProcessGroup::spawn_with(
+            &spec("sh", "trap '' TERM; printf stdout-ready; printf stderr-ready >&2; sleep 30 & wait"),
+            |cmd| {
+                cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            },
+        )
+        .unwrap();
+        let pgid = group.pgid();
+        let start = Instant::now();
+        let output = group
+            .wait_with_bounded_drain_controlled(
+                &crate::stream_drain::DrainLimits {
+                    resident_bound: 1024,
+                    spill_dir: dir.path().join("spill"),
+                },
+                || start.elapsed() >= Duration::from_millis(100),
+            )
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(output.stdout.resident(), b"stdout-ready");
+        assert_eq!(output.stderr.resident(), b"stderr-ready");
+        assert_eq!(output.residual_group_members, 0);
+        assert!(members_from_proc(pgid).is_empty());
+    }
+
+    #[test]
+    fn controlled_wait_preserves_natural_failure_and_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = ManagedProcessGroup::spawn_with(
+            &spec("sh", "printf ordinary-out; printf ordinary-error >&2; exit 7"),
+            |cmd| {
+                cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            },
+        )
+        .unwrap();
+        let output = group
+            .wait_with_bounded_drain_controlled(
+                &crate::stream_drain::DrainLimits {
+                    resident_bound: 1024,
+                    spill_dir: dir.path().join("spill"),
+                },
+                || false,
+            )
+            .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout.resident(), b"ordinary-out");
+        assert_eq!(output.stderr.resident(), b"ordinary-error");
     }
 }

@@ -3,33 +3,30 @@
 //!
 //! Stage 2 (the shadow comparison itself) lives in `rabs-replay`; this
 //! module is the coordinator-side policy that decides, per action,
-//! whether a request is SERVED from the published cache or executed
-//! PRIVATELY as fresh shadow evidence:
+//! whether a request is eligible for sampled cache serving or must
+//! execute PRIVATELY as fresh shadow evidence:
 //!
-//! - only LOW-RISK registry classes are ever sampled — an elevated
-//!   class always executes privately;
-//! - a class serves only with ENOUGH verification samples (H033 rows)
-//!   and a pass rate at or above policy (basis points; no floats);
-//! - even an eligible key serves only when its DETERMINISTIC share of
-//!   the sampling epoch is up: the bucket is derived from the action
-//!   key digest itself (`SHA-256` over the canonical key string), so
-//!   every process and every store agrees on the decision without
-//!   shared mutable state.
+//! - only LOW-RISK registry classes are ever sampled;
+//! - a published action must have an eligible serving disposition and
+//!   no durable quarantine or named blocking references;
+//! - evidence counts independent, attributable attempts of THIS action,
+//!   not repeated observations or invented worker identities;
+//! - rates are validated basis points and zero evidence always refuses,
+//!   including when the configured minimum is zero;
+//! - eligible keys are sampled deterministically from their action-key
+//!   digest, without shared mutable state.
 //!
-//! Every refusal to serve is a TYPED reason, never a silent downgrade:
-//! private execution still produces shadow evidence for the ladder.
+//! Sampling eligibility is NOT final delivery authorization: callers
+//! must still pass the clock/TTL-aware serving gate and validate the
+//! materializable closure before exposing cached output.
 //!
 //! A served result that diverges from authoritative stock is a
-//! soundness incident handled by [`quarantine_served_divergence`]:
-//! divergence incident appended (H026), scoped quarantine row added,
-//! serving disposition flipped to `"quarantined"` at one revision past
-//! the served record's revision — mirroring K007's revalidation branch,
-//! with the same crash-ordering property (quarantine row before the
-//! disposition write, so a crash leaves blocked-but-unlabeled, never
-//! serving-while-quarantined).
+//! soundness incident handled by [`quarantine_served_divergence`].
+//! Quarantine is persisted FIRST, then the incident is appended and the
+//! serving record is demoted, preserving all existing named blockers.
+//! An interrupted demotion remains blocked by the durable serving gate.
 //!
-//! State-machine refusals reuse [`RevalidationError`] verbatim: "no
-//! record" and "revision moved" mean exactly the same things here.
+//! State-machine refusals reuse [`RevalidationError`] verbatim.
 
 use sha2::{Digest, Sha256};
 
@@ -38,8 +35,10 @@ use rabs_protocol::result_identity::TypedDigest;
 use crate::metadata_store::{
     DivergenceIncidentRow, QuarantineScope, RabsMetadataStore, StoreError, digest_key,
 };
-use crate::serving_state::RevalidationError;
-use crate::trust_evidence::DISPOSITION_QUARANTINED;
+use crate::serving_state::{RevalidationError, SERVABLE_DISPOSITION, action_quarantine_present};
+use crate::trust_evidence::{
+    DISPOSITION_QUARANTINED, require_active_authority, verification_evidence,
+};
 
 /// Quarantine reason recorded for a served result that diverged from
 /// authoritative stock during sampled serving.
@@ -61,13 +60,15 @@ pub enum ActionClassRisk {
 /// disagree between processes compiling with different codegen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SamplingPolicy {
-    /// Fewer recorded verification samples than this: never serve.
+    /// Minimum independent attributable verification attempts. At least
+    /// one actual attempt is always required, even when this is zero.
     pub min_samples: u32,
-    /// Required fraction of PASSED verification samples, in basis
-    /// points (9_900 = 99%).
+    /// Required fraction of PASSED independent attempts, in basis
+    /// points (9_900 = 99%). A failed observation dominates other
+    /// observations of the same attempt.
     pub min_pass_rate_basis_points: u32,
-    /// Share of eligible keys served from cache per epoch, in basis
-    /// points (1_000 = 10% sampled serving).
+    /// Share of eligible keys served from cache, in basis points
+    /// (1_000 = 10% sampled serving).
     pub sample_rate_basis_points: u32,
 }
 
@@ -85,17 +86,27 @@ impl SamplingPolicy {
 }
 
 /// Why the gate refused to serve and demands private execution instead.
-/// Private execution is NOT a punishment: it produces the fresh shadow
-/// evidence the trust ladder consumes.
+/// Private execution produces fresh shadow evidence for the trust ladder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrivateExecutionReason {
     /// The action class is not a sampled class.
     ElevatedClassRisk,
-    /// Not enough verification samples recorded yet.
+    /// A basis-point rate was outside the supported closed interval.
+    InvalidPolicy,
+    /// No committed publication or corresponding serving record exists.
+    NoPublishedResult,
+    /// A durable action quarantine or named blocker forbids reuse.
+    Quarantined,
+    /// The mutable serving disposition does not permit reuse.
+    ServingNotEligible {
+        /// The stored disposition.
+        disposition: String,
+    },
+    /// Not enough independent verification attempts recorded yet.
     InsufficientVerificationSamples {
-        /// Samples recorded (passed + failed).
+        /// Attributable attempts recorded (passed + failed).
         observed: u32,
-        /// [`SamplingPolicy::min_samples`].
+        /// Policy minimum, with a hard lower bound of one.
         required: u32,
     },
     /// Pass rate below policy.
@@ -105,18 +116,18 @@ pub enum PrivateExecutionReason {
         /// [`SamplingPolicy::min_pass_rate_basis_points`].
         required_basis_points: u32,
     },
-    /// Eligible, but this key's deterministic epoch share says run it
-    /// privately this time.
+    /// Eligible, but this key's deterministic share says run privately.
     NotSampledThisEpoch {
         /// The key's bucket in basis points (stable per key).
         key_bucket_basis_points: u32,
     },
 }
 
-/// The gate's whole decision for one action.
+/// The sampling gate's decision for one action. A positive decision
+/// still requires the full serving/closure checks before delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SampleGateDecision {
-    /// Serve from the published cache.
+    /// Eligible for sampled serving from the published cache.
     ServeFromCache,
     /// Execute privately (typed reason), recording fresh evidence.
     ExecutePrivately(PrivateExecutionReason),
@@ -135,11 +146,12 @@ pub fn key_bucket_basis_points(action: &TypedDigest) -> u32 {
     ((window >> 16).saturating_mul(10_000)) >> 16
 }
 
-/// Decide whether ONE action request is served from cache or executed
-/// privately under `policy`. Checks run strictest-first.
+/// Decide whether ONE action is eligible for sampled cache serving or
+/// must execute privately. Checks run strictest-first; this never writes
+/// metadata or repairs a quarantine.
 ///
 /// # Errors
-/// [`StoreError`] from reading verification samples.
+/// [`StoreError`] from reading publication, serving, or evidence state.
 pub fn serving_sample_decision(
     store: &mut dyn RabsMetadataStore,
     action: &TypedDigest,
@@ -151,20 +163,49 @@ pub fn serving_sample_decision(
             PrivateExecutionReason::ElevatedClassRisk,
         ));
     }
-    let samples = store.list_verification_samples(action)?;
-    let observed = u32::try_from(samples.len()).unwrap_or(u32::MAX);
-    if observed < policy.min_samples {
+    if policy.min_pass_rate_basis_points > 10_000 || policy.sample_rate_basis_points > 10_000 {
         return Ok(SampleGateDecision::ExecutePrivately(
-            PrivateExecutionReason::InsufficientVerificationSamples {
-                observed,
-                required: policy.min_samples,
+            PrivateExecutionReason::InvalidPolicy,
+        ));
+    }
+    if !store.has_publication(action)? {
+        return Ok(SampleGateDecision::ExecutePrivately(
+            PrivateExecutionReason::NoPublishedResult,
+        ));
+    }
+    let action_key = digest_key(action);
+    let Some(record) = store.serving_record(&action_key)? else {
+        return Ok(SampleGateDecision::ExecutePrivately(
+            PrivateExecutionReason::NoPublishedResult,
+        ));
+    };
+    if !record.blocking.is_empty() || action_quarantine_present(store, &action_key)? {
+        return Ok(SampleGateDecision::ExecutePrivately(
+            PrivateExecutionReason::Quarantined,
+        ));
+    }
+    if record.disposition != SERVABLE_DISPOSITION {
+        return Ok(SampleGateDecision::ExecutePrivately(
+            PrivateExecutionReason::ServingNotEligible {
+                disposition: record.disposition,
             },
         ));
     }
-    let passed = samples.iter().filter(|sample| sample.passed).count();
-    // Integer-exact rate; `passed <= observed` keeps this within u32.
-    let pass_rate_basis_points =
-        u32::try_from(passed * 10_000 / usize::try_from(observed).unwrap_or(1)).unwrap_or(0);
+    let evidence = verification_evidence(store, action)?;
+    let observed = u32::try_from(evidence.attempts).unwrap_or(u32::MAX);
+    let required = policy.min_samples.max(1);
+    if observed < required {
+        return Ok(SampleGateDecision::ExecutePrivately(
+            PrivateExecutionReason::InsufficientVerificationSamples { observed, required },
+        ));
+    }
+    // The minimum above guarantees a nonzero denominator. Widen BEFORE
+    // multiplication, and divide by the full count rather than the
+    // u32-saturated diagnostic count. The quotient is always <= 10_000.
+    let pass_rate_basis_points = u32::try_from(
+        u128::from(evidence.passed_attempts) * 10_000 / u128::from(evidence.attempts),
+    )
+    .unwrap_or(0);
     if pass_rate_basis_points < policy.min_pass_rate_basis_points {
         return Ok(SampleGateDecision::ExecutePrivately(
             PrivateExecutionReason::VerificationRateBelowPolicy {
@@ -185,19 +226,18 @@ pub fn serving_sample_decision(
 }
 
 /// Instant-quarantine reaction to a SERVED result diverging from
-/// authoritative stock: divergence incident appended (class
-/// `"serving-sample-divergence"`), action-entry quarantine row added,
-/// serving disposition flipped to quarantined at
-/// `expected_revision + 1` with the blocking reference NAMED. Returns
-/// the new serving revision.
+/// authoritative stock. Persists an action-entry quarantine FIRST,
+/// appends a `"serving-sample-divergence"` incident, and demotes serving
+/// at `expected_revision + 1` while preserving earlier blocking refs.
+/// Returns the new serving revision.
 ///
-/// The sequence of the appended incident is the store's existing
-/// append-only count for the key, so repeated incidents never collide.
+/// Incident numbering advances past the highest EXISTING sequence,
+/// not the row count: other incident producers may leave sparse values.
 ///
 /// # Errors
-/// [`RevalidationError`] — nothing to revalidate, or the stored
-/// revision moved past `expected_revision` (another authority acted;
-/// retry against fresh state, never clobber).
+/// [`RevalidationError`] for missing/stale records, exhausted sequences,
+/// or store errors. An admitted divergence stays quarantined even if a
+/// later append or disposition update fails.
 pub fn quarantine_served_divergence(
     store: &mut dyn RabsMetadataStore,
     authority: &TypedDigest,
@@ -216,14 +256,33 @@ pub fn quarantine_served_divergence(
             stored: record.state_revision,
         });
     }
-    let new_revision = expected_revision + 1;
-    let seq = u64::try_from(
+    require_active_authority(store, authority)
+        .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
+    let new_revision = expected_revision
+        .checked_add(1)
+        .ok_or(RevalidationError::RevisionExhausted)?;
+    if !action_quarantine_present(store, action_key_str)
+        .map_err(|e| RevalidationError::Store(format!("{e:?}")))?
+    {
         store
-            .list_divergence_incidents(action_key_str)
-            .map_err(|e| RevalidationError::Store(format!("{e:?}")))?
-            .len(),
-    )
-    .unwrap_or(u64::MAX);
+            .add_quarantine(
+                QuarantineScope::ActionEntry,
+                action_key_str,
+                SERVING_SAMPLE_QUARANTINE_REASON,
+            )
+            .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
+    }
+    let incidents = store
+        .list_divergence_incidents(action_key_str)
+        .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
+    let seq = incidents
+        .iter()
+        .map(|incident| incident.seq)
+        .max()
+        .map_or(Some(0), |seq| seq.checked_add(1))
+        .ok_or_else(|| {
+            RevalidationError::Store("divergence incident sequence exhausted".to_owned())
+        })?;
     store
         .record_divergence_incident(
             authority,
@@ -241,13 +300,26 @@ pub fn quarantine_served_divergence(
             },
         )
         .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
-    store
-        .add_quarantine(
-            QuarantineScope::ActionEntry,
-            action_key_str,
-            SERVING_SAMPLE_QUARANTINE_REASON,
-        )
-        .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
+
+    let mut blocking = Vec::new();
+    for (scope, subject) in &record.blocking {
+        let scope = match scope.as_str() {
+            "location" => QuarantineScope::Location,
+            "logical-object" => QuarantineScope::LogicalObject,
+            "action-entry" => QuarantineScope::ActionEntry,
+            _ => {
+                return Err(RevalidationError::Store(format!(
+                    "unknown blocking quarantine scope: {scope}"
+                )));
+            }
+        };
+        blocking.push((scope, subject.clone()));
+    }
+    if !blocking.iter().any(|(scope, subject)| {
+        scope == &QuarantineScope::ActionEntry && subject == action_key_str
+    }) {
+        blocking.push((QuarantineScope::ActionEntry, action_key_str.to_owned()));
+    }
     store
         .put_serving_record(
             authority,
@@ -255,7 +327,7 @@ pub fn quarantine_served_divergence(
             DISPOSITION_QUARANTINED,
             new_revision,
             &record.validity,
-            &[(QuarantineScope::ActionEntry, action_key_str.to_owned())],
+            &blocking,
         )
         .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
     Ok(new_revision)
@@ -268,7 +340,7 @@ mod tests {
         ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationRow, ResultKindTag,
         RusqliteEngine, SqlMetadataStore,
     };
-    use crate::serving_state::{SERVABLE_DISPOSITION, ServeDecision, serving_gate};
+    use crate::serving_state::{ServeDecision, serving_gate};
     use rabs_protocol::result_identity::DigestAlgorithm;
     use rabs_protocol::serving::ServingValidity;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -340,18 +412,23 @@ mod tests {
         digest_key(&entry.action_key)
     }
 
-    /// Record `passes` passed then `fails` failed verification samples.
-    fn samples(store: &mut dyn RabsMetadataStore, tag: u8, passes: u32, fails: u32) {
-        let mut seq = 1_u64;
-        for _ in 0..passes {
+    /// Append independent attempts, never overwrite earlier failed
+    /// samples to manufacture a healthy pass rate.
+    fn samples(
+        store: &mut dyn RabsMetadataStore,
+        tag: u8,
+        generation: u128,
+        passes: u32,
+        fails: u32,
+    ) {
+        let mut seq = store.list_verification_samples(&action(tag)).unwrap().len() as u64 + 1;
+        for passed in std::iter::repeat_n(true, passes as usize)
+            .chain(std::iter::repeat_n(false, fails as usize))
+        {
+            let attempt = generation * 1_000 + u128::from(seq);
+            store.record_attempt(attempt, generation, "worker-sampler", seq).unwrap();
             store
-                .record_verification_sample(&action(tag), u128::from(seq), true, seq)
-                .unwrap();
-            seq += 1;
-        }
-        for _ in 0..fails {
-            store
-                .record_verification_sample(&action(tag), u128::from(seq), false, seq)
+                .record_verification_sample(&action(tag), attempt, passed, seq)
                 .unwrap();
             seq += 1;
         }
@@ -360,6 +437,7 @@ mod tests {
     /// All decision scenarios on one backend; returns the final
     /// snapshot for differential comparison.
     fn k008_scenarios(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+        let active = digest("rabs.authority.sha256.v1", 1);
         let strict = SamplingPolicy {
             min_samples: 4,
             min_pass_rate_basis_points: 9_900,
@@ -377,8 +455,39 @@ mod tests {
             .unwrap(),
             SampleGateDecision::ExecutePrivately(PrivateExecutionReason::ElevatedClassRisk)
         );
-
+        assert_eq!(
+            serving_sample_decision(store, &action(99), ActionClassRisk::LowRiskRegistry, &strict)
+                .unwrap(),
+            SampleGateDecision::ExecutePrivately(PrivateExecutionReason::NoPublishedResult)
+        );
         let key_one = published(store, 1, 10);
+
+        // Zero minimum with no evidence used to divide by zero.
+        assert_eq!(
+            serving_sample_decision(
+                store,
+                &action(1),
+                ActionClassRisk::LowRiskRegistry,
+                &SamplingPolicy::sample_all(0, 0),
+            )
+            .unwrap(),
+            SampleGateDecision::ExecutePrivately(
+                PrivateExecutionReason::InsufficientVerificationSamples {
+                    observed: 0,
+                    required: 1,
+                }
+            )
+        );
+        for invalid in [
+            SamplingPolicy { min_pass_rate_basis_points: 10_001, ..strict },
+            SamplingPolicy { sample_rate_basis_points: 10_001, ..strict },
+        ] {
+            assert_eq!(
+                serving_sample_decision(store, &action(1), ActionClassRisk::LowRiskRegistry, &invalid)
+                    .unwrap(),
+                SampleGateDecision::ExecutePrivately(PrivateExecutionReason::InvalidPolicy)
+            );
+        }
 
         // Insufficient samples refuse with counts.
         assert_eq!(
@@ -392,8 +501,7 @@ mod tests {
             )
         );
 
-        // A weak pass rate refuses with the measured rate.
-        samples(store, 1, 3, 1); // now 75% < 99%
+        samples(store, 1, 10, 3, 1);
         assert_eq!(
             serving_sample_decision(store, &action(1), ActionClassRisk::LowRiskRegistry, &strict)
                 .unwrap(),
@@ -404,18 +512,21 @@ mod tests {
                 }
             )
         );
-        samples(store, 1, 5, 0); // now 100%
+        samples(store, 1, 10, 5, 0);
         assert_eq!(
             serving_sample_decision(store, &action(1), ActionClassRisk::LowRiskRegistry, &strict)
                 .unwrap(),
-            SampleGateDecision::ServeFromCache
+            SampleGateDecision::ExecutePrivately(
+                PrivateExecutionReason::VerificationRateBelowPolicy {
+                    observed_basis_points: 8_888,
+                    required_basis_points: 9_900,
+                }
+            )
         );
 
-        // The zero-rate switch sends every eligible key to private
-        // execution with its stable bucket named; the full-rate switch
-        // never does.
-        let _key_two = published(store, 2, 11);
-        samples(store, 2, 4, 0);
+        // A healthy independent evidence set can still serve.
+        let key_two = published(store, 2, 11);
+        samples(store, 2, 11, 4, 0);
         let none = SamplingPolicy {
             sample_rate_basis_points: 0,
             ..strict
@@ -441,18 +552,53 @@ mod tests {
             .unwrap(),
             SampleGateDecision::ServeFromCache
         );
-
-        // Buckets are pure functions of the key: stable across calls
-        // and independent of store contents.
         assert_eq!(
             key_bucket_basis_points(&action(2)),
             key_bucket_basis_points(&action(2))
         );
 
-        // ---- Instant divergence quarantine ----
+        // Repeated observations and unknown attempts do not satisfy a
+        // stronger independent-execution requirement.
+        store.record_verification_sample(&action(2), 11_001, true, 500).unwrap();
+        store.record_verification_sample(&action(2), 99_999, true, 501).unwrap();
+        assert_eq!(
+            serving_sample_decision(
+                store,
+                &action(2),
+                ActionClassRisk::LowRiskRegistry,
+                &SamplingPolicy::sample_all(5, 9_900),
+            )
+            .unwrap(),
+            SampleGateDecision::ExecutePrivately(
+                PrivateExecutionReason::InsufficientVerificationSamples {
+                    observed: 4,
+                    required: 5,
+                }
+            )
+        );
+
+        store.set_serving_disposition_key(&key_two, "evidence-pending").unwrap();
+        assert_eq!(
+            serving_sample_decision(store, &action(2), ActionClassRisk::LowRiskRegistry, &strict)
+                .unwrap(),
+            SampleGateDecision::ExecutePrivately(PrivateExecutionReason::ServingNotEligible {
+                disposition: "evidence-pending".to_owned(),
+            })
+        );
+        store.set_serving_disposition_key(&key_two, SERVABLE_DISPOSITION).unwrap();
+        store.add_quarantine(QuarantineScope::ActionEntry, &key_two, "corrupt closure").unwrap();
+        assert!(store.serving_record(&key_two).unwrap().unwrap().blocking.is_empty());
+        assert_eq!(
+            serving_sample_decision(store, &action(2), ActionClassRisk::LowRiskRegistry, &strict)
+                .unwrap(),
+            SampleGateDecision::ExecutePrivately(PrivateExecutionReason::Quarantined)
+        );
+
+        // ---- Instant divergence quarantine, preserving prior blockers ----
+        store.add_quarantine(QuarantineScope::LogicalObject, "object:damaged", "bad bytes").unwrap();
         store
             .put_serving_record(
-                &digest("rabs.authority.sha256.v1", 1),
+                &active,
                 &key_one,
                 SERVABLE_DISPOSITION,
                 7,
@@ -462,45 +608,64 @@ mod tests {
                     clock_uncertainty_micros: 0,
                     coordinator_clock_epoch: 1,
                 },
-                &[],
+                &[(QuarantineScope::LogicalObject, "object:damaged".to_owned())],
             )
             .unwrap();
-
-        // Wrong expected revision refuses without writing anything.
         assert_eq!(
-            quarantine_served_divergence(
-                store,
-                &digest("rabs.authority.sha256.v1", 1),
-                &key_one,
-                6,
-                11,
-                22,
-                "stdout digest mismatch",
-            ),
+            serving_sample_decision(store, &action(1), ActionClassRisk::LowRiskRegistry, &strict)
+                .unwrap(),
+            SampleGateDecision::ExecutePrivately(PrivateExecutionReason::Quarantined)
+        );
+        let before = store.differential_snapshot().unwrap();
+        assert_eq!(
+            quarantine_served_divergence(store, &active, &key_one, 6, 11, 22, "mismatch"),
             Err(RevalidationError::StaleRevision { stored: 7 })
         );
+        let wrong = digest("rabs.authority.sha256.v1", 2);
+        assert_eq!(
+            quarantine_served_divergence(store, &wrong, &key_one, 7, 11, 22, "mismatch"),
+            Err(RevalidationError::Store(format!("{:?}", StoreError::NotActiveAuthority)))
+        );
+        assert_eq!(store.differential_snapshot().unwrap(), before);
 
+        // Sparse existing incident sequences must not collide with the
+        // sample gate's next incident or be mistaken for a row count.
+        store
+            .record_divergence_incident(
+                &active,
+                &DivergenceIncidentRow {
+                    action_key: key_one.clone(),
+                    seq: 40,
+                    class: "prior-incident".to_owned(),
+                    committed_manifest_key: String::new(),
+                    candidate_manifest_key: String::new(),
+                    candidate_evidence_key: String::new(),
+                    candidate_pin_hex: String::new(),
+                    generation_hex: "a".to_owned(),
+                    attempt_hex: "14".to_owned(),
+                    detail: "preexisting sparse sequence".to_owned(),
+                },
+            )
+            .unwrap();
         let new_revision = quarantine_served_divergence(
-            store,
-            &digest("rabs.authority.sha256.v1", 1),
-            &key_one,
-            7,
-            11,
-            22,
-            "stdout digest mismatch",
+            store, &active, &key_one, 7, 11, 22, "stdout digest mismatch",
         )
         .unwrap();
         assert_eq!(new_revision, 8);
-
         let incidents = store.list_divergence_incidents(&key_one).unwrap();
-        assert_eq!(incidents.len(), 1);
-        assert_eq!(incidents[0].class, "serving-sample-divergence");
-        assert_eq!(incidents[0].detail, "stdout digest mismatch");
+        assert_eq!(incidents.len(), 2);
+        assert_eq!(incidents[0].seq, 40);
+        assert_eq!(incidents[1].seq, 41);
+        assert_eq!(incidents[1].class, "serving-sample-divergence");
+        assert_eq!(incidents[1].detail, "stdout digest mismatch");
         let record = store.serving_record(&key_one).unwrap().unwrap();
         assert_eq!(record.disposition, DISPOSITION_QUARANTINED);
         assert_eq!(
             record.blocking,
-            vec![("action-entry".to_owned(), key_one.clone())]
+            vec![
+                ("action-entry".to_owned(), key_one.clone()),
+                ("logical-object".to_owned(), "object:damaged".to_owned()),
+            ]
         );
         assert_eq!(
             serving_gate(store, &key_one, 2_000, 1).unwrap(),
@@ -508,34 +673,21 @@ mod tests {
                 disposition: DISPOSITION_QUARANTINED.to_owned(),
             }
         );
-
-        // Re-quarantining against the moved revision is a typed
-        // stale-revision refusal; an unknown key is a typed no-record.
         assert_eq!(
-            quarantine_served_divergence(
-                store,
-                &digest("rabs.authority.sha256.v1", 1),
-                &key_one,
-                7,
-                11,
-                23,
-                "again",
-            ),
+            quarantine_served_divergence(store, &active, &key_one, 7, 11, 23, "again"),
             Err(RevalidationError::StaleRevision { stored: 8 })
         );
         assert_eq!(
-            quarantine_served_divergence(
-                store,
-                &digest("rabs.authority.sha256.v1", 1),
-                "missing:key",
-                1,
-                1,
-                1,
-                "x",
-            ),
+            quarantine_served_divergence(store, &active, &key_one, 8, 11, 23, "next"),
+            Ok(9)
+        );
+        let incidents = store.list_divergence_incidents(&key_one).unwrap();
+        assert_eq!(incidents.iter().map(|incident| incident.seq).collect::<Vec<_>>(), vec![40, 41, 42]);
+        assert_eq!(store.serving_record(&key_one).unwrap().unwrap().blocking, record.blocking);
+        assert_eq!(
+            quarantine_served_divergence(store, &active, "missing:key", 1, 1, 1, "x"),
             Err(RevalidationError::NoServingRecord)
         );
-
         store.differential_snapshot().unwrap()
     }
 

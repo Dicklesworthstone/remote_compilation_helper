@@ -694,6 +694,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn identical_roots_resolve_parent_components_within_boundary() {
+        let fixture = TestFixture::new("identical-roots", false, None);
+        let package = fixture.canonical_root.join("repo/crates/a");
+        let dependency = fixture.canonical_root.join("dep");
+        fs::create_dir_all(&package).expect("create package");
+        fs::create_dir_all(&dependency).expect("create dependency");
+        let policy = PathTopologyPolicy::new(
+            fixture.canonical_root.clone(),
+            fixture.canonical_root.clone(),
+        );
+        let normalized = normalize_project_path_with_policy(&package.join("../../../dep"), &policy)
+            .expect("resolve sibling dependency inside canonical root");
+        assert_eq!(normalized.canonical_path(), dependency);
+        assert!(!normalized.used_alias_prefix());
+
+        let outside = fixture.root.join("data/outside");
+        fs::create_dir_all(&outside).expect("create outside directory");
+        let error =
+            normalize_project_path_with_policy(&package.join("../../../../outside"), &policy)
+                .expect_err("actual root escape must remain rejected");
+        assert_eq!(
+            error.kind(),
+            &PathNormalizationErrorKind::OutsideCanonicalRoot
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_roots_reject_symlink_escape() {
+        let fixture = TestFixture::new("identical-roots-symlink", false, None);
+        let outside = fixture.root.join("outside");
+        fs::create_dir_all(&outside).expect("create outside directory");
+        let link = fixture.canonical_root.join("dep");
+        symlink(&outside, &link).expect("create escaping symlink");
+        let policy = PathTopologyPolicy::new(
+            fixture.canonical_root.clone(),
+            fixture.canonical_root.clone(),
+        );
+        let error = normalize_project_path_with_policy(&link, &policy)
+            .expect_err("symlink must not escape equal-root policy");
+        assert_eq!(
+            error.kind(),
+            &PathNormalizationErrorKind::OutsideCanonicalRoot
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn normalize_alias_path_to_same_canonical_identity() {
