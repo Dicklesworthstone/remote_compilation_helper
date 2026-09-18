@@ -1313,6 +1313,18 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
         );
     }
 
+    /// How long a test may wait to ACQUIRE a source-authority lock.
+    ///
+    /// Generous on purpose. What these tests assert is serialization —
+    /// "the second claimant does not get in while the first holds it", checked
+    /// with a short NEGATIVE wait — and that property does not get weaker as
+    /// this budget grows. A tight budget only adds a second, unintended
+    /// assertion: "and the machine was not busy". Under a 3000-test parallel
+    /// run on a loaded worker that one fails, and a suite that fails only under
+    /// load is a suite people learn to ignore (bd-es64k).
+    #[cfg(target_os = "linux")]
+    const TEST_LOCK_ACQUIRE_BUDGET: Duration = Duration::from_secs(60);
+
     #[cfg(target_os = "linux")]
     async fn claim_test_source_pair(
         lock: &Path,
@@ -1334,7 +1346,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             WorkerId::new("local-pair-test"),
             &ready,
             bootstrap.as_deref(),
-            Duration::from_secs(5),
+            TEST_LOCK_ACQUIRE_BUDGET,
         )
         .await?;
         guard.release_request = Some(release);
@@ -1365,7 +1377,9 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
         // Retire rather than delete so the test preserves its evidence.
         std::fs::rename(&root, dir.join("first-retired")).unwrap();
         first.release().await.unwrap();
-        let second = timeout(Duration::from_secs(5), second)
+        // The serialization assertion is the 100ms negative wait above; this
+        // one only says the release eventually lets the waiter through.
+        let second = timeout(TEST_LOCK_ACQUIRE_BUDGET, second)
             .await
             .unwrap()
             .unwrap()
@@ -1592,7 +1606,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             WorkerId::new("windows-reader"),
             marker,
             bootstrap.as_deref(),
-            Duration::from_secs(3),
+            TEST_LOCK_ACQUIRE_BUDGET,
         )
         .await
         .unwrap();
@@ -1604,7 +1618,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             WorkerId::new("posix-reader"),
             marker,
             bootstrap.as_deref(),
-            Duration::from_secs(3),
+            TEST_LOCK_ACQUIRE_BUDGET,
         ));
         assert!(
             timeout(Duration::from_millis(100), &mut competing)
@@ -1625,7 +1639,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             WorkerId::new("windows-after-drop"),
             marker,
             bootstrap.as_deref(),
-            Duration::from_secs(3),
+            TEST_LOCK_ACQUIRE_BUDGET,
         )
         .await
         .unwrap();
