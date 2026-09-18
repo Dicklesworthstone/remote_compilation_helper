@@ -624,4 +624,135 @@ mod tests {
             SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("fsq37")).unwrap()).unwrap();
         assert_eq!(scenario(&mut reference), scenario(&mut candidate));
     }
+
+    /// T039: the R113 x R108 crossing that neither H037 nor F031 asked
+    /// about. The generation fence is a monotone WATERMARK, not a
+    /// tombstone set, which is what lets it refuse ids that were never
+    /// minted (F031's wraparound case; pinned in
+    /// `tests/t039_generation_aba_scenarios.rs`). But the watermark is
+    /// itself a row, and `roll_back` shows it is exactly the kind of row
+    /// a rollback loses.
+    ///
+    /// So: lose ONLY the watermark, leave everything else intact, take
+    /// the operator reset that H037 says restores serving, and ask what
+    /// the fence still guarantees afterwards.
+    #[test]
+    fn t039_generation_fence_after_the_watermark_is_lost_and_a_reset_consumed() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        healthy(&mut store);
+        let auth = digest("rabs.authority.sha256.v1", 1);
+        let action = digest("rabs.action-key.sha256.v1", 7);
+
+        // Lose the watermark alone. Pins, serving state, evidence and the
+        // authority history all survive, so this gap is the ONLY reason
+        // serving refuses — the scenario is about the fence, not a torn
+        // publication.
+        store
+            .engine_mut()
+            .execute("DELETE FROM generation_high_water", &[])
+            .unwrap();
+        assert_eq!(
+            reconcile_startup(&mut store, &full_filesystem())
+                .unwrap()
+                .serving,
+            ServingDecision::Refused(vec![IncompleteState::GenerationHighWaterMissing]),
+            "a lost watermark must refuse serving before any reset"
+        );
+
+        // The operator reset restores serving (H037).
+        let outcome = apply_operator_reset(&mut store, 1, 500).unwrap();
+        assert!(outcome.quarantined_actions.is_empty());
+        assert_eq!(
+            reconcile_startup(&mut store, &full_filesystem())
+                .unwrap()
+                .serving,
+            ServingDecision::Allowed
+        );
+
+        // What the surviving `action_generations` rows still guarantee:
+        // an id that WAS minted cannot be minted again. The primary key
+        // carries this even with the watermark gone.
+        assert!(
+            store.create_generation(&auth, 11, &action).is_err(),
+            "an id that was actually minted must stay burned even without the watermark"
+        );
+
+        // A DOCUMENTED DIVERGENCE, not a wish. With the watermark
+        // present, an id below it that was never minted is refused
+        // (`t039_the_watermark_burns_ids_that_were_never_minted_at_all`).
+        // With the watermark gone, `generation_high_water` reads 0 — it
+        // is NOT recomputed from the surviving `action_generations` rows
+        // — so the same id is accepted. The fence has silently degraded
+        // from "monotone watermark" to "primary-key uniqueness", which
+        // is precisely the weaker set-membership semantics F031 replaced.
+        //
+        // The reset does not cause this and cannot repair it: the
+        // watermark is simply gone. Recomputing it from MAX(id) over the
+        // surviving rows at reset (or at open) would restore the
+        // guarantee for every id the store still remembers.
+        assert_eq!(
+            store.create_generation(&auth, 7, &action),
+            Ok(()),
+            "documented: a lost watermark downgrades the fence to primary-key \
+             uniqueness, so an id below it that was never minted is admitted"
+        );
+    }
+
+    /// T039, the sharper half, and A DOCUMENTED DEFECT rather than a
+    /// property. R113 says loss of generation-fence metadata must refuse
+    /// serving until an explicit reset and must NEVER be treated as an
+    /// ordinary cold cache. The check that enforces this is guarded by
+    /// `generations > 0`, so it fires only for PARTIAL loss — rows
+    /// survive, watermark gone. TOTAL loss makes the count zero and the
+    /// guard skips the check entirely.
+    ///
+    /// The consequence is not subtle: serving is allowed with no reset
+    /// and no operator involvement, and the generation id space is
+    /// completely free again, including the exact id the surviving
+    /// publication still names as its winner. That is the full ABA
+    /// window (R108) opened by a loss that R113 was written to catch.
+    ///
+    /// The store is not short of signal here — the publication's
+    /// `winner_generation` names a generation it can no longer account
+    /// for. The check simply does not look. Filed with the proposed fix;
+    /// asserting the current behaviour keeps the suite honest and green
+    /// instead of leaving a red test for the next agent to inherit.
+    #[test]
+    fn t039_total_generation_state_loss_is_not_detected_at_all() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        healthy(&mut store);
+        let auth = digest("rabs.authority.sha256.v1", 1);
+        let action = digest("rabs.action-key.sha256.v1", 7);
+
+        // Lose the whole generation lineage — rows and watermark — while
+        // the authority history and the publication survive.
+        for sql in [
+            "DELETE FROM action_generations",
+            "DELETE FROM generation_high_water",
+        ] {
+            store.engine_mut().execute(sql, &[]).unwrap();
+        }
+        assert_eq!(store.generation_count().unwrap(), 0);
+        assert!(!store.list_publications().unwrap().is_empty());
+
+        // PARTIAL loss refuses (the test above). TOTAL loss does not.
+        assert_eq!(
+            reconcile_startup(&mut store, &full_filesystem())
+                .unwrap()
+                .serving,
+            ServingDecision::Allowed,
+            "documented defect: total generation-state loss presents as an ordinary \
+             cold cache — no refusal, no reset required (R113)"
+        );
+        assert_eq!(store.highest_operator_reset().unwrap(), None);
+
+        // And the window is fully open: the id the surviving publication
+        // names as its own winner can be minted again.
+        assert_eq!(
+            store.create_generation(&auth, 11, &action),
+            Ok(()),
+            "documented defect: the winning generation id of a still-published \
+             action is re-mintable after total generation-state loss (R108)"
+        );
+    }
 }
