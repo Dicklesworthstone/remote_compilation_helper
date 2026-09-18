@@ -2101,6 +2101,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         }
     }
 
@@ -2475,6 +2476,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let state = WorkerState::new(config);
@@ -3472,6 +3474,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         });
         pool.add_worker_state(active).await;
 
@@ -3485,6 +3488,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         });
         user_drained_empty.drain().await;
         pool.add_worker_state(user_drained_empty).await;
@@ -3499,6 +3503,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         });
         removed_empty.drain_for_removal().await;
         pool.add_worker_state(removed_empty).await;
@@ -3518,6 +3523,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         });
         assert!(removed_busy.reserve_slots(1).await);
         removed_busy.drain_for_removal().await;

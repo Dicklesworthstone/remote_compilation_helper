@@ -28,6 +28,7 @@ mod tests {
             total_slots: 1,
             priority: 1,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let _client = SshClient::new(config, options);

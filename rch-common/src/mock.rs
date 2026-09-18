@@ -942,6 +942,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let mut client = MockSshClient::new_default(worker_config);
@@ -964,6 +965,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let mut client = MockSshClient::new(
@@ -992,6 +994,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let mut client = MockSshClient::new(worker_config, MockConfig::connection_failure());
@@ -1060,6 +1063,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let mut client = MockSshClient::new(worker_config, MockConfig::no_rustup());
@@ -1081,6 +1085,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let mut client = MockSshClient::new(worker_config, MockConfig::toolchain_install_failure());
@@ -1113,6 +1118,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let mut client = MockSshClient::new(worker_config, MockConfig::toolchain_install_failure());
@@ -1142,6 +1148,7 @@ mod tests {
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         assert!(is_mock_worker(&mock_worker));
 
@@ -1153,6 +1160,7 @@ mod tests {
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         assert!(!is_mock_worker(&real_worker));
     }
@@ -1379,6 +1387,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let client = MockSshClient::new_default(worker_config);
@@ -1400,6 +1409,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let mut client = MockSshClient::new(
@@ -1434,6 +1444,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let mut client = MockSshClient::new_default(worker_config);
@@ -1453,6 +1464,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let mut client = MockSshClient::new(
@@ -1475,6 +1487,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let client = MockSshClient::new_default(worker_config);
@@ -1491,6 +1504,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let client = MockSshClient::new_default(worker_config);

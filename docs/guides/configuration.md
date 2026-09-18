@@ -200,6 +200,7 @@ Each worker entry:
 - `total_slots` (u32, default `8`) — CPU slots available.
 - `priority` (u32, default `100`) — Higher = preferred.
 - `tags` (list, default `[]`) — Optional selection tags.
+- `tools` (list, default `[]`) — Verified named tool probes; see below.
 - `enabled` (bool, default `true`) — Skip worker if false.
 
 Example:
@@ -214,7 +215,51 @@ total_slots = 16
 priority = 100
 tags = ["ssd", "fast"]
 enabled = true
+tools = [
+  { name = "clang",  command = ["clang", "--version"] },
+  { name = "ld.lld", command = ["/usr/bin/ld.lld", "--version"] },
+]
 ```
+
+### `tools` — verified named tool probes
+
+Each entry declares a **fixed argv** that the worker runs as its configured
+user. The probe is judged by **exit status alone** — zero means present,
+anything else (missing binary, error exit, signal) means absent — and its
+output is discarded so a chatty tool cannot corrupt the fact stream.
+
+- `name` (string, required) — ASCII letters, digits, `-`, `_`, `.` or `+`.
+  Anything else (a space, an `=`, a control character) is **refused when the
+  config loads**: such a name could not survive the probe's `RCH_FACT
+  tool=<name>` format and would be read back as a different name, which is a
+  silent capability lie rather than a loud config error.
+- `command` (list of strings, required, non-empty) — the exact argv. It is
+  never caller-supplied; RCH exposes no general remote-shell probe API,
+  because a caller that could ask a worker to run an arbitrary command "to
+  check for a tool" would be a remote execution primitive wearing a
+  capability-probe hat.
+
+Results appear in `rch workers capabilities --refresh` under **Named tools**,
+split into `verified:` and `failed:`. The split matters: a worker that
+declared a tool whose probe fails is broken, while a name nothing declared is
+usually a typo or a fleet that was never configured for it.
+
+Declaring no `tools` sends the worker the byte-identical capability command it
+has always received, so adding probes to one worker cannot disturb the rest of
+a fleet — including workers still running an older `rch-wkr`.
+
+Jobs require them with `rch exec --job --require-tool NAME`, or per project:
+
+```toml
+# .rch/config.toml or ~/.config/rch/config.toml
+[jobs]
+required_tools = ["clang"]
+```
+
+Project defaults add to `--require-tool` rather than replacing it, and both
+apply to **job mode only**. A required tool no worker has verified admits no
+worker at all; selection reports
+`capability_missing:tool:<name>:probe_failed` or `...:not_declared`.
 
 ## Daemon Config (`daemon.toml`)
 

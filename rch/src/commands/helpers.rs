@@ -702,6 +702,7 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
             total_slots,
             priority,
             tags,
+            tools: Vec::new(),
         });
     }
 

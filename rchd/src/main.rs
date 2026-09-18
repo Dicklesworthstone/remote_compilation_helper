@@ -495,6 +495,21 @@ mod launchd {
         }
     }
 
+    /// Attached to an error when the service-manager binary could not be
+    /// EXECUTED, as distinct from executing and reporting something unhelpful.
+    ///
+    /// The distinction is load-bearing. "launchctl answered, but not usefully"
+    /// leaves the per-domain probes below worth running. "launchctl could not
+    /// be run" does not: every probe would invoke the same unusable program, so
+    /// any verdict built on their answers is unsound — and the verdict this
+    /// produced was the confident, wrong "registered in multiple launchd
+    /// domains" refusal, which sends an operator looking for a duplicate
+    /// registration when the real fault was that the binary would not exec
+    /// (bd-bd0k6).
+    #[derive(Debug, thiserror::Error)]
+    #[error("service-manager binary could not be executed")]
+    pub(super) struct ManagerUnusable;
+
     /// One deadline covers all probes and the start request. Read both pipes
     /// concurrently with bounded buffers and retain ownership of the child on
     /// every timeout/error path.
@@ -514,6 +529,7 @@ mod launchd {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
+            .map_err(|error| anyhow::Error::new(error).context(ManagerUnusable))
             .context("spawn service-manager command")?;
         let stdout = child.stdout.take().context("missing manager stdout")?;
         let stderr = child.stderr.take().context("missing manager stderr")?;
@@ -594,6 +610,20 @@ mod launchd {
             "launchd resolve {}: uid={uid} self_pid={self_pid} custom_socket={custom_socket} listed={listed:?} list_error={list_error:?}",
             program.display()
         );
+        // A listing that failed because the manager could not be EXECUTED ends
+        // the resolution here. Continuing would probe each domain with the same
+        // unusable program and then turn whatever those probes happened to
+        // answer into a verdict — which is how a transient exec failure became
+        // a confident "registered in multiple launchd domains" refusal, hiding
+        // the real fault behind a diagnosis that sent operators looking for a
+        // duplicate registration that did not exist (bd-bd0k6).
+        if let Some(error) = &list_error
+            && error.chain().any(|cause| cause.is::<ManagerUnusable>())
+        {
+            return Err(list_error.expect("checked Some above").context(
+                "cannot resolve launchd ownership: the service manager could not be executed",
+            ));
+        }
         if listed == Some(Some(self_pid)) {
             return Ok(Ownership::Managed);
         }
@@ -643,10 +673,17 @@ mod launchd {
             [] => return list_error.map_or(Ok(Ownership::Standalone), Err),
             [target] => target,
             _ => {
-                let initial = list_error.as_ref().map(ToString::to_string).unwrap_or_default();
+                let initial = list_error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
                 anyhow::bail!(
                     "RCH is registered in multiple launchd domains; refusing ambiguous startup (initial listing: {initial_listing})",
-                    initial_listing = if initial.is_empty() { "succeeded".to_string() } else { initial }
+                    initial_listing = if initial.is_empty() {
+                        "succeeded".to_string()
+                    } else {
+                        initial
+                    }
                 )
             }
         };
@@ -2108,6 +2145,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec!["rust".to_string()],
+            tools: Vec::new(),
         };
         pool.add_worker(worker_config).await;
 
@@ -2252,6 +2290,7 @@ mod tests {
             total_slots: 4,
             priority: 50,
             tags: vec![],
+            tools: Vec::new(),
         };
         context.pool.add_worker(worker_config).await;
 
@@ -2317,6 +2356,7 @@ mod tests {
                 total_slots: (i * 4) as u32,
                 priority: 100 - i as u32,
                 tags: vec![format!("tag-{}", i)],
+                tools: Vec::new(),
             };
             pool.add_worker(worker_config).await;
         }
@@ -2460,20 +2500,54 @@ mod launchd_singleton_tests {
 
     // Scripted protocol fixtures exercise error/ordering contracts. These are
     // not evidence of live launchd integration; native validation is separate.
-    fn manager_fixture(body: &str) -> (PathBuf, PathBuf) {
+    /// The ONE executable every launchd fixture runs, created once per process.
+    ///
+    /// Writing a fresh executable per fixture and immediately exec'ing it is
+    /// racy in a multithreaded test binary: `fs::write` holds a write fd for an
+    /// instant, any concurrent `Command::spawn` forks a child that inherits it,
+    /// and an exec of that file while the forked child still holds the fd fails
+    /// with ETXTBSY ("Text file busy"). That is exactly the suite-only failure
+    /// bd-bd0k6 chased — invisible when the test runs alone or serially,
+    /// reproducible only against ~1500 concurrently spawning tests.
+    ///
+    /// So the executable is written ONCE, long before any exec, and never
+    /// rewritten. Each fixture hard-links it into its own directory (same
+    /// inode, so still no writer) and supplies its behavior as a DATA file the
+    /// shim reads — data files are never exec'd, so they cannot be busy. No
+    /// retry, no serialization, no ignored error: the mechanism is gone.
+    #[cfg(unix)]
+    fn shared_manager_shim() -> &'static Path {
         use std::os::unix::fs::PermissionsExt;
+        static SHIM: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        SHIM.get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap().keep();
+            let shim = dir.join("manager-shim");
+            // `$0` is the hard link the fixture created, so the body is found
+            // next to the LINK rather than next to this file.
+            std::fs::write(
+                &shim,
+                "#!/bin/sh\nexec /bin/sh \"$(dirname \"$0\")/body\" \"$@\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+            shim
+        })
+        .as_path()
+    }
+
+    fn manager_fixture(body: &str) -> (PathBuf, PathBuf) {
         let retained = tempfile::tempdir().unwrap().keep();
         let program = retained.join("manager");
         let calls = retained.join("calls");
         std::fs::write(
-            &program,
+            retained.join("body"),
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n{body}\n",
+                "printf '%s\\n' \"$*\" >> {}\n{body}\n",
                 shell_escape::escape(calls.to_string_lossy())
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::hard_link(shared_manager_shim(), &program).unwrap();
         (program, calls)
     }
 
@@ -2544,6 +2618,34 @@ mod launchd_singleton_tests {
             manager_fixture("printf 'PID Status Label\\n42 0 com.rch.daemon\\n'");
         assert!(resolve_fixture(&program, true).await.is_err());
         assert_eq!(std::fs::read_to_string(calls).unwrap(), "list\n");
+    }
+
+    #[tokio::test]
+    async fn launchd_unexecutable_manager_is_reported_not_turned_into_a_domain_verdict() {
+        use std::os::unix::fs::PermissionsExt;
+        // A manager binary that cannot be EXECUTED is not "listing unknown".
+        // Resolution used to continue into per-domain probes and build a
+        // verdict from whatever they answered — which is how a transient exec
+        // failure became a confident "registered in multiple launchd domains"
+        // refusal that sent operators looking for a duplicate registration that
+        // did not exist (bd-bd0k6).
+        let dir = tempfile::tempdir().unwrap().keep();
+        let program = dir.join("manager");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = resolve_fixture(&program, false)
+            .await
+            .expect_err("an unexecutable service manager must not resolve to an ownership");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("could not be executed"),
+            "the exec failure must be the diagnosis: {rendered}"
+        );
+        assert!(
+            !rendered.contains("multiple launchd domains"),
+            "an exec failure must never be reported as a domain ambiguity: {rendered}"
+        );
     }
 
     #[tokio::test]

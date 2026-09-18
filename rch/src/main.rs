@@ -546,6 +546,15 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
     /// offload/local/queue/defer recommendation. Use `--json` for the
     /// machine-readable envelope.
     Admit {
+        /// Preflight as a job-mode admission (`rch exec --job`) instead of a
+        /// compilation: the classifier is bypassed, so a non-compilation
+        /// workload preflights as offload-eligible rather than `local`.
+        #[arg(long)]
+        job: bool,
+        /// Named tool the job requires a worker to have verified. Repeatable;
+        /// requires --job. Read-only here — nothing is synced or reserved.
+        #[arg(long, value_name = "NAME", requires = "job")]
+        require_tool: Vec<String>,
         /// Command to preflight (quote or pass as multiple args)
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
@@ -615,6 +624,19 @@ USAGE:
         /// loudly (exit 102) regardless of the job's own exit status.
         #[arg(long, value_name = "DIR", requires = "job")]
         result_dir: Vec<PathBuf>,
+        /// Require a worker that has VERIFIED this operator-declared tool
+        /// (`[[workers]] tools = [{ name = "...", command = [...] }]`).
+        /// Repeatable; requires --job.
+        ///
+        /// The gate runs before any slot is reserved, and it is evidence-based:
+        /// the worker must have run the declared probe successfully. A name no
+        /// worker has verified — including a typo — admits no worker at all,
+        /// because a silently dropped requirement would route the job to a
+        /// machine that cannot run it, and job mode returns the remote exit
+        /// status verbatim, so that failure is indistinguishable from the
+        /// job's own.
+        #[arg(long, value_name = "NAME", requires = "job")]
+        require_tool: Vec<String>,
         /// The compilation command to execute remotely
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
@@ -1927,8 +1949,27 @@ enum FleetAction {
     },
 }
 
+/// Whether the caller asked for machine output, by flag OR by environment.
+///
+/// `RCH_JSON=1` is documented (AGENTS.md "Output Mode Detection", README
+/// "Environment controls") as the first thing consulted when choosing an output
+/// mode, and [`rch_common::ui::context::OutputContext::detect`] honors it. The
+/// CLI built its context from flags alone, so an agent that followed the
+/// documented env-var route got a rich terminal panel where it expected a
+/// parseable envelope — and the failure surfaced as malformed JSON rather than
+/// as a mode mismatch (bd-e92eh).
 fn machine_output_requested(format: Option<&str>, json_flag: bool) -> bool {
-    json_flag || format.is_some()
+    machine_output_requested_with(format, json_flag, env::var("RCH_JSON").ok().as_deref())
+}
+
+/// The decision itself, with the environment passed in — mutating a real env
+/// var needs `unsafe` under Rust 2024, and this contract deserves tests.
+fn machine_output_requested_with(
+    format: Option<&str>,
+    json_flag: bool,
+    rch_json: Option<&str>,
+) -> bool {
+    json_flag || format.is_some() || rch_json.is_some_and(rch_common::placement::env_truthy)
 }
 
 fn resolve_output_format(format: Option<&str>, json_flag: bool) -> OutputFormat {
@@ -2185,8 +2226,12 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
             // interactively. Print a short hint instead of silently blocking on stdin.
             // RCH_HOOK_MODE=1 or RCH_JSON=1 force hook behavior (used by test harnesses).
             use std::io::IsTerminal;
-            let forced_hook = env::var_os("RCH_HOOK_MODE").is_some_and(|v| v != "0")
-                || env::var_os("RCH_JSON").is_some_and(|v| v != "0");
+            // Same truthiness rule as every other boolean env var in the repo,
+            // so `RCH_JSON=false` cannot mean one thing here and another in
+            // the output-mode decision (bd-e92eh).
+            let forced_hook = env::var("RCH_HOOK_MODE")
+                .is_ok_and(|v| rch_common::placement::env_truthy(&v))
+                || env::var("RCH_JSON").is_ok_and(|v| rch_common::placement::env_truthy(&v));
             if !forced_hook && std::io::stdin().is_terminal() {
                 eprintln!("rch runs in PreToolUse hook mode when invoked without a subcommand.");
                 eprintln!("It is now waiting for a JSON hook request on stdin.");
@@ -2273,7 +2318,11 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
             Commands::Diagnose { command, dry_run } => {
                 handle_diagnose(command, dry_run, &ctx).await
             }
-            Commands::Admit { command } => handle_admit(command, &ctx).await,
+            Commands::Admit {
+                job,
+                require_tool,
+                command,
+            } => handle_admit(job, require_tool, command, &ctx).await,
             Commands::Exec {
                 base,
                 dependency_base,
@@ -2283,6 +2332,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                 source_content_receipt,
                 job,
                 result_dir,
+                require_tool,
                 command,
             } => {
                 hook::run_exec(
@@ -2294,6 +2344,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                     source_content_receipt,
                     job,
                     result_dir,
+                    require_tool,
                     command,
                     &ctx,
                 )
@@ -3668,6 +3719,24 @@ fn remediation_workflows() -> Vec<RemediationWorkflow> {
             ),
         },
         RemediationWorkflow {
+            id: "job_requires_tool".to_string(),
+            summary: "Preflight and run a non-compilation job that needs a verified worker tool."
+                .to_string(),
+            commands: vec![
+                "rch admit --job --require-tool clang --json -- ./run_shards.sh".to_string(),
+                "rch exec --job --require-tool clang -- ./run_shards.sh".to_string(),
+                "rch workers capabilities --refresh --json".to_string(),
+            ],
+            observe: Some(
+                "admit --job bypasses the compilation classifier, so a non-compilation workload \
+                 reads offload rather than local. A required tool must appear under a worker's \
+                 verified named tools; capability_missing:tool:<name>:not_declared means no \
+                 worker declares a probe for it, :probe_failed means one does and the probe \
+                 fails."
+                    .to_string(),
+            ),
+        },
+        RemediationWorkflow {
             id: "proof_mode".to_string(),
             summary: "Fail-closed remote proof; refusal is RCH-I012, queue/replay is daemon-driven."
                 .to_string(),
@@ -4010,9 +4079,14 @@ async fn handle_diagnose(command: Vec<String>, dry_run: bool, ctx: &OutputContex
     Ok(())
 }
 
-async fn handle_admit(command: Vec<String>, ctx: &OutputContext) -> Result<()> {
+async fn handle_admit(
+    job: bool,
+    require_tool: Vec<String>,
+    command: Vec<String>,
+    ctx: &OutputContext,
+) -> Result<()> {
     let joined = command.join(" ");
-    commands::admit(&joined, ctx).await
+    commands::admit(&joined, job, require_tool, ctx).await
 }
 
 /// `rch cache warm` per-worker result (br-4zm6u). Emitted in the JSON
@@ -6763,6 +6837,7 @@ mod tests {
                 source_content_receipt,
                 job,
                 result_dir,
+                require_tool: _,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
@@ -6808,6 +6883,7 @@ mod tests {
                 source_content_receipt,
                 job,
                 result_dir,
+                require_tool: _,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
@@ -9919,6 +9995,38 @@ mod tests {
     fn machine_output_requested_neither_set() {
         let _guard = test_guard!();
         assert!(!machine_output_requested(None, false));
+    }
+
+    #[test]
+    fn machine_output_requested_honors_documented_rch_json_env() {
+        let _guard = test_guard!();
+        // AGENTS.md and the README both document RCH_JSON=1 as the FIRST thing
+        // consulted when choosing an output mode. The CLI read flags only, so
+        // an agent following the documented route got a rich terminal panel
+        // where it expected an envelope — and the failure looked like malformed
+        // JSON rather than a mode mismatch (bd-e92eh).
+        for value in ["1", "true", "TRUE", "yes", "on", "enabled"] {
+            assert!(
+                machine_output_requested_with(None, false, Some(value)),
+                "RCH_JSON={value} must request machine output"
+            );
+        }
+        // The VALUE is honored, not merely the variable's presence: exporting
+        // RCH_JSON=0 asked for no JSON.
+        for value in ["0", "false", "no", "off", "disabled", "", "  "] {
+            assert!(
+                !machine_output_requested_with(None, false, Some(value)),
+                "RCH_JSON={value:?} must NOT request machine output"
+            );
+        }
+        assert!(!machine_output_requested_with(None, false, None));
+        // Flags still win on their own.
+        assert!(machine_output_requested_with(None, true, Some("0")));
+        assert!(machine_output_requested_with(
+            Some("toon"),
+            false,
+            Some("0")
+        ));
     }
 
     #[test]

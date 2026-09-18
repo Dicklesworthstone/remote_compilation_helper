@@ -33,6 +33,15 @@ struct TerminalOwnership {
     local_wrapper_id: Option<String>,
 }
 
+/// Terminal result supplied by completion or cancellation; ownership stays separate.
+pub struct BuildCompletion {
+    pub exit_code: i32,
+    pub duration_ms: Option<u64>,
+    pub bytes_transferred: Option<u64>,
+    pub timing: Option<CommandTimingBreakdown>,
+    pub cancellation: Option<BuildCancellationMetadata>,
+}
+
 /// Linux boot identity plus process start ticks distinguish PID reuse and reboot.
 pub fn process_identity(pid: u32) -> Option<String> {
     if pid <= 1 {
@@ -399,9 +408,7 @@ impl BuildHistory {
             return Ok(None);
         }
         active.insert(id, state.clone());
-        if let Err(error) = self.persist_ownership(&active, None) {
-            return Err(error);
-        }
+        self.persist_ownership(&active, None)?;
         Ok(Some(state))
     }
 
@@ -537,11 +544,13 @@ impl BuildHistory {
             build_id,
             &state.worker_id,
             state.local_wrapper_id.as_deref(),
-            exit_code,
-            duration_ms,
-            bytes_transferred,
-            timing,
-            None,
+            BuildCompletion {
+                exit_code,
+                duration_ms,
+                bytes_transferred,
+                timing,
+                cancellation: None,
+            },
         )
         .expect("persist terminal ownership before release")
         .map(|(_, record)| record)
@@ -559,11 +568,13 @@ impl BuildHistory {
             build_id,
             &state.worker_id,
             state.local_wrapper_id.as_deref(),
-            130,
-            None,
-            bytes_transferred,
-            None,
-            cancellation,
+            BuildCompletion {
+                exit_code: 130,
+                duration_ms: None,
+                bytes_transferred,
+                timing: None,
+                cancellation,
+            },
         )
         .expect("persist terminal ownership before release")
         .map(|(_, record)| record)
@@ -1148,12 +1159,15 @@ impl BuildHistory {
         build_id: u64,
         worker_id: &str,
         wrapper: Option<&str>,
-        exit_code: i32,
-        duration_ms: Option<u64>,
-        bytes_transferred: Option<u64>,
-        timing: Option<CommandTimingBreakdown>,
-        cancellation: Option<BuildCancellationMetadata>,
+        completion: BuildCompletion,
     ) -> std::io::Result<Option<(ActiveBuildState, BuildRecord)>> {
+        let BuildCompletion {
+            exit_code,
+            duration_ms,
+            bytes_transferred,
+            timing,
+            cancellation,
+        } = completion;
         let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
         let Some(state) = active.get(&build_id) else {
             let terminal = self.terminal.read().unwrap_or_else(|e| e.into_inner());
@@ -1184,7 +1198,7 @@ impl BuildHistory {
             exit_code,
             duration_ms: duration_ms
                 .unwrap_or_else(|| state.started_at_mono.elapsed().as_millis() as u64),
-            location: state.location.clone(),
+            location: state.location,
             bytes_transferred,
             timing,
             cancellation,

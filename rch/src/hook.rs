@@ -1100,6 +1100,7 @@ async fn try_retry_on_bigger_worker(
         false, // do not block waiting on one specific worker during a retry
         &preferred,
         false, // retry upsizing is compilation-scoped; never job mode
+        &[],   // ...and therefore carries no named-tool requirements
     )
     .await
     {
@@ -2493,6 +2494,7 @@ pub async fn run_exec(
     source_content_receipt: bool,
     job: bool,
     result_dirs: Vec<PathBuf>,
+    required_tools: Vec<String>,
     command_parts: Vec<String>,
     out_ctx: &crate::ui::context::OutputContext,
 ) -> anyhow::Result<()> {
@@ -2589,6 +2591,24 @@ pub async fn run_exec(
             let reporter = HookReporter::new(OutputVisibility::Summary);
             exit_with_local_fallback(&command, &reporter, "config unavailable", require_remote);
         }
+    };
+
+    // A project's `[jobs] required_tools` is a statement that its jobs cannot
+    // run without those tools, so it ADDS to `--require-tool` rather than being
+    // replaced by it. Job mode only: a project-wide requirement that silently
+    // narrowed every ordinary build's worker pool would be a surprising way to
+    // lose the fleet. Duplicates collapse so the daemon sees each name once.
+    let required_tools = {
+        let mut tools = required_tools;
+        if job {
+            for tool in &config.jobs.required_tools {
+                let tool = tool.trim();
+                if !tool.is_empty() && !tools.iter().any(|existing| existing == tool) {
+                    tools.push(tool.to_string());
+                }
+            }
+        }
+        tools
     };
 
     // Issue #55: honor the same config knobs the hook honors, so
@@ -2774,6 +2794,7 @@ pub async fn run_exec(
         wait_for_worker,
         &preferred_workers,
         classification.kind == Some(CompilationKind::Job),
+        &required_tools,
     )
     .await
     {
@@ -2824,6 +2845,7 @@ pub async fn run_exec(
                         wait_for_worker,
                         &preferred_workers,
                         classification.kind == Some(CompilationKind::Job),
+                        &required_tools,
                     )
                     .await
                     .ok()
@@ -4539,6 +4561,7 @@ fn selected_worker_to_config(worker: &SelectedWorker) -> WorkerConfig {
         total_slots: worker.slots_available,
         priority: 100,
         tags,
+        tools: Vec::new(),
     }
 }
 

@@ -712,6 +712,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(worker_config).await;
 
@@ -763,6 +764,7 @@ mod tests {
                 total_slots: 4 * i as u32,
                 priority: 100 - i as u32,
                 tags: vec![format!("tag-{}", i)],
+                tools: Vec::new(),
             };
             pool.add_worker(worker_config).await;
         }
@@ -925,6 +927,7 @@ mod tests {
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(worker_config.clone()).await;
 
@@ -977,6 +980,7 @@ mod tests {
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(worker_config.clone()).await;
 
@@ -1030,6 +1034,7 @@ mod tests {
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(healthy_config).await;
 
@@ -1042,6 +1047,7 @@ mod tests {
             total_slots: 8,
             priority: 50,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(unreachable_config.clone()).await;
 
@@ -1095,6 +1101,7 @@ mod tests {
             total_slots: 2,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(worker_config.clone()).await;
 
@@ -1394,6 +1401,7 @@ mod tests {
             total_slots: 4,
             priority: 100,
             tags: vec!["rust".to_string()],
+            tools: Vec::new(),
         })
         .await;
         let ctx = crate::test_daemon_context(pool.clone());

@@ -164,6 +164,17 @@ pub struct SelectionRequest {
     /// preserving their immediate NoAdmissibleWorkers behavior.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub job_mode: bool,
+    /// Operator-declared named tools this work requires VERIFIED on the worker
+    /// (`rch exec --job --require-tool NAME`, or a project's
+    /// `jobs.required_tools`).
+    ///
+    /// Job mode only — the compilation classifier never sets it, so ordinary
+    /// offloaded builds keep their existing admission behavior exactly. Empty
+    /// means no gate; a name no worker has verified excludes every worker,
+    /// because the caller asked for the gate precisely because the job cannot
+    /// run without the tool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_tools: Vec<String>,
     /// Process ID of the hook (for active build tracking).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_pid: Option<u32>,
@@ -752,6 +763,29 @@ pub struct WorkerConfig {
     /// `workers.toml` as `os = "<name>"`.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Operator-declared named tool probes for this worker, written in
+    /// `workers.toml` as
+    /// `tools = [{ name = "clang", command = ["clang", "--version"] }]`.
+    ///
+    /// Unlike a tag, which is an unverified naming convention, each entry is
+    /// VERIFIED by running its fixed argv on the worker as the configured user;
+    /// only a zero exit makes the tool present. That is what lets
+    /// `--require-tool` gate selection on evidence instead of on a promise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<WorkerToolProbe>,
+}
+
+/// One operator-declared tool probe as it appears in `workers.toml`.
+///
+/// Kept as plain configuration data; [`crate::capability_probe::NamedToolProbe`]
+/// is the validated form, and the conversion is where a malformed name is
+/// refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerToolProbe {
+    /// The name `--require-tool` and `jobs.required_tools` refer to.
+    pub name: String,
+    /// The exact argv to run. Zero exit = present; anything else = absent.
+    pub command: Vec<String>,
 }
 
 fn default_priority() -> u32 {
@@ -799,6 +833,7 @@ impl Default for WorkerConfig {
             total_slots: 4,
             priority: default_priority(),
             tags: Vec::new(),
+            tools: Vec::new(),
         }
     }
 }
@@ -865,6 +900,21 @@ pub struct WorkerCapabilities {
     /// `None` on non-x86 workers or when the probe cannot read cpuinfo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_microarch_level: Option<u8>,
+    /// Operator-declared named tools whose probe exited ZERO on this worker.
+    ///
+    /// The list is evidence, not configuration: a name appears here only
+    /// because the worker ran the declared argv and it succeeded. Selection
+    /// gates `--require-tool` on this, which is the difference between a
+    /// verified capability and a tag somebody wrote by hand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_present: Vec<String>,
+    /// Operator-declared named tools whose probe RAN and did not exit zero.
+    ///
+    /// Kept separate from "never declared" so an operator can tell a worker
+    /// that is missing a tool from a fleet that never probed for it — the two
+    /// have different fixes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_absent: Vec<String>,
 
     // Health metrics (bd-3eaa)
     /// Number of CPU cores on the worker.
@@ -1143,6 +1193,25 @@ pub struct RchConfig {
     /// Where the fleet dashboard lives (`[dashboard]`), for `rch web`.
     #[serde(default)]
     pub dashboard: DashboardConfig,
+    /// Job-mode defaults (`[jobs]`), for `rch exec --job`.
+    #[serde(default)]
+    pub jobs: JobsConfig,
+}
+
+/// Job-mode configuration (`[jobs]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JobsConfig {
+    /// Named tools every job from this project requires a worker to have
+    /// VERIFIED, as though each were passed with `--require-tool`.
+    ///
+    /// This is the project saying "my jobs cannot run on a worker without
+    /// these", so it applies on top of any `--require-tool` given on the
+    /// command line rather than being replaced by it. It affects job mode
+    /// ONLY: ordinary offloaded compilation keeps its existing admission
+    /// behavior, because a project-wide requirement that silently narrowed
+    /// every build's worker pool would be a surprising way to lose the fleet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_tools: Vec<String>,
 }
 
 /// Daemon status API over TCP (`[api]`).

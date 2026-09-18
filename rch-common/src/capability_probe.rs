@@ -23,6 +23,104 @@ use crate::worker_facts::{
 /// separate from incidental stdout.
 pub const FACT_PREFIX: &str = "RCH_FACT ";
 
+/// Why an operator-declared tool probe was refused before it ever ran.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ToolProbeError {
+    /// The name cannot survive the fact wire format or is empty.
+    #[error("tool name {name:?} is invalid: {reason}")]
+    InvalidName {
+        /// The rejected name.
+        name: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// A probe with no argv can never prove anything.
+    #[error("tool {name:?} declares an empty probe command")]
+    EmptyCommand {
+        /// The tool whose command was empty.
+        name: String,
+    },
+}
+
+/// An operator-declared named tool probe: a FIXED argv, written in worker
+/// configuration, run as the configured remote user.
+///
+/// The argv is never caller-supplied. RCH deliberately exposes no general
+/// remote-shell probe API: a build that could ask a worker to run an arbitrary
+/// command "to check for a tool" would be a remote execution primitive wearing
+/// a capability-probe hat. Declaring the argv in operator config keeps the set
+/// of commands a worker will run for a probe finite and reviewable.
+///
+/// Verification is by EXIT STATUS: zero means present, anything else — missing
+/// binary, error exit, signal — means absent. Output is discarded so a chatty
+/// tool cannot corrupt the fact stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedToolProbe {
+    /// The name selection and `--require-tool` refer to.
+    name: String,
+    /// The exact argv to run.
+    command: Vec<String>,
+}
+
+impl NamedToolProbe {
+    /// Declare a probe, rejecting names that cannot round-trip the fact wire
+    /// format (`RCH_FACT tool=<name>`): a name containing `=`, whitespace or a
+    /// control character would be parsed back as a different name, which is a
+    /// silent capability lie rather than a loud config error.
+    ///
+    /// # Errors
+    /// [`ToolProbeError`] when the name is unusable or the command is empty.
+    pub fn new(
+        name: impl Into<String>,
+        command: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, ToolProbeError> {
+        let name = name.into();
+        let command: Vec<String> = command.into_iter().map(Into::into).collect();
+        let invalid = |reason| ToolProbeError::InvalidName {
+            name: name.clone(),
+            reason,
+        };
+        if name.is_empty() {
+            return Err(invalid("it is empty"));
+        }
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
+        {
+            return Err(invalid(
+                "only ASCII letters, digits and `-` `_` `.` `+` are allowed",
+            ));
+        }
+        if command.is_empty() {
+            return Err(ToolProbeError::EmptyCommand { name });
+        }
+        Ok(Self { name, command })
+    }
+
+    /// The declared name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The declared argv.
+    #[must_use]
+    pub fn command(&self) -> &[String] {
+        &self.command
+    }
+}
+
+impl TryFrom<&crate::types::WorkerToolProbe> for NamedToolProbe {
+    type Error = ToolProbeError;
+
+    /// Validate a `workers.toml` entry. This is the single point where a
+    /// malformed declaration is refused, so a bad name fails config load
+    /// loudly rather than becoming a worker that quietly advertises nothing.
+    fn try_from(entry: &crate::types::WorkerToolProbe) -> Result<Self, Self::Error> {
+        Self::new(entry.name.clone(), entry.command.iter().cloned())
+    }
+}
+
 /// Exact paths/identity the probe must use (never PATH-resolved).
 #[derive(Debug, Clone)]
 pub struct ProbeSpec {
@@ -36,6 +134,8 @@ pub struct ProbeSpec {
     pub rustup_path: Option<String>,
     /// Disk roots whose capacity to report (temp root, build roots, cargo home).
     pub disk_roots: Vec<String>,
+    /// Operator-declared named tool probes for this worker.
+    pub tools: Vec<NamedToolProbe>,
 }
 
 impl ProbeSpec {
@@ -47,7 +147,15 @@ impl ProbeSpec {
             cargo_path: None,
             rustup_path: None,
             disk_roots: Vec::new(),
+            tools: Vec::new(),
         }
+    }
+
+    /// Declare the operator-configured tool probes (builder style).
+    #[must_use]
+    pub fn with_tools(mut self, tools: impl IntoIterator<Item = NamedToolProbe>) -> Self {
+        self.tools = tools.into_iter().collect();
+        self
     }
 }
 
@@ -164,6 +272,27 @@ pub fn build_capability_probe_script(spec: &ProbeSpec) -> String {
            nixv=$(nix --version 2>/dev/null) && printf '%snix_version=%s\\n' \"$P\" \"$nixv\"; \
          fi; ",
     );
+    // Operator-declared named tools. Each is the exact argv from worker config,
+    // run as this (already configured) user with output discarded — verification
+    // is the EXIT STATUS, and a chatty tool must not be able to inject fact
+    // lines. Both outcomes are reported: `tool=` for present, `tool_absent=` for
+    // a declared probe that failed. The difference matters operationally — "the
+    // fleet never declared clang" and "this worker declares clang but the probe
+    // fails" have different fixes, and a facts stream that only carried
+    // successes could not tell them apart.
+    for tool in &spec.tools {
+        let argv = tool
+            .command()
+            .iter()
+            .map(|part| shq(part))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let name = shq(tool.name());
+        s.push_str(&format!(
+            "if {argv} >/dev/null 2>&1; then printf '%stool=%s\\n' \"$P\" {name}; \
+             else printf '%stool_absent=%s\\n' \"$P\" {name}; fi; "
+        ));
+    }
     // Disk roots: path;total_kb;avail_kb;avail_inodes (df -Pk and df -Pi).
     for root in &spec.disk_roots {
         let q = shq(root);
@@ -191,6 +320,10 @@ pub struct ProbedFacts {
     pub rust: RustFacts,
     pub runtimes: RuntimeFacts,
     pub disk_roots: Vec<DiskRootFacts>,
+    /// Operator-declared tools whose probe exited zero on this worker.
+    pub tools_present: Vec<String>,
+    /// Operator-declared tools whose probe ran and did NOT exit zero.
+    pub tools_absent: Vec<String>,
     /// Raw worker_version line (kept even if protocol was missing).
     worker_version: Option<String>,
     worker_protocol: Option<u32>,
@@ -206,6 +339,22 @@ impl ProbedFacts {
             (Some(os), Some(arch)) => Some(derive_target_triple(os, arch, None)),
             _ => None,
         }
+    }
+
+    /// Whether a named tool was VERIFIED present on this worker. Absence of
+    /// evidence reads as absence: a tool nobody declared a probe for is not
+    /// present, which is what keeps an unknown `--require-tool` name
+    /// inadmissible everywhere instead of silently unconstrained.
+    #[must_use]
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.tools_present.iter().any(|t| t == name)
+    }
+
+    /// Whether this worker DECLARED a probe for the tool (either outcome).
+    /// Distinguishes "the fleet never declared it" from "declared, probe fails".
+    #[must_use]
+    pub fn declares_tool(&self, name: &str) -> bool {
+        self.has_tool(name) || self.tools_absent.iter().any(|t| t == name)
     }
 }
 
@@ -263,6 +412,16 @@ pub fn parse_capability_probe(stdout: &str) -> ProbedFacts {
                     if !toolchain.is_empty() && !component.is_empty() {
                         f.rust.components.push(format!("{toolchain}:{component}"));
                     }
+                }
+            }
+            "tool" => {
+                if !value.is_empty() && !f.tools_present.iter().any(|t| t == value) {
+                    f.tools_present.push(value.to_string());
+                }
+            }
+            "tool_absent" => {
+                if !value.is_empty() && !f.tools_absent.iter().any(|t| t == value) {
+                    f.tools_absent.push(value.to_string());
                 }
             }
             "bun_version" => f.runtimes.bun_version = Some(value.to_string()),
@@ -341,6 +500,16 @@ pub struct CapabilityRequirement {
     ///
     /// Empty by default, so this constrains nothing until a caller opts in.
     pub needs_components: Vec<String>,
+    /// Operator-declared named tools the work needs verified on the worker
+    /// (`rch exec --job --require-tool NAME`, or a project's
+    /// `jobs.required_tools`).
+    ///
+    /// Empty by default: no requirement means no gate. A name no worker
+    /// declares a probe for is inadmissible EVERYWHERE rather than ignored —
+    /// a typo that silently disabled the gate would be worse than a refusal,
+    /// because the caller asked for the gate precisely because the job cannot
+    /// run without the tool.
+    pub needs_tools: Vec<String>,
 }
 
 impl CapabilityRequirement {
@@ -376,6 +545,17 @@ impl CapabilityRequirement {
     #[must_use]
     pub fn with_arch(mut self, arch: impl Into<String>) -> Self {
         self.needs_arch = Some(arch.into());
+        self
+    }
+
+    /// Require verified named tools (builder style).
+    #[must_use]
+    pub fn with_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.needs_tools = tools.into_iter().map(Into::into).collect();
         self
     }
 
@@ -518,6 +698,25 @@ pub fn assess_admissibility(facts: &ProbedFacts, req: &CapabilityRequirement) ->
             return CapabilityVerdict::Rejected {
                 reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
                 detail: format!("missing rustup component {component} for toolchain {toolchain}"),
+            };
+        }
+    }
+    // Operator-declared named tools. Rejecting here — before any slot is
+    // reserved — is the point: a job that needs a tool this worker lacks would
+    // otherwise hold a reservation only to fail on the worker, and the failure
+    // would be indistinguishable from the job's own nonzero exit (job mode
+    // surfaces remote status verbatim).
+    for needed in &req.needs_tools {
+        if !facts.has_tool(needed) {
+            return CapabilityVerdict::Rejected {
+                reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
+                detail: if facts.declares_tool(needed) {
+                    format!(
+                        "required tool `{needed}` is declared for this worker but its probe did not succeed"
+                    )
+                } else {
+                    format!("required tool `{needed}` has no declared probe on this worker")
+                },
             };
         }
     }
@@ -693,6 +892,122 @@ mod tests {
         s.cargo_path = Some("/home/rch/.cargo/bin/cargo".to_string());
         s.disk_roots = vec!["/data/tmp".to_string()];
         s
+    }
+
+    fn tool(name: &str, argv: &[&str]) -> NamedToolProbe {
+        NamedToolProbe::new(name, argv.iter().copied()).expect("valid probe")
+    }
+
+    #[test]
+    fn named_tool_probe_refuses_names_that_cannot_survive_the_wire_format() {
+        // A fact line is `RCH_FACT tool=<name>`, parsed on the FIRST `=`. A name
+        // carrying `=`, whitespace or a control character would parse back as a
+        // different name — a silent capability lie. Refuse at declaration.
+        for bad in [
+            "",
+            "clang=1",
+            "two words",
+            "new\nline",
+            "tab\there",
+            "sh;rm",
+        ] {
+            assert!(
+                NamedToolProbe::new(bad, ["true"]).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        for good in [
+            "clang",
+            "ld.lld",
+            "cargo-nextest",
+            "gcc-14",
+            "llvm_cov",
+            "g++",
+        ] {
+            assert!(
+                NamedToolProbe::new(good, ["true"]).is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
+        // A probe with no argv can never prove anything.
+        assert!(matches!(
+            NamedToolProbe::new("clang", Vec::<String>::new()),
+            Err(ToolProbeError::EmptyCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn script_probes_declared_tools_by_exit_status_and_reports_both_outcomes() {
+        let spec = spec().with_tools([
+            tool("clang", &["clang", "--version"]),
+            tool("ld.lld", &["/usr/bin/ld.lld", "--version"]),
+        ]);
+        let script = build_capability_probe_script(&spec);
+        // The operator's exact argv, shell-quoted, with output discarded: the
+        // verification is the exit status, and a chatty tool must not be able to
+        // inject its own RCH_FACT lines into the stream.
+        assert!(script.contains("if 'clang' '--version' >/dev/null 2>&1;"));
+        assert!(script.contains("if '/usr/bin/ld.lld' '--version' >/dev/null 2>&1;"));
+        assert!(script.contains("tool=%s"));
+        assert!(script.contains("tool_absent=%s"));
+        // No tools declared => no tool probes at all (no requirement, no gate).
+        assert!(!build_capability_probe_script(&self::spec()).contains("tool="));
+    }
+
+    #[test]
+    fn parsed_tool_facts_separate_verified_from_declared_but_failing() {
+        let facts = parse_capability_probe(
+            "RCH_FACT os=linux\nRCH_FACT tool=clang\nRCH_FACT tool_absent=ld.lld\nRCH_FACT tool=clang\n",
+        );
+        assert_eq!(facts.tools_present, vec!["clang".to_string()], "deduped");
+        assert_eq!(facts.tools_absent, vec!["ld.lld".to_string()]);
+        assert!(facts.has_tool("clang"));
+        assert!(!facts.has_tool("ld.lld"));
+        // Declared-but-failing is NOT the same as never declared.
+        assert!(facts.declares_tool("ld.lld"));
+        assert!(!facts.declares_tool("wild"));
+    }
+
+    #[test]
+    fn tool_requirements_gate_admissibility_and_unknown_names_are_inadmissible() {
+        let facts = parse_capability_probe(
+            "RCH_FACT os=linux\nRCH_FACT arch=x86_64\nRCH_FACT rch_wkr_path=/w\n\
+             RCH_FACT worker_version=1\nRCH_FACT worker_protocol=9\n\
+             RCH_FACT cargo_version=cargo 1.99\nRCH_FACT tool=clang\nRCH_FACT tool_absent=ld.lld\n",
+        );
+        let base = CapabilityRequirement::rust(1);
+        // No requirement => no gate.
+        assert_eq!(
+            assess_admissibility(&facts, &base),
+            CapabilityVerdict::Admissible
+        );
+        // Verified tool => admissible.
+        assert_eq!(
+            assess_admissibility(&facts, &base.clone().with_tools(["clang"])),
+            CapabilityVerdict::Admissible
+        );
+        // Declared but failing probe => rejected, and the detail says so.
+        let CapabilityVerdict::Rejected { reason, detail } =
+            assess_admissibility(&facts, &base.clone().with_tools(["ld.lld"]))
+        else {
+            panic!("a failing probe must not be admissible");
+        };
+        assert_eq!(reason, IncidentReasonCode::MissingRuntimeToolchainTarget);
+        assert!(detail.contains("did not succeed"), "{detail}");
+        // A name NOBODY declared (typo, or a tool the fleet never probed) is
+        // inadmissible rather than silently unconstrained — the caller asked
+        // for the gate because the job cannot run without the tool.
+        let CapabilityVerdict::Rejected { detail, .. } =
+            assess_admissibility(&facts, &base.clone().with_tools(["clanggg"]))
+        else {
+            panic!("an undeclared tool must not be admissible");
+        };
+        assert!(detail.contains("no declared probe"), "{detail}");
+        // Every required tool must hold, not just one.
+        assert!(matches!(
+            assess_admissibility(&facts, &base.with_tools(["clang", "ld.lld"])),
+            CapabilityVerdict::Rejected { .. }
+        ));
     }
 
     #[test]

@@ -2008,6 +2008,7 @@ async fn test_daemon_query_missing_socket() {
         false,
         &[],
         false,
+        &[],
     )
     .await;
     assert!(result.is_err());
@@ -2095,6 +2096,7 @@ async fn test_daemon_query_protocol() {
         false,
         &[],
         false,
+        &[],
     )
     .await;
 
@@ -2183,6 +2185,7 @@ async fn test_daemon_query_sends_preferred_workers() {
         false,
         &preferred,
         false,
+        &[],
     )
     .await;
 
@@ -2285,6 +2288,7 @@ async fn test_daemon_query_releases_worker_outside_requested_set() {
         false,
         &[WorkerId::new("requested")],
         false,
+        &[],
     )
     .await
     .expect("query should return a structured refusal");
@@ -2383,6 +2387,7 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
         false,
         &[WorkerId::new("requested")],
         false,
+        &[],
     )
     .await
     .expect("release failure should remain a structured selection refusal");
@@ -2472,6 +2477,7 @@ async fn test_daemon_query_wait_parameters() {
         true,
         &[],
         false,
+        &[],
     )
     .await;
 
@@ -2543,6 +2549,7 @@ async fn test_daemon_query_url_encoding() {
         false,
         &[],
         false,
+        &[],
     )
     .await;
     daemon_handle.await.expect("Daemon task");
@@ -5058,6 +5065,7 @@ fn make_test_worker_config(id: &str) -> WorkerConfig {
         total_slots: 8,
         priority: 100,
         tags: Vec::new(),
+        tools: Vec::new(),
     }
 }
 
@@ -8457,6 +8465,7 @@ async fn test_daemon_query_connect_timeout_fail_open() {
         false,
         &[],
         false,
+        &[],
     )
     .await;
 
@@ -8574,6 +8583,7 @@ async fn test_daemon_query_partial_response_timeout() {
         false,
         &[],
         false,
+        &[],
     )
     .await;
 

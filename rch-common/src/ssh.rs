@@ -1208,6 +1208,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec!["rust".to_string()],
+            tools: Vec::new(),
         };
 
         let client = SshClient::new(config.clone(), SshOptions::default());
@@ -1235,6 +1236,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec!["rust".to_string()],
+            tools: Vec::new(),
         }
     }
 

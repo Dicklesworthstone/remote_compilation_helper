@@ -83,6 +83,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         }
     }
 

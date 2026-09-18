@@ -75,6 +75,13 @@ pub struct RequiredCapabilities {
     /// native build, which stays schedulable on any worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub needs_os: Option<String>,
+    /// Operator-declared named tools the caller required (`--require-tool`).
+    ///
+    /// Job mode only, and never derived from the command: RCH cannot know that
+    /// `./run_shards.sh` shells out to clang, so the requirement is something
+    /// the caller states, not something a classifier guesses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs_tools: Vec<String>,
 }
 
 impl RequiredCapabilities {
@@ -93,6 +100,7 @@ impl RequiredCapabilities {
             needs_zig: self.needs_zig,
             needs_toolchains: self.needs_toolchains.clone(),
             needs_os: self.needs_os.clone(),
+            needs_tools: self.needs_tools.clone(),
             ..CapabilityRequirement::default()
         }
     }
@@ -115,6 +123,10 @@ pub struct AdmitPreflight {
     pub required: RequiredCapabilities,
     /// Whether proof/strict-remote policy is in force (caller-supplied).
     pub proof_policy: bool,
+    /// Whether this was preflighted as a job-mode admission (`--job`), where
+    /// the compilation classifier is bypassed rather than consulted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub job_mode: bool,
     /// The decision before daemon candidate data is folded in.
     pub base_recommendation: AdmitRecommendation,
     /// Operator-facing explanation.
@@ -367,8 +379,53 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
         family,
         required,
         proof_policy,
+        job_mode: false,
         base_recommendation,
         detail,
+    }
+}
+
+impl AdmitPreflight {
+    /// Re-frame a preflight as a JOB-mode admission (`rch exec --job`).
+    ///
+    /// Job mode bypasses the compilation classifier rather than consulting it,
+    /// so a job is offload-eligible whatever the classifier thought: `./fuzz.sh`
+    /// is not a compilation and must still preflight as `offload`, otherwise
+    /// this command would answer `local` for every workload job mode exists to
+    /// serve.
+    ///
+    /// The classification facts are KEPT rather than cleared. A caller that
+    /// passes `cargo test` to `--job` should still be able to see that it would
+    /// have classified as a compilation — that is usually a mistake worth
+    /// noticing, and erasing the evidence would hide it.
+    ///
+    /// Required tools are caller-stated, never derived: RCH cannot know that a
+    /// shell script shells out to clang.
+    #[must_use]
+    pub fn as_job(mut self, required_tools: Vec<String>) -> Self {
+        self.job_mode = true;
+        self.required.needs_tools = required_tools;
+        self.required.needs_tools.sort();
+        self.required.needs_tools.dedup();
+        self.base_recommendation = AdmitRecommendation::Offload;
+        let tools = if self.required.needs_tools.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; requires verified tool(s) {}",
+                self.required.needs_tools.join(", ")
+            )
+        };
+        self.detail = format!(
+            "job-mode admission: classifier bypassed, offload-eligible (classified as {}{})",
+            if self.is_compilation {
+                self.family.as_deref().unwrap_or("a compilation")
+            } else {
+                "non-compilation"
+            },
+            tools
+        );
+        self
     }
 }
 
@@ -412,6 +469,67 @@ mod tests {
     use crate::admission_rejection::{
         AdmissionRejectionCategory, CandidateRejection, aggregate_rejections,
     };
+
+    #[test]
+    fn job_mode_preflight_is_offload_eligible_whatever_the_classifier_said() {
+        // THE point of the job-mode preflight: `exec --job` bypasses the
+        // classifier, so a preflight that consulted it would answer `local`
+        // for every workload job mode exists to serve.
+        let script = preflight("./run_shards.sh --shard 3", false);
+        assert!(!script.is_compilation);
+        assert_eq!(script.base_recommendation, AdmitRecommendation::Local);
+
+        let job = script.clone().as_job(Vec::new());
+        assert!(job.job_mode);
+        assert_eq!(job.base_recommendation, AdmitRecommendation::Offload);
+        assert!(job.detail.contains("classifier bypassed"), "{}", job.detail);
+        // The classification facts are KEPT, not cleared — they are still the
+        // truth about the command, and erasing them would hide a mistake.
+        assert!(!job.is_compilation);
+        assert_eq!(job.command, script.command);
+        assert_eq!(job.compound, script.compound);
+
+        // A compilation passed to --job keeps its family visible, precisely so
+        // a caller can notice they probably did not mean `--job`.
+        let compile = preflight("cargo test --workspace", false).as_job(Vec::new());
+        assert!(compile.is_compilation);
+        assert_eq!(compile.family.as_deref(), Some("cargo_test"));
+        assert_eq!(compile.base_recommendation, AdmitRecommendation::Offload);
+        assert!(compile.detail.contains("cargo_test"), "{}", compile.detail);
+    }
+
+    #[test]
+    fn job_mode_required_tools_are_caller_stated_normalized_and_gate_ready() {
+        // Never derived: nothing can know that a shell script shells out to
+        // clang, so the requirement only ever comes from the caller.
+        assert!(
+            preflight("./fuzz.sh", false)
+                .as_job(Vec::new())
+                .required
+                .needs_tools
+                .is_empty()
+        );
+
+        let job = preflight("./fuzz.sh", false).as_job(vec![
+            "clang".to_string(),
+            "ld.lld".to_string(),
+            "clang".to_string(),
+        ]);
+        assert_eq!(
+            job.required.needs_tools,
+            vec!["clang".to_string(), "ld.lld".to_string()],
+            "sorted and deduped so the same request preflights identically"
+        );
+        assert!(job.detail.contains("clang, ld.lld"), "{}", job.detail);
+
+        // And it converts into the SAME requirement the selection gate uses,
+        // so the preflight cannot drift from the admission it predicts.
+        let requirement = job.required.to_requirement(1);
+        assert_eq!(
+            requirement.needs_tools,
+            vec!["clang".to_string(), "ld.lld".to_string()]
+        );
+    }
 
     #[test]
     fn msvc_target_requires_a_windows_host() {

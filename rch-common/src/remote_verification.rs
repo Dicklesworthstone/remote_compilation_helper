@@ -473,6 +473,7 @@ mod basic_tests {
             total_slots: 8,
             priority: 100,
             tags: Vec::new(),
+            tools: Vec::new(),
         }
     }
 

@@ -76,6 +76,7 @@ fn load_worker_from_env() -> Option<WorkerConfig> {
         total_slots: 4,
         priority: 100,
         tags: Vec::new(),
+        tools: Vec::new(),
     })
 }
 

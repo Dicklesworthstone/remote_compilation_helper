@@ -1075,6 +1075,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(config).await;
 
@@ -1098,6 +1099,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         })
         .await;
         let worker = pool.get(&id).await.unwrap();

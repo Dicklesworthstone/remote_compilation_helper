@@ -107,6 +107,45 @@ fn run_hook(input: &str) -> (i32, String, String) {
 // =============================================================================
 
 #[test]
+fn test_rch_json_env_forces_machine_output_like_the_flag() {
+    init_test_logging();
+    let logger = TestLogger::for_test("test_rch_json_env_forces_machine_output_like_the_flag");
+
+    require_binary!();
+
+    // AGENTS.md and the README both document RCH_JSON=1 as the first thing
+    // consulted when choosing an output mode, but the CLI built its context
+    // from flags alone — so an agent that followed the documented env-var route
+    // got a rich terminal panel where it expected a parseable envelope, and the
+    // failure surfaced as malformed JSON rather than as a mode mismatch
+    // (bd-e92eh). `admit` is the smallest surface that shows it: it needs no
+    // daemon and always prints something.
+    logger.log(TestPhase::Execute, "Running admit under RCH_JSON=1");
+    let (_exit, stdout, _stderr) = run_rch_with_env(&["admit", "ls -la"], "RCH_JSON", "1");
+
+    logger.log(TestPhase::Verify, "Checking the envelope");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("RCH_JSON=1 must yield a JSON envelope ({e}); got: {stdout}"));
+    assert_eq!(parsed["api_version"], "1.0", "got: {stdout}");
+    assert_eq!(parsed["command"], "admit", "got: {stdout}");
+    assert!(
+        !stdout.contains(ANSI_ESC),
+        "machine output must carry no ANSI: {stdout}"
+    );
+
+    // ...and the value is honored, not merely the variable's presence: a caller
+    // who exported RCH_JSON=0 asked for no JSON.
+    logger.log(TestPhase::Execute, "Running admit under RCH_JSON=0");
+    let (_exit, stdout_off, _stderr) = run_rch_with_env(&["admit", "ls -la"], "RCH_JSON", "0");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stdout_off).is_err(),
+        "RCH_JSON=0 must not force the envelope; got: {stdout_off}"
+    );
+
+    logger.pass();
+}
+
+#[test]
 fn test_status_json_outputs_to_stdout() {
     init_test_logging();
     let logger = TestLogger::for_test("test_status_json_outputs_to_stdout");

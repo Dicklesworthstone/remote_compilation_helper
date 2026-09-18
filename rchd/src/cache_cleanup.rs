@@ -681,6 +681,7 @@ mod tests {
             total_slots: 8,
             priority: 50,
             tags: vec![],
+            tools: Vec::new(),
         }
     }
 

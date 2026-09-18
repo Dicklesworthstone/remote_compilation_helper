@@ -825,6 +825,7 @@ mod tests {
             total_slots: 4,
             priority: 50,
             tags: vec![],
+            tools: Vec::new(),
         })
         .await;
         // Newly-added workers default to `Healthy` (see `WorkerState::new`), so
