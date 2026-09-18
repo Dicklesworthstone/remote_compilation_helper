@@ -2,7 +2,7 @@
 //! assembles the B014 pack from ambient toolchain evidence and prints
 //! the Cargo config to stdout, so the benchmark script can apply the
 //! layer0 variant exactly as the pack defines it.
-use rabs_key::layer0_pack::{PackEvidence, assemble};
+use rabs_key::layer0_pack::{AppleSdkBaseline, PackEvidence, assemble};
 use std::{ffi::OsString, num::NonZeroU32, process::Command};
 
 fn main() {
@@ -17,11 +17,29 @@ fn run() -> Result<(), String> {
     let mut threads = None;
     let mut line_tables_only = false;
     let mut split_debuginfo_unpacked = false;
+    let mut cranelift_dev_backend = false;
+    let mut target_cpu_baseline = None;
+    let mut apple_deployment_target = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--line-tables-only") => line_tables_only = true,
             Some("--split-debuginfo-unpacked") => split_debuginfo_unpacked = true,
+            Some("--cranelift") => cranelift_dev_backend = true,
+            Some("--target-cpu") => {
+                target_cpu_baseline = Some(
+                    args.next()
+                        .and_then(|v| v.into_string().ok())
+                        .ok_or("--target-cpu needs a baseline name")?,
+                );
+            }
+            Some("--deployment-target") => {
+                apple_deployment_target = Some(
+                    args.next()
+                        .and_then(|v| v.into_string().ok())
+                        .ok_or("--deployment-target needs a version")?,
+                );
+            }
             Some("--rustc") => compiler = args.next().ok_or("--rustc needs an executable path")?,
             Some("--zthreads") => {
                 threads = Some(
@@ -32,16 +50,20 @@ fn run() -> Result<(), String> {
             }
             Some("--help" | "-h") => {
                 println!(
-                    "Usage: layer0_render [--rustc PATH] [--zthreads COUNT] [--line-tables-only] [--split-debuginfo-unpacked]\n\nDebug settings are preserved unless explicitly requested. --line-tables-only\nkeeps source breakpoints/backtraces but removes variable/type information.\n--split-debuginfo-unpacked requires retaining separate debug files with the binary;\ncheck support on the selected target. Both affect the dev profile.\nUnstable threads are OFF unless explicitly requested and the selected nightly\nreports support. --rustc defaults to RUSTC, then rustc on PATH. Apply the rendered\nCargo config only with that same compiler/toolchain. Existing Cargo env/target\nrustflags take Cargo's normal precedence; no wrappers or user files are changed."
+                    "Usage: layer0_render [--rustc PATH] [--zthreads COUNT] [--line-tables-only] [--split-debuginfo-unpacked]\n                     [--cranelift] [--target-cpu BASELINE] [--deployment-target VERSION]\n\nDebug settings are preserved unless explicitly requested. --line-tables-only\nkeeps source breakpoints/backtraces but removes variable/type information.\n--split-debuginfo-unpacked requires retaining separate debug files with the binary;\ncheck support on the selected target. Both affect the dev profile.\nUnstable threads are OFF unless explicitly requested and the selected nightly\nreports support. --cranelift is likewise opt-in and requires the nightly codegen\nbackend to be installed; it applies to the dev profile only and keeps build\nscripts and proc macros on LLVM. --target-cpu pins an explicit portable baseline;\nmachine-relative spellings such as `native` are refused because they resolve\ndifferently on every host. --deployment-target applies on Apple hosts, where the\nSDK baseline is probed with xcrun. A faster linker is selected only when the\nclang driver that carries its flag is present and the host triple has a spelling\nin the pack. --rustc defaults to RUSTC, then rustc on PATH. Apply the rendered\nCargo config only with that same compiler/toolchain. Existing Cargo env/target\nrustflags take Cargo's normal precedence; no wrappers or user files are changed."
                 );
                 return Ok(());
             }
             _ => return Err(format!("unknown argument {arg:?}")),
         }
     }
-    let (version_line, rustc_z_help) = compiler_evidence(&compiler, threads.is_some())?;
+    let (version_line, host_target_triple, rustc_z_help) =
+        compiler_evidence(&compiler, threads.is_some())?;
     let mut linker_version_lines = Vec::new();
-    for linker in ["wild", "ld.lld", "lld", "mold"] {
+    // Only families the pack can actually SELECT are probed: a version line
+    // this pack has no flag spelling for would be collected and then silently
+    // discarded, which reads like a rejected candidate when it was never one.
+    for linker in ["wild", "ld.lld", "lld"] {
         if let Ok(output) = std::process::Command::new(linker).arg("--version").output()
             && output.status.success()
             && let Some(first) = String::from_utf8_lossy(&output.stdout).lines().next()
@@ -49,6 +71,11 @@ fn run() -> Result<(), String> {
             linker_version_lines.push(first.to_string());
         }
     }
+    let apple_sdk = if host_target_triple.contains("-apple-") {
+        apple_sdk_baseline()
+    } else {
+        None
+    };
     let evidence = PackEvidence {
         rustc_version_line: version_line,
         rustc_z_help,
@@ -56,6 +83,15 @@ fn run() -> Result<(), String> {
         line_tables_only,
         split_debuginfo_unpacked,
         linker_version_lines,
+        cranelift_backend_library: cranelift_backend(&compiler, &host_target_triple),
+        cranelift_dev_backend,
+        target_cpu_baseline,
+        apple_deployment_target,
+        apple_sdk,
+        // The flag spellings this pack renders are carried by the clang
+        // driver; without it, `linker = "clang"` breaks every build.
+        linker_driver_available: probe("clang", "--version"),
+        host_target_triple,
         sccache_available: probe("sccache", "--version"),
         hakari_available: probe("cargo", "hakari"),
     };
@@ -70,14 +106,70 @@ fn run() -> Result<(), String> {
             "layer0_render: requested threads disabled: selected compiler lacks proven nightly support"
         );
     }
+    if cranelift_dev_backend
+        && !pack
+            .knobs
+            .iter()
+            .any(|k| k.id == "codegen-backend-cranelift" && k.enabled)
+    {
+        eprintln!(
+            "layer0_render: requested cranelift disabled: selected compiler has no installed codegen backend"
+        );
+    }
     print!("{}", pack.render_config());
     Ok(())
+}
+
+/// The Cranelift backend library the SELECTED compiler would load, if its
+/// sysroot carries one. Probed from that compiler's own sysroot rather than
+/// from PATH: a second toolchain's backend cannot be loaded by this one.
+fn cranelift_backend(compiler: &std::ffi::OsStr, host: &str) -> Option<String> {
+    let sysroot = Command::new(compiler)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let sysroot = String::from_utf8_lossy(&sysroot.stdout).trim().to_owned();
+    let backends = std::path::Path::new(&sysroot)
+        .join("lib/rustlib")
+        .join(host)
+        .join("codegen-backends");
+    std::fs::read_dir(backends)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("cranelift"))
+        })
+        .map(|path| path.display().to_string())
+}
+
+/// The Apple SDK baseline, probed with `xcrun`. Version and path travel
+/// together: a version alone cannot be pinned, a path alone cannot be
+/// compared across machines.
+fn apple_sdk_baseline() -> Option<AppleSdkBaseline> {
+    let show = |flag: &str| {
+        Command::new("xcrun")
+            .arg(flag)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    Some(AppleSdkBaseline {
+        version: show("--show-sdk-version")?,
+        path: show("--show-sdk-path")?,
+    })
 }
 
 fn compiler_evidence(
     compiler: &std::ffi::OsStr,
     probe_threads: bool,
-) -> Result<(String, Option<String>), String> {
+) -> Result<(String, String, Option<String>), String> {
     let rustc = Command::new(compiler)
         .env("RUSTUP_AUTO_INSTALL", "0")
         .arg("-vV")
@@ -91,6 +183,15 @@ fn compiler_evidence(
     }
     let version = String::from_utf8_lossy(&rustc.stdout).into_owned();
     let version_line = version.lines().next().unwrap_or("").to_string();
+    // `rustc -vV` reports the host triple; every `[target.*]` section the
+    // pack renders is keyed on it, so it comes from the SAME probe as the
+    // version rather than from the builder's own compile-time target.
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .ok_or_else(|| format!("{compiler:?} -vV reported no host triple"))?
+        .trim()
+        .to_owned();
     let rustc_z_help = if probe_threads {
         let output = Command::new(compiler)
             .env("RUSTUP_AUTO_INSTALL", "0")
@@ -109,7 +210,7 @@ fn compiler_evidence(
     } else {
         None
     };
-    Ok((version_line, rustc_z_help))
+    Ok((version_line, host, rustc_z_help))
 }
 
 fn probe(bin: &str, arg: &str) -> bool {
@@ -149,7 +250,7 @@ mod tests {
         };
         let compiler = which("rustc");
         let cargo = which("cargo");
-        let (version, _) = compiler_evidence(compiler.as_ref(), false).unwrap();
+        let (version, host, _) = compiler_evidence(compiler.as_ref(), false).unwrap();
         eprintln!("compiler={compiler} version={version}");
         let mut measurements = Vec::new();
         // Three fresh-target samples per combination. Rotate ordering to avoid
@@ -174,6 +275,13 @@ mod tests {
                     line_tables_only: lines,
                     split_debuginfo_unpacked: split,
                     linker_version_lines: Vec::new(),
+                    host_target_triple: host.clone(),
+                    linker_driver_available: false,
+                    cranelift_backend_library: None,
+                    cranelift_dev_backend: false,
+                    target_cpu_baseline: None,
+                    apple_deployment_target: None,
+                    apple_sdk: None,
                     sccache_available: false,
                     hakari_available: false,
                 };
@@ -323,7 +431,7 @@ mod tests {
             };
             let compiler = which("rustc");
             let cargo = which("cargo");
-            let (version, help) = compiler_evidence(compiler.as_ref(), true).unwrap();
+            let (version, host, help) = compiler_evidence(compiler.as_ref(), true).unwrap();
             eprintln!("channel={channel} compiler={compiler} version={version}");
             let mut evidence = PackEvidence {
                 rustc_version_line: version,
@@ -332,6 +440,13 @@ mod tests {
                 line_tables_only: false,
                 split_debuginfo_unpacked: false,
                 linker_version_lines: Vec::new(),
+                host_target_triple: host,
+                linker_driver_available: false,
+                cranelift_backend_library: None,
+                cranelift_dev_backend: false,
+                target_cpu_baseline: None,
+                apple_deployment_target: None,
+                apple_sdk: None,
                 sccache_available: false,
                 hakari_available: false,
             };
