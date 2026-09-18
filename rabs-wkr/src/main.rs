@@ -10,6 +10,9 @@
 //! `--once` exits after one admitted execution completes, or after its output
 //! acknowledgement when `ranges-v1` retrieval was negotiated. Byte retrieval
 //! starts after process/drain completion; this is not live pipe streaming.
+//! Request IDs increase across restarts for each worker/endpoint state directory.
+//! RABS_WORKER_STATE_DIR overrides the persistent journal location. Uncertain
+//! execution is reconciled through request-status, never automatically replayed.
 
 use asupersync::cx::Cx;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -19,11 +22,13 @@ use rabs_wkr::execution::{
     DEFAULT_EXECUTION_TIMEOUT, ExecutionCompletion, ExecutionTask, StopReason,
 };
 use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
+use rabs_wkr::request_journal::{RECOVERY_PROTOCOL, WorkerJournal};
 use rabs_wkr::session::{
     CanonicalExecRequest, execute_canonical_controlled, probe_capability, sample_pressure,
 };
 use std::future::{Future, poll_fn};
 use std::io;
+use std::path::PathBuf;
 use std::pin::pin;
 use std::task::Poll;
 use std::time::Duration;
@@ -50,6 +55,23 @@ fn json_string(text: &str) -> String {
     out
 }
 
+fn worker_state_path(worker: &str, coordinator: &str) -> io::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("RABS_WORKER_STATE_DIR") {
+        let path = PathBuf::from(path);
+        return if path.is_absolute() {
+            Ok(path)
+        } else {
+            Err(io::Error::new(io::ErrorKind::InvalidInput, "RABS_WORKER_STATE_DIR must be absolute"))
+        };
+    }
+    let base = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "set RABS_WORKER_STATE_DIR or an absolute HOME/XDG_STATE_HOME"))?;
+    let binding = serde_json::json!(["rabs.worker-state.v1", worker, coordinator]).to_string();
+    Ok(base.join("rabs/workers").join(rabs_wkr::session::sha256_hex(binding.as_bytes())))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -63,7 +85,9 @@ fn main() {
                  USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once]\n\
                  Serves canonical-exec requests through the sandbox launcher; \
                  offers results, never commits (R50).\n\
-                 Negotiate output_transfer=ranges-v1 in session-ok to retrieve diagnostic bytes."
+                 Negotiate output_transfer=ranges-v1 in session-ok to retrieve diagnostic bytes.\n\
+                 Request IDs must increase across restarts; request-status reconciles outcomes.\n\
+                 RABS_WORKER_STATE_DIR selects a private durable state directory (never reset it to retry work)."
             );
             return;
         }
@@ -102,10 +126,21 @@ fn main() {
         std::process::exit(2);
     };
 
+    // No runtime task or network session can advertise ownership before the
+    // generation and incarnation are durable. Failure never selects a temp root.
+    let mut journal = match worker_state_path(&worker_id, &coordinator)
+        .and_then(|root| WorkerJournal::open(&root, &worker_id, &coordinator))
+    {
+        Ok(journal) => journal,
+        Err(error) => {
+            eprintln!("rabs-wkr: durable ownership unavailable: {error}");
+            std::process::exit(1);
+        }
+    };
     let report = probe_capability(&worker_id);
     eprintln!(
-        "{{\"v\":1,\"kind\":\"rabs-wkr-boot\",\"worker_id\":\"{}\",\"canonical\":{},\"slots\":{}}}",
-        report.worker_id, report.canonical_namespace, report.slots
+        "{{\"v\":1,\"kind\":\"rabs-wkr-boot\",\"worker_id\":{},\"canonical\":{},\"slots\":{}}}",
+        json_string(&report.worker_id), report.canonical_namespace, report.slots
     );
 
     let runtime = match RuntimeBuilder::current_thread().build() {
@@ -121,7 +156,7 @@ fn main() {
         handle
             .spawn(async move {
                 let cx = Cx::current().expect("runtime task Cx");
-                match session_loop(&cx, &coordinator, &report, once).await {
+                match session_loop(&cx, &coordinator, &report, once, &mut journal).await {
                     Ok(()) => 0,
                     Err(error) => {
                         eprintln!("rabs-wkr: session ended: {error}");
@@ -224,6 +259,35 @@ fn completion_frame(completion: &ExecutionCompletion) -> String {
     .to_string()
 }
 
+/// Only bounded outcome metadata enters the journal, not scratch paths, captured
+/// bytes, artifact manifests, or transfer promises. Completion is not publication.
+fn journal_completion(
+    journal: Option<&mut WorkerJournal>,
+    request_id: u64,
+    result: &Result<ExecutionCompletion, String>,
+) -> Result<(), String> {
+    let Some(journal) = journal else { return Ok(()); };
+    let (receipt, resolved) = match result {
+        Ok(completion) => {
+            let result = &completion.result;
+            (serde_json::json!({
+                "kind": "exec-result", "request_id": result.request_id,
+                "exit_code": result.exit_code, "executed": result.executed,
+                "stdout_sha256": result.stdout_sha256, "stderr_sha256": result.stderr_sha256,
+                "residual_group_members": result.residual_group_members,
+                "stop_reason": completion.stop_reason.map(StopReason::label),
+            }), result.executed && result.residual_group_members == 0)
+        }
+        Err(error) => (serde_json::json!({
+            "kind": "error", "request_id": request_id,
+            "reason": "execution-completion-failed", "execution_may_have_run": true,
+            "error_sha256": rabs_wkr::session::sha256_hex(error.as_bytes()),
+        }), false),
+    };
+    journal.finish(request_id, &receipt, resolved)
+        .map_err(|error| format!("persist execution outcome: {error}"))
+}
+
 fn request_error(request_id: Option<u64>, reason: &str) -> String {
     serde_json::json!({"kind": "error", "request_id": request_id, "reason": reason}).to_string()
 }
@@ -308,15 +372,17 @@ impl PendingOutput {
 
 /// The actual steady-state driver. The launch seam keeps tests independent of
 /// host isolation support; production supplies only execute_canonical_controlled.
-/// There is one active execution and no hidden queue. Request IDs must increase
-/// within a session: reconnect/resumption requires a separate durable protocol,
-/// and retransmitting an uncertain request here never launches it again.
+/// Production always supplies a durable journal. None is a test seam for the
+/// original session-scoped protocol tests, not a startup fallback on IO failure.
+/// There is one active execution and no hidden queue. Uncertain durable work
+/// blocks new admission across connections and process restarts.
 /// At most one completed output pair is retained; new execution waits for its
 /// identity-bound acknowledgement instead of evicting undelivered diagnostics.
 async fn drive_session<S, L, H>(
     stream: &mut S,
     report: &rabs_wkr::session::CapabilityReport,
     once: bool,
+    mut journal: Option<&mut WorkerJournal>,
     mut launch: L,
     mut heartbeat: H,
 ) -> Result<(), String>
@@ -339,9 +405,9 @@ where
             let reply = match next_event(&mut reader, stream, &mut active).await {
                 SessionEvent::Completed { request_id, result } => {
                     // Completion consumes the thread only AFTER drain and reap.
-                    // Output ownership remains until ACK; no next process can
-                    // overwrite or evict a pending diagnostic snapshot.
+                    // Persist its outcome before the first possibly-lost reply.
                     drop(active.take());
+                    journal_completion(journal.as_deref_mut(), request_id, &result)?;
                     let reply = match result {
                         Ok(mut completion) => {
                             let reply = completion_frame(&completion);
@@ -381,6 +447,16 @@ where
                                 "pending_output_request_id": pending_output.as_ref().map(|output| output.identity.request_id),
                             }).to_string()
                         }
+                        Some("request-status") => match (journal.as_deref(), request_id) {
+                            (Some(journal), Some(id)) => {
+                                let mut status = journal.status(id);
+                                status["active_in_this_session"] = serde_json::json!(active.as_ref().is_some_and(|task| task.request_id() == id));
+                                status["output_available_in_this_session"] = serde_json::json!(pending_output.as_ref().is_some_and(|output| output.identity.request_id == id));
+                                status.to_string()
+                            }
+                            (None, _) => request_error(request_id, "request-journal-unavailable"),
+                            (_, None) => request_error(None, "request-status-requires-request-id"),
+                        },
                         Some("output-read") => match pending_output.as_mut() {
                             Some(output) => output.read_frame(&value)
                                 .unwrap_or_else(|reason| request_error(request_id, &reason)),
@@ -425,13 +501,34 @@ where
                                 }
                                 Ok((request, timeout)) => {
                                     let id = request.request_id;
-                                    match launch(request, timeout) {
-                                        Ok(task) => {
-                                            last_admitted = Some(id);
-                                            active = Some(task);
-                                            continue;
+                                    let refusal = match journal.as_deref_mut() {
+                                        Some(journal) => journal.admit(&value, timeout)
+                                            .map_err(|error| format!("persist execution admission: {error}"))?,
+                                        None => None,
+                                    };
+                                    if let Some(reason) = refusal {
+                                        request_error(Some(id), reason)
+                                    } else {
+                                        // The journal commit is already durable. A crash from
+                                        // here through result persistence leaves uncertain work,
+                                        // never an absent entry that could authorize a rerun.
+                                        match launch(request, timeout) {
+                                            Ok(task) => {
+                                                last_admitted = Some(id);
+                                                active = Some(task);
+                                                continue;
+                                            }
+                                            Err(error) => {
+                                                if let Some(journal) = journal.as_deref_mut() {
+                                                    journal.finish(id, &serde_json::json!({
+                                                        "kind": "error", "request_id": id,
+                                                        "reason": "execution-start-failed",
+                                                        "execution_may_have_run": true,
+                                                    }), false).map_err(|error| format!("persist launch failure: {error}"))?;
+                                                }
+                                                request_error(Some(id), &format!("execution start: {error}"))
+                                            }
                                         }
-                                        Err(error) => request_error(Some(id), &format!("execution start: {error}")),
                                     }
                                 }
                             }
@@ -449,18 +546,33 @@ where
 
     // EOF, malformed/truncated transport, failed writes and cooperative runtime
     // cancellation all revoke the session's work and await cleanup asynchronously.
-    // Future-drop/panic still falls back to ExecutionTask's cancel-and-join guard.
+    // Future-drop/panic still falls back to ExecutionTask's cancel-and-join guard;
+    // its unclosed journal admission remains uncertain on the next startup.
     if let Some(mut task) = active.take() {
         task.cancel(StopReason::SessionLost);
+        let request_id = task.request_id();
         let cleanup = task.wait().await;
+        journal_completion(journal.as_deref_mut(), request_id, &cleanup)?;
         if outcome.is_ok() {
             cleanup.map_err(|e| format!("session cleanup: {e}"))?;
         }
     }
     // Scratch output is connection-owned, never exposed to a new session or
-    // kept in a global map after a failed transfer. This is not durable resume.
+    // kept in a global map after a failed transfer. Only outcome metadata persists.
     drop(pending_output);
     outcome
+}
+
+fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJournal) -> String {
+    serde_json::json!({
+        "kind": "worker-hello", "worker_id": report.worker_id,
+        "canonical": report.canonical_namespace, "slots": report.slots, "token_id": 1,
+        "output_transfers": [OUTPUT_TRANSFER], "recovery_protocols": [RECOVERY_PROTOCOL],
+        "boot_generation": journal.boot_generation().0,
+        "incarnation": format!("{:032x}", journal.incarnation().0),
+        "request_high_water": journal.high_water(),
+        "request_id_policy": "worker-endpoint-monotonic",
+    }).to_string()
 }
 
 async fn session_loop(
@@ -468,18 +580,16 @@ async fn session_loop(
     coordinator: &str,
     report: &rabs_wkr::session::CapabilityReport,
     once: bool,
+    journal: &mut WorkerJournal,
 ) -> Result<(), String> {
     let mut stream = TcpStream::connect(coordinator.to_string())
         .await
         .map_err(|e| format!("connect {coordinator}: {e}"))?;
     cx.trace("rabs-wkr connected to coordinator");
 
-    // This retains the existing prototype handshake; it does NOT upgrade the
-    // fixed-token newline transport into authenticated ATP.
-    let hello = format!(
-        "{{\"kind\":\"worker-hello\",\"worker_id\":{},\"canonical\":{},\"slots\":{},\"token_id\":1,\"output_transfers\":[\"{OUTPUT_TRANSFER}\"]}}",
-        json_string(&report.worker_id), report.canonical_namespace, report.slots,
-    );
+    // Identity and reconciliation capability are not authentication. The fixed
+    // token newline prototype still requires the separate ATP/enrollment work.
+    let hello = worker_hello(report, journal);
     write_frame(&mut stream, &hello).await.map_err(|e| format!("hello write: {e}"))?;
     let ack = FrameReader::default().read(&mut stream).await
         .map_err(|e| format!("handshake read: {e}"))?
@@ -488,6 +598,7 @@ async fn session_loop(
         return Err(format!("handshake refused: {ack}"));
     }
     let capture_output = output_transfer_requested(&ack)?;
+    validate_recovery_selection(&ack)?;
 
     let cargo_home = std::env::temp_dir().join(format!("rabs-wkr-ch-{}", std::process::id()));
     let home = std::env::temp_dir().join(format!("rabs-wkr-home-{}", std::process::id()));
@@ -499,6 +610,7 @@ async fn session_loop(
         &mut stream,
         report,
         once,
+        Some(journal),
         |request, timeout| {
             let cargo_home = cargo_home.clone();
             let home = home.clone();
@@ -522,6 +634,15 @@ fn session_ack_accepted(frame: &str) -> bool {
             value.get("kind").and_then(|kind| kind.as_str()).map(|kind| kind == "session-ok")
         })
         .unwrap_or(false)
+}
+
+fn validate_recovery_selection(frame: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(frame).map_err(|e| format!("handshake JSON: {e}"))?;
+    match value.get("recovery_protocol") {
+        None => Ok(()), // Admission remains durable even without status negotiation.
+        Some(value) if value.as_str() == Some(RECOVERY_PROTOCOL) => Ok(()),
+        Some(_) => Err("unsupported recovery_protocol selection".to_owned()),
+    }
 }
 
 fn output_transfer_requested(frame: &str) -> Result<bool, String> {
@@ -724,7 +845,7 @@ mod tests {
         let launches = Arc::new(AtomicUsize::new(0));
         let cleaned = Arc::new(AtomicBool::new(false));
         let worker_cleaned = Arc::clone(&cleaned);
-        wait(drive_session(&mut wire, &report(), true, |request, timeout| {
+        wait(drive_session(&mut wire, &report(), true, None, |request, timeout| {
             launches.fetch_add(1, Ordering::SeqCst);
             let cleaned = Arc::clone(&worker_cleaned);
             ExecutionTask::spawn(request.request_id, timeout, move |control| {
@@ -732,7 +853,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 cleaned.store(true, Ordering::Release);
-                result(request.request_id) // Deliberately zero: interruption wins.
+                result(request.request_id)
             })
         }, pressure)).unwrap();
         assert_eq!(launches.load(Ordering::SeqCst), 1);
@@ -763,7 +884,7 @@ mod tests {
             }
             let cleaned = Arc::new(AtomicBool::new(false));
             let worker_cleaned = Arc::clone(&cleaned);
-            let outcome = wait(drive_session(&mut wire, &report(), false, |request, timeout| {
+            let outcome = wait(drive_session(&mut wire, &report(), false, None, |request, timeout| {
                 let cleaned = Arc::clone(&worker_cleaned);
                 ExecutionTask::spawn(request.request_id, timeout, move |control| {
                     while control.reason().is_none() {
@@ -786,7 +907,7 @@ mod tests {
         let mut frame = request(7);
         frame["timeout_ms"] = serde_json::json!(15);
         peer.frame(frame);
-        wait(drive_session(&mut wire, &report(), true, |request, timeout| {
+        wait(drive_session(&mut wire, &report(), true, None, |request, timeout| {
             assert_eq!(timeout, Duration::from_millis(15));
             ExecutionTask::spawn(request.request_id, timeout, move |control| {
                 while control.reason().is_none() {
@@ -808,7 +929,7 @@ mod tests {
         peer.frame(request(9));
         let launches = Arc::new(AtomicUsize::new(0));
         let report = report();
-        let mut driver = Box::pin(drive_session(&mut wire, &report, false, |request, timeout| {
+        let mut driver = Box::pin(drive_session(&mut wire, &report, false, None, |request, timeout| {
             launches.fetch_add(1, Ordering::SeqCst);
             ExecutionTask::spawn(request.request_id, timeout, move |_| result(request.request_id))
         }, pressure));
@@ -826,8 +947,8 @@ mod tests {
                 std::thread::park_timeout(Duration::from_millis(10));
             }
             if expected_results == 1 {
-                peer.frame(request(9)); // Lost-response retransmission: no new process.
-                peer.frame(request(10)); // A fresh identity may reuse the released slot.
+                peer.frame(request(9));
+                peer.frame(request(10));
             }
         }
         peer.close();
@@ -991,7 +1112,7 @@ mod tests {
         peer.frame(request(10));
         let report = report();
         let launches = AtomicUsize::new(0);
-        let mut driver = Box::pin(drive_session(&mut wire, &report, true, |request, timeout| {
+        let mut driver = Box::pin(drive_session(&mut wire, &report, true, None, |request, timeout| {
             launches.fetch_add(1, Ordering::SeqCst);
             capture_launch(request, timeout)
         }, pressure));
@@ -1031,7 +1152,7 @@ mod tests {
         let peer = wire.clone();
         peer.frame(request(20));
         let report = report();
-        let mut driver = Box::pin(drive_session(&mut wire, &report, false, capture_launch, pressure));
+        let mut driver = Box::pin(drive_session(&mut wire, &report, false, None, capture_launch, pressure));
         pump(driver.as_mut(), &peer, 1);
         peer.frame(output_ack(20));
         peer.frame(request(21));
@@ -1047,7 +1168,7 @@ mod tests {
         let next_peer = next.clone();
         next.frame(output_read(21, "stdout", 0, 64));
         next.close();
-        wait(drive_session(&mut next, &report, false, capture_launch, pressure)).unwrap();
+        wait(drive_session(&mut next, &report, false, None, capture_launch, pressure)).unwrap();
         assert_eq!(next_peer.replies()[0]["reason"], "unknown-output-request");
     }
 
@@ -1077,6 +1198,135 @@ mod tests {
         assert!(output_transfer_requested(r#"{"kind":"session-ok","output_transfer":"ranges-v1"}"#).unwrap());
         for value in [serde_json::json!("ranges-v2"), serde_json::json!(true), serde_json::Value::Null] {
             assert!(output_transfer_requested(&serde_json::json!({"kind": "session-ok", "output_transfer": value}).to_string()).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journaled_result_write_failure_reconciles_without_duplicate_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        let mut wire = Wire::default();
+        wire.frame(request(40));
+        wire.0.lock().unwrap().fail_write = true;
+        let launches = AtomicUsize::new(0);
+        let outcome = wait(drive_session(&mut wire, &report(), true, Some(&mut journal), |request, timeout| {
+            let state: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join("requests.json")).unwrap()).unwrap();
+            assert_eq!(state["last"]["request_id"], 40, "admission precedes the launch seam");
+            assert_eq!(state["last"]["resolved"], false);
+            launches.fetch_add(1, Ordering::SeqCst);
+            capture_launch(request, timeout)
+        }, pressure));
+        assert!(outcome.is_err());
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        drop(journal);
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        let mut next = Wire::default();
+        let peer = next.clone();
+        next.frame(serde_json::json!({"kind":"request-status","request_id":40}));
+        next.frame(request(40));
+        next.close();
+        wait(drive_session(&mut next, &report(), false, Some(&mut journal), |_, _| {
+            panic!("a lost result write must never rerun the process")
+        }, pressure)).unwrap();
+        let replies = peer.replies();
+        assert_eq!(replies[0]["kind"], "request-status");
+        assert_eq!(replies[0]["status"], "terminal-observed");
+        assert_eq!(replies[0]["receipt"]["exit_code"], 0);
+        assert_eq!(replies[0]["output_recovery"], "unavailable");
+        assert_eq!(replies[0]["output_available_in_this_session"], false);
+        assert_eq!(replies[0]["publication_authorized"], false);
+        assert_eq!(replies[1]["reason"], "durable-request-already-admitted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journaled_disconnect_records_only_after_session_owned_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        let mut wire = Wire::default();
+        wire.frame(request(50));
+        wire.close();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let worker_cleaned = Arc::clone(&cleaned);
+        wait(drive_session(&mut wire, &report(), false, Some(&mut journal), |request, timeout| {
+            let cleaned = Arc::clone(&worker_cleaned);
+            ExecutionTask::spawn(request.request_id, timeout, move |control| {
+                while control.reason().is_none() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                cleaned.store(true, Ordering::Release);
+                result(request.request_id)
+            })
+        }, pressure)).unwrap();
+        assert!(cleaned.load(Ordering::Acquire));
+        drop(journal);
+        let journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        let status = journal.status(50);
+        assert_eq!(status["status"], "terminal-observed");
+        assert_eq!(status["receipt"]["stop_reason"], StopReason::SessionLost.label());
+        assert_ne!(status["receipt"]["exit_code"], 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journaled_unfinished_admission_blocks_replay_and_new_work() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        journal.admit(&request(60), DEFAULT_EXECUTION_TIMEOUT).unwrap();
+        drop(journal);
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        let mut wire = Wire::default();
+        let peer = wire.clone();
+        wire.frame(request(60));
+        wire.frame(request(61));
+        wire.frame(serde_json::json!({"kind":"request-status","request_id":60}));
+        wire.close();
+        wait(drive_session(&mut wire, &report(), false, Some(&mut journal), |_, _| {
+            panic!("uncertain prior ownership must block all process launch")
+        }, pressure)).unwrap();
+        let replies = peer.replies();
+        assert_eq!(replies[0]["reason"], "durable-request-already-admitted");
+        assert_eq!(replies[1]["reason"], "prior-execution-uncertain");
+        assert_eq!(replies[2]["status"], "execution-uncertain");
+        assert_eq!(replies[2]["replay_authorized"], false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journaled_launch_failure_does_not_authorize_another_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        let mut wire = Wire::default();
+        let peer = wire.clone();
+        wire.frame(request(70));
+        wire.frame(request(71));
+        wire.close();
+        let launches = AtomicUsize::new(0);
+        wait(drive_session(&mut wire, &report(), false, Some(&mut journal), |_, _| {
+            launches.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("injected launch failure"))
+        }, pressure)).unwrap();
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(peer.replies()[1]["reason"], "prior-execution-uncertain");
+        assert_eq!(journal.status(70)["status"], "execution-uncertain");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_handshake_advertises_identity_and_recovery_version() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        journal.admit(&request(80), DEFAULT_EXECUTION_TIMEOUT).unwrap();
+        let hello: serde_json::Value = serde_json::from_str(&worker_hello(&report(), &journal)).unwrap();
+        assert_eq!(hello["boot_generation"], journal.boot_generation().0);
+        assert_eq!(hello["incarnation"], format!("{:032x}", journal.incarnation().0));
+        assert_eq!(hello["request_high_water"], 80);
+        assert_eq!(hello["recovery_protocols"][0], RECOVERY_PROTOCOL);
+        assert!(validate_recovery_selection(r#"{"kind":"session-ok"}"#).is_ok());
+        assert!(validate_recovery_selection(&serde_json::json!({"kind":"session-ok","recovery_protocol":RECOVERY_PROTOCOL}).to_string()).is_ok());
+        for bad in [serde_json::json!("other"), serde_json::json!(true), serde_json::Value::Null] {
+            assert!(validate_recovery_selection(&serde_json::json!({"kind":"session-ok","recovery_protocol":bad}).to_string()).is_err());
         }
     }
 }
