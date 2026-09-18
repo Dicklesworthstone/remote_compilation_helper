@@ -409,4 +409,180 @@ mod tests {
         budget.reserve(100).unwrap();
         assert_eq!(budget.used(), 600);
     }
+
+    /// Build one of the sixteen exposure states from a bit pattern.
+    fn exposure_state(bits: u8) -> SubscriberFrontierReport {
+        SubscriberFrontierReport {
+            transcript_exposed: bits & 1 != 0,
+            transcript_uncertain: bits & 2 != 0,
+            stateful_intent_recorded: bits & 4 != 0,
+            stateful_uncertain: bits & 8 != 0,
+            last_fully_delivered_seq: 9,
+        }
+    }
+
+    #[test]
+    fn t037_panic_grants_no_extra_permission_across_the_whole_exposure_matrix() {
+        // THE T037 invariant, exhaustive rather than sampled: an internal
+        // wrapper panic must not change what the delivery frontier
+        // permits. Across all sixteen exposure states and both recovery
+        // configurations, exactly one state — nothing exposed, nothing
+        // uncertain — may take the seamless original-chain path.
+        //
+        // Two assertions with different strengths, stated plainly rather
+        // than left for a reader to assume:
+        //
+        // - The seamless-path BOUNDARY is real evidence. It is the thing
+        //   an implementation gets wrong, and fifteen of the sixteen
+        //   states exist to pin it down.
+        // - The equality against `decide_fallback` holds BY CONSTRUCTION
+        //   today, because `contain_panic` delegates to it. It is a
+        //   delegation guard, not independent proof: it fails only if
+        //   someone later reimplements the post-exposure branch with its
+        //   own rules instead of deferring to the frontier. Worth having
+        //   for that reason; worth not mistaking for more than it is.
+        for config in [
+            FallbackConfig::default(),
+            FallbackConfig {
+                labeled_transcript_recovery: true,
+            },
+        ] {
+            for bits in 0u8..16 {
+                let report = exposure_state(bits);
+                let nothing_exposed = bits == 0;
+                match contain_panic(&report, &config, 7) {
+                    ContainedOutcome::RunExactOriginalChain => assert!(
+                        nothing_exposed,
+                        "bits={bits}: the original chain may run ONLY when nothing \
+                         was exposed"
+                    ),
+                    ContainedOutcome::FrontierGoverned(action) => {
+                        assert!(
+                            !nothing_exposed,
+                            "bits={bits}: a clean frontier must not be frontier-governed"
+                        );
+                        assert_eq!(
+                            action,
+                            decide_fallback(&report, &config, 7),
+                            "bits={bits}, recovery={}: a panic must decide exactly as \
+                             a non-panic failure does",
+                            config.labeled_transcript_recovery
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn t037_uncertainty_alone_is_enough_to_forfeit_the_seamless_path() {
+        // The conservative half of the matrix, called out because it is
+        // the one an implementation is most tempted to get wrong: MAY
+        // have been exposed is treated as exposed. A wrapper that reran
+        // the original chain on an uncertain transcript would duplicate
+        // output the user already saw.
+        for bits in [2u8, 8, 10] {
+            assert!(
+                !matches!(
+                    contain_panic(&exposure_state(bits), &FallbackConfig::default(), 7),
+                    ContainedOutcome::RunExactOriginalChain
+                ),
+                "bits={bits}: an uncertain frontier must not take the seamless path"
+            );
+        }
+    }
+
+    #[test]
+    fn t037_a_real_panic_is_contained_in_both_regimes_and_never_printed() {
+        let _serial = HOOK_LOCK.lock().unwrap();
+        // Before exposure AND after exposure, with a REAL injected panic
+        // each time: the panic is contained (never a crash), recorded
+        // internally (evidence the nonprinting hook ran rather than the
+        // default printing one — a printed panic reads to Cargo like a
+        // compiler diagnostic, which is R105), and the outcome follows
+        // the regime.
+        for (label, report, expect_seamless) in [
+            ("before exposure", SubscriberFrontierReport::default(), true),
+            (
+                "after exposure",
+                SubscriberFrontierReport {
+                    transcript_exposed: true,
+                    last_fully_delivered_seq: 9,
+                    ..Default::default()
+                },
+                false,
+            ),
+        ] {
+            let store = Arc::new(Mutex::new(Vec::new()));
+            let guard = RecordingHookGuard::install(Arc::clone(&store));
+            let contained: Result<(), PanicRecord> =
+                run_contained(|| panic!("wrapper bug during {label}"), &store);
+            drop(guard);
+
+            let record = contained.expect_err("the panic must be contained, not propagated");
+            assert_eq!(record.message, format!("wrapper bug during {label}"));
+            assert!(
+                record.location.is_some(),
+                "{label}: the hook must record where it happened"
+            );
+            assert_eq!(
+                store.lock().unwrap().len(),
+                1,
+                "{label}: exactly one record, captured internally"
+            );
+            assert_eq!(
+                matches!(
+                    contain_panic(&report, &FallbackConfig::default(), 7),
+                    ContainedOutcome::RunExactOriginalChain
+                ),
+                expect_seamless,
+                "{label}: wrong post-panic regime"
+            );
+        }
+    }
+
+    #[test]
+    fn t037_a_non_string_panic_payload_is_still_contained_and_recorded() {
+        let _serial = HOOK_LOCK.lock().unwrap();
+        // `panic_any` with a non-string payload is the case a
+        // downcast-to-&str hook silently loses. It must still produce a
+        // record — an unrecorded panic would reach `run_contained`'s
+        // fallback marker and lose the location entirely.
+        let store = Arc::new(Mutex::new(Vec::new()));
+        let guard = RecordingHookGuard::install(Arc::clone(&store));
+        let contained: Result<(), PanicRecord> =
+            run_contained(|| std::panic::panic_any(42u32), &store);
+        drop(guard);
+
+        let record = contained.expect_err("a non-string panic must still be contained");
+        assert_eq!(record.message, "<non-string panic payload>");
+        assert!(
+            record.location.is_some(),
+            "the location survives even when the payload does not"
+        );
+    }
+
+    #[test]
+    fn t037_allocation_budget_holds_at_its_exact_boundary() {
+        // The OOM mitigation's edges, where an off-by-one turns a typed
+        // refusal back into the abort it exists to prevent.
+        let mut budget = AllocationBudget::new(100);
+        budget.reserve(100).expect("an exact-fit reservation fits");
+        assert_eq!(budget.used(), 100);
+        assert_eq!(
+            budget.reserve(1),
+            Err(AllocationRefused {
+                requested: 1,
+                available: 0,
+            }),
+            "a full budget refuses even one byte"
+        );
+        // Zero-byte reservations are always admissible, including when
+        // the budget is exhausted: refusing them would make callers
+        // special-case empty buffers.
+        budget.reserve(0).expect("a zero reservation always fits");
+        budget.release(100);
+        assert_eq!(budget.used(), 0);
+        budget.reserve(100).expect("released budget is reusable");
+    }
 }
