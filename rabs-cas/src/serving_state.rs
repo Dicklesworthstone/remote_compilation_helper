@@ -10,9 +10,10 @@
 //!   strictly greater than the stored one is a typed refusal
 //!   (`StaleServingRevision`), never an overwrite — idempotency lives at
 //!   the message layer, not by clobbering state.
-//! - **References are the authority**: serving is blocked by quarantine
-//!   ROWS the record names; a reason string is never the gate, and a
-//!   dangling reference is refused at write time
+//! - **Quarantine is independent of serving metadata**: named blocking
+//!   references AND durable action-entry quarantine rows deny serving.
+//!   Dropping a reference or rewriting a disposition is not a repair.
+//!   A dangling reference is refused at write time
 //!   (`UnknownQuarantineReference`).
 //! - **Clocks are distrusted conservatively**: wall-clock rollback,
 //!   clock-epoch discontinuity, or uncertainty crossing the not-after
@@ -21,20 +22,36 @@
 //!   — this module only names the cause; the protocol impl stays the
 //!   single authority on the verdict.
 //!
-//! Recovery from a blocking quarantine is a NEW record at a higher
-//! revision without the reference (written after the repair is
-//! processed); quarantine rows themselves are released by the H012
-//! repair flow, not here.
+//! Recovery requires the H012 repair flow to release the quarantine,
+//! followed by a NEW record at a higher revision without the reference.
+//! Ordinary trust reevaluation and failure revalidation are not repairs.
 
 use rabs_protocol::result_identity::TypedDigest;
 use rabs_protocol::serving::ServingValidity;
 
 use crate::metadata_store::{
-    DivergenceIncidentRow, QuarantineScope, RabsMetadataStore, StoreError,
+    DivergenceIncidentRow, QuarantineScope, RabsMetadataStore, SqlValue, StoreError,
 };
 
 /// Disposition string under which serving is possible at all.
 pub const SERVABLE_DISPOSITION: &str = "servable";
+
+/// Consult the durable quarantine independently of the mutable serving
+/// record. Quarantine is written before disposition updates, so the
+/// serving record may legitimately lag it after a crash. Keep this
+/// predicate shared with trust reevaluation; neither path may mistake
+/// an omitted junction reference for an authorized quarantine release.
+pub(crate) fn action_quarantine_present(
+    store: &mut dyn RabsMetadataStore,
+    action_key: &str,
+) -> Result<bool, StoreError> {
+    Ok(!store
+        .query(
+            "SELECT 1 FROM quarantines WHERE scope = 'action-entry' AND subject = ?1 LIMIT 1",
+            &[SqlValue::Text(action_key.to_owned())],
+        )?
+        .is_empty())
+}
 
 /// The gate's typed decision for one action key at one instant.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +63,7 @@ pub enum ServeDecision {
         /// The stored disposition.
         disposition: String,
     },
-    /// Blocked by named quarantine references.
+    /// Blocked by named references or a durable action quarantine.
     Blocked {
         /// The (scope, subject) rows blocking serving.
         references: Vec<(String, String)>,
@@ -84,6 +101,11 @@ pub fn serving_gate(
     if !record.blocking.is_empty() {
         return Ok(ServeDecision::Blocked {
             references: record.blocking,
+        });
+    }
+    if action_quarantine_present(store, action_key)? {
+        return Ok(ServeDecision::Blocked {
+            references: vec![("action-entry".to_owned(), action_key.to_owned())],
         });
     }
     if !record.validity.still_valid(now_unix_micros, now_epoch) {
@@ -271,6 +293,11 @@ pub enum RevalidationVerdict {
 pub enum RevalidationError {
     /// No serving record exists for this key.
     NoServingRecord,
+    /// A matching re-execution cannot release quarantine, named
+    /// blockers, or another non-servable disposition.
+    ServingBlocked,
+    /// The revision cannot advance without overflowing.
+    RevisionExhausted,
     /// The stored record's revision moved past `expected_revision`:
     /// someone else revalidated concurrently; retry against fresh
     /// state instead of clobbering (H040 replay rule).
@@ -285,6 +312,8 @@ impl std::fmt::Display for RevalidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoServingRecord => write!(f, "no serving record to revalidate"),
+            Self::ServingBlocked => write!(f, "serving is blocked; revalidation is not a repair"),
+            Self::RevisionExhausted => write!(f, "serving revision exhausted"),
             Self::StaleRevision { stored } => {
                 write!(f, "serving revision moved to {stored}; retry")
             }
@@ -300,10 +329,11 @@ impl std::error::Error for RevalidationError {}
 /// signature against the published one:
 ///
 /// - identical → verification sample appended (H033), serving renewed
-///   at `expected_revision + 1` with a fresh TTL window;
-/// - different → divergence incident appended (H026), scoped
-///   quarantine row added, serving disposition flipped to
-///   `"quarantined"` at the same higher revision.
+///   at `expected_revision + 1` with a fresh TTL window, but only if no
+///   quarantine, named blocker, or non-servable disposition forbids it;
+/// - different → scoped quarantine added FIRST, divergence incident
+///   appended (H026), serving disposition flipped to `"quarantined"`
+///   at the same higher revision.
 ///
 /// `ttl_micros` of `None` uses [`DEFAULT_REVALIDATION_TTL_MICROS`].
 ///
@@ -340,7 +370,9 @@ pub fn apply_revalidation(
             stored: record.state_revision,
         });
     }
-    let new_revision = expected_revision + 1;
+    let new_revision = expected_revision
+        .checked_add(1)
+        .ok_or(RevalidationError::RevisionExhausted)?;
     let ttl = ttl_micros.unwrap_or(DEFAULT_REVALIDATION_TTL_MICROS);
     let validity = ServingValidity {
         evaluated_at_unix_micros: now_unix_micros,
@@ -350,6 +382,16 @@ pub fn apply_revalidation(
     };
 
     if published_signature == revalidated_signature {
+        // A matching sample is evidence, not authorization to repair an
+        // incident or bypass another serving policy. Refuse before any
+        // writes; expired TTLs alone are still eligible for renewal.
+        if record.disposition != SERVABLE_DISPOSITION
+            || !record.blocking.is_empty()
+            || action_quarantine_present(store, action_key_str)
+                .map_err(|e| RevalidationError::Store(format!("{e:?}")))?
+        {
+            return Err(RevalidationError::ServingBlocked);
+        }
         // Byte-identical reproduction: append evidence, renew serving.
         store
             .record_verification_sample(action_key_typed, attempt, true, new_revision)
@@ -366,8 +408,15 @@ pub fn apply_revalidation(
             .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
         Ok(RevalidationVerdict::IdenticalEvidenceAppended { new_revision })
     } else {
-        // Success-or-different-failure under the same key is a
-        // SOUNDNESS INCIDENT: record it, then suppress serving.
+        // Quarantine FIRST. A crash or failed incident append must not
+        // leave a known-divergent action servable through its old row.
+        store
+            .add_quarantine(
+                QuarantineScope::ActionEntry,
+                action_key_str,
+                "k007-soundness-incident",
+            )
+            .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
         let seq = new_revision;
         store
             .record_divergence_incident(
@@ -387,13 +436,6 @@ pub fn apply_revalidation(
                          revalidated {revalidated_signature}"
                     ),
                 },
-            )
-            .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
-        store
-            .add_quarantine(
-                QuarantineScope::ActionEntry,
-                action_key_str,
-                "k007-soundness-incident",
             )
             .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
         store
@@ -513,6 +555,15 @@ mod tests {
             ServeDecision::NoRecord
         );
 
+        // Quarantining an unrelated action must not disable this one.
+        store
+            .add_quarantine(QuarantineScope::ActionEntry, "other:key", "unrelated incident")
+            .unwrap();
+        assert_eq!(
+            serving_gate(store, &action_key, 1_000, 0).unwrap(),
+            ServeDecision::Servable
+        );
+
         // H040 record with a TTL: revision 1 supersedes the legacy row.
         store
             .put_serving_record(
@@ -617,6 +668,14 @@ mod tests {
                 "divergent recompute",
             )
             .unwrap();
+        // Crash boundary: quarantine landed, but neither the disposition
+        // nor the junction references have been updated yet.
+        assert_eq!(
+            serving_gate(store, &action_key, 1_300, 1).unwrap(),
+            ServeDecision::Blocked {
+                references: vec![("action-entry".to_owned(), action_key.clone())],
+            }
+        );
         store
             .put_serving_record(
                 &active,
@@ -634,9 +693,9 @@ mod tests {
             }
         );
 
-        // T048/recovery: after the repair is processed the coordinator
-        // writes the NEXT revision without the reference — serving
-        // returns; the junction set is replaced atomically.
+        // Dropping the junction reference at a newer revision is NOT
+        // recovery: the durable incident is still unresolved. Only the
+        // explicit repair flow may release that quarantine row.
         store
             .put_serving_record(
                 &active,
@@ -649,7 +708,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             serving_gate(store, &action_key, 3_100, 1).unwrap(),
-            ServeDecision::Servable
+            ServeDecision::Blocked {
+                references: vec![("action-entry".to_owned(), action_key.clone())],
+            }
         );
         assert!(
             store
@@ -689,6 +750,10 @@ mod tests {
             "disposition-only write reset the revision — replay protection lost"
         );
         assert_eq!(after.disposition, "servable");
+        assert!(matches!(
+            serving_gate(store, &action_key, 3_100, 1).unwrap(),
+            ServeDecision::Blocked { .. }
+        ));
 
         store.differential_snapshot().unwrap()
     }
@@ -761,6 +826,32 @@ mod tests {
                 &[],
             ),
             Err(StoreError::StaleServingRevision)
+        );
+    }
+
+    #[test]
+    fn unreferenced_quarantine_survives_reopen() {
+        let path = fresh_path("quarantine-reopen");
+        let action_key;
+        {
+            let engine = RusqliteEngine::open(&path).unwrap();
+            let mut store = SqlMetadataStore::open(engine).unwrap();
+            let (_, key) = published_fixture(&mut store);
+            action_key = key;
+            store
+                .add_quarantine(QuarantineScope::ActionEntry, &action_key, "interrupted demotion")
+                .unwrap();
+        }
+        let engine = RusqliteEngine::open(&path).unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        let record = store.serving_record(&action_key).unwrap().unwrap();
+        assert_eq!(record.disposition, "servable");
+        assert!(record.blocking.is_empty());
+        assert_eq!(
+            serving_gate(&mut store, &action_key, 1_000, 0).unwrap(),
+            ServeDecision::Blocked {
+                references: vec![("action-entry".to_owned(), action_key)],
+            }
         );
     }
 
@@ -1040,6 +1131,66 @@ mod tests {
                 disposition: "quarantined".to_owned(),
             }
         );
+
+        // A later match must not erase the incident or its blocking
+        // references. Refusal happens before appending any evidence.
+        let before = store.differential_snapshot().unwrap();
+        assert_eq!(
+            apply_revalidation(
+                store,
+                &active,
+                &action_key,
+                &action_typed,
+                3,
+                23,
+                11,
+                "exit=1|diag=d1",
+                "exit=1|diag=d1",
+                "manifest-a",
+                "manifest-a",
+                "ev-c",
+                1_080_000,
+                1,
+                None,
+            ),
+            Err(RevalidationError::ServingBlocked)
+        );
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+
+        // Even a newer record that omits ALL references cannot make
+        // the durable quarantine disappear from the renewal gate.
+        store
+            .put_serving_record(
+                &active,
+                &action_key,
+                "servable",
+                4,
+                &validity(1_080_000, Some(DEFAULT_REVALIDATION_TTL_MICROS), 0, 1),
+                &[],
+            )
+            .unwrap();
+        let before = store.differential_snapshot().unwrap();
+        assert_eq!(
+            apply_revalidation(
+                store,
+                &active,
+                &action_key,
+                &action_typed,
+                4,
+                24,
+                11,
+                "exit=1|diag=d1",
+                "exit=1|diag=d1",
+                "manifest-a",
+                "manifest-a",
+                "ev-d",
+                1_100_000,
+                1,
+                None,
+            ),
+            Err(RevalidationError::ServingBlocked)
+        );
+        assert_eq!(store.differential_snapshot().unwrap(), before);
 
         store.differential_snapshot().unwrap()
     }
