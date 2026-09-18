@@ -16,6 +16,12 @@
 //! - post-seal mutation forces a RESEAL (new generation; already-run
 //!   actions keep their old generation forever) or a coherent
 //!   DOWNGRADE (no further sealed actions) — never a mixed state;
+//! - generation numbers are never reused within a command, and a
+//!   DOWNGRADE IS TERMINAL: neither sealing nor a later mutation can
+//!   bring a downgraded command back to a sealed state (T041). Both
+//!   rules exist because a downgrade clears the current generation, and
+//!   anything that renumbered from it restarted at 1 while existing
+//!   bindings still named generation 1;
 //! - lockfile replay to the worktree runs under a content precondition
 //!   and cannot express mutation of sealed history (there is no API
 //!   that changes a generation's digest).
@@ -74,6 +80,12 @@ pub struct ActionBinding {
 pub struct SnapshotLineage {
     requested: RequestedCommandSnapshot,
     current: Option<ResolvedExecutionSnapshot>,
+    /// Highest generation number ever minted for this command. Numbering
+    /// advances from HERE and never from `current`, because a downgrade
+    /// clears `current` — deriving the next number from it restarted the
+    /// sequence at 1 while old bindings still named generation 1, so one
+    /// number described two different resolution states (T041/R110).
+    highest_generation: u32,
     downgraded: bool,
     bindings: Vec<ActionBinding>,
 }
@@ -85,9 +97,24 @@ impl SnapshotLineage {
         Self {
             requested,
             current: None,
+            highest_generation: 0,
             downgraded: false,
             bindings: Vec::new(),
         }
+    }
+
+    /// Mint the next generation. The number comes from the never-reused
+    /// high-water, so no two sealed generations in one command can share
+    /// a number whatever the path here was.
+    fn mint(&mut self, resolution_sha256: [u8; 32]) -> ResolvedExecutionSnapshot {
+        self.highest_generation += 1;
+        let sealed = ResolvedExecutionSnapshot {
+            generation: self.highest_generation,
+            requested_sha256: self.requested.manifest_sha256,
+            resolution_sha256,
+        };
+        self.current = Some(sealed);
+        sealed
     }
 
     /// Immutable requested-command snapshot this lineage derives from.
@@ -102,16 +129,17 @@ impl SnapshotLineage {
         &mut self,
         resolution_sha256: [u8; 32],
     ) -> Result<ResolvedExecutionSnapshot, LineageError> {
+        if self.downgraded {
+            // A downgrade is terminal. Without this the `AlreadySealed`
+            // guard below is bypassed, because a downgrade clears
+            // `current` — a downgraded command could seal a fresh
+            // generation out from under bindings that already exist.
+            return Err(LineageError::Downgraded);
+        }
         if self.current.is_some() {
             return Err(LineageError::AlreadySealed);
         }
-        let sealed = ResolvedExecutionSnapshot {
-            generation: 1,
-            requested_sha256: self.requested.manifest_sha256,
-            resolution_sha256,
-        };
-        self.current = Some(sealed);
-        Ok(sealed)
+        Ok(self.mint(resolution_sha256))
     }
 
     /// Register one fine-grained action: it binds to EXACTLY the
@@ -139,17 +167,14 @@ impl SnapshotLineage {
         &mut self,
         reseal_with: Option<[u8; 32]>,
     ) -> MutationResponse {
+        if self.downgraded {
+            // Already decided. Answering `Resealed` here would invite
+            // registrations that `register_action` refuses outright, so
+            // the response would contradict the behaviour.
+            return MutationResponse::Downgraded;
+        }
         match reseal_with {
-            Some(resolution_sha256) => {
-                let next_generation = self.current.map_or(1, |sealed| sealed.generation + 1);
-                let sealed = ResolvedExecutionSnapshot {
-                    generation: next_generation,
-                    requested_sha256: self.requested.manifest_sha256,
-                    resolution_sha256,
-                };
-                self.current = Some(sealed);
-                MutationResponse::Resealed(sealed)
-            }
+            Some(resolution_sha256) => MutationResponse::Resealed(self.mint(resolution_sha256)),
             None => {
                 self.downgraded = true;
                 self.current = None;

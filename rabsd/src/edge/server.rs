@@ -552,6 +552,33 @@ fn parse_observation(value: &serde_json::Value) -> Option<crate::edge::shadow::C
     })
 }
 
+fn parse_hello(frame: &[u8]) -> Result<VersionHello, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(frame).map_err(|e| format!("json: {e}"))?;
+    if value.get("kind").and_then(|k| k.as_str()) != Some("hello") {
+        return Err("first frame must be kind=hello".to_string());
+    }
+    let range = |key: &str| -> Result<VersionRange, String> {
+        let node = value
+            .get(key)
+            .ok_or_else(|| format!("hello missing {key}"))?;
+        Ok(VersionRange {
+            minimum_compatible: node
+                .get("minimum_compatible")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32,
+            current: node
+                .get("current")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32,
+        })
+    };
+    Ok(VersionHello {
+        transport: range("transport")?,
+        application: range("application")?,
+    })
+}
+
 #[cfg(test)]
 mod live_serve_tests {
     use super::*;
@@ -611,31 +638,4 @@ mod live_serve_tests {
         assert_eq!(reply["outcome"], "execute-privately");
         assert!(!destination.exists());
     }
-}
-
-fn parse_hello(frame: &[u8]) -> Result<VersionHello, String> {
-    let value: serde_json::Value =
-        serde_json::from_slice(frame).map_err(|e| format!("json: {e}"))?;
-    if value.get("kind").and_then(|k| k.as_str()) != Some("hello") {
-        return Err("first frame must be kind=hello".to_string());
-    }
-    let range = |key: &str| -> Result<VersionRange, String> {
-        let node = value
-            .get(key)
-            .ok_or_else(|| format!("hello missing {key}"))?;
-        Ok(VersionRange {
-            minimum_compatible: node
-                .get("minimum_compatible")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as u32,
-            current: node
-                .get("current")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as u32,
-        })
-    };
-    Ok(VersionHello {
-        transport: range("transport")?,
-        application: range("application")?,
-    })
 }
