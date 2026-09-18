@@ -315,9 +315,10 @@ pub fn quarantine_served_divergence(
         };
         blocking.push((scope, subject.clone()));
     }
-    if !blocking.iter().any(|(scope, subject)| {
-        scope == &QuarantineScope::ActionEntry && subject == action_key_str
-    }) {
+    if !blocking
+        .iter()
+        .any(|(scope, subject)| scope == &QuarantineScope::ActionEntry && subject == action_key_str)
+    {
         blocking.push((QuarantineScope::ActionEntry, action_key_str.to_owned()));
     }
     store
@@ -421,16 +422,18 @@ mod tests {
         passes: u32,
         fails: u32,
     ) {
-        let mut seq = store.list_verification_samples(&action(tag)).unwrap().len() as u64 + 1;
-        for passed in std::iter::repeat_n(true, passes as usize)
-            .chain(std::iter::repeat_n(false, fails as usize))
-        {
+        let first = store.list_verification_samples(&action(tag)).unwrap().len() as u64 + 1;
+        for (seq, passed) in (first..).zip(
+            std::iter::repeat_n(true, passes as usize)
+                .chain(std::iter::repeat_n(false, fails as usize)),
+        ) {
             let attempt = generation * 1_000 + u128::from(seq);
-            store.record_attempt(attempt, generation, "worker-sampler", seq).unwrap();
+            store
+                .record_attempt(attempt, generation, "worker-sampler", seq)
+                .unwrap();
             store
                 .record_verification_sample(&action(tag), attempt, passed, seq)
                 .unwrap();
-            seq += 1;
         }
     }
 
@@ -456,8 +459,13 @@ mod tests {
             SampleGateDecision::ExecutePrivately(PrivateExecutionReason::ElevatedClassRisk)
         );
         assert_eq!(
-            serving_sample_decision(store, &action(99), ActionClassRisk::LowRiskRegistry, &strict)
-                .unwrap(),
+            serving_sample_decision(
+                store,
+                &action(99),
+                ActionClassRisk::LowRiskRegistry,
+                &strict
+            )
+            .unwrap(),
             SampleGateDecision::ExecutePrivately(PrivateExecutionReason::NoPublishedResult)
         );
         let key_one = published(store, 1, 10);
@@ -479,12 +487,23 @@ mod tests {
             )
         );
         for invalid in [
-            SamplingPolicy { min_pass_rate_basis_points: 10_001, ..strict },
-            SamplingPolicy { sample_rate_basis_points: 10_001, ..strict },
+            SamplingPolicy {
+                min_pass_rate_basis_points: 10_001,
+                ..strict
+            },
+            SamplingPolicy {
+                sample_rate_basis_points: 10_001,
+                ..strict
+            },
         ] {
             assert_eq!(
-                serving_sample_decision(store, &action(1), ActionClassRisk::LowRiskRegistry, &invalid)
-                    .unwrap(),
+                serving_sample_decision(
+                    store,
+                    &action(1),
+                    ActionClassRisk::LowRiskRegistry,
+                    &invalid
+                )
+                .unwrap(),
                 SampleGateDecision::ExecutePrivately(PrivateExecutionReason::InvalidPolicy)
             );
         }
@@ -559,8 +578,12 @@ mod tests {
 
         // Repeated observations and unknown attempts do not satisfy a
         // stronger independent-execution requirement.
-        store.record_verification_sample(&action(2), 11_001, true, 500).unwrap();
-        store.record_verification_sample(&action(2), 99_999, true, 501).unwrap();
+        store
+            .record_verification_sample(&action(2), 11_001, true, 500)
+            .unwrap();
+        store
+            .record_verification_sample(&action(2), 99_999, true, 501)
+            .unwrap();
         assert_eq!(
             serving_sample_decision(
                 store,
@@ -577,7 +600,9 @@ mod tests {
             )
         );
 
-        store.set_serving_disposition_key(&key_two, "evidence-pending").unwrap();
+        store
+            .set_serving_disposition_key(&key_two, "evidence-pending")
+            .unwrap();
         assert_eq!(
             serving_sample_decision(store, &action(2), ActionClassRisk::LowRiskRegistry, &strict)
                 .unwrap(),
@@ -585,9 +610,20 @@ mod tests {
                 disposition: "evidence-pending".to_owned(),
             })
         );
-        store.set_serving_disposition_key(&key_two, SERVABLE_DISPOSITION).unwrap();
-        store.add_quarantine(QuarantineScope::ActionEntry, &key_two, "corrupt closure").unwrap();
-        assert!(store.serving_record(&key_two).unwrap().unwrap().blocking.is_empty());
+        store
+            .set_serving_disposition_key(&key_two, SERVABLE_DISPOSITION)
+            .unwrap();
+        store
+            .add_quarantine(QuarantineScope::ActionEntry, &key_two, "corrupt closure")
+            .unwrap();
+        assert!(
+            store
+                .serving_record(&key_two)
+                .unwrap()
+                .unwrap()
+                .blocking
+                .is_empty()
+        );
         assert_eq!(
             serving_sample_decision(store, &action(2), ActionClassRisk::LowRiskRegistry, &strict)
                 .unwrap(),
@@ -595,7 +631,13 @@ mod tests {
         );
 
         // ---- Instant divergence quarantine, preserving prior blockers ----
-        store.add_quarantine(QuarantineScope::LogicalObject, "object:damaged", "bad bytes").unwrap();
+        store
+            .add_quarantine(
+                QuarantineScope::LogicalObject,
+                "object:damaged",
+                "bad bytes",
+            )
+            .unwrap();
         store
             .put_serving_record(
                 &active,
@@ -624,7 +666,10 @@ mod tests {
         let wrong = digest("rabs.authority.sha256.v1", 2);
         assert_eq!(
             quarantine_served_divergence(store, &wrong, &key_one, 7, 11, 22, "mismatch"),
-            Err(RevalidationError::Store(format!("{:?}", StoreError::NotActiveAuthority)))
+            Err(RevalidationError::Store(format!(
+                "{:?}",
+                StoreError::NotActiveAuthority
+            )))
         );
         assert_eq!(store.differential_snapshot().unwrap(), before);
 
@@ -648,7 +693,13 @@ mod tests {
             )
             .unwrap();
         let new_revision = quarantine_served_divergence(
-            store, &active, &key_one, 7, 11, 22, "stdout digest mismatch",
+            store,
+            &active,
+            &key_one,
+            7,
+            11,
+            22,
+            "stdout digest mismatch",
         )
         .unwrap();
         assert_eq!(new_revision, 8);
@@ -682,8 +733,17 @@ mod tests {
             Ok(9)
         );
         let incidents = store.list_divergence_incidents(&key_one).unwrap();
-        assert_eq!(incidents.iter().map(|incident| incident.seq).collect::<Vec<_>>(), vec![40, 41, 42]);
-        assert_eq!(store.serving_record(&key_one).unwrap().unwrap().blocking, record.blocking);
+        assert_eq!(
+            incidents
+                .iter()
+                .map(|incident| incident.seq)
+                .collect::<Vec<_>>(),
+            vec![40, 41, 42]
+        );
+        assert_eq!(
+            store.serving_record(&key_one).unwrap().unwrap().blocking,
+            record.blocking
+        );
         assert_eq!(
             quarantine_served_divergence(store, &active, "missing:key", 1, 1, 1, "x"),
             Err(RevalidationError::NoServingRecord)
