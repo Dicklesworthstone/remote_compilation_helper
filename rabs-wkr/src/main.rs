@@ -7,7 +7,9 @@
 //! offers, never publications; this binary has no coordinator commit API.
 //!
 //! CLI: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once]
-//! `--once` exits after one admitted execution completes, not after a ping.
+//! `--once` exits after one admitted execution completes, or after its output
+//! acknowledgement when `ranges-v1` retrieval was negotiated. Byte retrieval
+//! starts after process/drain completion; this is not live pipe streaming.
 
 use asupersync::cx::Cx;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -16,6 +18,7 @@ use asupersync::runtime::RuntimeBuilder;
 use rabs_wkr::execution::{
     DEFAULT_EXECUTION_TIMEOUT, ExecutionCompletion, ExecutionTask, StopReason,
 };
+use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
 use rabs_wkr::session::{
     CanonicalExecRequest, execute_canonical_controlled, probe_capability, sample_pressure,
 };
@@ -27,6 +30,7 @@ use std::time::Duration;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_FRAME_BYTES: usize = 1 << 20;
+const OUTPUT_TRANSFER: &str = "ranges-v1";
 
 fn json_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
@@ -58,7 +62,8 @@ fn main() {
                 "rabs-wkr {VERSION} — RABS trusted worker daemon\n\
                  USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once]\n\
                  Serves canonical-exec requests through the sandbox launcher; \
-                 offers results, never commits (R50)."
+                 offers results, never commits (R50).\n\
+                 Negotiate output_transfer=ranges-v1 in session-ok to retrieve diagnostic bytes."
             );
             return;
         }
@@ -211,6 +216,10 @@ fn completion_frame(completion: &ExecutionCompletion) -> String {
         "stdout_spill_path": result.stdout_spill_path,
         "stderr_spill_path": result.stderr_spill_path,
         "stop_reason": completion.stop_reason.map(StopReason::label),
+        "output_transfer": completion.outputs.as_ref().map(|_| OUTPUT_TRANSFER),
+        "stdout_bytes": completion.outputs.as_ref().map(|outputs| outputs.stdout.len()),
+        "stderr_bytes": completion.outputs.as_ref().map(|outputs| outputs.stderr.len()),
+        "output_ack_required": completion.outputs.is_some(),
     })
     .to_string()
 }
@@ -219,11 +228,91 @@ fn request_error(request_id: Option<u64>, reason: &str) -> String {
     serde_json::json!({"kind": "error", "request_id": request_id, "reason": reason}).to_string()
 }
 
+/// The identity an acknowledgement must echo AFTER the receiver independently
+/// verifies both reconstructed streams. An ACK is the receiver's claim, not
+/// proof of execution/publication or cryptographic proof that it read the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutputIdentity {
+    request_id: u64,
+    stdout_sha256: String,
+    stderr_sha256: String,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+}
+
+impl OutputIdentity {
+    fn new(request_id: u64, outputs: &CapturedOutputs) -> Self {
+        Self {
+            request_id,
+            stdout_sha256: outputs.stdout.sha256().to_owned(),
+            stderr_sha256: outputs.stderr.sha256().to_owned(),
+            stdout_bytes: outputs.stdout.len(),
+            stderr_bytes: outputs.stderr.len(),
+        }
+    }
+
+    fn from_ack(value: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            request_id: value.get("request_id")?.as_u64()?,
+            stdout_sha256: value.get("stdout_sha256")?.as_str()?.to_owned(),
+            stderr_sha256: value.get("stderr_sha256")?.as_str()?.to_owned(),
+            stdout_bytes: value.get("stdout_bytes")?.as_u64()?,
+            stderr_bytes: value.get("stderr_bytes")?.as_u64()?,
+        })
+    }
+}
+
+struct PendingOutput {
+    identity: OutputIdentity,
+    outputs: CapturedOutputs,
+}
+
+impl PendingOutput {
+    fn new(request_id: u64, outputs: CapturedOutputs) -> Self {
+        Self { identity: OutputIdentity::new(request_id, &outputs), outputs }
+    }
+
+    fn read_frame(&mut self, value: &serde_json::Value) -> Result<String, String> {
+        if value.get("request_id").and_then(serde_json::Value::as_u64) != Some(self.identity.request_id) {
+            return Err("unknown-output-request".to_owned());
+        }
+        if value.get("path").is_some() {
+            return Err("output-paths-not-accepted".to_owned());
+        }
+        let name = value.get("stream").and_then(serde_json::Value::as_str)
+            .ok_or("output stream must be stdout or stderr")?;
+        let stream = match name {
+            "stdout" => &mut self.outputs.stdout,
+            "stderr" => &mut self.outputs.stderr,
+            _ => return Err("output stream must be stdout or stderr".to_owned()),
+        };
+        let offset = value.get("offset").and_then(serde_json::Value::as_u64)
+            .ok_or("output offset must be an unsigned integer")?;
+        let max_bytes = match value.get("max_bytes") {
+            None => MAX_OUTPUT_CHUNK_BYTES,
+            Some(value) => value.as_u64().and_then(|size| usize::try_from(size).ok())
+                .filter(|size| *size > 0 && *size <= MAX_OUTPUT_CHUNK_BYTES)
+                .ok_or("invalid output chunk size")?,
+        };
+        let bytes = stream.read_chunk(offset, max_bytes).map_err(|error| format!("output read: {error}"))?;
+        let next_offset = offset.checked_add(bytes.len() as u64).ok_or("output offset overflow")?;
+        let data_hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        Ok(serde_json::json!({
+            "kind": "output-chunk", "request_id": self.identity.request_id, "stream": name,
+            "offset": offset, "next_offset": next_offset, "total_bytes": stream.len(),
+            "eof": next_offset == stream.len(), "data_hex": data_hex,
+            "sha256": stream.sha256(), "chunk_sha256": rabs_wkr::session::sha256_hex(&bytes),
+        }).to_string())
+    }
+}
+
 /// The actual steady-state driver. The launch seam keeps tests independent of
 /// host isolation support; production supplies only execute_canonical_controlled.
 /// There is one active execution and no hidden queue. Request IDs must increase
 /// within a session: reconnect/resumption requires a separate durable protocol,
 /// and retransmitting an uncertain request here never launches it again.
+/// At most one completed output pair is retained; new execution waits for its
+/// identity-bound acknowledgement instead of evicting undelivered diagnostics.
 async fn drive_session<S, L, H>(
     stream: &mut S,
     report: &rabs_wkr::session::CapabilityReport,
@@ -239,22 +328,33 @@ where
     let mut reader = FrameReader::default();
     let mut active: Option<ExecutionTask> = None;
     let mut last_admitted: Option<u64> = None;
+    let mut pending_output: Option<PendingOutput> = None;
+    let mut last_output_ack: Option<OutputIdentity> = None;
     let outcome = async {
         loop {
             if Cx::current().is_some_and(|cx| cx.checkpoint().is_err()) {
                 return Err("session cancelled".to_owned());
             }
+            let mut exit_after_reply = false;
             let reply = match next_event(&mut reader, stream, &mut active).await {
                 SessionEvent::Completed { request_id, result } => {
                     // Completion consumes the thread only AFTER drain and reap.
-                    // Clearing active now releases capacity; cancellation ACKs do not.
+                    // Output ownership remains until ACK; no next process can
+                    // overwrite or evict a pending diagnostic snapshot.
                     drop(active.take());
                     let reply = match result {
-                        Ok(completion) => completion_frame(&completion),
-                        Err(reason) => request_error(Some(request_id), &reason),
+                        Ok(mut completion) => {
+                            let reply = completion_frame(&completion);
+                            pending_output = completion.outputs.take().map(|outputs| PendingOutput::new(request_id, outputs));
+                            reply
+                        }
+                        Err(reason) => serde_json::json!({
+                            "kind": "error", "request_id": request_id, "reason": reason,
+                            "execution_may_have_run": true, "stage": "execution-completion",
+                        }).to_string(),
                     };
                     write_frame(stream, &reply).await.map_err(|e| format!("result write: {e}"))?;
-                    if once {
+                    if once && pending_output.is_none() {
                         return Ok(());
                     }
                     continue;
@@ -278,8 +378,27 @@ where
                                 "kind": "heartbeat", "worker_id": report.worker_id,
                                 "load_x100": pressure.load_x100, "free_disk_mib": pressure.free_disk_mib,
                                 "active_request_id": active.as_ref().map(ExecutionTask::request_id),
+                                "pending_output_request_id": pending_output.as_ref().map(|output| output.identity.request_id),
                             }).to_string()
                         }
+                        Some("output-read") => match pending_output.as_mut() {
+                            Some(output) => output.read_frame(&value)
+                                .unwrap_or_else(|reason| request_error(request_id, &reason)),
+                            None => request_error(request_id, "unknown-output-request"),
+                        },
+                        Some("output-ack") => match OutputIdentity::from_ack(&value) {
+                            Some(ack) if pending_output.as_ref().is_some_and(|output| output.identity == ack) => {
+                                drop(pending_output.take());
+                                last_output_ack = Some(ack);
+                                exit_after_reply = once;
+                                serde_json::json!({"kind": "output-acknowledged", "request_id": request_id, "already_released": false}).to_string()
+                            }
+                            Some(ack) if last_output_ack.as_ref() == Some(&ack) => {
+                                // A retransmitted ACK cannot release a NEWER capture.
+                                serde_json::json!({"kind": "output-acknowledged", "request_id": request_id, "already_released": true}).to_string()
+                            }
+                            _ => request_error(request_id, "output-ack-mismatch"),
+                        },
                         Some("cancel") => match (&active, request_id) {
                             (Some(task), Some(id)) if task.request_id() == id => {
                                 let accepted = task.cancel(StopReason::Cancelled);
@@ -301,6 +420,9 @@ where
                                 Ok((request, _)) if active.is_some() => {
                                     request_error(Some(request.request_id), "worker-busy")
                                 }
+                                Ok((request, _)) if pending_output.is_some() => {
+                                    request_error(Some(request.request_id), "output-unacknowledged")
+                                }
                                 Ok((request, timeout)) => {
                                     let id = request.request_id;
                                     match launch(request, timeout) {
@@ -319,6 +441,9 @@ where
                 }
             };
             write_frame(stream, &reply).await.map_err(|e| format!("control write: {e}"))?;
+            if exit_after_reply {
+                return Ok(());
+            }
         }
     }.await;
 
@@ -332,6 +457,9 @@ where
             cleanup.map_err(|e| format!("session cleanup: {e}"))?;
         }
     }
+    // Scratch output is connection-owned, never exposed to a new session or
+    // kept in a global map after a failed transfer. This is not durable resume.
+    drop(pending_output);
     outcome
 }
 
@@ -349,7 +477,7 @@ async fn session_loop(
     // This retains the existing prototype handshake; it does NOT upgrade the
     // fixed-token newline transport into authenticated ATP.
     let hello = format!(
-        "{{\"kind\":\"worker-hello\",\"worker_id\":{},\"canonical\":{},\"slots\":{},\"token_id\":1}}",
+        "{{\"kind\":\"worker-hello\",\"worker_id\":{},\"canonical\":{},\"slots\":{},\"token_id\":1,\"output_transfers\":[\"{OUTPUT_TRANSFER}\"]}}",
         json_string(&report.worker_id), report.canonical_namespace, report.slots,
     );
     write_frame(&mut stream, &hello).await.map_err(|e| format!("hello write: {e}"))?;
@@ -359,6 +487,7 @@ async fn session_loop(
     if !session_ack_accepted(&ack) {
         return Err(format!("handshake refused: {ack}"));
     }
+    let capture_output = output_transfer_requested(&ack)?;
 
     let cargo_home = std::env::temp_dir().join(format!("rabs-wkr-ch-{}", std::process::id()));
     let home = std::env::temp_dir().join(format!("rabs-wkr-home-{}", std::process::id()));
@@ -376,6 +505,9 @@ async fn session_loop(
             let spills = spills.clone();
             let slots = report.slots;
             ExecutionTask::spawn(request.request_id, timeout, move |control| {
+                if capture_output {
+                    control.request_output_capture();
+                }
                 execute_canonical_controlled(&request, &cargo_home, &home, slots, &spills, &control)
             })
         },
@@ -390,6 +522,15 @@ fn session_ack_accepted(frame: &str) -> bool {
             value.get("kind").and_then(|kind| kind.as_str()).map(|kind| kind == "session-ok")
         })
         .unwrap_or(false)
+}
+
+fn output_transfer_requested(frame: &str) -> Result<bool, String> {
+    let value: serde_json::Value = serde_json::from_str(frame).map_err(|e| format!("handshake JSON: {e}"))?;
+    match value.get("output_transfer") {
+        None => Ok(false),
+        Some(value) if value.as_str() == Some(OUTPUT_TRANSFER) => Ok(true),
+        Some(_) => Err("unsupported output_transfer selection".to_owned()),
+    }
 }
 
 fn parse_timeout(value: &serde_json::Value) -> Result<Duration, String> {
@@ -800,6 +941,142 @@ mod tests {
         for bad in [serde_json::json!(["safe", 17, "arg"]), serde_json::json!("arg"), serde_json::json!(["\u{0000}"])] {
             frame["args"] = bad;
             assert!(parse_exec_request(&frame).is_err());
+        }
+    }
+
+    fn capture_launch(request: CanonicalExecRequest, timeout: Duration) -> io::Result<ExecutionTask> {
+        ExecutionTask::spawn(request.request_id, timeout, move |control| {
+            let outputs = CapturedOutputs {
+                stdout: rabs_wkr::output::CapturedStream::from_reader(&b"A\0\xffB"[..], 4).unwrap(),
+                stderr: rabs_wkr::output::CapturedStream::from_reader(&b""[..], 0).unwrap(),
+            };
+            let mut result = result(request.request_id);
+            result.stdout_sha256 = outputs.stdout.sha256().to_owned();
+            result.stderr_sha256 = outputs.stderr.sha256().to_owned();
+            control.retain_outputs(Ok(outputs)).unwrap();
+            result
+        })
+    }
+
+    fn output_read(id: u64, stream: &str, offset: u64, max_bytes: usize) -> serde_json::Value {
+        serde_json::json!({"kind": "output-read", "request_id": id, "stream": stream,
+            "offset": offset, "max_bytes": max_bytes})
+    }
+
+    fn output_ack(id: u64) -> serde_json::Value {
+        serde_json::json!({"kind": "output-ack", "request_id": id,
+            "stdout_sha256": rabs_wkr::session::sha256_hex(b"A\0\xffB"),
+            "stderr_sha256": rabs_wkr::session::sha256_hex(b""),
+            "stdout_bytes": 4, "stderr_bytes": 0})
+    }
+
+    fn pump<F: Future>(mut driver: Pin<&mut F>, peer: &Wire, count: usize) {
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(driver.as_mut().poll(&mut cx).is_pending(), "session exited before output acknowledgement");
+            if peer.replies().len() >= count {
+                return;
+            }
+            assert!(Instant::now() < deadline, "output response deadline");
+            std::thread::park_timeout(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn once_retains_binary_output_until_exact_ack_and_does_not_evict_for_new_work() {
+        let mut wire = Wire::default();
+        let peer = wire.clone();
+        peer.frame(request(10));
+        let report = report();
+        let launches = AtomicUsize::new(0);
+        let mut driver = Box::pin(drive_session(&mut wire, &report, true, |request, timeout| {
+            launches.fetch_add(1, Ordering::SeqCst);
+            capture_launch(request, timeout)
+        }, pressure));
+        pump(driver.as_mut(), &peer, 1);
+        assert_eq!(peer.replies()[0]["output_transfer"], OUTPUT_TRANSFER);
+        assert_eq!(peer.replies()[0]["stdout_bytes"], 4);
+        peer.frame(output_read(10, "stdout", 0, 2));
+        peer.frame(output_read(10, "stdout", 2, 2));
+        peer.frame(output_read(10, "stdout", 0, 2));
+        peer.frame(output_read(10, "stderr", 0, 1));
+        peer.frame(request(11));
+        pump(driver.as_mut(), &peer, 6);
+        let replies = peer.replies();
+        assert_eq!(replies[1]["data_hex"], "4100");
+        assert_eq!(replies[2]["data_hex"], "ff42");
+        assert_eq!(replies[2]["eof"], true);
+        assert_eq!(replies[1], replies[3], "a range retry changes no stream cursor contract");
+        assert_eq!(replies[4]["data_hex"], "");
+        assert_eq!(replies[4]["eof"], true);
+        assert_eq!(replies[5]["reason"], "output-unacknowledged");
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        let mut wrong_ack = output_ack(10);
+        wrong_ack["stdout_bytes"] = serde_json::json!(3);
+        peer.frame(wrong_ack);
+        peer.frame(serde_json::json!({"kind": "ping"}));
+        pump(driver.as_mut(), &peer, 8);
+        assert_eq!(peer.replies()[6]["reason"], "output-ack-mismatch");
+        assert_eq!(peer.replies()[7]["pending_output_request_id"], 10);
+        peer.frame(output_ack(10));
+        wait(driver).unwrap();
+        assert_eq!(peer.replies()[8]["kind"], "output-acknowledged");
+    }
+
+    #[test]
+    fn duplicate_ack_cannot_release_new_output_and_disconnect_does_not_expose_it_to_next_session() {
+        let mut wire = Wire::default();
+        let peer = wire.clone();
+        peer.frame(request(20));
+        let report = report();
+        let mut driver = Box::pin(drive_session(&mut wire, &report, false, capture_launch, pressure));
+        pump(driver.as_mut(), &peer, 1);
+        peer.frame(output_ack(20));
+        peer.frame(request(21));
+        pump(driver.as_mut(), &peer, 3);
+        peer.frame(output_ack(20));
+        peer.frame(output_read(21, "stdout", 0, 64));
+        pump(driver.as_mut(), &peer, 5);
+        assert_eq!(peer.replies()[3]["already_released"], true);
+        assert_eq!(peer.replies()[4]["data_hex"], "4100ff42");
+        peer.close();
+        wait(driver).unwrap();
+        let mut next = Wire::default();
+        let next_peer = next.clone();
+        next.frame(output_read(21, "stdout", 0, 64));
+        next.close();
+        wait(drive_session(&mut next, &report, false, capture_launch, pressure)).unwrap();
+        assert_eq!(next_peer.replies()[0]["reason"], "unknown-output-request");
+    }
+
+    #[test]
+    fn output_ranges_refuse_foreign_ids_paths_and_invalid_bounds() {
+        let mut task = capture_launch(parse_exec_request(&request(30)).unwrap(), Duration::from_secs(5)).unwrap();
+        let completion = wait(task.wait()).unwrap();
+        let mut pending = PendingOutput::new(30, completion.outputs.unwrap());
+        let mut path = output_read(30, "stdout", 0, 1);
+        path["path"] = serde_json::json!("/etc/passwd");
+        for bad in [
+            output_read(31, "stdout", 0, 1), path,
+            output_read(30, "../../etc/passwd", 0, 1),
+            output_read(30, "stdout", u64::MAX, 1),
+            output_read(30, "stdout", 0, 0),
+            output_read(30, "stdout", 0, MAX_OUTPUT_CHUNK_BYTES + 1),
+        ] {
+            assert!(pending.read_frame(&bad).is_err(), "accepted {bad}");
+        }
+        let valid: serde_json::Value = serde_json::from_str(&pending.read_frame(&output_read(30, "stdout", 0, 64)).unwrap()).unwrap();
+        assert_eq!(valid["data_hex"], "4100ff42", "refusals do not damage retained output");
+    }
+
+    #[test]
+    fn output_transfer_negotiation_is_explicit_and_unknown_versions_refuse() {
+        assert!(!output_transfer_requested(r#"{"kind":"session-ok"}"#).unwrap());
+        assert!(output_transfer_requested(r#"{"kind":"session-ok","output_transfer":"ranges-v1"}"#).unwrap());
+        for value in [serde_json::json!("ranges-v2"), serde_json::json!(true), serde_json::Value::Null] {
+            assert!(output_transfer_requested(&serde_json::json!({"kind": "session-ok", "output_transfer": value}).to_string()).is_err());
         }
     }
 }
