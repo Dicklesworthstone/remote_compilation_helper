@@ -26,6 +26,7 @@
 
 use rabs_protocol::capability_tokens::CapabilityToken;
 use crate::execution::{DEFAULT_EXECUTION_TIMEOUT, ExecutionControl};
+use crate::output::CapturedOutputs;
 
 /// What this worker can do (advertised at handshake; the scheduler
 /// gates placement on it). Derived from a real HostIsolationSupport
@@ -85,9 +86,9 @@ pub struct ExecResult {
     pub stdout_sha256: String,
     /// SHA-256 of stderr bytes (hex).
     pub stderr_sha256: String,
-    /// Whether execution reached the sandbox at all (false includes
-    /// unavailable isolation or jobserver setup; a typed non-result,
-    /// not a fake success).
+    /// Whether a complete execution result is available. False includes
+    /// setup and capture failures and MUST NOT be taken as proof that no
+    /// process ran. The execution owner reports capture errors separately.
     pub executed: bool,
     /// Live process-group members still present after post-exit
     /// cleanup (bead G006). 0 = the managed group resolved fully; any
@@ -368,11 +369,27 @@ fn execute_canonical_inner(
             });
             #[cfg(not(unix))]
             let exit_code = output.status.code().unwrap_or(-1);
-            let (stdout_sha256, stderr_sha256) =
+            let (stdout_sha256, stderr_sha256) = if control.output_capture_requested() {
+                // Snapshot and hash the SAME complete bytes before the drain's
+                // resident heads disappear. This blocking work stays on the
+                // execution owner; the reactor never copies an entire stream.
+                let capture = CapturedOutputs::from_lanes(&output.stdout, &output.stderr);
+                let digests = capture.as_ref().ok().map(|outputs| (
+                    outputs.stdout.sha256().to_owned(), outputs.stderr.sha256().to_owned(),
+                ));
+                if control.retain_outputs(capture.map_err(|error| error.to_string())).is_err() {
+                    return exec_error(request.request_id);
+                }
+                let Some(digests) = digests else {
+                    return exec_error(request.request_id);
+                };
+                digests
+            } else {
                 match (stream_digest(&output.stdout), stream_digest(&output.stderr)) {
                     (Ok(s), Ok(e)) => (s, e),
                     _ => return exec_error(request.request_id),
-                };
+                }
+            };
             ExecResult {
                 request_id: request.request_id,
                 exit_code,

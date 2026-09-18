@@ -18,4 +18,5 @@
 
 pub mod execution;
 pub mod jobserver;
+pub mod output;
 pub mod session;

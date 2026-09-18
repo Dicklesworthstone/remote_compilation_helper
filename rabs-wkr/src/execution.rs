@@ -14,6 +14,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::output::CapturedOutputs;
 use crate::session::ExecResult;
 
 /// Default worker-local upper bound; a request may shorten, never extend it.
@@ -66,12 +67,19 @@ impl StopReason {
 const RUNNING: u8 = 0;
 const FINISHED: u8 = 4;
 
+#[derive(Debug, Default)]
+struct OutputCapture {
+    requested: bool,
+    result: Option<Result<CapturedOutputs, String>>,
+}
+
 /// Per-execution control, with no PID or other process-global authority.
 /// The first stop reason wins; completion fences all later cancellation.
 #[derive(Debug, Clone)]
 pub struct ExecutionControl {
     state: Arc<AtomicU8>,
     deadline: Instant,
+    output: Arc<Mutex<OutputCapture>>,
 }
 
 impl ExecutionControl {
@@ -86,6 +94,7 @@ impl ExecutionControl {
         Ok(Self {
             state: Arc::new(AtomicU8::new(RUNNING)),
             deadline,
+            output: Arc::new(Mutex::new(OutputCapture::default())),
         })
     }
 
@@ -103,6 +112,36 @@ impl ExecutionControl {
             self.cancel(StopReason::DeadlineExceeded);
         }
         StopReason::from_state(self.state.load(Ordering::Acquire))
+    }
+
+    /// Enable complete output capture before invoking the executor. Digest-only
+    /// callers do not pay for the additional disk snapshots. This is local
+    /// execution configuration, not authority to open an arbitrary remote path.
+    pub fn request_output_capture(&self) {
+        self.output.lock().unwrap_or_else(|e| e.into_inner()).requested = true;
+    }
+
+    /// Whether the owner requested readable output as well as digests.
+    #[must_use]
+    pub fn output_capture_requested(&self) -> bool {
+        self.output.lock().unwrap_or_else(|e| e.into_inner()).requested
+    }
+
+    /// Attach a complete capture (or a precise capture failure) exactly once.
+    /// Interrupted executions may still attach their pre-kill diagnostics.
+    /// The task validates the captured digests against its final ExecResult.
+    pub fn retain_outputs(&self, capture: Result<CapturedOutputs, String>) -> io::Result<()> {
+        let mut output = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        if output.result.is_some() || self.state.load(Ordering::Acquire) == FINISHED {
+            return Err(io::Error::other("output capture already completed"));
+        }
+        output.requested = true;
+        output.result = Some(capture);
+        Ok(())
+    }
+
+    fn take_outputs(&self) -> Option<Result<CapturedOutputs, String>> {
+        self.output.lock().unwrap_or_else(|e| e.into_inner()).result.take()
     }
 
     /// Freeze the result frontier. A subsequent cancel cannot relabel a
@@ -128,6 +167,9 @@ pub struct ExecutionCompletion {
     pub result: ExecResult,
     /// Typed interruption, independent of the compiler's exit-code convention.
     pub stop_reason: Option<StopReason>,
+    /// Complete readable streams when capture was requested and execution ran.
+    /// Ownership transfers to the session, not to process-global path names.
+    pub outputs: Option<CapturedOutputs>,
 }
 
 #[derive(Default)]
@@ -165,12 +207,24 @@ impl ExecutionTask {
                     execute(worker_control.clone())
                 }));
                 let stop_reason = worker_control.finish();
+                let capture = worker_control.take_outputs();
                 let result = match outcome {
                     Ok(mut result) if result.request_id == request_id => {
                         if let Some(reason) = stop_reason {
                             result.exit_code = reason.exit_code();
                         }
-                        Ok(ExecutionCompletion { result, stop_reason })
+                        match capture {
+                            Some(Ok(outputs)) if outputs.stdout.sha256() == result.stdout_sha256
+                                && outputs.stderr.sha256() == result.stderr_sha256 => {
+                                Ok(ExecutionCompletion { result, stop_reason, outputs: Some(outputs) })
+                            }
+                            Some(Ok(_)) => Err("output capture does not match result digests".to_owned()),
+                            Some(Err(error)) => Err(format!("output capture failed: {error}")),
+                            None if worker_control.output_capture_requested() && result.executed => {
+                                Err("executor omitted requested output capture".to_owned())
+                            }
+                            None => Ok(ExecutionCompletion { result, stop_reason, outputs: None }),
+                        }
                     }
                     Ok(_) => Err("executor returned a different request identity".to_owned()),
                     Err(_) => Err("execution thread panicked".to_owned()),
@@ -345,5 +399,42 @@ mod tests {
         assert!(wait(&mut panicked).unwrap_err().contains("panicked"));
         let mut misbound = ExecutionTask::spawn(11, Duration::from_secs(5), |_| result(12)).unwrap();
         assert!(wait(&mut misbound).unwrap_err().contains("identity"));
+    }
+
+    fn outputs(bytes: &[u8]) -> CapturedOutputs {
+        CapturedOutputs {
+            stdout: crate::output::CapturedStream::from_reader(bytes, bytes.len() as u64).unwrap(),
+            stderr: crate::output::CapturedStream::from_reader(&b""[..], 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn completion_owns_full_output_even_after_cancellation() {
+        let mut task = ExecutionTask::spawn(12, Duration::from_secs(5), |control| {
+            control.cancel(StopReason::Cancelled);
+            control.retain_outputs(Ok(outputs(b"output"))).unwrap();
+            assert!(control.retain_outputs(Ok(outputs(b"second"))).is_err());
+            result(12)
+        }).unwrap();
+        let mut completion = wait(&mut task).unwrap();
+        assert_eq!(completion.stop_reason, Some(StopReason::Cancelled));
+        assert_eq!(completion.result.exit_code, 130);
+        assert_eq!(completion.outputs.as_mut().unwrap().stdout.read_chunk(0, 64).unwrap(), b"output");
+    }
+
+    #[test]
+    fn missing_failed_and_misbound_captures_never_produce_successful_completion() {
+        for case in 0..3 {
+            let mut task = ExecutionTask::spawn(13, Duration::from_secs(5), move |control| {
+                control.request_output_capture();
+                match case {
+                    0 => {}
+                    1 => control.retain_outputs(Err("disk full".to_owned())).unwrap(),
+                    _ => control.retain_outputs(Ok(outputs(b"wrong bytes"))).unwrap(),
+                }
+                result(13)
+            }).unwrap();
+            assert!(wait(&mut task).unwrap_err().contains("output"));
+        }
     }
 }
