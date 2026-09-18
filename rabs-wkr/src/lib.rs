@@ -16,6 +16,7 @@
 //! This is a specialized worker, deliberately NOT a mode added to a broad
 //! generic daemon binary (the plan explicitly rejects extending `atpd`).
 
+pub mod artifacts;
 pub mod execution;
 pub mod jobserver;
 pub mod output;

@@ -14,6 +14,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::artifacts::{ArtifactPlan, CapturedArtifacts};
 use crate::output::CapturedOutputs;
 use crate::session::ExecResult;
 
@@ -73,6 +74,12 @@ struct OutputCapture {
     result: Option<Result<CapturedOutputs, String>>,
 }
 
+#[derive(Debug, Default)]
+struct ArtifactCapture {
+    plan: Option<ArtifactPlan>,
+    result: Option<Result<CapturedArtifacts, String>>,
+}
+
 /// Per-execution control, with no PID or other process-global authority.
 /// The first stop reason wins; completion fences all later cancellation.
 #[derive(Debug, Clone)]
@@ -80,6 +87,7 @@ pub struct ExecutionControl {
     state: Arc<AtomicU8>,
     deadline: Instant,
     output: Arc<Mutex<OutputCapture>>,
+    artifacts: Arc<Mutex<ArtifactCapture>>,
 }
 
 impl ExecutionControl {
@@ -95,6 +103,7 @@ impl ExecutionControl {
             state: Arc::new(AtomicU8::new(RUNNING)),
             deadline,
             output: Arc::new(Mutex::new(OutputCapture::default())),
+            artifacts: Arc::new(Mutex::new(ArtifactCapture::default())),
         })
     }
 
@@ -144,16 +153,44 @@ impl ExecutionControl {
         self.output.lock().unwrap_or_else(|e| e.into_inner()).result.take()
     }
 
+    /// Configure the exact artifact declaration before the executor starts.
+    /// A second configuration cannot silently replace the first contract.
+    fn request_artifacts(&self, plan: ArtifactPlan) -> io::Result<()> {
+        let mut artifacts = self.artifacts.lock().unwrap_or_else(|e| e.into_inner());
+        if artifacts.plan.is_some() || self.state.load(Ordering::Acquire) != RUNNING {
+            return Err(io::Error::other("artifact declaration already fixed"));
+        }
+        artifacts.plan = Some(plan);
+        Ok(())
+    }
+
+    /// The validated contract used to construct the canonical output mount.
+    #[must_use]
+    pub fn artifact_plan(&self) -> Option<ArtifactPlan> {
+        self.artifacts.lock().unwrap_or_else(|e| e.into_inner()).plan.clone()
+    }
+
+    /// Retain a complete offer or its capture failure, bound to this execution's
+    /// declaration. The result frontier independently rejects missing artifacts.
+    pub fn retain_artifacts(&self, capture: Result<CapturedArtifacts, String>) -> io::Result<()> {
+        let mut artifacts = self.artifacts.lock().unwrap_or_else(|e| e.into_inner());
+        if artifacts.plan.is_none() || artifacts.result.is_some()
+            || self.state.load(Ordering::Acquire) == FINISHED
+        {
+            return Err(io::Error::other("artifact capture not requested or already completed"));
+        }
+        if capture.as_ref().is_ok_and(|bundle| Some(bundle.plan()) != artifacts.plan.as_ref()) {
+            return Err(io::Error::other("artifact capture does not match declaration"));
+        }
+        artifacts.result = Some(capture);
+        Ok(())
+    }
+
     /// Freeze the result frontier. A subsequent cancel cannot relabel a
     /// completed execution or affect the next request on this session.
     pub(crate) fn finish(&self) -> Option<StopReason> {
         let _ = self.reason();
-        match self.state.compare_exchange(
-            RUNNING,
-            FINISHED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match self.state.compare_exchange(RUNNING, FINISHED, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => None,
             Err(state) => StopReason::from_state(state),
         }
@@ -170,6 +207,49 @@ pub struct ExecutionCompletion {
     /// Complete readable streams when capture was requested and execution ran.
     /// Ownership transfers to the session, not to process-global path names.
     pub outputs: Option<CapturedOutputs>,
+    /// Exact declared artifacts of a successful, uninterrupted, cleaned execution.
+    /// Failed/cancelled work never returns partial artifact offers.
+    pub artifacts: Option<CapturedArtifacts>,
+}
+
+fn complete_result(
+    control: &ExecutionControl,
+    mut result: ExecResult,
+    stop_reason: Option<StopReason>,
+) -> Result<ExecutionCompletion, String> {
+    if let Some(reason) = stop_reason {
+        result.exit_code = reason.exit_code();
+    }
+    let outputs = match control.take_outputs() {
+        Some(Ok(outputs)) if outputs.stdout.sha256() == result.stdout_sha256
+            && outputs.stderr.sha256() == result.stderr_sha256 => Some(outputs),
+        Some(Ok(_)) => return Err("output capture does not match result digests".to_owned()),
+        Some(Err(error)) => return Err(format!("output capture failed: {error}")),
+        None if control.output_capture_requested() && result.executed => {
+            return Err("executor omitted requested output capture".to_owned());
+        }
+        None => None,
+    };
+    let mut capture = control.artifacts.lock().unwrap_or_else(|e| e.into_inner());
+    let captured = capture.result.take();
+    let artifacts = if capture.plan.is_some() && result.executed && result.exit_code == 0
+        && stop_reason.is_none()
+    {
+        if result.residual_group_members != 0 {
+            return Err("artifact execution left residual process-group members".to_owned());
+        }
+        match captured {
+            Some(Ok(artifacts)) if Some(artifacts.plan()) == capture.plan.as_ref() => Some(artifacts),
+            Some(Ok(_)) => return Err("artifact capture does not match declaration".to_owned()),
+            Some(Err(error)) => return Err(format!("artifact capture failed: {error}")),
+            None => return Err("executor omitted requested artifact capture".to_owned()),
+        }
+    } else {
+        // Do not offer partially compiled objects even if an executor attached
+        // them before cancellation won. Diagnostics remain available separately.
+        None
+    };
+    Ok(ExecutionCompletion { result, stop_reason, outputs, artifacts })
 }
 
 #[derive(Default)]
@@ -196,7 +276,27 @@ impl ExecutionTask {
         timeout: Duration,
         execute: impl FnOnce(ExecutionControl) -> ExecResult + Send + 'static,
     ) -> io::Result<Self> {
+        Self::spawn_controlled(request_id, ExecutionControl::new(timeout)?, execute)
+    }
+
+    /// Fix the artifact contract BEFORE spawning, so even a very fast executor
+    /// cannot finish before its output requirements are registered.
+    pub fn spawn_with_artifacts(
+        request_id: u64,
+        timeout: Duration,
+        artifacts: ArtifactPlan,
+        execute: impl FnOnce(ExecutionControl) -> ExecResult + Send + 'static,
+    ) -> io::Result<Self> {
         let control = ExecutionControl::new(timeout)?;
+        control.request_artifacts(artifacts)?;
+        Self::spawn_controlled(request_id, control, execute)
+    }
+
+    fn spawn_controlled(
+        request_id: u64,
+        control: ExecutionControl,
+        execute: impl FnOnce(ExecutionControl) -> ExecResult + Send + 'static,
+    ) -> io::Result<Self> {
         let state = Arc::new(Mutex::new(CompletionState::default()));
         let worker_control = control.clone();
         let worker_state = Arc::clone(&state);
@@ -207,24 +307,9 @@ impl ExecutionTask {
                     execute(worker_control.clone())
                 }));
                 let stop_reason = worker_control.finish();
-                let capture = worker_control.take_outputs();
                 let result = match outcome {
-                    Ok(mut result) if result.request_id == request_id => {
-                        if let Some(reason) = stop_reason {
-                            result.exit_code = reason.exit_code();
-                        }
-                        match capture {
-                            Some(Ok(outputs)) if outputs.stdout.sha256() == result.stdout_sha256
-                                && outputs.stderr.sha256() == result.stderr_sha256 => {
-                                Ok(ExecutionCompletion { result, stop_reason, outputs: Some(outputs) })
-                            }
-                            Some(Ok(_)) => Err("output capture does not match result digests".to_owned()),
-                            Some(Err(error)) => Err(format!("output capture failed: {error}")),
-                            None if worker_control.output_capture_requested() && result.executed => {
-                                Err("executor omitted requested output capture".to_owned())
-                            }
-                            None => Ok(ExecutionCompletion { result, stop_reason, outputs: None }),
-                        }
+                    Ok(result) if result.request_id == request_id => {
+                        complete_result(&worker_control, result, stop_reason)
                     }
                     Ok(_) => Err("executor returned a different request identity".to_owned()),
                     Err(_) => Err("execution thread panicked".to_owned()),
@@ -249,21 +334,14 @@ impl ExecutionTask {
 
     /// Session-scoped identity; cancellations must match this exactly.
     #[must_use]
-    pub fn request_id(&self) -> u64 {
-        self.request_id
-    }
+    pub fn request_id(&self) -> u64 { self.request_id }
 
     /// Request cancellation without blocking the reactor on process cleanup.
-    pub fn cancel(&self, reason: StopReason) -> bool {
-        self.control.cancel(reason)
-    }
+    pub fn cancel(&self, reason: StopReason) -> bool { self.control.cancel(reason) }
 
     /// Poll completion alongside incoming control frames. Registers the waker
     /// under the same mutex as publication, so no completion wakeup is lost.
-    pub fn poll_completion(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<ExecutionCompletion, String>> {
+    pub fn poll_completion(&mut self, cx: &mut Context<'_>) -> Poll<Result<ExecutionCompletion, String>> {
         if self.completed {
             return Poll::Ready(Err("execution completion already consumed".to_owned()));
         }
@@ -277,9 +355,7 @@ impl ExecutionTask {
             }
         };
         self.completed = true;
-        if let Some(thread) = self.thread.take()
-            && thread.join().is_err()
-        {
+        if let Some(thread) = self.thread.take() && thread.join().is_err() {
             return Poll::Ready(Err("execution owner thread failed".to_owned()));
         }
         Poll::Ready(result)
@@ -310,18 +386,20 @@ mod tests {
 
     struct ThreadWake(std::thread::Thread);
     impl Wake for ThreadWake {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
+        fn wake(self: Arc<Self>) { self.0.unpark(); }
     }
 
     fn wait(task: &mut ExecutionTask) -> Result<ExecutionCompletion, String> {
         let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
         let mut cx = Context::from_waker(&waker);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match task.poll_completion(&mut cx) {
                 Poll::Ready(result) => return result,
-                Poll::Pending => std::thread::park_timeout(Duration::from_millis(100)),
+                Poll::Pending => {
+                    assert!(Instant::now() < deadline, "execution test timed out");
+                    std::thread::park_timeout(Duration::from_millis(100));
+                }
             }
         }
     }
@@ -357,12 +435,9 @@ mod tests {
     #[test]
     fn deadline_cannot_be_reported_as_success_even_if_executor_exits_zero() {
         let mut task = ExecutionTask::spawn(7, Duration::from_millis(30), |control| {
-            while control.reason().is_none() {
-                std::thread::sleep(Duration::from_millis(2));
-            }
+            while control.reason().is_none() { std::thread::sleep(Duration::from_millis(2)); }
             result(7)
-        })
-        .unwrap();
+        }).unwrap();
         let completed = wait(&mut task).unwrap();
         assert_eq!(completed.stop_reason, Some(StopReason::DeadlineExceeded));
         assert_eq!(completed.result.exit_code, 124);
@@ -374,13 +449,10 @@ mod tests {
         let cleaned = Arc::new(AtomicBool::new(false));
         let worker_cleaned = Arc::clone(&cleaned);
         let task = ExecutionTask::spawn(8, Duration::from_secs(5), move |control| {
-            while control.reason().is_none() {
-                std::thread::sleep(Duration::from_millis(2));
-            }
+            while control.reason().is_none() { std::thread::sleep(Duration::from_millis(2)); }
             worker_cleaned.store(true, Ordering::Release);
             result(8)
-        })
-        .unwrap();
+        }).unwrap();
         drop(task);
         assert!(cleaned.load(Ordering::Acquire));
     }
@@ -394,8 +466,7 @@ mod tests {
         assert!(!task.cancel(StopReason::Cancelled));
         let mut panicked = ExecutionTask::spawn(10, Duration::from_secs(5), |_| {
             panic!("test executor panic")
-        })
-        .unwrap();
+        }).unwrap();
         assert!(wait(&mut panicked).unwrap_err().contains("panicked"));
         let mut misbound = ExecutionTask::spawn(11, Duration::from_secs(5), |_| result(12)).unwrap();
         assert!(wait(&mut misbound).unwrap_err().contains("identity"));
@@ -435,6 +506,61 @@ mod tests {
                 result(13)
             }).unwrap();
             assert!(wait(&mut task).unwrap_err().contains("output"));
+        }
+    }
+
+    fn artifact_plan(name: &str) -> ArtifactPlan {
+        ArtifactPlan::new("dep".into(), vec![name.into()]).unwrap()
+    }
+
+    fn artifacts(plan: ArtifactPlan) -> CapturedArtifacts {
+        let prepared = crate::artifacts::PreparedArtifacts::new(plan).unwrap();
+        std::fs::write(prepared.backing().join("a"), b"compiled").unwrap();
+        prepared.capture(|| false).unwrap()
+    }
+
+    #[test]
+    fn artifact_success_requires_the_exact_capture_not_just_exit_zero() {
+        for case in 0..4 {
+            let mut task = ExecutionTask::spawn_with_artifacts(20, Duration::from_secs(5), artifact_plan("a"), move |control| {
+                assert!(control.request_artifacts(artifact_plan("b")).is_err());
+                match case {
+                    0 => {}
+                    1 => control.retain_artifacts(Err("missing file".into())).unwrap(),
+                    _ => control.retain_artifacts(Ok(artifacts(artifact_plan("a")))).unwrap(),
+                }
+                let mut result = result(20);
+                if case == 2 { result.residual_group_members = 1; }
+                result
+            }).unwrap();
+            let completion = wait(&mut task);
+            if case == 3 {
+                let mut completion = completion.unwrap();
+                assert_eq!(completion.artifacts.as_mut().unwrap().read_chunk("a", 0, 64).unwrap(), b"compiled");
+            } else {
+                assert!(completion.unwrap_err().contains("artifact"));
+            }
+        }
+        let control = ExecutionControl::new(Duration::from_secs(5)).unwrap();
+        control.request_artifacts(artifact_plan("b")).unwrap();
+        assert!(control.retain_artifacts(Ok(artifacts(artifact_plan("a")))).is_err());
+    }
+
+    #[test]
+    fn failed_and_interrupted_executions_retain_diagnostics_but_never_artifacts() {
+        for cancelled in [false, true] {
+            let mut task = ExecutionTask::spawn_with_artifacts(21, Duration::from_secs(5), artifact_plan("a"), move |control| {
+                control.retain_outputs(Ok(outputs(b"output"))).unwrap();
+                control.retain_artifacts(Ok(artifacts(artifact_plan("a")))).unwrap();
+                let mut result = result(21);
+                if cancelled { control.cancel(StopReason::Cancelled); }
+                else { result.exit_code = 1; }
+                result
+            }).unwrap();
+            let completion = wait(&mut task).unwrap();
+            assert!(completion.artifacts.is_none());
+            assert!(completion.outputs.is_some());
+            assert_ne!(completion.result.exit_code, 0);
         }
     }
 }
