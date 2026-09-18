@@ -114,7 +114,7 @@ pub(crate) fn require_active_authority(
     store: &mut dyn RabsMetadataStore,
     authority: &TypedDigest,
 ) -> Result<(), StoreError> {
-    match store.read_authority()? {
+    match store.active_authority()? {
         Some(current) if &current.digest == authority => Ok(()),
         _ => Err(StoreError::NotActiveAuthority),
     }
