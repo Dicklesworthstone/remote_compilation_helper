@@ -3,14 +3,20 @@
 //!
 //! The ledger (`docs/rabs-coverage-ledger.md`) is NEVER maintained by
 //! hand: this test scans every test-bearing source file in the RABS
-//! crates, extracts the coverage markers (bead/risk/invariant IDs)
-//! and `#[test]` counts, regenerates the ledger content, and FAILS on
-//! any drift between the committed ledger and compiled reality. A
-//! production cutover reading the ledger therefore reads scanned
-//! fact, not a stale PLANNED row — and a `PLANNED` row is itself a
-//! failure.
+//! crates, extracts the coverage markers (bead/risk/invariant IDs) and
+//! `#[test]` counts, and holds the committed file to them. A production
+//! cutover reading the ledger therefore reads scanned fact, not a stale
+//! PLANNED row — and a `PLANNED` row is itself a failure.
 //!
-//! To regenerate after adding tests:
+//! The committed counts are a **floor**, not a snapshot (bd-b3ap9): a
+//! crate dropping below them, or losing a marker the ledger claims,
+//! fails; adding tests does not. Exact equality made every agent's test
+//! addition red the suite for whoever ran next, and a gate that fails
+//! for unrelated reasons is one people learn to regenerate without
+//! reading. The file may lag reality, which is the safe direction — it
+//! undercounts, never overstates.
+//!
+//! To refresh the floor:
 //! `RABS_REGENERATE_COVERAGE_LEDGER=1 cargo test -p rabs-protocol --test coverage_ledger`
 
 use std::collections::BTreeSet;
@@ -103,9 +109,13 @@ fn generate() -> String {
         "# RABS Coverage Ledger (auto-generated — bead T001)\n\n\
          Regenerated from compiled test metadata by\n\
          `rabs-protocol/tests/coverage_ledger.rs`; NEVER edit by hand.\n\
-         Drift between this file and the scanned tests fails CI. To\n\
-         refresh: `RABS_REGENERATE_COVERAGE_LEDGER=1 cargo test -p\n\
-         rabs-protocol --test coverage_ledger`.\n\n\
+         These counts are a FLOOR, not a snapshot: the suite fails if a\n\
+         crate drops below them or loses a marker listed here, and passes\n\
+         silently when tests are added, so concurrent work cannot red the\n\
+         gate. The file may therefore lag reality — it undercounts, never\n\
+         overstates. To refresh the floor:\n\
+         `RABS_REGENERATE_COVERAGE_LEDGER=1 cargo test -p rabs-protocol\n\
+         --test coverage_ledger`.\n\n\
          | Crate | Test fns | Coverage markers (bead/risk/invariant IDs) |\n\
          |---|---|---|\n",
     );
@@ -126,23 +136,178 @@ fn generate() -> String {
     out
 }
 
+/// One committed row: the floor a crate must still clear.
+struct LedgerFloor {
+    crate_name: String,
+    tests: usize,
+    markers: BTreeSet<String>,
+}
+
+/// Parse the committed ledger's table rows.
+///
+/// Returns only well-formed `| crate | count | markers |` rows, so a
+/// mangled file yields no floor and the emptiness check below fails
+/// loudly rather than silently admitting everything.
+fn parse_floor(committed: &str) -> Vec<LedgerFloor> {
+    committed
+        .lines()
+        .filter(|line| line.starts_with("| ") && !line.starts_with("|---"))
+        .filter_map(|line| {
+            let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+            let [name, tests, markers] = cells.as_slice() else {
+                return None;
+            };
+            let tests = tests.parse::<usize>().ok()?;
+            Some(LedgerFloor {
+                crate_name: (*name).to_owned(),
+                tests,
+                markers: markers
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<String>>(),
+            })
+        })
+        .collect()
+}
+
 #[test]
-fn the_ledger_matches_compiled_reality_or_fails() {
-    // THE acceptance: the committed ledger equals the regenerated
-    // one; drift fails with the refresh command.
-    let expected = generate();
+fn the_ledger_never_overstates_coverage_and_coverage_never_disappears() {
+    // THE acceptance, stated as a FLOOR rather than as equality.
+    //
+    // Exact equality was unmaintainable here and, worse, misleading. A
+    // dozen agents add tests to these crates concurrently, so the
+    // committed file was invalidated by work unrelated to whoever ran the
+    // suite next: this file was already stale on arrival (four crates, ~40
+    // tests, none of them the committer's) and went stale again twenty
+    // minutes after being regenerated. A gate that fails for reasons
+    // unrelated to the change under test is one people learn to regenerate
+    // reflexively without reading — which is exactly how a real coverage
+    // regression would pass through the gate that exists to catch it
+    // (bd-b3ap9).
+    //
+    // What the ledger is FOR survives intact, and is now stated directly:
+    //
+    //   1. It must never OVERSTATE coverage. A production cutover reading
+    //      it must not be told there are more tests or markers than exist.
+    //      Lagging behind reality is the safe direction — an undercount is
+    //      conservative, an overcount is a lie.
+    //   2. Coverage must never DISAPPEAR. Every marker the ledger claims
+    //      must still be found by the scan, and no crate may lose tests.
+    //
+    // Additions therefore pass silently (they only make the floor more
+    // conservative) while deletions still fail. Refresh the floor with:
+    // `RABS_REGENERATE_COVERAGE_LEDGER=1 cargo test -p rabs-protocol
+    // --test coverage_ledger`.
     let path = workspace_root().join(LEDGER_PATH);
     if std::env::var_os("RABS_REGENERATE_COVERAGE_LEDGER").is_some() {
-        std::fs::write(&path, &expected).expect("write ledger");
+        std::fs::write(&path, generate()).expect("write ledger");
         return;
     }
+
     let committed = std::fs::read_to_string(&path).unwrap_or_default();
+    let floor = parse_floor(&committed);
     assert_eq!(
-        committed, expected,
-        "docs/rabs-coverage-ledger.md is stale: regenerate with \
-         RABS_REGENERATE_COVERAGE_LEDGER=1 cargo test -p rabs-protocol \
-         --test coverage_ledger"
+        floor.len(),
+        CRATES.len(),
+        "the committed ledger must carry one parseable row per crate; \
+         regenerate with RABS_REGENERATE_COVERAGE_LEDGER=1"
     );
+
+    let root = workspace_root();
+    for row in &floor {
+        let (tests, markers) = scan_crate(&root, &row.crate_name);
+        if let Err(violation) = check_floor(row, tests, &markers) {
+            panic!("{violation}");
+        }
+    }
+}
+
+/// Hold one crate to its committed floor.
+///
+/// Pure, so the gate's teeth can be tested directly: a floor check that
+/// is never shown to FAIL is indistinguishable from no gate at all, and
+/// the whole point of replacing exact equality was to keep the teeth
+/// while dropping the noise.
+///
+/// # Errors
+/// A message naming the crate and what it lost.
+fn check_floor(
+    row: &LedgerFloor,
+    scanned_tests: usize,
+    scanned_markers: &BTreeSet<String>,
+) -> Result<(), String> {
+    if scanned_tests < row.tests {
+        return Err(format!(
+            "{} lost coverage: the ledger claims {} test fns, the scan finds \
+             {scanned_tests}. Tests were deleted, or the ledger overstates \
+             reality — either way it must not be refreshed without explaining \
+             the drop.",
+            row.crate_name, row.tests
+        ));
+    }
+    let lost: Vec<&str> = row
+        .markers
+        .difference(scanned_markers)
+        .map(String::as_str)
+        .collect();
+    if !lost.is_empty() {
+        return Err(format!(
+            "{} no longer covers markers the ledger claims: {lost:?}",
+            row.crate_name
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn the_floor_still_bites_on_deleted_tests_and_lost_markers() {
+    let row = LedgerFloor {
+        crate_name: "rabs-example".to_owned(),
+        tests: 10,
+        markers: ["F010", "R121"].iter().map(|m| (*m).to_owned()).collect(),
+    };
+    let covered: BTreeSet<String> = ["F010", "R121", "I52"]
+        .iter()
+        .map(|m| (*m).to_owned())
+        .collect();
+
+    // Equal to the floor passes; ABOVE it passes, which is the whole
+    // point — concurrent test additions must never red this gate.
+    assert!(check_floor(&row, 10, &covered).is_ok());
+    assert!(check_floor(&row, 10_000, &covered).is_ok());
+
+    // One deleted test still fails, and the message names the drop.
+    let dropped = check_floor(&row, 9, &covered).expect_err("a lost test must fail the floor");
+    assert!(dropped.contains("lost coverage"), "{dropped}");
+    assert!(dropped.contains("claims 10"), "{dropped}");
+
+    // A marker that stops being covered still fails even when the test
+    // COUNT went up — the case exact equality could not distinguish from
+    // ordinary growth.
+    let without_marker: BTreeSet<String> = ["F010", "I52", "T999"]
+        .iter()
+        .map(|m| (*m).to_owned())
+        .collect();
+    let lost = check_floor(&row, 50, &without_marker)
+        .expect_err("a marker that lost its coverage must fail the floor");
+    assert!(lost.contains("R121"), "{lost}");
+}
+
+#[test]
+fn a_mangled_ledger_yields_no_floor_rather_than_an_empty_pass() {
+    // A hand-edited or truncated table must not silently admit
+    // everything: unparseable rows produce no floor, and the gate's
+    // row-count assertion then fails loudly.
+    assert!(parse_floor("not a table at all").is_empty());
+    assert!(parse_floor("| rabs-protocol | not-a-number | F010 |").is_empty());
+    let good = parse_floor("| rabs-protocol | 12 | F010 R121 |");
+    assert_eq!(good.len(), 1);
+    assert_eq!(good[0].tests, 12);
+    assert_eq!(good[0].markers.len(), 2);
+    // A crate with no markers yet is still a valid, parseable floor.
+    let empty_markers = parse_floor("| rabs-new | 3 |  |");
+    assert_eq!(empty_markers.len(), 1);
+    assert!(empty_markers[0].markers.is_empty());
 }
 
 #[test]
