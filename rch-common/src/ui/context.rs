@@ -70,8 +70,12 @@ impl OutputContext {
     where
         F: Fn(&str) -> Option<String>,
     {
-        // 1. Check for explicit machine output request
-        if get_env("RCH_JSON").is_some() {
+        // 1. Check for explicit machine output request.
+        //
+        // The VALUE is honored, not merely the variable's presence: `RCH_JSON=0`
+        // asked for no JSON, and treating it as a request was a trap for anyone
+        // who exports the variable once and toggles it.
+        if get_env("RCH_JSON").is_some_and(|value| crate::placement::env_truthy(&value)) {
             return Self::Machine;
         }
 
@@ -381,6 +385,36 @@ mod tests {
         let ctx = detect_with(&env, true, true, Some("status"));
         assert_eq!(ctx, OutputContext::Machine);
         assert!(ctx.is_machine());
+    }
+
+    #[test]
+    fn test_detect_rch_json_honors_the_value_not_just_presence() {
+        // Truthy spellings all request machine output...
+        for value in ["1", "true", "TRUE", "yes", "on", "enabled"] {
+            let env = TestEnv::new(&[("RCH_JSON", value)]);
+            assert_eq!(
+                detect_with(&env, true, true, Some("status")),
+                OutputContext::Machine,
+                "RCH_JSON={value}"
+            );
+        }
+        // ...and a falsy one does not. Exporting RCH_JSON=0 asked for NO JSON;
+        // treating the variable's mere presence as a request was a trap for
+        // anyone who exports it once and toggles the value (bd-e92eh).
+        for value in ["0", "false", "no", "off", "disabled", ""] {
+            let env = TestEnv::new(&[("RCH_JSON", value)]);
+            assert_ne!(
+                detect_with(&env, true, true, Some("status")),
+                OutputContext::Machine,
+                "RCH_JSON={value:?}"
+            );
+        }
+        // A falsy RCH_JSON must not shadow hook detection either.
+        let env = TestEnv::new(&[("RCH_JSON", "0"), ("RCH_HOOK_MODE", "1")]);
+        assert_eq!(
+            detect_with(&env, true, true, Some("status")),
+            OutputContext::Hook
+        );
     }
 
     #[test]

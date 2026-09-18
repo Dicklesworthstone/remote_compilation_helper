@@ -819,7 +819,13 @@ impl PlacementPlan {
 }
 
 /// Repo-standard env truthiness (`1`/`true`/`yes`/`on`/`enabled`).
-fn env_truthy(value: &str) -> bool {
+///
+/// Public because it IS the repo standard: every surface that reads a boolean
+/// environment variable must agree on what `RCH_FOO=0` means, and the way that
+/// agreement breaks is two modules each spelling it out for themselves
+/// (bd-e92eh was exactly that shape for `RCH_JSON`).
+#[must_use]
+pub fn env_truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on" | "enabled"

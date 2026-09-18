@@ -1949,8 +1949,27 @@ enum FleetAction {
     },
 }
 
+/// Whether the caller asked for machine output, by flag OR by environment.
+///
+/// `RCH_JSON=1` is documented (AGENTS.md "Output Mode Detection", README
+/// "Environment controls") as the first thing consulted when choosing an output
+/// mode, and [`rch_common::ui::context::OutputContext::detect`] honors it. The
+/// CLI built its context from flags alone, so an agent that followed the
+/// documented env-var route got a rich terminal panel where it expected a
+/// parseable envelope — and the failure surfaced as malformed JSON rather than
+/// as a mode mismatch (bd-e92eh).
 fn machine_output_requested(format: Option<&str>, json_flag: bool) -> bool {
-    json_flag || format.is_some()
+    machine_output_requested_with(format, json_flag, env::var("RCH_JSON").ok().as_deref())
+}
+
+/// The decision itself, with the environment passed in — mutating a real env
+/// var needs `unsafe` under Rust 2024, and this contract deserves tests.
+fn machine_output_requested_with(
+    format: Option<&str>,
+    json_flag: bool,
+    rch_json: Option<&str>,
+) -> bool {
+    json_flag || format.is_some() || rch_json.is_some_and(rch_common::placement::env_truthy)
 }
 
 fn resolve_output_format(format: Option<&str>, json_flag: bool) -> OutputFormat {
@@ -2207,8 +2226,12 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
             // interactively. Print a short hint instead of silently blocking on stdin.
             // RCH_HOOK_MODE=1 or RCH_JSON=1 force hook behavior (used by test harnesses).
             use std::io::IsTerminal;
-            let forced_hook = env::var_os("RCH_HOOK_MODE").is_some_and(|v| v != "0")
-                || env::var_os("RCH_JSON").is_some_and(|v| v != "0");
+            // Same truthiness rule as every other boolean env var in the repo,
+            // so `RCH_JSON=false` cannot mean one thing here and another in
+            // the output-mode decision (bd-e92eh).
+            let forced_hook = env::var("RCH_HOOK_MODE")
+                .is_ok_and(|v| rch_common::placement::env_truthy(&v))
+                || env::var("RCH_JSON").is_ok_and(|v| rch_common::placement::env_truthy(&v));
             if !forced_hook && std::io::stdin().is_terminal() {
                 eprintln!("rch runs in PreToolUse hook mode when invoked without a subcommand.");
                 eprintln!("It is now waiting for a JSON hook request on stdin.");
@@ -9972,6 +9995,38 @@ mod tests {
     fn machine_output_requested_neither_set() {
         let _guard = test_guard!();
         assert!(!machine_output_requested(None, false));
+    }
+
+    #[test]
+    fn machine_output_requested_honors_documented_rch_json_env() {
+        let _guard = test_guard!();
+        // AGENTS.md and the README both document RCH_JSON=1 as the FIRST thing
+        // consulted when choosing an output mode. The CLI read flags only, so
+        // an agent following the documented route got a rich terminal panel
+        // where it expected an envelope — and the failure looked like malformed
+        // JSON rather than a mode mismatch (bd-e92eh).
+        for value in ["1", "true", "TRUE", "yes", "on", "enabled"] {
+            assert!(
+                machine_output_requested_with(None, false, Some(value)),
+                "RCH_JSON={value} must request machine output"
+            );
+        }
+        // The VALUE is honored, not merely the variable's presence: exporting
+        // RCH_JSON=0 asked for no JSON.
+        for value in ["0", "false", "no", "off", "disabled", "", "  "] {
+            assert!(
+                !machine_output_requested_with(None, false, Some(value)),
+                "RCH_JSON={value:?} must NOT request machine output"
+            );
+        }
+        assert!(!machine_output_requested_with(None, false, None));
+        // Flags still win on their own.
+        assert!(machine_output_requested_with(None, true, Some("0")));
+        assert!(machine_output_requested_with(
+            Some("toon"),
+            false,
+            Some("0")
+        ));
     }
 
     #[test]
