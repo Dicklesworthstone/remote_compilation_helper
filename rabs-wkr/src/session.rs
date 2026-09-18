@@ -25,6 +25,7 @@
 //! periodically pushes `heartbeat` (capability + pressure).
 
 use rabs_protocol::capability_tokens::CapabilityToken;
+use crate::execution::{DEFAULT_EXECUTION_TIMEOUT, ExecutionControl};
 
 /// What this worker can do (advertised at handshake; the scheduler
 /// gates placement on it). Derived from a real HostIsolationSupport
@@ -77,7 +78,8 @@ pub struct CanonicalExecRequest {
 pub struct ExecResult {
     /// Echoes the request id.
     pub request_id: u64,
-    /// Process exit code (or 128+signal).
+    /// Process exit code (or 128+signal). Controlled interruption uses a
+    /// nonzero compatibility exit even if the process traps TERM and exits zero.
     pub exit_code: i32,
     /// SHA-256 of stdout bytes (hex).
     pub stdout_sha256: String,
@@ -230,27 +232,9 @@ fn free_disk_mib(_dir: &std::path::Path) -> u64 {
 /// heads carry diagnostics; overflow streams to disk spill archives.
 const EXEC_STREAM_RESIDENT_BOUND: usize = 1024 * 1024;
 
-/// Execute one canonical request through the PROVEN rabs-sandbox
-/// launcher. On a host that cannot run the namespace, returns a typed
-/// non-result (`executed: false`) — never a fabricated success.
-///
-/// G006 lifecycle ownership:
-/// - The action leads its OWN process group
-///   ([`rabs_asupersync::process_groups`]); after the leader exits, the
-///   escalating residual closer (inside
-///   `wait_with_bounded_drain`) guarantees no member of that group
-///   survives; the count is reported honestly on the wire.
-/// - The worker owns the concurrency budget: any client-supplied
-///   make-style coordination env is replaced with the worker-local
-///   `-j<slots>` budget ([`crate::jobserver`]) BEFORE the namespace argv
-///   is compiled, so no foreign jobserver handle can leak through
-///   `extra_env`.
-/// - Output capture is BOUNDED (G007): each stream keeps a resident
-///   head ([`EXEC_STREAM_RESIDENT_BOUND`]); overflow streams to
-///   retrievable spill archives under `spill_root`, result digests cover
-///   the FULL stream, and draining continues through cancellation — an
-///   orphaned descendant holding a pipe cannot hang the attempt because
-///   the residual closer forces EOF before lanes join.
+/// Execute through the canonical sandbox with the default finite local budget.
+/// This synchronous interface is for blocking callers; async sessions must use
+/// `ExecutionTask` so the reactor continues handling control traffic.
 #[must_use]
 pub fn execute_canonical(
     request: &CanonicalExecRequest,
@@ -258,6 +242,44 @@ pub fn execute_canonical(
     home_backing: &std::path::Path,
     slots: u32,
     spill_root: &std::path::Path,
+) -> ExecResult {
+    let Ok(control) = ExecutionControl::new(DEFAULT_EXECUTION_TIMEOUT) else {
+        return exec_error(request.request_id);
+    };
+    execute_canonical_controlled(
+        request, cargo_home_backing, home_backing, slots, spill_root, &control,
+    )
+}
+
+/// Execute using the session's cancellation/deadline authority. The sandbox,
+/// worker-local jobserver, process-group ownership and full-stream digests are
+/// shared with ordinary execution. A cancelled preflight never spawns; a stop
+/// after spawn sends TERM, escalates, drains and reaps before returning.
+#[must_use]
+pub fn execute_canonical_controlled(
+    request: &CanonicalExecRequest,
+    cargo_home_backing: &std::path::Path,
+    home_backing: &std::path::Path,
+    slots: u32,
+    spill_root: &std::path::Path,
+    control: &ExecutionControl,
+) -> ExecResult {
+    let mut result = execute_canonical_inner(
+        request, cargo_home_backing, home_backing, slots, spill_root, control,
+    );
+    if let Some(reason) = control.finish() {
+        result.exit_code = reason.exit_code();
+    }
+    result
+}
+
+fn execute_canonical_inner(
+    request: &CanonicalExecRequest,
+    cargo_home_backing: &std::path::Path,
+    home_backing: &std::path::Path,
+    slots: u32,
+    spill_root: &std::path::Path,
+    control: &ExecutionControl,
 ) -> ExecResult {
     use crate::jobserver::replace_with_worker_local;
     use rabs_asupersync::process_groups::ManagedProcessGroup;
@@ -267,20 +289,12 @@ pub fn execute_canonical(
         HostIsolationSupport, build_canonical_argv, command_for,
     };
     use std::process::Stdio;
+    if control.reason().is_some() {
+        return exec_error(request.request_id);
+    }
     let support = HostIsolationSupport::probe();
     if !support.missing_for_canonical().is_empty() {
-        return ExecResult {
-            request_id: request.request_id,
-            exit_code: -1,
-            stdout_sha256: sha256_hex(b""),
-            stderr_sha256: sha256_hex(b""),
-            executed: false,
-            residual_group_members: 0,
-            stdout_spill_bytes: 0,
-            stderr_spill_bytes: 0,
-            stdout_spill_path: None,
-            stderr_spill_path: None,
-        };
+        return exec_error(request.request_id);
     }
 
     let plan = CanonicalMountPlan::new(
@@ -326,13 +340,15 @@ pub fn execute_canonical(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Attribution starts with what the worker knows — the coordinator's
-    // request id; full authority/generation context rides the wire via
-    // G003's ActionActor and extends this chain later.
     let attribution = Attribution {
         attempt: Some(request.request_id.to_string()),
         ..Attribution::default()
     };
+    // Cancellation during fallible mount/jobserver preparation must not launch
+    // new work. A racing stop after this check is caught by the owned wait.
+    if control.reason().is_some() {
+        return exec_error(request.request_id);
+    }
     let Ok(group) = ManagedProcessGroup::spawn_command(command, attribution) else {
         return exec_error(request.request_id);
     };
@@ -340,13 +356,11 @@ pub fn execute_canonical(
         resident_bound: EXEC_STREAM_RESIDENT_BOUND,
         spill_dir: spill_root.join(format!("attempt-{}", request.request_id)),
     };
-    let outcome = match group.wait_with_bounded_drain(&limits) {
+    let outcome = match group.wait_with_bounded_drain_controlled(&limits, || control.reason().is_some()) {
         Ok(output) => {
-            // The residual closer already ran inside
-            // wait_with_bounded_drain; its honest count rides the output.
-            // ExecResult's documented wire contract: exit code, with a
-            // signal death encoded 128+signal (AGENTS.md exit-code
-            // semantics; std gives no code for a signaled process).
+            // The residual closer and both lane joins have completed. Keep the
+            // process's real exit here; the outer control frontier overrides an
+            // interrupted zero exit without fabricating output content.
             #[cfg(unix)]
             let exit_code = output.status.code().unwrap_or_else(|| {
                 use std::os::unix::process::ExitStatusExt;
@@ -354,9 +368,6 @@ pub fn execute_canonical(
             });
             #[cfg(not(unix))]
             let exit_code = output.status.code().unwrap_or(-1);
-            // Full-stream digests (resident head ++ spill archive). A
-            // digest failure means the offer would be unverifiable, so
-            // report the typed non-result instead of a fabricated hash.
             let (stdout_sha256, stderr_sha256) =
                 match (stream_digest(&output.stdout), stream_digest(&output.stderr)) {
                     (Ok(s), Ok(e)) => (s, e),
@@ -375,17 +386,9 @@ pub fn execute_canonical(
                 stderr_spill_path: output.stderr.spill().map(|s| s.path.display().to_string()),
             }
         }
-        Err(_) => {
-            // Drain or wait failed; the residual closer already ran
-            // inside wait_with_bounded_drain. Report the typed
-            // non-result.
-            exec_error(request.request_id)
-        }
+        Err(_) => exec_error(request.request_id),
     };
-    // Group fully resolved (drained + residual closer ran inside the
-    // bounded wait): release the fifo so the node unlinks before the
-    // result frame leaves; early-return paths above already got
-    // Drop-side cleanup.
+    // The group, output drains and jobserver all resolve before a result leaves.
     drop(bridge);
     outcome
 }
@@ -451,17 +454,14 @@ mod tests {
             slots: 8,
         };
         assert!(admit_worker(&token(), &[], 50, 7, 3, &report, true).is_ok());
-        // Wrong session: typed refusal.
         assert!(matches!(
             admit_worker(&token(), &[], 50, 999, 3, &report, true),
             Err(HandshakeRefusal::TokenInvalid(_))
         ));
-        // Revoked: typed refusal.
         assert!(matches!(
             admit_worker(&token(), &[1], 50, 7, 3, &report, true),
             Err(HandshakeRefusal::TokenInvalid(_))
         ));
-        // Non-canonical host where canonical is required.
         let weak = CapabilityReport {
             canonical_namespace: false,
             missing: vec!["bubblewrap".into()],
@@ -471,14 +471,11 @@ mod tests {
             admit_worker(&token(), &[], 50, 7, 3, &weak, true),
             Err(HandshakeRefusal::NotCanonicalCapable)
         ));
-        // Same weak host, canonical NOT required: admitted.
         assert!(admit_worker(&token(), &[], 50, 7, 3, &weak, false).is_ok());
     }
 
     #[test]
     fn exec_result_is_an_offer_with_content_digests() {
-        // No commit type is reachable from this module: ExecResult
-        // carries digests (an offer), never a published pointer.
         let result = ExecResult {
             request_id: 9,
             exit_code: 0,
@@ -509,8 +506,6 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn non_canonical_host_returns_typed_non_result_not_fake_success() {
-        // On macOS the canonical namespace is unavailable: executed=false,
-        // never a fabricated exit 0.
         let dir = tempfile::tempdir().expect("tempdir");
         let request = CanonicalExecRequest {
             request_id: 1,
@@ -522,5 +517,26 @@ mod tests {
         };
         let result = execute_canonical(&request, dir.path(), dir.path(), 4, dir.path());
         assert!(!result.executed, "no fabricated success off-Linux");
+    }
+
+    #[test]
+    fn cancelled_preflight_never_creates_a_jobserver_or_launches() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = CanonicalExecRequest {
+            request_id: 99,
+            program: "true".into(),
+            args: vec![],
+            toolchain_backing: dir.path().join("absent-toolchain").display().to_string(),
+            workspace_backing: dir.path().join("absent-workspace").display().to_string(),
+            jobserver_grant: Some(2),
+        };
+        let control = ExecutionControl::new(std::time::Duration::from_secs(10)).unwrap();
+        control.cancel(crate::execution::StopReason::Cancelled);
+        let result = execute_canonical_controlled(
+            &request, dir.path(), dir.path(), 2, dir.path(), &control,
+        );
+        assert!(!result.executed);
+        assert_eq!(result.exit_code, 130);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
