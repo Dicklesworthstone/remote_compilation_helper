@@ -914,6 +914,24 @@ pub async fn probe_worker(worker: &WorkerState) -> HealthCheckResult {
     check_worker_health(&worker_arc, &config, None).await
 }
 
+/// The ` --tool-probe '<json>'` suffix for a worker's declared tool probes, or
+/// an empty string when it declares none.
+///
+/// The JSON is single-quoted for the remote shell with embedded quotes escaped
+/// the POSIX way. Names and argv reaching here were validated at config load,
+/// but the quoting is unconditional: this string is interpolated into a remote
+/// command, and "the validator upstream would have caught it" is not a property
+/// this function should depend on.
+fn capability_tool_argument(tools: &[rch_common::types::WorkerToolProbe]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let Ok(json) = serde_json::to_string(tools) else {
+        return String::new();
+    };
+    format!(" --tool-probe '{}'", json.replace('\'', "'\\''"))
+}
+
 /// Probe worker capabilities (Bun, Node, Rust versions).
 ///
 /// Runs `rch-wkr capabilities` on the worker and parses the JSON output.
@@ -951,8 +969,20 @@ pub async fn probe_worker_capabilities(
     };
 
     // Try to run rch-wkr capabilities command
-    // Handle PATH vs ~/.local/bin lookup
-    let cmd = "if command -v rch-wkr >/dev/null 2>&1; then rch-wkr capabilities; else ~/.local/bin/rch-wkr capabilities; fi";
+    // Handle PATH vs ~/.local/bin lookup.
+    //
+    // Operator-declared tool probes are appended ONLY when this worker declares
+    // any. A worker with no declarations therefore receives the byte-identical
+    // command older deployments have always received, so adding this feature
+    // cannot break capability probing on a fleet that has not been redeployed.
+    // A worker that DOES declare tools and still runs an old binary fails the
+    // probe, falls back to its cached snapshot, and stays inadmissible for
+    // `--require-tool` work — the safe direction for a gate.
+    let tool_argument = capability_tool_argument(&worker_config.tools);
+    let cmd = format!(
+        "if command -v rch-wkr >/dev/null 2>&1; then rch-wkr capabilities{tool_argument}; else ~/.local/bin/rch-wkr capabilities{tool_argument}; fi"
+    );
+    let cmd = cmd.as_str();
 
     // Pooled path: run over the warm shared ControlMaster.
     if let Some(pool) = ssh_pool {
@@ -1063,6 +1093,37 @@ mod tests {
     use rch_common::test_guard;
     use rch_common::{WorkerConfig, WorkerId};
     use std::sync::OnceLock;
+
+    #[test]
+    fn capability_tool_argument_is_absent_without_declarations_and_quoted_with_them() {
+        let _guard = test_guard!();
+        // THE compatibility property: a worker that declares no tools receives
+        // the byte-identical command older deployments have always received, so
+        // shipping this feature cannot break capability probing on a fleet that
+        // has not been redeployed.
+        assert_eq!(capability_tool_argument(&[]), "");
+
+        let tools = vec![rch_common::types::WorkerToolProbe {
+            name: "clang".to_string(),
+            command: vec!["clang".to_string(), "--version".to_string()],
+        }];
+        let argument = capability_tool_argument(&tools);
+        assert!(argument.starts_with(" --tool-probe '"), "{argument}");
+        assert!(argument.ends_with('\''), "{argument}");
+        assert!(argument.contains(r#""name":"clang""#), "{argument}");
+
+        // The payload is interpolated into a REMOTE shell command, so a single
+        // quote inside it must not be able to end the quoted argument. (Config
+        // load rejects such names, but this function does not depend on an
+        // upstream validator having run.)
+        let tricky = vec![rch_common::types::WorkerToolProbe {
+            name: "t".to_string(),
+            command: vec!["sh".to_string(), "it's".to_string()],
+        }];
+        let argument = capability_tool_argument(&tricky);
+        assert!(!argument.contains("it's"), "raw quote survived: {argument}");
+        assert!(argument.contains(r"'\''"), "{argument}");
+    }
 
     #[test]
     fn test_duration_millis_u64_saturates() {
@@ -1431,6 +1492,7 @@ mod tests {
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         });
 
         let result = check_worker_health(&Arc::new(worker), &HealthConfig::default(), None).await;
@@ -1456,6 +1518,7 @@ mod tests {
                 total_slots: 8,
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
             }
         }
 
@@ -1471,6 +1534,7 @@ mod tests {
                 required_runtime: RequiredRuntime::default(),
                 classification_duration_us: None,
                 hook_pid: None,
+                required_tools: Vec::new(),
             }
         }
 
@@ -1659,6 +1723,7 @@ mod tests {
                 total_slots: 8,
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
             })
             .await;
             pool.add_worker(WorkerConfig {
@@ -1669,6 +1734,7 @@ mod tests {
                 total_slots: 16, // More slots - would normally be preferred
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
             })
             .await;
             pool.add_worker(WorkerConfig {
@@ -1679,6 +1745,7 @@ mod tests {
                 total_slots: 12, // More slots than closed
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
             })
             .await;
 
@@ -2107,6 +2174,7 @@ mod tests {
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         })
         .await;
 
@@ -2156,6 +2224,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         });
 
         let result = probe_worker(&worker).await;
@@ -2180,6 +2249,7 @@ mod tests {
             total_slots: 4,
             priority: 50,
             tags: vec![],
+            tools: Vec::new(),
         });
 
         let result = probe_worker(&worker).await;
@@ -2207,6 +2277,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         let worker = Arc::new(WorkerState::new(worker_config));
 
@@ -2325,6 +2396,7 @@ mod tests {
             total_slots: 4,
             priority: 50,
             tags: vec![],
+            tools: Vec::new(),
         };
         let worker = Arc::new(WorkerState::new(worker_config));
 
@@ -2353,6 +2425,7 @@ mod tests {
             total_slots: 4,
             priority: 50,
             tags: vec![],
+            tools: Vec::new(),
         };
         let worker = Arc::new(WorkerState::new(worker_config));
 
@@ -2426,6 +2499,7 @@ mod tests {
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         });
 
         // When mock is not enabled, is_mock_transport returns false
@@ -2446,6 +2520,7 @@ mod tests {
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         });
 
         set_mock_enabled_override(Some(true));

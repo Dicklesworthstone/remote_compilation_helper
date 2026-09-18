@@ -318,6 +318,37 @@ partially transferable fails loudly (`RCH-E309`, exit 102) regardless of the
 job's own exit status. Paths must be repository-relative; conflicts with
 `--clean-overlay` / `--source-content-receipt` are refused.
 
+#### Requiring a verified tool
+
+A job that needs a tool the fleet does not uniformly have can demand a worker
+that has **verified** it:
+
+```bash
+rch exec --job --require-tool clang -- ./native_fuzz.sh
+```
+
+The gate runs before any slot is reserved, and it is evidence-based: the worker
+must have run the operator-declared probe (see
+[Worker Config Example](#worker-config-example)) successfully. A project can
+make the requirement a default for all of its jobs:
+
+```toml
+[jobs]
+required_tools = ["clang"]
+```
+
+Project defaults ADD to `--require-tool` rather than being replaced by it, and
+both apply to job mode only — a project-wide requirement that silently narrowed
+every ordinary build's worker pool would be a surprising way to lose the fleet.
+
+A required name that no worker has verified admits **no worker at all**,
+including when the name is a typo. That is deliberate: silently dropping the
+requirement would route the job to a machine that cannot run it, and job mode
+returns the remote exit status verbatim — so the resulting failure would be
+indistinguishable from the job's own. Selection reports
+`capability_missing:tool:<name>:probe_failed` when a worker declared the tool
+but its probe failed, and `...:not_declared` when nothing declared it.
+
 ### Same-identity job recovery
 
 ```bash
@@ -564,7 +595,29 @@ identity_file = "~/.ssh/id_rsa"
 total_slots = 32
 priority = 100
 tags = ["fast", "ssd"]
+
+# Verified named tools. Each entry is a FIXED argv the worker runs as the
+# configured user; a zero exit marks the tool present, anything else marks it
+# absent. Unlike `tags`, which are an unverified naming convention, these are
+# evidence — which is what lets `--require-tool` gate worker selection.
+tools = [
+  { name = "clang",  command = ["clang", "--version"] },
+  { name = "ld.lld", command = ["/usr/bin/ld.lld", "--version"] },
+]
 ```
+
+Names must be ASCII letters, digits, `-`, `_`, `.` or `+`: a name carrying a
+space or `=` could not survive the probe's fact format and would be read back
+as a different name, so it is refused when the config loads rather than
+becoming a capability lie. `rch workers capabilities --refresh` reports the
+results under **Named tools** as `verified:` and `failed:` — a declared probe
+that fails is a different operational state from one that was never declared,
+and only the first points at a broken worker.
+
+There is deliberately no general remote-shell probe API. A caller that could
+ask a worker to run an arbitrary command "to check for a tool" would be a
+remote execution primitive wearing a capability-probe hat; declaring the argv
+in operator config keeps the set of probe commands finite and reviewable.
 
 ---
 

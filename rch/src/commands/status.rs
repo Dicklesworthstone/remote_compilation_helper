@@ -487,6 +487,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             false,
             &preferred_workers,
             false,
+            &[], // admission preflight is compilation-scoped: no tool requirements
         )
         .await
         {

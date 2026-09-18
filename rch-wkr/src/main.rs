@@ -64,7 +64,17 @@ enum Commands {
     /// Returns a JSON object with detected runtime versions for
     /// Rust, Bun, Node.js, and npm. Used by the daemon during
     /// health checks to populate WorkerCapabilities.
-    Capabilities,
+    Capabilities {
+        /// Operator-declared named tool probes to verify, as a JSON array of
+        /// `{"name": "clang", "command": ["clang", "--version"]}`.
+        ///
+        /// The daemon passes the declarations from `workers.toml`; each argv
+        /// runs directly (no shell) and a zero exit marks the tool present.
+        /// Omitted entirely when a worker declares no tools, so a worker
+        /// running an older binary is unaffected.
+        #[arg(long, value_name = "JSON")]
+        tool_probe: Option<String>,
+    },
 
     /// Clean up old project caches
     Cleanup {
@@ -232,8 +242,8 @@ async fn main() -> Result<()> {
             print_system_info();
             Ok(())
         }
-        Commands::Capabilities => {
-            let capabilities = probe_capabilities().await;
+        Commands::Capabilities { tool_probe } => {
+            let capabilities = probe_capabilities(tool_probe.as_deref()).await;
             // Output as JSON for the daemon to parse
             println!("{}", serde_json::to_string(&capabilities)?);
             Ok(())
@@ -386,9 +396,65 @@ fn print_system_info() {
 
 /// Probe runtime capabilities and return structured data.
 ///
+/// Run the operator-declared named tool probes and split them into verified and
+/// failed, alongside any warnings about declarations that could not be run.
+///
+/// Each probe runs the declared argv DIRECTLY — no shell, no PATH games beyond
+/// the ordinary exec lookup — and is judged solely by exit status, because the
+/// question is "can this worker run the tool", not "what did it print". stdin is
+/// closed so a tool that waits for input fails fast instead of wedging the whole
+/// capabilities probe; the daemon's probe timeout bounds the rest.
+fn probe_declared_tools(spec_json: Option<&str>) -> (Vec<String>, Vec<String>, Vec<String>) {
+    use rch_common::capability_probe::NamedToolProbe;
+    use rch_common::types::WorkerToolProbe;
+    use std::process::{Command, Stdio};
+
+    let (mut present, mut absent, mut warnings) = (Vec::new(), Vec::new(), Vec::new());
+    let Some(raw) = spec_json.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return (present, absent, warnings);
+    };
+    let declared: Vec<WorkerToolProbe> = match serde_json::from_str(raw) {
+        Ok(declared) => declared,
+        Err(error) => {
+            warnings.push(format!(
+                "tool probe declarations were not parseable: {error}"
+            ));
+            return (present, absent, warnings);
+        }
+    };
+    for entry in &declared {
+        // Re-validate on the worker rather than trusting the wire: the name
+        // ends up in a fact list the daemon gates selection on.
+        let probe = match NamedToolProbe::try_from(entry) {
+            Ok(probe) => probe,
+            Err(error) => {
+                warnings.push(format!("ignored tool declaration: {error}"));
+                continue;
+            }
+        };
+        let Some((program, args)) = probe.command().split_first() else {
+            continue;
+        };
+        let succeeded = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        let name = probe.name().to_string();
+        if succeeded {
+            present.push(name);
+        } else {
+            absent.push(name);
+        }
+    }
+    (present, absent, warnings)
+}
+
 /// This function detects installed runtimes (Rust, Bun, Node.js, npm)
 /// and returns a WorkerCapabilities struct suitable for JSON serialization.
-async fn probe_capabilities() -> WorkerCapabilities {
+async fn probe_capabilities(tool_probe: Option<&str>) -> WorkerCapabilities {
     use std::process::Command;
 
     let mut capabilities = WorkerCapabilities::new();
@@ -420,6 +486,12 @@ async fn probe_capabilities() -> WorkerCapabilities {
     capabilities.rustup_toolchains = toolchains;
     capabilities.rustup_components = components;
     warnings.extend(inventory_warnings);
+
+    let (tools_present, tools_absent, tool_warnings) = probe_declared_tools(tool_probe);
+    capabilities.tools_present = tools_present;
+    capabilities.tools_absent = tools_absent;
+    warnings.extend(tool_warnings);
+
     capabilities.probe_warnings = warnings;
 
     // Probe bun version
@@ -2647,5 +2719,46 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&base).expect("cleanup temp topology");
+    }
+
+    #[test]
+    fn declared_tool_probes_are_judged_by_exit_status() {
+        let _guard = test_guard!();
+        // No declarations => nothing probed, nothing reported. A worker whose
+        // operator declared no tools must produce the same facts it always did.
+        for empty in [None, Some(""), Some("   ")] {
+            let (present, absent, warnings) = probe_declared_tools(empty);
+            assert!(present.is_empty() && absent.is_empty() && warnings.is_empty());
+        }
+
+        // Exit status decides, and ONLY exit status: the successful probe here
+        // prints nothing useful and the failing one exists but exits nonzero,
+        // so neither could be classified by its output.
+        let (present, absent, warnings) = probe_declared_tools(Some(
+            r#"[{"name":"present","command":["true"]},
+                {"name":"failing","command":["false"]},
+                {"name":"missing","command":["rch-no-such-binary-9f3a"]}]"#,
+        ));
+        assert_eq!(present, vec!["present".to_string()]);
+        assert_eq!(absent, vec!["failing".to_string(), "missing".to_string()]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // A malformed declaration is reported, never silently treated as a
+        // verified tool.
+        let (present, absent, warnings) =
+            probe_declared_tools(Some(r#"[{"name":"bad name","command":["true"]}]"#));
+        assert!(present.is_empty() && absent.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("ignored tool declaration"),
+            "{warnings:?}"
+        );
+
+        // Unparseable JSON degrades to "no verified tools" WITH a warning, so
+        // the gate stays closed rather than opening on a broken payload.
+        let (present, absent, warnings) = probe_declared_tools(Some("{not json"));
+        assert!(present.is_empty() && absent.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("not parseable"), "{warnings:?}");
     }
 }

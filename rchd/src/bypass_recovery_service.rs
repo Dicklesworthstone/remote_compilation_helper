@@ -46,7 +46,7 @@ use rch_common::bypass_recovery::{
     CanaryDecision, CanaryOutcome, ProbeDecision, RecoveryProbe, decide_canary, decide_probe,
 };
 use rch_common::capability_probe::{
-    FACT_PREFIX, ProbeSpec, build_capability_probe_script, parse_capability_probe,
+    FACT_PREFIX, NamedToolProbe, ProbeSpec, build_capability_probe_script, parse_capability_probe,
     remote_worker_binary_path,
 };
 use rch_common::ssh::{SshClient, SshOptions};
@@ -195,6 +195,14 @@ impl SshRecoveryProber {
             remote_worker_binary_path(&config.user, declared_os.as_deref()),
         );
         spec.disk_roots.clone_from(&self.config.disk_roots);
+        // Operator-declared tool probes are part of the worker's capability
+        // facts, so a rejoining worker is measured on the same evidence
+        // selection uses. Invalid entries were refused at config load.
+        spec.tools = config
+            .tools
+            .iter()
+            .filter_map(|tool| NamedToolProbe::try_from(tool).ok())
+            .collect();
         spec
     }
 
@@ -745,6 +753,7 @@ mod tests {
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         }
     }
 

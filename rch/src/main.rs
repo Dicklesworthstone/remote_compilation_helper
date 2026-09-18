@@ -615,6 +615,19 @@ USAGE:
         /// loudly (exit 102) regardless of the job's own exit status.
         #[arg(long, value_name = "DIR", requires = "job")]
         result_dir: Vec<PathBuf>,
+        /// Require a worker that has VERIFIED this operator-declared tool
+        /// (`[[workers]] tools = [{ name = "...", command = [...] }]`).
+        /// Repeatable; requires --job.
+        ///
+        /// The gate runs before any slot is reserved, and it is evidence-based:
+        /// the worker must have run the declared probe successfully. A name no
+        /// worker has verified — including a typo — admits no worker at all,
+        /// because a silently dropped requirement would route the job to a
+        /// machine that cannot run it, and job mode returns the remote exit
+        /// status verbatim, so that failure is indistinguishable from the
+        /// job's own.
+        #[arg(long, value_name = "NAME", requires = "job")]
+        require_tool: Vec<String>,
         /// The compilation command to execute remotely
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
@@ -2283,6 +2296,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                 source_content_receipt,
                 job,
                 result_dir,
+                require_tool,
                 command,
             } => {
                 hook::run_exec(
@@ -2294,6 +2308,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                     source_content_receipt,
                     job,
                     result_dir,
+                    require_tool,
                     command,
                     &ctx,
                 )
@@ -6763,6 +6778,7 @@ mod tests {
                 source_content_receipt,
                 job,
                 result_dir,
+                require_tool: _,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
@@ -6808,6 +6824,7 @@ mod tests {
                 source_content_receipt,
                 job,
                 result_dir,
+                require_tool: _,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));

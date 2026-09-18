@@ -24,7 +24,7 @@ use anyhow::Result;
 use crate::error::{FleetError, SshError};
 use futures::future::BoxFuture;
 use rch_common::capability_probe::{
-    CapabilityRequirement, CapabilityVerdict, ProbeSpec, assess_admissibility,
+    CapabilityRequirement, CapabilityVerdict, NamedToolProbe, ProbeSpec, assess_admissibility,
     build_capability_probe_script, parse_capability_probe, remote_worker_binary_path,
 };
 use rch_common::disk_pressure_report::{
@@ -1192,6 +1192,16 @@ fn smoke_capability_probe_spec(worker: &WorkerConfig) -> ProbeSpec {
         worker.user.clone(),
         remote_worker_binary_path(&worker.user, declared_os.as_deref()),
     )
+    // Declared tool probes ride along: the smoke scenario should see the same
+    // facts selection will, or a worker can pass the smoke check and still be
+    // inadmissible for a `--require-tool` job. Entries that fail validation are
+    // refused at config load, so any that reach here are usable.
+    .with_tools(
+        worker
+            .tools
+            .iter()
+            .filter_map(|tool| NamedToolProbe::try_from(tool).ok()),
+    )
 }
 
 /// Execute the WorkerCapabilitiesExactUserPath smoke scenario against a worker:
@@ -2179,6 +2189,7 @@ mod tests {
             total_slots: 4,
             priority: 1,
             tags: vec![],
+            tools: Vec::new(),
         }
     }
 

@@ -608,6 +608,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         }];
 
         let diff = compute_worker_diff(&pool, &new_workers).await.unwrap();
@@ -629,6 +630,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(initial_config).await;
 
@@ -641,6 +643,7 @@ mod tests {
             total_slots: 16, // Changed
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let diff = compute_worker_diff(&pool, &[updated_config]).await.unwrap();
@@ -662,6 +665,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(config).await;
 
@@ -687,6 +691,7 @@ mod tests {
                     total_slots: 8,
                     priority: 100,
                     tags: vec![],
+                    tools: Vec::new(),
                     os: None,
                     enabled: true,
                 },
@@ -698,6 +703,7 @@ mod tests {
                     total_slots: 4,
                     priority: 50,
                     tags: vec![],
+                    tools: Vec::new(),
                     os: None,
                     enabled: true,
                 },
@@ -722,6 +728,7 @@ mod tests {
                 total_slots: 0,
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
                 os: None,
                 enabled: true,
             }],
@@ -746,6 +753,7 @@ mod tests {
                 total_slots: 8,
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
             }],
             to_update: vec![],
             to_remove: vec![],
@@ -784,6 +792,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(initial).await;
 
@@ -826,6 +835,7 @@ enabled = true
             total_slots: 8, // Will be updated to 16
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(initial).await;
 
@@ -905,6 +915,7 @@ enabled = true
                 total_slots: 8,
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
             }],
             to_update: vec![],
             to_remove: vec![],
@@ -925,6 +936,7 @@ enabled = true
                 total_slots: 8,
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
             }],
             to_remove: vec![],
         };
@@ -956,6 +968,7 @@ enabled = true
                 total_slots: 8,
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
                 os: None,
                 enabled: false,
             }],
@@ -980,6 +993,7 @@ enabled = true
                 total_slots: 8,
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
                 os: None,
                 enabled: true,
             }],
@@ -1058,6 +1072,7 @@ enabled = true
                 total_slots: 4,
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
             }],
         };
 
@@ -1081,6 +1096,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(initial).await;
 
@@ -1092,6 +1108,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let diff = compute_worker_diff(&pool, &[updated]).await.unwrap();
@@ -1113,6 +1130,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(initial).await;
 
@@ -1124,6 +1142,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let diff = compute_worker_diff(&pool, &[updated]).await.unwrap();
@@ -1143,6 +1162,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(initial).await;
 
@@ -1154,6 +1174,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let diff = compute_worker_diff(&pool, &[updated]).await.unwrap();
@@ -1173,6 +1194,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(initial).await;
 
@@ -1184,6 +1206,7 @@ enabled = true
             total_slots: 8,
             priority: 50, // Changed priority
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let diff = compute_worker_diff(&pool, &[updated]).await.unwrap();
@@ -1203,6 +1226,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(initial).await;
 
@@ -1214,6 +1238,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec!["gpu".to_string()], // Changed tags
+            tools: Vec::new(),
         };
 
         let diff = compute_worker_diff(&pool, &[updated]).await.unwrap();
@@ -1233,6 +1258,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(config.clone()).await;
 
@@ -1253,6 +1279,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(initial).await;
 
@@ -1266,6 +1293,7 @@ enabled = true
                 total_slots: 16, // Updated slots
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
             }],
             to_remove: vec![],
         };
@@ -1289,6 +1317,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(config).await;
 
@@ -1435,6 +1464,7 @@ enabled = true
                 total_slots: 8,
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
             };
             pool.add_worker(config).await;
         }
@@ -1449,6 +1479,7 @@ enabled = true
                 total_slots: 16, // Updated
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
             },
             WorkerConfig {
                 id: WorkerId::new("worker3"),
@@ -1458,6 +1489,7 @@ enabled = true
                 total_slots: 8,
                 priority: 100,
                 tags: vec![],
+                tools: Vec::new(),
             },
             WorkerConfig {
                 id: WorkerId::new("worker4"),
@@ -1467,6 +1499,7 @@ enabled = true
                 total_slots: 4,
                 priority: 50,
                 tags: vec!["gpu".to_string()],
+                tools: Vec::new(),
             },
         ];
 

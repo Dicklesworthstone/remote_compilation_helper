@@ -6530,6 +6530,7 @@ mod tests {
             total_slots: 4,
             priority: 100,
             tags: os.map(rch_common::os_tag).into_iter().collect(),
+            tools: Vec::new(),
         }
     }
 
@@ -7970,6 +7971,7 @@ Number of files transferred: 42
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let cmd = pipeline.build_sync_command(
@@ -8022,6 +8024,7 @@ Number of files transferred: 42
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let cmd = pipeline.build_sync_command(
@@ -8058,6 +8061,7 @@ Number of files transferred: 42
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let root = pipeline.remote_path();
@@ -8151,6 +8155,7 @@ Number of files transferred: 42
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let sync = pipeline.build_sync_command(
@@ -8206,6 +8211,7 @@ Number of files transferred: 42
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let cmd = pipeline.build_retrieve_command(
@@ -8280,6 +8286,7 @@ Number of files transferred: 42
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let cmd = pipeline.build_retrieve_streaming_command(
@@ -8348,6 +8355,7 @@ Number of files transferred: 42
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         }
     }
 
@@ -8615,6 +8623,7 @@ Number of files transferred: 42
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let cmd = pipeline.build_retrieve_streaming_command(
@@ -8740,6 +8749,7 @@ Number of files transferred: 42
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let mut overrides = HashMap::new();
@@ -12136,6 +12146,7 @@ Total file size: 123 bytes";
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let cmd = pipeline.build_sync_command(
@@ -12174,6 +12185,7 @@ Total file size: 123 bytes";
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let cmd = pipeline.build_sync_command(
@@ -12216,6 +12228,7 @@ Total file size: 123 bytes";
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let cmd = pipeline.build_sync_command(
@@ -12260,6 +12273,7 @@ Total file size: 123 bytes";
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let cmd = pipeline.build_sync_command(
@@ -12585,6 +12599,7 @@ Total file size: 123 bytes";
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         for command in [
@@ -12748,6 +12763,7 @@ Total file size: 123 bytes";
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let cmd = pipeline.build_sync_streaming_command(
@@ -12801,6 +12817,7 @@ Total file size: 123 bytes";
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
 
         let cmd = pipeline.build_sync_streaming_command(
@@ -13133,6 +13150,7 @@ Total file size: 123 bytes";
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         let cmd = pipeline.build_result_dir_retrieve_command(
             &worker,
@@ -13253,6 +13271,7 @@ Total file size: 123 bytes";
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         let cmd = pipeline.build_retrieve_command(
             &worker,
@@ -13332,6 +13351,7 @@ Total file size: 123 bytes";
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         let cmd = pipeline.build_retrieve_command(
             &worker,
@@ -13391,6 +13411,7 @@ Total file size: 123 bytes";
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         let cmd = pipeline.build_retrieve_command(
             &worker,
@@ -13457,6 +13478,7 @@ Total file size: 123 bytes";
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         let cmd = pipeline.build_retrieve_streaming_command(
             &worker,
@@ -13507,6 +13529,7 @@ Total file size: 123 bytes";
             total_slots: 4,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         let cmd = pipeline.build_retrieve_command(
             &worker,

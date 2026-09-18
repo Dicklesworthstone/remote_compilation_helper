@@ -213,6 +213,7 @@ impl TestWorkerEntry {
             total_slots: self.total_slots,
             priority: self.priority,
             tags: self.tags.clone(),
+            tools: Vec::new(),
         }
     }
 }

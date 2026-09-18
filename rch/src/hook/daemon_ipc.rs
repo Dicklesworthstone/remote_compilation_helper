@@ -174,6 +174,7 @@ pub(crate) async fn query_daemon(
     wait_for_worker: bool,
     preferred_workers: &[WorkerId],
     job_mode: bool,
+    required_tools: &[String],
 ) -> anyhow::Result<SelectionResponse> {
     // Mock support: RCH_MOCK_CIRCUIT_OPEN simulates all circuits open
     // This needs to be checked in the hook since the daemon may be started
@@ -265,6 +266,13 @@ pub(crate) async fn query_daemon(
     // Job-mode admissions (bd-g7rpy) may queue on active-project exclusion.
     if job_mode {
         query.push_str("&job_mode=1");
+    }
+
+    // Verified named-tool requirements (bd-ceewf), repeatable. Job mode only —
+    // the compilation classifier never produces them, so ordinary offloaded
+    // builds send a byte-identical query.
+    for tool in required_tools {
+        query.push_str(&format!("&require_tool={}", urlencoding_encode(tool)));
     }
 
     // When all workers are at capacity, queue the build on the daemon instead of

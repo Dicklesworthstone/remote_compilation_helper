@@ -49,6 +49,30 @@ pub(super) fn has_any_capabilities(capabilities: &WorkerCapabilities) -> bool {
         || capabilities.bun_version.is_some()
         || capabilities.node_version.is_some()
         || capabilities.npm_version.is_some()
+        || !capabilities.tools_present.is_empty()
+        || !capabilities.tools_absent.is_empty()
+}
+
+/// Operator-declared named tools, rendered as verified/failed (bd-ceewf).
+///
+/// Both halves are shown: a worker whose declared probe FAILED is a different
+/// operational state from one that was never asked, and only the first is
+/// actionable.
+fn format_named_tool_matrix(capabilities: &WorkerCapabilities) -> String {
+    if capabilities.tools_present.is_empty() && capabilities.tools_absent.is_empty() {
+        return "none declared".to_string();
+    }
+    let mut parts = Vec::new();
+    if !capabilities.tools_present.is_empty() {
+        parts.push(format!(
+            "verified: {}",
+            capabilities.tools_present.join(", ")
+        ));
+    }
+    if !capabilities.tools_absent.is_empty() {
+        parts.push(format!("failed: {}", capabilities.tools_absent.join(", ")));
+    }
+    parts.join("; ")
 }
 
 #[cfg(unix)]
@@ -1083,6 +1107,11 @@ pub async fn workers_probe(
                                     "    {} {}",
                                     style.key("Rustup components:"),
                                     style.value(&format_rustup_component_matrix(capabilities))
+                                );
+                                println!(
+                                    "    {} {}",
+                                    style.key("Named tools:"),
+                                    style.value(&format_named_tool_matrix(capabilities))
                                 );
                                 if !capabilities.probe_warnings.is_empty() {
                                     println!(
@@ -2155,6 +2184,7 @@ mod probe_summary_tests {
             total_slots: 8,
             priority: 100,
             tags: vec!["rust".to_string()],
+            tools: Vec::new(),
         }
     }
 

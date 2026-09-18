@@ -448,6 +448,7 @@ mod tests {
             total_slots: 16,
             priority: 50,
             tags: vec!["fast".to_string(), "ssd".to_string()],
+            tools: Vec::new(),
         };
         let info = WorkerInfo::from(&config);
         assert_eq!(info.id, "test-worker");
@@ -469,6 +470,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         };
         let info = WorkerInfo::from(&config);
         assert!(info.tags.is_empty());
@@ -485,6 +487,7 @@ mod tests {
             total_slots: 4,
             priority: 75,
             tags: vec!["gpu".to_string()],
+            tools: Vec::new(),
         };
         let info = WorkerInfo::from(&config);
         let json = serde_json::to_value(&info).unwrap();

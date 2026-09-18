@@ -1810,6 +1810,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     let mut hook_pid = None;
     let mut local_wrapper_id = None;
     let mut preferred_workers = Vec::new();
+    let mut required_tools: Vec<String> = Vec::new();
 
     for param in query.split('&') {
         if param.is_empty() {
@@ -1849,6 +1850,17 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             "job_mode" => {
                 job_mode = value == "1" || value.eq_ignore_ascii_case("true");
             }
+            // Repeatable `&require_tool=NAME`. Duplicates are collapsed; the
+            // gate itself is order-independent, and an empty value is dropped
+            // rather than becoming a requirement no worker can ever satisfy by
+            // accident.
+            "require_tool" => {
+                let name = percent_unescape_query_value(value);
+                let name = name.trim();
+                if !name.is_empty() && !required_tools.iter().any(|t| t == name) {
+                    required_tools.push(name.to_string());
+                }
+            }
             "classification_us" => {
                 // Classification latency from hook (for AGENTS.md compliance tracking)
                 classification_duration_us = value.parse().ok();
@@ -1887,6 +1899,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             classification_duration_us,
             hook_pid,
             job_mode,
+            required_tools,
         },
         wait_for_worker,
         wait_timeout_secs,
@@ -2851,11 +2864,13 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
             build_id,
             request.worker_id.as_str(),
             request.local_wrapper_id.as_deref(),
-            exit_code,
-            request.duration_ms,
-            request.bytes_transferred,
-            request.timing,
-            None,
+            crate::history::BuildCompletion {
+                exit_code,
+                duration_ms: request.duration_ms,
+                bytes_transferred: request.bytes_transferred,
+                timing: request.timing,
+                cancellation: None,
+            },
         )?
         else {
             return Ok(());
@@ -4645,6 +4660,7 @@ mod tests {
             total_slots,
             priority: 100,
             tags: vec![],
+            tools: Vec::new(),
         }
     }
 
@@ -4663,6 +4679,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let response = handle_select_worker(&ctx, request, false, None)
@@ -4696,6 +4713,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let response = handle_select_worker(&ctx, request, false, None)
@@ -4726,6 +4744,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let response = handle_select_worker(&ctx, request, false, None)
@@ -4756,6 +4775,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let response = handle_select_worker(&ctx, request, false, None)
@@ -4792,6 +4812,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let response = handle_select_worker(&ctx, request, true, Some(2))
@@ -4820,6 +4841,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let response = tokio::time::timeout(
@@ -4854,6 +4876,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let response = handle_select_worker(&ctx, request, false, None)
@@ -4884,6 +4907,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            required_tools: Vec::new(),
             hook_pid: Some(1234),
         };
 
@@ -5061,6 +5085,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let response = handle_select_worker(&ctx, request, false, None)
@@ -5089,6 +5114,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            required_tools: Vec::new(),
             hook_pid: Some(4242),
         };
 
@@ -5158,6 +5184,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            required_tools: Vec::new(),
             hook_pid: Some(1001),
         };
 
@@ -5180,6 +5207,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            required_tools: Vec::new(),
             hook_pid: Some(1002),
         };
 
@@ -5221,6 +5249,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            required_tools: Vec::new(),
             hook_pid: Some(2001),
         };
 
@@ -5243,6 +5272,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            required_tools: Vec::new(),
             hook_pid: Some(2002),
         };
 
@@ -5277,6 +5307,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            required_tools: Vec::new(),
             hook_pid: Some(pid),
         };
 
@@ -5325,6 +5356,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            required_tools: Vec::new(),
             hook_pid: Some(3001),
         };
 
@@ -5343,6 +5375,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            required_tools: Vec::new(),
             hook_pid: Some(3002),
         };
 
@@ -5378,6 +5411,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let response = handle_select_worker(&ctx, request, false, None)
@@ -5400,6 +5434,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let refusal = handle_select_worker(&ctx, absent_request, false, None)
             .await
@@ -7199,6 +7234,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::None,
             classification_duration_us: None,
+            required_tools: Vec::new(),
             hook_pid: Some(98765),
         };
         let response = handle_select_worker(&ctx, request, false, None)

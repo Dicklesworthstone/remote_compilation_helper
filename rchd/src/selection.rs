@@ -1416,6 +1416,7 @@ impl WorkerSelector {
             let toolchain_mismatch =
                 toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities);
             let component_mismatch = rustup_component_capability_mismatch(request, &capabilities);
+            let tool_mismatch = required_tool_capability_mismatch(request, &capabilities);
             let cached_toolchain_failure = if let Some(toolchain) = request.toolchain.as_ref() {
                 let toolchain_name = toolchain.rustup_toolchain();
                 worker
@@ -1515,6 +1516,12 @@ impl WorkerSelector {
                             request.required_runtime
                         ),
                     )
+                } else if let Some(reason) = tool_mismatch {
+                    // Sits where the real gate sits (immediately after runtime,
+                    // before components): a diagnostic that reported a worker
+                    // eligible where selection denies it is worse than none.
+                    push_reason_code(&mut reason_codes, "tool.required_missing");
+                    (WorkerSelectionDiagnosticDecision::Deny, reason)
                 } else if let Some(reason) = component_mismatch {
                     push_reason_code(&mut reason_codes, "toolchain.component_missing");
                     (WorkerSelectionDiagnosticDecision::Deny, reason)
@@ -2031,6 +2038,12 @@ impl WorkerSelector {
             any_has_runtime = true;
 
             let capabilities = worker.capabilities().await;
+            if let Some(reason) = required_tool_capability_mismatch(request, &capabilities) {
+                debug!("Worker {} excluded: {}", worker_id, reason);
+                metrics::inc_reliability_error("selection", "required_tool_missing");
+                filtered_by_hard_preflight += 1;
+                continue;
+            }
             if let Some(reason) = rustup_component_capability_mismatch(request, &capabilities) {
                 debug!("Worker {} excluded: {}", worker_id, reason);
                 metrics::inc_reliability_error("selection", "toolchain_component_missing");
@@ -3354,6 +3367,10 @@ pub async fn select_worker_with_config(
         any_has_runtime = true;
 
         let capabilities = worker.capabilities().await;
+        if let Some(reason) = required_tool_capability_mismatch(request, &capabilities) {
+            debug!("Worker {} excluded: {}", worker_id, reason);
+            continue;
+        }
         if let Some(reason) = rustup_component_capability_mismatch(request, &capabilities) {
             filtered_by_component += 1;
             debug!("Worker {} excluded: {}", worker_id, reason);
@@ -3915,6 +3932,34 @@ fn required_component_toolchain(request: &SelectionRequest) -> Option<String> {
         })
 }
 
+/// The first required named tool this worker has not VERIFIED, as a selection
+/// reason — or `None` when the request requires none (no requirement, no gate).
+///
+/// Mirrors [`rustup_component_capability_mismatch`] deliberately, including its
+/// position in every eligibility ladder: the decision must happen BEFORE a slot
+/// is reserved. A job admitted onto a worker that lacks its tool would hold a
+/// reservation only to fail on the worker, and job mode surfaces the remote
+/// status verbatim — so that failure would be indistinguishable from the job's
+/// own nonzero exit.
+///
+/// "Declared but the probe failed" and "no worker ever declared this name" are
+/// reported distinctly: the first is a broken worker, the second is usually a
+/// typo or a fleet that was never configured for the tool.
+fn required_tool_capability_mismatch(
+    request: &SelectionRequest,
+    capabilities: &WorkerCapabilities,
+) -> Option<String> {
+    request.required_tools.iter().find_map(|tool| {
+        (!capabilities.tools_present.iter().any(|t| t == tool)).then(|| {
+            if capabilities.tools_absent.iter().any(|t| t == tool) {
+                format!("capability_missing:tool:{tool}:probe_failed")
+            } else {
+                format!("capability_missing:tool:{tool}:not_declared")
+            }
+        })
+    })
+}
+
 fn rustup_component_capability_mismatch(
     request: &SelectionRequest,
     capabilities: &WorkerCapabilities,
@@ -4097,6 +4142,7 @@ mod tests {
             total_slots,
             priority: 100,
             tags: os.map(rch_common::os_tag).into_iter().collect(),
+            tools: Vec::new(),
         };
         let state = WorkerState::new(config);
         state.set_speed_score(speed);
@@ -4229,6 +4275,7 @@ mod tests {
                 required_runtime: RequiredRuntime::default(),
                 classification_duration_us: None,
                 hook_pid: None,
+                required_tools: Vec::new(),
             };
             let weights = SelectionWeights::default();
 
@@ -4264,6 +4311,7 @@ mod tests {
             required_runtime: RequiredRuntime::None,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let mut config = SelectionConfig::default();
         config.weights.disk = 0.0;
@@ -4324,6 +4372,7 @@ mod tests {
             required_runtime: RequiredRuntime::None,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let weights = SelectionWeights {
             slots: 0.0,
@@ -4377,6 +4426,7 @@ mod tests {
                 required_runtime: RequiredRuntime::default(),
                 classification_duration_us: None,
                 hook_pid: None,
+                required_tools: Vec::new(),
             };
             let weights = SelectionWeights::default();
 
@@ -4415,6 +4465,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let weights = SelectionWeights::default();
 
@@ -4439,6 +4490,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: Some(123),
             hook_pid: Some(4321),
+            required_tools: Vec::new(),
         };
 
         let decision_before = crate::metrics::RELIABILITY_DECISIONS_TOTAL
@@ -4492,6 +4544,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let weights = SelectionWeights::default();
 
@@ -4523,6 +4576,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -4558,6 +4612,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -4595,6 +4650,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig {
@@ -4648,6 +4704,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let weights = SelectionWeights::default();
 
@@ -4690,6 +4747,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -4726,6 +4784,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -4758,6 +4817,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -4795,6 +4855,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -4847,6 +4908,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let config = CircuitBreakerConfig::default();
 
@@ -5006,6 +5068,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -5044,6 +5107,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         (pool, selector, request)
@@ -5095,6 +5159,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -5207,6 +5272,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -5252,6 +5318,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -5295,6 +5362,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -5330,6 +5398,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -5394,6 +5463,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -5416,6 +5486,67 @@ mod tests {
                 .reason_codes
                 .iter()
                 .any(|code| code == "health.below_fallback_min_success_rate")
+        );
+    }
+
+    fn tool_gate_request() -> SelectionRequest {
+        SelectionRequest {
+            project: "tool-gate".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::None,
+            classification_duration_us: None,
+            hook_pid: None,
+            job_mode: true,
+            required_tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn required_tool_gate_needs_verified_evidence_not_a_declaration() {
+        let caps = WorkerCapabilities {
+            tools_present: vec!["clang".to_string()],
+            tools_absent: vec!["ld.lld".to_string()],
+            ..Default::default()
+        };
+        let mut request = tool_gate_request();
+
+        // No requirement, no gate — ordinary compilation is untouched.
+        assert!(required_tool_capability_mismatch(&request, &caps).is_none());
+
+        // Verified => admissible.
+        request.required_tools = vec!["clang".to_string()];
+        assert!(required_tool_capability_mismatch(&request, &caps).is_none());
+
+        // Declared but the probe failed: rejected, and the reason says which
+        // of the two operational states this is (a broken worker).
+        request.required_tools = vec!["ld.lld".to_string()];
+        assert_eq!(
+            required_tool_capability_mismatch(&request, &caps).as_deref(),
+            Some("capability_missing:tool:ld.lld:probe_failed")
+        );
+
+        // Never declared anywhere (typo, or a fleet never configured for it):
+        // also rejected, distinctly. A silently dropped requirement would route
+        // the job to a worker that cannot run it, and job mode returns the
+        // remote exit verbatim — indistinguishable from the job's own failure.
+        request.required_tools = vec!["clanggg".to_string()];
+        assert_eq!(
+            required_tool_capability_mismatch(&request, &caps).as_deref(),
+            Some("capability_missing:tool:clanggg:not_declared")
+        );
+
+        // EVERY required tool must hold, not just the first.
+        request.required_tools = vec!["clang".to_string(), "ld.lld".to_string()];
+        assert!(required_tool_capability_mismatch(&request, &caps).is_some());
+
+        // A worker with no probed facts at all satisfies no requirement.
+        request.required_tools = vec!["clang".to_string()];
+        assert!(
+            required_tool_capability_mismatch(&request, &WorkerCapabilities::default()).is_some()
         );
     }
 
@@ -5476,6 +5607,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         }
     }
 
@@ -5645,6 +5777,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -5681,6 +5814,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let mut high = base_request.clone();
@@ -5738,6 +5872,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -5775,6 +5910,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -5827,6 +5963,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -5892,6 +6029,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -5944,6 +6082,7 @@ mod tests {
             required_runtime: RequiredRuntime::Nix,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &nix_request).await;
@@ -6003,6 +6142,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let mut excluded_worker_ids = HashSet::new();
         excluded_worker_ids.insert("active-rust".to_string());
@@ -6093,6 +6233,7 @@ mod tests {
             required_runtime: RequiredRuntime::None,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let result = selector
             .select_with_exclusions(&pool, &job_request, &excluded_worker_ids)
@@ -6112,6 +6253,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let result = selector
             .select_with_exclusions(&pool, &compile_request, &excluded_worker_ids)
@@ -6214,6 +6356,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: Some(42),
             hook_pid: Some(4242),
+            required_tools: Vec::new(),
         };
         let mut excluded_worker_ids = std::collections::HashSet::new();
         excluded_worker_ids.insert("active-rust".to_string());
@@ -6271,6 +6414,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -6307,6 +6451,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -6370,6 +6515,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -6423,6 +6569,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -6487,6 +6634,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -6545,6 +6693,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -6621,6 +6770,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -6660,6 +6810,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let first = selector.select(&pool, &request).await;
@@ -6723,6 +6874,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -6784,6 +6936,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -6836,6 +6989,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -6883,6 +7037,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -6931,6 +7086,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -6988,6 +7144,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -7040,6 +7197,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -7091,6 +7249,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -7128,6 +7287,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -7170,6 +7330,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -7205,6 +7366,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         // Run multiple selections and verify distribution
@@ -7263,6 +7425,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -7303,6 +7466,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -7335,6 +7499,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -7372,6 +7537,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -7412,6 +7578,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let excluded = HashSet::from(["requested".to_string()]);
 
@@ -7459,6 +7626,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -7510,6 +7678,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -7720,6 +7889,7 @@ mod tests {
             total_slots: 4,
             priority: 1,
             tags: vec![],
+            tools: Vec::new(),
         };
         pool.add_worker(worker_config).await;
 
@@ -7735,6 +7905,7 @@ mod tests {
             required_runtime: RequiredRuntime::Rust,
             classification_duration_us: Some(250),
             hook_pid: Some(12345),
+            required_tools: Vec::new(),
         };
 
         // Make a selection
@@ -7923,6 +8094,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -7954,6 +8126,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
         // Unknown telemetry allows a healthy last-success worker.
@@ -8002,6 +8175,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
         let empty = std::collections::HashSet::new();
 
@@ -8048,6 +8222,7 @@ mod tests {
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
             hook_pid: None,
+            required_tools: Vec::new(),
         };
 
         let result = selector.select(&pool, &request).await;
@@ -8132,6 +8307,7 @@ mod tests {
                         required_runtime: RequiredRuntime::default(),
                         classification_duration_us: None,
                         hook_pid: None,
+                        required_tools: Vec::new(),
                     };
                     let result = select_worker_with_config(
                         &pool,
@@ -8749,6 +8925,7 @@ mod tests {
                 required_runtime: RequiredRuntime::default(),
                 classification_duration_us: None,
                 hook_pid: None,
+                required_tools: Vec::new(),
             };
 
             let result = selector.select(&pool, &request).await;
@@ -8812,6 +8989,7 @@ mod tests {
                 required_runtime: RequiredRuntime::default(),
                 classification_duration_us: None,
                 hook_pid: None,
+                required_tools: Vec::new(),
             };
 
             let result = selector.select(&pool, &request).await;
@@ -8900,6 +9078,7 @@ mod tests {
                 required_runtime: RequiredRuntime::default(),
                 classification_duration_us: None,
                 hook_pid: None,
+                required_tools: Vec::new(),
             };
 
             let first = selector.select(&pool, &request).await;
@@ -8948,6 +9127,7 @@ mod tests {
                 required_runtime: RequiredRuntime::default(),
                 classification_duration_us: None,
                 hook_pid: None,
+                required_tools: Vec::new(),
             }
         }
 

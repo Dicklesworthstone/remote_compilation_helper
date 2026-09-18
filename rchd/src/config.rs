@@ -391,6 +391,15 @@ pub struct WorkerEntry {
     #[serde(default)]
     pub tags: Vec<String>,
 
+    /// Operator-declared named tool probes:
+    /// `tools = [{ name = "clang", command = ["clang", "--version"] }]`.
+    ///
+    /// Each is run on the worker as the configured user and verified by exit
+    /// status, so `--require-tool` gates on evidence rather than on a tag
+    /// somebody remembered to write.
+    #[serde(default)]
+    pub tools: Vec<rch_common::types::WorkerToolProbe>,
+
     /// Host OS this worker builds on (`linux`, `darwin`, `windows`).
     ///
     /// Unlike [`Self::tags`], which are descriptive, this **gates** admission:
@@ -430,6 +439,7 @@ impl From<WorkerEntry> for WorkerConfig {
             total_slots: entry.total_slots,
             priority: entry.priority,
             tags,
+            tools: entry.tools,
         }
     }
 }
@@ -590,6 +600,22 @@ pub fn load_workers_config(path: Option<&Path>) -> Result<WorkersConfig> {
 
     let config: WorkersConfig = toml::from_str(&contents)
         .with_context(|| format!("Failed to parse workers config from {:?}", config_path))?;
+
+    // Tool probe declarations are validated HERE, at load, not at probe time: a
+    // name that cannot survive the `RCH_FACT tool=<name>` wire format would come
+    // back parsed as a different name, so the worker would advertise a
+    // capability nobody asked for while silently lacking the one that was
+    // declared. A loud config error beats a quiet capability lie.
+    for worker in &config.workers {
+        for tool in &worker.tools {
+            rch_common::capability_probe::NamedToolProbe::try_from(tool).with_context(|| {
+                format!(
+                    "worker {:?} in {:?} declares an unusable tool probe",
+                    worker.id, config_path
+                )
+            })?;
+        }
+    }
 
     info!("Loaded {} worker definitions", config.workers.len());
     Ok(config)
@@ -789,6 +815,7 @@ enabled = true
             total_slots: 8,
             priority: 100,
             tags: vec!["rust".to_string()],
+            tools: Vec::new(),
             os: None,
             enabled: true,
         };
@@ -1145,6 +1172,60 @@ tags = ["rust", "go", "python", "fast", "production"]
     }
 
     #[test]
+    fn test_named_tool_probes_load_and_malformed_names_fail_loudly() {
+        let _guard = test_guard!();
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+
+        std::fs::write(
+            &workers_path,
+            r#"
+[[workers]]
+id = "with-tools"
+host = "192.168.1.100"
+tools = [
+  { name = "clang", command = ["clang", "--version"] },
+  { name = "ld.lld", command = ["/usr/bin/ld.lld", "--version"] },
+]
+"#,
+        )
+        .unwrap();
+        let config = load_workers_config(Some(&workers_path)).unwrap();
+        assert_eq!(config.workers[0].tools.len(), 2);
+        assert_eq!(config.workers[0].tools[0].name, "clang");
+        assert_eq!(config.workers[0].tools[1].command[0], "/usr/bin/ld.lld");
+        // ...and the declaration rides through to the routing descriptor.
+        let workers = load_workers(Some(&workers_path)).unwrap();
+        assert_eq!(workers[0].tools.len(), 2);
+
+        // A name that cannot survive the `RCH_FACT tool=<name>` wire format
+        // would be parsed back as a DIFFERENT name, so the worker would
+        // advertise a capability nobody asked for while silently lacking the
+        // declared one. That must fail the load, not degrade quietly.
+        for bad in [
+            r#"{ name = "cl ang", command = ["true"] }"#,
+            r#"{ name = "clang=1", command = ["true"] }"#,
+            r#"{ name = "", command = ["true"] }"#,
+            r#"{ name = "clang", command = [] }"#,
+        ] {
+            std::fs::write(
+                &workers_path,
+                format!("[[workers]]\nid = \"bad\"\nhost = \"h\"\ntools = [{bad}]\n"),
+            )
+            .unwrap();
+            let error = load_workers_config(Some(&workers_path))
+                .expect_err(&format!("{bad} must fail the load"));
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("unusable tool probe"),
+                "{bad}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn test_declared_os_becomes_reserved_tag() {
         let _guard = test_guard!();
         init_test_logging();
@@ -1213,6 +1294,7 @@ tags = ["rust"]
             total_slots: 32,
             priority: 200,
             tags: vec!["tag1".to_string(), "tag2".to_string()],
+            tools: Vec::new(),
             os: None,
             enabled: true,
         };

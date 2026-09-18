@@ -643,10 +643,17 @@ mod launchd {
             [] => return list_error.map_or(Ok(Ownership::Standalone), Err),
             [target] => target,
             _ => {
-                let initial = list_error.as_ref().map(ToString::to_string).unwrap_or_default();
+                let initial = list_error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
                 anyhow::bail!(
                     "RCH is registered in multiple launchd domains; refusing ambiguous startup (initial listing: {initial_listing})",
-                    initial_listing = if initial.is_empty() { "succeeded".to_string() } else { initial }
+                    initial_listing = if initial.is_empty() {
+                        "succeeded".to_string()
+                    } else {
+                        initial
+                    }
                 )
             }
         };
@@ -2108,6 +2115,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec!["rust".to_string()],
+            tools: Vec::new(),
         };
         pool.add_worker(worker_config).await;
 
@@ -2252,6 +2260,7 @@ mod tests {
             total_slots: 4,
             priority: 50,
             tags: vec![],
+            tools: Vec::new(),
         };
         context.pool.add_worker(worker_config).await;
 
@@ -2317,6 +2326,7 @@ mod tests {
                 total_slots: (i * 4) as u32,
                 priority: 100 - i as u32,
                 tags: vec![format!("tag-{}", i)],
+                tools: Vec::new(),
             };
             pool.add_worker(worker_config).await;
         }

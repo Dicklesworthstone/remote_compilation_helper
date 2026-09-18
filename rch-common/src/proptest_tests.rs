@@ -668,6 +668,8 @@ mod tests {
                             zig_version: None,
                             cargo_zigbuild_version: None,
                             cpu_microarch_level: None,
+                            tools_present: Vec::new(),
+                            tools_absent: Vec::new(),
                             num_cpus,
                             load_avg_1,
                             load_avg_5,
@@ -702,6 +704,7 @@ mod tests {
                         total_slots,
                         priority,
                         tags,
+                        tools: Vec::new(),
                     },
                 )
         }
@@ -935,6 +938,7 @@ mod tests {
                 total_slots: 16,
                 priority: 200,
                 tags: vec!["gpu".to_string(), "high-memory".to_string()],
+                tools: Vec::new(),
             };
 
             let json = serde_json::to_string(&config).unwrap();

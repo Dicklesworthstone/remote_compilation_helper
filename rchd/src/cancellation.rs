@@ -793,11 +793,13 @@ impl CancellationOrchestrator {
                 state.id,
                 &state.worker_id,
                 state.local_wrapper_id.as_deref(),
-                130,
-                None,
-                None,
-                None,
-                Some(cancellation),
+                crate::history::BuildCompletion {
+                    exit_code: 130,
+                    duration_ms: None,
+                    bytes_transferred: None,
+                    timing: None,
+                    cancellation: Some(cancellation),
+                },
             ) {
                 Ok(Some((state, _))) => {
                     history_ok = true;

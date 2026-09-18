@@ -276,6 +276,7 @@ pub async fn workers_init(yes: bool, ctx: &OutputContext) -> Result<()> {
         total_slots: 8, // Default
         priority: 100,  // Default
         tags: vec![],
+        tools: Vec::new(),
     };
 
     workers.push(new_worker);
@@ -614,6 +615,7 @@ mod tests {
             total_slots: 8,
             priority: 100,
             tags: vec!["rust\"fast".to_string(), "gpu\nprod".to_string()],
+            tools: Vec::new(),
         }];
 
         let rendered = serialize_workers_config(&workers).expect("serialize workers config");
