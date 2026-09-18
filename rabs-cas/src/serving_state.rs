@@ -30,8 +30,9 @@ use rabs_protocol::result_identity::TypedDigest;
 use rabs_protocol::serving::ServingValidity;
 
 use crate::metadata_store::{
-    DivergenceIncidentRow, QuarantineScope, RabsMetadataStore, SqlValue, StoreError,
+    DivergenceIncidentRow, QuarantineScope, RabsMetadataStore, SqlValue, StoreError, digest_key,
 };
+use crate::trust_evidence::require_active_authority;
 
 /// Disposition string under which serving is possible at all.
 pub const SERVABLE_DISPOSITION: &str = "servable";
@@ -293,6 +294,9 @@ pub enum RevalidationVerdict {
 pub enum RevalidationError {
     /// No serving record exists for this key.
     NoServingRecord,
+    /// The canonical string key and typed evidence key name different
+    /// actions. No evidence or serving state may be written.
+    ActionKeyMismatch,
     /// A matching re-execution cannot release quarantine, named
     /// blockers, or another non-servable disposition.
     ServingBlocked,
@@ -312,6 +316,7 @@ impl std::fmt::Display for RevalidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoServingRecord => write!(f, "no serving record to revalidate"),
+            Self::ActionKeyMismatch => write!(f, "revalidation action keys do not match"),
             Self::ServingBlocked => write!(f, "serving is blocked; revalidation is not a repair"),
             Self::RevisionExhausted => write!(f, "serving revision exhausted"),
             Self::StaleRevision { stored } => {
@@ -333,7 +338,11 @@ impl std::error::Error for RevalidationError {}
 ///   quarantine, named blocker, or non-servable disposition forbids it;
 /// - different → scoped quarantine added FIRST, divergence incident
 ///   appended (H026), serving disposition flipped to `"quarantined"`
-///   at the same higher revision.
+///   at the same higher revision, retaining all earlier blockers.
+///
+/// Both paths validate the action-key binding and reject an already
+/// stale authority BEFORE writing evidence or quarantine. Transactional
+/// authority checks on the final store writes remain in force.
 ///
 /// `ttl_micros` of `None` uses [`DEFAULT_REVALIDATION_TTL_MICROS`].
 ///
@@ -370,6 +379,11 @@ pub fn apply_revalidation(
             stored: record.state_revision,
         });
     }
+    if digest_key(action_key_typed) != action_key_str {
+        return Err(RevalidationError::ActionKeyMismatch);
+    }
+    require_active_authority(store, authority)
+        .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
     let new_revision = expected_revision
         .checked_add(1)
         .ok_or(RevalidationError::RevisionExhausted)?;
@@ -408,16 +422,35 @@ pub fn apply_revalidation(
             .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
         Ok(RevalidationVerdict::IdenticalEvidenceAppended { new_revision })
     } else {
-        // Quarantine FIRST. A crash or failed incident append must not
-        // leave a known-divergent action servable through its old row.
-        store
-            .add_quarantine(
-                QuarantineScope::ActionEntry,
-                action_key_str,
-                "k007-soundness-incident",
-            )
+        // Quarantine FIRST. Preserve any existing incident reason;
+        // revalidation is not an authorized rewrite of an operator hold.
+        if !action_quarantine_present(store, action_key_str)
+            .map_err(|e| RevalidationError::Store(format!("{e:?}")))?
+        {
+            store
+                .add_quarantine(
+                    QuarantineScope::ActionEntry,
+                    action_key_str,
+                    "k007-soundness-incident",
+                )
+                .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
+        }
+        // Other incident producers need not number by serving revision.
+        // Retain the revision-based baseline while advancing past any
+        // existing sparse sequence rather than colliding with it.
+        let incidents = store
+            .list_divergence_incidents(action_key_str)
             .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
-        let seq = new_revision;
+        let seq = incidents
+            .iter()
+            .map(|incident| incident.seq)
+            .max()
+            .map_or(Some(new_revision), |seq| {
+                seq.checked_add(1).map(|next| next.max(new_revision))
+            })
+            .ok_or_else(|| {
+                RevalidationError::Store("divergence incident sequence exhausted".to_owned())
+            })?;
         store
             .record_divergence_incident(
                 authority,
@@ -438,6 +471,25 @@ pub fn apply_revalidation(
                 },
             )
             .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
+        let mut blocking = Vec::new();
+        for (scope, subject) in &record.blocking {
+            let scope = match scope.as_str() {
+                "location" => QuarantineScope::Location,
+                "logical-object" => QuarantineScope::LogicalObject,
+                "action-entry" => QuarantineScope::ActionEntry,
+                _ => {
+                    return Err(RevalidationError::Store(format!(
+                        "unknown blocking quarantine scope: {scope}"
+                    )));
+                }
+            };
+            blocking.push((scope, subject.clone()));
+        }
+        if !blocking.iter().any(|(scope, subject)| {
+            scope == &QuarantineScope::ActionEntry && subject == action_key_str
+        }) {
+            blocking.push((QuarantineScope::ActionEntry, action_key_str.to_owned()));
+        }
         store
             .put_serving_record(
                 authority,
@@ -445,7 +497,7 @@ pub fn apply_revalidation(
                 "quarantined",
                 new_revision,
                 &validity,
-                &[(QuarantineScope::ActionEntry, action_key_str.to_owned())],
+                &blocking,
             )
             .map_err(|e| RevalidationError::Store(format!("{e:?}")))?;
         Ok(RevalidationVerdict::SoundnessIncidentQuarantined {
@@ -454,6 +506,7 @@ pub fn apply_revalidation(
         })
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1211,6 +1264,152 @@ mod tests {
         assert_eq!(
             k007_lifecycle_scenarios(&mut reference),
             k007_lifecycle_scenarios(&mut candidate)
+        );
+    }
+
+    /// Reject misbound or already-stale callers before either kind of
+    /// side effect, then preserve independent blockers and sparse audit
+    /// history when a correctly authorized divergence is admitted.
+    fn k007_fencing_and_incident_history(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+        let (active, action_key) = published_fixture(store);
+        let action_typed = digest("rabs.action-key.sha256.v1", 7);
+        let wrong_action = digest("rabs.action-key.sha256.v1", 8);
+        let wrong_authority = digest("rabs.authority.sha256.v1", 2);
+        store
+            .put_serving_record(
+                &active,
+                &action_key,
+                SERVABLE_DISPOSITION,
+                1,
+                &validity(1_000, Some(500), 0, 1),
+                &[],
+            )
+            .unwrap();
+        let before = store.differential_snapshot().unwrap();
+        for signature in ["published", "diverged"] {
+            assert_eq!(
+                apply_revalidation(
+                    store, &wrong_authority, &action_key, &action_typed,
+                    1, 20, 10, "published", signature,
+                    "manifest-a", "manifest-b", "ev-b", 1_100, 1, None,
+                ),
+                Err(RevalidationError::Store(format!("{:?}", StoreError::NotActiveAuthority)))
+            );
+            assert_eq!(store.differential_snapshot().unwrap(), before);
+            assert_eq!(
+                apply_revalidation(
+                    store, &active, &action_key, &wrong_action,
+                    1, 20, 10, "published", signature,
+                    "manifest-a", "manifest-b", "ev-b", 1_100, 1, None,
+                ),
+                Err(RevalidationError::ActionKeyMismatch)
+            );
+            assert_eq!(store.differential_snapshot().unwrap(), before);
+        }
+
+        store
+            .add_quarantine(QuarantineScope::LogicalObject, "object:damaged", "bad bytes")
+            .unwrap();
+        store
+            .add_quarantine(QuarantineScope::ActionEntry, &action_key, "operator hold")
+            .unwrap();
+        store
+            .put_serving_record(
+                &active,
+                &action_key,
+                SERVABLE_DISPOSITION,
+                2,
+                &validity(1_000, Some(500), 0, 1),
+                &[(QuarantineScope::LogicalObject, "object:damaged".to_owned())],
+            )
+            .unwrap();
+        store
+            .record_divergence_incident(
+                &active,
+                &DivergenceIncidentRow {
+                    action_key: action_key.clone(),
+                    seq: 40,
+                    class: "prior-incident".to_owned(),
+                    committed_manifest_key: "manifest-a".to_owned(),
+                    candidate_manifest_key: "manifest-old".to_owned(),
+                    candidate_evidence_key: "ev-old".to_owned(),
+                    candidate_pin_hex: String::new(),
+                    generation_hex: "a".to_owned(),
+                    attempt_hex: "14".to_owned(),
+                    detail: "prior sparse incident".to_owned(),
+                },
+            )
+            .unwrap();
+        let frozen_publication: Vec<_> = store
+            .differential_snapshot()
+            .unwrap()
+            .into_iter()
+            .filter(|line| line.starts_with("action_publications|"))
+            .collect();
+        assert_eq!(
+            apply_revalidation(
+                store, &active, &action_key, &action_typed,
+                2, 20, 10, "published", "diverged",
+                "manifest-a", "manifest-b", "ev-b", 1_200, 1, None,
+            ),
+            Ok(RevalidationVerdict::SoundnessIncidentQuarantined {
+                incident_seq: 41,
+                new_revision: 3,
+            })
+        );
+        let incidents = store.list_divergence_incidents(&action_key).unwrap();
+        assert_eq!(incidents.len(), 2);
+        assert_eq!(incidents[0].seq, 40);
+        assert_eq!(incidents[1].seq, 41);
+        let record = store.serving_record(&action_key).unwrap().unwrap();
+        assert_eq!(
+            record.blocking,
+            vec![
+                ("action-entry".to_owned(), action_key.clone()),
+                ("logical-object".to_owned(), "object:damaged".to_owned()),
+            ]
+        );
+        assert_eq!(
+            store
+                .query(
+                    "SELECT reason FROM quarantines WHERE scope = 'action-entry' AND subject = ?1",
+                    &[SqlValue::Text(action_key.clone())],
+                )
+                .unwrap(),
+            vec![vec![SqlValue::Text("operator hold".to_owned())]]
+        );
+        assert!(matches!(
+            serving_gate(store, &action_key, 1_200, 1).unwrap(),
+            ServeDecision::NotServable { .. }
+        ));
+        let snapshot = store.differential_snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|line| line.starts_with("action_publications|"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            frozen_publication
+        );
+        snapshot
+    }
+
+    #[test]
+    fn k007_revalidation_fencing_reference() {
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        k007_fencing_and_incident_history(&mut store);
+    }
+
+    #[test]
+    fn k007_revalidation_fencing_differential() {
+        let reference_engine = RusqliteEngine::open(&fresh_path("k007fence-ref")).unwrap();
+        let candidate_engine = FsqliteEngine::open(&fresh_path("k007fence-fsq")).unwrap();
+        let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+        let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
+        assert_eq!(
+            k007_fencing_and_incident_history(&mut reference),
+            k007_fencing_and_incident_history(&mut candidate)
         );
     }
 }
