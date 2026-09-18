@@ -1016,7 +1016,12 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
 /// work starts. Pure classification — no network side effects; the daemon
 /// candidate/rejection query that further refines the recommendation lands with
 /// the selection-RPC work (bd-...12.3).
-pub async fn admit(command: &str, ctx: &OutputContext) -> Result<()> {
+pub async fn admit(
+    command: &str,
+    job: bool,
+    require_tool: Vec<String>,
+    ctx: &OutputContext,
+) -> Result<()> {
     use rch_common::admit_preflight::preflight;
 
     // Proof/strict-remote policy mirrors the ControlState surface
@@ -1032,7 +1037,11 @@ pub async fn admit(command: &str, ctx: &OutputContext) -> Result<()> {
             })
         });
 
+    // Job mode bypasses the classifier rather than consulting it, so the
+    // preflight must say so too: a fuzz script is not a compilation and would
+    // otherwise be reported `local` — the opposite of what `exec --job` does.
     let pf = preflight(command, proof_policy);
+    let pf = if job { pf.as_job(require_tool) } else { pf };
 
     if ctx.is_json() {
         let _ = ctx.json(&ApiResponse::ok("admit", &pf));
@@ -1050,6 +1059,13 @@ pub async fn admit(command: &str, ctx: &OutputContext) -> Result<()> {
             _ => style.value(r).to_string(),
         }
     });
+    if pf.job_mode {
+        println!(
+            "{} {}",
+            style.key("Mode:"),
+            style.value("job (classifier bypassed)")
+        );
+    }
     println!("{} {}", style.key("Compilation:"), pf.is_compilation);
     if let Some(family) = &pf.family {
         println!("{} {}", style.key("Family:"), style.value(family));
@@ -1077,6 +1093,9 @@ pub async fn admit(command: &str, ctx: &OutputContext) -> Result<()> {
     }
     for tc in &req.needs_toolchains {
         needs.push(format!("toolchain:{tc}"));
+    }
+    for tool in &req.needs_tools {
+        needs.push(format!("tool:{tool}"));
     }
     println!(
         "{} {}",

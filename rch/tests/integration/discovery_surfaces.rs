@@ -225,6 +225,7 @@ fn test_robot_docs_guide_covers_remediation_workflows() {
         "force_resync",
         "queue_attach_cancel",
         "real_fleet_smoke",
+        "job_requires_tool",
     ] {
         assert!(
             ids.contains(&expected),

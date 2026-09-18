@@ -546,6 +546,15 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
     /// offload/local/queue/defer recommendation. Use `--json` for the
     /// machine-readable envelope.
     Admit {
+        /// Preflight as a job-mode admission (`rch exec --job`) instead of a
+        /// compilation: the classifier is bypassed, so a non-compilation
+        /// workload preflights as offload-eligible rather than `local`.
+        #[arg(long)]
+        job: bool,
+        /// Named tool the job requires a worker to have verified. Repeatable;
+        /// requires --job. Read-only here — nothing is synced or reserved.
+        #[arg(long, value_name = "NAME", requires = "job")]
+        require_tool: Vec<String>,
         /// Command to preflight (quote or pass as multiple args)
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
@@ -2286,7 +2295,11 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
             Commands::Diagnose { command, dry_run } => {
                 handle_diagnose(command, dry_run, &ctx).await
             }
-            Commands::Admit { command } => handle_admit(command, &ctx).await,
+            Commands::Admit {
+                job,
+                require_tool,
+                command,
+            } => handle_admit(job, require_tool, command, &ctx).await,
             Commands::Exec {
                 base,
                 dependency_base,
@@ -3683,6 +3696,24 @@ fn remediation_workflows() -> Vec<RemediationWorkflow> {
             ),
         },
         RemediationWorkflow {
+            id: "job_requires_tool".to_string(),
+            summary: "Preflight and run a non-compilation job that needs a verified worker tool."
+                .to_string(),
+            commands: vec![
+                "rch admit --job --require-tool clang --json -- ./run_shards.sh".to_string(),
+                "rch exec --job --require-tool clang -- ./run_shards.sh".to_string(),
+                "rch workers capabilities --refresh --json".to_string(),
+            ],
+            observe: Some(
+                "admit --job bypasses the compilation classifier, so a non-compilation workload \
+                 reads offload rather than local. A required tool must appear under a worker's \
+                 verified named tools; capability_missing:tool:<name>:not_declared means no \
+                 worker declares a probe for it, :probe_failed means one does and the probe \
+                 fails."
+                    .to_string(),
+            ),
+        },
+        RemediationWorkflow {
             id: "proof_mode".to_string(),
             summary: "Fail-closed remote proof; refusal is RCH-I012, queue/replay is daemon-driven."
                 .to_string(),
@@ -4025,9 +4056,14 @@ async fn handle_diagnose(command: Vec<String>, dry_run: bool, ctx: &OutputContex
     Ok(())
 }
 
-async fn handle_admit(command: Vec<String>, ctx: &OutputContext) -> Result<()> {
+async fn handle_admit(
+    job: bool,
+    require_tool: Vec<String>,
+    command: Vec<String>,
+    ctx: &OutputContext,
+) -> Result<()> {
     let joined = command.join(" ");
-    commands::admit(&joined, ctx).await
+    commands::admit(&joined, job, require_tool, ctx).await
 }
 
 /// `rch cache warm` per-worker result (br-4zm6u). Emitted in the JSON

@@ -292,6 +292,7 @@ rch shim install|status|uninstall      # cargo shim: offload builds started by s
 rch agents list|status|install-hook|uninstall-hook
 rch diagnose "cargo build --release"
 rch admit "cargo build --release"      # read-only preflight: offload / local / queue / defer verdict
+rch admit --job --require-tool clang -- ./run_shards.sh   # same, for a job-mode admission
 rch why miss|refusal                   # RABS: explain a cache-key miss diff or an index refusal code
 rch exec -- cargo build --release
 rch --robot-triage --json
@@ -340,6 +341,13 @@ required_tools = ["clang"]
 Project defaults ADD to `--require-tool` rather than being replaced by it, and
 both apply to job mode only — a project-wide requirement that silently narrowed
 every ordinary build's worker pool would be a surprising way to lose the fleet.
+
+`rch admit --job [--require-tool NAME]... -- <command>` preflights the same
+decision read-only — it syncs nothing and reserves nothing. Without `--job` the
+preflight consults the compilation classifier, so a fuzz script answers
+`local`; with it the classifier is bypassed exactly as `exec --job` does, and
+the answer is `offload`. The classification facts are still reported, so a
+compilation accidentally passed to `--job` still shows its family.
 
 A required name that no worker has verified admits **no worker at all**,
 including when the name is a typo. That is deliberate: silently dropping the
