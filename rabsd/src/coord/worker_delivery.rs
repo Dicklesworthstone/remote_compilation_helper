@@ -278,7 +278,7 @@ fn download(
         let encoded = text(&chunk, "data_hex")?;
         require(is_hex(encoded, count * 2), "chunk encoding or length mismatch")?;
         let mut bytes = Vec::with_capacity(count);
-        for pair in encoded.as_bytes().chunks_exact(2) {
+        for pair in encoded.as_bytes().as_chunks::<2>().0 {
             let digit = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
             bytes.push(digit(pair[0]) * 16 + digit(pair[1]));
         }

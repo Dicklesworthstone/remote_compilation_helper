@@ -866,6 +866,16 @@ mod tests {
             serving_gate(&mut store, &action_key, 1_200, 4).unwrap(),
             ServeDecision::ExpiredClockEpoch
         );
+        // T048: the third clock anomaly, which the in-memory scenarios
+        // cover but this durability test did not. A record recovered
+        // from disk must deny a backward wall clock exactly as a live
+        // one does — "expires conservatively under clock anomalies" has
+        // to hold for a RECOVERED record, since recovery is precisely
+        // when a host's clock is most likely to have moved.
+        assert_eq!(
+            serving_gate(&mut store, &action_key, 900, 3).unwrap(),
+            ServeDecision::ExpiredClockRollback
+        );
         // Replay protection also survives the reopen.
         store.acquire_authority(&authority_row(1)).unwrap();
         let active = digest("rabs.authority.sha256.v1", 1);
