@@ -2196,6 +2196,41 @@ mod tests {
     }
 
     #[test]
+    fn the_accepted_false_positives_are_pinned_not_discovered() {
+        // The seed set matches a path COMPONENT by prefix, so it catches
+        // `.env.production` — and also catches things that are not
+        // secrets. This pins the boundary so the next reader meets it as
+        // a decision rather than as a surprise, and does not "fix" it by
+        // loosening the rule.
+        //
+        // Measured against this repository: of 1,257 tracked files
+        // exactly ONE is withheld, `dashboard/.env.example`. It is a
+        // placeholder template, not a build input, so the cost of
+        // excluding it is nothing and the benefit of not special-casing
+        // it is that `.env.example` cannot become a place to smuggle a
+        // real credential past the policy.
+        for template in [".env.example", "dashboard/.env.example", ".env.template"] {
+            assert_eq!(
+                member_disposition(template, false),
+                MemberDisposition::ExcludeSecretPolicy,
+                "{template}: accepted false positive — templates are withheld on purpose"
+            );
+        }
+        // Same prefix rule, and here it is doing real work: .envrc is a
+        // direnv script that very commonly holds credentials.
+        assert_eq!(
+            member_disposition(".envrc", false),
+            MemberDisposition::ExcludeSecretPolicy
+        );
+
+        // The asymmetry that justifies all of the above: a false
+        // positive costs an action its remote execution, a false
+        // negative ships a credential off the machine. Erring toward
+        // exclusion is correct, and is why none of these are
+        // special-cased back in.
+    }
+
+    #[test]
     fn no_always_include_path_is_withheld_by_secret_policy() {
         // The collision guard for the ordering choice. Secret policy is
         // consulted BEFORE the always-include set, which is right —

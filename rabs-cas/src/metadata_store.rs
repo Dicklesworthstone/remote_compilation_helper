@@ -39,6 +39,7 @@ use rabs_protocol::generation::{
     WorkerIncarnationId,
 };
 use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
+use rabs_protocol::release_authorization::ReleaseVerdict;
 use rabs_protocol::serving::ServingValidity;
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::{
@@ -64,7 +65,7 @@ use rabs_protocol::worker_fence::{
 /// (every execution lease links through its attempt); v22 = peer
 /// authority incarnation fencing (legacy rows require a newer term);
 /// v23 = credential-generation fencing (legacy unknown generations fail closed).
-pub const SCHEMA_VERSION: u32 = 24;
+pub const SCHEMA_VERSION: u32 = 25;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -500,6 +501,35 @@ pub const MIGRATIONS: &[Migration] = &[
         // `WHERE` form for the A002 differential lanes to agree.
         version: 24,
         statements: &["CREATE INDEX idx_pins_released ON pins (released)"],
+    },
+    Migration {
+        // T011: the durable landing site for the stock-differential
+        // corpus gate's verdict. `rabs-replay` mints it, this store
+        // keeps it, and the coordinator consults it before serving —
+        // the three cannot call each other directly, because rabs-cas
+        // must not depend on the replay harness (A002).
+        //
+        // Keyed by BUILD, one row per build, because a verdict is a
+        // statement about a binary. Recording a second verdict for the
+        // same build replaces it: a fresh corpus run supersedes an
+        // older one rather than accumulating rows whose precedence
+        // would then need its own rule.
+        //
+        // The validity columns mirror `action_serving_states` exactly,
+        // so a release verdict expires under the same clock discipline
+        // as a publication rather than under a second notion of time.
+        version: 25,
+        statements: &[
+            "CREATE TABLE release_verdicts ( \
+         build TEXT PRIMARY KEY, \
+         corpus TEXT NOT NULL, \
+         replayed INTEGER NOT NULL, \
+         explained INTEGER NOT NULL, \
+         evaluated_at_micros INTEGER NOT NULL, \
+         max_age_micros INTEGER, \
+         clock_uncertainty_micros INTEGER NOT NULL, \
+         clock_epoch INTEGER NOT NULL)",
+        ],
     },
 ];
 
@@ -1863,6 +1893,38 @@ pub trait RabsMetadataStore {
     /// The full serving record for an action key, if a row exists
     /// (legacy rows read back at revision 0 with defaults).
     fn serving_record(&mut self, action_key: &str) -> Result<Option<ServingRecordRow>, StoreError>;
+
+    // --- T011: durable stock-differential release verdicts ---
+
+    /// Record the corpus gate's verdict for one build, replacing any
+    /// earlier verdict for that same build.
+    ///
+    /// Replacement rather than append is deliberate: a newer corpus run
+    /// over the same binary supersedes the older one, and keeping both
+    /// would require a precedence rule whose only correct answer is
+    /// "the newest", which is what a replace already is.
+    ///
+    /// Deliberately NOT authority-gated, unlike the publication writes
+    /// nearby. A release verdict is produced by CI or an operator
+    /// BEFORE and OUTSIDE any coordinator term — requiring the active
+    /// authority would mean the gate could only be recorded by the very
+    /// process whose right to serve it governs.
+    ///
+    /// # Errors
+    /// [`StoreError`] on a backend failure, or
+    /// [`StoreError::Corruption`] if a count exceeds the storable
+    /// range.
+    fn record_release_verdict(&mut self, verdict: &ReleaseVerdict) -> Result<(), StoreError>;
+
+    /// The recorded verdict for `build`, if any. Returns the row as
+    /// stored; whether it AUTHORIZES anything is decided by
+    /// [`rabs_protocol::release_authorization::authorization`], never
+    /// here — a store that answered "authorized" would be a second
+    /// place for that policy to live.
+    ///
+    /// # Errors
+    /// [`StoreError`] on a backend failure or a malformed row.
+    fn release_verdict(&mut self, build: &str) -> Result<Option<ReleaseVerdict>, StoreError>;
 
     // --- H026: same-key divergence incidents + served-consumer
     // provenance (append-only; coordinator-authority-gated writes) ---
@@ -5813,6 +5875,88 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         }))
     }
 
+    fn record_release_verdict(&mut self, verdict: &ReleaseVerdict) -> Result<(), StoreError> {
+        let replayed = to_seq(verdict.replayed, "replayed")?;
+        let explained = to_seq(verdict.explained, "explained")?;
+        let uncertainty = to_seq(
+            verdict.validity.clock_uncertainty_micros,
+            "clock_uncertainty_micros",
+        )?;
+        let epoch = to_seq(verdict.validity.coordinator_clock_epoch, "clock_epoch")?;
+        let max_age = match verdict.validity.maximum_age_micros {
+            None => SqlValue::Null,
+            Some(age) => SqlValue::Int(to_seq(age, "max_age_micros")?),
+        };
+        let build = verdict.build.clone();
+        let corpus = verdict.corpus.clone();
+        let evaluated_at = verdict.validity.evaluated_at_unix_micros;
+        // Delete-then-insert rather than an upsert: `ON CONFLICT ... DO
+        // UPDATE` appears nowhere else in this store, because the A002
+        // differential lanes require every statement to mean the same
+        // thing on each engine, and the upsert form is the one most
+        // likely to diverge. The pair is atomic inside the transaction,
+        // so no reader can observe the gap.
+        self.in_txn(move |engine| {
+            engine.execute(
+                "DELETE FROM release_verdicts WHERE build = ?1",
+                &[SqlValue::Text(build.clone())],
+            )?;
+            engine.execute(
+                "INSERT INTO release_verdicts (build, corpus, replayed, explained, \
+                 evaluated_at_micros, max_age_micros, clock_uncertainty_micros, clock_epoch) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    SqlValue::Text(build),
+                    SqlValue::Text(corpus),
+                    SqlValue::Int(replayed),
+                    SqlValue::Int(explained),
+                    SqlValue::Int(evaluated_at),
+                    max_age,
+                    SqlValue::Int(uncertainty),
+                    SqlValue::Int(epoch),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn release_verdict(&mut self, build: &str) -> Result<Option<ReleaseVerdict>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT corpus, replayed, explained, evaluated_at_micros, max_age_micros, \
+             clock_uncertainty_micros, clock_epoch FROM release_verdicts WHERE build = ?1",
+            &[SqlValue::Text(build.to_owned())],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let [corpus, replayed, explained, evaluated_at, max_age, uncertainty, epoch] =
+            row.as_slice()
+        else {
+            return Err(StoreError::Corruption("release verdict shape".into()));
+        };
+        let evaluated_at = match evaluated_at {
+            SqlValue::Int(v) => *v,
+            _ => return Err(StoreError::Corruption("evaluated_at_micros shape".into())),
+        };
+        let maximum_age_micros = match max_age {
+            SqlValue::Null => None,
+            SqlValue::Int(_) => Some(expect_u64(max_age, "max_age_micros")?),
+            _ => return Err(StoreError::Corruption("max_age_micros shape".into())),
+        };
+        Ok(Some(ReleaseVerdict {
+            build: build.to_owned(),
+            corpus: expect_text(corpus, "corpus")?,
+            replayed: expect_u64(replayed, "replayed")?,
+            explained: expect_u64(explained, "explained")?,
+            validity: ServingValidity {
+                evaluated_at_unix_micros: evaluated_at,
+                maximum_age_micros,
+                clock_uncertainty_micros: expect_u64(uncertainty, "clock_uncertainty_micros")?,
+                coordinator_clock_epoch: expect_u64(epoch, "clock_epoch")?,
+            },
+        }))
+    }
+
     fn record_divergence_incident(
         &mut self,
         authority: &TypedDigest,
@@ -8943,6 +9087,7 @@ mod tests {
             "provisional_pin_lineage",
             "provisional_pins",
             "quarantines",
+            "release_verdicts",
             "schema_epochs",
             "serving_blocking_quarantines",
             "trust_states",
@@ -8965,6 +9110,98 @@ mod tests {
         let engine = FsqliteEngine::open(&fresh_path("h038-tables")).unwrap();
         let mut store = SqlMetadataStore::open(engine).unwrap();
         assert_eq!(table_names(&mut store), expected);
+    }
+
+    #[test]
+    fn t011_a_release_verdict_round_trips_and_a_rerun_supersedes_it() {
+        use rabs_protocol::release_authorization::{
+            ReleaseAuthorization, ReleaseAuthorizationMode, authorization,
+        };
+
+        let mut verdict = ReleaseVerdict {
+            build: "rabs-build-1".to_owned(),
+            corpus: "corpus-abc".to_owned(),
+            replayed: 1_200,
+            explained: 3,
+            validity: ServingValidity {
+                evaluated_at_unix_micros: 5_000,
+                maximum_age_micros: Some(100_000),
+                clock_uncertainty_micros: 25,
+                coordinator_clock_epoch: 4,
+            },
+        };
+
+        let stores: [Box<dyn RabsMetadataStore>; 2] = [
+            Box::new(SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap()),
+            // Both engines, because the A002 differential lanes must
+            // agree on this table exactly as they do on every other.
+            Box::new(
+                SqlMetadataStore::open(
+                    FsqliteEngine::open(&fresh_path("t011-release-verdicts")).unwrap(),
+                )
+                .unwrap(),
+            ),
+        ];
+        for mut store in stores {
+            // An unrecorded build reads back as nothing at all, which is
+            // the `Absent` standing rather than a silently empty pass.
+            assert_eq!(store.release_verdict("rabs-build-1").unwrap(), None);
+
+            store.record_release_verdict(&verdict).unwrap();
+            assert_eq!(
+                store.release_verdict("rabs-build-1").unwrap().as_ref(),
+                Some(&verdict),
+                "every field must survive the round trip, including the validity window"
+            );
+
+            // A verdict is keyed by BUILD: recording one says nothing
+            // about any other build, which is what stops a proof from
+            // outliving the binary it examined.
+            assert_eq!(store.release_verdict("rabs-build-2").unwrap(), None);
+
+            // A fresh corpus run over the same build SUPERSEDES rather
+            // than accumulating: two live verdicts for one build would
+            // need a precedence rule, and the only correct answer is
+            // "the newest", which is what replacement already is.
+            let mut rerun = verdict.clone();
+            rerun.corpus = "corpus-def".to_owned();
+            rerun.replayed = 1_500;
+            rerun.validity.evaluated_at_unix_micros = 9_000;
+            store.record_release_verdict(&rerun).unwrap();
+            assert_eq!(
+                store.release_verdict("rabs-build-1").unwrap(),
+                Some(rerun.clone()),
+                "the rerun must replace the earlier verdict, not sit beside it"
+            );
+
+            // And the durable row drives the real decision: live here,
+            // expired once the window elapses, under either mode.
+            let stored = store.release_verdict("rabs-build-1").unwrap();
+            assert_eq!(
+                authorization(stored.as_ref(), "rabs-build-1", 9_500, 4),
+                ReleaseAuthorization::Authorized { replayed: 1_500 }
+            );
+            let expired = authorization(stored.as_ref(), "rabs-build-1", 500_000, 4);
+            assert_eq!(expired, ReleaseAuthorization::Expired);
+            assert!(!expired.permits_serving(ReleaseAuthorizationMode::Required));
+        }
+
+        // A verdict with no expiry stores its NULL max-age as absence of
+        // a bound, not as a zero-length window that expires instantly.
+        verdict.validity.maximum_age_micros = None;
+        let mut store =
+            SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        store.record_release_verdict(&verdict).unwrap();
+        let stored = store.release_verdict("rabs-build-1").unwrap();
+        assert_eq!(
+            stored.as_ref().unwrap().validity.maximum_age_micros,
+            None,
+            "NULL max-age must read back as no bound"
+        );
+        assert_eq!(
+            authorization(stored.as_ref(), "rabs-build-1", i64::MAX, 4),
+            ReleaseAuthorization::Authorized { replayed: 1_200 }
+        );
     }
 
     #[test]
