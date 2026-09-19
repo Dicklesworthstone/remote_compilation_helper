@@ -30,12 +30,28 @@
 //!   and a gate that ignored skips would let coverage silently decay to
 //!   nothing while still authorizing.
 //!
-//! What this module does NOT do: wire itself into the coordinator's
-//! serving promotion. That crossing is a durable-verdict design
-//! decision (`rabs-cas` must not depend on this replay harness), and it
-//! is recorded on the bead rather than decided here.
+//! ## How it reaches the coordinator
+//!
+//! The gate runs here, in a replay harness; the coordinator that serves
+//! is another process that cannot depend on this crate (A002). So a
+//! passing [`PromotionAuthorized`] becomes data via
+//! [`PromotionAuthorized::into_verdict`]: a
+//! [`ReleaseVerdict`] that `rabs-cas` persists and `rabsd` consults
+//! before it serves anything. `rabs_protocol::release_authorization`
+//! owns that shape and the rules for reading it, so all three sides
+//! name one dependency-free crate rather than each other.
+//!
+//! Minting is the ONLY constructor of a verdict from a gate result,
+//! which is what carries this module's unforgeability across the
+//! boundary: the private fields make `PromotionAuthorized`
+//! unfabricatable, and `into_verdict` consuming one is what makes the
+//! durable row mean something. A hand-written row is still possible —
+//! it is a database — which is why the consulting side re-checks the
+//! empty-run invariant rather than trusting the row's provenance.
 
 use crate::shadow_pipeline::ShadowPipelineReport;
+use rabs_protocol::release_authorization::ReleaseVerdict;
+use rabs_protocol::serving::ServingValidity;
 use std::collections::BTreeSet;
 
 /// Operator policy for one release evaluation.
@@ -76,6 +92,44 @@ impl PromotionAuthorized {
     #[must_use]
     pub const fn explained(&self) -> usize {
         self.explained
+    }
+
+    /// Mint the durable verdict that carries this authorization across
+    /// the process boundary to the coordinator.
+    ///
+    /// The gate runs in a replay harness — in CI, or by an operator —
+    /// and the coordinator that serves is a different process, often on
+    /// a different machine, which cannot call into this crate at all
+    /// (`rabs-cas` must not depend on the harness; A002). So the
+    /// authorization has to become data. This is the only way to build
+    /// a [`ReleaseVerdict`] from a gate result, which keeps the
+    /// unforgeability the private fields buy: a verdict claiming a
+    /// corpus run is one a corpus run actually produced.
+    ///
+    /// `build` must identify the RABS binary the corpus exercised, in
+    /// whatever form the coordinator will report for itself — the two
+    /// are compared exactly, and a verdict that names a different build
+    /// authorizes nothing. `validity` is the operator's window, carried
+    /// rather than invented here, because how long a corpus run stays
+    /// good is a property of the deployment and not of this gate.
+    #[must_use]
+    pub fn into_verdict(
+        self,
+        build: impl Into<String>,
+        corpus: impl Into<String>,
+        validity: ServingValidity,
+    ) -> ReleaseVerdict {
+        ReleaseVerdict {
+            build: build.into(),
+            corpus: corpus.into(),
+            // usize -> u64 is lossless on every target RABS builds for,
+            // and saturating rather than wrapping in any case: a count
+            // that saturated would still be non-zero, so it could never
+            // turn a real run into the `NoEvidence` standing.
+            replayed: self.replayed as u64,
+            explained: self.explained as u64,
+            validity,
+        }
     }
 }
 
@@ -268,6 +322,79 @@ mod tests {
         let authorized = evaluate_release_gate(&clean, &policy()).expect("clean corpus authorizes");
         assert_eq!(authorized.replayed(), 3);
         assert_eq!(authorized.explained(), 0);
+    }
+
+    #[test]
+    fn minting_carries_the_evidence_across_the_process_boundary() {
+        use rabs_protocol::release_authorization::{
+            ReleaseAuthorization, ReleaseAuthorizationMode, authorization,
+        };
+
+        let mut explained_policy = policy();
+        explained_policy
+            .explained
+            .insert("cargo doc".to_owned());
+        let run = report(
+            vec![
+                row("cargo build", false, true),
+                row("cargo test", false, true),
+                row("cargo check", false, false),
+                row("cargo doc", true, false),
+            ],
+            0,
+            0,
+        );
+        let authorized =
+            evaluate_release_gate(&run, &explained_policy).expect("explained divergence authorizes");
+
+        let validity = ServingValidity {
+            evaluated_at_unix_micros: 1_000,
+            maximum_age_micros: Some(50_000),
+            clock_uncertainty_micros: 0,
+            coordinator_clock_epoch: 2,
+        };
+        let verdict = authorized.into_verdict("rabs-build-9", "corpus-xyz", validity);
+
+        // The counts survive: the explained tally in particular, so the
+        // explained set growing release over release is visible in the
+        // durable record rather than only in a policy file.
+        assert_eq!(verdict.replayed, 4);
+        assert_eq!(verdict.explained, 1);
+        assert_eq!(verdict.build, "rabs-build-9");
+        assert_eq!(verdict.corpus, "corpus-xyz");
+
+        // And the minted verdict actually authorizes the build it names,
+        // under the strictest mode — the end-to-end point of minting.
+        assert_eq!(
+            authorization(Some(&verdict), "rabs-build-9", 2_000, 2),
+            ReleaseAuthorization::Authorized { replayed: 4 }
+        );
+        assert!(
+            authorization(Some(&verdict), "rabs-build-9", 2_000, 2)
+                .permits_serving(ReleaseAuthorizationMode::Required)
+        );
+        // But says nothing about any other build.
+        assert!(
+            !authorization(Some(&verdict), "rabs-build-10", 2_000, 2)
+                .permits_serving(ReleaseAuthorizationMode::Required)
+        );
+    }
+
+    #[test]
+    fn a_refused_run_cannot_produce_a_verdict_at_all() {
+        // Not a runtime assertion — a type-level one, restated here so
+        // it is not quietly removed. `into_verdict` consumes a
+        // `PromotionAuthorized`, whose fields are private and which has
+        // no public constructor, so the ONLY way to reach a verdict is
+        // through a passing gate. A refusal is an `Err` carrying a
+        // `ReleaseRefusal`, which has no path to one.
+        let served_divergence = report(vec![row("cargo build", true, true)], 0, 0);
+        let refusal = evaluate_release_gate(&served_divergence, &policy())
+            .expect_err("a served divergence must refuse");
+        assert!(matches!(refusal, ReleaseRefusal::ServedDivergence { .. }));
+        // If a future edit gave `PromotionAuthorized` public fields or a
+        // constructor, this comment is the thing that was violated; the
+        // compiler cannot say so on its own.
     }
 
     #[test]

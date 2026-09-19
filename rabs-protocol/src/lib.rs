@@ -93,6 +93,7 @@ pub mod raw_bytes;
 pub mod reason_codes;
 pub mod reconnect;
 pub mod redaction;
+pub mod release_authorization;
 pub mod resource_envelope;
 pub mod result_identity;
 pub mod rolling_upgrade;

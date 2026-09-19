@@ -41,6 +41,12 @@ tempfile = "3.25.0"
 # bd-g900u: the public offer / ready-store builders, so the live commit
 # tests (bd-epyez) can drive the real publication engine from out here.
 rabs-cas = { path = "../rabs-cas", features = ["test-support"] }
+# T011: the coord serving tests drive the REAL stock-differential release
+# gate, so what authorizes a serve here is a verdict an actual passing
+# corpus run minted — not a hand-built row that merely has its shape.
+# Dev-graph only; rabsd is the top of the dependency order, so this adds
+# no production edge for A002 to refuse.
+rabs-replay = { path = "../rabs-replay" }
 # G003: the actor-shell smoke test constructs `Cx::for_testing()`, which
 # asupersync gates behind `test-internals` (br-asupersync-2x6hbi) so
 # production code cannot mint an all-caps context out of band. Dev-graph

@@ -1076,6 +1076,248 @@ fn a_committed_action_serves_its_real_bytes_into_a_worktree() {
 }
 
 #[test]
+fn the_release_gate_governs_serving_promotion_for_the_whole_build() {
+    // T011's acceptance: the stock-differential corpus gate is wired to
+    // serving promotion. This drives the REAL gate — a corpus replays,
+    // `evaluate_release_gate` authorizes, the authorization is minted
+    // into a durable verdict, the store keeps it, and `serve_action`
+    // consults it — so what is proven is the whole chain, not the shape
+    // of a hand-built row.
+    //
+    // The build-level question is asked BEFORE the per-action one, so a
+    // binary the corpus never cleared cannot serve even an action whose
+    // own serving record is perfect. Every case below uses exactly such
+    // an action: committed, unquarantined, live.
+    use rabs_protocol::release_authorization::{
+        ReleaseAuthorization, ReleaseAuthorizationMode, ReleaseVerdict,
+    };
+    use rabs_protocol::serving::ServingValidity;
+    use rabs_replay::release_gate::{ReleasePolicy, evaluate_release_gate};
+    use rabs_replay::shadow_pipeline::{CachedObservation, ShadowServingBackend, run_shadow_pipeline};
+
+    const BUILD: &str = "rabsd-build-under-test";
+
+    let dir = tempfile::tempdir().unwrap();
+    let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).expect("mount"));
+
+    // One committed, servable action to ask about.
+    let bootstrap = CoordLive::with_cas(Arc::clone(&cas));
+    let authority = bootstrap
+        .acquire_boot_authority(&cluster_id())
+        .expect("authority");
+    let artifact = b"the compiled rlib bytes a worker uploaded".repeat(64);
+    let object = {
+        let mut store = cas.store().lock().expect("store lock");
+        let declared = digest_set(&artifact, DigestRequest::default(), None)
+            .expect("digest")
+            .atp_content_id;
+        let mut reader: &[u8] = &artifact;
+        put_if_absent(
+            cas.layout(),
+            &mut *store,
+            &declared,
+            &mut reader,
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .expect("put artifact");
+        ObjectId(declared)
+    };
+    let (offer, manifest_bytes) = offer_serving_object(&authority, &object);
+    {
+        let mut store = cas.store().lock().expect("store lock");
+        install_admission_world(&mut *store, &authority);
+    }
+    store_manifest_object(&cas, &offer, &manifest_bytes);
+    assert!(
+        matches!(
+            bootstrap
+                .commit_offer(&offer, &sample_expected_descriptor())
+                .expect("commit"),
+            PublicationOutcome::Committed(_)
+        ),
+        "the fixture action must really be committed"
+    );
+    let now = now_micros();
+    let expected = || ExpectedOutputs::Exactly(BTreeSet::from(["out/lib.rlib".to_owned()]));
+
+    // A coordinator that declares no build identity and no mode is the
+    // DEFAULT one. It must serve: wiring the gate in cannot by itself
+    // stop a healthy deployment, which is the whole reason the default
+    // is advisory rather than fail-closed.
+    let mut worktree = 0;
+    let mut next_worktree = || {
+        worktree += 1;
+        dir.path().join(format!("worktree{worktree}"))
+    };
+    let default_coord = CoordLive::with_cas(Arc::clone(&cas));
+    let target = next_worktree();
+    assert!(
+        matches!(
+            default_coord
+                .serve_action(&sample_action_key(), &target, &expected(), now, 0)
+                .expect("serve"),
+            ServeOutcome::Served { .. }
+        ),
+        "the default (advisory, no verdict) deployment must keep serving"
+    );
+
+    // Same store, same impeccable action, but now the deployment has
+    // asked for enforcement. With no verdict recorded, nothing serves.
+    let required = CoordLive::with_cas(Arc::clone(&cas))
+        .with_release_authorization(BUILD, ReleaseAuthorizationMode::Required);
+    let target = next_worktree();
+    match required
+        .serve_action(&sample_action_key(), &target, &expected(), now, 0)
+        .expect("serve")
+    {
+        ServeOutcome::ReleaseUnauthorized { standing } => {
+            assert_eq!(standing, ReleaseAuthorization::Absent);
+        }
+        other => panic!("an unproven build must not serve, got {other:?}"),
+    }
+    assert!(
+        !target.exists(),
+        "a build-level refusal must not write a single byte"
+    );
+
+    // Run the REAL gate over a real corpus and mint its authorization.
+    struct NoCache;
+    impl ShadowServingBackend for NoCache {
+        fn lookup(&mut self, _command: &str) -> Option<CachedObservation> {
+            None
+        }
+    }
+    let corpus: Vec<String> = ["cargo build", "cargo test", "cargo check"]
+        .iter()
+        .map(|command| {
+            serde_json::json!({
+                "schema": "rabs.replay.invocation.v1",
+                "command": command,
+                "exit_code": 0,
+            })
+            .to_string()
+        })
+        .collect();
+    let lines: Vec<&str> = corpus.iter().map(String::as_str).collect();
+    let report = run_shadow_pipeline(&lines, &mut NoCache);
+    let authorized = evaluate_release_gate(
+        &report,
+        &ReleasePolicy {
+            explained: BTreeSet::new(),
+            minimum_replayed: 3,
+            maximum_skipped_basis_points: 0,
+        },
+    )
+    .expect("a clean corpus must authorize");
+    let live_window = ServingValidity {
+        evaluated_at_unix_micros: now,
+        maximum_age_micros: Some(3_600_000_000),
+        clock_uncertainty_micros: 0,
+        coordinator_clock_epoch: 0,
+    };
+    let verdict = authorized.into_verdict(BUILD, "corpus-under-test", live_window);
+
+    // A verdict for ANOTHER build does not authorize this one. The
+    // stale-proof-outliving-its-binary case, and the one this gate
+    // would be worthless without.
+    {
+        let mut other = verdict.clone();
+        other.build = "some-other-build".to_owned();
+        let mut store = cas.store().lock().expect("store lock");
+        store.record_release_verdict(&other).expect("record");
+    }
+    let target = next_worktree();
+    match required
+        .serve_action(&sample_action_key(), &target, &expected(), now, 0)
+        .expect("serve")
+    {
+        // Keyed by build, so the running build simply has no verdict.
+        ServeOutcome::ReleaseUnauthorized { standing } => {
+            assert_eq!(standing, ReleaseAuthorization::Absent);
+        }
+        other => panic!("another build's verdict must not authorize this one, got {other:?}"),
+    }
+    assert!(!target.exists());
+
+    // A verdict that claims no replayed records cannot authorize,
+    // however it reached the table — the consulting side re-checks the
+    // gate's own empty-run refusal rather than trusting the row.
+    {
+        let mut empty = verdict.clone();
+        empty.replayed = 0;
+        let mut store = cas.store().lock().expect("store lock");
+        store.record_release_verdict(&empty).expect("record");
+    }
+    let target = next_worktree();
+    match required
+        .serve_action(&sample_action_key(), &target, &expected(), now, 0)
+        .expect("serve")
+    {
+        ServeOutcome::ReleaseUnauthorized { standing } => {
+            assert_eq!(standing, ReleaseAuthorization::NoEvidence);
+        }
+        other => panic!("an evidence-free verdict must not authorize, got {other:?}"),
+    }
+    assert!(!target.exists());
+
+    // The real, live, matching verdict: NOW it serves, under the
+    // strictest mode, and delivers the committed bytes.
+    {
+        let mut store = cas.store().lock().expect("store lock");
+        store.record_release_verdict(&verdict).expect("record");
+    }
+    let target = next_worktree();
+    let served = required
+        .serve_action(&sample_action_key(), &target, &expected(), now, 0)
+        .expect("serve");
+    let ServeOutcome::Served { files } = served else {
+        panic!("a release-authorized build must serve, got {served:?}");
+    };
+    assert_eq!(files, vec![target.join("out").join("lib.rlib")]);
+    assert_eq!(
+        std::fs::read(&files[0]).expect("read served artifact"),
+        artifact,
+        "the served file must still be the committed bytes"
+    );
+
+    // And the SAME verdict stops authorizing once its window elapses —
+    // proof that expiry reaches the serving path rather than only the
+    // pure predicate.
+    let target = next_worktree();
+    let later = now + 7_200_000_000;
+    match required
+        .serve_action(&sample_action_key(), &target, &expected(), later, 0)
+        .expect("serve")
+    {
+        ServeOutcome::ReleaseUnauthorized { standing } => {
+            assert_eq!(standing, ReleaseAuthorization::Expired);
+        }
+        other => panic!("an expired verdict must stop authorizing, got {other:?}"),
+    }
+    assert!(!target.exists());
+
+    // Meanwhile the advisory deployment served throughout, including
+    // right now, against the very verdict state that refuses above.
+    // This is what "advisory" has to mean, and it is what makes the
+    // default safe to ship ahead of the enforcement.
+    let target = next_worktree();
+    assert!(
+        matches!(
+            default_coord
+                .serve_action(&sample_action_key(), &target, &expected(), later, 0)
+                .expect("serve"),
+            ServeOutcome::Served { .. }
+        ),
+        "advisory must never refuse on release grounds"
+    );
+
+    // Unused-variable guard: the verdict type is the crossing point
+    // between the harness and the coordinator, so name it once more.
+    let _: ReleaseVerdict = verdict;
+}
+
+#[test]
 fn a_hit_whose_outputs_differ_from_the_callers_work_is_refused() {
     // THE interlock (bd-6uuiq). A caller about to skip work states what
     // that work would produce. If the committed result produces anything
