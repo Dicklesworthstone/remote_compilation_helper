@@ -343,7 +343,6 @@ fn copy_verified(
     }
     let mut writer = StreamingObjectWriter::new(DigestRequest::default(), None);
     let mut buffer = vec![0_u8; 64 * 1024];
-    let mut written = 0_u64;
     let outcome = loop {
         let read = match input.read(&mut buffer) {
             Ok(0) => break Ok(()),
@@ -367,7 +366,6 @@ fn copy_verified(
                 error: e.to_string(),
             });
         }
-        written += read as u64;
     };
     if let Err(error) = outcome {
         let _ = std::fs::remove_file(&staging);
@@ -400,6 +398,18 @@ fn copy_verified(
         let _ = std::fs::remove_file(&staging);
         return Err(io_err("prepare-staging-metadata")(error));
     }
+    // Subscriber preparation may change the private bytes (for example a
+    // canonical .d file becomes subscriber-specific). Report the installed
+    // length, not the canonical source length. Do this before visibility.
+    let written = match output.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            drop(input);
+            drop(output);
+            let _ = std::fs::remove_file(&staging);
+            return Err(io_err("prepared-staging-metadata")(error));
+        }
+    };
     // Both bytes and freshness metadata are ready. There must be no fallible
     // preparation after this rename: success transfers output ownership to
     // the caller, and an error must still mean the destination was untouched.
@@ -653,6 +663,7 @@ fn install_one(
     out: &PlannedActionOutput,
     freshness: SystemTime,
     mode: MaterializationMode,
+    prepare: &impl Fn(&PlannedActionOutput, &std::fs::File) -> std::io::Result<()>,
 ) -> Result<OutputMaterialized, MaterializeError> {
     let began = Instant::now();
     let bytes = materialize_object_prepared(
@@ -661,6 +672,7 @@ fn install_one(
         &out.destination,
         mode,
         |staged| {
+            prepare(out, staged)?;
             if mode.mtime_permitted() {
                 staged.set_modified(freshness)
             } else {
@@ -758,6 +770,30 @@ pub fn materialize_action_outputs(
     outputs: &[PlannedActionOutput],
     mode: MaterializationMode,
 ) -> Result<ActionMaterializationReceipt, ActionMaterializeFailure> {
+    materialize_action_outputs_prepared(store, outputs, mode, SystemTime::now(), &|_, _| Ok(()))
+}
+
+/// Materialize a complete plan with subscriber-specific preparation of each
+/// verified PRIVATE staging inode, before its freshness stamp and atomic rename.
+///
+/// The callback never sees unverified CAS bytes and cannot mutate a CAS inode.
+/// It may derive dep-info or apply an independently established output mode.
+/// Its result is subscriber-local: never publish derived bytes under the source
+/// object identity. `freshness` is a caller-established floor, not an assertion
+/// that live inputs still match the action. The normal authority, destination
+/// ownership and input-validation requirements remain the caller's responsibility.
+///
+/// # Errors
+/// Preparation failure leaves that destination untouched and reports any
+/// previously installed prefix. A prefix is NOT permission to execute locally;
+/// subscriber delivery/ownership recovery must resolve the exposure frontier.
+pub fn materialize_action_outputs_prepared(
+    store: &mut dyn RabsMetadataStore,
+    outputs: &[PlannedActionOutput],
+    mode: MaterializationMode,
+    freshness: SystemTime,
+    prepare: &impl Fn(&PlannedActionOutput, &std::fs::File) -> std::io::Result<()>,
+) -> Result<ActionMaterializationReceipt, ActionMaterializeFailure> {
     // This validates one bundle; it is not a cross-request reservation.
     // The operation's destination arbiter remains the caller's obligation.
     validate_action_destinations(outputs).map_err(|error| ActionMaterializeFailure {
@@ -771,12 +807,11 @@ pub fn materialize_action_outputs(
         .into_iter()
         .partition(|out| out.role == OutputRole::ProvisionalMetadata);
 
-    let freshness = SystemTime::now();
     let started = Instant::now();
     let mut installed = Vec::with_capacity(outputs.len());
 
     for out in &heads {
-        match install_one(store, out, freshness, mode) {
+        match install_one(store, out, freshness, mode, prepare) {
             Ok(done) => installed.push(done),
             Err(error) => {
                 return Err(ActionMaterializeFailure { installed, error });
@@ -787,7 +822,7 @@ pub fn materialize_action_outputs(
 
     let tail_started = Instant::now();
     for out in &tails {
-        match install_one(store, out, freshness, mode) {
+        match install_one(store, out, freshness, mode, prepare) {
             Ok(done) => installed.push(done),
             Err(error) => {
                 return Err(ActionMaterializeFailure { installed, error });
@@ -1562,7 +1597,7 @@ mod tests {
             };
             let freshness = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567_890);
 
-            let receipt = install_one(&mut store, &output, freshness, mode).unwrap();
+            let receipt = install_one(&mut store, &output, freshness, mode, &|_, _| Ok(())).unwrap();
 
             assert_eq!(receipt.bytes, 14);
             assert_eq!(receipt.destination, output.destination);
