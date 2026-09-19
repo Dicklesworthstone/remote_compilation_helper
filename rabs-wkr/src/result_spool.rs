@@ -245,9 +245,36 @@ fn read_manifest(root: &Path, expected_digest: &str) -> io::Result<Value> {
     Ok(manifest)
 }
 
+#[derive(Debug)]
 pub struct RecoveredResult {
     pub recipient: ResultRecipient,
     pub completion: ExecutionCompletion,
+}
+
+/// Refuse an unexplained leftover rather than overwrite or silently discard it.
+pub fn exists(journal_root: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(journal_root.join(DIRECTORY)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// The small durable journal receipt must identify the same completed outcome
+/// as the seal. This bounded metadata check never rereads all output on the reactor.
+pub fn validate_receipt(
+    journal_root: &Path, request_id: u64, fingerprint: &str, digest: &str, receipt: &Value,
+) -> io::Result<()> {
+    let manifest = read_manifest(&journal_root.join(DIRECTORY), digest)?;
+    require(manifest["request_id"].as_u64() == Some(request_id)
+        && text(&manifest, "request_fingerprint")? == fingerprint, "retention/admission mismatch")?;
+    describe(&manifest["result"])?;
+    for field in ["kind", "request_id", "exit_code", "executed", "residual_group_members",
+        "stop_reason", "stdout_sha256", "stderr_sha256"] {
+        require(receipt.get(field).is_some() && receipt.get(field) == manifest["result"].get(field),
+            "journal outcome disagrees with retained result")?;
+    }
+    Ok(())
 }
 
 /// Rehydrate off the reactor, while the exclusive worker journal lock is held.
