@@ -21,7 +21,7 @@ const MOUNT_LOCK: &str = ".mount.lock";
 /// Local filesystem fencing, not a cross-host election mechanism. All production
 /// mounts must use this entry point. The inode is retained after unlock: removing
 /// it would let an old waiter and a new opener lock different files for one root.
-fn acquire_mount_lock(root: &Path) -> Result<File, String> {
+fn acquire_mount_lock(root: &Path) -> Result<MountLock, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -69,8 +69,16 @@ fn acquire_mount_lock(root: &Path) -> Result<File, String> {
     };
     file.try_lock()
         .map_err(|e| format!("CAS already mounted or exclusive lock unavailable: {e}"))?;
+    // Take the guard the instant the lock is held, not once validation
+    // has passed. Everything below can still refuse, and each of those
+    // returns was previously a plain `File` drop — release by last
+    // close, with the fork hazard `MountLock` exists to remove. The
+    // adversarial paths are exactly the ones that should not fall back
+    // to the weaker rule.
+    let file = MountLock(file);
     let named = validate()?;
     let opened = file
+        .0
         .metadata()
         .map_err(|e| format!("opened CAS mount lock: {e}"))?;
     if !opened.is_file() {
@@ -86,6 +94,44 @@ fn acquire_mount_lock(root: &Path) -> Result<File, String> {
     #[cfg(not(unix))]
     let _ = named;
     Ok(file)
+}
+
+/// Exclusive process ownership of one CAS root, released DETERMINISTICALLY.
+///
+/// The lock is `flock(2)`, which belongs to the open file description
+/// rather than to the descriptor. `flock(2)` is explicit about what ends
+/// one: "A lock is released either by an explicit `LOCK_UN` operation on
+/// any of these duplicate file descriptors, or when ALL such file
+/// descriptors have been closed." Duplicates here means the ones `dup`
+/// and `fork` create.
+///
+/// Dropping a `File` only closes OUR descriptor, so before this type
+/// existed the release was the second clause: the lock survived until
+/// every duplicate anywhere in the system was gone. Anything that forks
+/// while a `LiveCas` is mounted — every `Command::spawn` in this process,
+/// including the capability probes — hands the child a duplicate, and
+/// `O_CLOEXEC` does not retire it until the child reaches `exec`. A drop
+/// inside that window therefore did NOT free the root, and the next
+/// mount of it failed with "would block" for reasons unrelated to the
+/// caller.
+///
+/// That was observable: the janitor mount-lock tests failed 3 runs in 14
+/// (bd-oxi0c), always the reacquire-after-drop assertion, and only when
+/// a sibling test forked concurrently.
+///
+/// Taking the first clause instead makes release a property of this
+/// type rather than of what else happens to be forking: `LOCK_UN` frees
+/// the description immediately, whoever else still references it.
+#[derive(Debug)]
+pub struct MountLock(File);
+
+impl Drop for MountLock {
+    fn drop(&mut self) {
+        // Best effort by necessity — drop cannot report. An unlock
+        // failure leaves exactly the old behaviour (released on last
+        // close), so this can only improve on it, never regress it.
+        let _ = self.0.unlock();
+    }
 }
 
 /// Production `FilesystemReality`: real `exists` checks plus a recursive
@@ -149,8 +195,14 @@ pub struct LiveCas {
     pub reported: usize,
     /// Monotonic plan-sequence for janitor-owned GC receipts.
     pub gc_seq: std::sync::atomic::AtomicU64,
-    // Keep this last: all metadata handles drop before process ownership does.
-    _mount_lock: File,
+    // Keep this last: all metadata handles drop before process ownership
+    // does. Field order still governs that — `MountLock`'s own `Drop`
+    // runs when this field drops, which is after `store`, so the
+    // sqlite handles are closed before any other process can mount.
+    // (A `Drop for LiveCas` would have run BEFORE every field and
+    // inverted exactly that, which is why the unlock lives on the
+    // field's type rather than on the struct.)
+    _mount_lock: MountLock,
 }
 
 impl LiveCas {
