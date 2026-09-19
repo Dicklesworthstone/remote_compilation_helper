@@ -22,3 +22,4 @@ pub mod action_actor;
 pub mod target_lease;
 
 pub mod live;
+pub mod worker_delivery;
