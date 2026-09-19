@@ -7,12 +7,13 @@
 //!   risk R65), unchanged: a writable hardlink to an immutable CAS inode
 //!   is unrepresentable, not merely discouraged.
 //! - [`materialize_object`] — the byte path. It resolves a
-//!   non-quarantined raw copy through the metadata store (the store is
-//!   the authority on where copies are), streams it into a staging file
-//!   beside the destination while hashing, REFUSES if the recomputed
+//!   non-quarantined raw copy through the metadata store, independently
+//!   refuses quarantined logical objects, and streams a regular file into
+//!   staging beside the destination while hashing, REFUSES if the recomputed
 //!   content id is not the object's identity, and only then renames it
 //!   into place. Unverified bytes are never installed, and a partially
-//!   written file is never visible at the destination path.
+//!   written file is never visible at the destination path. A corrupt
+//!   replica is durably quarantined without deleting its forensic bytes.
 //!
 //! [`MaterializationMode::VerifiedCowReflink`] attempts Linux FICLONE
 //! only after a private filesystem probe verifies content and metadata
@@ -43,13 +44,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
+#[cfg(test)]
 use filetime::FileTime;
 use rabs_protocol::raw_bytes::RawBytes;
 use rabs_protocol::result_identity::{OutputRole, TypedDigest};
 
 use crate::blob_store::RAW_PROFILE_V1;
 use crate::digest_set::{DigestRequest, StreamingObjectWriter};
-use crate::metadata_store::{RabsMetadataStore, StoreError, digest_key};
+use crate::metadata_store::{RabsMetadataStore, SqlValue, StoreError, digest_key};
 
 /// Process-wide uniquifier for materialization staging names, so two
 /// concurrent materializations of the same destination never share a
@@ -66,6 +68,12 @@ pub enum MaterializeError {
     /// none non-quarantined, or none in a representation this profile
     /// can read.
     NoUsableCopy {
+        /// The object's digest key.
+        object: String,
+    },
+    /// The logical object is quarantined. Even a byte-correct physical
+    /// replica cannot authorize its installation until the repair flow runs.
+    QuarantinedObject {
         /// The object's digest key.
         object: String,
     },
@@ -102,6 +110,20 @@ pub enum MaterializeError {
         /// The duplicated destination path.
         path: String,
     },
+    /// A file output is also an ancestor of another output. Neither can be
+    /// installed coherently as a regular file in the same bundle.
+    OverlappingDestinations {
+        /// The output that would need to be both a file and a directory.
+        parent: String,
+        /// The output beneath it.
+        child: String,
+    },
+    /// A destination is not a named file or contains parent traversal.
+    /// Parent components cannot be collapsed safely through possible symlinks.
+    UnsafeDestination {
+        /// The rejected path, for diagnostics only.
+        path: String,
+    },
 }
 
 impl std::fmt::Display for MaterializeError {
@@ -109,6 +131,9 @@ impl std::fmt::Display for MaterializeError {
         match self {
             Self::ModeUnsupported(mode) => write!(f, "materialization mode {mode:?} unimplemented"),
             Self::NoUsableCopy { object } => write!(f, "no usable copy of {object}"),
+            Self::QuarantinedObject { object } => {
+                write!(f, "logical object {object} is quarantined")
+            }
             Self::Unreadable { path, error } => write!(f, "unreadable copy {path}: {error}"),
             Self::ContentMismatch {
                 expected,
@@ -119,6 +144,12 @@ impl std::fmt::Display for MaterializeError {
             Self::Store(error) => write!(f, "store: {error}"),
             Self::DuplicateDestination { path } => {
                 write!(f, "action plan declares {path} as a destination twice")
+            }
+            Self::OverlappingDestinations { parent, child } => {
+                write!(f, "action output {parent} is an ancestor of output {child}")
+            }
+            Self::UnsafeDestination { path } => {
+                write!(f, "action destination {path} is not a safe named file")
             }
         }
     }
@@ -150,10 +181,36 @@ pub fn materialize_object(
     destination: &Path,
     mode: MaterializationMode,
 ) -> Result<u64, MaterializeError> {
+    materialize_object_prepared(store, object, destination, mode, |_| Ok(()))
+}
+
+/// Run all fallible metadata preparation on the verified, private staging
+/// inode. The destination is not published until preparation succeeds, so an
+/// error cannot leave an installed output absent from the action receipt.
+fn materialize_object_prepared(
+    store: &mut dyn RabsMetadataStore,
+    object: &TypedDigest,
+    destination: &Path,
+    mode: MaterializationMode,
+    prepare_metadata: impl Fn(&std::fs::File) -> std::io::Result<()>,
+) -> Result<u64, MaterializeError> {
     if mode == MaterializationMode::ReadOnlyBind {
         return Err(MaterializeError::ModeUnsupported(mode));
     }
     let key = digest_key(object);
+    // A location lookup only chooses physical replicas. Logical quarantine
+    // dominates every replica, including one whose content digest is correct.
+    // Check before creating destination directories or staging any bytes.
+    if !store
+        .query(
+            "SELECT 1 FROM quarantines WHERE scope = 'logical-object' AND subject = ?1 LIMIT 1",
+            &[SqlValue::Text(key.clone())],
+        )
+        .map_err(|error| MaterializeError::Store(format!("{error:?}")))?
+        .is_empty()
+    {
+        return Err(MaterializeError::QuarantinedObject { object: key });
+    }
     let locations = store
         .object_locations(object)
         .map_err(|e: StoreError| MaterializeError::Store(format!("{e:?}")))?;
@@ -177,20 +234,76 @@ pub fn materialize_object(
 
     let mut last: Option<MaterializeError> = None;
     for source in raw {
-        match copy_verified(&source, object, &key, &parent, destination, mode) {
+        match copy_verified(
+            &source,
+            object,
+            &key,
+            &parent,
+            destination,
+            mode,
+            &prepare_metadata,
+        ) {
             Ok((bytes, _reflinked)) => return Ok(bytes),
-            // A corrupt copy is reported as such immediately: silently
-            // trying the next one would hide store corruption that the
-            // GC/quarantine flow needs to hear about.
-            Err(error @ MaterializeError::ContentMismatch { .. }) => return Err(error),
+            // Preserve the immediate corruption refusal, but also persist
+            // containment so subsequent requests do not repeatedly select
+            // the same bad copy. A healthy replica becomes eligible on the
+            // next request; this request never silently hides corruption.
+            Err(error @ MaterializeError::ContentMismatch { .. }) => {
+                store
+                    .set_location_quarantined(object, &source, true)
+                    .map_err(|quarantine| MaterializeError::Store(format!("{quarantine:?}")))?;
+                return Err(error);
+            }
             Err(error) => last = Some(error),
         }
     }
     Err(last.unwrap_or(MaterializeError::NoUsableCopy { object: key }))
 }
 
+/// A CAS copy must be an ordinary file, never a stream/device or a symlink.
+/// Reject obvious bad paths before opening, and inspect the opened handle as
+/// well. Linux also prevents a raced final-component symlink and uses a
+/// nonblocking open, so a swapped FIFO cannot stall opening the recorded copy.
+fn open_cas_copy(source: &str) -> Result<std::fs::File, MaterializeError> {
+    let unreadable = |error: std::io::Error| MaterializeError::Unreadable {
+        path: source.to_owned(),
+        error: error.to_string(),
+    };
+    let not_regular = || {
+        unreadable(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CAS copy is not a regular file",
+        ))
+    };
+    if !std::fs::symlink_metadata(source)
+        .map_err(unreadable)?
+        .file_type()
+        .is_file()
+    {
+        return Err(not_regular());
+    }
+    #[cfg(target_os = "linux")]
+    let file = {
+        use rustix::fs::{Mode, OFlags, open};
+
+        open(
+            source,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map(std::fs::File::from)
+        .map_err(|error| unreadable(std::io::Error::from(error)))?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let file = std::fs::File::open(source).map_err(unreadable)?;
+    if !file.metadata().map_err(unreadable)?.is_file() {
+        return Err(not_regular());
+    }
+    Ok(file)
+}
+
 /// Stream one copy into a staging file next to `destination`, verifying
-/// the content id as the bytes go past, then rename into place.
+/// the content id as the bytes go past, prepare its metadata, then rename.
 fn copy_verified(
     source: &str,
     object: &TypedDigest,
@@ -198,11 +311,9 @@ fn copy_verified(
     parent: &Path,
     destination: &Path,
     mode: MaterializationMode,
+    prepare_metadata: &impl Fn(&std::fs::File) -> std::io::Result<()>,
 ) -> Result<(u64, bool), MaterializeError> {
-    let mut input = std::fs::File::open(source).map_err(|e| MaterializeError::Unreadable {
-        path: source.to_owned(),
-        error: e.to_string(),
-    })?;
+    let mut input = open_cas_copy(source)?;
     let staging = staging_path(parent, destination);
     let mut output = std::fs::OpenOptions::new()
         .read(true)
@@ -280,8 +391,18 @@ fn copy_verified(
             path: source.to_owned(),
         });
     }
-    // The bytes are the object's. Publish them atomically; a reader
-    // never observes a half-written artifact at the destination.
+    if let Err(error) = prepare_metadata(&output) {
+        // The reflink input can also hold the staging inode open. Close both
+        // handles before unlinking, including on platforms denying open-file
+        // deletion. Never touch the previous destination on this path.
+        drop(input);
+        drop(output);
+        let _ = std::fs::remove_file(&staging);
+        return Err(io_err("prepare-staging-metadata")(error));
+    }
+    // Both bytes and freshness metadata are ready. There must be no fallible
+    // preparation after this rename: success transfers output ownership to
+    // the caller, and an error must still mean the destination was untouched.
     if let Err(error) = std::fs::rename(&staging, destination) {
         let _ = std::fs::remove_file(&staging);
         return Err(MaterializeError::Io {
@@ -522,22 +643,31 @@ fn planned_order_key(p: &PlannedActionOutput) -> (Vec<u8>, u8, PathBuf) {
     )
 }
 
-/// Install ONE declared output: verify-and-rename via
-/// [`materialize_object`], then apply the freshness stamp (plan §30:
+/// Install ONE declared output: verify, stamp the private staging inode,
+/// then atomically rename it into place (plan §30:
 /// outputs newer than inputs from Cargo's perspective). Stamping is
 /// gated on `mode.mtime_permitted()` structurally — mtime changes are
 /// ever applied only to private materializations.
 fn install_one(
     store: &mut dyn RabsMetadataStore,
     out: &PlannedActionOutput,
-    freshness: FileTime,
+    freshness: SystemTime,
     mode: MaterializationMode,
 ) -> Result<OutputMaterialized, MaterializeError> {
     let began = Instant::now();
-    let bytes = materialize_object(store, &out.object, &out.destination, mode)?;
-    if mode.mtime_permitted() {
-        filetime::set_file_mtime(&out.destination, freshness).map_err(io_err("set-mtime"))?;
-    }
+    let bytes = materialize_object_prepared(
+        store,
+        &out.object,
+        &out.destination,
+        mode,
+        |staged| {
+            if mode.mtime_permitted() {
+                staged.set_modified(freshness)
+            } else {
+                Ok(())
+            }
+        },
+    )?;
     Ok(OutputMaterialized {
         role: out.role,
         virtual_path: out.virtual_path.clone(),
@@ -547,13 +677,68 @@ fn install_one(
     })
 }
 
+/// Byte-preserving, whole-bundle lexical preflight. Resolve relative names
+/// against one working-directory snapshot, ignore `.` components, and reject
+/// duplicate or ancestor destinations before the first filesystem mutation.
+/// This is NOT filesystem containment: the caller's destination ownership and
+/// symlink/case-sensitivity policy remain required.
+fn validate_action_destinations(outputs: &[PlannedActionOutput]) -> Result<(), MaterializeError> {
+    use std::path::Component;
+
+    if outputs.is_empty() {
+        return Ok(());
+    }
+    let cwd = std::env::current_dir().map_err(io_err("destination-working-directory"))?;
+    let mut seen = std::collections::BTreeSet::<PathBuf>::new();
+    for out in outputs {
+        let path = &out.destination;
+        if path.file_name().is_none()
+            || path.components().any(|part| part == Component::ParentDir)
+        {
+            return Err(MaterializeError::UnsafeDestination {
+                path: path.to_string_lossy().into_owned(),
+            });
+        }
+        let absolute = cwd.join(path);
+        if !absolute.is_absolute() {
+            return Err(MaterializeError::UnsafeDestination {
+                path: path.to_string_lossy().into_owned(),
+            });
+        }
+        let key: PathBuf = absolute
+            .components()
+            .filter(|part| *part != Component::CurDir)
+            .collect();
+        if !seen.insert(key.clone()) {
+            return Err(MaterializeError::DuplicateDestination {
+                path: key.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    // Path ordering groups descendants immediately after their ancestor.
+    // Adjacent checks therefore cover all overlaps without a quadratic scan.
+    let mut previous: Option<&PathBuf> = None;
+    for path in &seen {
+        if let Some(parent) = previous
+            && path.starts_with(parent)
+        {
+            return Err(MaterializeError::OverlappingDestinations {
+                parent: parent.to_string_lossy().into_owned(),
+                child: path.to_string_lossy().into_owned(),
+            });
+        }
+        previous = Some(path);
+    }
+    Ok(())
+}
+
 /// Materialize a cached action's outputs with `.rmeta` first (K004;
 /// plan §87 steps 1–3 and 6).
 ///
 /// Ordering contract: every [`OutputRole::ProvisionalMetadata`] output
-/// is fetched, byte-verified, atomically renamed into place, and
-/// freshness-stamped BEFORE any other output begins. Within each phase
-/// the order is deterministic ([`planned_order_key`]). Every installed
+/// is fetched, byte-verified, freshness-stamped while private, and
+/// atomically renamed into place BEFORE any other output begins. Within each
+/// phase the order is deterministic ([`planned_order_key`]). Every installed
 /// file carries the SAME freshness timestamp captured once at call
 /// start, so the bundle is coherent from Cargo's mtime-sensitive
 /// freshness view (risk R6: incoherent hit mtimes cause rebuild storms
@@ -565,26 +750,20 @@ fn install_one(
 /// — silently substituting a second copy would hide store corruption.
 ///
 /// # Errors
-/// [`ActionMaterializeFailure`] with the installed prefix; duplicate
-/// destinations are refused before anything is touched.
+/// [`ActionMaterializeFailure`] with the installed prefix; duplicate,
+/// ancestor-overlapping, and parent-traversing destinations are refused
+/// before anything is touched.
 pub fn materialize_action_outputs(
     store: &mut dyn RabsMetadataStore,
     outputs: &[PlannedActionOutput],
     mode: MaterializationMode,
 ) -> Result<ActionMaterializationReceipt, ActionMaterializeFailure> {
-    // Destination arbiter, action scale (plan §30.1): reserve every
-    // declared path BEFORE installing anything; two rows claiming one
-    // path have no coherent ordering.
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for out in outputs {
-        let key = out.destination.to_string_lossy().into_owned();
-        if !seen.insert(key.clone()) {
-            return Err(ActionMaterializeFailure {
-                installed: Vec::new(),
-                error: MaterializeError::DuplicateDestination { path: key },
-            });
-        }
-    }
+    // This validates one bundle; it is not a cross-request reservation.
+    // The operation's destination arbiter remains the caller's obligation.
+    validate_action_destinations(outputs).map_err(|error| ActionMaterializeFailure {
+        installed: Vec::new(),
+        error,
+    })?;
 
     let mut ordered: Vec<&PlannedActionOutput> = outputs.iter().collect();
     ordered.sort_by_key(|p| planned_order_key(p));
@@ -592,7 +771,7 @@ pub fn materialize_action_outputs(
         .into_iter()
         .partition(|out| out.role == OutputRole::ProvisionalMetadata);
 
-    let freshness = FileTime::from_system_time(SystemTime::now());
+    let freshness = SystemTime::now();
     let started = Instant::now();
     let mut installed = Vec::with_capacity(outputs.len());
 
@@ -982,6 +1161,7 @@ mod tests {
             &dir,
             &target,
             MaterializationMode::VerifiedCowReflink,
+            &|_| Ok(()),
         )
         .unwrap();
         assert!(!reflinked);
@@ -1025,6 +1205,7 @@ mod tests {
             &dir,
             &target,
             MaterializationMode::VerifiedCowReflink,
+            &|_| Ok(()),
         )
         .unwrap();
         assert!(
@@ -1155,6 +1336,120 @@ mod tests {
     }
 
     #[test]
+    fn logical_quarantine_blocks_byte_correct_artifacts_before_destination_creation() {
+        use crate::metadata_store::QuarantineScope;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _layout, object) = store_with_object(dir.path(), b"valid bytes");
+        let key = digest_key(&object);
+        store
+            .add_quarantine(QuarantineScope::LogicalObject, &key, "unresolved incident")
+            .unwrap();
+        for mode in [
+            MaterializationMode::PrivateCopy,
+            MaterializationMode::VerifiedCowReflink,
+        ] {
+            let destination = dir.path().join("subscriber/target/out.rlib");
+            assert_eq!(
+                materialize_object(&mut store, &object, &destination, mode),
+                Err(MaterializeError::QuarantinedObject {
+                    object: key.clone()
+                })
+            );
+            assert!(!dir.path().join("subscriber").exists());
+        }
+        let existing = dir.path().join("existing.rlib");
+        fs::write(&existing, b"older output").unwrap();
+        assert!(matches!(
+            materialize_object(
+                &mut store,
+                &object,
+                &existing,
+                MaterializationMode::PrivateCopy
+            ),
+            Err(MaterializeError::QuarantinedObject { .. })
+        ));
+        assert_eq!(fs::read(&existing).unwrap(), b"older output");
+    }
+
+    #[test]
+    fn corrupt_materialization_durably_excludes_the_bad_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _layout, object) = store_with_object(dir.path(), b"valid bytes");
+        let source = PathBuf::from(&store.object_locations(&object).unwrap()[0].0);
+        fs::write(&source, b"corrupt bytes").unwrap();
+        let destination = dir.path().join("out.rlib");
+        fs::write(&destination, b"old output").unwrap();
+        assert!(matches!(
+            materialize_object(
+                &mut store,
+                &object,
+                &destination,
+                MaterializationMode::PrivateCopy
+            ),
+            Err(MaterializeError::ContentMismatch { .. })
+        ));
+        assert_eq!(fs::read(&destination).unwrap(), b"old output");
+        // Preserve the bad bytes for inspection instead of deleting evidence.
+        assert_eq!(fs::read(&source).unwrap(), b"corrupt bytes");
+        drop(store);
+
+        let engine = RusqliteEngine::open(&dir.path().join("meta.sqlite")).unwrap();
+        let mut reopened = SqlMetadataStore::open(engine).unwrap();
+        reopened.intern_domain(object.domain);
+        assert!(reopened.object_locations(&object).unwrap().is_empty());
+        assert!(matches!(
+            materialize_object(
+                &mut reopened,
+                &object,
+                &destination,
+                MaterializationMode::PrivateCopy
+            ),
+            Err(MaterializeError::NoUsableCopy { .. })
+        ));
+        assert_eq!(fs::read(&destination).unwrap(), b"old output");
+    }
+
+    #[test]
+    fn cas_copy_opening_accepts_only_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("copy");
+        fs::write(&source, b"regular bytes").unwrap();
+        let mut file = open_cas_copy(source.to_str().unwrap()).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"regular bytes");
+        assert!(matches!(
+            open_cas_copy(dir.path().to_str().unwrap()),
+            Err(MaterializeError::Unreadable { .. })
+        ));
+        assert!(matches!(
+            open_cas_copy(dir.path().join("missing").to_str().unwrap()),
+            Err(MaterializeError::Unreadable { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cas_copy_opening_refuses_symlinks_and_unbounded_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("copy");
+        let alias = dir.path().join("alias");
+        fs::write(&source, b"valid object bytes").unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        assert!(matches!(
+            open_cas_copy(alias.to_str().unwrap()),
+            Err(MaterializeError::Unreadable { .. })
+        ));
+        // A raw File::open + read-to-EOF loop would never finish on this
+        // device. It must be rejected before any content hashing begins.
+        assert!(matches!(
+            open_cas_copy("/dev/zero"),
+            Err(MaterializeError::Unreadable { .. })
+        ));
+    }
+
+    #[test]
     fn materializing_over_an_existing_file_replaces_it_atomically() {
         let dir = scratch_dir("replace");
         let bytes = b"new committed output";
@@ -1171,6 +1466,116 @@ mod tests {
         .expect("materialize");
         assert_eq!(fs::read(&destination).unwrap(), bytes);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_staging_metadata_preserves_existing_bytes_and_freshness() {
+        for mode in [
+            MaterializationMode::PrivateCopy,
+            MaterializationMode::VerifiedCowReflink,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut store, _layout, object) = store_with_object(dir.path(), b"new bytes");
+            let destination = dir.path().join("out.rmeta");
+            fs::write(&destination, b"previous output").unwrap();
+            let previous = FileTime::from_unix_time(1_000_000_000, 0);
+            filetime::set_file_mtime(&destination, previous).unwrap();
+            let original_stamp = fs::metadata(&destination).unwrap().modified().unwrap();
+            let calls = std::cell::Cell::new(0);
+
+            let failure = materialize_object_prepared(
+                &mut store,
+                &object,
+                &destination,
+                mode,
+                |staged| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(staged.metadata()?.len(), 9);
+                    assert_eq!(fs::read(&destination)?, b"previous output");
+                    staged.set_modified(SystemTime::UNIX_EPOCH)?;
+                    Err(std::io::Error::other("injected metadata failure"))
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(calls.get(), 1, "metadata is prepared before one publication");
+            assert!(matches!(
+                failure,
+                MaterializeError::Io {
+                    step: "prepare-staging-metadata",
+                    ..
+                }
+            ));
+            assert_eq!(fs::read(&destination).unwrap(), b"previous output");
+            assert_eq!(
+                fs::metadata(&destination).unwrap().modified().unwrap(),
+                original_stamp
+            );
+            assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".rabs-mat-")
+            }));
+        }
+    }
+
+    #[test]
+    fn failed_staging_metadata_does_not_publish_a_new_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _layout, object) = store_with_object(dir.path(), b"new bytes");
+        let destination = dir.path().join("new.rmeta");
+        let result = materialize_object_prepared(
+            &mut store,
+            &object,
+            &destination,
+            MaterializationMode::PrivateCopy,
+            |_| Err(std::io::Error::other("injected metadata failure")),
+        );
+        assert!(result.is_err());
+        assert!(!destination.exists());
+        assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rabs-mat-")
+        }));
+    }
+
+    #[test]
+    fn action_freshness_is_installed_without_changing_cas_metadata() {
+        for mode in [
+            MaterializationMode::PrivateCopy,
+            MaterializationMode::VerifiedCowReflink,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut store, _layout, object) = store_with_object(dir.path(), b"metadata bytes");
+            let source = PathBuf::from(&store.object_locations(&object).unwrap()[0].0);
+            let source_stamp = fs::metadata(&source).unwrap().modified().unwrap();
+            let output = PlannedActionOutput {
+                role: OutputRole::ProvisionalMetadata,
+                virtual_path: RawBytes::from("out.rmeta"),
+                object,
+                destination: dir.path().join("out.rmeta"),
+            };
+            let freshness = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567_890);
+
+            let receipt = install_one(&mut store, &output, freshness, mode).unwrap();
+
+            assert_eq!(receipt.bytes, 14);
+            assert_eq!(receipt.destination, output.destination);
+            assert_eq!(fs::read(&output.destination).unwrap(), b"metadata bytes");
+            assert_eq!(
+                fs::metadata(&output.destination).unwrap().modified().unwrap(),
+                freshness
+            );
+            assert_eq!(
+                fs::metadata(&source).unwrap().modified().unwrap(),
+                source_stamp
+            );
+        }
     }
 
     #[test]
@@ -1535,6 +1940,146 @@ mod tests {
         assert!(failure.installed.is_empty());
         assert!(!a.destination.exists(), "nothing installed");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lexical_destination_aliases_are_refused_without_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _layout, object) = store_with_object(dir.path(), b"artifact");
+        let first = PlannedActionOutput {
+            role: OutputRole::Materializable,
+            virtual_path: RawBytes::from("first"),
+            object,
+            destination: dir.path().join("out.rlib"),
+        };
+        let alias = PlannedActionOutput {
+            virtual_path: RawBytes::from("second"),
+            destination: dir.path().join(".").join("out.rlib"),
+            ..first.clone()
+        };
+        let failure = materialize_action_outputs(
+            &mut store,
+            &[first.clone(), alias],
+            MaterializationMode::PrivateCopy,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure.error,
+            MaterializeError::DuplicateDestination { .. }
+        ));
+        assert!(failure.installed.is_empty());
+        assert!(!first.destination.exists());
+
+        // Relative and absolute spelling must name the same reservation key.
+        let relative = PlannedActionOutput {
+            destination: PathBuf::from("relative-output.rlib"),
+            ..first.clone()
+        };
+        let absolute = PlannedActionOutput {
+            destination: std::env::current_dir().unwrap().join(&relative.destination),
+            ..first
+        };
+        assert!(matches!(
+            validate_action_destinations(&[relative, absolute]),
+            Err(MaterializeError::DuplicateDestination { .. })
+        ));
+    }
+
+    #[test]
+    fn ancestor_destinations_are_refused_before_either_installation_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _layout, object) = store_with_object(dir.path(), b"artifact");
+        let parent = PlannedActionOutput {
+            role: OutputRole::Materializable,
+            virtual_path: RawBytes::from("parent"),
+            object,
+            destination: dir.path().join("bundle"),
+        };
+        let child = PlannedActionOutput {
+            role: OutputRole::ProvisionalMetadata,
+            virtual_path: RawBytes::from("child"),
+            destination: parent.destination.join("child.rmeta"),
+            ..parent.clone()
+        };
+        for outputs in [
+            [parent.clone(), child.clone()],
+            [child.clone(), parent.clone()],
+        ] {
+            let failure = materialize_action_outputs(
+                &mut store,
+                &outputs,
+                MaterializationMode::PrivateCopy,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                failure.error,
+                MaterializeError::OverlappingDestinations { .. }
+            ));
+            assert!(failure.installed.is_empty());
+            assert!(!parent.destination.exists());
+        }
+    }
+
+    #[test]
+    fn parent_traversal_is_not_lexically_collapsed_through_possible_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _layout, object) = store_with_object(dir.path(), b"artifact");
+        let output = PlannedActionOutput {
+            role: OutputRole::ProvisionalMetadata,
+            virtual_path: RawBytes::from("out.rmeta"),
+            object,
+            destination: dir.path().join("untrusted/../out.rmeta"),
+        };
+        let failure = materialize_action_outputs(
+            &mut store,
+            &[output],
+            MaterializationMode::PrivateCopy,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure.error,
+            MaterializeError::UnsafeDestination { .. }
+        ));
+        assert!(failure.installed.is_empty());
+        assert!(!dir.path().join("untrusted").exists());
+        assert!(!dir.path().join("out.rmeta").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distinct_non_utf8_destinations_do_not_collide_through_lossy_display() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _layout, object) = store_with_object(dir.path(), b"artifact");
+        let first = PlannedActionOutput {
+            role: OutputRole::Materializable,
+            virtual_path: RawBytes::from("first"),
+            object,
+            destination: dir
+                .path()
+                .join(std::ffi::OsString::from_vec(b"out-\xff".to_vec())),
+        };
+        let second = PlannedActionOutput {
+            virtual_path: RawBytes::from("second"),
+            destination: dir
+                .path()
+                .join(std::ffi::OsString::from_vec(b"out-\xfe".to_vec())),
+            ..first.clone()
+        };
+        assert_eq!(
+            first.destination.to_string_lossy(),
+            second.destination.to_string_lossy()
+        );
+        let receipt = materialize_action_outputs(
+            &mut store,
+            &[first.clone(), second.clone()],
+            MaterializationMode::PrivateCopy,
+        )
+        .unwrap();
+        assert_eq!(receipt.installed.len(), 2);
+        assert_eq!(fs::read(&first.destination).unwrap(), b"artifact");
+        assert_eq!(fs::read(&second.destination).unwrap(), b"artifact");
     }
 
     #[test]
