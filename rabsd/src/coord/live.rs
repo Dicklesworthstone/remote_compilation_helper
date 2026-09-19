@@ -1942,10 +1942,20 @@ impl CoordLive {
         // install, so a concurrent serve into an overlapping path is
         // refused rather than interleaved.
         let bundle = BundleId(format!("serve:{key}:{}", self.next_seq()));
-        let paths: Vec<String> = plan
+        use rabs_protocol::raw_bytes::RawBytes;
+        use std::os::unix::ffi::OsStrExt;
+        // BYTES, not a lossy decode. A destination is an arbitrary byte
+        // sequence on Unix, and `to_string_lossy` mapped every one that
+        // differed only in invalid UTF-8 onto the same U+FFFD-bearing
+        // key — so two concurrent serves writing genuinely different
+        // files conflicted, and the refusal named a path that was not
+        // the path either of them asked for (bd-1rofg). It also made
+        // this the one lossy decode in a pipeline T026/R89 exists to
+        // keep byte-exact.
+        let paths: Vec<Vec<u8>> = plan
             .outputs
             .iter()
-            .map(|out| out.destination.to_string_lossy().into_owned())
+            .map(|out| out.destination.as_os_str().as_bytes().to_vec())
             .collect();
         // The guard releases on drop, so the reservation cannot outlive
         // this call however it ends — including an unwind, which
@@ -1954,7 +1964,11 @@ impl CoordLive {
         // end of the scope rather than being dropped immediately.
         let _reservation = reserve_scoped(&self.arbiter, bundle, &paths).map_err(|conflict| {
             ServeError::DestinationConflict {
-                path: conflict.path,
+                // Escaped rather than lossily decoded, so the operator
+                // sees a path they can tell apart from its neighbours
+                // and map back to real bytes. Same treatment the
+                // virtual-path refusals already give (`RawBytes`).
+                path: RawBytes::new(conflict.path).escaped(),
                 holder: conflict.holder.0,
             }
         })?;

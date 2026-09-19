@@ -33,12 +33,25 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 pub struct BundleId(pub String);
 
 /// Typed reservation refusal.
+///
+/// Paths are BYTES, not `String`. A destination on Unix is an arbitrary
+/// byte sequence, and the reservation identity has to be exactly as
+/// discriminating as the filesystem is: keying on a lossy UTF-8 decode
+/// collapsed every destination that differed only in invalid bytes onto
+/// one key, so two concurrent serves writing genuinely different files
+/// conflicted with each other (bd-1rofg). The direction was safe — a
+/// false refusal, never a false authorization — but the refusal named a
+/// path that was not the path anyone asked for, because the U+FFFD
+/// substitution is what had made them look identical.
+///
+/// It also contradicted T026/R89, whose fixtures assert byte equality
+/// with no lossy decode anywhere in the loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReservationConflict {
     /// The requested path that overlapped.
-    pub path: String,
+    pub path: Vec<u8>,
     /// The path already reserved that it overlaps with.
-    pub reserved: String,
+    pub reserved: Vec<u8>,
     /// Who holds it.
     pub holder: BundleId,
 }
@@ -46,8 +59,8 @@ pub struct ReservationConflict {
 /// Typed install refusal: the bundle never declared this destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndeclaredWrite {
-    /// The offending destination.
-    pub path: String,
+    /// The offending destination, as bytes (see [`ReservationConflict`]).
+    pub path: Vec<u8>,
 }
 
 /// What an authorized install may atomically replace.
@@ -118,7 +131,7 @@ impl Drop for ReservationGuard<'_> {
 pub fn reserve_scoped<'a>(
     arbiter: &'a Mutex<DestinationArbiter>,
     bundle: BundleId,
-    paths: &[String],
+    paths: &[Vec<u8>],
 ) -> Result<ReservationGuard<'a>, ReservationConflict> {
     lock(arbiter).reserve(&bundle, paths)?;
     Ok(ReservationGuard { arbiter, bundle })
@@ -129,23 +142,23 @@ pub fn reserve_scoped<'a>(
 /// real subtree claims, not prefixes that happen to contain no characters.
 struct Destination<'a> {
     absolute: bool,
-    components: Vec<&'a str>,
+    components: Vec<&'a [u8]>,
 }
 
-fn destination(path: &str) -> Option<Destination<'_>> {
-    if path.is_empty() || path.contains('\0') {
+fn destination(path: &[u8]) -> Option<Destination<'_>> {
+    if path.is_empty() || path.contains(&0) {
         return None;
     }
     let mut components = Vec::new();
-    for component in path.split('/') {
+    for component in path.split(|b| *b == b'/') {
         match component {
-            "" | "." => {}
-            ".." => return None,
+            b"" | b"." => {}
+            b".." => return None,
             component => components.push(component),
         }
     }
     Some(Destination {
-        absolute: path.starts_with('/'),
+        absolute: path.first() == Some(&b'/'),
         components,
     })
 }
@@ -154,7 +167,7 @@ fn destination(path: &str) -> Option<Destination<'_>> {
 /// absolute/relative namespaces are conservative conflicts: resolving the
 /// latter requires the caller's working-directory identity, which this
 /// operation-independent arbiter must not guess from the daemon's cwd.
-fn overlaps(a: &str, b: &str) -> bool {
+fn overlaps(a: &[u8], b: &[u8]) -> bool {
     let (Some(a), Some(b)) = (destination(a), destination(b)) else {
         return true;
     };
@@ -166,7 +179,7 @@ fn overlaps(a: &str, b: &str) -> bool {
 /// The per-operation destination arbiter.
 #[derive(Debug, Default)]
 pub struct DestinationArbiter {
-    reserved: BTreeMap<String, BundleId>,
+    reserved: BTreeMap<Vec<u8>, BundleId>,
 }
 
 impl DestinationArbiter {
@@ -187,7 +200,7 @@ impl DestinationArbiter {
     pub fn reserve(
         &mut self,
         bundle: &BundleId,
-        paths: &[String],
+        paths: &[Vec<u8>],
     ) -> Result<(), ReservationConflict> {
         for path in paths {
             for (reserved, holder) in &self.reserved {
@@ -218,10 +231,11 @@ impl DestinationArbiter {
     pub fn authorize_install(
         &self,
         bundle: &BundleId,
-        path: &str,
+        path: impl AsRef<[u8]>,
     ) -> Result<InstallScope, UndeclaredWrite> {
+        let path = path.as_ref();
         let denied = || UndeclaredWrite {
-            path: path.to_string(),
+            path: path.to_vec(),
         };
         let requested = destination(path).ok_or_else(denied)?;
         let mut inside_owned_subtree = false;
@@ -259,8 +273,13 @@ mod tests {
     fn bundle(name: &str) -> BundleId {
         BundleId(name.to_string())
     }
-    fn paths(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| (*s).to_string()).collect()
+    fn paths(list: &[&str]) -> Vec<Vec<u8>> {
+        list.iter().map(|s| s.as_bytes().to_vec()).collect()
+    }
+    /// The byte form of a path literal, for comparing against the
+    /// `Vec<u8>` a refusal carries.
+    fn b(path: &str) -> Vec<u8> {
+        path.as_bytes().to_vec()
     }
 
     #[test]
@@ -278,9 +297,10 @@ mod tests {
                 let error = arbiter
                     .reserve(&bundle("other"), &paths(&[alias]))
                     .unwrap_err();
-                assert_eq!(error.path, alias);
+                assert_eq!(error.path, b(alias));
                 assert_eq!(
-                    error.reserved, owned,
+                    error.reserved,
+                    b(owned),
                     "retain caller spelling for diagnostics"
                 );
                 assert_eq!(error.holder, owner);
@@ -431,7 +451,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(conflict.holder, a);
-        assert_eq!(conflict.reserved, "target/debug/build/x/out");
+        assert_eq!(conflict.reserved, b("target/debug/build/x/out"));
         // All-or-nothing: B's NON-overlapping path was not reserved.
         assert!(matches!(
             arbiter.authorize_install(&b, "target/debug/deps/liby.rmeta"),
@@ -459,7 +479,7 @@ mod tests {
         let err = arbiter
             .reserve(&bundle("b"), &paths(&["target/debug/build/x/out"]))
             .unwrap_err();
-        assert_eq!(err.reserved, "target/debug/build/x/out/gen.rs");
+        assert_eq!(err.reserved, b("target/debug/build/x/out/gen.rs"));
         // Sibling with a shared name PREFIX (not ancestry) is fine.
         arbiter
             .reserve(&bundle("b"), &paths(&["target/debug/build/x/output"]))
