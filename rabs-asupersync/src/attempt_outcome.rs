@@ -13,28 +13,27 @@
 //!
 //! ## The publication law (I16/R28)
 //!
-//! **Only [`OutcomeClass::Succeeded`] and
-//! [`OutcomeClass::DeterministicFailure`] are publication-eligible**
-//! ([`OutcomeClass::publication_eligible`]). A deterministic nonzero
-//! exit is a property of the INPUTS: rebuild it anywhere and it fails
-//! again, so caching/refusing identically is sound. Everything else —
-//! signals, OOM, cancellation, timeouts, lost workers — depends on the
-//! environment that ran the attempt; publishing its result would poison
-//! the cache for inputs that would succeed elsewhere.
+//! Only [`OutcomeClass::Succeeded`] and valid nonzero
+//! [`OutcomeClass::DeterministicFailure`] outcomes are publication
+//! CANDIDATES ([`OutcomeClass::publication_eligible`]). A normal exit
+//! alone does not prove determinism: closed inputs, complete capture,
+//! and class/trust policy must still admit the result. Signals, OOM,
+//! cancellation, timeouts, lost workers and malformed status evidence
+//! never pass even this preliminary process-outcome gate.
 //!
 //! ## Signal decoding and the OOM heuristic
 //!
 //! Workers encode signal deaths as exit code `128+signal` on the wire
-//! (AGENTS.md semantics); [`decode_exit_code`] recovers the split. The
-//! kernel's OOM killer manifests as a bare `SIGKILL`; within a managed
-//! group the POLICY also sends SIGKILL — but only during cancellation,
-//! which carries its own context flag. So: `SIGKILL` death without a
-//! policy-delivered kill classifies as [`TerminationCause::OomKilled`]
-//! (documented heuristic: inside our groups, an unsolicited SIGKILL is
-//! the OOM killer or an administrator — both are non-deterministic
-//! environment events, so misclassification between them has no safety
-//! consequence). `SIGABRT` maps to [`TerminationCause::InternalPanic`]
-//! (`abort()` is how Rust/C panic paths terminate). All other signals →
+//! (AGENTS.md semantics); [`decode_exit_code`] recovers the split. Native
+//! [`ExitStatus`] is different: an actual normal `exit(137)` is not a
+//! SIGKILL receipt. Native and wire statuses are deliberately decoded by
+//! different entry points rather than discarding native signal evidence.
+//!
+//! The kernel's OOM killer manifests as a bare `SIGKILL`; within a managed
+//! group the POLICY also sends SIGKILL during cancellation. An unsolicited
+//! SIGKILL maps to [`TerminationCause::OomKilled`] (an administrator kill
+//! is indistinguishable here, but also non-publishable). `SIGABRT` maps to
+//! [`TerminationCause::InternalPanic`]. Other signals map to
 //! [`TerminationCause::Signalled`].
 //!
 //! ## Precedence (evaluated top to bottom, first match wins)
@@ -42,14 +41,15 @@
 //! 1. `PolicyRefused` — admission refused before any exec;
 //! 2. `WorkerLost` — the worker itself died mid-attempt;
 //! 3. `LeaseExpired` — the attempt's lease lapsed;
-//! 4. deadline exceeded → `VolatileFailure` (a timeout IS a
-//!    cancellation, but the taxonomy keeps the richer cause);
-//! 5. policy-signalled + signal death → `Cancelled`;
+//! 4. deadline exceeded → `VolatileFailure`;
+//! 5. policy cancellation → `Cancelled`, INCLUDING a process that
+//!    traps TERM and exits zero or otherwise exits normally;
 //! 6. unsolicited `SIGKILL` → `OomKilled`;
 //! 7. `SIGABRT` → `InternalPanic`;
 //! 8. other signal → `SignalTerminated`;
 //! 9. exit 0 → `Succeeded`;
-//! 10. exit n ≠ 0 → `DeterministicFailure{n}`.
+//! 10. normal exit 1..=255 → `DeterministicFailure{n}`;
+//! 11. invalid status evidence → `InfrastructureFailure`.
 
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
@@ -65,14 +65,16 @@ const SIGKILL: i32 = 9;
 pub enum TerminationCause {
     /// Exited normally with code 0.
     ExitZero,
-    /// Exited normally with a nonzero code (deterministic failure).
+    /// Exited normally with a nonzero code; other publication gates
+    /// must still establish determinism.
     ExitNonZero(i32),
     /// Killed by an unsolicited signal (`SIGKILL` without a policy kill
     /// reads as the kernel OOM killer; see module docs).
     Signalled(i32),
     /// The kernel OOM killer terminated the attempt.
     OomKilled,
-    /// Our own teardown policy delivered the fatal signal (cancellation).
+    /// Our own teardown policy cancelled the attempt, even when the
+    /// process handled its signal and subsequently exited normally.
     CancelledByPolicy,
     /// A declared deadline expired before completion.
     DeadlineExceeded,
@@ -84,6 +86,9 @@ pub enum TerminationCause {
     InternalPanic,
     /// Admission refused the action before it ever ran.
     PolicyRefused,
+    /// A supplied exit code or signal is outside its representation's
+    /// valid range. Preserve the raw value, but never invent an exit.
+    InvalidStatus(i32),
 }
 
 /// Context flags that override the bare process view, supplied by the
@@ -99,26 +104,25 @@ pub struct OutcomeContext {
     pub lease_expired: bool,
     /// A declared deadline expired and teardown was initiated for it.
     pub deadline_exceeded: bool,
-    /// OUR teardown policy delivered the fatal signal (cancellation
-    /// path: `TerminationReceipt::kill_sent || term_sent` reaching the
-    /// leader). Distinguishes our SIGKILL from the OOM killer's.
+    /// OUR teardown policy cancelled this attempt. A caught TERM followed
+    /// by exit zero does not erase this receipt. Set from the attempt's
+    /// cancellation frontier, not from a later unrelated process signal.
     pub cancelled_by_policy: bool,
 }
 
 /// The RABS outcome taxonomy — WHAT the attempt counts as, and
-/// therefore whether its result may enter the CAS (I16/R28).
+/// whether it may be considered for publication (I16/R28).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutcomeClass {
-    /// Completed with exit 0: eligible for SUCCESS publication.
+    /// Completed with exit 0: candidate for SUCCESS publication.
     Succeeded,
-    /// Deterministic nonzero exit: same inputs fail the same way
-    /// everywhere. The ONLY FAILURE class eligible for publication.
+    /// Normal nonzero exit: the only failure candidate for publication.
+    /// Determinism still requires the action's input/capture/policy gates.
     DeterministicFailure(i32),
     /// Environment-dependent failure that may pass on a retry elsewhere
     /// (timeout is the canonical case).
     VolatileFailure,
-    /// Infrastructure-level interference (reserved; reached via
-    /// explicit caller context extensions).
+    /// Infrastructure-level interference or invalid termination evidence.
     InfrastructureFailure,
     /// The worker died mid-attempt.
     WorkerLost,
@@ -138,29 +142,30 @@ pub enum OutcomeClass {
 }
 
 impl OutcomeClass {
-    /// Whether this outcome may be written into the CAS as an
-    /// authoritative result (I16/R28): success always, failures ONLY
-    /// when deterministic. Every other class describes the ENVIRONMENT
-    /// that ran the attempt, not the inputs.
+    /// Preliminary process-outcome gate, NOT authorization to commit.
+    /// Other publication gates must establish closed inputs, complete
+    /// observations and admitted trust. Validate even directly constructed
+    /// failure variants so malformed values cannot bypass classification.
     #[must_use]
     pub fn publication_eligible(self) -> bool {
         matches!(
             self,
-            OutcomeClass::Succeeded | OutcomeClass::DeterministicFailure(_)
+            OutcomeClass::Succeeded | OutcomeClass::DeterministicFailure(1..=255)
         )
     }
 }
 
-/// Decode a wire exit code under AGENTS.md semantics: values ≥ 128 are
-/// `128+signal` encodings of a signal death.
+/// Decode a wire exit code under AGENTS.md semantics. `129..=255`
+/// represents `128+signal`; 128 itself encodes no signal. Negative
+/// sentinel values and values above one byte are invalid evidence.
+/// Use [`cause_from_exit`] or [`classify_status`] for native wait results.
 #[must_use]
 pub fn decode_exit_code(code: i32) -> TerminationCause {
-    if code >= 128 {
-        map_signal(code - 128, false)
-    } else if code == 0 {
-        TerminationCause::ExitZero
-    } else {
-        TerminationCause::ExitNonZero(code)
+    match code {
+        0 => TerminationCause::ExitZero,
+        1..=127 => TerminationCause::ExitNonZero(code),
+        129..=255 => map_signal(code - 128, false),
+        _ => TerminationCause::InvalidStatus(code),
     }
 }
 
@@ -174,27 +179,32 @@ fn map_signal(sig: i32, policy_killed: bool) -> TerminationCause {
         match sig {
             SIGKILL => TerminationCause::OomKilled,
             SIGABRT => TerminationCause::InternalPanic,
-            other => TerminationCause::Signalled(other),
+            1..=127 => TerminationCause::Signalled(sig),
+            _ => TerminationCause::InvalidStatus(sig),
         }
     }
 }
 
 /// Build a cause from a captured leader exit (the
 /// [`crate::termination::LeaderExit`] shape: optional code, optional
-/// signal) plus whether OUR policy killed the leader. A leader with NO
-/// observable ending (never reaped) reads as [`TerminationCause::
-/// WorkerLost`] — an attempt whose death nobody witnessed cannot be
-/// deterministic.
+/// signal) plus whether OUR policy cancelled the leader. Cancellation
+/// is retained even after a signal handler exits zero. Without an
+/// observable ending or cancellation receipt, the attempt is worker-lost,
+/// never deterministic. Native normal high exit codes are not wire signals.
 #[must_use]
 pub fn cause_from_exit(
     exit_code: Option<i32>,
     signal: Option<i32>,
     policy_killed: bool,
 ) -> TerminationCause {
+    if policy_killed {
+        return TerminationCause::CancelledByPolicy;
+    }
     match (signal, exit_code) {
-        (Some(sig), _) => map_signal(sig, policy_killed),
+        (Some(sig), _) => map_signal(sig, false),
         (None, Some(0)) => TerminationCause::ExitZero,
-        (None, Some(n)) => TerminationCause::ExitNonZero(n),
+        (None, Some(n @ 1..=255)) => TerminationCause::ExitNonZero(n),
+        (None, Some(n)) => TerminationCause::InvalidStatus(n),
         (None, None) => TerminationCause::WorkerLost,
     }
 }
@@ -216,20 +226,21 @@ pub fn classify(cause: TerminationCause, ctx: &OutcomeContext) -> OutcomeClass {
     if ctx.deadline_exceeded {
         return OutcomeClass::VolatileFailure;
     }
-    // Precedence 5: deliberate policy teardown.
-    if matches!(cause, TerminationCause::CancelledByPolicy) {
+    // A cancellation receipt cannot be erased by an exit code, including
+    // zero from a caught TERM, or by decoding SIGKILL without its context.
+    if ctx.cancelled_by_policy || matches!(cause, TerminationCause::CancelledByPolicy) {
         return OutcomeClass::Cancelled;
     }
-    // Precedence 6-10: the process view.
     match cause {
         TerminationCause::OomKilled => OutcomeClass::OomKilled,
         TerminationCause::InternalPanic => OutcomeClass::InternalPanic,
         TerminationCause::Signalled(s) => OutcomeClass::SignalTerminated(s),
         TerminationCause::ExitZero => OutcomeClass::Succeeded,
-        TerminationCause::ExitNonZero(n) => OutcomeClass::DeterministicFailure(n),
-        // Explicit causes are honored even without their context
-        // flags; only a deadline/policy-kill cause that LOST its
-        // context degrades to volatile — never to anything publishable.
+        TerminationCause::ExitNonZero(n @ 1..=255) => OutcomeClass::DeterministicFailure(n),
+        TerminationCause::ExitNonZero(_) | TerminationCause::InvalidStatus(_) => {
+            OutcomeClass::InfrastructureFailure
+        }
+        // Explicit causes remain non-publishable without context flags.
         TerminationCause::WorkerLost => OutcomeClass::WorkerLost,
         TerminationCause::LeaseExpired => OutcomeClass::LeaseExpired,
         TerminationCause::PolicyRefused => OutcomeClass::PolicyRefused,
@@ -239,15 +250,12 @@ pub fn classify(cause: TerminationCause, ctx: &OutcomeContext) -> OutcomeClass {
     }
 }
 
-/// Convenience: classify straight from a captured [`ExitStatus`] with
-/// no cancellation context (pure process view; callers that cancelled
-/// should go through [`cause_from_exit`] with the receipt's policy
-/// flags instead).
+/// Classify a native [`ExitStatus`] while honoring the supplied attempt
+/// context. A stopped process has not terminated: its stop signal must
+/// not be manufactured into a terminal signal receipt.
 #[must_use]
 pub fn classify_status(status: ExitStatus, ctx: &OutcomeContext) -> OutcomeClass {
-    let code = status.code();
-    let sig = status.signal().or_else(|| status.stopped_signal());
-    classify(cause_from_exit(code, sig, false), ctx)
+    classify(cause_from_exit(status.code(), status.signal(), false), ctx)
 }
 
 #[cfg(test)]
@@ -373,6 +381,91 @@ mod tests {
         assert!(!cls.publication_eligible());
     }
 
+    #[test]
+    fn cancellation_context_fences_every_native_exit_and_signal() {
+        let ctx = OutcomeContext {
+            cancelled_by_policy: true,
+            ..Default::default()
+        };
+        for code in 0..=255 {
+            let outcome = classify_status(status_from(code), &ctx);
+            assert_eq!(outcome, OutcomeClass::Cancelled, "native exit {code}");
+            assert!(!outcome.publication_eligible());
+            assert_eq!(
+                cause_from_exit(Some(code), None, true),
+                TerminationCause::CancelledByPolicy
+            );
+        }
+        for signal in [SIGABRT, SIGKILL, 15] {
+            assert_eq!(
+                classify_status(status_signalled(signal), &ctx),
+                OutcomeClass::Cancelled
+            );
+        }
+        for (ctx, expected) in [
+            (OutcomeContext { policy_refused: true, ..ctx }, OutcomeClass::PolicyRefused),
+            (OutcomeContext { worker_lost: true, ..ctx }, OutcomeClass::WorkerLost),
+            (OutcomeContext { lease_expired: true, ..ctx }, OutcomeClass::LeaseExpired),
+            (OutcomeContext { deadline_exceeded: true, ..ctx }, OutcomeClass::VolatileFailure),
+        ] {
+            assert_eq!(classify_status(status_from(0), &ctx), expected);
+        }
+    }
+
+    #[test]
+    fn malformed_statuses_cannot_become_deterministic_failures() {
+        let ctx = OutcomeContext::default();
+        for code in [i32::MIN, -1, 256, i32::MAX] {
+            assert_eq!(decode_exit_code(code), TerminationCause::InvalidStatus(code));
+            assert_eq!(
+                cause_from_exit(Some(code), None, false),
+                TerminationCause::InvalidStatus(code)
+            );
+            assert_eq!(
+                classify(TerminationCause::ExitNonZero(code), &ctx),
+                OutcomeClass::InfrastructureFailure
+            );
+            assert!(!OutcomeClass::DeterministicFailure(code).publication_eligible());
+        }
+        assert_eq!(decode_exit_code(128), TerminationCause::InvalidStatus(128));
+        assert!(!OutcomeClass::DeterministicFailure(0).publication_eligible());
+        assert_eq!(
+            classify(TerminationCause::ExitNonZero(0), &ctx),
+            OutcomeClass::InfrastructureFailure
+        );
+        for signal in [-1, 0, 128, i32::MAX] {
+            assert_eq!(
+                cause_from_exit(None, Some(signal), false),
+                TerminationCause::InvalidStatus(signal)
+            );
+        }
+    }
+
+    #[test]
+    fn native_high_exits_are_not_confused_with_wire_signal_encodings() {
+        let ctx = OutcomeContext::default();
+        for code in 1..=255 {
+            assert_eq!(
+                classify_status(status_from(code), &ctx),
+                OutcomeClass::DeterministicFailure(code)
+            );
+        }
+        for code in 129..=255 {
+            assert!(!classify(decode_exit_code(code), &ctx).publication_eligible());
+        }
+        assert_eq!(classify(decode_exit_code(137), &ctx), OutcomeClass::OomKilled);
+    }
+
+    #[test]
+    fn stopped_process_is_not_a_terminal_signal_receipt() {
+        let stopped = ExitStatus::from_raw((15 << 8) | 0x7f);
+        assert_eq!(stopped.stopped_signal(), Some(15));
+        assert_eq!(
+            classify_status(stopped, &OutcomeContext::default()),
+            OutcomeClass::WorkerLost
+        );
+    }
+
     // ---- REAL-PROCESS FIXTURES: causes driven through actual managed
     // ---- process groups, classified from OBSERVED evidence.
 
@@ -430,10 +523,6 @@ mod tests {
         };
         let receipt = graceful_shutdown(&mut g, &policy);
         assert!(receipt.kill_sent || receipt.term_sent, "policy signalled");
-        // Leader death evidence is signal-borne (we killed it). With
-        // the policy context set, classification MUST read Cancelled —
-        // even though a bare SIGTERM/SIGKILL decode would read
-        // signal/OOM.
         let cause = match receipt.leader_exit {
             Some(le) => cause_from_exit(le.exit_code, le.signal, true),
             None => TerminationCause::CancelledByPolicy,
@@ -460,5 +549,20 @@ mod tests {
         let cls = classify(decode_exit_code(-1), &ctx);
         assert_eq!(cls, OutcomeClass::PolicyRefused);
         assert!(!cls.publication_eligible());
+    }
+
+    #[test]
+    fn caught_term_with_zero_exit_still_honors_cancellation_receipt() {
+        // Deterministic fixture: install the handler before signalling the
+        // same shell, with no sleeps or parent/child signal timing race.
+        let mut group = spawn_sh("trap 'exit 0' TERM; kill -TERM $$; exit 99");
+        let status = group.wait_leader().expect("wait");
+        assert!(status.success(), "the handler must have exited zero");
+        let ctx = OutcomeContext {
+            cancelled_by_policy: true,
+            ..Default::default()
+        };
+        assert_eq!(classify_status(status, &ctx), OutcomeClass::Cancelled);
+        assert!(!classify_status(status, &ctx).publication_eligible());
     }
 }
