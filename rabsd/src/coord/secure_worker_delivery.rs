@@ -52,7 +52,7 @@ pub fn parse_worker_pin(value: &str) -> io::Result<[u8; 32]> {
         byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
     }), "expected 64 lowercase hex digits for worker SPKI SHA-256")?;
     let mut pin = [0; 32];
-    for (slot, pair) in pin.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+    for (slot, pair) in pin.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
         let digit = |byte: u8| if byte <= b'9' { byte - b'0' } else { byte - b'a' + 10 };
         *slot = digit(pair[0]) * 16 + digit(pair[1]);
     }
@@ -79,8 +79,10 @@ fn challenge_ids() -> io::Result<[u64; 3]> {
     let mut bytes = [0; 24];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     let mut ids = [0; 3];
-    for (id, chunk) in ids.iter_mut().zip(bytes.chunks_exact(8)) {
-        *id = u64::from_be_bytes(chunk.try_into().map_err(|_| invalid("challenge entropy"))?);
+    for (id, chunk) in ids.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        // `as_chunks::<8>` yields `[u8; 8]` directly, so the width is proven by
+        // the type and the previous fallible conversion cannot fail.
+        *id = u64::from_be_bytes(*chunk);
     }
     require(ids.iter().all(|id| *id != 0), "zero challenge identity")?;
     Ok(ids)
