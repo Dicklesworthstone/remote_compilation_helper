@@ -25,3 +25,4 @@ pub mod live;
 pub mod worker_delivery;
 pub mod secure_worker_delivery;
 pub mod delivery_recovery;
+pub mod delivery_archive;
