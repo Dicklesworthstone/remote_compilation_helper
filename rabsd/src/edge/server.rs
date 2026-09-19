@@ -439,6 +439,16 @@ fn serve_reply(coord: &crate::coord::live::EdgeSubscriber, value: &serde_json::V
             ExpectedOutputs::Exactly(set)
         }
     };
+    let expected = match (expected, value.get("dep_info_mappings")) {
+        (ExpectedOutputs::Exactly(paths), Some(value)) => {
+            let Some(mappings) = parse_dep_info_mappings(value) else {
+                return refusal("bad-dep-info-mappings", "expected bounded [canonical-directory, subscriber-directory] pairs");
+            };
+            ExpectedOutputs::WithDepInfo { paths, mappings }
+        }
+        (expected, None) => expected,
+        _ => return refusal("bad-dep-info-mappings", "dep-info mappings require expected_outputs"),
+    };
     // The committed serving record carries clock epoch 0 (its column
     // default) until the coordinator populates a real clock epoch, so
     // the gate is asked at that epoch; the instant is the daemon's own.
@@ -456,14 +466,13 @@ fn serve_reply(coord: &crate::coord::live::EdgeSubscriber, value: &serde_json::V
         })
         .to_string(),
         Ok(ServeOutcome::Served { files }) => {
-            let list: Vec<String> = files
-                .iter()
-                .map(|f| format!("\"{}\"", f.display().to_string().replace('"', "'")))
-                .collect();
-            format!(
-                "{{\"kind\":\"serve-result\",\"outcome\":\"served\",\"files\":[{}]}}",
-                list.join(",")
-            )
+            use std::os::unix::ffi::OsStrExt;
+            serde_json::json!({
+                "kind": "serve-result", "outcome": "served",
+                "files": files.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
+                "file_path_bytes": files.iter().map(|path| path.as_os_str().as_bytes()).collect::<Vec<_>>(),
+                "compiler_skip_authorized": false,
+            }).to_string()
         }
         Ok(ServeOutcome::NotServable(decision)) => format!(
             "{{\"kind\":\"serve-result\",\"outcome\":\"not-servable\",\"reason\":\"{}\"}}",
@@ -494,10 +503,103 @@ fn serve_reply(coord: &crate::coord::live::EdgeSubscriber, value: &serde_json::V
                 quote(&unexpected)
             )
         }
-        Err(error) => format!(
-            "{{\"kind\":\"serve-result\",\"outcome\":\"error\",\"reason\":\"{}\"}}",
-            error.to_string().replace('"', "'")
-        ),
+        Err(error) => serve_error_reply(&error),
+    }
+}
+
+fn parse_dep_info_mappings(value: &serde_json::Value) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    let entries = value.as_array()?;
+    if entries.len() > 64 { return None; }
+    let path_bytes = |value: &serde_json::Value| -> Option<Vec<u8>> {
+        if let Some(text) = value.as_str() {
+            return (text.len() <= 4096).then(|| text.as_bytes().to_vec());
+        }
+        let bytes = value.as_array()?;
+        if bytes.len() > 4096 { return None; }
+        bytes.iter().map(|byte| u8::try_from(byte.as_u64()?).ok()).collect()
+    };
+    entries.iter().map(|entry| {
+        let pair = entry.as_array()?;
+        if pair.len() != 2 { return None; }
+        Some((path_bytes(&pair[0])?, path_bytes(&pair[1])?))
+    }).collect()
+}
+
+/// Error transport preserves the materializer's installed prefix. No response
+/// from this file-only endpoint grants permission to rerun a compiler; in
+/// particular a timeout or lost response is NOT evidence of an untouched tree.
+fn serve_error_reply(error: &crate::coord::live::ServeError) -> String {
+    use crate::coord::live::ServeError;
+    use std::os::unix::ffi::OsStrExt;
+    let (started, files) = match error {
+        ServeError::Materialize(failure) => (true, failure.installed.iter()
+            .map(|output| output.destination.as_path()).collect::<Vec<_>>()),
+        _ => (false, Vec::new()),
+    };
+    serde_json::json!({
+        "kind": "serve-result", "outcome": "error", "reason": error.to_string(),
+        "materialization_started": started,
+        "installed": files.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
+        "installed_path_bytes": files.iter().map(|path| path.as_os_str().as_bytes()).collect::<Vec<_>>(),
+        "compiler_skip_authorized": false, "reexecution_authorized": false,
+    }).to_string()
+}
+
+#[cfg(test)]
+mod complete_output_wire_tests {
+    use super::{parse_dep_info_mappings, serve_error_reply};
+    use crate::coord::live::ServeError;
+    use rabs_cas::materialization::{ActionMaterializeFailure, MaterializeError, OutputMaterialized};
+    use rabs_protocol::raw_bytes::RawBytes;
+    use rabs_protocol::result_identity::OutputRole;
+    use std::os::unix::ffi::OsStringExt;
+    use std::path::PathBuf;
+
+    #[test]
+    fn mapping_wire_preserves_unix_bytes_and_refuses_malformed_pairs() {
+        let value = serde_json::json!([["/__rabs/workspace", [47, 116, 109, 112, 47, 255]]]);
+        assert_eq!(parse_dep_info_mappings(&value).unwrap(), vec![(b"/__rabs/workspace".to_vec(), b"/tmp/\xff".to_vec())]);
+        for value in [
+            serde_json::json!([["/__rabs/workspace"]]),
+            serde_json::json!([["/__rabs/workspace", [256]]]),
+            serde_json::json!([["/__rabs/workspace", [-1]]]),
+            serde_json::json!([["/__rabs/workspace", [1.5]]]),
+            serde_json::json!({"not":"a list"}),
+        ] {
+            assert!(parse_dep_info_mappings(&value).is_none());
+        }
+    }
+
+    #[test]
+    fn mapping_wire_bounds_both_cardinality_and_path_size() {
+        let pair = serde_json::json!(["/__rabs/workspace", "/subscriber"]);
+        assert!(parse_dep_info_mappings(&serde_json::json!(vec![pair; 65])).is_none());
+        assert!(parse_dep_info_mappings(&serde_json::json!([["/__rabs/workspace", "x".repeat(4097)]])).is_none());
+        assert!(parse_dep_info_mappings(&serde_json::json!([["/__rabs/workspace", vec![1; 4097]]])).is_none());
+    }
+
+    #[test]
+    fn partial_install_reply_never_loses_raw_paths_or_authorizes_reexecution() {
+        let raw = b"/target/quote\"-\xff.rmeta".to_vec();
+        let failure = ServeError::Materialize(ActionMaterializeFailure {
+            installed: vec![OutputMaterialized {
+                role: OutputRole::ProvisionalMetadata, virtual_path: RawBytes::from("out.rmeta"),
+                destination: PathBuf::from(std::ffi::OsString::from_vec(raw.clone())),
+                bytes: 42, nanos: 1,
+            }],
+            error: MaterializeError::Io { step: "prepare", error: "fault".to_owned() },
+        });
+        let reply: serde_json::Value = serde_json::from_str(&serve_error_reply(&failure)).unwrap();
+        assert_eq!(reply["outcome"], "error");
+        assert_eq!(reply["materialization_started"], true);
+        assert_eq!(reply["installed_path_bytes"], serde_json::json!([raw]));
+        assert_eq!(reply["compiler_skip_authorized"], false);
+        assert_eq!(reply["reexecution_authorized"], false);
+        let before = ServeError::Preparation { path: "/target".into(), reason: "mapping".into() };
+        let reply: serde_json::Value = serde_json::from_str(&serve_error_reply(&before)).unwrap();
+        assert_eq!(reply["materialization_started"], false);
+        assert_eq!(reply["installed_path_bytes"], serde_json::json!([]));
+        assert_eq!(reply["reexecution_authorized"], false);
     }
 }
 
