@@ -489,6 +489,15 @@ fn serve_reply(coord: &crate::coord::live::EdgeSubscriber, value: &serde_json::V
         Ok(ServeOutcome::NoCommit) => {
             "{\"kind\":\"serve-result\",\"outcome\":\"no-commit\"}".to_string()
         }
+        // T011: the running build is not release-authorized. The
+        // standing token is reported rather than a bare refusal,
+        // because "no verdict was ever recorded" and "the deployed
+        // build is not the proven one" need different operator
+        // responses.
+        Ok(ServeOutcome::ReleaseUnauthorized { standing }) => format!(
+            "{{\"kind\":\"serve-result\",\"outcome\":\"release-unauthorized\",\"standing\":\"{}\"}}",
+            standing.token()
+        ),
         Ok(ServeOutcome::ManifestUnavailable { key }) => format!(
             "{{\"kind\":\"serve-result\",\"outcome\":\"manifest-unavailable\",\"key\":\"{}\"}}",
             key.replace('"', "'")

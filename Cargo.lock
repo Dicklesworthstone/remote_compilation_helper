@@ -5222,6 +5222,7 @@ dependencies = [
  "rabs-cas",
  "rabs-key",
  "rabs-protocol",
+ "rabs-replay",
  "rabs-sandbox",
  "rabs-scheduler",
  "serde",

@@ -32,6 +32,9 @@ use crate::coord::action_actor::{
 };
 use crate::coord::target_lease::TargetLeaseRegistry;
 use crate::edge::destination_arbiter::{BundleId, DestinationArbiter, reserve_scoped};
+use rabs_protocol::release_authorization::{
+    ReleaseAuthorization, ReleaseAuthorizationMode, authorization as release_standing,
+};
 use crate::janitor::store::LiveCas;
 use rabs_cas::blob_store::RAW_PROFILE_V1;
 use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
@@ -235,6 +238,23 @@ pub enum ServeOutcome {
     ManifestUnavailable {
         /// The manifest object key that could not be loaded.
         key: String,
+    },
+    /// T011: this BUILD is not authorized to serve. The stock
+    /// differential corpus gate has not passed for the running binary —
+    /// no verdict, an expired one, one recorded for a different build,
+    /// or one carrying no evidence — and the deployment runs in
+    /// [`ReleaseAuthorizationMode::Required`].
+    ///
+    /// Distinct from [`Self::NotServable`], which is about one action.
+    /// This is about the whole binary, so it is checked before any
+    /// per-action state is read: a build that may not serve must not
+    /// serve even an action whose own record is impeccable. The
+    /// standing is preserved because "we never ran the gate here" and
+    /// "the deployed build is not the one we proved" call for different
+    /// operator responses.
+    ReleaseUnauthorized {
+        /// Why the running build is unproven.
+        standing: ReleaseAuthorization,
     },
     /// The committed result does not produce the output set the caller
     /// said its work would produce. NOT a hit: materializing it would
@@ -990,6 +1010,18 @@ pub struct CoordLive {
     /// authority, tombstoned at boot so no prior-authority attempt can
     /// ever publish.
     closed_prior_generations: AtomicU64,
+    /// T011: identity of the binary this coordinator is running, matched
+    /// EXACTLY against the build a release verdict names. Empty until an
+    /// operator sets it, which under
+    /// [`ReleaseAuthorizationMode::Required`] means no verdict can match
+    /// and nothing serves — fail-closed, and the right direction for a
+    /// deployment that asked for enforcement without saying what it is
+    /// running.
+    build_identity: String,
+    /// T011: what this deployment does about an unproven build. Advisory
+    /// by default, so wiring the gate in cannot by itself stop a healthy
+    /// deployment from serving.
+    release_mode: ReleaseAuthorizationMode,
 }
 
 impl std::fmt::Debug for CoordLive {
@@ -1039,6 +1071,104 @@ impl CoordLive {
         Self {
             cas: Some(cas),
             ..Self::new()
+        }
+    }
+
+    /// T011: declare which build this coordinator is, and what it does
+    /// when that build is not release-authorized.
+    ///
+    /// The two are set together on purpose. A mode without a build
+    /// identity cannot match any verdict, and a build identity without
+    /// a mode does nothing — offering them separately would make the
+    /// half-configured state the easy one to reach.
+    ///
+    /// `build` must be the same identity the corpus gate recorded via
+    /// `PromotionAuthorized::into_verdict`; the comparison is exact.
+    #[must_use]
+    pub fn with_release_authorization(
+        self,
+        build: impl Into<String>,
+        release_mode: ReleaseAuthorizationMode,
+    ) -> Self {
+        Self {
+            build_identity: build.into(),
+            release_mode,
+            ..self
+        }
+    }
+
+    /// T011: this coordinator's standing with the stock differential
+    /// corpus gate, read from the durable verdict.
+    ///
+    /// Reported regardless of mode — an advisory deployment learns what
+    /// enforcement would do to it BEFORE it turns enforcement on, which
+    /// is the point of shipping the mechanism ahead of the switch.
+    ///
+    /// # Errors
+    /// [`ServeError::NoStore`] with no mounted store,
+    /// [`ServeError::StoreUnavailable`] if the store lock is poisoned,
+    /// or [`ServeError::Store`] on a backend failure. A store that
+    /// cannot be read does not silently become an authorization.
+    pub fn release_authorization(
+        &self,
+        now_unix_micros: i64,
+        now_epoch: u64,
+    ) -> Result<ReleaseAuthorization, ServeError> {
+        let cas = self.cas.as_ref().ok_or(ServeError::NoStore)?;
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| ServeError::StoreUnavailable)?;
+        let verdict = store
+            .release_verdict(&self.build_identity)
+            .map_err(|error| ServeError::Store(format!("{error:?}")))?;
+        Ok(release_standing(
+            verdict.as_ref(),
+            &self.build_identity,
+            now_unix_micros,
+            now_epoch,
+        ))
+    }
+
+    /// The configured release-authorization mode.
+    #[must_use]
+    pub const fn release_mode(&self) -> ReleaseAuthorizationMode {
+        self.release_mode
+    }
+
+    /// The release standing as a status token, without ever blocking.
+    ///
+    /// Status must not be able to hang behind a long serve, so this
+    /// takes the store lock with `try_lock` and reports `"unknown"`
+    /// when it is busy, unmounted, poisoned, or unreadable. Every one
+    /// of those is reported as not-knowing rather than as a pass: a
+    /// status line that read "authorized" because the store was busy
+    /// would be the exact inversion of what this gate is for.
+    fn release_standing_for_status(&self) -> &'static str {
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros()),
+        )
+        .unwrap_or(i64::MAX);
+        let Some(cas) = self.cas.as_ref() else {
+            return "unknown";
+        };
+        let Ok(mut store) = cas.store().try_lock() else {
+            return "unknown";
+        };
+        match store.release_verdict(&self.build_identity) {
+            Ok(verdict) => release_standing(
+                verdict.as_ref(),
+                &self.build_identity,
+                now,
+                // The serving record's clock epoch column defaults to 0
+                // until the coordinator populates a real one, and a
+                // verdict is written against that same convention.
+                0,
+            )
+            .token(),
+            Err(_) => "unknown",
         }
     }
 
@@ -1744,6 +1874,29 @@ impl CoordLive {
             }
         }
 
+        // T011: the BUILD-level question, asked before any per-action
+        // state is read. A binary the corpus gate has not cleared must
+        // not serve even an action whose own serving record is
+        // impeccable, so this sits ahead of `serving_gate` rather than
+        // beside it — strictest-first, the same ordering discipline the
+        // per-action gate uses internally.
+        //
+        // Under the default Advisory mode this never refuses; it only
+        // evaluates, so the standing is available to the status surface
+        // and the operator can see what Required would have done.
+        let standing = release_standing(
+            store
+                .release_verdict(&self.build_identity)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+                .as_ref(),
+            &self.build_identity,
+            now_unix_micros,
+            now_epoch,
+        );
+        if !standing.permits_serving(self.release_mode) {
+            return Ok(ServeOutcome::ReleaseUnauthorized { standing });
+        }
+
         match serving_gate(&mut *store, &key, now_unix_micros, now_epoch)
             .map_err(|e| ServeError::Store(format!("{e:?}")))?
         {
@@ -1881,12 +2034,23 @@ impl CoordLive {
             "{{\"v\":1,\"kind\":\"coord-status\",\"available\":{},\"open_flights\":{open_flights},\
              \"lease_registry_mounted\":{lease_holders},\"destination_arbiter_mounted\":{reservations},\
              \"cas_mounted\":{},\"authority_held\":{},\"authority_term\":{},\
-             \"closed_prior_authority_generations\":{}}}",
+             \"closed_prior_authority_generations\":{},\
+             \"release_mode\":\"{}\",\"release_standing\":\"{}\"}}",
             self.available(),
             self.cas.is_some(),
             authority.is_some(),
             authority.map_or(0, |a| a.term),
             self.closed_prior_generations(),
+            match self.release_mode {
+                ReleaseAuthorizationMode::Advisory => "advisory",
+                ReleaseAuthorizationMode::Required => "required",
+            },
+            // T011: reported under BOTH modes, so an advisory
+            // deployment can see it would be refused before it flips
+            // the switch. A store that cannot be read reports
+            // "unknown" rather than borrowing the authorized token —
+            // the status line never reads better than the evidence.
+            self.release_standing_for_status(),
         )
     }
 
