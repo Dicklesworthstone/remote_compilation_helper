@@ -1,6 +1,7 @@
-//! Explicit loopback operator lane for receiving one real worker execution.
-//! This command neither starts a compiler locally nor installs received files
-//! into a worktree. Authenticated fleet transport remains a separate entry point.
+//! Explicit operator lanes for receiving one real worker execution.
+//! Neither command starts a compiler locally or installs files into a worktree.
+//! Plaintext loopback and mutually authenticated native ATP are separate modes;
+//! an error in the secure path never selects the loopback path.
 
 use rabsd::coord::worker_delivery::{
     Delivery, DeliveryFailure, MAX_FRAME_BYTES, WorkerPeer, receive_execution, validate_request,
@@ -162,7 +163,11 @@ pub fn run(args: &[String]) -> i32 {
         eprintln!("usage: rabsd --worker-exec-loopback <127.0.0.1:port> <expected-worker> <request.json> <new-absolute-directory>");
         return 2;
     }
-    match run_once(args) {
+    report_result(run_once(args))
+}
+
+fn report_result(result: Result<Delivery, DeliveryFailure>) -> i32 {
+    match result {
         Ok(delivery) => {
             println!("{}",delivery.to_json());
             // Byte delivery success is distinct from compiler success. The
@@ -175,6 +180,86 @@ pub fn run(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+fn coordinator_tls_files() -> io::Result<rabs_asupersync::worker_transport::TlsFiles> {
+    let path = |name: &str| -> io::Result<PathBuf> {
+        let value = std::env::var_os(name).filter(|value| !value.is_empty())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("missing {name}")))?;
+        let path = PathBuf::from(value);
+        if !path.is_absolute() { return Err(invalid("coordinator TLS files must use absolute paths")); }
+        Ok(path)
+    };
+    Ok(rabs_asupersync::worker_transport::TlsFiles {
+        ca: path("RABS_COORD_TLS_CA")?,
+        certificate: path("RABS_COORD_TLS_CERT")?,
+        private_key: path("RABS_COORD_TLS_KEY")?,
+    })
+}
+
+fn run_tls_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
+    use asupersync::runtime::RuntimeBuilder;
+    use rabs_asupersync::worker_transport::{MAX_JSON_RECORD, accept_peer};
+    use rabsd::coord::secure_worker_delivery::{parse_worker_pin, receive_authenticated};
+
+    let directory = PathBuf::from(&args[4]);
+    let failure = |detail: String| DeliveryFailure {
+        directory: directory.clone(), execution_may_have_run: false, detail,
+    };
+    let setup = (|| -> Result<_, String> {
+        let address: SocketAddr = args[0].parse().map_err(|_| "listen must be a literal IP:port")?;
+        if args[1].is_empty() { return Err("expected worker must not be empty".to_owned()); }
+        let pin = parse_worker_pin(&args[2]).map_err(|error| error.to_string())?;
+        let request = read_request(Path::new(&args[3])).map_err(|error| error.to_string())?;
+        if serde_json::to_vec(&request).map_err(|error| error.to_string())?.len() > MAX_JSON_RECORD {
+            return Err("request exceeds native ATP record limit".to_owned());
+        }
+        if !directory.is_absolute() || directory.components().any(|component| {
+            !matches!(component, std::path::Component::RootDir | std::path::Component::Normal(_))
+        }) {
+            return Err("delivery directory must be absolute without traversal".to_owned());
+        }
+        match std::fs::symlink_metadata(&directory) {
+            Ok(_) => return Err("delivery directory already exists".to_owned()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        if !directory.parent().is_some_and(Path::is_dir) {
+            return Err("delivery parent directory does not exist".to_owned());
+        }
+        // Validate all credentials BEFORE binding. This branch never invokes the
+        // loopback transport, including when the TLS listener itself is loopback.
+        let acceptor = coordinator_tls_files().map_err(|error| error.to_string())?.acceptor()?;
+        let runtime = RuntimeBuilder::current_thread().build()
+            .map_err(|error| format!("worker delivery runtime: {error:?}"))?;
+        Ok((runtime, acceptor, address, pin, request))
+    })().map_err(&failure)?;
+    let (runtime, acceptor, address, pin, request) = setup;
+    let peer = runtime.block_on(async {
+        let listener = asupersync::net::TcpListener::bind(address).await
+            .map_err(|error| format!("worker TLS listen: {error}"))?;
+        eprintln!("{}", json!({"kind":"worker-exec-listening",
+            "address":listener.local_addr().map_err(|error| error.to_string())?.to_string(),
+            "expected_worker":args[1], "expected_worker_spki_sha256":args[2],
+            "request_id":request["request_id"], "transport":"mutual-tls-atp",
+            "authentication_required":true}));
+        let (stream, _) = asupersync::time::timeout(asupersync::time::wall_now(), ACCEPT_BUDGET,
+            listener.accept()).await.map_err(|_| "worker TLS accept deadline exceeded")?
+            .map_err(|error| format!("worker TLS accept: {error}"))?;
+        accept_peer(&acceptor, stream).await
+    }).map_err(failure)?;
+    receive_authenticated(&runtime, peer, pin, &args[1], &request, &directory)
+}
+
+/// One explicitly pinned worker, authenticated transport, and one exact command.
+/// TLS/admission failures terminate without dispatch or a plaintext retry.
+pub fn run_tls(args: &[String]) -> i32 {
+    if args.len() != 5 {
+        eprintln!("usage: rabsd --worker-exec-tls <IP:port> <expected-worker> <worker-spki-sha256> <request.json> <new-absolute-directory>");
+        eprintln!("required: RABS_COORD_TLS_CA, RABS_COORD_TLS_CERT, RABS_COORD_TLS_KEY");
+        return 2;
+    }
+    report_result(run_tls_once(args))
 }
 
 #[cfg(test)]
