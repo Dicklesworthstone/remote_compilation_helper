@@ -31,6 +31,31 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 
 use crate::region_tree::Attribution;
 
+/// A spawned child is already a live effect even when admission subsequently
+/// fails. Keep cleanup armed until formation verification transfers ownership.
+/// This does not change ManagedProcessGroup's supervisor-owned Drop policy.
+struct UnadmittedProcess(Option<Child>);
+
+fn kill_and_reap_spawned(leader: &mut Child) {
+    let pgid = leader.id();
+    let _ = Command::new("kill")
+        .arg("-KILL").arg("--").arg(format!("-{pgid}"))
+        .stdout(Stdio::null()).stderr(Stdio::null()).status();
+    // Always retain the direct-child fallback, even when group formation itself
+    // was the failed check. A negative PGID signal alone may have no recipient.
+    let _ = leader.kill();
+    let _ = leader.wait();
+    let _ = reap_residuals(pgid);
+}
+
+impl Drop for UnadmittedProcess {
+    fn drop(&mut self) {
+        if let Some(leader) = self.0.as_mut() {
+            kill_and_reap_spawned(leader);
+        }
+    }
+}
+
 /// Signal delivered to a whole process group via `kill(1)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupSignal {
@@ -135,59 +160,63 @@ impl ManagedProcessGroup {
         configure: impl FnOnce(&mut Command),
     ) -> io::Result<Self> {
         let mut cmd = Command::new(&spec.program);
-        cmd.args(&spec.args).process_group(0);
+        cmd.args(&spec.args);
         if let Some(dir) = &spec.working_dir {
             cmd.current_dir(dir);
         }
         configure(&mut cmd);
+        // The configurator owns stdio/environment, not process containment.
+        // Apply the mandatory fresh group LAST, just like spawn_command does.
+        cmd.process_group(0);
         let leader = cmd.spawn()?;
         Self::verify_group_formation(leader, spec.attribution.clone())
     }
 
     /// Shared construction tail: verify the leader actually leads a
     /// fresh group before handing the handle out.
-    #[allow(unused_mut)]
-    fn verify_group_formation(mut leader: Child, attribution: Attribution) -> io::Result<Self> {
-        let pgid = leader.id();
-        // Fail loudly if the grouping request was not honored: a group we
-        // cannot trust would make every later group-signal wrong. A leader
-        // that already exited before the probe is fine — wait() surfaces
-        // its status; a LIVE leader absent from every /proc pgrp means the
-        // platform ignored process_group(0) and cleanup would be a lie.
-        #[cfg(target_os = "linux")]
-        let members = {
-            let probe = members_from_proc(pgid);
-            match leader.try_wait()? {
-                Some(_) => {}
-                None => {
-                    if !probe
-                        .iter()
-                        .any(|m| m.pid == i32::try_from(pgid).unwrap_or(-1))
-                        // Re-check exit before condemning: a leader that
-                        // exited between try_wait and the scan above is a
-                        // zombie our membership filter hides — the group WAS
-                        // honored, and wait_with_output will surface the
-                        // status. Only a STILL-RUNNING leader absent from
-                        // every pgrp means the platform ignored the request.
-                        && leader.try_wait()?.is_none()
-                    {
-                        return Err(io::Error::other(format!(
-                            "process_group(0) not honored: live leader pid {pgid} not found in any /proc pgrp"
-                        )));
+    fn verify_group_formation(leader: Child, attribution: Attribution) -> io::Result<Self> {
+        Self::admit_spawned(leader, attribution, |leader| {
+            let pgid = leader.id();
+            // A child that exits before the probe is fine; a still-running
+            // leader outside its requested fresh group must be refused.
+            #[cfg(target_os = "linux")]
+            let members = {
+                let probe = members_from_proc(pgid);
+                match leader.try_wait()? {
+                    Some(_) => {}
+                    None => {
+                        if !probe.iter().any(|m| m.pid == i32::try_from(pgid).unwrap_or(-1))
+                            // Recheck exit: the first scan may have raced the
+                            // leader becoming a zombie (filtered by the scan).
+                            && leader.try_wait()?.is_none()
+                        {
+                            return Err(io::Error::other(format!(
+                                "process_group(0) not honored: live leader pid {pgid} not found in any /proc pgrp"
+                            )));
+                        }
                     }
                 }
-            }
-            probe
-        };
-        #[cfg(not(target_os = "linux"))]
-        let members = members_from_proc(pgid);
-
-        Ok(Self {
-            pgid,
-            leader,
-            members,
-            attribution,
+                probe
+            };
+            #[cfg(not(target_os = "linux"))]
+            let members = members_from_proc(pgid);
+            Ok(members)
         })
+    }
+
+    /// The guard remains armed across every verifier error and unwind. The
+    /// verifier borrows the child, so it cannot detach ownership by taking it.
+    fn admit_spawned(
+        leader: Child,
+        attribution: Attribution,
+        verify: impl FnOnce(&mut Child) -> io::Result<Vec<GroupMember>>,
+    ) -> io::Result<Self> {
+        let mut pending = UnadmittedProcess(Some(leader));
+        let leader = pending.0.as_mut().expect("unadmitted process owns its child");
+        let pgid = leader.id();
+        let members = verify(leader)?;
+        let leader = pending.0.take().expect("successful admission transfers the child once");
+        Ok(Self { pgid, leader, members, attribution })
     }
     /// Group id (== leader pid by construction).
     #[must_use]
@@ -307,7 +336,8 @@ impl ManagedProcessGroup {
     /// [`crate::stream_drain::DEFAULT_MAX_CAPTURE_BYTES`]. Drain I/O failure,
     /// budget exhaustion or a lane startup failure stops the process immediately
     /// through the same TERM/KILL policy. No partial capture becomes success.
-    /// The stop predicate must not panic.
+    /// An unwinding stop predicate is resumed only after process/drain cleanup.
+    /// As elsewhere, panic=abort cannot run in-process cleanup guards.
     pub fn wait_with_bounded_drain_controlled(
         self,
         limits: &crate::stream_drain::DrainLimits,
@@ -349,7 +379,23 @@ impl ManagedProcessGroup {
                     break Err(error);
                 }
             }
-            if stopping_at.is_none() && (lanes.failed() || stop_requested()) {
+            let stop = if stopping_at.is_some() {
+                false
+            } else if lanes.failed() {
+                true
+            } else {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut stop_requested)) {
+                    Ok(stop) => stop,
+                    Err(panic) => {
+                        // Do not let an execution owner's unwind detach live
+                        // subprocesses or blocked output drain threads.
+                        kill_and_reap_spawned(&mut self.leader);
+                        let _ = lanes.join();
+                        std::panic::resume_unwind(panic);
+                    }
+                }
+            };
+            if stop {
                 stopping_at = Some(Instant::now());
                 let _ = self.signal_group(GroupSignal::Term);
             }
@@ -491,6 +537,89 @@ fn split_stat_fields(stat: &str) -> Option<(String, &str)> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn caller_configuration_cannot_override_fresh_process_group_formation() {
+        let group = ManagedProcessGroup::spawn_with(&spec("sh", "printf contained"), |cmd| {
+            // This nonexistent target group would reject spawn if the mandatory
+            // containment setting were applied before caller configuration.
+            cmd.process_group(i32::MAX)
+                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        }).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let output = group.wait_with_bounded_drain(&crate::stream_drain::DrainLimits {
+            resident_bound: 64, spill_dir: dir.path().join("spill"),
+        }).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.resident(), b"contained");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawned_tree() -> Child {
+        Command::new("sh").args(["-c", "sleep 30 & wait"])
+            .process_group(0).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .spawn().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn observe_descendant(leader: &mut Child) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while members_from_proc(leader.id()).len() < 2 {
+            assert!(leader.try_wait().unwrap().is_none());
+            assert!(Instant::now() < deadline, "child did not fork a descendant");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejected_formation_reaps_the_already_spawned_child_and_descendants() {
+        let leader = spawned_tree();
+        let pgid = leader.id();
+        let outcome = ManagedProcessGroup::admit_spawned(leader, Attribution::default(), |leader| {
+            observe_descendant(leader);
+            Err(io::Error::other("injected formation verification failure"))
+        });
+        assert!(outcome.unwrap_err().to_string().contains("verification failure"));
+        assert!(members_from_proc(pgid).is_empty());
+        assert!(!std::path::Path::new(&format!("/proc/{pgid}")).exists(), "leader was not reaped");
+    }
+
+    #[cfg(all(target_os = "linux", panic = "unwind"))]
+    #[test]
+    fn unwinding_formation_verification_keeps_cleanup_armed() {
+        let leader = spawned_tree();
+        let pgid = leader.id();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ManagedProcessGroup::admit_spawned(leader, Attribution::default(), |leader| {
+                observe_descendant(leader);
+                panic!("injected verification unwind")
+            })
+        }));
+        assert!(outcome.is_err());
+        assert!(members_from_proc(pgid).is_empty());
+        assert!(!std::path::Path::new(&format!("/proc/{pgid}")).exists());
+    }
+
+    #[cfg(all(target_os = "linux", panic = "unwind"))]
+    #[test]
+    fn stop_predicate_unwind_reaps_processes_and_joins_piped_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = ManagedProcessGroup::spawn_with(
+            &spec("sh", "printf prefix; printf diagnostic >&2; sleep 30 & wait"),
+            |cmd| { cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()); },
+        ).unwrap();
+        let pgid = group.pgid();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            group.wait_with_bounded_drain_controlled(
+                &crate::stream_drain::DrainLimits { resident_bound: 2, spill_dir: dir.path().join("spill") },
+                || panic!("injected stop predicate unwind"),
+            )
+        }));
+        assert!(outcome.is_err());
+        assert!(members_from_proc(pgid).is_empty());
+        assert!(!std::path::Path::new(&format!("/proc/{pgid}")).exists());
+    }
 
     #[test]
     fn capture_budget_exact_boundary_keeps_both_binary_streams() {
